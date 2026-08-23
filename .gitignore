@@ -1,0 +1,14 @@
+# Zig
+zig-cache/
+.zig-cache/
+zig-out/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local scratch
+*.local.*
+/tmp/
