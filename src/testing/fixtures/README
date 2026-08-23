@@ -1,0 +1,11 @@
+Recorded fixtures for tests (no network in unit tests):
+
+  sse/        recorded provider SSE streams — happy path, mid-stream drop,
+              malformed tool-call JSON, 429 + Retry-After, usage-only tail.
+              Torture cases: events split across chunk boundaries mid-escape
+              and mid-UTF-8.
+  ndjson/     recorded client⇄daemon protocol transcripts (golden tests).
+
+Record real OpenRouter streams with:
+  curl -N https://openrouter.ai/api/v1/chat/completions ... | tee fixture.sse
+then scrub anything sensitive before committing.
