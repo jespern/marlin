@@ -5338,7 +5338,8 @@ test "failed tool output uses red only for its marker and salient diagnostics" {
     });
     try app.blocks.append(gpa, .{
         .kind = .tool_result,
-        .text = try gpa.dupe(u8,
+        .text = try gpa.dupe(
+            u8,
             "compiler output\n/opt/zig/std.zig:10:2: stack frame\nerror: command failed\ncase one FAIL PermissionDenied\n[exit code: 1]",
         ),
         .label = try gpa.dupe(u8, ""),

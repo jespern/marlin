@@ -408,7 +408,12 @@ test "replaceExact: unique, ambiguous, replace_all" {
 test "fuzzyReplace: matches despite indentation drift" {
     const gpa = std.testing.allocator;
     const hay = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
-    const r = try fuzzyReplace(gpa, hay, "let x = 1;\nlet y = 2;", "    let x = 10;", );
+    const r = try fuzzyReplace(
+        gpa,
+        hay,
+        "let x = 1;\nlet y = 2;",
+        "    let x = 10;",
+    );
     defer gpa.free(r.text);
     try std.testing.expectEqualStrings("fn main() {\n    let x = 10;\n}\n", r.text);
 }
