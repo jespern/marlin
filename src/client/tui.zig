@@ -85,6 +85,9 @@ const App = struct {
     editor: Editor,
 
     mode: Mode = .insert,
+    /// Terminal columns (updated on every winsize event); used by handleKey
+    /// for the editor's vertical-move edge detection so it matches draw().
+    term_cols: usize = 80,
     blocks: std.ArrayList(RenderBlock) = .empty,
     delta: std.ArrayList(u8) = .empty,
     state: proto.SessionState = .idle,
@@ -617,6 +620,7 @@ pub fn run(
     {
         var ws = tty.getWinsize() catch vaxis.Winsize{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 };
         if (ws.rows == 0 or ws.cols == 0) ws = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 };
+        app.term_cols = ws.cols;
         try vx.resize(gpa, tty.writer(), ws);
     }
 
@@ -641,7 +645,10 @@ pub fn run(
         const event = try loop.nextEvent();
         switch (event) {
             .key_press => |key| try handleKey(&app, key),
-            .winsize => |ws| try vx.resize(gpa, tty.writer(), ws),
+            .winsize => |ws| {
+                app.term_cols = ws.cols;
+                try vx.resize(gpa, tty.writer(), ws);
+            },
             .paste => |text| {
                 app.editor.paste(text);
                 gpa.free(@constCast(text));
@@ -654,7 +661,10 @@ pub fn run(
                         .daemon_line => |l2| app.handleDaemonLine(l2),
                         .daemon_gone => app.should_quit = true,
                         .key_press => |k2| try handleKey(&app, k2),
-                        .winsize => |ws2| try vx.resize(gpa, tty.writer(), ws2),
+                        .winsize => |ws2| {
+                            app.term_cols = ws2.cols;
+                            try vx.resize(gpa, tty.writer(), ws2);
+                        },
                         .paste => |t2| {
                             app.editor.paste(t2);
                             gpa.free(@constCast(t2));
@@ -704,9 +714,8 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     switch (app.mode) {
         .insert => {
             const ed = &app.editor;
-            // Editing width matches draw(): terminal minus the prompt.
-            const edit_w: usize = 78; // safe default; layout only affects
-            // vertical-move edge detection, and draw() re-lays-out per frame.
+            // Same width draw() gives the editor: terminal minus the prompt.
+            const edit_w: usize = app.term_cols -| 2;
             if (key.matches(vaxis.Key.escape, .{})) {
                 app.mode = .normal; // draft survives: editor state untouched
             } else if (key.matches(vaxis.Key.enter, .{ .alt = true }) or
