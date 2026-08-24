@@ -1,6 +1,7 @@
 # Multi-model review ("councils")
 
-Status: design. Targets post-M4 (needs daemon, TUI, detached child sessions).
+Status: design; protocol and UX settled. Targets post-M4 (needs daemon, TUI,
+detached child sessions).
 Depends on the L3 subagent machinery (ARCHITECTURE.md §context, `task` tool) —
 a review is a specialization of it, not new architecture.
 
@@ -56,16 +57,30 @@ brief → approve/edit → fan-out (N detached reviewer sessions, parallel)
 
 ### 2.1 Brief
 
-Built by the primary from its live context. Contents:
+Built by the primary from its live context and the user's natural-language
+review request. The primary interprets requests such as "review the system
+from the top; adversarial, focus on crypto and UX" into a proposed scope,
+stance, and evidence-gathering plan. Contents:
 
 - **Target** (see §3): inlined diff, or file manifest + entry points.
 - **Decisions-and-constraints digest**: "we deliberately chose X because Y".
   Kills the false-positive class where reviewers flag intentional choices.
   Same summary contract as L2 compaction — reuse that machinery.
-- **Focus lines**: the human's suspicion, verbatim.
+- **Review mission**: the primary's concise formulation of what the council
+  should attempt to prove or disprove, including the proposed stance.
+- **Focus lines**: the human's original request and suspicions, verbatim. The
+  primary may organize or augment these, but never silently rewrite them away.
 - **Finding contract** (§2.3) the reviewer must return.
 
-Shown in the TUI before fan-out; approve as-is or edit inline.
+Shown in the TUI before fan-out; the user can edit the complete brief, change
+the inferred scope/stance/deliberation, approve it as-is, or cancel. Inference
+is an ergonomic shortcut, never authority to spend N model calls against the
+wrong target.
+
+Every reviewer receives the same core brief. Provider-specific wire formatting
+may differ, but covertly tailoring the mission per model would make independent
+agreement less meaningful. Explicit per-model roles are a possible later
+feature and must be visible in the approved brief.
 
 ### 2.2 Fan-out
 
@@ -125,13 +140,20 @@ appear as an appendix).
   `debate 5 grok`. Accepted rows become plan/todo items in the parent session
   — review output flows into fix work without re-prompting.
 
-### 2.5 Rebuttal (rounds = 1, opt-in)
+### 2.5 Deliberation (opt-in)
 
-Per contested claim only: primary sends its rebuttal to the reviewer that
-raised it, reviewer gets one counter, done. The forcing function that matters:
-the primary must respond to *every* finding (accept or rebut) — no
-cherry-picking easy ones. No N-way debate in v1; if contested claims need
-adjudication later, add pairwise debate on one claim as a separate verb.
+Two named modes; do not expose an open-ended debate-round counter in the UX:
+
+- `independent` — reviewers return one critique each; the primary still
+  clusters and verifies every claim, but does not argue with reviewers.
+- `rebuttal` — the primary must respond to every finding (accept or rebut).
+  For a contested claim it sends the evidence-backed rebuttal to the reviewer
+  that raised it; the reviewer gets one counter, then the exchange ends.
+
+The forcing function that matters is complete coverage — no cherry-picking
+easy findings. No N-way debate or arbitrary depth in v1; if contested claims
+later need further adjudication, add pairwise debate on one claim as a
+separate explicit verb.
 
 ## 3. Scope
 
@@ -161,14 +183,28 @@ minimal until ~20 real reviews have been run:
 
 ```toml
 [council.crypto]
-models  = ["anthropic/claude-5.6-sonnet", "anthropic/claude-fable-5",
-           "x-ai/grok-4.6", "z-ai/glm-5.3"]
-effort  = "high"          # pinned per council
-rounds  = 0               # 0 = independent one-shot, 1 = rebuttal enabled
-tools   = "read-only"     # none | read-only
-max_turns = 12            # per reviewer
-# stance per model (for/against/neutral, Zen-style) — deferred, likely (v2)
+models       = ["anthropic/claude-5.6-sonnet", "anthropic/claude-fable-5",
+                "x-ai/grok-4.6", "z-ai/glm-5.3"]
+effort       = "high"          # reasoning effort pinned per reviewer
+stance       = "balanced"      # balanced | adversarial; invocation may override
+deliberation = "independent"   # independent | rebuttal
+tools        = "read-only"     # none | read-only
+max_turns    = 12              # exploration/tool budget per reviewer
+max_tokens   = 40000           # total token budget per reviewer
+# Different stance per model (for/against/neutral, Zen-style) remains deferred.
 ```
+
+These are intentionally separate controls:
+
+| control | meaning |
+|---------|---------|
+| `effort` | how hard each model reasons per provider call |
+| `stance` | how critically the initial review brief frames the target |
+| `deliberation` | whether the primary and reviewer exchange one rebuttal |
+| `max_turns` / `max_tokens` | how much exploration each reviewer may perform |
+
+Council defaults can be overridden for one review, but an override is shown in
+the brief preview and never mutates the named council.
 
 Everything on OpenRouter already — reviewers are just sessions pinned to a
 different model. No CLI-wrapping (the duct tape Claude Code users need to
@@ -183,17 +219,67 @@ Verification cost scales with claim count, not model count — a noisy 4th
 model is nearly free at fan-out but doubles triage. No harness surfaces this
 today; it falls out of sessions-as-data.
 
-## 5. UX surface (PLACEHOLDER — syntax not settled)
+## 5. UX surface
 
-The `--diff/--council` flag style below is disliked and explicitly not final;
-the pipeline above is the design, the invocation grammar is not. Candidates
-to explore when this gets built: a `/review` interactive picker (scope +
-council + focus as a small form), review as a mode on the current selection,
-or council names as verbs (`/crypto ...`). Decide at build time, in the TUI.
+Council definition and review invocation are separate surfaces: `/council`
+mutates durable named configuration; `/review` creates one immutable review
+run from a council plus an approved brief. Council names do not become global
+slash verbs (`/crypto`) — that pollutes autocomplete and makes configuration
+indistinguishable from actions.
+
+### 5.1 Council manager
 
 ```
-/review <scope> <council> -- focus: ...        # strawman only
+/council                 # list/pick councils
+/council new             # open creation form
+/council crypto          # inspect/edit this council
+/council delete crypto   # confirm, then remove it
 ```
+
+The creation/edit form contains:
+
+```
+name          crypto
+models        [✓ sol] [✓ fable] [✓ grok] [✓ glm]
+effort        high
+stance        balanced | adversarial
+deliberation  independent | rebuttal
+tools         read-only
+budget        12 turns / 40k tokens per reviewer
+```
+
+Use the existing model catalog as a multi-select picker. The daemon validates
+model ids and writes council configuration atomically; the TUI must not edit
+TOML directly. Config-file edits and `/council` edits share one source of
+truth and become visible after daemon reload/acknowledgement.
+
+### 5.2 Review invocation
+
+```
+/review
+/review crypto review the system from the top; adversarial, focus on crypto and UX
+```
+
+`/review` with no arguments opens a small form:
+
+```
+council       crypto
+scope         whole repo       # proposed by primary; editable
+stance        adversarial      # council default or request override
+deliberation  independent      # council default; editable for this run
+focus         review the system from the top; focus on crypto and UX
+```
+
+The fast path treats the first argument as a council name only when it exactly
+matches a configured council; otherwise the whole argument string pre-fills
+`focus` and the picker requests a council. Submitting either path asks the
+primary to construct the brief from §2.1, then opens the full brief preview.
+Only explicit approval starts fan-out.
+
+The primary may infer scope from the request and live context — e.g. "from the
+top" suggests `whole repo`, while "review these changes" suggests
+`working diff` — but scope always remains a visible structured field. This
+keeps the natural-language path quick without hiding its cost or reach.
 
 ## 6. Store & protocol touchpoints
 
@@ -217,5 +303,6 @@ or council names as verbs (`/crypto ...`). Decide at build time, in the TUI.
    was a strength of none of the manual flows.
 4. Where does the scoreboard render — a live strip, `marlin review stats`, or
    just a query? (Defer until data exists; no persistent sidebar.)
-5. Stance steering (assign one model "argue this is broken"): worth a config
-   knob, or does adversarial framing in the brief cover it? Defer.
+5. Per-model stance steering (assign one model "argue this is broken" while
+   another defends it) remains deferred. Council-wide `balanced | adversarial`
+   framing is sufficient for v1 and stays visible in the approved brief.
