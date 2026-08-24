@@ -6,6 +6,10 @@
 
 const std = @import("std");
 
+/// Reasoning-effort fields differ between OpenRouter and the OpenAI Chat
+/// Completions-compatible endpoints used for local models.
+pub const Dialect = enum { openrouter, openai_compatible };
+
 pub const Role = enum { system, user, assistant, tool };
 
 pub const ToolCall = struct {

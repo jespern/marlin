@@ -13,6 +13,7 @@ pub const Session = struct {
     title: []const u8,
     cwd: []const u8,
     model: []const u8,
+    effort: proto.ReasoningEffort = .auto,
     state: proto.SessionState = .idle,
     /// Highest block seq persisted; next block gets last_seq + 1.
     last_seq: u64 = 0,

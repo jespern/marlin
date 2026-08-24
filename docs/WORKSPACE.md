@@ -24,7 +24,7 @@ prompt for capability escalations.
 | Concern | Mechanism | Prompt? |
 |---|---|---|
 | Reads | free | never |
-| Writes inside workspace | shadow snapshot = undo | never |
+| Writes inside workspace | COW shadow snapshot = undo | never |
 | Writes outside workspace | sandbox escalation | rare, capability-grant, session-scoped |
 | Two marlin sessions, one dir | write lease → park | never (park, don't ask) |
 | Deliberate parallel work on one repo | worktree isolation | explicit at session create |
@@ -41,24 +41,42 @@ path. We built the right mechanism; this changes what flows through it.
 ## 2. The workspace layer
 
 Every session gets a **workspace**: the daemon's answer to "where do writes
-go and who guarantees undo." One concept, three mechanisms.
+go and who guarantees undo." In shared mode its root is exactly the
+canonicalized directory the session was launched in: never an implicitly
+discovered parent Git root, and no explicit override in M3.5. One concept,
+three mechanisms.
 
-### 2.1 Shadow snapshots (always on, once enabled)
+### 2.1 Copy-on-write shadow snapshots (always on, once enabled)
 
-The daemon keeps its own repo per directory under
-`~/.local/state/marlin/shadows/<dirhash>`: a bare repo with GIT_WORK_TREE
-pointed at the session dir, driven with plumbing only (temp index +
-`write-tree`). It never touches the user's `.git`, index, or stashes.
+The daemon keeps a private snapshot set per canonical workspace. A snapshot is
+a path/metadata manifest plus copy-on-write clones of regular files:
+`clonefile` on APFS and `FICLONE` on supporting Linux filesystems. Snapshot and
+working file initially share physical blocks; later writes allocate only the
+changed blocks. The daemon never touches the user's `.git`, index, or stashes.
+
+The clone store normally lives under
+`~/.local/state/marlin/shadows/<dirhash>`. File cloning requires the store and
+workspace to be on the same supporting filesystem, so capability is probed per
+workspace. If cloning is unavailable or the state directory is on another
+filesystem, use a real/content-addressed copy and surface the slower mode;
+never silently omit files or weaken the undo guarantee. Ordinary hard links
+are not a fallback: in-place writes would corrupt both names.
 
 - Snapshot at turn start, lazily on the first mutating tool call (not on
-  read-only turns; `write-tree` on huge trees isn't free).
+  read-only turns; walking a high-inode tree still isn't free).
 - Works identically whether the user's dir is a git repo or not — marlin
-  brings its own repo, so "is this a repo?" prompts don't exist. The user's
-  repo stops being a dependency of marlin's guarantees.
+  owns the snapshot engine, so "is this a repo?" prompts don't exist. The
+  user's repo stops being a dependency of marlin's guarantees.
+- Clone every regular file under the workspace, including ignored files.
+  The manifest also records directories, permissions, symlink targets, and
+  deletions. Exclude only `.git`, Marlin's own state, and special files such
+  as sockets and devices.
 - Enables real undo: `/undo turn`, "restore file as of turn N" — all reads
   from the shadow, all recorded as session blocks.
-- Costs: disk (mitigate: respect .gitignore, GC snapshots past a horizon)
-  and snapshot latency on huge trees (mitigate: lazy + only when mutating).
+- Costs: one walk and clone/copy operation per file, changed blocks after the
+  snapshot, and retained history. Mitigate with lazy capture and GC past a
+  horizon; add explicit cache exclusions only if rollout measurements justify
+  weakening complete regular-file coverage.
 
 **UX rule: `/undo` must show its diff before applying, never after.** In
 shared mode a marlin snapshot may include external edits (§3), so a blind
@@ -71,9 +89,10 @@ not an architecture problem.
 All marlin writes flow through daemon tools, so the daemon enforces: a turn
 takes a **write lease** on the workspace root before its first mutating
 call; read-only turns take none. A second mutating turn on a leased root
-**parks** (state `waiting_workspace`, sidebar glyph, steer-able) — exactly
-the awaiting_approval parking with a different reason code. Most collisions
-are seconds long; queueing is the right default and asks nothing.
+**parks** (state `waiting_workspace`, visible in the on-demand session picker
+and actionable status summary, steer-able) — exactly the awaiting_approval
+parking with a different reason code. Most collisions are seconds long;
+queueing is the right default and asks nothing.
 
 Lease events land in the block log, so "why did this turn wait 40s" is
 answerable. The **user never holds a lease** — leases order agents; user
@@ -153,8 +172,11 @@ control the writer, branch-and-land when we do.
 - **seatbelt is deprecated** on macOS; Chrome still rides it, zag proves the
   shape. Landlock+seccomp on Linux. Sandbox implementation is two focused
   files behind the existing bash tool.
-- **Shadow snapshots of non-repo dirs** snapshot everything not
-  .gitignore'd; a dir full of large binaries will hurt until GC lands.
+- **COW snapshots still scale with inode count.** Large files are cheap on the
+  clone fast path, but a tree containing hundreds of thousands of tiny files
+  still requires a walk and clone syscall per file. Unsupported or
+  cross-filesystem fallback copies may be substantially slower; expose the
+  active mode and measure it during rollout.
 
 ## 6. Config & rollout
 

@@ -12,6 +12,7 @@
 const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
+const Effort = @import("../../core/effort.zig").Effort;
 
 // ------------------------------------------------------------- request --
 
@@ -26,6 +27,8 @@ pub const ToolSpec = struct {
 pub fn buildRequestBody(
     gpa: std.mem.Allocator,
     model: []const u8,
+    dialect: provider.Dialect,
+    effort: Effort,
     messages: []const provider.Message,
     tools: []const ToolSpec,
 ) ![]u8 {
@@ -36,6 +39,14 @@ pub fn buildRequestBody(
 
     try ws.writeAll("{\"model\":");
     try enc(model, .{}, ws);
+    if (effort.providerValue()) |value| {
+        switch (dialect) {
+            .openrouter => try ws.writeAll(",\"reasoning\":{\"effort\":"),
+            .openai_compatible => try ws.writeAll(",\"reasoning_effort\":"),
+        }
+        try enc(value, .{}, ws);
+        if (dialect == .openrouter) try ws.writeByte('}');
+    }
     try ws.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     for (messages, 0..) |m, i| {
         if (i > 0) try ws.writeByte(',');
@@ -307,11 +318,20 @@ test "request body builds valid json" {
     const tools = [_]ToolSpec{
         .{ .name = "bash", .description = "run a command", .schema_json = "{\"type\":\"object\"}" },
     };
-    const body = try buildRequestBody(gpa, "openai/gpt-4o", &msgs, &tools);
+    const body = try buildRequestBody(gpa, "openai/gpt-4o", .openrouter, .high, &msgs, &tools);
     defer gpa.free(body);
     // Must be valid JSON with the right top-level fields.
     const ok = std.json.validate(gpa, body) catch false;
     try std.testing.expect(ok);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"high\"}") != null);
+
+    const auto_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .auto, &msgs, &.{});
+    defer gpa.free(auto_body);
+    try std.testing.expect(std.mem.indexOf(u8, auto_body, "reasoning_effort") == null);
+
+    const local_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .low, &msgs, &.{});
+    defer gpa.free(local_body);
+    try std.testing.expect(std.mem.indexOf(u8, local_body, "\"reasoning_effort\":\"low\"") != null);
 }

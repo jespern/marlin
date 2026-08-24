@@ -70,7 +70,7 @@ Shown in the TUI before fan-out; approve as-is or edit inline.
 ### 2.2 Fan-out
 
 One detached child session per council model. Ordinary sessions in the store
-(parent pointer set, visible in sidebar under the parent, individually
+(parent pointer set, grouped under the parent in `/sessions`, individually
 attachable/resumable — you can reopen grok's review afterwards and interrogate
 it: "walk me through the exploit"). Runs on the existing
 one-thread-per-turn model; status glyphs in the parent:
@@ -215,7 +215,7 @@ or council names as verbs (`/crypto ...`). Decide at build time, in the TUI.
 3. Reviewer context for diff scope: diff-only, or diff + read-only tools too?
    Lean: give tools even here; reviewers grepping callers of changed functions
    was a strength of none of the manual flows.
-4. Where does the scoreboard render — `marlin review stats`, sidebar, or just
-   a query? (Defer until data exists.)
+4. Where does the scoreboard render — a live strip, `marlin review stats`, or
+   just a query? (Defer until data exists; no persistent sidebar.)
 5. Stance steering (assign one model "argue this is broken"): worth a config
    knob, or does adversarial framing in the brief cover it? Defer.

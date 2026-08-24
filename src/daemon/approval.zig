@@ -6,7 +6,7 @@
 //! mutating ask; session approvals mode "auto" (headless / --yolo) flips all
 //! to auto. `ask` emits approval_request to all subscribed clients; first
 //! decision wins; no timeout — the turn parks in awaiting_approval (that
-//! parked state is exactly what the sidebar/phone surfaces).
+//! parked state is exactly what the session picker/status summary/phone surfaces).
 //!
 //! Threading: the TURN thread blocks in Gate.wait(); the DISPATCHER thread
 //! resolves via Gate.resolve() when a client answers (or on interrupt).

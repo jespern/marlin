@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const block = @import("block.zig");
+pub const ReasoningEffort = @import("effort.zig").Effort;
 
 pub const proto_version: u32 = 1;
 
@@ -24,6 +25,7 @@ pub const ClientMsg = union(enum) {
     session_create: struct {
         cwd: []const u8,
         model: []const u8,
+        effort: ReasoningEffort = .auto,
         title: []const u8 = "",
         /// "default" = mutating tools ask; "auto" = everything auto-approved
         /// (headless one-shots and --yolo).
@@ -32,6 +34,7 @@ pub const ClientMsg = union(enum) {
     session_list: struct {},
     session_kill: struct { sid: u64 },
     session_set_model: struct { sid: u64, model: []const u8 },
+    session_set_effort: struct { sid: u64, effort: ReasoningEffort },
     sub: struct { sid: u64, from_seq: u64 = 0 },
     unsub: struct { sid: u64 },
     input: struct { sid: u64, text: []const u8 },
@@ -93,6 +96,7 @@ pub const SessionInfo = struct {
     /// compatible with daemons that predate this field.
     cwd: []const u8 = "",
     model: []const u8,
+    effort: ReasoningEffort = .auto,
     status: []const u8,
     created_at: i64,
     running: bool,
@@ -149,6 +153,12 @@ test "round trip: client messages" {
     const back = try decode(ClientMsg, arena, line);
     try std.testing.expectEqual(@as(u64, 0xDEAD_BEEF_0000_1111), back.input.sid);
     try std.testing.expectEqualStrings("hi \"there\"\nline2", back.input.text);
+
+    const effort_msg: ClientMsg = .{ .session_set_effort = .{ .sid = 9, .effort = .xhigh } };
+    const effort_line = try encode(gpa, effort_msg);
+    defer gpa.free(effort_line);
+    const effort_back = try decode(ClientMsg, arena, effort_line);
+    try std.testing.expectEqual(ReasoningEffort.xhigh, effort_back.session_set_effort.effort);
 }
 
 test "round trip: daemon block message with tool_result body" {

@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const block = @import("../core/block.zig");
+const Effort = @import("../core/effort.zig").Effort;
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -42,6 +43,7 @@ const schema_sql =
     \\  created_at INTEGER NOT NULL,
     \\  cwd TEXT NOT NULL,
     \\  model TEXT NOT NULL,
+    \\  effort TEXT NOT NULL DEFAULT 'auto',
     \\  status TEXT NOT NULL DEFAULT 'idle',
     \\  pinned_context TEXT NOT NULL DEFAULT '',
     \\  tokens_in INTEGER NOT NULL DEFAULT 0,
@@ -69,7 +71,7 @@ const schema_sql =
     \\  block_id INTEGER NOT NULL,
     \\  PRIMARY KEY(hash, block_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','2');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','3');
 ;
 
 pub const SessionRow = struct {
@@ -77,6 +79,7 @@ pub const SessionRow = struct {
     title: []const u8,
     cwd: []const u8,
     model: []const u8,
+    effort: Effort,
     status: []const u8,
     tokens_in: u64,
     tokens_out: u64,
@@ -104,17 +107,26 @@ pub const Store = struct {
     /// current by schema_sql (which stamps the version via INSERT OR IGNORE).
     fn migrate(self: Store) Error!void {
         const ver = try self.kvGetInt("schema_version");
-        if (ver >= 2) return;
-        // v1 → v2: blob GC columns + retroactive auto_vacuum.
-        // ALTERs must not re-run, so they are guarded by the version check.
-        // VACUUM rewrites the DB so the INCREMENTAL auto_vacuum PRAGMA
-        // (set by schema_sql above) actually takes effect on old files.
-        try self.execAll(
-            \\ALTER TABLE blobs ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
-            \\ALTER TABLE blobs ADD COLUMN tombstone INTEGER NOT NULL DEFAULT 0;
-            \\UPDATE kv SET value='2' WHERE key='schema_version';
-            \\VACUUM;
-        );
+        if (ver < 2) {
+            // v1 → v2: blob GC columns + retroactive auto_vacuum.
+            // ALTERs must not re-run, so they are guarded by the version check.
+            // VACUUM rewrites the DB so the INCREMENTAL auto_vacuum PRAGMA
+            // (set by schema_sql above) actually takes effect on old files.
+            try self.execAll(
+                \\ALTER TABLE blobs ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE blobs ADD COLUMN tombstone INTEGER NOT NULL DEFAULT 0;
+                \\UPDATE kv SET value='2' WHERE key='schema_version';
+                \\VACUUM;
+            );
+        }
+        if (ver < 3) {
+            // v2 → v3: reasoning effort is durable session state. `auto`
+            // preserves the provider/model default for every existing row.
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN effort TEXT NOT NULL DEFAULT 'auto';
+                \\UPDATE kv SET value='3' WHERE key='schema_version';
+            );
+        }
     }
 
     fn kvGetInt(self: Store, key: []const u8) Error!i64 {
@@ -143,15 +155,16 @@ pub const Store = struct {
 
     // ---------------------------------------------------------- sessions --
 
-    pub fn createSession(self: Store, id: u64, created_at: i64, cwd: []const u8, model: []const u8) Error!void {
+    pub fn createSession(self: Store, id: u64, created_at: i64, cwd: []const u8, model: []const u8, effort: Effort) Error!void {
         const stmt = try self.prepare(
-            "INSERT INTO sessions(id, created_at, cwd, model) VALUES(?,?,?,?)",
+            "INSERT INTO sessions(id, created_at, cwd, model, effort) VALUES(?,?,?,?,?)",
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(id));
         bindInt(stmt, 2, created_at);
         bindText(stmt, 3, cwd);
         bindText(stmt, 4, model);
+        bindText(stmt, 5, @tagName(effort));
         try stepDone(stmt);
     }
 
@@ -174,11 +187,20 @@ pub const Store = struct {
         try stepDone(stmt);
     }
 
+    pub fn setSessionEffort(self: Store, id: u64, effort: Effort) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET effort=? WHERE id=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, @tagName(effort));
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
     pub const SessionListing = struct {
         id: u64,
         title: []const u8,
         cwd: []const u8,
         model: []const u8,
+        effort: Effort,
         status: []const u8,
         created_at: i64,
 
@@ -193,7 +215,7 @@ pub const Store = struct {
     /// All sessions, newest first. Caller deinits each entry + frees slice.
     pub fn listSessions(self: Store) Error![]SessionListing {
         const stmt = try self.prepare(
-            "SELECT id, title, cwd, model, status, created_at FROM sessions ORDER BY created_at DESC, id DESC",
+            "SELECT id, title, cwd, model, effort, status, created_at FROM sessions ORDER BY created_at DESC, id DESC",
         );
         defer finalize(stmt);
         var out: std.ArrayList(SessionListing) = .empty;
@@ -210,8 +232,9 @@ pub const Store = struct {
                 .title = try self.dupeCol(stmt, 1),
                 .cwd = try self.dupeCol(stmt, 2),
                 .model = try self.dupeCol(stmt, 3),
-                .status = try self.dupeCol(stmt, 4),
-                .created_at = c.sqlite3_column_int64(stmt, 5),
+                .effort = Effort.parse(columnText(stmt, 4)) orelse .auto,
+                .status = try self.dupeCol(stmt, 5),
+                .created_at = c.sqlite3_column_int64(stmt, 6),
             });
         }
         return out.toOwnedSlice(self.gpa);
@@ -232,7 +255,7 @@ pub const Store = struct {
     /// Fetch one session row. Strings are allocated with gpa; caller frees.
     pub fn getSession(self: Store, id: u64) Error!SessionRow {
         const stmt = try self.prepare(
-            "SELECT title, cwd, model, status, tokens_in, tokens_out FROM sessions WHERE id=?",
+            "SELECT title, cwd, model, effort, status, tokens_in, tokens_out FROM sessions WHERE id=?",
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(id));
@@ -244,9 +267,10 @@ pub const Store = struct {
             .title = try self.dupeCol(stmt, 0),
             .cwd = try self.dupeCol(stmt, 1),
             .model = try self.dupeCol(stmt, 2),
-            .status = try self.dupeCol(stmt, 3),
-            .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 4)),
-            .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 5)),
+            .effort = Effort.parse(columnText(stmt, 3)) orelse .auto,
+            .status = try self.dupeCol(stmt, 4),
+            .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 5)),
+            .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 6)),
         };
     }
 
@@ -414,6 +438,12 @@ fn finalize(stmt: *c.sqlite3_stmt) void {
     _ = c.sqlite3_finalize(stmt);
 }
 
+fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {
+    const ptr = c.sqlite3_column_text(stmt, col);
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+    return ptr[0..len];
+}
+
 fn bindInt(stmt: *c.sqlite3_stmt, idx: c_int, v: i64) void {
     _ = c.sqlite3_bind_int64(stmt, idx, v);
 }
@@ -452,7 +482,7 @@ test "session + block round trip (in-memory)" {
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try store.createSession(42, 1700000000000, "/tmp", "openrouter/foo");
+    try store.createSession(42, 1700000000000, "/tmp", "openrouter/foo", .high);
     try std.testing.expectEqual(@as(?u64, 42), try store.lastSession());
     const sessions = try store.listSessions();
     defer {
@@ -462,6 +492,12 @@ test "session + block round trip (in-memory)" {
     try std.testing.expectEqual(@as(usize, 1), sessions.len);
     try std.testing.expectEqualStrings("/tmp", sessions[0].cwd);
     try std.testing.expectEqualStrings("openrouter/foo", sessions[0].model);
+    try std.testing.expectEqual(Effort.high, sessions[0].effort);
+
+    try store.setSessionEffort(42, .low);
+    const session = try store.getSession(42);
+    defer store.freeSession(session);
+    try std.testing.expectEqual(Effort.low, session.effort);
 
     const blk1 = block.Block{
         .id = 1,
@@ -504,7 +540,7 @@ test "duplicate seq rejected (append-only integrity)" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
-    try store.createSession(1, 0, "/", "m");
+    try store.createSession(1, 0, "/", "m", .auto);
     const mk = struct {
         fn blk(seq: u64) block.Block {
             return .{ .id = seq, .session_id = 1, .turn_id = 1, .seq = seq, .ts = 0, .body = .{ .user_msg = .{ .text = "x" } } };
@@ -537,13 +573,13 @@ test "blob round trip is content-addressed and idempotent" {
     try store.addBlobRef(h1, 202);
 }
 
-test "schema is v2 with auto_vacuum incremental" {
+test "schema is v3 with effort and auto_vacuum incremental" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 2), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 3), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 2), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 3), try store.kvGetInt("schema_version"));
 }

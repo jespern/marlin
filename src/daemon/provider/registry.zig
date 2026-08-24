@@ -18,11 +18,13 @@
 //! M1: config-driven [providers.*] table + the anthropic dialect.
 
 const std = @import("std");
+const provider = @import("provider.zig");
 
 pub const Endpoint = struct {
     url: [:0]const u8,
     bearer: ?[]const u8,
     model: []const u8,
+    dialect: provider.Dialect,
 
     pub fn deinit(self: Endpoint, gpa: std.mem.Allocator) void {
         gpa.free(self.url);
@@ -51,6 +53,7 @@ pub fn resolve(
             .url = try joinChatUrl(gpa, base),
             .bearer = try gpa.dupe(u8, key),
             .model = try gpa.dupe(u8, model),
+            .dialect = .openrouter,
         };
     }
     if (std.mem.eql(u8, provider_name, "local")) {
@@ -64,13 +67,14 @@ pub fn resolve(
             .url = try joinChatUrl(gpa, base),
             .bearer = if (key) |k| try gpa.dupe(u8, k) else null,
             .model = try gpa.dupe(u8, model),
+            .dialect = .openai_compatible,
         };
     }
     return error.UnknownProvider;
 }
 
-fn overrideBaseUrl(environ: *const std.process.Environ.Map, comptime provider: []const u8) ?[]const u8 {
-    const v = environ.get("MARLIN_BASE_URL_" ++ provider) orelse return null;
+fn overrideBaseUrl(environ: *const std.process.Environ.Map, comptime provider_name: []const u8) ?[]const u8 {
+    const v = environ.get("MARLIN_BASE_URL_" ++ provider_name) orelse return null;
     return if (v.len == 0) null else v;
 }
 

@@ -93,7 +93,12 @@ pub fn run(
         const cwd_len = try std.process.currentPath(io, &cwd_buf);
         // Headless one-shots auto-approve: there is no one to ask.
         const approvals: []const u8 = if (flags.ask) "default" else "auto";
-        try conn.send(.{ .session_create = .{ .cwd = cwd_buf[0..cwd_len], .model = model_str, .approvals = approvals } });
+        try conn.send(.{ .session_create = .{
+            .cwd = cwd_buf[0..cwd_len],
+            .model = model_str,
+            .effort = cfg.effort_default,
+            .approvals = approvals,
+        } });
         const created = try conn.recvUntil(arena, .session_created);
         sid = created.sid;
     }

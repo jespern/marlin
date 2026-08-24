@@ -57,6 +57,10 @@ pub fn isEmpty(self: *const Editor) bool {
     return self.text.items.len == 0;
 }
 
+pub fn isWalkingHistory(self: *const Editor) bool {
+    return self.hist_idx != null;
+}
+
 // ---------------------------------------------------------------- history --
 
 /// Record a submitted message (called for our own submits AND for replayed

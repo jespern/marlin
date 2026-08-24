@@ -45,7 +45,7 @@ marlin/
 │   │   ├── ui/
 │   │   │   ├── layout.zig     # binary-tree splits, focus
 │   │   │   ├── session_view.zig  # virtual block list, streaming region, collapse
-│   │   │   ├── sidebar.zig    # session list + status glyphs
+│   │   │   ├── session_picker.zig # on-demand session switcher + activity state
 │   │   │   ├── input.zig      # prompt box, /-commands, !-commands, history
 │   │   │   ├── select.zig     # mouse selection over logical text, OSC52 copy
 │   │   │   └── markdown.zig   # minimal md render (headings, code, lists, inline)
@@ -72,6 +72,10 @@ extraction clean):
   is the only file that knows curl.
 
 # Milestones
+
+Detailed decisions and proposed build slices for the current M3.5 → M4 work
+live in `docs/M3_5_M4_PLAN.md`. Implementation stays paused until its open
+product questions are resolved.
 
 Each milestone ends with something you use daily; cut scope inside a milestone,
 never the ordering. (Rough sizing assumes nights-and-weekends pace.)
@@ -104,16 +108,20 @@ marlin is developed from inside marlin. e2e: reboot vs kill-9 converge.
 ship a marlin change from a marlin session and `/reboot --build` into it.*
 
 ## M3.5 — workspace layer, phase 1 (docs/WORKSPACE.md)
-Shadow snapshots (daemon-owned repo per dir; /undo with diff preview; drift
-notes when external tools edit the wc) + write leases (waiting_workspace
-parking). Feature-flagged `[workspace] enabled`, DEFAULT OFF — M2 approval
+Copy-on-write shadow snapshots (per-file reflinks with a portable copy
+fallback; /undo with diff preview; drift notes when external tools edit the wc)
++ write leases (`waiting_workspace` parking). Feature-flagged `[workspace]
+enabled`, DEFAULT OFF — M2 approval
 semantics hold until sandbox escalations land (M4/M5).
 *Exit: two marlin sessions on one repo can't clobber each other; codex
 running alongside marlin is detected, absorbed, and undoable.*
 
 ## M4 — multiplexer
-Sidebar, splits, J/K session switching, status glyphs (running/idle/approval),
-mouse selection + OSC52, !c family, daemon-side register (!y/!p cross-session).
+No persistent sidebar. Sessions live in an on-demand `/sessions` picker with
+title/workspace/status, J/K switches recent sessions, and the status bar shows
+only actionable background activity (for example `2 running · 1 approval`).
+Splits carry a small per-pane session label. Mouse selection + OSC52, !c family,
+and daemon-side register (!y/!p cross-session).
 Image paste (ARCHITECTURE.md §image/asset paste): clipboard capture →
 attachment upload → blob → vision content parts; kitty-protocol thumbnails
 or placeholder cards.
@@ -131,7 +139,8 @@ notifications), skills. *Exit: one real MCP server + one hook in daily use.*
 Workspace phase 2 (docs/WORKSPACE.md): bash sandboxing (seatbelt/Landlock)
 + capability escalations through the approval gate (retires per-tool ask
 prompts), worktree isolation w/ /land and /discard. `task` subagent
-tool + nested sidebar, TCP listener + token auth. Then decide: PWA client.
+tool + parent/child hierarchy in the session picker, TCP listener + token auth.
+Then decide: PWA client.
 Multi-model review councils (docs/REVIEW.md) build on the subagent machinery
 here — a review child is a specialized `task` child.
 

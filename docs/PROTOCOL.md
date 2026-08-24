@@ -27,10 +27,11 @@ single-instancing is listed for hardening.
 | message | payload | reply |
 |---|---|---|
 | hello | proto_version, client_kind | hello_ok or err |
-| session_create | cwd, model, title?, approvals? | session_created{sid} |
+| session_create | cwd, model, effort?, title?, approvals? | session_created{sid} |
 | session_list | — | session_list_result{sessions} |
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
 | session_set_model | sid, model | ok, or err{busy} mid-turn |
+| session_set_effort | sid, effort | ok, or err{busy} mid-turn |
 | sub | sid, from_seq | replayed blk×N (if from_seq ≥ 1), then status |
 | unsub | sid | ok |
 | input | sid, text | ok; starts a turn (idle) or queues steer (running) |
@@ -42,6 +43,10 @@ single-instancing is listed for hardening.
 
 `session_create.approvals`: `"default"` (mutating tools ask) or `"auto"`
 (everything auto-approved — what `marlin run` uses; `--ask` opts back in).
+
+`effort`: `"auto"` omits the provider parameter and preserves the model's
+default. Explicit values are `"none"`, `"minimal"`, `"low"`, `"medium"`,
+`"high"`, `"xhigh"`, and `"max"`; support is model-dependent.
 
 `sub.from_seq`: 0 = live-only. N ≥ 1 = replay stored blocks with seq ≥ N
 first, then live. Clients that reconnect pass last_seen_seq + 1.
@@ -62,7 +67,7 @@ first, then live. Clients that reconnect pass last_seen_seq + 1.
 | err {code, msg} | bad_msg, no_hello, version, no_session, busy, bad_approval |
 
 Each entry in `session_list_result.sessions` includes `sid`, `title`, `cwd`,
-`model`, persisted `status`, `created_at`, and whether the session is currently
+`model`, `effort`, persisted `status`, `created_at`, and whether the session is currently
 `running`.
 
 ## Approval flow (M2)

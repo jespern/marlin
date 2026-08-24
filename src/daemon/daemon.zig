@@ -75,6 +75,7 @@ const Client = struct {
 const Session = struct {
     id: u64,
     model: []u8, // gpa-owned
+    effort: proto.ReasoningEffort = .auto,
     cwd: []u8, // gpa-owned
     state: proto.SessionState = .idle,
     turn_thread: ?std.Thread = null,
@@ -390,11 +391,12 @@ pub const Daemon = struct {
             },
             .session_create => |sc| {
                 const sid = ids.next(self.io);
-                try self.store.createSession(sid, nowMs(self.io), sc.cwd, sc.model);
+                try self.store.createSession(sid, nowMs(self.io), sc.cwd, sc.model, sc.effort);
                 const session = try self.gpa.create(Session);
                 session.* = .{
                     .id = sid,
                     .model = try self.gpa.dupe(u8, sc.model),
+                    .effort = sc.effort,
                     .cwd = try self.gpa.dupe(u8, sc.cwd),
                     .approval_mode = approval.Mode.parse(sc.approvals),
                 };
@@ -416,6 +418,7 @@ pub const Daemon = struct {
                         .title = row.title,
                         .cwd = row.cwd,
                         .model = row.model,
+                        .effort = row.effort,
                         .status = row.status,
                         .created_at = row.created_at,
                         .running = live != null and live.?.state == .running,
@@ -431,7 +434,7 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .ok = .{} });
             },
             .session_set_model => |sm| {
-                const session = self.sessions.get(sm.sid) orelse {
+                const session = (try self.getOrLoadSession(sm.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
@@ -443,6 +446,19 @@ pub const Daemon = struct {
                 self.gpa.free(session.model);
                 session.model = new_model;
                 self.store.setSessionModel(sm.sid, sm.model) catch {};
+                self.sendTo(client, .{ .ok = .{} });
+            },
+            .session_set_effort => |se| {
+                const session = (try self.getOrLoadSession(se.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot switch effort mid-turn" } });
+                    return;
+                }
+                session.effort = se.effort;
+                self.store.setSessionEffort(se.sid, se.effort) catch {};
                 self.sendTo(client, .{ .ok = .{} });
             },
             .sub => |s| {
@@ -471,21 +487,9 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .ok = .{} });
             },
             .input => |inp| {
-                const session = self.sessions.get(inp.sid) orelse blk: {
-                    // Session exists in DB but not in memory (daemon restart).
-                    const row = self.store.getSession(inp.sid) catch {
-                        self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
-                        return;
-                    };
-                    defer self.store.freeSession(row);
-                    const session = try self.gpa.create(Session);
-                    session.* = .{
-                        .id = inp.sid,
-                        .model = try self.gpa.dupe(u8, row.model),
-                        .cwd = try self.gpa.dupe(u8, row.cwd),
-                    };
-                    try self.sessions.put(self.gpa, inp.sid, session);
-                    break :blk session;
+                const session = (try self.getOrLoadSession(inp.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
                 };
                 if (session.state == .running) {
                     // Steer: queue for the running turn.
@@ -517,7 +521,7 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .ok = .{} });
             },
             .session_compact => |sc| {
-                const session = self.sessions.get(sc.sid) orelse {
+                const session = (try self.getOrLoadSession(sc.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
@@ -536,6 +540,7 @@ pub const Daemon = struct {
                     .sid = session.id,
                     .cwd = try self.gpa.dupe(u8, session.cwd),
                     .model = try self.gpa.dupe(u8, session.model),
+                    .effort = session.effort,
                     .text = try self.gpa.dupe(u8, ""),
                     .cancel = &session.cancel,
                     .session = session,
@@ -604,6 +609,33 @@ pub const Daemon = struct {
         }
     }
 
+    /// Sessions are loaded lazily after daemon restart. Settings and manual
+    /// compaction must work before the first new input, not only after the
+    /// input path happens to rehydrate the row.
+    fn getOrLoadSession(self: *Daemon, sid: u64) !?*Session {
+        if (self.sessions.get(sid)) |session| return session;
+        const row = self.store.getSession(sid) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.store.freeSession(row);
+
+        const session = try self.gpa.create(Session);
+        errdefer self.gpa.destroy(session);
+        const model = try self.gpa.dupe(u8, row.model);
+        errdefer self.gpa.free(model);
+        const cwd = try self.gpa.dupe(u8, row.cwd);
+        errdefer self.gpa.free(cwd);
+        session.* = .{
+            .id = sid,
+            .model = model,
+            .effort = row.effort,
+            .cwd = cwd,
+        };
+        try self.sessions.put(self.gpa, sid, session);
+        return session;
+    }
+
     // ------------------------------------------------------------- turns --
 
     const TurnJob = struct {
@@ -611,6 +643,7 @@ pub const Daemon = struct {
         sid: u64,
         cwd: []u8, // job-owned copies
         model: []u8,
+        effort: proto.ReasoningEffort,
         text: []u8,
         cancel: *std.atomic.Value(bool),
         session: *Session,
@@ -624,6 +657,7 @@ pub const Daemon = struct {
             .sid = session.id,
             .cwd = try self.gpa.dupe(u8, session.cwd),
             .model = try self.gpa.dupe(u8, session.model),
+            .effort = session.effort,
             .text = try self.gpa.dupe(u8, text),
             .cancel = &session.cancel,
             .session = session,
@@ -665,9 +699,10 @@ pub const Daemon = struct {
         const result = loop.runTurn(self.gpa, self.io, &self.store, .{
             .session_id = job.sid,
             .cwd = job.cwd,
-            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model },
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
+            .effort = job.effort,
             .cfg = self.cfg,
-            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model } else null,
+            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .dialect = c.dialect } else null,
             .prune_frontier = &job.session.prune_frontier,
             .context_used_out = &job.session.context_used,
             .approval_mode = job.session.approval_mode,
@@ -718,9 +753,10 @@ pub const Daemon = struct {
         const did = loop.compactSession(self.gpa, self.io, &self.store, .{
             .session_id = job.sid,
             .cwd = job.cwd,
-            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model },
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
+            .effort = .auto,
             .cfg = self.cfg,
-            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model } else null,
+            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .dialect = c.dialect } else null,
             .approval_mode = .auto, // compaction runs no tools
             .on_block = TurnHooks.onBlock,
             .on_delta_ctx = job,

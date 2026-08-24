@@ -4,10 +4,13 @@
 //! lands (M1), M0 runs on defaults + environment (OPENROUTER_API_KEY).
 
 const std = @import("std");
+const Effort = @import("effort.zig").Effort;
 
 pub const Config = struct {
     model_default: []const u8 = "openrouter/anthropic/claude-sonnet-4.5",
     model_compaction: ?[]const u8 = null, // null → use model_default
+    /// `.auto` omits the request parameter and preserves the model default.
+    effort_default: Effort = .auto,
 
     /// Model picker list (/model with no args). Curated, not fetched:
     /// OpenRouter exposes 300+ models and a dump of that is not a picker.
@@ -34,7 +37,7 @@ pub const Config = struct {
     mutating_tools_policy: Policy = .ask,
     readonly_tools_policy: Policy = .auto,
 
-    /// Workspace layer (docs/WORKSPACE.md): shadow snapshots, write leases,
+    /// Workspace layer (docs/WORKSPACE.md): COW shadow snapshots, write leases,
     /// sandbox escalations. Master switch — OFF until M3.5 lands; M2
     /// approval semantics hold while false.
     workspace_enabled: bool = false,
@@ -51,6 +54,7 @@ pub fn defaults() Config {
 
 test "defaults are sane" {
     const c = defaults();
+    try std.testing.expectEqual(Effort.auto, c.effort_default);
     try std.testing.expect(c.output_headroom_tokens > 0);
     try std.testing.expect(c.prune_protect_tokens > c.prune_min_reclaim_tokens);
 }

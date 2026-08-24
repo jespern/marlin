@@ -167,7 +167,7 @@ Key decisions:
 `~/.local/state/marlin/marlin.db` (WAL mode). Tables:
 
 ```
-sessions(id, title, created_at, cwd, model, provider, status,
+sessions(id, title, created_at, cwd, model, effort, provider, status,
          pinned_context, config_json)
 blocks(id, session_id, turn_id, seq, kind, ts, body_json)
 blobs(hash, bytes, created_at, tombstone)  -- full tool outputs, content-addressed
@@ -199,7 +199,8 @@ regenerable/low-value with age; block structure is not.
 
 **Trimming design (post-v1, lands when the DB first annoys someone):**
 
-- **Session lifecycle: archive → delete.** Archived = hidden from sidebar,
+- **Session lifecycle: archive → delete.** Archived = hidden from the default
+  `/sessions` picker results,
   fully retained. `marlin rm <session>` deletes blocks + decrements blob
   refs. Optional retention config (`delete_archived_after = "180d"`, off by
   default). Explicit or policy-driven, never silent.
@@ -446,7 +447,7 @@ sidecar executables breaks scp-and-run; the internal engine is the bundle.
   "always allow `git *` in this session".
 - An `ask` emits `approval.request` to *all* subscribed clients; first decision
   wins; timeout (default: none — turn parks in `awaiting_approval`, exactly the
-  state the sidebar/phone surfaces).
+  state the session picker, actionable status summary, and phone surface).
 - bash sandboxing (v1.5, stolen from zag): seatbelt profile on macOS, Landlock
   + seccomp on Linux; deny-by-default on `~/.ssh`, key files, browser profiles.
 
@@ -561,21 +562,28 @@ get these right; Hermes is the counter-example):
   of a hardcoded rainbow. (Check what libvaxis exposes for OSC queries;
   it's Ghostty-adjacent so likely most of it.)
 
+**No persistent sidebar.** Session navigation is occasional; it must not tax
+every frame with permanent horizontal chrome. `/sessions` opens a fuzzy picker
+showing title, workspace, recency, and state. J/K switches recent sessions in
+normal mode. The status bar reports background sessions only when actionable
+(`2 running · 1 approval`), and narrow terminals lose nothing. A split pane
+identifies its session with a compact pane label.
+
 ```
-┌ sidebar ──────┬─ main: session view ────────────────┐
-│ ● 1 api-fix   │  blocks rendered as cards:          │
-│ ◐ 2 refactor  │  user / assistant md / tool collapse│
-│ ⚠ 3 deploy    │  [streaming region at bottom]       │
-│   (⚠ = needs  │                                     │
-│    approval)  ├─ todo (when present) ───────────────┤
-│               │ ✓ parse args   ▸ wire store   · tui │
-│               ├─ input ─────────────────────────────┤
-│               │ > _                                 │
-└───────────────┴─ status: model · ctx% · $ · state ──┘
+┌─ main: api-fix ● ───────────────────────────────────┐
+│ blocks rendered as cards:                           │
+│ user / assistant md / collapsed tools               │
+│ [streaming region at bottom]                        │
+├─ todo (when present) ───────────────────────────────┤
+│ ✓ parse args   ▸ wire store   · tui                  │
+├─ input ─────────────────────────────────────────────┤
+│ > _                                                  │
+└─ status: model · ctx% · $ · state · 1 approval ─────┘
 ```
 
 - **Modes**: insert (typing → input box), normal (j/k scroll blocks, J/K
-  sessions, Enter attach, v visual-select, y yank, s/x split, tab cycle panes).
+  recent sessions, `/sessions` for arbitrary attach, v visual-select, y yank,
+  s/x split, tab cycle panes).
   Prefix-key compat layer later if muscle memory demands it.
 - **Splits**: binary-tree layout, each pane = a session view (or the same
   session twice). No VTE anywhere.

@@ -18,11 +18,13 @@ const http = @import("provider/http.zig");
 const sse = @import("provider/sse.zig");
 const tools_registry = @import("tools/registry.zig");
 const files_tool = @import("tools/files.zig");
+const Effort = @import("../core/effort.zig").Effort;
 
 pub const Endpoint = struct {
     url: [:0]const u8, // .../chat/completions
     bearer: ?[]const u8,
     model: []const u8, // provider-native model string
+    dialect: provider.Dialect,
 };
 
 pub const ToolPhase = enum { start, done };
@@ -31,6 +33,7 @@ pub const RunOpts = struct {
     session_id: u64,
     cwd: []const u8,
     endpoint: Endpoint,
+    effort: Effort = .auto,
     cfg: config.Config,
     /// Compaction endpoint (usually same as endpoint but cheap model);
     /// null → use `endpoint` for summarization too.
@@ -203,7 +206,14 @@ pub fn runTurn(
             tools[ti] = .{ .name = s.name, .description = s.description, .schema_json = s.schema_json };
         }
 
-        const body = try openai.buildRequestBody(arena, opts.endpoint.model, msgs, &tools);
+        const body = try openai.buildRequestBody(
+            arena,
+            opts.endpoint.model,
+            opts.endpoint.dialect,
+            opts.effort,
+            msgs,
+            &tools,
+        );
 
         // -- stream the response --
         var acc = openai.StreamAccum.init(gpa);
@@ -252,6 +262,13 @@ pub fn runTurn(
                 .tokens_in = total_in,
                 .tokens_out = total_out,
             };
+        }
+
+        // Text emitted alongside tool calls is user-facing progress commentary,
+        // not the final answer. Persist it so the TUI does not briefly stream a
+        // useful update and then erase it when the tool round starts.
+        if (acc.text.items.len > 0) {
+            _ = try ap.append(.{ .reasoning = .{ .text = acc.text.items } });
         }
 
         // -- execute tool calls (serial in M2; parallel_safe grouping later) --
@@ -424,7 +441,7 @@ fn summarize(
         .{ .role = .system, .payload = .{ .text = context.compaction_prompt } },
         .{ .role = .user, .payload = .{ .text = transcript } },
     };
-    const body = try openai.buildRequestBody(arena, ep.model, &msgs, &.{});
+    const body = try openai.buildRequestBody(arena, ep.model, ep.dialect, .auto, &msgs, &.{});
 
     var acc = openai.StreamAccum.init(gpa);
     defer acc.deinit();

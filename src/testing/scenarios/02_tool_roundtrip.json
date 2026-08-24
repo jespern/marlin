@@ -3,6 +3,7 @@
     {
       "expect_contains": ["what is in /tmp/marlin-e2e-test-dir"],
       "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"I’ll inspect the target and report what I find.\"}}]}",
         "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}",
         "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\"}}]}}]}",
         "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"echo tool-was-run\\\"}\"}}]}}]}",
@@ -23,6 +24,6 @@
     "argv": ["run", "--quiet", "--model", "openrouter/test/model", "what is in /tmp/marlin-e2e-test-dir"],
     "exit_code": 0,
     "stdout_contains": ["the tool ran fine"],
-    "db_kinds": ["user_msg", "tool_call", "tool_result", "assistant_msg"]
+    "db_kinds": ["user_msg", "reasoning", "tool_call", "tool_result", "assistant_msg"]
   }
 }
