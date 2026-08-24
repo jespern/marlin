@@ -415,6 +415,37 @@ get these right; Hermes is the counter-example):
 - Tool blocks render collapsed by default (name + one-line summary + status),
   expand on demand. Approvals render as inline prompt cards.
 
+### Image / asset paste
+
+Bracketed paste is text-only, so complex assets are grabbed out-of-band
+(the Claude Code approach):
+
+- **Capture (client).** On paste keystroke, check the OS clipboard for image
+  data before falling back to text: NSPasteboard/pngpaste (macOS),
+  `wl-paste -t image/png` (Wayland), `xclip -t image/png` (X11). Pasted TEXT
+  that resolves to an existing image/PDF path (which is what drag-onto-
+  terminal produces) offers attach-by-path — that variant works over ssh too.
+- **Wire + store.** Chunked attachment-upload protocol message (base64 body,
+  stays nc+jq debuggable); daemon writes to the existing blob store (an
+  image is a blob with a mime type). `user_msg` gains
+  `attachments: []BlobRef` — a pasted image is part of the message, not a
+  new block kind.
+- **Context assembly.** Provider layer maps attachments to image content
+  parts (both dialects take base64). Non-vision model → degrade to
+  `[image: 1.2MB png]` + status-line warning. Images are prime L1 prune
+  targets: huge in tokens, regenerable from the blob — old image parts get
+  stubbed first.
+- **Rendering.** Kitty graphics protocol where available (Ghostty/Kitty/
+  WezTerm/iTerm2; vaxis has support) for inline thumbnails; elsewhere a
+  placeholder card `▣ image.png 1.4MB [o: open]` with `o` → open/xdg-open
+  on the blob. No sixel — the terminal set that has sixel but not kitty
+  protocol is not worth the code.
+- **Known limitation (by design):** clipboard-image paste requires the
+  client to run where the clipboard lives. Under `ssh box → marlin` the
+  client is remote and the local clipboard image cannot reach it (no
+  terminal protocol carries it); use attach-by-path, or the (v2) web/TCP
+  client which makes the local machine the client again. Not a bug.
+
 ## 9. Config
 
 `~/.config/marlin/config.toml` (TOML: comments + zig-toml exists; no YAML dep):

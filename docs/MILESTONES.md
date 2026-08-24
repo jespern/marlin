@@ -106,6 +106,9 @@ ship a marlin change from a marlin session and `/reboot --build` into it.*
 ## M4 — multiplexer
 Sidebar, splits, J/K session switching, status glyphs (running/idle/approval),
 mouse selection + OSC52, !c family, daemon-side register (!y/!p cross-session).
+Image paste (ARCHITECTURE.md §image/asset paste): clipboard capture →
+attachment upload → blob → vision content parts; kitty-protocol thumbnails
+or placeholder cards.
 *Exit: herdr/tmux no longer wrap marlin; marlin IS the terminal you keep open.*
 
 ## M5 — extensibility
