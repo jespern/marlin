@@ -30,6 +30,10 @@ const store_mod = @import("store.zig");
 const loop = @import("loop.zig");
 const context = @import("context.zig");
 const approval = @import("approval.zig");
+const permissions = @import("permissions.zig");
+const sandbox = @import("sandbox.zig");
+const network_policy = @import("network_policy.zig");
+const extensions = @import("extensions.zig");
 const registry = @import("provider/registry.zig");
 const http = @import("provider/http.zig");
 
@@ -85,6 +89,11 @@ const Session = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     /// Approval mode fixed at creation (headless "auto" vs interactive).
     approval_mode: approval.Mode = .default,
+    /// Kernel shell sandbox + prompt-free shell execution (/sandbox).
+    /// Seeded from cfg.permissions_enabled; effective only with a verified
+    /// backend. In-memory like approval_mode: a daemon restart returns the
+    /// session to the configured default.
+    sandbox_enabled: bool = false,
     /// Gate the turn thread parks on for `ask` decisions.
     gate: approval.Gate = .{},
     /// L1 prune frontier (context.zig): tool_results with seq < this are
@@ -108,6 +117,12 @@ pub const Daemon = struct {
     environ: *const std.process.Environ.Map,
     store: store_mod.Store,
     cfg: config.Config,
+    extensions: *extensions.Runtime,
+    network: network_policy.Policy,
+    sandbox_backend: sandbox.Backend = .unavailable,
+    /// Non-null exactly when sandbox_backend is .seatbelt: the profile's
+    /// protected-read denials are parameterized on these roots.
+    protected_roots: ?sandbox.ProtectedRoots = null,
     events: queue.Mpsc(Event),
     clients: std.AutoHashMapUnmanaged(u64, *Client) = .empty,
     sessions: std.AutoHashMapUnmanaged(u64, *Session) = .empty,
@@ -142,17 +157,65 @@ pub const Daemon = struct {
 
         const db_path = try store_mod.defaultDbPath(gpa, io, environ);
         defer gpa.free(db_path);
+        var opened_store = try store_mod.Store.open(gpa, db_path);
+        var store_moved = false;
+        errdefer if (!store_moved) opened_store.close();
+
+        var loaded_config = try config.load(gpa, io, environ);
+        defer loaded_config.deinit();
+        const cfg = loaded_config.value;
+        const extension_runtime = try extensions.Runtime.init(gpa, io, cfg, environ);
+        defer extension_runtime.deinit();
+        const network = network_policy.Policy.init(gpa, io, environ, .{
+            .blocklists = cfg.network_blocklists,
+            .allow = cfg.network_allow,
+            .deny = cfg.network_deny,
+        });
+        var probe_environ: ?std.process.Environ.Map = null;
+        defer if (probe_environ) |*env| env.deinit();
+        // Probe unconditionally: the canary is cheap, and a verified backend
+        // is what lets /sandbox enable enforcement later without re-probing.
+        // cfg.permissions_enabled only seeds each session's default.
+        var sandbox_backend: sandbox.Backend = blk: {
+            probe_environ = permissions.toolEnvironment(gpa, environ) catch break :blk .unavailable;
+            break :blk sandbox.verifySeatbelt(gpa, io, &probe_environ.?);
+        };
+
+        // A verified backend without resolvable protected roots cannot honor
+        // the protected-path contract, so it must not claim enforcement.
+        var protected_roots: ?sandbox.ProtectedRoots = null;
+        defer if (protected_roots) |*roots| roots.deinit(gpa);
+        if (sandbox_backend == .seatbelt) {
+            protected_roots = sandbox.resolveProtectedRoots(gpa, io, environ) catch null;
+            if (protected_roots == null) sandbox_backend = .unavailable;
+        }
+        std.log.info("shell sandbox {s}; new sessions {s}", .{
+            switch (sandbox_backend) {
+                .seatbelt => @as([]const u8, "verified (seatbelt)"),
+                .unavailable => "unavailable",
+            },
+            if (cfg.permissions_enabled and sandbox_backend == .seatbelt)
+                @as([]const u8, "run workspace shell without prompts")
+            else
+                "keep per-call shell approvals",
+        });
 
         var self = Daemon{
             .gpa = gpa,
             .io = io,
             .environ = environ,
-            .store = try store_mod.Store.open(gpa, db_path),
-            .cfg = config.defaults(),
+            .store = opened_store,
+            .cfg = cfg,
+            .extensions = extension_runtime,
+            .network = network,
+            .sandbox_backend = sandbox_backend,
+            .protected_roots = protected_roots,
             .events = queue.Mpsc(Event).init(gpa),
         };
+        store_moved = true;
         defer self.store.close();
         defer self.events.deinit();
+        defer self.network.deinit();
 
         // Socket setup: mkdir -p, remove stale socket, listen, chmod 0600.
         const sock_path = try proto.socketPath(gpa, environ);
@@ -369,6 +432,20 @@ pub const Daemon = struct {
                 // and stop reading, so usage must already be on the wire.
                 self.broadcastMeta(td.sid, td.tokens_in, td.tokens_out);
                 self.broadcastStatus(td.sid, session.state);
+                const payload = std.json.Stringify.valueAlloc(self.gpa, .{
+                    .sid = td.sid,
+                    .interrupted = td.interrupted,
+                    .ok = td.err_text == null,
+                    .error_message = td.err_text,
+                    .tokens_in = td.tokens_in,
+                    .tokens_out = td.tokens_out,
+                }, .{}) catch null;
+                if (payload) |json| {
+                    defer self.gpa.free(json);
+                    self.extensions.fireHook(.on_turn_done, json);
+                    self.extensions.fireHook(.on_session_done, json);
+                    if (td.err_text != null) self.extensions.fireHook(.on_error, json);
+                }
                 // A pending /reboot proceeds once the last turn drains.
                 self.maybeFinishReboot();
             },
@@ -390,7 +467,12 @@ pub const Daemon = struct {
                     return;
                 }
                 client.said_hello = true;
-                self.sendTo(client, .{ .hello_ok = .{ .proto_version = proto.proto_version, .daemon_version = daemon_version } });
+                self.sendTo(client, .{ .hello_ok = .{
+                    .proto_version = proto.proto_version,
+                    .daemon_version = daemon_version,
+                    .sandbox_available = self.sandbox_backend == .seatbelt,
+                    .network_filtering = self.network.isActive(),
+                } });
             },
             .session_create => |sc| {
                 const sid = ids.next(self.io);
@@ -402,6 +484,7 @@ pub const Daemon = struct {
                     .effort = sc.effort,
                     .cwd = try self.gpa.dupe(u8, sc.cwd),
                     .approval_mode = approval.Mode.parse(sc.approvals),
+                    .sandbox_enabled = self.cfg.permissions_enabled,
                 };
                 try self.sessions.put(self.gpa, sid, session);
                 self.sendTo(client, .{ .session_created = .{ .sid = sid } });
@@ -446,6 +529,26 @@ pub const Daemon = struct {
                 }
                 session.effort = se.effort;
                 self.store.setSessionEffort(se.sid, se.effort) catch {};
+                self.sendTo(client, .{ .ok = .{} });
+                self.broadcastSessionList();
+            },
+            .session_set_sandbox => |ss| {
+                const session = (try self.getOrLoadSession(ss.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot toggle sandbox mid-turn" } });
+                    return;
+                }
+                if (ss.enabled and self.sandbox_backend != .seatbelt) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "sandbox_unavailable",
+                        .msg = "platform sandbox not verified on this daemon; per-call approvals retained",
+                    } });
+                    return;
+                }
+                session.sandbox_enabled = ss.enabled;
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionList();
             },
@@ -630,6 +733,7 @@ pub const Daemon = struct {
             .model = model,
             .effort = row.effort,
             .cwd = cwd,
+            .sandbox_enabled = self.cfg.permissions_enabled,
         };
         try self.sessions.put(self.gpa, sid, session);
         return session;
@@ -695,12 +799,40 @@ pub const Daemon = struct {
         }
         defer if (cep) |*c| c.deinit(self.gpa);
 
+        var sandbox_temp: ?[]u8 = null;
+        defer if (sandbox_temp) |path| self.gpa.free(path);
+        var sandbox_options = sandbox.Options{};
+        if (self.sandbox_backend == .seatbelt and job.session.sandbox_enabled) {
+            const tmp_root = self.environ.get("TMPDIR") orelse "/private/tmp";
+            sandbox_temp = std.fmt.allocPrint(self.gpa, "{s}{c}marlin-tools{c}{d}", .{
+                std.mem.trimEnd(u8, tmp_root, std.fs.path.sep_str),
+                std.fs.path.sep,
+                std.fs.path.sep,
+                job.sid,
+            }) catch null;
+            if (sandbox_temp) |path| {
+                Io.Dir.cwd().createDirPath(self.io, path) catch {
+                    self.gpa.free(path);
+                    sandbox_temp = null;
+                };
+            }
+            if (sandbox_temp) |path| sandbox_options = .{
+                .backend = .seatbelt,
+                .temp_root = path,
+                .protected = self.protected_roots,
+            };
+        }
+
         const result = loop.runTurn(self.gpa, self.io, &self.store, .{
             .session_id = job.sid,
             .cwd = job.cwd,
             .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
             .effort = job.effort,
             .cfg = self.cfg,
+            .tool_environ = self.environ,
+            .sandbox_options = sandbox_options,
+            .network_policy = &self.network,
+            .extensions = self.extensions,
             .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .dialect = c.dialect } else null,
             .prune_frontier = &job.session.prune_frontier,
             .context_used_out = &job.session.context_used,
@@ -755,6 +887,7 @@ pub const Daemon = struct {
             .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
             .effort = .auto,
             .cfg = self.cfg,
+            .extensions = self.extensions,
             .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .dialect = c.dialect } else null,
             .approval_mode = .auto, // compaction runs no tools
             .on_block = TurnHooks.onBlock,
@@ -824,6 +957,15 @@ pub const Daemon = struct {
                 .args_json = args_json,
             } }) catch return;
             self.events.push(self.io, .{ .turn_awaiting = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+            const payload = std.json.Stringify.valueAlloc(self.gpa, .{
+                .sid = job.sid,
+                .approval_id = id,
+                .call_id = call_id,
+                .tool = tool,
+                .args_json = args_json,
+            }, .{}) catch return;
+            defer self.gpa.free(payload);
+            self.extensions.fireHook(.on_approval_needed, payload);
         }
 
         fn onApprovalDone(ctx: ?*anyopaque, id: u64, verdict: approval.Verdict) void {
@@ -895,6 +1037,8 @@ pub const Daemon = struct {
                 .state = state,
                 .created_at = row.created_at,
                 .running = state == .running,
+                .sandboxed = self.sandbox_backend == .seatbelt and
+                    (if (live) |session| session.sandbox_enabled else self.cfg.permissions_enabled),
             };
         }
         self.sendTo(client, .{ .session_list_result = .{ .sessions = infos } });

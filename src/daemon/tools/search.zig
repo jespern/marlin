@@ -27,18 +27,24 @@ pub const GrepArgs = struct {
 
 pub const max_output_bytes: usize = 2 * 1024 * 1024;
 
-pub fn grep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, cwd: []const u8) ![]u8 {
+pub fn grep(
+    gpa: std.mem.Allocator,
+    io: Io,
+    args: GrepArgs,
+    cwd: []const u8,
+    child_environ: ?*const std.process.Environ.Map,
+) ![]u8 {
     const search_path = try files.resolvePath(gpa, args.path orelse ".", cwd);
     defer gpa.free(search_path);
 
     // Prefer ripgrep when present.
-    if (rgAvailable(gpa, io)) return rgGrep(gpa, io, args, search_path);
+    if (rgAvailable(gpa, io, child_environ)) return rgGrep(gpa, io, args, search_path, child_environ);
     return internalGrep(gpa, io, args, search_path);
 }
 
 var rg_checked = std.atomic.Value(u8).init(0); // 0=unknown 1=yes 2=no
 
-fn rgAvailable(gpa: std.mem.Allocator, io: Io) bool {
+fn rgAvailable(gpa: std.mem.Allocator, io: Io, child_environ: ?*const std.process.Environ.Map) bool {
     switch (rg_checked.load(.acquire)) {
         1 => return true,
         2 => return false,
@@ -46,6 +52,7 @@ fn rgAvailable(gpa: std.mem.Allocator, io: Io) bool {
     }
     const res = std.process.run(gpa, io, .{
         .argv = &.{ "rg", "--version" },
+        .environ_map = child_environ,
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
     }) catch {
@@ -59,7 +66,13 @@ fn rgAvailable(gpa: std.mem.Allocator, io: Io) bool {
     return ok;
 }
 
-fn rgGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []const u8) ![]u8 {
+fn rgGrep(
+    gpa: std.mem.Allocator,
+    io: Io,
+    args: GrepArgs,
+    search_path: []const u8,
+    child_environ: ?*const std.process.Environ.Map,
+) ![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.appendSlice(gpa, &.{ "rg", "--line-number", "--no-heading", "--color=never", "--max-count=1000" });
@@ -73,6 +86,7 @@ fn rgGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []const u
 
     const res = std.process.run(gpa, io, .{
         .argv = argv.items,
+        .environ_map = child_environ,
         .stdout_limit = .limited(max_output_bytes),
         .stderr_limit = .limited(64 * 1024),
     }) catch |e| {

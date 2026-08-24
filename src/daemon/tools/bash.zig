@@ -5,10 +5,13 @@
 //! context cap is applied by the loop via context.zig.
 //! TODO(M1): cancellation flag → SIGTERM → grace → SIGKILL (needs spawn API
 //! + poll loop instead of the blocking run helper).
-//! TODO(M6): seatbelt / Landlock sandboxing.
+//! M3.5: subprocess environment is scrubbed at the registry boundary;
+//! macOS Seatbelt wraps execution when the daemon's canary verified it.
+//! TODO: Landlock adapter for Linux.
 
 const std = @import("std");
 const Io = std.Io;
+const sandbox = @import("../sandbox.zig");
 
 pub const spec_name = "bash";
 pub const spec_description =
@@ -36,11 +39,41 @@ pub const Result = struct {
 /// because the capture is blobbed first).
 pub const max_capture_bytes: usize = 4 * 1024 * 1024;
 
-pub fn run(gpa: std.mem.Allocator, io: Io, args: Args, cwd: []const u8) !Result {
-    const argv = [_][]const u8{ "bash", "-c", args.command };
+pub fn run(
+    gpa: std.mem.Allocator,
+    io: Io,
+    args: Args,
+    cwd: []const u8,
+    child_environ: ?*const std.process.Environ.Map,
+    sandbox_options: sandbox.Options,
+) !Result {
+    const direct_argv = [_][]const u8{ "bash", "-c", args.command };
+    var argv: []const []const u8 = &direct_argv;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    if (sandbox_options.backend == .seatbelt) {
+        const arena = arena_state.allocator();
+        const temp_root = sandbox_options.temp_root orelse return error.SandboxTempUnavailable;
+        const protected = sandbox_options.protected orelse return error.SandboxProtectedUnavailable;
+        // Seatbelt subpath parameters match real paths only; the env
+        // spellings of cwd/temp may sit behind symlinks (/tmp, /var).
+        const real_workspace = try Io.Dir.realPathFileAbsoluteAlloc(io, cwd, arena);
+        const real_temp = try Io.Dir.realPathFileAbsoluteAlloc(io, temp_root, arena);
+        // A workspace under a protected root cannot receive both its write
+        // grant and the read denial; refuse rather than run half-enforced.
+        if (protected.contains(real_workspace)) return error.SandboxWorkspaceProtected;
+        argv = try sandbox.seatbeltArgv(arena, .{
+            .workspace = real_workspace,
+            .temp_root = real_temp,
+            .protected = protected,
+        }, args.command, &.{});
+    }
     const res = std.process.run(gpa, io, .{
-        .argv = &argv,
+        .argv = argv,
         .cwd = .{ .path = cwd },
+        .environ_map = child_environ,
         .stdout_limit = .limited(max_capture_bytes),
         .stderr_limit = .limited(max_capture_bytes),
     }) catch |e| {
@@ -71,6 +104,70 @@ pub fn run(gpa: std.mem.Allocator, io: Io, args: Args, cwd: []const u8) !Result 
         .exit_code = exit_code,
         .truncated = truncated,
     };
+}
+
+test "sandboxed bash enforces write scope and protected reads (macOS)" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const base = try std.fmt.allocPrint(gpa, "/tmp/marlin-bash-sandbox-test-{x}", .{std.mem.readInt(u64, &rand, .little)});
+    defer gpa.free(base);
+    defer Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    const workspace = try std.fs.path.join(gpa, &.{ base, "ws" });
+    defer gpa.free(workspace);
+    const temp_root = try std.fs.path.join(gpa, &.{ base, "tmp" });
+    defer gpa.free(temp_root);
+    const secret_dir = try std.fs.path.join(gpa, &.{ base, "ssh" });
+    defer gpa.free(secret_dir);
+    const secret_file = try std.fs.path.join(gpa, &.{ secret_dir, "id_ed25519" });
+    defer gpa.free(secret_file);
+
+    const cwd_dir = Io.Dir.cwd();
+    try cwd_dir.createDirPath(io, workspace);
+    try cwd_dir.createDirPath(io, temp_root);
+    try cwd_dir.createDirPath(io, secret_dir);
+    try cwd_dir.writeFile(io, .{ .sub_path = secret_file, .data = "canary" });
+
+    // Options carry the resolved spelling (as the daemon does); the script
+    // below deliberately probes via the /tmp symlink spelling to prove the
+    // kernel matches the resolved target, not the requested string.
+    const real_secret = try Io.Dir.realPathFileAbsoluteAlloc(io, secret_dir, gpa);
+    defer gpa.free(real_secret);
+
+    const options = sandbox.Options{
+        .backend = .seatbelt,
+        .temp_root = temp_root,
+        .protected = .{
+            .ssh = real_secret,
+            .aws = real_secret,
+            .gnupg = real_secret,
+            .marlin_credentials = real_secret,
+        },
+    };
+
+    const script = try std.fmt.allocPrint(gpa,
+        \\printf ok > marker || exit 10
+        \\if printf out > "{s}/blocked"; then exit 12; fi
+        \\if cat "{s}" > /dev/null; then exit 13; fi
+        \\exit 0
+    , .{ base, secret_file });
+    defer gpa.free(script);
+
+    const r = try run(gpa, io, .{ .command = script }, workspace, null, options);
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 0), r.exit_code);
+
+    // A workspace inside a protected root is refused, not run half-enforced.
+    try std.testing.expectError(
+        error.SandboxWorkspaceProtected,
+        run(gpa, io, .{ .command = "true" }, secret_dir, null, options),
+    );
 }
 
 test {

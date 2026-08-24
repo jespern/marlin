@@ -439,16 +439,21 @@ Code-style — marlin's pitch is ONE static binary, and shipping per-platform
 sidecar executables breaks scp-and-run; the internal engine is the bundle.
 (zig-regex is ~stdlib-only and adds nothing to the dependency long tail.)
 
-**Approval system** (designed in from day one — every execution flows through it):
+**Permission and approval system** (full contract: `docs/PERMISSIONS.md`):
 
-- Policy per tool per session: `auto | ask | deny`. Default: read-only tools
-  auto, mutating tools ask. `--yolo` flips everything to auto for a session.
-- Allowlist patterns promote repeated approvals: approving `git status` offers
-  "always allow `git *` in this session".
+- Every execution flows through the existing approval gate. The shipped
+  legacy policy remains per-tool `auto | ask | deny` until capability mode is
+  enabled: read-only tools auto, mutating tools ask.
+- Capability mode asks for a typed operation and concrete scope, not a command
+  prefix. Decisions are deny, allow once, or allow for this session. There is
+  intentionally no `git *` allowlist: commands sharing a prefix do not share a
+  risk boundary.
+- `--yolo` skips legacy convenience prompts; it does not bypass protected
+  paths, secret-environment isolation, or kernel sandbox boundaries.
 - An `ask` emits `approval.request` to *all* subscribed clients; first decision
   wins; timeout (default: none — turn parks in `awaiting_approval`, exactly the
   state the session picker, actionable status summary, and phone surface).
-- bash sandboxing (v1.5, stolen from zag): seatbelt profile on macOS, Landlock
+- bash sandboxing (M3.5, stolen from zag): Seatbelt profile on macOS, Landlock
   + seccomp on Linux; deny-by-default on `~/.ssh`, key files, browser profiles.
 
 **Secrets** (threat: prompt injection or buggy tool logic exfiltrates
@@ -489,8 +494,10 @@ secret IMMORTAL):
 **Extension tools — process boundaries only:**
 
 - **MCP client** (v1): stdio transport first, HTTP later. Config lists servers;
-  their tools appear in the registry namespaced (`mcp:playwright:click`).
-  Approval policy applies identically.
+  their tools appear in the registry with provider-safe names
+  (`mcp__playwright__click`). Approval policy applies identically. The client
+  speaks the current stateless protocol and falls back to the deployed legacy
+  initialize lifecycle.
 - **Exec tools**: a config entry maps name+JSON-schema → executable; marlin
   passes args as JSON on stdin, stdout is the result. A shell script is a tool.
 - **Hooks**: `on_session_done`, `on_approval_needed`, `on_error`, `on_turn_done`
@@ -635,7 +642,7 @@ Bracketed paste is text-only, so complex assets are grabbed out-of-band
 
 ## 9. Config
 
-`~/.config/marlin/config.toml` (TOML: comments + zig-toml exists; no YAML dep):
+`~/.config/marlin/config.toml` (focused TOML decoder; no YAML dependency):
 
 ```toml
 [daemon]
@@ -668,14 +675,32 @@ inline_tool_cap = 8000
 [approval]
 default_mutating = "ask"
 
+[permissions]
+enabled = true                # canary-gated; legacy ask fallback when unavailable
+# protected_paths = ["~/.config/acme/credentials"]
+
+[network]
+# Allow-by-default, managed network tools only. Values are comma-separated.
+blocklists = "hagezi-tif-mini"
+allow = "false-positive.example"
+deny = "local-deny.example"
+
 [[tools.exec]]
 name = "deploy_status"
-cmd = "~/.config/marlin/tools/deploy-status.sh"
+cmd = ["~/.config/marlin/tools/deploy-status.sh", "--json"]
+description = "Report deploy status"
 schema = '{"type":"object","properties":{}}'
+mutating = false
+parallel_safe = true
+timeout_ms = 10000
 
 [[mcp]]
 name = "playwright"
 cmd = ["npx", "@playwright/mcp"]
+mutating = true                 # conservative default for every server tool
+
+[skills]
+directories = ["~/.config/marlin/skills"]
 
 [hooks]
 on_approval_needed = "~/.config/marlin/hooks/notify.sh"
@@ -689,7 +714,7 @@ on_session_done = "~/.config/marlin/hooks/notify.sh"
 | libcurl (C) | HTTPS/SSE/HTTP2, everywhere already | swap for std.http later behind iface |
 | SQLite (C) | store + FTS5, everywhere already | block-log iface hides it |
 | libvaxis (Zig) | TUI: input, mouse, OSC52, unicode width | active, Ghostty-adjacent |
-| zig-toml (Zig) | config | tiny; vendor it |
+| focused internal TOML decoder | config | only supported Marlin shapes; no runtime dep |
 | std.json | strict parse + our lenient-repair layer on top | — |
 
 Everything else: std. No async framework, no allocator exotica (GPA +

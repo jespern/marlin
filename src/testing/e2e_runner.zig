@@ -33,6 +33,11 @@ const Check = struct {
     stderr_contains: []const []const u8 = &.{},
     db_kinds: []const []const u8 = &.{},
     runs: u8 = 1,
+    /// Optional per-scenario M5 config and executable hook fixture.
+    config_toml: ?[]const u8 = null,
+    hook_script: ?[]const u8 = null,
+    mcp_script: ?[]const u8 = null,
+    hook_output_contains: ?[]const u8 = null,
 };
 
 const ScenarioFile = struct {
@@ -122,6 +127,21 @@ fn runScenario(
     try Io.Dir.cwd().createDirPath(io, state_dir);
     defer Io.Dir.cwd().deleteTree(io, state_dir) catch {};
 
+    if (sf.check.config_toml) |contents| {
+        const config_dir = try std.fs.path.join(arena, &.{ state_dir, ".config", "marlin" });
+        try Io.Dir.cwd().createDirPath(io, config_dir);
+        const config_path = try std.fs.path.join(arena, &.{ config_dir, "config.toml" });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = contents });
+    }
+    if (sf.check.hook_script) |contents| {
+        const hook_path = try std.fs.path.join(arena, &.{ state_dir, "hook.sh" });
+        try writeExecutable(gpa, io, hook_path, contents);
+    }
+    if (sf.check.mcp_script) |contents| {
+        const mcp_path = try std.fs.path.join(arena, &.{ state_dir, "mcp.sh" });
+        try writeExecutable(gpa, io, mcp_path, contents);
+    }
+
     // 1. Spawn the fake provider; read PORT line.
     var prov = try std.process.spawn(io, .{
         .argv = &.{ fakeprov_bin, scenario_path },
@@ -151,6 +171,10 @@ fn runScenario(
     try env.put("MARLIN_BASE_URL_OPENROUTER", base_url);
     try env.put("OPENROUTER_API_KEY", "test-key-e2e");
     try env.put("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    // Fixtures assert the LEGACY approval transcript (an M3.5 exit
+    // criterion). Capability permissions are pinned off; a scenario that
+    // wants them sets MARLIN_PERMISSIONS=1 in its own "env" map below.
+    try env.put("MARLIN_PERMISSIONS", "0");
     var env_it = sf.check.env.map.iterator();
     while (env_it.next()) |kv| {
         try env.put(kv.key_ptr.*, kv.value_ptr.*);
@@ -217,6 +241,22 @@ fn runScenario(
         }
     }
 
+    if (sf.check.hook_output_contains) |needle| {
+        const hook_output = try std.fs.path.join(arena, &.{ state_dir, "hook-events" });
+        var attempts: u8 = 0;
+        while (attempts < 50) : (attempts += 1) {
+            const contents = Io.Dir.cwd().readFileAlloc(io, hook_output, gpa, .limited(256 * 1024)) catch {
+                io.sleep(.fromMilliseconds(20), .awake) catch {};
+                continue;
+            };
+            defer gpa.free(contents);
+            if (std.mem.indexOf(u8, contents, needle) != null) break;
+            io.sleep(.fromMilliseconds(20), .awake) catch {};
+        } else {
+            return error.HookOutputMissing;
+        }
+    }
+
     // 4. Fake provider must have consumed all steps and validated them.
     const prov_term = try prov.wait(io);
     prov_done = true;
@@ -253,6 +293,18 @@ fn runScenario(
     }
 
     print(io, "ok\n", .{});
+}
+
+fn writeExecutable(gpa: std.mem.Allocator, io: Io, path: []const u8, contents: []const u8) !void {
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+    const chmod = try std.process.run(gpa, io, .{
+        .argv = &.{ "/bin/chmod", "700", path },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    defer gpa.free(chmod.stdout);
+    defer gpa.free(chmod.stderr);
+    if (chmod.term != .exited or chmod.term.exited != 0) return error.ExecutableFixtureSetupFailed;
 }
 
 fn print(io: Io, comptime fmt: []const u8, args: anytype) void {

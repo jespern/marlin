@@ -65,7 +65,9 @@ pub fn run(
         return 2;
     };
 
-    const cfg = config.defaults();
+    var loaded_config = try config.load(gpa, io, environ);
+    defer loaded_config.deinit();
+    const cfg = loaded_config.value;
     const model_str = flags.model orelse cfg.model_default;
 
     const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {

@@ -56,6 +56,10 @@ test {
     _ = @import("daemon/loop.zig");
     _ = @import("daemon/context.zig");
     _ = @import("daemon/approval.zig");
+    _ = @import("daemon/permissions.zig");
+    _ = @import("daemon/sandbox.zig");
+    _ = @import("daemon/network_policy.zig");
+    _ = @import("daemon/extensions.zig");
     _ = @import("daemon/hooks.zig");
     _ = @import("daemon/skills.zig");
     _ = @import("daemon/tools/registry.zig");

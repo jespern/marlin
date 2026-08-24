@@ -1,10 +1,18 @@
-//! Configuration: ~/.config/marlin/config.toml → Config struct.
+//! Configuration: ~/.config/marlin/config.toml → an owned Config view.
 //!
-//! v1 keys are documented in docs/ARCHITECTURE.md §9. Until the TOML dep
-//! lands (M1), M0 runs on defaults + environment (OPENROUTER_API_KEY).
+//! `Loaded` owns every dynamic slice referenced by `Config`; keep it alive
+//! for as long as the daemon or client uses the value.
 
 const std = @import("std");
+const Io = std.Io;
 const Effort = @import("effort.zig").Effort;
+const credentials = @import("credentials.zig");
+const toml = @import("config_toml.zig");
+
+pub const ExecTool = toml.ExecTool;
+pub const McpServer = toml.McpServer;
+pub const Hooks = toml.Hooks;
+pub const Policy = toml.Policy;
 
 pub const Config = struct {
     model_default: []const u8 = "openrouter/anthropic/claude-sonnet-4.5",
@@ -14,7 +22,7 @@ pub const Config = struct {
 
     /// Model picker list (/model with no args). Curated, not fetched:
     /// OpenRouter exposes 300+ models and a dump of that is not a picker.
-    /// TODO(M4, TOML): user-defined favorites replace these defaults.
+    /// User-defined favorites replace these defaults when present in TOML.
     model_favorites: []const []const u8 = &.{
         "openrouter/anthropic/claude-sonnet-4.5",
         "openrouter/anthropic/claude-opus-4.5",
@@ -37,24 +45,236 @@ pub const Config = struct {
     mutating_tools_policy: Policy = .ask,
     readonly_tools_policy: Policy = .auto,
 
-    /// Workspace layer (docs/WORKSPACE.md): COW shadow snapshots, write leases,
-    /// sandbox escalations. Master switch — OFF until M4.5 lands; M2
-    /// approval semantics hold while false.
-    workspace_enabled: bool = false,
+    /// Capability permissions (docs/PERMISSIONS.md). Secret environment
+    /// isolation is unconditional; this flag gates the capability
+    /// approval/enforcement flow. On by default: every enforcement-affecting
+    /// surface is canary-gated and fails closed to legacy ask behavior, so
+    /// the flag only changes behavior on a platform whose sandbox proved
+    /// itself at daemon startup. MARLIN_PERMISSIONS=0 opts out.
+    permissions_enabled: bool = true,
 
-    pub const Policy = enum { auto, ask, deny };
+    /// Allow-by-default hostname policy for Marlin-owned network tools.
+    /// Values are comma-separated catalog ids/domains. An explicit deny wins;
+    /// an explicit allow overrides subscribed feed matches.
+    network_blocklists: ?[]const u8 = null,
+    network_allow: ?[]const u8 = null,
+    network_deny: ?[]const u8 = null,
+
+    /// Process-boundary extensions (M5). All slices are owned by `Loaded`.
+    exec_tools: []const ExecTool = &.{},
+    mcp_servers: []const McpServer = &.{},
+    hooks: Hooks = .{},
+    skill_directories: []const []const u8 = &.{},
+
+    /// Workspace layer (docs/WORKSPACE.md): COW shadow snapshots and write
+    /// leases. Independent of permissions and OFF until M4.5 lands.
+    workspace_enabled: bool = false,
 };
 
 pub fn defaults() Config {
     return .{};
 }
 
-// TODO(M1): TOML loading (zig-toml), provider table, exec tools, MCP servers,
-// hooks. Config file is read once by the daemon at startup + on SIGHUP.
+/// Defaults plus environment overrides, primarily for focused tests and the
+/// rollout compatibility layer. Normal daemon startup uses `load` below.
+pub fn fromEnviron(environ: *const std.process.Environ.Map) Config {
+    var c = defaults();
+    applyEnviron(&c, environ);
+    return c;
+}
+
+fn applyEnviron(c: *Config, environ: *const std.process.Environ.Map) void {
+    if (environ.get("MARLIN_PERMISSIONS")) |v| {
+        c.permissions_enabled = std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
+    }
+    if (environ.get("MARLIN_NETWORK_BLOCKLISTS")) |value| c.network_blocklists = value;
+    if (environ.get("MARLIN_NETWORK_ALLOW")) |value| c.network_allow = value;
+    if (environ.get("MARLIN_NETWORK_DENY")) |value| c.network_deny = value;
+}
+
+pub const Loaded = struct {
+    gpa: std.mem.Allocator,
+    arena_state: *std.heap.ArenaAllocator,
+    value: Config,
+
+    pub fn deinit(self: *Loaded) void {
+        self.arena_state.deinit();
+        self.gpa.destroy(self.arena_state);
+        self.* = undefined;
+    }
+};
+
+/// Load the XDG-aware config file once. A missing file is equivalent to
+/// defaults; a present malformed file fails startup rather than silently
+/// running with a different tool or approval policy than the user intended.
+pub fn load(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+) !Loaded {
+    const arena_state = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_state);
+    arena_state.* = .init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = defaults();
+    const config_dir = try credentials.configDir(arena, environ);
+    const default_skills = try std.fs.path.join(arena, &.{ config_dir, "skills" });
+    const skill_dirs = try arena.alloc([]const u8, 1);
+    skill_dirs[0] = default_skills;
+    cfg.skill_directories = skill_dirs;
+
+    const path = try std.fs.path.join(arena, &.{ config_dir, "config.toml" });
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(2 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (bytes) |contents| {
+        const doc = try toml.parse(arena, contents);
+        applyDocument(&cfg, doc);
+    }
+    // Environment is the final override layer during the M3.5 rollout.
+    applyEnviron(&cfg, environ);
+    try validate(gpa, cfg);
+    return .{ .gpa = gpa, .arena_state = arena_state, .value = cfg };
+}
+
+fn applyDocument(cfg: *Config, doc: toml.Document) void {
+    if (doc.model_default) |value| cfg.model_default = value;
+    if (doc.model_compaction) |value| cfg.model_compaction = value;
+    if (doc.model_favorites) |value| cfg.model_favorites = value;
+    if (doc.output_headroom_tokens) |value| cfg.output_headroom_tokens = value;
+    if (doc.compaction_headroom_tokens) |value| cfg.compaction_headroom_tokens = value;
+    if (doc.inline_tool_cap_bytes) |value| cfg.inline_tool_cap_bytes = value;
+    if (doc.prune_protect_tokens) |value| cfg.prune_protect_tokens = value;
+    if (doc.prune_min_reclaim_tokens) |value| cfg.prune_min_reclaim_tokens = value;
+    if (doc.mutating_tools_policy) |value| cfg.mutating_tools_policy = value;
+    if (doc.readonly_tools_policy) |value| cfg.readonly_tools_policy = value;
+    if (doc.permissions_enabled) |value| cfg.permissions_enabled = value;
+    if (doc.workspace_enabled) |value| cfg.workspace_enabled = value;
+    if (doc.network_blocklists) |value| cfg.network_blocklists = value;
+    if (doc.network_allow) |value| cfg.network_allow = value;
+    if (doc.network_deny) |value| cfg.network_deny = value;
+    if (doc.skill_directories) |value| cfg.skill_directories = value;
+    cfg.exec_tools = doc.exec_tools;
+    cfg.mcp_servers = doc.mcp_servers;
+    cfg.hooks = doc.hooks;
+}
+
+fn validate(gpa: std.mem.Allocator, cfg: Config) !void {
+    if (cfg.model_default.len == 0) return error.EmptyDefaultModel;
+    if (cfg.output_headroom_tokens == 0 or cfg.inline_tool_cap_bytes == 0) return error.InvalidContextLimit;
+    if (cfg.prune_protect_tokens <= cfg.prune_min_reclaim_tokens) return error.InvalidPruneThresholds;
+    for (cfg.exec_tools, 0..) |tool, i| {
+        try validateToolName(tool.name);
+        if (tool.cmd.len == 0) return error.ExecToolMissingCommand;
+        for (cfg.exec_tools[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, tool.name)) return error.DuplicateExecTool;
+        }
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, tool.schema, .{}) catch return error.InvalidExecToolSchema;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidExecToolSchema;
+    }
+    for (cfg.mcp_servers, 0..) |server, i| {
+        try validateToolName(server.name);
+        if (server.cmd.len == 0) return error.McpServerMissingCommand;
+        for (cfg.mcp_servers[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, server.name)) return error.DuplicateMcpServer;
+        }
+    }
+}
+
+fn validateToolName(name: []const u8) !void {
+    if (name.len == 0) return error.InvalidExtensionName;
+    for (name) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) return error.InvalidExtensionName;
+    }
+}
 
 test "defaults are sane" {
     const c = defaults();
     try std.testing.expectEqual(Effort.auto, c.effort_default);
     try std.testing.expect(c.output_headroom_tokens > 0);
     try std.testing.expect(c.prune_protect_tokens > c.prune_min_reclaim_tokens);
+    try std.testing.expect(c.permissions_enabled);
+    try std.testing.expect(!c.workspace_enabled);
+}
+
+test "MARLIN_PERMISSIONS opts out of capability permissions" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+
+    try std.testing.expect(fromEnviron(&environ).permissions_enabled);
+    try environ.put("MARLIN_PERMISSIONS", "0");
+    try std.testing.expect(!fromEnviron(&environ).permissions_enabled);
+    try environ.put("MARLIN_PERMISSIONS", "1");
+    try std.testing.expect(fromEnviron(&environ).permissions_enabled);
+    try environ.put("MARLIN_PERMISSIONS", "true");
+    try std.testing.expect(fromEnviron(&environ).permissions_enabled);
+}
+
+test "network policy environment bridge is opt-in" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+
+    try std.testing.expect(fromEnviron(&environ).network_blocklists == null);
+    try environ.put("MARLIN_NETWORK_BLOCKLISTS", "hagezi-tif-mini");
+    try environ.put("MARLIN_NETWORK_ALLOW", "safe.example");
+    try environ.put("MARLIN_NETWORK_DENY", "blocked.example");
+    const cfg = fromEnviron(&environ);
+    try std.testing.expectEqualStrings("hagezi-tif-mini", cfg.network_blocklists.?);
+    try std.testing.expectEqualStrings("safe.example", cfg.network_allow.?);
+    try std.testing.expectEqualStrings("blocked.example", cfg.network_deny.?);
+}
+
+test "load reads XDG config and environment wins" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    const root = try std.fmt.allocPrint(gpa, "/tmp/marlin-config-{x}", .{std.mem.readInt(u64, &random, .little)});
+    defer gpa.free(root);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const dir = try std.fs.path.join(gpa, &.{ root, "marlin" });
+    defer gpa.free(dir);
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(gpa, &.{ dir, "config.toml" });
+    defer gpa.free(path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data =
+        \\[model]
+        \\default = "local/test"
+        \\[approval]
+        \\default_mutating = "deny"
+        \\[permissions]
+        \\enabled = true
+        \\[network]
+        \\blocklists = "hagezi-tif-mini"
+        \\allow = "safe.example"
+        \\deny = "from-config.example"
+        \\[[tools.exec]]
+        \\name = "echo_json"
+        \\cmd = ["sh", "-c", "cat"]
+        \\schema = '{"type":"object"}'
+    });
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("XDG_CONFIG_HOME", root);
+    try environ.put("MARLIN_PERMISSIONS", "0");
+    var loaded = try load(gpa, io, &environ);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("local/test", loaded.value.model_default);
+    try std.testing.expectEqual(Policy.deny, loaded.value.mutating_tools_policy);
+    try std.testing.expect(!loaded.value.permissions_enabled);
+    try std.testing.expectEqualStrings("hagezi-tif-mini", loaded.value.network_blocklists.?);
+    try std.testing.expectEqualStrings("safe.example", loaded.value.network_allow.?);
+    try std.testing.expectEqualStrings("from-config.example", loaded.value.network_deny.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.value.exec_tools.len);
+    try std.testing.expectEqualStrings("echo_json", loaded.value.exec_tools[0].name);
 }

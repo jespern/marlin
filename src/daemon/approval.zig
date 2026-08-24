@@ -10,7 +10,7 @@
 //!
 //! Threading: the TURN thread blocks in Gate.wait(); the DISPATCHER thread
 //! resolves via Gate.resolve() when a client answers (or on interrupt).
-//! TODO(M6): allowlist patterns + promotion UX, bash sandboxing hooks.
+//! TODO(M3.5): capability-scoped once/session grants and sandbox escalations.
 
 const std = @import("std");
 const Io = std.Io;
@@ -35,12 +35,20 @@ pub const Mode = enum {
 /// What to do for one call, derived from policy — before asking anyone.
 pub const Decision = enum { run, ask, deny };
 
-pub fn policyFor(cfg: config.Config, mode: Mode, mutating: bool) Decision {
+/// `sandboxed`: this exact call will execute under the canary-verified
+/// kernel sandbox (currently: bash with a Seatbelt backend). The sandbox
+/// enforces what the ask-prompt was guarding — workspace write scope and
+/// protected paths — so such a call runs without a per-call approval
+/// (docs/PERMISSIONS.md auto-inside policy). The daemon asserts it only for
+/// sessions whose /sandbox toggle is on AND whose backend verified; policy
+/// trusts that upstream gate. An explicit deny still wins: deny is a
+/// statement of intent, not a missing safety net.
+pub fn policyFor(cfg: config.Config, mode: Mode, mutating: bool, sandboxed: bool) Decision {
     if (mode == .auto) return .run;
     const p = if (mutating) cfg.mutating_tools_policy else cfg.readonly_tools_policy;
     return switch (p) {
         .auto => .run,
-        .ask => .ask,
+        .ask => if (sandboxed) .run else .ask,
         .deny => .deny,
     };
 }
@@ -113,14 +121,30 @@ pub const Gate = struct {
 
 test "policyFor: defaults and auto mode" {
     const cfg = config.defaults();
-    try std.testing.expectEqual(Decision.run, policyFor(cfg, .default, false));
-    try std.testing.expectEqual(Decision.ask, policyFor(cfg, .default, true));
-    try std.testing.expectEqual(Decision.run, policyFor(cfg, .auto, true));
+    try std.testing.expectEqual(Decision.run, policyFor(cfg, .default, false, false));
+    try std.testing.expectEqual(Decision.ask, policyFor(cfg, .default, true, false));
+    try std.testing.expectEqual(Decision.run, policyFor(cfg, .auto, true, false));
 
     var deny_cfg = cfg;
     deny_cfg.mutating_tools_policy = .deny;
-    try std.testing.expectEqual(Decision.deny, policyFor(deny_cfg, .default, true));
-    try std.testing.expectEqual(Decision.run, policyFor(deny_cfg, .auto, true));
+    try std.testing.expectEqual(Decision.deny, policyFor(deny_cfg, .default, true, false));
+    try std.testing.expectEqual(Decision.run, policyFor(deny_cfg, .auto, true, false));
+}
+
+test "policyFor: auto-inside runs sandboxed calls without a prompt" {
+    const cfg = config.defaults();
+    try std.testing.expectEqual(Decision.run, policyFor(cfg, .default, true, true));
+
+    // A session whose sandbox toggle is off never reaches this path with
+    // sandboxed=true — the daemon only asserts it for enabled sessions with
+    // a verified backend; an unsandboxed call keeps asking.
+    try std.testing.expectEqual(Decision.ask, policyFor(cfg, .default, true, false));
+
+    // Explicit deny is intent, not a missing safety net — sandbox never
+    // overrides it.
+    var deny_cfg = cfg;
+    deny_cfg.mutating_tools_policy = .deny;
+    try std.testing.expectEqual(Decision.deny, policyFor(deny_cfg, .default, true, true));
 }
 
 test "gate: cross-thread resolve" {

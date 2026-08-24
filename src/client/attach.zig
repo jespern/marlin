@@ -16,6 +16,9 @@ pub const Conn = struct {
     writer: Io.net.Stream.Writer,
     rbuf: []u8,
     wbuf: []u8,
+    /// Daemon capabilities from hello_ok; populated by connect().
+    sandbox_available: bool = false,
+    network_filtering: bool = false,
 
     pub fn deinit(self: *Conn) void {
         self.stream.close(self.io);
@@ -119,7 +122,9 @@ pub fn connect(
     try c.send(.{ .hello = .{ .proto_version = proto.proto_version } });
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    _ = try c.recvUntil(arena_state.allocator(), .hello_ok);
+    const hello = try c.recvUntil(arena_state.allocator(), .hello_ok);
+    c.sandbox_available = hello.sandbox_available;
+    c.network_filtering = hello.network_filtering;
     return c;
 }
 

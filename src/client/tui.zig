@@ -64,6 +64,7 @@ const ComposerCommand = struct {
 const composer_commands = [_]ComposerCommand{
     .{ .name = "/model", .usage = " [model]", .description = "switch model or open the picker", .accepts_args = true },
     .{ .name = "/effort", .usage = " [level]", .description = "set reasoning effort or open the picker", .accepts_args = true },
+    .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/compact", .description = "compact the current context" },
@@ -181,6 +182,8 @@ const SessionSummary = struct {
     state: proto.SessionState,
     created_at: i64,
     label: []u8,
+    /// Effective shell-sandbox state (session toggle AND verified backend).
+    sandboxed: bool,
 
     fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
@@ -544,6 +547,7 @@ const App = struct {
                 .state = info.state,
                 .created_at = info.created_at,
                 .label = label,
+                .sandboxed = info.sandboxed,
             }) catch {
                 self.gpa.free(title);
                 self.gpa.free(cwd);
@@ -794,6 +798,8 @@ const App = struct {
                 return;
             };
             self.applyEffort(selected);
+        } else if (std.mem.eql(u8, head, "/sandbox")) {
+            self.toggleSandbox(it.rest());
         } else if (std.mem.eql(u8, head, "/sessions")) {
             self.openPicker(.session);
         } else if (std.mem.eql(u8, head, "/new")) {
@@ -817,7 +823,7 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /model <m> · /effort <level> · /new · /compact · /reboot [--build] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /model <m> · /effort <level> · /sandbox [on|off] · /new · /compact · /reboot [--build] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -922,6 +928,41 @@ const App = struct {
         self.conn.send(.{ .session_set_effort = .{ .sid = self.sid, .effort = selected } }) catch return;
         self.effort = selected;
         self.setNotice("effort → {s}", .{@tagName(selected)});
+    }
+
+    /// Effective sandbox state of the active session, from the last watch
+    /// snapshot. Before a snapshot arrives, assume the daemon default (the
+    /// snapshot follows within the same connect exchange).
+    fn currentSandboxed(self: *const App) bool {
+        if (self.sessionSummary(self.sid)) |summary| return summary.sandboxed;
+        return self.conn.sandbox_available;
+    }
+
+    fn toggleSandbox(self: *App, arg: []const u8) void {
+        if (self.state == .running or self.state == .awaiting_approval) {
+            self.setNotice("cannot toggle sandbox mid-turn", .{});
+            return;
+        }
+        const target = if (arg.len == 0)
+            !self.currentSandboxed()
+        else if (std.mem.eql(u8, arg, "on"))
+            true
+        else if (std.mem.eql(u8, arg, "off"))
+            false
+        else {
+            self.setNotice("usage: /sandbox [on|off]", .{});
+            return;
+        };
+        if (target and !self.conn.sandbox_available) {
+            self.setNotice("sandbox unavailable on this platform — per-call approvals retained", .{});
+            return;
+        }
+        self.conn.send(.{ .session_set_sandbox = .{ .sid = self.sid, .enabled = target } }) catch return;
+        if (target) {
+            self.setNotice("sandbox on — workspace shell runs without prompts", .{});
+        } else {
+            self.setNotice("sandbox off — every shell call asks again", .{});
+        }
     }
 
     fn applyPickerItem(self: *App, item: []const u8) void {
@@ -1040,7 +1081,11 @@ const Palette = struct {
     const md_callout: vaxis.Style = .{ .bg = md_callout_bg };
     const reasoning_bg: vaxis.Color = .{ .rgb = .{ 0x30, 0x33, 0x39 } };
     const reasoning_panel: vaxis.Style = .{ .bg = reasoning_bg };
-    const reasoning: vaxis.Style = .{ .fg = .{ .index = 7 }, .bg = reasoning_bg, .italic = true };
+    /// Reasoning commentary keeps body-text brightness and posture: the same
+    /// words were just streamed in the default style, and dimming/italicizing
+    /// them on completion reads as the text degrading. The panel background
+    /// and mark carry the "commentary" distinction instead.
+    const reasoning: vaxis.Style = .{ .bg = reasoning_bg };
     const reasoning_mark: vaxis.Style = .{ .fg = .{ .index = 6 }, .bg = reasoning_bg, .bold = true };
     /// Tool machinery (the ⚙ glyph, arg previews, result bodies): dimmed
     /// gray so it reads as background activity, never as user input or as
@@ -3413,6 +3458,47 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     }
     _ = status_win.print(status_segments[0..status_n], .{ .wrap = .none });
 
+    // Far-right indicators: shell sandbox state and DNS blocklist filtering.
+    // Drawn after the left segments so they win on narrow terminals.
+    const sandboxed_now = app.currentSandboxed();
+    const sandbox_txt: []const u8 = if (sandboxed_now)
+        "⛨ sandboxed"
+    else if (app.conn.sandbox_available)
+        "⛨ sandbox off"
+    else
+        "⛨ no sandbox";
+    const sandbox_style = if (sandboxed_now)
+        Palette.status_running
+    else if (app.conn.sandbox_available)
+        Palette.status_context_warn
+    else
+        Palette.status_sep;
+    // The shield is 3 UTF-8 bytes but renders as one cell; every variant
+    // above carries exactly one, so columns = bytes - 2.
+    const sandbox_cols: u16 = @intCast(sandbox_txt.len - "⛨".len + 1);
+    const dns_on = app.conn.network_filtering;
+    var right_w: u16 = sandbox_cols + 1; // trailing space
+    if (dns_on) right_w += "dnsblock".len + 3; // " · " renders as 3 cells
+    if (status_win.width > right_w) {
+        const right_win = status_win.child(.{
+            .x_off = @intCast(status_win.width - right_w),
+            .width = right_w,
+        });
+        var right_segments: [4]vaxis.Segment = undefined;
+        var right_n: usize = 0;
+        if (dns_on) {
+            right_segments[right_n] = .{ .text = "dnsblock", .style = Palette.status_running };
+            right_n += 1;
+            right_segments[right_n] = .{ .text = " · ", .style = Palette.status_sep };
+            right_n += 1;
+        }
+        right_segments[right_n] = .{ .text = sandbox_txt, .style = sandbox_style };
+        right_n += 1;
+        right_segments[right_n] = .{ .text = " ", .style = Palette.status_bar };
+        right_n += 1;
+        _ = right_win.print(right_segments[0..right_n], .{ .wrap = .none });
+    }
+
     // ---- model / reasoning-effort selector overlay ----
     if (app.picker) |sel| {
         const items = try app.pickerItems(arena);
@@ -3572,7 +3658,9 @@ pub fn run(
     };
     defer conn.deinit();
 
-    const cfg = config.defaults();
+    var loaded_config = try config.load(gpa, io, environ);
+    defer loaded_config.deinit();
+    const cfg = loaded_config.value;
     var model_at_start: []const u8 = cfg.model_default;
     var effort_at_start: proto.ReasoningEffort = cfg.effort_default;
     var model_buf: [256]u8 = undefined;
@@ -4418,7 +4506,10 @@ test "reasoning cards are bright, padded, and inset" {
     try std.testing.expectEqualStrings("", lines.items[lines.items.len - 1].text);
     try std.testing.expectEqualStrings("  · ", lines.items[1].text);
     try std.testing.expect(lines.items[1].style.bold);
-    try std.testing.expect(lines.items[1].style2.italic);
+    // Body text must not be dimmed or italicized — it keeps the default
+    // foreground so completed commentary stays as readable as it streamed.
+    try std.testing.expect(!lines.items[1].style2.italic);
+    try std.testing.expect(vaxis.Color.eql(lines.items[1].style2.fg, vaxis.Color.default));
     for (lines.items) |line| {
         try std.testing.expect(line.fill_style != null);
         try std.testing.expect(vaxis.Color.eql(line.fill_style.?.bg, Palette.reasoning_bg));

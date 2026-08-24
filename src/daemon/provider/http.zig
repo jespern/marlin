@@ -122,6 +122,15 @@ pub const GetResult = struct {
     content_type: ?[]u8, // caller frees when non-null
 };
 
+pub const GetOneResult = struct {
+    status: i64,
+    body: []u8, // caller frees
+    content_type: ?[]u8, // caller frees when non-null
+    /// Raw Location value when libcurl recognizes a redirect response.
+    /// May be relative; caller resolves it against the requested URL.
+    location: ?[]u8, // caller frees when non-null
+};
+
 /// Simple bounded GET (fetch tool). Follows redirects; caps the body.
 pub fn get(
     gpa: std.mem.Allocator,
@@ -169,6 +178,65 @@ pub fn get(
         .status = status,
         .body = try sink.body.toOwnedSlice(gpa),
         .content_type = ctype,
+    };
+}
+
+/// Bounded GET without following redirects. The fetch tool uses this form so
+/// its hostname policy can authorize every hop before a connection is made.
+pub fn getOne(
+    gpa: std.mem.Allocator,
+    url: [:0]const u8,
+    max_bytes: usize,
+    timeout_ms: c_long,
+    cancel: ?*std.atomic.Value(bool),
+) Error!GetOneResult {
+    const easy = c.curl_easy_init() orelse return error.CurlInit;
+    defer c.curl_easy_cleanup(easy);
+
+    var sink = GetSink{ .gpa = gpa, .max = max_bytes, .cancel = cancel };
+    errdefer sink.body.deinit(gpa);
+
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_URL, url.ptr);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEFUNCTION, GetSink.write);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEDATA, &sink);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, 10_000));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_TIMEOUT_MS, timeout_ms);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_NOPROGRESS, @as(c_long, 0));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFOFUNCTION, GetSink.progress);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFODATA, &sink);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 0));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_ACCEPT_ENCODING, "");
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_USERAGENT, "marlin/0.0");
+
+    const code = c.curl_easy_perform(easy);
+    var status: c_long = 0;
+    _ = c.curl_easy_getinfo(easy, c.CURLINFO_RESPONSE_CODE, &status);
+
+    if (code == c.CURLE_ABORTED_BY_CALLBACK) {
+        if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+    } else if (code != c.CURLE_OK and status == 0) {
+        return error.CurlPerform;
+    }
+
+    var content_type: ?[]u8 = null;
+    errdefer if (content_type) |value| gpa.free(value);
+    var ct_ptr: [*c]u8 = null;
+    if (c.curl_easy_getinfo(easy, c.CURLINFO_CONTENT_TYPE, &ct_ptr) == c.CURLE_OK and ct_ptr != null) {
+        content_type = try gpa.dupe(u8, std.mem.span(ct_ptr));
+    }
+
+    var location: ?[]u8 = null;
+    errdefer if (location) |value| gpa.free(value);
+    var location_ptr: [*c]u8 = null;
+    if (c.curl_easy_getinfo(easy, c.CURLINFO_REDIRECT_URL, &location_ptr) == c.CURLE_OK and location_ptr != null) {
+        location = try gpa.dupe(u8, std.mem.span(location_ptr));
+    }
+
+    return .{
+        .status = status,
+        .body = try sink.body.toOwnedSlice(gpa),
+        .content_type = content_type,
+        .location = location,
     };
 }
 

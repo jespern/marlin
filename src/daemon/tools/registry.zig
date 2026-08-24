@@ -9,6 +9,9 @@ const std = @import("std");
 const Io = std.Io;
 
 const block = @import("../../core/block.zig");
+const permissions = @import("../permissions.zig");
+const sandbox = @import("../sandbox.zig");
+const network_policy = @import("../network_policy.zig");
 const bash = @import("bash.zig");
 const files = @import("files.zig");
 const search = @import("search.zig");
@@ -57,12 +60,39 @@ pub fn dispatch(
     name: []const u8,
     args_json: []const u8,
     cwd: []const u8,
+    source_environ: ?*const std.process.Environ.Map,
+    sandbox_options: sandbox.Options,
+    policy: ?*const network_policy.Policy,
     cancel: ?*std.atomic.Value(bool),
 ) ExecOut {
+    // bash and the rg-backed grep path are the current tool subprocesses.
+    // Build their environment here so new subprocess-backed tools have one
+    // obvious boundary to reuse.
+    var child_environ: std.process.Environ.Map = undefined;
+    var has_child_environ = false;
+    defer if (has_child_environ) child_environ.deinit();
+    if (source_environ != null and
+        (std.mem.eql(u8, name, bash.spec_name) or std.mem.eql(u8, name, search.grep_spec_name)))
+    {
+        child_environ = permissions.toolEnvironment(gpa, source_environ.?) catch |e| {
+            return .{ .output = errText(gpa, e), .status = .err };
+        };
+        has_child_environ = true;
+    }
+    if (has_child_environ and sandbox_options.backend == .seatbelt) {
+        const temp_root = sandbox_options.temp_root orelse {
+            return .{ .output = gpa.dupe(u8, "error: sandbox temp root unavailable") catch @panic("oom"), .status = .err };
+        };
+        child_environ.put("TMPDIR", temp_root) catch |e| {
+            return .{ .output = errText(gpa, e), .status = .err };
+        };
+    }
+    const child_environ_ptr: ?*const std.process.Environ.Map = if (has_child_environ) &child_environ else null;
+
     if (std.mem.eql(u8, name, bash.spec_name)) {
         const parsed = parseArgs(bash.Args, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        const r = bash.run(gpa, io, parsed.value, cwd) catch |e| {
+        const r = bash.run(gpa, io, parsed.value, cwd, child_environ_ptr, sandbox_options) catch |e| {
             return .{ .output = errText(gpa, e), .status = .err };
         };
         if (r.exit_code != 0) {
@@ -91,7 +121,7 @@ pub fn dispatch(
     if (std.mem.eql(u8, name, search.grep_spec_name)) {
         const parsed = parseArgs(search.GrepArgs, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        return textResult(search.grep(gpa, io, parsed.value, cwd), gpa);
+        return textResult(search.grep(gpa, io, parsed.value, cwd, child_environ_ptr), gpa);
     }
     if (std.mem.eql(u8, name, search.glob_spec_name)) {
         const parsed = parseArgs(search.GlobArgs, gpa, args_json) orelse return argError(gpa, args_json);
@@ -101,7 +131,7 @@ pub fn dispatch(
     if (std.mem.eql(u8, name, fetch_tool.spec_name)) {
         const parsed = parseArgs(fetch_tool.Args, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        return textResult(fetch_tool.fetch(gpa, parsed.value, cancel), gpa);
+        return textResult(fetch_tool.fetch(gpa, parsed.value, policy, cancel), gpa);
     }
     const msg = std.fmt.allocPrint(gpa, "error: unknown tool '{s}'", .{name}) catch @panic("oom");
     return .{ .output = msg, .status = .err };
@@ -149,7 +179,7 @@ test "dispatch: unknown tool returns error text, not crash" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const r = dispatch(gpa, io, "bogus", "{}", "/tmp", null);
+    const r = dispatch(gpa, io, "bogus", "{}", "/tmp", null, .{}, null, null);
     defer gpa.free(r.output);
     try std.testing.expectEqual(block.ToolStatus.err, r.status);
     try std.testing.expect(std.mem.indexOf(u8, r.output, "unknown tool") != null);
@@ -160,9 +190,38 @@ test "dispatch: bad args json returns error text" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const r = dispatch(gpa, io, "read_file", "{not json", "/tmp", null);
+    const r = dispatch(gpa, io, "read_file", "{not json", "/tmp", null, .{}, null, null);
     defer gpa.free(r.output);
     try std.testing.expectEqual(block.ToolStatus.err, r.status);
+}
+
+test "dispatch: tool subprocess cannot see provider credentials" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var source_environ = std.process.Environ.Map.init(gpa);
+    defer source_environ.deinit();
+    try source_environ.put("OPENROUTER_API_KEY", "must-not-cross-boundary");
+    try source_environ.put("PUBLIC_VALUE", "visible");
+
+    const r = dispatch(
+        gpa,
+        io,
+        "bash",
+        \\{"command":"printf '%s|%s' \"${OPENROUTER_API_KEY-unset}\" \"$PUBLIC_VALUE\""}
+    ,
+        "/tmp",
+        &source_environ,
+        .{},
+        null,
+        null,
+    );
+    defer gpa.free(r.output);
+
+    try std.testing.expectEqual(block.ToolStatus.ok, r.status);
+    try std.testing.expectEqualStrings("unset|visible", r.output);
 }
 
 test {

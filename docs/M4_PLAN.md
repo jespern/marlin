@@ -1,19 +1,21 @@
-# M4 → M4.5 planning ledger
+# M4 implementation ledger and deferred workspace track
 
-Status: **planning only**. Do not begin implementation until the open M4
-product decisions below have been reviewed. `MILESTONES.md` remains the
-roadmap; this document is the execution contract for the next two milestones.
+Status: **M4 implemented and verified (2026-08-24)**. The focused one-session-
+at-a-time multiplexer shipped; the richer input/remote candidates did not
+become exit requirements. The former M4.5 workspace milestone is moved to the
+Later track, after M6, rather than pretending phase 2 can precede phase 1.
 
 ## Current position
 
-Treat M3 as closed for feature sequencing. Context management, compaction,
-usage accounting, and self-hosting reboot exist and pass the automated gates;
-normal dogfooding can continue to produce M3 polish without holding M4.
+M4a/M4b are complete: session-status watch, `/sessions`, MRU J/K switching,
+actionable background status, per-session drafts/view state, durable turn/seq
+identity, background approvals, and uncapped `!c` retrieval all pass the unit
+and E2E gates. Splits, image input, remote attach, and cross-session registers
+remain optional future slices.
 
-M4 is now the next milestone: focused multi-session terminal UX without
-persistent chrome. Workspace snapshots, drift, undo, and write leases are
-explicitly deferred to M4.5. Their design is recorded below but is not a gate
-for M4 and should be reopened using evidence from multi-session dogfooding.
+Workspace snapshots, drift, undo, leases, and worktree isolation are deferred
+as one coherent Later track. Their design remains below and in `WORKSPACE.md`;
+reopen it using actual multiplexer collision/recovery evidence.
 
 ## Decisions already made
 
@@ -23,8 +25,8 @@ for M4 and should be reopened using evidence from multi-session dogfooding.
    keep them, identify their session with a compact pane label.
 2. **Workspace safety is deferred, not half-built.** M4 does not implement
    snapshots, drift detection, `/undo`, `waiting_workspace`, or write leases.
-   Existing per-tool approval behavior remains unchanged and the workspace
-   feature flag stays off.
+   M3.5 capability permissions remain in force and the workspace feature flag
+   stays off.
 3. **Blocks remain truth.** Durable session events survive reconnect and
    reboot. Transient UI state is derived from blocks and protocol status, not
    held only in a client.
@@ -119,11 +121,11 @@ questions are answered. It should describe a workflow Marlin actually
 replaces, not require features kept only because an old wireframe contained
 them.
 
-## Deferred M4.5 — workspace safety
+## Later — workspace safety (formerly M4.5)
 
-This milestone is intentionally parked until M4 multi-session use tells us
-where collisions, recovery, and latency hurt in practice. No M4 implementation
-depends on it.
+This track is intentionally parked until M4/M6 multi-session and subagent use
+tells us where collisions, recovery, and latency hurt in practice. No M4-M6
+implementation depends on it.
 
 Two tentative decisions are worth retaining for that later review:
 
@@ -134,7 +136,7 @@ Two tentative decisions are worth retaining for that later review:
    including ignored files, a metadata manifest, and an honest portable copy
    fallback. Never use hard links for snapshots.
 
-The following questions are deliberately unresolved until M4.5 planning:
+The following questions are deliberately unresolved until Later planning:
 
 - when full snapshots and drift checks run;
 - how arbitrary shell writes and external writers are attributed;
@@ -145,5 +147,5 @@ The following questions are deliberately unresolved until M4.5 planning:
 
 A likely implementation shape, subject to that later review, is configuration
 and contracts → snapshot engine → turn integration and drift → write leases →
-undo → opt-in rollout. `[workspace] enabled = false` remains the default until
-the complete safety matrix passes.
+undo → worktree isolation/land/discard → opt-in rollout. `[workspace] enabled =
+false` remains the default until the complete safety matrix passes.

@@ -40,6 +40,10 @@ pub const ClientMsg = union(enum) {
     session_kill: struct { sid: u64 },
     session_set_model: struct { sid: u64, model: []const u8 },
     session_set_effort: struct { sid: u64, effort: ReasoningEffort },
+    /// Toggle the kernel shell sandbox (and its prompt-free shell execution)
+    /// for one session. Enabling requires the daemon's verified backend
+    /// (hello_ok.sandbox_available); the daemon rejects it otherwise.
+    session_set_sandbox: struct { sid: u64, enabled: bool },
     /// Fetch an uncapped tool result by its content-addressed blob hash.
     /// Used by `!c`; the inline block body may be intentionally truncated.
     blob_get: struct { hash: []const u8 },
@@ -66,7 +70,16 @@ pub const ApprovalAnswer = enum { granted, denied };
 
 /// Daemon → client.
 pub const DaemonMsg = union(enum) {
-    hello_ok: struct { proto_version: u32, daemon_version: []const u8 },
+    hello_ok: struct {
+        proto_version: u32,
+        daemon_version: []const u8,
+        /// The daemon's kernel shell sandbox passed its startup canary;
+        /// sessions may enable prompt-free sandboxed shell execution.
+        sandbox_available: bool = false,
+        /// A DNS blocklist / explicit-deny network policy is loaded for
+        /// Marlin-owned network tools.
+        network_filtering: bool = false,
+    },
     session_created: struct { sid: u64 },
     session_list_result: struct { sessions: []const SessionInfo },
     blk: struct { sid: u64, b: block.Block },
@@ -114,6 +127,9 @@ pub const SessionInfo = struct {
     state: SessionState = .idle,
     created_at: i64,
     running: bool,
+    /// Effective shell-sandbox state: the session's toggle AND a verified
+    /// backend. Defaults false when decoding older daemons.
+    sandboxed: bool = false,
 };
 
 /// Encode one message as an NDJSON line (incl. trailing \n). Caller frees.
@@ -173,6 +189,12 @@ test "round trip: client messages" {
     defer gpa.free(effort_line);
     const effort_back = try decode(ClientMsg, arena, effort_line);
     try std.testing.expectEqual(ReasoningEffort.xhigh, effort_back.session_set_effort.effort);
+
+    const sandbox_msg: ClientMsg = .{ .session_set_sandbox = .{ .sid = 9, .enabled = false } };
+    const sandbox_line = try encode(gpa, sandbox_msg);
+    defer gpa.free(sandbox_line);
+    const sandbox_back = try decode(ClientMsg, arena, sandbox_line);
+    try std.testing.expect(!sandbox_back.session_set_sandbox.enabled);
 
     const watch_line = try encode(gpa, ClientMsg{ .session_watch = .{} });
     defer gpa.free(watch_line);

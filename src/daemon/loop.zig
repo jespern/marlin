@@ -12,11 +12,15 @@ const config = @import("../core/config.zig");
 const Store = @import("store.zig").Store;
 const context = @import("context.zig");
 const approval = @import("approval.zig");
+const sandbox = @import("sandbox.zig");
+const network_policy = @import("network_policy.zig");
+const extensions = @import("extensions.zig");
 const provider = @import("provider/provider.zig");
 const openai = @import("provider/openai_compat.zig");
 const http = @import("provider/http.zig");
 const sse = @import("provider/sse.zig");
 const tools_registry = @import("tools/registry.zig");
+const bash_tool = @import("tools/bash.zig");
 const files_tool = @import("tools/files.zig");
 const Effort = @import("../core/effort.zig").Effort;
 
@@ -35,6 +39,15 @@ pub const RunOpts = struct {
     endpoint: Endpoint,
     effort: Effort = .auto,
     cfg: config.Config,
+    /// Daemon-owned environment. Tool subprocesses receive a scrubbed copy;
+    /// provider credentials never cross the daemon boundary.
+    tool_environ: ?*const std.process.Environ.Map = null,
+    /// Kernel sandbox selected only after its runtime canary passes.
+    sandbox_options: sandbox.Options = .{},
+    /// Allow-by-default hostname policy for structured network tools.
+    network_policy: ?*const network_policy.Policy = null,
+    /// Daemon-owned M5 extension registry (exec, MCP, skills, hooks).
+    extensions: ?*extensions.Runtime = null,
     /// Compaction endpoint (usually same as endpoint but cheap model);
     /// null → use `endpoint` for summarization too.
     compaction_endpoint: ?Endpoint = null,
@@ -159,7 +172,11 @@ pub fn runTurn(
         for (loaded, 0..) |lb, i| blocks[i] = lb.blk;
 
         const frontier: u64 = if (opts.prune_frontier) |pf| pf.* else 0;
-        var msgs = try context.assemble(arena, blocks, .{ .prune_before_seq = frontier });
+        const system_prompt_suffix = if (opts.extensions) |ext| ext.systemPromptSuffix() else "";
+        var msgs = try context.assemble(arena, blocks, .{
+            .prune_before_seq = frontier,
+            .system_prompt_suffix = system_prompt_suffix,
+        });
 
         // -- L2 headroom check (turn boundary = before each request) --
         var est_used = context.estimateAssembled(msgs);
@@ -173,14 +190,20 @@ pub fn runTurn(
                 }
                 blocks = try arena.alloc(block.Block, loaded2.len);
                 for (loaded2, 0..) |lb, i| blocks[i] = lb.blk;
-                msgs = try context.assemble(arena, blocks, .{ .prune_before_seq = frontier });
+                msgs = try context.assemble(arena, blocks, .{
+                    .prune_before_seq = frontier,
+                    .system_prompt_suffix = system_prompt_suffix,
+                });
             } else if (opts.prune_frontier) |pf| {
                 // Compaction not possible (session too small / no progress):
                 // fall back to L1 pruning if it can reclaim enough.
                 if (context.planPrune(blocks, pf.*, opts.cfg.prune_protect_tokens, opts.cfg.prune_min_reclaim_tokens)) |new_frontier| {
                     pf.* = new_frontier;
                     _ = try ap.append(.{ .system_note = .{ .text = "context pruned (L1): old tool outputs elided" } });
-                    msgs = try context.assemble(arena, blocks, .{ .prune_before_seq = new_frontier });
+                    msgs = try context.assemble(arena, blocks, .{
+                        .prune_before_seq = new_frontier,
+                        .system_prompt_suffix = system_prompt_suffix,
+                    });
                 }
             }
         } else if (opts.prune_frontier) |pf| {
@@ -192,7 +215,10 @@ pub fn runTurn(
                 if (context.planPrune(blocks, pf.*, opts.cfg.prune_protect_tokens, opts.cfg.prune_min_reclaim_tokens)) |new_frontier| {
                     pf.* = new_frontier;
                     _ = try ap.append(.{ .system_note = .{ .text = "context pruned (L1): old tool outputs elided" } });
-                    msgs = try context.assemble(arena, blocks, .{ .prune_before_seq = new_frontier });
+                    msgs = try context.assemble(arena, blocks, .{
+                        .prune_before_seq = new_frontier,
+                        .system_prompt_suffix = system_prompt_suffix,
+                    });
                 }
             }
         }
@@ -201,8 +227,12 @@ pub fn runTurn(
         est_used = context.estimateAssembled(msgs);
         if (opts.context_used_out) |cu| cu.store(est_used, .release);
 
-        var tools: [tools_registry.specs.len]openai.ToolSpec = undefined;
+        const extension_specs = if (opts.extensions) |ext| ext.specs() else &.{};
+        const tools = try arena.alloc(openai.ToolSpec, tools_registry.specs.len + extension_specs.len);
         for (&tools_registry.specs, 0..) |*s, ti| {
+            tools[ti] = .{ .name = s.name, .description = s.description, .schema_json = s.schema_json };
+        }
+        for (extension_specs, tools_registry.specs.len..) |s, ti| {
             tools[ti] = .{ .name = s.name, .description = s.description, .schema_json = s.schema_json };
         }
 
@@ -212,7 +242,7 @@ pub fn runTurn(
             opts.endpoint.dialect,
             opts.effort,
             msgs,
-            &tools,
+            tools,
         );
 
         // -- stream the response --
@@ -283,9 +313,18 @@ pub fn runTurn(
             } });
 
             // -- approval gate: EVERY execution flows through here --
-            const spec = tools_registry.find(pc.name.items);
+            const spec = tools_registry.find(pc.name.items) orelse
+                if (opts.extensions) |ext| ext.find(pc.name.items) else null;
+            // Auto-inside (docs/PERMISSIONS.md): a shell call that will
+            // execute under the canary-verified kernel sandbox needs no
+            // per-call prompt — the sandbox enforces the write scope and
+            // protected paths the prompt was guarding. Direct write/edit
+            // tools bypass the kernel sandbox and keep asking until
+            // symlink-safe direct-tool enforcement lands.
+            const sandboxed = opts.sandbox_options.backend == .seatbelt and
+                std.mem.eql(u8, pc.name.items, bash_tool.spec_name);
             const decision: approval.Decision = if (spec) |s|
-                approval.policyFor(opts.cfg, opts.approval_mode, s.mutating)
+                approval.policyFor(opts.cfg, opts.approval_mode, s.mutating, sandboxed)
             else
                 .run; // unknown tool → dispatch returns error text anyway
 
@@ -495,7 +534,20 @@ pub fn compactSession(
 fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, name: []const u8, args_json: []const u8) tools_registry.ExecOut {
     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .start);
     defer if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .done);
-    return tools_registry.dispatch(gpa, io, name, args_json, opts.cwd, opts.cancel);
+    if (opts.extensions) |ext| {
+        if (ext.dispatch(name, args_json, opts.cwd)) |result| return result;
+    }
+    return tools_registry.dispatch(
+        gpa,
+        io,
+        name,
+        args_json,
+        opts.cwd,
+        opts.tool_environ,
+        opts.sandbox_options,
+        opts.network_policy,
+        opts.cancel,
+    );
 }
 
 fn nowMs(io: Io) i64 {

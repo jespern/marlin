@@ -20,7 +20,9 @@ marlin/
 │   │   ├── store.zig          # SQLite: blocks, sessions, blobs, FTS; the ONLY sqlite user
 │   │   ├── loop.zig           # agent turn: assemble→stream→tools→repeat; steer queue
 │   │   ├── context.zig        # assembly + L0 caps + L1 prune + L2 compaction + rehydrate
-│   │   ├── approval.zig       # policies, allowlists, pending-approval registry
+│   │   ├── approval.zig       # policies, capability grants, pending approvals
+│   │   ├── permissions.zig    # capability/path policy + child secret boundary
+│   │   ├── sandbox.zig        # runtime-verified Seatbelt/Landlock adapters
 │   │   ├── tools/
 │   │   │   ├── registry.zig   # spec: name, schema, parallel_safe, policy; dispatch
 │   │   │   ├── bash.zig       # subprocess, cancellation, (later: sandbox.zig)
@@ -73,9 +75,8 @@ extraction clean):
 
 # Milestones
 
-Detailed decisions and proposed build slices for the current M4 → M4.5 work
-live in `docs/M4_PLAN.md`. Implementation stays paused until its open
-product questions are resolved.
+The active M3.5 permissions contract lives in `docs/PERMISSIONS.md`. M4 and
+deferred M4.5 decisions live in `docs/M4_PLAN.md`.
 
 Each milestone ends with something you use daily; cut scope inside a milestone,
 never the ordering. (Rough sizing assumes nights-and-weekends pace.)
@@ -107,7 +108,19 @@ marlin is developed from inside marlin. e2e: reboot vs kill-9 converge.
 *Exit: a 3-hour session never hits a context error, costs behave, and you
 ship a marlin change from a marlin session and `/reboot --build` into it.*
 
+## M3.5 — permissions and secret boundary
+Capability-scoped approvals (once or session), scrubbed tool-process
+environments, protected-path enforcement, exact-value capture redaction, and
+platform shell sandboxes. Existing per-tool approval behavior remains the
+fallback when sandbox verification fails; a verified sandbox makes operations
+inside the exact session workspace automatic. The Later workspace track adds
+recovery, not write authority.
+*Exit: provider secrets cannot enter tool output, protected reads and outside
+writes are enforceably blocked, and escalation cards name the exact capability
+and scope being granted.*
+
 ## M4 — multiplexer
+**Status: implemented and verified (2026-08-24).**
 No persistent sidebar. Sessions live in an on-demand `/sessions` picker with
 title/workspace/status, J/K switches recent sessions, and the status bar shows
 only actionable background activity (for example `2 running · 1 approval`).
@@ -119,27 +132,28 @@ starts.
 *Exit: several local sessions can run and be revisited from one full-width
 Marlin UI without losing their place or hiding actionable background state.*
 
-## M4.5 — workspace safety (docs/WORKSPACE.md)
-Deferred until M4 multi-session dogfooding gives us real collision and latency
-data. Copy-on-write shadow snapshots with portable fallback, `/undo` with diff
-preview, external drift notes, and write leases with `waiting_workspace`
-parking. Feature-flagged `[workspace] enabled`, DEFAULT OFF; existing approval
-semantics remain unchanged until the full safety matrix passes.
-*Exit: two marlin sessions on one workspace cannot silently clobber each other;
-an external writer is detected and its pre-Marlin state remains recoverable.*
-
 ## M5 — extensibility
-MCP stdio client, exec tools, hooks (approval-needed → ntfy script = phone
-notifications), skills. *Exit: one real MCP server + one hook in daily use.*
+**Status: implemented and automated (2026-08-24); daily-use proof remains.**
+Owned TOML configuration, MCP stdio client (current protocol plus legacy
+fallback), exec tools, non-blocking hooks (approval/turn/session/error), and
+on-demand skills. All extension tools use the provider schema list and the
+same approval gate as built-ins. *Exit: one real MCP server + one hook in daily
+use; the fake-provider/stdio E2E gates prove mechanics, not operational value.*
 
 ## M6 — hardening & v2 doors
-Workspace phase 2 (docs/WORKSPACE.md): bash sandboxing (seatbelt/Landlock)
-+ capability escalations through the approval gate (retires per-tool ask
-prompts), worktree isolation w/ /land and /discard. `task` subagent
-tool + parent/child hierarchy in the session picker, TCP listener + token auth.
-Then decide: PWA client.
-Multi-model review councils (docs/REVIEW.md) build on the subagent machinery
-here — a review child is a specialized `task` child.
+Parallel-safe tool execution; durable `task` children with parent/child
+hierarchy, cancellation, budgets, and session-picker status; then multi-model
+review councils (docs/REVIEW.md) as specialized read-only task fan-out. TCP
+listener/token auth is a retained v2 door to schedule only for a concrete
+remote-client need. Then decide: PWA client. Execution plan: `docs/M6_PLAN.md`.
+
+## Later — workspace recovery & isolation (formerly M4.5)
+Copy-on-write snapshots with portable fallback, `/undo` preview, external
+drift notes, write leases/parking, then worktree isolation with `/land` and
+`/discard`. Kept as one ordered track so phase 2 does not precede phase 1.
+Feature-flagged `[workspace] enabled`, DEFAULT OFF.
+*Exit: concurrent Marlin sessions cannot silently clobber one another, external
+writes remain recoverable, and isolated work lands only through reviewed merge.*
 
 # Open questions (decide before M1, none block M0)
 

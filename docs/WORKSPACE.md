@@ -1,12 +1,16 @@
 # marlin workspace & permissions
 
-Status: **deferred design draft**, feature-flagged off (`[workspace]
+Status: **Later-track design draft**, feature-flagged off (`[workspace]
 enabled = false`). Workspace identity and the COW-first snapshot direction are
 tentatively accepted; timing, undo, drift, lease, and retention semantics must
 be reopened after M4 dogfooding. Nothing below changes runtime behavior until
 the flag flips; M2's approval gate (mutating tools ask) remains the shipped
-behavior. Implementation target: M4.5 (snapshots + leases), M6 (sandbox
-escalations, worktree isolation).
+behavior. Snapshots, leases, and worktree isolation now remain one ordered
+track after M6.
+
+Permissions and secret isolation no longer wait for this workspace layer.
+Their active M3.5 contract is `docs/PERMISSIONS.md`; this document owns only
+the later snapshot, undo, lease, and isolation semantics.
 
 ## 1. Why not approval prompts
 
@@ -25,7 +29,7 @@ prompt for capability escalations.
 | Concern | Mechanism | Prompt? |
 |---|---|---|
 | Reads | free | never |
-| Writes inside workspace | COW shadow snapshot = undo | never |
+| Writes inside workspace | M3.5 sandbox authority; M4.5 snapshot adds undo | never |
 | Writes outside workspace | sandbox escalation | rare, capability-grant, session-scoped |
 | Two marlin sessions, one dir | write lease → park | never (park, don't ask) |
 | Deliberate parallel work on one repo | worktree isolation | explicit at session create |
@@ -99,7 +103,7 @@ Lease events land in the block log, so "why did this turn wait 40s" is
 answerable. The **user never holds a lease** — leases order agents; user
 edits are handled by drift detection (§3).
 
-### 2.3 Worktree isolation (opt-in, later)
+### 2.3 Worktree isolation (opt-in, after snapshots and leases)
 
 For deliberate long-running parallelism on one repo:
 `session_create{workspace: "isolated"}` → daemon creates a `git worktree` +
@@ -186,17 +190,14 @@ control the writer, branch-and-land when we do.
 enabled = false        # master switch; everything in this doc is behind it
 # snapshots = true     # (once enabled) shadow snapshots + /undo + drift notes
 # leases = true        # (once enabled) write leases + waiting_workspace
-# sandbox = "off"      # off | escalate (M4/M5): bash sandbox + capability prompts
 ```
 
 Rollout order (inside-out by usefulness):
-1. **M4.5 — snapshots + leases.** Daemon-internal, no TUI beyond a status
-   glyph and the drift note. Snapshots before sandboxing: the sandbox denies
-   damage *outside* the workspace, snapshots undo damage *inside* it.
-2. **M6 — workspace phase 2: sandbox escalations** through the existing
-   approval gate; per-tool ask prompts are then retired in favor of
-   capability escalations (flag-guarded flip). Worktree isolation lands
-   here too, once the multiplexer (M4) makes parallel sessions ergonomic
-   enough to want it.
+1. **Snapshots + leases.** Daemon-internal, no TUI beyond a status
+   glyph and the drift note. The M3.5 permission sandbox denies damage outside
+   the workspace; snapshots add recovery for approved damage inside it.
+2. **Worktree isolation + land/discard** follows only after the recovery and
+   concurrency contracts above are proven.
 
-Until then: `[workspace] enabled = false` and M2 semantics hold.
+Until then: `[workspace] enabled = false`; permissions evolve independently
+under `docs/PERMISSIONS.md`.

@@ -117,6 +117,10 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
 /// tool_result blocks with seq < frontier get their inline bodies stubbed.
 pub const AssembleOpts = struct {
     prune_before_seq: u64 = 0,
+    /// Stable extension text (currently the sorted skill index) appended to
+    /// the base system prompt. Full skill bodies stay out of context until
+    /// the model explicitly loads one with the skill tool.
+    system_prompt_suffix: []const u8 = "",
 };
 
 /// Assemble provider messages from a block log slice. All returned message
@@ -133,7 +137,11 @@ pub fn assemble(
     opts: AssembleOpts,
 ) ![]provider.Message {
     var msgs: std.ArrayList(provider.Message) = .empty;
-    try msgs.append(arena, .{ .role = .system, .payload = .{ .text = system_prompt_base } });
+    const system_prompt = if (opts.system_prompt_suffix.len == 0)
+        system_prompt_base
+    else
+        try std.fmt.allocPrint(arena, "{s}\n{s}", .{ system_prompt_base, opts.system_prompt_suffix });
+    try msgs.append(arena, .{ .role = .system, .payload = .{ .text = system_prompt } });
 
     // Pass 1: collect compaction coverage. Ranges may nest (a later
     // compaction covers an earlier compaction block itself); a block is

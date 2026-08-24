@@ -6,6 +6,7 @@
 const std = @import("std");
 
 const http = @import("../provider/http.zig");
+const network_policy = @import("../network_policy.zig");
 
 pub const spec_name = "fetch";
 pub const spec_description =
@@ -19,18 +20,63 @@ pub const Args = struct { url: []const u8 };
 
 pub const max_fetch_bytes: usize = 4 * 1024 * 1024;
 
-pub fn fetch(gpa: std.mem.Allocator, args: Args, cancel: ?*std.atomic.Value(bool)) ![]u8 {
+pub fn fetch(
+    gpa: std.mem.Allocator,
+    args: Args,
+    policy: ?*const network_policy.Policy,
+    cancel: ?*std.atomic.Value(bool),
+) ![]u8 {
     if (!std.mem.startsWith(u8, args.url, "http://") and !std.mem.startsWith(u8, args.url, "https://")) {
         return std.fmt.allocPrint(gpa, "error: only http(s) URLs are supported, got '{s}'", .{args.url});
     }
-    const url_z = try gpa.dupeZ(u8, args.url);
-    defer gpa.free(url_z);
+    var current_url = try gpa.dupe(u8, args.url);
+    defer gpa.free(current_url);
 
-    const res = http.get(gpa, url_z, max_fetch_bytes, 60_000, cancel) catch |e| {
-        return std.fmt.allocPrint(gpa, "error: fetch failed: {t}", .{e});
-    };
+    var res: http.GetOneResult = undefined;
+    var have_response = false;
+    var redirects: usize = 0;
+    while (redirects <= max_redirects) : (redirects += 1) {
+        if (policy) |active| {
+            const matched = active.checkUrl(current_url) catch |err| {
+                return std.fmt.allocPrint(gpa, "error: invalid fetch URL: {t}", .{err});
+            };
+            if (matched) |rule| {
+                return std.fmt.allocPrint(
+                    gpa,
+                    "error: network policy blocked '{s}' via {s} (matched {s})",
+                    .{ current_url, rule.source, rule.domain },
+                );
+            }
+        }
+
+        const url_z = try gpa.dupeZ(u8, current_url);
+        defer gpa.free(url_z);
+        var next = http.getOne(gpa, url_z, max_fetch_bytes, 60_000, cancel) catch |err| {
+            return std.fmt.allocPrint(gpa, "error: fetch failed: {t}", .{err});
+        };
+
+        if (!isRedirect(next.status)) {
+            res = next;
+            have_response = true;
+            break;
+        }
+        const location = next.location orelse {
+            freeGetOne(gpa, &next);
+            return gpa.dupe(u8, "error: redirect response had no Location header");
+        };
+        const resolved = resolveRedirect(gpa, current_url, location) catch |err| {
+            freeGetOne(gpa, &next);
+            return std.fmt.allocPrint(gpa, "error: invalid redirect URL: {t}", .{err});
+        };
+        freeGetOne(gpa, &next);
+        gpa.free(current_url);
+        current_url = resolved;
+    }
+    if (!have_response) return gpa.dupe(u8, "error: too many redirects");
+
     defer gpa.free(res.body);
     defer if (res.content_type) |ct| gpa.free(ct);
+    defer if (res.location) |location| gpa.free(location);
 
     if (res.status >= 400) {
         return std.fmt.allocPrint(gpa, "error: HTTP {d}\n{s}", .{
@@ -58,6 +104,29 @@ pub fn fetch(gpa: std.mem.Allocator, args: Args, cancel: ?*std.atomic.Value(bool
         });
     }
     return gpa.dupe(u8, res.body);
+}
+
+const max_redirects: usize = 5;
+
+fn isRedirect(status: i64) bool {
+    return status == 300 or status == 301 or status == 302 or status == 303 or
+        status == 307 or status == 308;
+}
+
+fn freeGetOne(gpa: std.mem.Allocator, result: *http.GetOneResult) void {
+    gpa.free(result.body);
+    if (result.content_type) |value| gpa.free(value);
+    if (result.location) |value| gpa.free(value);
+}
+
+fn resolveRedirect(gpa: std.mem.Allocator, base_text: []const u8, location: []const u8) ![]u8 {
+    const base = try std.Uri.parse(base_text);
+    const storage = try gpa.alloc(u8, location.len + base_text.len + 1);
+    defer gpa.free(storage);
+    @memcpy(storage[0..location.len], location);
+    var aux = storage;
+    const resolved = try base.resolveInPlace(location.len, &aux);
+    return std.fmt.allocPrint(gpa, "{f}", .{resolved.fmt(.all)});
 }
 
 /// Crude but effective HTML → text: drops script/style/head, breaks on block
@@ -150,7 +219,6 @@ pub fn htmlToText(gpa: std.mem.Allocator, html: []const u8) ![]u8 {
     return squeezed.toOwnedSlice(gpa);
 }
 
-
 /// std.ascii lost indexOfIgnoreCase in the 0.16 refactor; local replacements.
 fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     return indexOfIgnoreCasePos(haystack, 0, needle);
@@ -206,11 +274,11 @@ fn extractAttr(tag_full: []const u8, comptime name: []const u8) ?[]const u8 {
 
 fn isBlockTag(tag_name: []const u8) bool {
     const blocks = [_][]const u8{
-        "p",  "/p",  "div", "/div", "br",    "br/",    "li",  "/li", "ul", "/ul",
-        "ol", "/ol", "h1",  "/h1",  "h2",    "/h2",    "h3",  "/h3", "h4", "/h4",
-        "h5", "/h5", "h6",  "/h6",  "tr",    "/tr",    "td",  "/td", "th", "/th",
-        "table", "/table", "pre", "/pre", "section", "/section", "article", "/article",
-        "header", "/header", "footer", "/footer", "blockquote", "/blockquote",
+        "p",      "/p",      "div",        "/div",        "br",      "br/",      "li",      "/li",      "ul",     "/ul",
+        "ol",     "/ol",     "h1",         "/h1",         "h2",      "/h2",      "h3",      "/h3",      "h4",     "/h4",
+        "h5",     "/h5",     "h6",         "/h6",         "tr",      "/tr",      "td",      "/td",      "th",     "/th",
+        "table",  "/table",  "pre",        "/pre",        "section", "/section", "article", "/article", "header", "/header",
+        "footer", "/footer", "blockquote", "/blockquote",
     };
     for (blocks) |b| {
         if (std.ascii.eqlIgnoreCase(tag_name, b)) return true;
@@ -222,9 +290,12 @@ const Entity = struct { text: []const u8, len: usize };
 
 fn decodeEntity(s: []const u8) ?Entity {
     const table = .{
-        .{ "&amp;", "&" }, .{ "&lt;", "<" },   .{ "&gt;", ">" },    .{ "&quot;", "\"" },
-        .{ "&#39;", "'" }, .{ "&apos;", "'" }, .{ "&nbsp;", " " },  .{ "&mdash;", "—" },
-        .{ "&ndash;", "–" }, .{ "&hellip;", "…" }, .{ "&copy;", "©" },
+        .{ "&amp;", "&" }, .{ "&lt;", "<" },   .{ "&gt;", ">" },   .{ "&quot;", "\"" },
+        .{ "&#39;", "'" }, .{ "&apos;", "'" }, .{ "&nbsp;", " " },
+        .{ "&mdash;", "—" },
+        .{ "&ndash;", "–" },
+        .{ "&hellip;", "…" },
+        .{ "&copy;", "©" },
     };
     inline for (table) |e| {
         if (std.mem.startsWith(u8, s, e[0])) return .{ .text = e[1], .len = e[0].len };
@@ -251,9 +322,32 @@ test "htmlToText strips tags, keeps links, decodes entities" {
 
 test "fetch rejects non-http urls" {
     const gpa = std.testing.allocator;
-    const out = try fetch(gpa, .{ .url = "file:///etc/passwd" }, null);
+    const out = try fetch(gpa, .{ .url = "file:///etc/passwd" }, null, null);
     defer gpa.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "error:"));
+}
+
+test "fetch blocks an explicit denied hostname before network I/O" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var policy = network_policy.Policy.init(gpa, io, &environ, .{ .deny = "blocked.test" });
+    defer policy.deinit();
+
+    const out = try fetch(gpa, .{ .url = "https://sub.blocked.test/secret" }, &policy, null);
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "error: network policy blocked"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "explicit deny") != null);
+}
+
+test "relative redirect resolution preserves authority" {
+    const gpa = std.testing.allocator;
+    const resolved = try resolveRedirect(gpa, "https://example.com/a/b", "../next?q=1");
+    defer gpa.free(resolved);
+    try std.testing.expectEqualStrings("https://example.com/next?q=1", resolved);
 }
 
 test {
