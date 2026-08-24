@@ -9,6 +9,7 @@
     --bg: #17191d; --panel: #1e2126; --panel2: #24282e; --line: #2c313a;
     --fg: #e8eaee; --dim: #8b93a1; --accent: #5cc8e8; --green: #73d091;
     --yellow: #e8c765; --red: #f07178; --blue: #829aff;
+    --add-bg: #1f3729; --del-bg: #3b2429;
   }
   * { box-sizing: border-box; margin: 0; }
   body {
@@ -20,6 +21,11 @@
     border-right: 1px solid var(--line); display: flex; flex-direction: column;
   }
   #side h1 { font-size: 14px; padding: 14px 16px 10px; color: var(--accent); letter-spacing: 1px; }
+  #side h1 button {
+    float: right; font: inherit; background: none; border: 1px solid var(--line);
+    color: var(--dim); border-radius: 4px; cursor: pointer; padding: 0 8px;
+  }
+  #side h1 button:hover { color: var(--fg); }
   #sessions { overflow-y: auto; flex: 1; }
   .sess { padding: 8px 16px; cursor: pointer; border-left: 2px solid transparent; }
   .sess:hover { background: var(--panel2); }
@@ -34,33 +40,49 @@
     background: var(--panel2); border-left: 3px solid var(--accent);
     padding: 8px 12px; border-radius: 4px; white-space: pre-wrap;
   }
-  .assistant { white-space: pre-wrap; }
-  .reasoning {
-    background: var(--panel); padding: 6px 12px; border-radius: 4px;
-    white-space: pre-wrap;
-  }
+  .reasoning { background: var(--panel); padding: 6px 12px; border-radius: 4px; }
   .reasoning::before { content: "· "; color: var(--accent); font-weight: bold; }
   .tool summary { color: var(--dim); cursor: pointer; }
   .tool summary .name { color: var(--yellow); }
-  .tool pre {
-    color: var(--dim); background: var(--panel); margin: 4px 0 0; padding: 8px 12px;
-    border-radius: 4px; overflow-x: auto; max-height: 320px; overflow-y: auto;
+  .tool summary .prev { color: var(--dim); }
+  .tool pre, .md pre {
+    background: var(--panel); margin: 4px 0; padding: 8px 12px;
+    border-radius: 4px; overflow-x: auto;
   }
+  .tool pre { color: var(--dim); max-height: 340px; overflow-y: auto; }
   .tool.err summary { color: var(--red); }
   .note { color: var(--dim); font-size: 13px; }
-  .delta { white-space: pre-wrap; opacity: 0.9; }
+  /* markdown */
+  .md p, .md ul, .md ol, .md blockquote, .md table, .md h1, .md h2, .md h3, .md h4 { margin: 0 0 8px; }
+  .md h1, .md h2 { font-size: 16px; color: var(--accent); }
+  .md h3, .md h4 { font-size: 14px; color: var(--accent); }
+  .md code { background: var(--panel2); padding: 0 4px; border-radius: 3px; color: var(--yellow); }
+  .md pre code { background: none; padding: 0; color: var(--fg); }
+  .md ul, .md ol { padding-left: 24px; }
+  .md blockquote { border-left: 3px solid var(--line); padding-left: 10px; color: var(--dim); font-style: italic; }
+  .md a { color: var(--blue); }
+  .md table { border-collapse: collapse; }
+  .md th, .md td { border: 1px solid var(--line); padding: 3px 10px; text-align: left; }
+  .md th { background: var(--panel2); }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
+  /* diff coloring */
+  .d-add { color: var(--green); background: var(--add-bg); display: inline-block; width: 100%; }
+  .d-del { color: var(--red); background: var(--del-bg); display: inline-block; width: 100%; }
+  .d-hunk { color: var(--blue); }
+  .d-meta { color: var(--dim); }
   #approval {
     display: none; background: #3a2f1e; border-top: 1px solid var(--yellow);
     padding: 10px 22px; gap: 12px; align-items: center;
   }
   #approval.show { display: flex; }
   #approval .q { flex: 1; color: var(--yellow); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #approval button {
-    font: inherit; padding: 4px 14px; border-radius: 4px; border: 1px solid var(--line);
+  button.act {
+    font: inherit; padding: 3px 12px; border-radius: 4px; border: 1px solid var(--line);
     background: var(--panel2); color: var(--fg); cursor: pointer;
   }
-  #approval button.yes { border-color: var(--green); color: var(--green); }
-  #approval button.no { border-color: var(--red); color: var(--red); }
+  button.act:hover { border-color: var(--dim); }
+  button.act.yes { border-color: var(--green); color: var(--green); }
+  button.act.no { border-color: var(--red); color: var(--red); }
   #composer { display: flex; border-top: 1px solid var(--line); background: var(--panel); }
   #composer .prompt { padding: 12px 0 12px 16px; color: var(--accent); }
   #input {
@@ -68,26 +90,31 @@
     font: inherit; padding: 12px;
   }
   #status {
-    display: flex; gap: 8px; padding: 6px 16px; background: var(--panel);
+    display: flex; gap: 10px; padding: 6px 16px; background: var(--panel);
     border-top: 1px solid var(--line); color: var(--dim); font-size: 12px;
+    align-items: center;
   }
   #status .state.running { color: var(--green); }
   #status .state.awaiting_approval { color: var(--yellow); }
   #status .state.err { color: var(--red); }
-  #status .right { margin-left: auto; }
+  #status .notice { color: var(--yellow); }
+  #status .right { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+  #interrupt { display: none; }
+  #interrupt.show { display: inline-block; }
+  #sandbox-btn.on { color: var(--green); border-color: var(--green); }
 </style>
 </head>
 <body>
 <div id="side">
-  <h1>MARLIN</h1>
+  <h1>MARLIN <button id="new-btn" title="new session">+ new</button></h1>
   <div id="sessions"></div>
 </div>
 <div id="main">
   <div id="transcript"></div>
   <div id="approval">
     <span class="q"></span>
-    <button class="yes">approve</button>
-    <button class="no">deny</button>
+    <button class="act yes">approve</button>
+    <button class="act no">deny</button>
   </div>
   <div id="composer">
     <span class="prompt">❯</span>
@@ -95,7 +122,11 @@
   </div>
   <div id="status">
     <span class="state">idle</span><span>·</span><span class="model"></span>
-    <span class="right sandbox"></span>
+    <span class="notice"></span>
+    <span class="right">
+      <button id="interrupt" class="act no">⏹ interrupt</button>
+      <button id="sandbox-btn" class="act">⛨ sandbox</button>
+    </span>
   </div>
 </div>
 <script>
@@ -104,11 +135,94 @@
 // raw JSON before parsing and send them back unquoted via raw templates.
 const bigints = raw => raw.replace(/"(sid|parent_sid|session_id)":(\d{12,})/g, '"$1":"$2"');
 const $ = s => document.querySelector(s);
-let sid = null, es = null, lastSeq = 0, deltaEl = null, approvalId = null;
+let sid = null, cur = null, es = null, lastSeq = 0, deltaEl = null, deltaText = '', approvalId = null;
+
+// ---- markdown (escape-first; only escaped text ever reaches innerHTML) ----
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function inlineMd(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|\W)\*([^*\s][^*]*)\*/g, '$1<em>$2</em>')
+    .replace(/~~([^~]+)~~/g, '<del>$1</del>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+}
+const isDiff = t => t.startsWith('@@ ') || t.includes('\n@@ ');
+function diffHtml(t) {
+  return t.split('\n').map(l => {
+    const e = esc(l);
+    if (/^\+\+\+|^--- |^diff --git|^index /.test(l)) return '<span class="d-meta">' + e + '</span>';
+    if (l.startsWith('+')) return '<span class="d-add">' + e + '</span>';
+    if (l.startsWith('-')) return '<span class="d-del">' + e + '</span>';
+    if (l.startsWith('@@')) return '<span class="d-hunk">' + e + '</span>';
+    return e;
+  }).join('\n');
+}
+function renderMd(text) {
+  const out = [];
+  const lines = text.split('\n');
+  let i = 0, code = null, codeLang = '', para = [], list = null, table = null;
+  const flushPara = () => { if (para.length) { out.push('<p>' + para.map(inlineMd).join('<br>') + '</p>'); para = []; } };
+  const flushList = () => { if (list) { out.push('<' + list.tag + '>' + list.items.map(x => '<li>' + inlineMd(x) + '</li>').join('') + '</' + list.tag + '>'); list = null; } };
+  const flushTable = () => {
+    if (!table) return;
+    const row = (cells, tag) => '<tr>' + cells.map(c => '<' + tag + '>' + inlineMd(c.trim()) + '</' + tag + '>').join('') + '</tr>';
+    out.push('<table>' + row(table.head, 'th') + table.rows.map(r => row(r, 'td')).join('') + '</table>');
+    table = null;
+  };
+  const flushAll = () => { flushPara(); flushList(); flushTable(); };
+  const cells = l => l.replace(/^\||\|$/g, '').split('|');
+  while (i < lines.length) {
+    const l = lines[i];
+    if (code !== null) {
+      if (/^```/.test(l)) {
+        const body = code.join('\n');
+        out.push('<pre>' + (codeLang === 'diff' || isDiff(body) ? diffHtml(body) : '<code>' + esc(body) + '</code>') + '</pre>');
+        code = null;
+      } else code.push(l);
+      i++; continue;
+    }
+    if (/^```/.test(l)) { flushAll(); code = []; codeLang = l.slice(3).trim(); i++; continue; }
+    const h = l.match(/^(#{1,4})\s+(.*)/);
+    if (h) { flushAll(); const n = Math.min(h[1].length, 4); out.push('<h' + n + '>' + inlineMd(h[2]) + '</h' + n + '>'); i++; continue; }
+    if (/^(---+|\*\*\*+)\s*$/.test(l)) { flushAll(); out.push('<hr>'); i++; continue; }
+    if (/^>\s?/.test(l)) { flushAll(); out.push('<blockquote>' + inlineMd(l.replace(/^>\s?/, '')) + '</blockquote>'); i++; continue; }
+    const li = l.match(/^\s*[-*]\s+(.*)/), oli = l.match(/^\s*\d+[.)]\s+(.*)/);
+    if (li || oli) {
+      flushPara(); flushTable();
+      const tag = li ? 'ul' : 'ol';
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
+      list.items.push((li || oli)[1]);
+      i++; continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(l)) {
+      flushPara(); flushList();
+      if (!table) {
+        if (i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+          table = { head: cells(l), rows: [] };
+          i += 2; continue;
+        }
+      } else { table.rows.push(cells(l)); i++; continue; }
+    }
+    if (l.trim() === '') { flushAll(); i++; continue; }
+    flushList(); flushTable();
+    para.push(l);
+    i++;
+  }
+  flushAll();
+  return out.join('');
+}
 
 async function send(rawJson) {
   const r = await fetch('/send', { method: 'POST', body: rawJson });
   return JSON.parse(bigints(await r.text()));
+}
+
+function notice(text) {
+  const n = $('#status .notice');
+  n.textContent = text;
+  setTimeout(() => { if (n.textContent === text) n.textContent = ''; }, 5000);
 }
 
 function el(tag, cls, text) {
@@ -125,6 +239,20 @@ function scrollBottom() {
 
 function clearDelta() {
   if (deltaEl) { deltaEl.remove(); deltaEl = null; }
+  deltaText = '';
+}
+
+function toolPreview(name, argsJson) {
+  try {
+    const a = JSON.parse(argsJson);
+    if (a.command) return a.command;
+    if (a.path) return a.path;
+    if (a.pattern) return a.pattern;
+    if (a.url) return a.url;
+    if (a.prompt) return a.prompt;
+    if (a.name) return a.name;
+  } catch (e) {}
+  return (argsJson || '');
 }
 
 function addBlock(b) {
@@ -133,20 +261,29 @@ function addBlock(b) {
   const v = b.body[kind];
   let node = null;
   if (kind === 'user_msg') node = el('div', 'block user', v.text);
-  else if (kind === 'assistant_msg') { clearDelta(); node = el('div', 'block assistant', v.text); }
-  else if (kind === 'reasoning') { clearDelta(); node = el('div', 'block reasoning', v.text); }
-  else if (kind === 'tool_call') {
+  else if (kind === 'assistant_msg') {
+    clearDelta();
+    node = el('div', 'block md');
+    node.innerHTML = renderMd(v.text);
+  } else if (kind === 'reasoning') {
+    clearDelta();
+    node = el('div', 'block reasoning md');
+    node.innerHTML = renderMd(v.text);
+  } else if (kind === 'tool_call') {
     node = el('details', 'block tool');
     const s = el('summary', null, '⚙ ');
     s.appendChild(el('span', 'name', v.name));
-    s.appendChild(document.createTextNode(' ' + (v.args_json || '').slice(0, 120)));
+    s.appendChild(el('span', 'prev', ' ' + toolPreview(v.name, v.args_json).slice(0, 140)));
     node.appendChild(s);
     node.dataset.call = v.call_id;
   } else if (kind === 'tool_result') {
+    const pre = el('pre');
+    const body = v.inline_body || '';
+    if (isDiff(body)) pre.innerHTML = diffHtml(body);
+    else pre.textContent = body;
     const call = t.querySelector(`[data-call="${CSS.escape(v.call_id || '')}"]`);
-    const pre = el('pre', null, v.inline_body || '');
     if (call) {
-      if (v.status && v.status !== 'ok') call.classList.add('err');
+      if (v.status && v.status !== 'ok') { call.classList.add('err'); call.open = true; }
       call.appendChild(pre);
       return;
     }
@@ -160,6 +297,14 @@ function addBlock(b) {
   if (node) { t.appendChild(node); scrollBottom(); }
 }
 
+function setState(state) {
+  const st = $('#status .state');
+  st.textContent = state;
+  st.className = 'state ' + state;
+  $('#interrupt').classList.toggle('show', state === 'running' || state === 'awaiting_approval');
+  if (state !== 'awaiting_approval') $('#approval').classList.remove('show');
+}
+
 function handle(m) {
   if (m.blk) {
     if (m.blk.sid !== sid) return;
@@ -169,15 +314,13 @@ function handle(m) {
     addBlock(b);
   } else if (m.delta) {
     if (m.delta.sid !== sid) return;
-    if (!deltaEl) { deltaEl = el('div', 'block delta', ''); $('#transcript').appendChild(deltaEl); }
-    deltaEl.textContent += m.delta.text;
+    if (!deltaEl) { deltaEl = el('div', 'block md'); $('#transcript').appendChild(deltaEl); }
+    deltaText += m.delta.text;
+    deltaEl.innerHTML = renderMd(deltaText);
     scrollBottom();
   } else if (m.status) {
     if (m.status.sid !== sid) return;
-    const st = $('#status .state');
-    st.textContent = m.status.state;
-    st.className = 'state ' + m.status.state;
-    if (m.status.state !== 'awaiting_approval') $('#approval').classList.remove('show');
+    setState(m.status.state);
   } else if (m.approval_request) {
     if (m.approval_request.sid !== sid) return;
     approvalId = m.approval_request.approval_id;
@@ -186,6 +329,8 @@ function handle(m) {
     $('#approval').classList.add('show');
   } else if (m.session_list_result) {
     renderSessions(m.session_list_result.sessions);
+  } else if (m.err) {
+    notice(m.err.code + ': ' + m.err.msg);
   }
 }
 
@@ -198,20 +343,24 @@ function renderSessions(list) {
     d.appendChild(el('div', 'm', s.state + ' · ' + (s.model || '').split('/').slice(-1)[0]));
     d.onclick = () => open(s);
     box.appendChild(d);
+    if (s.sid === sid) {
+      cur = s;
+      $('#sandbox-btn').classList.toggle('on', !!s.sandboxed);
+      $('#sandbox-btn').textContent = s.sandboxed ? '⛨ sandboxed' : '⛨ sandbox off';
+    }
   }
 }
 
 function open(s) {
   sid = s.sid;
+  cur = s;
   lastSeq = 0;
   approvalId = null;
   clearDelta();
   $('#transcript').innerHTML = '';
   $('#approval').classList.remove('show');
   $('#status .model').textContent = s.model || '';
-  $('#status .sandbox').textContent = s.sandboxed ? '⛨ sandboxed' : '';
-  const st = $('#status .state');
-  st.textContent = s.state; st.className = 'state ' + s.state;
+  setState(s.state);
   if (es) es.close();
   es = new EventSource('/events?sid=' + sid);
   es.onmessage = e => handle(JSON.parse(bigints(e.data)));
@@ -239,6 +388,18 @@ $('#approval .yes').onclick = () =>
   send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"granted"}}');
 $('#approval .no').onclick = () =>
   send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"denied"}}');
+$('#interrupt').onclick = () => { if (sid) send('{"interrupt":{"sid":' + sid + '}}'); };
+$('#sandbox-btn').onclick = async () => {
+  if (!sid || !cur) return;
+  const r = await send('{"session_set_sandbox":{"sid":' + sid + ',"enabled":' + (!cur.sandboxed) + '}}');
+  if (r.err) notice(r.err.msg); else loadSessions();
+};
+$('#new-btn').onclick = async () => {
+  const cwd = cur ? cur.cwd : '/tmp';
+  const model = cur ? cur.model : '';
+  const r = await send('{"session_create":{"cwd":' + JSON.stringify(cwd) + ',"model":' + JSON.stringify(model) + '}}');
+  if (r.session_created) { sid = null; await loadSessions(); }
+};
 
 loadSessions();
 setInterval(loadSessions, 15000);
