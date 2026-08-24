@@ -116,6 +116,89 @@ pub fn streamPost(
     return .{ .status = status, .error_body = null };
 }
 
+pub const GetResult = struct {
+    status: i64,
+    body: []u8, // caller frees
+    content_type: ?[]u8, // caller frees when non-null
+};
+
+/// Simple bounded GET (fetch tool). Follows redirects; caps the body.
+pub fn get(
+    gpa: std.mem.Allocator,
+    url: [:0]const u8,
+    max_bytes: usize,
+    timeout_ms: c_long,
+    cancel: ?*std.atomic.Value(bool),
+) Error!GetResult {
+    const easy = c.curl_easy_init() orelse return error.CurlInit;
+    defer c.curl_easy_cleanup(easy);
+
+    var sink = GetSink{ .gpa = gpa, .max = max_bytes, .cancel = cancel };
+    errdefer sink.body.deinit(gpa);
+
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_URL, url.ptr);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEFUNCTION, GetSink.write);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEDATA, &sink);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, 10_000));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_TIMEOUT_MS, timeout_ms);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_NOPROGRESS, @as(c_long, 0));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFOFUNCTION, GetSink.progress);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFODATA, &sink);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_MAXREDIRS, @as(c_long, 5));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_ACCEPT_ENCODING, ""); // all built-in codings
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_USERAGENT, "marlin/0.0");
+
+    const code = c.curl_easy_perform(easy);
+    var status: c_long = 0;
+    _ = c.curl_easy_getinfo(easy, c.CURLINFO_RESPONSE_CODE, &status);
+
+    if (code == c.CURLE_ABORTED_BY_CALLBACK) {
+        // Either cancelled or byte cap hit; cap keeps what we have.
+        if (cancel) |f| if (f.load(.acquire)) return error.Cancelled;
+    } else if (code != c.CURLE_OK and status == 0) {
+        return error.CurlPerform;
+    }
+
+    var ctype: ?[]u8 = null;
+    var ct_ptr: [*c]u8 = null;
+    if (c.curl_easy_getinfo(easy, c.CURLINFO_CONTENT_TYPE, &ct_ptr) == c.CURLE_OK and ct_ptr != null) {
+        ctype = try gpa.dupe(u8, std.mem.span(ct_ptr));
+    }
+    return .{
+        .status = status,
+        .body = try sink.body.toOwnedSlice(gpa),
+        .content_type = ctype,
+    };
+}
+
+const GetSink = struct {
+    gpa: std.mem.Allocator,
+    body: std.ArrayList(u8) = .empty,
+    max: usize,
+    cancel: ?*std.atomic.Value(bool),
+
+    fn write(ptr: [*c]u8, size: usize, nmemb: usize, userdata: ?*anyopaque) callconv(.c) usize {
+        const self: *GetSink = @ptrCast(@alignCast(userdata.?));
+        const bytes = ptr[0 .. size * nmemb];
+        if (self.body.items.len + bytes.len > self.max) {
+            const room = self.max - self.body.items.len;
+            self.body.appendSlice(self.gpa, bytes[0..room]) catch return 0;
+            return 0; // abort transfer; we keep what we got
+        }
+        self.body.appendSlice(self.gpa, bytes) catch return 0;
+        return bytes.len;
+    }
+
+    fn progress(userdata: ?*anyopaque, _: c.curl_off_t, _: c.curl_off_t, _: c.curl_off_t, _: c.curl_off_t) callconv(.c) c_int {
+        const self: *GetSink = @ptrCast(@alignCast(userdata.?));
+        if (self.cancel) |flag| {
+            if (flag.load(.acquire)) return 1;
+        }
+        return 0;
+    }
+};
+
 /// Curl callback state + trampolines. Generic over the caller's ctx type.
 fn Callback(comptime Ctx: type) type {
     return struct {

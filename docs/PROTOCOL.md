@@ -27,14 +27,19 @@ single-instancing is listed for hardening.
 | message | payload | reply |
 |---|---|---|
 | hello | proto_version, client_kind | hello_ok or err |
-| session_create | cwd, model, title? | session_created{sid} |
+| session_create | cwd, model, title?, approvals? | session_created{sid} |
 | session_list | — | session_list_result{sessions} |
-| session_kill | sid | ok (sets the turn's cancel flag) |
+| session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
+| session_set_model | sid, model | ok, or err{busy} mid-turn |
 | sub | sid, from_seq | replayed blk×N (if from_seq ≥ 1), then status |
 | unsub | sid | ok |
 | input | sid, text | ok; starts a turn (idle) or queues steer (running) |
-| interrupt | sid | ok (cooperative cancel; system_note lands when it takes) |
+| approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |
+| interrupt | sid | ok (cooperative cancel; also denies a pending approval) |
 | shutdown | — | ok, then daemon exits cleanly |
+
+`session_create.approvals`: `"default"` (mutating tools ask) or `"auto"`
+(everything auto-approved — what `marlin run` uses; `--ask` opts back in).
 
 `sub.from_seq`: 0 = live-only. N ≥ 1 = replay stored blocks with seq ≥ N
 first, then live. Clients that reconnect pass last_seen_seq + 1.
@@ -49,9 +54,24 @@ first, then live. Clients that reconnect pass last_seen_seq + 1.
 | blk {sid, b} | a block was persisted (replay AND live fan-out) |
 | delta {sid, turn_id, text} | streaming assistant text (ephemeral) |
 | status {sid, state} | session state change: idle/running/awaiting_approval/err/done |
+| approval_request {sid, approval_id, call_id, tool, args_json} | a mutating tool call parked on the gate; answer with `approve` |
 | session_meta {sid, tokens_in, tokens_out} | after each turn; ALWAYS sent before the closing status |
 | ok | generic ack |
-| err {code, msg} | bad_msg, no_hello, version, no_session |
+| err {code, msg} | bad_msg, no_hello, version, no_session, busy, bad_approval |
+
+## Approval flow (M2)
+
+1. Turn thread hits a mutating tool call in an `approvals="default"` session.
+2. `approval_request` fans out to ALL subscribed clients; session status
+   flips to `awaiting_approval`. The turn thread parks on the session gate.
+3. Any client answers with `approve{approval_id, granted|denied}`. First
+   decision wins; later/stale answers get `ok` but are ignored.
+4. An `approval` block is persisted with the decision; status returns to
+   `running`; execution continues (granted) or the tool result is a denial
+   error the model sees (denied).
+5. `interrupt`/`session_kill`/daemon shutdown deny the pending gate so the
+   turn never hangs. No timeout otherwise — parked is a feature (phone hook
+   in M5 surfaces it).
 
 ## Ordering guarantees
 

@@ -28,6 +28,7 @@ const config = @import("../core/config.zig");
 const queue = @import("../core/queue.zig");
 const store_mod = @import("store.zig");
 const loop = @import("loop.zig");
+const approval = @import("approval.zig");
 const registry = @import("provider/registry.zig");
 const http = @import("provider/http.zig");
 
@@ -42,6 +43,11 @@ const Event = union(enum) {
     // From turn threads (loop.zig callbacks). All payloads gpa-owned.
     turn_block: struct { sid: u64, line: []u8 }, // pre-encoded proto.DaemonMsg.blk
     turn_delta: struct { sid: u64, line: []u8 },
+    /// A tool call needs a client decision; fan out approval_request and
+    /// flip session status to awaiting_approval. Line pre-encoded.
+    turn_awaiting: struct { sid: u64, line: []u8 },
+    /// The gate resolved; session status back to running.
+    turn_resumed: struct { sid: u64 },
     turn_done: struct { sid: u64, interrupted: bool, err_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
     shutdown,
 };
@@ -69,6 +75,10 @@ const Session = struct {
     state: proto.SessionState = .idle,
     turn_thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = .init(false),
+    /// Approval mode fixed at creation (headless "auto" vs interactive).
+    approval_mode: approval.Mode = .default,
+    /// Gate the turn thread parks on for `ask` decisions.
+    gate: approval.Gate = .{},
     /// Queued mid-turn steer texts (gpa-owned), drained by poll_steer.
     steer_queue: std.ArrayList([]u8) = .empty,
     steer_mutex: Io.Mutex = .init,
@@ -98,6 +108,11 @@ pub const Daemon = struct {
     ) !void {
         http.globalInit();
         defer http.globalDeinit();
+
+        // The daemon must survive its spawning terminal: autostart puts us in
+        // our own process group, and we ignore SIGHUP for the case where the
+        // user runs `marlin daemon` in a terminal that later goes away.
+        ignoreSighup();
 
         const db_path = try store_mod.defaultDbPath(gpa, io, environ);
         defer gpa.free(db_path);
@@ -295,6 +310,16 @@ pub const Daemon = struct {
                 defer self.gpa.free(td.line);
                 self.fanOutLine(td.sid, td.line);
             },
+            .turn_awaiting => |ta| {
+                defer self.gpa.free(ta.line);
+                if (self.sessions.get(ta.sid)) |session| session.state = .awaiting_approval;
+                self.fanOutLine(ta.sid, ta.line);
+                self.broadcastStatus(ta.sid, .awaiting_approval);
+            },
+            .turn_resumed => |tr| {
+                if (self.sessions.get(tr.sid)) |session| session.state = .running;
+                self.broadcastStatus(tr.sid, .running);
+            },
             .turn_done => |td| {
                 defer if (td.err_text) |t| self.gpa.free(t);
                 const session = self.sessions.get(td.sid) orelse return;
@@ -337,6 +362,7 @@ pub const Daemon = struct {
                     .id = sid,
                     .model = try self.gpa.dupe(u8, sc.model),
                     .cwd = try self.gpa.dupe(u8, sc.cwd),
+                    .approval_mode = approval.Mode.parse(sc.approvals),
                 };
                 try self.sessions.put(self.gpa, sid, session);
                 self.sendTo(client, .{ .session_created = .{ .sid = sid } });
@@ -365,7 +391,23 @@ pub const Daemon = struct {
             .session_kill => |sk| {
                 if (self.sessions.get(sk.sid)) |session| {
                     session.cancel.store(true, .release);
+                    session.gate.denyPending(self.io);
                 }
+                self.sendTo(client, .{ .ok = .{} });
+            },
+            .session_set_model => |sm| {
+                const session = self.sessions.get(sm.sid) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot switch model mid-turn" } });
+                    return;
+                }
+                const new_model = try self.gpa.dupe(u8, sm.model);
+                self.gpa.free(session.model);
+                session.model = new_model;
+                self.store.setSessionModel(sm.sid, sm.model) catch {};
                 self.sendTo(client, .{ .ok = .{} });
             },
             .sub => |s| {
@@ -422,9 +464,27 @@ pub const Daemon = struct {
                 try self.startTurn(session, inp.text);
                 self.sendTo(client, .{ .ok = .{} });
             },
+            .approve => |a| {
+                const session = self.sessions.get(a.sid) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                const id = std.fmt.parseInt(u64, a.approval_id, 10) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "bad_approval", .msg = "bad approval id" } });
+                    return;
+                };
+                const verdict: approval.Verdict = switch (a.decision) {
+                    .granted => .approved,
+                    .denied => .denied,
+                };
+                // First decision wins; stale answers are ignored.
+                _ = session.gate.resolve(self.io, id, verdict);
+                self.sendTo(client, .{ .ok = .{} });
+            },
             .interrupt => |i| {
                 if (self.sessions.get(i.sid)) |session| {
                     session.cancel.store(true, .release);
+                    session.gate.denyPending(self.io);
                 }
                 self.sendTo(client, .{ .ok = .{} });
             },
@@ -495,6 +555,10 @@ pub const Daemon = struct {
             .cwd = job.cwd,
             .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model },
             .cfg = self.cfg,
+            .approval_mode = job.session.approval_mode,
+            .gate = &job.session.gate,
+            .on_approval_needed = TurnHooks.onApprovalNeeded,
+            .on_approval_done = TurnHooks.onApprovalDone,
             .on_delta = TurnHooks.onDelta,
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
@@ -553,6 +617,29 @@ pub const Daemon = struct {
             _ = gpa;
             return text;
         }
+
+        fn onApprovalNeeded(ctx: ?*anyopaque, id: u64, call_id: []const u8, tool: []const u8, args_json: []const u8) void {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            var id_buf: [24]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch return;
+            const line = proto.encode(self.gpa, proto.DaemonMsg{ .approval_request = .{
+                .sid = job.sid,
+                .approval_id = id_str,
+                .call_id = call_id,
+                .tool = tool,
+                .args_json = args_json,
+            } }) catch return;
+            self.events.push(self.io, .{ .turn_awaiting = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+        }
+
+        fn onApprovalDone(ctx: ?*anyopaque, id: u64, verdict: approval.Verdict) void {
+            _ = id;
+            _ = verdict;
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            self.events.push(self.io, .{ .turn_resumed = .{ .sid = job.sid } }) catch {};
+        }
     };
 
     // ----------------------------------------------------------- fan-out --
@@ -598,6 +685,7 @@ pub const Daemon = struct {
         while (sit.next()) |sp| {
             const session = sp.*;
             session.cancel.store(true, .release);
+            session.gate.denyPending(self.io);
             if (session.turn_thread) |t| t.join();
             session.steer_mutex.lockUncancelable(self.io);
             for (session.steer_queue.items) |s| self.gpa.free(s);
@@ -630,6 +718,16 @@ pub const Daemon = struct {
         Io.Dir.cwd().deleteFile(self.io, sock_path) catch {};
     }
 };
+
+fn ignoreSighup() void {
+    if (std.posix.Sigaction == void) return;
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.HUP, &act, null);
+}
 
 fn posixChmod600(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;

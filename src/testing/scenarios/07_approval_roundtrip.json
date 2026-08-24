@@ -1,0 +1,26 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["touch the marker"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo approval-path-ran\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["approval-path-ran"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"approved and executed\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":4}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--ask", "--model", "openrouter/test/model", "touch the marker"],
+    "exit_code": 0,
+    "stdout_contains": ["approved and executed"],
+    "db_kinds": ["user_msg", "tool_call", "approval", "tool_result", "assistant_msg"]
+  }
+}

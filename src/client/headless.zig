@@ -6,6 +6,9 @@
 //!   --continue        reuse the most recent session
 //!   --model <m>       override the model (registry string)
 //!   --quiet           suppress streaming; print only the final text
+//!   --ask             create the session in default approval mode (mutating
+//!                     tools ask; headless then auto-grants — e2e test seam
+//!                     for the park/approve/resume path)
 
 const std = @import("std");
 const Io = std.Io;
@@ -18,6 +21,7 @@ pub const Flags = struct {
     continue_last: bool = false,
     model: ?[]const u8 = null,
     quiet: bool = false,
+    ask: bool = false,
     task: ?[]const u8 = null,
 };
 
@@ -30,6 +34,8 @@ pub fn parseFlags(args: []const [:0]const u8) !Flags {
             f.continue_last = true;
         } else if (std.mem.eql(u8, a, "--quiet")) {
             f.quiet = true;
+        } else if (std.mem.eql(u8, a, "--ask")) {
+            f.ask = true;
         } else if (std.mem.eql(u8, a, "--model")) {
             i += 1;
             if (i >= args.len) return error.MissingModelArg;
@@ -85,7 +91,9 @@ pub fn run(
     } else {
         var cwd_buf: [4096]u8 = undefined;
         const cwd_len = try std.process.currentPath(io, &cwd_buf);
-        try conn.send(.{ .session_create = .{ .cwd = cwd_buf[0..cwd_len], .model = model_str } });
+        // Headless one-shots auto-approve: there is no one to ask.
+        const approvals: []const u8 = if (flags.ask) "default" else "auto";
+        try conn.send(.{ .session_create = .{ .cwd = cwd_buf[0..cwd_len], .model = model_str, .approvals = approvals } });
         const created = try conn.recvUntil(arena, .session_created);
         sid = created.sid;
     }
@@ -144,6 +152,13 @@ pub fn run(
                 if (m.sid == sid) {
                     tokens_in = m.tokens_in;
                     tokens_out = m.tokens_out;
+                }
+            },
+            .approval_request => |ar| {
+                // A --continue'd interactive session may still be in "ask"
+                // mode; headless grants everything (same as approvals=auto).
+                if (ar.sid == sid) {
+                    try conn.send(.{ .approve = .{ .sid = sid, .approval_id = ar.approval_id, .decision = .granted } });
                 }
             },
             .err => |e| {

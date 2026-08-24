@@ -5,6 +5,7 @@ const Io = std.Io;
 
 const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
+const tui = @import("client/tui.zig");
 
 pub const Command = enum {
     attach,
@@ -27,7 +28,7 @@ pub const Command = enum {
 pub fn dispatch(
     gpa: std.mem.Allocator,
     io: Io,
-    environ: *const std.process.Environ.Map,
+    environ: *std.process.Environ.Map,
     self_exe: []const u8,
     args: []const [:0]const u8,
 ) !u8 {
@@ -45,7 +46,16 @@ pub fn dispatch(
         .ls => return headless.ls(gpa, io, environ, self_exe),
         .kill => return headless.kill(gpa, io, environ, self_exe, rest),
         .shutdown => return headless.shutdown(gpa, io, environ),
-        .attach => try stdoutPrint(io, "marlin attach (TUI): not implemented yet (M2)\n", .{}),
+        .attach => {
+            var sid_arg: ?u64 = null;
+            if (rest.len > 0) {
+                sid_arg = std.fmt.parseInt(u64, rest[0], 10) catch {
+                    try stdoutPrint(io, "marlin: bad session id '{s}'\n", .{rest[0]});
+                    return 2;
+                };
+            }
+            return tui.run(gpa, io, environ, self_exe, sid_arg);
+        },
     }
     return 0;
 }
@@ -54,8 +64,9 @@ const help_text =
     \\marlin — a fast, simple AI agent harness
     \\
     \\usage:
-    \\  marlin                 attach to the daemon (TUI)
-    \\  marlin run [--continue] [--model <m>] [--quiet] "task"
+    \\  marlin                 attach to the daemon (TUI, newest session)
+    \\  marlin attach <id>     attach TUI to a specific session
+    \\  marlin run [--continue] [--model <m>] [--quiet] [--ask] "task"
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls              list sessions
     \\  marlin kill <id>       interrupt a session's running turn

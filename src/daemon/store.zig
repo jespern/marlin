@@ -128,6 +128,14 @@ pub const Store = struct {
         try stepDone(stmt);
     }
 
+    pub fn setSessionModel(self: Store, id: u64, model: []const u8) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET model=? WHERE id=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, model);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
     pub const SessionListing = struct {
         id: u64,
         title: []const u8,

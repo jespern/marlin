@@ -21,15 +21,26 @@ pub const SessionState = enum { idle, running, awaiting_approval, err, done };
 /// Client → daemon.
 pub const ClientMsg = union(enum) {
     hello: struct { proto_version: u32, client_kind: []const u8 = "generic" },
-    session_create: struct { cwd: []const u8, model: []const u8, title: []const u8 = "" },
+    session_create: struct {
+        cwd: []const u8,
+        model: []const u8,
+        title: []const u8 = "",
+        /// "default" = mutating tools ask; "auto" = everything auto-approved
+        /// (headless one-shots and --yolo).
+        approvals: []const u8 = "default",
+    },
     session_list: struct {},
     session_kill: struct { sid: u64 },
+    session_set_model: struct { sid: u64, model: []const u8 },
     sub: struct { sid: u64, from_seq: u64 = 0 },
     unsub: struct { sid: u64 },
     input: struct { sid: u64, text: []const u8 },
+    approve: struct { sid: u64, approval_id: []const u8, decision: ApprovalAnswer },
     interrupt: struct { sid: u64 },
     shutdown: struct {},
 };
+
+pub const ApprovalAnswer = enum { granted, denied };
 
 /// Daemon → client.
 pub const DaemonMsg = union(enum) {
@@ -39,6 +50,14 @@ pub const DaemonMsg = union(enum) {
     blk: struct { sid: u64, b: block.Block },
     delta: struct { sid: u64, turn_id: u64, text: []const u8 },
     status: struct { sid: u64, state: SessionState },
+    approval_request: struct {
+        sid: u64,
+        approval_id: []const u8,
+        call_id: []const u8,
+        tool: []const u8,
+        /// Raw JSON args — clients render their own preview.
+        args_json: []const u8,
+    },
     session_meta: struct { sid: u64, tokens_in: u64, tokens_out: u64 },
     ok: struct {},
     err: struct { code: []const u8, msg: []const u8 },

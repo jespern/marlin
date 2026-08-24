@@ -11,12 +11,12 @@ const jsonx = @import("../core/jsonx.zig");
 const config = @import("../core/config.zig");
 const Store = @import("store.zig").Store;
 const context = @import("context.zig");
+const approval = @import("approval.zig");
 const provider = @import("provider/provider.zig");
 const openai = @import("provider/openai_compat.zig");
 const http = @import("provider/http.zig");
 const sse = @import("provider/sse.zig");
-const bash = @import("tools/bash.zig");
-const files = @import("tools/files.zig");
+const tools_registry = @import("tools/registry.zig");
 
 pub const Endpoint = struct {
     url: [:0]const u8, // .../chat/completions
@@ -31,6 +31,17 @@ pub const RunOpts = struct {
     cwd: []const u8,
     endpoint: Endpoint,
     cfg: config.Config,
+    /// Session approval mode (default: mutating tools ask).
+    approval_mode: approval.Mode = .auto,
+    /// Gate the turn parks on while a client decides. Required when
+    /// approval_mode may produce `ask` decisions.
+    gate: ?*approval.Gate = null,
+    /// Called when an `ask` decision needs a client answer, BEFORE parking.
+    /// The callback must deliver approval_request to clients (and flip the
+    /// session status to awaiting_approval). `id` is the approval id.
+    on_approval_needed: ?*const fn (ctx: ?*anyopaque, id: u64, call_id: []const u8, tool: []const u8, args_json: []const u8) void = null,
+    /// Called after the gate resolves (status back to running).
+    on_approval_done: ?*const fn (ctx: ?*anyopaque, id: u64, verdict: approval.Verdict) void = null,
     /// Called with streaming assistant text for UI liveness.
     on_delta: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     on_delta_ctx: ?*anyopaque = null,
@@ -133,10 +144,10 @@ pub fn runTurn(
         for (loaded, 0..) |lb, i| blocks[i] = lb.blk;
         const msgs = try context.assemble(arena, blocks);
 
-        const tools = [_]openai.ToolSpec{
-            .{ .name = bash.spec_name, .description = bash.spec_description, .schema_json = bash.spec_schema },
-            .{ .name = files.read_spec_name, .description = files.read_spec_description, .schema_json = files.read_spec_schema },
-        };
+        var tools: [tools_registry.specs.len]openai.ToolSpec = undefined;
+        for (&tools_registry.specs, 0..) |*s, ti| {
+            tools[ti] = .{ .name = s.name, .description = s.description, .schema_json = s.schema_json };
+        }
 
         const body = try openai.buildRequestBody(arena, opts.endpoint.model, msgs, &tools);
 
@@ -189,7 +200,7 @@ pub fn runTurn(
             };
         }
 
-        // -- execute tool calls (serial in M0) --
+        // -- execute tool calls (serial in M2; parallel_safe grouping later) --
         for (acc.calls.items) |*pc| {
             const args_repaired = jsonx.repairObject(gpa, pc.args.items) catch pc.args.items;
             defer if (args_repaired.ptr != pc.args.items.ptr) gpa.free(@constCast(args_repaired));
@@ -200,9 +211,64 @@ pub fn runTurn(
                 .args_json = args_repaired,
             } });
 
-            if (opts.on_tool) |cb| cb(opts.on_delta_ctx, pc.name.items, .start);
-            const exec = executeTool(gpa, io, pc.name.items, args_repaired, opts.cwd);
-            if (opts.on_tool) |cb| cb(opts.on_delta_ctx, pc.name.items, .done);
+            // -- approval gate: EVERY execution flows through here --
+            const spec = tools_registry.find(pc.name.items);
+            const decision: approval.Decision = if (spec) |s|
+                approval.policyFor(opts.cfg, opts.approval_mode, s.mutating)
+            else
+                .run; // unknown tool → dispatch returns error text anyway
+
+            var exec: tools_registry.ExecOut = undefined;
+            switch (decision) {
+                .deny => {
+                    exec = .{
+                        .output = try gpa.dupe(u8, "error: tool denied by session policy"),
+                        .status = .denied,
+                    };
+                },
+                .ask => {
+                    const approval_id = ids.next(io);
+                    const id_str = try std.fmt.allocPrint(gpa, "{d}", .{approval_id});
+                    defer gpa.free(id_str);
+
+                    if (opts.on_approval_needed) |cb|
+                        cb(opts.on_delta_ctx, approval_id, pc.call_id.items, pc.name.items, args_repaired);
+
+                    const verdict: approval.Verdict = if (opts.gate) |g|
+                        g.wait(io, approval_id, opts.cancel)
+                    else
+                        .approved; // no gate wired (tests) → auto
+
+                    if (opts.on_approval_done) |cb| cb(opts.on_delta_ctx, approval_id, verdict);
+
+                    try ap.append(.{ .approval = .{
+                        .approval_id = id_str,
+                        .call_id = pc.call_id.items,
+                        .decision = switch (verdict) {
+                            .approved => .granted,
+                            .denied => .denied,
+                        },
+                        .decided_by = null,
+                    } });
+
+                    if (verdict == .denied) {
+                        // Interrupt while parked also lands here; surface both.
+                        const was_cancel = cancelled(opts.cancel);
+                        exec = .{
+                            .output = try gpa.dupe(u8, if (was_cancel)
+                                "error: tool call interrupted by user"
+                            else
+                                "error: tool call denied by user"),
+                            .status = if (was_cancel) .interrupted else .denied,
+                        };
+                    } else {
+                        exec = runTool(gpa, io, opts, pc.name.items, args_repaired);
+                    }
+                },
+                .run => {
+                    exec = runTool(gpa, io, opts, pc.name.items, args_repaired);
+                },
+            }
             defer gpa.free(exec.output);
 
             // Blob the full output when it exceeds the inline cap.
@@ -231,54 +297,10 @@ fn cancelled(flag: ?*std.atomic.Value(bool)) bool {
     return f.load(.acquire);
 }
 
-const ExecOut = struct {
-    output: []u8,
-    status: block.ToolStatus,
-};
-
-fn executeTool(gpa: std.mem.Allocator, io: Io, name: []const u8, args_json: []const u8, cwd: []const u8) ExecOut {
-    if (std.mem.eql(u8, name, bash.spec_name)) {
-        const parsed = std.json.parseFromSlice(bash.Args, gpa, args_json, .{ .ignore_unknown_fields = true }) catch {
-            return argError(gpa, args_json);
-        };
-        defer parsed.deinit();
-        const r = bash.run(gpa, io, parsed.value, cwd) catch |e| {
-            return .{ .output = errText(gpa, e), .status = .err };
-        };
-        if (r.exit_code != 0) {
-            const with_code = std.fmt.allocPrint(gpa, "{s}\n[exit code: {d}]", .{ r.output, r.exit_code }) catch
-                return .{ .output = r.output, .status = .err };
-            gpa.free(r.output);
-            return .{ .output = with_code, .status = .err };
-        }
-        return .{ .output = r.output, .status = .ok };
-    }
-    if (std.mem.eql(u8, name, files.read_spec_name)) {
-        const parsed = std.json.parseFromSlice(files.ReadArgs, gpa, args_json, .{ .ignore_unknown_fields = true }) catch {
-            return argError(gpa, args_json);
-        };
-        defer parsed.deinit();
-        const out = files.readFile(gpa, io, parsed.value, cwd) catch |e| {
-            return .{ .output = errText(gpa, e), .status = .err };
-        };
-        const is_err = std.mem.startsWith(u8, out, "error:");
-        return .{ .output = out, .status = if (is_err) .err else .ok };
-    }
-    const msg = std.fmt.allocPrint(gpa, "error: unknown tool '{s}'", .{name}) catch @panic("oom");
-    return .{ .output = msg, .status = .err };
-}
-
-fn argError(gpa: std.mem.Allocator, args_json: []const u8) ExecOut {
-    const msg = std.fmt.allocPrint(
-        gpa,
-        "error: could not parse tool arguments as JSON. Got: {s}\nRe-issue the call with valid JSON matching the schema.",
-        .{args_json[0..@min(args_json.len, 500)]},
-    ) catch @panic("oom");
-    return .{ .output = msg, .status = .err };
-}
-
-fn errText(gpa: std.mem.Allocator, e: anyerror) []u8 {
-    return std.fmt.allocPrint(gpa, "error: {t}", .{e}) catch @panic("oom");
+fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, name: []const u8, args_json: []const u8) tools_registry.ExecOut {
+    if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .start);
+    defer if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .done);
+    return tools_registry.dispatch(gpa, io, name, args_json, opts.cwd, opts.cancel);
 }
 
 fn nowMs(io: Io) i64 {

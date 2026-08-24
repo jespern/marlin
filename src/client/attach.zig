@@ -94,11 +94,14 @@ pub fn connect(
     if (conn == null) {
         // Autostart: spawn `<self> daemon` and never wait on it. When this
         // client exits, the daemon is reparented to init and lives on.
+        // Own process group: the daemon must not receive the terminal's
+        // SIGHUP/SIGINT when the spawning client's TTY goes away.
         var child = try std.process.spawn(io, .{
             .argv = &.{ self_exe, "daemon" },
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,
+            .pgid = 0,
         });
         _ = &child; // deliberately not waited/killed
 

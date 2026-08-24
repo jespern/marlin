@@ -17,12 +17,16 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // ---- marlin ----
+    const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const exe = b.addExecutable(.{
         .name = "marlin",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+            },
         }),
     });
     exe.root_module.linkSystemLibrary("curl", .{});
@@ -51,6 +55,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Installed too: handy for driving the TUI manually against a script.
+    b.installArtifact(fakeprov);
 
     // ---- e2e ----
     const e2e_runner = b.addExecutable(.{
