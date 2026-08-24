@@ -487,23 +487,27 @@ pub fn reboot(
         }
     }
 
-    // 1. Optional build, streamed to the terminal.
+    // 1. Optional build. The TUI has restored the terminal by this point, so
+    // inherit stdout/stderr instead of buffering a long, apparently idle wait.
     if (do_build) {
-        const res = std.process.run(gpa, io, .{
+        try eprint(io, "marlin: building release binary...\n", .{});
+        var child = std.process.spawn(io, .{
             .argv = &.{ "zig", "build", "-Doptimize=ReleaseFast" },
-            .stdout_limit = .limited(4 * 1024 * 1024),
-            .stderr_limit = .limited(4 * 1024 * 1024),
         }) catch |e| {
             try eprint(io, "marlin: release build failed to spawn: {t}\n", .{e});
             return 1;
         };
-        defer gpa.free(res.stdout);
-        defer gpa.free(res.stderr);
-        const ok = res.term == .exited and res.term.exited == 0;
+        const term = child.wait(io) catch |e| {
+            child.kill(io);
+            try eprint(io, "marlin: release build wait failed: {t} — reboot aborted\n", .{e});
+            return 1;
+        };
+        const ok = term == .exited and term.exited == 0;
         if (!ok) {
-            try eprint(io, "marlin: build failed — reboot aborted\n{s}\n", .{res.stderr[0..@min(res.stderr.len, 4000)]});
+            try eprint(io, "marlin: build failed — reboot aborted\n", .{});
             return 1;
         }
+        try eprint(io, "marlin: build complete; restarting...\n", .{});
     }
 
     // 2. Sanity-exec the candidate. The one unrecoverable reboot failure is

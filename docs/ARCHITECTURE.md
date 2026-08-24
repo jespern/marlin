@@ -106,9 +106,9 @@ Sequence:
 
 1. **Binary selection.** `/reboot` re-execs the path argv[0] resolved to at
    daemon start (you `zig build` beforehand; binary lives at a stable path).
-   `/reboot --build` runs `zig build -Doptimize=ReleaseFast` first, streams output into a
-   `system_note` block, and proceeds only on success. Either way the
-   candidate is sanity-exec'd (`--version`) before committing —
+   `/reboot --build` restores the terminal, runs
+   `zig build -Doptimize=ReleaseFast` with live output there, and proceeds only
+   on success. Either way the candidate is sanity-exec'd (`--version`) before committing —
    exec-into-broken-binary is the one unrecoverable failure (daemon gone,
    nothing to reattach), so it must be impossible.
 2. **Quiesce.** Default: wait for running turns to reach a block boundary.

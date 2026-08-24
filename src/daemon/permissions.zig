@@ -69,6 +69,49 @@ pub fn assessPath(
     };
 }
 
+/// Symlink-safe workspace-write authorization for the direct file tools
+/// (write_file/edit): the auto-inside policy may skip the approval prompt
+/// only when the REAL target provably stays inside the REAL workspace.
+/// `args_json` is the tool call's raw arguments; anything unparseable or
+/// unprovable answers false and the legacy prompt applies.
+///
+/// Symlink safety: walk up from the resolved target to the deepest EXISTING
+/// ancestor and realpath it — nonexistent trailing components cannot be
+/// symlinks, so ancestor containment is sufficient for paths being created.
+pub fn workspaceWriteAllowed(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    args_json: []const u8,
+) bool {
+    const parsed = std.json.parseFromSlice(
+        struct { path: []const u8 },
+        gpa,
+        args_json,
+        .{ .ignore_unknown_fields = true },
+    ) catch return false;
+    defer parsed.deinit();
+
+    var assessed = assessPath(gpa, cwd, parsed.value.path) catch return false;
+    defer assessed.deinit(gpa);
+    if (assessed.location != .workspace) return false;
+
+    const real_cwd = std.Io.Dir.realPathFileAbsoluteAlloc(io, cwd, gpa) catch return false;
+    defer gpa.free(real_cwd);
+
+    var candidate: []const u8 = assessed.resolved;
+    var hops: usize = 0;
+    while (hops < 64) : (hops += 1) {
+        if (std.Io.Dir.realPathFileAbsoluteAlloc(io, candidate, gpa)) |real| {
+            defer gpa.free(real);
+            return isWithin(real_cwd, real);
+        } else |_| {
+            candidate = std.fs.path.dirname(candidate) orelse return false;
+        }
+    }
+    return false;
+}
+
 /// Conservative built-in protected-path policy. Matching is component-aware
 /// for credential directories and basename-aware for common secret files.
 /// Configurable additions and explicit grants land with rich approvals.
@@ -162,6 +205,48 @@ pub fn isWithin(root: []const u8, candidate: []const u8) bool {
     if (root.len == 0 or candidate.len <= root.len) return false;
     if (std.fs.path.isSep(root[root.len - 1])) return true;
     return std.fs.path.isSep(candidate[root.len]);
+}
+
+test "workspace write authorization is symlink-safe" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const base = try std.fmt.allocPrint(gpa, "/tmp/marlin-wswrite-test-{x}", .{std.mem.readInt(u64, &rand, .little)});
+    defer gpa.free(base);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    const ws = try std.fs.path.join(gpa, &.{ base, "ws" });
+    defer gpa.free(ws);
+    const outside = try std.fs.path.join(gpa, &.{ base, "outside" });
+    defer gpa.free(outside);
+    try std.Io.Dir.cwd().createDirPath(io, ws);
+    try std.Io.Dir.cwd().createDirPath(io, outside);
+
+    // A symlink inside the workspace pointing out of it.
+    const link = try std.fs.path.join(gpa, &.{ ws, "escape" });
+    defer gpa.free(link);
+    const ln = try std.process.run(gpa, io, .{
+        .argv = &.{ "/bin/ln", "-s", outside, link },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    defer gpa.free(ln.stdout);
+    defer gpa.free(ln.stderr);
+
+    // Ordinary workspace targets: existing dirs and yet-to-exist files.
+    try std.testing.expect(workspaceWriteAllowed(gpa, io, ws, "{\"path\":\"src/main.zig\"}"));
+    try std.testing.expect(workspaceWriteAllowed(gpa, io, ws, "{\"path\":\"deep/new/dir/file.txt\"}"));
+    // Lexical escapes and absolute outside targets.
+    try std.testing.expect(!workspaceWriteAllowed(gpa, io, ws, "{\"path\":\"../outside/x\"}"));
+    try std.testing.expect(!workspaceWriteAllowed(gpa, io, ws, "{\"path\":\"/etc/hosts\"}"));
+    // The symlink escape: lexically inside, physically outside.
+    try std.testing.expect(!workspaceWriteAllowed(gpa, io, ws, "{\"path\":\"escape/x\"}"));
+    // Garbage arguments fail closed.
+    try std.testing.expect(!workspaceWriteAllowed(gpa, io, ws, "{not json"));
+    try std.testing.expect(!workspaceWriteAllowed(gpa, io, ws, "{}"));
 }
 
 test "secret environment names cover provider keys and configured patterns" {

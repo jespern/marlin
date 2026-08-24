@@ -12,6 +12,7 @@ const config = @import("../core/config.zig");
 const Store = @import("store.zig").Store;
 const context = @import("context.zig");
 const approval = @import("approval.zig");
+const permissions = @import("permissions.zig");
 const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const extensions = @import("extensions.zig");
@@ -397,14 +398,21 @@ pub fn runTurn(
         // opts into parallel safety can overlap.
         for (prepared) |*call| {
             // -- approval gate: EVERY execution flows through here --
-            // Auto-inside (docs/PERMISSIONS.md): a shell call that will
-            // execute under the canary-verified kernel sandbox needs no
-            // per-call prompt — the sandbox enforces the write scope and
-            // protected paths the prompt was guarding. Direct write/edit
-            // tools bypass the kernel sandbox and keep asking until
-            // symlink-safe direct-tool enforcement lands.
-            const sandboxed = opts.sandbox_options.backend == .seatbelt and
+            // Auto-inside (docs/PERMISSIONS.md): a call whose boundaries are
+            // ENFORCED needs no per-call prompt. Shell is enforced by the
+            // canary-verified kernel sandbox; write_file/edit run in-daemon,
+            // so their enforcement is the symlink-safe proof that the real
+            // target stays inside the real workspace (fs.write_workspace:
+            // "allow when sandbox verified"). Outside-workspace or unprovable
+            // targets keep the legacy prompt.
+            var sandboxed = opts.sandbox_options.backend == .seatbelt and
                 std.mem.eql(u8, call.name, bash_tool.spec_name);
+            if (!sandboxed and opts.sandbox_options.backend == .seatbelt and
+                (std.mem.eql(u8, call.name, files_tool.write_spec_name) or
+                    std.mem.eql(u8, call.name, files_tool.edit_spec_name)))
+            {
+                sandboxed = permissions.workspaceWriteAllowed(gpa, io, opts.cwd, call.args_json);
+            }
             const decision: approval.Decision = if (call.spec) |s|
                 if (opts.tool_profile == .read_only and s.mutating)
                     .deny

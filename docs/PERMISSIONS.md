@@ -27,8 +27,14 @@ Current progress:
   never verified a backend keeps legacy ask behavior. Scope is deliberately
   shell-only: direct write/edit tools bypass the kernel sandbox, so they
   keep asking until symlink-safe direct-tool enforcement lands.
-- **Next:** rich once/session escalation grants and symlink-safe direct-tool
-  enforcement behind the default-off capability flag.
+- **Landed in the working tree:** auto-inside for direct workspace writes.
+  write_file/edit skip the prompt only when the symlink-safe check proves
+  the REAL target stays inside the REAL workspace (deepest existing
+  ancestor realpath; nonexistent trailing components cannot be symlinks).
+  Outside-workspace or unprovable targets keep the legacy prompt. Gated on
+  the same per-session sandbox regime as shell auto-inside.
+- **Next:** rich once/session escalation grants; typed protected-read
+  refusals for direct read tools.
 
 ## Product contract
 
@@ -141,9 +147,15 @@ security boundary.
 The baseline shell sandbox permits ordinary reads, writes within the canonical
 session cwd and a Marlin-owned temporary location, process execution, and
 network access. It denies writes outside the workspace and reads of the
-protected credential roots. Network isolation is a later hardening decision;
-M3.5 must state clearly that allowed shell commands can still exfiltrate
-workspace data.
+protected credential roots. The write boundary also covers implicit paths
+selected by subprocesses, including toolchain caches, package stores, config
+files, and temporary directories. Sandboxed tools receive a private writable
+`TMPDIR` below the host temporary root; they do not receive write access to the
+entire shared `/tmp`. Agents should use `$TMPDIR` for disposable state and keep
+persistent caches in the workspace (for Zig, for example,
+`ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-cache/global`) rather than treating the denial
+as a build failure. Network isolation is a later hardening decision; M3.5 must
+state clearly that allowed shell commands can still exfiltrate workspace data.
 
 Use Seatbelt on macOS and Landlock on Linux, with seccomp added only for a
 specific syscall threat model. `sandbox-exec` and its SBPL language are

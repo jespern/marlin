@@ -1503,6 +1503,30 @@ fn shimmerSpans(
     return spans.toOwnedSlice(arena);
 }
 
+/// Freshest complete-ish line of a streaming text (for the reasoning ticker).
+fn lastNonEmptyLine(text: []const u8) []const u8 {
+    var it = std.mem.splitBackwardsScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return text;
+}
+
+/// Largest byte index <= max that does not split a UTF-8 sequence.
+fn utf8Floor(text: []const u8, max: usize) usize {
+    var end = @min(max, text.len);
+    while (end > 0 and end < text.len and (text[end] & 0xc0) == 0x80) end -= 1;
+    return end;
+}
+
+/// Clip long text at a UTF-8-safe boundary with an ellipsis; short text
+/// passes through untouched.
+fn clipText(arena: std.mem.Allocator, text: []const u8, max: usize) ![]const u8 {
+    if (text.len <= max) return text;
+    return std.fmt.allocPrint(arena, "{s} …", .{text[0..utf8Floor(text, max)]});
+}
+
 fn nowWallMs(io: Io) i64 {
     const ts = Io.Timestamp.now(io, .real);
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
@@ -2235,11 +2259,55 @@ fn isSalientToolErrorLine(line: []const u8) bool {
 }
 
 /// Return the consecutive successful tool pairs that are safe to summarize.
-/// A failure — or a diff produced by a file-edit tool — stops the run so
-/// its call/result render in full.
+/// Provider tool batches are persisted as all calls followed by all results;
+/// older transcripts may still alternate call/result. A failure — or a diff
+/// produced by a file-edit tool — keeps the batch expanded.
 fn collapsibleToolRun(blocks: []const RenderBlock, start: usize) CollapsedToolRun {
-    if (start >= blocks.len) return .{ .count = 0, .next = start };
+    if (start >= blocks.len or blocks[start].kind != .tool_call)
+        return .{ .count = 0, .next = start };
     const turn_id = blocks[start].turn_id;
+
+    // Never mistake a suffix of a calls-first batch for an alternating pair.
+    if (start > 0 and
+        blocks[start - 1].kind == .tool_call and
+        blocks[start - 1].turn_id == turn_id)
+    {
+        return .{ .count = 0, .next = start };
+    }
+
+    var calls_end = start;
+    while (calls_end < blocks.len and
+        blocks[calls_end].kind == .tool_call and
+        blocks[calls_end].turn_id == turn_id) : (calls_end += 1)
+    {}
+    const batch_count = calls_end - start;
+    if (batch_count > 1) {
+        var result_idx = calls_end;
+        while (result_idx < blocks.len and
+            blocks[result_idx].kind == .approval and
+            blocks[result_idx].turn_id == turn_id) : (result_idx += 1)
+        {}
+        var result_count: usize = 0;
+        while (result_count < batch_count and
+            result_idx < blocks.len and
+            blocks[result_idx].kind == .tool_result and
+            blocks[result_idx].turn_id == turn_id)
+        {
+            const result = blocks[result_idx];
+            const call = blocks[start + result_count];
+            if (result.status != .ok or
+                (isDiffOutput(result.text) and isFileEditTool(call.label)))
+            {
+                return .{ .count = 0, .next = start };
+            }
+            result_count += 1;
+            result_idx += 1;
+        }
+        if (result_count == batch_count) return .{ .count = batch_count, .next = result_idx };
+        return .{ .count = 0, .next = start };
+    }
+
+    // Compatibility with transcripts written before calls-first batching.
     var i = start;
     var count: usize = 0;
     while (i < blocks.len and
@@ -2262,6 +2330,40 @@ fn collapsibleToolRun(blocks: []const RenderBlock, start: usize) CollapsedToolRu
     return .{ .count = count, .next = i };
 }
 
+/// A calls-first batch can be visible while its tools are still running.
+/// Return its extent only when it is the incomplete tail of the transcript.
+fn pendingToolBatch(blocks: []const RenderBlock, start: usize) ?CollapsedToolRun {
+    if (start >= blocks.len or blocks[start].kind != .tool_call) return null;
+    const turn_id = blocks[start].turn_id;
+    if (start > 0 and
+        blocks[start - 1].kind == .tool_call and
+        blocks[start - 1].turn_id == turn_id) return null;
+
+    var calls_end = start;
+    while (calls_end < blocks.len and
+        blocks[calls_end].kind == .tool_call and
+        blocks[calls_end].turn_id == turn_id) : (calls_end += 1)
+    {}
+    const count = calls_end - start;
+    if (count < 2) return null;
+
+    var i = calls_end;
+    while (i < blocks.len and
+        blocks[i].kind == .approval and
+        blocks[i].turn_id == turn_id) : (i += 1)
+    {}
+    var results: usize = 0;
+    while (i < blocks.len and
+        blocks[i].kind == .tool_result and
+        blocks[i].turn_id == turn_id and
+        results < count) : (i += 1)
+    {
+        results += 1;
+    }
+    if (results < count and i == blocks.len) return .{ .count = count, .next = i };
+    return null;
+}
+
 /// Flatten blocks + delta into wrapped display lines for a given width.
 /// Returned list and its line slices use `arena` (per-frame).
 fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(Line) {
@@ -2277,13 +2379,18 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         if (!app.show_tool_transcript and rb.kind == .tool_call) {
             const blocks_all = app.blocks.items;
             const collapsed = collapsibleToolRun(blocks_all, block_idx);
+            const pending_batch = if (app.state == .running and collapsed.count == 0)
+                pendingToolBatch(blocks_all, block_idx)
+            else
+                null;
             // A trailing call with no result yet is still executing: fold it
             // into the summary line instead of flashing a ⚙ detail line that
             // vanishes the moment a fast command completes (the flash reads
             // as the page jolting). Approval-parked calls keep their detail
             // line — the user must see what they are deciding on.
-            var in_flight = false;
-            if (app.state == .running and
+            var in_flight = pending_batch != null;
+            var running_call_idx = block_idx;
+            if (!in_flight and app.state == .running and
                 collapsed.next < blocks_all.len and
                 blocks_all[collapsed.next].kind == .tool_call and
                 blocks_all[collapsed.next].turn_id == rb.turn_id)
@@ -2291,18 +2398,22 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                 var j = collapsed.next + 1;
                 while (j < blocks_all.len and blocks_all[j].kind == .approval) : (j += 1) {}
                 in_flight = j == blocks_all.len;
+                running_call_idx = collapsed.next;
             }
             if (collapsed.count > 0 or in_flight) {
-                const summary = if (collapsed.count > 0)
+                const displayed_count = if (pending_batch) |batch| batch.count else collapsed.count;
+                const summary = if (!in_flight)
                     try std.fmt.allocPrint(arena, "Ran {d} {s}", .{
-                        collapsed.count,
-                        if (collapsed.count == 1) "command" else "commands",
+                        displayed_count,
+                        if (displayed_count == 1) "command" else "commands",
                     })
+                else if (displayed_count > 1)
+                    try std.fmt.allocPrint(arena, "Running {d} commands", .{displayed_count})
                 else
                     "Running";
                 var hint: []const u8 = " · ctrl+t to view transcript";
-                if (in_flight) {
-                    const call = blocks_all[collapsed.next];
+                if (in_flight and pending_batch == null) {
+                    const call = blocks_all[running_call_idx];
                     const hi = extractHighlightArg(call.label, call.text) orelse
                         call.text[0..@min(call.text.len, 40)];
                     const capped = hi[0..@min(hi.len, 60)];
@@ -2333,7 +2444,12 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                 try blankLine(arena, &lines);
                 try wrapMarkdown(arena, &lines, rb.text, w);
             },
-            .reasoning => try wrapReasoningCard(arena, &lines, rb.text, w),
+            .reasoning => {
+                // Commentary is one short sentence by prompt contract;
+                // anything much longer is a provider reasoning summary —
+                // keep the card, clip the wall (full text stays in the log).
+                try wrapReasoningCard(arena, &lines, try clipText(arena, rb.text, 280), w);
+            },
             .tool_call => {
                 last_tool_label = rb.label;
                 // Keep the machinery subdued. Bash commands receive semantic
@@ -2434,10 +2550,19 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         }
     }
 
-    // Streaming region: provider reasoning gets the same surfaced card style
-    // as durable progress notes; assistant content remains normal Markdown.
+    // Streaming region: provider reasoning summaries are verbose by nature
+    // (first-person deliberation), so the live view is a one-line ticker
+    // showing only the freshest thought — not a growing wall. The durable
+    // card at round end is clipped separately below.
     if (app.reasoning_delta.items.len > 0) {
-        try wrapReasoningCard(arena, &lines, app.reasoning_delta.items, w);
+        const tail = lastNonEmptyLine(app.reasoning_delta.items);
+        const cap = @min(tail.len, w -| 8);
+        try lines.append(arena, .{
+            .text = "  · ",
+            .style = Palette.reasoning_mark,
+            .text2 = tail[0..utf8Floor(tail, cap)],
+            .style2 = Palette.collapse_hint,
+        });
     }
     if (app.delta.items.len > 0) {
         try blankLine(arena, &lines);
@@ -5375,6 +5500,86 @@ test "successful tools collapse but diffs and failures stop the run" {
     try std.testing.expectEqual(@as(usize, 2), collapsed.count);
     try std.testing.expectEqual(@as(usize, 4), collapsed.next);
     try std.testing.expectEqual(@as(usize, 0), collapsibleToolRun(&blocks, 4).count);
+}
+
+test "calls-first parallel tool batches collapse as one transcript run" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    const entries = [_]struct { block.BlockKind, []const u8, []const u8 }{
+        .{ .tool_call, "{}", "read_file" },
+        .{ .tool_call, "{}", "read_file" },
+        .{ .tool_call, "{}", "grep" },
+        .{ .tool_result, "first file", "" },
+        .{ .tool_result, "second file", "" },
+        .{ .tool_result, "matches", "" },
+    };
+    for (entries) |entry| {
+        try app.blocks.append(gpa, .{
+            .kind = entry[0],
+            .turn_id = 9,
+            .text = try gpa.dupe(u8, entry[1]),
+            .label = try gpa.dupe(u8, entry[2]),
+        });
+    }
+
+    const collapsed = collapsibleToolRun(app.blocks.items, 0);
+    try std.testing.expectEqual(@as(usize, 3), collapsed.count);
+    try std.testing.expectEqual(@as(usize, 6), collapsed.next);
+    try std.testing.expectEqual(@as(usize, 0), collapsibleToolRun(app.blocks.items, 1).count);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = try layoutLines(arena_state.allocator(), &app, 100);
+    var summaries: usize = 0;
+    for (lines.items) |line| {
+        if (std.mem.eql(u8, line.text2, "Ran 3 commands")) summaries += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line.text, "first file") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line.text2, "first file") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), summaries);
+}
+
+test "in-flight calls-first batch renders one compact running line" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .state = .running,
+    };
+    defer app.deinit();
+    for ([_][]const u8{ "read_file", "grep", "glob" }) |name| {
+        try app.blocks.append(gpa, .{
+            .kind = .tool_call,
+            .turn_id = 9,
+            .text = try gpa.dupe(u8, "{}"),
+            .label = try gpa.dupe(u8, name),
+        });
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = try layoutLines(arena_state.allocator(), &app, 100);
+    var summaries: usize = 0;
+    for (lines.items) |line| {
+        if (std.mem.eql(u8, line.text2, "Running 3 commands")) summaries += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line.text, "⚙") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), summaries);
 }
 
 test "failed tool output uses red only for its marker and salient diagnostics" {
