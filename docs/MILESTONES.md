@@ -117,7 +117,11 @@ mouse selection + OSC52, !c family, daemon-side register (!y/!p cross-session).
 Image paste (ARCHITECTURE.md §image/asset paste): clipboard capture →
 attachment upload → blob → vision content parts; kitty-protocol thumbnails
 or placeholder cards.
-*Exit: herdr/tmux no longer wrap marlin; marlin IS the terminal you keep open.*
+Remote Mode B (§remote access): `marlin attach <remote>` speaking the wire
+protocol over ssh, named remotes in config, skew-mismatch recovery gesture.
+Primary remote path from here; ssh -t stays as fallback.
+*Exit: herdr/tmux no longer wrap marlin; marlin IS the terminal you keep open,
+including for the work machine from the laptop.*
 
 ## M5 — extensibility
 MCP stdio client, exec tools, hooks (approval-needed → ntfy script = phone

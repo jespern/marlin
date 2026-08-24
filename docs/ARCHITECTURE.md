@@ -17,7 +17,56 @@ with the latter, it's simpler to ship):
   print result, exit nonzero on failure. Doubles as the eval harness.
 - `marlin ls / attach <id> / kill <id>` — thin protocol clients for scripting.
 
-Remote use is ssh as dumb transport, exactly herdr's pattern:
+### Remote access: two modes, one blessed
+
+**One marlind per USER (not per machine).** The daemon owns every session
+for that user on that box; `$XDG_RUNTIME_DIR/marlin/daemon.sock` (0600,
+per-user by construction) encodes this. Two users on one machine = two
+daemons, mutually invisible. Autostart/flock logic stays inside the user's
+runtime dir, never system-wide. Clients — local or remote — are ephemeral
+views: nothing lives in a client but a render cache and a draft input box.
+
+**Mode B — protocol over ssh (PRIMARY).** A local `marlin` client speaks
+the wire protocol to a remote daemon, ssh carrying NDJSON instead of
+terminal frames:
+
+```
+marlin attach work      # ssh work ... → daemon.sock; blocks stream back
+marlin ls work
+```
+
+Transport is `ssh <host> nc -U <sock>` (or an equivalent stdio bridge
+subcommand, `marlin _pipe`, to drop the nc dependency). Named remotes in
+config:
+
+```toml
+[remote.work]
+host = "work"           # ssh config name; keys/agent/jump hosts all apply
+```
+
+Why primary: from_seq replay resynchronizes STATE, not a screen — a
+dropped connection reconnects with zero lost blocks (better than mosh for
+this app, and mosh only ever repaired pixels). Typing/scroll/selection are
+local-latency; only submits and steers cross the wire. The client runs
+where the clipboard lives, so image paste works (the ssh-clipboard
+limitation in §image/asset paste applies only to Mode A) and kitty
+graphics / OSC 52 / OSC color queries negotiate with the user's actual
+terminal.
+
+Version skew is the tax: laptop client vs work daemon from different
+builds. The proto_version handshake already rejects mismatches cleanly;
+recovery should be one gesture — on mismatch, offer to copy the daemon's
+binary down (or the client's up): single static binary makes the fix a
+one-liner. Path semantics: tool output paths are daemon-side; any "open
+file" gesture must know it's remote (scp-on-demand or just don't).
+
+**Mode A — ssh as terminal transport (fallback).** `ssh -t box marlin` /
+`mosh box -- marlin`: the TUI runs next to the daemon, the local terminal
+just displays cells. Zero setup, works from machines that don't have
+marlin installed at all (or via scp-and-run: the binary travels
+trivially). Costs: every keystroke/scroll round-trips, no local clipboard
+integration. Use when Mode B is degraded (skew you can't fix right now,
+weird networks) or when you're already shelled in.
 
 ```
 ssh box                 # then: marlin            (attach over unix socket)
