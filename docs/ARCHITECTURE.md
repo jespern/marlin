@@ -367,6 +367,21 @@ get these right; Hermes is the counter-example):
   colored backgrounds — jarring and unreadable with syntax coloring.
   Lives in the block renderer next to markdown.zig; edit-tool results render
   as diffs by default.
+- **No invented theme format — a semantic role map onto ANSI-16.** Every
+  rendered element gets a role (`diff.add`, `diff.del`, `todo.active`,
+  `status.cost`, `block.border`, `md.heading`, shimmer endpoints…), each
+  resolving to an ANSI palette index by default. Marlin decides
+  relationships (dim/bright/accent); the user's terminal theme supplies the
+  pigments — so marlin renders natively in any iTerm2/Ghostty scheme, light
+  or dark, locally or over ssh, with zero config. Layered on top:
+  per-role TOML overrides (ANSI name or truecolor), and optional whole-map
+  swap via **base16/base24 scheme files** (the de-facto standard; a base16 →
+  role-map converter is ~50 lines — do not parse .itermcolors plists).
+  Effects needing interpolation (shimmer gradient, dimmed diff variants)
+  query the terminal's actual RGB for the relevant slots via OSC 4/10/11 at
+  startup and derive from those — gradients match the user's theme instead
+  of a hardcoded rainbow. (Check what libvaxis exposes for OSC queries;
+  it's Ghostty-adjacent so likely most of it.)
 
 ```
 ┌ sidebar ──────┬─ main: session view ────────────────┐
@@ -423,6 +438,14 @@ api_key_env = "NONE"
 output_headroom = 16000
 compaction_headroom = 8000
 inline_tool_cap = 8000
+
+[theme]
+# Default: no theme — semantic roles map to ANSI-16 and the terminal's own
+# scheme colors everything. Both keys optional.
+# scheme = "~/.config/marlin/themes/gruvbox.yaml"   # base16/base24 file
+# [theme.roles]                                     # per-role overrides
+# diff.add = "green"          # ANSI name…
+# todo.active = "#e5c07b"     # …or truecolor
 
 [approval]
 default_mutating = "ask"
