@@ -174,6 +174,9 @@ pub const Daemon = struct {
     cfg: config.Config,
     extensions: *extensions.Runtime,
     network: network_policy.Policy,
+    /// Reusable libcurl easy handles. Checked out exclusively by turn threads;
+    /// idle handles keep provider HTTP/TLS connections warm across turns.
+    http_pool: http.Pool,
     sandbox_backend: sandbox.Backend = .unavailable,
     /// Non-null exactly when sandbox_backend is .seatbelt: the profile's
     /// protected-read denials are parameterized on these roots.
@@ -186,6 +189,9 @@ pub const Daemon = struct {
     /// /reboot in flight: client id awaiting the coordinated shutdown.
     /// The daemon quiesces (waits for turns to reach done) then acks + exits.
     pending_reboot: ?u64 = null,
+    /// Set when reboot unlinks the listener before ACK. Cleanup must not
+    /// unlink the same pathname again after the replacement daemon binds it.
+    socket_retired: bool = false,
     /// Model catalog cache (registry-form ids, gpa-owned). Refreshed at
     /// most once per catalog_ttl_ms; fetch runs on a worker thread.
     catalog: std.ArrayList([]u8) = .empty,
@@ -271,6 +277,7 @@ pub const Daemon = struct {
             .cfg = cfg,
             .extensions = extension_runtime,
             .network = network,
+            .http_pool = http.Pool.init(gpa, io),
             .sandbox_backend = sandbox_backend,
             .protected_roots = protected_roots,
             .events = queue.Mpsc(Event).init(gpa),
@@ -1064,6 +1071,22 @@ pub const Daemon = struct {
         }
     }
 
+    /// Durable note for a turn that failed AFTER the loop started (its
+    /// user_msg is already in the log): the failure reason itself must land
+    /// in the transcript, not just flip the session to err.
+    fn persistTurnNote(self: *Daemon, job: *TurnJob, note: []const u8) void {
+        const b = block.Block{
+            .id = ids.next(self.io),
+            .session_id = job.sid,
+            .turn_id = ids.next(self.io),
+            .seq = (self.store.lastSeq(job.sid) catch return) + 1,
+            .ts = nowMs(self.io),
+            .body = .{ .system_note = .{ .text = note } },
+        };
+        self.store.appendBlock(b) catch return;
+        TurnHooks.onBlock(job, b);
+    }
+
     fn turnMain(job: *TurnJob) void {
         const self = job.daemon;
         defer {
@@ -1122,6 +1145,7 @@ pub const Daemon = struct {
             .session_id = job.sid,
             .cwd = job.cwd,
             .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
+            .http_pool = &self.http_pool,
             .effort = job.effort,
             .cfg = self.cfg,
             .tool_environ = self.environ,
@@ -1136,6 +1160,7 @@ pub const Daemon = struct {
             .on_approval_needed = TurnHooks.onApprovalNeeded,
             .on_approval_done = TurnHooks.onApprovalDone,
             .on_delta = TurnHooks.onDelta,
+            .on_reasoning_delta = TurnHooks.onReasoningDelta,
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
             .on_task = if (job.session.kind == .root) TurnHooks.onTask else null,
@@ -1145,6 +1170,11 @@ pub const Daemon = struct {
             .max_rounds = job.session.max_rounds,
         }, job.text) catch |e| {
             err_text = std.fmt.allocPrint(self.gpa, "turn failed: {t}", .{e}) catch null;
+            // The reason must survive in the transcript: turn_done frees
+            // err_text after status fan-out, so without a durable note the
+            // user sees a bare "error" state with no explanation.
+            if (e != error.ProviderError)
+                self.persistTurnNote(job, err_text orelse "turn failed");
             self.finishTurn(job.sid, false, err_text, null, 0, 0);
             return;
         };
@@ -1182,6 +1212,7 @@ pub const Daemon = struct {
             .session_id = job.sid,
             .cwd = job.cwd,
             .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
+            .http_pool = &self.http_pool,
             .effort = .auto,
             .cfg = self.cfg,
             .extensions = self.extensions,
@@ -1228,6 +1259,13 @@ pub const Daemon = struct {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
             const line = proto.encode(self.gpa, proto.DaemonMsg{ .delta = .{ .sid = job.sid, .turn_id = 0, .text = text } }) catch return;
+            self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+        }
+
+        fn onReasoningDelta(ctx: ?*anyopaque, text: []const u8) void {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            const line = proto.encode(self.gpa, proto.DaemonMsg{ .reasoning_delta = .{ .sid = job.sid, .turn_id = 0, .text = text } }) catch return;
             self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
         }
 
@@ -1510,11 +1548,16 @@ pub const Daemon = struct {
             if (state == .running or state == .awaiting_approval) return; // not yet
         }
         self.pending_reboot = null;
+        // Retire the public socket before ACKing. The ACK tells the client it
+        // may exec immediately, so no new process may still connect to this
+        // dying daemon and lose its hello request during cleanup.
+        self.running = false;
+        self.nudgeAcceptLoop();
+        self.removeSocketFile();
+        self.socket_retired = true;
         if (self.lookupClient(requester)) |client| {
             self.sendTo(client, .{ .ok = .{} });
         }
-        self.running = false;
-        self.nudgeAcceptLoop();
     }
 
     fn nudgeAcceptLoop(self: *Daemon) void {
@@ -1523,6 +1566,12 @@ pub const Daemon = struct {
         const ua = Io.net.UnixAddress.init(sock_path) catch return;
         const s = ua.connect(self.io) catch return;
         s.close(self.io);
+    }
+
+    fn removeSocketFile(self: *Daemon) void {
+        const sock_path = proto.socketPath(self.gpa, self.environ) catch return;
+        defer self.gpa.free(sock_path);
+        Io.Dir.cwd().deleteFile(self.io, sock_path) catch {};
     }
 
     fn shutdownCleanup(self: *Daemon) void {
@@ -1557,6 +1606,7 @@ pub const Daemon = struct {
             self.gpa.destroy(session);
         }
         self.sessions.deinit(self.gpa);
+        self.http_pool.deinit();
 
         // Close all client outboxes; writer threads exit, readers hit EOF.
         clients_mutex.lockUncancelable(self.io);
@@ -1574,9 +1624,7 @@ pub const Daemon = struct {
         clients_mutex.unlock(self.io);
 
         // Remove the socket so the (blocked) accept loop errors out.
-        const sock_path = proto.socketPath(self.gpa, self.environ) catch return;
-        defer self.gpa.free(sock_path);
-        Io.Dir.cwd().deleteFile(self.io, sock_path) catch {};
+        if (!self.socket_retired) self.removeSocketFile();
     }
 };
 

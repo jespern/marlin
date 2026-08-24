@@ -60,7 +60,8 @@ run_leg() { # $1 = leg name, $2 = "reboot" | "kill9"
 
   # Normalize: kinds + bodies only (ids/timestamps legitimately differ).
   sqlite3 "$state/marlin/marlin.db" \
-    "SELECT seq, kind, body_json FROM blocks ORDER BY seq;" > "$SUITE_TMP/$leg.dump"
+    "PRAGMA busy_timeout=5000; SELECT seq, kind, body_json FROM blocks ORDER BY seq;" \
+    > "$SUITE_TMP/$leg.dump"
   echo "$state"
 }
 

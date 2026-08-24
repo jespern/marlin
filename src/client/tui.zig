@@ -207,6 +207,7 @@ const SavedSessionView = struct {
     editor: Editor,
     blocks: std.ArrayList(RenderBlock),
     delta: std.ArrayList(u8),
+    reasoning_delta: std.ArrayList(u8),
     state: proto.SessionState,
     model: std.ArrayList(u8),
     effort: proto.ReasoningEffort,
@@ -234,6 +235,7 @@ const SavedSessionView = struct {
         for (self.blocks.items) |*rb| rb.deinit(gpa);
         self.blocks.deinit(gpa);
         self.delta.deinit(gpa);
+        self.reasoning_delta.deinit(gpa);
         self.model.deinit(gpa);
         self.cwd.deinit(gpa);
     }
@@ -252,6 +254,7 @@ const App = struct {
     term_cols: usize = 80,
     blocks: std.ArrayList(RenderBlock) = .empty,
     delta: std.ArrayList(u8) = .empty,
+    reasoning_delta: std.ArrayList(u8) = .empty,
     state: proto.SessionState = .idle,
     model: std.ArrayList(u8) = .empty,
     effort: proto.ReasoningEffort = .auto,
@@ -356,6 +359,7 @@ const App = struct {
         for (self.blocks.items) |*rb| rb.deinit(self.gpa);
         self.blocks.deinit(self.gpa);
         self.delta.deinit(self.gpa);
+        self.reasoning_delta.deinit(self.gpa);
         self.model.deinit(self.gpa);
         self.cwd.deinit(self.gpa);
         self.home.deinit(self.gpa);
@@ -410,6 +414,7 @@ const App = struct {
         self.editor = Editor.init(self.gpa);
         self.blocks = .empty;
         self.delta = .empty;
+        self.reasoning_delta = .empty;
         self.state = .idle;
         self.model = .empty;
         self.effort = .auto;
@@ -440,6 +445,7 @@ const App = struct {
             .editor = self.editor,
             .blocks = self.blocks,
             .delta = self.delta,
+            .reasoning_delta = self.reasoning_delta,
             .state = self.state,
             .model = self.model,
             .effort = self.effort,
@@ -470,6 +476,7 @@ const App = struct {
         self.editor = saved.editor;
         self.blocks = saved.blocks;
         self.delta = saved.delta;
+        self.reasoning_delta = saved.reasoning_delta;
         self.state = saved.state;
         self.model = saved.model;
         self.effort = saved.effort;
@@ -708,6 +715,10 @@ const App = struct {
                 if (d.sid != self.sid) return;
                 self.delta.appendSlice(self.gpa, d.text) catch {};
             },
+            .reasoning_delta => |d| {
+                if (d.sid != self.sid) return;
+                self.reasoning_delta.appendSlice(self.gpa, d.text) catch {};
+            },
             .status => |s| {
                 if (s.sid != self.sid) {
                     if (self.saved_views.get(s.sid)) |saved| saved.state = s.state;
@@ -775,12 +786,17 @@ const App = struct {
             .assistant_msg => |a| {
                 // Finalized text replaces the streaming delta.
                 self.delta.clearRetainingCapacity();
+                self.reasoning_delta.clearRetainingCapacity();
                 self.pushDurableBlock(b, .assistant_msg, a.text, "", .ok);
             },
             .reasoning => |r| {
-                // The same progress text arrived first as ephemeral deltas.
-                // Replace that streaming copy with the durable block.
-                self.delta.clearRetainingCapacity();
+                // Reasoning and progress commentary use distinct live streams
+                // but the same durable card type. Clear whichever buffer this
+                // finalized block exactly replaces.
+                if (std.mem.eql(u8, self.reasoning_delta.items, r.text))
+                    self.reasoning_delta.clearRetainingCapacity()
+                else if (std.mem.eql(u8, self.delta.items, r.text))
+                    self.delta.clearRetainingCapacity();
                 self.pushDurableBlock(b, .reasoning, r.text, "", .ok);
             },
             .tool_call => |tc| self.pushDurableBlock(b, .tool_call, tc.args_json, tc.name, .ok),
@@ -2418,11 +2434,15 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         }
     }
 
-    // Streaming region: current delta text as an in-progress assistant msg.
+    // Streaming region: provider reasoning gets the same surfaced card style
+    // as durable progress notes; assistant content remains normal Markdown.
+    if (app.reasoning_delta.items.len > 0) {
+        try wrapReasoningCard(arena, &lines, app.reasoning_delta.items, w);
+    }
     if (app.delta.items.len > 0) {
         try blankLine(arena, &lines);
         try wrapMarkdown(arena, &lines, app.delta.items, w);
-    } else if (app.state == .running) {
+    } else if (app.reasoning_delta.items.len == 0 and app.state == .running) {
         try blankLine(arena, &lines);
         const head = try std.fmt.allocPrint(arena, "{s} ", .{
             spinner_frames[app.spinner_frame % spinner_frames.len],
@@ -4180,15 +4200,10 @@ pub fn run(
     app.setCwdStr(cwd_at_start);
     if (environ.get("HOME")) |home| app.setHomeStr(home);
     app.touchRecentSession(sid);
-    if (conn.network_filtering) {
-        app.setNotice("dnsblock ready — {d} rules from {d} feeds · /network status", .{
-            conn.network_rule_count,
-            conn.network_feed_count,
-        });
-    } else if (conn.network_configured) {
+    // Healthy filtering is visible in the status-bar segment already; only
+    // a misconfiguration (configured but failed to load) warrants a notice.
+    if (!conn.network_filtering and conn.network_configured) {
         app.setNotice("dnsblock configured but unavailable — feed load failed; networking is fail-open", .{});
-    } else {
-        app.setNotice("dnsblock off — add [network] blocklists or deny rules, then /reboot", .{});
     }
 
     // -- vaxis init --

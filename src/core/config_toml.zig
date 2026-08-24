@@ -50,6 +50,7 @@ pub const Document = struct {
     network_allow: ?[]const u8 = null,
     network_deny: ?[]const u8 = null,
     skill_directories: ?[]const []const u8 = null,
+    openrouter_sort: ??[]const u8 = null,
     exec_tools: []const ExecTool = &.{},
     mcp_servers: []const McpServer = &.{},
     hooks: Hooks = .{},
@@ -66,6 +67,7 @@ const Section = enum {
     network,
     hooks,
     skills,
+    openrouter,
     exec_tool,
     mcp,
 };
@@ -160,6 +162,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             .skills => if (std.mem.eql(u8, key, "directories")) {
                 doc.skill_directories = try stringArray(arena, value);
             },
+            .openrouter => if (std.mem.eql(u8, key, "sort")) {
+                doc.openrouter_sort = try optionalString(arena, value);
+            },
             .hooks => {
                 if (std.mem.eql(u8, key, "on_session_done")) doc.hooks.on_session_done = try optionalString(arena, value);
                 if (std.mem.eql(u8, key, "on_approval_needed")) doc.hooks.on_approval_needed = try optionalString(arena, value);
@@ -233,6 +238,7 @@ fn sectionFor(name: []const u8) Section {
         .{ "network", Section.network },
         .{ "hooks", Section.hooks },
         .{ "skills", Section.skills },
+        .{ "providers.openrouter", Section.openrouter },
     };
     inline for (entries) |entry| if (std.mem.eql(u8, name, entry[0])) return entry[1];
     return .unknown;
@@ -371,6 +377,8 @@ test "parse Marlin config surface" {
         \\on_turn_done = "/tmp/notify"
         \\[skills]
         \\directories = ["/tmp/skills"]
+        \\[providers.openrouter]
+        \\sort = "latency"
     );
     try std.testing.expectEqualStrings("local/qwen", doc.model_default.?);
     try std.testing.expectEqual(@as(usize, 2), doc.model_favorites.?.len);
@@ -380,6 +388,7 @@ test "parse Marlin config surface" {
     try std.testing.expect(!doc.exec_tools[0].mutating);
     try std.testing.expectEqualStrings("mcp-files", doc.mcp_servers[0].cmd[0]);
     try std.testing.expectEqualStrings("/tmp/notify", doc.hooks.on_turn_done.?);
+    try std.testing.expectEqualStrings("latency", doc.openrouter_sort.?.?);
 }
 
 test "known malformed values fail" {

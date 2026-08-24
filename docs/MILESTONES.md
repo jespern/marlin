@@ -27,7 +27,7 @@ marlin/
 │   │   │   ├── registry.zig   # spec: name, schema, parallel_safe, policy; dispatch
 │   │   │   ├── bash.zig       # subprocess, cancellation, (later: sandbox.zig)
 │   │   │   ├── files.zig      # read/write/edit (fuzzy string-replace)
-│   │   │   ├── search.zig     # grep (rg-or-internal), glob
+│   │   │   ├── search.zig     # grep (rg → system grep → native), glob
 │   │   │   ├── fetch.zig      # curl GET → text
 │   │   │   ├── exec_tool.zig  # config-declared executable tools
 │   │   │   └── mcp.zig        # MCP client, stdio transport, tool bridging
@@ -36,7 +36,7 @@ marlin/
 │   │   │   ├── openai_compat.zig
 │   │   │   ├── anthropic.zig
 │   │   │   ├── sse.zig        # SSE parser (shared)
-│   │   │   ├── http.zig       # libcurl wrapper, retry/backoff, cancellation
+│   │   │   ├── http.zig       # pooled libcurl wrapper, streaming, cancellation
 │   │   │   └── registry.zig   # model string → dialect+endpoint+key
 │   │   ├── hooks.zig          # event → script runner
 │   │   └── skills.zig         # index scan, frontmatter parse, skill tool

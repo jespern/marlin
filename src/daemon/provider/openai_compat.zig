@@ -23,6 +23,17 @@ pub const ToolSpec = struct {
     schema_json: []const u8,
 };
 
+pub const RequestOptions = struct {
+    /// OpenRouter sticky-routing/observability key. Omitted for generic
+    /// OpenAI-compatible endpoints so strict local servers remain compatible.
+    session_id: ?[]const u8 = null,
+    /// "throughput", "latency", "price", or null for router default.
+    provider_sort: ?[]const u8 = null,
+    /// Emit explicit per-content cache breakpoints for model families that
+    /// require them (Claude/Gemini/Qwen through OpenRouter).
+    explicit_cache: bool = false,
+};
+
 /// Build the request body JSON. Caller frees.
 pub fn buildRequestBody(
     gpa: std.mem.Allocator,
@@ -31,6 +42,7 @@ pub fn buildRequestBody(
     effort: Effort,
     messages: []const provider.Message,
     tools: []const ToolSpec,
+    opts: RequestOptions,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -47,6 +59,17 @@ pub fn buildRequestBody(
         try enc(value, .{}, ws);
         if (dialect == .openrouter) try ws.writeByte('}');
     }
+    if (dialect == .openrouter) {
+        if (opts.session_id) |session_id| {
+            try ws.writeAll(",\"session_id\":");
+            try enc(session_id, .{}, ws);
+        }
+        if (opts.provider_sort) |sort| {
+            try ws.writeAll(",\"provider\":{\"sort\":");
+            try enc(sort, .{}, ws);
+            try ws.writeByte('}');
+        }
+    }
     try ws.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     for (messages, 0..) |m, i| {
         if (i > 0) try ws.writeByte(',');
@@ -61,7 +84,13 @@ pub fn buildRequestBody(
         switch (m.payload) {
             .text => |t| {
                 try ws.writeAll(",\"content\":");
-                try enc(t, .{}, ws);
+                if (dialect == .openrouter and opts.explicit_cache and m.cache_breakpoint) {
+                    try ws.writeAll("[{\"type\":\"text\",\"text\":");
+                    try enc(t, .{}, ws);
+                    try ws.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}}]");
+                } else {
+                    try enc(t, .{}, ws);
+                }
             },
             .assistant_tool_calls => |calls| {
                 // content may be present alongside tool_calls
@@ -88,7 +117,18 @@ pub fn buildRequestBody(
                 try ws.writeAll(",\"tool_call_id\":");
                 try enc(tr.call_id, .{}, ws);
                 try ws.writeAll(",\"content\":");
-                try enc(tr.text, .{}, ws);
+                // OpenRouter's ChatToolMessage accepts the same text content
+                // items as user/system messages, so the final result in a
+                // completed batch can advance Claude/Qwen/Gemini's explicit
+                // cache prefix rather than only caching the initial system
+                // prompt.
+                if (dialect == .openrouter and opts.explicit_cache and m.cache_breakpoint) {
+                    try ws.writeAll("[{\"type\":\"text\",\"text\":");
+                    try enc(tr.text, .{}, ws);
+                    try ws.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}}]");
+                } else {
+                    try enc(tr.text, .{}, ws);
+                }
             },
         }
         try ws.writeAll("}");
@@ -107,6 +147,7 @@ pub fn buildRequestBody(
             try ws.writeAll("}}");
         }
         try ws.writeAll("]");
+        if (dialect == .openrouter) try ws.writeAll(",\"parallel_tool_calls\":true");
     }
     try ws.writeAll("}");
     return aw.toOwnedSlice();
@@ -123,6 +164,10 @@ pub const StreamAccum = struct {
     /// Reasoning text if the provider emits it (OpenRouter: `reasoning`).
     reasoning: std.ArrayList(u8) = .empty,
     calls: std.ArrayList(PartialCall) = .empty,
+    /// OpenRouter identifiers make a request directly inspectable through its
+    /// Activity/generation observability surfaces; kept only for live logs.
+    generation_id: std.ArrayList(u8) = .empty,
+    provider_name: std.ArrayList(u8) = .empty,
     finish_reason: ?FinishReason = null,
     usage: ?provider.Usage = null,
     saw_done: bool = false,
@@ -131,7 +176,12 @@ pub const StreamAccum = struct {
 
     /// Immediate delta sink for UI liveness; may be null in headless tests.
     on_delta: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    on_reasoning_delta: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     on_delta_ctx: ?*anyopaque = null,
+    text_forwarded: usize = 0,
+    reasoning_forwarded: usize = 0,
+
+    const forward_batch_bytes: usize = 48;
 
     pub const FinishReason = enum { stop, tool_calls, length, content_filter, other };
 
@@ -149,6 +199,8 @@ pub const StreamAccum = struct {
     pub fn deinit(self: *StreamAccum) void {
         self.text.deinit(self.gpa);
         self.reasoning.deinit(self.gpa);
+        self.generation_id.deinit(self.gpa);
+        self.provider_name.deinit(self.gpa);
         for (self.calls.items) |*pc| {
             pc.call_id.deinit(self.gpa);
             pc.name.deinit(self.gpa);
@@ -179,12 +231,30 @@ pub const StreamAccum = struct {
             else => return error.BadChunk,
         };
 
+        if (self.generation_id.items.len == 0) {
+            if (root.get("id")) |id| if (id == .string)
+                try self.generation_id.appendSlice(self.gpa, id.string);
+        }
+        if (self.provider_name.items.len == 0) {
+            if (root.get("provider")) |name| if (name == .string)
+                try self.provider_name.appendSlice(self.gpa, name.string);
+        }
+
         // usage: on the final chunk (or OpenRouter's usage-only tail chunk)
         if (root.get("usage")) |u| if (u == .object) {
             const tin = intField(u.object, "prompt_tokens") orelse 0;
             const tout = intField(u.object, "completion_tokens") orelse 0;
+            const cached = nestedIntField(u.object, "prompt_tokens_details", "cached_tokens") orelse 0;
+            const cache_write = nestedIntField(u.object, "prompt_tokens_details", "cache_write_tokens") orelse 0;
+            const reasoning_tokens = nestedIntField(u.object, "completion_tokens_details", "reasoning_tokens") orelse 0;
             if (tin != 0 or tout != 0)
-                self.usage = .{ .tokens_in = tin, .tokens_out = tout };
+                self.usage = .{
+                    .tokens_in = tin,
+                    .tokens_out = tout,
+                    .cached_tokens = cached,
+                    .cache_write_tokens = cache_write,
+                    .reasoning_tokens = reasoning_tokens,
+                };
         };
 
         const choices = root.get("choices") orelse return;
@@ -201,10 +271,11 @@ pub const StreamAccum = struct {
 
         if (delta.object.get("content")) |ct| if (ct == .string and ct.string.len > 0) {
             try self.text.appendSlice(self.gpa, ct.string);
-            if (self.on_delta) |cb| cb(self.on_delta_ctx, ct.string);
+            self.maybeForwardText();
         };
         if (delta.object.get("reasoning")) |rs| if (rs == .string and rs.string.len > 0) {
             try self.reasoning.appendSlice(self.gpa, rs.string);
+            self.maybeForwardReasoning();
         };
 
         if (delta.object.get("tool_calls")) |tcs| if (tcs == .array) {
@@ -232,6 +303,36 @@ pub const StreamAccum = struct {
         return &self.calls.items[self.calls.items.len - 1];
     }
 
+    /// Providers often stream one token per SSE event. Coalescing a small
+    /// batch prevents a complete TUI layout/render for every token while
+    /// preserving line-level liveness. The loop calls flushDeltas at EOF.
+    fn maybeForwardText(self: *StreamAccum) void {
+        const pending = self.text.items[self.text_forwarded..];
+        if (pending.len < forward_batch_bytes and std.mem.indexOfScalar(u8, pending, '\n') == null) return;
+        if (self.on_delta) |cb| cb(self.on_delta_ctx, pending);
+        self.text_forwarded = self.text.items.len;
+    }
+
+    fn maybeForwardReasoning(self: *StreamAccum) void {
+        const pending = self.reasoning.items[self.reasoning_forwarded..];
+        if (pending.len < forward_batch_bytes and std.mem.indexOfScalar(u8, pending, '\n') == null) return;
+        if (self.on_reasoning_delta) |cb| cb(self.on_delta_ctx, pending);
+        self.reasoning_forwarded = self.reasoning.items.len;
+    }
+
+    pub fn flushDeltas(self: *StreamAccum) void {
+        const text_pending = self.text.items[self.text_forwarded..];
+        if (text_pending.len > 0) {
+            if (self.on_delta) |cb| cb(self.on_delta_ctx, text_pending);
+            self.text_forwarded = self.text.items.len;
+        }
+        const reasoning_pending = self.reasoning.items[self.reasoning_forwarded..];
+        if (reasoning_pending.len > 0) {
+            if (self.on_reasoning_delta) |cb| cb(self.on_delta_ctx, reasoning_pending);
+            self.reasoning_forwarded = self.reasoning.items.len;
+        }
+    }
+
     fn parseFinish(s: []const u8) FinishReason {
         if (std.mem.eql(u8, s, "stop")) return .stop;
         if (std.mem.eql(u8, s, "tool_calls")) return .tool_calls;
@@ -246,6 +347,12 @@ pub const StreamAccum = struct {
             .integer => |i| if (i >= 0) @intCast(i) else null,
             else => null,
         };
+    }
+
+    fn nestedIntField(o: std.json.ObjectMap, object_key: []const u8, key: []const u8) ?u64 {
+        const nested = o.get(object_key) orelse return null;
+        if (nested != .object) return null;
+        return intField(nested.object, key);
     }
 };
 
@@ -263,13 +370,18 @@ test "text deltas accumulate; usage and finish captured" {
         ,
         \\{"choices":[{"index":0,"delta":{"content":"lo"}}]}
         ,
-        \\{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}
+        \\{"id":"gen-test","provider":"OpenAI","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":3}}}
         ,
         "[DONE]",
     });
     try std.testing.expectEqualStrings("Hello", acc.text.items);
     try std.testing.expectEqual(StreamAccum.FinishReason.stop, acc.finish_reason.?);
     try std.testing.expectEqual(@as(u64, 10), acc.usage.?.tokens_in);
+    try std.testing.expectEqual(@as(u64, 8), acc.usage.?.cached_tokens);
+    try std.testing.expectEqual(@as(u64, 1), acc.usage.?.cache_write_tokens);
+    try std.testing.expectEqual(@as(u64, 3), acc.usage.?.reasoning_tokens);
+    try std.testing.expectEqualStrings("gen-test", acc.generation_id.items);
+    try std.testing.expectEqualStrings("OpenAI", acc.provider_name.items);
     try std.testing.expect(acc.saw_done);
     try std.testing.expectEqual(@as(u32, 0), acc.parse_errors);
 }
@@ -309,6 +421,42 @@ test "garbage chunk counts a parse error but doesn't kill the stream" {
     try std.testing.expectEqualStrings("ok", acc.text.items);
 }
 
+test "short text and reasoning deltas flush as separate streams" {
+    const Capture = struct {
+        text: [64]u8 = undefined,
+        text_len: usize = 0,
+        reasoning: [64]u8 = undefined,
+        reasoning_len: usize = 0,
+
+        fn onText(ctx: ?*anyopaque, bytes: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(self.text[self.text_len .. self.text_len + bytes.len], bytes);
+            self.text_len += bytes.len;
+        }
+
+        fn onReasoning(ctx: ?*anyopaque, bytes: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(self.reasoning[self.reasoning_len .. self.reasoning_len + bytes.len], bytes);
+            self.reasoning_len += bytes.len;
+        }
+    };
+
+    var capture = Capture{};
+    var acc = StreamAccum.init(std.testing.allocator);
+    defer acc.deinit();
+    acc.on_delta = Capture.onText;
+    acc.on_reasoning_delta = Capture.onReasoning;
+    acc.on_delta_ctx = &capture;
+    feedEvents(&acc, &.{
+        \\{"choices":[{"delta":{"reasoning":"think","content":"answer"}}]}
+    });
+    try std.testing.expectEqual(@as(usize, 0), capture.text_len);
+    try std.testing.expectEqual(@as(usize, 0), capture.reasoning_len);
+    acc.flushDeltas();
+    try std.testing.expectEqualStrings("answer", capture.text[0..capture.text_len]);
+    try std.testing.expectEqualStrings("think", capture.reasoning[0..capture.reasoning_len]);
+}
+
 test "request body builds valid json" {
     const gpa = std.testing.allocator;
     const msgs = [_]provider.Message{
@@ -318,20 +466,47 @@ test "request body builds valid json" {
     const tools = [_]ToolSpec{
         .{ .name = "bash", .description = "run a command", .schema_json = "{\"type\":\"object\"}" },
     };
-    const body = try buildRequestBody(gpa, "openai/gpt-4o", .openrouter, .high, &msgs, &tools);
+    const body = try buildRequestBody(gpa, "openai/gpt-4o", .openrouter, .high, &msgs, &tools, .{
+        .session_id = "marlin-abc",
+        .provider_sort = "throughput",
+    });
     defer gpa.free(body);
     // Must be valid JSON with the right top-level fields.
     const ok = std.json.validate(gpa, body) catch false;
     try std.testing.expect(ok);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parallel_tool_calls\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"high\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"session_id\":\"marlin-abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"provider\":{\"sort\":\"throughput\"}") != null);
 
-    const auto_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .auto, &msgs, &.{});
+    const auto_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .auto, &msgs, &.{}, .{
+        .session_id = "must-not-leak",
+        .provider_sort = "throughput",
+    });
     defer gpa.free(auto_body);
     try std.testing.expect(std.mem.indexOf(u8, auto_body, "reasoning_effort") == null);
+    try std.testing.expect(std.mem.indexOf(u8, auto_body, "session_id") == null);
+    try std.testing.expect(std.mem.indexOf(u8, auto_body, "provider\"") == null);
 
-    const local_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .low, &msgs, &.{});
+    const local_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .low, &msgs, &.{}, .{});
     defer gpa.free(local_body);
     try std.testing.expect(std.mem.indexOf(u8, local_body, "\"reasoning_effort\":\"low\"") != null);
+
+    var cached_msgs = msgs;
+    cached_msgs[0].cache_breakpoint = true;
+    const cached_body = try buildRequestBody(gpa, "anthropic/claude", .openrouter, .auto, &cached_msgs, &.{}, .{ .explicit_cache = true });
+    defer gpa.free(cached_body);
+    try std.testing.expect(std.mem.indexOf(u8, cached_body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+
+    const cached_tool_msgs = [_]provider.Message{
+        .{ .role = .assistant, .payload = .{ .assistant_tool_calls = .{ .text = "", .calls = &.{
+            .{ .call_id = "call-1", .name = "grep", .args_json = "{}" },
+        } } } },
+        .{ .role = .tool, .payload = .{ .tool_result = .{ .call_id = "call-1", .text = "result" } }, .cache_breakpoint = true },
+    };
+    const cached_tool_body = try buildRequestBody(gpa, "anthropic/claude", .openrouter, .auto, &cached_tool_msgs, &.{}, .{ .explicit_cache = true });
+    defer gpa.free(cached_tool_body);
+    try std.testing.expect(std.mem.indexOf(u8, cached_tool_body, "\"role\":\"tool\",\"tool_call_id\":\"call-1\",\"content\":[{\"type\":\"text\",\"text\":\"result\",\"cache_control\":{\"type\":\"ephemeral\"}}]") != null);
 }

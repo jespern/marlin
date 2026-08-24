@@ -135,7 +135,7 @@
 // raw JSON before parsing and send them back unquoted via raw templates.
 const bigints = raw => raw.replace(/"(sid|parent_sid|session_id)":(\d{12,})/g, '"$1":"$2"');
 const $ = s => document.querySelector(s);
-let sid = null, cur = null, es = null, lastSeq = 0, deltaEl = null, deltaText = '', approvalId = null;
+let sid = null, cur = null, es = null, lastSeq = 0, deltaEl = null, deltaText = '', reasoningEl = null, reasoningText = '', approvalId = null;
 // Set on each session open; replayed history stays collapsed while blocks
 // stamped after this moment count as live (block ts is ms epoch).
 let openedAt = 0;
@@ -245,6 +245,11 @@ function clearDelta() {
   deltaText = '';
 }
 
+function clearReasoning() {
+  if (reasoningEl) { reasoningEl.remove(); reasoningEl = null; }
+  reasoningText = '';
+}
+
 function toolPreview(name, argsJson) {
   try {
     const a = JSON.parse(argsJson);
@@ -266,10 +271,12 @@ function addBlock(b) {
   if (kind === 'user_msg') node = el('div', 'block user', v.text);
   else if (kind === 'assistant_msg') {
     clearDelta();
+    clearReasoning();
     node = el('div', 'block md');
     node.innerHTML = renderMd(v.text);
   } else if (kind === 'reasoning') {
-    clearDelta();
+    if (reasoningText === v.text) clearReasoning();
+    else if (deltaText === v.text) clearDelta();
     node = el('div', 'block reasoning md');
     node.innerHTML = renderMd(v.text);
   } else if (kind === 'tool_call') {
@@ -325,6 +332,11 @@ function handle(m) {
     if (!deltaEl) { deltaEl = el('div', 'block md'); $('#transcript').appendChild(deltaEl); }
     deltaText += m.delta.text;
     deltaEl.innerHTML = renderMd(deltaText);
+  } else if (m.reasoning_delta) {
+    if (m.reasoning_delta.sid !== sid) return;
+    if (!reasoningEl) { reasoningEl = el('div', 'block reasoning md'); $('#transcript').appendChild(reasoningEl); }
+    reasoningText += m.reasoning_delta.text;
+    reasoningEl.innerHTML = renderMd(reasoningText);
     scrollBottom();
   } else if (m.status) {
     if (m.status.sid !== sid) return;
@@ -366,6 +378,7 @@ function open(s) {
   openedAt = Date.now();
   approvalId = null;
   clearDelta();
+  clearReasoning();
   $('#transcript').innerHTML = '';
   $('#approval').classList.remove('show');
   $('#status .model').textContent = s.model || '';

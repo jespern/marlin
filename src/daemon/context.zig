@@ -50,12 +50,17 @@ pub const system_prompt_base =
     \\
     \\TOOLS
     \\- Prefer the structured tools over shell equivalents: read_file over cat,
-    \\  the grep tool (ripgrep-backed) over shell grep, glob over find, and
-    \\  edit/write_file over sed or heredocs. They are faster, render better
-    \\  for the user, and reads never wait on approval.
+    \\  the grep tool (ripgrep-backed) over shell grep, glob over find, fetch
+    \\  over curl or wget for ordinary HTTP requests, and edit/write_file over
+    \\  sed or heredocs. They are faster, render better for the user, and reads
+    \\  never wait on approval.
     \\- When a shell search is genuinely needed, use `rg` (ripgrep), never
     \\  bare grep or find — it is dramatically faster on repositories and
     \\  respects .gitignore. Fall back to grep only where rg is unavailable.
+    \\- When processing JSON in the shell, use `jq` rather than ad-hoc
+    \\  grep/sed/awk pipelines. It preserves the data's structure and makes
+    \\  filtering, validation, and reshaping explicit. Fall back only where
+    \\  jq is unavailable.
     \\- Reserve bash for what it is uniquely good at: builds, tests, git, and
     \\  running programs.
     \\- Read a file before editing it; after a change, re-run a focused check.
@@ -192,11 +197,7 @@ pub fn assemble(
         try sys.appendSlice(arena, "\n\nPROJECT INSTRUCTIONS (from the repository; follow unless the user overrides)\n");
         try sys.appendSlice(arena, opts.project_instructions);
     }
-    if (opts.environment.len > 0) {
-        try sys.append(arena, '\n');
-        try sys.appendSlice(arena, opts.environment);
-    }
-    try msgs.append(arena, .{ .role = .system, .payload = .{ .text = sys.items } });
+    try msgs.append(arena, .{ .role = .system, .payload = .{ .text = sys.items }, .cache_breakpoint = true });
 
     // Pass 1: collect compaction coverage. Ranges may nest (a later
     // compaction covers an earlier compaction block itself); a block is
@@ -226,11 +227,30 @@ pub fn assemble(
         }
     }
 
+    // Put volatile workspace state as late as possible: immediately before
+    // the newest user/steer input. Date and git dirtiness therefore cannot
+    // invalidate the stable system + prior-conversation cache prefix, while
+    // every provider round in this turn still sees the same environment.
+    var environment_before_seq: u64 = 0;
+    if (opts.environment.len > 0) {
+        for (blocks) |b| {
+            if (b.seq <= covered_max) continue;
+            switch (b.body) {
+                .user_msg, .steer => environment_before_seq = b.seq,
+                else => {},
+            }
+        }
+    }
+
     // Pass 2: map non-covered, non-compaction blocks to messages.
     var i: usize = 0;
     while (i < blocks.len) : (i += 1) {
         const b = blocks[i];
         if (b.seq <= covered_max) continue; // inside a summarized range
+        if (b.seq == environment_before_seq) {
+            if (msgs.items.len > 0) msgs.items[msgs.items.len - 1].cache_breakpoint = true;
+            try msgs.append(arena, .{ .role = .system, .payload = .{ .text = opts.environment } });
+        }
         switch (b.body) {
             .user_msg => |u| try msgs.append(arena, .{ .role = .user, .payload = .{ .text = u.text } }),
             .steer => |s| try msgs.append(arena, .{ .role = .user, .payload = .{ .text = s.text } }),
@@ -252,17 +272,46 @@ pub fn assemble(
                 try msgs.append(arena, .{ .role = .assistant, .payload = .{
                     .assistant_tool_calls = .{ .text = "", .calls = calls.items },
                 } });
-                // Then their results (interleaved tool_result blocks).
-                while (j < blocks.len) : (j += 1) {
+                // Then their results. Approval/audit blocks are durable UI
+                // evidence but not provider messages, so they must not split
+                // an assistant tool batch from its results.
+                const replied = try arena.alloc(bool, calls.items.len);
+                @memset(replied, false);
+                var results_seen: usize = 0;
+                results: while (j < blocks.len and results_seen < calls.items.len) : (j += 1) {
                     switch (blocks[j].body) {
-                        .tool_result => |tr| try msgs.append(arena, .{ .role = .tool, .payload = .{
-                            .tool_result = .{
-                                .call_id = tr.call_id,
-                                .text = pruneBody(blocks[j].seq, tr.inline_body, opts),
-                            },
-                        } }),
-                        else => break,
+                        .tool_result => |tr| {
+                            try msgs.append(arena, .{ .role = .tool, .payload = .{
+                                .tool_result = .{
+                                    .call_id = tr.call_id,
+                                    .text = pruneBody(blocks[j].seq, tr.inline_body, opts),
+                                },
+                            } });
+                            results_seen += 1;
+                            for (calls.items, 0..) |call, ci| {
+                                if (!replied[ci] and std.mem.eql(u8, call.call_id, tr.call_id)) {
+                                    replied[ci] = true;
+                                    break;
+                                }
+                            }
+                        },
+                        .reasoning, .approval, .system_note => {},
+                        else => break :results,
                     }
+                }
+                // A turn that died between dispatch and result leaves a
+                // dangling call in the durable log. Providers reject an
+                // assistant tool call with no tool reply, which would wedge
+                // the session on every future turn — repair at assembly
+                // with a synthetic result.
+                for (calls.items, replied) |call, got| {
+                    if (got) continue;
+                    try msgs.append(arena, .{ .role = .tool, .payload = .{
+                        .tool_result = .{
+                            .call_id = call.call_id,
+                            .text = "[tool call did not complete: the turn ended before a result was recorded]",
+                        },
+                    } });
                 }
                 i = j - 1;
             },
@@ -279,6 +328,10 @@ pub fn assemble(
             .compaction => {}, // handled above
         }
     }
+    // A completed tool batch is a profitable breakpoint for the next model
+    // round; unlike a bare user prompt, it is known to have a follow-up.
+    if (msgs.items.len > 0 and msgs.items[msgs.items.len - 1].role == .tool)
+        msgs.items[msgs.items.len - 1].cache_breakpoint = true;
     return msgs.toOwnedSlice(arena);
 }
 
@@ -549,6 +602,50 @@ test "assemble: user → tool round trip shape" {
     try std.testing.expectEqual(provider.Role.tool, msgs[3].role);
 }
 
+test "assemble: batched calls survive interleaved audit blocks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const blocks = [_]block.Block{
+        tb(1, .{ .user_msg = .{ .text = "inspect both" } }),
+        tb(2, .{ .tool_call = .{ .call_id = "c1", .name = "read_file", .args_json = "{}" } }),
+        tb(3, .{ .tool_call = .{ .call_id = "c2", .name = "grep", .args_json = "{}" } }),
+        tb(4, .{ .approval = .{ .approval_id = "a1", .call_id = "c1", .decision = .granted, .decided_by = null } }),
+        tb(5, .{ .tool_result = .{ .call_id = "c1", .status = .ok, .inline_body = "one", .full_body_ref = null } }),
+        tb(6, .{ .tool_result = .{ .call_id = "c2", .status = .ok, .inline_body = "two", .full_body_ref = null } }),
+        tb(7, .{ .assistant_msg = .{ .text = "done" } }),
+    };
+    const msgs = try assemble(arena, &blocks, .{});
+    try std.testing.expectEqual(@as(usize, 6), msgs.len);
+    try std.testing.expectEqual(@as(usize, 2), msgs[2].payload.assistant_tool_calls.calls.len);
+    try std.testing.expectEqualStrings("c1", msgs[3].payload.tool_result.call_id);
+    try std.testing.expectEqualStrings("c2", msgs[4].payload.tool_result.call_id);
+}
+
+test "assemble: dangling tool call gets a synthetic result" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A turn that died between tool dispatch and result (observed live:
+    // provider then 400s with "No tool output found for function call …"
+    // on every subsequent turn).
+    const blocks = [_]block.Block{
+        tb(1, .{ .user_msg = .{ .text = "hi" } }),
+        tb(2, .{ .tool_call = .{ .call_id = "c1", .name = "edit", .args_json = "{}" } }),
+        tb(3, .{ .system_note = .{ .text = "turn failed: provider stream error" } }),
+        tb(4, .{ .user_msg = .{ .text = "try again" } }),
+    };
+    const msgs = try assemble(arena, &blocks, .{});
+    // system, user, assistant(calls), synthetic tool reply, user
+    try std.testing.expectEqual(@as(usize, 5), msgs.len);
+    try std.testing.expectEqual(provider.Role.tool, msgs[3].role);
+    try std.testing.expectEqualStrings("c1", msgs[3].payload.tool_result.call_id);
+    try std.testing.expect(std.mem.indexOf(u8, msgs[3].payload.tool_result.text, "did not complete") != null);
+    try std.testing.expectEqual(provider.Role.user, msgs[4].role);
+}
+
 test "assemble: system prompt carries instructions, environment, and suffix" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -565,10 +662,16 @@ test "assemble: system prompt carries instructions, environment, and suffix" {
     try std.testing.expect(std.mem.indexOf(u8, sys, "SKILLS") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "PROJECT INSTRUCTIONS") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "never bare zig test") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sys, "Working directory: /work/api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "Working directory: /work/api") == null);
+    try std.testing.expectEqual(provider.Role.system, msgs[1].role);
+    try std.testing.expect(std.mem.indexOf(u8, msgs[1].payload.text, "Working directory: /work/api") != null);
+    try std.testing.expect(msgs[0].cache_breakpoint);
+    try std.testing.expect(!msgs[1].cache_breakpoint);
     // The base prompt must reference the regimes the environment reports and
     // steer shell searches to ripgrep.
     try std.testing.expect(std.mem.indexOf(u8, sys, "rg` (ripgrep)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "use `jq`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "fetch\n  over curl or wget") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "SANDBOX AND PERMISSIONS") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "DNS blocklist") != null);
 
@@ -576,6 +679,24 @@ test "assemble: system prompt carries instructions, environment, and suffix" {
     const bare = try assemble(arena, &blocks, .{});
     try std.testing.expect(std.mem.indexOf(u8, bare[0].payload.text, "PROJECT INSTRUCTIONS") == null);
     try std.testing.expect(std.mem.indexOf(u8, bare[0].payload.text, "ENVIRONMENT\n-") == null);
+}
+
+test "assemble: volatile environment follows stable history" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocks = [_]block.Block{
+        tb(1, .{ .user_msg = .{ .text = "old question" } }),
+        tb(2, .{ .assistant_msg = .{ .text = "old answer" } }),
+        tb(3, .{ .user_msg = .{ .text = "new question" } }),
+    };
+    const msgs = try assemble(arena, &blocks, .{ .environment = "ENVIRONMENT volatile" });
+    try std.testing.expectEqual(@as(usize, 5), msgs.len);
+    try std.testing.expectEqualStrings("old answer", msgs[2].payload.text);
+    try std.testing.expect(msgs[2].cache_breakpoint);
+    try std.testing.expectEqual(provider.Role.system, msgs[3].role);
+    try std.testing.expectEqualStrings("ENVIRONMENT volatile", msgs[3].payload.text);
+    try std.testing.expectEqualStrings("new question", msgs[4].payload.text);
 }
 
 test "assemble: compaction replaces covered range, summary emitted first" {

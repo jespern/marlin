@@ -47,9 +47,9 @@ replay test asserting the semantic content (text, calls, usage). When a
 provider changes their stream format: re-record, watch what breaks, fix, keep
 BOTH fixtures (old format + new) — providers roll back too.
 
-Wanted-but-not-yet-recorded: mid-stream disconnect, 429 with Retry-After,
-reasoning deltas (o-series / Claude via OpenRouter), multiple parallel tool
-calls in one response.
+Wanted-but-not-yet-recorded: mid-stream disconnect, 429 with Retry-After, and
+real reasoning deltas (o-series / Claude via OpenRouter). Parallel tool calls
+are covered synthetically and by the full-binary e2e batch scenario.
 
 ## Layer 3 — e2e scenarios
 
@@ -80,7 +80,8 @@ it's ~200 lines on purpose.
 
 Current coverage: basic completion, tool round-trip (fragmented args),
 --continue across invocations, provider 500 → system_note + exit 1, oversized
-tool output → blob + inline elision.
+tool output → blob + inline elision, and concurrent safe tool batches with
+provider-order transcript reconstruction.
 
 ## Layer 4 — live smoke
 

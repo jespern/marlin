@@ -99,6 +99,7 @@ pub const DaemonMsg = union(enum) {
     session_list_result: struct { sessions: []const SessionInfo },
     blk: struct { sid: u64, b: block.Block },
     delta: struct { sid: u64, turn_id: u64, text: []const u8 },
+    reasoning_delta: struct { sid: u64, turn_id: u64, text: []const u8 },
     status: struct { sid: u64, state: SessionState },
     approval_request: struct {
         sid: u64,

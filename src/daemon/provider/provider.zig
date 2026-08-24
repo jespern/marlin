@@ -22,6 +22,9 @@ pub const ToolCall = struct {
 pub const Message = struct {
     role: Role,
     payload: Payload,
+    /// OpenRouter explicit provider-cache breakpoint. Ignored by generic
+    /// OpenAI-compatible endpoints and models with implicit caching.
+    cache_breakpoint: bool = false,
 
     pub const Payload = union(enum) {
         /// Plain text content (system/user/assistant text messages).
@@ -42,6 +45,9 @@ pub const Message = struct {
 pub const Usage = struct {
     tokens_in: u64,
     tokens_out: u64,
+    cached_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
+    reasoning_tokens: u64 = 0,
 };
 
 test {

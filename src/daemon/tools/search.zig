@@ -1,5 +1,5 @@
-//! Search tools: grep (ripgrep subprocess when available, internal fallback)
-//! and glob (recursive walker + pattern match). Both parallel_safe.
+//! Search tools: grep (ripgrep, then system grep, then internal fallback) and
+//! glob (recursive walker + pattern match). Both parallel_safe.
 
 const std = @import("std");
 const Io = std.Io;
@@ -37,12 +37,20 @@ pub fn grep(
     const search_path = try files.resolvePath(gpa, args.path orelse ".", cwd);
     defer gpa.free(search_path);
 
-    // Prefer ripgrep when present.
+    // ripgrep is the ideal path. A platform grep is still orders of magnitude
+    // faster than interpreting a regex once per line, and is present on every
+    // currently supported Marlin target. Keep the native walker as the final
+    // dependency-free fallback for minimal environments.
     if (rgAvailable(gpa, io, child_environ)) return rgGrep(gpa, io, args, search_path, child_environ);
+    if (systemGrepAvailable(gpa, io, child_environ)) {
+        return systemGrep(gpa, io, args, search_path, child_environ) catch
+            internalGrep(gpa, io, args, search_path);
+    }
     return internalGrep(gpa, io, args, search_path);
 }
 
 var rg_checked = std.atomic.Value(u8).init(0); // 0=unknown 1=yes 2=no
+var system_grep_checked = std.atomic.Value(u8).init(0);
 
 fn rgAvailable(gpa: std.mem.Allocator, io: Io, child_environ: ?*const std.process.Environ.Map) bool {
     switch (rg_checked.load(.acquire)) {
@@ -63,6 +71,28 @@ fn rgAvailable(gpa: std.mem.Allocator, io: Io, child_environ: ?*const std.proces
     defer gpa.free(res.stderr);
     const ok = res.term == .exited and res.term.exited == 0;
     rg_checked.store(if (ok) 1 else 2, .release);
+    return ok;
+}
+
+fn systemGrepAvailable(gpa: std.mem.Allocator, io: Io, child_environ: ?*const std.process.Environ.Map) bool {
+    switch (system_grep_checked.load(.acquire)) {
+        1 => return true,
+        2 => return false,
+        else => {},
+    }
+    const res = std.process.run(gpa, io, .{
+        .argv = &.{ "grep", "--version" },
+        .environ_map = child_environ,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch {
+        system_grep_checked.store(2, .release);
+        return false;
+    };
+    defer gpa.free(res.stdout);
+    defer gpa.free(res.stderr);
+    const ok = res.term == .exited and res.term.exited == 0;
+    system_grep_checked.store(if (ok) 1 else 2, .release);
     return ok;
 }
 
@@ -106,6 +136,55 @@ fn rgGrep(
     return capLines(gpa, res.stdout, args.limit);
 }
 
+/// Fast fallback for supported Unix targets. GNU and BSD grep both support
+/// these options; explicit excludes approximate rg's ignore behavior without
+/// making the last-resort Zig walker pay the regex-engine cost.
+fn systemGrep(
+    gpa: std.mem.Allocator,
+    io: Io,
+    args: GrepArgs,
+    search_path: []const u8,
+    child_environ: ?*const std.process.Environ.Map,
+) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{
+        "grep",                "-R",                         "-n",                       "-I",                    "-E",
+        "--exclude-dir=.git",  "--exclude-dir=node_modules", "--exclude-dir=.zig-cache", "--exclude-dir=zig-out", "--exclude-dir=target",
+        "--exclude-dir=.venv", "--exclude-dir=__pycache__",  "--exclude-dir=.cache",     "--exclude=*.sock",
+    });
+
+    var include_arg: ?[]u8 = null;
+    defer if (include_arg) |value| gpa.free(value);
+    if (args.glob) |glob_pattern| {
+        include_arg = try std.fmt.allocPrint(gpa, "--include={s}", .{glob_pattern});
+        try argv.append(gpa, include_arg.?);
+    }
+    try argv.append(gpa, "--");
+    try argv.append(gpa, args.pattern);
+    try argv.append(gpa, search_path);
+
+    const res = try std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .environ_map = child_environ,
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(res.stdout);
+    defer gpa.free(res.stderr);
+
+    const code: i64 = switch (res.term) {
+        .exited => |exit_code| exit_code,
+        else => -1,
+    };
+    if (code == 1) return gpa.dupe(u8, "no matches");
+    // BSD grep reports traversal oddities (notably Unix sockets) as exit 2.
+    // Let the caller fall through to the native file-only walker rather than
+    // turning an irrelevant filesystem entry into a failed tool call.
+    if (code != 0) return error.SystemGrepFailed;
+    return capLines(gpa, res.stdout, args.limit);
+}
+
 /// Internal fallback: recursive walk + regex match (zig-regex engine).
 /// Feature-parity goal with the rg path: real regex, skip list for bulky
 /// dirs (rg gets this from .gitignore), binary sniff, same output format.
@@ -116,12 +195,23 @@ fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []c
     errdefer out.deinit(gpa);
     var matches: u64 = 0;
 
-    var compiled: ?regex_mod.Regex = regex_mod.Regex.compile(gpa, args.pattern) catch null;
+    // Literal search (including `foo|bar|baz`) is both the common agent case
+    // and dramatically faster than invoking zig-regex for every line.
+    var literal_set = try LiteralSet.parse(gpa, args.pattern);
+    defer if (literal_set) |*set| set.deinit(gpa);
+    var compiled: ?regex_mod.Regex = if (literal_set == null)
+        regex_mod.Regex.compile(gpa, args.pattern) catch null
+    else
+        null;
     defer if (compiled) |*r| r.deinit();
     if (compiled == null and looksLikeRegex(args.pattern)) {
         try out.appendSlice(gpa, "note: pattern did not compile as regex; matched as a LITERAL substring instead.\n");
     }
-    const matcher = Matcher{ .re = if (compiled) |*r| r else null, .literal = args.pattern };
+    const matcher = Matcher{
+        .re = if (compiled) |*r| r else null,
+        .literals = if (literal_set) |*set| set.items.items else null,
+        .literal_fallback = args.pattern,
+    };
 
     // Single file?
     const stat = Io.Dir.cwd().statFile(io, search_path, .{}) catch |e| {
@@ -158,9 +248,16 @@ fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []c
 /// Line matcher: compiled regex when available, literal substring otherwise.
 const Matcher = struct {
     re: ?*regex_mod.Regex,
-    literal: []const u8,
+    literals: ?[]const []const u8,
+    literal_fallback: []const u8,
 
     fn matches(self: Matcher, gpa: std.mem.Allocator, line: []const u8) bool {
+        if (self.literals) |alternatives| {
+            for (alternatives) |literal| {
+                if (std.mem.indexOf(u8, line, literal) != null) return true;
+            }
+            return false;
+        }
         if (self.re) |r| {
             const m = r.find(line) catch return false;
             if (m) |found| {
@@ -170,7 +267,62 @@ const Matcher = struct {
             }
             return false;
         }
-        return std.mem.indexOf(u8, line, self.literal) != null;
+        return std.mem.indexOf(u8, line, self.literal_fallback) != null;
+    }
+};
+
+/// Recognize the regex subset that dominates source searches: literals and
+/// top-level literal alternatives. Escaped punctuation is unescaped; regex
+/// classes/operators and semantic escapes fall through to the regex engine.
+const LiteralSet = struct {
+    items: std.ArrayList([]u8) = .empty,
+
+    fn parse(gpa: std.mem.Allocator, pattern: []const u8) !?LiteralSet {
+        var set = LiteralSet{};
+        errdefer set.deinit(gpa);
+        var current: std.ArrayList(u8) = .empty;
+        defer current.deinit(gpa);
+
+        var i: usize = 0;
+        while (i < pattern.len) : (i += 1) {
+            const byte = pattern[i];
+            if (byte == '|') {
+                try set.appendCurrent(gpa, &current);
+                continue;
+            }
+            if (byte == '\\') {
+                if (i + 1 >= pattern.len) {
+                    set.deinit(gpa);
+                    return null;
+                }
+                const escaped = pattern[i + 1];
+                if (std.mem.indexOfScalar(u8, ".[](){}^$|+*?\\", escaped) == null) {
+                    set.deinit(gpa);
+                    return null;
+                }
+                try current.append(gpa, escaped);
+                i += 1;
+                continue;
+            }
+            if (std.mem.indexOfScalar(u8, ".[](){}^$+*?", byte) != null) {
+                set.deinit(gpa);
+                return null;
+            }
+            try current.append(gpa, byte);
+        }
+        try set.appendCurrent(gpa, &current);
+        return set;
+    }
+
+    fn appendCurrent(self: *LiteralSet, gpa: std.mem.Allocator, current: *std.ArrayList(u8)) !void {
+        const owned = try current.toOwnedSlice(gpa);
+        errdefer gpa.free(owned);
+        try self.items.append(gpa, owned);
+    }
+
+    fn deinit(self: *LiteralSet, gpa: std.mem.Allocator) void {
+        for (self.items.items) |item| gpa.free(item);
+        self.items.deinit(gpa);
     }
 };
 
@@ -412,6 +564,10 @@ test "internal grep + glob on a temp tree" {
     const gr = try internalGrep(gpa, io, .{ .pattern = "hel+o nee.le" }, dir_path);
     defer gpa.free(gr);
     try std.testing.expect(std.mem.indexOf(u8, gr, "one.txt:1:") != null);
+
+    const alternatives = try internalGrep(gpa, io, .{ .pattern = "missing|needle|also-missing" }, dir_path);
+    defer gpa.free(alternatives);
+    try std.testing.expect(std.mem.indexOf(u8, alternatives, "one.txt:1:") != null);
 
     // Regex that matches nothing really is no matches (not a dialect artifact).
     const gn = try internalGrep(gpa, io, .{ .pattern = "^needle$" }, dir_path);

@@ -19,6 +19,9 @@ pub const Config = struct {
     model_compaction: ?[]const u8 = null, // null → use model_default
     /// `.auto` omits the request parameter and preserves the model default.
     effort_default: Effort = .auto,
+    /// OpenRouter otherwise prioritizes price. Throughput routing is the
+    /// interactive-agent default; null restores OpenRouter's own policy.
+    openrouter_sort: ?[]const u8 = "throughput",
 
     /// Model picker list (/model with no args). Curated, not fetched:
     /// OpenRouter exposes 300+ models and a dump of that is not a picker.
@@ -99,6 +102,9 @@ fn applyEnviron(c: *Config, environ: *const std.process.Environ.Map) void {
     if (environ.get("MARLIN_NETWORK_BLOCKLISTS")) |value| c.network_blocklists = value;
     if (environ.get("MARLIN_NETWORK_ALLOW")) |value| c.network_allow = value;
     if (environ.get("MARLIN_NETWORK_DENY")) |value| c.network_deny = value;
+    if (environ.get("MARLIN_OPENROUTER_SORT")) |value| {
+        c.openrouter_sort = if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "none")) null else value;
+    }
 }
 
 pub const Loaded = struct {
@@ -217,6 +223,7 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.network_allow) |value| cfg.network_allow = value;
     if (doc.network_deny) |value| cfg.network_deny = value;
     if (doc.skill_directories) |value| cfg.skill_directories = value;
+    if (doc.openrouter_sort) |value| cfg.openrouter_sort = value;
     cfg.exec_tools = doc.exec_tools;
     cfg.mcp_servers = doc.mcp_servers;
     cfg.hooks = doc.hooks;
@@ -226,6 +233,11 @@ fn validate(gpa: std.mem.Allocator, cfg: Config) !void {
     if (cfg.model_default.len == 0) return error.EmptyDefaultModel;
     if (cfg.output_headroom_tokens == 0 or cfg.inline_tool_cap_bytes == 0) return error.InvalidContextLimit;
     if (cfg.prune_protect_tokens <= cfg.prune_min_reclaim_tokens) return error.InvalidPruneThresholds;
+    if (cfg.openrouter_sort) |sort| {
+        if (!std.mem.eql(u8, sort, "throughput") and
+            !std.mem.eql(u8, sort, "latency") and
+            !std.mem.eql(u8, sort, "price")) return error.InvalidOpenRouterSort;
+    }
     for (cfg.exec_tools, 0..) |tool, i| {
         try validateToolName(tool.name);
         if (tool.cmd.len == 0) return error.ExecToolMissingCommand;
@@ -255,6 +267,7 @@ fn validateToolName(name: []const u8) !void {
 test "defaults are sane" {
     const c = defaults();
     try std.testing.expectEqual(Effort.auto, c.effort_default);
+    try std.testing.expectEqualStrings("throughput", c.openrouter_sort.?);
     try std.testing.expect(c.output_headroom_tokens > 0);
     try std.testing.expect(c.prune_protect_tokens > c.prune_min_reclaim_tokens);
     try std.testing.expect(c.permissions_enabled);

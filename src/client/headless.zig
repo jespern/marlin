@@ -456,7 +456,7 @@ pub fn compact(
 
 /// `marlin reboot [--build] [--force]` — coordinated re-exec onto a fresh
 /// binary (ARCHITECTURE.md §self-hosting reboot).
-///   1. --build: run `zig build` first; abort on failure.
+///   1. --build: build the daily-driver binary in ReleaseFast; abort on failure.
 ///   2. Sanity-exec the candidate binary (`--version`) — exec-into-broken
 ///      must be impossible.
 ///   3. Send reboot{force}; daemon quiesces, acks, exits.
@@ -490,11 +490,11 @@ pub fn reboot(
     // 1. Optional build, streamed to the terminal.
     if (do_build) {
         const res = std.process.run(gpa, io, .{
-            .argv = &.{ "zig", "build" },
+            .argv = &.{ "zig", "build", "-Doptimize=ReleaseFast" },
             .stdout_limit = .limited(4 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
         }) catch |e| {
-            try eprint(io, "marlin: zig build failed to spawn: {t}\n", .{e});
+            try eprint(io, "marlin: release build failed to spawn: {t}\n", .{e});
             return 1;
         };
         defer gpa.free(res.stdout);

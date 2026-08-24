@@ -43,6 +43,139 @@ pub const StreamRequest = struct {
     cancel: ?*std.atomic.Value(bool) = null,
 };
 
+/// Daemon-owned idle easy-handle pool. A handle belongs to exactly one turn
+/// thread while checked out; returning it preserves libcurl's live
+/// connections, DNS cache, and TLS session cache for the next turn.
+pub const Pool = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    idle: std.ArrayList(*c.CURL) = .empty,
+    max_idle: usize = 8,
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) Pool {
+        return .{ .gpa = gpa, .io = io };
+    }
+
+    pub fn deinit(self: *Pool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.idle.items) |easy| c.curl_easy_cleanup(easy);
+        self.idle.deinit(self.gpa);
+    }
+
+    pub fn acquire(self: *Pool) Error!Client {
+        self.mutex.lockUncancelable(self.io);
+        const reused = self.idle.pop();
+        self.mutex.unlock(self.io);
+        const easy = reused orelse c.curl_easy_init() orelse return error.CurlInit;
+        return .{ .easy = easy, .pool = self };
+    }
+
+    fn release(self: *Pool, easy: *c.CURL) void {
+        // Drop every request-owned pointer while retaining connection state.
+        c.curl_easy_reset(easy);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.idle.items.len >= self.max_idle) {
+            c.curl_easy_cleanup(easy);
+            return;
+        }
+        self.idle.append(self.gpa, easy) catch c.curl_easy_cleanup(easy);
+    }
+};
+
+/// One exclusively-owned easy handle. Repeated streamPost calls reuse live
+/// connections; deinit returns pooled handles instead of closing them.
+pub const Client = struct {
+    easy: *c.CURL,
+    pool: ?*Pool = null,
+
+    pub fn init() Error!Client {
+        return .{ .easy = c.curl_easy_init() orelse return error.CurlInit };
+    }
+
+    pub fn deinit(self: *Client) void {
+        if (self.pool) |pool| {
+            pool.release(self.easy);
+        } else {
+            c.curl_easy_cleanup(self.easy);
+        }
+        self.* = undefined;
+    }
+
+    pub fn streamPost(
+        self: *Client,
+        gpa: std.mem.Allocator,
+        req: StreamRequest,
+        ctx: anytype,
+        comptime on_chunk: fn (@TypeOf(ctx), []const u8) void,
+    ) Error!Response {
+        const easy = self.easy;
+        // Reset request options without discarding libcurl's connection, DNS,
+        // cookie, or TLS session caches.
+        c.curl_easy_reset(easy);
+
+        var headers: ?*c.curl_slist = null;
+        defer if (headers) |h| c.curl_slist_free_all(h);
+        headers = c.curl_slist_append(headers, "Content-Type: application/json");
+        headers = c.curl_slist_append(headers, "Accept: text/event-stream");
+
+        var auth_buf: [4096]u8 = undefined;
+        if (req.bearer) |tok| {
+            const line = std.fmt.bufPrintZ(&auth_buf, "Authorization: Bearer {s}", .{tok}) catch
+                return error.OutOfMemory;
+            headers = c.curl_slist_append(headers, line.ptr);
+        }
+        var hdr_z: std.ArrayList(u8) = .empty;
+        defer hdr_z.deinit(gpa);
+        for (req.extra_headers) |h| {
+            hdr_z.clearRetainingCapacity();
+            try hdr_z.appendSlice(gpa, h);
+            try hdr_z.append(gpa, 0);
+            headers = c.curl_slist_append(headers, @ptrCast(hdr_z.items.ptr));
+        }
+
+        var cb = Callback(@TypeOf(ctx)){ .gpa = gpa, .ctx = ctx, .cancel = req.cancel };
+
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_URL, req.url.ptr);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_HTTPHEADER, headers);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_POST, @as(c_long, 1));
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_POSTFIELDS, req.body_json.ptr);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_POSTFIELDSIZE, @as(c_long, @intCast(req.body_json.len)));
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_HEADERFUNCTION, Callback(@TypeOf(ctx)).header);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_HEADERDATA, &cb);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEFUNCTION, Callback(@TypeOf(ctx)).write(on_chunk));
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEDATA, &cb);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_CONNECTTIMEOUT_MS, req.connect_timeout_ms);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_LOW_SPEED_LIMIT, @as(c_long, 1));
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_LOW_SPEED_TIME, @divTrunc(req.idle_timeout_ms, 1000));
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_NOPROGRESS, @as(c_long, 0));
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFOFUNCTION, Callback(@TypeOf(ctx)).progress);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFODATA, &cb);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_ACCEPT_ENCODING, "");
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_HTTP_VERSION, c.CURL_HTTP_VERSION_2TLS);
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_TCP_KEEPALIVE, @as(c_long, 1));
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_NOSIGNAL, @as(c_long, 1));
+        _ = c.curl_easy_setopt(easy, c.CURLOPT_USERAGENT, "marlin/0.0");
+
+        const code = c.curl_easy_perform(easy);
+
+        var status: c_long = 0;
+        _ = c.curl_easy_getinfo(easy, c.CURLINFO_RESPONSE_CODE, &status);
+
+        if (code == c.CURLE_ABORTED_BY_CALLBACK) return error.Cancelled;
+        if (code != c.CURLE_OK and status < 400) return error.CurlPerform;
+
+        if (status >= 400) {
+            return .{ .status = status, .error_body = try cb.err_body.toOwnedSlice(gpa) };
+        }
+        cb.err_body.deinit(gpa);
+        return .{ .status = status, .error_body = null };
+    }
+};
+
 /// One-time global init (call from main once; not thread-safe by contract).
 pub fn globalInit() void {
     _ = c.curl_global_init(c.CURL_GLOBAL_DEFAULT);
@@ -60,60 +193,9 @@ pub fn streamPost(
     ctx: anytype,
     comptime on_chunk: fn (@TypeOf(ctx), []const u8) void,
 ) Error!Response {
-    const easy = c.curl_easy_init() orelse return error.CurlInit;
-    defer c.curl_easy_cleanup(easy);
-
-    var headers: ?*c.curl_slist = null;
-    defer if (headers) |h| c.curl_slist_free_all(h);
-    headers = c.curl_slist_append(headers, "Content-Type: application/json");
-    headers = c.curl_slist_append(headers, "Accept: text/event-stream");
-
-    var auth_buf: [4096]u8 = undefined;
-    if (req.bearer) |tok| {
-        const line = std.fmt.bufPrintZ(&auth_buf, "Authorization: Bearer {s}", .{tok}) catch
-            return error.OutOfMemory;
-        headers = c.curl_slist_append(headers, line.ptr);
-    }
-    var hdr_z: std.ArrayList(u8) = .empty;
-    defer hdr_z.deinit(gpa);
-    for (req.extra_headers) |h| {
-        hdr_z.clearRetainingCapacity();
-        try hdr_z.appendSlice(gpa, h);
-        try hdr_z.append(gpa, 0);
-        headers = c.curl_slist_append(headers, @ptrCast(hdr_z.items.ptr));
-    }
-
-    var cb = Callback(@TypeOf(ctx)){ .gpa = gpa, .ctx = ctx, .cancel = req.cancel };
-
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_URL, req.url.ptr);
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_HTTPHEADER, headers);
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_POST, @as(c_long, 1));
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_POSTFIELDS, req.body_json.ptr);
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_POSTFIELDSIZE, @as(c_long, @intCast(req.body_json.len)));
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEFUNCTION, Callback(@TypeOf(ctx)).write(on_chunk));
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEDATA, &cb);
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_CONNECTTIMEOUT_MS, req.connect_timeout_ms);
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_LOW_SPEED_LIMIT, @as(c_long, 1));
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_LOW_SPEED_TIME, @divTrunc(req.idle_timeout_ms, 1000));
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_NOPROGRESS, @as(c_long, 0));
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFOFUNCTION, Callback(@TypeOf(ctx)).progress);
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFODATA, &cb);
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
-    _ = c.curl_easy_setopt(easy, c.CURLOPT_USERAGENT, "marlin/0.0");
-
-    const code = c.curl_easy_perform(easy);
-
-    var status: c_long = 0;
-    _ = c.curl_easy_getinfo(easy, c.CURLINFO_RESPONSE_CODE, &status);
-
-    if (code == c.CURLE_ABORTED_BY_CALLBACK) return error.Cancelled;
-    if (code != c.CURLE_OK and status == 0) return error.CurlPerform;
-
-    if (status >= 400) {
-        return .{ .status = status, .error_body = try cb.err_body.toOwnedSlice(gpa) };
-    }
-    cb.err_body.deinit(gpa);
-    return .{ .status = status, .error_body = null };
+    var client = try Client.init();
+    defer client.deinit();
+    return client.streamPost(gpa, req, ctx, on_chunk);
 }
 
 pub const GetResult = struct {
@@ -279,15 +361,33 @@ fn Callback(comptime Ctx: type) type {
 
         const Self = @This();
 
+        fn header(ptr: [*c]u8, size: usize, nmemb: usize, userdata: ?*anyopaque) callconv(.c) usize {
+            const self: *Self = @ptrCast(@alignCast(userdata.?));
+            const bytes = ptr[0 .. size * nmemb];
+            if (!std.mem.startsWith(u8, bytes, "HTTP/")) return bytes.len;
+
+            // Handles both "HTTP/1.1 200" and "HTTP/2 200". Redirects and
+            // proxy handshakes may produce multiple status lines; the latest
+            // one describes the body that follows.
+            const first_space = std.mem.indexOfScalar(u8, bytes, ' ') orelse return bytes.len;
+            var status_at = first_space + 1;
+            while (status_at < bytes.len and bytes[status_at] == ' ') status_at += 1;
+            const rest = bytes[status_at..];
+            if (rest.len < 3) return bytes.len;
+            const status = std.fmt.parseInt(u16, rest[0..3], 10) catch return bytes.len;
+            self.status_checked = true;
+            self.is_error_status = status >= 400;
+            return bytes.len;
+        }
+
         fn write(comptime on_chunk: fn (Ctx, []const u8) void) fn ([*c]u8, usize, usize, ?*anyopaque) callconv(.c) usize {
             return struct {
                 fn go(ptr: [*c]u8, size: usize, nmemb: usize, userdata: ?*anyopaque) callconv(.c) usize {
                     const self: *Self = @ptrCast(@alignCast(userdata.?));
                     const bytes = ptr[0 .. size * nmemb];
-                    // We can't see the status line from the write cb directly;
-                    // error bodies are small and non-SSE, so buffer defensively:
-                    // heuristic: SSE chunks start streaming only on 200s, but
-                    // we ALSO keep a copy of early bytes in case status >= 400.
+                    // A malformed server that omits a status line is treated
+                    // conservatively; normal success streams never enter this
+                    // error-only buffer.
                     if (!self.status_checked or self.is_error_status) {
                         self.err_body.appendSlice(self.gpa, bytes) catch return 0;
                         if (self.err_body.items.len > 64 * 1024) return 0; // cap error body
@@ -308,13 +408,23 @@ fn Callback(comptime Ctx: type) type {
     };
 }
 
-// NOTE on the error-body heuristic above: for M0 we keep it simple — the
-// caller checks Response.status; when >=400 the SSE sink will have received
-// the error bytes too, which is harmless (no valid `data:` lines parse out
-// of a JSON error object). M1 refines this with a HEADERFUNCTION that flips
-// is_error_status as soon as the status line arrives.
-
 test "compiles and links against libcurl" {
     globalInit();
     defer globalDeinit();
+}
+
+test "pool returns an easy handle for reuse" {
+    globalInit();
+    defer globalDeinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var pool = Pool.init(std.testing.allocator, threaded.io());
+    defer pool.deinit();
+
+    var first = try pool.acquire();
+    const ptr = first.easy;
+    first.deinit();
+    var second = try pool.acquire();
+    defer second.deinit();
+    try std.testing.expectEqual(ptr, second.easy);
 }

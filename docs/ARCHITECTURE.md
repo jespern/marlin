@@ -106,7 +106,7 @@ Sequence:
 
 1. **Binary selection.** `/reboot` re-execs the path argv[0] resolved to at
    daemon start (you `zig build` beforehand; binary lives at a stable path).
-   `/reboot --build` runs `zig build` first, streams output into a
+   `/reboot --build` runs `zig build -Doptimize=ReleaseFast` first, streams output into a
    `system_note` block, and proceeds only on success. Either way the
    candidate is sanity-exec'd (`--version`) before committing —
    exec-into-broken-binary is the one unrecoverable failure (daemon gone,
@@ -116,9 +116,13 @@ Sequence:
    buffers are discardable; interrupted sessions get a `system_note`
    ("interrupted by reboot") and resume with `--continue`. Running
    background bash tasks are listed for confirmation (they get orphaned).
-3. **Daemon exit.** Persist, release flock, exit. No exec on the daemon
-   side — the client's autostart path (flock + pidfile, already spec'd)
-   brings up the new binary. One mechanism, not two.
+3. **Daemon exit.** Persist, stop accepting clients, unlink the public socket,
+   then ACK and exit. Removing the socket before the ACK makes the client-side
+   exec a clean handoff rather than a race with a dying listener. No exec on
+   the daemon side — the client's autostart path brings up the new binary.
+   Connection setup also retries transient EOF/reset errors during `hello`, so
+   it remains compatible with an older daemon that ACKs before releasing its
+   socket. One restart mechanism, not two.
 4. **Client re-exec.** Client writes a small lossy UI snapshot (focused
    session, split layout, input draft) to JSON, exec()s the new binary,
    which autostarts the new daemon, reattaches with from_seq replay, and
@@ -287,21 +291,23 @@ Per running turn, in its own thread:
 assemble context (see §6)
 loop:
     stream POST to provider (SSE)
-      → emit delta events as text arrives
+      → emit coalesced text/reasoning delta events as text arrives
       → collect tool_calls (may be several)
     if no tool_calls: finalize assistant_msg block; done
-    for each tool_call (serial today; parallel-safe groups are M6a-next):
-      approval gate (§7) — may block on client response w/ timeout
-      execute tool → tool_result block (cap inline, blob full)
+    persist the complete assistant tool_call batch
+    resolve approval gates (§7) — may block on client response
+    execute each maximal consecutive parallel_safe group concurrently;
+      serialize unsafe/mutating calls as ordering barriers
+    persist tool_results in original provider-call order
     check steer queue: if user typed mid-turn, inject steer block
       as a user-role message before next request   [zag's pattern]
     loop
 ```
 
-- **Parallel tool execution (M6a-next)**: tools already declare
-  `.parallel_safe`; the scheduler still executes serially. The widening step
-  will run consecutive safe calls concurrently, keep provider-call result
-  order, and serialize anything mutating (bash, write, edit).
+- **Parallel tool execution**: `.parallel_safe` is enforced by the scheduler.
+  Consecutive safe calls overlap; mutations and unknown tools remain ordering
+  barriers. Calls and results are each persisted as contiguous ordered groups,
+  matching the provider transcript even when completion order differs.
 - **Cancellation**: interrupt sets an atomic flag; the HTTP read loop and tool
   subprocess waits poll it. Subprocesses get SIGTERM → grace → SIGKILL. The
   half-finished turn is finalized as an interrupted `system_note` + whatever
@@ -327,6 +333,10 @@ provider/
 
 - OpenRouter is the default registry entry; `base_url` + `api_key_env` in
   config adds any OpenAI-compatible endpoint without code.
+- Every OpenRouter request carries the Marlin session's stable `session_id`.
+  OpenRouter therefore keeps a session on the same provider/cache and groups
+  its generations in Activity. `[providers.openrouter] sort` defaults to
+  `"throughput"` (`"latency"`, `"price"`, or `null` are supported).
 
 ### No single point of failure
 
@@ -376,12 +386,17 @@ for direct routes (or degrades to tokens-only) — don't let it lie.
   stored on the session (`session.meta` event carries it to clients). Token
   estimates for un-sent deltas use bytes/4 — good enough because true usage
   resyncs every turn. No tokenizers in the binary.
-- Anthropic dialect sets `cache_control` on the system prompt and on the last
-  stable message before the tail. OpenAI-compat relies on implicit prefix
-  caching, which our append-only discipline (§6) maximizes automatically.
+- OpenRouter requests set explicit `cache_control` breakpoints on the stable
+  system prompt, the last stable message before the live environment, and a
+  completed tool batch for Claude/Gemini/Qwen families. Models with automatic
+  caching use the same append-only prefix without extra parameters. Returned
+  cached/write/reasoning token counts and generation/provider ids are decoded
+  for diagnostics; OpenRouter remains the observability system of record.
 - HTTP: libcurl via C interop for v1 (TLS, HTTP/2, proxies, battle-tested SSE
-  chunking). `std.http.Client` can replace it later behind the same interface;
-  pragmatism beats purity while std matures.
+  chunking). Turn threads exclusively check out reusable easy handles from a
+  daemon pool, retaining live HTTP/TLS connections, DNS, and TLS-session caches
+  across provider rounds and turns. `std.http.Client` can replace it later
+  behind the same interface.
 
 ## 6. Context assembly & compaction
 
@@ -390,7 +405,9 @@ Context for each request is **derived** from the block log at turn start:
 ```
 [system prompt]  (stable per session: base + skills index + pinned context)
 [compaction summaries, oldest first]      // from compaction blocks
-[blocks after last compaction point, mapped to messages]
+[stable blocks before this turn]
+[current environment]                     // volatile; inserted late
+[newest user/steer + subsequent tool rounds]
 ```
 
 The cascade (in order; each layer only fires if the previous wasn't enough):
@@ -428,9 +445,11 @@ The cascade (in order; each layer only fires if the previous wasn't enough):
   first slice waits on one child and forbids recursive task calls; concurrent
   ordered fan-out is the next widening step.
 
-Cache discipline, stated once: between L1/L2 events the assembly is strictly
-append-only with a byte-stable prefix. L1/L2 are the only cache breaks, both
-rare and both logged as `system_note` blocks so cost anomalies are explainable.
+Cache discipline, stated once: between L1/L2 events the stable prefix is
+strictly append-only. Volatile date/git/sandbox state is inserted immediately
+before the newest user/steer input, so it cannot invalidate cached prior
+history. L1/L2 are the only deliberate stable-prefix breaks; both are rare and
+logged as `system_note` blocks so cost anomalies are explainable.
 
 ## 7. Tools & safety
 
@@ -441,24 +460,21 @@ bash        (mutating, approval-gated by default)
 read_file   (parallel_safe)
 write_file  (mutating)
 edit        (string-replace w/ fuzzy fallback; mutating)
-grep        (ripgrep if present, else internal; parallel_safe)
+grep        (rg → system grep → native walker; parallel_safe)
 glob        (parallel_safe)
 fetch       (HTTP GET → markdown-ish text; parallel_safe)
 task        (durable read-only child; M6a)
 ```
 
 **grep engine policy.** Prefer `rg` when on PATH: best engine, native
-.gitignore/hidden/binary filtering (exactly the filter set an agent needs),
-and the `path:line:content` shape models were trained on. The internal
-fallback must stay *functionally equivalent*, not a degraded cousin: real
-regex via the zig-regex package (Thompson NFA + backtracking hybrid, pure
-Zig — pinned to a tagged release; its main branch tracks Zig master), the
-bulky-dir skip list standing in for .gitignore, same output format. A
-pattern the engine can't compile degrades to literal substring with an
-explicit note in the result. Rejected: bundling the rg binary Claude
-Code-style — marlin's pitch is ONE static binary, and shipping per-platform
-sidecar executables breaks scp-and-run; the internal engine is the bundle.
-(zig-regex is ~stdlib-only and adds nothing to the dependency long tail.)
+.gitignore/hidden/binary filtering, and the `path:line:content` shape models
+were trained on. If it is absent, GNU/BSD `grep` supplies an optimized regex
+engine on supported Unix targets with explicit bulky-directory/socket
+excludes. A platform-grep traversal error falls through to the file-only Zig
+walker. That last path treats plain patterns as direct substring searches and
+uses zig-regex only when syntax requires it, avoiding the former per-line
+regex cliff. A pattern the engine cannot compile degrades to a literal with an
+explicit note. Rejected: bundling an `rg` sidecar; Marlin remains one binary.
 
 **Permission and approval system** (full contract: `docs/PERMISSIONS.md`):
 
@@ -678,6 +694,7 @@ compaction = "openrouter/google/gemini-2.5-flash"
 
 [providers.openrouter]
 api_key_env = "OPENROUTER_API_KEY"
+sort = "throughput"           # throughput (default), latency, price, or null
 
 [providers.local]             # any OpenAI-compatible endpoint
 base_url = "http://localhost:8080/v1"

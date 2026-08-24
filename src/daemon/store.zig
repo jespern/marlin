@@ -104,8 +104,30 @@ pub const Store = struct {
     pub fn open(gpa: std.mem.Allocator, path: ?[:0]const u8) Error!Store {
         var db: ?*c.sqlite3 = null;
         const p: [*c]const u8 = if (path) |pp| pp.ptr else ":memory:";
-        if (c.sqlite3_open(p, &db) != c.SQLITE_OK) {
+        // This one connection is shared across threads: turn threads append
+        // blocks while the dispatcher answers queries. FULLMUTEX forces
+        // sqlite's serialized mode regardless of how the system library was
+        // compiled — plain sqlite3_open left that to the library default,
+        // and concurrent prepare/step corrupted the heap (observed live:
+        // parser segfault dereferencing the SQL text as a pointer the
+        // moment a turn start overlapped a session-list broadcast).
+        if (c.sqlite3_open_v2(
+            p,
+            &db,
+            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX,
+            null,
+        ) != c.SQLITE_OK) {
             if (db) |d| _ = c.sqlite3_close(d);
+            return error.SqliteOpen;
+        }
+        // A coordinated reboot deliberately lets the replacement process
+        // start as soon as the old daemon has quiesced and acknowledged. The
+        // old connection may still be in its final close path, so wait out
+        // that short handoff instead of turning SQLITE_BUSY into a failed
+        // daemon start. This also protects rapid CLI readers/writers from
+        // transient WAL/schema locks.
+        if (c.sqlite3_busy_timeout(db.?, 5000) != c.SQLITE_OK) {
+            _ = c.sqlite3_close(db.?);
             return error.SqliteOpen;
         }
         const store = Store{ .db = db.?, .gpa = gpa };
@@ -675,6 +697,42 @@ test "duplicate seq rejected (append-only integrity)" {
     };
     try store.appendBlock(mk.blk(1));
     try std.testing.expectError(error.SqliteStep, store.appendBlock(mk.blk(1)));
+}
+
+test "one connection survives concurrent turn writes and dispatcher reads" {
+    // Production shape: turn threads append blocks while the dispatcher
+    // answers session-list queries on the SAME connection. Requires the
+    // serialized (FULLMUTEX) open mode; without it this corrupted the heap
+    // and segfaulted inside sqlite's parser on the first real prompt.
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+
+    const Writer = struct {
+        fn run(s: *Store) void {
+            var seq: u64 = 1;
+            while (seq <= 300) : (seq += 1) {
+                s.appendBlock(.{
+                    .id = seq,
+                    .session_id = 1,
+                    .turn_id = 1,
+                    .seq = seq,
+                    .ts = 0,
+                    .body = .{ .user_msg = .{ .text = "concurrent" } },
+                }) catch return;
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Writer.run, .{&store});
+    var reads: usize = 0;
+    while (reads < 300) : (reads += 1) {
+        const sessions = try store.listSessions(false);
+        for (sessions) |session| session.deinit(gpa);
+        gpa.free(sessions);
+    }
+    t.join();
+    try std.testing.expectEqual(@as(u64, 300), try store.lastSeq(1));
 }
 
 test "blob round trip is content-addressed and idempotent" {

@@ -46,7 +46,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |
 | session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn |
 | interrupt | sid | ok (cooperative cancel; also denies a pending approval) |
-| reboot | force? | quiesce (wait for turns; force interrupts), then ok RIGHT BEFORE daemon exit — requester's cue to re-exec; autostart brings up the new binary |
+| reboot | force? | quiesce (wait for turns; force interrupts), retire the listening socket, then ok RIGHT BEFORE daemon exit — requester's cue to re-exec; autostart brings up the new binary |
 | shutdown | — | ok, then daemon exits cleanly |
 
 `session_create.approvals`: `"default"` (mutating tools ask) or `"auto"`
@@ -74,6 +74,7 @@ descendants.
 | session_list_result | reply to session_list |
 | blk {sid, b} | a block was persisted (replay AND live fan-out) |
 | delta {sid, turn_id, text} | streaming assistant text (ephemeral) |
+| reasoning_delta {sid, turn_id, text} | provider reasoning stream (ephemeral, rendered separately from assistant text) |
 | status {sid, state} | session state change: idle/running/awaiting_approval/err/done |
 | approval_request {sid, approval_id, call_id, tool, args_json} | a mutating tool call parked on the gate; answer with `approve` |
 | session_meta {sid, tokens_in, tokens_out, context_used, context_limit} | after each turn; ALWAYS sent before the closing status. context_* feed the status-bar gauge (0 = unmeasured) |

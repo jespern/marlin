@@ -39,6 +39,9 @@ pub const RunOpts = struct {
     session_id: u64,
     cwd: []const u8,
     endpoint: Endpoint,
+    /// Daemon-owned curl easy-handle pool. Each turn checks out one exclusive
+    /// handle and reuses it for every provider/compaction round.
+    http_pool: ?*http.Pool = null,
     effort: Effort = .auto,
     cfg: config.Config,
     /// Daemon-owned environment. Tool subprocesses receive a scrubbed copy;
@@ -73,6 +76,9 @@ pub const RunOpts = struct {
     on_approval_done: ?*const fn (ctx: ?*anyopaque, id: u64, verdict: approval.Verdict) void = null,
     /// Called with streaming assistant text for UI liveness.
     on_delta: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    /// Separate provider reasoning stream; clients render it as a progress
+    /// card instead of mixing it into final assistant prose.
+    on_reasoning_delta: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     on_delta_ctx: ?*anyopaque = null,
     /// Called when a tool starts/finishes (for progress display).
     on_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, phase: ToolPhase) void = null,
@@ -145,6 +151,9 @@ pub fn runTurn(
         .turn_id = ids.next(io),
     };
 
+    var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init();
+    defer http_client.deinit();
+
     _ = try ap.append(.{ .user_msg = .{ .text = user_text } });
 
     // System-prompt context built once per turn: repo-local instructions and
@@ -199,7 +208,7 @@ pub fn runTurn(
         // -- L2 headroom check (turn boundary = before each request) --
         var est_used = context.estimateAssembled(msgs);
         if (context.needsCompaction(est_used, opts.endpoint.model, opts.cfg)) {
-            if (try maybeCompact(gpa, io, arena, &ap, opts, blocks, .auto)) {
+            if (try maybeCompact(gpa, io, arena, &ap, &http_client, opts, blocks, .auto)) {
                 // Re-load + re-assemble on top of the new compaction block.
                 const loaded2 = try store.getBlocks(opts.session_id, 1, 1_000_000);
                 defer {
@@ -266,21 +275,24 @@ pub fn runTurn(
             opts.effort,
             msgs,
             tools,
+            try providerRequestOptions(arena, opts, opts.endpoint),
         );
 
         // -- stream the response --
         var acc = openai.StreamAccum.init(gpa);
         defer acc.deinit();
         acc.on_delta = opts.on_delta;
+        acc.on_reasoning_delta = opts.on_reasoning_delta;
         acc.on_delta_ctx = opts.on_delta_ctx;
 
         var pump = Pump{ .parser = sse.Parser.init(gpa), .acc = &acc };
         defer pump.parser.deinit();
 
-        const resp = http.streamPost(gpa, .{
+        const resp = http_client.streamPost(gpa, .{
             .url = opts.endpoint.url,
             .bearer = opts.endpoint.bearer,
             .body_json = body,
+            .extra_headers = observabilityHeaders(opts.endpoint.dialect),
             .cancel = opts.cancel,
         }, &pump, Pump.onChunk) catch |e| switch (e) {
             error.Cancelled => {
@@ -299,10 +311,32 @@ pub fn runTurn(
             _ = try ap.append(.{ .system_note = .{ .text = msg } });
             return error.ProviderError;
         }
+        acc.flushDeltas();
 
         if (acc.usage) |u| {
             total_in += u.tokens_in;
             total_out += u.tokens_out;
+            if (opts.endpoint.dialect == .openrouter) {
+                std.log.debug(
+                    "OpenRouter generation {s} via {s}: input={d} cached={d} cache_write={d} output={d} reasoning={d}",
+                    .{
+                        if (acc.generation_id.items.len > 0) acc.generation_id.items else "unknown",
+                        if (acc.provider_name.items.len > 0) acc.provider_name.items else "unknown",
+                        u.tokens_in,
+                        u.cached_tokens,
+                        u.cache_write_tokens,
+                        u.tokens_out,
+                        u.reasoning_tokens,
+                    },
+                );
+            }
+        }
+
+        // Provider-surfaced reasoning is useful liveness and durable context
+        // for the human transcript, but is intentionally not sent back to the
+        // model by context assembly.
+        if (acc.reasoning.items.len > 0) {
+            _ = try ap.append(.{ .reasoning = .{ .text = acc.reasoning.items } });
         }
 
         // -- no tool calls → final answer --
@@ -324,20 +358,45 @@ pub fn runTurn(
             _ = try ap.append(.{ .reasoning = .{ .text = acc.text.items } });
         }
 
-        // -- execute tool calls (serial in M2; parallel_safe grouping later) --
-        for (acc.calls.items) |*pc| {
+        // Persist the provider's complete assistant tool batch before any
+        // result. Besides matching the Chat Completions transcript contract,
+        // this lets independent read-only calls execute concurrently.
+        const prepared = try arena.alloc(PreparedCall, acc.calls.items.len);
+        var prepared_count: usize = 0;
+        defer {
+            for (prepared[0..prepared_count]) |*call| call.deinit(gpa);
+        }
+        for (acc.calls.items, 0..) |*pc, i| {
             const args_repaired = jsonx.repairObject(gpa, pc.args.items) catch pc.args.items;
-            defer if (args_repaired.ptr != pc.args.items.ptr) gpa.free(@constCast(args_repaired));
+            const args_owned = if (args_repaired.ptr != pc.args.items.ptr)
+                @constCast(args_repaired)
+            else
+                try gpa.dupe(u8, args_repaired);
+            errdefer gpa.free(args_owned);
 
             const tool_call_block_id = try ap.append(.{ .tool_call = .{
                 .call_id = pc.call_id.items,
                 .name = pc.name.items,
-                .args_json = args_repaired,
+                .args_json = args_owned,
             } });
 
-            // -- approval gate: EVERY execution flows through here --
             const spec = tools_registry.find(pc.name.items) orelse
                 if (opts.extensions) |ext| ext.find(pc.name.items) else null;
+            prepared[i] = .{
+                .call_id = pc.call_id.items,
+                .name = pc.name.items,
+                .args_json = args_owned,
+                .tool_call_block_id = tool_call_block_id,
+                .spec = spec,
+            };
+            prepared_count += 1;
+        }
+
+        // Resolve all policy decisions before launching a parallel group.
+        // Approval prompts remain serial and explicit; only calls whose spec
+        // opts into parallel safety can overlap.
+        for (prepared) |*call| {
+            // -- approval gate: EVERY execution flows through here --
             // Auto-inside (docs/PERMISSIONS.md): a shell call that will
             // execute under the canary-verified kernel sandbox needs no
             // per-call prompt — the sandbox enforces the write scope and
@@ -345,8 +404,8 @@ pub fn runTurn(
             // tools bypass the kernel sandbox and keep asking until
             // symlink-safe direct-tool enforcement lands.
             const sandboxed = opts.sandbox_options.backend == .seatbelt and
-                std.mem.eql(u8, pc.name.items, bash_tool.spec_name);
-            const decision: approval.Decision = if (spec) |s|
+                std.mem.eql(u8, call.name, bash_tool.spec_name);
+            const decision: approval.Decision = if (call.spec) |s|
                 if (opts.tool_profile == .read_only and s.mutating)
                     .deny
                 else
@@ -354,10 +413,9 @@ pub fn runTurn(
             else
                 .run; // unknown tool → dispatch returns error text anyway
 
-            var exec: tools_registry.ExecOut = undefined;
             switch (decision) {
                 .deny => {
-                    exec = .{
+                    call.exec = .{
                         .output = try gpa.dupe(u8, "error: tool denied by session policy"),
                         .status = .denied,
                     };
@@ -368,7 +426,7 @@ pub fn runTurn(
                     defer gpa.free(id_str);
 
                     if (opts.on_approval_needed) |cb|
-                        cb(opts.on_delta_ctx, approval_id, pc.call_id.items, pc.name.items, args_repaired);
+                        cb(opts.on_delta_ctx, approval_id, call.call_id, call.name, call.args_json);
 
                     const verdict: approval.Verdict = if (opts.gate) |g|
                         g.wait(io, approval_id, opts.cancel)
@@ -379,7 +437,7 @@ pub fn runTurn(
 
                     _ = try ap.append(.{ .approval = .{
                         .approval_id = id_str,
-                        .call_id = pc.call_id.items,
+                        .call_id = call.call_id,
                         .decision = switch (verdict) {
                             .approved => .granted,
                             .denied => .denied,
@@ -390,22 +448,25 @@ pub fn runTurn(
                     if (verdict == .denied) {
                         // Interrupt while parked also lands here; surface both.
                         const was_cancel = cancelled(opts.cancel);
-                        exec = .{
+                        call.exec = .{
                             .output = try gpa.dupe(u8, if (was_cancel)
                                 "error: tool call interrupted by user"
                             else
                                 "error: tool call denied by user"),
                             .status = if (was_cancel) .interrupted else .denied,
                         };
-                    } else {
-                        exec = runTool(gpa, io, opts, tool_call_block_id, pc.name.items, args_repaired);
                     }
                 },
-                .run => {
-                    exec = runTool(gpa, io, opts, tool_call_block_id, pc.name.items, args_repaired);
-                },
+                .run => {},
             }
-            defer gpa.free(exec.output);
+        }
+
+        try executePrepared(gpa, io, opts, prepared);
+
+        // Results stay in provider call order even when execution completed
+        // out of order. The transcript is therefore deterministic and valid.
+        for (prepared) |*call| {
+            const exec = call.exec.?;
 
             // Blob the full output when it exceeds the inline cap.
             const cap: usize = opts.cfg.inline_tool_cap_bytes;
@@ -416,7 +477,7 @@ pub fn runTurn(
             defer if (inline_body.ptr != exec.output.ptr) gpa.free(@constCast(inline_body));
 
             const tr_block_id = try ap.append(.{ .tool_result = .{
-                .call_id = pc.call_id.items,
+                .call_id = call.call_id,
                 .status = exec.status,
                 .inline_body = inline_body,
                 .full_body_ref = full_ref,
@@ -448,6 +509,7 @@ fn maybeCompact(
     io: Io,
     arena: std.mem.Allocator,
     ap: *Appender,
+    http_client: *http.Client,
     opts: RunOpts,
     blocks: []const block.Block,
     trigger: CompactTrigger,
@@ -462,7 +524,15 @@ fn maybeCompact(
     const transcript = try context.renderForSummary(arena, blocks, plan.from_seq, plan.to_seq, 400_000);
     const ep = opts.compaction_endpoint orelse opts.endpoint;
 
-    const summary = summarize(gpa, arena, ep, transcript, opts.cancel) catch |e| {
+    const summary = summarize(
+        gpa,
+        arena,
+        http_client,
+        ep,
+        transcript,
+        opts.cancel,
+        try providerRequestOptions(arena, opts, ep),
+    ) catch |e| {
         const msg = try std.fmt.allocPrint(arena, "compaction failed ({t}) — continuing uncompacted", .{e});
         _ = try ap.append(.{ .system_note = .{ .text = msg } });
         return false;
@@ -498,25 +568,28 @@ fn maybeCompact(
 fn summarize(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
+    http_client: *http.Client,
     ep: Endpoint,
     transcript: []const u8,
     cancel: ?*std.atomic.Value(bool),
+    request_opts: openai.RequestOptions,
 ) ![]const u8 {
     var msgs = [_]provider.Message{
         .{ .role = .system, .payload = .{ .text = context.compaction_prompt } },
         .{ .role = .user, .payload = .{ .text = transcript } },
     };
-    const body = try openai.buildRequestBody(arena, ep.model, ep.dialect, .auto, &msgs, &.{});
+    const body = try openai.buildRequestBody(arena, ep.model, ep.dialect, .auto, &msgs, &.{}, request_opts);
 
     var acc = openai.StreamAccum.init(gpa);
     defer acc.deinit();
     var pump = Pump{ .parser = sse.Parser.init(gpa), .acc = &acc };
     defer pump.parser.deinit();
 
-    const resp = try http.streamPost(gpa, .{
+    const resp = try http_client.streamPost(gpa, .{
         .url = ep.url,
         .bearer = ep.bearer,
         .body_json = body,
+        .extra_headers = observabilityHeaders(ep.dialect),
         .cancel = cancel,
     }, &pump, Pump.onChunk);
     if (resp.status >= 400) {
@@ -535,6 +608,9 @@ pub fn compactSession(
     store: *Store,
     opts: RunOpts,
 ) !bool {
+    var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init();
+    defer http_client.deinit();
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -554,13 +630,35 @@ pub fn compactSession(
         .seq = try store.lastSeq(opts.session_id),
         .turn_id = ids.next(io),
     };
-    return maybeCompact(gpa, io, arena, &ap, opts, blocks, .manual);
+    return maybeCompact(gpa, io, arena, &ap, &http_client, opts, blocks, .manual);
 }
 
 fn toolAllowed(opts: RunOpts, spec: *const tools_registry.Spec) bool {
     if (std.mem.eql(u8, spec.name, task_tool.spec_name)) return opts.on_task != null and opts.tool_profile == .full;
     if (opts.tool_profile == .read_only and spec.mutating) return false;
     return true;
+}
+
+fn providerRequestOptions(arena: std.mem.Allocator, opts: RunOpts, ep: Endpoint) !openai.RequestOptions {
+    if (ep.dialect != .openrouter) return .{};
+    return .{
+        .session_id = try std.fmt.allocPrint(arena, "marlin-{x:0>16}", .{opts.session_id}),
+        .provider_sort = opts.cfg.openrouter_sort,
+        .explicit_cache = needsExplicitCache(ep.model),
+    };
+}
+
+fn needsExplicitCache(model: []const u8) bool {
+    return std.mem.startsWith(u8, model, "anthropic/") or
+        std.mem.startsWith(u8, model, "google/") or
+        std.mem.startsWith(u8, model, "qwen/") or
+        std.mem.startsWith(u8, model, "alibaba/");
+}
+
+const openrouter_observability_headers = [_][]const u8{"X-OpenRouter-Metadata: enabled"};
+
+fn observabilityHeaders(dialect: provider.Dialect) []const []const u8 {
+    return if (dialect == .openrouter) &openrouter_observability_headers else &.{};
 }
 
 fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, name: []const u8, args_json: []const u8) tools_registry.ExecOut {
@@ -587,6 +685,70 @@ fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, 
         opts.network_policy,
         opts.cancel,
     );
+}
+
+const PreparedCall = struct {
+    call_id: []const u8,
+    name: []const u8,
+    args_json: []u8,
+    tool_call_block_id: u64,
+    spec: ?*const tools_registry.Spec,
+    exec: ?tools_registry.ExecOut = null,
+
+    fn deinit(self: *PreparedCall, gpa: std.mem.Allocator) void {
+        gpa.free(self.args_json);
+        if (self.exec) |result| gpa.free(result.output);
+        self.* = undefined;
+    }
+
+    fn parallelSafe(self: PreparedCall) bool {
+        return self.spec != null and self.spec.?.parallel_safe;
+    }
+};
+
+const ToolWorker = struct {
+    fn run(gpa: std.mem.Allocator, io: Io, opts: RunOpts, call: *PreparedCall) void {
+        call.exec = runTool(gpa, io, opts, call.tool_call_block_id, call.name, call.args_json);
+    }
+};
+
+/// Execute maximal contiguous groups of parallel-safe calls concurrently.
+/// Unsafe calls are ordering barriers, preserving model-requested mutation
+/// semantics. Results are only persisted by the parent turn thread.
+fn executePrepared(gpa: std.mem.Allocator, io: Io, opts: RunOpts, calls: []PreparedCall) !void {
+    var i: usize = 0;
+    while (i < calls.len) {
+        if (calls[i].exec != null) {
+            i += 1;
+            continue;
+        }
+        if (!calls[i].parallelSafe()) {
+            ToolWorker.run(gpa, io, opts, &calls[i]);
+            i += 1;
+            continue;
+        }
+
+        var end = i + 1;
+        while (end < calls.len and calls[end].exec == null and calls[end].parallelSafe()) : (end += 1) {}
+        if (end - i == 1) {
+            ToolWorker.run(gpa, io, opts, &calls[i]);
+            i = end;
+            continue;
+        }
+
+        var threads: std.ArrayList(std.Thread) = .empty;
+        defer threads.deinit(gpa);
+        try threads.ensureTotalCapacity(gpa, end - i);
+        for (calls[i..end]) |*call| {
+            const thread = std.Thread.spawn(.{}, ToolWorker.run, .{ gpa, io, opts, call }) catch {
+                ToolWorker.run(gpa, io, opts, call);
+                continue;
+            };
+            threads.appendAssumeCapacity(thread);
+        }
+        for (threads.items) |thread| thread.join();
+        i = end;
+    }
 }
 
 fn nowMs(io: Io) i64 {
