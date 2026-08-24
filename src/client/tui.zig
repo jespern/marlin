@@ -9,7 +9,7 @@
 //!   └─ status: state · model · tokens · ctx ────┤
 //!
 //! Keys:
-//!   insert:  type → input; Enter send; Alt+Enter/Ctrl+J newline;
+//!   insert:  type → input; Enter send; Shift+Enter/Alt+Enter/Ctrl+J newline;
 //!            Up/Down move lines or walk history at the edges;
 //!            Esc → normal (draft survives); Ctrl+C interrupt/quit
 //!   normal:  i insert; j/k scroll; g/G top/bottom; q quit; Ctrl+C same
@@ -33,6 +33,8 @@ const Event = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
+    /// Animation clock; posted only while a turn is running.
+    tick,
     /// Bracketed paste text (allocated by the loop's paste allocator = gpa;
     /// handler frees).
     paste: []const u8,
@@ -79,6 +81,34 @@ const PendingApproval = struct {
     }
 };
 
+const SelectionPoint = struct {
+    line: usize,
+    /// Terminal cell column, not a byte offset.
+    col: usize,
+
+    fn before(a: SelectionPoint, b: SelectionPoint) bool {
+        return a.line < b.line or (a.line == b.line and a.col <= b.col);
+    }
+};
+
+const Selection = struct {
+    lo: SelectionPoint,
+    hi: SelectionPoint,
+
+    fn init(a: SelectionPoint, b: SelectionPoint) Selection {
+        return if (a.before(b)) .{ .lo = a, .hi = b } else .{ .lo = b, .hi = a };
+    }
+
+    /// Selected terminal-cell interval on `line`, end-exclusive and clamped
+    /// to the rendered text width. Mouse endpoints themselves are inclusive.
+    fn columns(self: Selection, line: usize, line_width: usize) ?struct { start: usize, end: usize } {
+        if (line < self.lo.line or line > self.hi.line) return null;
+        const start = if (line == self.lo.line) @min(self.lo.col, line_width) else 0;
+        const wanted_end = if (line == self.hi.line) self.hi.col +| 1 else line_width;
+        return .{ .start = start, .end = @min(wanted_end, line_width) };
+    }
+};
+
 const App = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -115,15 +145,17 @@ const App = struct {
     /// Full model catalog from the daemon (owned copies). Empty until
     /// model_list_result arrives; picker falls back to cfg.model_favorites.
     catalog: std.ArrayList([]u8) = .empty,
-    /// Mouse selection over the session view, in ABSOLUTE line indices into
-    /// the current layout (stable while scrolled because layout is
-    /// deterministic per width). anchor = press point, head = drag point.
-    sel_anchor: ?usize = null,
-    sel_head: usize = 0,
+    /// Character-precise mouse selection over the session view. Lines are
+    /// absolute layout indices; columns are terminal cells within the line.
+    sel_anchor: ?SelectionPoint = null,
+    sel_head: SelectionPoint = .{ .line = 0, .col = 0 },
     sel_dragging: bool = false,
     /// Set when a selection was completed (mouse released): next frame
-    /// copies these lines via OSC52 and clears the flag.
+    /// copies the selected cells via OSC52 and clears the flag.
     copy_pending: bool = false,
+    spinner_frame: usize = 0,
+    animation_active: std.atomic.Value(bool) = .init(false),
+    animation_stop: std.atomic.Value(bool) = .init(false),
     cfg: config.Config = .{},
     /// Transient one-line notice shown in the status bar.
     notice: std.ArrayList(u8) = .empty,
@@ -186,7 +218,9 @@ const App = struct {
             },
             .status => |s| {
                 if (s.sid != self.sid) return;
+                if (s.state == .running and self.state != .running) self.spinner_frame = 0;
                 self.state = s.state;
+                self.animation_active.store(s.state == .running, .release);
                 if (s.state != .awaiting_approval) self.pending = null;
             },
             .approval_request => |ar| {
@@ -312,10 +346,9 @@ const App = struct {
         }
     }
 
-    /// Normalized selection range (inclusive absolute line indices).
-    fn selRange(self: *const App) ?struct { lo: usize, hi: usize } {
+    fn selection(self: *const App) ?Selection {
         const a = self.sel_anchor orelse return null;
-        return .{ .lo = @min(a, self.sel_head), .hi = @max(a, self.sel_head) };
+        return Selection.init(a, self.sel_head);
     }
 
     /// The picker's source list: full catalog when loaded, else favorites.
@@ -379,6 +412,11 @@ const App = struct {
         self.context_limit = 0;
         self.pending = null;
         self.state = .idle;
+        self.animation_active.store(false, .release);
+        self.spinner_frame = 0;
+        self.sel_anchor = null;
+        self.sel_dragging = false;
+        self.copy_pending = false;
         self.sid = sid;
         self.conn.send(.{ .sub = .{ .sid = sid, .from_seq = 1 } }) catch {};
         self.setNotice("new session {d}", .{sid});
@@ -440,6 +478,58 @@ const Line = struct {
     text3: []const u8 = "",
     style3: vaxis.Style = .{},
 };
+
+const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
+fn lineWidth(win: vaxis.Window, line: Line) usize {
+    return @as(usize, win.gwidth(line.text)) +
+        @as(usize, win.gwidth(line.text2)) +
+        @as(usize, win.gwidth(line.text3));
+}
+
+fn lineText(arena: std.mem.Allocator, line: Line) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ line.text, line.text2, line.text3 });
+}
+
+/// Append every complete grapheme intersecting [start_col, end_col).
+fn appendColumns(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    win: vaxis.Window,
+    text: []const u8,
+    start_col: usize,
+    end_col: usize,
+) !void {
+    var it = vaxis.unicode.graphemeIterator(text);
+    var col: usize = 0;
+    while (it.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        const next = col + @as(usize, win.gwidth(bytes));
+        if (next > start_col and col < end_col) try out.appendSlice(arena, bytes);
+        col = next;
+        if (col >= end_col) break;
+    }
+}
+
+fn selectedText(
+    arena: std.mem.Allocator,
+    win: vaxis.Window,
+    lines: []const Line,
+    selection: Selection,
+) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (selection.lo.line >= lines.len) return out.items;
+    const last = @min(selection.hi.line, lines.len - 1);
+    var line_idx = selection.lo.line;
+    while (line_idx <= last) : (line_idx += 1) {
+        if (line_idx > selection.lo.line) try out.append(arena, '\n');
+        const line = lines[line_idx];
+        const text = try lineText(arena, line);
+        const cols = selection.columns(line_idx, lineWidth(win, line)) orelse continue;
+        try appendColumns(arena, &out, win, text, cols.start, cols.end);
+    }
+    return out.items;
+}
 
 /// Flatten blocks + delta into wrapped display lines for a given width.
 /// Returned list and its line slices use `arena` (per-frame).
@@ -529,7 +619,10 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         try wrapPrefixed(arena, &lines, "", app.delta.items, Palette.delta_style, w);
     } else if (app.state == .running) {
         try blankLine(arena, &lines);
-        try wrapInto(arena, &lines, "…", .{ .text = "…", .style = Palette.tool_out });
+        const loading = try std.fmt.allocPrint(arena, "{s} Working…", .{
+            spinner_frames[app.spinner_frame % spinner_frames.len],
+        });
+        try wrapInto(arena, &lines, loading, .{ .text = loading, .style = Palette.tool_out });
     }
 
     // Approval card.
@@ -648,7 +741,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // Input grows 1..max_rows with content; session view yields.
     const prompt: []const u8 = if (app.mode == .insert) "> " else ": ";
     const input_h: u16 = @intCast(app.editor.displayHeight(w -| prompt.len));
-    const view_h: u16 = h -| (input_h + 1); // + status line
+    const input_gap: u16 = 1;
+    const view_h: u16 = h -| (input_h + input_gap + 1); // input + gap + status
 
     // ---- session view ----
     var lines = try layoutLines(arena, app, w);
@@ -669,23 +763,35 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     for (visible, 0..) |ln, row| {
         const abs_line = first_visible + row;
-        const selected = if (app.selRange()) |r| abs_line >= r.lo and abs_line <= r.hi else false;
         var segs_buf: [3]vaxis.Segment = undefined;
         var n: usize = 0;
-        segs_buf[n] = .{ .text = ln.text, .style = styleSel(ln.style, selected) };
+        segs_buf[n] = .{ .text = ln.text, .style = ln.style };
         n += 1;
         if (ln.text2.len > 0) {
-            segs_buf[n] = .{ .text = ln.text2, .style = styleSel(ln.style2, selected) };
+            segs_buf[n] = .{ .text = ln.text2, .style = ln.style2 };
             n += 1;
         }
         if (ln.text3.len > 0) {
-            segs_buf[n] = .{ .text = ln.text3, .style = styleSel(ln.style3, selected) };
+            segs_buf[n] = .{ .text = ln.text3, .style = ln.style3 };
             n += 1;
         }
         _ = win.print(segs_buf[0..n], .{
             .row_offset = @intCast(row),
             .wrap = .none,
         });
+        // Apply selection after printing so partial-cell highlighting keeps
+        // each segment's original syntax color and other style attributes.
+        if (app.selection()) |sel| {
+            if (sel.columns(abs_line, lineWidth(win, ln))) |cols| {
+                var col = cols.start;
+                while (col < cols.end and col < @as(usize, w)) : (col += 1) {
+                    const cell = win.readCell(@intCast(col), @intCast(row)) orelse continue;
+                    var selected_cell = cell;
+                    selected_cell.style.reverse = true;
+                    win.writeCell(@intCast(col), @intCast(row), selected_cell);
+                }
+            }
+        }
     }
 
     // ---- input box ----
@@ -786,6 +892,17 @@ fn readerThread(app: *App, loop: *vaxis.Loop(Event)) void {
         };
     }
     loop.postEvent(.daemon_gone) catch {};
+}
+
+fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
+    while (!app.animation_stop.load(.acquire)) {
+        if (app.animation_active.load(.acquire)) {
+            loop.postEvent(.tick) catch return;
+            app.io.sleep(.fromMilliseconds(90), .awake) catch {};
+        } else {
+            app.io.sleep(.fromMilliseconds(200), .awake) catch {};
+        }
+    }
 }
 
 pub const RebootPlan = struct {
@@ -913,9 +1030,8 @@ pub fn run(
     try writer.flush();
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
     try vx.setBracketedPaste(writer, true);
-    // Mouse: wheel scrolls the session view (kitty/sgr mouse mode). Text
-    // selection via shift+drag still reaches the terminal (standard escape
-    // hatch all TUIs share); native selection + OSC52 lands in M4.
+    // Mouse: wheel scrolls the session view; native cell-precise selection
+    // copies through OSC52. Shift+drag remains the terminal's escape hatch.
     try vx.setMouseMode(writer, true);
     try writer.flush();
 
@@ -935,6 +1051,10 @@ pub fn run(
     defer rt.join();
     defer conn.stream.shutdown(io, .both) catch {};
 
+    const animation_thread = try std.Thread.spawn(.{}, animationThread, .{ &app, &loop });
+    defer animation_thread.join();
+    defer app.animation_stop.store(true, .release);
+
     // First frame before any event arrives.
     {
         var frame_arena = std.heap.ArenaAllocator.init(gpa);
@@ -950,6 +1070,7 @@ pub fn run(
         switch (event) {
             .key_press => |key| try handleKey(&app, key),
             .mouse => |m| handleMouse(&app, m),
+            .tick => app.spinner_frame +%= 1,
             .winsize => |ws| {
                 app.term_cols = ws.cols;
                 try vx.resize(gpa, tty.writer(), ws);
@@ -967,6 +1088,7 @@ pub fn run(
                         .daemon_gone => app.should_quit = true,
                         .key_press => |k2| try handleKey(&app, k2),
                         .mouse => |m2| handleMouse(&app, m2),
+                        .tick => app.spinner_frame +%= 1,
                         .winsize => |ws2| {
                             app.term_cols = ws2.cols;
                             try vx.resize(gpa, tty.writer(), ws2);
@@ -991,20 +1113,20 @@ pub fn run(
         // notice shows this frame; selection stays highlighted).
         if (app.copy_pending) {
             app.copy_pending = false;
-            if (app.selRange()) |r| {
+            if (app.selection()) |selection| {
                 const farena = frame_arena.allocator();
                 const sel_lines = try layoutLines(farena, &app, @intCast(app.term_cols));
-                var buf: std.ArrayList(u8) = .empty;
-                var i: usize = r.lo;
-                while (i <= r.hi and i < sel_lines.items.len) : (i += 1) {
-                    const ln = sel_lines.items[i];
-                    try buf.appendSlice(farena, ln.text);
-                    try buf.appendSlice(farena, ln.text2);
-                    try buf.appendSlice(farena, ln.text3);
-                    try buf.append(farena, '\n');
+                const text = try selectedText(farena, vx.window(), sel_lines.items, selection);
+                if (text.len > 0) {
+                    var copied = true;
+                    vx.copyToSystemClipboard(writer, text, farena) catch {
+                        copied = false;
+                    };
+                    if (copied)
+                        app.setNotice("copied selection", .{})
+                    else
+                        app.setNotice("clipboard copy failed", .{});
                 }
-                vx.copyToSystemClipboard(writer, buf.items, farena) catch {};
-                app.setNotice("copied {d} line(s)", .{r.hi - r.lo + 1});
             }
         }
 
@@ -1017,10 +1139,29 @@ pub fn run(
 }
 
 /// Mouse: the wheel ALWAYS scrolls the session view — never the input box,
-/// never history. Left press/drag/release selects whole lines in the view;
-/// release copies them via OSC52 (line granularity for M3.x; char-precise
-/// selection is the M4 select.zig job).
+/// never history. Left press/drag/release selects terminal-cell ranges in
+/// the session view; release copies the precise range via OSC52.
 fn handleMouse(app: *App, m: vaxis.Mouse) void {
+    // Some terminals report the release button as `none`, so complete an
+    // active left-button drag based on event type before switching on button.
+    if (m.type == .release and app.sel_dragging) {
+        if (app.last_view_h > 0) {
+            const raw_row: usize = if (m.row < 0) 0 else @intCast(m.row);
+            const row = @min(raw_row, app.last_view_h - 1);
+            const col: usize = if (m.col < 0) 0 else @intCast(m.col);
+            app.sel_head = .{ .line = app.last_first_visible + row, .col = col };
+        }
+        app.sel_dragging = false;
+        if (app.sel_anchor) |anchor| {
+            if (anchor.line != app.sel_head.line or anchor.col != app.sel_head.col) {
+                app.copy_pending = true;
+            } else {
+                app.sel_anchor = null;
+            }
+        }
+        return;
+    }
+
     switch (m.button) {
         .wheel_up => app.scroll_up +|= 3,
         .wheel_down => app.scroll_up -|= 3,
@@ -1031,31 +1172,20 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
                 if (m.type == .press) app.sel_anchor = null; // click below view clears
                 return;
             }
-            const abs = app.last_first_visible + row;
+            const point = SelectionPoint{
+                .line = app.last_first_visible + row,
+                .col = if (m.col < 0) 0 else @intCast(m.col),
+            };
             switch (m.type) {
                 .press => {
-                    app.sel_anchor = abs;
-                    app.sel_head = abs;
+                    app.sel_anchor = point;
+                    app.sel_head = point;
                     app.sel_dragging = true;
                 },
                 .drag => {
-                    if (app.sel_dragging) app.sel_head = abs;
+                    if (app.sel_dragging) app.sel_head = point;
                 },
-                .release => {
-                    if (app.sel_dragging) {
-                        app.sel_head = abs;
-                        app.sel_dragging = false;
-                        if (app.sel_anchor) |a| {
-                            if (a != abs) {
-                                // Real drag: copy on release.
-                                app.copy_pending = true;
-                            } else {
-                                // Plain click: clear any selection.
-                                app.sel_anchor = null;
-                            }
-                        }
-                    }
-                },
+                .release => {}, // active drags are completed above
                 .motion => {},
             }
         },
@@ -1072,11 +1202,12 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-fn styleSel(base: vaxis.Style, selected: bool) vaxis.Style {
-    if (!selected) return base;
-    var s = base;
-    s.reverse = true;
-    return s;
+fn isNewlineKey(key: vaxis.Key) bool {
+    // Key.matches intentionally consumes Shift for printable text, which
+    // could make plain Enter look shifted when a terminal attaches text to
+    // control keys. Modifier-sensitive Enter handling must be exact.
+    return (key.codepoint == vaxis.Key.enter and (key.mods.shift or key.mods.alt)) or
+        (key.codepoint == 'j' and key.mods.ctrl and !key.mods.alt);
 }
 
 fn handleKey(app: *App, key: vaxis.Key) !void {
@@ -1149,9 +1280,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             if (key.matches(vaxis.Key.escape, .{})) {
                 app.mode = .normal; // draft survives: editor state untouched
                 app.sel_anchor = null;
-            } else if (key.matches(vaxis.Key.enter, .{ .alt = true }) or
-                key.matches('j', .{ .ctrl = true }))
-            {
+            } else if (isNewlineKey(key)) {
                 ed.insertNewline();
             } else if (key.matches(vaxis.Key.enter, .{})) {
                 const text = try ed.takeExpanded();
@@ -1161,6 +1290,10 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 if (!ed.moveUp(edit_w)) ed.histUp();
             } else if (key.matches(vaxis.Key.down, .{})) {
                 if (!ed.moveDown(edit_w)) ed.histDown();
+            } else if (key.matches(vaxis.Key.left, .{ .alt = true }) or key.matches('b', .{ .alt = true })) {
+                ed.moveWordLeft();
+            } else if (key.matches(vaxis.Key.right, .{ .alt = true }) or key.matches('f', .{ .alt = true })) {
+                ed.moveWordRight();
             } else if (key.matches(vaxis.Key.left, .{}) or key.matches('b', .{ .ctrl = true })) {
                 ed.moveLeft();
             } else if (key.matches(vaxis.Key.right, .{}) or key.matches('f', .{ .ctrl = true })) {
@@ -1207,4 +1340,31 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "modified enter inserts a newline while plain enter submits" {
+    try std.testing.expect(isNewlineKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .shift = true } }));
+    try std.testing.expect(isNewlineKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .alt = true } }));
+    try std.testing.expect(isNewlineKey(.{ .codepoint = 'j', .mods = .{ .ctrl = true } }));
+    try std.testing.expect(!isNewlineKey(.{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expect(!isNewlineKey(.{ .codepoint = vaxis.Key.enter, .text = "\r" }));
+}
+
+test "selection is character precise on one or many lines" {
+    const same = Selection.init(.{ .line = 4, .col = 8 }, .{ .line = 4, .col = 2 });
+    const same_cols = same.columns(4, 20).?;
+    try std.testing.expectEqual(@as(usize, 2), same_cols.start);
+    try std.testing.expectEqual(@as(usize, 9), same_cols.end);
+
+    const multi = Selection.init(.{ .line = 2, .col = 3 }, .{ .line = 4, .col = 5 });
+    const first = multi.columns(2, 10).?;
+    try std.testing.expectEqual(@as(usize, 3), first.start);
+    try std.testing.expectEqual(@as(usize, 10), first.end);
+    const middle = multi.columns(3, 10).?;
+    try std.testing.expectEqual(@as(usize, 0), middle.start);
+    try std.testing.expectEqual(@as(usize, 10), middle.end);
+    const last = multi.columns(4, 10).?;
+    try std.testing.expectEqual(@as(usize, 0), last.start);
+    try std.testing.expectEqual(@as(usize, 6), last.end);
+    try std.testing.expect(multi.columns(1, 10) == null);
 }

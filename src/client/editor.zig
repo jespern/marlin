@@ -225,6 +225,51 @@ pub fn moveRight(self: *Editor) void {
     self.goal_col = null;
 }
 
+/// Option+Left / Alt+B: move to the beginning of the previous word.
+/// A word is letters, digits, underscore, or any non-ASCII codepoint;
+/// punctuation and whitespace are boundaries. This follows readline's
+/// backward-word behavior: skip boundaries, then skip the word itself.
+pub fn moveWordLeft(self: *Editor) void {
+    const t = self.text.items;
+    var i = self.cursor;
+    while (i > 0) {
+        const start = prevCpStart(t, i);
+        if (isWordCodepoint(t[start..i])) break;
+        i = start;
+    }
+    while (i > 0) {
+        const start = prevCpStart(t, i);
+        if (!isWordCodepoint(t[start..i])) break;
+        i = start;
+    }
+    self.cursor = i;
+    self.goal_col = null;
+}
+
+/// Option+Right / Alt+F: move to the end of the next word.
+pub fn moveWordRight(self: *Editor) void {
+    const t = self.text.items;
+    var i = self.cursor;
+    while (i < t.len) {
+        const end = nextCpEnd(t, i);
+        if (isWordCodepoint(t[i..end])) break;
+        i = end;
+    }
+    while (i < t.len) {
+        const end = nextCpEnd(t, i);
+        if (!isWordCodepoint(t[i..end])) break;
+        i = end;
+    }
+    self.cursor = i;
+    self.goal_col = null;
+}
+
+fn isWordCodepoint(bytes: []const u8) bool {
+    const cp = std.unicode.utf8Decode(bytes) catch return false;
+    if (cp >= 0x80) return true;
+    return std.ascii.isAlphanumeric(@intCast(cp)) or cp == '_';
+}
+
 pub fn deleteBefore(self: *Editor) void {
     if (self.cursor == 0) return;
     const start = prevCpStart(self.text.items, self.cursor);
@@ -585,4 +630,24 @@ test "utf8 cursor movement" {
     ed.moveLeft(); // before é
     ed.deleteAfter(); // delete é
     try testing.expectEqualStrings("a漢", ed.text.items);
+}
+
+test "wordwise cursor movement crosses punctuation and unicode" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("one, two café");
+
+    ed.moveWordLeft();
+    try testing.expectEqual(@as(usize, "one, two ".len), ed.cursor);
+    ed.moveWordLeft();
+    try testing.expectEqual(@as(usize, "one, ".len), ed.cursor);
+    ed.moveWordLeft();
+    try testing.expectEqual(@as(usize, 0), ed.cursor);
+
+    ed.moveWordRight();
+    try testing.expectEqual(@as(usize, "one".len), ed.cursor);
+    ed.moveWordRight();
+    try testing.expectEqual(@as(usize, "one, two".len), ed.cursor);
+    ed.moveWordRight();
+    try testing.expectEqual(@as(usize, "one, two café".len), ed.cursor);
 }
