@@ -85,6 +85,39 @@ const CommandMatches = struct {
 
 const PickerKind = enum { model, effort, session };
 
+/// Baked display lines for blocks of completed turns. Line contents point
+/// into `arena_state` (derived strings) or App-owned block text; both stay
+/// valid until reset. Keyed by width/transcript-toggle plus an epoch the
+/// App bumps whenever existing blocks mutate or the session switches.
+const LayoutCache = struct {
+    arena_state: ?*std.heap.ArenaAllocator = null,
+    lines: std.ArrayList(Line) = .empty,
+    covered: usize = 0,
+    width: usize = 0,
+    expanded: bool = false,
+    epoch: u64 = 0,
+    label_state: []const u8 = "",
+
+    fn allocator(self: *LayoutCache, gpa: std.mem.Allocator) !std.mem.Allocator {
+        if (self.arena_state == null) {
+            const st = try gpa.create(std.heap.ArenaAllocator);
+            st.* = .init(gpa);
+            self.arena_state = st;
+        }
+        return self.arena_state.?.allocator();
+    }
+
+    fn reset(self: *LayoutCache, gpa: std.mem.Allocator) void {
+        if (self.arena_state) |st| {
+            st.deinit();
+            gpa.destroy(st);
+        }
+        // The lines list itself lives in the arena; dropping the arena
+        // dropped it too.
+        self.* = .{};
+    }
+};
+
 /// A block reduced to what the renderer needs (owned copies).
 const RenderBlock = struct {
     kind: block.BlockKind,
@@ -329,6 +362,11 @@ const App = struct {
     animation_active: std.atomic.Value(bool) = .init(false),
     animation_stop: std.atomic.Value(bool) = .init(false),
     cfg: config.Config = .{},
+    /// Baked layout of completed turns; see LayoutCache.
+    layout_cache: LayoutCache = .{},
+    /// Bumped whenever existing blocks mutate in place or the block list is
+    /// replaced (session switch) — invalidates layout_cache.
+    layout_epoch: u64 = 0,
     /// Transient one-line notice shown in the status bar.
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
@@ -339,6 +377,7 @@ const App = struct {
     reboot_request: RebootRequest = .none,
 
     fn deinit(self: *App) void {
+        self.layout_cache.reset(self.gpa);
         self.picker_filter.deinit(self.gpa);
         for (self.catalog.items) |m| self.gpa.free(m);
         self.catalog.deinit(self.gpa);
@@ -411,6 +450,7 @@ const App = struct {
     }
 
     fn resetActiveAfterMove(self: *App) void {
+        self.layout_epoch +%= 1;
         self.editor = Editor.init(self.gpa);
         self.blocks = .empty;
         self.delta = .empty;
@@ -473,6 +513,7 @@ const App = struct {
     }
 
     fn restoreSavedView(self: *App, saved: *SavedSessionView) void {
+        self.layout_epoch +%= 1;
         self.editor = saved.editor;
         self.blocks = saved.blocks;
         self.delta = saved.delta;
@@ -773,14 +814,18 @@ const App = struct {
     fn applyBlock(self: *App, b: block.Block) void {
         switch (b.body) {
             .user_msg => |u| {
-                if (!reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id))
+                if (reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id))
+                    self.layout_epoch +%= 1
+                else
                     self.pushDurableBlock(b, .user_msg, u.text, "", .ok);
                 // Seed input history from the log (replay covers pre-reboot
                 // messages; live blocks cover this session's submits).
                 self.editor.pushHistory(u.text);
             },
             .steer => |s| {
-                if (!reconcilePendingEcho(self.blocks.items, .steer, s.text, b.seq, b.turn_id))
+                if (reconcilePendingEcho(self.blocks.items, .steer, s.text, b.seq, b.turn_id))
+                    self.layout_epoch +%= 1
+                else
                     self.pushDurableBlock(b, .steer, s.text, "", .ok);
             },
             .assistant_msg => |a| {
@@ -2366,20 +2411,27 @@ fn pendingToolBatch(blocks: []const RenderBlock, start: usize) ?CollapsedToolRun
 
 /// Flatten blocks + delta into wrapped display lines for a given width.
 /// Returned list and its line slices use `arena` (per-frame).
-fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(Line) {
-    var lines: std.ArrayList(Line) = .empty;
-    const w: usize = if (width == 0) 80 else width;
-
-    // The tool that produced the result being rendered — results carry no
-    // label of their own, and edit-tool diffs get more room than read diffs.
-    var last_tool_label: []const u8 = "";
-    var block_idx: usize = 0;
-    while (block_idx < app.blocks.items.len) : (block_idx += 1) {
+/// Render blocks[start..end) as display lines. `alloc` owns every derived
+/// string: the frame arena for the live tail, the layout cache's arena for
+/// baked completed turns. `allow_fold` enables the running-command fold,
+/// which reads live session state and therefore applies only to the tail.
+fn layoutBlockRange(
+    alloc: std.mem.Allocator,
+    app: *App,
+    lines: *std.ArrayList(Line),
+    start: usize,
+    end: usize,
+    w: usize,
+    last_tool_label: *[]const u8,
+    allow_fold: bool,
+) !void {
+    var block_idx: usize = start;
+    while (block_idx < end) : (block_idx += 1) {
         const rb = app.blocks.items[block_idx];
         if (!app.show_tool_transcript and rb.kind == .tool_call) {
             const blocks_all = app.blocks.items;
             const collapsed = collapsibleToolRun(blocks_all, block_idx);
-            const pending_batch = if (app.state == .running and collapsed.count == 0)
+            const pending_batch = if (allow_fold and app.state == .running and collapsed.count == 0)
                 pendingToolBatch(blocks_all, block_idx)
             else
                 null;
@@ -2390,7 +2442,7 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
             // line — the user must see what they are deciding on.
             var in_flight = pending_batch != null;
             var running_call_idx = block_idx;
-            if (!in_flight and app.state == .running and
+            if (!in_flight and allow_fold and app.state == .running and
                 collapsed.next < blocks_all.len and
                 blocks_all[collapsed.next].kind == .tool_call and
                 blocks_all[collapsed.next].turn_id == rb.turn_id)
@@ -2403,12 +2455,12 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
             if (collapsed.count > 0 or in_flight) {
                 const displayed_count = if (pending_batch) |batch| batch.count else collapsed.count;
                 const summary = if (!in_flight)
-                    try std.fmt.allocPrint(arena, "Ran {d} {s}", .{
+                    try std.fmt.allocPrint(alloc, "Ran {d} {s}", .{
                         displayed_count,
                         if (displayed_count == 1) "command" else "commands",
                     })
                 else if (displayed_count > 1)
-                    try std.fmt.allocPrint(arena, "Running {d} commands", .{displayed_count})
+                    try std.fmt.allocPrint(alloc, "Running {d} commands", .{displayed_count})
                 else
                     "Running";
                 var hint: []const u8 = " · ctrl+t to view transcript";
@@ -2417,13 +2469,13 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                     const hi = extractHighlightArg(call.label, call.text) orelse
                         call.text[0..@min(call.text.len, 40)];
                     const capped = hi[0..@min(hi.len, 60)];
-                    hint = try std.fmt.allocPrint(arena, " · {s} {s}{s}", .{
+                    hint = try std.fmt.allocPrint(alloc, " · {s} {s}{s}", .{
                         call.label,
                         capped,
                         if (capped.len < hi.len) "…" else "",
                     });
                 }
-                try lines.append(arena, .{
+                try lines.append(alloc, .{
                     .text = "  • ",
                     .style = Palette.note,
                     .text2 = summary,
@@ -2437,41 +2489,41 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         }
         switch (rb.kind) {
             .user_msg => {
-                try blankLine(arena, &lines);
-                try wrapPromptCard(arena, &lines, rb.text, w);
+                try blankLine(alloc, lines);
+                try wrapPromptCard(alloc, lines, rb.text, w);
             },
             .assistant_msg => {
-                try blankLine(arena, &lines);
-                try wrapMarkdown(arena, &lines, rb.text, w);
+                try blankLine(alloc, lines);
+                try wrapMarkdown(alloc, lines, rb.text, w);
             },
             .reasoning => {
                 // Commentary is one short sentence by prompt contract;
                 // anything much longer is a provider reasoning summary —
                 // keep the card, clip the wall (full text stays in the log).
-                try wrapReasoningCard(arena, &lines, try clipText(arena, rb.text, 280), w);
+                try wrapReasoningCard(alloc, lines, try clipText(alloc, rb.text, 280), w);
             },
             .tool_call => {
-                last_tool_label = rb.label;
+                last_tool_label.* = rb.label;
                 // Keep the machinery subdued. Bash commands receive semantic
                 // shell roles; for file tools the emphasized value is a path.
                 const hi = extractHighlightArg(rb.label, rb.text);
-                const head = try std.fmt.allocPrint(arena, "  ⚙ {s} ", .{rb.label});
+                const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{rb.label});
                 if (hi) |h| {
                     const hi_capped = h[0..@min(h.len, w -| (head.len + 2))];
                     const is_bash = std.mem.eql(u8, rb.label, "bash");
-                    try lines.append(arena, .{
+                    try lines.append(alloc, .{
                         .text = head,
                         .style = Palette.tool,
                         .text2 = hi_capped,
                         .style2 = if (is_bash) Palette.shell_command else Palette.tool_cmd,
                         .syntax = if (is_bash)
-                            try shellCommandSpans(arena, hi_capped, head.len)
+                            try shellCommandSpans(alloc, hi_capped, head.len)
                         else
                             &.{},
                     });
                 } else {
                     const preview_len = @min(rb.text.len, @min(w -| (rb.label.len + 4), 120));
-                    try lines.append(arena, .{
+                    try lines.append(alloc, .{
                         .text = head,
                         .style = Palette.tool,
                         .text2 = rb.text[0..preview_len],
@@ -2485,7 +2537,7 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                 // a truncated diff misleads. Diffs merely read via bash keep
                 // diff coloring but the ordinary cap.
                 const is_diff = isDiffOutput(rb.text);
-                const max_shown: usize = if (is_diff and isFileEditTool(last_tool_label)) 24 else 8;
+                const max_shown: usize = if (is_diff and isFileEditTool(last_tool_label.*)) 24 else 8;
                 const language = if (is_diff) diffLanguage(rb.text) else SyntaxLanguage.generic;
                 var shown: usize = 0;
                 var total: usize = 0;
@@ -2494,7 +2546,7 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                     total += 1;
                     if (shown < max_shown) {
                         if (rb.status == .ok and is_diff) {
-                            try appendDiffLine(arena, &lines, "    ", l, language, Palette.tool_out);
+                            try appendDiffLine(alloc, lines, "    ", l, language, Palette.tool_out);
                         } else if (rb.status != .ok) {
                             // One failure marker establishes the section;
                             // repeating it for every stack-frame line creates
@@ -2507,7 +2559,7 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                             } else "      ";
                             const salient = isSalientToolErrorLine(l) or
                                 (rb.status == .denied and shown == 0);
-                            try lines.append(arena, .{
+                            try lines.append(alloc, .{
                                 .text = prefix,
                                 .style = if (shown == 0) Palette.tool_err else Palette.tool_out,
                                 .text2 = l,
@@ -2515,9 +2567,9 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                             });
                         } else {
                             const glyph = "    ";
-                            const git_syntax = try gitLogSpans(arena, l, glyph.len);
+                            const git_syntax = try gitLogSpans(alloc, l, glyph.len);
                             if (git_syntax.len > 0) {
-                                try lines.append(arena, .{
+                                try lines.append(alloc, .{
                                     .text = glyph,
                                     .style = Palette.tool_out,
                                     .text2 = l,
@@ -2525,30 +2577,74 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                                     .syntax = git_syntax,
                                 });
                             } else {
-                                const prefixed = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, l });
-                                try lines.append(arena, .{ .text = prefixed, .style = Palette.tool_out });
+                                const prefixed = try std.fmt.allocPrint(alloc, "{s}{s}", .{ glyph, l });
+                                try lines.append(alloc, .{ .text = prefixed, .style = Palette.tool_out });
                             }
                         }
                         shown += 1;
                     }
                 }
                 if (total > shown) {
-                    const more = try std.fmt.allocPrint(arena, "    … {d} more lines", .{total - shown});
-                    try lines.append(arena, .{ .text = more, .style = Palette.tool_out });
+                    const more = try std.fmt.allocPrint(alloc, "    … {d} more lines", .{total - shown});
+                    try lines.append(alloc, .{ .text = more, .style = Palette.tool_out });
                 }
             },
             .approval => {
-                const txt = try std.fmt.allocPrint(arena, "    [approval: {s}]", .{rb.text});
-                try wrapInto(arena, &lines, txt, .{ .text = txt, .style = Palette.note });
+                const txt = try std.fmt.allocPrint(alloc, "    [approval: {s}]", .{rb.text});
+                try wrapInto(alloc, lines, txt, .{ .text = txt, .style = Palette.note });
             },
-            .steer => try wrapPrefixed(arena, &lines, "  ↪ ", rb.text, Palette.steer, w),
+            .steer => try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w),
             .system_note => {
-                const txt = try std.fmt.allocPrint(arena, "[{s}]", .{rb.text});
-                try wrapPrefixed(arena, &lines, "  ", txt, Palette.note, w);
+                const txt = try std.fmt.allocPrint(alloc, "[{s}]", .{rb.text});
+                try wrapPrefixed(alloc, lines, "  ", txt, Palette.note, w);
             },
-            .compaction => try wrapPrefixed(arena, &lines, "  ≋ ", rb.text, Palette.note, w),
+            .compaction => try wrapPrefixed(alloc, lines, "  ≋ ", rb.text, Palette.note, w),
         }
     }
+}
+
+/// Blocks of COMPLETED turns are immutable layout input: collapse runs never
+/// cross turn boundaries and folding only affects the active tail. Everything
+/// before the final turn-id group (which also covers optimistic echoes) is
+/// safe to bake into the layout cache.
+fn stableBlockCount(app: *const App) usize {
+    const items = app.blocks.items;
+    if (items.len == 0) return 0;
+    const last_turn = items[items.len - 1].turn_id;
+    var i = items.len;
+    while (i > 0 and items[i - 1].turn_id == last_turn) i -= 1;
+    return i;
+}
+
+fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(Line) {
+    var lines: std.ArrayList(Line) = .empty;
+    const w: usize = if (width == 0) 80 else width;
+
+    // Completed turns bake once into the persistent cache; each frame then
+    // costs O(active turn), not O(session). Any key change or epoch bump
+    // (session switch, echo reconcile) rebuilds from scratch.
+    const cache = &app.layout_cache;
+    if (cache.width != w or cache.expanded != app.show_tool_transcript or
+        cache.epoch != app.layout_epoch or cache.covered > app.blocks.items.len)
+    {
+        cache.reset(app.gpa);
+        cache.width = w;
+        cache.expanded = app.show_tool_transcript;
+        cache.epoch = app.layout_epoch;
+    }
+    const stable = stableBlockCount(app);
+    if (stable > cache.covered) {
+        const bake_alloc = try cache.allocator(app.gpa);
+        const prev = cache.lines.items.len;
+        var label = cache.label_state;
+        try layoutBlockRange(bake_alloc, app, &cache.lines, cache.covered, stable, w, &label, false);
+        cache.label_state = label;
+        try resolveLineLinks(bake_alloc, cache.lines.items[prev..]);
+        cache.covered = stable;
+    }
+    try lines.appendSlice(arena, cache.lines.items);
+    var label_state = cache.label_state;
+    try layoutBlockRange(arena, app, &lines, cache.covered, app.blocks.items.len, w, &label_state, true);
 
     // Streaming region: provider reasoning summaries are verbose by nature
     // (first-person deliberation), so the live view is a one-line ticker
@@ -5785,4 +5881,70 @@ test "local commands enter editor history" {
     try std.testing.expectEqual(@as(usize, 1), app.editor.history.items.len);
     app.editor.histUp();
     try std.testing.expectEqualStrings("/help", app.editor.text.items);
+}
+
+test "layout cache: incremental result equals fresh one-shot layout" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    const Fixture = struct {
+        fn fill(app: *App, a: std.mem.Allocator, turns: usize) !void {
+            var t: usize = 0;
+            var seq: u64 = 1;
+            while (t < turns) : (t += 1) {
+                const turn_id = t + 10;
+                try app.blocks.append(a, .{ .kind = .user_msg, .seq = seq, .turn_id = turn_id, .text = try a.dupe(u8, "do the thing"), .label = try a.dupe(u8, "") });
+                seq += 1;
+                try app.blocks.append(a, .{ .kind = .tool_call, .seq = seq, .turn_id = turn_id, .text = try a.dupe(u8, "{\"command\":\"zig build test\"}"), .label = try a.dupe(u8, "bash") });
+                seq += 1;
+                try app.blocks.append(a, .{ .kind = .tool_result, .seq = seq, .turn_id = turn_id, .status = if (t % 3 == 0) .err else .ok, .text = try a.dupe(u8, "line one\nline two\nline three"), .label = try a.dupe(u8, "") });
+                seq += 1;
+                try app.blocks.append(a, .{ .kind = .assistant_msg, .seq = seq, .turn_id = turn_id, .text = try a.dupe(u8, "done: **ok**"), .label = try a.dupe(u8, "") });
+                seq += 1;
+            }
+        }
+        fn rendered(a: std.mem.Allocator, app: *App) ![]const u8 {
+            var out: std.ArrayList(u8) = .empty;
+            const lines = try layoutLines(a, app, 120);
+            for (lines.items) |line| {
+                try out.appendSlice(a, try lineText(a, line));
+                try out.append(a, '\n');
+            }
+            return out.items;
+        }
+    };
+
+    // Incremental: layout after 3 turns (warms cache), add 2 more, layout again.
+    var warm = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer warm.deinit();
+    try Fixture.fill(&warm, gpa, 3);
+    var arena1 = std.heap.ArenaAllocator.init(gpa);
+    defer arena1.deinit();
+    _ = try Fixture.rendered(arena1.allocator(), &warm);
+    try std.testing.expect(warm.layout_cache.covered > 0);
+    for (warm.blocks.items) |*rb| rb.deinit(gpa);
+    warm.blocks.clearRetainingCapacity();
+    try Fixture.fill(&warm, gpa, 5);
+    warm.layout_epoch +%= 1; // list rebuilt wholesale, as a session switch would
+    var arena2 = std.heap.ArenaAllocator.init(gpa);
+    defer arena2.deinit();
+    _ = try Fixture.rendered(arena2.allocator(), &warm);
+    try std.testing.expect(warm.layout_cache.covered > 0);
+    // Now truly incremental: append one more turn on the warmed cache.
+    try Fixture.fill(&warm, gpa, 1);
+    var arena3 = std.heap.ArenaAllocator.init(gpa);
+    defer arena3.deinit();
+    const incremental = try Fixture.rendered(arena3.allocator(), &warm);
+
+    // Fresh app, identical blocks, single cold layout.
+    var fresh = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer fresh.deinit();
+    try Fixture.fill(&fresh, gpa, 5);
+    try Fixture.fill(&fresh, gpa, 1);
+    var arena4 = std.heap.ArenaAllocator.init(gpa);
+    defer arena4.deinit();
+    const cold = try Fixture.rendered(arena4.allocator(), &fresh);
+
+    try std.testing.expectEqualStrings(cold, incremental);
 }

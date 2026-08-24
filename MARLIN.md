@@ -7,9 +7,12 @@ headless CLI are thin socket clients. Docs are the contract — start with
 
 ## Build and test
 
-- `zig build` — build AND install `zig-out/bin/marlin`. `zig build test` and
+- `zig build` — build AND install `zig-out/bin/marlin`, defaulting to
+  ReleaseFast (the installed binary is the daily driver; a Debug install is
+  5-10x slower). Pass `-Doptimize=Debug` only for debugging the binary.
+  Unit tests always compile Debug regardless. `zig build test` and
   `zig build e2e` do NOT install; a running daemon only picks up changes
-  after `zig build` + reboot (`!rb` in the TUI).
+  after an install + reboot (`!rb` in the TUI).
 - `zig build test` — unit + fixture tests. Always use this, never bare
   `zig test <file>` (module graph and deps won't resolve).
 - `zig build e2e` — end-to-end scenarios: real binary against the fake

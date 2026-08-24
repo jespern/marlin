@@ -14,7 +14,11 @@ const std = @import("std");
 ///   zig build smoke      live tests against real OpenRouter (needs key)
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // The installed binary is the daily driver: default it to ReleaseFast so
+    // a plain `zig build` can never silently replace it with a Debug build
+    // (5-10x slower TUI/JSON/sqlite). Unit tests keep their own Debug module
+    // below for full safety checks and fast compile iteration.
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
     const version = b.option([]const u8, "version", "Marlin version embedded in the binary") orelse "0.0.0-dev";
 
     // ---- marlin ----
@@ -47,7 +51,22 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // ---- unit tests ----
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    // Dedicated Debug module: safety checks stay on and test compiles stay
+    // fast regardless of the install optimize mode.
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+            .{ .name = "regex", .module = regex.module("regex") },
+        },
+    });
+    test_module.linkSystemLibrary("curl", .{});
+    test_module.linkSystemLibrary("sqlite3", .{});
+    test_module.link_libc = true;
+    test_module.addOptions("build_options", build_options);
+    const exe_tests = b.addTest(.{ .root_module = test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit + fixture tests");
     test_step.dependOn(&run_exe_tests.step);
