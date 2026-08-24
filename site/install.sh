@@ -1,5 +1,5 @@
 #!/bin/sh
-# marlin installer — https://marlin.wtf
+# marlin installer, https://marlin.wtf
 #
 # What this does (the whole thing, no surprises):
 #   1. figures out your OS/arch
