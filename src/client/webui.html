@@ -136,6 +136,9 @@
 const bigints = raw => raw.replace(/"(sid|parent_sid|session_id)":(\d{12,})/g, '"$1":"$2"');
 const $ = s => document.querySelector(s);
 let sid = null, cur = null, es = null, lastSeq = 0, deltaEl = null, deltaText = '', approvalId = null;
+// Set on each session open; replayed history stays collapsed while blocks
+// stamped after this moment count as live (block ts is ms epoch).
+let openedAt = 0;
 
 // ---- markdown (escape-first; only escaped text ever reaches innerHTML) ----
 const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -283,7 +286,12 @@ function addBlock(b) {
     else pre.textContent = body;
     const call = t.querySelector(`[data-call="${CSS.escape(v.call_id || '')}"]`);
     if (call) {
-      if (v.status && v.status !== 'ok') { call.classList.add('err'); call.open = true; }
+      if (v.status && v.status !== 'ok') {
+        call.classList.add('err');
+        // Auto-expand only LIVE failures; a replayed transcript full of
+        // historical errors must not arrive as a wall of open sections.
+        if (typeof b.ts === 'number' && b.ts >= openedAt) call.open = true;
+      }
       call.appendChild(pre);
       return;
     }
@@ -355,6 +363,7 @@ function open(s) {
   sid = s.sid;
   cur = s;
   lastSeq = 0;
+  openedAt = Date.now();
   approvalId = null;
   clearDelta();
   $('#transcript').innerHTML = '';
