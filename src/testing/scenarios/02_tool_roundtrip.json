@@ -1,0 +1,28 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["what is in /tmp/marlin-e2e-test-dir"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"echo tool-was-run\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":10}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["\"tool_call_id\":\"call_1\"", "tool-was-run"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"the tool ran fine\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":5}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "what is in /tmp/marlin-e2e-test-dir"],
+    "exit_code": 0,
+    "stdout_contains": ["the tool ran fine"],
+    "db_kinds": ["user_msg", "tool_call", "tool_result", "assistant_msg"]
+  }
+}

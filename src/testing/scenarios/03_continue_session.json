@@ -1,0 +1,28 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["remember the number 42"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"noted\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["remember the number 42", "noted", "what number"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"42\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":1}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "runs": 2,
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "remember the number 42"],
+    "argv2": ["run", "--quiet", "--continue", "--model", "openrouter/test/model", "what number"],
+    "exit_code": 0,
+    "stdout_contains": ["42"],
+    "db_kinds": ["user_msg", "assistant_msg", "user_msg", "assistant_msg"]
+  }
+}

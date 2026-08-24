@@ -73,6 +73,10 @@ pub fn run(
             try eprint(io, "marlin: OPENROUTER_API_KEY is not set\n", .{});
             return 1;
         },
+        error.MissingBaseUrl => {
+            try eprint(io, "marlin: MARLIN_LOCAL_BASE_URL is not set for local/ models\n", .{});
+            return 1;
+        },
         error.UnknownProvider => {
             try eprint(io, "marlin: unknown provider in model '{s}'\n", .{model_str});
             return 1;

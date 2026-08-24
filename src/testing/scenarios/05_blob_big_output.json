@@ -1,0 +1,26 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["produce big output"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_big\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"yes A | head -c 100000\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["\"tool_call_id\":\"call_big\"", "bytes elided"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"handled the big output\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":90,\"completion_tokens\":4}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "produce big output"],
+    "exit_code": 0,
+    "stdout_contains": ["handled the big output"],
+    "db_kinds": ["user_msg", "tool_call", "tool_result", "assistant_msg"]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["trigger an error"],
+      "status": 500,
+      "body": "{\"error\":{\"message\":\"synthetic upstream explosion\",\"code\":500}}"
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "trigger an error"],
+    "exit_code": 1,
+    "stderr_contains": ["provider error"],
+    "db_kinds": ["user_msg", "system_note"]
+  }
+}

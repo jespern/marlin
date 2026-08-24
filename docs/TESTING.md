@@ -1,0 +1,113 @@
+# Testing marlin
+
+marlin's bar: **`zig build test && zig build e2e` green is the definition of
+"works"** — a successful manual run is anecdote, not evidence. Features land
+with their tests in the same commit. Expect more test code than core code;
+that is intended, not accidental.
+
+## The pyramid
+
+| Layer | Command | What it proves | Network | When it runs |
+|---|---|---|---|---|
+| 1. Unit | `zig build test` | each module's logic, inline `test` blocks | none | every save |
+| 2. Fixture | `zig build test` (same step) | real recorded provider streams still parse | none | every save |
+| 3. e2e | `zig build e2e` | the REAL binary against a scripted fake provider | localhost only | every commit |
+| 4. Smoke | `zig build smoke` | live provider behavior hasn't drifted | real OpenRouter (~1¢) | nightly / manual |
+
+**No mocks inside marlin — ever.** The binary under e2e test is the same one
+users run; what we fake is the network peer (the fake provider), never an
+internal component. If something can't be tested without an internal mock,
+that's an architecture smell to fix, not a mock to write.
+
+## Layer 1 — unit tests
+
+Inline `test` blocks next to the code they test. Every file is forced through
+the compiler by the import block at the bottom of `src/main.zig` — when you
+add a file, add it there or its tests silently never run.
+
+**The bug rule: every bug found at a higher layer gets reproduced as a test at
+the LOWEST layer that can express it** — a protocol bug becomes a unit test on
+proto.zig, not another e2e scenario. e2e catches regressions; unit tests
+explain them.
+
+## Layer 2 — fixture tests (recorded reality)
+
+`src/testing/fixture_tests.zig` replays real captured SSE streams through the
+parser pipeline at pathological chunk sizes (1 byte, primes, huge).
+
+Recording a new fixture:
+
+```bash
+export OPENROUTER_API_KEY=...
+scripts/record-fixture.sh <name> [model]     # → src/testing/fixtures/sse/<name>.sse
+```
+
+Review the capture (no secrets — generation IDs are fine), commit it, add a
+replay test asserting the semantic content (text, calls, usage). When a
+provider changes their stream format: re-record, watch what breaks, fix, keep
+BOTH fixtures (old format + new) — providers roll back too.
+
+Wanted-but-not-yet-recorded: mid-stream disconnect, 429 with Retry-After,
+reasoning deltas (o-series / Claude via OpenRouter), multiple parallel tool
+calls in one response.
+
+## Layer 3 — e2e scenarios
+
+```bash
+zig build e2e                # all scenarios
+```
+
+Each scenario is one JSON file in `src/testing/scenarios/`, consumed by two
+programs at once:
+
+- **marlin-fakeprov** (`src/testing/fake_provider_main.zig`) serves `steps`:
+  for request N it validates the request body against `expect_contains` (so we
+  assert what marlin SENDS — both directions are under test), then replays the
+  scripted SSE events or an HTTP error.
+- **e2e-runner** (`src/testing/e2e_runner.zig`) reads `check`: spawns the fake
+  provider, then the real marlin binary with an isolated `XDG_STATE_HOME` temp
+  dir and `MARLIN_BASE_URL_OPENROUTER` pointed at localhost, then asserts exit
+  code, stdout/stderr substrings, and — marlin's superpower — **the block log
+  in the SQLite store** (`db_kinds`: the exact ordered list of block kinds the
+  run must have persisted). The append-only store means every e2e test can
+  verify the full causal history, not just the final output.
+
+Adding a scenario: copy an existing file, keep the naming convention
+(`NN_short_name.json` — they run in sorted order), cover exactly one behavior
+per scenario. If the fake provider needs a new capability (delays, dropped
+connections, malformed chunks), extend `Step` in fake_provider_main.zig —
+it's ~200 lines on purpose.
+
+Current coverage: basic completion, tool round-trip (fragmented args),
+--continue across invocations, provider 500 → system_note + exit 1, oversized
+tool output → blob + inline elision.
+
+## Layer 4 — live smoke
+
+```bash
+export OPENROUTER_API_KEY=...
+zig build smoke              # skips (exit 0) when the key is unset
+```
+
+Four checks against a cheap real model: completion, tool round trip,
+--continue recall. Catches the category fixtures can't: live provider drift.
+CI runs it nightly and on manual dispatch, never on PRs.
+
+## CI
+
+`.github/workflows/ci.yml`: fmt check + unit/fixture + e2e on macOS and Linux
+for every push/PR. Smoke is a separate job gated on schedule/dispatch with
+`OPENROUTER_API_KEY` from repo secrets.
+
+## Rules going into M1 (daemon + protocol)
+
+1. **Every protocol message type ships with a golden transcript test** —
+   recorded NDJSON exchanges replayed against the daemon, asserting responses
+   byte-for-byte (modulo ids/timestamps, which get normalized).
+2. The e2e runner grows a daemon mode: spawn `marlin daemon`, drive it with a
+   scripted protocol client over the socket, assert both the wire traffic and
+   the resulting block log.
+3. Concurrency bugs get deterministic reproductions: the fake provider's
+   `delay_ms_between_events` exists precisely to freeze races into scenarios.
+4. Unit-test time stays under ~5s and e2e under ~30s locally. When they
+   outgrow that, split steps — never skip them.

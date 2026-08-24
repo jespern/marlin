@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libsqlite3-dev sqlite3
+
+      # macOS ships curl + sqlite3 in the SDK; nothing to install.
+
+      - name: Format check
+        run: zig fmt --check src build.zig
+
+      - name: Unit + fixture tests
+        run: zig build test
+
+      - name: End-to-end scenarios
+        run: zig build e2e
+
+  smoke:
+    # Live provider smoke — nightly + manual only, never blocks PRs.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libsqlite3-dev sqlite3
+      - name: Live smoke against OpenRouter
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: zig build smoke
+
+# Nightly smoke schedule (also runnable manually from the Actions tab).
+# Kept in a separate workflow trigger block for clarity:
+#   schedule: [{cron: "17 4 * * *"}]
+# Enable by uncommenting under `on:` once the repo has the secret set.

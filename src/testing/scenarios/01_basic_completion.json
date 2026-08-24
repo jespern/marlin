@@ -1,0 +1,19 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["\"model\":\"test/model\"", "say hello", "\"stream\":true"],
+      "sse": [
+        "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello \"}}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"from fake\"}}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "say hello"],
+    "exit_code": 0,
+    "stdout_contains": ["hello from fake"],
+    "db_kinds": ["user_msg", "assistant_msg"]
+  }
+}
