@@ -14,11 +14,14 @@
 //! any other marlin client.
 //!
 //! Binds 127.0.0.1 only. There is NO authentication: anything that can reach
-//! the port can drive marlin (including reboot/shutdown). POC, not a deploy.
+//! the port can drive marlin (including reboot/shutdown). POC, not a deploy —
+//! which is why serving requires the explicit `[web] enabled = true` opt-in
+//! (or MARLIN_WEB=1); it must never be reachable by default.
 
 const std = @import("std");
 const Io = std.Io;
 
+const config = @import("../core/config.zig");
 const proto = @import("../core/proto.zig");
 const attach = @import("attach.zig");
 
@@ -32,6 +35,28 @@ pub fn serve(
     self_exe: []const u8,
     args: []const [:0]const u8,
 ) !u8 {
+    // Deliberately opt-in: this is an unauthenticated localhost surface that
+    // can drive every daemon capability. Refuse to start unless the user has
+    // said so in durable configuration (or the env override for one-offs).
+    {
+        var loaded = config.load(gpa, io, environ) catch |e| {
+            std.log.err("cannot load config: {t}", .{e});
+            return 1;
+        };
+        defer loaded.deinit();
+        if (!loaded.value.web_enabled) {
+            std.log.err(
+                "the web ui is disabled (it is an UNAUTHENTICATED local control surface).\n" ++
+                    "  enable it deliberately: add\n" ++
+                    "    [web]\n" ++
+                    "    enabled = true\n" ++
+                    "  to ~/.config/marlin/config.toml, or run once with MARLIN_WEB=1.",
+                .{},
+            );
+            return 2;
+        }
+    }
+
     var port: u16 = default_port;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {

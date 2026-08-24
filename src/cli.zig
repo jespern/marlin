@@ -103,7 +103,8 @@ const help_text =
     \\  marlin compact [handle] manually compact a session's context
     \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
     \\  marlin shutdown        stop the daemon
-    \\  marlin web [--port N]  local web UI (127.0.0.1:8377, unauthenticated POC)
+    \\  marlin web [--port N]  local web UI — opt-in via [web] enabled = true
+    \\                         (127.0.0.1:8377; UNAUTHENTICATED, localhost only)
     \\  marlin help | version
     \\
 ;

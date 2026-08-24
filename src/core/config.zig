@@ -69,6 +69,12 @@ pub const Config = struct {
     /// Workspace layer (docs/WORKSPACE.md): COW shadow snapshots and write
     /// leases. Independent of permissions and OFF until M4.5 lands.
     workspace_enabled: bool = false,
+
+    /// `marlin web` gate. OFF by default and deliberately opt-in: the web
+    /// bridge is an unauthenticated localhost surface that can drive every
+    /// daemon capability (including shutdown). `[web] enabled = true` or
+    /// MARLIN_WEB=1 turns it on.
+    web_enabled: bool = false,
 };
 
 pub fn defaults() Config {
@@ -86,6 +92,9 @@ pub fn fromEnviron(environ: *const std.process.Environ.Map) Config {
 fn applyEnviron(c: *Config, environ: *const std.process.Environ.Map) void {
     if (environ.get("MARLIN_PERMISSIONS")) |v| {
         c.permissions_enabled = std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
+    }
+    if (environ.get("MARLIN_WEB")) |v| {
+        c.web_enabled = std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
     }
     if (environ.get("MARLIN_NETWORK_BLOCKLISTS")) |value| c.network_blocklists = value;
     if (environ.get("MARLIN_NETWORK_ALLOW")) |value| c.network_allow = value;
@@ -157,6 +166,26 @@ pub fn load(
     return .{ .gpa = gpa, .arena_state = arena_state, .value = cfg };
 }
 
+test "web ui stays off unless deliberately enabled" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+
+    try std.testing.expect(!defaults().web_enabled);
+    try std.testing.expect(!fromEnviron(&environ).web_enabled);
+    try environ.put("MARLIN_WEB", "1");
+    try std.testing.expect(fromEnviron(&environ).web_enabled);
+    try environ.put("MARLIN_WEB", "0");
+    try std.testing.expect(!fromEnviron(&environ).web_enabled);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const doc = try toml.parse(arena_state.allocator(), "[web]\nenabled = true\n");
+    var cfg = defaults();
+    applyDocument(&cfg, doc);
+    try std.testing.expect(cfg.web_enabled);
+}
+
 pub fn networkPolicyConfigured(cfg: Config) bool {
     return hasCsvEntry(cfg.network_blocklists) or hasCsvEntry(cfg.network_deny);
 }
@@ -183,6 +212,7 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.readonly_tools_policy) |value| cfg.readonly_tools_policy = value;
     if (doc.permissions_enabled) |value| cfg.permissions_enabled = value;
     if (doc.workspace_enabled) |value| cfg.workspace_enabled = value;
+    if (doc.web_enabled) |value| cfg.web_enabled = value;
     if (doc.network_blocklists) |value| cfg.network_blocklists = value;
     if (doc.network_allow) |value| cfg.network_allow = value;
     if (doc.network_deny) |value| cfg.network_deny = value;

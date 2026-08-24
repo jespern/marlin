@@ -45,6 +45,7 @@ pub const Document = struct {
     readonly_tools_policy: ?Policy = null,
     permissions_enabled: ?bool = null,
     workspace_enabled: ?bool = null,
+    web_enabled: ?bool = null,
     network_blocklists: ?[]const u8 = null,
     network_allow: ?[]const u8 = null,
     network_deny: ?[]const u8 = null,
@@ -61,6 +62,7 @@ const Section = enum {
     approval,
     permissions,
     workspace,
+    web,
     network,
     hooks,
     skills,
@@ -147,6 +149,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             .workspace => if (std.mem.eql(u8, key, "enabled")) {
                 doc.workspace_enabled = try boolean(value);
             },
+            .web => if (std.mem.eql(u8, key, "enabled")) {
+                doc.web_enabled = try boolean(value);
+            },
             .network => {
                 if (std.mem.eql(u8, key, "blocklists")) doc.network_blocklists = try string(arena, value);
                 if (std.mem.eql(u8, key, "allow")) doc.network_allow = try string(arena, value);
@@ -224,6 +229,7 @@ fn sectionFor(name: []const u8) Section {
         .{ "approval", Section.approval },
         .{ "permissions", Section.permissions },
         .{ "workspace", Section.workspace },
+        .{ "web", Section.web },
         .{ "network", Section.network },
         .{ "hooks", Section.hooks },
         .{ "skills", Section.skills },
