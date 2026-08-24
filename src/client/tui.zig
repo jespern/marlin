@@ -654,12 +654,21 @@ const Palette = struct {
     /// gray so it reads as background activity, never as user input or as
     /// assistant prose meant for the human.
     const tool: vaxis.Style = .{ .fg = .{ .index = 8 } };
-    /// The command itself inside a bash call: brighter than the machinery
-    /// so the eye can pick out WHAT ran while skimming (codex/claude do
-    /// this; it's the one part of a tool line worth reading).
+    /// File-tool targets remain a single emphasized value. Bash previews use
+    /// the semantic shell roles below instead of rendering as one blue blob.
     const tool_cmd: vaxis.Style = .{ .fg = .{ .index = 4 }, .bold = true }; // blue
+    const shell_command: vaxis.Style = .{ .fg = .{ .index = 7 } };
+    const shell_executable: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x82, 0xaa, 0xff } }, .bold = true };
+    const shell_flag: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x89, 0xdd, 0xff } } };
+    const shell_operator: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xc7, 0x92, 0xea } }, .bold = true };
+    const shell_string: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xc3, 0xe8, 0x8d } } };
+    const shell_path: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
+    const shell_variable: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xf7, 0x8c, 0x6c } } };
     const tool_out: vaxis.Style = .{ .fg = .{ .index = 8 }, .dim = true };
     const tool_err: vaxis.Style = .{ .fg = .{ .index = 1 } }; // red
+    const git_subject: vaxis.Style = .{ .fg = .{ .index = 7 } };
+    const git_hash: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
+    const git_ref: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x89, 0xdd, 0xff } }, .bold = true };
     // Fixed dark surfaces match the current Codex-like composer and keep the
     // add/delete signal restrained enough for syntax colors to remain legible.
     const diff_add_bg: vaxis.Color = .{ .rgb = .{ 0x1f, 0x37, 0x29 } };
@@ -993,6 +1002,176 @@ fn syntaxSpans(
             continue;
         }
         i += 1;
+    }
+    return spans.items;
+}
+
+fn isShellOperator(c: u8) bool {
+    return switch (c) {
+        '&', '|', ';', '<', '>', '(', ')' => true,
+        else => false,
+    };
+}
+
+/// Return the end of a shell operator, including a leading file descriptor
+/// (`2>&1`). Keeping the whole redirection together makes it read as syntax,
+/// not as a number followed by unrelated punctuation.
+fn shellOperatorEnd(command: []const u8, start: usize) ?usize {
+    var at = start;
+    while (at < command.len and std.ascii.isDigit(command[at])) at += 1;
+    if (at == command.len or !isShellOperator(command[at])) return null;
+    if (at > start and command[at] != '<' and command[at] != '>') return null;
+
+    at += 1;
+    while (at < command.len and
+        (isShellOperator(command[at]) or std.ascii.isDigit(command[at])))
+    {
+        at += 1;
+    }
+    return at;
+}
+
+fn shellOperatorExpectsCommand(operator: []const u8) bool {
+    if (operator.len == 0 or std.ascii.isDigit(operator[0]) or
+        operator[0] == '<' or operator[0] == '>') return false;
+    if (std.mem.startsWith(u8, operator, "&>")) return false;
+    return std.mem.indexOfAny(u8, operator, "|;&()") != null;
+}
+
+fn isShellWrapper(word: []const u8) bool {
+    return wordIn(word, "command builtin env exec nohup sudo");
+}
+
+fn isShellPath(word: []const u8) bool {
+    return (word.len > 0 and (word[0] == '.' or word[0] == '~' or word[0] == '/')) or
+        std.mem.indexOfScalar(u8, word, '/') != null;
+}
+
+/// Shell-aware styling for bash tool previews. This is deliberately lexical:
+/// it separates the landmarks people scan for (programs, flags, operators,
+/// strings, paths, and variables) without trying to execute or fully parse
+/// arbitrary shell input.
+fn shellCommandSpans(
+    arena: std.mem.Allocator,
+    command: []const u8,
+    offset: usize,
+) ![]const SyntaxSpan {
+    var spans: std.ArrayList(SyntaxSpan) = .empty;
+    var at: usize = 0;
+    var expect_command = true;
+
+    while (at < command.len) {
+        while (at < command.len and (command[at] == ' ' or command[at] == '\t')) at += 1;
+        if (at >= command.len) break;
+
+        if (command[at] == '#') {
+            try appendSyntaxSpan(arena, &spans, at, command.len, offset, Palette.syntax_comment);
+            break;
+        }
+
+        if (command[at] == '"' or command[at] == '\'' or command[at] == '`') {
+            const quote = command[at];
+            var end = at + 1;
+            while (end < command.len) {
+                if (command[end] == '\\' and quote != '\'') {
+                    end = @min(end + 2, command.len);
+                    continue;
+                }
+                if (command[end] == quote) {
+                    end += 1;
+                    break;
+                }
+                end += 1;
+            }
+            try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.shell_string);
+            expect_command = false;
+            at = end;
+            continue;
+        }
+
+        if (command[at] == '$') {
+            var end = at + 1;
+            if (end < command.len and command[end] == '{') {
+                end += 1;
+                while (end < command.len and command[end] != '}') end += 1;
+                if (end < command.len) end += 1;
+            } else {
+                while (end < command.len and
+                    (std.ascii.isAlphanumeric(command[end]) or command[end] == '_')) end += 1;
+            }
+            try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.shell_variable);
+            at = end;
+            continue;
+        }
+
+        if (shellOperatorEnd(command, at)) |end| {
+            try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.shell_operator);
+            if (shellOperatorExpectsCommand(command[at..end])) expect_command = true;
+            at = end;
+            continue;
+        }
+
+        var end = at + 1;
+        while (end < command.len and command[end] != ' ' and command[end] != '\t' and
+            command[end] != '"' and command[end] != '\'' and command[end] != '`' and
+            !isShellOperator(command[end]))
+        {
+            end += 1;
+        }
+        const word = command[at..end];
+        const assignment = std.mem.indexOfScalar(u8, word, '=') != null and word[0] != '-';
+
+        if (expect_command and assignment) {
+            try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.shell_variable);
+        } else if (isKeyword(.shell, word)) {
+            try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.syntax_keyword);
+            expect_command = wordIn(word, "do elif else for function if select then time until while");
+        } else if (expect_command) {
+            try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.shell_executable);
+            expect_command = isShellWrapper(word);
+        } else if (word.len > 1 and word[0] == '-') {
+            try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.shell_flag);
+        } else if (isShellPath(word)) {
+            try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.shell_path);
+        } else if (assignment) {
+            try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.shell_variable);
+        } else if (std.ascii.isDigit(word[0])) {
+            var all_numeric = true;
+            for (word) |c| {
+                if (!std.ascii.isDigit(c)) {
+                    all_numeric = false;
+                    break;
+                }
+            }
+            if (all_numeric) try appendSyntaxSpan(arena, &spans, at, end, offset, Palette.syntax_number);
+        }
+        at = end;
+    }
+    return spans.items;
+}
+
+/// Recognize the stable `git log --oneline` shape without depending on the
+/// originating command. This also handles useful stdout from a compound shell
+/// command whose final step failed: the error glyph stays red, while the log
+/// itself remains legible.
+fn gitLogSpans(
+    arena: std.mem.Allocator,
+    line: []const u8,
+    offset: usize,
+) ![]const SyntaxSpan {
+    var hash_end: usize = 0;
+    while (hash_end < line.len and hash_end < 40 and std.ascii.isHex(line[hash_end])) hash_end += 1;
+    if (hash_end < 7 or hash_end >= line.len or line[hash_end] != ' ') return &.{};
+
+    var spans: std.ArrayList(SyntaxSpan) = .empty;
+    try appendSyntaxSpan(arena, &spans, 0, hash_end, offset, Palette.git_hash);
+
+    var refs_start = hash_end + 1;
+    while (refs_start < line.len and line[refs_start] == ' ') refs_start += 1;
+    if (refs_start < line.len and line[refs_start] == '(') {
+        if (std.mem.indexOfScalarPos(u8, line, refs_start + 1, ')')) |close| {
+            try appendSyntaxSpan(arena, &spans, refs_start, close + 1, offset, Palette.git_ref);
+        }
     }
     return spans.items;
 }
@@ -1368,17 +1547,22 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
             },
             .reasoning => try wrapReasoningCard(arena, &lines, rb.text, w),
             .tool_call => {
-                // "⚙ bash " dim + the command bright + trailing args dim.
-                // For file tools the highlighted part is the path.
+                // Keep the machinery subdued. Bash commands receive semantic
+                // shell roles; for file tools the emphasized value is a path.
                 const hi = extractHighlightArg(rb.label, rb.text);
                 const head = try std.fmt.allocPrint(arena, "  ⚙ {s} ", .{rb.label});
                 if (hi) |h| {
                     const hi_capped = h[0..@min(h.len, w -| (head.len + 2))];
+                    const is_bash = std.mem.eql(u8, rb.label, "bash");
                     try lines.append(arena, .{
                         .text = head,
                         .style = Palette.tool,
                         .text2 = hi_capped,
-                        .style2 = Palette.tool_cmd,
+                        .style2 = if (is_bash) Palette.shell_command else Palette.tool_cmd,
+                        .syntax = if (is_bash)
+                            try shellCommandSpans(arena, hi_capped, head.len)
+                        else
+                            &.{},
                     });
                 } else {
                     const preview_len = @min(rb.text.len, @min(w -| (rb.label.len + 4), 120));
@@ -1412,8 +1596,19 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                         if (rb.status == .ok and is_diff) {
                             try appendDiffLine(arena, &lines, glyph, l, language, base_style);
                         } else {
-                            const prefixed = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, l });
-                            try lines.append(arena, .{ .text = prefixed, .style = base_style });
+                            const git_syntax = try gitLogSpans(arena, l, glyph.len);
+                            if (git_syntax.len > 0) {
+                                try lines.append(arena, .{
+                                    .text = glyph,
+                                    .style = base_style,
+                                    .text2 = l,
+                                    .style2 = Palette.git_subject,
+                                    .syntax = git_syntax,
+                                });
+                            } else {
+                                const prefixed = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, l });
+                                try lines.append(arena, .{ .text = prefixed, .style = base_style });
+                            }
                         }
                         shown += 1;
                     }
@@ -3628,6 +3823,42 @@ test "reasoning cards are bright, padded, and inset" {
         try std.testing.expect(vaxis.Color.eql(line.fill_style.?.bg, Palette.reasoning_bg));
         try std.testing.expect(displayWidth(try lineText(arena, line)) <= 36);
     }
+}
+
+test "bash previews distinguish commands flags operators strings and paths" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const command = "git log --oneline --decorate -8 && printf '\\n--- current ---\\n' && git diff --stat ./src";
+    const spans = try shellCommandSpans(arena, command, 0);
+
+    const first_git = syntaxForBytes(spans, 0, 1).?;
+    const flag_at = std.mem.indexOf(u8, command, "--oneline").?;
+    const operator_at = std.mem.indexOf(u8, command, "&&").?;
+    const string_at = std.mem.indexOfScalar(u8, command, '\'').?;
+    const printf_at = std.mem.indexOf(u8, command, "printf").?;
+    const path_at = std.mem.indexOf(u8, command, "./src").?;
+
+    try std.testing.expect(vaxis.Color.eql(first_git.fg, Palette.shell_executable.fg));
+    try std.testing.expect(vaxis.Color.eql(syntaxForBytes(spans, flag_at, flag_at + 1).?.fg, Palette.shell_flag.fg));
+    try std.testing.expect(vaxis.Color.eql(syntaxForBytes(spans, operator_at, operator_at + 1).?.fg, Palette.shell_operator.fg));
+    try std.testing.expect(vaxis.Color.eql(syntaxForBytes(spans, string_at, string_at + 1).?.fg, Palette.shell_string.fg));
+    try std.testing.expect(vaxis.Color.eql(syntaxForBytes(spans, printf_at, printf_at + 1).?.fg, Palette.shell_executable.fg));
+    try std.testing.expect(vaxis.Color.eql(syntaxForBytes(spans, path_at, path_at + 1).?.fg, Palette.shell_path.fg));
+}
+
+test "git oneline output separates hash refs and subject" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const line = "d892bef (HEAD -> main) Polish TUI output and reasoning controls";
+    const spans = try gitLogSpans(arena_state.allocator(), line, 4);
+
+    try std.testing.expectEqual(@as(usize, 2), spans.len);
+    try std.testing.expectEqual(@as(usize, 4), spans[0].start);
+    try std.testing.expectEqual(@as(usize, 11), spans[0].end);
+    try std.testing.expect(vaxis.Color.eql(spans[0].style.fg, Palette.git_hash.fg));
+    try std.testing.expect(vaxis.Color.eql(spans[1].style.fg, Palette.git_ref.fg));
+    try std.testing.expectEqual(@as(usize, 0), (try gitLogSpans(arena_state.allocator(), "not a git log line", 4)).len);
 }
 
 test "status metadata is compact without losing its identity" {
