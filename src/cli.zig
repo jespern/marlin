@@ -12,6 +12,7 @@ pub const Command = enum {
     run,
     ls,
     kill,
+    shutdown,
     help,
     version,
 
@@ -27,6 +28,7 @@ pub fn dispatch(
     gpa: std.mem.Allocator,
     io: Io,
     environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
     args: []const [:0]const u8,
 ) !u8 {
     const cmd: Command = if (args.len == 0)
@@ -38,9 +40,12 @@ pub fn dispatch(
     switch (cmd) {
         .version => try stdoutPrint(io, "marlin 0.0.0\n", .{}),
         .help => try stdoutPrint(io, help_text, .{}),
-        .daemon => try daemon.serveStub(io),
-        .run => return headless.run(gpa, io, environ, rest),
-        else => try stdoutPrint(io, "marlin: '{s}' not implemented yet (see docs/MILESTONES.md)\n", .{@tagName(cmd)}),
+        .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
+        .run => return headless.run(gpa, io, environ, self_exe, rest),
+        .ls => return headless.ls(gpa, io, environ, self_exe),
+        .kill => return headless.kill(gpa, io, environ, self_exe, rest),
+        .shutdown => return headless.shutdown(gpa, io, environ),
+        .attach => try stdoutPrint(io, "marlin attach (TUI): not implemented yet (M2)\n", .{}),
     }
     return 0;
 }
@@ -53,8 +58,8 @@ const help_text =
     \\  marlin run [--continue] [--model <m>] [--quiet] "task"
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls              list sessions
-    \\  marlin attach <id>     attach to a session
-    \\  marlin kill <id>       terminate a session
+    \\  marlin kill <id>       interrupt a session's running turn
+    \\  marlin shutdown        stop the daemon
     \\  marlin help | version
     \\
 ;
@@ -68,5 +73,6 @@ pub fn stdoutPrint(io: Io, comptime fmt: []const u8, fmt_args: anytype) !void {
 
 test "command parse" {
     try std.testing.expectEqual(Command.run, Command.parse("run").?);
+    try std.testing.expectEqual(Command.shutdown, Command.parse("shutdown").?);
     try std.testing.expectEqual(@as(?Command, null), Command.parse("bogus"));
 }

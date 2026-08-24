@@ -36,6 +36,15 @@ pub const RunOpts = struct {
     on_delta_ctx: ?*anyopaque = null,
     /// Called when a tool starts/finishes (for progress display).
     on_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, phase: ToolPhase) void = null,
+    /// Called after EVERY block is persisted (daemon fan-out). The block's
+    /// memory is only valid during the callback.
+    on_block: ?*const fn (ctx: ?*anyopaque, b: block.Block) void = null,
+    /// Cooperative cancellation: checked between rounds and threaded into
+    /// the HTTP layer. When set mid-stream the turn ends with .interrupted.
+    cancel: ?*std.atomic.Value(bool) = null,
+    /// Steer poll: return queued mid-turn user text (caller allocs w/ gpa;
+    /// loop frees). Checked between rounds; injected as a steer block.
+    poll_steer: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 = null,
     max_rounds: u32 = 32,
 };
 
@@ -45,6 +54,30 @@ pub const TurnResult = struct {
     rounds: u32,
     tokens_in: u64,
     tokens_out: u64,
+    interrupted: bool = false,
+};
+
+/// Bundles the repetitive persist-then-notify step.
+const Appender = struct {
+    store: *Store,
+    io: Io,
+    opts: *const RunOpts,
+    seq: u64,
+    turn_id: u64,
+
+    fn append(self: *Appender, body: block.Body) !void {
+        self.seq += 1;
+        const b = block.Block{
+            .id = ids.next(self.io),
+            .session_id = self.opts.session_id,
+            .turn_id = self.turn_id,
+            .seq = self.seq,
+            .ts = nowMs(self.io),
+            .body = body,
+        };
+        try self.store.appendBlock(b);
+        if (self.opts.on_block) |cb| cb(self.opts.on_delta_ctx, b);
+    }
 };
 
 /// Run one full agent turn: user text in → tool roundtrips → final text out.
@@ -57,25 +90,35 @@ pub fn runTurn(
     opts: RunOpts,
     user_text: []const u8,
 ) !TurnResult {
-    const turn_id = ids.next(io);
-    var seq = try store.lastSeq(opts.session_id);
+    var ap = Appender{
+        .store = store,
+        .io = io,
+        .opts = &opts,
+        .seq = try store.lastSeq(opts.session_id),
+        .turn_id = ids.next(io),
+    };
 
-    // Persist the user message.
-    seq += 1;
-    try store.appendBlock(.{
-        .id = ids.next(io),
-        .session_id = opts.session_id,
-        .turn_id = turn_id,
-        .seq = seq,
-        .ts = nowMs(io),
-        .body = .{ .user_msg = .{ .text = user_text } },
-    });
+    try ap.append(.{ .user_msg = .{ .text = user_text } });
 
     var total_in: u64 = 0;
     var total_out: u64 = 0;
     var round: u32 = 0;
 
     while (round < opts.max_rounds) : (round += 1) {
+        // -- cancellation checkpoint --
+        if (cancelled(opts.cancel)) {
+            try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
+            try store.updateSessionUsage(opts.session_id, total_in, total_out);
+            return .{ .text = try gpa.dupe(u8, ""), .rounds = round, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
+        }
+        // -- steer checkpoint: inject queued mid-turn user text --
+        if (opts.poll_steer) |poll| {
+            while (poll(opts.on_delta_ctx, gpa)) |steer_text| {
+                defer gpa.free(steer_text);
+                try ap.append(.{ .steer = .{ .text = steer_text } });
+            }
+        }
+
         // -- assemble context from the full block log (arena per request) --
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
@@ -106,26 +149,26 @@ pub fn runTurn(
         var pump = Pump{ .parser = sse.Parser.init(gpa), .acc = &acc };
         defer pump.parser.deinit();
 
-        const resp = try http.streamPost(gpa, .{
+        const resp = http.streamPost(gpa, .{
             .url = opts.endpoint.url,
             .bearer = opts.endpoint.bearer,
             .body_json = body,
-        }, &pump, Pump.onChunk);
+            .cancel = opts.cancel,
+        }, &pump, Pump.onChunk) catch |e| switch (e) {
+            error.Cancelled => {
+                try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
+                try store.updateSessionUsage(opts.session_id, total_in, total_out);
+                return .{ .text = try gpa.dupe(u8, ""), .rounds = round, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
+            },
+            else => return e,
+        };
 
         if (resp.status >= 400) {
             const eb = resp.error_body orelse try gpa.dupe(u8, "");
             defer gpa.free(eb);
             const msg = try std.fmt.allocPrint(gpa, "provider returned HTTP {d}: {s}", .{ resp.status, eb[0..@min(eb.len, 2000)] });
-            errdefer gpa.free(msg);
-            seq += 1;
-            try store.appendBlock(.{
-                .id = ids.next(io),
-                .session_id = opts.session_id,
-                .turn_id = turn_id,
-                .seq = seq,
-                .ts = nowMs(io),
-                .body = .{ .system_note = .{ .text = msg } },
-            });
+            defer gpa.free(msg);
+            try ap.append(.{ .system_note = .{ .text = msg } });
             return error.ProviderError;
         }
 
@@ -136,15 +179,7 @@ pub fn runTurn(
 
         // -- no tool calls → final answer --
         if (acc.calls.items.len == 0) {
-            seq += 1;
-            try store.appendBlock(.{
-                .id = ids.next(io),
-                .session_id = opts.session_id,
-                .turn_id = turn_id,
-                .seq = seq,
-                .ts = nowMs(io),
-                .body = .{ .assistant_msg = .{ .text = acc.text.items } },
-            });
+            try ap.append(.{ .assistant_msg = .{ .text = acc.text.items } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return .{
                 .text = try gpa.dupe(u8, acc.text.items),
@@ -159,20 +194,11 @@ pub fn runTurn(
             const args_repaired = jsonx.repairObject(gpa, pc.args.items) catch pc.args.items;
             defer if (args_repaired.ptr != pc.args.items.ptr) gpa.free(@constCast(args_repaired));
 
-            // Persist the tool_call block.
-            seq += 1;
-            try store.appendBlock(.{
-                .id = ids.next(io),
-                .session_id = opts.session_id,
-                .turn_id = turn_id,
-                .seq = seq,
-                .ts = nowMs(io),
-                .body = .{ .tool_call = .{
-                    .call_id = pc.call_id.items,
-                    .name = pc.name.items,
-                    .args_json = args_repaired,
-                } },
-            });
+            try ap.append(.{ .tool_call = .{
+                .call_id = pc.call_id.items,
+                .name = pc.name.items,
+                .args_json = args_repaired,
+            } });
 
             if (opts.on_tool) |cb| cb(opts.on_delta_ctx, pc.name.items, .start);
             const exec = executeTool(gpa, io, pc.name.items, args_repaired, opts.cwd);
@@ -187,25 +213,22 @@ pub fn runTurn(
             const inline_body = try context.capInline(gpa, exec.output, cap);
             defer if (inline_body.ptr != exec.output.ptr) gpa.free(@constCast(inline_body));
 
-            seq += 1;
-            try store.appendBlock(.{
-                .id = ids.next(io),
-                .session_id = opts.session_id,
-                .turn_id = turn_id,
-                .seq = seq,
-                .ts = nowMs(io),
-                .body = .{ .tool_result = .{
-                    .call_id = pc.call_id.items,
-                    .status = exec.status,
-                    .inline_body = inline_body,
-                    .full_body_ref = full_ref,
-                } },
-            });
+            try ap.append(.{ .tool_result = .{
+                .call_id = pc.call_id.items,
+                .status = exec.status,
+                .inline_body = inline_body,
+                .full_body_ref = full_ref,
+            } });
         }
         // Loop: next round re-assembles including the new tool results.
     }
 
     return error.TooManyRounds;
+}
+
+fn cancelled(flag: ?*std.atomic.Value(bool)) bool {
+    const f = flag orelse return false;
+    return f.load(.acquire);
 }
 
 const ExecOut = struct {

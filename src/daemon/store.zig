@@ -128,6 +128,46 @@ pub const Store = struct {
         try stepDone(stmt);
     }
 
+    pub const SessionListing = struct {
+        id: u64,
+        title: []const u8,
+        model: []const u8,
+        status: []const u8,
+        created_at: i64,
+
+        pub fn deinit(self: SessionListing, gpa: std.mem.Allocator) void {
+            gpa.free(self.title);
+            gpa.free(self.model);
+            gpa.free(self.status);
+        }
+    };
+
+    /// All sessions, newest first. Caller deinits each entry + frees slice.
+    pub fn listSessions(self: Store) Error![]SessionListing {
+        const stmt = try self.prepare(
+            "SELECT id, title, model, status, created_at FROM sessions ORDER BY created_at DESC, id DESC",
+        );
+        defer finalize(stmt);
+        var out: std.ArrayList(SessionListing) = .empty;
+        errdefer {
+            for (out.items) |s| s.deinit(self.gpa);
+            out.deinit(self.gpa);
+        }
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            try out.append(self.gpa, .{
+                .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .title = try self.dupeCol(stmt, 1),
+                .model = try self.dupeCol(stmt, 2),
+                .status = try self.dupeCol(stmt, 3),
+                .created_at = c.sqlite3_column_int64(stmt, 4),
+            });
+        }
+        return out.toOwnedSlice(self.gpa);
+    }
+
     /// Most recently created session id, if any (for `marlin run --continue`).
     pub fn lastSession(self: Store) Error!?u64 {
         const stmt = try self.prepare(

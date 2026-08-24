@@ -19,10 +19,12 @@ const cli = @import("cli.zig");
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
+    const self_exe = if (args.len > 0) args[0] else "marlin";
     return cli.dispatch(
         init.gpa,
         init.io,
         init.environ_map,
+        self_exe,
         if (args.len > 1) args[1..] else &.{},
     );
 }
@@ -36,6 +38,7 @@ test {
     _ = @import("core/config.zig");
     _ = @import("core/jsonx.zig");
     _ = @import("core/ids.zig");
+    _ = @import("core/queue.zig");
     _ = @import("daemon/session.zig");
     _ = @import("daemon/store.zig");
     _ = @import("daemon/loop.zig");

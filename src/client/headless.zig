@@ -1,11 +1,8 @@
-//! `marlin run "task"` — headless one-shot session. Doubles as the eval
-//! harness (docs/ARCHITECTURE.md §11): create session, run to completion,
-//! print result to stdout, exit nonzero on failure.
+//! Headless protocol clients: `marlin run`, `marlin ls`, `marlin kill`,
+//! `marlin shutdown`. All drive the daemon over the socket — the in-process
+//! M0 path is gone; the daemon autostarts on demand (attach.connect).
 //!
-//! M0 NOTE: no daemon exists yet, so this drives daemon/loop.zig in-process.
-//! From M1 it becomes a true protocol client and the in-process path dies.
-//!
-//! Flags:
+//! run flags:
 //!   --continue        reuse the most recent session
 //!   --model <m>       override the model (registry string)
 //!   --quiet           suppress streaming; print only the final text
@@ -14,11 +11,8 @@ const std = @import("std");
 const Io = std.Io;
 
 const config = @import("../core/config.zig");
-const store_mod = @import("../daemon/store.zig");
-const loop = @import("../daemon/loop.zig");
-const ids = @import("../core/ids.zig");
-const registry = @import("../daemon/provider/registry.zig");
-const http = @import("../daemon/provider/http.zig");
+const proto = @import("../core/proto.zig");
+const attach = @import("attach.zig");
 
 pub const Flags = struct {
     continue_last: bool = false,
@@ -53,6 +47,7 @@ pub fn run(
     gpa: std.mem.Allocator,
     io: Io,
     environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
     args: []const [:0]const u8,
 ) !u8 {
     const flags = parseFlags(args) catch {
@@ -67,108 +62,187 @@ pub fn run(
     const cfg = config.defaults();
     const model_str = flags.model orelse cfg.model_default;
 
-    // Resolve provider endpoint + credentials.
-    const ep = registry.resolve(gpa, environ, model_str) catch |e| switch (e) {
-        error.MissingApiKey => {
-            try eprint(io, "marlin: OPENROUTER_API_KEY is not set\n", .{});
-            return 1;
-        },
-        error.MissingBaseUrl => {
-            try eprint(io, "marlin: MARLIN_LOCAL_BASE_URL is not set for local/ models\n", .{});
-            return 1;
-        },
-        error.UnknownProvider => {
-            try eprint(io, "marlin: unknown provider in model '{s}'\n", .{model_str});
-            return 1;
-        },
-        else => return e,
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{e});
+        return 1;
     };
-    defer ep.deinit(gpa);
+    defer conn.deinit();
 
-    http.globalInit();
-    defer http.globalDeinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    // Open store.
-    const db_path = try store_mod.defaultDbPath(gpa, io, environ);
-    defer gpa.free(db_path);
-    var store = try store_mod.Store.open(gpa, db_path);
-    defer store.close();
-
-    // Session: new or continued.
-    var cwd_buf: [4096]u8 = undefined;
-    const cwd_len = try std.process.currentPath(io, &cwd_buf);
-    const cwd = cwd_buf[0..cwd_len];
-
-    var session_id: u64 = undefined;
+    // Resolve the session id.
+    var sid: u64 = 0;
     if (flags.continue_last) {
-        session_id = (try store.lastSession()) orelse {
+        try conn.send(.{ .session_list = .{} });
+        const list = try conn.recvUntil(arena, .session_list_result);
+        if (list.sessions.len == 0) {
             try eprint(io, "marlin: no session to continue\n", .{});
             return 1;
-        };
+        }
+        sid = list.sessions[0].sid; // newest first
     } else {
-        session_id = ids.next(io);
-        try store.createSession(session_id, nowMs(io), cwd, model_str);
+        var cwd_buf: [4096]u8 = undefined;
+        const cwd_len = try std.process.currentPath(io, &cwd_buf);
+        try conn.send(.{ .session_create = .{ .cwd = cwd_buf[0..cwd_len], .model = model_str } });
+        const created = try conn.recvUntil(arena, .session_created);
+        sid = created.sid;
     }
 
-    // Delta/tool progress sinks.
-    var sink = Sink{ .io = io, .quiet = flags.quiet };
+    // Subscribe live-only (we don't need history replayed) and start the turn.
+    try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+    try conn.send(.{ .input = .{ .sid = sid, .text = task } });
 
-    const result = loop.runTurn(gpa, io, &store, .{
-        .session_id = session_id,
-        .cwd = cwd,
-        .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model },
-        .cfg = cfg,
-        .on_delta = Sink.onDelta,
-        .on_delta_ctx = &sink,
-        .on_tool = Sink.onTool,
-    }, task) catch |e| switch (e) {
-        error.ProviderError => {
-            try eprint(io, "\nmarlin: provider error (see session log)\n", .{});
-            return 1;
-        },
-        error.TooManyRounds => {
-            try eprint(io, "\nmarlin: gave up after too many tool rounds\n", .{});
-            return 1;
-        },
-        else => return e,
-    };
-    defer gpa.free(result.text);
+    // Stream until the session goes idle/err again.
+    var final_text: ?[]u8 = null;
+    defer if (final_text) |t| gpa.free(t);
+    var tokens_in: u64 = 0;
+    var tokens_out: u64 = 0;
+    var saw_running = false;
+    var failed = false;
 
+    while (true) {
+        var msg_arena = std.heap.ArenaAllocator.init(gpa);
+        defer msg_arena.deinit();
+        const msg = conn.recv(msg_arena.allocator()) catch break;
+        switch (msg) {
+            .delta => |d| {
+                if (d.sid == sid and !flags.quiet) try print(io, "{s}", .{d.text});
+            },
+            .blk => |b| {
+                if (b.sid != sid) continue;
+                switch (b.b.body) {
+                    .assistant_msg => |am| {
+                        if (final_text) |t| gpa.free(t);
+                        final_text = try gpa.dupe(u8, am.text);
+                    },
+                    .tool_call => |tc| {
+                        if (!flags.quiet) try print(io, "\n[tool: {s}]\n", .{tc.name});
+                    },
+                    .system_note => |sn| {
+                        if (!flags.quiet) try print(io, "\n[{s}]\n", .{sn.text});
+                    },
+                    else => {},
+                }
+            },
+            .status => |s| {
+                if (s.sid != sid) continue;
+                switch (s.state) {
+                    .running => saw_running = true,
+                    .idle => if (saw_running) break,
+                    .err => {
+                        failed = true;
+                        if (saw_running) break;
+                        saw_running = true; // err before running=already done
+                    },
+                    else => {},
+                }
+                if (s.state == .err) break;
+            },
+            .session_meta => |m| {
+                if (m.sid == sid) {
+                    tokens_in = m.tokens_in;
+                    tokens_out = m.tokens_out;
+                }
+            },
+            .err => |e| {
+                try eprint(io, "marlin: daemon error {s}: {s}\n", .{ e.code, e.msg });
+                return 1;
+            },
+            else => {},
+        }
+    }
+
+    if (failed) {
+        try eprint(io, "\nmarlin: turn failed (see session log)\n", .{});
+        return 1;
+    }
     if (flags.quiet) {
-        try print(io, "{s}\n", .{result.text});
+        try print(io, "{s}\n", .{final_text orelse ""});
     } else {
-        // Streaming already printed the text; add the summary line.
-        try print(io, "\n\n[{d} round(s), {d} in / {d} out tokens, session {d}]\n", .{
-            result.rounds, result.tokens_in, result.tokens_out, session_id,
-        });
+        try print(io, "\n\n[{d} in / {d} out tokens, session {d}]\n", .{ tokens_in, tokens_out, sid });
     }
     return 0;
 }
 
-const Sink = struct {
+pub fn ls(
+    gpa: std.mem.Allocator,
     io: Io,
-    quiet: bool,
-    printed_any: bool = false,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+) !u8 {
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{e});
+        return 1;
+    };
+    defer conn.deinit();
 
-    fn onDelta(ctx: ?*anyopaque, text: []const u8) void {
-        const self: *Sink = @ptrCast(@alignCast(ctx.?));
-        if (self.quiet) return;
-        self.printed_any = true;
-        print(self.io, "{s}", .{text}) catch {};
-    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try conn.send(.{ .session_list = .{} });
+    const list = try conn.recvUntil(arena_state.allocator(), .session_list_result);
 
-    fn onTool(ctx: ?*anyopaque, name: []const u8, phase: loop.ToolPhase) void {
-        const self: *Sink = @ptrCast(@alignCast(ctx.?));
-        if (self.quiet) return;
-        switch (phase) {
-            .start => print(self.io, "\n[tool: {s} ...", .{name}) catch {},
-            .done => print(self.io, " done]\n", .{}) catch {},
-        }
+    if (list.sessions.len == 0) {
+        try print(io, "no sessions\n", .{});
+        return 0;
     }
-};
+    for (list.sessions) |s| {
+        const marker: []const u8 = if (s.running) "●" else " ";
+        const title = if (s.title.len > 0) s.title else "(untitled)";
+        try print(io, "{s} {d}  {s}  [{s}]\n", .{ marker, s.sid, title, s.model });
+    }
+    return 0;
+}
+
+pub fn kill(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    if (args.len < 1) {
+        try eprint(io, "usage: marlin kill <session-id>\n", .{});
+        return 2;
+    }
+    const sid = std.fmt.parseInt(u64, args[0], 10) catch {
+        try eprint(io, "marlin: bad session id '{s}'\n", .{args[0]});
+        return 2;
+    };
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{e});
+        return 1;
+    };
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try conn.send(.{ .session_kill = .{ .sid = sid } });
+    _ = try conn.recvUntil(arena_state.allocator(), .ok);
+    return 0;
+}
+
+pub fn shutdown(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+) !u8 {
+    const conn = (attach.tryConnect(gpa, io, environ) catch null) orelse {
+        try print(io, "marlin: daemon not running\n", .{});
+        return 0;
+    };
+    defer conn.deinit();
+    try conn.send(.{ .hello = .{ .proto_version = proto.proto_version } });
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    _ = try conn.recvUntil(arena_state.allocator(), .hello_ok);
+    try conn.send(.{ .shutdown = .{} });
+    _ = conn.recvUntil(arena_state.allocator(), .ok) catch {};
+    return 0;
+}
 
 fn print(io: Io, comptime fmt: []const u8, args: anytype) !void {
-    var buf: [4096]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var w: Io.File.Writer = .init(.stdout(), io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
@@ -179,11 +253,6 @@ fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     var w: Io.File.Writer = .init(.stderr(), io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
-}
-
-fn nowMs(io: Io) i64 {
-    const ts = Io.Timestamp.now(io, .real);
-    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
 }
 
 test "flag parsing" {

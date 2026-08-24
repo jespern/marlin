@@ -142,16 +142,30 @@ fn runScenario(
 
     const base_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/v1", .{port});
 
-    // 2. Environment for marlin: isolated state, fake endpoint, dummy key.
+    // 2. Environment for marlin: isolated state, socket, fake endpoint.
     var env = std.process.Environ.Map.init(arena);
     try env.put("HOME", state_dir); // nothing should use it, but be safe
     try env.put("XDG_STATE_HOME", state_dir);
+    const sock_path = try std.fmt.allocPrint(arena, "{s}/daemon.sock", .{state_dir});
+    try env.put("MARLIN_SOCKET", sock_path);
     try env.put("MARLIN_BASE_URL_OPENROUTER", base_url);
     try env.put("OPENROUTER_API_KEY", "test-key-e2e");
     try env.put("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     var env_it = sf.check.env.map.iterator();
     while (env_it.next()) |kv| {
         try env.put(kv.key_ptr.*, kv.value_ptr.*);
+    }
+    // Always stop the per-scenario daemon (autostarted by marlin run).
+    defer {
+        const res = std.process.run(gpa, io, .{
+            .argv = &.{ marlin_bin, "shutdown" },
+            .environ_map = &env,
+            .stdout_limit = .limited(64 * 1024),
+        }) catch null;
+        if (res) |r| {
+            gpa.free(r.stdout);
+            gpa.free(r.stderr);
+        }
     }
 
     // 3. Run marlin (1 or 2 invocations).

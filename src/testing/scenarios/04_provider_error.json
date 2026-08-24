@@ -9,7 +9,7 @@
   "check": {
     "argv": ["run", "--quiet", "--model", "openrouter/test/model", "trigger an error"],
     "exit_code": 1,
-    "stderr_contains": ["provider error"],
+    "stderr_contains": ["turn failed"],
     "db_kinds": ["user_msg", "system_note"]
   }
 }
