@@ -19,6 +19,7 @@
 //!   - Turn threads never see sessions; they get a TurnJob value copy.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Io = std.Io;
 
 const proto = @import("../core/proto.zig");
@@ -37,7 +38,7 @@ const extensions = @import("extensions.zig");
 const registry = @import("provider/registry.zig");
 const http = @import("provider/http.zig");
 
-const daemon_version = "0.0.0";
+const daemon_version = build_options.version;
 
 // ---------------------------------------------------------------- events --
 

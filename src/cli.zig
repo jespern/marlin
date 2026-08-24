@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const build_options = @import("build_options");
 
 const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
@@ -41,7 +42,7 @@ pub fn dispatch(
     const rest = if (args.len == 0) args else args[1..];
 
     switch (cmd) {
-        .version => try stdoutPrint(io, "marlin 0.0.0\n", .{}),
+        .version => try stdoutPrint(io, "marlin {s}\n", .{build_options.version}),
         .help => try stdoutPrint(io, help_text, .{}),
         .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
         .run => return headless.run(gpa, io, environ, self_exe, rest),

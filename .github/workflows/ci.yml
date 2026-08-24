@@ -29,6 +29,9 @@ jobs:
       - name: Format check
         run: zig fmt --check src build.zig
 
+      - name: Installer tests
+        run: sh scripts/test-install.sh
+
       - name: Unit + fixture tests
         run: zig build test
 

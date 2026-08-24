@@ -15,6 +15,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = b.option([]const u8, "version", "Marlin version embedded in the binary") orelse "0.0.0-dev";
 
     // ---- marlin ----
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
@@ -34,6 +35,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("curl", .{});
     exe.root_module.linkSystemLibrary("sqlite3", .{});
     exe.root_module.link_libc = true;
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    exe.root_module.addOptions("build_options", build_options);
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Build and run marlin");
