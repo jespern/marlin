@@ -17,7 +17,8 @@
 //!     "exit_code": 0,
 //!     "stdout_contains": ["hello"],
 //!     "db_kinds": ["user_msg","assistant_msg"],   // expected block kinds, in order
-//!     "runs": 1                                   // repeat marlin N times (for --continue tests)
+//!     "runs": 1,                                  // repeat marlin N times (for --continue tests)
+//!     "session_handle_flow": true                 // exercise ls/prefix/archive/unarchive
 //!   }
 //! For runs > 1, "argv2" gives the second invocation's args.
 
@@ -43,6 +44,7 @@ const Check = struct {
     hook_script: ?[]const u8 = null,
     mcp_script: ?[]const u8 = null,
     hook_output_contains: ?[]const u8 = null,
+    session_handle_flow: bool = false,
 };
 
 const ScenarioFile = struct {
@@ -279,6 +281,10 @@ fn runScenario(
         else => return error.ProviderCrashed,
     }
 
+    if (sf.check.session_handle_flow) {
+        try checkSessionHandleFlow(gpa, io, marlin_bin, &env, state_dir);
+    }
+
     // 5. DB assertions via the sqlite3 CLI (avoids linking sqlite here).
     if (sf.check.db_kinds.len > 0) {
         const db_path = try std.fmt.allocPrint(arena, "{s}/marlin/marlin.db", .{state_dir});
@@ -335,6 +341,93 @@ fn runScenario(
     }
 
     print(io, "ok\n", .{});
+}
+
+fn checkSessionHandleFlow(
+    gpa: std.mem.Allocator,
+    io: Io,
+    marlin_bin: []const u8,
+    env: *const std.process.Environ.Map,
+    state_dir: []const u8,
+) !void {
+    const listed = try std.process.run(gpa, io, .{
+        .argv = &.{ marlin_bin, "ls" },
+        .environ_map = env,
+        .cwd = .{ .path = state_dir },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    });
+    defer gpa.free(listed.stdout);
+    defer gpa.free(listed.stderr);
+    if (listed.term != .exited or listed.term.exited != 0) return error.SessionHandleListFailed;
+
+    const line_end = std.mem.indexOfScalar(u8, listed.stdout, '\n') orelse listed.stdout.len;
+    var words = std.mem.tokenizeAny(u8, listed.stdout[0..line_end], " \t\r");
+    const handle = words.next() orelse return error.SessionHandleMissing;
+    if (handle.len < 8 or handle.len > 64) return error.SessionHandleBadLength;
+    for (handle) |c| if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) return error.SessionHandleBadSyntax;
+    const prefix = handle[0..4];
+
+    const archived = try std.process.run(gpa, io, .{
+        .argv = &.{ marlin_bin, "archive", prefix },
+        .environ_map = env,
+        .cwd = .{ .path = state_dir },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    });
+    defer gpa.free(archived.stdout);
+    defer gpa.free(archived.stderr);
+    if (archived.term != .exited or archived.term.exited != 0 or
+        std.mem.indexOf(u8, archived.stdout, handle) == null)
+    {
+        return error.SessionHandleArchiveFailed;
+    }
+
+    const hidden = try std.process.run(gpa, io, .{
+        .argv = &.{ marlin_bin, "ls" },
+        .environ_map = env,
+        .cwd = .{ .path = state_dir },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    });
+    defer gpa.free(hidden.stdout);
+    defer gpa.free(hidden.stderr);
+    if (hidden.term != .exited or hidden.term.exited != 0 or
+        !std.mem.eql(u8, hidden.stdout, "no sessions\n"))
+    {
+        return error.SessionHandleArchiveVisibilityFailed;
+    }
+
+    const inclusive = try std.process.run(gpa, io, .{
+        .argv = &.{ marlin_bin, "ls", "--all" },
+        .environ_map = env,
+        .cwd = .{ .path = state_dir },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    });
+    defer gpa.free(inclusive.stdout);
+    defer gpa.free(inclusive.stderr);
+    if (inclusive.term != .exited or inclusive.term.exited != 0 or
+        std.mem.indexOf(u8, inclusive.stdout, handle) == null or
+        std.mem.indexOf(u8, inclusive.stdout, "archived") == null)
+    {
+        return error.SessionHandleInclusiveListFailed;
+    }
+
+    const restored = try std.process.run(gpa, io, .{
+        .argv = &.{ marlin_bin, "unarchive", prefix },
+        .environ_map = env,
+        .cwd = .{ .path = state_dir },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    });
+    defer gpa.free(restored.stdout);
+    defer gpa.free(restored.stderr);
+    if (restored.term != .exited or restored.term.exited != 0 or
+        std.mem.indexOf(u8, restored.stdout, handle) == null)
+    {
+        return error.SessionHandleRestoreFailed;
+    }
 }
 
 fn writeExecutable(gpa: std.mem.Allocator, io: Io, path: []const u8, contents: []const u8) !void {

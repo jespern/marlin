@@ -15,8 +15,21 @@ with the latter, it's simpler to ship):
   attach simultaneously, to the same or different sessions.
 - `marlin run "task"` — headless one-shot: create session, run to completion,
   print result, exit nonzero on failure. Doubles as the eval harness.
-- `marlin ls / attach <id> / archive <id> / unarchive <id> / kill <id>` —
+- `marlin ls / attach <handle> / archive <handle> / unarchive <handle> /
+  kill <handle>` —
   thin protocol clients for scripting.
+
+### Session identity at the human boundary
+
+SQLite and the wire protocol keep sortable `u64` session ids. User-facing
+surfaces do not expose those unwieldy numbers: they derive a stable,
+domain-separated SHA-256 handle and normally show its first eight lowercase
+hex characters. Commands accept any case-insensitive unique prefix of at least
+four characters (`marlin attach 63df`); resolution includes archived sessions,
+never silently picks an ambiguous match, and listings extend beyond eight
+characters if a collision requires it. Exact decimal ids remain accepted for
+backward compatibility, but new scripts should consume the handle from
+`marlin ls`.
 
 ### Remote access: two modes, one blessed
 

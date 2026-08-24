@@ -23,6 +23,8 @@ multiplexed by a TUI that is just another client.**
 
 - Sessions live in the daemon. Detach, reboot your laptop, ssh in from another
   machine, reattach — the agent never noticed.
+- Sessions have short stable handles: `marlin ls` prints eight characters and
+  `marlin attach 63df` accepts any unique prefix of four or more.
 - The multiplexer knows "session 3 is awaiting approval for `rm -rf`" as a
   *typed event*, not a guess from terminal output. Tap-to-approve from a phone
   becomes a protocol message, not a screen-scrape.

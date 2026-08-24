@@ -88,6 +88,12 @@ states. M6 hierarchy fields are `parent_sid` (null for roots), `kind` (`root`,
 `archived` is true only in inclusive list results. Older clients may ignore
 these fields; older entries decode as active roots.
 
+`sid` remains the durable numeric protocol identity. Clients derive the
+human-facing session handle from it (domain-separated SHA-256, eight hex
+characters unless collision extension is needed) and resolve unique prefixes
+locally against an inclusive session list; the daemon protocol itself does not
+trade readability for a second identity or a storage migration.
+
 ## Approval flow (M2)
 
 1. Turn thread hits a mutating tool call in an `approvals="default"` session.

@@ -5,10 +5,10 @@
 //!   marlin daemon         → run the daemon in the foreground         [M1]
 //!   marlin run "task"     → headless one-shot session                [M0]
 //!   marlin ls [--all]     → list sessions                            [M1]
-//!   marlin attach <id>    → attach TUI to a session                  [M2]
-//!   marlin archive <id>   → hide a durable session hierarchy         [M6]
-//!   marlin unarchive <id> → restore an archived hierarchy            [M6]
-//!   marlin kill <id>      → interrupt a session                      [M1]
+//!   marlin attach <handle>    → attach TUI to a session               [M2]
+//!   marlin archive <handle>   → hide a durable session hierarchy      [M6]
+//!   marlin unarchive <handle> → restore an archived hierarchy         [M6]
+//!   marlin kill <handle>      → interrupt a session                   [M1]
 //!
 //! See docs/ARCHITECTURE.md §1 for the process model.
 //!
@@ -52,6 +52,7 @@ test {
     _ = @import("core/config.zig");
     _ = @import("core/jsonx.zig");
     _ = @import("core/ids.zig");
+    _ = @import("core/session_handle.zig");
     _ = @import("core/queue.zig");
     _ = @import("daemon/session.zig");
     _ = @import("daemon/store.zig");

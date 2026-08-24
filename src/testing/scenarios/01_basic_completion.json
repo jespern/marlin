@@ -14,6 +14,7 @@
     "argv": ["run", "--quiet", "--model", "openrouter/test/model", "say hello"],
     "exit_code": 0,
     "stdout_contains": ["hello from fake"],
-    "db_kinds": ["user_msg", "assistant_msg"]
+    "db_kinds": ["user_msg", "assistant_msg"],
+    "session_handle_flow": true
   }
 }

@@ -59,20 +59,21 @@ pub fn dispatch(
         .shutdown => return headless.shutdown(gpa, io, environ),
         .web => return web.serve(gpa, io, environ, self_exe, rest),
         .attach => {
-            var sid_arg: ?u64 = null;
-            if (rest.len > 0) {
-                sid_arg = std.fmt.parseInt(u64, rest[0], 10) catch {
-                    try stdoutPrint(io, "marlin: bad session id '{s}'\n", .{rest[0]});
-                    return 2;
-                };
+            if (rest.len > 1) {
+                try stdoutPrint(io, "usage: marlin attach [session-handle]\n", .{});
+                return 2;
             }
+            const sid_arg: ?[]const u8 = if (rest.len == 1) rest[0] else null;
             var plan = tui.RebootPlan{};
             const code = try tui.run(gpa, io, environ, self_exe, sid_arg, &plan);
             if (plan.request != .none) {
                 // TUI torn down cleanly; now run the reboot sequence and
-                // exec back into `marlin attach <sid>`.
-                var sid_buf: [24]u8 = undefined;
-                const sid_str = try std.fmt.bufPrintZ(&sid_buf, "{d}", .{plan.sid});
+                // exec back into `marlin attach @<sid>`.
+                var sid_buf: [25]u8 = undefined;
+                // Internal exact-id syntax keeps reboot continuity immune to
+                // any public-prefix collision while old decimal input remains
+                // accepted for compatibility.
+                const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{plan.sid});
                 var argv: std.ArrayList([:0]const u8) = .empty;
                 defer argv.deinit(gpa);
                 if (plan.request == .build) try argv.append(gpa, "--build");
@@ -92,14 +93,14 @@ const help_text =
     \\
     \\usage:
     \\  marlin                 attach to the daemon (TUI, newest session)
-    \\  marlin attach <id>     attach TUI to a specific session
+    \\  marlin attach <handle> attach TUI to a session (unique prefix, min 4)
     \\  marlin run [--continue] [--model <m>] [--quiet] [--ask] "task"
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls [--all]      list sessions
-    \\  marlin archive <id>    hide a session tree without deleting it
-    \\  marlin unarchive <id>  restore an archived session tree
-    \\  marlin kill <id>       interrupt a session's running turn
-    \\  marlin compact [id]    manually compact a session's context
+    \\  marlin archive <handle> hide a session tree without deleting it
+    \\  marlin unarchive <handle> restore an archived session tree
+    \\  marlin kill <handle>   interrupt a session's running turn
+    \\  marlin compact [handle] manually compact a session's context
     \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
     \\  marlin shutdown        stop the daemon
     \\  marlin web [--port N]  local web UI (127.0.0.1:8377, unauthenticated POC)

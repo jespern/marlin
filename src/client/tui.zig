@@ -30,6 +30,7 @@ const vaxis = @import("vaxis");
 const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const config = @import("../core/config.zig");
+const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const credentials = @import("../core/credentials.zig");
 const Editor = @import("editor.zig");
@@ -292,6 +293,10 @@ const App = struct {
     /// existing fuzzy picker; full view state lives in saved_views.
     sessions: std.ArrayList(SessionSummary) = .empty,
     session_labels: std.ArrayList([]const u8) = .empty,
+    /// Monotonic catalog of active and archived ids, seeded before entering
+    /// the TUI. It lets visible handles remain globally unambiguous even
+    /// though session_watch intentionally omits archived rows.
+    known_session_ids: std.ArrayList(u64) = .empty,
     saved_views: std.AutoHashMapUnmanaged(u64, *SavedSessionView) = .empty,
     background_approvals: std.AutoHashMapUnmanaged(u64, PendingApproval) = .empty,
     recent_sessions: std.ArrayList(u64) = .empty,
@@ -327,7 +332,7 @@ const App = struct {
     awaiting_new_session: bool = false,
     pending_new_cwd: std.ArrayList(u8) = .empty,
     /// Set by /reboot: after clean TUI teardown, run() returns this to
-    /// cli.zig which execs `marlin reboot [--build] --then attach <sid>`.
+    /// cli.zig which execs `marlin reboot [--build] --then attach @<sid>`.
     reboot_request: RebootRequest = .none,
 
     fn deinit(self: *App) void {
@@ -337,6 +342,7 @@ const App = struct {
         for (self.sessions.items) |*session| session.deinit(self.gpa);
         self.sessions.deinit(self.gpa);
         self.session_labels.deinit(self.gpa);
+        self.known_session_ids.deinit(self.gpa);
         var saved_it = self.saved_views.valueIterator();
         while (saved_it.next()) |saved| {
             saved.*.deinit(self.gpa);
@@ -380,6 +386,22 @@ const App = struct {
     fn sessionSummary(self: *const App, sid: u64) ?*const SessionSummary {
         for (self.sessions.items) |*session| {
             if (session.sid == sid) return session;
+        }
+        return null;
+    }
+
+    fn rememberSession(self: *App, sid: u64) void {
+        for (self.known_session_ids.items) |known| if (known == sid) return;
+        self.known_session_ids.append(self.gpa, sid) catch {};
+    }
+
+    fn displaySessionHandle(self: *const App, buf: *session_handle.Full, sid: u64) []const u8 {
+        return session_handle.display(buf, sid, self.known_session_ids.items);
+    }
+
+    fn sessionIdForLabel(self: *const App, label: []const u8) ?u64 {
+        for (self.sessions.items) |session| {
+            if (std.mem.eql(u8, session.label, label)) return session.sid;
         }
         return null;
     }
@@ -508,7 +530,9 @@ const App = struct {
         self.animation_active.store(self.state == .running, .release);
         const from_seq = if (self.last_seq == 0) 1 else self.last_seq +| 1;
         self.conn.send(.{ .sub = .{ .sid = sid, .from_seq = from_seq } }) catch {};
-        self.setNotice("session → #{x}", .{sid});
+        self.rememberSession(sid);
+        var handle_buf: session_handle.Full = undefined;
+        self.setNotice("session → {s}", .{self.displaySessionHandle(&handle_buf, sid)});
     }
 
     fn cycleSession(self: *App, direction: i8) void {
@@ -524,6 +548,7 @@ const App = struct {
     }
 
     fn replaceSessionSummaries(self: *App, incoming: []const proto.SessionInfo) void {
+        for (incoming) |info| self.rememberSession(info.sid);
         for (self.sessions.items) |*session| session.deinit(self.gpa);
         self.sessions.clearRetainingCapacity();
         self.session_labels.clearRetainingCapacity();
@@ -541,9 +566,10 @@ const App = struct {
             };
             const identity = if (info.title.len > 0) info.title else info.model;
             const hierarchy = if (info.parent_sid != null) @as([]const u8, "  ↳ ") else "";
-            const label = std.fmt.allocPrint(self.gpa, "{s}#{x}  {s} · {s} · {s}", .{
+            var handle_buf: session_handle.Full = undefined;
+            const label = std.fmt.allocPrint(self.gpa, "{s}{s}  {s} · {s} · {s}", .{
                 hierarchy,
-                info.sid,
+                self.displaySessionHandle(&handle_buf, info.sid),
                 identity,
                 @tagName(info.state),
                 info.cwd,
@@ -917,7 +943,7 @@ const App = struct {
         const current = self.pickerCurrent();
         for (self.pickerSource(), 0..) |item, i| {
             const selected = if (kind == .session)
-                (sessionIdFromLabel(item) orelse 0) == self.sid
+                (self.sessionIdForLabel(item) orelse 0) == self.sid
             else
                 std.mem.eql(u8, item, current);
             if (selected) {
@@ -1061,7 +1087,7 @@ const App = struct {
         switch (self.picker_kind) {
             .model => self.applyModel(item),
             .effort => self.applyEffort(proto.ReasoningEffort.parse(item) orelse return),
-            .session => self.switchSession(sessionIdFromLabel(item) orelse return, true) catch
+            .session => self.switchSession(self.sessionIdForLabel(item) orelse return, true) catch
                 self.setNotice("could not switch session", .{}),
         }
     }
@@ -1134,7 +1160,8 @@ const App = struct {
                 self.setNotice("session archived, but could not switch sessions", .{});
                 return;
             };
-            self.setNotice("archived session #{x}", .{archived_sid});
+            var handle_buf: session_handle.Full = undefined;
+            self.setNotice("archived session {s}", .{self.displaySessionHandle(&handle_buf, archived_sid)});
         } else {
             self.newSession() catch {
                 self.setNotice("session archived; use /new to continue", .{});
@@ -1170,6 +1197,7 @@ const App = struct {
     fn handleSessionCreated(self: *App, sid: u64) void {
         if (!self.awaiting_new_session) return;
         self.awaiting_new_session = false;
+        self.rememberSession(sid);
         const model = self.gpa.dupe(u8, self.model.items) catch return;
         defer self.gpa.free(model);
         const effort = self.effort;
@@ -1182,7 +1210,8 @@ const App = struct {
         if (self.cwd.items.len == 0) self.setCwdStr(self.pending_new_cwd.items);
         self.pending_new_cwd.clearRetainingCapacity();
         self.shortcut_help = false;
-        self.setNotice("new session #{x}", .{sid});
+        var handle_buf: session_handle.Full = undefined;
+        self.setNotice("new session {s}", .{self.displaySessionHandle(&handle_buf, sid)});
     }
 
     fn approveReply(self: *App, granted: bool) void {
@@ -1324,20 +1353,6 @@ const Palette = struct {
 fn statusModel(model: []const u8) []const u8 {
     const gateway = "openrouter/";
     return if (std.mem.startsWith(u8, model, gateway)) model[gateway.len..] else model;
-}
-
-fn sessionIdFromLabel(label: []const u8) ?u64 {
-    const hash = std.mem.indexOfScalar(u8, label, '#') orelse return null;
-    const id_text = label[hash + 1 ..];
-    if (id_text.len == 0) return null;
-    const end = std.mem.indexOfScalar(u8, id_text, ' ') orelse id_text.len;
-    return std.fmt.parseInt(u64, id_text[0..end], 16) catch null;
-}
-
-test "session labels resolve root and indented child ids" {
-    try std.testing.expectEqual(@as(?u64, 0x2a), sessionIdFromLabel("#2a  root · idle · /tmp"));
-    try std.testing.expectEqual(@as(?u64, 0x2b), sessionIdFromLabel("  ↳ #2b  child · done · /tmp"));
-    try std.testing.expectEqual(@as(?u64, null), sessionIdFromLabel("no session id"));
 }
 
 fn statusCwd(arena: std.mem.Allocator, cwd: []const u8, home: []const u8) ![]const u8 {
@@ -3719,7 +3734,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     else
         Palette.status_context;
     const cwd_txt = try statusCwd(arena, app.cwd.items, app.home.items);
-    const session_txt = try std.fmt.allocPrint(arena, "#{x:0>4}", .{app.sid & 0xFFFF});
+    var session_handle_buf: session_handle.Full = undefined;
+    const session_txt = try std.fmt.allocPrint(arena, "{s}", .{app.displaySessionHandle(&session_handle_buf, app.sid)});
     const scroll_txt = try std.fmt.allocPrint(arena, "↕ {d} (G: bottom)", .{app.scroll_up});
     const focused_parent_sid = if (app.sessionSummary(app.sid)) |summary| summary.parent_sid else null;
     var child_count: usize = 0;
@@ -3736,9 +3752,10 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             else => {},
         }
     }
-    const child_txt: []const u8 = if (focused_parent_sid) |parent_sid|
-        try std.fmt.allocPrint(arena, "child of #{x:0>4}", .{parent_sid & 0xFFFF})
-    else if (child_count > 0)
+    const child_txt: []const u8 = if (focused_parent_sid) |parent_sid| child: {
+        var parent_handle_buf: session_handle.Full = undefined;
+        break :child try std.fmt.allocPrint(arena, "child of {s}", .{app.displaySessionHandle(&parent_handle_buf, parent_sid)});
+    } else if (child_count > 0)
         if (child_approvals > 0)
             try std.fmt.allocPrint(arena, "{d} child{s} · {d} approval{s}", .{
                 child_count,
@@ -3798,9 +3815,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     else
         "";
 
-    // Session tag: last 4 hex digits of the id — enough to tell sessions
-    // apart in `marlin ls` (which shows the same suffix) without eating
-    // half the status bar with a u64.
+    // Stable public session handle, shared with `marlin ls` and accepted by
+    // attach/archive/kill/compact as any unique prefix of four or more chars.
     var status_segments: [27]vaxis.Segment = undefined;
     var status_n: usize = 0;
     status_segments[status_n] = .{ .text = " ", .style = Palette.status_bar };
@@ -3958,7 +3974,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         while (i < items.len and row <= shown) : (i += 1) {
             const f = items[i];
             const cur = if (app.picker_kind == .session)
-                (sessionIdFromLabel(f) orelse 0) == app.sid
+                (app.sessionIdForLabel(f) orelse 0) == app.sid
             else
                 std.mem.eql(u8, f, current);
             const line = try std.fmt.allocPrint(arena, " {s}{s}", .{ f[0..@min(f.len, box_w -| 4)], if (cur) " ●" else "" });
@@ -4055,7 +4071,7 @@ pub fn run(
     io: Io,
     environ: *std.process.Environ.Map,
     self_exe: []const u8,
-    sid_arg: ?u64,
+    sid_arg: ?[]const u8,
     reboot_out: ?*RebootPlan,
 ) !u8 {
     // -- first-run bootstrap: no provider key → prompt before the TUI --
@@ -4078,6 +4094,9 @@ pub fn run(
     var model_buf: [256]u8 = undefined;
     var cwd_at_start: []const u8 = "";
     var cwd_buf: [4096]u8 = undefined;
+    var initial_known_ids: std.ArrayList(u64) = .empty;
+    var initial_ids_transferred = false;
+    defer if (!initial_ids_transferred) initial_known_ids.deinit(gpa);
 
     var sid: u64 = 0;
     {
@@ -4087,10 +4106,22 @@ pub fn run(
 
         // Fetch metadata even for an explicit attach: the session may have
         // been created from another directory (or another client process).
-        try conn.send(.{ .session_list = .{ .include_archived = sid_arg != null } });
+        try conn.send(.{ .session_list = .{ .include_archived = true } });
         const list = try conn.recvUntil(arena, .session_list_result);
+        for (list.sessions) |session| try initial_known_ids.append(gpa, session.sid);
         var selected: ?usize = null;
-        if (sid_arg) |requested| {
+        if (sid_arg) |query| {
+            const ids = try arena.alloc(u64, list.sessions.len);
+            for (list.sessions, 0..) |session, i| ids[i] = session.sid;
+            const requested = session_handle.resolve(query, ids) catch |err| {
+                switch (err) {
+                    error.PrefixTooShort => std.log.err("session handle '{s}' is too short (use at least {d} characters)", .{ query, session_handle.min_prefix_len }),
+                    error.InvalidHandle => std.log.err("invalid session handle '{s}'", .{query}),
+                    error.NotFound => std.log.err("no session matches '{s}'", .{query}),
+                    error.Ambiguous => std.log.err("session handle '{s}' is ambiguous; use more characters from `marlin ls --all`", .{query}),
+                }
+                return 2;
+            };
             sid = requested;
             for (list.sessions, 0..) |session, i| {
                 if (session.sid == requested) {
@@ -4098,9 +4129,13 @@ pub fn run(
                     break;
                 }
             }
-        } else if (list.sessions.len > 0) {
-            sid = list.sessions[0].sid;
-            selected = 0;
+        } else {
+            for (list.sessions, 0..) |session, i| {
+                if (session.archived) continue;
+                sid = session.sid;
+                selected = i;
+                break;
+            }
         }
 
         if (selected) |i| {
@@ -4129,7 +4164,16 @@ pub fn run(
         try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 1 } });
     }
 
-    var app = App{ .gpa = gpa, .io = io, .conn = conn, .sid = sid, .editor = Editor.init(gpa), .cfg = cfg };
+    var app = App{
+        .gpa = gpa,
+        .io = io,
+        .conn = conn,
+        .sid = sid,
+        .editor = Editor.init(gpa),
+        .known_session_ids = initial_known_ids,
+        .cfg = cfg,
+    };
+    initial_ids_transferred = true;
     defer app.deinit();
     app.setModelStr(model_at_start);
     app.effort = effort_at_start;
@@ -5450,7 +5494,8 @@ test "session labels round-trip ids and preserve inactive view state" {
         .created_at = 1,
         .running = true,
     }});
-    try std.testing.expectEqual(@as(?u64, 0x2a), sessionIdFromLabel(app.session_labels.items[0]));
+    try std.testing.expectEqual(@as(?u64, 0x2a), app.sessionIdForLabel(app.session_labels.items[0]));
+    try std.testing.expectEqual(@as(?u64, null), app.sessionIdForLabel("no session label"));
     try std.testing.expectEqual(proto.SessionState.running, app.state);
 
     app.editor.insertSlice("draft survives");

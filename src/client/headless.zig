@@ -16,7 +16,62 @@ const Io = std.Io;
 
 const config = @import("../core/config.zig");
 const proto = @import("../core/proto.zig");
+const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
+
+const ResolvedSession = struct {
+    sid: u64,
+    handle: session_handle.Full,
+    handle_len: usize,
+
+    fn text(self: *const ResolvedSession) []const u8 {
+        return self.handle[0..self.handle_len];
+    }
+};
+
+fn sessionIds(arena: std.mem.Allocator, sessions: []const proto.SessionInfo) ![]u64 {
+    const ids = try arena.alloc(u64, sessions.len);
+    for (sessions, 0..) |session, i| ids[i] = session.sid;
+    return ids;
+}
+
+fn resolvedSession(sid: u64, known: []const u64) ResolvedSession {
+    var handle_buf: session_handle.Full = undefined;
+    const handle = session_handle.display(&handle_buf, sid, known);
+    return .{ .sid = sid, .handle = handle_buf, .handle_len = handle.len };
+}
+
+/// Resolve every command-line session reference against the complete durable
+/// catalog, including archived sessions. Null means a diagnostic was printed.
+fn resolveSessionArg(
+    io: Io,
+    conn: *attach.Conn,
+    arena: std.mem.Allocator,
+    query: []const u8,
+) !?ResolvedSession {
+    try conn.send(.{ .session_list = .{ .include_archived = true } });
+    const list = try conn.recvUntil(arena, .session_list_result);
+    const ids = try sessionIds(arena, list.sessions);
+    const sid = session_handle.resolve(query, ids) catch |err| {
+        switch (err) {
+            error.PrefixTooShort => try eprint(io, "marlin: session handle '{s}' is too short (use at least {d} characters)\n", .{ query, session_handle.min_prefix_len }),
+            error.InvalidHandle => try eprint(io, "marlin: invalid session handle '{s}'\n", .{query}),
+            error.NotFound => try eprint(io, "marlin: no session matches '{s}'\n", .{query}),
+            error.Ambiguous => {
+                try eprint(io, "marlin: session handle '{s}' is ambiguous; use more characters:\n", .{query});
+                for (list.sessions) |session| {
+                    if (!session_handle.matchesPrefix(query, session.sid)) continue;
+                    var handle_buf: session_handle.Full = undefined;
+                    const handle = session_handle.display(&handle_buf, session.sid, ids);
+                    const title = if (session.title.len > 0) session.title else "(untitled)";
+                    try eprint(io, "  {s}  {s}  {s}\n", .{ handle, title, session.cwd });
+                }
+            },
+        }
+        return null;
+    };
+    return resolvedSession(sid, ids);
+}
 
 pub const Flags = struct {
     continue_last: bool = false,
@@ -184,7 +239,16 @@ pub fn run(
     if (flags.quiet) {
         try print(io, "{s}\n", .{final_text orelse ""});
     } else {
-        try print(io, "\n\n[{d} in / {d} out tokens, session {d}]\n", .{ tokens_in, tokens_out, sid });
+        var resolved = resolvedSession(sid, &.{});
+        // Collision extension needs the complete catalog. Failure to refresh
+        // this cosmetic suffix must not turn a completed agent run into an
+        // error, so retain the ordinary eight-character fallback.
+        if (conn.send(.{ .session_list = .{ .include_archived = true } })) |_| {
+            if (conn.recvUntil(arena, .session_list_result)) |list| {
+                if (sessionIds(arena, list.sessions)) |ids| resolved = resolvedSession(sid, ids) else |_| {}
+            } else |_| {}
+        } else |_| {}
+        try print(io, "\n\n[{d} in / {d} out tokens, session {s}]\n", .{ tokens_in, tokens_out, resolved.text() });
     }
     return 0;
 }
@@ -212,20 +276,30 @@ pub fn ls(
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    try conn.send(.{ .session_list = .{ .include_archived = include_archived } });
-    const list = try conn.recvUntil(arena_state.allocator(), .session_list_result);
+    const arena = arena_state.allocator();
+    // Always load archived ids so every displayed handle is globally unique;
+    // ordinary `ls` merely filters those rows from its output.
+    try conn.send(.{ .session_list = .{ .include_archived = true } });
+    const list = try conn.recvUntil(arena, .session_list_result);
+    const ids = try sessionIds(arena, list.sessions);
 
-    if (list.sessions.len == 0) {
+    var visible: usize = 0;
+    for (list.sessions) |session| if (include_archived or !session.archived) {
+        visible += 1;
+    };
+    if (visible == 0) {
         try print(io, "no sessions\n", .{});
         return 0;
     }
     for (list.sessions) |s| {
+        if (!include_archived and s.archived) continue;
         const marker: []const u8 = if (s.running) "●" else " ";
         const hierarchy: []const u8 = if (s.parent_sid != null) "  ↳" else "";
         const title = if (s.title.len > 0) s.title else "(untitled)";
         const archived = if (s.archived) "  archived" else "";
-        // #xxxx short tag matches the TUI status bar; full id for attach.
-        try print(io, "{s}{s} #{x:0>4}  {s}  [{s}]  ({d}){s}\n", .{ marker, hierarchy, s.sid & 0xFFFF, title, s.model, s.sid, archived });
+        var handle_buf: session_handle.Full = undefined;
+        const handle = session_handle.display(&handle_buf, s.sid, ids);
+        try print(io, "{s}{s} {s}  {s}  [{s}]{s}\n", .{ marker, hierarchy, handle, title, s.model, archived });
     }
     return 0;
 }
@@ -239,13 +313,9 @@ pub fn setArchived(
     archived: bool,
 ) !u8 {
     if (args.len != 1) {
-        try eprint(io, "usage: marlin {s} <session-id>\n", .{if (archived) "archive" else "unarchive"});
+        try eprint(io, "usage: marlin {s} <session-handle>\n", .{if (archived) "archive" else "unarchive"});
         return 2;
     }
-    const sid = std.fmt.parseInt(u64, args[0], 10) catch {
-        try eprint(io, "marlin: bad session id '{s}'\n", .{args[0]});
-        return 2;
-    };
     const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
         try eprint(io, "marlin: cannot reach daemon: {t}\n", .{e});
         return 1;
@@ -253,9 +323,11 @@ pub fn setArchived(
     defer conn.deinit();
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+    const resolved = (try resolveSessionArg(io, conn, arena_state.allocator(), args[0])) orelse return 2;
+    const sid = resolved.sid;
     try conn.send(.{ .session_archive = .{ .sid = sid, .archived = archived } });
     _ = try conn.recvUntil(arena_state.allocator(), .ok);
-    try print(io, "{s} session {d}\n", .{ if (archived) "archived" else "restored", sid });
+    try print(io, "{s} session {s}\n", .{ if (archived) "archived" else "restored", resolved.text() });
     return 0;
 }
 
@@ -267,13 +339,9 @@ pub fn kill(
     args: []const [:0]const u8,
 ) !u8 {
     if (args.len < 1) {
-        try eprint(io, "usage: marlin kill <session-id>\n", .{});
+        try eprint(io, "usage: marlin kill <session-handle>\n", .{});
         return 2;
     }
-    const sid = std.fmt.parseInt(u64, args[0], 10) catch {
-        try eprint(io, "marlin: bad session id '{s}'\n", .{args[0]});
-        return 2;
-    };
     const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
         try eprint(io, "marlin: cannot reach daemon: {t}\n", .{e});
         return 1;
@@ -281,6 +349,8 @@ pub fn kill(
     defer conn.deinit();
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+    const resolved = (try resolveSessionArg(io, conn, arena_state.allocator(), args[0])) orelse return 2;
+    const sid = resolved.sid;
     try conn.send(.{ .session_kill = .{ .sid = sid } });
     _ = try conn.recvUntil(arena_state.allocator(), .ok);
     return 0;
@@ -305,7 +375,7 @@ pub fn shutdown(
     return 0;
 }
 
-/// `marlin compact [sid]` — manual L2 compaction. Without sid: newest
+/// `marlin compact [handle]` — manual L2 compaction. Without one: newest
 /// session. Waits for the daemon to finish (status returns to idle/err).
 pub fn compact(
     gpa: std.mem.Allocator,
@@ -324,19 +394,32 @@ pub fn compact(
     const arena = arena_state.allocator();
 
     var sid: u64 = 0;
+    var resolved_handle: session_handle.Full = undefined;
+    var resolved_handle_len: usize = 0;
     if (args.len >= 1) {
-        sid = std.fmt.parseInt(u64, args[0], 10) catch {
-            try eprint(io, "marlin: bad session id '{s}'\n", .{args[0]});
-            return 2;
-        };
+        const resolved = (try resolveSessionArg(io, conn, arena, args[0])) orelse return 2;
+        sid = resolved.sid;
+        resolved_handle = resolved.handle;
+        resolved_handle_len = resolved.handle_len;
     } else {
-        try conn.send(.{ .session_list = .{} });
+        try conn.send(.{ .session_list = .{ .include_archived = true } });
         const list = try conn.recvUntil(arena, .session_list_result);
-        if (list.sessions.len == 0) {
+        var selected: ?u64 = null;
+        for (list.sessions) |session| {
+            if (!session.archived) {
+                selected = session.sid;
+                break;
+            }
+        }
+        if (selected == null) {
             try eprint(io, "marlin: no sessions\n", .{});
             return 1;
         }
-        sid = list.sessions[0].sid;
+        sid = selected.?;
+        const ids = try sessionIds(arena, list.sessions);
+        const resolved = resolvedSession(sid, ids);
+        resolved_handle = resolved.handle;
+        resolved_handle_len = resolved.handle_len;
     }
 
     try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
@@ -352,7 +435,7 @@ pub fn compact(
                 switch (s.state) {
                     .running => saw_running = true,
                     .idle, .done => if (saw_running) {
-                        try print(io, "compacted session {d}\n", .{sid});
+                        try print(io, "compacted session {s}\n", .{resolved_handle[0..resolved_handle_len]});
                         return 0;
                     },
                     .err => {

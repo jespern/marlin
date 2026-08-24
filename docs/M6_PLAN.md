@@ -64,7 +64,8 @@ The smallest general primitive councils can reuse now exists:
 - Lifecycle: parent interrupt cancels children it is awaiting; daemon restart
   reconstructs hierarchy and marks genuinely orphaned work honestly. Child
   failures are result data and do not crash the parent turn.
-- UX: picker and `marlin ls` indentation are implemented. The status bar shows
+- UX: picker, short stable session handles, and `marlin ls` indentation are
+  implemented. The status bar shows
   a parent's child count and actionable child activity, or the parent tag when
   a child is focused. Children remain ordinary attachable sessions; no
   permanent sidebar.
