@@ -30,6 +30,46 @@ mode 0600) by default. An optional TCP listener (`--listen host:port`, token
 auth) exists for the (v2) web client; unix-socket-only is the v1 default and
 the tailnet covers remote machines via ssh.
 
+### Self-hosting reboot (`/reboot`)
+
+Marlin is developed from inside marlin, so daemon+client must re-exec onto a
+freshly built binary without losing where you were. Design premise: **a
+reboot is a voluntary, coordinated crash** — it exercises exactly the
+crash-resilience path (store is truth, clients replay with from_seq). If
+`/reboot` and `kill -9` + restart don't converge to the same restored state,
+the reboot is lying about the crash story; e2e test both and diff.
+
+Sequence:
+
+1. **Binary selection.** `/reboot` re-execs the path argv[0] resolved to at
+   daemon start (you `zig build` beforehand; binary lives at a stable path).
+   `/reboot --build` runs `zig build` first, streams output into a
+   `system_note` block, and proceeds only on success. Either way the
+   candidate is sanity-exec'd (`--version`) before committing —
+   exec-into-broken-binary is the one unrecoverable failure (daemon gone,
+   nothing to reattach), so it must be impossible.
+2. **Quiesce.** Default: wait for running turns to reach a block boundary.
+   `/reboot!` interrupts instead: finalized blocks are truth, partial delta
+   buffers are discardable; interrupted sessions get a `system_note`
+   ("interrupted by reboot") and resume with `--continue`. Running
+   background bash tasks are listed for confirmation (they get orphaned).
+3. **Daemon exit.** Persist, release flock, exit. No exec on the daemon
+   side — the client's autostart path (flock + pidfile, already spec'd)
+   brings up the new binary. One mechanism, not two.
+4. **Client re-exec.** Client writes a small lossy UI snapshot (focused
+   session, split layout, input draft) to JSON, exec()s the new binary,
+   which autostarts the new daemon, reattaches with from_seq replay, and
+   restores the snapshot. Snapshot fails to parse across versions → default
+   layout, same session: annoyance, not data loss.
+5. **Version skew.** On boot the daemon runs store migrations before
+   accepting clients; the handshake rejects mismatched proto_version so
+   old-client/new-daemon is a clean error, never a crash.
+
+What survives: everything durable (sessions, block logs, blobs, approvals,
+config) — by construction, since store ≠ context. What's rebuilt: in-flight
+turns (resumable), MCP server processes (spawn-on-use), UI state
+(best-effort snapshot).
+
 ### Concurrency model
 
 One OS thread per running agent turn (they're 99% blocked on network/subprocess),
@@ -287,15 +327,58 @@ Compatible with the emerging cross-tool skills convention.
 
 libvaxis. Modal, vim-flavored, herdr-lookalike layout:
 
+### UX principles (taste decisions, decided early — Aug 2026)
+
+Learned from daily-driving Claude Code, Codex CLI, and Hermes (the first two
+get these right; Hermes is the counter-example):
+
+- **Full-screen alt-screen TUI, always.** Cell-grid rendering, never
+  line-by-line append to the scrollback. Line-oriented output is the root
+  cause of janky buffering; owning the whole screen is why Claude Code's
+  "fullscreen" mode feels solid. (libvaxis gives us this for free — treat it
+  as a commitment, not an implementation detail.)
+- **Status bar is signal-only.** Model, context %, cost, session state —
+  things that change a decision *right now*. No session-duration counters, no
+  feature-toggle indicators, no diagnostic chrome. Every candidate status item
+  answers "would I act on this mid-turn?" or it stays out.
+- **Todo/plan list pinned above the input** when the agent maintains one:
+  current step highlighted, done items dimmed/checked. Always visible without
+  scrolling — "where is it in the plan" must never require leaving the live
+  region. Collapses to nothing when there's no plan.
+- **Progress chrome is a capped stack of live strips.** The region between
+  session view and input holds one-line strips: the todo strip, a review
+  fan-out row (`sol ✓ · grok … · glm ✓`), later background-task rows. Rules
+  that keep it from becoming a dashboard: (1) each strip has a collapsed
+  one-glyph form (`▸ wire store (3/7)`, `review 3/4 ✓`); only the most
+  recently changed (or focused) strip renders expanded. (2) Hard cap ~3
+  strips; overflow demotes to a status-bar segment. (3) **Attach before
+  stacking**: if a long-running activity corresponds to a plan step, its
+  progress renders inline on that todo line
+  (`▸ adversarial review  sol ✓ grok … glm ✓`) instead of spawning its own
+  strip — the common case stays at exactly one strip. A strip must be live
+  (recently changed, potentially actionable) to hold vertical space.
+- **Liveness via text shimmer.** While a turn runs, the working indicator is
+  an animated gradient/shimmer on the status word (the Claude/Codex rainbow
+  effect), not spinner characters and not log lines. Cheap in a cell grid:
+  cycle fg color across the word per frame.
+- **Diffs render like a diff tool, not like raw patch output.** Foreground
+  green/red on the normal background, gutter `+`/`-`, dim line numbers,
+  optional word-level emphasis within changed lines. Never full-line
+  colored backgrounds — jarring and unreadable with syntax coloring.
+  Lives in the block renderer next to markdown.zig; edit-tool results render
+  as diffs by default.
+
 ```
 ┌ sidebar ──────┬─ main: session view ────────────────┐
 │ ● 1 api-fix   │  blocks rendered as cards:          │
 │ ◐ 2 refactor  │  user / assistant md / tool collapse│
 │ ⚠ 3 deploy    │  [streaming region at bottom]       │
 │   (⚠ = needs  │                                     │
-│    approval)  ├─ input ─────────────────────────────┤
+│    approval)  ├─ todo (when present) ───────────────┤
+│               │ ✓ parse args   ▸ wire store   · tui │
+│               ├─ input ─────────────────────────────┤
 │               │ > _                                 │
-└───────────────┴─ status: model · tokens · $ · state ┘
+└───────────────┴─ status: model · ctx% · $ · state ──┘
 ```
 
 - **Modes**: insert (typing → input box), normal (j/k scroll blocks, J/K

@@ -57,7 +57,8 @@ marlin/
 └── docs/
     ├── ARCHITECTURE.md
     ├── MILESTONES.md
-    └── PROTOCOL.md            # wire protocol reference (grows with proto.zig)
+    ├── PROTOCOL.md            # wire protocol reference (grows with proto.zig)
+    └── REVIEW.md              # multi-model review councils (post-M4 design)
 ```
 
 Dependency rules (enforce by convention, they keep the build fast and the
@@ -93,10 +94,14 @@ insert/normal modes, /model /new /compact(manual stub), Ctrl+C interrupt,
 steer-while-running. Full tool set (write/edit/grep/glob/fetch) + approval
 prompts inline. *Exit: marlin replaces your daily driver for some real tasks.*
 
-## M3 — context engine done right
+## M3 — context engine + self-hosting
 L0 caps + L1 pruning + L2 compaction w/ headroom trigger + rehydration +
 usage accounting in status bar. Fixture tests for the cascade.
-*Exit: a 3-hour session never hits a context error and costs behave.*
+`/reboot` + `/reboot --build` (ARCHITECTURE.md §self-hosting reboot):
+coordinated re-exec onto fresh binaries with full state restore — from here
+marlin is developed from inside marlin. e2e: reboot vs kill-9 converge.
+*Exit: a 3-hour session never hits a context error, costs behave, and you
+ship a marlin change from a marlin session and `/reboot --build` into it.*
 
 ## M4 — multiplexer
 Sidebar, splits, J/K session switching, status glyphs (running/idle/approval),
@@ -110,6 +115,8 @@ notifications), skills. *Exit: one real MCP server + one hook in daily use.*
 ## M6 — hardening & v2 doors
 bash sandboxing (seatbelt/Landlock), allowlist promotion UX, `task` subagent
 tool + nested sidebar, TCP listener + token auth. Then decide: PWA client.
+Multi-model review councils (docs/REVIEW.md) build on the subagent machinery
+here — a review child is a specialized `task` child.
 
 # Open questions (decide before M1, none block M0)
 
