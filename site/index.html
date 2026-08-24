@@ -68,10 +68,7 @@
     font-size:1.05rem;
     margin:4px 0 0;
   }
-  .blink{ animation:blink 1s steps(2,start) infinite; }
-  @keyframes blink{ to{ visibility:hidden; } }
   @media (prefers-reduced-motion:reduce){
-    .blink{ animation:none; }
     marquee{ /* politely stop scrolling */ }
   }
 
@@ -172,6 +169,57 @@
     border:0; height:6px;
     background:linear-gradient(90deg,red,orange,yellow,lime,cyan,blue,violet);
   }
+
+  /* --- the install bar: the one thing on this page that means business --- */
+  .install{
+    background:#000;
+    border:4px ridge var(--lime);
+    padding:10px 12px;
+    margin:14px 0 4px;
+    text-align:center;
+  }
+  .install .label{
+    color:var(--yellow);
+    font-weight:bold;
+    font-size:1.05rem;
+    display:block;
+    margin-bottom:6px;
+  }
+  .install .cmdrow{
+    display:flex;
+    gap:6px;
+    justify-content:center;
+    align-items:stretch;
+    flex-wrap:wrap;
+  }
+  .install code{
+    font-family:"Courier New",monospace;
+    font-size:1.0rem;
+    font-weight:bold;
+    color:var(--lime);
+    background:#001100;
+    border:2px inset #808080;
+    padding:8px 12px;
+    white-space:nowrap;
+    overflow-x:auto;
+    max-width:100%;
+  }
+  .install button{
+    font-family:"Comic Sans MS","Comic Neue",cursive;
+    font-weight:bold;
+    font-size:0.9rem;
+    color:#000;
+    background:#c0c0c0;
+    border:2px outset #fff;
+    padding:0 12px;
+    cursor:pointer;
+  }
+  .install button:active{ border-style:inset; }
+  .install .fineprint{
+    color:#8888ff;
+    font-size:0.75rem;
+    margin:6px 0 0;
+  }
 </style>
 </head>
 <body>
@@ -180,9 +228,17 @@
   <header>
     <img class="fish" src="assets/marlin.gif" alt="a marlin leaping out of the ocean, majestically, at 64 colors">
     <h1><span class="tilde">~*~</span> marlin <span class="tilde">~*~</span></h1>
-    <p class="tagline">the AI agent harness that <b>SWIMS</b> &nbsp;🐟&nbsp;
-      <span class="blink">est. 2026</span></p>
+    <p class="tagline">the AI agent harness that <b>SWIMS</b> &nbsp;🐟&nbsp; est. 2026</p>
   </header>
+
+  <div class="install">
+    <span class="label">⚡ install it (one line, like the binary deserves):</span>
+    <div class="cmdrow">
+      <code id="installcmd">curl -fsSL https://marlin.wtf/install.sh | sh</code>
+      <button id="copybtn" type="button" title="copy to clipboard">copy</button>
+    </div>
+    <p class="fineprint">yes it's curl|sh. read it first if you want — it's short: <a href="install.sh">install.sh</a> · (installer ships when M2 does)</p>
+  </div>
 
   <marquee scrollamount="6">
     ★★★ WELCOME to marlin.wtf ★★★ one binary ★ zero electrons harmed ★ daemon-native ★ written in ZIG ★ scp it to a box and GO ★ thank you for visiting my website ★★★
@@ -264,6 +320,21 @@ $ ./marlin          <span class="c"># attach the TUI, watch it work</span></pre>
     var n=parseInt(localStorage.getItem(k)||'41',10)+1;
     localStorage.setItem(k,String(n));
     document.getElementById('counter').textContent=String(n).padStart(6,'0');
+  })();
+
+  // copy the install command; era-appropriate feedback.
+  (function(){
+    var btn=document.getElementById('copybtn');
+    var cmd=document.getElementById('installcmd');
+    btn.addEventListener('click',function(){
+      navigator.clipboard.writeText(cmd.textContent).then(function(){
+        btn.textContent='copied!!';
+        setTimeout(function(){ btn.textContent='copy'; },1500);
+      },function(){
+        btn.textContent='ctrl+c it';
+        setTimeout(function(){ btn.textContent='copy'; },2000);
+      });
+    });
   })();
 </script>
 </body>
