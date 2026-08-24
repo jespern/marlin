@@ -38,7 +38,7 @@ pub const Config = struct {
     readonly_tools_policy: Policy = .auto,
 
     /// Workspace layer (docs/WORKSPACE.md): COW shadow snapshots, write leases,
-    /// sandbox escalations. Master switch — OFF until M3.5 lands; M2
+    /// sandbox escalations. Master switch — OFF until M4.5 lands; M2
     /// approval semantics hold while false.
     workspace_enabled: bool = false,
 

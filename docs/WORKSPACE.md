@@ -1,11 +1,12 @@
 # marlin workspace & permissions
 
-Status: design accepted, **feature-flagged off by default** (`[workspace]
-enabled = false`). Nothing below changes runtime behavior until the flag
-flips; M2's approval gate (mutating tools ask) remains the shipped behavior.
-Implementation target: M3.5 (snapshots + leases), M6 (sandbox escalations,
-worktree isolation). This doc exists so M3+ work doesn't build UX on
-semantics we intend to replace.
+Status: **deferred design draft**, feature-flagged off (`[workspace]
+enabled = false`). Workspace identity and the COW-first snapshot direction are
+tentatively accepted; timing, undo, drift, lease, and retention semantics must
+be reopened after M4 dogfooding. Nothing below changes runtime behavior until
+the flag flips; M2's approval gate (mutating tools ask) remains the shipped
+behavior. Implementation target: M4.5 (snapshots + leases), M6 (sandbox
+escalations, worktree isolation).
 
 ## 1. Why not approval prompts
 
@@ -43,7 +44,7 @@ path. We built the right mechanism; this changes what flows through it.
 Every session gets a **workspace**: the daemon's answer to "where do writes
 go and who guarantees undo." In shared mode its root is exactly the
 canonicalized directory the session was launched in: never an implicitly
-discovered parent Git root, and no explicit override in M3.5. One concept,
+discovered parent Git root, and no explicit override in M4.5. One concept,
 three mechanisms.
 
 ### 2.1 Copy-on-write shadow snapshots (always on, once enabled)
@@ -189,7 +190,7 @@ enabled = false        # master switch; everything in this doc is behind it
 ```
 
 Rollout order (inside-out by usefulness):
-1. **M3.5 — snapshots + leases.** Daemon-internal, no TUI beyond a status
+1. **M4.5 — snapshots + leases.** Daemon-internal, no TUI beyond a status
    glyph and the drift note. Snapshots before sandboxing: the sandbox denies
    damage *outside* the workspace, snapshots undo damage *inside* it.
 2. **M6 — workspace phase 2: sandbox escalations** through the existing

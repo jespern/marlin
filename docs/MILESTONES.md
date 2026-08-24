@@ -73,8 +73,8 @@ extraction clean):
 
 # Milestones
 
-Detailed decisions and proposed build slices for the current M3.5 → M4 work
-live in `docs/M3_5_M4_PLAN.md`. Implementation stays paused until its open
+Detailed decisions and proposed build slices for the current M4 → M4.5 work
+live in `docs/M4_PLAN.md`. Implementation stays paused until its open
 product questions are resolved.
 
 Each milestone ends with something you use daily; cut scope inside a milestone,
@@ -107,29 +107,26 @@ marlin is developed from inside marlin. e2e: reboot vs kill-9 converge.
 *Exit: a 3-hour session never hits a context error, costs behave, and you
 ship a marlin change from a marlin session and `/reboot --build` into it.*
 
-## M3.5 — workspace layer, phase 1 (docs/WORKSPACE.md)
-Copy-on-write shadow snapshots (per-file reflinks with a portable copy
-fallback; /undo with diff preview; drift notes when external tools edit the wc)
-+ write leases (`waiting_workspace` parking). Feature-flagged `[workspace]
-enabled`, DEFAULT OFF — M2 approval
-semantics hold until sandbox escalations land (M4/M5).
-*Exit: two marlin sessions on one repo can't clobber each other; codex
-running alongside marlin is detected, absorbed, and undoable.*
-
 ## M4 — multiplexer
 No persistent sidebar. Sessions live in an on-demand `/sessions` picker with
 title/workspace/status, J/K switches recent sessions, and the status bar shows
 only actionable background activity (for example `2 running · 1 approval`).
-Splits carry a small per-pane session label. Mouse selection + OSC52, !c family,
-and daemon-side register (!y/!p cross-session).
-Image paste (ARCHITECTURE.md §image/asset paste): clipboard capture →
-attachment upload → blob → vision content parts; kitty-protocol thumbnails
-or placeholder cards.
-Remote Mode B (§remote access): `marlin attach <remote>` speaking the wire
-protocol over ssh, named remotes in config, skew-mismatch recovery gesture.
-Primary remote path from here; ssh -t stays as fallback.
-*Exit: herdr/tmux no longer wrap marlin; marlin IS the terminal you keep open,
-including for the work machine from the laptop.*
+Session switching preserves each session's view and draft. Mouse selection +
+OSC52 and the `!c` family finish the focused terminal workflow. Two-pane
+splits, image input, cross-session registers, and remote attach are candidate
+slices, not exit requirements; decide them in `docs/M4_PLAN.md` before work
+starts.
+*Exit: several local sessions can run and be revisited from one full-width
+Marlin UI without losing their place or hiding actionable background state.*
+
+## M4.5 — workspace safety (docs/WORKSPACE.md)
+Deferred until M4 multi-session dogfooding gives us real collision and latency
+data. Copy-on-write shadow snapshots with portable fallback, `/undo` with diff
+preview, external drift notes, and write leases with `waiting_workspace`
+parking. Feature-flagged `[workspace] enabled`, DEFAULT OFF; existing approval
+semantics remain unchanged until the full safety matrix passes.
+*Exit: two marlin sessions on one workspace cannot silently clobber each other;
+an external writer is detected and its pre-Marlin state remains recoverable.*
 
 ## M5 — extensibility
 MCP stdio client, exec tools, hooks (approval-needed → ntfy script = phone

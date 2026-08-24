@@ -3605,6 +3605,31 @@ test "one-line composer and scrollback prompt cards are three rows" {
     try std.testing.expect(lines.items[2].fill_style != null);
 }
 
+test "reasoning cards are bright, padded, and inset" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+    try wrapReasoningCard(
+        arena,
+        &lines,
+        "I am checking the implementation evidence before mapping it against the milestone exit criteria.",
+        38,
+    );
+
+    try std.testing.expect(lines.items.len >= 4); // top + wrapped body + bottom
+    try std.testing.expectEqualStrings("", lines.items[0].text);
+    try std.testing.expectEqualStrings("", lines.items[lines.items.len - 1].text);
+    try std.testing.expectEqualStrings("  · ", lines.items[1].text);
+    try std.testing.expect(lines.items[1].style.bold);
+    try std.testing.expect(lines.items[1].style2.italic);
+    for (lines.items) |line| {
+        try std.testing.expect(line.fill_style != null);
+        try std.testing.expect(vaxis.Color.eql(line.fill_style.?.bg, Palette.reasoning_bg));
+        try std.testing.expect(displayWidth(try lineText(arena, line)) <= 36);
+    }
+}
+
 test "status metadata is compact without losing its identity" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
