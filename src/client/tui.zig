@@ -1427,22 +1427,26 @@ const Line = struct {
 
 const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
-/// Hues for the Working shimmer, tuned to read on the dark panel. The
-/// animation tick advances the phase so color travels through the word.
-const rainbow_colors = [_]vaxis.Color{
-    .{ .rgb = .{ 0xff, 0x6b, 0x6b } },
-    .{ .rgb = .{ 0xff, 0xa9, 0x4d } },
-    .{ .rgb = .{ 0xff, 0xe0, 0x66 } },
-    .{ .rgb = .{ 0x73, 0xd0, 0x91 } },
-    .{ .rgb = .{ 0x66, 0xc2, 0xe0 } },
-    .{ .rgb = .{ 0x82, 0x9a, 0xff } },
-    .{ .rgb = .{ 0xc5, 0x8f, 0xff } },
+/// Grayscale ramp for the Working shimmer: a crest of white travels through
+/// otherwise mid-grey letters as the animation tick advances the phase —
+/// monochrome movement, not a color cycle.
+const shimmer_shades = [_]vaxis.Color{
+    .{ .rgb = .{ 0x6e, 0x6e, 0x6e } },
+    .{ .rgb = .{ 0x7e, 0x7e, 0x7e } },
+    .{ .rgb = .{ 0x96, 0x96, 0x96 } },
+    .{ .rgb = .{ 0xb6, 0xb6, 0xb6 } },
+    .{ .rgb = .{ 0xdc, 0xdc, 0xdc } },
+    .{ .rgb = .{ 0xff, 0xff, 0xff } },
+    .{ .rgb = .{ 0xdc, 0xdc, 0xdc } },
+    .{ .rgb = .{ 0xb6, 0xb6, 0xb6 } },
+    .{ .rgb = .{ 0x96, 0x96, 0x96 } },
+    .{ .rgb = .{ 0x7e, 0x7e, 0x7e } },
 };
 
-/// One bold rainbow span per code point of `text`, phase-shifted by `frame`
-/// so successive animation ticks cycle the colors. `offset` is the byte
-/// position of `text` within the line's concatenated visible text.
-fn rainbowSpans(
+/// One bold shimmer span per code point of `text`, phase-shifted by `frame`
+/// so successive animation ticks move the brightness crest. `offset` is the
+/// byte position of `text` within the line's concatenated visible text.
+fn shimmerSpans(
     arena: std.mem.Allocator,
     text: []const u8,
     offset: usize,
@@ -1458,7 +1462,7 @@ fn rainbowSpans(
             .start = offset + i,
             .end = offset + end,
             .style = .{
-                .fg = rainbow_colors[(char_index + frame) % rainbow_colors.len],
+                .fg = shimmer_shades[(char_index + frame) % shimmer_shades.len],
                 .bold = true,
             },
         });
@@ -2424,7 +2428,7 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
             .style2 = Palette.working,
             .text3 = elapsed,
             .style3 = Palette.collapse_hint,
-            .syntax = try rainbowSpans(arena, word, head.len, app.spinner_frame),
+            .syntax = try shimmerSpans(arena, word, head.len, app.spinner_frame),
         });
     }
 
