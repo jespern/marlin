@@ -205,7 +205,8 @@ pub fn ls(
     for (list.sessions) |s| {
         const marker: []const u8 = if (s.running) "●" else " ";
         const title = if (s.title.len > 0) s.title else "(untitled)";
-        try print(io, "{s} {d}  {s}  [{s}]\n", .{ marker, s.sid, title, s.model });
+        // #xxxx short tag matches the TUI status bar; full id for attach.
+        try print(io, "{s} #{x:0>4}  {s}  [{s}]  ({d})\n", .{ marker, s.sid & 0xFFFF, title, s.model, s.sid });
     }
     return 0;
 }

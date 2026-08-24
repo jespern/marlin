@@ -9,6 +9,20 @@ pub const Config = struct {
     model_default: []const u8 = "openrouter/anthropic/claude-sonnet-4.5",
     model_compaction: ?[]const u8 = null, // null → use model_default
 
+    /// Model picker list (/model with no args). Curated, not fetched:
+    /// OpenRouter exposes 300+ models and a dump of that is not a picker.
+    /// TODO(M4, TOML): user-defined favorites replace these defaults.
+    model_favorites: []const []const u8 = &.{
+        "openrouter/anthropic/claude-sonnet-4.5",
+        "openrouter/anthropic/claude-opus-4.5",
+        "openrouter/openai/gpt-5.2",
+        "openrouter/google/gemini-2.5-pro",
+        "openrouter/x-ai/grok-4.6",
+        "openrouter/deepseek/deepseek-v4",
+        "openrouter/z-ai/glm-5.3",
+        "openrouter/moonshotai/kimi-k3",
+    },
+
     /// Context engine (docs/ARCHITECTURE.md §6).
     output_headroom_tokens: u32 = 16_000,
     compaction_headroom_tokens: u32 = 8_000,

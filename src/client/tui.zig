@@ -102,7 +102,23 @@ const App = struct {
     /// Line count of the last rendered frame; used to keep the view
     /// anchored (not sliding) when new lines arrive while scrolled up.
     last_total_lines: usize = 0,
+    /// View geometry of the last frame (for mouse row → line mapping).
+    last_first_visible: usize = 0,
+    last_view_h: usize = 0,
     pending: ?PendingApproval = null,
+    /// Model picker overlay: null = closed; value = highlighted index into
+    /// cfg.model_favorites.
+    picker: ?usize = null,
+    /// Mouse selection over the session view, in ABSOLUTE line indices into
+    /// the current layout (stable while scrolled because layout is
+    /// deterministic per width). anchor = press point, head = drag point.
+    sel_anchor: ?usize = null,
+    sel_head: usize = 0,
+    sel_dragging: bool = false,
+    /// Set when a selection was completed (mouse released): next frame
+    /// copies these lines via OSC52 and clears the flag.
+    copy_pending: bool = false,
+    cfg: config.Config = .{},
     /// Transient one-line notice shown in the status bar.
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
@@ -244,12 +260,15 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/model")) {
             const m = it.rest();
             if (m.len == 0) {
-                self.setNotice("model: {s}", .{self.model.items});
+                // Open the picker, preselecting the current model.
+                var sel: usize = 0;
+                for (self.cfg.model_favorites, 0..) |fav, i| {
+                    if (std.mem.eql(u8, fav, self.model.items)) sel = i;
+                }
+                self.picker = sel;
                 return;
             }
-            self.conn.send(.{ .session_set_model = .{ .sid = self.sid, .model = m } }) catch return;
-            self.setModelStr(m);
-            self.setNotice("model → {s}", .{m});
+            self.applyModel(m);
         } else if (std.mem.eql(u8, head, "/new")) {
             self.newSession() catch {
                 self.setNotice("could not create session", .{});
@@ -273,6 +292,22 @@ const App = struct {
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
+    }
+
+    /// Normalized selection range (inclusive absolute line indices).
+    fn selRange(self: *const App) ?struct { lo: usize, hi: usize } {
+        const a = self.sel_anchor orelse return null;
+        return .{ .lo = @min(a, self.sel_head), .hi = @max(a, self.sel_head) };
+    }
+
+    fn applyModel(self: *App, m: []const u8) void {
+        if (self.state == .running or self.state == .awaiting_approval) {
+            self.setNotice("cannot switch model mid-turn", .{});
+            return;
+        }
+        self.conn.send(.{ .session_set_model = .{ .sid = self.sid, .model = m } }) catch return;
+        self.setModelStr(m);
+        self.setNotice("model → {s}", .{m});
     }
 
     fn newSession(self: *App) !void {
@@ -586,19 +621,23 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const max_scroll = total -| view_h;
     if (app.scroll_up > max_scroll) app.scroll_up = max_scroll;
     const first_visible = (total -| view_h) -| app.scroll_up;
+    app.last_first_visible = first_visible;
+    app.last_view_h = view_h;
     const visible = lines.items[first_visible..@min(first_visible + view_h, total)];
 
     for (visible, 0..) |ln, row| {
+        const abs_line = first_visible + row;
+        const selected = if (app.selRange()) |r| abs_line >= r.lo and abs_line <= r.hi else false;
         var segs_buf: [3]vaxis.Segment = undefined;
         var n: usize = 0;
-        segs_buf[n] = .{ .text = ln.text, .style = ln.style };
+        segs_buf[n] = .{ .text = ln.text, .style = styleSel(ln.style, selected) };
         n += 1;
         if (ln.text2.len > 0) {
-            segs_buf[n] = .{ .text = ln.text2, .style = ln.style2 };
+            segs_buf[n] = .{ .text = ln.text2, .style = styleSel(ln.style2, selected) };
             n += 1;
         }
         if (ln.text3.len > 0) {
-            segs_buf[n] = .{ .text = ln.text3, .style = ln.style3 };
+            segs_buf[n] = .{ .text = ln.text3, .style = styleSel(ln.style3, selected) };
             n += 1;
         }
         _ = win.print(segs_buf[0..n], .{
@@ -630,15 +669,50 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         try std.fmt.allocPrint(arena, " · ↕ {d} (G: bottom)", .{app.scroll_up})
     else
         "";
-    const status = try std.fmt.allocPrint(arena, " {s} · {s}{s}{s} · s{d}  {s}", .{
+    // Session tag: last 4 hex digits of the id — enough to tell sessions
+    // apart in `marlin ls` (which shows the same suffix) without eating
+    // half the status bar with a u64.
+    const status = try std.fmt.allocPrint(arena, " {s} · {s}{s}{s} · #{x:0>4}  {s}", .{
         state_txt,
         app.model.items,
         ctx_txt,
         scroll_txt,
-        app.sid,
+        app.sid & 0xFFFF,
         app.notice.items,
     });
     _ = status_win.printSegment(.{ .text = status, .style = Palette.status_bar }, .{ .wrap = .none });
+
+    // ---- model picker overlay ----
+    if (app.picker) |sel| {
+        const favs = app.cfg.model_favorites;
+        var widest: u16 = 20;
+        for (favs) |f| widest = @max(widest, @as(u16, @intCast(@min(f.len, 70))));
+        const box_w: u16 = @min(widest + 8, w -| 4);
+        const box_h: u16 = @intCast(@min(favs.len + 2, h -| 2));
+        const px: i17 = @intCast((w -| box_w) / 2);
+        const py: i17 = @intCast((h -| box_h) / 2);
+        const box = win.child(.{
+            .x_off = px,
+            .y_off = py,
+            .width = box_w,
+            .height = box_h,
+            .border = .{ .where = .all, .style = Palette.tool },
+        });
+        box.fill(.{ .style = .{} });
+        _ = box.printSegment(.{ .text = " model — ↑/↓/j/k · Enter · 1-9 · Esc", .style = Palette.tool }, .{ .wrap = .none });
+        for (favs, 0..) |f, i| {
+            if (i + 1 >= box_h) break;
+            const cur = std.mem.eql(u8, f, app.model.items);
+            const line = try std.fmt.allocPrint(arena, " {d} {s}{s}", .{ i + 1, f[0..@min(f.len, box_w -| 6)], if (cur) " ●" else "" });
+            const style: vaxis.Style = if (i == sel)
+                .{ .fg = .{ .index = 6 }, .bold = true, .reverse = true }
+            else if (cur)
+                .{ .fg = .{ .index = 6 } }
+            else
+                .{};
+            _ = box.printSegment(.{ .text = line, .style = style }, .{ .row_offset = @intCast(i + 1), .wrap = .none });
+        }
+    }
 }
 
 // ------------------------------------------------------------ entry point --
@@ -709,7 +783,7 @@ pub fn run(
         try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 1 } });
     }
 
-    var app = App{ .gpa = gpa, .io = io, .conn = conn, .sid = sid, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = io, .conn = conn, .sid = sid, .editor = Editor.init(gpa), .cfg = cfg };
     defer app.deinit();
     app.setModelStr(model_at_start);
 
@@ -808,6 +882,28 @@ pub fn run(
 
         var frame_arena = std.heap.ArenaAllocator.init(gpa);
         defer frame_arena.deinit();
+
+        // Completed mouse selection → OSC52 copy (before draw so the
+        // notice shows this frame; selection stays highlighted).
+        if (app.copy_pending) {
+            app.copy_pending = false;
+            if (app.selRange()) |r| {
+                const farena = frame_arena.allocator();
+                const sel_lines = try layoutLines(farena, &app, @intCast(app.term_cols));
+                var buf: std.ArrayList(u8) = .empty;
+                var i: usize = r.lo;
+                while (i <= r.hi and i < sel_lines.items.len) : (i += 1) {
+                    const ln = sel_lines.items[i];
+                    try buf.appendSlice(farena, ln.text);
+                    try buf.appendSlice(farena, ln.text2);
+                    try buf.appendSlice(farena, ln.text3);
+                    try buf.append(farena, '\n');
+                }
+                vx.copyToSystemClipboard(writer, buf.items, farena) catch {};
+                app.setNotice("copied {d} line(s)", .{r.hi - r.lo + 1});
+            }
+        }
+
         try draw(&app, &vx, frame_arena.allocator());
         try vx.render(writer);
         try writer.flush();
@@ -817,15 +913,57 @@ pub fn run(
 }
 
 /// Mouse: the wheel ALWAYS scrolls the session view — never the input box,
-/// never history — regardless of mode. (The wheel-over-REPL-walks-history
-/// behavior some tools have is exactly what we're avoiding: scrollback is
-/// what you reach for the wheel for.)
+/// never history. Left press/drag/release selects whole lines in the view;
+/// release copies them via OSC52 (line granularity for M3.x; char-precise
+/// selection is the M4 select.zig job).
 fn handleMouse(app: *App, m: vaxis.Mouse) void {
     switch (m.button) {
         .wheel_up => app.scroll_up +|= 3,
         .wheel_down => app.scroll_up -|= 3,
-        else => {}, // clicks/drag: selection lands in M4
+        .left => {
+            const row: usize = if (m.row < 0) 0 else @intCast(m.row);
+            // Only rows inside the session view participate.
+            if (row >= app.last_view_h) {
+                if (m.type == .press) app.sel_anchor = null; // click below view clears
+                return;
+            }
+            const abs = app.last_first_visible + row;
+            switch (m.type) {
+                .press => {
+                    app.sel_anchor = abs;
+                    app.sel_head = abs;
+                    app.sel_dragging = true;
+                },
+                .drag => {
+                    if (app.sel_dragging) app.sel_head = abs;
+                },
+                .release => {
+                    if (app.sel_dragging) {
+                        app.sel_head = abs;
+                        app.sel_dragging = false;
+                        if (app.sel_anchor) |a| {
+                            if (a != abs) {
+                                // Real drag: copy on release.
+                                app.copy_pending = true;
+                            } else {
+                                // Plain click: clear any selection.
+                                app.sel_anchor = null;
+                            }
+                        }
+                    }
+                },
+                .motion => {},
+            }
+        },
+        else => {},
     }
+}
+
+fn styleSel(base: vaxis.Style, selected: bool) vaxis.Style {
+    if (!selected) return base;
+    var s = base;
+    s.reverse = true;
+    return s;
 }
 
 fn handleKey(app: *App, key: vaxis.Key) !void {
@@ -835,6 +973,28 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             app.interrupt();
         } else {
             app.should_quit = true;
+        }
+        return;
+    }
+
+    // Model picker overlay swallows all keys while open.
+    if (app.picker) |sel| {
+        const n = app.cfg.model_favorites.len;
+        if (key.matches(vaxis.Key.escape, .{})) {
+            app.picker = null;
+        } else if (key.matches(vaxis.Key.enter, .{})) {
+            app.picker = null;
+            app.applyModel(app.cfg.model_favorites[sel]);
+        } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            app.picker = if (sel + 1 < n) sel + 1 else 0;
+        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            app.picker = if (sel > 0) sel - 1 else n - 1;
+        } else if (key.codepoint >= '1' and key.codepoint <= '9') {
+            const idx: usize = @intCast(key.codepoint - '1');
+            if (idx < n) {
+                app.picker = null;
+                app.applyModel(app.cfg.model_favorites[idx]);
+            }
         }
         return;
     }
@@ -858,6 +1018,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             const edit_w: usize = app.term_cols -| 2;
             if (key.matches(vaxis.Key.escape, .{})) {
                 app.mode = .normal; // draft survives: editor state untouched
+                app.sel_anchor = null;
             } else if (key.matches(vaxis.Key.enter, .{ .alt = true }) or
                 key.matches('j', .{ .ctrl = true }))
             {
