@@ -10,7 +10,8 @@
 //!
 //! Keys:
 //!   insert:  type → input; Enter send; Shift+Enter/Alt+Enter/Ctrl+J newline;
-//!            Up/Down move lines or walk history at the edges;
+//!            Up/Down or Ctrl+P/N move lines or walk history at the edges;
+//!            readline/macOS movement and deletion chords are supported;
 //!            Esc → normal (draft survives); Ctrl+C interrupt/quit
 //!   normal:  i insert; j/k scroll; g/G top/bottom; q quit; Ctrl+C same
 //!   approval pending: y approve, n deny (both modes, input empty)
@@ -1941,6 +1942,81 @@ fn isNewlineKey(key: vaxis.Key) bool {
         (key.codepoint == 'j' and key.mods.ctrl and !key.mods.alt);
 }
 
+/// Common readline bindings plus their native terminal-key equivalents. Keep
+/// this translation separate from Editor so key compatibility can be tested
+/// without constructing a complete TUI App.
+const EditCommand = enum {
+    move_left,
+    move_right,
+    move_word_left,
+    move_word_right,
+    move_line_start,
+    move_line_end,
+    delete_before,
+    delete_after,
+    delete_word_before,
+    delete_word_before_whitespace,
+    delete_word_after,
+    delete_to_line_start,
+    delete_to_line_end,
+};
+
+fn editCommand(key: vaxis.Key) ?EditCommand {
+    if (key.matches(vaxis.Key.left, .{ .alt = true }) or key.matches('b', .{ .alt = true }))
+        return .move_word_left;
+    if (key.matches(vaxis.Key.right, .{ .alt = true }) or key.matches('f', .{ .alt = true }))
+        return .move_word_right;
+    if (key.matches(vaxis.Key.left, .{}) or key.matches('b', .{ .ctrl = true }))
+        return .move_left;
+    if (key.matches(vaxis.Key.right, .{}) or key.matches('f', .{ .ctrl = true }))
+        return .move_right;
+    if (key.matches(vaxis.Key.home, .{}) or key.matches('a', .{ .ctrl = true }))
+        return .move_line_start;
+    if (key.matches(vaxis.Key.end, .{}) or key.matches('e', .{ .ctrl = true }))
+        return .move_line_end;
+    if (key.matches(vaxis.Key.backspace, .{ .alt = true }))
+        return .delete_word_before;
+    if (key.matches(vaxis.Key.delete, .{ .alt = true }) or key.matches('d', .{ .alt = true }))
+        return .delete_word_after;
+    if (key.matches(vaxis.Key.backspace, .{}) or key.matches('h', .{ .ctrl = true }))
+        return .delete_before;
+    if (key.matches(vaxis.Key.delete, .{}) or key.matches('d', .{ .ctrl = true }))
+        return .delete_after;
+    if (key.matches('k', .{ .ctrl = true }))
+        return .delete_to_line_end;
+    if (key.matches('u', .{ .ctrl = true }))
+        return .delete_to_line_start;
+    if (key.matches('w', .{ .ctrl = true }))
+        return .delete_word_before_whitespace;
+    return null;
+}
+
+fn isPreviousInputRowKey(key: vaxis.Key) bool {
+    return key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true });
+}
+
+fn isNextInputRowKey(key: vaxis.Key) bool {
+    return key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true });
+}
+
+fn applyEditCommand(ed: *Editor, command: EditCommand) void {
+    switch (command) {
+        .move_left => ed.moveLeft(),
+        .move_right => ed.moveRight(),
+        .move_word_left => ed.moveWordLeft(),
+        .move_word_right => ed.moveWordRight(),
+        .move_line_start => ed.moveLineStart(),
+        .move_line_end => ed.moveLineEnd(),
+        .delete_before => ed.deleteBefore(),
+        .delete_after => ed.deleteAfter(),
+        .delete_word_before => ed.deleteWordBefore(),
+        .delete_word_before_whitespace => ed.deleteWordBeforeWhitespace(),
+        .delete_word_after => ed.deleteWordAfter(),
+        .delete_to_line_start => ed.deleteToLineStart(),
+        .delete_to_line_end => ed.deleteToLineEnd(),
+    }
+}
+
 fn handleKey(app: *App, key: vaxis.Key) !void {
     // Ctrl+C: interrupt a running turn; quit when idle.
     if (key.matches('c', .{ .ctrl = true })) {
@@ -2017,32 +2093,12 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 const text = try ed.takeExpanded();
                 defer app.gpa.free(text);
                 app.submitInput(text);
-            } else if (key.matches(vaxis.Key.up, .{})) {
+            } else if (isPreviousInputRowKey(key)) {
                 if (!ed.moveUp(edit_w)) ed.histUp();
-            } else if (key.matches(vaxis.Key.down, .{})) {
+            } else if (isNextInputRowKey(key)) {
                 if (!ed.moveDown(edit_w)) ed.histDown();
-            } else if (key.matches(vaxis.Key.left, .{ .alt = true }) or key.matches('b', .{ .alt = true })) {
-                ed.moveWordLeft();
-            } else if (key.matches(vaxis.Key.right, .{ .alt = true }) or key.matches('f', .{ .alt = true })) {
-                ed.moveWordRight();
-            } else if (key.matches(vaxis.Key.left, .{}) or key.matches('b', .{ .ctrl = true })) {
-                ed.moveLeft();
-            } else if (key.matches(vaxis.Key.right, .{}) or key.matches('f', .{ .ctrl = true })) {
-                ed.moveRight();
-            } else if (key.matches(vaxis.Key.home, .{}) or key.matches('a', .{ .ctrl = true })) {
-                ed.moveLineStart();
-            } else if (key.matches(vaxis.Key.end, .{}) or key.matches('e', .{ .ctrl = true })) {
-                ed.moveLineEnd();
-            } else if (key.matches(vaxis.Key.backspace, .{})) {
-                ed.deleteBefore();
-            } else if (key.matches(vaxis.Key.delete, .{}) or key.matches('d', .{ .ctrl = true })) {
-                ed.deleteAfter();
-            } else if (key.matches('k', .{ .ctrl = true })) {
-                ed.deleteToLineEnd();
-            } else if (key.matches('u', .{ .ctrl = true })) {
-                ed.deleteToLineStart();
-            } else if (key.matches('w', .{ .ctrl = true })) {
-                ed.deleteWordBefore();
+            } else if (editCommand(key)) |command| {
+                applyEditCommand(ed, command);
             } else if (key.text) |text| {
                 ed.insertSlice(text);
             }
@@ -2079,6 +2135,40 @@ test "modified enter inserts a newline while plain enter submits" {
     try std.testing.expect(isNewlineKey(.{ .codepoint = 'j', .mods = .{ .ctrl = true } }));
     try std.testing.expect(!isNewlineKey(.{ .codepoint = vaxis.Key.enter }));
     try std.testing.expect(!isNewlineKey(.{ .codepoint = vaxis.Key.enter, .text = "\r" }));
+}
+
+test "standard editor key bindings map to commands" {
+    const Case = struct { key: vaxis.Key, command: EditCommand };
+    const cases = [_]Case{
+        .{ .key = .{ .codepoint = vaxis.Key.left }, .command = .move_left },
+        .{ .key = .{ .codepoint = 'b', .mods = .{ .ctrl = true } }, .command = .move_left },
+        .{ .key = .{ .codepoint = vaxis.Key.right }, .command = .move_right },
+        .{ .key = .{ .codepoint = 'f', .mods = .{ .ctrl = true } }, .command = .move_right },
+        .{ .key = .{ .codepoint = vaxis.Key.left, .mods = .{ .alt = true } }, .command = .move_word_left },
+        .{ .key = .{ .codepoint = 'b', .mods = .{ .alt = true } }, .command = .move_word_left },
+        .{ .key = .{ .codepoint = vaxis.Key.right, .mods = .{ .alt = true } }, .command = .move_word_right },
+        .{ .key = .{ .codepoint = 'f', .mods = .{ .alt = true } }, .command = .move_word_right },
+        .{ .key = .{ .codepoint = vaxis.Key.home }, .command = .move_line_start },
+        .{ .key = .{ .codepoint = 'a', .mods = .{ .ctrl = true } }, .command = .move_line_start },
+        .{ .key = .{ .codepoint = vaxis.Key.end }, .command = .move_line_end },
+        .{ .key = .{ .codepoint = 'e', .mods = .{ .ctrl = true } }, .command = .move_line_end },
+        .{ .key = .{ .codepoint = vaxis.Key.backspace }, .command = .delete_before },
+        .{ .key = .{ .codepoint = 'h', .mods = .{ .ctrl = true } }, .command = .delete_before },
+        .{ .key = .{ .codepoint = vaxis.Key.delete }, .command = .delete_after },
+        .{ .key = .{ .codepoint = 'd', .mods = .{ .ctrl = true } }, .command = .delete_after },
+        .{ .key = .{ .codepoint = vaxis.Key.backspace, .mods = .{ .alt = true } }, .command = .delete_word_before },
+        .{ .key = .{ .codepoint = 'w', .mods = .{ .ctrl = true } }, .command = .delete_word_before_whitespace },
+        .{ .key = .{ .codepoint = vaxis.Key.delete, .mods = .{ .alt = true } }, .command = .delete_word_after },
+        .{ .key = .{ .codepoint = 'd', .mods = .{ .alt = true } }, .command = .delete_word_after },
+        .{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } }, .command = .delete_to_line_start },
+        .{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } }, .command = .delete_to_line_end },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.command, editCommand(case.key).?);
+
+    try std.testing.expect(isPreviousInputRowKey(.{ .codepoint = vaxis.Key.up }));
+    try std.testing.expect(isPreviousInputRowKey(.{ .codepoint = 'p', .mods = .{ .ctrl = true } }));
+    try std.testing.expect(isNextInputRowKey(.{ .codepoint = vaxis.Key.down }));
+    try std.testing.expect(isNextInputRowKey(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
 }
 
 test "selection is character precise on one or many lines" {

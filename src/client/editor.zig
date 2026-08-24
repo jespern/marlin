@@ -230,8 +230,12 @@ pub fn moveRight(self: *Editor) void {
 /// punctuation and whitespace are boundaries. This follows readline's
 /// backward-word behavior: skip boundaries, then skip the word itself.
 pub fn moveWordLeft(self: *Editor) void {
-    const t = self.text.items;
-    var i = self.cursor;
+    self.cursor = wordStartBefore(self.text.items, self.cursor);
+    self.goal_col = null;
+}
+
+fn wordStartBefore(t: []const u8, cursor: usize) usize {
+    var i = cursor;
     while (i > 0) {
         const start = prevCpStart(t, i);
         if (isWordCodepoint(t[start..i])) break;
@@ -242,14 +246,17 @@ pub fn moveWordLeft(self: *Editor) void {
         if (!isWordCodepoint(t[start..i])) break;
         i = start;
     }
-    self.cursor = i;
-    self.goal_col = null;
+    return i;
 }
 
 /// Option+Right / Alt+F: move to the end of the next word.
 pub fn moveWordRight(self: *Editor) void {
-    const t = self.text.items;
-    var i = self.cursor;
+    self.cursor = wordEndAfter(self.text.items, self.cursor);
+    self.goal_col = null;
+}
+
+fn wordEndAfter(t: []const u8, cursor: usize) usize {
+    var i = cursor;
     while (i < t.len) {
         const end = nextCpEnd(t, i);
         if (isWordCodepoint(t[i..end])) break;
@@ -260,8 +267,7 @@ pub fn moveWordRight(self: *Editor) void {
         if (!isWordCodepoint(t[i..end])) break;
         i = end;
     }
-    self.cursor = i;
-    self.goal_col = null;
+    return i;
 }
 
 fn isWordCodepoint(bytes: []const u8) bool {
@@ -319,14 +325,31 @@ pub fn deleteToLineStart(self: *Editor) void {
     self.cursor = start;
 }
 
-/// Ctrl+W: delete the whitespace-delimited word before the cursor.
+/// Option+Delete / Alt+Backspace: delete backward using the same word
+/// boundaries as Option+Left.
 pub fn deleteWordBefore(self: *Editor) void {
+    const start = wordStartBefore(self.text.items, self.cursor);
+    self.text.replaceRange(self.gpa, start, self.cursor - start, "") catch return;
+    self.cursor = start;
+    self.goal_col = null;
+}
+
+/// Ctrl+W: delete the whitespace-delimited word before the cursor.
+pub fn deleteWordBeforeWhitespace(self: *Editor) void {
     const t = self.text.items;
     var i = self.cursor;
     while (i > 0 and isSpace(t[i - 1])) i -= 1;
     while (i > 0 and !isSpace(t[i - 1])) i -= 1;
     self.text.replaceRange(self.gpa, i, self.cursor - i, "") catch return;
     self.cursor = i;
+    self.goal_col = null;
+}
+
+/// Alt+D / Option+Forward Delete: delete forward using the same word
+/// boundaries as Option+Right.
+pub fn deleteWordAfter(self: *Editor) void {
+    const end = wordEndAfter(self.text.items, self.cursor);
+    self.text.replaceRange(self.gpa, self.cursor, end - self.cursor, "") catch return;
     self.goal_col = null;
 }
 
@@ -627,10 +650,25 @@ test "delete word and line ops" {
     var ed = Editor.init(testing.allocator);
     defer ed.deinit();
     ed.insertSlice("git commit -m wip");
-    ed.deleteWordBefore();
+    ed.deleteWordBeforeWhitespace();
     try testing.expectEqualStrings("git commit -m ", ed.text.items);
     ed.deleteToLineStart();
     try testing.expectEqualStrings("", ed.text.items);
+}
+
+test "word deletion uses readline boundaries" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("hello-world café");
+
+    ed.deleteWordBefore();
+    try testing.expectEqualStrings("hello-world ", ed.text.items);
+    ed.deleteWordBefore();
+    try testing.expectEqualStrings("hello-", ed.text.items);
+
+    ed.moveLineStart();
+    ed.deleteWordAfter();
+    try testing.expectEqualStrings("-", ed.text.items);
 }
 
 test "utf8 cursor movement" {
