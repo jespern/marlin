@@ -30,6 +30,7 @@ const Editor = @import("editor.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
+    mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
     /// Bracketed paste text (allocated by the loop's paste allocator = gpa;
     /// handler frees).
@@ -98,6 +99,9 @@ const App = struct {
     context_limit: u64 = 0,
     /// 0 = pinned to bottom; N = scrolled up N lines.
     scroll_up: usize = 0,
+    /// Line count of the last rendered frame; used to keep the view
+    /// anchored (not sliding) when new lines arrive while scrolled up.
+    last_total_lines: usize = 0,
     pending: ?PendingApproval = null,
     /// Transient one-line notice shown in the status bar.
     notice: std.ArrayList(u8) = .empty,
@@ -572,6 +576,13 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // ---- session view ----
     var lines = try layoutLines(arena, app, w);
     const total = lines.items.len;
+    // Anchor while reading: scroll_up counts from the BOTTOM, so content
+    // arriving while scrolled up would slide the view. Compensate by the
+    // growth delta; pinned (scroll_up == 0) stays pinned.
+    if (app.scroll_up > 0 and total > app.last_total_lines) {
+        app.scroll_up +|= total - app.last_total_lines;
+    }
+    app.last_total_lines = total;
     const max_scroll = total -| view_h;
     if (app.scroll_up > max_scroll) app.scroll_up = max_scroll;
     const first_visible = (total -| view_h) -| app.scroll_up;
@@ -615,10 +626,15 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         try std.fmt.allocPrint(arena, " · ctx {d}%", .{app.context_used * 100 / app.context_limit})
     else
         "";
-    const status = try std.fmt.allocPrint(arena, " {s} · {s}{s} · s{d}  {s}", .{
+    const scroll_txt: []const u8 = if (app.scroll_up > 0)
+        try std.fmt.allocPrint(arena, " · ↕ {d} (G: bottom)", .{app.scroll_up})
+    else
+        "";
+    const status = try std.fmt.allocPrint(arena, " {s} · {s}{s}{s} · s{d}  {s}", .{
         state_txt,
         app.model.items,
         ctx_txt,
+        scroll_txt,
         app.sid,
         app.notice.items,
     });
@@ -719,6 +735,10 @@ pub fn run(
     try writer.flush();
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
     try vx.setBracketedPaste(writer, true);
+    // Mouse: wheel scrolls the session view (kitty/sgr mouse mode). Text
+    // selection via shift+drag still reaches the terminal (standard escape
+    // hatch all TUIs share); native selection + OSC52 lands in M4.
+    try vx.setMouseMode(writer, true);
     try writer.flush();
 
     // Initial size: not all paths deliver a winsize event up-front (and a
@@ -751,6 +771,7 @@ pub fn run(
         const event = try loop.nextEvent();
         switch (event) {
             .key_press => |key| try handleKey(&app, key),
+            .mouse => |m| handleMouse(&app, m),
             .winsize => |ws| {
                 app.term_cols = ws.cols;
                 try vx.resize(gpa, tty.writer(), ws);
@@ -767,6 +788,7 @@ pub fn run(
                         .daemon_line => |l2| app.handleDaemonLine(l2),
                         .daemon_gone => app.should_quit = true,
                         .key_press => |k2| try handleKey(&app, k2),
+                        .mouse => |m2| handleMouse(&app, m2),
                         .winsize => |ws2| {
                             app.term_cols = ws2.cols;
                             try vx.resize(gpa, tty.writer(), ws2);
@@ -792,6 +814,18 @@ pub fn run(
     }
     if (reboot_out) |ro| ro.* = .{ .request = app.reboot_request, .sid = app.sid };
     return 0;
+}
+
+/// Mouse: the wheel ALWAYS scrolls the session view — never the input box,
+/// never history — regardless of mode. (The wheel-over-REPL-walks-history
+/// behavior some tools have is exactly what we're avoiding: scrollback is
+/// what you reach for the wheel for.)
+fn handleMouse(app: *App, m: vaxis.Mouse) void {
+    switch (m.button) {
+        .wheel_up => app.scroll_up +|= 3,
+        .wheel_down => app.scroll_up -|= 3,
+        else => {}, // clicks/drag: selection lands in M4
+    }
 }
 
 fn handleKey(app: *App, key: vaxis.Key) !void {
