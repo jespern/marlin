@@ -307,6 +307,51 @@ provider/
 
 - OpenRouter is the default registry entry; `base_url` + `api_key_env` in
   config adds any OpenAI-compatible endpoint without code.
+
+### No single point of failure
+
+Four distinct failure layers, four distinct answers:
+
+1. **Aggregator outage** (OpenRouter: one auth endpoint, one billing
+   account, one proxy — every model gone at once). Mitigation: 2-3 DIRECT
+   provider entries alongside it. Pure config, zero code — xAI, DeepSeek,
+   Z.ai, Mistral, OpenAI, Gemini's compat endpoint are all
+   `base_url + api_key_cmd` in the openai_compat dialect. The council
+   models (sol / fable / grok / glm) all have direct endpoints: councils
+   survive an OpenRouter outage on config alone.
+2. **Model-family outage** (Anthropic having a bad day). Mitigated by
+   holding keys for ≥2 families; the anthropic dialect (already planned
+   for cache_control) doubles as the direct line to the most-used family.
+3. **Account failure** (credits, revoked key, tier limits). Only a second
+   billing path fixes this — direct keys are that path, not a second
+   protocol.
+4. **No internet.** `[providers.local]` (llama.cpp/vLLM/Ollama) is spec'd;
+   exercise it in the smoke suite once so it's KNOWN working, not
+   theoretically working.
+
+**Failover policy** (the one piece of real code):
+
+```toml
+[model]
+default   = "openrouter/anthropic/claude-sonnet-4-5"
+fallbacks = ["anthropic/claude-sonnet-4-5", "xai/grok-4.6"]
+```
+
+On persistent provider failure (5xx/429 surviving retry-with-backoff, auth
+errors), advance down the list. A failover is a VISIBLE system_note block
+("openrouter failed (503×3) → anthropic direct") — it changes cost,
+caching, and possibly behavior, so it belongs in the causal log; never
+silent. Not sticky: next session starts at default. Mid-turn failover is
+safe by construction — deltas are ephemeral, so discard the partial buffer
+and re-request the same assembled context against the fallback.
+
+**Don't build:** Gemini-native, Bedrock (SigV4), Vertex dialects — heavy
+auth for platforms not in use. The two-dialect rule holds.
+
+**Accounting footnote:** OpenRouter reports $ directly; direct providers
+report only tokens. The status-bar `$` needs a small local price table
+for direct routes (or degrades to tokens-only) — don't let it lie.
+
 - **Usage accounting is provider-reported**: every response's `usage` field is
   stored on the session (`session.meta` event carries it to clients). Token
   estimates for un-sent deltas use bytes/4 — good enough because true usage
