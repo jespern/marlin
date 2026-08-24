@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>~*~ marlin ~*~ the agent harness that SWIMS</title>
+<meta name="description" content="marlin: a daemon-native AI agent harness in Zig. one binary. it's a fish.">
+<link rel="icon" href="assets/marlin-tiny.gif">
+<style>
+  /* ============================================================
+     marlin.wtf — proudly designed like it's 1997
+     ============================================================ */
+  :root{
+    --hot-pink:#ff00cc; --lime:#00ff00; --cyan:#00ffff; --yellow:#ffff00;
+    --purple:#9900ff; --ocean:#000066; --panel:#000033;
+  }
+  html{ box-sizing:border-box; }
+  *,*:before,*:after{ box-sizing:inherit; }
+
+  body{
+    margin:0;
+    font-family:"Comic Sans MS","Comic Neue",cursive;
+    color:#fff;
+    background-color:var(--ocean);
+    /* tiled diagonal water: no image needed, pure 90s energy */
+    background-image:
+      repeating-linear-gradient(45deg,
+        #000066 0px, #000066 14px,
+        #000080 14px, #000080 28px);
+  }
+
+  .page{
+    max-width:760px;             /* 800x600, minus scrollbar, obviously */
+    margin:0 auto;
+    padding:8px;
+  }
+
+  /* --- the sacred table-with-bevel look, in div form --- */
+  .panel{
+    background:var(--panel);
+    border:4px ridge var(--cyan);
+    padding:12px;
+    margin:14px 0;
+  }
+  .panel h2{
+    margin:0 0 8px;
+    color:var(--yellow);
+    text-shadow:2px 2px 0 var(--hot-pink);
+    font-size:1.4rem;
+  }
+
+  header{ text-align:center; padding-top:10px; }
+  header img.fish{
+    width:min(420px, 92%);
+    border:6px outset var(--hot-pink);
+    image-rendering:auto;
+  }
+  h1{
+    font-size:2.6rem;
+    margin:8px 0 0;
+    color:var(--lime);
+    text-shadow:3px 3px 0 var(--purple), 6px 6px 0 #000;
+    letter-spacing:2px;
+  }
+  h1 .tilde{ color:var(--hot-pink); }
+  .tagline{
+    color:var(--cyan);
+    font-size:1.05rem;
+    margin:4px 0 0;
+  }
+  .blink{ animation:blink 1s steps(2,start) infinite; }
+  @keyframes blink{ to{ visibility:hidden; } }
+  @media (prefers-reduced-motion:reduce){
+    .blink{ animation:none; }
+    marquee{ /* politely stop scrolling */ }
+  }
+
+  marquee, .marquee{
+    background:#000;
+    color:var(--lime);
+    border:3px double var(--yellow);
+    padding:4px 0;
+    font-weight:bold;
+    display:block;
+    width:100%;
+  }
+
+  .construction{
+    text-align:center;
+    color:var(--yellow);
+    font-weight:bold;
+    font-size:1.1rem;
+  }
+  .construction .cone{ font-size:1.4rem; }
+
+  ul.starlist{ list-style:none; padding-left:0; margin:6px 0; }
+  ul.starlist li{ padding:3px 0; }
+  ul.starlist li:before{ content:"★ "; color:var(--hot-pink); }
+  ul.starlist li b{ color:var(--cyan); }
+
+  pre.term{
+    background:#000;
+    color:var(--lime);
+    border:3px inset #808080;
+    padding:10px;
+    overflow-x:auto;
+    font-family:"Courier New",monospace;
+    font-size:0.9rem;
+    margin:8px 0;
+  }
+  pre.term .c{ color:#808080; }
+
+  a{ color:var(--cyan); }
+  a:visited{ color:var(--purple); }
+  a:hover{ color:var(--hot-pink); background:var(--yellow); }
+
+  .btn88x31{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    width:88px; height:31px;
+    text-align:center;
+    font-size:10px;
+    line-height:1.1;
+    font-family:Verdana,sans-serif;
+    font-weight:bold;
+    text-decoration:none;
+    border:2px outset #c0c0c0;
+    margin:2px;
+    overflow:hidden;
+    vertical-align:middle;
+  }
+  .btn88x31:hover{ border-style:inset; background:inherit; }
+  .b-zig{ background:#f7a41d; color:#000; }
+  .b-gh{ background:#000; color:#fff; }
+  .b-best{ background:#008080; color:#fff; }
+  .b-rg{ background:#800000; color:#fff; }
+
+  table.oldschool{
+    width:100%;
+    border-collapse:separate;
+    border-spacing:2px;
+    background:#000;
+  }
+  table.oldschool td, table.oldschool th{
+    border:2px inset #808080;
+    padding:5px 8px;
+    font-size:0.95rem;
+  }
+  table.oldschool th{ background:var(--purple); color:var(--yellow); }
+  table.oldschool td{ background:#000044; }
+
+  .counter{
+    font-family:"Courier New",monospace;
+    background:#000;
+    color:#f00;
+    border:2px inset #808080;
+    padding:2px 6px;
+    letter-spacing:3px;
+    font-weight:bold;
+  }
+
+  footer{
+    text-align:center;
+    font-size:0.85rem;
+    color:var(--cyan);
+    padding:16px 0 30px;
+  }
+  .webring a{ margin:0 8px; font-weight:bold; }
+
+  hr.rainbow{
+    border:0; height:6px;
+    background:linear-gradient(90deg,red,orange,yellow,lime,cyan,blue,violet);
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <img class="fish" src="assets/marlin.gif" alt="a marlin leaping out of the ocean, majestically, at 64 colors">
+    <h1><span class="tilde">~*~</span> marlin <span class="tilde">~*~</span></h1>
+    <p class="tagline">the AI agent harness that <b>SWIMS</b> &nbsp;🐟&nbsp;
+      <span class="blink">est. 2026</span></p>
+  </header>
+
+  <marquee scrollamount="6">
+    ★★★ WELCOME to marlin.wtf ★★★ one binary ★ zero electrons harmed ★ daemon-native ★ written in ZIG ★ scp it to a box and GO ★ thank you for visiting my website ★★★
+  </marquee>
+
+  <div class="panel">
+    <h2>&gt;&gt; what IS marlin??</h2>
+    <p>
+      marlin is a <b>terminal AI agent harness</b>: a daemon that owns your
+      sessions + thin clients that attach to them. kill your terminal, the
+      agent keeps working. reattach from your phone over ssh. it's like
+      tmux and claude code had a baby and the baby was a <b>fish</b>.
+    </p>
+    <ul class="starlist">
+      <li><b>one static binary</b> — scp-and-run, no node_modules the size of Jupiter</li>
+      <li><b>daemon-native</b> — sessions survive client death, reboots, your mood</li>
+      <li><b>append-only block log</b> — the store is TRUTH, scrollback is a view</li>
+      <li><b>multi-model review councils</b> — 4 LLMs argue about your crypto code so you don't have to</li>
+      <li><b>written in Zig</b> — compiles before you finish blinking</li>
+    </ul>
+  </div>
+
+  <p class="construction">
+    <span class="cone">🚧</span> THIS SITE IS UNDER CONSTRUCTION <span class="cone">🚧</span><br>
+    (so is marlin. we are at M2 of 6. the fish is still growing.)
+  </p>
+
+  <div class="panel">
+    <h2>&gt;&gt; try it (soon™)</h2>
+    <pre class="term">$ scp marlin yourbox:
+$ ssh yourbox
+$ ./marlin run "why is my build broken"
+<span class="c"># ...streaming wisdom...</span>
+$ ./marlin          <span class="c"># attach the TUI, watch it work</span></pre>
+    <p style="font-size:0.9rem">requires: a terminal, a dream, and an OpenRouter key.</p>
+  </div>
+
+  <div class="panel">
+    <h2>&gt;&gt; the ROADMAP (fancy word for todo list)</h2>
+    <table class="oldschool">
+      <tr><th>milestone</th><th>what</th><th>status</th></tr>
+      <tr><td>M0</td><td>the loop works</td><td>✅ DONE</td></tr>
+      <tr><td>M1</td><td>daemon + protocol</td><td>✅ DONE</td></tr>
+      <tr><td>M2</td><td>TUI v1</td><td>🔨 HAMMERING</td></tr>
+      <tr><td>M3</td><td>context engine + /reboot (self-hosting!!)</td><td>📋 planned</td></tr>
+      <tr><td>M4</td><td>multiplexer + image paste</td><td>📋 planned</td></tr>
+      <tr><td>M5</td><td>MCP, hooks, skills</td><td>📋 planned</td></tr>
+      <tr><td>M6</td><td>sandboxing + review councils</td><td>🌊 the deep end</td></tr>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>&gt;&gt; sign my guestbook... i mean, links</h2>
+    <p style="text-align:center">
+      <a class="btn88x31 b-gh" href="#">github soon™</a>
+      <a class="btn88x31 b-zig" href="https://ziglang.org">made w/ ZIG</a>
+      <a class="btn88x31 b-rg" href="https://github.com/BurntSushi/ripgrep">powered by rg*</a>
+      <a class="btn88x31 b-best" href="#">best viewed in a TERMINAL</a>
+    </p>
+    <p style="font-size:0.8rem;text-align:center">*rg optional. we bring our own regex like responsible adults.</p>
+  </div>
+
+  <hr class="rainbow">
+
+  <footer>
+    <p>you are visitor number <span class="counter" id="counter">000042</span> (probably)</p>
+    <p class="webring">
+      <a href="#">&lt;&lt; prev</a> · part of the <b>terminal agents webring</b> · <a href="#">next &gt;&gt;</a>
+    </p>
+    <p>© 2026 · handcrafted HTML · no framework was harmed ·
+       <a href="mailto:fish@marlin.wtf">fish@marlin.wtf</a></p>
+  </footer>
+</div>
+
+<script>
+  // the world's most honest hit counter: localStorage, counts only you.
+  (function(){
+    var k='marlin_hits';
+    var n=parseInt(localStorage.getItem(k)||'41',10)+1;
+    localStorage.setItem(k,String(n));
+    document.getElementById('counter').textContent=String(n).padStart(6,'0');
+  })();
+</script>
+</body>
+</html>
