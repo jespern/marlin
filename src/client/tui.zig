@@ -26,6 +26,7 @@ const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const config = @import("../core/config.zig");
 const attach = @import("attach.zig");
+const credentials = @import("../core/credentials.zig");
 const Editor = @import("editor.zig");
 
 const Event = union(enum) {
@@ -107,8 +108,13 @@ const App = struct {
     last_view_h: usize = 0,
     pending: ?PendingApproval = null,
     /// Model picker overlay: null = closed; value = highlighted index into
-    /// cfg.model_favorites.
+    /// the FILTERED list (see pickerItems).
     picker: ?usize = null,
+    /// Type-to-filter query while the picker is open.
+    picker_filter: std.ArrayList(u8) = .empty,
+    /// Full model catalog from the daemon (owned copies). Empty until
+    /// model_list_result arrives; picker falls back to cfg.model_favorites.
+    catalog: std.ArrayList([]u8) = .empty,
     /// Mouse selection over the session view, in ABSOLUTE line indices into
     /// the current layout (stable while scrolled because layout is
     /// deterministic per width). anchor = press point, head = drag point.
@@ -128,6 +134,9 @@ const App = struct {
     reboot_request: RebootRequest = .none,
 
     fn deinit(self: *App) void {
+        self.picker_filter.deinit(self.gpa);
+        for (self.catalog.items) |m| self.gpa.free(m);
+        self.catalog.deinit(self.gpa);
         for (self.blocks.items) |*rb| rb.deinit(self.gpa);
         self.blocks.deinit(self.gpa);
         self.delta.deinit(self.gpa);
@@ -192,6 +201,14 @@ const App = struct {
                 self.pending = p;
             },
             .session_created => |sc| self.handleSessionCreated(sc.sid),
+            .model_list_result => |ml| {
+                for (self.catalog.items) |old| self.gpa.free(old);
+                self.catalog.clearRetainingCapacity();
+                for (ml.models) |m| {
+                    const copy = self.gpa.dupe(u8, m) catch continue;
+                    self.catalog.append(self.gpa, copy) catch self.gpa.free(copy);
+                }
+            },
             .session_meta => |m| {
                 if (m.sid != self.sid) return;
                 self.tokens_in = m.tokens_in;
@@ -260,12 +277,13 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/model")) {
             const m = it.rest();
             if (m.len == 0) {
-                // Open the picker, preselecting the current model.
-                var sel: usize = 0;
-                for (self.cfg.model_favorites, 0..) |fav, i| {
-                    if (std.mem.eql(u8, fav, self.model.items)) sel = i;
+                self.picker = 0;
+                self.picker_filter.clearRetainingCapacity();
+                // Ask the daemon for the full catalog (async; picker shows
+                // favorites until the reply lands).
+                if (self.catalog.items.len == 0) {
+                    self.conn.send(.{ .model_list = .{} }) catch {};
                 }
-                self.picker = sel;
                 return;
             }
             self.applyModel(m);
@@ -298,6 +316,30 @@ const App = struct {
     fn selRange(self: *const App) ?struct { lo: usize, hi: usize } {
         const a = self.sel_anchor orelse return null;
         return .{ .lo = @min(a, self.sel_head), .hi = @max(a, self.sel_head) };
+    }
+
+    /// The picker's source list: full catalog when loaded, else favorites.
+    fn pickerSource(self: *const App) []const []const u8 {
+        if (self.catalog.items.len > 0) return @ptrCast(self.catalog.items);
+        return self.cfg.model_favorites;
+    }
+
+    /// Filtered picker items (arena-allocated indices into pickerSource).
+    /// Filter: case-insensitive substring; multiple space-separated words
+    /// must ALL match ("son 4.5" → claude-sonnet-4.5).
+    fn pickerItems(self: *const App, arena: std.mem.Allocator) ![]const []const u8 {
+        const source = self.pickerSource();
+        const q = self.picker_filter.items;
+        if (q.len == 0) return source;
+        var out: std.ArrayList([]const u8) = .empty;
+        outer: for (source) |m| {
+            var words = std.mem.tokenizeScalar(u8, q, ' ');
+            while (words.next()) |word| {
+                if (containsIgnoreCase(m, word) == null) continue :outer;
+            }
+            try out.append(arena, m);
+        }
+        return out.items;
     }
 
     fn applyModel(self: *App, m: []const u8) void {
@@ -684,11 +726,15 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     // ---- model picker overlay ----
     if (app.picker) |sel| {
-        const favs = app.cfg.model_favorites;
-        var widest: u16 = 20;
-        for (favs) |f| widest = @max(widest, @as(u16, @intCast(@min(f.len, 70))));
+        const items = try app.pickerItems(arena);
+        const total_src = app.pickerSource().len;
+
+        var widest: u16 = 30;
+        for (items) |f| widest = @max(widest, @as(u16, @intCast(@min(f.len, 70))));
         const box_w: u16 = @min(widest + 8, w -| 4);
-        const box_h: u16 = @intCast(@min(favs.len + 2, h -| 2));
+        const list_max: u16 = @min(@as(u16, 14), h -| 6);
+        const shown: u16 = @intCast(@min(items.len, list_max));
+        const box_h: u16 = shown + 3; // filter line + list + hint line
         const px: i17 = @intCast((w -| box_w) / 2);
         const py: i17 = @intCast((h -| box_h) / 2);
         const box = win.child(.{
@@ -699,19 +745,31 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             .border = .{ .where = .all, .style = Palette.tool },
         });
         box.fill(.{ .style = .{} });
-        _ = box.printSegment(.{ .text = " model — ↑/↓/j/k · Enter · 1-9 · Esc", .style = Palette.tool }, .{ .wrap = .none });
-        for (favs, 0..) |f, i| {
-            if (i + 1 >= box_h) break;
+
+        // Filter line (acts as a mini prompt).
+        const src_note: []const u8 = if (app.catalog.items.len == 0) " (favorites — catalog loading…)" else "";
+        const fline = try std.fmt.allocPrint(arena, " filter: {s}▏{s}", .{ app.picker_filter.items, src_note });
+        _ = box.printSegment(.{ .text = fline, .style = Palette.user }, .{ .wrap = .none });
+
+        // Windowed list around the selection.
+        const win_start = if (sel >= list_max) sel + 1 - list_max else 0;
+        var row: u16 = 1;
+        var i: usize = win_start;
+        while (i < items.len and row <= shown) : (i += 1) {
+            const f = items[i];
             const cur = std.mem.eql(u8, f, app.model.items);
-            const line = try std.fmt.allocPrint(arena, " {d} {s}{s}", .{ i + 1, f[0..@min(f.len, box_w -| 6)], if (cur) " ●" else "" });
+            const line = try std.fmt.allocPrint(arena, " {s}{s}", .{ f[0..@min(f.len, box_w -| 4)], if (cur) " ●" else "" });
             const style: vaxis.Style = if (i == sel)
                 .{ .fg = .{ .index = 6 }, .bold = true, .reverse = true }
             else if (cur)
                 .{ .fg = .{ .index = 6 } }
             else
                 .{};
-            _ = box.printSegment(.{ .text = line, .style = style }, .{ .row_offset = @intCast(i + 1), .wrap = .none });
+            _ = box.printSegment(.{ .text = line, .style = style }, .{ .row_offset = row, .wrap = .none });
+            row += 1;
         }
+        const hint = try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Esc", .{ items.len, total_src });
+        _ = box.printSegment(.{ .text = hint, .style = Palette.tool_out }, .{ .row_offset = shown + 1, .wrap = .none });
     }
 }
 
@@ -735,6 +793,47 @@ pub const RebootPlan = struct {
     sid: u64 = 0,
 };
 
+/// First-run bootstrap: prompt for an OpenRouter key on plain stdio (before
+/// any TUI), store it in ~/.config/marlin/credentials (0600), and inject it
+/// into this process's environ so the autostarted daemon inherits it.
+/// Returns false when the user gave nothing usable.
+fn bootstrapKey(gpa: std.mem.Allocator, io: Io, environ: *std.process.Environ.Map) !bool {
+    var obuf: [1024]u8 = undefined;
+    var ow: Io.File.Writer = .init(.stderr(), io, &obuf);
+    try ow.interface.print(
+        \\marlin needs a provider to talk to.
+        \\
+        \\  OpenRouter (one key, every model): https://openrouter.ai/keys
+        \\  (or set MARLIN_LOCAL_BASE_URL for any OpenAI-compatible endpoint)
+        \\
+        \\Paste your OpenRouter API key (stored in ~/.config/marlin/credentials,
+        \\chmod 600; the env var OPENROUTER_API_KEY always overrides): 
+    , .{});
+    try ow.interface.flush();
+
+    var ibuf: [512]u8 = undefined;
+    var reader: Io.File.Reader = .init(.stdin(), io, &ibuf);
+    const line = reader.interface.takeDelimiterExclusive('\n') catch {
+        try ow.interface.print("\nno input — aborting.\n", .{});
+        try ow.interface.flush();
+        return false;
+    };
+    const key = std.mem.trim(u8, line, " \t\r\n");
+    if (key.len < 8) {
+        try ow.interface.print("that doesn't look like a key — aborting.\n", .{});
+        try ow.interface.flush();
+        return false;
+    }
+    try credentials.store(gpa, io, environ, "OPENROUTER_API_KEY", key);
+    try environ.put(
+        try environ.allocator.dupe(u8, "OPENROUTER_API_KEY"),
+        try environ.allocator.dupe(u8, key),
+    );
+    try ow.interface.print("saved. starting marlin…\n", .{});
+    try ow.interface.flush();
+    return true;
+}
+
 pub fn run(
     gpa: std.mem.Allocator,
     io: Io,
@@ -743,6 +842,11 @@ pub fn run(
     sid_arg: ?u64,
     reboot_out: ?*RebootPlan,
 ) !u8 {
+    // -- first-run bootstrap: no provider key → prompt before the TUI --
+    if (environ.get("OPENROUTER_API_KEY") == null and environ.get("MARLIN_LOCAL_BASE_URL") == null) {
+        if (!try bootstrapKey(gpa, io, environ)) return 1;
+    }
+
     // -- connect + pick session BEFORE entering the TUI --
     const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
         std.log.err("cannot reach daemon: {t}", .{e});
@@ -959,6 +1063,15 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
     }
 }
 
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or haystack.len < needle.len) return null;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
 fn styleSel(base: vaxis.Style, selected: bool) vaxis.Style {
     if (!selected) return base;
     var s = base;
@@ -977,23 +1090,40 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    // Model picker overlay swallows all keys while open.
+    // Model picker overlay swallows all keys while open. Typing filters;
+    // Up/Down or Ctrl+n/p navigate; Enter applies; Esc closes.
     if (app.picker) |sel| {
-        const n = app.cfg.model_favorites.len;
         if (key.matches(vaxis.Key.escape, .{})) {
             app.picker = null;
-        } else if (key.matches(vaxis.Key.enter, .{})) {
-            app.picker = null;
-            app.applyModel(app.cfg.model_favorites[sel]);
-        } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-            app.picker = if (sel + 1 < n) sel + 1 else 0;
-        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-            app.picker = if (sel > 0) sel - 1 else n - 1;
-        } else if (key.codepoint >= '1' and key.codepoint <= '9') {
-            const idx: usize = @intCast(key.codepoint - '1');
-            if (idx < n) {
+            app.picker_filter.clearRetainingCapacity();
+            return;
+        }
+        // Count filtered items to clamp navigation (cheap stack arena).
+        var fb: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&fb);
+        const items = app.pickerItems(fba.allocator()) catch app.pickerSource();
+        const n = items.len;
+
+        if (key.matches(vaxis.Key.enter, .{})) {
+            if (n > 0) {
+                const pick = items[@min(sel, n - 1)];
                 app.picker = null;
-                app.applyModel(app.cfg.model_favorites[idx]);
+                app.applyModel(pick);
+                app.picker_filter.clearRetainingCapacity();
+            }
+        } else if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
+            if (n > 0) app.picker = if (sel + 1 < n) sel + 1 else 0;
+        } else if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
+            if (n > 0) app.picker = if (sel > 0) sel - 1 else n - 1;
+        } else if (key.matches(vaxis.Key.backspace, .{})) {
+            if (app.picker_filter.items.len > 0) {
+                _ = app.picker_filter.pop();
+                app.picker = 0;
+            }
+        } else if (key.text) |txt| {
+            if (txt.len > 0 and txt[0] >= 0x20 and txt[0] != 0x7f) {
+                app.picker_filter.appendSlice(app.gpa, txt) catch {};
+                app.picker = 0;
             }
         }
         return;

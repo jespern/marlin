@@ -80,6 +80,14 @@ fn joinChatUrl(gpa: std.mem.Allocator, base: []const u8) Error![:0]u8 {
     return std.fmt.allocPrintSentinel(gpa, "{s}/chat/completions", .{trimmed}, 0) catch error.OutOfMemory;
 }
 
+/// The OpenRouter models-catalog endpoint (honors the same base-url
+/// override the chat endpoint uses, so e2e can fake it). Caller frees.
+pub fn openrouterModelsUrl(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) Error![:0]u8 {
+    const base = overrideBaseUrl(environ, "OPENROUTER") orelse "https://openrouter.ai/api/v1";
+    const trimmed = std.mem.trimEnd(u8, base, "/");
+    return std.fmt.allocPrintSentinel(gpa, "{s}/models", .{trimmed}, 0) catch error.OutOfMemory;
+}
+
 test "joinChatUrl normalizes trailing slash" {
     const gpa = std.testing.allocator;
     const a = try joinChatUrl(gpa, "http://127.0.0.1:9999/v1/");

@@ -38,6 +38,9 @@ pub const ClientMsg = union(enum) {
     approve: struct { sid: u64, approval_id: []const u8, decision: ApprovalAnswer },
     /// Manual L2 compaction (/compact). Rejected while a turn is running.
     session_compact: struct { sid: u64 },
+    /// Full model catalog for the /model picker: daemon fetches the
+    /// provider's model list (cached ~1h) and replies model_list_result.
+    model_list: struct {},
     interrupt: struct { sid: u64 },
     /// Coordinated shutdown for /reboot: quiesce (wait for running turns to
     /// hit a block boundary — or interrupt them when force=true), persist,
@@ -75,6 +78,10 @@ pub const DaemonMsg = union(enum) {
         context_used: u64 = 0,
         context_limit: u64 = 0,
     },
+    /// Reply to model_list: full registry-form model ids
+    /// ("openrouter/vendor/model"), sorted. Empty on fetch failure — the
+    /// client falls back to its curated favorites.
+    model_list_result: struct { models: []const []const u8 },
     ok: struct {},
     err: struct { code: []const u8, msg: []const u8 },
 };

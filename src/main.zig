@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
+const credentials = @import("core/credentials.zig");
 
 /// Debug builds default unexpected_error_tracing=true, which makes ANY
 /// unmapped errno (e.g. ECONNREFUSED from a stale daemon socket — an
@@ -29,6 +30,8 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     const self_exe = if (args.len > 0) args[0] else "marlin";
+    // Fill env gaps from ~/.config/marlin/credentials (env always wins).
+    credentials.loadInto(init.gpa, init.io, init.environ_map) catch {};
     return cli.dispatch(
         init.gpa,
         init.io,

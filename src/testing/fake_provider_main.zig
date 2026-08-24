@@ -114,7 +114,14 @@ pub fn main(init: std.process.Init) !u8 {
         var writer = Io.net.Stream.Writer.init(stream, io, &wbuf);
         const w = &writer.interface;
 
-        if (step.status == 200) {
+        if (step.status == 200 and step.body.len > 0) {
+            // Plain JSON response (e.g. the /models catalog).
+            try w.print(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}",
+                .{ step.body.len, step.body },
+            );
+            try w.flush();
+        } else if (step.status == 200) {
             try w.writeAll("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
             try w.flush();
             for (step.sse) |event_data| {

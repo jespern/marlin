@@ -49,6 +49,9 @@ const Event = union(enum) {
     turn_awaiting: struct { sid: u64, line: []u8 },
     /// The gate resolved; session status back to running.
     turn_resumed: struct { sid: u64 },
+    /// Model catalog fetched by a worker thread (raw registry-form ids,
+    /// one allocation each, gpa-owned; dispatcher takes ownership).
+    catalog_ready: struct { client_id: u64, models: [][]u8 },
     turn_done: struct { sid: u64, interrupted: bool, err_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
     shutdown,
 };
@@ -109,6 +112,13 @@ pub const Daemon = struct {
     /// /reboot in flight: client id awaiting the coordinated shutdown.
     /// The daemon quiesces (waits for turns to reach done) then acks + exits.
     pending_reboot: ?u64 = null,
+    /// Model catalog cache (registry-form ids, gpa-owned). Refreshed at
+    /// most once per catalog_ttl_ms; fetch runs on a worker thread.
+    catalog: std.ArrayList([]u8) = .empty,
+    catalog_fetched_at: i64 = 0,
+    catalog_fetching: bool = false,
+
+    const catalog_ttl_ms: i64 = 60 * 60 * 1000; // 1h
 
     // ------------------------------------------------------------- serve --
 
@@ -332,6 +342,16 @@ pub const Daemon = struct {
                 if (self.sessions.get(tr.sid)) |session| session.state = .running;
                 self.broadcastStatus(tr.sid, .running);
             },
+            .catalog_ready => |cr| {
+                // Replace the cache (dispatcher owns it now).
+                for (self.catalog.items) |m| self.gpa.free(m);
+                self.catalog.clearRetainingCapacity();
+                for (cr.models) |m| self.catalog.append(self.gpa, m) catch self.gpa.free(m);
+                self.gpa.free(cr.models);
+                self.catalog_fetched_at = nowMs(self.io);
+                self.catalog_fetching = false;
+                if (self.lookupClient(cr.client_id)) |client| self.sendCatalog(client);
+            },
             .turn_done => |td| {
                 defer if (td.err_text) |t| self.gpa.free(t);
                 const session = self.sessions.get(td.sid) orelse return;
@@ -523,6 +543,28 @@ pub const Daemon = struct {
                 session.turn_thread = try std.Thread.spawn(.{}, compactMain, .{job});
                 self.broadcastStatus(session.id, .running);
                 self.sendTo(client, .{ .ok = .{} });
+            },
+            .model_list => {
+                // Fresh cache → answer immediately.
+                if (self.catalog.items.len > 0 and nowMs(self.io) - self.catalog_fetched_at < catalog_ttl_ms) {
+                    self.sendCatalog(client);
+                    return;
+                }
+                // Stale/empty → kick a fetch thread (one at a time); the
+                // reply goes out when catalog_ready lands. A second client
+                // asking mid-fetch gets whatever cache exists (possibly
+                // empty = favorites fallback) rather than queueing.
+                if (self.catalog_fetching) {
+                    self.sendCatalog(client);
+                    return;
+                }
+                self.catalog_fetching = true;
+                const t = std.Thread.spawn(.{}, catalogFetchMain, .{ self, client.id }) catch {
+                    self.catalog_fetching = false;
+                    self.sendCatalog(client);
+                    return;
+                };
+                t.detach();
             },
             .interrupt => |i| {
                 if (self.sessions.get(i.sid)) |session| {
@@ -778,6 +820,62 @@ pub const Daemon = struct {
         self.fanOutLine(sid, line);
     }
 
+    /// Send the current catalog (possibly empty → client falls back to
+    /// favorites).
+    fn sendCatalog(self: *Daemon, client: *Client) void {
+        const models = self.gpa.alloc([]const u8, self.catalog.items.len) catch return;
+        defer self.gpa.free(models);
+        for (self.catalog.items, 0..) |m, i| models[i] = m;
+        self.sendTo(client, .{ .model_list_result = .{ .models = models } });
+    }
+
+    /// Worker thread: GET /models from OpenRouter, parse ids, hand the
+    /// result to the dispatcher. Failure → empty list (client falls back).
+    fn catalogFetchMain(self: *Daemon, client_id: u64) void {
+        const models = self.fetchCatalog() catch
+            self.gpa.alloc([]u8, 0) catch return;
+        self.events.push(self.io, .{ .catalog_ready = .{ .client_id = client_id, .models = models } }) catch {
+            for (models) |m| self.gpa.free(m);
+            self.gpa.free(models);
+        };
+    }
+
+    fn fetchCatalog(self: *Daemon) ![][]u8 {
+        const url = try registry.openrouterModelsUrl(self.gpa, self.environ);
+        defer self.gpa.free(url);
+
+        const res = try http.get(self.gpa, url, 8 * 1024 * 1024, 30_000, null);
+        defer self.gpa.free(res.body);
+        defer if (res.content_type) |ct| self.gpa.free(ct);
+        if (res.status >= 400) return error.CatalogHttp;
+
+        // {"data":[{"id":"vendor/model",...},...]}
+        const Parsed = struct {
+            data: []const struct { id: []const u8 },
+        };
+        const parsed = try std.json.parseFromSlice(Parsed, self.gpa, res.body, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |m| self.gpa.free(m);
+            out.deinit(self.gpa);
+        }
+        for (parsed.value.data) |entry| {
+            if (entry.id.len == 0) continue;
+            const full = try std.fmt.allocPrint(self.gpa, "openrouter/{s}", .{entry.id});
+            try out.append(self.gpa, full);
+        }
+        std.mem.sort([]u8, out.items, {}, struct {
+            fn lt(_: void, a: []u8, b: []u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        return out.toOwnedSlice(self.gpa);
+    }
+
     fn broadcastMeta(self: *Daemon, sid: u64, tin: u64, tout: u64) void {
         var used: u64 = 0;
         var limit: u64 = 0;
@@ -826,6 +924,8 @@ pub const Daemon = struct {
     }
 
     fn shutdownCleanup(self: *Daemon) void {
+        for (self.catalog.items) |m| self.gpa.free(m);
+        self.catalog.deinit(self.gpa);
         // Cancel running turns and join them.
         var sit = self.sessions.valueIterator();
         while (sit.next()) |sp| {
