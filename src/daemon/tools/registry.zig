@@ -12,10 +12,12 @@ const block = @import("../../core/block.zig");
 const permissions = @import("../permissions.zig");
 const sandbox = @import("../sandbox.zig");
 const network_policy = @import("../network_policy.zig");
+const shell_network = @import("../shell_network.zig");
 const bash = @import("bash.zig");
 const files = @import("files.zig");
 const search = @import("search.zig");
 const fetch_tool = @import("fetch.zig");
+const task = @import("task.zig");
 
 pub const Spec = struct {
     name: []const u8,
@@ -37,6 +39,9 @@ pub const specs = [_]Spec{
     .{ .name = search.grep_spec_name, .description = search.grep_spec_description, .schema_json = search.grep_spec_schema, .parallel_safe = true, .mutating = false },
     .{ .name = search.glob_spec_name, .description = search.glob_spec_description, .schema_json = search.glob_spec_schema, .parallel_safe = true, .mutating = false },
     .{ .name = fetch_tool.spec_name, .description = fetch_tool.spec_description, .schema_json = fetch_tool.spec_schema, .parallel_safe = true, .mutating = false },
+    // Execution crosses back to the daemon dispatcher through RunOpts.on_task;
+    // generic dispatch intentionally has no session/store access.
+    .{ .name = task.spec_name, .description = task.spec_description, .schema_json = task.spec_schema, .parallel_safe = false, .mutating = false },
 };
 
 pub fn find(name: []const u8) ?*const Spec {
@@ -92,6 +97,20 @@ pub fn dispatch(
     if (std.mem.eql(u8, name, bash.spec_name)) {
         const parsed = parseArgs(bash.Args, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
+        if (policy) |active| {
+            var blocked = shell_network.inspect(gpa, parsed.value.command, active) catch |e| {
+                return .{ .output = errText(gpa, e), .status = .err };
+            };
+            if (blocked) |*denied| {
+                defer denied.deinit(gpa);
+                const output = std.fmt.allocPrint(
+                    gpa,
+                    "error: network policy blocked bash command '{s}' from connecting to '{s}' via {s} (matched {s}); shell command was not run",
+                    .{ denied.tool, denied.host, denied.source, denied.domain },
+                ) catch @panic("oom");
+                return .{ .output = output, .status = .denied };
+            }
+        }
         const r = bash.run(gpa, io, parsed.value, cwd, child_environ_ptr, sandbox_options) catch |e| {
             return .{ .output = errText(gpa, e), .status = .err };
         };
@@ -172,6 +191,7 @@ test "find: all specs resolvable, unknown is null" {
     try std.testing.expect(find("bash").?.mutating);
     try std.testing.expect(!find("read_file").?.mutating);
     try std.testing.expect(find("grep").?.parallel_safe);
+    try std.testing.expect(!find("task").?.parallel_safe);
 }
 
 test "dispatch: unknown tool returns error text, not crash" {
@@ -193,6 +213,34 @@ test "dispatch: bad args json returns error text" {
     const r = dispatch(gpa, io, "read_file", "{not json", "/tmp", null, .{}, null, null);
     defer gpa.free(r.output);
     try std.testing.expectEqual(block.ToolStatus.err, r.status);
+}
+
+test "dispatch: bash literal network destination is denied before execution" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var policy = network_policy.Policy.init(gpa, io, &environ, .{ .deny = "blocked.test" });
+    defer policy.deinit();
+
+    const r = dispatch(
+        gpa,
+        io,
+        "bash",
+        \\{"command":"curl https://sub.blocked.test/upload"}
+    ,
+        "/tmp",
+        null,
+        .{},
+        &policy,
+        null,
+    );
+    defer gpa.free(r.output);
+    try std.testing.expectEqual(block.ToolStatus.denied, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "shell command was not run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "explicit deny") != null);
 }
 
 test "dispatch: tool subprocess cannot see provider credentials" {

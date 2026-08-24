@@ -1,0 +1,35 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["delegate one focused inspection", "\"name\":\"task\""],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_task\",\"function\":{\"name\":\"task\",\"arguments\":\"{\\\"prompt\\\":\\\"Inspect durable child metadata and report one sentence.\\\",\\\"max_rounds\\\":6}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["Inspect durable child metadata", "\"name\":\"read_file\""],
+      "expect_not_contains": ["\"name\":\"task\"", "\"name\":\"bash\"", "\"name\":\"write_file\"", "\"name\":\"edit_file\""],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"child found durable hierarchy metadata\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":5}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["child_sid", "child found durable hierarchy metadata"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"parent received the durable child result\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":70,\"completion_tokens\":6}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "delegate one focused inspection"],
+    "exit_code": 0,
+    "stdout_contains": ["parent received the durable child result"],
+    "db_session_meta": ["root|0|0|0", "task_child|1|1|6"]
+  }
+}

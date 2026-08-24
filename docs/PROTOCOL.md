@@ -32,6 +32,8 @@ single-instancing is listed for hardening.
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
 | session_set_model | sid, model | ok, or err{busy} mid-turn |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
+| session_set_sandbox | sid, enabled | ok, or err when busy/unavailable |
+| session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded |
 | sub | sid, from_seq | replayed blk×N (if from_seq ≥ 1), then status |
 | unsub | sid | ok |
 | input | sid, text | ok; starts a turn (idle) or queues steer (running) |
@@ -67,8 +69,11 @@ first, then live. Clients that reconnect pass last_seen_seq + 1.
 | err {code, msg} | bad_msg, no_hello, version, no_session, busy, bad_approval |
 
 Each entry in `session_list_result.sessions` includes `sid`, `title`, `cwd`,
-`model`, `effort`, persisted `status`, `created_at`, and whether the session is currently
-`running`.
+`model`, `effort`, persisted `status`, `created_at`, whether the session is
+currently `running`, and the effective `sandboxed` and `network_filtering`
+states. M6 hierarchy fields are `parent_sid` (null for roots), `kind` (`root`,
+`task_child`, or reserved `review_child`), `parent_block_id`, and `max_rounds`.
+Older clients may ignore them; older entries decode as roots.
 
 ## Approval flow (M2)
 

@@ -37,10 +37,22 @@ const network_policy = @import("network_policy.zig");
 const extensions = @import("extensions.zig");
 const registry = @import("provider/registry.zig");
 const http = @import("provider/http.zig");
+const task_tool = @import("tools/task.zig");
+const tools_registry = @import("tools/registry.zig");
 
 const daemon_version = build_options.version;
 
 // ---------------------------------------------------------------- events --
+
+const ChildStart = struct {
+    parent_sid: u64,
+    parent_block_id: u64,
+    prompt: []u8,
+    model: ?[]u8,
+    effort: ?proto.ReasoningEffort,
+    max_rounds: u32,
+    future: *TaskFuture,
+};
 
 /// Everything that flows into the dispatcher.
 const Event = union(enum) {
@@ -57,7 +69,12 @@ const Event = union(enum) {
     /// Model catalog fetched by a worker thread (raw registry-form ids,
     /// one allocation each, gpa-owned; dispatcher takes ownership).
     catalog_ready: struct { client_id: u64, models: [][]u8 },
-    turn_done: struct { sid: u64, interrupted: bool, err_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
+    /// Turn thread → dispatcher completion. final_text and err_text are
+    /// separately owned because child task results serialize both fields.
+    turn_done: struct { sid: u64, interrupted: bool, err_text: ?[]u8, final_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
+    /// Parent turn thread → dispatcher. All strings are gpa-owned; `future`
+    /// points into the parked parent turn's stack until resolve().
+    child_start: ChildStart,
     shutdown,
 };
 
@@ -80,8 +97,39 @@ const Client = struct {
     }
 };
 
+const TaskFuture = struct {
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
+    done: bool = false,
+    output: ?[]u8 = null,
+    status: block.ToolStatus = .err,
+
+    fn wait(self: *TaskFuture, io: Io) tools_registry.ExecOut {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (!self.done) self.cond.waitUncancelable(io, &self.mutex);
+        return .{ .output = self.output.?, .status = self.status };
+    }
+
+    /// Result ownership transfers to the waiting turn on success.
+    fn resolve(self: *TaskFuture, io: Io, output: []u8, status: block.ToolStatus) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.done) return false;
+        self.output = output;
+        self.status = status;
+        self.done = true;
+        self.cond.signal(io);
+        return true;
+    }
+};
+
 const Session = struct {
     id: u64,
+    parent_sid: ?u64 = null,
+    kind: proto.SessionKind = .root,
+    parent_block_id: ?u64 = null,
+    max_rounds: u32 = 32,
     model: []u8, // gpa-owned
     effort: proto.ReasoningEffort = .auto,
     cwd: []u8, // gpa-owned
@@ -95,6 +143,9 @@ const Session = struct {
     /// backend. In-memory like approval_mode: a daemon restart returns the
     /// session to the configured default.
     sandbox_enabled: bool = false,
+    /// Per-session gate for the daemon-global managed-tool hostname policy.
+    /// A restart restores the default: enabled when blocking rules loaded.
+    network_filtering_enabled: bool = false,
     /// Gate the turn thread parks on for `ask` decisions.
     gate: approval.Gate = .{},
     /// L1 prune frontier (context.zig): tool_results with seq < this are
@@ -108,6 +159,8 @@ const Session = struct {
     /// Queued mid-turn steer texts (gpa-owned), drained by poll_steer.
     steer_queue: std.ArrayList([]u8) = .empty,
     steer_mutex: Io.Mutex = .init,
+    /// Non-null only while a task child is running for a parked parent call.
+    task_waiter: ?*TaskFuture = null,
 };
 
 // ---------------------------------------------------------------- daemon --
@@ -161,6 +214,9 @@ pub const Daemon = struct {
         var opened_store = try store_mod.Store.open(gpa, db_path);
         var store_moved = false;
         errdefer if (!store_moved) opened_store.close();
+        // Provider streams are not resumable across daemon death. Keep their
+        // durable session hierarchy and mark the abandoned lifecycle honestly.
+        try opened_store.recoverInterruptedSessions();
 
         var loaded_config = try config.load(gpa, io, environ);
         defer loaded_config.deinit();
@@ -199,6 +255,11 @@ pub const Daemon = struct {
                 @as([]const u8, "run workspace shell without prompts")
             else
                 "keep per-call shell approvals",
+        });
+        std.log.info("network filtering {s}: {d} rules from {d} feeds (managed tools only)", .{
+            if (network.isActive()) @as([]const u8, "active") else "inactive",
+            network.ruleCount(),
+            network.feedCount(),
         });
 
         var self = Daemon{
@@ -402,12 +463,18 @@ pub const Daemon = struct {
             },
             .turn_awaiting => |ta| {
                 defer self.gpa.free(ta.line);
-                if (self.sessions.get(ta.sid)) |session| session.state = .awaiting_approval;
+                if (self.sessions.get(ta.sid)) |session| {
+                    session.state = .awaiting_approval;
+                    self.store.setSessionStatus(ta.sid, "awaiting_approval") catch {};
+                }
                 self.fanOutActionableLine(ta.sid, ta.line);
                 self.broadcastStatus(ta.sid, .awaiting_approval);
             },
             .turn_resumed => |tr| {
-                if (self.sessions.get(tr.sid)) |session| session.state = .running;
+                if (self.sessions.get(tr.sid)) |session| {
+                    session.state = .running;
+                    self.store.setSessionStatus(tr.sid, "running") catch {};
+                }
                 self.broadcastStatus(tr.sid, .running);
             },
             .catalog_ready => |cr| {
@@ -422,6 +489,7 @@ pub const Daemon = struct {
             },
             .turn_done => |td| {
                 defer if (td.err_text) |t| self.gpa.free(t);
+                defer if (td.final_text) |t| self.gpa.free(t);
                 const session = self.sessions.get(td.sid) orelse return;
                 if (session.turn_thread) |t| {
                     t.join();
@@ -429,6 +497,7 @@ pub const Daemon = struct {
                 }
                 session.cancel.store(false, .release);
                 session.state = if (td.err_text != null) .err else .idle;
+                self.store.setSessionStatus(td.sid, @tagName(session.state)) catch {};
                 // Meta BEFORE status: clients treat idle/err as end-of-turn
                 // and stop reading, so usage must already be on the wire.
                 self.broadcastMeta(td.sid, td.tokens_in, td.tokens_out);
@@ -447,8 +516,39 @@ pub const Daemon = struct {
                     self.extensions.fireHook(.on_session_done, json);
                     if (td.err_text != null) self.extensions.fireHook(.on_error, json);
                 }
+                // A child is an ordinary durable session plus this one-shot
+                // rendezvous back to the parent tool call.
+                if (session.task_waiter) |future| {
+                    session.task_waiter = null;
+                    const outcome_status: block.ToolStatus = if (td.interrupted)
+                        .interrupted
+                    else if (td.err_text != null)
+                        .err
+                    else
+                        .ok;
+                    const result_json = std.json.Stringify.valueAlloc(self.gpa, .{
+                        .child_sid = td.sid,
+                        .status = if (td.interrupted)
+                            @as([]const u8, "interrupted")
+                        else if (td.err_text != null)
+                            "error"
+                        else
+                            "completed",
+                        .final_text = td.final_text orelse "",
+                        .error_message = td.err_text,
+                    }, .{}) catch self.gpa.dupe(u8, "error: could not encode child result") catch @panic("oom");
+                    if (!future.resolve(self.io, result_json, outcome_status)) self.gpa.free(result_json);
+                }
                 // A pending /reboot proceeds once the last turn drains.
                 self.maybeFinishReboot();
+            },
+            .child_start => |cs| {
+                defer self.gpa.free(cs.prompt);
+                defer if (cs.model) |m| self.gpa.free(m);
+                self.startChild(cs) catch |e| {
+                    const output = std.fmt.allocPrint(self.gpa, "error: could not start child session: {t}", .{e}) catch @panic("oom");
+                    if (!cs.future.resolve(self.io, output, .err)) self.gpa.free(output);
+                };
             },
             .shutdown => {
                 self.running = false;
@@ -473,6 +573,8 @@ pub const Daemon = struct {
                     .daemon_version = daemon_version,
                     .sandbox_available = self.sandbox_backend == .seatbelt,
                     .network_filtering = self.network.isActive(),
+                    .network_feed_count = self.network.feedCount(),
+                    .network_rule_count = self.network.ruleCount(),
                 } });
             },
             .session_create => |sc| {
@@ -486,6 +588,7 @@ pub const Daemon = struct {
                     .cwd = try self.gpa.dupe(u8, sc.cwd),
                     .approval_mode = approval.Mode.parse(sc.approvals),
                     .sandbox_enabled = self.cfg.permissions_enabled,
+                    .network_filtering_enabled = self.network.isActive(),
                 };
                 try self.sessions.put(self.gpa, sid, session);
                 self.sendTo(client, .{ .session_created = .{ .sid = sid } });
@@ -497,10 +600,7 @@ pub const Daemon = struct {
                 try self.sendSessionList(client);
             },
             .session_kill => |sk| {
-                if (self.sessions.get(sk.sid)) |session| {
-                    session.cancel.store(true, .release);
-                    session.gate.denyPending(self.io);
-                }
+                self.cancelSessionTree(sk.sid);
                 self.sendTo(client, .{ .ok = .{} });
             },
             .session_set_model => |sm| {
@@ -550,6 +650,26 @@ pub const Daemon = struct {
                     return;
                 }
                 session.sandbox_enabled = ss.enabled;
+                self.sendTo(client, .{ .ok = .{} });
+                self.broadcastSessionList();
+            },
+            .session_set_network_filtering => |sn| {
+                const session = (try self.getOrLoadSession(sn.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot toggle network filtering mid-turn" } });
+                    return;
+                }
+                if (sn.enabled and !self.network.isActive()) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "network_filter_unavailable",
+                        .msg = "no network blocklist or explicit deny rules loaded; update config and reboot",
+                    } });
+                    return;
+                }
+                session.network_filtering_enabled = sn.enabled;
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionList();
             },
@@ -650,6 +770,7 @@ pub const Daemon = struct {
                 };
                 session.state = .running;
                 session.turn_thread = try std.Thread.spawn(.{}, compactMain, .{job});
+                self.store.setSessionStatus(session.id, "running") catch {};
                 self.broadcastStatus(session.id, .running);
                 self.sendTo(client, .{ .ok = .{} });
             },
@@ -676,10 +797,7 @@ pub const Daemon = struct {
                 t.detach();
             },
             .interrupt => |i| {
-                if (self.sessions.get(i.sid)) |session| {
-                    session.cancel.store(true, .release);
-                    session.gate.denyPending(self.io);
-                }
+                self.cancelSessionTree(i.sid);
                 self.sendTo(client, .{ .ok = .{} });
             },
             .shutdown => {
@@ -731,13 +849,86 @@ pub const Daemon = struct {
         errdefer self.gpa.free(cwd);
         session.* = .{
             .id = sid,
+            .parent_sid = row.parent_sid,
+            .kind = row.kind,
+            .parent_block_id = row.parent_block_id,
+            .max_rounds = if (row.max_rounds > 0) row.max_rounds else 32,
             .model = model,
             .effort = row.effort,
             .cwd = cwd,
             .sandbox_enabled = self.cfg.permissions_enabled,
+            .network_filtering_enabled = self.network.isActive(),
         };
         try self.sessions.put(self.gpa, sid, session);
         return session;
+    }
+
+    fn cancelSessionTree(self: *Daemon, sid: u64) void {
+        if (self.sessions.get(sid)) |session| cancelActiveSession(self, session);
+        // Nesting is deliberately limited to one level in this M6 slice.
+        // Keeping the relation scan here makes the cascade explicit and easy
+        // to generalize when deeper task trees become a product decision.
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            const child = sp.*;
+            if (child.parent_sid == sid) cancelActiveSession(self, child);
+        }
+    }
+
+    /// Dispatcher-only child creation. The caller is a parent turn thread,
+    /// but it reaches this function solely through Event.child_start.
+    fn startChild(self: *Daemon, cs: ChildStart) !void {
+        const parent = self.sessions.get(cs.parent_sid) orelse return error.ParentSessionMissing;
+        if (parent.kind != .root) return error.NestedTaskDenied;
+        if (parent.cancel.load(.acquire)) return error.Cancelled;
+
+        const sid = ids.next(self.io);
+        const model_src = cs.model orelse parent.model;
+        const effort = cs.effort orelse parent.effort;
+        const title = taskTitle(cs.prompt);
+
+        const session = try self.gpa.create(Session);
+        var session_transferred = false;
+        errdefer if (!session_transferred) self.gpa.destroy(session);
+        const model = try self.gpa.dupe(u8, model_src);
+        errdefer if (!session_transferred) self.gpa.free(model);
+        const cwd = try self.gpa.dupe(u8, parent.cwd);
+        errdefer if (!session_transferred) self.gpa.free(cwd);
+        session.* = .{
+            .id = sid,
+            .parent_sid = parent.id,
+            .kind = .task_child,
+            .parent_block_id = cs.parent_block_id,
+            .max_rounds = cs.max_rounds,
+            .model = model,
+            .effort = effort,
+            .cwd = cwd,
+            .approval_mode = .default,
+            .sandbox_enabled = parent.sandbox_enabled,
+            .network_filtering_enabled = parent.network_filtering_enabled,
+            .task_waiter = cs.future,
+        };
+
+        try self.store.createChildSession(
+            sid,
+            nowMs(self.io),
+            parent.id,
+            cs.parent_block_id,
+            title,
+            parent.cwd,
+            model_src,
+            effort,
+            cs.max_rounds,
+        );
+        try self.sessions.put(self.gpa, sid, session);
+        session_transferred = true;
+        self.startTurn(session, cs.prompt) catch |e| {
+            session.task_waiter = null;
+            session.state = .err;
+            self.store.setSessionStatus(sid, "err") catch {};
+            self.broadcastSessionList();
+            return e;
+        };
     }
 
     // ------------------------------------------------------------- turns --
@@ -756,18 +947,26 @@ pub const Daemon = struct {
     fn startTurn(self: *Daemon, session: *Session, text: []const u8) !void {
         const job = try self.gpa.create(TurnJob);
         errdefer self.gpa.destroy(job);
+        const cwd = try self.gpa.dupe(u8, session.cwd);
+        errdefer self.gpa.free(cwd);
+        const model = try self.gpa.dupe(u8, session.model);
+        errdefer self.gpa.free(model);
+        const owned_text = try self.gpa.dupe(u8, text);
+        errdefer self.gpa.free(owned_text);
         job.* = .{
             .daemon = self,
             .sid = session.id,
-            .cwd = try self.gpa.dupe(u8, session.cwd),
-            .model = try self.gpa.dupe(u8, session.model),
+            .cwd = cwd,
+            .model = model,
             .effort = session.effort,
-            .text = try self.gpa.dupe(u8, text),
+            .text = owned_text,
             .cancel = &session.cancel,
             .session = session,
         };
+        const thread = try std.Thread.spawn(.{}, turnMain, .{job});
+        session.turn_thread = thread;
         session.state = .running;
-        session.turn_thread = try std.Thread.spawn(.{}, turnMain, .{job});
+        self.store.setSessionStatus(session.id, "running") catch {};
         self.broadcastStatus(session.id, .running);
     }
 
@@ -787,7 +986,7 @@ pub const Daemon = struct {
 
         const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
             err_text = std.fmt.allocPrint(self.gpa, "provider resolve failed: {t}", .{e}) catch null;
-            self.finishTurn(job.sid, false, err_text, 0, 0);
+            self.finishTurn(job.sid, false, err_text, null, 0, 0);
             return;
         };
         defer ep.deinit(self.gpa);
@@ -832,7 +1031,7 @@ pub const Daemon = struct {
             .cfg = self.cfg,
             .tool_environ = self.environ,
             .sandbox_options = sandbox_options,
-            .network_policy = &self.network,
+            .network_policy = if (job.session.network_filtering_enabled) &self.network else null,
             .extensions = self.extensions,
             .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .dialect = c.dialect } else null,
             .prune_frontier = &job.session.prune_frontier,
@@ -844,18 +1043,20 @@ pub const Daemon = struct {
             .on_delta = TurnHooks.onDelta,
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
+            .on_task = if (job.session.kind == .root) TurnHooks.onTask else null,
+            .tool_profile = if (job.session.kind == .root) .full else .read_only,
             .cancel = job.cancel,
             .poll_steer = TurnHooks.pollSteer,
+            .max_rounds = job.session.max_rounds,
         }, job.text) catch |e| {
             err_text = std.fmt.allocPrint(self.gpa, "turn failed: {t}", .{e}) catch null;
-            self.finishTurn(job.sid, false, err_text, 0, 0);
+            self.finishTurn(job.sid, false, err_text, null, 0, 0);
             return;
         };
-        defer self.gpa.free(result.text);
         tokens_in = result.tokens_in;
         tokens_out = result.tokens_out;
         interrupted = result.interrupted;
-        self.finishTurn(job.sid, interrupted, null, tokens_in, tokens_out);
+        self.finishTurn(job.sid, interrupted, null, result.text, tokens_in, tokens_out);
     }
 
     /// /compact thread body: like turnMain but runs only the compaction
@@ -872,7 +1073,7 @@ pub const Daemon = struct {
 
         const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "provider resolve failed: {t}", .{e}) catch null;
-            self.finishTurn(job.sid, false, t, 0, 0);
+            self.finishTurn(job.sid, false, t, null, 0, 0);
             return;
         };
         defer ep.deinit(self.gpa);
@@ -896,22 +1097,24 @@ pub const Daemon = struct {
             .cancel = job.cancel,
         }) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "compaction failed: {t}", .{e}) catch null;
-            self.finishTurn(job.sid, false, t, 0, 0);
+            self.finishTurn(job.sid, false, t, null, 0, 0);
             return;
         };
         _ = did; // "nothing to compact" already logged as a system_note
-        self.finishTurn(job.sid, false, null, 0, 0);
+        self.finishTurn(job.sid, false, null, null, 0, 0);
     }
 
-    fn finishTurn(self: *Daemon, sid: u64, interrupted: bool, err_text: ?[]u8, tin: u64, tout: u64) void {
+    fn finishTurn(self: *Daemon, sid: u64, interrupted: bool, err_text: ?[]u8, final_text: ?[]u8, tin: u64, tout: u64) void {
         self.events.push(self.io, .{ .turn_done = .{
             .sid = sid,
             .interrupted = interrupted,
             .err_text = err_text,
+            .final_text = final_text,
             .tokens_in = tin,
             .tokens_out = tout,
         } }) catch {
             if (err_text) |t| self.gpa.free(t);
+            if (final_text) |t| self.gpa.free(t);
         };
     }
 
@@ -931,6 +1134,51 @@ pub const Daemon = struct {
             const self = job.daemon;
             const line = proto.encode(self.gpa, proto.DaemonMsg{ .delta = .{ .sid = job.sid, .turn_id = 0, .text = text } }) catch return;
             self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+        }
+
+        fn onTask(ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            if (job.session.kind != .root) return taskError(self.gpa, "nested task calls are disabled");
+
+            const parsed = std.json.parseFromSlice(task_tool.Args, self.gpa, args_json, .{
+                .ignore_unknown_fields = false,
+            }) catch return taskError(self.gpa, "task arguments do not match the schema");
+            defer parsed.deinit();
+            const args = parsed.value;
+            if (std.mem.trim(u8, args.prompt, " \t\r\n").len == 0)
+                return taskError(self.gpa, "task prompt must not be empty");
+            if (args.max_rounds == 0 or args.max_rounds > 32)
+                return taskError(self.gpa, "task max_rounds must be between 1 and 32");
+
+            const prompt = self.gpa.dupe(u8, args.prompt) catch return taskError(self.gpa, "out of memory");
+            var model: ?[]u8 = null;
+            if (args.model) |m| {
+                if (m.len == 0) {
+                    self.gpa.free(prompt);
+                    return taskError(self.gpa, "task model must not be empty");
+                }
+                model = self.gpa.dupe(u8, m) catch {
+                    self.gpa.free(prompt);
+                    return taskError(self.gpa, "out of memory");
+                };
+            }
+
+            var future = TaskFuture{};
+            self.events.push(self.io, .{ .child_start = .{
+                .parent_sid = job.sid,
+                .parent_block_id = parent_block_id,
+                .prompt = prompt,
+                .model = model,
+                .effort = args.effort,
+                .max_rounds = args.max_rounds,
+                .future = &future,
+            } }) catch {
+                self.gpa.free(prompt);
+                if (model) |m| self.gpa.free(m);
+                return taskError(self.gpa, "daemon is shutting down");
+            };
+            return future.wait(self.io);
         }
 
         fn pollSteer(ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 {
@@ -1030,6 +1278,10 @@ pub const Daemon = struct {
                 std.meta.stringToEnum(proto.SessionState, row.status) orelse .idle;
             infos[i] = .{
                 .sid = row.id,
+                .parent_sid = row.parent_sid,
+                .kind = row.kind,
+                .parent_block_id = row.parent_block_id,
+                .max_rounds = row.max_rounds,
                 .title = row.title,
                 .cwd = row.cwd,
                 .model = row.model,
@@ -1040,6 +1292,8 @@ pub const Daemon = struct {
                 .running = state == .running,
                 .sandboxed = self.sandbox_backend == .seatbelt and
                     (if (live) |session| session.sandbox_enabled else self.cfg.permissions_enabled),
+                .network_filtering = self.network.isActive() and
+                    (if (live) |session| session.network_filtering_enabled else true),
             };
         }
         self.sendTo(client, .{ .session_list_result = .{ .sessions = infos } });
@@ -1160,12 +1414,25 @@ pub const Daemon = struct {
     fn shutdownCleanup(self: *Daemon) void {
         for (self.catalog.items) |m| self.gpa.free(m);
         self.catalog.deinit(self.gpa);
-        // Cancel running turns and join them.
+        // Cancel running turns. Resolve child rendezvous before joining: the
+        // dispatcher is no longer consuming turn_done events, so a parent
+        // parked in task.wait must not depend on its child completion event.
+        var cancel_it = self.sessions.valueIterator();
+        while (cancel_it.next()) |sp| {
+            const session = sp.*;
+            cancelActiveSession(self, session);
+            if (session.task_waiter) |future| {
+                session.task_waiter = null;
+                const output = self.gpa.dupe(u8, "error: child interrupted by daemon shutdown") catch continue;
+                if (!future.resolve(self.io, output, .interrupted)) self.gpa.free(output);
+            }
+        }
+
+        // Join and release sessions after every parked parent can make
+        // progress independently of dispatcher event processing.
         var sit = self.sessions.valueIterator();
         while (sit.next()) |sp| {
             const session = sp.*;
-            session.cancel.store(true, .release);
-            session.gate.denyPending(self.io);
             if (session.turn_thread) |t| t.join();
             session.steer_mutex.lockUncancelable(self.io);
             for (session.steer_queue.items) |s| self.gpa.free(s);
@@ -1215,6 +1482,26 @@ fn posixChmod600(path: []const u8) void {
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
     _ = std.c.chmod(buf[0..path.len :0], 0o600);
+}
+
+fn cancelActiveSession(self: *Daemon, session: *Session) void {
+    if (session.state != .running and session.state != .awaiting_approval) return;
+    session.cancel.store(true, .release);
+    session.gate.denyPending(self.io);
+}
+
+fn taskError(gpa: std.mem.Allocator, message: []const u8) tools_registry.ExecOut {
+    const output = std.fmt.allocPrint(gpa, "error: {s}", .{message}) catch @panic("oom");
+    return .{ .output = output, .status = .err };
+}
+
+fn taskTitle(prompt: []const u8) []const u8 {
+    const first_line = if (std.mem.indexOfScalar(u8, prompt, '\n')) |i| prompt[0..i] else prompt;
+    const trimmed = std.mem.trim(u8, first_line, " \t\r");
+    var end = @min(trimmed.len, 72);
+    // Avoid cutting a valid UTF-8 title in the middle of a continuation run.
+    while (end > 0 and end < trimmed.len and (trimmed[end] & 0xc0) == 0x80) end -= 1;
+    return trimmed[0..end];
 }
 
 fn nowMs(io: Io) i64 {

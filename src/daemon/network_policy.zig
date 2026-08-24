@@ -109,6 +109,12 @@ pub const Policy = struct {
         return self.blocked.count();
     }
 
+    /// Number of rules capable of blocking a host. Explicit allows are not
+    /// counted because they only subtract from feed matches.
+    pub fn ruleCount(self: *const Policy) usize {
+        return self.blocked.count() + self.explicit_deny.count();
+    }
+
     /// True when any blocking rule is in effect (feed domains or explicit
     /// denies). Allow-only settings filter nothing.
     pub fn isActive(self: *const Policy) bool {

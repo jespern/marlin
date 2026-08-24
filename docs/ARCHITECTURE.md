@@ -168,7 +168,8 @@ Key decisions:
 
 ```
 sessions(id, title, created_at, cwd, model, effort, provider, status,
-         pinned_context, config_json)
+         pinned_context, config_json, parent_sid, kind, parent_block_id,
+         max_rounds)
 blocks(id, session_id, turn_id, seq, kind, ts, body_json)
 blobs(hash, bytes, created_at, tombstone)  -- full tool outputs, content-addressed
 blob_refs(hash, block_id)                  -- refcounting for GC
@@ -272,7 +273,7 @@ loop:
       → emit delta events as text arrives
       → collect tool_calls (may be several)
     if no tool_calls: finalize assistant_msg block; done
-    for each tool_call (parallel where safe, see below):
+    for each tool_call (serial today; parallel-safe groups are M6a-next):
       approval gate (§7) — may block on client response w/ timeout
       execute tool → tool_result block (cap inline, blob full)
     check steer queue: if user typed mid-turn, inject steer block
@@ -280,9 +281,10 @@ loop:
     loop
 ```
 
-- **Parallel tool execution**: read-only tools (read/grep/glob/fetch) run
-  concurrently; anything mutating (bash, write, edit) serializes. Tools declare
-  `.parallel_safe` in their spec.
+- **Parallel tool execution (M6a-next)**: tools already declare
+  `.parallel_safe`; the scheduler still executes serially. The widening step
+  will run consecutive safe calls concurrently, keep provider-call result
+  order, and serialize anything mutating (bash, write, edit).
 - **Cancellation**: interrupt sets an atomic flag; the HTTP read loop and tool
   subprocess waits poll it. Subprocesses get SIGTERM → grace → SIGKILL. The
   half-finished turn is finalized as an interrupted `system_note` + whatever
@@ -401,11 +403,13 @@ The cascade (in order; each layer only fires if the previous wasn't enough):
        (Claude Code's insight: summary-only compaction is amnesia.)
   Don't compact tiny sessions (< min_blocks); don't compact twice in a row
   without progress between.
-- **L3 — subagents (architectural).** `task` tool spawns a child session with
-  its own context, allowlisted tools, and model; only its final summary enters
-  the parent as a tool_result. Child sessions are ordinary sessions (visible
-  in `marlin ls`, attachable read-only) — the multiplexer shows them nested
-  under the parent.
+- **L3 — subagents (M6a active).** `task` spawns a durable child through the
+  dispatcher with its own context, optional model/effort, read-only tools, and
+  a round budget; only its structured final result enters the parent as a
+  tool_result. Child sessions are ordinary sessions (visible in `marlin ls`
+  and attachable) and the multiplexer groups them beneath the parent. The
+  first slice waits on one child and forbids recursive task calls; concurrent
+  ordered fan-out is the next widening step.
 
 Cache discipline, stated once: between L1/L2 events the assembly is strictly
 append-only with a byte-stable prefix. L1/L2 are the only cache breaks, both
@@ -423,7 +427,7 @@ edit        (string-replace w/ fuzzy fallback; mutating)
 grep        (ripgrep if present, else internal; parallel_safe)
 glob        (parallel_safe)
 fetch       (HTTP GET → markdown-ish text; parallel_safe)
-task        (subagent spawn; v1.5)
+task        (durable read-only child; M6a)
 ```
 
 **grep engine policy.** Prefer `rg` when on PATH: best engine, native

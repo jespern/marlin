@@ -10,6 +10,10 @@ const proto = @import("../core/proto.zig");
 
 pub const Session = struct {
     id: u64,
+    parent_sid: ?u64 = null,
+    kind: proto.SessionKind = .root,
+    parent_block_id: ?u64 = null,
+    max_rounds: u32 = 32,
     title: []const u8,
     cwd: []const u8,
     model: []const u8,
@@ -22,8 +26,8 @@ pub const Session = struct {
     tokens_out: u64 = 0,
 };
 
-// TODO(M1): steer queue, pending approval set, in-flight turn handle
-// (thread + cancel flag), parent/child links for subagents (M6).
+// The daemon's live Session adds synchronization-only fields (thread, cancel,
+// approval gate, task rendezvous); this value documents durable state.
 
 test {
     std.testing.refAllDecls(@This());

@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>~*~ marlin ~*~ the agent harness that SWIMS</title>
-<meta name="description" content="marlin: a daemon-native AI agent harness in Zig. one binary. it's a fish.">
+<title>~*~ marlin ~*~ daemon-native terminal agents</title>
+<meta name="description" content="marlin is a daemon-native terminal AI agent harness in Zig: durable structured sessions, a focused TUI multiplexer, extensions, permissions, and child agents.">
 <link rel="icon" href="assets/marlin-tiny.gif">
 <style>
   /* ============================================================
@@ -47,6 +47,50 @@
     color:var(--yellow);
     text-shadow:2px 2px 0 var(--hot-pink);
     font-size:1.4rem;
+  }
+  .lede{ font-size:1.05rem; line-height:1.45; }
+  .badge{
+    display:inline-block;
+    padding:2px 7px;
+    margin-right:5px;
+    color:#000;
+    background:var(--yellow);
+    border:2px outset #fff;
+    font-family:Verdana,sans-serif;
+    font-size:0.72rem;
+    font-weight:bold;
+  }
+  .status-note{
+    color:#fff;
+    background:#330033;
+    border:3px dashed var(--hot-pink);
+    padding:10px 12px;
+    margin:18px 0;
+    line-height:1.4;
+  }
+  .feature-grid{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:8px;
+    margin-top:12px;
+  }
+  .feature{
+    background:#000044;
+    border:2px inset #808080;
+    padding:9px 10px;
+    line-height:1.35;
+  }
+  .feature b{ color:var(--cyan); display:block; margin-bottom:2px; }
+  .fineprint{ color:#c0c0c0; font-size:0.85rem; line-height:1.4; }
+  code.inline{
+    color:var(--lime);
+    background:#001100;
+    font-family:"Courier New",monospace;
+    padding:1px 4px;
+  }
+  @media (max-width:620px){
+    .feature-grid{ grid-template-columns:1fr; }
+    h1{ font-size:2.1rem; }
   }
 
   header{ text-align:center; padding-top:10px; }
@@ -140,6 +184,7 @@
     border-spacing:2px;
     background:#000;
   }
+  .table-scroll{ width:100%; overflow-x:auto; }
   table.oldschool td, table.oldschool th{
     border:2px inset #808080;
     padding:5px 8px;
@@ -225,11 +270,11 @@
   <header>
     <img class="fish" src="assets/marlin.gif" alt="a marlin leaping out of the ocean, majestically, at 64 colors">
     <h1><span class="tilde">~*~</span> marlin <span class="tilde">~*~</span></h1>
-    <p class="tagline">the AI agent harness that <b>SWIMS</b> &nbsp;🐟&nbsp; est. 2026</p>
+    <p class="tagline">durable terminal agents that <b>SWIM</b> between clients &nbsp;🐟&nbsp; built in Zig</p>
   </header>
 
   <div class="install">
-    <span class="label">⚡ install it (one line, like the binary deserves):</span>
+    <span class="label">⚡ install the latest tagged build (macOS + Linux):</span>
     <div class="cmdrow">
       <code id="installcmd">curl -fsSL https://marlin.wtf/install.sh | sh</code>
       <button id="copybtn" type="button" title="copy to clipboard">copy</button>
@@ -237,64 +282,105 @@
   </div>
 
   <marquee scrollamount="6">
-    ★★★ WELCOME to marlin.wtf ★★★ one binary ★ zero electrons harmed ★ daemon-native ★ written in ZIG ★ scp it to a box and GO ★ thank you for visiting my website ★★★
+    ★★★ WELCOME to marlin.wtf ★★★ one binary ★ daemon-owned sessions ★ structured scrollback ★ TUI multiplexer ★ MCP + hooks + skills ★ CHILD AGENTS HAVE ENTERED THE WATER ★ written in ZIG ★★★
   </marquee>
 
   <div class="panel">
     <h2>&gt;&gt; what IS marlin??</h2>
-    <p>
-      marlin is a <b>terminal AI agent harness</b>: a daemon that owns your
-      sessions + thin clients that attach to them. kill your terminal, the
-      agent keeps working. reattach from your phone over ssh. it's like
-      tmux and claude code had a baby and the baby was a <b>fish</b>.
+    <p class="lede">
+      marlin is a <b>daemon-native terminal AI agent harness</b>. The daemon
+      owns structured sessions; the TUI and headless CLI are thin clients.
+      Close a terminal and the turn keeps running. Reattach later—or from
+      another terminal over SSH—and the transcript, status, approvals, and
+      full tool results are still there.
     </p>
     <ul class="starlist">
-      <li><b>one static binary</b>: scp-and-run, no node_modules the size of Jupiter</li>
-      <li><b>daemon-native</b>: sessions survive client death, reboots, your mood</li>
-      <li><b>append-only block log</b>: the store is TRUTH, scrollback is a view</li>
-      <li><b>multi-model review councils</b>: 4 LLMs argue about your crypto code so you don't have to</li>
-      <li><b>written in Zig</b>: compiles before you finish blinking</li>
+      <li><b>one binary</b>: no Node runtime, no Python environment, no terminal scraping</li>
+      <li><b>structured multiplexer</b>: switch sessions without losing drafts, scroll position, or actionable state</li>
+      <li><b>append-only truth</b>: context may compact; durable history and full tool output do not pretend they never happened</li>
+      <li><b>process-boundary extensions</b>: MCP stdio servers, executable tools, hooks, and Markdown skills</li>
+      <li><b>durable child sessions</b>: a parent can delegate focused read-only work to an inspectable child</li>
     </ul>
   </div>
 
-  <p class="construction">
-    <span class="cone">🚧</span> THIS SITE IS UNDER CONSTRUCTION <span class="cone">🚧</span><br>
-    (so is marlin. we are at M2 of 6. the fish is still growing.)
-  </p>
-
-  <div class="panel">
-    <h2>&gt;&gt; try it (soon™)</h2>
-    <pre class="term">$ scp marlin yourbox:
-$ ssh yourbox
-$ ./marlin run "why is my build broken"
-<span class="c"># ...streaming wisdom...</span>
-$ ./marlin          <span class="c"># attach the TUI, watch it work</span></pre>
-    <p style="font-size:0.9rem">requires: a terminal, a dream, and an OpenRouter key.</p>
+  <div class="status-note">
+    <span class="badge">DEVELOPMENT PREVIEW</span>
+    Marlin is already self-hosting and useful for real work, but it is not a
+    stable 1.0 product. The multiplexer and extension foundations are built;
+    M6 is actively widening child sessions into concurrent delegation and
+    review councils. Config and protocol details may still move.
   </div>
 
   <div class="panel">
-    <h2>&gt;&gt; the ROADMAP (fancy word for todo list)</h2>
-    <table class="oldschool">
-      <tr><th>milestone</th><th>what</th><th>status</th></tr>
-      <tr><td>M0</td><td>the loop works</td><td>✅ DONE</td></tr>
-      <tr><td>M1</td><td>daemon + protocol</td><td>✅ DONE</td></tr>
-      <tr><td>M2</td><td>TUI v1</td><td>🔨 HAMMERING</td></tr>
-      <tr><td>M3</td><td>context engine + /reboot (self-hosting!!)</td><td>📋 planned</td></tr>
-      <tr><td>M4</td><td>multiplexer + image paste</td><td>📋 planned</td></tr>
-      <tr><td>M5</td><td>MCP, hooks, skills</td><td>📋 planned</td></tr>
-      <tr><td>M6</td><td>sandboxing + review councils</td><td>🌊 the deep end</td></tr>
-    </table>
+    <h2>&gt;&gt; what works TODAY</h2>
+    <div class="feature-grid">
+      <div class="feature"><b>Focused TUI</b>Multiline composer, mouse selection + OSC52 copy, command completion, readable tool/reasoning output, model and effort controls.</div>
+      <div class="feature"><b>Real multiplexer</b>Durable concurrent sessions, <code class="inline">/sessions</code>, recent-session switching, per-session view state, background activity and child status.</div>
+      <div class="feature"><b>Context that admits reality</b>Inline output caps, full content-addressed blobs, pruning, compaction, usage accounting, and durable reconnect replay.</div>
+      <div class="feature"><b>Self-hosting loop</b>Headless runs, steering, approvals, interruption, and coordinated <code class="inline">/reboot --build</code> while developing Marlin inside Marlin.</div>
+      <div class="feature"><b>Extension boundaries</b>Owned TOML config, executable tools, MCP stdio, asynchronous hooks, and on-demand skills through one schema + approval path.</div>
+      <div class="feature"><b>Permission foundation</b>Scrubbed tool environments, approval policy, protected-path rules, managed network filtering, and verified macOS shell sandboxing with safe fallback.</div>
+      <div class="feature"><b>First child-agent slice</b>A synchronous <code class="inline">task</code> call creates a durable, attachable, read-only child with a budget, cancellation cascade, and structured result.</div>
+      <div class="feature"><b>Provider choice</b>OpenRouter-first model catalog plus OpenAI-compatible and Anthropic provider paths, with per-session model and reasoning effort.</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>&gt;&gt; take it for a swim</h2>
+    <pre class="term">$ curl -fsSL https://marlin.wtf/install.sh | sh
+$ export OPENROUTER_API_KEY=...
+$ marlin run "why is my build broken"
+<span class="c"># ...the daemon keeps the structured session...</span>
+$ marlin             <span class="c"># attach the TUI</span>
+$ marlin ls          <span class="c"># see every session, including children</span></pre>
+    <p class="fineprint">
+      Tagged builds target macOS and Linux on aarch64 and x86_64. The installer
+      verifies a published SHA-256 checksum and writes to
+      <code class="inline">~/.local/bin</code> without sudo.
+      Tracking main instead? Clone the
+      <a href="https://github.com/jespern/marlin">repository</a> and run
+      <code class="inline">zig build</code> with Zig 0.16.0.
+    </p>
+  </div>
+
+  <div class="panel">
+    <h2>&gt;&gt; development STATUS</h2>
+    <div class="table-scroll"><table class="oldschool">
+      <tr><th>track</th><th>where it is</th><th>status</th></tr>
+      <tr><td>M0–M3</td><td>agent loop, daemon, TUI, context engine, self-hosting reboot</td><td>✅ BUILT</td></tr>
+      <tr><td>M3.5</td><td>permissions + secret boundary</td><td>🔧 HARDENING</td></tr>
+      <tr><td>M4</td><td>structured session multiplexer</td><td>✅ VERIFIED</td></tr>
+      <tr><td>M5</td><td>MCP, executable tools, hooks, skills</td><td>🐕 DOGFOODING</td></tr>
+      <tr><td>M6a</td><td>durable child sessions + task primitive</td><td>🐟 FIRST SLICE</td></tr>
+      <tr><td>M6 next</td><td>ordered concurrent children + review councils</td><td>🔨 ACTIVE</td></tr>
+      <tr><td>later</td><td>workspace snapshots/isolation + remote/PWA decisions</td><td>📋 EVIDENCE FIRST</td></tr>
+    </table></div>
+    <p class="fineprint">
+      The source-of-truth details live in the
+      <a href="https://github.com/jespern/marlin/blob/main/docs/MILESTONES.md">milestones</a>
+      and the active <a href="https://github.com/jespern/marlin/blob/main/docs/M6_PLAN.md">M6 execution plan</a>.
+    </p>
+  </div>
+
+  <div class="panel">
+    <h2>&gt;&gt; NOT shipped yet (honesty zone)</h2>
+    <ul class="starlist">
+      <li><b>review councils</b>: designed, but named councils and concurrent reviewer fan-out are next—not marketing-present-tense</li>
+      <li><b>native remote transport or web UI</b>: use SSH/mosh today; raw TCP and a PWA wait for a concrete trust boundary and workflow</li>
+      <li><b>workspace undo/isolation</b>: snapshots, leases, worktrees, <code class="inline">/land</code>, and <code class="inline">/discard</code> remain one deliberately later track</li>
+      <li><b>kitchen sink surfaces</b>: no messaging gateway, voice stack, embedded terminal emulator, or dashboard empire</li>
+    </ul>
   </div>
 
   <div class="panel">
     <h2>&gt;&gt; sign my guestbook... i mean, links</h2>
     <p style="text-align:center">
-      <a class="btn88x31 b-gh" href="#">github soon™</a>
+      <a class="btn88x31 b-gh" href="https://github.com/jespern/marlin">SOURCE on GH</a>
       <a class="btn88x31 b-zig" href="https://ziglang.org">made w/ ZIG</a>
-      <a class="btn88x31 b-rg" href="https://github.com/BurntSushi/ripgrep">powered by rg*</a>
-      <a class="btn88x31 b-best" href="#">best viewed in a TERMINAL</a>
+      <a class="btn88x31 b-rg" href="https://github.com/jespern/marlin/releases">RELEASES</a>
+      <a class="btn88x31 b-best" href="https://github.com/jespern/marlin/blob/main/docs/ARCHITECTURE.md">ARCHITECTURE</a>
     </p>
-    <p style="font-size:0.8rem;text-align:center">*rg optional. we bring our own regex like responsible adults.</p>
+    <p style="font-size:0.8rem;text-align:center">one handcrafted HTML file. the fish rejected React.</p>
   </div>
 
   <hr class="rainbow">
@@ -302,7 +388,7 @@ $ ./marlin          <span class="c"># attach the TUI, watch it work</span></pre>
   <footer>
     <p>you are visitor number <span class="counter" id="counter">000042</span> (probably)</p>
     <p class="webring">
-      <a href="#">&lt;&lt; prev</a> · part of the <b>terminal agents webring</b> · <a href="#">next &gt;&gt;</a>
+      <a href="https://github.com/jespern/marlin">&lt;&lt; source</a> · part of the <b>terminal agents webring</b> · <a href="https://github.com/jespern/marlin/blob/main/docs/MILESTONES.md">roadmap &gt;&gt;</a>
     </p>
     <p>© 2026 · handcrafted HTML · no framework was harmed ·
        <a href="mailto:fish@marlin.wtf">fish@marlin.wtf</a></p>

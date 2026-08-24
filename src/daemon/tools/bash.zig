@@ -16,7 +16,8 @@ const sandbox = @import("../sandbox.zig");
 pub const spec_name = "bash";
 pub const spec_description =
     "Run a shell command with bash -c. Returns interleaved stdout/stderr and the exit code. " ++
-    "The working directory is the session's cwd.";
+    "The working directory is the session's cwd. When network filtering is enabled, " ++
+    "literal destinations used by common network commands are screened before execution.";
 pub const spec_schema =
     \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to run"}},"required":["command"]}
 ;

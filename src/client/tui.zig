@@ -65,6 +65,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/model", .usage = " [model]", .description = "switch model or open the picker", .accepts_args = true },
     .{ .name = "/effort", .usage = " [level]", .description = "set reasoning effort or open the picker", .accepts_args = true },
     .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
+    .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/compact", .description = "compact the current context" },
@@ -175,6 +176,8 @@ const Selection = struct {
 
 const SessionSummary = struct {
     sid: u64,
+    parent_sid: ?u64,
+    kind: proto.SessionKind,
     title: []u8,
     cwd: []u8,
     model: []u8,
@@ -184,6 +187,8 @@ const SessionSummary = struct {
     label: []u8,
     /// Effective shell-sandbox state (session toggle AND verified backend).
     sandboxed: bool,
+    /// Whether managed tools enforce the loaded hostname policy.
+    network_filtering: bool,
 
     fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
@@ -219,6 +224,7 @@ const SavedSessionView = struct {
     copy_pending: bool,
     show_tool_transcript: bool,
     spinner_frame: usize,
+    turn_started_ms: i64,
     last_seq: u64,
 
     fn deinit(self: *SavedSessionView, gpa: std.mem.Allocator) void {
@@ -308,6 +314,9 @@ const App = struct {
     /// cache so the next render repaints every terminal cell.
     refresh_requested: bool = false,
     spinner_frame: usize = 0,
+    /// Wall-clock ms when the active session's current turn entered
+    /// .running; drives the elapsed counter on the Working line.
+    turn_started_ms: i64 = 0,
     animation_active: std.atomic.Value(bool) = .init(false),
     animation_stop: std.atomic.Value(bool) = .init(false),
     cfg: config.Config = .{},
@@ -398,6 +407,7 @@ const App = struct {
         self.copy_pending = false;
         self.show_tool_transcript = false;
         self.spinner_frame = 0;
+        self.turn_started_ms = 0;
     }
 
     fn saveActiveView(self: *App) !void {
@@ -426,6 +436,7 @@ const App = struct {
             .copy_pending = self.copy_pending,
             .show_tool_transcript = self.show_tool_transcript,
             .spinner_frame = self.spinner_frame,
+            .turn_started_ms = self.turn_started_ms,
             .last_seq = self.last_seq,
         };
         try self.saved_views.put(self.gpa, self.sid, saved);
@@ -455,6 +466,7 @@ const App = struct {
         self.copy_pending = saved.copy_pending;
         self.show_tool_transcript = saved.show_tool_transcript;
         self.spinner_frame = saved.spinner_frame;
+        self.turn_started_ms = saved.turn_started_ms;
         self.last_seq = saved.last_seq;
     }
 
@@ -527,7 +539,9 @@ const App = struct {
                 continue;
             };
             const identity = if (info.title.len > 0) info.title else info.model;
-            const label = std.fmt.allocPrint(self.gpa, "#{x}  {s} · {s} · {s}", .{
+            const hierarchy = if (info.parent_sid != null) @as([]const u8, "  ↳ ") else "";
+            const label = std.fmt.allocPrint(self.gpa, "{s}#{x}  {s} · {s} · {s}", .{
+                hierarchy,
                 info.sid,
                 identity,
                 @tagName(info.state),
@@ -540,6 +554,8 @@ const App = struct {
             };
             self.sessions.append(self.gpa, .{
                 .sid = info.sid,
+                .parent_sid = info.parent_sid,
+                .kind = info.kind,
                 .title = title,
                 .cwd = cwd,
                 .model = model,
@@ -548,6 +564,7 @@ const App = struct {
                 .created_at = info.created_at,
                 .label = label,
                 .sandboxed = info.sandboxed,
+                .network_filtering = info.network_filtering,
             }) catch {
                 self.gpa.free(title);
                 self.gpa.free(cwd);
@@ -657,7 +674,10 @@ const App = struct {
                     if (self.saved_views.get(s.sid)) |saved| saved.state = s.state;
                     return;
                 }
-                if (s.state == .running and self.state != .running) self.spinner_frame = 0;
+                if (s.state == .running and self.state != .running) {
+                    self.spinner_frame = 0;
+                    self.turn_started_ms = nowWallMs(self.io);
+                }
                 self.state = s.state;
                 self.animation_active.store(s.state == .running, .release);
                 if (s.state != .awaiting_approval) self.pending = null;
@@ -764,6 +784,7 @@ const App = struct {
             self.pushBlockPending(.user_msg, trimmed, "", .ok, true);
             self.state = .running;
             self.spinner_frame = 0;
+            self.turn_started_ms = nowWallMs(self.io);
             self.animation_active.store(true, .release);
         }
         self.scroll_up = 0;
@@ -800,6 +821,8 @@ const App = struct {
             self.applyEffort(selected);
         } else if (std.mem.eql(u8, head, "/sandbox")) {
             self.toggleSandbox(it.rest());
+        } else if (std.mem.eql(u8, head, "/network")) {
+            self.networkCommand(it.rest());
         } else if (std.mem.eql(u8, head, "/sessions")) {
             self.openPicker(.session);
         } else if (std.mem.eql(u8, head, "/new")) {
@@ -823,7 +846,7 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /model <m> · /effort <level> · /sandbox [on|off] · /new · /compact · /reboot [--build] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /model <m> · /effort <level> · /sandbox [on|off] · /network [on|off|status] · /new · /compact · /reboot [--build] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -965,6 +988,41 @@ const App = struct {
         }
     }
 
+    fn currentNetworkFiltering(self: *const App) bool {
+        if (self.sessionSummary(self.sid)) |summary| return summary.network_filtering;
+        return self.conn.network_filtering;
+    }
+
+    fn networkCommand(self: *App, arg: []const u8) void {
+        if (arg.len == 0 or std.mem.eql(u8, arg, "status")) {
+            const state = if (self.currentNetworkFiltering()) "on" else "off";
+            self.setNotice("network filter {s} — {d} rules from {d} feeds; fetch enforced · shell literals screened", .{
+                state,
+                self.conn.network_rule_count,
+                self.conn.network_feed_count,
+            });
+            return;
+        }
+        if (self.state == .running or self.state == .awaiting_approval) {
+            self.setNotice("cannot toggle network filtering mid-turn", .{});
+            return;
+        }
+        const target = if (std.mem.eql(u8, arg, "on"))
+            true
+        else if (std.mem.eql(u8, arg, "off"))
+            false
+        else {
+            self.setNotice("usage: /network [on|off|status]", .{});
+            return;
+        };
+        if (target and !self.conn.network_filtering) {
+            self.setNotice("network filter unavailable — configure [network] blocklists or deny rules, then reboot", .{});
+            return;
+        }
+        self.conn.send(.{ .session_set_network_filtering = .{ .sid = self.sid, .enabled = target } }) catch return;
+        self.setNotice("network filter {s} for this session", .{if (target) @as([]const u8, "on") else "off"});
+    }
+
     fn applyPickerItem(self: *App, item: []const u8) void {
         switch (self.picker_kind) {
             .model => self.applyModel(item),
@@ -1081,11 +1139,14 @@ const Palette = struct {
     const md_callout: vaxis.Style = .{ .bg = md_callout_bg };
     const reasoning_bg: vaxis.Color = .{ .rgb = .{ 0x30, 0x33, 0x39 } };
     const reasoning_panel: vaxis.Style = .{ .bg = reasoning_bg };
-    /// Reasoning commentary keeps body-text brightness and posture: the same
-    /// words were just streamed in the default style, and dimming/italicizing
-    /// them on completion reads as the text degrading. The panel background
-    /// and mark carry the "commentary" distinction instead.
-    const reasoning: vaxis.Style = .{ .bg = reasoning_bg };
+    /// Reasoning commentary sits one step ABOVE body text, never below it:
+    /// the same words were just streamed in the default style, and
+    /// dimming/italicizing them on completion reads as the text degrading.
+    /// True RGB white rather than palette index 15 — many terminal themes
+    /// map "bright white" to the same shade as the default foreground,
+    /// which made the lift invisible. The panel background and mark carry
+    /// the rest of the "commentary" distinction.
+    const reasoning: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } }, .bg = reasoning_bg };
     const reasoning_mark: vaxis.Style = .{ .fg = .{ .index = 6 }, .bg = reasoning_bg, .bold = true };
     /// Tool machinery (the ⚙ glyph, arg previews, result bodies): dimmed
     /// gray so it reads as background activity, never as user input or as
@@ -1102,6 +1163,11 @@ const Palette = struct {
     const shell_path: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
     const shell_variable: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xf7, 0x8c, 0x6c } } };
     const tool_out: vaxis.Style = .{ .fg = .{ .index = 8 }, .dim = true };
+    /// Secondary text on collapse-summary and Working lines. Deliberately
+    /// NOT tool_out: index-8+dim is near-invisible on dark themes, and these
+    /// lines are the only live signal while a turn runs.
+    const collapse_hint: vaxis.Style = .{ .fg = .{ .index = 7 } };
+    const working: vaxis.Style = .{ .fg = .{ .index = 7 }, .bold = true };
     const tool_err: vaxis.Style = .{ .fg = .{ .index = 1 } }; // red
     const git_subject: vaxis.Style = .{ .fg = .{ .index = 7 } };
     const git_hash: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
@@ -1134,6 +1200,7 @@ const Palette = struct {
     const status_error: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 1 }, .bold = true };
     const status_model: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 6 } };
     const status_effort: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 5 } };
+    const status_child: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 6 }, .bold = true };
     const status_context: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 4 } };
     const status_context_warn: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 } };
     const status_context_hot: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 1 } };
@@ -1240,6 +1307,52 @@ const Line = struct {
 };
 
 const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
+/// Hues for the Working shimmer, tuned to read on the dark panel. The
+/// animation tick advances the phase so color travels through the word.
+const rainbow_colors = [_]vaxis.Color{
+    .{ .rgb = .{ 0xff, 0x6b, 0x6b } },
+    .{ .rgb = .{ 0xff, 0xa9, 0x4d } },
+    .{ .rgb = .{ 0xff, 0xe0, 0x66 } },
+    .{ .rgb = .{ 0x73, 0xd0, 0x91 } },
+    .{ .rgb = .{ 0x66, 0xc2, 0xe0 } },
+    .{ .rgb = .{ 0x82, 0x9a, 0xff } },
+    .{ .rgb = .{ 0xc5, 0x8f, 0xff } },
+};
+
+/// One bold rainbow span per code point of `text`, phase-shifted by `frame`
+/// so successive animation ticks cycle the colors. `offset` is the byte
+/// position of `text` within the line's concatenated visible text.
+fn rainbowSpans(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    offset: usize,
+    frame: usize,
+) ![]const SyntaxSpan {
+    var spans: std.ArrayList(SyntaxSpan) = .empty;
+    var i: usize = 0;
+    var char_index: usize = 0;
+    while (i < text.len) {
+        const seq = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const end = @min(i + seq, text.len);
+        try spans.append(arena, .{
+            .start = offset + i,
+            .end = offset + end,
+            .style = .{
+                .fg = rainbow_colors[(char_index + frame) % rainbow_colors.len],
+                .bold = true,
+            },
+        });
+        i = end;
+        char_index += 1;
+    }
+    return spans.toOwnedSlice(arena);
+}
+
+fn nowWallMs(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
 
 fn lineWidth(win: vaxis.Window, line: Line) usize {
     return @as(usize, win.gwidth(line.text)) +
@@ -1934,8 +2047,16 @@ fn isDiffOutput(text: []const u8) bool {
     return std.mem.indexOf(u8, text, "\n@@ ") != null or std.mem.startsWith(u8, text, "@@ ");
 }
 
+/// Tools whose diff output is a change the agent MADE. Only these stop the
+/// collapse run below; a diff the agent merely read (`bash git diff …`) is
+/// ordinary command output and collapses like any other success.
+fn isFileEditTool(label: []const u8) bool {
+    return std.mem.eql(u8, label, "edit") or std.mem.eql(u8, label, "write_file");
+}
+
 /// Return the consecutive successful tool pairs that are safe to summarize.
-/// A failure or diff stops the run so its call/result render in full.
+/// A failure — or a diff produced by a file-edit tool — stops the run so
+/// its call/result render in full.
 fn collapsibleToolRun(blocks: []const RenderBlock, start: usize) CollapsedToolRun {
     if (start >= blocks.len) return .{ .count = 0, .next = start };
     const turn_id = blocks[start].turn_id;
@@ -1954,7 +2075,7 @@ fn collapsibleToolRun(blocks: []const RenderBlock, start: usize) CollapsedToolRu
             blocks[result_idx].kind != .tool_result or
             blocks[result_idx].turn_id != turn_id) break;
         const result = blocks[result_idx];
-        if (result.status != .ok or isDiffOutput(result.text)) break;
+        if (result.status != .ok or (isDiffOutput(result.text) and isFileEditTool(blocks[i].label))) break;
         count += 1;
         i = result_idx + 1;
     }
@@ -1967,25 +2088,59 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
     var lines: std.ArrayList(Line) = .empty;
     const w: usize = if (width == 0) 80 else width;
 
+    // The tool that produced the result being rendered — results carry no
+    // label of their own, and edit-tool diffs get more room than read diffs.
+    var last_tool_label: []const u8 = "";
     var block_idx: usize = 0;
     while (block_idx < app.blocks.items.len) : (block_idx += 1) {
         const rb = app.blocks.items[block_idx];
         if (!app.show_tool_transcript and rb.kind == .tool_call) {
-            const collapsed = collapsibleToolRun(app.blocks.items, block_idx);
-            if (collapsed.count > 0) {
-                const summary = try std.fmt.allocPrint(arena, "Ran {d} {s}", .{
-                    collapsed.count,
-                    if (collapsed.count == 1) "command" else "commands",
-                });
+            const blocks_all = app.blocks.items;
+            const collapsed = collapsibleToolRun(blocks_all, block_idx);
+            // A trailing call with no result yet is still executing: fold it
+            // into the summary line instead of flashing a ⚙ detail line that
+            // vanishes the moment a fast command completes (the flash reads
+            // as the page jolting). Approval-parked calls keep their detail
+            // line — the user must see what they are deciding on.
+            var in_flight = false;
+            if (app.state == .running and
+                collapsed.next < blocks_all.len and
+                blocks_all[collapsed.next].kind == .tool_call and
+                blocks_all[collapsed.next].turn_id == rb.turn_id)
+            {
+                var j = collapsed.next + 1;
+                while (j < blocks_all.len and blocks_all[j].kind == .approval) : (j += 1) {}
+                in_flight = j == blocks_all.len;
+            }
+            if (collapsed.count > 0 or in_flight) {
+                const summary = if (collapsed.count > 0)
+                    try std.fmt.allocPrint(arena, "Ran {d} {s}", .{
+                        collapsed.count,
+                        if (collapsed.count == 1) "command" else "commands",
+                    })
+                else
+                    "Running";
+                var hint: []const u8 = " · ctrl+t to view transcript";
+                if (in_flight) {
+                    const call = blocks_all[collapsed.next];
+                    const hi = extractHighlightArg(call.label, call.text) orelse
+                        call.text[0..@min(call.text.len, 40)];
+                    const capped = hi[0..@min(hi.len, 60)];
+                    hint = try std.fmt.allocPrint(arena, " · {s} {s}{s}", .{
+                        call.label,
+                        capped,
+                        if (capped.len < hi.len) "…" else "",
+                    });
+                }
                 try lines.append(arena, .{
                     .text = "  • ",
                     .style = Palette.note,
                     .text2 = summary,
                     .style2 = Palette.assistant,
-                    .text3 = " · ctrl+t to view transcript",
-                    .style3 = Palette.tool_out,
+                    .text3 = hint,
+                    .style3 = Palette.collapse_hint,
                 });
-                block_idx = collapsed.next - 1;
+                block_idx = if (in_flight) blocks_all.len - 1 else collapsed.next - 1;
                 continue;
             }
         }
@@ -2000,6 +2155,7 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
             },
             .reasoning => try wrapReasoningCard(arena, &lines, rb.text, w),
             .tool_call => {
+                last_tool_label = rb.label;
                 // Keep the machinery subdued. Bash commands receive semantic
                 // shell roles; for file tools the emphasized value is a path.
                 const hi = extractHighlightArg(rb.label, rb.text);
@@ -2035,10 +2191,12 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                     .denied => "    ⊘ ",
                     .interrupted => "    ⏹ ",
                 };
-                // Collapsed: show at most 8 lines — but a diff hunk shows
-                // whole (up to 24) because a truncated diff misleads.
+                // Collapsed: show at most 8 lines — but a diff the agent
+                // AUTHORED (edit/write tools) shows whole (up to 24) because
+                // a truncated diff misleads. Diffs merely read via bash keep
+                // diff coloring but the ordinary cap.
                 const is_diff = isDiffOutput(rb.text);
-                const max_shown: usize = if (is_diff) 24 else 8;
+                const max_shown: usize = if (is_diff and isFileEditTool(last_tool_label)) 24 else 8;
                 const language = if (is_diff) diffLanguage(rb.text) else SyntaxLanguage.generic;
                 var shown: usize = 0;
                 var total: usize = 0;
@@ -2090,10 +2248,27 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         try wrapMarkdown(arena, &lines, app.delta.items, w);
     } else if (app.state == .running) {
         try blankLine(arena, &lines);
-        const loading = try std.fmt.allocPrint(arena, "{s} Working…", .{
+        const head = try std.fmt.allocPrint(arena, "{s} ", .{
             spinner_frames[app.spinner_frame % spinner_frames.len],
         });
-        try wrapInto(arena, &lines, loading, .{ .text = loading, .style = Palette.tool_out });
+        const word = "Working…";
+        const elapsed_s: i64 = if (app.turn_started_ms > 0)
+            @max(0, @divTrunc(nowWallMs(app.io) - app.turn_started_ms, 1000))
+        else
+            0;
+        const elapsed = if (elapsed_s >= 60)
+            try std.fmt.allocPrint(arena, " · {d}m {d}s", .{ @divTrunc(elapsed_s, 60), @mod(elapsed_s, 60) })
+        else
+            try std.fmt.allocPrint(arena, " · {d}s", .{elapsed_s});
+        try lines.append(arena, .{
+            .text = head,
+            .style = Palette.working,
+            .text2 = word,
+            .style2 = Palette.working,
+            .text3 = elapsed,
+            .style3 = Palette.collapse_hint,
+            .syntax = try rainbowSpans(arena, word, head.len, app.spinner_frame),
+        });
     }
 
     // Approval card.
@@ -3385,10 +3560,68 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const cwd_txt = try statusCwd(arena, app.cwd.items, app.home.items);
     const session_txt = try std.fmt.allocPrint(arena, "#{x:0>4}", .{app.sid & 0xFFFF});
     const scroll_txt = try std.fmt.allocPrint(arena, "↕ {d} (G: bottom)", .{app.scroll_up});
+    const focused_parent_sid = if (app.sessionSummary(app.sid)) |summary| summary.parent_sid else null;
+    var child_count: usize = 0;
+    var child_running: usize = 0;
+    var child_approvals: usize = 0;
+    var child_errors: usize = 0;
+    for (app.sessions.items) |session| {
+        if (session.parent_sid != app.sid) continue;
+        child_count += 1;
+        switch (session.state) {
+            .running => child_running += 1,
+            .awaiting_approval => child_approvals += 1,
+            .err => child_errors += 1,
+            else => {},
+        }
+    }
+    const child_txt: []const u8 = if (focused_parent_sid) |parent_sid|
+        try std.fmt.allocPrint(arena, "child of #{x:0>4}", .{parent_sid & 0xFFFF})
+    else if (child_count > 0)
+        if (child_approvals > 0)
+            try std.fmt.allocPrint(arena, "{d} child{s} · {d} approval{s}", .{
+                child_count,
+                if (child_count == 1) "" else "ren",
+                child_approvals,
+                if (child_approvals == 1) "" else "s",
+            })
+        else if (child_errors > 0)
+            try std.fmt.allocPrint(arena, "{d} child{s} · {d} error{s}", .{
+                child_count,
+                if (child_count == 1) "" else "ren",
+                child_errors,
+                if (child_errors == 1) "" else "s",
+            })
+        else if (child_running > 0)
+            try std.fmt.allocPrint(arena, "{d} child{s} · {d} running", .{
+                child_count,
+                if (child_count == 1) "" else "ren",
+                child_running,
+            })
+        else
+            try std.fmt.allocPrint(arena, "{d} child{s}", .{
+                child_count,
+                if (child_count == 1) "" else "ren",
+            })
+    else
+        "";
+    const child_style = if (child_approvals > 0)
+        Palette.status_approval
+    else if (child_errors > 0)
+        Palette.status_error
+    else if (child_running > 0)
+        Palette.status_running
+    else
+        Palette.status_child;
     var background_running: usize = 0;
     var background_approvals: usize = 0;
     for (app.sessions.items) |session| {
         if (session.sid == app.sid) continue;
+        // The hierarchy segment owns the focused parent/child relationship;
+        // keep the generic background counter for unrelated sessions and
+        // running siblings rather than showing the same activity twice.
+        if (session.parent_sid == app.sid) continue;
+        if (focused_parent_sid != null and session.sid == focused_parent_sid.?) continue;
         switch (session.state) {
             .running => background_running += 1,
             .awaiting_approval => background_approvals += 1,
@@ -3407,7 +3640,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // Session tag: last 4 hex digits of the id — enough to tell sessions
     // apart in `marlin ls` (which shows the same suffix) without eating
     // half the status bar with a u64.
-    var status_segments: [25]vaxis.Segment = undefined;
+    var status_segments: [27]vaxis.Segment = undefined;
     var status_n: usize = 0;
     status_segments[status_n] = .{ .text = " ", .style = Palette.status_bar };
     status_n += 1;
@@ -3441,6 +3674,12 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     status_n += 1;
     status_segments[status_n] = .{ .text = session_txt, .style = Palette.status_sep };
     status_n += 1;
+    if (child_txt.len > 0) {
+        status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+        status_n += 1;
+        status_segments[status_n] = .{ .text = child_txt, .style = child_style };
+        status_n += 1;
+    }
     if (background_txt.len > 0) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
@@ -3476,9 +3715,21 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // The shield is 3 UTF-8 bytes but renders as one cell; every variant
     // above carries exactly one, so columns = bytes - 2.
     const sandbox_cols: u16 = @intCast(sandbox_txt.len - "⛨".len + 1);
-    const dns_on = app.conn.network_filtering;
-    var right_w: u16 = sandbox_cols + 1; // trailing space
-    if (dns_on) right_w += "dnsblock".len + 3; // " · " renders as 3 cells
+    const dns_available = app.conn.network_filtering;
+    const dns_on = app.currentNetworkFiltering();
+    const dns_txt: []const u8 = if (dns_on)
+        "dnsblock on"
+    else if (dns_available)
+        "dnsblock off"
+    else
+        "dnsblock n/a";
+    const dns_style = if (dns_on)
+        Palette.status_running
+    else if (dns_available)
+        Palette.status_context_warn
+    else
+        Palette.status_sep;
+    const right_w: u16 = sandbox_cols + 1 + @as(u16, @intCast(dns_txt.len)) + 3;
     if (status_win.width > right_w) {
         const right_win = status_win.child(.{
             .x_off = @intCast(status_win.width - right_w),
@@ -3486,12 +3737,10 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         });
         var right_segments: [4]vaxis.Segment = undefined;
         var right_n: usize = 0;
-        if (dns_on) {
-            right_segments[right_n] = .{ .text = "dnsblock", .style = Palette.status_running };
-            right_n += 1;
-            right_segments[right_n] = .{ .text = " · ", .style = Palette.status_sep };
-            right_n += 1;
-        }
+        right_segments[right_n] = .{ .text = dns_txt, .style = dns_style };
+        right_n += 1;
+        right_segments[right_n] = .{ .text = " · ", .style = Palette.status_sep };
+        right_n += 1;
         right_segments[right_n] = .{ .text = sandbox_txt, .style = sandbox_style };
         right_n += 1;
         right_segments[right_n] = .{ .text = " ", .style = Palette.status_bar };
@@ -3724,6 +3973,14 @@ pub fn run(
     app.setCwdStr(cwd_at_start);
     if (environ.get("HOME")) |home| app.setHomeStr(home);
     app.touchRecentSession(sid);
+    if (conn.network_filtering) {
+        app.setNotice("dnsblock ready — {d} rules from {d} feeds · /network status", .{
+            conn.network_rule_count,
+            conn.network_feed_count,
+        });
+    } else {
+        app.setNotice("dnsblock unavailable — configure [network] and reboot", .{});
+    }
 
     // -- vaxis init --
     var tty_buf: [4096]u8 = undefined;
@@ -4506,10 +4763,10 @@ test "reasoning cards are bright, padded, and inset" {
     try std.testing.expectEqualStrings("", lines.items[lines.items.len - 1].text);
     try std.testing.expectEqualStrings("  · ", lines.items[1].text);
     try std.testing.expect(lines.items[1].style.bold);
-    // Body text must not be dimmed or italicized — it keeps the default
-    // foreground so completed commentary stays as readable as it streamed.
+    // Body text must never be dimmed or italicized — completed commentary
+    // renders true-RGB white, one step above the streaming default.
     try std.testing.expect(!lines.items[1].style2.italic);
-    try std.testing.expect(vaxis.Color.eql(lines.items[1].style2.fg, vaxis.Color.default));
+    try std.testing.expect(vaxis.Color.eql(lines.items[1].style2.fg, .{ .rgb = .{ 0xff, 0xff, 0xff } }));
     for (lines.items) |line| {
         try std.testing.expect(line.fill_style != null);
         try std.testing.expect(vaxis.Color.eql(line.fill_style.?.bg, Palette.reasoning_bg));
@@ -4870,6 +5127,24 @@ test "successful tools collapse but diffs and failures stop the run" {
     try std.testing.expectEqual(@as(usize, 2), collapsed.count);
     try std.testing.expectEqual(@as(usize, 4), collapsed.next);
     try std.testing.expectEqual(@as(usize, 0), collapsibleToolRun(&blocks, 4).count);
+}
+
+test "diffs merely read via bash collapse like any other success" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocks = [_]RenderBlock{
+        .{ .kind = .tool_call, .text = try arena.dupe(u8, "{}"), .label = try arena.dupe(u8, "bash") },
+        .{ .kind = .tool_result, .text = try arena.dupe(u8, "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new"), .label = try arena.dupe(u8, "") },
+        .{ .kind = .tool_call, .text = try arena.dupe(u8, "{}"), .label = try arena.dupe(u8, "grep") },
+        .{ .kind = .tool_result, .text = try arena.dupe(u8, "one match"), .label = try arena.dupe(u8, "") },
+    };
+
+    // The bash `git diff` output looks like a diff but the agent changed
+    // nothing — the whole run summarizes.
+    const collapsed = collapsibleToolRun(&blocks, 0);
+    try std.testing.expectEqual(@as(usize, 2), collapsed.count);
+    try std.testing.expectEqual(@as(usize, 4), collapsed.next);
 }
 
 test "tool collapse never crosses a durable turn boundary" {

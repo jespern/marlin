@@ -211,9 +211,10 @@ pub fn ls(
     }
     for (list.sessions) |s| {
         const marker: []const u8 = if (s.running) "●" else " ";
+        const hierarchy: []const u8 = if (s.parent_sid != null) "  ↳" else "";
         const title = if (s.title.len > 0) s.title else "(untitled)";
         // #xxxx short tag matches the TUI status bar; full id for attach.
-        try print(io, "{s} #{x:0>4}  {s}  [{s}]  ({d})\n", .{ marker, s.sid & 0xFFFF, title, s.model, s.sid });
+        try print(io, "{s}{s} #{x:0>4}  {s}  [{s}]  ({d})\n", .{ marker, hierarchy, s.sid & 0xFFFF, title, s.model, s.sid });
     }
     return 0;
 }

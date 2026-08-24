@@ -32,6 +32,7 @@ const Io = std.Io;
 
 pub const Step = struct {
     expect_contains: []const []const u8 = &.{},
+    expect_not_contains: []const []const u8 = &.{},
     status: u16 = 200,
     sse: []const []const u8 = &.{},
     body: []const u8 = "",
@@ -103,6 +104,14 @@ pub fn main(init: std.process.Init) !u8 {
         for (step.expect_contains) |needle| {
             if (std.mem.indexOf(u8, req.body, needle) == null) {
                 try stdoutPrint(io, "FAIL step {d}: request body missing {f}\nBODY: {s}\n", .{
+                    step_idx, std.json.fmt(needle, .{}), req.body[0..@min(req.body.len, 4000)],
+                });
+                return 3;
+            }
+        }
+        for (step.expect_not_contains) |needle| {
+            if (std.mem.indexOf(u8, req.body, needle) != null) {
+                try stdoutPrint(io, "FAIL step {d}: request body unexpectedly contains {f}\nBODY: {s}\n", .{
                     step_idx, std.json.fmt(needle, .{}), req.body[0..@min(req.body.len, 4000)],
                 });
                 return 3;

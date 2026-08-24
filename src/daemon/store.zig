@@ -9,6 +9,7 @@
 const std = @import("std");
 const block = @import("../core/block.zig");
 const Effort = @import("../core/effort.zig").Effort;
+const proto = @import("../core/proto.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -47,7 +48,11 @@ const schema_sql =
     \\  status TEXT NOT NULL DEFAULT 'idle',
     \\  pinned_context TEXT NOT NULL DEFAULT '',
     \\  tokens_in INTEGER NOT NULL DEFAULT 0,
-    \\  tokens_out INTEGER NOT NULL DEFAULT 0
+    \\  tokens_out INTEGER NOT NULL DEFAULT 0,
+    \\  parent_sid INTEGER REFERENCES sessions(id),
+    \\  kind TEXT NOT NULL DEFAULT 'root',
+    \\  parent_block_id INTEGER REFERENCES blocks(id),
+    \\  max_rounds INTEGER
     \\);
     \\CREATE TABLE IF NOT EXISTS blocks(
     \\  id INTEGER PRIMARY KEY,
@@ -71,11 +76,15 @@ const schema_sql =
     \\  block_id INTEGER NOT NULL,
     \\  PRIMARY KEY(hash, block_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','3');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','4');
 ;
 
 pub const SessionRow = struct {
     id: u64,
+    parent_sid: ?u64,
+    kind: proto.SessionKind,
+    parent_block_id: ?u64,
+    max_rounds: u32,
     title: []const u8,
     cwd: []const u8,
     model: []const u8,
@@ -127,6 +136,17 @@ pub const Store = struct {
                 \\UPDATE kv SET value='3' WHERE key='schema_version';
             );
         }
+        if (ver < 4) {
+            // v3 → v4: durable one-level session hierarchy and child budget.
+            // Existing sessions become roots through the column defaults.
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN parent_sid INTEGER REFERENCES sessions(id);
+                \\ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'root';
+                \\ALTER TABLE sessions ADD COLUMN parent_block_id INTEGER REFERENCES blocks(id);
+                \\ALTER TABLE sessions ADD COLUMN max_rounds INTEGER;
+                \\UPDATE kv SET value='4' WHERE key='schema_version';
+            );
+        }
     }
 
     fn kvGetInt(self: Store, key: []const u8) Error!i64 {
@@ -168,6 +188,49 @@ pub const Store = struct {
         try stepDone(stmt);
     }
 
+    pub fn createChildSession(
+        self: Store,
+        id: u64,
+        created_at: i64,
+        parent_sid: u64,
+        parent_block_id: u64,
+        title: []const u8,
+        cwd: []const u8,
+        model: []const u8,
+        effort: Effort,
+        max_rounds: u32,
+    ) Error!void {
+        const stmt = try self.prepare(
+            "INSERT INTO sessions(id, title, created_at, cwd, model, effort, parent_sid, kind, parent_block_id, max_rounds) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        bindText(stmt, 2, title);
+        bindInt(stmt, 3, created_at);
+        bindText(stmt, 4, cwd);
+        bindText(stmt, 5, model);
+        bindText(stmt, 6, @tagName(effort));
+        bindInt(stmt, 7, @bitCast(parent_sid));
+        bindText(stmt, 8, "task_child");
+        bindInt(stmt, 9, @bitCast(parent_block_id));
+        bindInt(stmt, 10, @intCast(max_rounds));
+        try stepDone(stmt);
+    }
+
+    pub fn setSessionStatus(self: Store, id: u64, status: []const u8) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET status=? WHERE id=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, status);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
+    /// A process restart cannot resume an in-flight provider stream. Preserve
+    /// the durable hierarchy but report those sessions as interrupted.
+    pub fn recoverInterruptedSessions(self: Store) Error!void {
+        try self.execAll("UPDATE sessions SET status='err' WHERE status IN ('running','awaiting_approval');");
+    }
+
     pub fn updateSessionUsage(self: Store, id: u64, tokens_in: u64, tokens_out: u64) Error!void {
         const stmt = try self.prepare(
             "UPDATE sessions SET tokens_in=?, tokens_out=? WHERE id=?",
@@ -197,6 +260,10 @@ pub const Store = struct {
 
     pub const SessionListing = struct {
         id: u64,
+        parent_sid: ?u64,
+        kind: proto.SessionKind,
+        parent_block_id: ?u64,
+        max_rounds: u32,
         title: []const u8,
         cwd: []const u8,
         model: []const u8,
@@ -215,7 +282,13 @@ pub const Store = struct {
     /// All sessions, newest first. Caller deinits each entry + frees slice.
     pub fn listSessions(self: Store) Error![]SessionListing {
         const stmt = try self.prepare(
-            "SELECT id, title, cwd, model, effort, status, created_at FROM sessions ORDER BY created_at DESC, id DESC",
+            \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
+            \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at
+            \\FROM sessions s
+            \\ORDER BY COALESCE((SELECT p.created_at FROM sessions p WHERE p.id=s.parent_sid), s.created_at) DESC,
+            \\         COALESCE(s.parent_sid, s.id) DESC,
+            \\         CASE WHEN s.parent_sid IS NULL THEN 0 ELSE 1 END,
+            \\         s.created_at ASC, s.id ASC
         );
         defer finalize(stmt);
         var out: std.ArrayList(SessionListing) = .empty;
@@ -229,12 +302,16 @@ pub const Store = struct {
             if (rc != c.SQLITE_ROW) return error.SqliteStep;
             try out.append(self.gpa, .{
                 .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
-                .title = try self.dupeCol(stmt, 1),
-                .cwd = try self.dupeCol(stmt, 2),
-                .model = try self.dupeCol(stmt, 3),
-                .effort = Effort.parse(columnText(stmt, 4)) orelse .auto,
-                .status = try self.dupeCol(stmt, 5),
-                .created_at = c.sqlite3_column_int64(stmt, 6),
+                .parent_sid = columnOptionalU64(stmt, 1),
+                .kind = std.meta.stringToEnum(proto.SessionKind, columnText(stmt, 2)) orelse .root,
+                .parent_block_id = columnOptionalU64(stmt, 3),
+                .max_rounds = @intCast(c.sqlite3_column_int64(stmt, 4)),
+                .title = try self.dupeCol(stmt, 5),
+                .cwd = try self.dupeCol(stmt, 6),
+                .model = try self.dupeCol(stmt, 7),
+                .effort = Effort.parse(columnText(stmt, 8)) orelse .auto,
+                .status = try self.dupeCol(stmt, 9),
+                .created_at = c.sqlite3_column_int64(stmt, 10),
             });
         }
         return out.toOwnedSlice(self.gpa);
@@ -243,7 +320,7 @@ pub const Store = struct {
     /// Most recently created session id, if any (for `marlin run --continue`).
     pub fn lastSession(self: Store) Error!?u64 {
         const stmt = try self.prepare(
-            "SELECT id FROM sessions ORDER BY created_at DESC, id DESC LIMIT 1",
+            "SELECT id FROM sessions WHERE parent_sid IS NULL ORDER BY created_at DESC, id DESC LIMIT 1",
         );
         defer finalize(stmt);
         const rc = c.sqlite3_step(stmt);
@@ -255,7 +332,7 @@ pub const Store = struct {
     /// Fetch one session row. Strings are allocated with gpa; caller frees.
     pub fn getSession(self: Store, id: u64) Error!SessionRow {
         const stmt = try self.prepare(
-            "SELECT title, cwd, model, effort, status, tokens_in, tokens_out FROM sessions WHERE id=?",
+            "SELECT parent_sid, kind, parent_block_id, COALESCE(max_rounds, 0), title, cwd, model, effort, status, tokens_in, tokens_out FROM sessions WHERE id=?",
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(id));
@@ -264,13 +341,17 @@ pub const Store = struct {
         if (rc != c.SQLITE_ROW) return error.SqliteStep;
         return .{
             .id = id,
-            .title = try self.dupeCol(stmt, 0),
-            .cwd = try self.dupeCol(stmt, 1),
-            .model = try self.dupeCol(stmt, 2),
-            .effort = Effort.parse(columnText(stmt, 3)) orelse .auto,
-            .status = try self.dupeCol(stmt, 4),
-            .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 5)),
-            .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 6)),
+            .parent_sid = columnOptionalU64(stmt, 0),
+            .kind = std.meta.stringToEnum(proto.SessionKind, columnText(stmt, 1)) orelse .root,
+            .parent_block_id = columnOptionalU64(stmt, 2),
+            .max_rounds = @intCast(c.sqlite3_column_int64(stmt, 3)),
+            .title = try self.dupeCol(stmt, 4),
+            .cwd = try self.dupeCol(stmt, 5),
+            .model = try self.dupeCol(stmt, 6),
+            .effort = Effort.parse(columnText(stmt, 7)) orelse .auto,
+            .status = try self.dupeCol(stmt, 8),
+            .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 9)),
+            .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 10)),
         };
     }
 
@@ -444,6 +525,11 @@ fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {
     return ptr[0..len];
 }
 
+fn columnOptionalU64(stmt: *c.sqlite3_stmt, col: c_int) ?u64 {
+    if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return null;
+    return @bitCast(c.sqlite3_column_int64(stmt, col));
+}
+
 fn bindInt(stmt: *c.sqlite3_stmt, idx: c_int, v: i64) void {
     _ = c.sqlite3_bind_int64(stmt, idx, v);
 }
@@ -573,13 +659,52 @@ test "blob round trip is content-addressed and idempotent" {
     try store.addBlobRef(h1, 202);
 }
 
-test "schema is v3 with effort and auto_vacuum incremental" {
+test "schema is v4 with child hierarchy and auto_vacuum incremental" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 3), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 4), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 3), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 4), try store.kvGetInt("schema_version"));
+}
+
+test "child session metadata is durable and grouped beneath its root" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+
+    try store.createSession(10, 100, "/work", "openrouter/root", .high);
+    try store.appendBlock(.{
+        .id = 77,
+        .session_id = 10,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 101,
+        .body = .{ .tool_call = .{ .call_id = "task-1", .name = "task", .args_json = "{}" } },
+    });
+    try store.createChildSession(20, 102, 10, 77, "inspect storage", "/work", "openrouter/child", .medium, 7);
+
+    const child = try store.getSession(20);
+    defer store.freeSession(child);
+    try std.testing.expectEqual(@as(?u64, 10), child.parent_sid);
+    try std.testing.expectEqual(proto.SessionKind.task_child, child.kind);
+    try std.testing.expectEqual(@as(?u64, 77), child.parent_block_id);
+    try std.testing.expectEqual(@as(u32, 7), child.max_rounds);
+
+    const listed = try store.listSessions();
+    defer {
+        for (listed) |row| row.deinit(gpa);
+        gpa.free(listed);
+    }
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
+    try std.testing.expectEqual(@as(u64, 10), listed[0].id);
+    try std.testing.expectEqual(@as(u64, 20), listed[1].id);
+
+    try store.setSessionStatus(20, "running");
+    try store.recoverInterruptedSessions();
+    const recovered = try store.getSession(20);
+    defer store.freeSession(recovered);
+    try std.testing.expectEqualStrings("err", recovered.status);
 }

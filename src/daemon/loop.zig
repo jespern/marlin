@@ -1,6 +1,5 @@
-//! The agent turn loop (docs/ARCHITECTURE.md §4). M0: in-process, blocking,
-//! auto-approve, deltas printed by a caller-supplied sink. The daemon-thread
-//! version (steer queue, interrupt flag, parallel tools) lands in M1.
+//! The agent turn loop (docs/ARCHITECTURE.md §4): context assembly, provider
+//! streaming, approval-gated tools, steering, compaction, and cancellation.
 
 const std = @import("std");
 const Io = std.Io;
@@ -20,6 +19,7 @@ const openai = @import("provider/openai_compat.zig");
 const http = @import("provider/http.zig");
 const sse = @import("provider/sse.zig");
 const tools_registry = @import("tools/registry.zig");
+const task_tool = @import("tools/task.zig");
 const bash_tool = @import("tools/bash.zig");
 const files_tool = @import("tools/files.zig");
 const Effort = @import("../core/effort.zig").Effort;
@@ -32,6 +32,7 @@ pub const Endpoint = struct {
 };
 
 pub const ToolPhase = enum { start, done };
+pub const ToolProfile = enum { full, read_only };
 
 pub const RunOpts = struct {
     session_id: u64,
@@ -74,6 +75,12 @@ pub const RunOpts = struct {
     on_delta_ctx: ?*anyopaque = null,
     /// Called when a tool starts/finishes (for progress display).
     on_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, phase: ToolPhase) void = null,
+    /// Daemon-owned durable-child primitive. It receives the already-persisted
+    /// parent tool_call block id and parks this turn until the child completes.
+    on_task: ?*const fn (ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut = null,
+    /// Read-only child sessions advertise only non-mutating tools and never
+    /// advertise task, preventing recursive delegation in the first M6 cut.
+    tool_profile: ToolProfile = .full,
     /// Called after EVERY block is persisted (daemon fan-out). The block's
     /// memory is only valid during the callback.
     on_block: ?*const fn (ctx: ?*anyopaque, b: block.Block) void = null,
@@ -228,12 +235,24 @@ pub fn runTurn(
         if (opts.context_used_out) |cu| cu.store(est_used, .release);
 
         const extension_specs = if (opts.extensions) |ext| ext.specs() else &.{};
-        const tools = try arena.alloc(openai.ToolSpec, tools_registry.specs.len + extension_specs.len);
-        for (&tools_registry.specs, 0..) |*s, ti| {
-            tools[ti] = .{ .name = s.name, .description = s.description, .schema_json = s.schema_json };
+        var tool_count: usize = 0;
+        for (&tools_registry.specs) |*s| if (toolAllowed(opts, s)) {
+            tool_count += 1;
+        };
+        for (extension_specs) |*s| if (toolAllowed(opts, s)) {
+            tool_count += 1;
+        };
+        const tools = try arena.alloc(openai.ToolSpec, tool_count);
+        var tool_i: usize = 0;
+        for (&tools_registry.specs) |*s| {
+            if (!toolAllowed(opts, s)) continue;
+            tools[tool_i] = .{ .name = s.name, .description = s.description, .schema_json = s.schema_json };
+            tool_i += 1;
         }
-        for (extension_specs, tools_registry.specs.len..) |s, ti| {
-            tools[ti] = .{ .name = s.name, .description = s.description, .schema_json = s.schema_json };
+        for (extension_specs) |*s| {
+            if (!toolAllowed(opts, s)) continue;
+            tools[tool_i] = .{ .name = s.name, .description = s.description, .schema_json = s.schema_json };
+            tool_i += 1;
         }
 
         const body = try openai.buildRequestBody(
@@ -306,7 +325,7 @@ pub fn runTurn(
             const args_repaired = jsonx.repairObject(gpa, pc.args.items) catch pc.args.items;
             defer if (args_repaired.ptr != pc.args.items.ptr) gpa.free(@constCast(args_repaired));
 
-            _ = try ap.append(.{ .tool_call = .{
+            const tool_call_block_id = try ap.append(.{ .tool_call = .{
                 .call_id = pc.call_id.items,
                 .name = pc.name.items,
                 .args_json = args_repaired,
@@ -324,7 +343,10 @@ pub fn runTurn(
             const sandboxed = opts.sandbox_options.backend == .seatbelt and
                 std.mem.eql(u8, pc.name.items, bash_tool.spec_name);
             const decision: approval.Decision = if (spec) |s|
-                approval.policyFor(opts.cfg, opts.approval_mode, s.mutating, sandboxed)
+                if (opts.tool_profile == .read_only and s.mutating)
+                    .deny
+                else
+                    approval.policyFor(opts.cfg, opts.approval_mode, s.mutating, sandboxed)
             else
                 .run; // unknown tool → dispatch returns error text anyway
 
@@ -372,11 +394,11 @@ pub fn runTurn(
                             .status = if (was_cancel) .interrupted else .denied,
                         };
                     } else {
-                        exec = runTool(gpa, io, opts, pc.name.items, args_repaired);
+                        exec = runTool(gpa, io, opts, tool_call_block_id, pc.name.items, args_repaired);
                     }
                 },
                 .run => {
-                    exec = runTool(gpa, io, opts, pc.name.items, args_repaired);
+                    exec = runTool(gpa, io, opts, tool_call_block_id, pc.name.items, args_repaired);
                 },
             }
             defer gpa.free(exec.output);
@@ -531,9 +553,22 @@ pub fn compactSession(
     return maybeCompact(gpa, io, arena, &ap, opts, blocks, .manual);
 }
 
-fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, name: []const u8, args_json: []const u8) tools_registry.ExecOut {
+fn toolAllowed(opts: RunOpts, spec: *const tools_registry.Spec) bool {
+    if (std.mem.eql(u8, spec.name, task_tool.spec_name)) return opts.on_task != null and opts.tool_profile == .full;
+    if (opts.tool_profile == .read_only and spec.mutating) return false;
+    return true;
+}
+
+fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, name: []const u8, args_json: []const u8) tools_registry.ExecOut {
     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .start);
     defer if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .done);
+    if (std.mem.eql(u8, name, task_tool.spec_name)) {
+        if (opts.on_task) |cb| return cb(opts.on_delta_ctx, parent_block_id, args_json);
+        return .{
+            .output = gpa.dupe(u8, "error: task is unavailable in this session") catch @panic("oom"),
+            .status = .denied,
+        };
+    }
     if (opts.extensions) |ext| {
         if (ext.dispatch(name, args_json, opts.cwd)) |result| return result;
     }

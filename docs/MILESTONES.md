@@ -141,10 +141,13 @@ same approval gate as built-ins. *Exit: one real MCP server + one hook in daily
 use; the fake-provider/stdio E2E gates prove mechanics, not operational value.*
 
 ## M6 — hardening & v2 doors
-Parallel-safe tool execution; durable `task` children with parent/child
-hierarchy, cancellation, budgets, and session-picker status; then multi-model
-review councils (docs/REVIEW.md) as specialized read-only task fan-out. TCP
-listener/token auth is a retained v2 door to schedule only for a concrete
+**Status: active; single-child vertical slice verified (2026-08-24).** Durable
+read-only `task` children now have parent/child hierarchy, dispatcher-owned
+creation, cancellation cascade, round budgets, structured results, and
+session-picker visibility. Next: parallel-safe execution and multi-child
+ordering; then multi-model review councils (docs/REVIEW.md) as specialized
+read-only task fan-out. TCP listener/token auth is a retained v2 door to
+schedule only for a concrete
 remote-client need. Then decide: PWA client. Execution plan: `docs/M6_PLAN.md`.
 
 ## Later — workspace recovery & isolation (formerly M4.5)

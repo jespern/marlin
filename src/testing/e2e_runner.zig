@@ -32,6 +32,9 @@ const Check = struct {
     stdout_contains: []const []const u8 = &.{},
     stderr_contains: []const []const u8 = &.{},
     db_kinds: []const []const u8 = &.{},
+    /// Expected durable session hierarchy rows:
+    /// kind|has_parent|has_parent_block|max_rounds.
+    db_session_meta: []const []const u8 = &.{},
     runs: u8 = 1,
     /// Optional per-scenario M5 config and executable hook fixture.
     config_toml: ?[]const u8 = null,
@@ -288,6 +291,34 @@ fn runScenario(
             if (!std.mem.eql(u8, want, got)) {
                 print(io, "\n  db kind mismatch: want {s}, got {s}\n", .{ want, got });
                 return error.DbKindsMismatch;
+            }
+        }
+    }
+
+    if (sf.check.db_session_meta.len > 0) {
+        const db_path = try std.fmt.allocPrint(arena, "{s}/marlin/marlin.db", .{state_dir});
+        const query =
+            "SELECT kind || '|' || (parent_sid IS NOT NULL) || '|' || " ++
+            "(parent_block_id IS NOT NULL) || '|' || COALESCE(max_rounds,0) " ++
+            "FROM sessions ORDER BY CASE WHEN parent_sid IS NULL THEN 0 ELSE 1 END, created_at;";
+        const res = try std.process.run(gpa, io, .{
+            .argv = &.{ "sqlite3", db_path, query },
+            .stdout_limit = .limited(1024 * 1024),
+        });
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+
+        var lines: std.ArrayList([]const u8) = .empty;
+        var lit = std.mem.splitScalar(u8, std.mem.trim(u8, res.stdout, "\n"), '\n');
+        while (lit.next()) |line| if (line.len > 0) try lines.append(arena, line);
+        if (lines.items.len != sf.check.db_session_meta.len) {
+            print(io, "\n  db has {d} session rows, want {d}: {s}\n", .{ lines.items.len, sf.check.db_session_meta.len, res.stdout });
+            return error.DbSessionMetaMismatch;
+        }
+        for (sf.check.db_session_meta, lines.items) |want, got| {
+            if (!std.mem.eql(u8, want, got)) {
+                print(io, "\n  db session metadata mismatch: want {s}, got {s}\n", .{ want, got });
+                return error.DbSessionMetaMismatch;
             }
         }
     }

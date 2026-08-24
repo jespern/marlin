@@ -1,8 +1,9 @@
 # M6 execution plan
 
-Status: **ready for sequencing, not implementation-complete**. M4 is verified;
-M5 mechanics are verified and need a short real-server/hook dogfood pass. The
-workspace recovery/isolation track formerly called M4.5 is deliberately Later.
+Status: **active**. The first M6a vertical slice (one durable synchronous
+read-only child) is implemented and verified. M4 is verified; M5 mechanics are
+verified and still need a short real-server/hook dogfood pass. The workspace
+recovery/isolation track formerly called M4.5 is deliberately Later.
 
 ## What exists now
 
@@ -11,24 +12,33 @@ workspace recovery/isolation track formerly called M4.5 is deliberately Later.
 - M5 supplies one dynamic tool-schema and dispatch path for exec, MCP, and
   skills. MCP calls serialize safely per server; hooks run outside turn and
   dispatcher critical paths.
+- Schema v4 and the protocol carry `parent_sid`, `kind`, `parent_block_id`, and
+  the child round budget. Existing sessions migrate as roots; stale in-flight
+  state becomes `err` after daemon restart.
+- `task` creates one child through a typed dispatcher event/future, waits for
+  its structured result, cascades parent cancellation, and limits children to
+  a read-only tool profile with no recursive `task`. Children are ordinary
+  attachable sessions grouped beneath their root in session listings.
 - Council product behavior is specified in `REVIEW.md`, but `/council`,
-  `/review`, child-session storage, and review blocks are not implemented.
+  `/review`, concurrent child fan-out, and review blocks are not implemented.
 - `parallel_safe` is metadata only today: the loop still runs every tool call
-  serially. There is no parent/child field in the session store or protocol.
+  serially. This no longer blocks proving the child ownership path; it is the
+  next M6a widening step.
 - The daemon listens only on its local Unix socket. Raw TCP/token auth and a
   PWA remain architectural doors, not partially shipped surfaces.
 
 ## Entry gate: finish proving M5
 
-Before changing the session model, run one useful stdio MCP server and one
-notification hook during ordinary work. Capture only actionable fixes: config
+During M6, run one useful stdio MCP server and one notification hook during
+ordinary work. Capture only actionable fixes: config
 diagnostics, lifecycle/restart behavior, output rendering, and approval
 classification. This is operational proof, not another feature phase.
 
 Also close these bounded hardening debts when they intersect M6 work:
 
-1. Honor `parallel_safe` by executing consecutive safe calls concurrently,
-   retaining deterministic tool-result order and per-call cancellation.
+1. After the single-child path is stable, honor `parallel_safe` by executing
+   consecutive safe calls concurrently, retaining provider-call result order
+   and per-call cancellation.
 2. Give built-in bash and extension subprocesses one cancellation/deadline
    primitive (TERM, grace, KILL) instead of a mixture of blocking helpers.
 3. Make config/MCP startup errors name the table, server/tool, and bad field.
@@ -37,29 +47,36 @@ Also close these bounded hardening debts when they intersect M6 work:
 
 ## M6a — durable child sessions and `task`
 
-Add the smallest general primitive councils can reuse:
+The smallest general primitive councils can reuse now exists:
 
 - Store/protocol: `parent_sid`, `kind` (`task_child`, later `review_child`),
   `parent_block_id`, budget, and child state. Migrate existing sessions as
   roots. The `/sessions` snapshot becomes a hierarchy without a second state
   store.
-- Tool contract: `task` takes a focused prompt plus optional model, effort,
-  turn/token budget, and read-only policy. The daemon—not the model—creates the
-  child, starts its turn, and returns the final answer as the parent tool
-  result.
+- Tool contract: `task` takes a focused prompt plus optional model, effort, and
+  round budget. The daemon—not the model—creates the read-only child, starts
+  its turn, and returns `{child_sid,status,final_text,error_message}` as the
+  parent tool result.
 - Runtime: child creation crosses the dispatcher through a typed event/future;
-  turn threads never mutate session/store ownership directly. Multiple task
-  calls in one provider round rely on the parallel-safe entry gate so council
-  seats actually run concurrently.
+  turn threads never create session/store hierarchy state directly. The first
+  slice deliberately waits on one child. Multiple calls and council seats are
+  the next concurrency step.
 - Lifecycle: parent interrupt cancels children it is awaiting; daemon restart
   reconstructs hierarchy and marks genuinely orphaned work honestly. Child
   failures are result data and do not crash the parent turn.
-- UX: picker indentation and one compact live child-progress strip. Children
-  remain ordinary attachable sessions; no permanent sidebar.
+- UX: picker and `marlin ls` indentation are implemented. The status bar shows
+  a parent's child count and actionable child activity, or the parent tag when
+  a child is focused. Children remain ordinary attachable sessions; no
+  permanent sidebar.
 
-Exit: one parent launches at least three children concurrently, survives client
-disconnect/reconnect, receives ordered results, and cancellation/budgets hold
-under E2E fixtures.
+Verified checkpoint: one parent completes a child through the real daemon and
+fake provider; the E2E asserts that task/bash/write/edit are absent from the
+child schema, the structured result returns to the parent, and hierarchy plus
+round budget are durable in SQLite.
+
+Remaining exit: one parent launches at least three children concurrently,
+survives client disconnect/reconnect, receives ordered results, and
+cancellation/budgets hold under E2E fixtures.
 
 ## M6b — councils as specialized tasks
 

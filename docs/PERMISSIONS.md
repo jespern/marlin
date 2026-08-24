@@ -166,10 +166,18 @@ escalation reruns the call with only that capability added.
 
 Networking remains allow-by-default. Marlin-owned network tools may subscribe
 to optional hostname blocklists as defense in depth; this is not presented as
-an exfiltration boundary. Raw subprocess sockets, direct IP connections,
-custom DNS, and DNS-over-HTTPS remain outside managed-tool coverage until a
-proxy or platform network filter exists. Marlin does not infer networking by
-regex-scanning shell command text.
+an exfiltration boundary. The built-in `fetch` tool enforces the policy before
+each connection and redirect. The `bash` boundary also performs a conservative
+shell-aware preflight for literal destinations supplied to common network
+commands (`curl`, `wget`, HTTPie, Git, SSH/SCP, rsync, netcat, and related
+tools), and refuses the entire shell command when one matches.
+
+Shell preflight is best-effort screening rather than enforcement. Variables,
+string construction, aliases, scripts, interpreters, subprocess redirects,
+direct IP connections, custom DNS, DNS-over-HTTPS, and unrecognized programs
+can bypass it. Arbitrary subprocess sockets remain outside complete coverage
+until a proxy or platform network filter exists. The TUI therefore describes
+coverage as `fetch enforced · shell literals screened`.
 
 The primary configuration is:
 
@@ -184,10 +192,33 @@ Each value accepts a comma-separated set. `MARLIN_NETWORK_BLOCKLISTS`,
 `MARLIN_NETWORK_ALLOW`, and `MARLIN_NETWORK_DENY` are final environment
 overrides for temporary or automated runs.
 
+The daemon loads and refreshes configured feeds at startup. The TUI handshake
+reports the loaded feed/rule counts, shows `dnsblock on`, `dnsblock off`, or
+`dnsblock n/a` beside the sandbox indicator, and emits a short startup notice.
+Runtime controls are session-scoped and in-memory:
+
+```text
+/network status
+/network on
+/network off
+```
+
+New and rehydrated sessions default to filtering on whenever at least one
+blocking rule loaded. Child tasks inherit their parent's setting. `/network
+off` bypasses the policy for that session without unloading the daemon-global
+index; `/network on` is rejected when no rules loaded. Changes to subscribed
+lists or explicit allow/deny rules still require a config edit and daemon
+reboot.
+
 Precedence is explicit deny, explicit allow, subscribed blocklist, then the
 default allow. Rules apply to a domain and its subdomains. Every redirect from
 the built-in `fetch` tool is checked before Marlin connects to the next host;
-a blocked result names the matching rule and list.
+a blocked result is a normal failed tool result that names the URL, matching
+domain, and source list. A matching Bash preflight names the recognized program
+and host and states that the shell command was not run. No connection is made
+by the guarded operation, there is no approval prompt or automatic bypass, and
+the model may re-plan. A user can add an explicit allow and reboot, or
+deliberately disable filtering for the session and retry.
 
 The starter catalog contains the security-only HaGeZi Threat Intelligence
 Feeds mini list (GPL-3.0; malware, phishing, scams, spam, cryptojacking, and

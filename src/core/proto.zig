@@ -19,6 +19,11 @@ pub const proto_version: u32 = 1;
 
 pub const SessionState = enum { idle, running, awaiting_approval, err, done };
 
+/// Durable role in the session hierarchy. M6 initially permits one level of
+/// task children; review_child is reserved for the council layer that reuses
+/// the same storage/protocol shape.
+pub const SessionKind = enum { root, task_child, review_child };
+
 /// Client → daemon.
 pub const ClientMsg = union(enum) {
     hello: struct { proto_version: u32, client_kind: []const u8 = "generic" },
@@ -44,6 +49,9 @@ pub const ClientMsg = union(enum) {
     /// for one session. Enabling requires the daemon's verified backend
     /// (hello_ok.sandbox_available); the daemon rejects it otherwise.
     session_set_sandbox: struct { sid: u64, enabled: bool },
+    /// Toggle managed-tool hostname filtering for one session. Enabling
+    /// requires a loaded policy (hello_ok.network_filtering).
+    session_set_network_filtering: struct { sid: u64, enabled: bool },
     /// Fetch an uncapped tool result by its content-addressed blob hash.
     /// Used by `!c`; the inline block body may be intentionally truncated.
     blob_get: struct { hash: []const u8 },
@@ -77,8 +85,10 @@ pub const DaemonMsg = union(enum) {
         /// sessions may enable prompt-free sandboxed shell execution.
         sandbox_available: bool = false,
         /// A DNS blocklist / explicit-deny network policy is loaded for
-        /// Marlin-owned network tools.
+        /// Marlin-owned network tools and may be enabled per session.
         network_filtering: bool = false,
+        network_feed_count: u64 = 0,
+        network_rule_count: u64 = 0,
     },
     session_created: struct { sid: u64 },
     session_list_result: struct { sessions: []const SessionInfo },
@@ -115,6 +125,13 @@ pub const DaemonMsg = union(enum) {
 
 pub const SessionInfo = struct {
     sid: u64,
+    /// Null for roots. Defaults preserve compatibility with pre-M6 daemons.
+    parent_sid: ?u64 = null,
+    kind: SessionKind = .root,
+    /// The parent's tool_call block that created this child.
+    parent_block_id: ?u64 = null,
+    /// Durable round budget for child sessions; 0 means the root default.
+    max_rounds: u32 = 0,
     title: []const u8,
     /// Session root as recorded at creation time. Default keeps decoding
     /// compatible with daemons that predate this field.
@@ -130,6 +147,9 @@ pub const SessionInfo = struct {
     /// Effective shell-sandbox state: the session's toggle AND a verified
     /// backend. Defaults false when decoding older daemons.
     sandboxed: bool = false,
+    /// Whether Marlin-owned network tools enforce the loaded hostname policy
+    /// for this session. Defaults false when decoding older daemons.
+    network_filtering: bool = false,
 };
 
 /// Encode one message as an NDJSON line (incl. trailing \n). Caller frees.
@@ -195,6 +215,12 @@ test "round trip: client messages" {
     defer gpa.free(sandbox_line);
     const sandbox_back = try decode(ClientMsg, arena, sandbox_line);
     try std.testing.expect(!sandbox_back.session_set_sandbox.enabled);
+
+    const network_msg: ClientMsg = .{ .session_set_network_filtering = .{ .sid = 9, .enabled = true } };
+    const network_line = try encode(gpa, network_msg);
+    defer gpa.free(network_line);
+    const network_back = try decode(ClientMsg, arena, network_line);
+    try std.testing.expect(network_back.session_set_network_filtering.enabled);
 
     const watch_line = try encode(gpa, ClientMsg{ .session_watch = .{} });
     defer gpa.free(watch_line);
@@ -266,6 +292,8 @@ test "older session-list entries default cwd" {
     );
     try std.testing.expectEqualStrings("", m.session_list_result.sessions[0].cwd);
     try std.testing.expectEqual(SessionState.idle, m.session_list_result.sessions[0].state);
+    try std.testing.expectEqual(SessionKind.root, m.session_list_result.sessions[0].kind);
+    try std.testing.expectEqual(@as(?u64, null), m.session_list_result.sessions[0].parent_sid);
 }
 
 test "garbage line is an error, not a crash" {
