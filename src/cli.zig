@@ -7,6 +7,7 @@ const build_options = @import("build_options");
 const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
 const tui = @import("client/tui.zig");
+const web = @import("client/web.zig");
 
 pub const Command = enum {
     attach,
@@ -19,6 +20,7 @@ pub const Command = enum {
     compact,
     reboot,
     shutdown,
+    web,
     help,
     version,
 
@@ -55,6 +57,7 @@ pub fn dispatch(
         .compact => return headless.compact(gpa, io, environ, self_exe, rest),
         .reboot => return headless.reboot(gpa, io, environ, self_exe, rest),
         .shutdown => return headless.shutdown(gpa, io, environ),
+        .web => return web.serve(gpa, io, environ, self_exe, rest),
         .attach => {
             var sid_arg: ?u64 = null;
             if (rest.len > 0) {
@@ -99,6 +102,7 @@ const help_text =
     \\  marlin compact [id]    manually compact a session's context
     \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
     \\  marlin shutdown        stop the daemon
+    \\  marlin web [--port N]  local web UI (127.0.0.1:8377, unauthenticated POC)
     \\  marlin help | version
     \\
 ;

@@ -78,6 +78,7 @@ test {
     _ = @import("daemon/provider/http.zig");
     _ = @import("daemon/provider/registry.zig");
     _ = @import("client/attach.zig");
+    _ = @import("client/web.zig");
     _ = @import("testing/fixture_tests.zig");
     _ = @import("client/tui.zig");
 }
