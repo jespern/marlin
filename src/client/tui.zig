@@ -48,6 +48,29 @@ const Mode = enum { insert, normal };
 
 pub const RebootRequest = enum { none, plain, build };
 
+const SlashCommand = struct {
+    name: []const u8,
+    usage: []const u8 = "",
+    description: []const u8,
+    accepts_args: bool = false,
+};
+
+/// Visible command catalog. `/q` remains an accepted alias for `/quit`, and
+/// prefix matching naturally makes `/q` complete to the canonical spelling.
+const slash_commands = [_]SlashCommand{
+    .{ .name = "/model", .usage = " [model]", .description = "switch model or open the picker", .accepts_args = true },
+    .{ .name = "/new", .description = "start a new session" },
+    .{ .name = "/compact", .description = "compact the current context" },
+    .{ .name = "/reboot", .usage = " [--build]", .description = "restart Marlin", .accepts_args = true },
+    .{ .name = "/help", .description = "show commands and key bindings" },
+    .{ .name = "/quit", .description = "leave Marlin" },
+};
+
+const SlashMatches = struct {
+    indices: [slash_commands.len]usize = undefined,
+    len: usize = 0,
+};
+
 /// A block reduced to what the renderer needs (owned copies).
 const RenderBlock = struct {
     kind: block.BlockKind,
@@ -159,6 +182,9 @@ const App = struct {
     /// Model picker overlay: null = closed; value = highlighted index into
     /// the FILTERED list (see pickerItems).
     picker: ?usize = null,
+    /// Highlighted row in the slash-command autocomplete menu. The menu
+    /// itself is derived from editor text and therefore needs no open flag.
+    slash_selection: usize = 0,
     /// Type-to-filter query while the picker is open.
     picker_filter: std.ArrayList(u8) = .empty,
     /// Full model catalog from the daemon (owned copies). Empty until
@@ -517,6 +543,13 @@ const Palette = struct {
     const prompt_panel: vaxis.Style = .{ .bg = prompt_bg };
     const prompt_text: vaxis.Style = .{ .bg = prompt_bg };
     const prompt_mark: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 6 }, .bold = true };
+    const command_bg: vaxis.Color = .{ .rgb = .{ 0x2d, 0x30, 0x35 } };
+    const command_menu: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 7 } };
+    const command_name: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 6 }, .bold = true };
+    const command_description: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 8 }, .dim = true };
+    const command_selected: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 7 } };
+    const command_selected_name: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 6 }, .bold = true };
+    const command_selected_description: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 7 } };
     const assistant: vaxis.Style = .{};
     const reasoning: vaxis.Style = .{ .fg = .{ .index = 8 }, .italic = true };
     /// Tool machinery (the ⚙ glyph, arg previews, result bodies): dimmed
@@ -579,6 +612,37 @@ fn statusCwd(arena: std.mem.Allocator, cwd: []const u8, home: []const u8) ![]con
         return std.fmt.allocPrint(arena, "~{s}", .{cwd[home.len..]});
     }
     return cwd;
+}
+
+/// Autocomplete is active only while the composer contains a command token;
+/// once an argument or newline starts, normal editor navigation takes over.
+fn slashQuery(editor: *const Editor) ?[]const u8 {
+    const text = editor.text.items;
+    if (text.len == 0 or text[0] != '/') return null;
+    for (text) |c| {
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') return null;
+    }
+    return text;
+}
+
+fn slashMatches(editor: *const Editor) SlashMatches {
+    var out = SlashMatches{};
+    const query = slashQuery(editor) orelse return out;
+    for (slash_commands, 0..) |command, i| {
+        if (query.len <= command.name.len and
+            std.ascii.eqlIgnoreCase(query, command.name[0..query.len]))
+        {
+            out.indices[out.len] = i;
+            out.len += 1;
+        }
+    }
+    return out;
+}
+
+fn completeSlashCommand(editor: *Editor, command: SlashCommand, add_argument_space: bool) void {
+    editor.clear();
+    editor.insertSlice(command.name);
+    if (add_argument_space and command.accepts_args) editor.insertSlice(" ");
 }
 
 const LinkSpan = struct {
@@ -1382,6 +1446,58 @@ fn inputPanelHeight(content_height: usize) usize {
     return content_height + 2; // one blank row above and below the editor
 }
 
+fn drawSlashMenu(
+    app: *App,
+    win: vaxis.Window,
+    arena: std.mem.Allocator,
+    input_top: u16,
+    width: u16,
+) !void {
+    if (app.mode != .insert or app.picker != null or slashQuery(&app.editor) == null) return;
+    const matches = slashMatches(&app.editor);
+    if (matches.len == 0) return;
+
+    const shown: u16 = @intCast(@min(matches.len, slash_commands.len));
+    const menu_h = shown + 1; // results + keyboard hint
+    if (input_top < menu_h) return;
+    app.slash_selection = @min(app.slash_selection, matches.len - 1);
+
+    const menu = win.child(.{
+        .x_off = 1,
+        .y_off = @intCast(input_top - menu_h),
+        .width = width -| 2,
+        .height = menu_h,
+    });
+    menu.fill(.{ .style = Palette.command_menu });
+
+    const pad = "                        ";
+    var row: usize = 0;
+    while (row < shown) : (row += 1) {
+        const command = slash_commands[matches.indices[row]];
+        const selected = row == app.slash_selection;
+        const row_style = if (selected) Palette.command_selected else Palette.command_menu;
+        const name_style = if (selected) Palette.command_selected_name else Palette.command_name;
+        const description_style = if (selected) Palette.command_selected_description else Palette.command_description;
+        const row_win = menu.child(.{ .y_off = @intCast(row), .height = 1, .width = menu.width });
+        row_win.fill(.{ .style = row_style });
+
+        const label = try std.fmt.allocPrint(arena, " {s}{s}", .{ command.name, command.usage });
+        const pad_len: usize = if (label.len < pad.len) pad.len - label.len else 1;
+        const segments = [_]vaxis.Segment{
+            .{ .text = label, .style = name_style },
+            .{ .text = pad[0..pad_len], .style = row_style },
+            .{ .text = command.description, .style = description_style },
+        };
+        _ = row_win.print(&segments, .{ .wrap = .none });
+    }
+
+    const hint = menu.child(.{ .y_off = @intCast(shown), .height = 1, .width = menu.width });
+    _ = hint.printSegment(.{
+        .text = " ↑↓ select · Tab complete · Enter run",
+        .style = Palette.command_description,
+    }, .{ .wrap = .none });
+}
+
 fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const win = vx.window();
     win.clear();
@@ -1459,7 +1575,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     }
 
     // ---- input box ----
-    const input_panel = win.child(.{ .y_off = h - 1 - input_h, .height = input_h, .width = w });
+    const input_top = h - 1 - input_h;
+    const input_panel = win.child(.{ .y_off = input_top, .height = input_h, .width = w });
     input_panel.fill(.{ .style = Palette.prompt_panel });
     const input_win = input_panel.child(.{
         .x_off = 1,
@@ -1469,6 +1586,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     });
     app.editor.draw(input_win, prompt, Palette.prompt_mark, Palette.prompt_text);
     if (app.mode == .normal) win.hideCursor();
+    try drawSlashMenu(app, win, arena, input_top, w);
 
     // ---- status bar ----
     const status_win = win.child(.{ .y_off = h - 1, .height = 1, .width = w });
@@ -2084,6 +2202,36 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             const ed = &app.editor;
             // Same width draw() gives the editor: terminal minus the prompt.
             const edit_w: usize = app.term_cols -| 2;
+            const command_matches = slashMatches(ed);
+            if (command_matches.len > 0) {
+                app.slash_selection = @min(app.slash_selection, command_matches.len - 1);
+                if (isNextInputRowKey(key)) {
+                    app.slash_selection = if (app.slash_selection + 1 < command_matches.len)
+                        app.slash_selection + 1
+                    else
+                        0;
+                    return;
+                } else if (isPreviousInputRowKey(key) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
+                    app.slash_selection = if (app.slash_selection > 0)
+                        app.slash_selection - 1
+                    else
+                        command_matches.len - 1;
+                    return;
+                } else if (key.matches(vaxis.Key.tab, .{})) {
+                    const command = slash_commands[command_matches.indices[app.slash_selection]];
+                    completeSlashCommand(ed, command, true);
+                    app.slash_selection = 0;
+                    return;
+                } else if (key.matches(vaxis.Key.enter, .{})) {
+                    const command = slash_commands[command_matches.indices[app.slash_selection]];
+                    completeSlashCommand(ed, command, false);
+                    const text = try ed.takeExpanded();
+                    defer app.gpa.free(text);
+                    app.slash_selection = 0;
+                    app.submitInput(text);
+                    return;
+                }
+            }
             if (key.matches(vaxis.Key.escape, .{})) {
                 app.mode = .normal; // draft survives: editor state untouched
                 app.sel_anchor = null;
@@ -2095,12 +2243,16 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.submitInput(text);
             } else if (isPreviousInputRowKey(key)) {
                 if (!ed.moveUp(edit_w)) ed.histUp();
+                app.slash_selection = 0;
             } else if (isNextInputRowKey(key)) {
                 if (!ed.moveDown(edit_w)) ed.histDown();
+                app.slash_selection = 0;
             } else if (editCommand(key)) |command| {
                 applyEditCommand(ed, command);
+                app.slash_selection = 0;
             } else if (key.text) |text| {
                 ed.insertSlice(text);
+                app.slash_selection = 0;
             }
         },
         .normal => {
@@ -2135,6 +2287,54 @@ test "modified enter inserts a newline while plain enter submits" {
     try std.testing.expect(isNewlineKey(.{ .codepoint = 'j', .mods = .{ .ctrl = true } }));
     try std.testing.expect(!isNewlineKey(.{ .codepoint = vaxis.Key.enter }));
     try std.testing.expect(!isNewlineKey(.{ .codepoint = vaxis.Key.enter, .text = "\r" }));
+}
+
+test "slash command catalog filters by prefix and completes arguments" {
+    const gpa = std.testing.allocator;
+    var ed = Editor.init(gpa);
+    defer ed.deinit();
+
+    ed.insertSlice("/");
+    try std.testing.expectEqual(slash_commands.len, slashMatches(&ed).len);
+    ed.clear();
+    ed.insertSlice("/co");
+    const compact = slashMatches(&ed);
+    try std.testing.expectEqual(@as(usize, 1), compact.len);
+    try std.testing.expectEqualStrings("/compact", slash_commands[compact.indices[0]].name);
+    ed.clear();
+    ed.insertSlice("/q");
+    const quit = slashMatches(&ed);
+    try std.testing.expectEqual(@as(usize, 1), quit.len);
+    try std.testing.expectEqualStrings("/quit", slash_commands[quit.indices[0]].name);
+
+    completeSlashCommand(&ed, slash_commands[0], true);
+    try std.testing.expectEqualStrings("/model ", ed.text.items);
+    try std.testing.expect(slashQuery(&ed) == null);
+}
+
+test "slash command Tab completes and Enter runs the selection" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined, // completion and /help are entirely client-local
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.editor.insertSlice("/mo");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/model ", app.editor.text.items);
+
+    app.editor.clear();
+    app.editor.insertSlice("/he");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(app.editor.isEmpty());
+    try std.testing.expectEqualStrings("/help", app.editor.history.items[0]);
+    try std.testing.expect(app.notice.items.len > 0);
 }
 
 test "standard editor key bindings map to commands" {
