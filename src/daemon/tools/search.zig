@@ -12,7 +12,8 @@ pub const grep_spec_name = "grep";
 pub const grep_spec_description =
     "Search file contents for a regex pattern (ripgrep syntax). Returns matching " ++
     "lines as 'path:line:content'. Searches the given directory recursively " ++
-    "(default: session cwd).";
+    "(default: session cwd). If ripgrep is not installed, falls back to plain " ++
+    "substring matching (no regex).";
 pub const grep_spec_schema =
     \\{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"file or directory to search (default: cwd)"},"glob":{"type":"string","description":"only search files matching this glob, e.g. *.zig"},"limit":{"type":"integer","minimum":1}},"required":["pattern"]}
 ;
@@ -97,6 +98,13 @@ fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []c
     errdefer out.deinit(gpa);
     var matches: u64 = 0;
 
+    // The rg path takes real regex; this fallback is literal. A pattern that
+    // looks like regex would silently match nothing — tell the model instead
+    // of letting it conclude "no matches" from a dialect mismatch.
+    if (looksLikeRegex(args.pattern)) {
+        try out.appendSlice(gpa, "note: ripgrep not installed; pattern treated as a LITERAL substring, not regex. Use a plain substring.\n");
+    }
+
     // Single file?
     const stat = Io.Dir.cwd().statFile(io, search_path, .{}) catch |e| {
         return std.fmt.allocPrint(gpa, "error: cannot access '{s}': {t}", .{ search_path, e });
@@ -122,8 +130,11 @@ fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []c
             grepOneFile(gpa, io, &out, &matches, args, full, entry.path) catch continue;
         }
     }
-    if (out.items.len == 0) {
+    if (matches == 0) {
         out.deinit(gpa);
+        if (looksLikeRegex(args.pattern)) {
+            return gpa.dupe(u8, "no matches (note: ripgrep not installed; the pattern was matched as a LITERAL substring, not regex — try a plain substring)");
+        }
         return gpa.dupe(u8, "no matches");
     }
     return out.toOwnedSlice(gpa);
@@ -156,10 +167,24 @@ fn grepOneFile(
 }
 
 fn skipPath(path: []const u8) bool {
-    const skip_dirs = [_][]const u8{ ".git/", "node_modules/", ".zig-cache/", "zig-out/", ".hg/" };
+    const skip_dirs = [_][]const u8{
+        ".git/",        "node_modules/", ".zig-cache/", "zig-out/",
+        ".hg/",         ".svn/",         "target/",     ".venv/",
+        "__pycache__/", ".cache/",
+    };
     for (skip_dirs) |d| {
         if (std.mem.startsWith(u8, path, d) or std.mem.indexOf(u8, path, "/") != null and std.mem.indexOf(u8, path, d) != null) return true;
     }
+    return false;
+}
+
+/// Heuristic: does the pattern contain regex metacharacters that the literal
+/// fallback cannot honor? (Used only to warn the model, never to reject.)
+fn looksLikeRegex(pattern: []const u8) bool {
+    for (pattern) |ch| switch (ch) {
+        '\\', '[', ']', '(', ')', '{', '}', '^', '$', '|', '+', '*', '?', '.' => return true,
+        else => {},
+    };
     return false;
 }
 
@@ -348,6 +373,12 @@ test "internal grep + glob on a temp tree" {
     const g = try internalGrep(gpa, io, .{ .pattern = "needle" }, dir_path);
     defer gpa.free(g);
     try std.testing.expect(std.mem.indexOf(u8, g, "one.txt:1:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "note:") == null); // plain pattern → no warning
+
+    // Regex-looking pattern in the literal fallback carries a dialect warning.
+    const gr = try internalGrep(gpa, io, .{ .pattern = "need.*le" }, dir_path);
+    defer gpa.free(gr);
+    try std.testing.expect(std.mem.indexOf(u8, gr, "LITERAL substring") != null);
 
     const gl = try glob(gpa, io, .{ .pattern = "*.txt" }, dir_path);
     defer gpa.free(gl);
