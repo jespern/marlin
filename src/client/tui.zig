@@ -3,16 +3,20 @@
 //! land in M4. This client is a pure protocol consumer: attach.Conn in,
 //! blocks out. Deltas are ephemeral; finalized blocks replace them.
 //!
-//! Layout (M2):
+//! Layout (M3):
 //!   ┌─ session view: blocks, streaming region ─┐
-//!   ├─ input box (1 line) ──────────────────────┤
-//!   └─ status: mode · state · model · tokens ───┘
+//!   ├─ input box (1-8 lines, grows with content)┤
+//!   └─ status: state · model · tokens · ctx ────┤
 //!
 //! Keys:
-//!   insert:  type → input; Enter send; Esc → normal; Ctrl+C interrupt/quit
+//!   insert:  type → input; Enter send; Alt+Enter/Ctrl+J newline;
+//!            Up/Down move lines or walk history at the edges;
+//!            Esc → normal (draft survives); Ctrl+C interrupt/quit
 //!   normal:  i insert; j/k scroll; g/G top/bottom; q quit; Ctrl+C same
 //!   approval pending: y approve, n deny (both modes, input empty)
-//!   commands: /model <m>, /new, /compact, /help, /quit
+//!   commands: /model <m>, /new, /compact, /reboot [--build], /help, /quit
+//!   paste:   bracketed paste; large pastes become [paste #N: X lines]
+//!            chips, expanded into the message on send.
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,10 +26,14 @@ const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const config = @import("../core/config.zig");
 const attach = @import("attach.zig");
+const Editor = @import("editor.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
+    /// Bracketed paste text (allocated by the loop's paste allocator = gpa;
+    /// handler frees).
+    paste: []const u8,
     /// One raw NDJSON line from the daemon (gpa-owned; handler frees).
     daemon_line: []u8,
     daemon_gone,
@@ -74,6 +82,7 @@ const App = struct {
     io: Io,
     conn: *attach.Conn,
     sid: u64,
+    editor: Editor,
 
     mode: Mode = .insert,
     blocks: std.ArrayList(RenderBlock) = .empty,
@@ -101,6 +110,7 @@ const App = struct {
         self.delta.deinit(self.gpa);
         self.model.deinit(self.gpa);
         self.notice.deinit(self.gpa);
+        self.editor.deinit();
     }
 
     fn setNotice(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -175,7 +185,12 @@ const App = struct {
 
     fn applyBlock(self: *App, b: block.Block) void {
         switch (b.body) {
-            .user_msg => |u| self.pushBlock(.user_msg, u.text, "", .ok),
+            .user_msg => |u| {
+                self.pushBlock(.user_msg, u.text, "", .ok);
+                // Seed input history from the log (replay covers pre-reboot
+                // messages; live blocks cover this session's submits).
+                self.editor.pushHistory(u.text);
+            },
             .steer => |s| self.pushBlock(.steer, s.text, "", .ok),
             .assistant_msg => |a| {
                 // Finalized text replaces the streaming delta.
@@ -445,14 +460,17 @@ fn wrapPrefixed(
     }
 }
 
-fn draw(app: *App, vx: *vaxis.Vaxis, input: *vaxis.widgets.TextInput, arena: std.mem.Allocator) !void {
+fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const win = vx.window();
     win.clear();
     const h = win.height;
     const w = win.width;
     if (h < 4 or w < 20) return;
 
-    const view_h: u16 = h - 2; // input line + status line
+    // Input grows 1..max_rows with content; session view yields.
+    const prompt: []const u8 = if (app.mode == .insert) "> " else ": ";
+    const input_h: u16 = @intCast(app.editor.displayHeight(w -| prompt.len));
+    const view_h: u16 = h -| (input_h + 1); // + status line
 
     // ---- session view ----
     var lines = try layoutLines(arena, app, w);
@@ -469,12 +487,9 @@ fn draw(app: *App, vx: *vaxis.Vaxis, input: *vaxis.widgets.TextInput, arena: std
         });
     }
 
-    // ---- input line ----
-    const input_win = win.child(.{ .y_off = h - 2, .height = 1, .width = w });
-    const prompt: []const u8 = if (app.mode == .insert) "> " else ": ";
-    _ = input_win.printSegment(.{ .text = prompt, .style = Palette.user }, .{ .wrap = .none });
-    const field = input_win.child(.{ .x_off = 2, .width = w -| 2, .height = 1 });
-    input.draw(field);
+    // ---- input box ----
+    const input_win = win.child(.{ .y_off = h - 1 - input_h, .height = input_h, .width = w });
+    app.editor.draw(input_win, prompt, Palette.user);
     if (app.mode == .normal) win.hideCursor();
 
     // ---- status bar ----
@@ -488,15 +503,12 @@ fn draw(app: *App, vx: *vaxis.Vaxis, input: *vaxis.widgets.TextInput, arena: std
         .done => "done",
     };
     const ctx_txt: []const u8 = if (app.context_limit > 0)
-        try std.fmt.allocPrint(arena, "ctx {d}%", .{app.context_used * 100 / app.context_limit})
+        try std.fmt.allocPrint(arena, " · ctx {d}%", .{app.context_used * 100 / app.context_limit})
     else
         "";
-    const status = try std.fmt.allocPrint(arena, " {s} · {s} · {s} · {d}↑ {d}↓ · {s} · s{d}  {s}", .{
-        @tagName(app.mode),
+    const status = try std.fmt.allocPrint(arena, " {s} · {s}{s} · s{d}  {s}", .{
         state_txt,
         app.model.items,
-        app.tokens_in,
-        app.tokens_out,
         ctx_txt,
         app.sid,
         app.notice.items,
@@ -572,7 +584,7 @@ pub fn run(
         try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 1 } });
     }
 
-    var app = App{ .gpa = gpa, .io = io, .conn = conn, .sid = sid };
+    var app = App{ .gpa = gpa, .io = io, .conn = conn, .sid = sid, .editor = Editor.init(gpa) };
     defer app.deinit();
     app.setModelStr(model_at_start);
 
@@ -582,7 +594,11 @@ pub fn run(
     defer tty.deinit();
     const writer = tty.writer();
 
-    var vx = try vaxis.init(io, gpa, environ, .{});
+    var vx = try vaxis.init(io, gpa, environ, .{
+        // Doubles as the bracketed-paste allocator: Loop passes it when
+        // parsing paste bodies into .paste events.
+        .system_clipboard_allocator = gpa,
+    });
     defer vx.deinit(gpa, tty.writer());
 
     var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
@@ -593,6 +609,8 @@ pub fn run(
     try vx.enterAltScreen(writer);
     try writer.flush();
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+    try vx.setBracketedPaste(writer, true);
+    try writer.flush();
 
     // Initial size: not all paths deliver a winsize event up-front (and a
     // PTY may report late); fetch it directly so the first frame renders.
@@ -609,14 +627,11 @@ pub fn run(
     defer rt.join();
     defer conn.stream.shutdown(io, .both) catch {};
 
-    var input = vaxis.widgets.TextInput.init(gpa);
-    defer input.deinit();
-
     // First frame before any event arrives.
     {
         var frame_arena = std.heap.ArenaAllocator.init(gpa);
         defer frame_arena.deinit();
-        try draw(&app, &vx, &input, frame_arena.allocator());
+        try draw(&app, &vx, frame_arena.allocator());
         try vx.render(writer);
         try writer.flush();
     }
@@ -625,8 +640,12 @@ pub fn run(
     while (!app.should_quit) {
         const event = try loop.nextEvent();
         switch (event) {
-            .key_press => |key| try handleKey(&app, &input, key),
+            .key_press => |key| try handleKey(&app, key),
             .winsize => |ws| try vx.resize(gpa, tty.writer(), ws),
+            .paste => |text| {
+                app.editor.paste(text);
+                gpa.free(@constCast(text));
+            },
             .daemon_line => |line| {
                 app.handleDaemonLine(line);
                 // Drain any additional queued lines before redrawing.
@@ -634,8 +653,12 @@ pub fn run(
                     switch (ev2) {
                         .daemon_line => |l2| app.handleDaemonLine(l2),
                         .daemon_gone => app.should_quit = true,
-                        .key_press => |k2| try handleKey(&app, &input, k2),
+                        .key_press => |k2| try handleKey(&app, k2),
                         .winsize => |ws2| try vx.resize(gpa, tty.writer(), ws2),
+                        .paste => |t2| {
+                            app.editor.paste(t2);
+                            gpa.free(@constCast(t2));
+                        },
                     }
                 }
             },
@@ -647,7 +670,7 @@ pub fn run(
 
         var frame_arena = std.heap.ArenaAllocator.init(gpa);
         defer frame_arena.deinit();
-        try draw(&app, &vx, &input, frame_arena.allocator());
+        try draw(&app, &vx, frame_arena.allocator());
         try vx.render(writer);
         try writer.flush();
     }
@@ -655,7 +678,7 @@ pub fn run(
     return 0;
 }
 
-fn handleKey(app: *App, input: *vaxis.widgets.TextInput, key: vaxis.Key) !void {
+fn handleKey(app: *App, key: vaxis.Key) !void {
     // Ctrl+C: interrupt a running turn; quit when idle.
     if (key.matches('c', .{ .ctrl = true })) {
         if (app.state == .running or app.state == .awaiting_approval) {
@@ -667,7 +690,7 @@ fn handleKey(app: *App, input: *vaxis.widgets.TextInput, key: vaxis.Key) !void {
     }
 
     // Approval hotkeys work in both modes when the input is empty.
-    if (app.pending != null and inputEmpty(input)) {
+    if (app.pending != null and app.editor.isEmpty()) {
         if (key.matches('y', .{})) {
             app.approveReply(true);
             return;
@@ -680,14 +703,44 @@ fn handleKey(app: *App, input: *vaxis.widgets.TextInput, key: vaxis.Key) !void {
 
     switch (app.mode) {
         .insert => {
+            const ed = &app.editor;
+            // Editing width matches draw(): terminal minus the prompt.
+            const edit_w: usize = 78; // safe default; layout only affects
+            // vertical-move edge detection, and draw() re-lays-out per frame.
             if (key.matches(vaxis.Key.escape, .{})) {
-                app.mode = .normal;
+                app.mode = .normal; // draft survives: editor state untouched
+            } else if (key.matches(vaxis.Key.enter, .{ .alt = true }) or
+                key.matches('j', .{ .ctrl = true }))
+            {
+                ed.insertNewline();
             } else if (key.matches(vaxis.Key.enter, .{})) {
-                const text = try input.toOwnedSlice();
-                defer app.gpa.free(@constCast(text));
+                const text = try ed.takeExpanded();
+                defer app.gpa.free(text);
                 app.submitInput(text);
-            } else {
-                try input.update(.{ .key_press = key });
+            } else if (key.matches(vaxis.Key.up, .{})) {
+                if (!ed.moveUp(edit_w)) ed.histUp();
+            } else if (key.matches(vaxis.Key.down, .{})) {
+                if (!ed.moveDown(edit_w)) ed.histDown();
+            } else if (key.matches(vaxis.Key.left, .{}) or key.matches('b', .{ .ctrl = true })) {
+                ed.moveLeft();
+            } else if (key.matches(vaxis.Key.right, .{}) or key.matches('f', .{ .ctrl = true })) {
+                ed.moveRight();
+            } else if (key.matches(vaxis.Key.home, .{}) or key.matches('a', .{ .ctrl = true })) {
+                ed.moveLineStart();
+            } else if (key.matches(vaxis.Key.end, .{}) or key.matches('e', .{ .ctrl = true })) {
+                ed.moveLineEnd();
+            } else if (key.matches(vaxis.Key.backspace, .{})) {
+                ed.deleteBefore();
+            } else if (key.matches(vaxis.Key.delete, .{}) or key.matches('d', .{ .ctrl = true })) {
+                ed.deleteAfter();
+            } else if (key.matches('k', .{ .ctrl = true })) {
+                ed.deleteToLineEnd();
+            } else if (key.matches('u', .{ .ctrl = true })) {
+                ed.deleteToLineStart();
+            } else if (key.matches('w', .{ .ctrl = true })) {
+                ed.deleteWordBefore();
+            } else if (key.text) |text| {
+                ed.insertSlice(text);
             }
         },
         .normal => {
@@ -710,10 +763,6 @@ fn handleKey(app: *App, input: *vaxis.widgets.TextInput, key: vaxis.Key) !void {
             }
         },
     }
-}
-
-fn inputEmpty(input: *vaxis.widgets.TextInput) bool {
-    return input.buf.firstHalf().len == 0 and input.buf.secondHalf().len == 0;
 }
 
 test {
