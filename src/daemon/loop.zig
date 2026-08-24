@@ -76,7 +76,7 @@ const Appender = struct {
     seq: u64,
     turn_id: u64,
 
-    fn append(self: *Appender, body: block.Body) !void {
+    fn append(self: *Appender, body: block.Body) !u64 {
         self.seq += 1;
         const b = block.Block{
             .id = ids.next(self.io),
@@ -88,6 +88,7 @@ const Appender = struct {
         };
         try self.store.appendBlock(b);
         if (self.opts.on_block) |cb| cb(self.opts.on_delta_ctx, b);
+        return b.id;
     }
 };
 
@@ -109,7 +110,7 @@ pub fn runTurn(
         .turn_id = ids.next(io),
     };
 
-    try ap.append(.{ .user_msg = .{ .text = user_text } });
+    _ = try ap.append(.{ .user_msg = .{ .text = user_text } });
 
     var total_in: u64 = 0;
     var total_out: u64 = 0;
@@ -118,7 +119,7 @@ pub fn runTurn(
     while (round < opts.max_rounds) : (round += 1) {
         // -- cancellation checkpoint --
         if (cancelled(opts.cancel)) {
-            try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
+            _ = try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return .{ .text = try gpa.dupe(u8, ""), .rounds = round, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
         }
@@ -126,7 +127,7 @@ pub fn runTurn(
         if (opts.poll_steer) |poll| {
             while (poll(opts.on_delta_ctx, gpa)) |steer_text| {
                 defer gpa.free(steer_text);
-                try ap.append(.{ .steer = .{ .text = steer_text } });
+                _ = try ap.append(.{ .steer = .{ .text = steer_text } });
             }
         }
 
@@ -167,7 +168,7 @@ pub fn runTurn(
             .cancel = opts.cancel,
         }, &pump, Pump.onChunk) catch |e| switch (e) {
             error.Cancelled => {
-                try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
+                _ = try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
                 try store.updateSessionUsage(opts.session_id, total_in, total_out);
                 return .{ .text = try gpa.dupe(u8, ""), .rounds = round, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
             },
@@ -179,7 +180,7 @@ pub fn runTurn(
             defer gpa.free(eb);
             const msg = try std.fmt.allocPrint(gpa, "provider returned HTTP {d}: {s}", .{ resp.status, eb[0..@min(eb.len, 2000)] });
             defer gpa.free(msg);
-            try ap.append(.{ .system_note = .{ .text = msg } });
+            _ = try ap.append(.{ .system_note = .{ .text = msg } });
             return error.ProviderError;
         }
 
@@ -190,7 +191,7 @@ pub fn runTurn(
 
         // -- no tool calls → final answer --
         if (acc.calls.items.len == 0) {
-            try ap.append(.{ .assistant_msg = .{ .text = acc.text.items } });
+            _ = try ap.append(.{ .assistant_msg = .{ .text = acc.text.items } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return .{
                 .text = try gpa.dupe(u8, acc.text.items),
@@ -205,7 +206,7 @@ pub fn runTurn(
             const args_repaired = jsonx.repairObject(gpa, pc.args.items) catch pc.args.items;
             defer if (args_repaired.ptr != pc.args.items.ptr) gpa.free(@constCast(args_repaired));
 
-            try ap.append(.{ .tool_call = .{
+            _ = try ap.append(.{ .tool_call = .{
                 .call_id = pc.call_id.items,
                 .name = pc.name.items,
                 .args_json = args_repaired,
@@ -241,7 +242,7 @@ pub fn runTurn(
 
                     if (opts.on_approval_done) |cb| cb(opts.on_delta_ctx, approval_id, verdict);
 
-                    try ap.append(.{ .approval = .{
+                    _ = try ap.append(.{ .approval = .{
                         .approval_id = id_str,
                         .call_id = pc.call_id.items,
                         .decision = switch (verdict) {
@@ -275,16 +276,17 @@ pub fn runTurn(
             const cap: usize = opts.cfg.inline_tool_cap_bytes;
             var full_ref: ?[]const u8 = null;
             defer if (full_ref) |r| gpa.free(@constCast(r));
-            if (exec.output.len > cap) full_ref = try store.putBlob(exec.output);
+            if (exec.output.len > cap) full_ref = try store.putBlob(exec.output, nowMs(io));
             const inline_body = try context.capInline(gpa, exec.output, cap);
             defer if (inline_body.ptr != exec.output.ptr) gpa.free(@constCast(inline_body));
 
-            try ap.append(.{ .tool_result = .{
+            const tr_block_id = try ap.append(.{ .tool_result = .{
                 .call_id = pc.call_id.items,
                 .status = exec.status,
                 .inline_body = inline_body,
                 .full_body_ref = full_ref,
             } });
+            if (full_ref) |r| try store.addBlobRef(r, tr_block_id);
         }
         // Loop: next round re-assembles including the new tool results.
     }

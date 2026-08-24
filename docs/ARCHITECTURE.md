@@ -121,7 +121,8 @@ Key decisions:
 sessions(id, title, created_at, cwd, model, provider, status,
          pinned_context, config_json)
 blocks(id, session_id, turn_id, seq, kind, ts, body_json)
-blobs(hash, bytes)                      -- full tool outputs, content-addressed
+blobs(hash, bytes, created_at, tombstone)  -- full tool outputs, content-addressed
+blob_refs(hash, block_id)                  -- refcounting for GC
 blocks_fts(...)                         -- FTS5 over user/assistant/tool text
 kv(key, value)                          -- daemon metadata, schema version
 ```
@@ -131,6 +132,41 @@ cross-session search for free. (zag uses JSONL+tail-recovery; we get the same
 crash property from WAL with better query power. If SQLite ever feels heavy,
 the block log abstraction makes swapping trivial — nothing outside `store/`
 knows it's SQLite.)
+
+### Growth & trimming
+
+Text blocks are cheap (~1GB/yr worst case); **blobs and images are the
+growers**, and FTS roughly doubles the text footprint. The append-only
+invariant protects *causal block structure*, not every 400KB build log
+forever — same insight as L1 pruning, applied to disk: blob bodies are
+regenerable/low-value with age; block structure is not.
+
+**Day-one schema commitments** (cost nothing now, painful to retrofit):
+
+- `PRAGMA auto_vacuum = INCREMENTAL` set at DB creation — cannot be enabled
+  retroactively without a full vacuum rewrite.
+- Blobs carry `created_at` + `tombstone`; refs live in `blob_refs` so
+  orphan detection is a join, not a scan of block bodies.
+
+**Trimming design (post-v1, lands when the DB first annoys someone):**
+
+- **Session lifecycle: archive → delete.** Archived = hidden from sidebar,
+  fully retained. `marlin rm <session>` deletes blocks + decrements blob
+  refs. Optional retention config (`delete_archived_after = "180d"`, off by
+  default). Explicit or policy-driven, never silent.
+- **Blob demotion.** Blobs past an age horizon whose only referents sit in
+  idle sessions get truncated to a tombstone ("full output expired <date>,
+  was 412KB, hash …"). Every block and ref stays resolvable — scrollback
+  never breaks, `!c` on ancient output says "expired" instead of lying.
+  Images get their own (shorter) horizon or thumbnail-only demotion.
+- **`marlin gc`**: orphan-blob sweep → expired-blob demotion →
+  `PRAGMA incremental_vacuum` → FTS optimize → WAL checkpoint; reports
+  bytes freed. Optionally auto-runs on daemon idle at low cadence.
+- DB size surfaces in `marlin ls` / dump-state — not the status bar (it is
+  never a mid-turn decision).
+- Test hooks: tombstones are first-class in the dump-state oracle (a
+  tombstone survives reboot as a tombstone); gc→reboot→dump joins the
+  reboot matrix.
 
 ## 3. Wire protocol (client ⇄ daemon)
 

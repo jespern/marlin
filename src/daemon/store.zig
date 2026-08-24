@@ -29,6 +29,7 @@ pub const Error = error{
 };
 
 const schema_sql =
+    \\PRAGMA auto_vacuum=INCREMENTAL;
     \\PRAGMA journal_mode=WAL;
     \\PRAGMA synchronous=NORMAL;
     \\PRAGMA foreign_keys=ON;
@@ -59,9 +60,16 @@ const schema_sql =
     \\CREATE INDEX IF NOT EXISTS blocks_by_session ON blocks(session_id, seq);
     \\CREATE TABLE IF NOT EXISTS blobs(
     \\  hash TEXT PRIMARY KEY,
-    \\  bytes BLOB NOT NULL
+    \\  bytes BLOB NOT NULL,
+    \\  created_at INTEGER NOT NULL DEFAULT 0,
+    \\  tombstone INTEGER NOT NULL DEFAULT 0
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','1');
+    \\CREATE TABLE IF NOT EXISTS blob_refs(
+    \\  hash TEXT NOT NULL,
+    \\  block_id INTEGER NOT NULL,
+    \\  PRIMARY KEY(hash, block_id)
+    \\) WITHOUT ROWID;
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','2');
 ;
 
 pub const SessionRow = struct {
@@ -88,7 +96,37 @@ pub const Store = struct {
         }
         const store = Store{ .db = db.?, .gpa = gpa };
         try store.execAll(schema_sql);
+        try store.migrate();
         return store;
+    }
+
+    /// Bring pre-existing DBs up to the current schema. New DBs are created
+    /// current by schema_sql (which stamps the version via INSERT OR IGNORE).
+    fn migrate(self: Store) Error!void {
+        const ver = try self.kvGetInt("schema_version");
+        if (ver >= 2) return;
+        // v1 → v2: blob GC columns + retroactive auto_vacuum.
+        // ALTERs must not re-run, so they are guarded by the version check.
+        // VACUUM rewrites the DB so the INCREMENTAL auto_vacuum PRAGMA
+        // (set by schema_sql above) actually takes effect on old files.
+        try self.execAll(
+            \\ALTER TABLE blobs ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+            \\ALTER TABLE blobs ADD COLUMN tombstone INTEGER NOT NULL DEFAULT 0;
+            \\UPDATE kv SET value='2' WHERE key='schema_version';
+            \\VACUUM;
+        );
+    }
+
+    fn kvGetInt(self: Store, key: []const u8) Error!i64 {
+        const stmt = try self.prepare("SELECT value FROM kv WHERE key=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, key);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return 0;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        const ptr = c.sqlite3_column_text(stmt, 0);
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        return std.fmt.parseInt(i64, ptr[0..len], 10) catch 0;
     }
 
     pub fn close(self: *Store) void {
@@ -313,19 +351,30 @@ pub const Store = struct {
     // ------------------------------------------------------------- blobs --
 
     /// Store bytes content-addressed; returns hex hash (allocated, caller frees).
-    pub fn putBlob(self: Store, bytes: []const u8) Error![]const u8 {
+    /// `now_ms` stamps created_at on first insert (dedup keeps the original).
+    pub fn putBlob(self: Store, bytes: []const u8, now_ms: i64) Error![]const u8 {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         const hex = std.fmt.allocPrint(self.gpa, "{x}", .{&digest}) catch
             return error.OutOfMemory;
         errdefer self.gpa.free(hex);
 
-        const stmt = try self.prepare("INSERT OR IGNORE INTO blobs(hash, bytes) VALUES(?,?)");
+        const stmt = try self.prepare("INSERT OR IGNORE INTO blobs(hash, bytes, created_at) VALUES(?,?,?)");
         defer finalize(stmt);
         bindText(stmt, 1, hex);
         _ = c.sqlite3_bind_blob(stmt, 2, bytes.ptr, @intCast(bytes.len), static_destructor);
+        bindInt(stmt, 3, now_ms);
         try stepDone(stmt);
         return hex;
+    }
+
+    /// Record that `block_id` references blob `hash` (for GC refcounting).
+    pub fn addBlobRef(self: Store, hash: []const u8, block_id: u64) Error!void {
+        const stmt = try self.prepare("INSERT OR IGNORE INTO blob_refs(hash, block_id) VALUES(?,?)");
+        defer finalize(stmt);
+        bindText(stmt, 1, hash);
+        bindInt(stmt, 2, @bitCast(block_id));
+        try stepDone(stmt);
     }
 
     pub fn getBlob(self: Store, hash: []const u8) Error![]const u8 {
@@ -459,9 +508,9 @@ test "blob round trip is content-addressed and idempotent" {
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    const h1 = try store.putBlob("big tool output");
+    const h1 = try store.putBlob("big tool output", 1700000000001);
     defer gpa.free(h1);
-    const h2 = try store.putBlob("big tool output");
+    const h2 = try store.putBlob("big tool output", 1700000000002);
     defer gpa.free(h2);
     try std.testing.expectEqualStrings(h1, h2);
 
@@ -470,4 +519,20 @@ test "blob round trip is content-addressed and idempotent" {
     try std.testing.expectEqualStrings("big tool output", bytes);
 
     try std.testing.expectError(error.NotFound, store.getBlob("nope"));
+
+    // Ref bookkeeping is idempotent too.
+    try store.addBlobRef(h1, 101);
+    try store.addBlobRef(h1, 101);
+    try store.addBlobRef(h1, 202);
+}
+
+test "schema is v2 with auto_vacuum incremental" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+
+    try std.testing.expectEqual(@as(i64, 2), try store.kvGetInt("schema_version"));
+    // migrate() must be a no-op on a current DB (idempotent open).
+    try store.migrate();
+    try std.testing.expectEqual(@as(i64, 2), try store.kvGetInt("schema_version"));
 }
