@@ -405,6 +405,41 @@ sidecar executables breaks scp-and-run; the internal engine is the bundle.
 - bash sandboxing (v1.5, stolen from zag): seatbelt profile on macOS, Landlock
   + seccomp on Linux; deny-by-default on `~/.ssh`, key files, browser profiles.
 
+**Secrets** (threat: prompt injection or buggy tool logic exfiltrates
+credentials; hazard multiplier: the append-only store makes any leaked
+secret IMMORTAL):
+
+- **The daemon is the credential boundary.** Provider keys live in daemon
+  memory only. Tool subprocesses get a scrubbed environment: every env var
+  the daemon consumed as a secret is stripped at the single spawn site,
+  plus a configurable deny pattern list (`*_API_KEY`, `*_TOKEN`,
+  `*_SECRET`, `AWS_*`). `bash: env` must never print a provider key into
+  a tool_result.
+- **Redact at capture time (L0), before appendBlock.** Blocks are
+  immutable, so redaction after persistence is impossible by design. Two
+  layers: (a) known-value scrub — the daemon greps tool output for the
+  literal bytes of every secret it loaded and replaces with
+  `[REDACTED:<name>]`; exact match, zero false positives; (b) pattern
+  scrub for secret-shaped strings (sk-*, AKIA*, PEM blocks, JWTs),
+  configurable since build logs hit false positives. Redaction runs
+  before persistence AND context assembly: the model never sees the
+  bytes, so injection cannot make it repeat them. (Same principle as
+  1Password-for-Claude's zero-exposure framework: the agent may USE a
+  credential, it never HOLDS it in context.)
+- **Config holds no plaintext.** `api_key_env` (existing) or
+  `api_key_cmd = "op read op://..."` — run at daemon start and /reboot,
+  cached in memory. op/pass/security(1) become the vault; marlin never
+  writes a key to disk.
+- **Protected paths enforced, not requested.** read_file/grep on
+  `.env*`, `*_rsa`, `*.pem`, `~/.aws/credentials` etc. returns
+  refusal-as-data ("blocked by secrets policy; /allow to override") —
+  policy in the tool layer, not a plea in the system prompt.
+- **(v2 door) Credential brokering:** daemon as forward proxy injecting
+  auth headers for allowlisted hosts, so agent-written code calling
+  external APIs never holds tokens (Agent Vault pattern). Needs TLS
+  interception + CA management; wrong cost/benefit for v1, right shape
+  for the daemon if it ever matters.
+
 **Extension tools — process boundaries only:**
 
 - **MCP client** (v1): stdio transport first, HTTP later. Config lists servers;
