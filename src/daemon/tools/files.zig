@@ -155,6 +155,17 @@ pub fn editFile(gpa: std.mem.Allocator, io: Io, args: EditArgs, cwd: []const u8)
     dir.writeFile(io, .{ .sub_path = abs, .data = rr.text }) catch |e| {
         return std.fmt.allocPrint(gpa, "error: cannot write '{s}': {t}", .{ args.path, e });
     };
+
+    // Single-site edits get a mini unified diff (with enclosing-declaration
+    // context, git-style) appended: confirmation for the model, and the TUI
+    // renders it as a colored diff. Multi-site (replace_all) keeps the
+    // one-line summary — N scattered hunks are noise in both places.
+    if (rr.count == 1) {
+        if (unifiedDiff(gpa, contents, rr.at, rr.old_len, args.new_string)) |diff| {
+            defer gpa.free(diff);
+            return std.fmt.allocPrint(gpa, "replaced 1 occurrence(s) in {s}\n{s}", .{ args.path, diff });
+        } else |_| {}
+    }
     return std.fmt.allocPrint(gpa, "replaced {d} occurrence(s) in {s}", .{ rr.count, args.path });
 }
 
@@ -164,7 +175,14 @@ fn ambiguousMsg(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     , .{path});
 }
 
-const ReplaceResult = struct { text: []u8, count: usize };
+const ReplaceResult = struct {
+    text: []u8,
+    count: usize,
+    /// Byte offset of the (first) match in the ORIGINAL text + its length —
+    /// what the diff renderer needs to window the change.
+    at: usize = 0,
+    old_len: usize = 0,
+};
 
 fn replaceExact(
     gpa: std.mem.Allocator,
@@ -181,7 +199,9 @@ fn replaceExact(
     errdefer out.deinit(gpa);
     var rest = haystack;
     var count: usize = 0;
+    var first_at: usize = 0;
     while (std.mem.indexOf(u8, rest, old)) |at| {
+        if (count == 0) first_at = (haystack.len - rest.len) + at;
         try out.appendSlice(gpa, rest[0..at]);
         try out.appendSlice(gpa, new);
         rest = rest[at + old.len ..];
@@ -189,7 +209,7 @@ fn replaceExact(
         if (!replace_all) break;
     }
     try out.appendSlice(gpa, rest);
-    return .{ .text = try out.toOwnedSlice(gpa), .count = count };
+    return .{ .text = try out.toOwnedSlice(gpa), .count = count, .at = first_at, .old_len = old.len };
 }
 
 /// Whitespace-tolerant single replace: finds a run of lines in `haystack`
@@ -242,7 +262,124 @@ fn fuzzyReplace(
     try out.appendSlice(gpa, haystack[0..first.start]);
     try out.appendSlice(gpa, new);
     try out.appendSlice(gpa, haystack[last.end..]);
-    return .{ .text = try out.toOwnedSlice(gpa), .count = 1 };
+    return .{ .text = try out.toOwnedSlice(gpa), .count = 1, .at = first.start, .old_len = last.end - first.start };
+}
+
+// -------------------------------------------------------------- diffing --
+
+/// Render a git-style mini unified diff for a single replacement at byte
+/// offset `at` (length `old_len`) in `original`, replaced by `new_text`.
+/// 3 lines of context each side; hunk header carries the enclosing
+/// declaration (git's -p behavior): the nearest preceding line that starts
+/// at column 0 with an identifier-ish character.
+///
+///   @@ -12,7 +12,7 @@ pub fn editFile(...)
+///    context
+///   -old line
+///   +new line
+///    context
+fn unifiedDiff(
+    gpa: std.mem.Allocator,
+    original: []const u8,
+    at: usize,
+    old_len: usize,
+    new_text: []const u8,
+) ![]u8 {
+    const ctx_lines = 3;
+
+    // Expand [at, at+old_len) to whole-line boundaries.
+    const repl_start = if (std.mem.lastIndexOfScalar(u8, original[0..at], '\n')) |p| p + 1 else 0;
+    const repl_end_raw = at + old_len;
+    const repl_end = if (std.mem.indexOfScalarPos(u8, original, @min(repl_end_raw, original.len), '\n')) |p| p + 1 else original.len;
+
+    // Walk lines to find: hunk start (ctx_lines before), line numbers, and
+    // the enclosing declaration for the header.
+    var line_no: usize = 1; // 1-based line number of `pos`
+    var pos: usize = 0;
+    var ctx_ring: [ctx_lines]usize = @splat(0);
+    var ring_len: usize = 0;
+    var func_ctx: []const u8 = "";
+    while (pos < repl_start) {
+        const eol = std.mem.indexOfScalarPos(u8, original, pos, '\n') orelse original.len;
+        const line = original[pos..eol];
+        // git's default "function name" heuristic: line starts at col 0
+        // with a letter/underscore (covers fn/pub fn/def/class/impl...).
+        if (line.len > 0 and (std.ascii.isAlphabetic(line[0]) or line[0] == '_')) {
+            func_ctx = line;
+        }
+        // Ring of the last ctx_lines line-start offsets.
+        ctx_ring[ring_len % ctx_lines] = pos;
+        ring_len += 1;
+        pos = eol + 1;
+        line_no += 1;
+    }
+    const repl_start_line = line_no; // line number where the change begins
+    const n_ctx_before = @min(ring_len, ctx_lines);
+    const hunk_start_off = if (n_ctx_before == 0) repl_start else ctx_ring[(ring_len - n_ctx_before) % ctx_lines];
+    const hunk_start_line = repl_start_line - n_ctx_before;
+
+    // Collect the changed region's old lines.
+    var old_count: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, original[repl_start..repl_end], "\n"), '\n');
+        while (it.next()) |_| old_count += 1;
+    }
+    // New region: prefix-of-line + new_text + suffix-of-line.
+    const suffix_end = if (repl_end > 0 and original[repl_end - 1] == '\n') repl_end - 1 else repl_end;
+    const new_region = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{
+        original[repl_start..at],
+        new_text,
+        original[@min(repl_end_raw, suffix_end)..suffix_end],
+    });
+    defer gpa.free(new_region);
+    var new_count: usize = 0;
+    if (new_region.len > 0) {
+        var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, new_region, "\n"), '\n');
+        while (it.next()) |_| new_count += 1;
+    }
+
+    // Context after.
+    var after_end = repl_end;
+    var n_ctx_after: usize = 0;
+    while (n_ctx_after < ctx_lines and after_end < original.len) {
+        const eol = std.mem.indexOfScalarPos(u8, original, after_end, '\n') orelse original.len;
+        after_end = @min(eol + 1, original.len);
+        n_ctx_after += 1;
+    }
+
+    // Cap pathological hunks (giant old_string): bail rather than spam.
+    if (old_count + new_count > 80) return error.DiffTooBig;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    const old_total = n_ctx_before + old_count + n_ctx_after;
+    const new_total = n_ctx_before + new_count + n_ctx_after;
+    try out.print(gpa, "@@ -{d},{d} +{d},{d} @@", .{ hunk_start_line, old_total, hunk_start_line, new_total });
+    if (func_ctx.len > 0) {
+        try out.print(gpa, " {s}", .{func_ctx[0..@min(func_ctx.len, 60)]});
+    }
+    try out.append(gpa, '\n');
+
+    // Leading context.
+    try emitLines(gpa, &out, original[hunk_start_off..repl_start], ' ');
+    // Old / new.
+    try emitLines(gpa, &out, original[repl_start..repl_end], '-');
+    if (new_region.len > 0) try emitLines(gpa, &out, new_region, '+');
+    // Trailing context.
+    try emitLines(gpa, &out, original[repl_end..after_end], ' ');
+
+    return out.toOwnedSlice(gpa);
+}
+
+fn emitLines(gpa: std.mem.Allocator, out: *std.ArrayList(u8), region: []const u8, marker: u8) !void {
+    if (region.len == 0) return;
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, region, "\n"), '\n');
+    while (it.next()) |line| {
+        try out.append(gpa, marker);
+        try out.appendSlice(gpa, line);
+        try out.append(gpa, '\n');
+    }
 }
 
 /// Resolve a possibly-relative path against the session cwd. Caller frees.
@@ -299,6 +436,49 @@ test "write + edit + read round trip on disk" {
     const r = try readFile(gpa, io, .{ .path = "sub/f.txt" }, dir_path);
     defer gpa.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "hello marlin") != null);
+}
+
+test "unifiedDiff: hunk header carries enclosing declaration" {
+    const gpa = std.testing.allocator;
+    const src =
+        "const std = @import(\"std\");\n" ++
+        "\n" ++
+        "pub fn greet(name: []const u8) void {\n" ++
+        "    const msg = \"hello\";\n" ++
+        "    print(msg, name);\n" ++
+        "}\n";
+    const at = std.mem.indexOf(u8, src, "\"hello\"").?;
+    const diff = try unifiedDiff(gpa, src, at, "\"hello\"".len, "\"howdy\"");
+    defer gpa.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "@@ ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "pub fn greet(name: []const u8) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "-    const msg = \"hello\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+    const msg = \"howdy\";") != null);
+    // context lines present with leading space
+    try std.testing.expect(std.mem.indexOf(u8, diff, " }\n") != null or std.mem.endsWith(u8, diff, " }\n"));
+}
+
+test "editFile result embeds a colored-diff-ready hunk" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/marlin-difftest-{x}", .{std.mem.readInt(u64, &rand, .little)});
+    defer gpa.free(dir_path);
+    defer Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+
+    const w = try writeFile(gpa, io, .{ .path = "m.zig", .content = "fn main() void {\n    var x = 1;\n}\n" }, dir_path);
+    gpa.free(w);
+    const e = try editFile(gpa, io, .{ .path = "m.zig", .old_string = "var x = 1;", .new_string = "var x = 2;" }, dir_path);
+    defer gpa.free(e);
+    try std.testing.expect(std.mem.indexOf(u8, e, "replaced 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "@@ ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "fn main() void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "-    var x = 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "+    var x = 2;") != null);
 }
 
 test {

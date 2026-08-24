@@ -325,9 +325,21 @@ const Palette = struct {
     const user: vaxis.Style = .{ .fg = .{ .index = 6 }, .bold = true }; // cyan
     const assistant: vaxis.Style = .{};
     const reasoning: vaxis.Style = .{ .fg = .{ .index = 8 }, .italic = true };
-    const tool: vaxis.Style = .{ .fg = .{ .index = 4 } }; // blue
-    const tool_out: vaxis.Style = .{ .fg = .{ .index = 8 } }; // dim
+    /// Tool machinery (the ⚙ glyph, arg previews, result bodies): dimmed
+    /// gray so it reads as background activity, never as user input or as
+    /// assistant prose meant for the human.
+    const tool: vaxis.Style = .{ .fg = .{ .index = 8 } };
+    /// The command itself inside a bash call: brighter than the machinery
+    /// so the eye can pick out WHAT ran while skimming (codex/claude do
+    /// this; it's the one part of a tool line worth reading).
+    const tool_cmd: vaxis.Style = .{ .fg = .{ .index = 4 }, .bold = true }; // blue
+    const tool_out: vaxis.Style = .{ .fg = .{ .index = 8 }, .dim = true };
     const tool_err: vaxis.Style = .{ .fg = .{ .index = 1 } }; // red
+    // Diff lines inside tool output: fg-colored, diff-tool style (never
+    // full-line backgrounds).
+    const diff_add: vaxis.Style = .{ .fg = .{ .index = 2 } }; // green
+    const diff_del: vaxis.Style = .{ .fg = .{ .index = 1 } }; // red
+    const diff_hunk: vaxis.Style = .{ .fg = .{ .index = 6 } }; // cyan @@ + decl ctx
     const note: vaxis.Style = .{ .fg = .{ .index = 3 } }; // yellow
     const steer: vaxis.Style = .{ .fg = .{ .index = 5 } }; // magenta
     const status_bar: vaxis.Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 7 } };
@@ -335,11 +347,17 @@ const Palette = struct {
     const delta_style: vaxis.Style = .{};
 };
 
-/// One logical line ready to draw: text slice + style. Slices point into
-/// the App's block storage (valid for the frame).
+/// One logical display line: 1..3 styled segments (segments never wrap
+/// independently; the line is the wrap unit). Slices point into the App's
+/// block storage or the frame arena (valid for the frame).
 const Line = struct {
     text: []const u8,
     style: vaxis.Style,
+    /// Optional second/third segment printed after `text` on the same row.
+    text2: []const u8 = "",
+    style2: vaxis.Style = .{},
+    text3: []const u8 = "",
+    style3: vaxis.Style = .{},
 };
 
 /// Flatten blocks + delta into wrapped display lines for a given width.
@@ -360,33 +378,55 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
             },
             .reasoning => try wrapPrefixed(arena, &lines, "· ", rb.text, Palette.reasoning, w),
             .tool_call => {
-                const preview_len = @min(rb.text.len, @min(w -| (rb.label.len + 4), 120));
-                const header = try std.fmt.allocPrint(arena, "⚙ {s} {s}", .{ rb.label, rb.text[0..preview_len] });
-                try wrapInto(arena, &lines, header, .{ .text = header, .style = Palette.tool });
+                // "⚙ bash " dim + the command bright + trailing args dim.
+                // For file tools the highlighted part is the path.
+                const hi = extractHighlightArg(rb.label, rb.text);
+                const head = try std.fmt.allocPrint(arena, "⚙ {s} ", .{rb.label});
+                if (hi) |h| {
+                    const hi_capped = h[0..@min(h.len, w -| (head.len + 2))];
+                    try lines.append(arena, .{
+                        .text = head,
+                        .style = Palette.tool,
+                        .text2 = hi_capped,
+                        .style2 = Palette.tool_cmd,
+                    });
+                } else {
+                    const preview_len = @min(rb.text.len, @min(w -| (rb.label.len + 4), 120));
+                    try lines.append(arena, .{
+                        .text = head,
+                        .style = Palette.tool,
+                        .text2 = rb.text[0..preview_len],
+                        .style2 = Palette.tool,
+                    });
+                }
             },
             .tool_result => {
-                const style = if (rb.status == .ok) Palette.tool_out else Palette.tool_err;
+                const base_style = if (rb.status == .ok) Palette.tool_out else Palette.tool_err;
                 const glyph: []const u8 = switch (rb.status) {
                     .ok => "  ",
                     .err => "  ✗ ",
                     .denied => "  ⊘ ",
                     .interrupted => "  ⏹ ",
                 };
-                // Collapsed: show at most 8 lines of output.
+                // Collapsed: show at most 8 lines — but a diff hunk shows
+                // whole (up to 24) because a truncated diff misleads.
+                const is_diff = std.mem.indexOf(u8, rb.text, "\n@@ ") != null or std.mem.startsWith(u8, rb.text, "@@ ");
+                const max_shown: usize = if (is_diff) 24 else 8;
                 var shown: usize = 0;
                 var total: usize = 0;
                 var it = std.mem.splitScalar(u8, rb.text, '\n');
                 while (it.next()) |l| {
                     total += 1;
-                    if (shown < 8) {
+                    if (shown < max_shown) {
+                        const style = if (rb.status == .ok and is_diff) diffLineStyle(l) orelse base_style else base_style;
                         const prefixed = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, l });
-                        try wrapInto(arena, &lines, prefixed, .{ .text = prefixed, .style = style });
+                        try lines.append(arena, .{ .text = prefixed, .style = style });
                         shown += 1;
                     }
                 }
                 if (total > shown) {
                     const more = try std.fmt.allocPrint(arena, "  … {d} more lines", .{total - shown});
-                    try wrapInto(arena, &lines, more, .{ .text = more, .style = Palette.tool_out });
+                    try lines.append(arena, .{ .text = more, .style = Palette.tool_out });
                 }
             },
             .approval => {
@@ -422,6 +462,60 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
 
 fn blankLine(arena: std.mem.Allocator, lines: *std.ArrayList(Line)) !void {
     try lines.append(arena, .{ .text = "", .style = .{} });
+}
+
+/// The one argument worth reading in a tool call: bash's command, file
+/// tools' path, grep/glob's pattern, fetch's url. Returns a slice into
+/// args_json (JSON-escaped — good enough for a one-line preview; commands
+/// with heavy escaping still show faithfully enough to recognize).
+fn extractHighlightArg(tool_name: []const u8, args_json: []const u8) ?[]const u8 {
+    const key: []const u8 = if (std.mem.eql(u8, tool_name, "bash"))
+        "command"
+    else if (std.mem.eql(u8, tool_name, "grep") or std.mem.eql(u8, tool_name, "glob"))
+        "pattern"
+    else if (std.mem.eql(u8, tool_name, "fetch"))
+        "url"
+    else if (std.mem.eql(u8, tool_name, "read_file") or
+        std.mem.eql(u8, tool_name, "write_file") or
+        std.mem.eql(u8, tool_name, "edit"))
+        "path"
+    else
+        return null;
+    return extractJsonStringRaw(args_json, key);
+}
+
+/// Find "key":"..." and return the raw (still-escaped) string contents.
+fn extractJsonStringRaw(json: []const u8, key: []const u8) ?[]const u8 {
+    var needle_buf: [32]u8 = undefined;
+    if (key.len + 3 > needle_buf.len) return null;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{key}) catch return null;
+    var at = std.mem.indexOf(u8, json, needle) orelse return null;
+    at += needle.len;
+    while (at < json.len and (json[at] == ' ' or json[at] == '\t')) at += 1;
+    if (at >= json.len or json[at] != '"') return null;
+    at += 1;
+    var end = at;
+    while (end < json.len) : (end += 1) {
+        if (json[end] == '\\') {
+            end += 1;
+            continue;
+        }
+        if (json[end] == '"') break;
+    }
+    if (end > json.len) return null;
+    return json[at..end];
+}
+
+/// Style for a diff line inside tool output, or null when it isn't one.
+/// Conservative: only unambiguous markers, so shell output that happens to
+/// start with '-' (flag lists etc.) rarely false-positives — we require the
+/// result to contain a hunk header before any of this fires (see caller's
+/// is_diff gate for the elision rule; styling itself keys per line).
+fn diffLineStyle(l: []const u8) ?vaxis.Style {
+    if (std.mem.startsWith(u8, l, "@@ ")) return Palette.diff_hunk;
+    if (std.mem.startsWith(u8, l, "+") and !std.mem.startsWith(u8, l, "+++")) return Palette.diff_add;
+    if (std.mem.startsWith(u8, l, "-") and !std.mem.startsWith(u8, l, "---")) return Palette.diff_del;
+    return null;
 }
 
 fn wrapInto(arena: std.mem.Allocator, lines: *std.ArrayList(Line), _: []const u8, line: Line) !void {
@@ -484,7 +578,19 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const visible = lines.items[first_visible..@min(first_visible + view_h, total)];
 
     for (visible, 0..) |ln, row| {
-        _ = win.printSegment(.{ .text = ln.text, .style = ln.style }, .{
+        var segs_buf: [3]vaxis.Segment = undefined;
+        var n: usize = 0;
+        segs_buf[n] = .{ .text = ln.text, .style = ln.style };
+        n += 1;
+        if (ln.text2.len > 0) {
+            segs_buf[n] = .{ .text = ln.text2, .style = ln.style2 };
+            n += 1;
+        }
+        if (ln.text3.len > 0) {
+            segs_buf[n] = .{ .text = ln.text3, .style = ln.style3 };
+            n += 1;
+        }
+        _ = win.print(segs_buf[0..n], .{
             .row_offset = @intCast(row),
             .wrap = .none,
         });
