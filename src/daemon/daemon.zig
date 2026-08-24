@@ -130,6 +130,7 @@ const Session = struct {
     kind: proto.SessionKind = .root,
     parent_block_id: ?u64 = null,
     max_rounds: u32 = 32,
+    archived: bool = false,
     model: []u8, // gpa-owned
     effort: proto.ReasoningEffort = .auto,
     cwd: []u8, // gpa-owned
@@ -573,6 +574,7 @@ pub const Daemon = struct {
                     .daemon_version = daemon_version,
                     .sandbox_available = self.sandbox_backend == .seatbelt,
                     .network_filtering = self.network.isActive(),
+                    .network_configured = config.networkPolicyConfigured(self.cfg),
                     .network_feed_count = self.network.feedCount(),
                     .network_rule_count = self.network.ruleCount(),
                 } });
@@ -594,20 +596,38 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .session_created = .{ .sid = sid } });
                 self.broadcastSessionList();
             },
-            .session_list => try self.sendSessionList(client),
+            .session_list => |sl| try self.sendSessionList(client, sl.include_archived),
             .session_watch => {
                 client.watches_sessions = true;
-                try self.sendSessionList(client);
+                try self.sendSessionList(client, false);
             },
             .session_kill => |sk| {
                 self.cancelSessionTree(sk.sid);
                 self.sendTo(client, .{ .ok = .{} });
+            },
+            .session_archive => |sa| {
+                _ = (try self.getOrLoadSession(sa.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (sa.archived and self.sessionTreeBusy(sa.sid)) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot archive a running session tree" } });
+                    return;
+                }
+                self.store.setSessionTreeArchived(sa.sid, if (sa.archived) nowMs(self.io) else null) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "store", .msg = "could not update session archive state" } });
+                    return;
+                };
+                self.markLoadedSessionTreeArchived(sa.sid, sa.archived);
+                self.sendTo(client, .{ .ok = .{} });
+                self.broadcastSessionList();
             },
             .session_set_model => |sm| {
                 const session = (try self.getOrLoadSession(sm.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                if (self.rejectArchivedSession(client, session)) return;
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot switch model mid-turn" } });
                     return;
@@ -624,6 +644,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                if (self.rejectArchivedSession(client, session)) return;
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot switch effort mid-turn" } });
                     return;
@@ -638,6 +659,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                if (self.rejectArchivedSession(client, session)) return;
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot toggle sandbox mid-turn" } });
                     return;
@@ -658,6 +680,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                if (self.rejectArchivedSession(client, session)) return;
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot toggle network filtering mid-turn" } });
                     return;
@@ -665,7 +688,10 @@ pub const Daemon = struct {
                 if (sn.enabled and !self.network.isActive()) {
                     self.sendTo(client, .{ .err = .{
                         .code = "network_filter_unavailable",
-                        .msg = "no network blocklist or explicit deny rules loaded; update config and reboot",
+                        .msg = if (config.networkPolicyConfigured(self.cfg))
+                            "network policy is configured but no blocking rules loaded; reboot after connectivity returns"
+                        else
+                            "no network blocklist or explicit deny rules configured; update config and reboot",
                     } });
                     return;
                 }
@@ -714,6 +740,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                if (self.rejectArchivedSession(client, session)) return;
                 if (session.state == .running) {
                     // Steer: queue for the running turn.
                     const owned = try self.gpa.dupe(u8, inp.text);
@@ -748,6 +775,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                if (self.rejectArchivedSession(client, session)) return;
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot compact mid-turn" } });
                     return;
@@ -853,6 +881,7 @@ pub const Daemon = struct {
             .kind = row.kind,
             .parent_block_id = row.parent_block_id,
             .max_rounds = if (row.max_rounds > 0) row.max_rounds else 32,
+            .archived = row.archived,
             .model = model,
             .effort = row.effort,
             .cwd = cwd,
@@ -861,6 +890,15 @@ pub const Daemon = struct {
         };
         try self.sessions.put(self.gpa, sid, session);
         return session;
+    }
+
+    fn rejectArchivedSession(self: *Daemon, client: *Client, session: *const Session) bool {
+        if (!session.archived) return false;
+        self.sendTo(client, .{ .err = .{
+            .code = "archived",
+            .msg = "unarchive the session before modifying it",
+        } });
+        return true;
     }
 
     fn cancelSessionTree(self: *Daemon, sid: u64) void {
@@ -875,11 +913,40 @@ pub const Daemon = struct {
         }
     }
 
+    fn loadedSessionBelongsToTree(self: *Daemon, session: *const Session, root_sid: u64) bool {
+        var cursor: ?u64 = session.id;
+        while (cursor) |candidate_sid| {
+            if (candidate_sid == root_sid) return true;
+            const candidate = self.sessions.get(candidate_sid) orelse return false;
+            cursor = candidate.parent_sid;
+        }
+        return false;
+    }
+
+    fn sessionTreeBusy(self: *Daemon, sid: u64) bool {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            const session = sp.*;
+            if (!self.loadedSessionBelongsToTree(session, sid)) continue;
+            if (session.state == .running or session.state == .awaiting_approval) return true;
+        }
+        return false;
+    }
+
+    fn markLoadedSessionTreeArchived(self: *Daemon, sid: u64, archived: bool) void {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            const session = sp.*;
+            if (self.loadedSessionBelongsToTree(session, sid)) session.archived = archived;
+        }
+    }
+
     /// Dispatcher-only child creation. The caller is a parent turn thread,
     /// but it reaches this function solely through Event.child_start.
     fn startChild(self: *Daemon, cs: ChildStart) !void {
         const parent = self.sessions.get(cs.parent_sid) orelse return error.ParentSessionMissing;
         if (parent.kind != .root) return error.NestedTaskDenied;
+        if (parent.archived) return error.ParentSessionArchived;
         if (parent.cancel.load(.acquire)) return error.Cancelled;
 
         const sid = ids.next(self.io);
@@ -970,6 +1037,33 @@ pub const Daemon = struct {
         self.broadcastStatus(session.id, .running);
     }
 
+    /// A turn that dies before the loop runs would leave no blocks at all —
+    /// the session looks inexplicably blank when inspected (worst for task
+    /// children, whose transcript is the only evidence of what happened).
+    /// Persist the submitted prompt and a failure note so the log tells the
+    /// story; runs on the turn thread like the loop's own block appends.
+    fn persistFailedTurn(self: *Daemon, job: *TurnJob, note: []const u8) void {
+        const turn_id = ids.next(self.io);
+        var seq = self.store.lastSeq(job.sid) catch return;
+        const bodies = [_]block.Body{
+            .{ .user_msg = .{ .text = job.text } },
+            .{ .system_note = .{ .text = note } },
+        };
+        for (bodies) |body| {
+            seq += 1;
+            const b = block.Block{
+                .id = ids.next(self.io),
+                .session_id = job.sid,
+                .turn_id = turn_id,
+                .seq = seq,
+                .ts = nowMs(self.io),
+                .body = body,
+            };
+            self.store.appendBlock(b) catch return;
+            TurnHooks.onBlock(job, b);
+        }
+    }
+
     fn turnMain(job: *TurnJob) void {
         const self = job.daemon;
         defer {
@@ -985,7 +1079,8 @@ pub const Daemon = struct {
         var interrupted = false;
 
         const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
-            err_text = std.fmt.allocPrint(self.gpa, "provider resolve failed: {t}", .{e}) catch null;
+            err_text = std.fmt.allocPrint(self.gpa, "provider resolve failed for model '{s}': {t}", .{ job.model, e }) catch null;
+            self.persistFailedTurn(job, err_text orelse "provider resolve failed");
             self.finishTurn(job.sid, false, err_text, null, 0, 0);
             return;
         };
@@ -1151,6 +1246,24 @@ pub const Daemon = struct {
             if (args.max_rounds == 0 or args.max_rounds > 32)
                 return taskError(self.gpa, "task max_rounds must be between 1 and 32");
 
+            // Validate a requested model BEFORE creating the child: an
+            // unresolvable model would otherwise die pre-loop and leave a
+            // blank err-state session behind (observed with a bare model
+            // name like "gpt-5.3-codex" — registry ids are provider-prefixed).
+            if (args.model) |m| {
+                if (registry.resolve(self.gpa, self.environ, m)) |probe| {
+                    probe.deinit(self.gpa);
+                } else |e| {
+                    const msg = std.fmt.allocPrint(
+                        self.gpa,
+                        "task model '{s}' is not resolvable ({t}); use a registry-form id like 'openrouter/anthropic/claude-sonnet-4.5' or omit model to inherit this session's",
+                        .{ m, e },
+                    ) catch return taskError(self.gpa, "out of memory");
+                    defer self.gpa.free(msg);
+                    return taskError(self.gpa, msg);
+                }
+            }
+
             const prompt = self.gpa.dupe(u8, args.prompt) catch return taskError(self.gpa, "out of memory");
             var model: ?[]u8 = null;
             if (args.model) |m| {
@@ -1262,8 +1375,8 @@ pub const Daemon = struct {
         self.broadcastSessionList();
     }
 
-    fn sendSessionList(self: *Daemon, client: *Client) !void {
-        const rows = try self.store.listSessions();
+    fn sendSessionList(self: *Daemon, client: *Client, include_archived: bool) !void {
+        const rows = try self.store.listSessions(include_archived);
         defer {
             for (rows) |row| row.deinit(self.gpa);
             self.gpa.free(rows);
@@ -1294,6 +1407,7 @@ pub const Daemon = struct {
                     (if (live) |session| session.sandbox_enabled else self.cfg.permissions_enabled),
                 .network_filtering = self.network.isActive() and
                     (if (live) |session| session.network_filtering_enabled else true),
+                .archived = row.archived,
             };
         }
         self.sendTo(client, .{ .session_list_result = .{ .sessions = infos } });
@@ -1304,7 +1418,7 @@ pub const Daemon = struct {
         while (it.next()) |cp| {
             const client = cp.*;
             if (!client.said_hello or !client.watches_sessions) continue;
-            self.sendSessionList(client) catch {};
+            self.sendSessionList(client, false) catch {};
         }
     }
 

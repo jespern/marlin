@@ -22,14 +22,20 @@ instance implicitly: a second daemon fails to bind the socket... after
 deleting it. KNOWN GAP (M1): concurrent autostart can race; flock-based
 single-instancing is listed for hardening.
 
+`hello_ok.network_configured` reports whether a blocklist or explicit deny was
+requested, while `network_filtering` reports whether blocking rules actually
+loaded. This lets clients distinguish an intentional opt-out from a configured
+policy that failed open. Both default false when decoding an older daemon.
+
 ## Client → daemon
 
 | message | payload | reply |
 |---|---|---|
 | hello | proto_version, client_kind | hello_ok or err |
 | session_create | cwd, model, effort?, title?, approvals? | session_created{sid} |
-| session_list | — | session_list_result{sessions} |
+| session_list | include_archived? | session_list_result{sessions}; archived omitted by default |
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
+| session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
 | session_set_model | sid, model | ok, or err{busy} mid-turn |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable |
@@ -53,6 +59,12 @@ default. Explicit values are `"none"`, `"minimal"`, `"low"`, `"medium"`,
 `sub.from_seq`: 0 = live-only. N ≥ 1 = replay stored blocks with seq ≥ N
 first, then live. Clients that reconnect pass last_seen_seq + 1.
 
+`session_archive.archived` defaults to true. Archiving is durable and
+non-destructive: blocks and blobs remain available, but archived sessions are
+read-only and omitted from ordinary list/watch snapshots. Send `archived:false`
+to restore the hierarchy. Parent archive/restore operations include all
+descendants.
+
 ## Daemon → client
 
 | message | when |
@@ -73,7 +85,8 @@ Each entry in `session_list_result.sessions` includes `sid`, `title`, `cwd`,
 currently `running`, and the effective `sandboxed` and `network_filtering`
 states. M6 hierarchy fields are `parent_sid` (null for roots), `kind` (`root`,
 `task_child`, or reserved `review_child`), `parent_block_id`, and `max_rounds`.
-Older clients may ignore them; older entries decode as roots.
+`archived` is true only in inclusive list results. Older clients may ignore
+these fields; older entries decode as active roots.
 
 ## Approval flow (M2)
 

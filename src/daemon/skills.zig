@@ -169,11 +169,9 @@ test "skills scan recursively, sort stably, and load on demand" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var random: [8]u8 = undefined;
-    io.random(&random);
-    const root = try std.fmt.allocPrint(gpa, "/tmp/marlin-skills-{x}", .{std.mem.readInt(u64, &random, .little)});
-    defer gpa.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-skills");
+    defer temp.deinit();
+    const root = temp.path;
     const nested = try std.fs.path.join(gpa, &.{ root, "review" });
     defer gpa.free(nested);
     try Io.Dir.cwd().createDirPath(io, nested);

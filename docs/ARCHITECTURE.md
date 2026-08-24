@@ -15,7 +15,8 @@ with the latter, it's simpler to ship):
   attach simultaneously, to the same or different sessions.
 - `marlin run "task"` — headless one-shot: create session, run to completion,
   print result, exit nonzero on failure. Doubles as the eval harness.
-- `marlin ls / attach <id> / kill <id>` — thin protocol clients for scripting.
+- `marlin ls / attach <id> / archive <id> / unarchive <id> / kill <id>` —
+  thin protocol clients for scripting.
 
 ### Remote access: two modes, one blessed
 
@@ -200,11 +201,14 @@ regenerable/low-value with age; block structure is not.
 
 **Trimming design (post-v1, lands when the DB first annoys someone):**
 
-- **Session lifecycle: archive → delete.** Archived = hidden from the default
-  `/sessions` picker results,
-  fully retained. `marlin rm <session>` deletes blocks + decrements blob
-  refs. Optional retention config (`delete_archived_after = "180d"`, off by
-  default). Explicit or policy-driven, never silent.
+- **Session lifecycle: archive → delete.** Archive is implemented: `/archive`
+  and `marlin archive <session>` hide a durable session hierarchy from default
+  navigation while retaining its complete log; `marlin ls --all` and
+  `marlin unarchive <session>` provide recovery. Permanent
+  `marlin rm <session>` remains future work; it will delete blocks + decrement
+  blob refs.
+  Optional retention config (`delete_archived_after = "180d"`, off by default)
+  remains future work. Explicit or policy-driven, never silent.
 - **Blob demotion.** Blobs past an age horizon whose only referents sit in
   idle sessions get truncated to a tombstone ("full output expired <date>,
   was 412KB, hash …"). Every block and ref stays resolvable — scrollback
@@ -606,10 +610,11 @@ identifies its session with a compact pane label.
 - **Copy commands**: `!c` last tool result (full blob, not inline cap),
   `!c msg` / `!c code` / `!c cmd` / `!c all`; `!y` / `!p [sid]` for the
   daemon-side register (cross-session paste, no OS clipboard).
-- **Command namespace**: `/` = session & harness commands (`/model`, `/compact`,
-  `/new`, `/allow`); `!` = terse aliases for frequent actions (`!rb` expands
-  to `/reboot --build`, `!c` copies the last output). Plain text = message to
-  agent. `Esc` during a turn = queue steer text; `Ctrl+C` = interrupt.
+- **Command namespace**: `/` = session & harness commands (`/sessions`,
+  `/model`, `/compact`, `/new`, `/archive`, `/allow`); `!` = terse aliases for
+  frequent actions (`!rb` expands to `/reboot --build`, `!c` copies the last
+  output). Plain text = message to agent. `Esc` during a turn = queue steer
+  text; `Ctrl+C` = interrupt.
 - Tool blocks render collapsed by default (name + one-line summary + status),
   expand on demand. Approvals render as inline prompt cards.
 
@@ -646,7 +651,9 @@ Bracketed paste is text-only, so complex assets are grabbed out-of-band
 
 ## 9. Config
 
-`~/.config/marlin/config.toml` (focused TOML decoder; no YAML dependency):
+`~/.config/marlin/config.toml` (focused TOML decoder; no YAML dependency).
+When absent, Marlin atomically creates a sparse starter file selecting the
+security-only `hagezi-tif-mini` network feed. Existing files are never rewritten:
 
 ```toml
 [daemon]

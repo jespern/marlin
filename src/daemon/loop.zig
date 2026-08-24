@@ -2,6 +2,7 @@
 //! streaming, approval-gated tools, steering, compaction, and cancellation.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const block = @import("../core/block.zig");
@@ -146,6 +147,13 @@ pub fn runTurn(
 
     _ = try ap.append(.{ .user_msg = .{ .text = user_text } });
 
+    // System-prompt context built once per turn: repo-local instructions and
+    // the dynamic environment (cwd, git, date, sandbox/network regime).
+    const project_instructions = projectInstructions(gpa, io, opts.cwd);
+    defer if (project_instructions) |pi| gpa.free(pi);
+    const environment: ?[]u8 = environmentBlock(gpa, io, &opts) catch null;
+    defer if (environment) |env| gpa.free(env);
+
     var total_in: u64 = 0;
     var total_out: u64 = 0;
     var round: u32 = 0;
@@ -180,10 +188,13 @@ pub fn runTurn(
 
         const frontier: u64 = if (opts.prune_frontier) |pf| pf.* else 0;
         const system_prompt_suffix = if (opts.extensions) |ext| ext.systemPromptSuffix() else "";
-        var msgs = try context.assemble(arena, blocks, .{
+        var asm_opts = context.AssembleOpts{
             .prune_before_seq = frontier,
             .system_prompt_suffix = system_prompt_suffix,
-        });
+            .project_instructions = project_instructions orelse "",
+            .environment = environment orelse "",
+        };
+        var msgs = try context.assemble(arena, blocks, asm_opts);
 
         // -- L2 headroom check (turn boundary = before each request) --
         var est_used = context.estimateAssembled(msgs);
@@ -197,20 +208,15 @@ pub fn runTurn(
                 }
                 blocks = try arena.alloc(block.Block, loaded2.len);
                 for (loaded2, 0..) |lb, i| blocks[i] = lb.blk;
-                msgs = try context.assemble(arena, blocks, .{
-                    .prune_before_seq = frontier,
-                    .system_prompt_suffix = system_prompt_suffix,
-                });
+                msgs = try context.assemble(arena, blocks, asm_opts);
             } else if (opts.prune_frontier) |pf| {
                 // Compaction not possible (session too small / no progress):
                 // fall back to L1 pruning if it can reclaim enough.
                 if (context.planPrune(blocks, pf.*, opts.cfg.prune_protect_tokens, opts.cfg.prune_min_reclaim_tokens)) |new_frontier| {
                     pf.* = new_frontier;
                     _ = try ap.append(.{ .system_note = .{ .text = "context pruned (L1): old tool outputs elided" } });
-                    msgs = try context.assemble(arena, blocks, .{
-                        .prune_before_seq = new_frontier,
-                        .system_prompt_suffix = system_prompt_suffix,
-                    });
+                    asm_opts.prune_before_seq = new_frontier;
+                    msgs = try context.assemble(arena, blocks, asm_opts);
                 }
             }
         } else if (opts.prune_frontier) |pf| {
@@ -222,10 +228,8 @@ pub fn runTurn(
                 if (context.planPrune(blocks, pf.*, opts.cfg.prune_protect_tokens, opts.cfg.prune_min_reclaim_tokens)) |new_frontier| {
                     pf.* = new_frontier;
                     _ = try ap.append(.{ .system_note = .{ .text = "context pruned (L1): old tool outputs elided" } });
-                    msgs = try context.assemble(arena, blocks, .{
-                        .prune_before_seq = new_frontier,
-                        .system_prompt_suffix = system_prompt_suffix,
-                    });
+                    asm_opts.prune_before_seq = new_frontier;
+                    msgs = try context.assemble(arena, blocks, asm_opts);
                 }
             }
         }
@@ -590,6 +594,122 @@ fn nowMs(io: Io) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
 }
 
+/// Repo-local agent instructions: MARLIN.md, falling back to AGENTS.md, at
+/// the session root. Read fresh each turn so edits apply immediately.
+/// Missing, empty, or oversized files yield null.
+fn projectInstructions(gpa: std.mem.Allocator, io: Io, cwd: []const u8) ?[]u8 {
+    const names = [_][]const u8{ "MARLIN.md", "AGENTS.md" };
+    for (names) |name| {
+        const path = std.fs.path.join(gpa, &.{ cwd, name }) catch return null;
+        defer gpa.free(path);
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(48 * 1024)) catch continue;
+        if (std.mem.trim(u8, bytes, " \t\r\n").len == 0) {
+            gpa.free(bytes);
+            continue;
+        }
+        return bytes;
+    }
+    return null;
+}
+
+/// One git probe in the session cwd under the scrubbed tool environment.
+/// Returns owned stdout on exit 0; any failure degrades to null.
+fn gitProbe(
+    gpa: std.mem.Allocator,
+    io: Io,
+    opts: *const RunOpts,
+    argv: []const []const u8,
+    stdout_limit: usize,
+) ?[]u8 {
+    const res = std.process.run(gpa, io, .{
+        .argv = argv,
+        .cwd = .{ .path = opts.cwd },
+        .environ_map = opts.tool_environ,
+        .stdout_limit = .limited(stdout_limit),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    defer gpa.free(res.stderr);
+    if (res.term != .exited or res.term.exited != 0) {
+        gpa.free(res.stdout);
+        return null;
+    }
+    return res.stdout;
+}
+
+/// The dynamic ENVIRONMENT section of the system prompt: facts the model
+/// would otherwise burn a round discovering or silently guess wrong (cwd,
+/// date, git state) plus the live sandbox/network regime that the base
+/// prompt's SANDBOX AND PERMISSIONS section refers to.
+fn environmentBlock(gpa: std.mem.Allocator, io: Io, opts: *const RunOpts) ![]u8 {
+    const ts = Io.Timestamp.now(io, .real);
+    const secs: u64 = @intCast(@max(0, @divTrunc(ts.nanoseconds, std.time.ns_per_s)));
+    const year_day = (std.time.epoch.EpochSeconds{ .secs = secs }).getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    var git_owned: ?[]u8 = null;
+    defer if (git_owned) |g| gpa.free(g);
+    var git_desc: []const u8 = "not a git repository";
+    if (gitProbe(gpa, io, opts, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }, 4096)) |branch_raw| {
+        defer gpa.free(branch_raw);
+        const branch = std.mem.trim(u8, branch_raw, " \r\n");
+        var dirty: usize = 0;
+        if (gitProbe(gpa, io, opts, &.{ "git", "status", "--porcelain" }, 256 * 1024)) |status_raw| {
+            defer gpa.free(status_raw);
+            var it = std.mem.splitScalar(u8, status_raw, '\n');
+            while (it.next()) |line| {
+                if (line.len > 0) dirty += 1;
+            }
+        }
+        git_owned = try std.fmt.allocPrint(
+            gpa,
+            "a git repository, branch {s}, {d} changed/untracked files",
+            .{ branch, dirty },
+        );
+        git_desc = git_owned.?;
+    }
+
+    const sandbox_desc: []const u8 = switch (opts.sandbox_options.backend) {
+        .seatbelt => "active (kernel-enforced; workspace shell commands run without approval prompts)",
+        .unavailable => "inactive (shell commands may require per-call user approval)",
+    };
+
+    var network_owned: ?[]u8 = null;
+    defer if (network_owned) |n| gpa.free(n);
+    var network_desc: []const u8 = "off";
+    if (opts.network_policy) |np| {
+        if (np.isActive()) {
+            network_owned = if (np.domainCount() > 0)
+                try std.fmt.allocPrint(gpa, "DNS blocklist active ({d} {s}, {d} blocked domains)", .{
+                    np.feedCount(),
+                    if (np.feedCount() == 1) @as([]const u8, "feed") else "feeds",
+                    np.domainCount(),
+                })
+            else
+                try gpa.dupe(u8, "explicit deny rules active");
+            network_desc = network_owned.?;
+        }
+    }
+
+    return std.fmt.allocPrint(gpa,
+        \\
+        \\ENVIRONMENT
+        \\- Working directory: {s} ({s})
+        \\- Platform: {s} ({s}) · Today's date: {d:0>4}-{d:0>2}-{d:0>2}
+        \\- Shell sandbox: {s}
+        \\- Network filtering: {s}
+    , .{
+        opts.cwd,
+        git_desc,
+        @tagName(builtin.os.tag),
+        @tagName(builtin.cpu.arch),
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        sandbox_desc,
+        network_desc,
+    });
+}
+
 /// Glue: curl chunk → SSE parser → StreamAccum.
 const Pump = struct {
     parser: sse.Parser,
@@ -603,6 +723,43 @@ const Pump = struct {
         acc.onEvent(ev);
     }
 };
+
+test "environment block reports cwd, git absence, and inactive regimes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-envblock-test");
+    defer temp.deinit();
+    const dir = temp.path;
+
+    const opts = RunOpts{
+        .session_id = 1,
+        .cwd = dir,
+        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .dialect = .openai_compatible },
+        .cfg = config.defaults(),
+    };
+    const env = try environmentBlock(gpa, io, &opts);
+    defer gpa.free(env);
+
+    try std.testing.expect(std.mem.indexOf(u8, env, "ENVIRONMENT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env, dir) != null);
+    try std.testing.expect(std.mem.indexOf(u8, env, "not a git repository") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env, "Shell sandbox: inactive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env, "Network filtering: off") != null);
+    // A plausible date, not the epoch: the year has four digits and 20xx.
+    try std.testing.expect(std.mem.indexOf(u8, env, "date: 20") != null);
+
+    // No MARLIN.md/AGENTS.md in the fresh dir → no instructions.
+    try std.testing.expect(projectInstructions(gpa, io, dir) == null);
+    const agents_path = try std.fs.path.join(gpa, &.{ dir, "AGENTS.md" });
+    defer gpa.free(agents_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = agents_path, .data = "Use spaces, not tabs." });
+    const instructions = projectInstructions(gpa, io, dir);
+    defer if (instructions) |text| gpa.free(text);
+    try std.testing.expectEqualStrings("Use spaces, not tabs.", instructions.?);
+}
 
 test {
     std.testing.refAllDecls(@This());

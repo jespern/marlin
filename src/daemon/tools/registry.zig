@@ -215,7 +215,7 @@ test "dispatch: bad args json returns error text" {
     try std.testing.expectEqual(block.ToolStatus.err, r.status);
 }
 
-test "dispatch: bash literal network destination is denied before execution" {
+test "dispatch: bash policy denies atomically and null policy bypasses screening" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -225,22 +225,49 @@ test "dispatch: bash literal network destination is denied before execution" {
     var policy = network_policy.Policy.init(gpa, io, &environ, .{ .deny = "blocked.test" });
     defer policy.deinit();
 
-    const r = dispatch(
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-network-dispatch");
+    defer temp.deinit();
+    const cwd = temp.path;
+
+    const denied = dispatch(
         gpa,
         io,
         "bash",
-        \\{"command":"curl https://sub.blocked.test/upload"}
+        \\{"command":"printf touched > marker; curl https://sub.blocked.test/upload"}
     ,
-        "/tmp",
+        cwd,
         null,
         .{},
         &policy,
         null,
     );
-    defer gpa.free(r.output);
-    try std.testing.expectEqual(block.ToolStatus.denied, r.status);
-    try std.testing.expect(std.mem.indexOf(u8, r.output, "shell command was not run") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.output, "explicit deny") != null);
+    defer gpa.free(denied.output);
+    try std.testing.expectEqual(block.ToolStatus.denied, denied.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied.output, "sub.blocked.test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied.output, "shell command was not run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied.output, "explicit deny") != null);
+
+    const marker = try std.fs.path.join(gpa, &.{ cwd, "marker" });
+    defer gpa.free(marker);
+    try std.testing.expect(Io.Dir.cwd().statFile(io, marker, .{}) catch null == null);
+
+    // This defines a local shell function, so the disabled-policy path proves
+    // the dispatch behavior without making a real network connection.
+    const bypassed = dispatch(
+        gpa,
+        io,
+        "bash",
+        \\{"command":"curl() { printf bypassed; }; curl https://sub.blocked.test/upload"}
+    ,
+        cwd,
+        null,
+        .{},
+        null,
+        null,
+    );
+    defer gpa.free(bypassed.output);
+    try std.testing.expectEqual(block.ToolStatus.ok, bypassed.status);
+    try std.testing.expectEqualStrings("bypassed", bypassed.output);
 }
 
 test "dispatch: tool subprocess cannot see provider credentials" {

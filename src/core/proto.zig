@@ -36,13 +36,15 @@ pub const ClientMsg = union(enum) {
         /// (headless one-shots and --yolo).
         approvals: []const u8 = "default",
     },
-    session_list: struct {},
+    session_list: struct { include_archived: bool = false },
     /// Subscribe this client to refreshed session_list_result snapshots when
     /// any session enters an actionable state or its membership changes.
     /// The daemon replies with an immediate snapshot, then sends updates until
     /// the client disconnects. This is independent of per-session block subs.
     session_watch: struct {},
     session_kill: struct { sid: u64 },
+    /// Hide/restore a durable session hierarchy without deleting its log.
+    session_archive: struct { sid: u64, archived: bool = true },
     session_set_model: struct { sid: u64, model: []const u8 },
     session_set_effort: struct { sid: u64, effort: ReasoningEffort },
     /// Toggle the kernel shell sandbox (and its prompt-free shell execution)
@@ -87,6 +89,9 @@ pub const DaemonMsg = union(enum) {
         /// A DNS blocklist / explicit-deny network policy is loaded for
         /// Marlin-owned network tools and may be enabled per session.
         network_filtering: bool = false,
+        /// A blocklist or explicit-deny policy was requested in configuration.
+        /// False distinguishes opt-out from a configured policy that failed.
+        network_configured: bool = false,
         network_feed_count: u64 = 0,
         network_rule_count: u64 = 0,
     },
@@ -150,6 +155,8 @@ pub const SessionInfo = struct {
     /// Whether Marlin-owned network tools enforce the loaded hostname policy
     /// for this session. Defaults false when decoding older daemons.
     network_filtering: bool = false,
+    /// Archived sessions appear only in explicitly inclusive list requests.
+    archived: bool = false,
 };
 
 /// Encode one message as an NDJSON line (incl. trailing \n). Caller frees.
@@ -268,6 +275,16 @@ test "decode ignores unknown fields; defaults apply" {
     try std.testing.expectEqual(@as(u64, 5), m.sub.sid);
 }
 
+test "older hello defaults network configuration state" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const m = try decode(DaemonMsg, arena_state.allocator(),
+        \\{"hello_ok":{"proto_version":1,"daemon_version":"old"}}
+    );
+    try std.testing.expect(!m.hello_ok.network_configured);
+    try std.testing.expect(!m.hello_ok.network_filtering);
+}
+
 test "round trip: blob result preserves arbitrary bytes" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -294,6 +311,16 @@ test "older session-list entries default cwd" {
     try std.testing.expectEqual(SessionState.idle, m.session_list_result.sessions[0].state);
     try std.testing.expectEqual(SessionKind.root, m.session_list_result.sessions[0].kind);
     try std.testing.expectEqual(@as(?u64, null), m.session_list_result.sessions[0].parent_sid);
+    try std.testing.expect(!m.session_list_result.sessions[0].archived);
+}
+
+test "older session-list requests exclude archived sessions by default" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const m = try decode(ClientMsg, arena_state.allocator(),
+        \\{"session_list":{}}
+    );
+    try std.testing.expect(!m.session_list.include_archived);
 }
 
 test "garbage line is an error, not a crash" {

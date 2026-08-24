@@ -393,11 +393,9 @@ test "internal grep + glob on a temp tree" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var rand: [8]u8 = undefined;
-    io.random(&rand);
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/marlin-search-test-{x}", .{std.mem.readInt(u64, &rand, .little)});
-    defer gpa.free(dir_path);
-    defer Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-search-test");
+    defer temp.deinit();
+    const dir_path = temp.path;
 
     const w1 = try files.writeFile(gpa, io, .{ .path = "a/one.txt", .content = "hello needle here\nplain line\n" }, dir_path);
     gpa.free(w1);

@@ -19,10 +19,10 @@ pub const Feed = struct {
     refresh_ns: i96,
 };
 
-/// Security-only starter catalog. Lists remain opt-in; Marlin does not enable
-/// advertising/tracker lists because those create unrelated developer-tool
-/// breakage. The mini TIF is intentionally preferred over the 2M-entry full
-/// feed for a daemon-resident first version.
+/// Security-only starter catalog. Newly generated config selects the mini TIF;
+/// Marlin does not select advertising/tracker lists because those create
+/// unrelated developer-tool breakage. The mini feed is intentionally preferred
+/// over the 2M-entry full feed for a daemon-resident first version.
 pub const catalog = [_]Feed{
     .{
         .id = "hagezi-tif-mini",

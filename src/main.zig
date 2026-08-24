@@ -4,9 +4,11 @@
 //!   marlin                → attach (TUI client; autostarts daemon)   [M2]
 //!   marlin daemon         → run the daemon in the foreground         [M1]
 //!   marlin run "task"     → headless one-shot session                [M0]
-//!   marlin ls             → list sessions                            [M1]
+//!   marlin ls [--all]     → list sessions                            [M1]
 //!   marlin attach <id>    → attach TUI to a session                  [M2]
-//!   marlin kill <id>      → terminate a session                      [M1]
+//!   marlin archive <id>   → hide a durable session hierarchy         [M6]
+//!   marlin unarchive <id> → restore an archived hierarchy            [M6]
+//!   marlin kill <id>      → interrupt a session                      [M1]
 //!
 //! See docs/ARCHITECTURE.md §1 for the process model.
 //!

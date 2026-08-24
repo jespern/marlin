@@ -9,10 +9,12 @@
 set -euo pipefail
 
 MARLIN="$1"; FAKEPROV="$2"; SCENARIO="$3"
+TEST_TMP_ROOT="${TMPDIR:-/private/tmp}"
+SUITE_TMP="$(mktemp -d "$TEST_TMP_ROOT/marlin-conv-suite-XXXXXX")"
 
 run_leg() { # $1 = leg name, $2 = "reboot" | "kill9"
   local leg="$1" mode="$2"
-  local state; state="$(mktemp -d "/tmp/marlin-conv-$leg-XXXXXX")"
+  local state; state="$(mktemp -d "$SUITE_TMP/state-$leg-XXXXXX")"
   local sock="$state/daemon.sock"
 
   "$FAKEPROV" "$SCENARIO" > "$state/prov.out" &
@@ -58,17 +60,17 @@ run_leg() { # $1 = leg name, $2 = "reboot" | "kill9"
 
   # Normalize: kinds + bodies only (ids/timestamps legitimately differ).
   sqlite3 "$state/marlin/marlin.db" \
-    "SELECT seq, kind, body_json FROM blocks ORDER BY seq;" > "/tmp/marlin-conv-$leg.dump"
+    "SELECT seq, kind, body_json FROM blocks ORDER BY seq;" > "$SUITE_TMP/$leg.dump"
   echo "$state"
 }
 
 sA="$(run_leg A reboot)"
 sB="$(run_leg B kill9)"
 
-if diff -u /tmp/marlin-conv-A.dump /tmp/marlin-conv-B.dump; then
+if diff -u "$SUITE_TMP/A.dump" "$SUITE_TMP/B.dump"; then
   echo "CONVERGENCE OK: reboot and kill-9 restore identical block logs"
-  rm -rf "$sA" "$sB" /tmp/marlin-conv-A.dump /tmp/marlin-conv-B.dump
+  rm -rf "$SUITE_TMP"
 else
-  echo "CONVERGENCE FAILED: states diverge (dumps kept in /tmp)"
+  echo "CONVERGENCE FAILED: states diverge (artifacts kept in $SUITE_TMP)"
   exit 1
 fi

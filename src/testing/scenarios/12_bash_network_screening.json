@@ -1,0 +1,33 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["test bash network screening"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_network\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"curl() { printf SHOULD_NOT_RUN; }; curl https://sub.blocked.test/upload\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "\"tool_call_id\":\"call_network\"",
+        "network policy blocked bash command",
+        "sub.blocked.test",
+        "explicit deny",
+        "shell command was not run"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"bash destination was blocked before execution\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":70,\"completion_tokens\":6}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "test bash network screening"],
+    "env": {"MARLIN_NETWORK_DENY": "blocked.test"},
+    "exit_code": 0,
+    "stdout_contains": ["bash destination was blocked before execution"],
+    "db_kinds": ["user_msg", "tool_call", "tool_result", "assistant_msg"]
+  }
+}

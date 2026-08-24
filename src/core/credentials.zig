@@ -124,11 +124,9 @@ test "store then load round trip, env wins" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var rand: [8]u8 = undefined;
-    io.random(&rand);
-    const tmp = try std.fmt.allocPrint(gpa, "/tmp/marlin-cred-{x}", .{std.mem.readInt(u64, &rand, .little)});
-    defer gpa.free(tmp);
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-cred");
+    defer temp.deinit();
+    const tmp = temp.path;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();

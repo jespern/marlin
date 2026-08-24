@@ -23,6 +23,8 @@
 
 const std = @import("std");
 const Io = std.Io;
+const temp_dir = @import("temp_dir.zig");
+const TempDir = temp_dir.Dir;
 
 const Check = struct {
     argv: []const []const u8,
@@ -60,9 +62,13 @@ pub fn main(init: std.process.Init) !u8 {
         std.log.err("usage: e2e_runner <marlin-bin> <fakeprov-bin> <scenarios-dir>", .{});
         return 2;
     }
-    const marlin_bin = args[1];
-    const fakeprov_bin = args[2];
+    // Build-system artifact args may be relative to the runner's original
+    // cwd. Resolve them before each scenario moves Marlin into its isolated
+    // working directory.
+    const marlin_bin = try Io.Dir.cwd().realPathFileAlloc(io, args[1], arena);
+    const fakeprov_bin = try Io.Dir.cwd().realPathFileAlloc(io, args[2], arena);
     const scenarios_dir = args[3];
+    const temp_root = temp_dir.rootFromEnvironment(init.environ_map.get("TMPDIR"));
 
     var dir = Io.Dir.cwd().openDir(io, scenarios_dir, .{ .iterate = true }) catch |e| {
         std.log.err("cannot open scenarios dir '{s}': {t}", .{ scenarios_dir, e });
@@ -86,7 +92,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     for (names.items) |name| {
-        runScenario(gpa, io, arena, marlin_bin, fakeprov_bin, scenarios_dir, name) catch |e| {
+        runScenario(gpa, io, arena, marlin_bin, fakeprov_bin, scenarios_dir, temp_root, name) catch |e| {
             failures += 1;
             print(io, "FAIL {s}: {t}\n", .{ name, e });
         };
@@ -111,6 +117,7 @@ fn runScenario(
     marlin_bin: []const u8,
     fakeprov_bin: []const u8,
     scenarios_dir: []const u8,
+    temp_root: []const u8,
     name: []const u8,
 ) !void {
     print(io, "e2e {s} ... ", .{name});
@@ -121,14 +128,12 @@ fn runScenario(
         .ignore_unknown_fields = true,
     });
 
-    // Temp state dir for this scenario (unique per run).
-    var rand_bytes: [8]u8 = undefined;
-    io.random(&rand_bytes);
-    const state_dir = try std.fmt.allocPrint(arena, "/tmp/marlin-e2e-{x}", .{
-        std.mem.readInt(u64, &rand_bytes, .little),
-    });
-    try Io.Dir.cwd().createDirPath(io, state_dir);
-    defer Io.Dir.cwd().deleteTree(io, state_dir) catch {};
+    // Temp state and working directory for this scenario (unique per run).
+    // Keeping both beneath TMPDIR makes the runner safe inside Marlin's own
+    // Seatbelt profile and prevents file-tool fixtures leaking into the repo.
+    var temp = try TempDir.init(gpa, io, temp_root, "marlin-e2e");
+    defer temp.deinit();
+    const state_dir = temp.path;
 
     if (sf.check.config_toml) |contents| {
         const config_dir = try std.fs.path.join(arena, &.{ state_dir, ".config", "marlin" });
@@ -168,6 +173,7 @@ fn runScenario(
     // 2. Environment for marlin: isolated state, socket, fake endpoint.
     var env = std.process.Environ.Map.init(arena);
     try env.put("HOME", state_dir); // nothing should use it, but be safe
+    try env.put("TMPDIR", state_dir);
     try env.put("XDG_STATE_HOME", state_dir);
     const sock_path = try std.fmt.allocPrint(arena, "{s}/daemon.sock", .{state_dir});
     try env.put("MARLIN_SOCKET", sock_path);
@@ -178,6 +184,9 @@ fn runScenario(
     // criterion). Capability permissions are pinned off; a scenario that
     // wants them sets MARLIN_PERMISSIONS=1 in its own "env" map below.
     try env.put("MARLIN_PERMISSIONS", "0");
+    // Production's generated starter config subscribes to a remote feed.
+    // Fake-provider scenarios stay hermetic unless their own env opts in.
+    try env.put("MARLIN_NETWORK_BLOCKLISTS", "");
     var env_it = sf.check.env.map.iterator();
     while (env_it.next()) |kv| {
         try env.put(kv.key_ptr.*, kv.value_ptr.*);
@@ -187,6 +196,7 @@ fn runScenario(
         const res = std.process.run(gpa, io, .{
             .argv = &.{ marlin_bin, "shutdown" },
             .environ_map = &env,
+            .cwd = .{ .path = state_dir },
             .stdout_limit = .limited(64 * 1024),
         }) catch null;
         if (res) |r| {
@@ -206,6 +216,7 @@ fn runScenario(
         const res = try std.process.run(gpa, io, .{
             .argv = argv.items,
             .environ_map = &env,
+            .cwd = .{ .path = state_dir },
             .stdout_limit = .limited(4 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
         });

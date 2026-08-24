@@ -12,13 +12,13 @@
 //!   insert:  type → input; Enter send; Shift+Enter/Alt+Enter/Ctrl+J newline;
 //!            Up/Down or Ctrl+P/N move lines or walk history at the edges;
 //!            readline/macOS movement and deletion chords are supported;
-//!            Esc → normal (draft survives); Ctrl+C interrupt/quit
+//!            Esc → normal (draft survives); Ctrl+C interrupts active work
 //!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom; q quit
 //!   global:  Ctrl+L clears/redraws and returns to bottom; Ctrl+T toggles
 //!            the expanded tool transcript
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /new, /compact,
-//!             /reboot [--build], /help, /quit
+//!             /archive, /reboot [--build], /help, /quit
 //!   shortcuts: !c (copy last full tool output), !rb (reboot with build)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
 //!            chips, expanded into the message on send.
@@ -68,6 +68,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/new", .description = "start a new session" },
+    .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/compact", .description = "compact the current context" },
     .{ .name = "/reboot", .usage = " [--build]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
@@ -587,6 +588,18 @@ const App = struct {
             }
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
         }
+
+        // Default snapshots omit archived sessions. Keep MRU cycling aligned
+        // with exactly what the picker can reach.
+        var recent_i: usize = 0;
+        while (recent_i < self.recent_sessions.items.len) {
+            if (self.sessionSummary(self.recent_sessions.items[recent_i]) == null) {
+                _ = self.recent_sessions.orderedRemove(recent_i);
+            } else {
+                recent_i += 1;
+            }
+        }
+        self.recent_cursor = 0;
     }
 
     fn pushBlock(self: *App, kind: block.BlockKind, text: []const u8, label: []const u8, status: block.ToolStatus) void {
@@ -829,6 +842,15 @@ const App = struct {
             self.newSession() catch {
                 self.setNotice("could not create session", .{});
             };
+        } else if (std.mem.eql(u8, head, "/archive")) {
+            const arg = it.rest();
+            if (arg.len == 0) {
+                self.archiveCurrentSession();
+            } else if (std.mem.eql(u8, arg, "children")) {
+                self.archiveFinishedChildren();
+            } else {
+                self.setNotice("usage: /archive [children]", .{});
+            }
         } else if (std.mem.eql(u8, head, "!c")) {
             self.copyLastToolOutput();
         } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
@@ -846,7 +868,7 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /model <m> · /effort <level> · /sandbox [on|off] · /network [on|off|status] · /new · /compact · /reboot [--build] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /new · /archive · /model <m> · /effort <level> · /sandbox [on|off] · /network [on|off|status] · /compact · /reboot [--build] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -995,6 +1017,14 @@ const App = struct {
 
     fn networkCommand(self: *App, arg: []const u8) void {
         if (arg.len == 0 or std.mem.eql(u8, arg, "status")) {
+            if (!self.conn.network_filtering) {
+                if (self.conn.network_configured) {
+                    self.setNotice("network filter unavailable — configured rules failed to load; networking is fail-open", .{});
+                } else {
+                    self.setNotice("network filter off — no blocklist or deny rules configured", .{});
+                }
+                return;
+            }
             const state = if (self.currentNetworkFiltering()) "on" else "off";
             self.setNotice("network filter {s} — {d} rules from {d} feeds; fetch enforced · shell literals screened", .{
                 state,
@@ -1016,7 +1046,11 @@ const App = struct {
             return;
         };
         if (target and !self.conn.network_filtering) {
-            self.setNotice("network filter unavailable — configure [network] blocklists or deny rules, then reboot", .{});
+            if (self.conn.network_configured) {
+                self.setNotice("network filter unavailable — configured rules failed to load; reboot after connectivity returns", .{});
+            } else {
+                self.setNotice("network filter off — add [network] blocklists or deny rules, then reboot", .{});
+            }
             return;
         }
         self.conn.send(.{ .session_set_network_filtering = .{ .sid = self.sid, .enabled = target } }) catch return;
@@ -1055,6 +1089,82 @@ const App = struct {
         // message has no sub; simplest correct M2 flow: remember we asked.
         // Handled in handleDaemonLineCreated below via the pending flag.
         self.awaiting_new_session = true;
+    }
+
+    fn sessionBelongsToTree(self: *const App, candidate_sid: u64, root_sid: u64) bool {
+        var cursor: ?u64 = candidate_sid;
+        while (cursor) |sid| {
+            if (sid == root_sid) return true;
+            const summary = self.sessionSummary(sid) orelse return false;
+            cursor = summary.parent_sid;
+        }
+        return false;
+    }
+
+    fn archiveCurrentSession(self: *App) void {
+        if (self.state == .running or self.state == .awaiting_approval) {
+            self.setNotice("cannot archive a running session — interrupt it first", .{});
+            return;
+        }
+
+        const archived_sid = self.sid;
+        var fallback: ?u64 = null;
+        if (self.sessionSummary(archived_sid)) |current| {
+            if (current.parent_sid) |parent_sid| {
+                if (self.sessionSummary(parent_sid) != null) fallback = parent_sid;
+            }
+        }
+        if (fallback == null) {
+            for (self.recent_sessions.items) |candidate_sid| {
+                if (!self.sessionBelongsToTree(candidate_sid, archived_sid) and
+                    self.sessionSummary(candidate_sid) != null)
+                {
+                    fallback = candidate_sid;
+                    break;
+                }
+            }
+        }
+
+        self.conn.send(.{ .session_archive = .{ .sid = archived_sid } }) catch {
+            self.setNotice("could not archive session", .{});
+            return;
+        };
+        if (fallback) |sid| {
+            self.switchSession(sid, true) catch {
+                self.setNotice("session archived, but could not switch sessions", .{});
+                return;
+            };
+            self.setNotice("archived session #{x}", .{archived_sid});
+        } else {
+            self.newSession() catch {
+                self.setNotice("session archived; use /new to continue", .{});
+            };
+        }
+    }
+
+    /// Archive every finished (idle/err/done) child of the focused session
+    /// in one sweep — the one-command answer to a status bar stuck on
+    /// "N children · N errors" after task children have been dealt with.
+    /// Running or approval-parked children are deliberately left alone.
+    fn archiveFinishedChildren(self: *App) void {
+        var archived: usize = 0;
+        var skipped_active: usize = 0;
+        for (self.sessions.items) |session| {
+            if (session.parent_sid != self.sid) continue;
+            if (session.state == .running or session.state == .awaiting_approval) {
+                skipped_active += 1;
+                continue;
+            }
+            self.conn.send(.{ .session_archive = .{ .sid = session.sid } }) catch continue;
+            archived += 1;
+        }
+        if (archived == 0 and skipped_active == 0) {
+            self.setNotice("no children to archive", .{});
+        } else if (skipped_active > 0) {
+            self.setNotice("archived {d}, left {d} still active", .{ archived, skipped_active });
+        } else {
+            self.setNotice("archived {d} finished child{s}", .{ archived, if (archived == 1) "" else "ren" });
+        }
     }
 
     fn handleSessionCreated(self: *App, sid: u64) void {
@@ -1142,11 +1252,12 @@ const Palette = struct {
     /// Reasoning commentary sits one step ABOVE body text, never below it:
     /// the same words were just streamed in the default style, and
     /// dimming/italicizing them on completion reads as the text degrading.
-    /// True RGB white rather than palette index 15 — many terminal themes
-    /// map "bright white" to the same shade as the default foreground,
-    /// which made the lift invisible. The panel background and mark carry
-    /// the rest of the "commentary" distinction.
-    const reasoning: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } }, .bg = reasoning_bg };
+    /// Emphasis comes from WEIGHT, not color: measured on a real theme, the
+    /// default foreground is already pure white, so no fg value can be
+    /// brighter — but bold strokes light more pixels per glyph and read as
+    /// brighter at terminal sizes. RGB white is kept to pin the floor on
+    /// themes whose default fg actually is grey.
+    const reasoning: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } }, .bg = reasoning_bg, .bold = true };
     const reasoning_mark: vaxis.Style = .{ .fg = .{ .index = 6 }, .bg = reasoning_bg, .bold = true };
     /// Tool machinery (the ⚙ glyph, arg previews, result bodies): dimmed
     /// gray so it reads as background activity, never as user input or as
@@ -1216,9 +1327,17 @@ fn statusModel(model: []const u8) []const u8 {
 }
 
 fn sessionIdFromLabel(label: []const u8) ?u64 {
-    if (label.len < 2 or label[0] != '#') return null;
-    const end = std.mem.indexOfScalar(u8, label, ' ') orelse label.len;
-    return std.fmt.parseInt(u64, label[1..end], 16) catch null;
+    const hash = std.mem.indexOfScalar(u8, label, '#') orelse return null;
+    const id_text = label[hash + 1 ..];
+    if (id_text.len == 0) return null;
+    const end = std.mem.indexOfScalar(u8, id_text, ' ') orelse id_text.len;
+    return std.fmt.parseInt(u64, id_text[0..end], 16) catch null;
+}
+
+test "session labels resolve root and indented child ids" {
+    try std.testing.expectEqual(@as(?u64, 0x2a), sessionIdFromLabel("#2a  root · idle · /tmp"));
+    try std.testing.expectEqual(@as(?u64, 0x2b), sessionIdFromLabel("  ↳ #2b  child · done · /tmp"));
+    try std.testing.expectEqual(@as(?u64, null), sessionIdFromLabel("no session id"));
 }
 
 fn statusCwd(arena: std.mem.Allocator, cwd: []const u8, home: []const u8) ![]const u8 {
@@ -2054,6 +2173,32 @@ fn isFileEditTool(label: []const u8) bool {
     return std.mem.eql(u8, label, "edit") or std.mem.eql(u8, label, "write_file");
 }
 
+/// A failed command can emit hundreds of perfectly ordinary compiler or test
+/// lines. Reserve red for the lines that actually summarize the failure; the
+/// surrounding transcript stays at the same quiet level as successful tool
+/// output, so the useful diagnostic remains easy to find.
+fn isSalientToolErrorLine(line: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    const prefixes = [_][]const u8{
+        "error:",
+        "fatal:",
+        "panic:",
+        "fail ",
+        "fail:",
+        "denied:",
+        "blocked:",
+        "permission denied",
+        "access denied",
+        "[exit code:",
+    };
+    for (prefixes) |prefix| {
+        if (std.ascii.startsWithIgnoreCase(trimmed, prefix)) return true;
+    }
+    return std.ascii.indexOfIgnoreCase(trimmed, " fail ") != null or
+        std.ascii.indexOfIgnoreCase(trimmed, ": permission denied") != null or
+        std.ascii.indexOfIgnoreCase(trimmed, ": access denied") != null;
+}
+
 /// Return the consecutive successful tool pairs that are safe to summarize.
 /// A failure — or a diff produced by a file-edit tool — stops the run so
 /// its call/result render in full.
@@ -2184,13 +2329,6 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                 }
             },
             .tool_result => {
-                const base_style = if (rb.status == .ok) Palette.tool_out else Palette.tool_err;
-                const glyph: []const u8 = switch (rb.status) {
-                    .ok => "    ",
-                    .err => "    ✗ ",
-                    .denied => "    ⊘ ",
-                    .interrupted => "    ⏹ ",
-                };
                 // Collapsed: show at most 8 lines — but a diff the agent
                 // AUTHORED (edit/write tools) shows whole (up to 24) because
                 // a truncated diff misleads. Diffs merely read via bash keep
@@ -2205,20 +2343,39 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                     total += 1;
                     if (shown < max_shown) {
                         if (rb.status == .ok and is_diff) {
-                            try appendDiffLine(arena, &lines, glyph, l, language, base_style);
+                            try appendDiffLine(arena, &lines, "    ", l, language, Palette.tool_out);
+                        } else if (rb.status != .ok) {
+                            // One failure marker establishes the section;
+                            // repeating it for every stack-frame line creates
+                            // a solid red wall with no visual hierarchy.
+                            const prefix: []const u8 = if (shown == 0) switch (rb.status) {
+                                .err => "    ✗ ",
+                                .denied => "    ⊘ ",
+                                .interrupted => "    ⏹ ",
+                                .ok => unreachable,
+                            } else "      ";
+                            const salient = isSalientToolErrorLine(l) or
+                                (rb.status == .denied and shown == 0);
+                            try lines.append(arena, .{
+                                .text = prefix,
+                                .style = if (shown == 0) Palette.tool_err else Palette.tool_out,
+                                .text2 = l,
+                                .style2 = if (salient) Palette.tool_err else Palette.tool_out,
+                            });
                         } else {
+                            const glyph = "    ";
                             const git_syntax = try gitLogSpans(arena, l, glyph.len);
                             if (git_syntax.len > 0) {
                                 try lines.append(arena, .{
                                     .text = glyph,
-                                    .style = base_style,
+                                    .style = Palette.tool_out,
                                     .text2 = l,
                                     .style2 = Palette.git_subject,
                                     .syntax = git_syntax,
                                 });
                             } else {
                                 const prefixed = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, l });
-                                try lines.append(arena, .{ .text = prefixed, .style = base_style });
+                                try lines.append(arena, .{ .text = prefixed, .style = Palette.tool_out });
                             }
                         }
                         shown += 1;
@@ -3386,7 +3543,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .description = "GLOBAL", .heading = true },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
-    .{ .key = "Ctrl+C", .description = "interrupt turn / quit when idle" },
+    .{ .key = "Ctrl+C", .description = "interrupt the active turn" },
 };
 
 fn drawShortcutHelp(win: vaxis.Window, arena: std.mem.Allocator) !void {
@@ -3721,11 +3878,13 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         "dnsblock on"
     else if (dns_available)
         "dnsblock off"
+    else if (app.conn.network_configured)
+        "dnsblock err"
     else
-        "dnsblock n/a";
+        "dnsblock off";
     const dns_style = if (dns_on)
         Palette.status_running
-    else if (dns_available)
+    else if (dns_available or app.conn.network_configured)
         Palette.status_context_warn
     else
         Palette.status_sep;
@@ -3924,7 +4083,7 @@ pub fn run(
 
         // Fetch metadata even for an explicit attach: the session may have
         // been created from another directory (or another client process).
-        try conn.send(.{ .session_list = .{} });
+        try conn.send(.{ .session_list = .{ .include_archived = sid_arg != null } });
         const list = try conn.recvUntil(arena, .session_list_result);
         var selected: ?usize = null;
         if (sid_arg) |requested| {
@@ -3978,8 +4137,10 @@ pub fn run(
             conn.network_rule_count,
             conn.network_feed_count,
         });
+    } else if (conn.network_configured) {
+        app.setNotice("dnsblock configured but unavailable — feed load failed; networking is fail-open", .{});
     } else {
-        app.setNotice("dnsblock unavailable — configure [network] and reboot", .{});
+        app.setNotice("dnsblock off — add [network] blocklists or deny rules, then /reboot", .{});
     }
 
     // -- vaxis init --
@@ -4298,12 +4459,14 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    // Ctrl+C: interrupt a running turn; quit when idle.
+    // Ctrl+C is never an implicit process exit. A repeated keypress can land
+    // after an interrupt transitions the session to idle; quitting then would
+    // make the stop gesture race the daemon status update.
     if (key.matches('c', .{ .ctrl = true })) {
         if (app.state == .running or app.state == .awaiting_approval) {
             app.interrupt();
         } else {
-            app.should_quit = true;
+            app.setNotice("nothing to interrupt · q or /quit exits", .{});
         }
         return;
     }
@@ -4654,6 +4817,27 @@ test "Ctrl+L clears transient view state without touching the draft" {
     try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
 }
 
+test "Ctrl+C never exits an idle TUI or destroys its draft" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    app.editor.insertSlice("draft survives");
+
+    try handleKey(&app, .{ .codepoint = 'c', .mods = .{ .ctrl = true } });
+
+    try std.testing.expect(!app.should_quit);
+    try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
+    try std.testing.expectEqualStrings("nothing to interrupt · q or /quit exits", app.notice.items);
+}
+
 test "Escape leaves normal mode after closing any active picker" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -4764,8 +4948,9 @@ test "reasoning cards are bright, padded, and inset" {
     try std.testing.expectEqualStrings("  · ", lines.items[1].text);
     try std.testing.expect(lines.items[1].style.bold);
     // Body text must never be dimmed or italicized — completed commentary
-    // renders true-RGB white, one step above the streaming default.
+    // renders bold true-RGB white, one step above the streaming default.
     try std.testing.expect(!lines.items[1].style2.italic);
+    try std.testing.expect(lines.items[1].style2.bold);
     try std.testing.expect(vaxis.Color.eql(lines.items[1].style2.fg, .{ .rgb = .{ 0xff, 0xff, 0xff } }));
     for (lines.items) |line| {
         try std.testing.expect(line.fill_style != null);
@@ -5127,6 +5312,63 @@ test "successful tools collapse but diffs and failures stop the run" {
     try std.testing.expectEqual(@as(usize, 2), collapsed.count);
     try std.testing.expectEqual(@as(usize, 4), collapsed.next);
     try std.testing.expectEqual(@as(usize, 0), collapsibleToolRun(&blocks, 4).count);
+}
+
+test "failed tool output uses red only for its marker and salient diagnostics" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .show_tool_transcript = true,
+    };
+    defer app.deinit();
+    try app.blocks.append(gpa, .{
+        .kind = .tool_call,
+        .text = try gpa.dupe(u8, "{}"),
+        .label = try gpa.dupe(u8, "bash"),
+    });
+    try app.blocks.append(gpa, .{
+        .kind = .tool_result,
+        .text = try gpa.dupe(u8,
+            "compiler output\n/opt/zig/std.zig:10:2: stack frame\nerror: command failed\ncase one FAIL PermissionDenied\n[exit code: 1]",
+        ),
+        .label = try gpa.dupe(u8, ""),
+        .status = .err,
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = try layoutLines(arena_state.allocator(), &app, 100);
+
+    var saw_marker = false;
+    var saw_neutral_continuation = false;
+    var saw_red_error = false;
+    var saw_red_fail = false;
+    for (lines.items) |line| {
+        if (std.mem.eql(u8, line.text2, "compiler output")) {
+            saw_marker = std.mem.eql(u8, line.text, "    ✗ ") and
+                vaxis.Color.eql(line.style.fg, Palette.tool_err.fg) and
+                vaxis.Color.eql(line.style2.fg, Palette.tool_out.fg) and
+                line.style2.dim;
+        } else if (std.mem.indexOf(u8, line.text2, "stack frame") != null) {
+            saw_neutral_continuation = std.mem.eql(u8, line.text, "      ") and
+                vaxis.Color.eql(line.style.fg, Palette.tool_out.fg) and
+                vaxis.Color.eql(line.style2.fg, Palette.tool_out.fg);
+        } else if (std.mem.startsWith(u8, line.text2, "error:")) {
+            saw_red_error = vaxis.Color.eql(line.style2.fg, Palette.tool_err.fg);
+        } else if (std.mem.indexOf(u8, line.text2, " FAIL ") != null) {
+            saw_red_fail = vaxis.Color.eql(line.style2.fg, Palette.tool_err.fg);
+        }
+    }
+    try std.testing.expect(saw_marker);
+    try std.testing.expect(saw_neutral_continuation);
+    try std.testing.expect(saw_red_error);
+    try std.testing.expect(saw_red_fail);
 }
 
 test "diffs merely read via bash collapse like any other success" {

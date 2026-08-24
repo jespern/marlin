@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const Io = std.Io;
+const temp_dir = @import("temp_dir.zig");
+const TempDir = temp_dir.Dir;
 
 const model = "openrouter/google/gemini-2.5-flash";
 
@@ -26,19 +28,18 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
-    // Isolated state dir so smoke never touches the real session DB.
-    var rand_bytes: [8]u8 = undefined;
-    io.random(&rand_bytes);
-    const state_dir = try std.fmt.allocPrint(arena, "/tmp/marlin-smoke-{x}", .{
-        std.mem.readInt(u64, &rand_bytes, .little),
-    });
-    try Io.Dir.cwd().createDirPath(io, state_dir);
-    defer Io.Dir.cwd().deleteTree(io, state_dir) catch {};
+    // Isolated state dir so smoke never touches the real session DB. Honor
+    // TMPDIR so the runner also works beneath Marlin's Seatbelt profile.
+    const temp_root = temp_dir.rootFromEnvironment(init.environ_map.get("TMPDIR"));
+    var temp = try TempDir.init(gpa, io, temp_root, "marlin-smoke");
+    defer temp.deinit();
+    const state_dir = temp.path;
 
     var env = std.process.Environ.Map.init(arena);
     var src_it = init.environ_map.array_hash_map.iterator();
     while (src_it.next()) |kv| try env.put(kv.key_ptr.*, kv.value_ptr.*);
     try env.put("XDG_STATE_HOME", state_dir);
+    try env.put("TMPDIR", state_dir);
 
     var failures: u32 = 0;
 

@@ -338,12 +338,9 @@ test "runtime registers and dispatches exec tools and skills" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var random: [8]u8 = undefined;
-    io.random(&random);
-    const root = try std.fmt.allocPrint(gpa, "/tmp/marlin-extension-{x}", .{std.mem.readInt(u64, &random, .little)});
-    defer gpa.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-extension");
+    defer temp.deinit();
+    const root = temp.path;
     const skill_path = try std.fs.path.join(gpa, &.{ root, "demo.md" });
     defer gpa.free(skill_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = skill_path, .data =

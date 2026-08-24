@@ -104,9 +104,18 @@ pub const Loaded = struct {
     }
 };
 
-/// Load the XDG-aware config file once. A missing file is equivalent to
-/// defaults; a present malformed file fails startup rather than silently
-/// running with a different tool or approval policy than the user intended.
+const starter_config =
+    \\# Marlin starter configuration. Existing files are never rewritten.
+    \\# See docs/PERMISSIONS.md for network policy scope and overrides.
+    \\
+    \\[network]
+    \\blocklists = "hagezi-tif-mini"
+    \\
+;
+
+/// Load the XDG-aware config file once. A missing file is initialized with a
+/// sparse starter configuration; a present malformed file fails startup rather
+/// than silently running with a different tool or approval policy than intended.
 pub fn load(
     gpa: std.mem.Allocator,
     io: Io,
@@ -126,18 +135,39 @@ pub fn load(
     cfg.skill_directories = skill_dirs;
 
     const path = try std.fs.path.join(arena, &.{ config_dir, "config.toml" });
-    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(2 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => null,
+    const cwd = Io.Dir.cwd();
+    const bytes = cwd.readFileAlloc(io, path, arena, .limited(2 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            var atomic = try cwd.createFileAtomic(io, path, .{ .make_path = true });
+            defer atomic.deinit(io);
+            try atomic.file.writeStreamingAll(io, starter_config);
+            atomic.link(io) catch |link_err| switch (link_err) {
+                error.PathAlreadyExists => {},
+                else => return link_err,
+            };
+            break :blk try cwd.readFileAlloc(io, path, arena, .limited(2 * 1024 * 1024));
+        },
         else => return err,
     };
-    if (bytes) |contents| {
-        const doc = try toml.parse(arena, contents);
-        applyDocument(&cfg, doc);
-    }
+    const doc = try toml.parse(arena, bytes);
+    applyDocument(&cfg, doc);
     // Environment is the final override layer during the M3.5 rollout.
     applyEnviron(&cfg, environ);
     try validate(gpa, cfg);
     return .{ .gpa = gpa, .arena_state = arena_state, .value = cfg };
+}
+
+pub fn networkPolicyConfigured(cfg: Config) bool {
+    return hasCsvEntry(cfg.network_blocklists) or hasCsvEntry(cfg.network_deny);
+}
+
+fn hasCsvEntry(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    var entries = std.mem.splitScalar(u8, raw, ',');
+    while (entries.next()) |entry| {
+        if (std.mem.trim(u8, entry, " \t\r\n").len > 0) return true;
+    }
+    return false;
 }
 
 fn applyDocument(cfg: *Config, doc: toml.Document) void {
@@ -230,17 +260,47 @@ test "network policy environment bridge is opt-in" {
     try std.testing.expectEqualStrings("blocked.example", cfg.network_deny.?);
 }
 
+test "missing config creates sparse network starter without replacing existing files" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-config-starter");
+    defer temp.deinit();
+    const root = temp.path;
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("XDG_CONFIG_HOME", root);
+
+    var loaded = try load(gpa, io, &environ);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("hagezi-tif-mini", loaded.value.network_blocklists.?);
+    try std.testing.expect(networkPolicyConfigured(loaded.value));
+
+    const path = try std.fs.path.join(gpa, &.{ root, "marlin", "config.toml" });
+    defer gpa.free(path);
+    const created = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096));
+    defer gpa.free(created);
+    try std.testing.expectEqualStrings(starter_config, created);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[network]\ndeny = \"preserved.example\"\n" });
+    var reloaded = try load(gpa, io, &environ);
+    defer reloaded.deinit();
+    try std.testing.expectEqualStrings("preserved.example", reloaded.value.network_deny.?);
+    try std.testing.expect(reloaded.value.network_blocklists == null);
+}
+
 test "load reads XDG config and environment wins" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    var random: [8]u8 = undefined;
-    io.random(&random);
-    const root = try std.fmt.allocPrint(gpa, "/tmp/marlin-config-{x}", .{std.mem.readInt(u64, &random, .little)});
-    defer gpa.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-config");
+    defer temp.deinit();
+    const root = temp.path;
     const dir = try std.fs.path.join(gpa, &.{ root, "marlin" });
     defer gpa.free(dir);
     try Io.Dir.cwd().createDirPath(io, dir);

@@ -1,6 +1,7 @@
-//! Headless protocol clients: `marlin run`, `marlin ls`, `marlin kill`,
-//! `marlin shutdown`. All drive the daemon over the socket — the in-process
-//! M0 path is gone; the daemon autostarts on demand (attach.connect).
+//! Headless protocol clients: `marlin run`, `marlin ls`, `marlin archive`,
+//! `marlin unarchive`, `marlin kill`, and `marlin shutdown`. All drive the
+//! daemon over the socket — the in-process M0 path is gone; the daemon
+//! autostarts on demand (attach.connect).
 //!
 //! run flags:
 //!   --continue        reuse the most recent session
@@ -193,7 +194,16 @@ pub fn ls(
     io: Io,
     environ: *const std.process.Environ.Map,
     self_exe: []const u8,
+    args: []const [:0]const u8,
 ) !u8 {
+    const include_archived = if (args.len == 0)
+        false
+    else if (args.len == 1 and std.mem.eql(u8, args[0], "--all"))
+        true
+    else {
+        try eprint(io, "usage: marlin ls [--all]\n", .{});
+        return 2;
+    };
     const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
         try eprint(io, "marlin: cannot reach daemon: {t}\n", .{e});
         return 1;
@@ -202,7 +212,7 @@ pub fn ls(
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    try conn.send(.{ .session_list = .{} });
+    try conn.send(.{ .session_list = .{ .include_archived = include_archived } });
     const list = try conn.recvUntil(arena_state.allocator(), .session_list_result);
 
     if (list.sessions.len == 0) {
@@ -213,9 +223,39 @@ pub fn ls(
         const marker: []const u8 = if (s.running) "●" else " ";
         const hierarchy: []const u8 = if (s.parent_sid != null) "  ↳" else "";
         const title = if (s.title.len > 0) s.title else "(untitled)";
+        const archived = if (s.archived) "  archived" else "";
         // #xxxx short tag matches the TUI status bar; full id for attach.
-        try print(io, "{s}{s} #{x:0>4}  {s}  [{s}]  ({d})\n", .{ marker, hierarchy, s.sid & 0xFFFF, title, s.model, s.sid });
+        try print(io, "{s}{s} #{x:0>4}  {s}  [{s}]  ({d}){s}\n", .{ marker, hierarchy, s.sid & 0xFFFF, title, s.model, s.sid, archived });
     }
+    return 0;
+}
+
+pub fn setArchived(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+    archived: bool,
+) !u8 {
+    if (args.len != 1) {
+        try eprint(io, "usage: marlin {s} <session-id>\n", .{if (archived) "archive" else "unarchive"});
+        return 2;
+    }
+    const sid = std.fmt.parseInt(u64, args[0], 10) catch {
+        try eprint(io, "marlin: bad session id '{s}'\n", .{args[0]});
+        return 2;
+    };
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{e});
+        return 1;
+    };
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try conn.send(.{ .session_archive = .{ .sid = sid, .archived = archived } });
+    _ = try conn.recvUntil(arena_state.allocator(), .ok);
+    try print(io, "{s} session {d}\n", .{ if (archived) "archived" else "restored", sid });
     return 0;
 }
 

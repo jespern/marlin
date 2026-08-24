@@ -419,11 +419,9 @@ test "write + edit + read round trip on disk" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var rand: [8]u8 = undefined;
-    io.random(&rand);
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/marlin-files-test-{x}", .{std.mem.readInt(u64, &rand, .little)});
-    defer gpa.free(dir_path);
-    defer Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-files-test");
+    defer temp.deinit();
+    const dir_path = temp.path;
 
     const w = try writeFile(gpa, io, .{ .path = "sub/f.txt", .content = "hello world\n" }, dir_path);
     defer gpa.free(w);
@@ -464,11 +462,9 @@ test "editFile result embeds a colored-diff-ready hunk" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var rand: [8]u8 = undefined;
-    io.random(&rand);
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/marlin-difftest-{x}", .{std.mem.readInt(u64, &rand, .little)});
-    defer gpa.free(dir_path);
-    defer Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-difftest");
+    defer temp.deinit();
+    const dir_path = temp.path;
 
     const w = try writeFile(gpa, io, .{ .path = "m.zig", .content = "fn main() void {\n    var x = 1;\n}\n" }, dir_path);
     gpa.free(w);

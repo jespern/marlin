@@ -114,11 +114,9 @@ test "sandboxed bash enforces write scope and protected reads (macOS)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var rand: [8]u8 = undefined;
-    io.random(&rand);
-    const base = try std.fmt.allocPrint(gpa, "/tmp/marlin-bash-sandbox-test-{x}", .{std.mem.readInt(u64, &rand, .little)});
-    defer gpa.free(base);
-    defer Io.Dir.cwd().deleteTree(io, base) catch {};
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-bash-sandbox-test");
+    defer temp.deinit();
+    const base = temp.path;
 
     const workspace = try std.fs.path.join(gpa, &.{ base, "ws" });
     defer gpa.free(workspace);
@@ -136,7 +134,7 @@ test "sandboxed bash enforces write scope and protected reads (macOS)" {
     try cwd_dir.writeFile(io, .{ .sub_path = secret_file, .data = "canary" });
 
     // Options carry the resolved spelling (as the daemon does); the script
-    // below deliberately probes via the /tmp symlink spelling to prove the
+    // below deliberately probes via the caller-visible spelling to prove the
     // kernel matches the resolved target, not the requested string.
     const real_secret = try Io.Dir.realPathFileAbsoluteAlloc(io, secret_dir, gpa);
     defer gpa.free(real_secret);

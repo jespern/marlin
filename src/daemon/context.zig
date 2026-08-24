@@ -40,13 +40,52 @@ pub const system_prompt_base =
     \\COMMUNICATION
     \\- Lead with the outcome, then give only the detail needed to understand or
     \\  verify it. Use plain language and match the user's technical level.
-    \\- Before using tools, briefly say what you are checking and why. During
-    \\  longer work, provide concise progress updates at meaningful transitions;
-    \\  do not narrate every command.
+    \\- Before a tool round, say what you are doing next in ONE short sentence;
+    \\  it renders as a progress card between tool runs. Do not narrate every
+    \\  command, and never let a progress note grow into a paragraph.
     \\- Final answers must stand alone. Prefer short paragraphs; use Markdown
     \\  lists or tables when they make comparisons materially easier to scan.
     \\- State uncertainty plainly. Distinguish observed facts, reasonable
     \\  inferences, and claims that still need real-world validation.
+    \\
+    \\TOOLS
+    \\- Prefer the structured tools over shell equivalents: read_file over cat,
+    \\  the grep tool (ripgrep-backed) over shell grep, glob over find, and
+    \\  edit/write_file over sed or heredocs. They are faster, render better
+    \\  for the user, and reads never wait on approval.
+    \\- When a shell search is genuinely needed, use `rg` (ripgrep), never
+    \\  bare grep or find — it is dramatically faster on repositories and
+    \\  respects .gitignore. Fall back to grep only where rg is unavailable.
+    \\- Reserve bash for what it is uniquely good at: builds, tests, git, and
+    \\  running programs.
+    \\- Read a file before editing it; after a change, re-run a focused check.
+    \\
+    \\SANDBOX AND PERMISSIONS
+    \\- Shell commands may execute inside a kernel sandbox (the ENVIRONMENT
+    \\  section states whether it is active). Inside it, commands run without
+    \\  per-call approval, but the OS denies writes outside this workspace and
+    \\  reads of credential paths (~/.ssh, ~/.aws, ~/.gnupg, Marlin's own
+    \\  credentials). Such a denial in tool output is enforced policy, not a
+    \\  bug: re-plan within the workspace, or tell the user which exact step
+    \\  needs to run outside the sandbox and why.
+    \\- Provider API keys and secret-shaped variables (*_API_KEY, *_TOKEN,
+    \\  *_SECRET, AWS_*) are deliberately stripped from tool subprocesses.
+    \\  Their absence is intentional; do not debug it or attempt recovery.
+    \\- Marlin's network tools enforce a DNS blocklist when one is enabled
+    \\  (see ENVIRONMENT). A blocked host is a policy decision to report to
+    \\  the user, not a network outage to work around.
+    \\
+    \\CODE EDITING
+    \\- Match the surrounding code's style, naming, idiom, and comment density.
+    \\- Never add comments that narrate the change, restate the diff, or talk
+    \\  to a reviewer; comment only what the code cannot say itself.
+    \\- Change only what the task requires: no drive-by reformatting, renames,
+    \\  or "improvements" to unrelated code. Prefer the smallest design that
+    \\  genuinely solves the problem.
+    \\
+    \\GIT
+    \\- Never commit, push, branch, or otherwise rewrite git state unless the
+    \\  user explicitly asked for that action in this conversation.
     \\
     \\WORKING METHOD
     \\- Use tools to inspect the actual workspace and verify important claims.
@@ -63,8 +102,8 @@ pub const system_prompt_base =
     \\- If a command fails, identify whether the failure is in the product, the
     \\  test, or the environment before drawing a conclusion.
     \\
-    \\Use the available tools efficiently. When done, state the result plainly,
-    \\mention verification performed, and call out only meaningful remaining work.
+    \\When done, state the result plainly, mention verification performed, and
+    \\call out only meaningful remaining work.
 ;
 
 /// Apply the L0 inline cap to a tool output destined for context: head+tail
@@ -121,6 +160,12 @@ pub const AssembleOpts = struct {
     /// the base system prompt. Full skill bodies stay out of context until
     /// the model explicitly loads one with the skill tool.
     system_prompt_suffix: []const u8 = "",
+    /// Repo-local instructions (MARLIN.md / AGENTS.md at the session root),
+    /// injected verbatim under a PROJECT INSTRUCTIONS header. Empty = none.
+    project_instructions: []const u8 = "",
+    /// Per-turn dynamic facts (cwd, platform, date, git, sandbox, network),
+    /// pre-rendered by the loop including its ENVIRONMENT header.
+    environment: []const u8 = "",
 };
 
 /// Assemble provider messages from a block log slice. All returned message
@@ -137,11 +182,21 @@ pub fn assemble(
     opts: AssembleOpts,
 ) ![]provider.Message {
     var msgs: std.ArrayList(provider.Message) = .empty;
-    const system_prompt = if (opts.system_prompt_suffix.len == 0)
-        system_prompt_base
-    else
-        try std.fmt.allocPrint(arena, "{s}\n{s}", .{ system_prompt_base, opts.system_prompt_suffix });
-    try msgs.append(arena, .{ .role = .system, .payload = .{ .text = system_prompt } });
+    var sys: std.ArrayList(u8) = .empty;
+    try sys.appendSlice(arena, system_prompt_base);
+    if (opts.system_prompt_suffix.len > 0) {
+        try sys.append(arena, '\n');
+        try sys.appendSlice(arena, opts.system_prompt_suffix);
+    }
+    if (opts.project_instructions.len > 0) {
+        try sys.appendSlice(arena, "\n\nPROJECT INSTRUCTIONS (from the repository; follow unless the user overrides)\n");
+        try sys.appendSlice(arena, opts.project_instructions);
+    }
+    if (opts.environment.len > 0) {
+        try sys.append(arena, '\n');
+        try sys.appendSlice(arena, opts.environment);
+    }
+    try msgs.append(arena, .{ .role = .system, .payload = .{ .text = sys.items } });
 
     // Pass 1: collect compaction coverage. Ranges may nest (a later
     // compaction covers an earlier compaction block itself); a block is
@@ -492,6 +547,35 @@ test "assemble: user → tool round trip shape" {
     try std.testing.expectEqual(@as(usize, 5), msgs.len);
     try std.testing.expectEqual(provider.Role.system, msgs[0].role);
     try std.testing.expectEqual(provider.Role.tool, msgs[3].role);
+}
+
+test "assemble: system prompt carries instructions, environment, and suffix" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const blocks = [_]block.Block{tb(1, .{ .user_msg = .{ .text = "hi" } })};
+    const msgs = try assemble(arena, &blocks, .{
+        .system_prompt_suffix = "SKILLS\n- deploy: ...",
+        .project_instructions = "Run `zig build test`, never bare zig test.",
+        .environment = "\nENVIRONMENT\n- Working directory: /work/api (a git repository, branch main, 3 changed/untracked files)",
+    });
+    const sys = msgs[0].payload.text;
+    try std.testing.expect(std.mem.indexOf(u8, sys, "You are Marlin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "SKILLS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "PROJECT INSTRUCTIONS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "never bare zig test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "Working directory: /work/api") != null);
+    // The base prompt must reference the regimes the environment reports and
+    // steer shell searches to ripgrep.
+    try std.testing.expect(std.mem.indexOf(u8, sys, "rg` (ripgrep)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "SANDBOX AND PERMISSIONS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "DNS blocklist") != null);
+
+    // Omitted sections leave no orphan headers behind.
+    const bare = try assemble(arena, &blocks, .{});
+    try std.testing.expect(std.mem.indexOf(u8, bare[0].payload.text, "PROJECT INSTRUCTIONS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bare[0].payload.text, "ENVIRONMENT\n-") == null);
 }
 
 test "assemble: compaction replaces covered range, summary emitted first" {

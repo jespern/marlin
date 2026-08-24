@@ -13,6 +13,8 @@ pub const Command = enum {
     daemon,
     run,
     ls,
+    archive,
+    unarchive,
     kill,
     compact,
     reboot,
@@ -46,7 +48,9 @@ pub fn dispatch(
         .help => try stdoutPrint(io, help_text, .{}),
         .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
-        .ls => return headless.ls(gpa, io, environ, self_exe),
+        .ls => return headless.ls(gpa, io, environ, self_exe, rest),
+        .archive => return headless.setArchived(gpa, io, environ, self_exe, rest, true),
+        .unarchive => return headless.setArchived(gpa, io, environ, self_exe, rest, false),
         .kill => return headless.kill(gpa, io, environ, self_exe, rest),
         .compact => return headless.compact(gpa, io, environ, self_exe, rest),
         .reboot => return headless.reboot(gpa, io, environ, self_exe, rest),
@@ -88,7 +92,9 @@ const help_text =
     \\  marlin attach <id>     attach TUI to a specific session
     \\  marlin run [--continue] [--model <m>] [--quiet] [--ask] "task"
     \\  marlin daemon          run the daemon in the foreground
-    \\  marlin ls              list sessions
+    \\  marlin ls [--all]      list sessions
+    \\  marlin archive <id>    hide a session tree without deleting it
+    \\  marlin unarchive <id>  restore an archived session tree
     \\  marlin kill <id>       interrupt a session's running turn
     \\  marlin compact [id]    manually compact a session's context
     \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
@@ -106,6 +112,8 @@ pub fn stdoutPrint(io: Io, comptime fmt: []const u8, fmt_args: anytype) !void {
 
 test "command parse" {
     try std.testing.expectEqual(Command.run, Command.parse("run").?);
+    try std.testing.expectEqual(Command.archive, Command.parse("archive").?);
+    try std.testing.expectEqual(Command.unarchive, Command.parse("unarchive").?);
     try std.testing.expectEqual(Command.shutdown, Command.parse("shutdown").?);
     try std.testing.expectEqual(@as(?Command, null), Command.parse("bogus"));
 }

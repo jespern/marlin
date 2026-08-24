@@ -19,6 +19,7 @@ pub const Conn = struct {
     /// Daemon capabilities from hello_ok; populated by connect().
     sandbox_available: bool = false,
     network_filtering: bool = false,
+    network_configured: bool = false,
     network_feed_count: u64 = 0,
     network_rule_count: u64 = 0,
 
@@ -127,6 +128,7 @@ pub fn connect(
     const hello = try c.recvUntil(arena_state.allocator(), .hello_ok);
     c.sandbox_available = hello.sandbox_available;
     c.network_filtering = hello.network_filtering;
+    c.network_configured = hello.network_configured;
     c.network_feed_count = hello.network_feed_count;
     c.network_rule_count = hello.network_rule_count;
     return c;

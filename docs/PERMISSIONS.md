@@ -165,7 +165,7 @@ escalation reruns the call with only that capability added.
 ## Network blocklists
 
 Networking remains allow-by-default. Marlin-owned network tools may subscribe
-to optional hostname blocklists as defense in depth; this is not presented as
+to hostname blocklists as defense in depth; this is not presented as
 an exfiltration boundary. The built-in `fetch` tool enforces the policy before
 each connection and redirect. The `bash` boundary also performs a conservative
 shell-aware preflight for literal destinations supplied to common network
@@ -192,9 +192,17 @@ Each value accepts a comma-separated set. `MARLIN_NETWORK_BLOCKLISTS`,
 `MARLIN_NETWORK_ALLOW`, and `MARLIN_NETWORK_DENY` are final environment
 overrides for temporary or automated runs.
 
+On first startup, Marlin atomically creates `~/.config/marlin/config.toml` when
+it does not exist and selects `hagezi-tif-mini`. Existing config files are never
+rewritten, including existing files without a network section. Keeping the
+generated entry, changing it, or removing it is the user's explicit policy.
+
 The daemon loads and refreshes configured feeds at startup. The TUI handshake
-reports the loaded feed/rule counts, shows `dnsblock on`, `dnsblock off`, or
-`dnsblock n/a` beside the sandbox indicator, and emits a short startup notice.
+reports whether policy was configured separately from whether rules loaded,
+shows `dnsblock on`, `dnsblock off`, or `dnsblock err` beside the sandbox
+indicator, and emits a short startup notice. A load failure is fail-open and is
+reported differently from an unconfigured policy.
+
 Runtime controls are session-scoped and in-memory:
 
 ```text
@@ -222,9 +230,10 @@ deliberately disable filtering for the session and retry.
 
 The starter catalog contains the security-only HaGeZi Threat Intelligence
 Feeds mini list (GPL-3.0; malware, phishing, scams, spam, cryptojacking, and
-command-and-control domains). It is opt-in, refreshed at most every 12 hours
-on daemon startup, cached under the user's cache directory, and falls back to
-the last-known-good copy. If no copy is available, refresh failure is visible
+command-and-control domains). It is selected in newly generated config,
+refreshed at most every 12 hours on daemon startup, cached under the user's
+cache directory, and falls back to the last-known-good copy. If no copy is
+available, refresh failure is visible
 in daemon logs and networking fails open. Marlin intentionally does not ship
 ad/tracker lists in the security preset.
 
