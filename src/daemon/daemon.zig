@@ -63,6 +63,9 @@ const Client = struct {
     writer_thread: ?std.Thread = null,
     subs: std.ArrayList(u64) = .empty, // subscribed session ids
     said_hello: bool = false,
+    /// Receives refreshed session-list snapshots without subscribing to every
+    /// session's block stream (M4 multiplexer/background activity contract).
+    watches_sessions: bool = false,
 
     fn subscribed(self: *const Client, sid: u64) bool {
         for (self.subs.items) |s| {
@@ -336,7 +339,7 @@ pub const Daemon = struct {
             .turn_awaiting => |ta| {
                 defer self.gpa.free(ta.line);
                 if (self.sessions.get(ta.sid)) |session| session.state = .awaiting_approval;
-                self.fanOutLine(ta.sid, ta.line);
+                self.fanOutActionableLine(ta.sid, ta.line);
                 self.broadcastStatus(ta.sid, .awaiting_approval);
             },
             .turn_resumed => |tr| {
@@ -402,29 +405,12 @@ pub const Daemon = struct {
                 };
                 try self.sessions.put(self.gpa, sid, session);
                 self.sendTo(client, .{ .session_created = .{ .sid = sid } });
+                self.broadcastSessionList();
             },
-            .session_list => {
-                const rows = try self.store.listSessions();
-                defer {
-                    for (rows) |row| row.deinit(self.gpa);
-                    self.gpa.free(rows);
-                }
-                var infos = try self.gpa.alloc(proto.SessionInfo, rows.len);
-                defer self.gpa.free(infos);
-                for (rows, 0..) |row, i| {
-                    const live = self.sessions.get(row.id);
-                    infos[i] = .{
-                        .sid = row.id,
-                        .title = row.title,
-                        .cwd = row.cwd,
-                        .model = row.model,
-                        .effort = row.effort,
-                        .status = row.status,
-                        .created_at = row.created_at,
-                        .running = live != null and live.?.state == .running,
-                    };
-                }
-                self.sendTo(client, .{ .session_list_result = .{ .sessions = infos } });
+            .session_list => try self.sendSessionList(client),
+            .session_watch => {
+                client.watches_sessions = true;
+                try self.sendSessionList(client);
             },
             .session_kill => |sk| {
                 if (self.sessions.get(sk.sid)) |session| {
@@ -447,6 +433,7 @@ pub const Daemon = struct {
                 session.model = new_model;
                 self.store.setSessionModel(sm.sid, sm.model) catch {};
                 self.sendTo(client, .{ .ok = .{} });
+                self.broadcastSessionList();
             },
             .session_set_effort => |se| {
                 const session = (try self.getOrLoadSession(se.sid)) orelse {
@@ -460,6 +447,18 @@ pub const Daemon = struct {
                 session.effort = se.effort;
                 self.store.setSessionEffort(se.sid, se.effort) catch {};
                 self.sendTo(client, .{ .ok = .{} });
+                self.broadcastSessionList();
+            },
+            .blob_get => |bg| {
+                const bytes = self.store.getBlob(bg.hash) catch |err| {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "blob",
+                        .msg = if (err == error.NotFound) "full tool output expired or missing" else "could not read full tool output",
+                    } });
+                    return;
+                };
+                defer self.gpa.free(bytes);
+                self.sendTo(client, .{ .blob_result = .{ .hash = bg.hash, .bytes = bytes } });
             },
             .sub => |s| {
                 if (!client.subscribed(s.sid)) try client.subs.append(self.gpa, s.sid);
@@ -851,10 +850,63 @@ pub const Daemon = struct {
         client.outbox.push(ctx.self.io, copy) catch ctx.self.gpa.free(copy);
     }
 
+    /// Approval requests are actionable multiplexer state, not transcript
+    /// traffic: session-watch clients receive them even when that session is
+    /// not focused/subscribed, so switching to it presents the real card.
+    fn fanOutActionableLine(self: *Daemon, sid: u64, line: []const u8) void {
+        const ctx = FanCtx{ .self = self, .sid = sid, .line = line };
+        self.forEachClient(ctx, struct {
+            fn send(c: FanCtx, client: *Client) void {
+                if (!client.said_hello or (!client.subscribed(c.sid) and !client.watches_sessions)) return;
+                const copy = c.self.gpa.dupe(u8, c.line) catch return;
+                client.outbox.push(c.self.io, copy) catch c.self.gpa.free(copy);
+            }
+        }.send);
+    }
+
     fn broadcastStatus(self: *Daemon, sid: u64, state: proto.SessionState) void {
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{ .sid = sid, .state = state } }) catch return;
         defer self.gpa.free(line);
         self.fanOutLine(sid, line);
+        self.broadcastSessionList();
+    }
+
+    fn sendSessionList(self: *Daemon, client: *Client) !void {
+        const rows = try self.store.listSessions();
+        defer {
+            for (rows) |row| row.deinit(self.gpa);
+            self.gpa.free(rows);
+        }
+        const infos = try self.gpa.alloc(proto.SessionInfo, rows.len);
+        defer self.gpa.free(infos);
+        for (rows, 0..) |row, i| {
+            const live = self.sessions.get(row.id);
+            const state = if (live) |session|
+                session.state
+            else
+                std.meta.stringToEnum(proto.SessionState, row.status) orelse .idle;
+            infos[i] = .{
+                .sid = row.id,
+                .title = row.title,
+                .cwd = row.cwd,
+                .model = row.model,
+                .effort = row.effort,
+                .status = row.status,
+                .state = state,
+                .created_at = row.created_at,
+                .running = state == .running,
+            };
+        }
+        self.sendTo(client, .{ .session_list_result = .{ .sessions = infos } });
+    }
+
+    fn broadcastSessionList(self: *Daemon) void {
+        var it = self.clients.valueIterator();
+        while (it.next()) |cp| {
+            const client = cp.*;
+            if (!client.said_hello or !client.watches_sessions) continue;
+            self.sendSessionList(client) catch {};
+        }
     }
 
     /// Send the current catalog (possibly empty → client falls back to

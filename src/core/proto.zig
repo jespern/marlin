@@ -32,9 +32,17 @@ pub const ClientMsg = union(enum) {
         approvals: []const u8 = "default",
     },
     session_list: struct {},
+    /// Subscribe this client to refreshed session_list_result snapshots when
+    /// any session enters an actionable state or its membership changes.
+    /// The daemon replies with an immediate snapshot, then sends updates until
+    /// the client disconnects. This is independent of per-session block subs.
+    session_watch: struct {},
     session_kill: struct { sid: u64 },
     session_set_model: struct { sid: u64, model: []const u8 },
     session_set_effort: struct { sid: u64, effort: ReasoningEffort },
+    /// Fetch an uncapped tool result by its content-addressed blob hash.
+    /// Used by `!c`; the inline block body may be intentionally truncated.
+    blob_get: struct { hash: []const u8 },
     sub: struct { sid: u64, from_seq: u64 = 0 },
     unsub: struct { sid: u64 },
     input: struct { sid: u64, text: []const u8 },
@@ -85,6 +93,9 @@ pub const DaemonMsg = union(enum) {
     /// ("openrouter/vendor/model"), sorted. Empty on fetch failure — the
     /// client falls back to its curated favorites.
     model_list_result: struct { models: []const []const u8 },
+    /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
+    /// contain arbitrary command output (including NULs).
+    blob_result: struct { hash: []const u8, bytes: []const u8 },
     ok: struct {},
     err: struct { code: []const u8, msg: []const u8 },
 };
@@ -98,6 +109,9 @@ pub const SessionInfo = struct {
     model: []const u8,
     effort: ReasoningEffort = .auto,
     status: []const u8,
+    /// Typed live state. Defaults to idle when decoding pre-M4 daemons; the
+    /// legacy status/running fields remain on the wire for compatibility.
+    state: SessionState = .idle,
     created_at: i64,
     running: bool,
 };
@@ -159,6 +173,19 @@ test "round trip: client messages" {
     defer gpa.free(effort_line);
     const effort_back = try decode(ClientMsg, arena, effort_line);
     try std.testing.expectEqual(ReasoningEffort.xhigh, effort_back.session_set_effort.effort);
+
+    const watch_line = try encode(gpa, ClientMsg{ .session_watch = .{} });
+    defer gpa.free(watch_line);
+    const watch_back = try decode(ClientMsg, arena, watch_line);
+    try std.testing.expectEqual(
+        std.meta.activeTag(ClientMsg{ .session_watch = .{} }),
+        std.meta.activeTag(watch_back),
+    );
+
+    const blob_line = try encode(gpa, ClientMsg{ .blob_get = .{ .hash = "abc123" } });
+    defer gpa.free(blob_line);
+    const blob_back = try decode(ClientMsg, arena, blob_line);
+    try std.testing.expectEqualStrings("abc123", blob_back.blob_get.hash);
 }
 
 test "round trip: daemon block message with tool_result body" {
@@ -193,6 +220,22 @@ test "decode ignores unknown fields; defaults apply" {
     try std.testing.expectEqual(@as(u64, 5), m.sub.sid);
 }
 
+test "round trip: blob result preserves arbitrary bytes" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const original = DaemonMsg{ .blob_result = .{
+        .hash = "abc123",
+        .bytes = "line one\nline two\x00tail",
+    } };
+    const line = try encode(gpa, original);
+    defer gpa.free(line);
+    const back = try decode(DaemonMsg, arena_state.allocator(), line);
+    try std.testing.expectEqualStrings("abc123", back.blob_result.hash);
+    try std.testing.expectEqualStrings("line one\nline two\x00tail", back.blob_result.bytes);
+}
+
 test "older session-list entries default cwd" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -200,6 +243,7 @@ test "older session-list entries default cwd" {
         \\{"session_list_result":{"sessions":[{"sid":5,"title":"old","model":"m","status":"idle","created_at":1,"running":false}]}}
     );
     try std.testing.expectEqualStrings("", m.session_list_result.sessions[0].cwd);
+    try std.testing.expectEqual(SessionState.idle, m.session_list_result.sessions[0].state);
 }
 
 test "garbage line is an error, not a crash" {

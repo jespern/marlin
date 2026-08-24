@@ -13,13 +13,13 @@
 //!            Up/Down or Ctrl+P/N move lines or walk history at the edges;
 //!            readline/macOS movement and deletion chords are supported;
 //!            Esc → normal (draft survives); Ctrl+C interrupt/quit
-//!   normal:  i insert; j/k scroll; g/G top/bottom; q quit; Ctrl+C same
+//!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom; q quit
 //!   global:  Ctrl+L clears/redraws and returns to bottom; Ctrl+T toggles
 //!            the expanded tool transcript
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /new, /compact,
 //!             /reboot [--build], /help, /quit
-//!   shortcuts: !rb (reboot with build)
+//!   shortcuts: !c (copy last full tool output), !rb (reboot with build)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
 //!            chips, expanded into the message on send.
 
@@ -64,11 +64,13 @@ const ComposerCommand = struct {
 const composer_commands = [_]ComposerCommand{
     .{ .name = "/model", .usage = " [model]", .description = "switch model or open the picker", .accepts_args = true },
     .{ .name = "/effort", .usage = " [level]", .description = "set reasoning effort or open the picker", .accepts_args = true },
+    .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/compact", .description = "compact the current context" },
     .{ .name = "/reboot", .usage = " [--build]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
     .{ .name = "/quit", .description = "leave Marlin" },
+    .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!rb", .description = "rebuild and restart Marlin" },
 };
 
@@ -77,16 +79,23 @@ const CommandMatches = struct {
     len: usize = 0,
 };
 
-const PickerKind = enum { model, effort };
+const PickerKind = enum { model, effort, session };
 
 /// A block reduced to what the renderer needs (owned copies).
 const RenderBlock = struct {
     kind: block.BlockKind,
+    /// Durable identity from the block log. Zero marks an optimistic local
+    /// echo that will be reconciled when the daemon block arrives.
+    seq: u64 = 0,
+    turn_id: u64 = 0,
     /// Primary text (message text, tool output, note...).
     text: []u8,
     /// tool_call: "name" — used for the collapsed header line.
     label: []u8,
     status: block.ToolStatus = .ok,
+    /// Content-addressed uncapped tool output. Null means `text` is already
+    /// the complete result and can be copied without another daemon query.
+    full_body_ref: ?[]u8 = null,
     /// Locally inserted for instant submit feedback. The matching durable
     /// block clears this bit instead of producing a duplicate render block.
     pending_echo: bool = false,
@@ -94,13 +103,22 @@ const RenderBlock = struct {
     fn deinit(self: *RenderBlock, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
         gpa.free(self.label);
+        if (self.full_body_ref) |ref| gpa.free(ref);
     }
 };
 
-fn reconcilePendingEcho(blocks: []RenderBlock, kind: block.BlockKind, text: []const u8) bool {
+fn reconcilePendingEcho(
+    blocks: []RenderBlock,
+    kind: block.BlockKind,
+    text: []const u8,
+    seq: u64,
+    turn_id: u64,
+) bool {
     for (blocks) |*rendered| {
         if (rendered.pending_echo and rendered.kind == kind and std.mem.eql(u8, rendered.text, text)) {
             rendered.pending_echo = false;
+            rendered.seq = seq;
+            rendered.turn_id = turn_id;
             return true;
         }
     }
@@ -154,6 +172,62 @@ const Selection = struct {
     }
 };
 
+const SessionSummary = struct {
+    sid: u64,
+    title: []u8,
+    cwd: []u8,
+    model: []u8,
+    effort: proto.ReasoningEffort,
+    state: proto.SessionState,
+    created_at: i64,
+    label: []u8,
+
+    fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
+        gpa.free(self.title);
+        gpa.free(self.cwd);
+        gpa.free(self.model);
+        gpa.free(self.label);
+    }
+};
+
+/// Inactive sessions keep their complete client-side view state without
+/// remaining subscribed to their block streams. Moving these containers in
+/// and out of App is allocation-free after the first visit.
+const SavedSessionView = struct {
+    editor: Editor,
+    blocks: std.ArrayList(RenderBlock),
+    delta: std.ArrayList(u8),
+    state: proto.SessionState,
+    model: std.ArrayList(u8),
+    effort: proto.ReasoningEffort,
+    cwd: std.ArrayList(u8),
+    tokens_in: u64,
+    tokens_out: u64,
+    context_used: u64,
+    context_limit: u64,
+    scroll_up: usize,
+    last_total_lines: usize,
+    last_first_visible: usize,
+    last_view_h: usize,
+    pending: ?PendingApproval,
+    sel_anchor: ?SelectionPoint,
+    sel_head: SelectionPoint,
+    sel_dragging: bool,
+    copy_pending: bool,
+    show_tool_transcript: bool,
+    spinner_frame: usize,
+    last_seq: u64,
+
+    fn deinit(self: *SavedSessionView, gpa: std.mem.Allocator) void {
+        self.editor.deinit();
+        for (self.blocks.items) |*rb| rb.deinit(gpa);
+        self.blocks.deinit(gpa);
+        self.delta.deinit(gpa);
+        self.model.deinit(gpa);
+        self.cwd.deinit(gpa);
+    }
+};
+
 const App = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -179,6 +253,8 @@ const App = struct {
     tokens_out: u64 = 0,
     context_used: u64 = 0,
     context_limit: u64 = 0,
+    /// Highest durable block incorporated for the active session.
+    last_seq: u64 = 0,
     /// 0 = pinned to bottom; N = scrolled up N lines.
     scroll_up: usize = 0,
     /// Line count of the last rendered frame; used to keep the view
@@ -192,6 +268,8 @@ const App = struct {
     /// filtered model or effort list (see pickerItems).
     picker: ?usize = null,
     picker_kind: PickerKind = .model,
+    /// Compact normal-mode shortcut reference opened with `?`.
+    shortcut_help: bool = false,
     /// Highlighted row in the command/shortcut autocomplete menu. The menu
     /// itself is derived from editor text and therefore needs no open flag.
     command_selection: usize = 0,
@@ -200,6 +278,14 @@ const App = struct {
     /// Full model catalog from the daemon (owned copies). Empty until
     /// model_list_result arrives; picker falls back to cfg.model_favorites.
     catalog: std.ArrayList([]u8) = .empty,
+    /// Live lightweight session catalog from session_watch. Labels back the
+    /// existing fuzzy picker; full view state lives in saved_views.
+    sessions: std.ArrayList(SessionSummary) = .empty,
+    session_labels: std.ArrayList([]const u8) = .empty,
+    saved_views: std.AutoHashMapUnmanaged(u64, *SavedSessionView) = .empty,
+    background_approvals: std.AutoHashMapUnmanaged(u64, PendingApproval) = .empty,
+    recent_sessions: std.ArrayList(u64) = .empty,
+    recent_cursor: usize = 0,
     /// Character-precise mouse selection over the session view. Lines are
     /// absolute layout indices; columns are terminal cells within the line.
     sel_anchor: ?SelectionPoint = null,
@@ -208,6 +294,10 @@ const App = struct {
     /// Set when a selection was completed (mouse released): next frame
     /// copies the selected cells via OSC52 and clears the flag.
     copy_pending: bool = false,
+    /// Text ready for the event loop to send through OSC52. Blob responses
+    /// arrive in the daemon reader path, where the terminal writer is not
+    /// available, so `!c` stages the bytes here for the next frame.
+    clipboard_pending: std.ArrayList(u8) = .empty,
     /// Successful non-diff tool runs are rolled up by default. Errors and
     /// diffs remain visible even when the rest of the transcript is hidden.
     show_tool_transcript: bool = false,
@@ -222,6 +312,7 @@ const App = struct {
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
     awaiting_new_session: bool = false,
+    pending_new_cwd: std.ArrayList(u8) = .empty,
     /// Set by /reboot: after clean TUI teardown, run() returns this to
     /// cli.zig which execs `marlin reboot [--build] --then attach <sid>`.
     reboot_request: RebootRequest = .none,
@@ -230,6 +321,19 @@ const App = struct {
         self.picker_filter.deinit(self.gpa);
         for (self.catalog.items) |m| self.gpa.free(m);
         self.catalog.deinit(self.gpa);
+        for (self.sessions.items) |*session| session.deinit(self.gpa);
+        self.sessions.deinit(self.gpa);
+        self.session_labels.deinit(self.gpa);
+        var saved_it = self.saved_views.valueIterator();
+        while (saved_it.next()) |saved| {
+            saved.*.deinit(self.gpa);
+            self.gpa.destroy(saved.*);
+        }
+        self.saved_views.deinit(self.gpa);
+        self.background_approvals.deinit(self.gpa);
+        self.recent_sessions.deinit(self.gpa);
+        self.pending_new_cwd.deinit(self.gpa);
+        self.clipboard_pending.deinit(self.gpa);
         for (self.blocks.items) |*rb| rb.deinit(self.gpa);
         self.blocks.deinit(self.gpa);
         self.delta.deinit(self.gpa);
@@ -260,8 +364,244 @@ const App = struct {
         self.home.appendSlice(self.gpa, home) catch {};
     }
 
+    fn sessionSummary(self: *const App, sid: u64) ?*const SessionSummary {
+        for (self.sessions.items) |*session| {
+            if (session.sid == sid) return session;
+        }
+        return null;
+    }
+
+    fn resetActiveAfterMove(self: *App) void {
+        self.editor = Editor.init(self.gpa);
+        self.blocks = .empty;
+        self.delta = .empty;
+        self.state = .idle;
+        self.model = .empty;
+        self.effort = .auto;
+        self.cwd = .empty;
+        self.tokens_in = 0;
+        self.tokens_out = 0;
+        self.context_used = 0;
+        self.context_limit = 0;
+        self.last_seq = 0;
+        self.scroll_up = 0;
+        self.last_total_lines = 0;
+        self.last_first_visible = 0;
+        self.last_view_h = 0;
+        self.pending = null;
+        self.sel_anchor = null;
+        self.sel_head = .{ .line = 0, .col = 0 };
+        self.sel_dragging = false;
+        self.copy_pending = false;
+        self.show_tool_transcript = false;
+        self.spinner_frame = 0;
+    }
+
+    fn saveActiveView(self: *App) !void {
+        const saved = try self.gpa.create(SavedSessionView);
+        errdefer self.gpa.destroy(saved);
+        saved.* = .{
+            .editor = self.editor,
+            .blocks = self.blocks,
+            .delta = self.delta,
+            .state = self.state,
+            .model = self.model,
+            .effort = self.effort,
+            .cwd = self.cwd,
+            .tokens_in = self.tokens_in,
+            .tokens_out = self.tokens_out,
+            .context_used = self.context_used,
+            .context_limit = self.context_limit,
+            .scroll_up = self.scroll_up,
+            .last_total_lines = self.last_total_lines,
+            .last_first_visible = self.last_first_visible,
+            .last_view_h = self.last_view_h,
+            .pending = self.pending,
+            .sel_anchor = self.sel_anchor,
+            .sel_head = self.sel_head,
+            .sel_dragging = self.sel_dragging,
+            .copy_pending = self.copy_pending,
+            .show_tool_transcript = self.show_tool_transcript,
+            .spinner_frame = self.spinner_frame,
+            .last_seq = self.last_seq,
+        };
+        try self.saved_views.put(self.gpa, self.sid, saved);
+        self.resetActiveAfterMove();
+    }
+
+    fn restoreSavedView(self: *App, saved: *SavedSessionView) void {
+        self.editor = saved.editor;
+        self.blocks = saved.blocks;
+        self.delta = saved.delta;
+        self.state = saved.state;
+        self.model = saved.model;
+        self.effort = saved.effort;
+        self.cwd = saved.cwd;
+        self.tokens_in = saved.tokens_in;
+        self.tokens_out = saved.tokens_out;
+        self.context_used = saved.context_used;
+        self.context_limit = saved.context_limit;
+        self.scroll_up = saved.scroll_up;
+        self.last_total_lines = saved.last_total_lines;
+        self.last_first_visible = saved.last_first_visible;
+        self.last_view_h = saved.last_view_h;
+        self.pending = saved.pending;
+        self.sel_anchor = saved.sel_anchor;
+        self.sel_head = saved.sel_head;
+        self.sel_dragging = saved.sel_dragging;
+        self.copy_pending = saved.copy_pending;
+        self.show_tool_transcript = saved.show_tool_transcript;
+        self.spinner_frame = saved.spinner_frame;
+        self.last_seq = saved.last_seq;
+    }
+
+    fn touchRecentSession(self: *App, sid: u64) void {
+        for (self.recent_sessions.items, 0..) |recent, i| {
+            if (recent == sid) {
+                _ = self.recent_sessions.orderedRemove(i);
+                break;
+            }
+        }
+        self.recent_sessions.insert(self.gpa, 0, sid) catch return;
+        self.recent_cursor = 0;
+    }
+
+    fn switchSession(self: *App, sid: u64, touch_recent: bool) !void {
+        if (sid == self.sid) return;
+        const old_sid = self.sid;
+        try self.saveActiveView();
+        self.conn.send(.{ .unsub = .{ .sid = old_sid } }) catch {};
+        self.sid = sid;
+
+        if (self.saved_views.get(sid)) |saved| {
+            _ = self.saved_views.remove(sid);
+            self.restoreSavedView(saved);
+            self.gpa.destroy(saved);
+        } else if (self.sessionSummary(sid)) |summary| {
+            try self.model.appendSlice(self.gpa, summary.model);
+            try self.cwd.appendSlice(self.gpa, summary.cwd);
+            self.effort = summary.effort;
+            self.state = summary.state;
+        }
+        if (self.background_approvals.get(sid)) |pending| {
+            self.pending = pending;
+            _ = self.background_approvals.remove(sid);
+        }
+
+        if (touch_recent) self.touchRecentSession(sid);
+        self.animation_active.store(self.state == .running, .release);
+        const from_seq = if (self.last_seq == 0) 1 else self.last_seq +| 1;
+        self.conn.send(.{ .sub = .{ .sid = sid, .from_seq = from_seq } }) catch {};
+        self.setNotice("session → #{x}", .{sid});
+    }
+
+    fn cycleSession(self: *App, direction: i8) void {
+        if (self.recent_sessions.items.len < 2) return;
+        const len = self.recent_sessions.items.len;
+        if (direction > 0) {
+            self.recent_cursor = (self.recent_cursor + 1) % len;
+        } else {
+            self.recent_cursor = if (self.recent_cursor == 0) len - 1 else self.recent_cursor - 1;
+        }
+        const sid = self.recent_sessions.items[self.recent_cursor];
+        self.switchSession(sid, false) catch self.setNotice("could not switch session", .{});
+    }
+
+    fn replaceSessionSummaries(self: *App, incoming: []const proto.SessionInfo) void {
+        for (self.sessions.items) |*session| session.deinit(self.gpa);
+        self.sessions.clearRetainingCapacity();
+        self.session_labels.clearRetainingCapacity();
+
+        for (incoming) |info| {
+            const title = self.gpa.dupe(u8, info.title) catch continue;
+            const cwd = self.gpa.dupe(u8, info.cwd) catch {
+                self.gpa.free(title);
+                continue;
+            };
+            const model = self.gpa.dupe(u8, info.model) catch {
+                self.gpa.free(title);
+                self.gpa.free(cwd);
+                continue;
+            };
+            const identity = if (info.title.len > 0) info.title else info.model;
+            const label = std.fmt.allocPrint(self.gpa, "#{x}  {s} · {s} · {s}", .{
+                info.sid,
+                identity,
+                @tagName(info.state),
+                info.cwd,
+            }) catch {
+                self.gpa.free(title);
+                self.gpa.free(cwd);
+                self.gpa.free(model);
+                continue;
+            };
+            self.sessions.append(self.gpa, .{
+                .sid = info.sid,
+                .title = title,
+                .cwd = cwd,
+                .model = model,
+                .effort = info.effort,
+                .state = info.state,
+                .created_at = info.created_at,
+                .label = label,
+            }) catch {
+                self.gpa.free(title);
+                self.gpa.free(cwd);
+                self.gpa.free(model);
+                self.gpa.free(label);
+                continue;
+            };
+            self.session_labels.append(self.gpa, label) catch {};
+
+            var known_recent = false;
+            for (self.recent_sessions.items) |recent| {
+                if (recent == info.sid) known_recent = true;
+            }
+            if (!known_recent) self.recent_sessions.append(self.gpa, info.sid) catch {};
+
+            if (info.sid == self.sid) {
+                self.state = info.state;
+            } else if (self.saved_views.get(info.sid)) |saved| {
+                saved.state = info.state;
+            }
+            if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
+        }
+    }
+
     fn pushBlock(self: *App, kind: block.BlockKind, text: []const u8, label: []const u8, status: block.ToolStatus) void {
         self.pushBlockPending(kind, text, label, status, false);
+    }
+
+    fn pushDurableBlock(
+        self: *App,
+        b: block.Block,
+        kind: block.BlockKind,
+        text: []const u8,
+        label: []const u8,
+        status: block.ToolStatus,
+    ) void {
+        const before = self.blocks.items.len;
+        self.pushBlock(kind, text, label, status);
+        if (self.blocks.items.len > before) {
+            const rendered = &self.blocks.items[self.blocks.items.len - 1];
+            rendered.seq = b.seq;
+            rendered.turn_id = b.turn_id;
+        }
+    }
+
+    fn pushDurableToolResult(
+        self: *App,
+        b: block.Block,
+        text: []const u8,
+        status: block.ToolStatus,
+        full_body_ref: ?[]const u8,
+    ) void {
+        const before = self.blocks.items.len;
+        self.pushDurableBlock(b, .tool_result, text, "", status);
+        if (self.blocks.items.len == before) return;
+        if (full_body_ref) |ref| {
+            self.blocks.items[self.blocks.items.len - 1].full_body_ref = self.gpa.dupe(u8, ref) catch null;
+        }
     }
 
     fn pushBlockPending(
@@ -300,6 +640,8 @@ const App = struct {
         switch (msg) {
             .blk => |b| {
                 if (b.sid != self.sid) return;
+                if (b.b.seq <= self.last_seq) return;
+                self.last_seq = b.b.seq;
                 self.applyBlock(b.b);
             },
             .delta => |d| {
@@ -307,14 +649,16 @@ const App = struct {
                 self.delta.appendSlice(self.gpa, d.text) catch {};
             },
             .status => |s| {
-                if (s.sid != self.sid) return;
+                if (s.sid != self.sid) {
+                    if (self.saved_views.get(s.sid)) |saved| saved.state = s.state;
+                    return;
+                }
                 if (s.state == .running and self.state != .running) self.spinner_frame = 0;
                 self.state = s.state;
                 self.animation_active.store(s.state == .running, .release);
                 if (s.state != .awaiting_approval) self.pending = null;
             },
             .approval_request => |ar| {
-                if (ar.sid != self.sid) return;
                 var p = PendingApproval{};
                 p.id_len = @min(ar.approval_id.len, p.id_buf.len);
                 @memcpy(p.id_buf[0..p.id_len], ar.approval_id[0..p.id_len]);
@@ -322,9 +666,14 @@ const App = struct {
                 @memcpy(p.tool_buf[0..p.tool_len], ar.tool[0..p.tool_len]);
                 p.args_len = @min(ar.args_json.len, p.args_buf.len);
                 @memcpy(p.args_buf[0..p.args_len], ar.args_json[0..p.args_len]);
-                self.pending = p;
+                if (ar.sid == self.sid)
+                    self.pending = p
+                else
+                    self.background_approvals.put(self.gpa, ar.sid, p) catch {};
             },
             .session_created => |sc| self.handleSessionCreated(sc.sid),
+            .session_list_result => |sl| self.replaceSessionSummaries(sl.sessions),
+            .blob_result => |blob| self.stageClipboard(blob.bytes),
             .model_list_result => |ml| {
                 for (self.catalog.items) |old| self.gpa.free(old);
                 self.catalog.clearRetainingCapacity();
@@ -350,35 +699,35 @@ const App = struct {
     fn applyBlock(self: *App, b: block.Block) void {
         switch (b.body) {
             .user_msg => |u| {
-                if (!reconcilePendingEcho(self.blocks.items, .user_msg, u.text))
-                    self.pushBlock(.user_msg, u.text, "", .ok);
+                if (!reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id))
+                    self.pushDurableBlock(b, .user_msg, u.text, "", .ok);
                 // Seed input history from the log (replay covers pre-reboot
                 // messages; live blocks cover this session's submits).
                 self.editor.pushHistory(u.text);
             },
             .steer => |s| {
-                if (!reconcilePendingEcho(self.blocks.items, .steer, s.text))
-                    self.pushBlock(.steer, s.text, "", .ok);
+                if (!reconcilePendingEcho(self.blocks.items, .steer, s.text, b.seq, b.turn_id))
+                    self.pushDurableBlock(b, .steer, s.text, "", .ok);
             },
             .assistant_msg => |a| {
                 // Finalized text replaces the streaming delta.
                 self.delta.clearRetainingCapacity();
-                self.pushBlock(.assistant_msg, a.text, "", .ok);
+                self.pushDurableBlock(b, .assistant_msg, a.text, "", .ok);
             },
             .reasoning => |r| {
                 // The same progress text arrived first as ephemeral deltas.
                 // Replace that streaming copy with the durable block.
                 self.delta.clearRetainingCapacity();
-                self.pushBlock(.reasoning, r.text, "", .ok);
+                self.pushDurableBlock(b, .reasoning, r.text, "", .ok);
             },
-            .tool_call => |tc| self.pushBlock(.tool_call, tc.args_json, tc.name, .ok),
-            .tool_result => |tr| self.pushBlock(.tool_result, tr.inline_body, "", tr.status),
+            .tool_call => |tc| self.pushDurableBlock(b, .tool_call, tc.args_json, tc.name, .ok),
+            .tool_result => |tr| self.pushDurableToolResult(b, tr.inline_body, tr.status, tr.full_body_ref),
             .approval => |ap| {
                 const txt = if (ap.decision) |d| @tagName(d) else "pending";
-                self.pushBlock(.approval, txt, "", .ok);
+                self.pushDurableBlock(b, .approval, txt, "", .ok);
             },
-            .system_note => |sn| self.pushBlock(.system_note, sn.text, "", .ok),
-            .compaction => |cp| self.pushBlock(.compaction, cp.summary, "", .ok),
+            .system_note => |sn| self.pushDurableBlock(b, .system_note, sn.text, "", .ok),
+            .compaction => |cp| self.pushDurableBlock(b, .compaction, cp.summary, "", .ok),
         }
         // New content: keep pinned to bottom unless the user scrolled up.
         if (self.scroll_up > 0) self.scroll_up +|= 0; // stay where they are
@@ -445,10 +794,14 @@ const App = struct {
                 return;
             };
             self.applyEffort(selected);
+        } else if (std.mem.eql(u8, head, "/sessions")) {
+            self.openPicker(.session);
         } else if (std.mem.eql(u8, head, "/new")) {
             self.newSession() catch {
                 self.setNotice("could not create session", .{});
             };
+        } else if (std.mem.eql(u8, head, "!c")) {
+            self.copyLastToolOutput();
         } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
             const arg = it.rest();
             if (self.state == .running or self.state == .awaiting_approval) {
@@ -464,10 +817,41 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/model <m> · /effort <level> · /new · /compact · /reboot [--build] · !rb · /quit — Ctrl+T tools · Ctrl+C interrupt", .{});
+            self.setNotice("/sessions · /model <m> · /effort <level> · /new · /compact · /reboot [--build] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
+    }
+
+    fn stageClipboard(self: *App, text: []const u8) void {
+        if (text.len == 0) {
+            self.setNotice("last tool output is empty", .{});
+            return;
+        }
+        self.clipboard_pending.clearRetainingCapacity();
+        self.clipboard_pending.appendSlice(self.gpa, text) catch {
+            self.setNotice("could not stage clipboard output", .{});
+        };
+    }
+
+    fn copyLastToolOutput(self: *App) void {
+        var i = self.blocks.items.len;
+        while (i > 0) {
+            i -= 1;
+            const rendered = self.blocks.items[i];
+            if (rendered.kind != .tool_result) continue;
+            if (rendered.full_body_ref) |ref| {
+                self.conn.send(.{ .blob_get = .{ .hash = ref } }) catch {
+                    self.setNotice("could not request full tool output", .{});
+                    return;
+                };
+                self.setNotice("fetching full tool output…", .{});
+            } else {
+                self.stageClipboard(rendered.text);
+            }
+            return;
+        }
+        self.setNotice("no tool output to copy", .{});
     }
 
     fn selection(self: *const App) ?Selection {
@@ -481,7 +865,11 @@ const App = struct {
         self.picker_filter.clearRetainingCapacity();
         const current = self.pickerCurrent();
         for (self.pickerSource(), 0..) |item, i| {
-            if (std.mem.eql(u8, item, current)) {
+            const selected = if (kind == .session)
+                (sessionIdFromLabel(item) orelse 0) == self.sid
+            else
+                std.mem.eql(u8, item, current);
+            if (selected) {
                 self.picker = i;
                 break;
             }
@@ -494,6 +882,7 @@ const App = struct {
         return switch (self.picker_kind) {
             .model => if (self.catalog.items.len > 0) @ptrCast(self.catalog.items) else self.cfg.model_favorites,
             .effort => &proto.ReasoningEffort.choices,
+            .session => self.session_labels.items,
         };
     }
 
@@ -539,6 +928,8 @@ const App = struct {
         switch (self.picker_kind) {
             .model => self.applyModel(item),
             .effort => self.applyEffort(proto.ReasoningEffort.parse(item) orelse return),
+            .session => self.switchSession(sessionIdFromLabel(item) orelse return, true) catch
+                self.setNotice("could not switch session", .{}),
         }
     }
 
@@ -546,6 +937,7 @@ const App = struct {
         return switch (self.picker_kind) {
             .model => self.model.items,
             .effort => @tagName(self.effort),
+            .session => "",
         };
     }
 
@@ -557,7 +949,8 @@ const App = struct {
             .model = self.model.items,
             .effort = self.effort,
         } });
-        self.setCwdStr(cwd_buf[0..cwd_len]);
+        self.pending_new_cwd.clearRetainingCapacity();
+        try self.pending_new_cwd.appendSlice(self.gpa, cwd_buf[0..cwd_len]);
         // The reply is routed through the reader thread; we can't recv here.
         // Optimistic switch happens when session_created arrives — but that
         // message has no sub; simplest correct M2 flow: remember we asked.
@@ -568,24 +961,19 @@ const App = struct {
     fn handleSessionCreated(self: *App, sid: u64) void {
         if (!self.awaiting_new_session) return;
         self.awaiting_new_session = false;
-        // Switch: clear state, subscribe.
-        for (self.blocks.items) |*rb| rb.deinit(self.gpa);
-        self.blocks.clearRetainingCapacity();
-        self.delta.clearRetainingCapacity();
-        self.tokens_in = 0;
-        self.tokens_out = 0;
-        self.context_used = 0;
-        self.context_limit = 0;
-        self.pending = null;
-        self.state = .idle;
-        self.animation_active.store(false, .release);
-        self.spinner_frame = 0;
-        self.sel_anchor = null;
-        self.sel_dragging = false;
-        self.copy_pending = false;
-        self.sid = sid;
-        self.conn.send(.{ .sub = .{ .sid = sid, .from_seq = 1 } }) catch {};
-        self.setNotice("new session {d}", .{sid});
+        const model = self.gpa.dupe(u8, self.model.items) catch return;
+        defer self.gpa.free(model);
+        const effort = self.effort;
+        self.switchSession(sid, true) catch {
+            self.setNotice("could not switch to new session", .{});
+            return;
+        };
+        if (self.model.items.len == 0) self.setModelStr(model);
+        self.effort = effort;
+        if (self.cwd.items.len == 0) self.setCwdStr(self.pending_new_cwd.items);
+        self.pending_new_cwd.clearRetainingCapacity();
+        self.shortcut_help = false;
+        self.setNotice("new session #{x}", .{sid});
     }
 
     fn approveReply(self: *App, granted: bool) void {
@@ -631,6 +1019,10 @@ const Palette = struct {
     const command_selected: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 7 } };
     const command_selected_name: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 6 }, .bold = true };
     const command_selected_description: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 7 } };
+    const shortcut_panel: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 7 } };
+    const shortcut_key: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 6 }, .bold = true };
+    const shortcut_text: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 7 } };
+    const shortcut_border: vaxis.Style = .{ .fg = .{ .index = 6 } };
     const assistant: vaxis.Style = .{};
     const md_heading_1: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x89, 0xdd, 0xff } }, .bold = true };
     const md_heading_2: vaxis.Style = .{ .fg = .{ .index = 6 }, .bold = true };
@@ -709,6 +1101,12 @@ const Palette = struct {
 fn statusModel(model: []const u8) []const u8 {
     const gateway = "openrouter/";
     return if (std.mem.startsWith(u8, model, gateway)) model[gateway.len..] else model;
+}
+
+fn sessionIdFromLabel(label: []const u8) ?u64 {
+    if (label.len < 2 or label[0] != '#') return null;
+    const end = std.mem.indexOfScalar(u8, label, ' ') orelse label.len;
+    return std.fmt.parseInt(u64, label[1..end], 16) catch null;
 }
 
 fn statusCwd(arena: std.mem.Allocator, cwd: []const u8, home: []const u8) ![]const u8 {
@@ -1494,12 +1892,22 @@ fn isDiffOutput(text: []const u8) bool {
 /// Return the consecutive successful tool pairs that are safe to summarize.
 /// A failure or diff stops the run so its call/result render in full.
 fn collapsibleToolRun(blocks: []const RenderBlock, start: usize) CollapsedToolRun {
+    if (start >= blocks.len) return .{ .count = 0, .next = start };
+    const turn_id = blocks[start].turn_id;
     var i = start;
     var count: usize = 0;
-    while (i < blocks.len and blocks[i].kind == .tool_call) {
+    while (i < blocks.len and
+        blocks[i].kind == .tool_call and
+        blocks[i].turn_id == turn_id)
+    {
         var result_idx = i + 1;
-        while (result_idx < blocks.len and blocks[result_idx].kind == .approval) : (result_idx += 1) {}
-        if (result_idx >= blocks.len or blocks[result_idx].kind != .tool_result) break;
+        while (result_idx < blocks.len and
+            blocks[result_idx].kind == .approval and
+            blocks[result_idx].turn_id == turn_id) : (result_idx += 1)
+        {}
+        if (result_idx >= blocks.len or
+            blocks[result_idx].kind != .tool_result or
+            blocks[result_idx].turn_id != turn_id) break;
         const result = blocks[result_idx];
         if (result.status != .ok or isDiffOutput(result.text)) break;
         count += 1;
@@ -2741,6 +3149,73 @@ fn drawCommandMenu(
     }, .{ .wrap = .none });
 }
 
+const ShortcutHelpRow = struct {
+    key: []const u8 = "",
+    description: []const u8,
+    heading: bool = false,
+};
+
+const shortcut_help_rows = [_]ShortcutHelpRow{
+    .{ .key = "Esc / i", .description = "return to insert mode" },
+    .{ .key = "J / K", .description = "switch recent sessions" },
+    .{ .key = "j / k", .description = "scroll one line" },
+    .{ .key = "Ctrl+d / Ctrl+u", .description = "scroll one page" },
+    .{ .key = "g / G", .description = "jump to top / bottom" },
+    .{ .key = "?", .description = "toggle shortcut help" },
+    .{ .key = "q", .description = "quit Marlin" },
+    .{ .description = "GLOBAL", .heading = true },
+    .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
+    .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
+    .{ .key = "Ctrl+C", .description = "interrupt turn / quit when idle" },
+};
+
+fn drawShortcutHelp(win: vaxis.Window, arena: std.mem.Allocator) !void {
+    const h = win.height;
+    const w = win.width;
+    if (h < 8 or w < 32) return;
+
+    const shown: u16 = @intCast(@min(shortcut_help_rows.len, h -| 6));
+    const box_h = shown + 3; // title + rows + close hint
+    const box_w: u16 = @min(@as(u16, 58), w -| 4);
+    const box = win.child(.{
+        .x_off = @intCast((w -| box_w) / 2),
+        .y_off = @intCast((h -| box_h) / 2),
+        .width = box_w,
+        .height = box_h,
+        .border = .{ .where = .all, .style = Palette.shortcut_border },
+    });
+    box.fill(.{ .style = Palette.shortcut_panel });
+    _ = box.printSegment(.{
+        .text = " NORMAL MODE · shortcuts",
+        .style = Palette.shortcut_key,
+    }, .{ .wrap = .none });
+
+    const key_column: usize = 19;
+    var row: u16 = 0;
+    while (row < shown) : (row += 1) {
+        const item = shortcut_help_rows[row];
+        const row_win = box.child(.{ .y_off = @intCast(row + 1), .height = 1, .width = box.width });
+        if (item.heading) {
+            const heading = try std.fmt.allocPrint(arena, " {s}", .{item.description});
+            _ = row_win.printSegment(.{ .text = heading, .style = Palette.shortcut_key }, .{ .wrap = .none });
+            continue;
+        }
+        const key = try std.fmt.allocPrint(arena, " {s}", .{item.key});
+        const padding = try spaces(arena, if (key.len < key_column) key_column - key.len else 1);
+        const segments = [_]vaxis.Segment{
+            .{ .text = key, .style = Palette.shortcut_key },
+            .{ .text = padding, .style = Palette.shortcut_panel },
+            .{ .text = item.description, .style = Palette.shortcut_text },
+        };
+        _ = row_win.print(&segments, .{ .wrap = .none });
+    }
+
+    _ = box.printSegment(.{
+        .text = " Esc · ? · q close",
+        .style = Palette.shortcut_text,
+    }, .{ .row_offset = shown + 1, .wrap = .none });
+}
+
 fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const win = vx.window();
     win.clear();
@@ -2865,11 +3340,29 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const cwd_txt = try statusCwd(arena, app.cwd.items, app.home.items);
     const session_txt = try std.fmt.allocPrint(arena, "#{x:0>4}", .{app.sid & 0xFFFF});
     const scroll_txt = try std.fmt.allocPrint(arena, "↕ {d} (G: bottom)", .{app.scroll_up});
+    var background_running: usize = 0;
+    var background_approvals: usize = 0;
+    for (app.sessions.items) |session| {
+        if (session.sid == app.sid) continue;
+        switch (session.state) {
+            .running => background_running += 1,
+            .awaiting_approval => background_approvals += 1,
+            else => {},
+        }
+    }
+    const background_txt = if (background_running > 0 or background_approvals > 0)
+        try std.fmt.allocPrint(arena, "{d} running · {d} approval{s}", .{
+            background_running,
+            background_approvals,
+            if (background_approvals == 1) "" else "s",
+        })
+    else
+        "";
 
     // Session tag: last 4 hex digits of the id — enough to tell sessions
     // apart in `marlin ls` (which shows the same suffix) without eating
     // half the status bar with a u64.
-    var status_segments: [21]vaxis.Segment = undefined;
+    var status_segments: [25]vaxis.Segment = undefined;
     var status_n: usize = 0;
     status_segments[status_n] = .{ .text = " ", .style = Palette.status_bar };
     status_n += 1;
@@ -2903,6 +3396,15 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     status_n += 1;
     status_segments[status_n] = .{ .text = session_txt, .style = Palette.status_sep };
     status_n += 1;
+    if (background_txt.len > 0) {
+        status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+        status_n += 1;
+        status_segments[status_n] = .{
+            .text = background_txt,
+            .style = if (background_approvals > 0) Palette.status_approval else Palette.status_running,
+        };
+        status_n += 1;
+    }
     if (app.notice.items.len > 0) {
         status_segments[status_n] = .{ .text = "  ", .style = Palette.status_bar };
         status_n += 1;
@@ -2919,6 +3421,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         const picker_label: []const u8 = switch (app.picker_kind) {
             .model => "model",
             .effort => "effort",
+            .session => "sessions",
         };
 
         var widest: u16 = 30;
@@ -2956,7 +3459,10 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         var i: usize = win_start;
         while (i < items.len and row <= shown) : (i += 1) {
             const f = items[i];
-            const cur = std.mem.eql(u8, f, current);
+            const cur = if (app.picker_kind == .session)
+                (sessionIdFromLabel(f) orelse 0) == app.sid
+            else
+                std.mem.eql(u8, f, current);
             const line = try std.fmt.allocPrint(arena, " {s}{s}", .{ f[0..@min(f.len, box_w -| 4)], if (cur) " ●" else "" });
             const style: vaxis.Style = if (i == sel)
                 .{ .fg = .{ .index = 6 }, .bold = true, .reverse = true }
@@ -2970,6 +3476,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         const hint = try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Esc", .{ items.len, total_src });
         _ = box.printSegment(.{ .text = hint, .style = Palette.tool_out }, .{ .row_offset = shown + 1, .wrap = .none });
     }
+
+    if (app.shortcut_help and app.picker == null) try drawShortcutHelp(win, arena);
 }
 
 // ------------------------------------------------------------ entry point --
@@ -3127,6 +3635,7 @@ pub fn run(
     app.effort = effort_at_start;
     app.setCwdStr(cwd_at_start);
     if (environ.get("HOME")) |home| app.setHomeStr(home);
+    app.touchRecentSession(sid);
 
     // -- vaxis init --
     var tty_buf: [4096]u8 = undefined;
@@ -3170,6 +3679,9 @@ pub fn run(
     // closing the fd under a live read is a BADF panic on the Threaded Io.
     defer rt.join();
     defer conn.stream.shutdown(io, .both) catch {};
+    // Lightweight catalog/status updates for every session; block streams
+    // remain subscribed only for the focused session.
+    try conn.send(.{ .session_watch = .{} });
 
     const animation_thread = try std.Thread.spawn(.{}, animationThread, .{ &app, &loop });
     defer animation_thread.join();
@@ -3253,6 +3765,22 @@ pub fn run(
                         app.setNotice("clipboard copy failed", .{});
                 }
             }
+        }
+
+        if (app.clipboard_pending.items.len > 0) {
+            var copied = true;
+            vx.copyToSystemClipboard(
+                writer,
+                app.clipboard_pending.items,
+                frame_arena.allocator(),
+            ) catch {
+                copied = false;
+            };
+            app.clipboard_pending.clearRetainingCapacity();
+            if (copied)
+                app.setNotice("copied last tool output", .{})
+            else
+                app.setNotice("clipboard copy failed", .{});
         }
 
         try draw(&app, &vx, frame_arena.allocator());
@@ -3435,6 +3963,15 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
+    // Shortcut help is modal: only explicit close keys act on it. Global
+    // Ctrl commands above remain available for redraw, transcript, and abort.
+    if (app.shortcut_help) {
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('?', .{}) or key.matches('q', .{})) {
+            app.shortcut_help = false;
+        }
+        return;
+    }
+
     // Model/effort selector swallows all keys while open. Typing filters;
     // Up/Down or Ctrl+n/p navigate; Enter applies; Esc closes.
     if (app.picker) |sel| {
@@ -3548,10 +4085,16 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             }
         },
         .normal => {
-            if (key.matches('i', .{})) {
+            if (key.matches('?', .{})) {
+                app.shortcut_help = true;
+            } else if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{})) {
                 app.mode = .insert;
             } else if (key.matches('q', .{})) {
                 app.should_quit = true;
+            } else if (key.matches('J', .{ .shift = true }) or key.matches('J', .{})) {
+                app.cycleSession(1);
+            } else if (key.matches('K', .{ .shift = true }) or key.matches('K', .{})) {
+                app.cycleSession(-1);
             } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
                 app.scroll_up -|= 1;
             } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
@@ -3587,7 +4130,7 @@ test "composer command catalog filters slash commands and bang shortcuts" {
     defer ed.deinit();
 
     ed.insertSlice("/");
-    try std.testing.expectEqual(composer_commands.len - 1, commandMatches(&ed).len);
+    try std.testing.expectEqual(composer_commands.len - 2, commandMatches(&ed).len);
     ed.clear();
     ed.insertSlice("/co");
     const compact = commandMatches(&ed);
@@ -3602,8 +4145,9 @@ test "composer command catalog filters slash commands and bang shortcuts" {
     ed.clear();
     ed.insertSlice("!");
     const shortcuts = commandMatches(&ed);
-    try std.testing.expectEqual(@as(usize, 1), shortcuts.len);
-    try std.testing.expectEqualStrings("!rb", composer_commands[shortcuts.indices[0]].name);
+    try std.testing.expectEqual(@as(usize, 2), shortcuts.len);
+    try std.testing.expectEqualStrings("!c", composer_commands[shortcuts.indices[0]].name);
+    try std.testing.expectEqualStrings("!rb", composer_commands[shortcuts.indices[1]].name);
 
     completeCommand(&ed, composer_commands[0], true);
     try std.testing.expectEqualStrings("/model ", ed.text.items);
@@ -3763,6 +4307,63 @@ test "Ctrl+L clears transient view state without touching the draft" {
     try std.testing.expect(app.refresh_requested);
     try std.testing.expectEqualStrings("", app.notice.items);
     try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
+}
+
+test "Escape leaves normal mode after closing any active picker" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .mode = .normal,
+        .picker = 0,
+    };
+    defer app.deinit();
+    app.editor.insertSlice("draft survives");
+
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try std.testing.expect(app.picker == null);
+
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
+}
+
+test "question mark opens modal shortcut help in normal mode" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .mode = .normal,
+        .scroll_up = 8,
+    };
+    defer app.deinit();
+
+    try handleKey(&app, .{ .codepoint = '?' });
+    try std.testing.expect(app.shortcut_help);
+
+    try handleKey(&app, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(usize, 8), app.scroll_up);
+    try std.testing.expect(app.shortcut_help);
+
+    try handleKey(&app, .{ .codepoint = 'q' });
+    try std.testing.expect(!app.shortcut_help);
+    try std.testing.expect(!app.should_quit);
+
+    try handleKey(&app, .{ .codepoint = '?' });
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(!app.shortcut_help);
+    try std.testing.expectEqual(Mode.normal, app.mode);
 }
 
 test "selection is character precise on one or many lines" {
@@ -4180,6 +4781,22 @@ test "successful tools collapse but diffs and failures stop the run" {
     try std.testing.expectEqual(@as(usize, 0), collapsibleToolRun(&blocks, 4).count);
 }
 
+test "tool collapse never crosses a durable turn boundary" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocks = [_]RenderBlock{
+        .{ .kind = .tool_call, .turn_id = 11, .text = try arena.dupe(u8, "{}"), .label = try arena.dupe(u8, "grep") },
+        .{ .kind = .tool_result, .turn_id = 11, .text = try arena.dupe(u8, "match"), .label = try arena.dupe(u8, "") },
+        .{ .kind = .tool_call, .turn_id = 12, .text = try arena.dupe(u8, "{}"), .label = try arena.dupe(u8, "read_file") },
+        .{ .kind = .tool_result, .turn_id = 12, .text = try arena.dupe(u8, "contents"), .label = try arena.dupe(u8, "") },
+    };
+
+    const collapsed = collapsibleToolRun(&blocks, 0);
+    try std.testing.expectEqual(@as(usize, 1), collapsed.count);
+    try std.testing.expectEqual(@as(usize, 2), collapsed.next);
+}
+
 test "durable user block reconciles optimistic local echo" {
     const gpa = std.testing.allocator;
     var rendered = [_]RenderBlock{.{
@@ -4190,9 +4807,87 @@ test "durable user block reconciles optimistic local echo" {
     }};
     defer rendered[0].deinit(gpa);
 
-    try std.testing.expect(reconcilePendingEcho(&rendered, .user_msg, "hello"));
+    try std.testing.expect(reconcilePendingEcho(&rendered, .user_msg, "hello", 9, 3));
     try std.testing.expect(!rendered[0].pending_echo);
-    try std.testing.expect(!reconcilePendingEcho(&rendered, .user_msg, "hello"));
+    try std.testing.expectEqual(@as(u64, 9), rendered[0].seq);
+    try std.testing.expectEqual(@as(u64, 3), rendered[0].turn_id);
+    try std.testing.expect(!reconcilePendingEcho(&rendered, .user_msg, "hello", 9, 3));
+}
+
+test "session labels round-trip ids and preserve inactive view state" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 0x2a,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.replaceSessionSummaries(&.{.{
+        .sid = 0x2a,
+        .title = "review",
+        .cwd = "/tmp/project",
+        .model = "provider/model",
+        .status = "running",
+        .state = .running,
+        .created_at = 1,
+        .running = true,
+    }});
+    try std.testing.expectEqual(@as(?u64, 0x2a), sessionIdFromLabel(app.session_labels.items[0]));
+    try std.testing.expectEqual(proto.SessionState.running, app.state);
+
+    app.editor.insertSlice("draft survives");
+    app.scroll_up = 17;
+    app.pushBlock(.assistant_msg, "scrollback survives", "", .ok);
+    try app.saveActiveView();
+    try std.testing.expectEqual(@as(usize, 0), app.blocks.items.len);
+
+    const saved = app.saved_views.get(0x2a).?;
+    _ = app.saved_views.remove(0x2a);
+    app.restoreSavedView(saved);
+    gpa.destroy(saved);
+    try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 17), app.scroll_up);
+    try std.testing.expectEqualStrings("scrollback survives", app.blocks.items[0].text);
+}
+
+test "tool results retain full blob refs and inline !c stages clipboard text" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.applyBlock(.{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 4,
+        .seq = 7,
+        .ts = 0,
+        .body = .{ .tool_result = .{
+            .call_id = "call",
+            .status = .ok,
+            .inline_body = "capped",
+            .full_body_ref = "abc123",
+        } },
+    });
+    try std.testing.expectEqualStrings("abc123", app.blocks.items[0].full_body_ref.?);
+    app.blocks.items[0].deinit(gpa);
+    app.blocks.clearRetainingCapacity();
+
+    app.pushBlock(.tool_result, "complete output", "", .ok);
+    app.runCommand("!c");
+    try std.testing.expectEqualStrings("complete output", app.clipboard_pending.items);
 }
 
 test "local commands enter editor history" {
