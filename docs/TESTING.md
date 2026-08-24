@@ -99,6 +99,43 @@ CI runs it nightly and on manual dispatch, never on PRs.
 for every push/PR. Smoke is a separate job gated on schedule/dispatch with
 `OPENROUTER_API_KEY` from repo secrets.
 
+## Reboot / crash-recovery tests (lands with M3 `/reboot`)
+
+Reboot correctness is NOT tested with hand-authored "convoluted state"
+scenarios — imagined weirdness always misses field weirdness #16. Instead:
+a state-snapshot oracle + a mechanically generated matrix.
+
+1. **Oracle: canonical state dump.** `marlin dump-state` (hidden subcommand
+   or runner-side) serializes everything the daemon considers durable truth
+   — sessions, block logs, blob hashes, pending approvals, session state
+   machines — as canonical JSON, ids/timestamps normalized. Every reboot
+   test is then: `dump → reboot → dump → diff == ∅`, modulo an explicit
+   allowlist (the reboot's own system_note; in-flight turn demoted to
+   resumable). No per-scenario assertions; the diff catches categories
+   nobody thought to assert.
+2. **Matrix, not authorship.** Dimensions: turn state (idle / mid-stream /
+   mid-tool / awaiting-approval) × session count/mix × background bash task
+   (y/n) × reboot flavor (`/reboot` / `/reboot!` / `kill -9`+restart) ×
+   store (fresh / needs-migration fixture) × UI snapshot (valid / corrupt /
+   missing). The runner iterates the product; `delay_ms_between_events`
+   freezes mid-stream/mid-tool states deterministically.
+3. **Convergence family (the load-bearing test).** Identical scripted
+   setup; branch A `/reboot`, branch B `kill -9` at the equivalent moment;
+   both restart, both dump. Dumps must be identical modulo the specified
+   quiesce delta (`/reboot` may contain one more finalized block — that
+   difference is pinned, not tolerated). Divergence means crash recovery
+   broke or reboot does secret cleanup crashes won't get.
+4. **Hand-authored scenarios only for non-matrix adversaries:** `--build`
+   fails mid-compile (old daemon must keep running), candidate passes build
+   but fails `--version` sanity exec, unparseable UI snapshot (default
+   layout, same session), migration fails halfway (store untouched or
+   cleanly rolled back), stale client vs new daemon (handshake rejects
+   cleanly). One behavior per file, as usual.
+
+Bug rule applies: matrix-found divergences get reproduced at the lowest
+layer that expresses them (store recovery → store.zig unit test), never
+enshrined as another e2e.
+
 ## Rules going into M1 (daemon + protocol)
 
 1. **Every protocol message type ships with a golden transcript test** —
