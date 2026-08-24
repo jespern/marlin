@@ -5,7 +5,7 @@
 //!
 //! Layout (M3):
 //!   ┌─ session view: blocks, streaming region ─┐
-//!   ├─ input box (1-8 lines, grows with content)┤
+//!   ├─ prompt panel (3-10 lines, grows with content) ┤
 //!   └─ status: state · model · tokens · ctx ────┤
 //!
 //! Keys:
@@ -55,12 +55,25 @@ const RenderBlock = struct {
     /// tool_call: "name" — used for the collapsed header line.
     label: []u8,
     status: block.ToolStatus = .ok,
+    /// Locally inserted for instant submit feedback. The matching durable
+    /// block clears this bit instead of producing a duplicate render block.
+    pending_echo: bool = false,
 
     fn deinit(self: *RenderBlock, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
         gpa.free(self.label);
     }
 };
+
+fn reconcilePendingEcho(blocks: []RenderBlock, kind: block.BlockKind, text: []const u8) bool {
+    for (blocks) |*rendered| {
+        if (rendered.pending_echo and rendered.kind == kind and std.mem.eql(u8, rendered.text, text)) {
+            rendered.pending_echo = false;
+            return true;
+        }
+    }
+    return false;
+}
 
 const PendingApproval = struct {
     id_buf: [32]u8 = undefined,
@@ -124,6 +137,11 @@ const App = struct {
     delta: std.ArrayList(u8) = .empty,
     state: proto.SessionState = .idle,
     model: std.ArrayList(u8) = .empty,
+    /// Session root from daemon metadata, not necessarily the attach
+    /// process's current directory.
+    cwd: std.ArrayList(u8) = .empty,
+    /// Used only to render cwd with a compact ~/ prefix.
+    home: std.ArrayList(u8) = .empty,
     tokens_in: u64 = 0,
     tokens_out: u64 = 0,
     context_used: u64 = 0,
@@ -173,6 +191,8 @@ const App = struct {
         self.blocks.deinit(self.gpa);
         self.delta.deinit(self.gpa);
         self.model.deinit(self.gpa);
+        self.cwd.deinit(self.gpa);
+        self.home.deinit(self.gpa);
         self.notice.deinit(self.gpa);
         self.editor.deinit();
     }
@@ -187,13 +207,40 @@ const App = struct {
         self.model.appendSlice(self.gpa, m) catch {};
     }
 
+    fn setCwdStr(self: *App, cwd: []const u8) void {
+        self.cwd.clearRetainingCapacity();
+        self.cwd.appendSlice(self.gpa, cwd) catch {};
+    }
+
+    fn setHomeStr(self: *App, home: []const u8) void {
+        self.home.clearRetainingCapacity();
+        self.home.appendSlice(self.gpa, home) catch {};
+    }
+
     fn pushBlock(self: *App, kind: block.BlockKind, text: []const u8, label: []const u8, status: block.ToolStatus) void {
+        self.pushBlockPending(kind, text, label, status, false);
+    }
+
+    fn pushBlockPending(
+        self: *App,
+        kind: block.BlockKind,
+        text: []const u8,
+        label: []const u8,
+        status: block.ToolStatus,
+        pending_echo: bool,
+    ) void {
         const t = self.gpa.dupe(u8, text) catch return;
         const l = self.gpa.dupe(u8, label) catch {
             self.gpa.free(t);
             return;
         };
-        self.blocks.append(self.gpa, .{ .kind = kind, .text = t, .label = l, .status = status }) catch {
+        self.blocks.append(self.gpa, .{
+            .kind = kind,
+            .text = t,
+            .label = l,
+            .status = status,
+            .pending_echo = pending_echo,
+        }) catch {
             self.gpa.free(t);
             self.gpa.free(l);
         };
@@ -260,12 +307,16 @@ const App = struct {
     fn applyBlock(self: *App, b: block.Block) void {
         switch (b.body) {
             .user_msg => |u| {
-                self.pushBlock(.user_msg, u.text, "", .ok);
+                if (!reconcilePendingEcho(self.blocks.items, .user_msg, u.text))
+                    self.pushBlock(.user_msg, u.text, "", .ok);
                 // Seed input history from the log (replay covers pre-reboot
                 // messages; live blocks cover this session's submits).
                 self.editor.pushHistory(u.text);
             },
-            .steer => |s| self.pushBlock(.steer, s.text, "", .ok),
+            .steer => |s| {
+                if (!reconcilePendingEcho(self.blocks.items, .steer, s.text))
+                    self.pushBlock(.steer, s.text, "", .ok);
+            },
             .assistant_msg => |a| {
                 // Finalized text replaces the streaming delta.
                 self.delta.clearRetainingCapacity();
@@ -291,14 +342,29 @@ const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') {
+            // Commands are client actions rather than durable user_msg
+            // blocks, but they still belong in the local editor history so
+            // Up then Enter can repeat them during this client lifetime.
+            self.editor.pushHistory(trimmed);
             self.runCommand(trimmed);
             return;
         }
+        const was_running = self.state == .running;
         self.conn.send(.{ .input = .{ .sid = self.sid, .text = trimmed } }) catch {
             self.setNotice("send failed — daemon gone?", .{});
             return;
         };
-        if (self.state == .running) self.setNotice("queued as steer (turn running)", .{});
+        if (was_running) {
+            self.pushBlockPending(.steer, trimmed, "", .ok, true);
+            self.setNotice("queued as steer (turn running)", .{});
+        } else {
+            // The composer becomes a scrollback card immediately. The turn
+            // thread's persisted user_msg will reconcile this local echo.
+            self.pushBlockPending(.user_msg, trimmed, "", .ok, true);
+            self.state = .running;
+            self.spinner_frame = 0;
+            self.animation_active.store(true, .release);
+        }
         self.scroll_up = 0;
     }
 
@@ -392,6 +458,7 @@ const App = struct {
             .cwd = cwd_buf[0..cwd_len],
             .model = self.model.items,
         } });
+        self.setCwdStr(cwd_buf[0..cwd_len]);
         // The reply is routed through the reader thread; we can't recv here.
         // Optimistic switch happens when session_created arrives — but that
         // message has no sub; simplest correct M2 flow: remember we asked.
@@ -442,6 +509,13 @@ const App = struct {
 
 const Palette = struct {
     const user: vaxis.Style = .{ .fg = .{ .index = 6 }, .bold = true }; // cyan
+    // Sampled from the Codex composer in the same terminal (#42454b), so
+    // the raised surface has the same contrast instead of approximating it
+    // through theme-dependent ANSI grays.
+    const prompt_bg: vaxis.Color = .{ .rgb = .{ 0x42, 0x45, 0x4b } };
+    const prompt_panel: vaxis.Style = .{ .bg = prompt_bg };
+    const prompt_text: vaxis.Style = .{ .bg = prompt_bg };
+    const prompt_mark: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 6 }, .bold = true };
     const assistant: vaxis.Style = .{};
     const reasoning: vaxis.Style = .{ .fg = .{ .index = 8 }, .italic = true };
     /// Tool machinery (the ⚙ glyph, arg previews, result bodies): dimmed
@@ -454,16 +528,71 @@ const Palette = struct {
     const tool_cmd: vaxis.Style = .{ .fg = .{ .index = 4 }, .bold = true }; // blue
     const tool_out: vaxis.Style = .{ .fg = .{ .index = 8 }, .dim = true };
     const tool_err: vaxis.Style = .{ .fg = .{ .index = 1 } }; // red
-    // Diff lines inside tool output: fg-colored, diff-tool style (never
-    // full-line backgrounds).
-    const diff_add: vaxis.Style = .{ .fg = .{ .index = 2 } }; // green
-    const diff_del: vaxis.Style = .{ .fg = .{ .index = 1 } }; // red
+    // Fixed dark surfaces match the current Codex-like composer and keep the
+    // add/delete signal restrained enough for syntax colors to remain legible.
+    const diff_add_bg: vaxis.Color = .{ .rgb = .{ 0x1f, 0x37, 0x29 } };
+    const diff_del_bg: vaxis.Color = .{ .rgb = .{ 0x3b, 0x24, 0x29 } };
+    const diff_add: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x73, 0xd0, 0x91 } }, .bg = diff_add_bg, .bold = true };
+    const diff_del: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xf0, 0x71, 0x78 } }, .bg = diff_del_bg, .bold = true };
+    const diff_add_code: vaxis.Style = .{ .bg = diff_add_bg };
+    const diff_del_code: vaxis.Style = .{ .bg = diff_del_bg };
+    const diff_context: vaxis.Style = .{ .fg = .{ .index = 8 } };
     const diff_hunk: vaxis.Style = .{ .fg = .{ .index = 6 } }; // cyan @@ + decl ctx
+    const syntax_keyword: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xc7, 0x92, 0xea } }, .bold = true };
+    const syntax_string: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xc3, 0xe8, 0x8d } } };
+    const syntax_number: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xf7, 0x8c, 0x6c } } };
+    const syntax_comment: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x69, 0x70, 0x98 } }, .italic = true };
+    const syntax_type: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x89, 0xdd, 0xff } } };
+    const syntax_function: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x82, 0xaa, 0xff } } };
+    const syntax_constant: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
     const note: vaxis.Style = .{ .fg = .{ .index = 3 } }; // yellow
     const steer: vaxis.Style = .{ .fg = .{ .index = 5 } }; // magenta
-    const status_bar: vaxis.Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 7 } };
+    const status_bg: vaxis.Color = .{ .index = 0 };
+    const status_bar: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 7 } };
+    const status_sep: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 8 }, .dim = true };
+    const status_idle: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 2 } };
+    const status_running: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 }, .bold = true };
+    const status_approval: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 }, .bold = true };
+    const status_error: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 1 }, .bold = true };
+    const status_model: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 6 } };
+    const status_context: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 4 } };
+    const status_context_warn: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 } };
+    const status_context_hot: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 1 } };
+    const status_cwd: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 2 } };
+    const status_notice: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 } };
     const approval_card: vaxis.Style = .{ .fg = .{ .index = 3 }, .bold = true };
     const delta_style: vaxis.Style = .{};
+};
+
+fn statusModel(model: []const u8) []const u8 {
+    const gateway = "openrouter/";
+    return if (std.mem.startsWith(u8, model, gateway)) model[gateway.len..] else model;
+}
+
+fn statusCwd(arena: std.mem.Allocator, cwd: []const u8, home: []const u8) ![]const u8 {
+    if (cwd.len == 0) return "cwd ?";
+    if (home.len > 0 and
+        std.mem.startsWith(u8, cwd, home) and
+        (cwd.len == home.len or cwd[home.len] == '/'))
+    {
+        return std.fmt.allocPrint(arena, "~{s}", .{cwd[home.len..]});
+    }
+    return cwd;
+}
+
+const LinkSpan = struct {
+    /// Byte offsets in the concatenated visible text of a Line.
+    start: usize,
+    end: usize,
+    /// OSC 8 destination. Always an allowlisted http(s) URL.
+    uri: []const u8,
+};
+
+const SyntaxSpan = struct {
+    /// Byte offsets in the concatenated visible text of a Line.
+    start: usize,
+    end: usize,
+    style: vaxis.Style,
 };
 
 /// One logical display line: 1..3 styled segments (segments never wrap
@@ -472,11 +601,22 @@ const Palette = struct {
 const Line = struct {
     text: []const u8,
     style: vaxis.Style,
+    /// When set, paint the complete terminal row before printing segments.
+    /// Prompt cards use this to retain their background past the text.
+    fill_style: ?vaxis.Style = null,
     /// Optional second/third segment printed after `text` on the same row.
     text2: []const u8 = "",
     style2: vaxis.Style = .{},
     text3: []const u8 = "",
     style3: vaxis.Style = .{},
+    /// Hyperlinks over the concatenated text/text2/text3 byte stream.
+    links: []const LinkSpan = &.{},
+    /// Foreground-only code syntax overlays. The underlying row background
+    /// remains intact for added/deleted diff lines.
+    syntax: []const SyntaxSpan = &.{},
+    /// Wrapped message lines resolve links against the unbroken source URL.
+    /// Other line kinds are scanned once after layout is complete.
+    links_resolved: bool = false,
 };
 
 const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
@@ -489,6 +629,396 @@ fn lineWidth(win: vaxis.Window, line: Line) usize {
 
 fn lineText(arena: std.mem.Allocator, line: Line) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ line.text, line.text2, line.text3 });
+}
+
+const SyntaxLanguage = enum {
+    generic,
+    zig,
+    rust,
+    javascript,
+    python,
+    shell,
+    json,
+    toml,
+    yaml,
+    c_like,
+    go,
+    ruby,
+    markdown,
+};
+
+fn languageForPath(path: []const u8) SyntaxLanguage {
+    const ext = std.fs.path.extension(path);
+    if (std.mem.eql(u8, ext, ".zig")) return .zig;
+    if (std.mem.eql(u8, ext, ".rs")) return .rust;
+    if (std.mem.eql(u8, ext, ".js") or std.mem.eql(u8, ext, ".jsx") or
+        std.mem.eql(u8, ext, ".ts") or std.mem.eql(u8, ext, ".tsx") or
+        std.mem.eql(u8, ext, ".mjs") or std.mem.eql(u8, ext, ".cjs")) return .javascript;
+    if (std.mem.eql(u8, ext, ".py") or std.mem.eql(u8, ext, ".pyi")) return .python;
+    if (std.mem.eql(u8, ext, ".sh") or std.mem.eql(u8, ext, ".bash") or
+        std.mem.eql(u8, ext, ".zsh") or std.mem.eql(u8, ext, ".fish")) return .shell;
+    if (std.mem.eql(u8, ext, ".json") or std.mem.eql(u8, ext, ".jsonc")) return .json;
+    if (std.mem.eql(u8, ext, ".toml")) return .toml;
+    if (std.mem.eql(u8, ext, ".yaml") or std.mem.eql(u8, ext, ".yml")) return .yaml;
+    if (std.mem.eql(u8, ext, ".c") or std.mem.eql(u8, ext, ".h") or
+        std.mem.eql(u8, ext, ".cc") or std.mem.eql(u8, ext, ".cpp") or
+        std.mem.eql(u8, ext, ".cxx") or std.mem.eql(u8, ext, ".hpp") or
+        std.mem.eql(u8, ext, ".java") or std.mem.eql(u8, ext, ".swift") or
+        std.mem.eql(u8, ext, ".kt")) return .c_like;
+    if (std.mem.eql(u8, ext, ".go")) return .go;
+    if (std.mem.eql(u8, ext, ".rb")) return .ruby;
+    if (std.mem.eql(u8, ext, ".md") or std.mem.eql(u8, ext, ".mdx")) return .markdown;
+    return .generic;
+}
+
+/// Edit results start with `replaced ... in path`; regular git diffs expose
+/// the target in a `+++ b/path` line. Supporting both keeps bash-produced
+/// diffs useful too.
+fn diffLanguage(text: []const u8) SyntaxLanguage {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.lastIndexOf(u8, line, " in ")) |at| {
+            const path = std.mem.trim(u8, line[at + 4 ..], " \t\r");
+            const lang = languageForPath(path);
+            if (lang != .generic) return lang;
+        }
+        if (std.mem.startsWith(u8, line, "+++ ")) {
+            var path = std.mem.trim(u8, line[4..], " \t\r");
+            if (std.mem.startsWith(u8, path, "b/")) path = path[2..];
+            if (!std.mem.eql(u8, path, "/dev/null")) return languageForPath(path);
+        }
+    }
+    return .generic;
+}
+
+fn wordIn(word: []const u8, words: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, words, ' ');
+    while (it.next()) |candidate| {
+        if (std.mem.eql(u8, word, candidate)) return true;
+    }
+    return false;
+}
+
+fn isKeyword(lang: SyntaxLanguage, word: []const u8) bool {
+    const words: []const u8 = switch (lang) {
+        .zig => "align allowzero and anyframe anytype asm async await break catch comptime const continue defer else enum errdefer error export extern fn for if inline linksection noalias noinline nosuspend opaque or orelse packed pub resume return struct suspend switch test threadlocal try union unreachable usingnamespace var volatile while",
+        .rust => "as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait type unsafe use where while",
+        .javascript => "async await break case catch class const continue debugger default delete do else export extends finally for function if import in instanceof let new of return static super switch this throw try typeof var void while with yield interface type enum implements namespace private protected public readonly",
+        .python => "and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case",
+        .shell => "case do done elif else esac fi for function if in select then time until while",
+        .c_like => "alignas alignof auto break case catch class const constexpr continue default delete do else enum explicit export extern final for friend goto if import inline interface namespace new noexcept operator override private protected public register return signed sizeof static struct switch template this throw try typedef typename union unsigned using virtual volatile while",
+        .go => "break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var",
+        .ruby => "alias and begin break case class def defined do else elsif end ensure false for if in module next not or redo rescue retry return self super then true undef unless until when while yield",
+        else => "",
+    };
+    return wordIn(word, words);
+}
+
+fn isBuiltinType(word: []const u8) bool {
+    return wordIn(
+        word,
+        "anyerror anyopaque bool byte c_int char comptime_float comptime_int f16 f32 f64 f80 f128 i8 i16 i32 i64 i128 isize noreturn str string String u8 u16 u32 u64 u128 usize void",
+    );
+}
+
+fn isConstant(word: []const u8) bool {
+    return wordIn(word, "false true null undefined nil None True False");
+}
+
+fn isIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_' or c == '@' or c == '$';
+}
+
+fn isIdentContinue(c: u8) bool {
+    return isIdentStart(c) or std.ascii.isDigit(c);
+}
+
+fn lineCommentMarker(lang: SyntaxLanguage) ?[]const u8 {
+    return switch (lang) {
+        .python, .shell, .toml, .yaml, .ruby => "#",
+        .zig, .rust, .javascript, .c_like, .go => "//",
+        else => null,
+    };
+}
+
+fn appendSyntaxSpan(
+    arena: std.mem.Allocator,
+    spans: *std.ArrayList(SyntaxSpan),
+    start: usize,
+    end: usize,
+    offset: usize,
+    style: vaxis.Style,
+) !void {
+    try spans.append(arena, .{ .start = offset + start, .end = offset + end, .style = style });
+}
+
+/// Lightweight, line-local lexer. It intentionally recognizes broad lexical
+/// classes rather than pretending to be a parser; malformed/incomplete diff
+/// lines still receive stable highlighting and never affect stored text.
+fn syntaxSpans(
+    arena: std.mem.Allocator,
+    code: []const u8,
+    lang: SyntaxLanguage,
+    offset: usize,
+) ![]const SyntaxSpan {
+    var spans: std.ArrayList(SyntaxSpan) = .empty;
+    var i: usize = 0;
+    while (i < code.len) {
+        if (lineCommentMarker(lang)) |marker| {
+            if (std.mem.startsWith(u8, code[i..], marker)) {
+                try appendSyntaxSpan(arena, &spans, i, code.len, offset, Palette.syntax_comment);
+                break;
+            }
+        }
+        if (std.mem.startsWith(u8, code[i..], "/*")) {
+            const close = std.mem.indexOfPos(u8, code, i + 2, "*/");
+            const end = if (close) |at| at + 2 else code.len;
+            try appendSyntaxSpan(arena, &spans, i, end, offset, Palette.syntax_comment);
+            i = end;
+            continue;
+        }
+        const c = code[i];
+        if (c == '"' or c == '\'' or c == '`') {
+            const quote = c;
+            var end = i + 1;
+            while (end < code.len) : (end += 1) {
+                if (code[end] == '\\') {
+                    end = @min(end + 1, code.len);
+                    continue;
+                }
+                if (code[end] == quote) {
+                    end += 1;
+                    break;
+                }
+            }
+            try appendSyntaxSpan(arena, &spans, i, end, offset, Palette.syntax_string);
+            i = end;
+            continue;
+        }
+        if (std.ascii.isDigit(c)) {
+            var end = i + 1;
+            while (end < code.len and (std.ascii.isAlphanumeric(code[end]) or
+                code[end] == '.' or code[end] == '_')) : (end += 1)
+            {}
+            try appendSyntaxSpan(arena, &spans, i, end, offset, Palette.syntax_number);
+            i = end;
+            continue;
+        }
+        if (isIdentStart(c)) {
+            var end = i + 1;
+            while (end < code.len and isIdentContinue(code[end])) : (end += 1) {}
+            const word = code[i..end];
+            var style: ?vaxis.Style = null;
+            if (isKeyword(lang, word) or c == '@')
+                style = Palette.syntax_keyword
+            else if (isConstant(word))
+                style = Palette.syntax_constant
+            else if (isBuiltinType(word) or std.ascii.isUpper(c))
+                style = Palette.syntax_type
+            else {
+                var next = end;
+                while (next < code.len and (code[next] == ' ' or code[next] == '\t')) next += 1;
+                if (next < code.len and code[next] == '(') style = Palette.syntax_function;
+            }
+            if (style) |token_style| try appendSyntaxSpan(arena, &spans, i, end, offset, token_style);
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    return spans.items;
+}
+
+fn isUrlStart(text: []const u8, at: usize) bool {
+    return std.mem.startsWith(u8, text[at..], "https://") or
+        std.mem.startsWith(u8, text[at..], "http://");
+}
+
+fn isUrlTerminator(c: u8) bool {
+    return c <= ' ' or c == '<' or c == '>' or c == '"' or c == '\'' or c == '`';
+}
+
+fn countByte(text: []const u8, needle: u8) usize {
+    var count: usize = 0;
+    for (text) |c| if (c == needle) {
+        count += 1;
+    };
+    return count;
+}
+
+/// End of a plain http(s) URL, excluding prose/Markdown punctuation.
+fn urlEnd(text: []const u8, start: usize) usize {
+    var end = start;
+    while (end < text.len and !isUrlTerminator(text[end])) end += 1;
+
+    // Sentence punctuation is almost never intended to be part of a URL.
+    while (end > start and std.mem.indexOfScalar(u8, ".,;:!?", text[end - 1]) != null) end -= 1;
+
+    // Keep balanced delimiters inside URLs, but drop unmatched prose or
+    // Markdown closers: `(https://example.test/foo)` -> URL without final `)`.
+    const pairs = [_][2]u8{ .{ '(', ')' }, .{ '[', ']' }, .{ '{', '}' } };
+    inline for (pairs) |pair| {
+        while (end > start and text[end - 1] == pair[1] and
+            countByte(text[start..end], pair[1]) > countByte(text[start..end], pair[0]))
+        {
+            end -= 1;
+        }
+    }
+    return end;
+}
+
+/// Find visible spans that should carry OSC 8 metadata. Markdown stays
+/// visible for now, but both its label and destination become clickable.
+fn findLinkSpans(arena: std.mem.Allocator, text: []const u8) ![]const LinkSpan {
+    var spans: std.ArrayList(LinkSpan) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '[') {
+            if (std.mem.indexOfPos(u8, text, i + 1, "](")) |label_end| {
+                const uri_start = label_end + 2;
+                if (uri_start < text.len and isUrlStart(text, uri_start)) {
+                    const uri_end = urlEnd(text, uri_start);
+                    if (uri_end > uri_start and uri_end < text.len and text[uri_end] == ')') {
+                        const uri = text[uri_start..uri_end];
+                        if (label_end > i + 1) try spans.append(arena, .{
+                            .start = i + 1,
+                            .end = label_end,
+                            .uri = uri,
+                        });
+                        try spans.append(arena, .{
+                            .start = uri_start,
+                            .end = uri_end,
+                            .uri = uri,
+                        });
+                        i = uri_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if (isUrlStart(text, i)) {
+            const end = urlEnd(text, i);
+            if (end > i) try spans.append(arena, .{ .start = i, .end = end, .uri = text[i..end] });
+            i = @max(end, i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    return spans.items;
+}
+
+/// Intersect source-text links with one hard-wrapped chunk. Each resulting
+/// span keeps the full URI even when only part of its label/URL is visible.
+fn linksForChunk(
+    arena: std.mem.Allocator,
+    source_links: []const LinkSpan,
+    chunk_start: usize,
+    chunk_end: usize,
+    prefix_len: usize,
+) ![]const LinkSpan {
+    var spans: std.ArrayList(LinkSpan) = .empty;
+    for (source_links) |link| {
+        const start = @max(link.start, chunk_start);
+        const end = @min(link.end, chunk_end);
+        if (start < end) try spans.append(arena, .{
+            .start = prefix_len + start - chunk_start,
+            .end = prefix_len + end - chunk_start,
+            .uri = link.uri,
+        });
+    }
+    return spans.items;
+}
+
+fn resolveLineLinks(arena: std.mem.Allocator, lines: []Line) !void {
+    for (lines) |*line| {
+        if (line.links_resolved) continue;
+        const text = try lineText(arena, line.*);
+        line.links = try findLinkSpans(arena, text);
+        line.links_resolved = true;
+    }
+}
+
+fn linkForBytes(links: []const LinkSpan, start: usize, end: usize) ?[]const u8 {
+    for (links) |link| {
+        if (start < link.end and end > link.start) return link.uri;
+    }
+    return null;
+}
+
+fn syntaxForBytes(spans: []const SyntaxSpan, start: usize, end: usize) ?vaxis.Style {
+    for (spans) |span| {
+        if (start < span.end and end > span.start) return span.style;
+    }
+    return null;
+}
+
+/// Overlay only syntax foreground/attributes. In particular, never replace
+/// the add/delete background already present on the rendered cell.
+fn applyLineSyntax(win: vaxis.Window, row: u16, line: Line) void {
+    if (line.syntax.len == 0) return;
+    const parts = [_][]const u8{ line.text, line.text2, line.text3 };
+    var byte_offset: usize = 0;
+    var col: usize = 0;
+    for (parts) |part| {
+        var part_offset: usize = 0;
+        var it = vaxis.unicode.graphemeIterator(part);
+        while (it.next()) |grapheme| {
+            const bytes = grapheme.bytes(part);
+            const start = byte_offset + part_offset;
+            const end = start + bytes.len;
+            const cell_width: usize = @intCast(win.gwidth(bytes));
+            if (syntaxForBytes(line.syntax, start, end)) |style| {
+                if (col < @as(usize, win.width)) {
+                    if (win.readCell(@intCast(col), row)) |cell| {
+                        var highlighted = cell;
+                        highlighted.style.fg = style.fg;
+                        highlighted.style.bold = style.bold;
+                        highlighted.style.dim = style.dim;
+                        highlighted.style.italic = style.italic;
+                        highlighted.style.strikethrough = style.strikethrough;
+                        win.writeCell(@intCast(col), row, highlighted);
+                    }
+                }
+            }
+            part_offset += bytes.len;
+            col += cell_width;
+        }
+        byte_offset += part.len;
+    }
+}
+
+/// Attach OSC 8 metadata after styled segments have been painted. This keeps
+/// syntax colors and selection independent from the link parser.
+fn applyLineLinks(win: vaxis.Window, row: u16, line: Line) void {
+    if (line.links.len == 0) return;
+    const parts = [_][]const u8{ line.text, line.text2, line.text3 };
+    var byte_offset: usize = 0;
+    var col: usize = 0;
+    for (parts) |part| {
+        var part_offset: usize = 0;
+        var it = vaxis.unicode.graphemeIterator(part);
+        while (it.next()) |grapheme| {
+            const bytes = grapheme.bytes(part);
+            const start = byte_offset + part_offset;
+            const end = start + bytes.len;
+            const cell_width: usize = @intCast(win.gwidth(bytes));
+            if (linkForBytes(line.links, start, end)) |uri| {
+                if (col < @as(usize, win.width)) {
+                    if (win.readCell(@intCast(col), row)) |cell| {
+                        var linked = cell;
+                        linked.link = .{ .uri = uri };
+                        linked.style.fg = .{ .index = 6 }; // cyan
+                        linked.style.ul_style = .single;
+                        win.writeCell(@intCast(col), row, linked);
+                    }
+                }
+            }
+            part_offset += bytes.len;
+            col += cell_width;
+        }
+        byte_offset += part.len;
+    }
 }
 
 /// Append every complete grapheme intersecting [start_col, end_col).
@@ -531,6 +1061,52 @@ fn selectedText(
     return out.items;
 }
 
+fn wrapPromptCard(
+    arena: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    text: []const u8,
+    width: usize,
+) !void {
+    const first_prefix = " ❯ ";
+    const continuation = "   ";
+    const prefix_cells: usize = 3;
+    const body_width = width -| (prefix_cells + 1); // keep right padding
+    if (body_width < 8) return;
+
+    try lines.append(arena, .{ .text = "", .style = Palette.prompt_text, .fill_style = Palette.prompt_panel });
+    var first = true;
+    var logical = std.mem.splitScalar(u8, text, '\n');
+    while (logical.next()) |raw_line| {
+        const source_links = try findLinkSpans(arena, raw_line);
+        var rest = raw_line;
+        while (true) {
+            const take = @min(rest.len, body_width);
+            const chunk_start = raw_line.len - rest.len;
+            const prefix = if (first) first_prefix else continuation;
+            const links = try linksForChunk(
+                arena,
+                source_links,
+                chunk_start,
+                chunk_start + take,
+                prefix.len,
+            );
+            try lines.append(arena, .{
+                .text = prefix,
+                .style = if (first) Palette.prompt_mark else Palette.prompt_text,
+                .text2 = rest[0..take],
+                .style2 = Palette.prompt_text,
+                .fill_style = Palette.prompt_panel,
+                .links = links,
+                .links_resolved = true,
+            });
+            first = false;
+            if (take == rest.len) break;
+            rest = rest[take..];
+        }
+    }
+    try lines.append(arena, .{ .text = "", .style = Palette.prompt_text, .fill_style = Palette.prompt_panel });
+}
+
 /// Flatten blocks + delta into wrapped display lines for a given width.
 /// Returned list and its line slices use `arena` (per-frame).
 fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(Line) {
@@ -540,8 +1116,8 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
     for (app.blocks.items) |rb| {
         switch (rb.kind) {
             .user_msg => {
-                try wrapInto(arena, &lines, "", .{ .text = "", .style = .{} }); // blank separator
-                try wrapPrefixed(arena, &lines, "❯ ", rb.text, Palette.user, w);
+                try blankLine(arena, &lines);
+                try wrapPromptCard(arena, &lines, rb.text, w);
             },
             .assistant_msg => {
                 try blankLine(arena, &lines);
@@ -583,15 +1159,19 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
                 // whole (up to 24) because a truncated diff misleads.
                 const is_diff = std.mem.indexOf(u8, rb.text, "\n@@ ") != null or std.mem.startsWith(u8, rb.text, "@@ ");
                 const max_shown: usize = if (is_diff) 24 else 8;
+                const language = if (is_diff) diffLanguage(rb.text) else SyntaxLanguage.generic;
                 var shown: usize = 0;
                 var total: usize = 0;
                 var it = std.mem.splitScalar(u8, rb.text, '\n');
                 while (it.next()) |l| {
                     total += 1;
                     if (shown < max_shown) {
-                        const style = if (rb.status == .ok and is_diff) diffLineStyle(l) orelse base_style else base_style;
-                        const prefixed = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, l });
-                        try lines.append(arena, .{ .text = prefixed, .style = style });
+                        if (rb.status == .ok and is_diff) {
+                            try appendDiffLine(arena, &lines, glyph, l, language, base_style);
+                        } else {
+                            const prefixed = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, l });
+                            try lines.append(arena, .{ .text = prefixed, .style = base_style });
+                        }
                         shown += 1;
                     }
                 }
@@ -631,6 +1211,7 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         const card = try std.fmt.allocPrint(arena, "⚠ approve {s} {s} ?  [y]es / [n]o", .{ p.tool(), p.args() });
         try wrapPrefixed(arena, &lines, "", card, Palette.approval_card, w);
     }
+    try resolveLineLinks(arena, lines.items);
     return lines;
 }
 
@@ -680,16 +1261,66 @@ fn extractJsonStringRaw(json: []const u8, key: []const u8) ?[]const u8 {
     return json[at..end];
 }
 
-/// Style for a diff line inside tool output, or null when it isn't one.
-/// Conservative: only unambiguous markers, so shell output that happens to
-/// start with '-' (flag lists etc.) rarely false-positives — we require the
-/// result to contain a hunk header before any of this fires (see caller's
-/// is_diff gate for the elision rule; styling itself keys per line).
-fn diffLineStyle(l: []const u8) ?vaxis.Style {
-    if (std.mem.startsWith(u8, l, "@@ ")) return Palette.diff_hunk;
-    if (std.mem.startsWith(u8, l, "+") and !std.mem.startsWith(u8, l, "+++")) return Palette.diff_add;
-    if (std.mem.startsWith(u8, l, "-") and !std.mem.startsWith(u8, l, "---")) return Palette.diff_del;
-    return null;
+fn hunkContextStart(line: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, line, "@@")) return null;
+    const close = std.mem.indexOfPos(u8, line, 2, "@@") orelse return null;
+    var start = close + 2;
+    while (start < line.len and (line[start] == ' ' or line[start] == '\t')) start += 1;
+    return if (start < line.len) start else null;
+}
+
+/// Turn a raw unified-diff line into a gutter + code row. Changed rows carry
+/// a subtle full-width surface; syntax is an independent foreground overlay.
+fn appendDiffLine(
+    arena: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    glyph: []const u8,
+    line: []const u8,
+    language: SyntaxLanguage,
+    fallback_style: vaxis.Style,
+) !void {
+    if (std.mem.startsWith(u8, line, "@@ ")) {
+        const text = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, line });
+        const syntax = if (hunkContextStart(line)) |start|
+            try syntaxSpans(arena, line[start..], language, glyph.len + start)
+        else
+            &.{};
+        try lines.append(arena, .{ .text = text, .style = Palette.diff_hunk, .syntax = syntax });
+        return;
+    }
+
+    const is_add = std.mem.startsWith(u8, line, "+") and !std.mem.startsWith(u8, line, "+++");
+    const is_del = std.mem.startsWith(u8, line, "-") and !std.mem.startsWith(u8, line, "---");
+    const is_context = std.mem.startsWith(u8, line, " ");
+    if (is_add or is_del or is_context) {
+        const gutter = try std.fmt.allocPrint(arena, "{s}{c}", .{ glyph, line[0] });
+        const code = line[1..];
+        const code_style = if (is_add)
+            Palette.diff_add_code
+        else if (is_del)
+            Palette.diff_del_code
+        else
+            Palette.diff_context;
+        const marker_style = if (is_add)
+            Palette.diff_add
+        else if (is_del)
+            Palette.diff_del
+        else
+            Palette.diff_context;
+        const syntax = try syntaxSpans(arena, code, language, gutter.len);
+        try lines.append(arena, .{
+            .text = gutter,
+            .style = marker_style,
+            .text2 = code,
+            .style2 = code_style,
+            .fill_style = if (is_add or is_del) code_style else null,
+            .syntax = syntax,
+        });
+        return;
+    }
+
+    const text = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, line });
+    try lines.append(arena, .{ .text = text, .style = fallback_style });
 }
 
 fn wrapInto(arena: std.mem.Allocator, lines: *std.ArrayList(Line), _: []const u8, line: Line) !void {
@@ -712,23 +1343,42 @@ fn wrapPrefixed(
     var first = true;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw_line| {
+        const source_links = try findLinkSpans(arena, raw_line);
         var rest = raw_line;
         while (true) {
             const take = @min(rest.len, body_width);
+            const chunk_start = raw_line.len - rest.len;
             const chunk = rest[0..take];
-            const full = if (first and prefix.len > 0)
+            const has_prefix = first and prefix.len > 0;
+            const full = if (has_prefix)
                 try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, chunk })
             else if (prefix.len > 0)
                 try std.fmt.allocPrint(arena, "{s}{s}", .{ " " ** 0, chunk }) // continuation, no prefix
             else
                 chunk;
-            try lines.append(arena, .{ .text = full, .style = style });
+            const links = try linksForChunk(
+                arena,
+                source_links,
+                chunk_start,
+                chunk_start + take,
+                if (has_prefix) prefix.len else 0,
+            );
+            try lines.append(arena, .{
+                .text = full,
+                .style = style,
+                .links = links,
+                .links_resolved = true,
+            });
             first = false;
             if (take == rest.len) break;
             rest = rest[take..];
         }
         if (raw_line.len == 0) try lines.append(arena, .{ .text = "", .style = style });
     }
+}
+
+fn inputPanelHeight(content_height: usize) usize {
+    return content_height + 2; // one blank row above and below the editor
 }
 
 fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
@@ -738,9 +1388,12 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const w = win.width;
     if (h < 4 or w < 20) return;
 
-    // Input grows 1..max_rows with content; session view yields.
-    const prompt: []const u8 = if (app.mode == .insert) "> " else ": ";
-    const input_h: u16 = @intCast(app.editor.displayHeight(w -| prompt.len));
+    // The composer is a three-row panel for a one-line prompt (padding,
+    // content, padding) and grows with multiline input.
+    const prompt: []const u8 = if (app.mode == .insert) "❯ " else ": ";
+    const panel_inner_w = w -| 2; // one cell of horizontal padding
+    const content_h: u16 = @intCast(app.editor.displayHeight(panel_inner_w -| 2));
+    const input_h: u16 = @intCast(inputPanelHeight(content_h));
     const input_gap: u16 = 1;
     const view_h: u16 = h -| (input_h + input_gap + 1); // input + gap + status
 
@@ -763,6 +1416,14 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     for (visible, 0..) |ln, row| {
         const abs_line = first_visible + row;
+        if (ln.fill_style) |fill_style| {
+            const row_win = win.child(.{
+                .y_off = @intCast(row),
+                .height = 1,
+                .width = w,
+            });
+            row_win.fill(.{ .style = fill_style });
+        }
         var segs_buf: [3]vaxis.Segment = undefined;
         var n: usize = 0;
         segs_buf[n] = .{ .text = ln.text, .style = ln.style };
@@ -779,6 +1440,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             .row_offset = @intCast(row),
             .wrap = .none,
         });
+        applyLineSyntax(win, @intCast(row), ln);
+        applyLineLinks(win, @intCast(row), ln);
         // Apply selection after printing so partial-cell highlighting keeps
         // each segment's original syntax color and other style attributes.
         if (app.selection()) |sel| {
@@ -795,8 +1458,15 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     }
 
     // ---- input box ----
-    const input_win = win.child(.{ .y_off = h - 1 - input_h, .height = input_h, .width = w });
-    app.editor.draw(input_win, prompt, Palette.user);
+    const input_panel = win.child(.{ .y_off = h - 1 - input_h, .height = input_h, .width = w });
+    input_panel.fill(.{ .style = Palette.prompt_panel });
+    const input_win = input_panel.child(.{
+        .x_off = 1,
+        .y_off = 1,
+        .width = panel_inner_w,
+        .height = content_h,
+    });
+    app.editor.draw(input_win, prompt, Palette.prompt_mark, Palette.prompt_text);
     if (app.mode == .normal) win.hideCursor();
 
     // ---- status bar ----
@@ -809,26 +1479,67 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         .err => "error",
         .done => "done",
     };
-    const ctx_txt: []const u8 = if (app.context_limit > 0)
-        try std.fmt.allocPrint(arena, " · ctx {d}%", .{app.context_used * 100 / app.context_limit})
+    const state_style: vaxis.Style = switch (app.state) {
+        .idle, .done => Palette.status_idle,
+        .running => Palette.status_running,
+        .awaiting_approval => Palette.status_approval,
+        .err => Palette.status_error,
+    };
+    const context_percent = if (app.context_limit > 0)
+        app.context_used * 100 / app.context_limit
     else
-        "";
-    const scroll_txt: []const u8 = if (app.scroll_up > 0)
-        try std.fmt.allocPrint(arena, " · ↕ {d} (G: bottom)", .{app.scroll_up})
+        0;
+    const ctx_txt = try std.fmt.allocPrint(arena, "ctx {d}%", .{context_percent});
+    const ctx_style = if (context_percent >= 90)
+        Palette.status_context_hot
+    else if (context_percent >= 70)
+        Palette.status_context_warn
     else
-        "";
+        Palette.status_context;
+    const cwd_txt = try statusCwd(arena, app.cwd.items, app.home.items);
+    const session_txt = try std.fmt.allocPrint(arena, "#{x:0>4}", .{app.sid & 0xFFFF});
+    const scroll_txt = try std.fmt.allocPrint(arena, "↕ {d} (G: bottom)", .{app.scroll_up});
+
     // Session tag: last 4 hex digits of the id — enough to tell sessions
     // apart in `marlin ls` (which shows the same suffix) without eating
     // half the status bar with a u64.
-    const status = try std.fmt.allocPrint(arena, " {s} · {s}{s}{s} · #{x:0>4}  {s}", .{
-        state_txt,
-        app.model.items,
-        ctx_txt,
-        scroll_txt,
-        app.sid & 0xFFFF,
-        app.notice.items,
-    });
-    _ = status_win.printSegment(.{ .text = status, .style = Palette.status_bar }, .{ .wrap = .none });
+    var status_segments: [19]vaxis.Segment = undefined;
+    var status_n: usize = 0;
+    status_segments[status_n] = .{ .text = " ", .style = Palette.status_bar };
+    status_n += 1;
+    status_segments[status_n] = .{ .text = state_txt, .style = state_style };
+    status_n += 1;
+    status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+    status_n += 1;
+    status_segments[status_n] = .{ .text = statusModel(app.model.items), .style = Palette.status_model };
+    status_n += 1;
+    if (app.context_limit > 0) {
+        status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+        status_n += 1;
+        status_segments[status_n] = .{ .text = ctx_txt, .style = ctx_style };
+        status_n += 1;
+    }
+    status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+    status_n += 1;
+    status_segments[status_n] = .{ .text = cwd_txt, .style = Palette.status_cwd };
+    status_n += 1;
+    if (app.scroll_up > 0) {
+        status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+        status_n += 1;
+        status_segments[status_n] = .{ .text = scroll_txt, .style = Palette.status_bar };
+        status_n += 1;
+    }
+    status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+    status_n += 1;
+    status_segments[status_n] = .{ .text = session_txt, .style = Palette.status_sep };
+    status_n += 1;
+    if (app.notice.items.len > 0) {
+        status_segments[status_n] = .{ .text = "  ", .style = Palette.status_bar };
+        status_n += 1;
+        status_segments[status_n] = .{ .text = app.notice.items, .style = Palette.status_notice };
+        status_n += 1;
+    }
+    _ = status_win.print(status_segments[0..status_n], .{ .wrap = .none });
 
     // ---- model picker overlay ----
     if (app.picker) |sel| {
@@ -974,31 +1685,49 @@ pub fn run(
     const cfg = config.defaults();
     var model_at_start: []const u8 = cfg.model_default;
     var model_buf: [256]u8 = undefined;
+    var cwd_at_start: []const u8 = "";
+    var cwd_buf: [4096]u8 = undefined;
 
     var sid: u64 = 0;
     {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        if (sid_arg) |s| {
-            sid = s;
-        } else {
-            // Newest session, or create one.
-            try conn.send(.{ .session_list = .{} });
-            const list = try conn.recvUntil(arena, .session_list_result);
-            if (list.sessions.len > 0) {
-                sid = list.sessions[0].sid;
-                const m = list.sessions[0].model;
-                const n = @min(m.len, model_buf.len);
-                @memcpy(model_buf[0..n], m[0..n]);
-                model_at_start = model_buf[0..n];
-            } else {
-                var cwd_buf: [4096]u8 = undefined;
-                const cwd_len = try std.process.currentPath(io, &cwd_buf);
-                try conn.send(.{ .session_create = .{ .cwd = cwd_buf[0..cwd_len], .model = cfg.model_default } });
-                const created = try conn.recvUntil(arena, .session_created);
-                sid = created.sid;
+
+        // Fetch metadata even for an explicit attach: the session may have
+        // been created from another directory (or another client process).
+        try conn.send(.{ .session_list = .{} });
+        const list = try conn.recvUntil(arena, .session_list_result);
+        var selected: ?usize = null;
+        if (sid_arg) |requested| {
+            sid = requested;
+            for (list.sessions, 0..) |session, i| {
+                if (session.sid == requested) {
+                    selected = i;
+                    break;
+                }
             }
+        } else if (list.sessions.len > 0) {
+            sid = list.sessions[0].sid;
+            selected = 0;
+        }
+
+        if (selected) |i| {
+            const m = list.sessions[i].model;
+            const model_len = @min(m.len, model_buf.len);
+            @memcpy(model_buf[0..model_len], m[0..model_len]);
+            model_at_start = model_buf[0..model_len];
+
+            const session_cwd = list.sessions[i].cwd;
+            const cwd_len = @min(session_cwd.len, cwd_buf.len);
+            @memcpy(cwd_buf[0..cwd_len], session_cwd[0..cwd_len]);
+            cwd_at_start = cwd_buf[0..cwd_len];
+        } else if (sid_arg == null) {
+            const cwd_len = try std.process.currentPath(io, &cwd_buf);
+            cwd_at_start = cwd_buf[0..cwd_len];
+            try conn.send(.{ .session_create = .{ .cwd = cwd_at_start, .model = cfg.model_default } });
+            const created = try conn.recvUntil(arena, .session_created);
+            sid = created.sid;
         }
         // Full replay: seq 1 onward.
         try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 1 } });
@@ -1007,6 +1736,8 @@ pub fn run(
     var app = App{ .gpa = gpa, .io = io, .conn = conn, .sid = sid, .editor = Editor.init(gpa), .cfg = cfg };
     defer app.deinit();
     app.setModelStr(model_at_start);
+    app.setCwdStr(cwd_at_start);
+    if (environ.get("HOME")) |home| app.setHomeStr(home);
 
     // -- vaxis init --
     var tty_buf: [4096]u8 = undefined;
@@ -1367,4 +2098,214 @@ test "selection is character precise on one or many lines" {
     try std.testing.expectEqual(@as(usize, 0), last.start);
     try std.testing.expectEqual(@as(usize, 6), last.end);
     try std.testing.expect(multi.columns(1, 10) == null);
+}
+
+test "one-line composer and scrollback prompt cards are three rows" {
+    try std.testing.expectEqual(@as(usize, 3), inputPanelHeight(1));
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+    try wrapPromptCard(arena, &lines, "ship it", 80);
+
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expect(lines.items[0].fill_style != null);
+    try std.testing.expectEqualStrings(" ❯ ", lines.items[1].text);
+    try std.testing.expectEqualStrings("ship it", lines.items[1].text2);
+    try std.testing.expect(lines.items[2].fill_style != null);
+}
+
+test "status metadata is compact without losing its identity" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings(
+        "anthropic/claude-sonnet-4.5",
+        statusModel("openrouter/anthropic/claude-sonnet-4.5"),
+    );
+    try std.testing.expectEqualStrings(
+        "~/Work/marlin",
+        try statusCwd(arena, "/Users/jespern/Work/marlin", "/Users/jespern"),
+    );
+    try std.testing.expectEqualStrings(
+        "/opt/marlin",
+        try statusCwd(arena, "/opt/marlin", "/Users/jespern"),
+    );
+}
+
+test "diff language comes from edit summaries or git target paths" {
+    try std.testing.expectEqual(
+        SyntaxLanguage.zig,
+        diffLanguage("replaced 1 occurrence(s) in src/client/tui.zig\n@@ -1,2 +1,2 @@"),
+    );
+    try std.testing.expectEqual(
+        SyntaxLanguage.javascript,
+        diffLanguage("diff --git a/web/app.ts b/web/app.ts\n--- a/web/app.ts\n+++ b/web/app.ts\n@@ -1 +1 @@"),
+    );
+    try std.testing.expectEqual(SyntaxLanguage.generic, diffLanguage("@@ -1 +1 @@"));
+}
+
+test "diff rows combine subtle surfaces with syntax foregrounds" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+
+    try appendDiffLine(arena, &lines, "  ", "+    const msg = \"hello\";", .zig, Palette.tool_out);
+    try appendDiffLine(arena, &lines, "  ", "@@ -4,1 +4,1 @@ pub fn greet() void {", .zig, Palette.tool_out);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+
+    const added = lines.items[0];
+    try std.testing.expectEqualStrings("  +", added.text);
+    try std.testing.expectEqualStrings("    const msg = \"hello\";", added.text2);
+    try std.testing.expect(added.fill_style != null);
+    try std.testing.expect(vaxis.Color.eql(added.fill_style.?.bg, Palette.diff_add_bg));
+    try std.testing.expect(added.syntax.len >= 2); // `const` + string
+
+    const hunk = lines.items[1];
+    try std.testing.expect(std.mem.indexOf(u8, hunk.text, "pub fn greet") != null);
+    try std.testing.expect(hunk.syntax.len >= 3); // pub + fn + greet
+
+    var screen = try vaxis.Screen.init(gpa, .{
+        .rows = 1,
+        .cols = 48,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 48,
+        .height = 1,
+        .screen = &screen,
+    };
+    win.fill(.{ .style = added.fill_style.? });
+    _ = win.print(&.{
+        .{ .text = added.text, .style = added.style },
+        .{ .text = added.text2, .style = added.style2 },
+    }, .{ .wrap = .none });
+    applyLineSyntax(win, 0, added);
+
+    // Three gutter cells + four spaces puts the `c` in `const` at column 7.
+    const keyword_cell = win.readCell(7, 0).?;
+    try std.testing.expect(vaxis.Color.eql(keyword_cell.style.bg, Palette.diff_add_bg));
+    try std.testing.expect(vaxis.Color.eql(keyword_cell.style.fg, Palette.syntax_keyword.fg));
+}
+
+test "plain and Markdown URLs become safe clickable spans" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = "See https://marlin.wtf/docs, then [the repo](https://github.com/jespern/marlin).";
+    const spans = try findLinkSpans(arena, text);
+
+    try std.testing.expectEqual(@as(usize, 3), spans.len);
+    try std.testing.expectEqualStrings("https://marlin.wtf/docs", spans[0].uri);
+    try std.testing.expectEqualStrings("the repo", text[spans[1].start..spans[1].end]);
+    try std.testing.expectEqualStrings("https://github.com/jespern/marlin", spans[1].uri);
+    try std.testing.expectEqualStrings(spans[1].uri, spans[2].uri);
+
+    const unsafe = try findLinkSpans(arena, "[nope](javascript:alert(1)) file:///tmp/secret");
+    try std.testing.expectEqual(@as(usize, 0), unsafe.len);
+}
+
+test "wrapped URL pieces retain the complete OSC 8 destination" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "https://example.test/really/long/path";
+    const text = "see " ++ uri;
+    var lines: std.ArrayList(Line) = .empty;
+    try wrapPrefixed(arena, &lines, "", text, Palette.assistant, 16);
+
+    var linked_lines: usize = 0;
+    for (lines.items) |line| {
+        if (line.links.len == 0) continue;
+        linked_lines += 1;
+        for (line.links) |link| try std.testing.expectEqualStrings(uri, link.uri);
+    }
+    try std.testing.expect(linked_lines >= 2);
+}
+
+test "link spans attach OSC 8 metadata to rendered cells" {
+    const gpa = std.testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{
+        .rows = 1,
+        .cols = 32,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 32,
+        .height = 1,
+        .screen = &screen,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const text = "go https://marlin.wtf";
+    const line = Line{
+        .text = text,
+        .style = Palette.assistant,
+        .links = try findLinkSpans(arena_state.allocator(), text),
+        .links_resolved = true,
+    };
+    _ = win.printSegment(.{ .text = text }, .{ .wrap = .none });
+    applyLineLinks(win, 0, line);
+
+    const linked = win.readCell(3, 0).?;
+    try std.testing.expectEqualStrings("https://marlin.wtf", linked.link.uri);
+    try std.testing.expectEqual(vaxis.Cell.Style.Underline.single, linked.style.ul_style);
+    try std.testing.expectEqualStrings("", win.readCell(0, 0).?.link.uri);
+}
+
+test "URL punctuation trimming keeps balanced path delimiters" {
+    const text = "https://example.test/wiki/Foo_(bar)).";
+    const end = urlEnd(text, 0);
+    try std.testing.expectEqualStrings("https://example.test/wiki/Foo_(bar)", text[0..end]);
+}
+
+test "durable user block reconciles optimistic local echo" {
+    const gpa = std.testing.allocator;
+    var rendered = [_]RenderBlock{.{
+        .kind = .user_msg,
+        .text = try gpa.dupe(u8, "hello"),
+        .label = try gpa.dupe(u8, ""),
+        .pending_echo = true,
+    }};
+    defer rendered[0].deinit(gpa);
+
+    try std.testing.expect(reconcilePendingEcho(&rendered, .user_msg, "hello"));
+    try std.testing.expect(!rendered[0].pending_echo);
+    try std.testing.expect(!reconcilePendingEcho(&rendered, .user_msg, "hello"));
+}
+
+test "slash commands enter local editor history" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined, // /help is entirely client-local
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.submitInput("/help");
+    try std.testing.expectEqual(@as(usize, 1), app.editor.history.items.len);
+    app.editor.histUp();
+    try std.testing.expectEqualStrings("/help", app.editor.text.items);
 }

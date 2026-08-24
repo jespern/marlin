@@ -177,12 +177,14 @@ pub const Store = struct {
     pub const SessionListing = struct {
         id: u64,
         title: []const u8,
+        cwd: []const u8,
         model: []const u8,
         status: []const u8,
         created_at: i64,
 
         pub fn deinit(self: SessionListing, gpa: std.mem.Allocator) void {
             gpa.free(self.title);
+            gpa.free(self.cwd);
             gpa.free(self.model);
             gpa.free(self.status);
         }
@@ -191,7 +193,7 @@ pub const Store = struct {
     /// All sessions, newest first. Caller deinits each entry + frees slice.
     pub fn listSessions(self: Store) Error![]SessionListing {
         const stmt = try self.prepare(
-            "SELECT id, title, model, status, created_at FROM sessions ORDER BY created_at DESC, id DESC",
+            "SELECT id, title, cwd, model, status, created_at FROM sessions ORDER BY created_at DESC, id DESC",
         );
         defer finalize(stmt);
         var out: std.ArrayList(SessionListing) = .empty;
@@ -206,9 +208,10 @@ pub const Store = struct {
             try out.append(self.gpa, .{
                 .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
                 .title = try self.dupeCol(stmt, 1),
-                .model = try self.dupeCol(stmt, 2),
-                .status = try self.dupeCol(stmt, 3),
-                .created_at = c.sqlite3_column_int64(stmt, 4),
+                .cwd = try self.dupeCol(stmt, 2),
+                .model = try self.dupeCol(stmt, 3),
+                .status = try self.dupeCol(stmt, 4),
+                .created_at = c.sqlite3_column_int64(stmt, 5),
             });
         }
         return out.toOwnedSlice(self.gpa);
@@ -451,6 +454,14 @@ test "session + block round trip (in-memory)" {
 
     try store.createSession(42, 1700000000000, "/tmp", "openrouter/foo");
     try std.testing.expectEqual(@as(?u64, 42), try store.lastSession());
+    const sessions = try store.listSessions();
+    defer {
+        for (sessions) |session| session.deinit(gpa);
+        gpa.free(sessions);
+    }
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqualStrings("/tmp", sessions[0].cwd);
+    try std.testing.expectEqualStrings("openrouter/foo", sessions[0].model);
 
     const blk1 = block.Block{
         .id = 1,

@@ -539,12 +539,12 @@ get these right; Hermes is the counter-example):
   an animated gradient/shimmer on the status word (the Claude/Codex rainbow
   effect), not spinner characters and not log lines. Cheap in a cell grid:
   cycle fg color across the word per frame.
-- **Diffs render like a diff tool, not like raw patch output.** Foreground
-  green/red on the normal background, gutter `+`/`-`, dim line numbers,
-  optional word-level emphasis within changed lines. Never full-line
-  colored backgrounds — jarring and unreadable with syntax coloring.
-  Lives in the block renderer next to markdown.zig; edit-tool results render
-  as diffs by default.
+- **Diffs render like a diff tool, not like raw patch output.** Gutter
+  `+`/`-`, restrained full-row green/red surfaces, and language-aware syntax
+  foregrounds keep the change shape obvious without washing out the code.
+  Hunk headers retain the enclosing declaration/function context produced by
+  the edit tool. Lives in the block renderer next to markdown.zig; edit-tool
+  results render as diffs by default.
 - **No invented theme format — a semantic role map onto ANSI-16.** Every
   rendered element gets a role (`diff.add`, `diff.del`, `todo.active`,
   `status.cost`, `block.border`, `md.heading`, shimmer endpoints…), each

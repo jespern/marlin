@@ -414,6 +414,7 @@ pub const Daemon = struct {
                     infos[i] = .{
                         .sid = row.id,
                         .title = row.title,
+                        .cwd = row.cwd,
                         .model = row.model,
                         .status = row.status,
                         .created_at = row.created_at,

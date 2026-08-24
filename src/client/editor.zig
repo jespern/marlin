@@ -476,12 +476,20 @@ pub fn displayHeight(self: *const Editor, width: usize) usize {
     return @max(1, @min(n, max_rows));
 }
 
-/// Draw into `win` (height = displayHeight rows). `prompt` styles row 0;
-/// continuation rows get matching indent. Shows the terminal cursor.
-pub fn draw(self: *const Editor, win: vaxis.Window, prompt: []const u8, prompt_style: vaxis.Style) void {
+/// Draw into `win` (height = displayHeight rows). The prompt and editable
+/// text have separate styles so a parent input panel can keep one continuous
+/// background beneath both. Continuation rows get matching indent.
+pub fn draw(
+    self: *const Editor,
+    win: vaxis.Window,
+    prompt: []const u8,
+    prompt_style: vaxis.Style,
+    text_style: vaxis.Style,
+) void {
     const w: usize = win.width;
-    if (w <= prompt.len + 2) return;
-    const body_w = w - prompt.len;
+    const prompt_width: usize = win.gwidth(prompt);
+    if (w <= prompt_width + 2) return;
+    const body_w = w - prompt_width;
     const rows = self.layoutRows(body_w);
     const pos = self.cursorRowCol(rows, body_w);
     const h: usize = win.height;
@@ -500,7 +508,10 @@ pub fn draw(self: *const Editor, win: vaxis.Window, prompt: []const u8, prompt_s
             });
         } else {
             // Continuation indent aligns with the prompt.
-            _ = win.printSegment(.{ .text = "…", .style = .{ .fg = .{ .index = 8 } } }, .{
+            var continuation_style = text_style;
+            continuation_style.fg = .{ .index = 7 };
+            continuation_style.dim = true;
+            _ = win.printSegment(.{ .text = "…", .style = continuation_style }, .{
                 .row_offset = @intCast(screen_row),
                 .wrap = .none,
             });
@@ -508,17 +519,17 @@ pub fn draw(self: *const Editor, win: vaxis.Window, prompt: []const u8, prompt_s
         const seg = t[rows[ri].start..rows[ri].end];
         if (seg.len > 0) {
             const child = win.child(.{
-                .x_off = @intCast(prompt.len),
+                .x_off = @intCast(prompt_width),
                 .y_off = @intCast(screen_row),
                 .width = @intCast(body_w),
                 .height = 1,
             });
-            _ = child.printSegment(.{ .text = seg, .style = .{} }, .{ .wrap = .none });
+            _ = child.printSegment(.{ .text = seg, .style = text_style }, .{ .wrap = .none });
         }
         screen_row += 1;
     }
 
-    win.showCursor(@intCast(prompt.len + pos.col), @intCast(pos.row - first));
+    win.showCursor(@intCast(prompt_width + pos.col), @intCast(pos.row - first));
 }
 
 // ------------------------------------------------------------------ tests --

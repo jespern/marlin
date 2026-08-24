@@ -61,6 +61,10 @@ first, then live. Clients that reconnect pass last_seen_seq + 1.
 | ok | generic ack |
 | err {code, msg} | bad_msg, no_hello, version, no_session, busy, bad_approval |
 
+Each entry in `session_list_result.sessions` includes `sid`, `title`, `cwd`,
+`model`, persisted `status`, `created_at`, and whether the session is currently
+`running`.
+
 ## Approval flow (M2)
 
 1. Turn thread hits a mutating tool call in an `approvals="default"` session.

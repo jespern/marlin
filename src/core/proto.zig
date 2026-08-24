@@ -89,6 +89,9 @@ pub const DaemonMsg = union(enum) {
 pub const SessionInfo = struct {
     sid: u64,
     title: []const u8,
+    /// Session root as recorded at creation time. Default keeps decoding
+    /// compatible with daemons that predate this field.
+    cwd: []const u8 = "",
     model: []const u8,
     status: []const u8,
     created_at: i64,
@@ -178,6 +181,15 @@ test "decode ignores unknown fields; defaults apply" {
     );
     try std.testing.expectEqual(@as(u64, 0), m.sub.from_seq);
     try std.testing.expectEqual(@as(u64, 5), m.sub.sid);
+}
+
+test "older session-list entries default cwd" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const m = try decode(DaemonMsg, arena_state.allocator(),
+        \\{"session_list_result":{"sessions":[{"sid":5,"title":"old","model":"m","status":"idle","created_at":1,"running":false}]}}
+    );
+    try std.testing.expectEqualStrings("", m.session_list_result.sessions[0].cwd);
 }
 
 test "garbage line is an error, not a crash" {
