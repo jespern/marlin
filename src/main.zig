@@ -16,6 +16,15 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 
+/// Debug builds default unexpected_error_tracing=true, which makes ANY
+/// unmapped errno (e.g. ECONNREFUSED from a stale daemon socket — an
+/// expected, handled condition in tryConnect's autostart path) dump a
+/// stack trace to stderr before the error is even returned to us. We
+/// handle our errors; stderr is not a debug channel in a TUI app.
+pub const std_options: std.Options = .{
+    .unexpected_error_tracing = false,
+};
+
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
