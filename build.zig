@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- marlin ----
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
+    const regex = b.dependency("regex", .{ .target = target, .optimize = optimize });
     const exe = b.addExecutable(.{
         .name = "marlin",
         .root_module = b.createModule(.{
@@ -26,6 +27,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                .{ .name = "regex", .module = regex.module("regex") },
             },
         }),
     });

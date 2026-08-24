@@ -331,6 +331,19 @@ fetch       (HTTP GET → markdown-ish text; parallel_safe)
 task        (subagent spawn; v1.5)
 ```
 
+**grep engine policy.** Prefer `rg` when on PATH: best engine, native
+.gitignore/hidden/binary filtering (exactly the filter set an agent needs),
+and the `path:line:content` shape models were trained on. The internal
+fallback must stay *functionally equivalent*, not a degraded cousin: real
+regex via the zig-regex package (Thompson NFA + backtracking hybrid, pure
+Zig — pinned to a tagged release; its main branch tracks Zig master), the
+bulky-dir skip list standing in for .gitignore, same output format. A
+pattern the engine can't compile degrades to literal substring with an
+explicit note in the result. Rejected: bundling the rg binary Claude
+Code-style — marlin's pitch is ONE static binary, and shipping per-platform
+sidecar executables breaks scp-and-run; the internal engine is the bundle.
+(zig-regex is ~stdlib-only and adds nothing to the dependency long tail.)
+
 **Approval system** (designed in from day one — every execution flows through it):
 
 - Policy per tool per session: `auto | ask | deny`. Default: read-only tools

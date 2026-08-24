@@ -9,6 +9,10 @@
             .url = "git+https://github.com/rockorager/libvaxis#c060d314930c5552b99a89278a6a695baf0352da",
             .hash = "vaxis-0.6.0-BWNV_LC4CwBka_bJk8SOXqzCM-nyQH00jzdL0kUhGwRE",
         },
+        .regex = .{
+            .url = "https://github.com/zig-utils/zig-regex/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "zig_regex-0.2.0-omky0f_2BgAXpSGi4MbMSngUU98FBX9RQIB2ShE3G2ww",
+        },
     },
     .paths = .{
         "build.zig",

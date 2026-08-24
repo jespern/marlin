@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const regex_mod = @import("regex");
 
 const files = @import("files.zig");
 
@@ -10,10 +11,9 @@ const files = @import("files.zig");
 
 pub const grep_spec_name = "grep";
 pub const grep_spec_description =
-    "Search file contents for a regex pattern (ripgrep syntax). Returns matching " ++
+    "Search file contents for a regex pattern. Returns matching " ++
     "lines as 'path:line:content'. Searches the given directory recursively " ++
-    "(default: session cwd). If ripgrep is not installed, falls back to plain " ++
-    "substring matching (no regex).";
+    "(default: session cwd).";
 pub const grep_spec_schema =
     \\{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"file or directory to search (default: cwd)"},"glob":{"type":"string","description":"only search files matching this glob, e.g. *.zig"},"limit":{"type":"integer","minimum":1}},"required":["pattern"]}
 ;
@@ -92,25 +92,29 @@ fn rgGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []const u
     return capLines(gpa, res.stdout, args.limit);
 }
 
-/// Internal fallback: recursive walk + literal substring match (no regex).
+/// Internal fallback: recursive walk + regex match (zig-regex engine).
+/// Feature-parity goal with the rg path: real regex, skip list for bulky
+/// dirs (rg gets this from .gitignore), binary sniff, same output format.
+/// A pattern the engine cannot compile degrades to literal substring with
+/// an explicit note — tool errors are data.
 fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var matches: u64 = 0;
 
-    // The rg path takes real regex; this fallback is literal. A pattern that
-    // looks like regex would silently match nothing — tell the model instead
-    // of letting it conclude "no matches" from a dialect mismatch.
-    if (looksLikeRegex(args.pattern)) {
-        try out.appendSlice(gpa, "note: ripgrep not installed; pattern treated as a LITERAL substring, not regex. Use a plain substring.\n");
+    var compiled: ?regex_mod.Regex = regex_mod.Regex.compile(gpa, args.pattern) catch null;
+    defer if (compiled) |*r| r.deinit();
+    if (compiled == null and looksLikeRegex(args.pattern)) {
+        try out.appendSlice(gpa, "note: pattern did not compile as regex; matched as a LITERAL substring instead.\n");
     }
+    const matcher = Matcher{ .re = if (compiled) |*r| r else null, .literal = args.pattern };
 
     // Single file?
     const stat = Io.Dir.cwd().statFile(io, search_path, .{}) catch |e| {
         return std.fmt.allocPrint(gpa, "error: cannot access '{s}': {t}", .{ search_path, e });
     };
     if (stat.kind == .file) {
-        try grepOneFile(gpa, io, &out, &matches, args, search_path, search_path);
+        try grepOneFile(gpa, io, &out, &matches, matcher, args.limit, search_path, search_path);
     } else {
         var dir = Io.Dir.cwd().openDir(io, search_path, .{ .iterate = true }) catch |e| {
             return std.fmt.allocPrint(gpa, "error: cannot open '{s}': {t}", .{ search_path, e });
@@ -127,25 +131,42 @@ fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []c
             }
             const full = try std.fs.path.join(gpa, &.{ search_path, entry.path });
             defer gpa.free(full);
-            grepOneFile(gpa, io, &out, &matches, args, full, entry.path) catch continue;
+            grepOneFile(gpa, io, &out, &matches, matcher, args.limit, full, entry.path) catch continue;
         }
     }
     if (matches == 0) {
         out.deinit(gpa);
-        if (looksLikeRegex(args.pattern)) {
-            return gpa.dupe(u8, "no matches (note: ripgrep not installed; the pattern was matched as a LITERAL substring, not regex — try a plain substring)");
-        }
         return gpa.dupe(u8, "no matches");
     }
     return out.toOwnedSlice(gpa);
 }
+
+/// Line matcher: compiled regex when available, literal substring otherwise.
+const Matcher = struct {
+    re: ?*regex_mod.Regex,
+    literal: []const u8,
+
+    fn matches(self: Matcher, gpa: std.mem.Allocator, line: []const u8) bool {
+        if (self.re) |r| {
+            const m = r.find(line) catch return false;
+            if (m) |found| {
+                var mut = found;
+                mut.deinit(gpa);
+                return true;
+            }
+            return false;
+        }
+        return std.mem.indexOf(u8, line, self.literal) != null;
+    }
+};
 
 fn grepOneFile(
     gpa: std.mem.Allocator,
     io: Io,
     out: *std.ArrayList(u8),
     matches: *u64,
-    args: GrepArgs,
+    matcher: Matcher,
+    limit: u64,
     full_path: []const u8,
     display_path: []const u8,
 ) !void {
@@ -157,8 +178,8 @@ fn grepOneFile(
     var it = std.mem.splitScalar(u8, contents, '\n');
     while (it.next()) |line| {
         line_no += 1;
-        if (matches.* >= args.limit) return;
-        if (std.mem.indexOf(u8, line, args.pattern) == null) continue;
+        if (matches.* >= limit) return;
+        if (!matcher.matches(gpa, line)) continue;
         matches.* += 1;
         const entry = try std.fmt.allocPrint(gpa, "{s}:{d}:{s}\n", .{ display_path, line_no, line });
         defer gpa.free(entry);
@@ -373,12 +394,17 @@ test "internal grep + glob on a temp tree" {
     const g = try internalGrep(gpa, io, .{ .pattern = "needle" }, dir_path);
     defer gpa.free(g);
     try std.testing.expect(std.mem.indexOf(u8, g, "one.txt:1:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, g, "note:") == null); // plain pattern → no warning
+    try std.testing.expect(std.mem.indexOf(u8, g, "note:") == null);
 
-    // Regex-looking pattern in the literal fallback carries a dialect warning.
-    const gr = try internalGrep(gpa, io, .{ .pattern = "need.*le" }, dir_path);
+    // Real regex works in the internal engine now.
+    const gr = try internalGrep(gpa, io, .{ .pattern = "hel+o nee.le" }, dir_path);
     defer gpa.free(gr);
-    try std.testing.expect(std.mem.indexOf(u8, gr, "LITERAL substring") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gr, "one.txt:1:") != null);
+
+    // Regex that matches nothing really is no matches (not a dialect artifact).
+    const gn = try internalGrep(gpa, io, .{ .pattern = "^needle$" }, dir_path);
+    defer gpa.free(gn);
+    try std.testing.expect(std.mem.indexOf(u8, gn, "no matches") != null);
 
     const gl = try glob(gpa, io, .{ .pattern = "*.txt" }, dir_path);
     defer gpa.free(gl);
