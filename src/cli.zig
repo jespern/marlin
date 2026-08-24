@@ -13,6 +13,8 @@ pub const Command = enum {
     run,
     ls,
     kill,
+    compact,
+    reboot,
     shutdown,
     help,
     version,
@@ -45,6 +47,8 @@ pub fn dispatch(
         .run => return headless.run(gpa, io, environ, self_exe, rest),
         .ls => return headless.ls(gpa, io, environ, self_exe),
         .kill => return headless.kill(gpa, io, environ, self_exe, rest),
+        .compact => return headless.compact(gpa, io, environ, self_exe, rest),
+        .reboot => return headless.reboot(gpa, io, environ, self_exe, rest),
         .shutdown => return headless.shutdown(gpa, io, environ),
         .attach => {
             var sid_arg: ?u64 = null;
@@ -54,7 +58,22 @@ pub fn dispatch(
                     return 2;
                 };
             }
-            return tui.run(gpa, io, environ, self_exe, sid_arg);
+            var plan = tui.RebootPlan{};
+            const code = try tui.run(gpa, io, environ, self_exe, sid_arg, &plan);
+            if (plan.request != .none) {
+                // TUI torn down cleanly; now run the reboot sequence and
+                // exec back into `marlin attach <sid>`.
+                var sid_buf: [24]u8 = undefined;
+                const sid_str = try std.fmt.bufPrintZ(&sid_buf, "{d}", .{plan.sid});
+                var argv: std.ArrayList([:0]const u8) = .empty;
+                defer argv.deinit(gpa);
+                if (plan.request == .build) try argv.append(gpa, "--build");
+                try argv.append(gpa, "--then");
+                try argv.append(gpa, "attach");
+                try argv.append(gpa, sid_str);
+                return headless.reboot(gpa, io, environ, self_exe, argv.items);
+            }
+            return code;
         },
     }
     return 0;
@@ -70,6 +89,8 @@ const help_text =
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls              list sessions
     \\  marlin kill <id>       interrupt a session's running turn
+    \\  marlin compact [id]    manually compact a session's context
+    \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
     \\  marlin shutdown        stop the daemon
     \\  marlin help | version
     \\

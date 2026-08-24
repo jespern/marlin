@@ -33,6 +33,8 @@ const Event = union(enum) {
 
 const Mode = enum { insert, normal };
 
+pub const RebootRequest = enum { none, plain, build };
+
 /// A block reduced to what the renderer needs (owned copies).
 const RenderBlock = struct {
     kind: block.BlockKind,
@@ -80,6 +82,8 @@ const App = struct {
     model: std.ArrayList(u8) = .empty,
     tokens_in: u64 = 0,
     tokens_out: u64 = 0,
+    context_used: u64 = 0,
+    context_limit: u64 = 0,
     /// 0 = pinned to bottom; N = scrolled up N lines.
     scroll_up: usize = 0,
     pending: ?PendingApproval = null,
@@ -87,6 +91,9 @@ const App = struct {
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
     awaiting_new_session: bool = false,
+    /// Set by /reboot: after clean TUI teardown, run() returns this to
+    /// cli.zig which execs `marlin reboot [--build] --then attach <sid>`.
+    reboot_request: RebootRequest = .none,
 
     fn deinit(self: *App) void {
         for (self.blocks.items) |*rb| rb.deinit(self.gpa);
@@ -156,6 +163,8 @@ const App = struct {
                 if (m.sid != self.sid) return;
                 self.tokens_in = m.tokens_in;
                 self.tokens_out = m.tokens_out;
+                if (m.context_used > 0) self.context_used = m.context_used;
+                if (m.context_limit > 0) self.context_limit = m.context_limit;
             },
             .err => |e| {
                 self.setNotice("daemon error {s}: {s}", .{ e.code, e.msg });
@@ -223,11 +232,22 @@ const App = struct {
             self.newSession() catch {
                 self.setNotice("could not create session", .{});
             };
+        } else if (std.mem.eql(u8, head, "/reboot")) {
+            const arg = it.rest();
+            if (self.state == .running or self.state == .awaiting_approval) {
+                self.setNotice("turn running — /reboot waits for it (interrupt first if you want force)", .{});
+            }
+            self.reboot_request = if (std.mem.eql(u8, arg, "--build")) .build else .plain;
+            self.should_quit = true;
         } else if (std.mem.eql(u8, head, "/compact")) {
-            // M3: real compaction. Manual stub so the muscle memory exists.
-            self.setNotice("compaction lands in M3", .{});
+            if (self.state == .running or self.state == .awaiting_approval) {
+                self.setNotice("cannot compact mid-turn", .{});
+                return;
+            }
+            self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
+            self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/model <m> · /new · /compact · /quit — Esc normal, i insert, j/k scroll, Ctrl+C interrupt", .{});
+            self.setNotice("/model <m> · /new · /compact · /reboot [--build] · /quit — Esc normal, i insert, j/k scroll, Ctrl+C interrupt", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -256,6 +276,8 @@ const App = struct {
         self.delta.clearRetainingCapacity();
         self.tokens_in = 0;
         self.tokens_out = 0;
+        self.context_used = 0;
+        self.context_limit = 0;
         self.pending = null;
         self.state = .idle;
         self.sid = sid;
@@ -465,12 +487,17 @@ fn draw(app: *App, vx: *vaxis.Vaxis, input: *vaxis.widgets.TextInput, arena: std
         .err => "error",
         .done => "done",
     };
-    const status = try std.fmt.allocPrint(arena, " {s} · {s} · {s} · {d}↑ {d}↓ · s{d}  {s}", .{
+    const ctx_txt: []const u8 = if (app.context_limit > 0)
+        try std.fmt.allocPrint(arena, "ctx {d}%", .{app.context_used * 100 / app.context_limit})
+    else
+        "";
+    const status = try std.fmt.allocPrint(arena, " {s} · {s} · {s} · {d}↑ {d}↓ · {s} · s{d}  {s}", .{
         @tagName(app.mode),
         state_txt,
         app.model.items,
         app.tokens_in,
         app.tokens_out,
+        ctx_txt,
         app.sid,
         app.notice.items,
     });
@@ -492,12 +519,18 @@ fn readerThread(app: *App, loop: *vaxis.Loop(Event)) void {
     loop.postEvent(.daemon_gone) catch {};
 }
 
+pub const RebootPlan = struct {
+    request: RebootRequest = .none,
+    sid: u64 = 0,
+};
+
 pub fn run(
     gpa: std.mem.Allocator,
     io: Io,
     environ: *std.process.Environ.Map,
     self_exe: []const u8,
     sid_arg: ?u64,
+    reboot_out: ?*RebootPlan,
 ) !u8 {
     // -- connect + pick session BEFORE entering the TUI --
     const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
@@ -618,6 +651,7 @@ pub fn run(
         try vx.render(writer);
         try writer.flush();
     }
+    if (reboot_out) |ro| ro.* = .{ .request = app.reboot_request, .sid = app.sid };
     return 0;
 }
 

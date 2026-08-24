@@ -1,0 +1,120 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "build the demo"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_1\", \"function\": {\"name\": \"bash\", \"arguments\": \"{\\\"command\\\": \\\"echo step-one\\\"}\"}}]}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 30, \"completion_tokens\": 8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "step-one"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_2\", \"function\": {\"name\": \"bash\", \"arguments\": \"{\\\"command\\\": \\\"echo step-two\\\"}\"}}]}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 50, \"completion_tokens\": 8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "step-two"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_3\", \"function\": {\"name\": \"bash\", \"arguments\": \"{\\\"command\\\": \\\"echo step-three\\\"}\"}}]}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 70, \"completion_tokens\": 8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "step-three"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_4\", \"function\": {\"name\": \"bash\", \"arguments\": \"{\\\"command\\\": \\\"echo step-four\\\"}\"}}]}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 90, \"completion_tokens\": 8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "step-four"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_5\", \"function\": {\"name\": \"bash\", \"arguments\": \"{\\\"command\\\": \\\"echo step-five\\\"}\"}}]}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 110, \"completion_tokens\": 8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "step-five"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_6\", \"function\": {\"name\": \"bash\", \"arguments\": \"{\\\"command\\\": \\\"echo step-six\\\"}\"}}]}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 130, \"completion_tokens\": 8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "step-six"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"content\": \"demo built\"}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 160, \"completion_tokens\": 4}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "Summarize this agent conversation",
+        "step-one"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"content\": \"## Accomplished\\nRan six echo steps building the demo.\\n## Files touched\\n(none)\\n## Next steps\\n(none)\"}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 300, \"completion_tokens\": 30}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": [
+      "run",
+      "--quiet",
+      "--model",
+      "openrouter/test/model",
+      "build the demo"
+    ],
+    "argv2": [
+      "compact"
+    ],
+    "runs": 2,
+    "exit_code": 0,
+    "stdout_contains": [
+      "compacted session"
+    ],
+    "db_kinds": [
+      "user_msg",
+      "tool_call",
+      "tool_result",
+      "tool_call",
+      "tool_result",
+      "tool_call",
+      "tool_result",
+      "tool_call",
+      "tool_result",
+      "tool_call",
+      "tool_result",
+      "tool_call",
+      "tool_result",
+      "assistant_msg",
+      "compaction",
+      "system_note"
+    ]
+  }
+}

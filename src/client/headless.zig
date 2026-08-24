@@ -256,6 +256,170 @@ pub fn shutdown(
     return 0;
 }
 
+/// `marlin compact [sid]` — manual L2 compaction. Without sid: newest
+/// session. Waits for the daemon to finish (status returns to idle/err).
+pub fn compact(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{e});
+        return 1;
+    };
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var sid: u64 = 0;
+    if (args.len >= 1) {
+        sid = std.fmt.parseInt(u64, args[0], 10) catch {
+            try eprint(io, "marlin: bad session id '{s}'\n", .{args[0]});
+            return 2;
+        };
+    } else {
+        try conn.send(.{ .session_list = .{} });
+        const list = try conn.recvUntil(arena, .session_list_result);
+        if (list.sessions.len == 0) {
+            try eprint(io, "marlin: no sessions\n", .{});
+            return 1;
+        }
+        sid = list.sessions[0].sid;
+    }
+
+    try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+    try conn.send(.{ .session_compact = .{ .sid = sid } });
+
+    // Wait for the compaction lifecycle to complete: running → idle.
+    var saw_running = false;
+    while (true) {
+        const msg = try conn.recv(arena);
+        switch (msg) {
+            .status => |s| {
+                if (s.sid != sid) continue;
+                switch (s.state) {
+                    .running => saw_running = true,
+                    .idle, .done => if (saw_running) {
+                        try print(io, "compacted session {d}\n", .{sid});
+                        return 0;
+                    },
+                    .err => {
+                        try eprint(io, "marlin: compaction errored\n", .{});
+                        return 1;
+                    },
+                    else => {},
+                }
+            },
+            .err => |e| {
+                try eprint(io, "marlin: {s}: {s}\n", .{ e.code, e.msg });
+                return 1;
+            },
+            else => {},
+        }
+    }
+}
+
+/// `marlin reboot [--build] [--force]` — coordinated re-exec onto a fresh
+/// binary (ARCHITECTURE.md §self-hosting reboot).
+///   1. --build: run `zig build` first; abort on failure.
+///   2. Sanity-exec the candidate binary (`--version`) — exec-into-broken
+///      must be impossible.
+///   3. Send reboot{force}; daemon quiesces, acks, exits.
+///   4. Re-exec ourselves (argv[0] path) with the given follow-up args —
+///      autostart brings up the new daemon.
+pub fn reboot(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    var do_build = false;
+    var force = false;
+    var follow_up: []const [:0]const u8 = &.{};
+    for (args, 0..) |a, i| {
+        if (std.mem.eql(u8, a, "--build")) {
+            do_build = true;
+        } else if (std.mem.eql(u8, a, "--force")) {
+            force = true;
+        } else if (std.mem.eql(u8, a, "--then")) {
+            // e2e seam: exec into `marlin <follow-up args>` instead of the TUI.
+            follow_up = args[i + 1 ..];
+            break;
+        } else {
+            try eprint(io, "usage: marlin reboot [--build] [--force] [--then <args...>]\n", .{});
+            return 2;
+        }
+    }
+
+    // 1. Optional build, streamed to the terminal.
+    if (do_build) {
+        const res = std.process.run(gpa, io, .{
+            .argv = &.{ "zig", "build" },
+            .stdout_limit = .limited(4 * 1024 * 1024),
+            .stderr_limit = .limited(4 * 1024 * 1024),
+        }) catch |e| {
+            try eprint(io, "marlin: zig build failed to spawn: {t}\n", .{e});
+            return 1;
+        };
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        const ok = res.term == .exited and res.term.exited == 0;
+        if (!ok) {
+            try eprint(io, "marlin: build failed — reboot aborted\n{s}\n", .{res.stderr[0..@min(res.stderr.len, 4000)]});
+            return 1;
+        }
+    }
+
+    // 2. Sanity-exec the candidate. The one unrecoverable reboot failure is
+    // exec-into-broken-binary; make it impossible.
+    {
+        const res = std.process.run(gpa, io, .{
+            .argv = &.{ self_exe, "version" },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        }) catch |e| {
+            try eprint(io, "marlin: candidate binary failed sanity exec: {t} — reboot aborted\n", .{e});
+            return 1;
+        };
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        const ok = res.term == .exited and res.term.exited == 0 and
+            std.mem.startsWith(u8, res.stdout, "marlin");
+        if (!ok) {
+            try eprint(io, "marlin: candidate binary failed sanity check — reboot aborted\n", .{});
+            return 1;
+        }
+    }
+
+    // 3. Coordinated daemon shutdown (skip silently when no daemon runs —
+    // reboot then degrades to plain exec).
+    if (attach.tryConnect(gpa, io, environ) catch null) |conn| {
+        defer conn.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        try conn.send(.{ .hello = .{ .proto_version = proto.proto_version, .client_kind = "reboot" } });
+        _ = try conn.recvUntil(arena, .hello_ok);
+        try conn.send(.{ .reboot = .{ .force = force } });
+        _ = conn.recvUntil(arena, .ok) catch {
+            try eprint(io, "marlin: daemon did not ack reboot (crashed?) — proceeding\n", .{});
+        };
+    }
+
+    // 4. Re-exec. The new process autostarts the new daemon on connect.
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, self_exe);
+    for (follow_up) |a| try argv.append(gpa, a);
+    const err = std.process.replace(io, .{ .argv = argv.items });
+    try eprint(io, "marlin: exec failed: {t}\n", .{err});
+    return 1;
+}
+
 fn print(io: Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [8192]u8 = undefined;
     var w: Io.File.Writer = .init(.stdout(), io, &buf);

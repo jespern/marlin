@@ -17,6 +17,7 @@ const openai = @import("provider/openai_compat.zig");
 const http = @import("provider/http.zig");
 const sse = @import("provider/sse.zig");
 const tools_registry = @import("tools/registry.zig");
+const files_tool = @import("tools/files.zig");
 
 pub const Endpoint = struct {
     url: [:0]const u8, // .../chat/completions
@@ -31,6 +32,16 @@ pub const RunOpts = struct {
     cwd: []const u8,
     endpoint: Endpoint,
     cfg: config.Config,
+    /// Compaction endpoint (usually same as endpoint but cheap model);
+    /// null → use `endpoint` for summarization too.
+    compaction_endpoint: ?Endpoint = null,
+    /// L1 prune frontier (session state, survives turns): tool_result blocks
+    /// with seq < this are stubbed at assembly. Loop advances it when the
+    /// soft threshold trips; caller persists it per session.
+    prune_frontier: ?*u64 = null,
+    /// Written with the estimated assembled context tokens each round
+    /// (status-bar accounting; provider-reported usage resyncs it per turn).
+    context_used_out: ?*std.atomic.Value(u64) = null,
     /// Session approval mode (default: mutating tools ask).
     approval_mode: approval.Mode = .auto,
     /// Gate the turn parks on while a client decides. Required when
@@ -143,7 +154,49 @@ pub fn runTurn(
         }
         var blocks = try arena.alloc(block.Block, loaded.len);
         for (loaded, 0..) |lb, i| blocks[i] = lb.blk;
-        const msgs = try context.assemble(arena, blocks);
+
+        const frontier: u64 = if (opts.prune_frontier) |pf| pf.* else 0;
+        var msgs = try context.assemble(arena, blocks, .{ .prune_before_seq = frontier });
+
+        // -- L2 headroom check (turn boundary = before each request) --
+        var est_used = context.estimateAssembled(msgs);
+        if (context.needsCompaction(est_used, opts.endpoint.model, opts.cfg)) {
+            if (try maybeCompact(gpa, io, arena, &ap, opts, blocks, .auto)) {
+                // Re-load + re-assemble on top of the new compaction block.
+                const loaded2 = try store.getBlocks(opts.session_id, 1, 1_000_000);
+                defer {
+                    for (loaded2) |*lb| lb.deinit();
+                    gpa.free(loaded2);
+                }
+                blocks = try arena.alloc(block.Block, loaded2.len);
+                for (loaded2, 0..) |lb, i| blocks[i] = lb.blk;
+                msgs = try context.assemble(arena, blocks, .{ .prune_before_seq = frontier });
+            } else if (opts.prune_frontier) |pf| {
+                // Compaction not possible (session too small / no progress):
+                // fall back to L1 pruning if it can reclaim enough.
+                if (context.planPrune(blocks, pf.*, opts.cfg.prune_protect_tokens, opts.cfg.prune_min_reclaim_tokens)) |new_frontier| {
+                    pf.* = new_frontier;
+                    _ = try ap.append(.{ .system_note = .{ .text = "context pruned (L1): old tool outputs elided" } });
+                    msgs = try context.assemble(arena, blocks, .{ .prune_before_seq = new_frontier });
+                }
+            }
+        } else if (opts.prune_frontier) |pf| {
+            // Soft threshold: prune well before compaction territory so the
+            // cheap lever fires first. Soft = half the compaction trigger.
+            const limit = context.contextLimit(opts.endpoint.model);
+            const soft = limit / 2;
+            if (est_used > soft) {
+                if (context.planPrune(blocks, pf.*, opts.cfg.prune_protect_tokens, opts.cfg.prune_min_reclaim_tokens)) |new_frontier| {
+                    pf.* = new_frontier;
+                    _ = try ap.append(.{ .system_note = .{ .text = "context pruned (L1): old tool outputs elided" } });
+                    msgs = try context.assemble(arena, blocks, .{ .prune_before_seq = new_frontier });
+                }
+            }
+        }
+
+        // Publish the (possibly reduced) estimate for status displays.
+        est_used = context.estimateAssembled(msgs);
+        if (opts.context_used_out) |cu| cu.store(est_used, .release);
 
         var tools: [tools_registry.specs.len]openai.ToolSpec = undefined;
         for (&tools_registry.specs, 0..) |*s, ti| {
@@ -297,6 +350,129 @@ pub fn runTurn(
 fn cancelled(flag: ?*std.atomic.Value(bool)) bool {
     const f = flag orelse return false;
     return f.load(.acquire);
+}
+
+// ------------------------------------------------------------ compaction --
+
+pub const CompactTrigger = enum { auto, manual };
+
+/// Try to compact the session: summarize the plannable range via the
+/// compaction endpoint, append a compaction block, then rehydrate. Returns
+/// false when there's nothing sensible to compact (small session, no
+/// progress since last compaction) or the summarizer failed (logged;
+/// the turn proceeds uncompacted rather than dying).
+fn maybeCompact(
+    gpa: std.mem.Allocator,
+    io: Io,
+    arena: std.mem.Allocator,
+    ap: *Appender,
+    opts: RunOpts,
+    blocks: []const block.Block,
+    trigger: CompactTrigger,
+) !bool {
+    const plan = context.planCompaction(blocks) orelse {
+        if (trigger == .manual) {
+            _ = try ap.append(.{ .system_note = .{ .text = "nothing to compact (session too small or no progress since last compaction)" } });
+        }
+        return false;
+    };
+
+    const transcript = try context.renderForSummary(arena, blocks, plan.from_seq, plan.to_seq, 400_000);
+    const ep = opts.compaction_endpoint orelse opts.endpoint;
+
+    const summary = summarize(gpa, arena, ep, transcript, opts.cancel) catch |e| {
+        const msg = try std.fmt.allocPrint(arena, "compaction failed ({t}) — continuing uncompacted", .{e});
+        _ = try ap.append(.{ .system_note = .{ .text = msg } });
+        return false;
+    };
+
+    _ = try ap.append(.{ .compaction = .{
+        .summary = summary,
+        .covers_from_seq = plan.from_seq,
+        .covers_to_seq = plan.to_seq,
+    } });
+
+    // -- rehydrate: head+tail of recently written files + continuation note.
+    // (Claude Code's insight: summary-only compaction is amnesia.)
+    const paths = try context.recentWrittenFiles(arena, blocks, 3);
+    for (paths) |p| {
+        const abs = try files_tool.resolvePath(arena, p, opts.cwd);
+        const contents = Io.Dir.cwd().readFileAlloc(io, abs, arena, .limited(64 * 1024)) catch continue;
+        const windowed = try context.capInline(arena, contents, 4_000);
+        const note = try std.fmt.allocPrint(arena, "[rehydrated after compaction] {s}:\n{s}", .{ p, windowed });
+        _ = try ap.append(.{ .system_note = .{ .text = "rehydrated file state after compaction" } });
+        _ = try ap.append(.{ .user_msg = .{ .text = note } });
+    }
+    const note_txt: []const u8 = switch (trigger) {
+        .auto => "context compacted automatically (headroom); summary + rehydrated files above replace the older conversation",
+        .manual => "context compacted by /compact; summary + rehydrated files above replace the older conversation",
+    };
+    _ = try ap.append(.{ .system_note = .{ .text = note_txt } });
+    return true;
+}
+
+/// One non-tool provider round: transcript in, summary text out.
+/// Allocated into `arena`.
+fn summarize(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    ep: Endpoint,
+    transcript: []const u8,
+    cancel: ?*std.atomic.Value(bool),
+) ![]const u8 {
+    var msgs = [_]provider.Message{
+        .{ .role = .system, .payload = .{ .text = context.compaction_prompt } },
+        .{ .role = .user, .payload = .{ .text = transcript } },
+    };
+    const body = try openai.buildRequestBody(arena, ep.model, &msgs, &.{});
+
+    var acc = openai.StreamAccum.init(gpa);
+    defer acc.deinit();
+    var pump = Pump{ .parser = sse.Parser.init(gpa), .acc = &acc };
+    defer pump.parser.deinit();
+
+    const resp = try http.streamPost(gpa, .{
+        .url = ep.url,
+        .bearer = ep.bearer,
+        .body_json = body,
+        .cancel = cancel,
+    }, &pump, Pump.onChunk);
+    if (resp.status >= 400) {
+        if (resp.error_body) |eb| gpa.free(eb);
+        return error.SummarizerHttpError;
+    }
+    if (acc.text.items.len == 0) return error.EmptySummary;
+    return arena.dupe(u8, acc.text.items);
+}
+
+/// Manual /compact: run the summarize+append+rehydrate path outside a turn.
+/// Returns true when a compaction block was appended.
+pub fn compactSession(
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *Store,
+    opts: RunOpts,
+) !bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const loaded = try store.getBlocks(opts.session_id, 1, 1_000_000);
+    defer {
+        for (loaded) |*lb| lb.deinit();
+        gpa.free(loaded);
+    }
+    const blocks = try arena.alloc(block.Block, loaded.len);
+    for (loaded, 0..) |lb, i| blocks[i] = lb.blk;
+
+    var ap = Appender{
+        .store = store,
+        .io = io,
+        .opts = &opts,
+        .seq = try store.lastSeq(opts.session_id),
+        .turn_id = ids.next(io),
+    };
+    return maybeCompact(gpa, io, arena, &ap, opts, blocks, .manual);
 }
 
 fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, name: []const u8, args_json: []const u8) tools_registry.ExecOut {

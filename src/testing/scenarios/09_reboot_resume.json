@@ -1,0 +1,28 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["first task"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"first answer\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["first answer", "second task"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"survived the reboot\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":4}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "first task"],
+    "argv2": ["reboot", "--then", "run", "--quiet", "--continue", "second task"],
+    "runs": 2,
+    "exit_code": 0,
+    "stdout_contains": ["survived the reboot"],
+    "db_kinds": ["user_msg", "assistant_msg", "user_msg", "assistant_msg"]
+  }
+}

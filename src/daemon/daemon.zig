@@ -28,6 +28,7 @@ const config = @import("../core/config.zig");
 const queue = @import("../core/queue.zig");
 const store_mod = @import("store.zig");
 const loop = @import("loop.zig");
+const context = @import("context.zig");
 const approval = @import("approval.zig");
 const registry = @import("provider/registry.zig");
 const http = @import("provider/http.zig");
@@ -79,6 +80,14 @@ const Session = struct {
     approval_mode: approval.Mode = .default,
     /// Gate the turn thread parks on for `ask` decisions.
     gate: approval.Gate = .{},
+    /// L1 prune frontier (context.zig): tool_results with seq < this are
+    /// stubbed at assembly. Advanced by the turn thread, read by it only —
+    /// but stored here so it survives across turns. In-memory only: after a
+    /// daemon restart pruning re-derives from scratch (worst case: one
+    /// slightly-fatter first request).
+    prune_frontier: u64 = 0,
+    /// Last estimated assembled context size (tokens), for status display.
+    context_used: std.atomic.Value(u64) = .init(0),
     /// Queued mid-turn steer texts (gpa-owned), drained by poll_steer.
     steer_queue: std.ArrayList([]u8) = .empty,
     steer_mutex: Io.Mutex = .init,
@@ -97,6 +106,9 @@ pub const Daemon = struct {
     sessions: std.AutoHashMapUnmanaged(u64, *Session) = .empty,
     next_client_id: u64 = 1,
     running: bool = true,
+    /// /reboot in flight: client id awaiting the coordinated shutdown.
+    /// The daemon quiesces (waits for turns to reach done) then acks + exits.
+    pending_reboot: ?u64 = null,
 
     // ------------------------------------------------------------- serve --
 
@@ -333,6 +345,8 @@ pub const Daemon = struct {
                 // and stop reading, so usage must already be on the wire.
                 self.broadcastMeta(td.sid, td.tokens_in, td.tokens_out);
                 self.broadcastStatus(td.sid, session.state);
+                // A pending /reboot proceeds once the last turn drains.
+                self.maybeFinishReboot();
             },
             .shutdown => {
                 self.running = false;
@@ -481,6 +495,35 @@ pub const Daemon = struct {
                 _ = session.gate.resolve(self.io, id, verdict);
                 self.sendTo(client, .{ .ok = .{} });
             },
+            .session_compact => |sc| {
+                const session = self.sessions.get(sc.sid) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot compact mid-turn" } });
+                    return;
+                }
+                if (session.turn_thread) |t| {
+                    t.join();
+                    session.turn_thread = null;
+                }
+                const job = try self.gpa.create(TurnJob);
+                errdefer self.gpa.destroy(job);
+                job.* = .{
+                    .daemon = self,
+                    .sid = session.id,
+                    .cwd = try self.gpa.dupe(u8, session.cwd),
+                    .model = try self.gpa.dupe(u8, session.model),
+                    .text = try self.gpa.dupe(u8, ""),
+                    .cancel = &session.cancel,
+                    .session = session,
+                };
+                session.state = .running;
+                session.turn_thread = try std.Thread.spawn(.{}, compactMain, .{job});
+                self.broadcastStatus(session.id, .running);
+                self.sendTo(client, .{ .ok = .{} });
+            },
             .interrupt => |i| {
                 if (self.sessions.get(i.sid)) |session| {
                     session.cancel.store(true, .release);
@@ -496,6 +539,24 @@ pub const Daemon = struct {
                 // Pragmatic: the accept loop checks self.running after accept;
                 // we nudge it with a dummy connection from here (same process).
                 self.nudgeAcceptLoop();
+            },
+            .reboot => |r| {
+                // A reboot is a voluntary, coordinated crash (ARCHITECTURE.md
+                // §self-hosting reboot). Quiesce: by default wait for running
+                // turns to finish; force interrupts them (blocks are truth,
+                // partial deltas are discardable).
+                self.pending_reboot = client.id;
+                if (r.force) {
+                    var sit = self.sessions.valueIterator();
+                    while (sit.next()) |sp| {
+                        const session = sp.*;
+                        if (session.state == .running or session.state == .awaiting_approval) {
+                            session.cancel.store(true, .release);
+                            session.gate.denyPending(self.io);
+                        }
+                    }
+                }
+                self.maybeFinishReboot();
             },
         }
     }
@@ -550,11 +611,22 @@ pub const Daemon = struct {
         };
         defer ep.deinit(self.gpa);
 
+        // Compaction endpoint: model_compaction when configured AND
+        // resolvable; otherwise the loop falls back to the main endpoint.
+        var cep: ?registry.Endpoint = null;
+        if (self.cfg.model_compaction) |cm| {
+            cep = registry.resolve(self.gpa, self.environ, cm) catch null;
+        }
+        defer if (cep) |*c| c.deinit(self.gpa);
+
         const result = loop.runTurn(self.gpa, self.io, &self.store, .{
             .session_id = job.sid,
             .cwd = job.cwd,
             .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model },
             .cfg = self.cfg,
+            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model } else null,
+            .prune_frontier = &job.session.prune_frontier,
+            .context_used_out = &job.session.context_used,
             .approval_mode = job.session.approval_mode,
             .gate = &job.session.gate,
             .on_approval_needed = TurnHooks.onApprovalNeeded,
@@ -574,6 +646,49 @@ pub const Daemon = struct {
         tokens_out = result.tokens_out;
         interrupted = result.interrupted;
         self.finishTurn(job.sid, interrupted, null, tokens_in, tokens_out);
+    }
+
+    /// /compact thread body: like turnMain but runs only the compaction
+    /// path. Ends with the normal turn_done bookkeeping (state → idle,
+    /// meta broadcast) so clients see a coherent lifecycle.
+    fn compactMain(job: *TurnJob) void {
+        const self = job.daemon;
+        defer {
+            self.gpa.free(job.cwd);
+            self.gpa.free(job.model);
+            self.gpa.free(job.text);
+            self.gpa.destroy(job);
+        }
+
+        const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
+            const t = std.fmt.allocPrint(self.gpa, "provider resolve failed: {t}", .{e}) catch null;
+            self.finishTurn(job.sid, false, t, 0, 0);
+            return;
+        };
+        defer ep.deinit(self.gpa);
+        var cep: ?registry.Endpoint = null;
+        if (self.cfg.model_compaction) |cm| {
+            cep = registry.resolve(self.gpa, self.environ, cm) catch null;
+        }
+        defer if (cep) |*c| c.deinit(self.gpa);
+
+        const did = loop.compactSession(self.gpa, self.io, &self.store, .{
+            .session_id = job.sid,
+            .cwd = job.cwd,
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model },
+            .cfg = self.cfg,
+            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model } else null,
+            .approval_mode = .auto, // compaction runs no tools
+            .on_block = TurnHooks.onBlock,
+            .on_delta_ctx = job,
+            .cancel = job.cancel,
+        }) catch |e| {
+            const t = std.fmt.allocPrint(self.gpa, "compaction failed: {t}", .{e}) catch null;
+            self.finishTurn(job.sid, false, t, 0, 0);
+            return;
+        };
+        _ = did; // "nothing to compact" already logged as a system_note
+        self.finishTurn(job.sid, false, null, 0, 0);
     }
 
     fn finishTurn(self: *Daemon, sid: u64, interrupted: bool, err_text: ?[]u8, tin: u64, tout: u64) void {
@@ -664,12 +779,43 @@ pub const Daemon = struct {
     }
 
     fn broadcastMeta(self: *Daemon, sid: u64, tin: u64, tout: u64) void {
-        const line = proto.encode(self.gpa, proto.DaemonMsg{ .session_meta = .{ .sid = sid, .tokens_in = tin, .tokens_out = tout } }) catch return;
+        var used: u64 = 0;
+        var limit: u64 = 0;
+        if (self.sessions.get(sid)) |session| {
+            used = session.context_used.load(.acquire);
+            limit = context.contextLimit(session.model);
+        }
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .session_meta = .{
+            .sid = sid,
+            .tokens_in = tin,
+            .tokens_out = tout,
+            .context_used = used,
+            .context_limit = limit,
+        } }) catch return;
         defer self.gpa.free(line);
         self.fanOutLine(sid, line);
     }
 
     // ---------------------------------------------------------- shutdown --
+
+    /// Complete a pending /reboot once every session is quiescent. Sends the
+    /// ok ack to the requesting client (its cue to exec the new binary),
+    /// then shuts down exactly like `shutdown` — the client's autostart
+    /// brings up the new binary. One restart mechanism, not two.
+    fn maybeFinishReboot(self: *Daemon) void {
+        const requester = self.pending_reboot orelse return;
+        var sit = self.sessions.valueIterator();
+        while (sit.next()) |sp| {
+            const state = sp.*.state;
+            if (state == .running or state == .awaiting_approval) return; // not yet
+        }
+        self.pending_reboot = null;
+        if (self.lookupClient(requester)) |client| {
+            self.sendTo(client, .{ .ok = .{} });
+        }
+        self.running = false;
+        self.nudgeAcceptLoop();
+    }
 
     fn nudgeAcceptLoop(self: *Daemon) void {
         const sock_path = proto.socketPath(self.gpa, self.environ) catch return;

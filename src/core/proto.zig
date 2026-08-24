@@ -36,7 +36,15 @@ pub const ClientMsg = union(enum) {
     unsub: struct { sid: u64 },
     input: struct { sid: u64, text: []const u8 },
     approve: struct { sid: u64, approval_id: []const u8, decision: ApprovalAnswer },
+    /// Manual L2 compaction (/compact). Rejected while a turn is running.
+    session_compact: struct { sid: u64 },
     interrupt: struct { sid: u64 },
+    /// Coordinated shutdown for /reboot: quiesce (wait for running turns to
+    /// hit a block boundary — or interrupt them when force=true), persist,
+    /// release the socket, exit 0. Reply `ok` is sent RIGHT BEFORE exit; the
+    /// requesting client execs the new binary when it sees it. Autostart
+    /// then brings up the new daemon (one restart mechanism, not two).
+    reboot: struct { force: bool = false },
     shutdown: struct {},
 };
 
@@ -58,7 +66,15 @@ pub const DaemonMsg = union(enum) {
         /// Raw JSON args — clients render their own preview.
         args_json: []const u8,
     },
-    session_meta: struct { sid: u64, tokens_in: u64, tokens_out: u64 },
+    session_meta: struct {
+        sid: u64,
+        tokens_in: u64,
+        tokens_out: u64,
+        /// Estimated tokens in the assembled context (0 = not yet measured)
+        /// and the model's window, for the status bar's context gauge.
+        context_used: u64 = 0,
+        context_limit: u64 = 0,
+    },
     ok: struct {},
     err: struct { code: []const u8, msg: []const u8 },
 };

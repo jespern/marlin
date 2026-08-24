@@ -79,6 +79,15 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("e2e", "Run end-to-end scenarios (real binary, fake provider)");
     e2e_step.dependOn(&e2e_cmd.step);
 
+    // ---- reboot convergence (reboot vs kill-9 must restore identical state) ----
+    const conv_cmd = b.addSystemCommand(&.{"src/testing/reboot_convergence.sh"});
+    conv_cmd.addArtifactArg(exe);
+    conv_cmd.addArtifactArg(fakeprov);
+    conv_cmd.addFileArg(b.path("src/testing/scenarios/09_reboot_resume.json"));
+    conv_cmd.has_side_effects = true;
+    const conv_step = b.step("converge", "Verify reboot vs kill-9 restore identical state");
+    conv_step.dependOn(&conv_cmd.step);
+
     // ---- live smoke (real OpenRouter; needs OPENROUTER_API_KEY) ----
     const smoke = b.addExecutable(.{
         .name = "smoke",
