@@ -1,28 +1,281 @@
-//! The agent turn loop (docs/ARCHITECTURE.md §4).
-//!
-//! Runs on its own thread per turn:
-//!
-//!   assemble context (context.zig)
-//!   loop:
-//!     stream POST to provider (SSE) → delta events; collect tool_calls
-//!     if none → finalize assistant_msg block; done
-//!     for each tool_call:
-//!       approval gate (approval.zig) — may park in awaiting_approval
-//!       execute (tools/registry.zig) → tool_result block
-//!     drain steer queue → inject steer block as user-role message
-//!     repeat
-//!
-//! Cancellation: atomic flag polled by the HTTP read loop and subprocess
-//! waits. Retry: exponential backoff on 429/5xx/mid-stream drop; partial
-//! deltas are discarded (they were never truth) and the request re-issued
-//! against unchanged context — safe and cache-friendly.
+//! The agent turn loop (docs/ARCHITECTURE.md §4). M0: in-process, blocking,
+//! auto-approve, deltas printed by a caller-supplied sink. The daemon-thread
+//! version (steer queue, interrupt flag, parallel tools) lands in M1.
 
 const std = @import("std");
+const Io = std.Io;
 
-// TODO(M0): single-turn version, no daemon: run(store, session, user_text)
-//           with auto-approved bash+read_file and stdout delta printing.
-// TODO(M1): thread spawn, event queue emission, steer queue, interrupt flag.
-// TODO(M1): parallel_safe tool batching (read-only tools concurrently).
+const block = @import("../core/block.zig");
+const ids = @import("../core/ids.zig");
+const jsonx = @import("../core/jsonx.zig");
+const config = @import("../core/config.zig");
+const Store = @import("store.zig").Store;
+const context = @import("context.zig");
+const provider = @import("provider/provider.zig");
+const openai = @import("provider/openai_compat.zig");
+const http = @import("provider/http.zig");
+const sse = @import("provider/sse.zig");
+const bash = @import("tools/bash.zig");
+const files = @import("tools/files.zig");
+
+pub const Endpoint = struct {
+    url: [:0]const u8, // .../chat/completions
+    bearer: ?[]const u8,
+    model: []const u8, // provider-native model string
+};
+
+pub const ToolPhase = enum { start, done };
+
+pub const RunOpts = struct {
+    session_id: u64,
+    cwd: []const u8,
+    endpoint: Endpoint,
+    cfg: config.Config,
+    /// Called with streaming assistant text for UI liveness.
+    on_delta: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    on_delta_ctx: ?*anyopaque = null,
+    /// Called when a tool starts/finishes (for progress display).
+    on_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, phase: ToolPhase) void = null,
+    max_rounds: u32 = 32,
+};
+
+pub const TurnResult = struct {
+    /// Final assistant text (allocated; caller frees).
+    text: []u8,
+    rounds: u32,
+    tokens_in: u64,
+    tokens_out: u64,
+};
+
+/// Run one full agent turn: user text in → tool roundtrips → final text out.
+/// All blocks are persisted as they happen; a crash mid-turn leaves a
+/// consistent log.
+pub fn runTurn(
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *Store,
+    opts: RunOpts,
+    user_text: []const u8,
+) !TurnResult {
+    const turn_id = ids.next(io);
+    var seq = try store.lastSeq(opts.session_id);
+
+    // Persist the user message.
+    seq += 1;
+    try store.appendBlock(.{
+        .id = ids.next(io),
+        .session_id = opts.session_id,
+        .turn_id = turn_id,
+        .seq = seq,
+        .ts = nowMs(io),
+        .body = .{ .user_msg = .{ .text = user_text } },
+    });
+
+    var total_in: u64 = 0;
+    var total_out: u64 = 0;
+    var round: u32 = 0;
+
+    while (round < opts.max_rounds) : (round += 1) {
+        // -- assemble context from the full block log (arena per request) --
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const loaded = try store.getBlocks(opts.session_id, 1, 1_000_000);
+        defer {
+            for (loaded) |*lb| lb.deinit();
+            gpa.free(loaded);
+        }
+        var blocks = try arena.alloc(block.Block, loaded.len);
+        for (loaded, 0..) |lb, i| blocks[i] = lb.blk;
+        const msgs = try context.assemble(arena, blocks);
+
+        const tools = [_]openai.ToolSpec{
+            .{ .name = bash.spec_name, .description = bash.spec_description, .schema_json = bash.spec_schema },
+            .{ .name = files.read_spec_name, .description = files.read_spec_description, .schema_json = files.read_spec_schema },
+        };
+
+        const body = try openai.buildRequestBody(arena, opts.endpoint.model, msgs, &tools);
+
+        // -- stream the response --
+        var acc = openai.StreamAccum.init(gpa);
+        defer acc.deinit();
+        acc.on_delta = opts.on_delta;
+        acc.on_delta_ctx = opts.on_delta_ctx;
+
+        var pump = Pump{ .parser = sse.Parser.init(gpa), .acc = &acc };
+        defer pump.parser.deinit();
+
+        const resp = try http.streamPost(gpa, .{
+            .url = opts.endpoint.url,
+            .bearer = opts.endpoint.bearer,
+            .body_json = body,
+        }, &pump, Pump.onChunk);
+
+        if (resp.status >= 400) {
+            const eb = resp.error_body orelse try gpa.dupe(u8, "");
+            defer gpa.free(eb);
+            const msg = try std.fmt.allocPrint(gpa, "provider returned HTTP {d}: {s}", .{ resp.status, eb[0..@min(eb.len, 2000)] });
+            errdefer gpa.free(msg);
+            seq += 1;
+            try store.appendBlock(.{
+                .id = ids.next(io),
+                .session_id = opts.session_id,
+                .turn_id = turn_id,
+                .seq = seq,
+                .ts = nowMs(io),
+                .body = .{ .system_note = .{ .text = msg } },
+            });
+            return error.ProviderError;
+        }
+
+        if (acc.usage) |u| {
+            total_in += u.tokens_in;
+            total_out += u.tokens_out;
+        }
+
+        // -- no tool calls → final answer --
+        if (acc.calls.items.len == 0) {
+            seq += 1;
+            try store.appendBlock(.{
+                .id = ids.next(io),
+                .session_id = opts.session_id,
+                .turn_id = turn_id,
+                .seq = seq,
+                .ts = nowMs(io),
+                .body = .{ .assistant_msg = .{ .text = acc.text.items } },
+            });
+            try store.updateSessionUsage(opts.session_id, total_in, total_out);
+            return .{
+                .text = try gpa.dupe(u8, acc.text.items),
+                .rounds = round + 1,
+                .tokens_in = total_in,
+                .tokens_out = total_out,
+            };
+        }
+
+        // -- execute tool calls (serial in M0) --
+        for (acc.calls.items) |*pc| {
+            const args_repaired = jsonx.repairObject(gpa, pc.args.items) catch pc.args.items;
+            defer if (args_repaired.ptr != pc.args.items.ptr) gpa.free(@constCast(args_repaired));
+
+            // Persist the tool_call block.
+            seq += 1;
+            try store.appendBlock(.{
+                .id = ids.next(io),
+                .session_id = opts.session_id,
+                .turn_id = turn_id,
+                .seq = seq,
+                .ts = nowMs(io),
+                .body = .{ .tool_call = .{
+                    .call_id = pc.call_id.items,
+                    .name = pc.name.items,
+                    .args_json = args_repaired,
+                } },
+            });
+
+            if (opts.on_tool) |cb| cb(opts.on_delta_ctx, pc.name.items, .start);
+            const exec = executeTool(gpa, io, pc.name.items, args_repaired, opts.cwd);
+            if (opts.on_tool) |cb| cb(opts.on_delta_ctx, pc.name.items, .done);
+            defer gpa.free(exec.output);
+
+            // Blob the full output when it exceeds the inline cap.
+            const cap: usize = opts.cfg.inline_tool_cap_bytes;
+            var full_ref: ?[]const u8 = null;
+            defer if (full_ref) |r| gpa.free(@constCast(r));
+            if (exec.output.len > cap) full_ref = try store.putBlob(exec.output);
+            const inline_body = try context.capInline(gpa, exec.output, cap);
+            defer if (inline_body.ptr != exec.output.ptr) gpa.free(@constCast(inline_body));
+
+            seq += 1;
+            try store.appendBlock(.{
+                .id = ids.next(io),
+                .session_id = opts.session_id,
+                .turn_id = turn_id,
+                .seq = seq,
+                .ts = nowMs(io),
+                .body = .{ .tool_result = .{
+                    .call_id = pc.call_id.items,
+                    .status = exec.status,
+                    .inline_body = inline_body,
+                    .full_body_ref = full_ref,
+                } },
+            });
+        }
+        // Loop: next round re-assembles including the new tool results.
+    }
+
+    return error.TooManyRounds;
+}
+
+const ExecOut = struct {
+    output: []u8,
+    status: block.ToolStatus,
+};
+
+fn executeTool(gpa: std.mem.Allocator, io: Io, name: []const u8, args_json: []const u8, cwd: []const u8) ExecOut {
+    if (std.mem.eql(u8, name, bash.spec_name)) {
+        const parsed = std.json.parseFromSlice(bash.Args, gpa, args_json, .{ .ignore_unknown_fields = true }) catch {
+            return argError(gpa, args_json);
+        };
+        defer parsed.deinit();
+        const r = bash.run(gpa, io, parsed.value, cwd) catch |e| {
+            return .{ .output = errText(gpa, e), .status = .err };
+        };
+        if (r.exit_code != 0) {
+            const with_code = std.fmt.allocPrint(gpa, "{s}\n[exit code: {d}]", .{ r.output, r.exit_code }) catch
+                return .{ .output = r.output, .status = .err };
+            gpa.free(r.output);
+            return .{ .output = with_code, .status = .err };
+        }
+        return .{ .output = r.output, .status = .ok };
+    }
+    if (std.mem.eql(u8, name, files.read_spec_name)) {
+        const parsed = std.json.parseFromSlice(files.ReadArgs, gpa, args_json, .{ .ignore_unknown_fields = true }) catch {
+            return argError(gpa, args_json);
+        };
+        defer parsed.deinit();
+        const out = files.readFile(gpa, io, parsed.value, cwd) catch |e| {
+            return .{ .output = errText(gpa, e), .status = .err };
+        };
+        const is_err = std.mem.startsWith(u8, out, "error:");
+        return .{ .output = out, .status = if (is_err) .err else .ok };
+    }
+    const msg = std.fmt.allocPrint(gpa, "error: unknown tool '{s}'", .{name}) catch @panic("oom");
+    return .{ .output = msg, .status = .err };
+}
+
+fn argError(gpa: std.mem.Allocator, args_json: []const u8) ExecOut {
+    const msg = std.fmt.allocPrint(
+        gpa,
+        "error: could not parse tool arguments as JSON. Got: {s}\nRe-issue the call with valid JSON matching the schema.",
+        .{args_json[0..@min(args_json.len, 500)]},
+    ) catch @panic("oom");
+    return .{ .output = msg, .status = .err };
+}
+
+fn errText(gpa: std.mem.Allocator, e: anyerror) []u8 {
+    return std.fmt.allocPrint(gpa, "error: {t}", .{e}) catch @panic("oom");
+}
+
+fn nowMs(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+/// Glue: curl chunk → SSE parser → StreamAccum.
+const Pump = struct {
+    parser: sse.Parser,
+    acc: *openai.StreamAccum,
+
+    fn onChunk(self: *Pump, bytes: []const u8) void {
+        self.parser.feed(bytes, self.acc, onEvent) catch {};
+    }
+
+    fn onEvent(acc: *openai.StreamAccum, ev: sse.Event) void {
+        acc.onEvent(ev);
+    }
+};
 
 test {
     std.testing.refAllDecls(@This());

@@ -1,29 +1,152 @@
 //! Lenient JSON utilities.
 //!
 //! Models emit damaged JSON in tool arguments constantly: trailing commas,
-//! unbalanced braces, raw newlines in strings, prose before/after the object.
-//! Strategy (docs/ARCHITECTURE.md §4): strict parse first; on failure run a
-//! bounded repair pass; on repeated failure, hand the parse error back to the
-//! model as the tool result — models self-correct.
+//! unbalanced braces, raw newlines inside strings, prose before/after the
+//! object. Strategy (docs/ARCHITECTURE.md §4): strict validate first; on
+//! failure run a bounded repair pass; if still invalid, the caller feeds the
+//! parse error back to the model as the tool result — models self-correct.
 
 const std = @import("std");
 
-pub const RepairError = error{Unrecoverable};
+pub const RepairError = error{ Unrecoverable, OutOfMemory };
 
 /// Attempt to extract/repair a JSON object from model output.
-/// Returned slice is allocated with `gpa` (caller frees) unless the input was
-/// already valid, in which case the input slice itself is returned.
+/// Fast path: input already valid → the input slice itself is returned.
+/// Repair path: returns a new slice allocated with `gpa` (caller owns).
 pub fn repairObject(gpa: std.mem.Allocator, raw: []const u8) RepairError![]const u8 {
-    _ = gpa;
-    // TODO(M0):
-    //   1. fast path: std.json.validate → return raw
-    //   2. trim to outermost {...} (drop prose prefix/suffix)
-    //   3. strip trailing commas; balance braces/brackets; close dangling string
-    //   4. re-validate; else error.Unrecoverable
-    return raw;
+    if (validate(raw)) return raw;
+
+    // 1. Trim to the outermost {...} (drop prose prefix/suffix).
+    const first = std.mem.indexOfScalar(u8, raw, '{') orelse return error.Unrecoverable;
+    const last = std.mem.lastIndexOfScalar(u8, raw, '}');
+    const candidate = if (last != null and last.? > first)
+        raw[first .. last.? + 1]
+    else
+        raw[first..]; // no closing brace at all — repair pass will close it
+    if (validate(candidate)) return try gpa.dupe(u8, candidate);
+
+    // 2. Structural repair: walk the candidate tracking string/escape state;
+    //    escape raw newlines inside strings, drop trailing commas, then close
+    //    any dangling string and unbalanced containers.
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var stack: std.ArrayList(u8) = .empty; // open container chars
+    defer stack.deinit(gpa);
+
+    var in_string = false;
+    var escaped = false;
+    for (candidate) |ch| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                try out.append(gpa, ch);
+            } else switch (ch) {
+                '\\' => {
+                    escaped = true;
+                    try out.append(gpa, ch);
+                },
+                '"' => {
+                    in_string = false;
+                    try out.append(gpa, ch);
+                },
+                '\n' => try out.appendSlice(gpa, "\\n"),
+                '\r' => try out.appendSlice(gpa, "\\r"),
+                '\t' => try out.appendSlice(gpa, "\\t"),
+                else => try out.append(gpa, ch),
+            }
+            continue;
+        }
+        switch (ch) {
+            '"' => {
+                in_string = true;
+                try out.append(gpa, ch);
+            },
+            '{', '[' => {
+                try stack.append(gpa, ch);
+                try out.append(gpa, ch);
+            },
+            '}', ']' => {
+                // Drop a trailing comma before a closer.
+                trimTrailingComma(&out);
+                if (stack.items.len > 0) {
+                    const open = stack.items[stack.items.len - 1];
+                    const want: u8 = if (open == '{') '}' else ']';
+                    if (ch == want) _ = stack.pop();
+                    // Mismatched closer: keep it; validation decides.
+                }
+                try out.append(gpa, ch);
+            },
+            else => try out.append(gpa, ch),
+        }
+    }
+    // Close dangling string.
+    if (in_string) {
+        if (escaped) _ = out.pop(); // drop lone trailing backslash
+        try out.append(gpa, '"');
+    }
+    // Drop trailing comma at top of remaining structure, then close stack.
+    trimTrailingComma(&out);
+    while (stack.pop()) |open| {
+        try out.append(gpa, if (open == '{') '}' else ']');
+    }
+
+    const repaired = try out.toOwnedSlice(gpa);
+    if (validate(repaired)) return repaired;
+    gpa.free(repaired);
+    return error.Unrecoverable;
 }
 
-test "valid json passes through" {
+fn trimTrailingComma(out: *std.ArrayList(u8)) void {
+    var i = out.items.len;
+    while (i > 0) : (i -= 1) {
+        const c = out.items[i - 1];
+        if (c == ' ' or c == '\n' or c == '\r' or c == '\t') continue;
+        if (c == ',') {
+            _ = out.orderedRemove(i - 1);
+        }
+        break;
+    }
+}
+
+fn validate(s: []const u8) bool {
+    return std.json.validate(std.heap.page_allocator, s) catch false;
+}
+
+// ---------------------------------------------------------------- tests --
+
+test "valid json passes through untouched" {
     const out = try repairObject(std.testing.allocator, "{\"a\":1}");
     try std.testing.expectEqualStrings("{\"a\":1}", out);
+}
+
+test "prose around the object is trimmed" {
+    const gpa = std.testing.allocator;
+    const out = try repairObject(gpa, "Sure! Here are the args: {\"cmd\":\"ls\"} Hope that helps.");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("{\"cmd\":\"ls\"}", out);
+}
+
+test "trailing comma removed" {
+    const gpa = std.testing.allocator;
+    const out = try repairObject(gpa, "{\"a\":1,\"b\":2,}");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2}", out);
+}
+
+test "unclosed braces and dangling string closed" {
+    const gpa = std.testing.allocator;
+    const out = try repairObject(gpa, "{\"cmd\":\"echo hi");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("{\"cmd\":\"echo hi\"}", out);
+}
+
+test "raw newline inside string escaped" {
+    const gpa = std.testing.allocator;
+    const out = try repairObject(gpa, "{\"text\":\"line1\nline2\"}");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("{\"text\":\"line1\\nline2\"}", out);
+}
+
+test "hopeless input is Unrecoverable" {
+    try std.testing.expectError(error.Unrecoverable, repairObject(std.testing.allocator, "no json here at all"));
 }

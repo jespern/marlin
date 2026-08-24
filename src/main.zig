@@ -16,10 +16,15 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    try cli.dispatch(init.gpa, init.io, if (args.len > 1) args[1..] else &.{});
+    return cli.dispatch(
+        init.gpa,
+        init.io,
+        init.environ_map,
+        if (args.len > 1) args[1..] else &.{},
+    );
 }
 
 test {

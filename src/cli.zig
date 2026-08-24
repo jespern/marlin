@@ -23,20 +23,26 @@ pub const Command = enum {
     }
 };
 
-pub fn dispatch(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !void {
-    _ = gpa;
+pub fn dispatch(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    args: []const [:0]const u8,
+) !u8 {
     const cmd: Command = if (args.len == 0)
         .attach
     else
         Command.parse(args[0]) orelse .help;
+    const rest = if (args.len == 0) args else args[1..];
 
     switch (cmd) {
         .version => try stdoutPrint(io, "marlin 0.0.0\n", .{}),
         .help => try stdoutPrint(io, help_text, .{}),
         .daemon => try daemon.serveStub(io),
-        .run => try headless.runStub(io),
+        .run => return headless.run(gpa, io, environ, rest),
         else => try stdoutPrint(io, "marlin: '{s}' not implemented yet (see docs/MILESTONES.md)\n", .{@tagName(cmd)}),
     }
+    return 0;
 }
 
 const help_text =
@@ -44,7 +50,7 @@ const help_text =
     \\
     \\usage:
     \\  marlin                 attach to the daemon (TUI)
-    \\  marlin run "task"      headless one-shot session
+    \\  marlin run [--continue] [--model <m>] [--quiet] "task"
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls              list sessions
     \\  marlin attach <id>     attach to a session

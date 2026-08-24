@@ -1,16 +1,169 @@
 //! HTTP layer: libcurl wrapper. THE ONLY FILE THAT KNOWS CURL.
 //!
-//! - streaming POST with write callback → sse.zig feed()
-//! - cancellation: progress callback polls the turn's atomic cancel flag
-//! - retry/backoff: exponential w/ jitter on 429/5xx/connect errors,
-//!   honoring Retry-After; max attempts then stream_error{retryable:false}
+//! - streaming POST: response bytes are handed to an on_chunk callback as
+//!   they arrive (curl write callback → caller's SSE parser)
+//! - cancellation: curl progress callback polls an atomic cancel flag
+//! - retry/backoff (M0.5): exponential w/ jitter on 429/5xx/connect errors;
+//!   the caller re-issues the whole request — partial deltas are discarded
 //! - swap target: std.http.Client behind this same interface, someday.
 
 const std = @import("std");
 
-// TODO(M0): link libcurl in build.zig, easy-handle wrapper, header auth
-//           (Bearer from api_key_env), timeouts (connect 10s, idle 120s).
+const c = @cImport({
+    @cInclude("curl/curl.h");
+});
 
-test {
-    std.testing.refAllDecls(@This());
+pub const Error = error{
+    CurlInit,
+    CurlPerform,
+    Cancelled,
+    HttpStatus,
+    OutOfMemory,
+};
+
+pub const Response = struct {
+    /// HTTP status code (set even when body streaming succeeded).
+    status: i64,
+    /// Collected error body when status >= 400 (allocated, caller frees).
+    /// null on success (body went to the stream callback instead).
+    error_body: ?[]u8,
+};
+
+pub const StreamRequest = struct {
+    url: [:0]const u8,
+    /// Bearer token; header built internally. Optional for local endpoints.
+    bearer: ?[]const u8,
+    body_json: []const u8,
+    /// Extra headers, each as a full "Name: value" line.
+    extra_headers: []const []const u8 = &.{},
+    connect_timeout_ms: c_long = 10_000,
+    /// Abort if no bytes arrive for this long (idle watchdog).
+    idle_timeout_ms: c_long = 120_000,
+    /// Polled by curl's progress callback; set from another thread to abort.
+    cancel: ?*std.atomic.Value(bool) = null,
+};
+
+/// One-time global init (call from main once; not thread-safe by contract).
+pub fn globalInit() void {
+    _ = c.curl_global_init(c.CURL_GLOBAL_DEFAULT);
+}
+
+pub fn globalDeinit() void {
+    c.curl_global_cleanup();
+}
+
+/// Streaming POST. Calls `on_chunk(ctx, bytes)` for each response chunk as
+/// it arrives. Returns after the stream completes or fails.
+pub fn streamPost(
+    gpa: std.mem.Allocator,
+    req: StreamRequest,
+    ctx: anytype,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) void,
+) Error!Response {
+    const easy = c.curl_easy_init() orelse return error.CurlInit;
+    defer c.curl_easy_cleanup(easy);
+
+    var headers: ?*c.curl_slist = null;
+    defer if (headers) |h| c.curl_slist_free_all(h);
+    headers = c.curl_slist_append(headers, "Content-Type: application/json");
+    headers = c.curl_slist_append(headers, "Accept: text/event-stream");
+
+    var auth_buf: [4096]u8 = undefined;
+    if (req.bearer) |tok| {
+        const line = std.fmt.bufPrintZ(&auth_buf, "Authorization: Bearer {s}", .{tok}) catch
+            return error.OutOfMemory;
+        headers = c.curl_slist_append(headers, line.ptr);
+    }
+    var hdr_z: std.ArrayList(u8) = .empty;
+    defer hdr_z.deinit(gpa);
+    for (req.extra_headers) |h| {
+        hdr_z.clearRetainingCapacity();
+        try hdr_z.appendSlice(gpa, h);
+        try hdr_z.append(gpa, 0);
+        headers = c.curl_slist_append(headers, @ptrCast(hdr_z.items.ptr));
+    }
+
+    var cb = Callback(@TypeOf(ctx)){ .gpa = gpa, .ctx = ctx, .cancel = req.cancel };
+
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_URL, req.url.ptr);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_HTTPHEADER, headers);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_POST, @as(c_long, 1));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_POSTFIELDS, req.body_json.ptr);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_POSTFIELDSIZE, @as(c_long, @intCast(req.body_json.len)));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEFUNCTION, Callback(@TypeOf(ctx)).write(on_chunk));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEDATA, &cb);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_CONNECTTIMEOUT_MS, req.connect_timeout_ms);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_LOW_SPEED_LIMIT, @as(c_long, 1));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_LOW_SPEED_TIME, @divTrunc(req.idle_timeout_ms, 1000));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_NOPROGRESS, @as(c_long, 0));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFOFUNCTION, Callback(@TypeOf(ctx)).progress);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_XFERINFODATA, &cb);
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
+    _ = c.curl_easy_setopt(easy, c.CURLOPT_USERAGENT, "marlin/0.0");
+
+    const code = c.curl_easy_perform(easy);
+
+    var status: c_long = 0;
+    _ = c.curl_easy_getinfo(easy, c.CURLINFO_RESPONSE_CODE, &status);
+
+    if (code == c.CURLE_ABORTED_BY_CALLBACK) return error.Cancelled;
+    if (code != c.CURLE_OK and status == 0) return error.CurlPerform;
+
+    if (status >= 400) {
+        return .{ .status = status, .error_body = try cb.err_body.toOwnedSlice(gpa) };
+    }
+    cb.err_body.deinit(gpa);
+    return .{ .status = status, .error_body = null };
+}
+
+/// Curl callback state + trampolines. Generic over the caller's ctx type.
+fn Callback(comptime Ctx: type) type {
+    return struct {
+        gpa: std.mem.Allocator,
+        ctx: Ctx,
+        cancel: ?*std.atomic.Value(bool),
+        status_checked: bool = false,
+        is_error_status: bool = false,
+        err_body: std.ArrayList(u8) = .empty,
+
+        const Self = @This();
+
+        fn write(comptime on_chunk: fn (Ctx, []const u8) void) fn ([*c]u8, usize, usize, ?*anyopaque) callconv(.c) usize {
+            return struct {
+                fn go(ptr: [*c]u8, size: usize, nmemb: usize, userdata: ?*anyopaque) callconv(.c) usize {
+                    const self: *Self = @ptrCast(@alignCast(userdata.?));
+                    const bytes = ptr[0 .. size * nmemb];
+                    // We can't see the status line from the write cb directly;
+                    // error bodies are small and non-SSE, so buffer defensively:
+                    // heuristic: SSE chunks start streaming only on 200s, but
+                    // we ALSO keep a copy of early bytes in case status >= 400.
+                    if (!self.status_checked or self.is_error_status) {
+                        self.err_body.appendSlice(self.gpa, bytes) catch return 0;
+                        if (self.err_body.items.len > 64 * 1024) return 0; // cap error body
+                    }
+                    if (!self.is_error_status) on_chunk(self.ctx, bytes);
+                    return size * nmemb;
+                }
+            }.go;
+        }
+
+        fn progress(userdata: ?*anyopaque, _: c.curl_off_t, _: c.curl_off_t, _: c.curl_off_t, _: c.curl_off_t) callconv(.c) c_int {
+            const self: *Self = @ptrCast(@alignCast(userdata.?));
+            if (self.cancel) |flag| {
+                if (flag.load(.acquire)) return 1; // abort transfer
+            }
+            return 0;
+        }
+    };
+}
+
+// NOTE on the error-body heuristic above: for M0 we keep it simple — the
+// caller checks Response.status; when >=400 the SSE sink will have received
+// the error bytes too, which is harmless (no valid `data:` lines parse out
+// of a JSON error object). M1 refines this with a HEADERFUNCTION that flips
+// is_error_status as soon as the status line arrives.
+
+test "compiles and links against libcurl" {
+    globalInit();
+    defer globalDeinit();
 }

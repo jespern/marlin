@@ -8,25 +8,37 @@ const std = @import("std");
 
 pub const Role = enum { system, user, assistant, tool };
 
+pub const ToolCall = struct {
+    call_id: []const u8,
+    name: []const u8,
+    /// Raw JSON arguments string.
+    args_json: []const u8,
+};
+
 pub const Message = struct {
     role: Role,
-    text: []const u8,
-    // TODO(M0): tool_call / tool_result payload variants; cache_control
-    //           annotations consumed only by the anthropic dialect.
+    payload: Payload,
+
+    pub const Payload = union(enum) {
+        /// Plain text content (system/user/assistant text messages).
+        text: []const u8,
+        /// Assistant turn that requested tool calls (text may be empty).
+        assistant_tool_calls: struct {
+            text: []const u8,
+            calls: []const ToolCall,
+        },
+        /// Result of one tool call, echoed back to the model.
+        tool_result: struct {
+            call_id: []const u8,
+            text: []const u8,
+        },
+    };
 };
 
-/// Events yielded while streaming one model response.
-pub const Event = union(enum) {
-    delta: []const u8, // assistant text fragment
-    reasoning_delta: []const u8,
-    tool_call: struct { call_id: []const u8, name: []const u8, args_json: []const u8 },
-    usage: struct { tokens_in: u64, tokens_out: u64 },
-    done: void,
-    stream_error: struct { retryable: bool, msg: []const u8 },
+pub const Usage = struct {
+    tokens_in: u64,
+    tokens_out: u64,
 };
-
-// TODO(M0): the vtable iface + openai_compat implementation; retry/backoff
-//           policy lives in http.zig, dialect parsing in sse.zig callbacks.
 
 test {
     std.testing.refAllDecls(@This());

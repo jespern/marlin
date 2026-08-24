@@ -20,10 +20,9 @@ pub fn build(b: *std.Build) void {
     });
 
     // System C dependencies (present on macOS and virtually all Linux distros).
-    // Uncommented as soon as store.zig / http.zig land in M0:
-    // exe.root_module.linkSystemLibrary("sqlite3", .{});
-    // exe.root_module.linkSystemLibrary("curl", .{});
-    // exe.root_module.link_libc = true;
+    exe.root_module.linkSystemLibrary("curl", .{});
+    exe.root_module.linkSystemLibrary("sqlite3", .{});
+    exe.root_module.link_libc = true;
 
     b.installArtifact(exe);
 
