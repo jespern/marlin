@@ -588,8 +588,9 @@ get these right; Hermes is the counter-example):
   `!c msg` / `!c code` / `!c cmd` / `!c all`; `!y` / `!p [sid]` for the
   daemon-side register (cross-session paste, no OS clipboard).
 - **Command namespace**: `/` = session & harness commands (`/model`, `/compact`,
-  `/new`, `/allow`), `!` = copy/clipboard family. Plain text = message to agent.
-  `Esc` during a turn = queue steer text; `Ctrl+C` = interrupt.
+  `/new`, `/allow`); `!` = terse aliases for frequent actions (`!rb` expands
+  to `/reboot --build`, `!c` copies the last output). Plain text = message to
+  agent. `Esc` during a turn = queue steer text; `Ctrl+C` = interrupt.
 - Tool blocks render collapsed by default (name + one-line summary + status),
   expand on demand. Approvals render as inline prompt cards.
 
