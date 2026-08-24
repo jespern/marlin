@@ -20,6 +20,11 @@ pub const Config = struct {
     mutating_tools_policy: Policy = .ask,
     readonly_tools_policy: Policy = .auto,
 
+    /// Workspace layer (docs/WORKSPACE.md): shadow snapshots, write leases,
+    /// sandbox escalations. Master switch — OFF until M3.5 lands; M2
+    /// approval semantics hold while false.
+    workspace_enabled: bool = false,
+
     pub const Policy = enum { auto, ask, deny };
 };
 

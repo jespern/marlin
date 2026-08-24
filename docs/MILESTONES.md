@@ -103,6 +103,14 @@ marlin is developed from inside marlin. e2e: reboot vs kill-9 converge.
 *Exit: a 3-hour session never hits a context error, costs behave, and you
 ship a marlin change from a marlin session and `/reboot --build` into it.*
 
+## M3.5 — workspace layer, phase 1 (docs/WORKSPACE.md)
+Shadow snapshots (daemon-owned repo per dir; /undo with diff preview; drift
+notes when external tools edit the wc) + write leases (waiting_workspace
+parking). Feature-flagged `[workspace] enabled`, DEFAULT OFF — M2 approval
+semantics hold until sandbox escalations land (M4/M5).
+*Exit: two marlin sessions on one repo can't clobber each other; codex
+running alongside marlin is detected, absorbed, and undoable.*
+
 ## M4 — multiplexer
 Sidebar, splits, J/K session switching, status glyphs (running/idle/approval),
 mouse selection + OSC52, !c family, daemon-side register (!y/!p cross-session).
@@ -116,7 +124,9 @@ MCP stdio client, exec tools, hooks (approval-needed → ntfy script = phone
 notifications), skills. *Exit: one real MCP server + one hook in daily use.*
 
 ## M6 — hardening & v2 doors
-bash sandboxing (seatbelt/Landlock), allowlist promotion UX, `task` subagent
+Workspace phase 2 (docs/WORKSPACE.md): bash sandboxing (seatbelt/Landlock)
++ capability escalations through the approval gate (retires per-tool ask
+prompts), worktree isolation w/ /land and /discard. `task` subagent
 tool + nested sidebar, TCP listener + token auth. Then decide: PWA client.
 Multi-model review councils (docs/REVIEW.md) build on the subagent machinery
 here — a review child is a specialized `task` child.
