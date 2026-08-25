@@ -2217,33 +2217,34 @@ pub const Daemon = struct {
     /// Send the current catalog (possibly empty → client falls back to
     /// favorites).
     fn sendCatalog(self: *Daemon, client: *Client) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
         // Local dialects lead the fetched OpenRouter catalog: they exist on
         // this machine, not in any remote list, and are only offered when
         // actually usable (binary installed / key configured). Pricing stays
-        // null — unknown, never free.
-        var local_buf: [6][]const u8 = undefined;
-        var local_n: usize = 0;
-        if (self.claudeCodeAvailable()) {
-            // The documented `claude --model` aliases (latest of each family)
+        // null — unknown, never free. Versioned entries are DERIVED from the
+        // catalog's anthropic slugs (dots → dashes gives the native model
+        // ids Claude Code and the Messages API accept), so the choice tracks
+        // reality without a hardcoded list to rot.
+        var local_list: std.ArrayList([]const u8) = .empty;
+        const cc_available = self.claudeCodeAvailable();
+        if (cc_available) {
+            // Documented `claude --model` aliases (latest of each family)
             // plus "default" = whatever the user's Claude Code config picks.
-            // Any full model name still works typed by hand — these are the
-            // picker's curation, not a validation list.
-            for ([_][]const u8{
+            local_list.appendSlice(arena, &.{
                 "claudecode/fable",
                 "claudecode/opus",
                 "claudecode/sonnet",
                 "claudecode/default",
-            }) |id| {
-                local_buf[local_n] = id;
-                local_n += 1;
-            }
+            }) catch return;
+            self.appendNativeAnthropicIds(arena, &local_list, "claudecode/") catch return;
         }
         if (self.environ.get("ANTHROPIC_API_KEY")) |key| if (key.len > 0) {
-            local_buf[local_n] = "anthropic/claude-fable-5";
-            local_buf[local_n + 1] = "anthropic/claude-sonnet-4-5";
-            local_n += 2;
+            self.appendNativeAnthropicIds(arena, &local_list, "anthropic/") catch return;
         };
-        const locals = local_buf[0..local_n];
+        const locals = local_list.items;
 
         const total = locals.len + self.catalog.items.len;
         const models = self.gpa.alloc([]const u8, total) catch return;
@@ -2264,6 +2265,28 @@ pub const Daemon = struct {
             };
         }
         self.sendTo(client, .{ .model_list_result = .{ .models = models, .pricing = pricing } });
+    }
+
+    /// Versioned native model ids for the local Anthropic-family dialects,
+    /// derived from the fetched OpenRouter catalog: "openrouter/anthropic/
+    /// claude-opus-4.8" → "<prefix>claude-opus-4-8". Batch variants are
+    /// API-only routing products, not chat models, and are skipped.
+    fn appendNativeAnthropicIds(
+        self: *Daemon,
+        arena: std.mem.Allocator,
+        list: *std.ArrayList([]const u8),
+        comptime prefix: []const u8,
+    ) !void {
+        const catalog_prefix = "openrouter/anthropic/";
+        for (self.catalog.items) |m| {
+            if (!std.mem.startsWith(u8, m.id, catalog_prefix)) continue;
+            const slug = m.id[catalog_prefix.len..];
+            if (!std.mem.startsWith(u8, slug, "claude-")) continue;
+            if (std.mem.indexOfScalar(u8, slug, ':') != null) continue;
+            const entry = try std.fmt.allocPrint(arena, prefix ++ "{s}", .{slug});
+            std.mem.replaceScalar(u8, entry[prefix.len..], '.', '-');
+            try list.append(arena, entry);
+        }
     }
 
     /// True when delegated sessions can actually run: an explicit binary
