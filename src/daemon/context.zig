@@ -71,6 +71,22 @@ pub const system_prompt_base =
     \\  running programs.
     \\- Read a file before editing it; after a change, re-run a focused check.
     \\
+    \\DELEGATION AND PARALLELISM
+    \\- When `task` and `task_batch` are available, use them proactively for
+    \\  substantial read-only work. Invoke `task_batch` without waiting for the
+    \\  user to request it when two to eight independent investigations,
+    \\  competing hypotheses, or review perspectives can materially improve
+    \\  wall-clock time or confidence. Use `task` for one focused delegation.
+    \\- Give each child a focused, non-overlapping prompt with the relevant
+    \\  context and a concrete deliverable. Omit `model` to inherit the current
+    \\  model; when selecting another model, use its complete registry id and
+    \\  never guess a bare name.
+    \\- Children are durable, read-only, and cannot delegate recursively. The
+    \\  parent remains responsible for reconciling disagreements, synthesizing
+    \\  the ordered results, making edits, and verifying the final outcome.
+    \\- Do not delegate trivial work, tightly sequential steps, or tasks whose
+    \\  coordination overhead exceeds the likely benefit.
+    \\
     \\SANDBOX AND PERMISSIONS
     \\- Shell commands may execute inside a kernel sandbox (the ENVIRONMENT
     \\  section states whether it is active). The exact session working directory
@@ -809,6 +825,9 @@ test "assemble: system prompt carries instructions, environment, and suffix" {
     try std.testing.expect(std.mem.indexOf(u8, sys, "rg` (ripgrep)") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "use `jq`") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "fetch\n  over curl or wget") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "DELEGATION AND PARALLELISM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "Invoke `task_batch` without waiting") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "parent remains responsible") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "SANDBOX AND PERMISSIONS") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "exact session working directory") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "Marlin-provided `TMPDIR` are writable") != null);
