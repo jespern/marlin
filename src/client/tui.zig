@@ -13,7 +13,8 @@
 //!            Up/Down or Ctrl+P/N move lines or walk history at the edges;
 //!            readline/macOS movement and deletion chords are supported;
 //!            Esc → normal (draft survives); Ctrl+C interrupts active work
-//!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom; q quit
+//!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom;
+//!            a archive current + advance; A archive finished children; q quit
 //!   global:  Ctrl+L clears/redraws and returns to bottom; Ctrl+T toggles
 //!            the expanded tool transcript
 //!   approval pending: y approve, n deny (both modes, input empty)
@@ -970,7 +971,7 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /new · /archive · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /compact · /reboot [--build] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /new · /archive [children] · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /compact · /reboot [--build] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -2472,12 +2473,13 @@ fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), 
     const language = if (is_diff) diffLanguage(rb.text) else SyntaxLanguage.generic;
     var shown: usize = 0;
     var total: usize = 0;
+    var diff_nums: DiffLineNumbers = .{};
     var it = std.mem.splitScalar(u8, rb.text, '\n');
     while (it.next()) |l| {
         total += 1;
         if (shown < max_shown) {
             if (rb.status == .ok and is_diff) {
-                try appendDiffLine(alloc, lines, "    ", l, language, Palette.tool_out);
+                try appendDiffLine(alloc, lines, "    ", l, language, Palette.tool_out, &diff_nums);
             } else if (rb.status != .ok) {
                 // One failure marker establishes the section;
                 // repeating it for every stack-frame line creates
@@ -2904,6 +2906,31 @@ fn hunkContextStart(line: []const u8) ?usize {
 
 /// Turn a raw unified-diff line into a gutter + code row. Changed rows carry
 /// a subtle full-width surface; syntax is an independent foreground overlay.
+/// Line-number gutter state for a streamed diff: seeded by each @@ hunk
+/// header, advanced per rendered line. Adds/context show the NEW file's
+/// number, deletions the OLD one; inactive (no header seen) renders none.
+const DiffLineNumbers = struct {
+    old: usize = 0,
+    new: usize = 0,
+    active: bool = false,
+
+    fn onHunk(self: *DiffLineNumbers, line: []const u8) void {
+        self.active = false;
+        const minus = std.mem.indexOfScalar(u8, line, '-') orelse return;
+        const plus = std.mem.indexOfScalarPos(u8, line, minus, '+') orelse return;
+        self.old = parseLeadingInt(line[minus + 1 ..]) orelse return;
+        self.new = parseLeadingInt(line[plus + 1 ..]) orelse return;
+        self.active = true;
+    }
+
+    fn parseLeadingInt(text: []const u8) ?usize {
+        var end: usize = 0;
+        while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+        if (end == 0) return null;
+        return std.fmt.parseInt(usize, text[0..end], 10) catch null;
+    }
+};
+
 fn appendDiffLine(
     arena: std.mem.Allocator,
     lines: *std.ArrayList(Line),
@@ -2911,8 +2938,10 @@ fn appendDiffLine(
     line: []const u8,
     language: SyntaxLanguage,
     fallback_style: vaxis.Style,
+    nums: *DiffLineNumbers,
 ) !void {
     if (std.mem.startsWith(u8, line, "@@ ")) {
+        nums.onHunk(line);
         const text = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, line });
         const syntax = if (hunkContextStart(line)) |start|
             try syntaxSpans(arena, line[start..], language, glyph.len + start)
@@ -2926,7 +2955,24 @@ fn appendDiffLine(
     const is_del = std.mem.startsWith(u8, line, "-") and !std.mem.startsWith(u8, line, "---");
     const is_context = std.mem.startsWith(u8, line, " ");
     if (is_add or is_del or is_context) {
-        const gutter = try std.fmt.allocPrint(arena, "{s}{c}", .{ glyph, line[0] });
+        var number: usize = 0;
+        if (nums.active) {
+            if (is_add) {
+                number = nums.new;
+                nums.new += 1;
+            } else if (is_del) {
+                number = nums.old;
+                nums.old += 1;
+            } else {
+                number = nums.new;
+                nums.new += 1;
+                nums.old += 1;
+            }
+        }
+        const gutter = if (nums.active)
+            try std.fmt.allocPrint(arena, "{s}{d:>4} {c}", .{ glyph, number, line[0] })
+        else
+            try std.fmt.allocPrint(arena, "{s}{c}", .{ glyph, line[0] });
         const code = line[1..];
         const code_style = if (is_add)
             Palette.diff_add_code
@@ -3952,6 +3998,8 @@ const ShortcutHelpRow = struct {
 const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Esc / i", .description = "return to insert mode" },
     .{ .key = "J / K", .description = "switch recent sessions" },
+    .{ .key = "a", .description = "archive session and move on" },
+    .{ .key = "A", .description = "archive all finished children" },
     .{ .key = "j / k", .description = "scroll one line" },
     .{ .key = "Ctrl+d / Ctrl+u", .description = "scroll one page" },
     .{ .key = "g / G", .description = "jump to top / bottom" },
@@ -4895,6 +4943,15 @@ fn applyEditCommand(ed: *Editor, command: EditCommand) void {
     }
 }
 
+const NormalSessionAction = enum { archive_current, archive_finished_children };
+
+fn normalSessionAction(key: vaxis.Key) ?NormalSessionAction {
+    if (key.matches('a', .{})) return .archive_current;
+    if (key.matches('A', .{ .shift = true }) or key.matches('A', .{}))
+        return .archive_finished_children;
+    return null;
+}
+
 fn handleKey(app: *App, key: vaxis.Key) !void {
     if (key.matches('t', .{ .ctrl = true })) {
         app.show_tool_transcript = !app.show_tool_transcript;
@@ -5048,6 +5105,11 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.shortcut_help = true;
             } else if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{})) {
                 app.mode = .insert;
+            } else if (normalSessionAction(key)) |action| {
+                switch (action) {
+                    .archive_current => app.archiveCurrentSession(),
+                    .archive_finished_children => app.archiveFinishedChildren(),
+                }
             } else if (key.matches('q', .{})) {
                 app.should_quit = true;
             } else if (key.matches('J', .{ .shift = true }) or key.matches('J', .{})) {
@@ -5346,6 +5408,42 @@ test "question mark opens modal shortcut help in normal mode" {
     try std.testing.expectEqual(Mode.normal, app.mode);
 }
 
+test "normal mode archive shortcuts distinguish current from child sweep" {
+    try std.testing.expectEqual(
+        NormalSessionAction.archive_current,
+        normalSessionAction(.{ .codepoint = 'a' }).?,
+    );
+    try std.testing.expectEqual(
+        NormalSessionAction.archive_finished_children,
+        normalSessionAction(.{ .codepoint = 'A', .mods = .{ .shift = true } }).?,
+    );
+    try std.testing.expect(normalSessionAction(.{ .codepoint = 'a', .mods = .{ .ctrl = true } }) == null);
+    try std.testing.expect(normalSessionAction(.{ .codepoint = 'j' }) == null);
+}
+
+test "normal archive keys dispatch through session safety checks" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .mode = .normal,
+        .state = .running,
+    };
+    defer app.deinit();
+
+    try handleKey(&app, .{ .codepoint = 'a' });
+    try std.testing.expectEqualStrings("cannot archive a running session — interrupt it first", app.notice.items);
+
+    app.notice.clearRetainingCapacity();
+    try handleKey(&app, .{ .codepoint = 'A', .mods = .{ .shift = true } });
+    try std.testing.expectEqualStrings("no children to archive", app.notice.items);
+}
+
 test "selection is character precise on one or many lines" {
     const same = Selection.init(.{ .line = 4, .col = 8 }, .{ .line = 4, .col = 2 });
     const same_cols = same.columns(4, 20).?;
@@ -5484,9 +5582,17 @@ test "diff rows combine subtle surfaces with syntax foregrounds" {
     const arena = arena_state.allocator();
     var lines: std.ArrayList(Line) = .empty;
 
-    try appendDiffLine(arena, &lines, "  ", "+    const msg = \"hello\";", .zig, Palette.tool_out);
-    try appendDiffLine(arena, &lines, "  ", "@@ -4,1 +4,1 @@ pub fn greet() void {", .zig, Palette.tool_out);
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    var nums: DiffLineNumbers = .{};
+    try appendDiffLine(arena, &lines, "  ", "+    const msg = \"hello\";", .zig, Palette.tool_out, &nums);
+    try appendDiffLine(arena, &lines, "  ", "@@ -4,1 +4,1 @@ pub fn greet() void {", .zig, Palette.tool_out, &nums);
+    try appendDiffLine(arena, &lines, "  ", "+    greet();", .zig, Palette.tool_out, &nums);
+    try appendDiffLine(arena, &lines, "  ", "-    farewell();", .zig, Palette.tool_out, &nums);
+    try std.testing.expectEqual(@as(usize, 4), lines.items.len);
+
+    // Before any hunk header: no number. After: new-file numbers for adds,
+    // old-file numbers for deletions.
+    try std.testing.expectEqualStrings("     4 +", lines.items[2].text);
+    try std.testing.expectEqualStrings("     4 -", lines.items[3].text);
 
     const added = lines.items[0];
     try std.testing.expectEqualStrings("  +", added.text);

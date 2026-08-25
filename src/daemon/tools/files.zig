@@ -108,14 +108,48 @@ pub fn writeFile(gpa: std.mem.Allocator, io: Io, args: WriteArgs, cwd: []const u
     if (previous) |old_content| {
         if (std.mem.eql(u8, old_content, args.content))
             return std.fmt.allocPrint(gpa, "wrote {d} bytes to {s} (content unchanged)", .{ args.content.len, args.path });
-        const diff = try unifiedDiff(gpa, old_content, 0, old_content.len, args.content);
+        const diff = unifiedDiff(gpa, old_content, 0, old_content.len, args.content) catch |e| switch (e) {
+            error.DiffTooBig => return std.fmt.allocPrint(
+                gpa,
+                "wrote {d} bytes to {s} (change too large for an inline diff)",
+                .{ args.content.len, args.path },
+            ),
+            else => return e,
+        };
         defer gpa.free(diff);
         return std.fmt.allocPrint(gpa, "wrote {d} bytes to {s}\n{s}", .{ args.content.len, args.path, diff });
     }
-    const diff = try unifiedDiff(gpa, "", 0, 0, args.content);
-    defer gpa.free(diff);
-    return std.fmt.allocPrint(gpa, "created {s} ({d} bytes)\n{s}", .{ args.path, args.content.len, diff });
+    // A new file is pure additions: render the head directly (no diff engine
+    // needed) and cap it so a big file cannot flood transcript and context.
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var total: usize = std.mem.count(u8, args.content, "\n");
+    if (args.content.len > 0 and args.content[args.content.len - 1] != '\n') total += 1;
+    const intro = try std.fmt.allocPrint(gpa, "created {s} ({d} bytes)\n@@ -0,0 +1,{d} @@\n", .{
+        args.path,
+        args.content.len,
+        total,
+    });
+    defer gpa.free(intro);
+    try out.appendSlice(gpa, intro);
+    var shown: usize = 0;
+    var it = std.mem.splitScalar(u8, args.content, '\n');
+    while (it.next()) |line| {
+        if (shown == total or shown == creation_preview_lines) break;
+        try out.append(gpa, '+');
+        try out.appendSlice(gpa, line);
+        try out.append(gpa, '\n');
+        shown += 1;
+    }
+    if (total > shown) {
+        const more = try std.fmt.allocPrint(gpa, "… {d} more new lines", .{total - shown});
+        defer gpa.free(more);
+        try out.appendSlice(gpa, more);
+    }
+    return out.toOwnedSlice(gpa);
 }
+
+const creation_preview_lines = 40;
 
 // ------------------------------------------------------------------ edit --
 
@@ -514,4 +548,28 @@ test "editFile result embeds a colored-diff-ready hunk" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "creation diffs cap at a head preview" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-files-cap");
+    defer temp.deinit();
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var i: usize = 0;
+    while (i < 120) : (i += 1) {
+        var buf: [24]u8 = undefined;
+        try content.appendSlice(gpa, try std.fmt.bufPrint(&buf, "line {d}\n", .{i}));
+    }
+
+    const w = try writeFile(gpa, io, .{ .path = "big.txt", .content = content.items }, temp.path);
+    defer gpa.free(w);
+    try std.testing.expect(std.mem.startsWith(u8, w, "created "));
+    try std.testing.expect(std.mem.indexOf(u8, w, "+line 39") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "+line 41") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "more new lines") != null);
 }
