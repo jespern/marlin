@@ -18,6 +18,7 @@ pub const Command = enum {
     unarchive,
     kill,
     compact,
+    mcp,
     gc,
     reboot,
     shutdown,
@@ -58,6 +59,7 @@ pub fn dispatch(
         .unarchive => return headless.setArchived(gpa, io, environ, self_exe, rest, false),
         .kill => return headless.kill(gpa, io, environ, self_exe, rest),
         .compact => return headless.compact(gpa, io, environ, self_exe, rest),
+        .mcp => return headless.mcp(gpa, io, environ, self_exe, rest),
         .gc => return headless.gc(gpa, io, environ, rest),
         .reboot => return headless.reboot(gpa, io, environ, self_exe, rest),
         .shutdown => return headless.shutdown(gpa, io, environ),
@@ -131,6 +133,9 @@ const help_text =
     \\  marlin unarchive <handle> restore an archived session tree
     \\  marlin kill <handle>   interrupt a session's running turn
     \\  marlin compact [handle] manually compact a session's context
+    \\  marlin mcp list       inspect configured MCP servers
+    \\  marlin mcp add <name> -- <command> [args...]
+    \\  marlin mcp remove <name> | restart <name> | reload
     \\  marlin gc [--expire-days N] reclaim orphan/old full-output blobs
     \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
     \\  marlin shutdown        stop the daemon

@@ -54,6 +54,7 @@ pub const Message = struct {
         tool_result: struct {
             call_id: []const u8,
             text: []const u8,
+            media: []const Media = &.{},
         },
     };
 };

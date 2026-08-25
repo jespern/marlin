@@ -133,11 +133,13 @@ image attachments and provider vision mapping.
 Marlin UI without losing their place or hiding actionable background state.*
 
 ## M5 — extensibility
-**Status: implemented and automated (2026-08-24); daily-use proof remains.**
+**Status: productized and automated (2026-08-25); daily-use proof remains.**
 Owned TOML configuration, MCP stdio client (current protocol plus legacy
-fallback), exec tools, non-blocking hooks (approval/turn/session/error), and
-on-demand skills. All extension tools use the provider schema list and the
-same approval gate as built-ins. *Exit: one real MCP server + one hook in daily
+fallback), isolated per-server health, daemon-owned add/remove/restart/reload,
+per-tool read/write policy, durable image results, exec tools, non-blocking
+hooks (approval/turn/session/error), and on-demand skills. All extension tools
+use the provider schema list and the same approval gate as built-ins.
+*Exit: one real MCP server + one hook in daily
 use; the fake-provider/stdio E2E gates prove mechanics, not operational value.*
 
 ## M6 — hardening & v2 doors

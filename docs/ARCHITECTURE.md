@@ -706,14 +706,25 @@ secret IMMORTAL):
 
 **Extension tools — process boundaries only:**
 
-- **MCP client** (v1): stdio transport first, HTTP later. Config lists servers;
+- **MCP client** (v1): stdio transport is shipped; streamable HTTP remains a
+  later transport. Config lists servers;
   their tools appear in the registry with provider-safe names
   (`mcp__playwright__click`). Approval policy applies identically. The client
   speaks the current stateless protocol and falls back to the deployed legacy
   initialize lifecycle. One absolute deadline spans lock acquisition, stdin
   write, and response matching; unrelated stdout cannot extend it. Turn
   cancellation kills the server process so one wedged call cannot serialize
-  every session behind an uncancellable server mutex.
+  every session behind an uncancellable server mutex. Discovery is isolated
+  per server: a broken process becomes visible health data and contributes no
+  tools without preventing daemon startup. `/mcp` and `marlin mcp` list,
+  add, remove, restart, and atomically reload daemon-owned configuration while
+  sessions are quiescent. Failed registry rebuilds retain the old live registry
+  and roll back generated config edits. MCP `readOnlyHint` annotations classify
+  individual tools; exact `readonly_tools` and `mutating_tools` config overrides
+  take precedence over the server default. Returned PNG/JPEG/GIF/WebP content
+  is bounded, signature-checked, persisted in the blob store with the
+  tool_result, rendered as media metadata, and mapped to provider-native image
+  blocks on the following round.
 - **Exec tools**: a config entry maps name+JSON-schema → executable; marlin
   passes args as JSON on stdin, stdout is the result. A shell script is a tool.
 - **Hooks**: `on_session_done`, `on_approval_needed`, `on_error`, `on_turn_done`
@@ -932,6 +943,8 @@ timeout_ms = 10000
 name = "playwright"
 cmd = ["npx", "@playwright/mcp"]
 mutating = true                 # conservative default for every server tool
+readonly_tools = ["snapshot"]  # exact remote tool-name overrides
+mutating_tools = ["click"]     # wins over annotation/default
 
 [skills]
 directories = ["~/.config/marlin/skills"]

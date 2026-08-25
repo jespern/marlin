@@ -240,6 +240,10 @@ pub const Daemon = struct {
     store: store_mod.Store,
     cfg: config.Config,
     extensions: *extensions.Runtime,
+    /// A successful `/mcp reload` owns the newly read config here because the
+    /// replacement extension registry references its strings. The startup
+    /// config remains owned by serve's outer scope.
+    extension_config: ?config.Loaded = null,
     network: network_policy.Policy,
     /// Shared std.http connection pool. Requests are turn-thread-owned while
     /// idle HTTP/TLS connections remain warm across turns.
@@ -317,7 +321,8 @@ pub const Daemon = struct {
         defer loaded_config.deinit();
         const cfg = loaded_config.value;
         const extension_runtime = try extensions.Runtime.init(gpa, io, cfg, environ);
-        defer extension_runtime.deinit();
+        var extension_transferred = false;
+        defer if (!extension_transferred) extension_runtime.deinit();
         const network = network_policy.Policy.init(gpa, io, environ, .{
             .blocklists = cfg.network_blocklists,
             .allow = cfg.network_allow,
@@ -371,6 +376,11 @@ pub const Daemon = struct {
             .events = queue.Mpsc(Event).init(gpa),
             .instance_lock = instance_lock,
         };
+        extension_transferred = true;
+        defer {
+            self.extensions.deinit();
+            if (self.extension_config) |*loaded| loaded.deinit();
+        }
         lock_moved = true;
         defer self.releaseInstanceLock();
         store_moved = true;
@@ -403,10 +413,19 @@ pub const Daemon = struct {
         // SIGTERM/SIGINT shut down gracefully (socket removed, store closed)
         // instead of dying mid-write. Watcher exits when the pipe closes.
         var pipe_fds: [2]std.posix.fd_t = undefined;
-        const shutdown_pipe: ?[2]std.posix.fd_t = if (builtin.os.tag != .windows and std.c.pipe(&pipe_fds) == 0)
-            pipe_fds
-        else
-            null;
+        const shutdown_pipe: ?[2]std.posix.fd_t = pipe: {
+            if (builtin.os.tag == .windows or std.c.pipe(&pipe_fds) != 0) break :pipe null;
+            errdefer {
+                _ = std.c.close(pipe_fds[0]);
+                _ = std.c.close(pipe_fds[1]);
+            }
+            // Extensions may spawn at any later point (/mcp reload). Neither
+            // end of the signal pipe may cross exec: an inherited write end
+            // prevents EOF and deadlocks serve() while joining its watcher.
+            try setCloseOnExec(pipe_fds[0]);
+            try setCloseOnExec(pipe_fds[1]);
+            break :pipe pipe_fds;
+        };
         var watcher: ?std.Thread = null;
         // Teardown order is load-bearing (defers run LIFO): close the WRITE
         // end first — that EOFs a watcher that never got a signal byte — THEN
@@ -1292,6 +1311,108 @@ pub const Daemon = struct {
                     self.sendCatalog(client);
                     return;
                 };
+            },
+            .mcp_list => self.sendMcpStatus(client),
+            .mcp_restart => |request| {
+                if (self.anySessionBusy()) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "busy",
+                        .msg = "wait for running turns before restarting an MCP server",
+                    } });
+                    return;
+                }
+                _ = self.extensions.restartMcp(request.name) catch |err| {
+                    self.sendTo(client, .{ .err = .{
+                        .code = if (err == error.UnknownMcpServer) "no_mcp_server" else "mcp_restart",
+                        .msg = if (err == error.UnknownMcpServer) "unknown MCP server" else "could not rebuild MCP tools",
+                    } });
+                    return;
+                };
+                self.sendMcpStatus(client);
+            },
+            .mcp_add => |request| {
+                if (self.anySessionBusy()) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "busy",
+                        .msg = "wait for running turns before adding an MCP server",
+                    } });
+                    return;
+                }
+                if (request.cmd.len == 0) {
+                    self.sendTo(client, .{ .err = .{ .code = "mcp_command", .msg = "MCP command cannot be empty" } });
+                    return;
+                }
+                const previous = config.readRawAlloc(self.gpa, self.io, self.environ) catch |err| {
+                    std.log.warn("could not snapshot MCP config: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{ .code = "config", .msg = "could not read config.toml" } });
+                    return;
+                };
+                defer self.gpa.free(previous);
+                config.addMcpServer(self.gpa, self.io, self.environ, request.name, request.cmd) catch |err| {
+                    self.sendTo(client, .{ .err = .{
+                        .code = if (err == error.DuplicateMcpServer) "mcp_exists" else "config",
+                        .msg = if (err == error.DuplicateMcpServer) "an MCP server with that name already exists" else "could not add MCP server to config.toml",
+                    } });
+                    return;
+                };
+                self.reloadExtensions() catch |err| {
+                    std.log.warn("extension reload after MCP add failed: {t}", .{err});
+                    config.replaceRaw(self.gpa, self.io, self.environ, previous) catch |restore_err| {
+                        std.log.err("MCP config rollback failed: {t}", .{restore_err});
+                    };
+                    self.sendTo(client, .{ .err = .{ .code = "extensions", .msg = "could not rebuild extensions; config change was rolled back" } });
+                    return;
+                };
+                self.sendMcpStatus(client);
+            },
+            .mcp_remove => |request| {
+                if (self.anySessionBusy()) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "busy",
+                        .msg = "wait for running turns before removing an MCP server",
+                    } });
+                    return;
+                }
+                const previous = config.readRawAlloc(self.gpa, self.io, self.environ) catch |err| {
+                    std.log.warn("could not snapshot MCP config: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{ .code = "config", .msg = "could not read config.toml" } });
+                    return;
+                };
+                defer self.gpa.free(previous);
+                config.removeMcpServer(self.gpa, self.io, self.environ, request.name) catch |err| {
+                    self.sendTo(client, .{ .err = .{
+                        .code = if (err == error.UnknownMcpServer) "no_mcp_server" else "config",
+                        .msg = if (err == error.UnknownMcpServer) "unknown MCP server" else "could not remove MCP server from config.toml",
+                    } });
+                    return;
+                };
+                self.reloadExtensions() catch |err| {
+                    std.log.warn("extension reload after MCP removal failed: {t}", .{err});
+                    config.replaceRaw(self.gpa, self.io, self.environ, previous) catch |restore_err| {
+                        std.log.err("MCP config rollback failed: {t}", .{restore_err});
+                    };
+                    self.sendTo(client, .{ .err = .{ .code = "extensions", .msg = "could not rebuild extensions; config change was rolled back" } });
+                    return;
+                };
+                self.sendMcpStatus(client);
+            },
+            .mcp_reload => {
+                if (self.anySessionBusy()) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "busy",
+                        .msg = "wait for running turns before reloading extensions",
+                    } });
+                    return;
+                }
+                self.reloadExtensions() catch |err| {
+                    std.log.warn("extension config reload failed: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{
+                        .code = "extensions",
+                        .msg = "config or extensions are invalid; existing MCP servers were left unchanged",
+                    } });
+                    return;
+                };
+                self.sendMcpStatus(client);
             },
             .interrupt => |i| {
                 const result = self.cancelSessionTree(i.sid);
@@ -2473,6 +2594,52 @@ pub const Daemon = struct {
         return false;
     }
 
+    fn anySessionBusy(self: *Daemon) bool {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            if (sp.*.state == .running or sp.*.state == .awaiting_approval) return true;
+        }
+        return false;
+    }
+
+    /// Build a complete replacement before changing either live field. A bad
+    /// config, duplicate tool, or allocation failure therefore leaves every
+    /// active extension and its owned config storage untouched.
+    fn reloadExtensions(self: *Daemon) !void {
+        var loaded = try config.load(self.gpa, self.io, self.environ);
+        var loaded_transferred = false;
+        defer if (!loaded_transferred) loaded.deinit();
+        const replacement = try extensions.Runtime.init(self.gpa, self.io, loaded.value, self.environ);
+
+        const previous = self.extensions;
+        var previous_config = self.extension_config;
+        self.extensions = replacement;
+        self.extension_config = loaded;
+        loaded_transferred = true;
+        previous.deinit();
+        if (previous_config) |*old| old.deinit();
+    }
+
+    fn sendMcpStatus(self: *Daemon, client: *Client) void {
+        const statuses = self.extensions.mcpStatuses(self.gpa) catch {
+            self.sendTo(client, .{ .err = .{ .code = "oom", .msg = "could not list MCP servers" } });
+            return;
+        };
+        defer self.gpa.free(statuses);
+        const wire = self.gpa.alloc(proto.McpServerInfo, statuses.len) catch {
+            self.sendTo(client, .{ .err = .{ .code = "oom", .msg = "could not list MCP servers" } });
+            return;
+        };
+        defer self.gpa.free(wire);
+        for (statuses, wire) |status, *info| info.* = .{
+            .name = status.name,
+            .ready = status.ready,
+            .tool_count = @intCast(status.tool_count),
+            .error_message = status.error_message,
+        };
+        self.sendTo(client, .{ .mcp_list_result = .{ .servers = wire } });
+    }
+
     fn refusePendingRebootForApproval(self: *Daemon) void {
         const requester = self.pending_reboot orelse return;
         self.pending_reboot = null;
@@ -2729,6 +2896,18 @@ fn catalogRate(pricing: ?std.json.Value, field: []const u8) ?f64 {
 /// thread turns that byte into the ordinary .shutdown dispatcher event, so a
 /// signal shuts down through exactly the code path /quit and reboot use.
 var shutdown_pipe_write = std.atomic.Value(i32).init(-1);
+
+fn setCloseOnExec(fd: std.posix.fd_t) !void {
+    while (true) switch (std.posix.errno(std.posix.system.fcntl(
+        fd,
+        std.posix.F.SETFD,
+        @as(usize, std.posix.FD_CLOEXEC),
+    ))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
 
 fn onShutdownSignal(_: std.c.SIG) callconv(.c) void {
     const fd = shutdown_pipe_write.load(.acquire);

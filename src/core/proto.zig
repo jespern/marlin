@@ -56,6 +56,13 @@ pub const ModelPricing = struct {
     tiered: bool = false,
 };
 
+pub const McpServerInfo = struct {
+    name: []const u8,
+    ready: bool,
+    tool_count: u32,
+    error_message: ?[]const u8 = null,
+};
+
 /// Client-owned media submitted with one user message. Base64 keeps NDJSON
 /// valid for arbitrary binary data and lets a local client upload directly
 /// to a remote daemon without sharing a filesystem.
@@ -138,6 +145,15 @@ pub const ClientMsg = union(enum) {
     /// Full model catalog for the /model picker: daemon fetches the
     /// provider's model list (cached ~1h) and replies model_list_result.
     model_list: struct {},
+    /// MCP is daemon-owned. Listing and lifecycle actions therefore work from
+    /// any thin client without assuming a shared process or filesystem.
+    mcp_list: struct {},
+    mcp_restart: struct { name: []const u8 },
+    /// Persist a stdio server in config.toml, then rebuild the live registry.
+    mcp_add: struct { name: []const u8, cmd: []const []const u8 },
+    mcp_remove: struct { name: []const u8 },
+    /// Re-read config and atomically replace extensions while no turn is live.
+    mcp_reload: struct {},
     interrupt: struct {
         sid: u64,
         /// Opt into interrupt_result instead of the legacy ok reply.
@@ -218,6 +234,7 @@ pub const DaemonMsg = union(enum) {
         models: []const []const u8,
         pricing: []const ModelPricing = &.{},
     },
+    mcp_list_result: struct { servers: []const McpServerInfo },
     /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
     /// contain arbitrary command output (including NULs).
     blob_result: struct { hash: []const u8, bytes: []const u8 },

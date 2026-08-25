@@ -556,6 +556,22 @@ pub const Store = struct {
         hash: []const u8,
         bytes: []const u8,
     ) Error!void {
+        return self.appendBlockWithBlobs(blk, &.{.{ .hash = hash, .bytes = bytes }});
+    }
+
+    pub const BlobPayload = struct {
+        hash: []const u8,
+        bytes: []const u8,
+    };
+
+    /// Persist a block and all binary content it references in one SQLite
+    /// transaction. A crash can leave neither dangling attachment metadata
+    /// nor an unreferenced just-written media blob.
+    pub fn appendBlockWithBlobs(
+        self: Store,
+        blk: block.Block,
+        blobs: []const BlobPayload,
+    ) Error!void {
         const body_json = std.json.Stringify.valueAlloc(self.gpa, blk.body, .{}) catch
             return error.OutOfMemory;
         defer self.gpa.free(body_json);
@@ -567,7 +583,7 @@ pub const Store = struct {
         var committed = false;
         defer if (!committed) self.execAll("ROLLBACK;") catch {};
 
-        {
+        for (blobs) |blob_value| {
             const stmt = try self.prepare(
                 \\INSERT INTO blobs(hash, bytes, created_at) VALUES(?,?,?)
                 \\ON CONFLICT(hash) DO UPDATE SET
@@ -575,8 +591,8 @@ pub const Store = struct {
                 \\WHERE blobs.tombstone=1
             );
             defer finalize(stmt);
-            bindText(stmt, 1, hash);
-            _ = c.sqlite3_bind_blob(stmt, 2, bytes.ptr, @intCast(bytes.len), static_destructor);
+            bindText(stmt, 1, blob_value.hash);
+            _ = c.sqlite3_bind_blob(stmt, 2, blob_value.bytes.ptr, @intCast(blob_value.bytes.len), static_destructor);
             bindInt(stmt, 3, blk.ts);
             try stepDone(stmt);
         }
@@ -595,10 +611,10 @@ pub const Store = struct {
             bindText(stmt, 7, body_json);
             try stepDone(stmt);
         }
-        {
+        for (blobs) |blob_value| {
             const stmt = try self.prepare("INSERT OR IGNORE INTO blob_refs(hash, block_id) VALUES(?,?)");
             defer finalize(stmt);
-            bindText(stmt, 1, hash);
+            bindText(stmt, 1, blob_value.hash);
             bindInt(stmt, 2, @bitCast(blk.id));
             try stepDone(stmt);
         }

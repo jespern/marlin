@@ -27,7 +27,40 @@ const Exec = struct {
 
 const Mcp = struct {
     server: *mcp.Server,
-    mutating: bool,
+    default_mutating: bool,
+    readonly_tools: []const []const u8,
+    mutating_tools: []const []const u8,
+    last_error: ?[]u8 = null,
+
+    fn deinit(self: *Mcp, gpa: std.mem.Allocator) void {
+        self.server.deinit();
+        if (self.last_error) |message| gpa.free(message);
+    }
+
+    fn setError(self: *Mcp, gpa: std.mem.Allocator, err: anyerror) void {
+        if (self.last_error) |message| gpa.free(message);
+        self.last_error = std.fmt.allocPrint(gpa, "{t}", .{err}) catch
+            gpa.dupe(u8, "out of memory while recording MCP error") catch null;
+    }
+
+    fn clearError(self: *Mcp, gpa: std.mem.Allocator) void {
+        if (self.last_error) |message| gpa.free(message);
+        self.last_error = null;
+    }
+
+    fn toolMutating(self: Mcp, tool: mcp.Tool) bool {
+        if (containsString(self.mutating_tools, tool.remote_name)) return true;
+        if (containsString(self.readonly_tools, tool.remote_name)) return false;
+        if (tool.read_only_hint) |read_only| return !read_only;
+        return self.default_mutating;
+    }
+};
+
+pub const McpStatus = struct {
+    name: []const u8,
+    ready: bool,
+    tool_count: usize,
+    error_message: ?[]const u8,
 };
 
 const HookPaths = struct {
@@ -122,38 +155,23 @@ pub const Runtime = struct {
         for (cfg.mcp_servers) |server_cfg| {
             const argv = try expandPaths(arena, server_cfg.cmd, environ.get("HOME"));
             const server = try mcp.Server.init(gpa, io, server_cfg.name, argv, child_environ);
-            var server_transferred = false;
-            errdefer if (!server_transferred) server.deinit();
+            var entry = Mcp{
+                .server = server,
+                .default_mutating = server_cfg.mutating,
+                .readonly_tools = server_cfg.readonly_tools,
+                .mutating_tools = server_cfg.mutating_tools,
+            };
             server.discover() catch |err| {
-                std.log.err("MCP server '{s}' discovery failed: {t}", .{ server_cfg.name, err });
+                std.log.warn("MCP server '{s}' unavailable: {t}", .{ server_cfg.name, err });
+                entry.setError(gpa, err);
+            };
+            self.mcp_servers.append(gpa, entry) catch |err| {
+                entry.deinit(gpa);
                 return err;
             };
-            try self.mcp_servers.append(gpa, .{ .server = server, .mutating = server_cfg.mutating });
-            server_transferred = true;
-            for (server.tools.items) |tool| {
-                if (registry.find(tool.public_name) != null or self.find(tool.public_name) != null)
-                    return error.ExtensionToolNameConflict;
-                try self.specs_list.append(gpa, .{
-                    .name = tool.public_name,
-                    .description = tool.description,
-                    .schema_json = tool.schema_json,
-                    .parallel_safe = false,
-                    .mutating = server_cfg.mutating,
-                });
-            }
         }
 
-        if (self.skill_index.items.items.len > 0) {
-            if (registry.find(skills.spec_name) != null or self.find(skills.spec_name) != null)
-                return error.ExtensionToolNameConflict;
-            try self.specs_list.append(gpa, .{
-                .name = skills.spec_name,
-                .description = skills.spec_description,
-                .schema_json = skills.spec_schema,
-                .parallel_safe = true,
-                .mutating = false,
-            });
-        }
+        try self.rebuildSpecs();
         return self;
     }
 
@@ -169,7 +187,7 @@ pub const Runtime = struct {
         var owned_threads = threads;
         owned_threads.deinit(self.gpa);
 
-        for (self.mcp_servers.items) |entry| entry.server.deinit();
+        for (self.mcp_servers.items) |*entry| entry.deinit(self.gpa);
         self.mcp_servers.deinit(self.gpa);
         self.exec_tools.deinit(self.gpa);
         self.specs_list.deinit(self.gpa);
@@ -194,6 +212,66 @@ pub const Runtime = struct {
             if (std.mem.eql(u8, spec.name, name)) return spec;
         }
         return null;
+    }
+
+    pub fn mcpStatuses(self: *const Runtime, allocator: std.mem.Allocator) ![]McpStatus {
+        const statuses = try allocator.alloc(McpStatus, self.mcp_servers.items.len);
+        for (self.mcp_servers.items, statuses) |entry, *status| status.* = .{
+            .name = entry.server.name,
+            .ready = entry.last_error == null,
+            .tool_count = if (entry.last_error == null) entry.server.tools.items.len else 0,
+            .error_message = entry.last_error,
+        };
+        return statuses;
+    }
+
+    /// Rediscover one configured server. The daemon calls this only while all
+    /// sessions are quiescent, so rebuilding provider-facing specs is atomic
+    /// from every turn's perspective. Discovery failure is health data, not a
+    /// daemon failure; the broken server simply contributes no tools.
+    pub fn restartMcp(self: *Runtime, name: []const u8) !bool {
+        const entry = for (self.mcp_servers.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.server.name, name)) break candidate;
+        } else return error.UnknownMcpServer;
+        // Specs borrow the server's discovered tool storage. Find the target
+        // first so an unknown name cannot erase an otherwise healthy registry,
+        // then drop all borrowed specs before discovery replaces that storage.
+        self.specs_list.clearRetainingCapacity();
+        entry.clearError(self.gpa);
+        entry.server.discover() catch |err| {
+            std.log.warn("MCP server '{s}' restart failed: {t}", .{ name, err });
+            entry.setError(self.gpa, err);
+        };
+        try self.rebuildSpecs();
+        return entry.last_error == null;
+    }
+
+    fn rebuildSpecs(self: *Runtime) !void {
+        self.specs_list.clearRetainingCapacity();
+        for (self.exec_tools.items) |entry| try self.appendSpec(entry.spec);
+        for (self.mcp_servers.items) |entry| {
+            if (entry.last_error != null) continue;
+            for (entry.server.tools.items) |tool| try self.appendSpec(.{
+                .name = tool.public_name,
+                .description = tool.description,
+                .schema_json = tool.schema_json,
+                .parallel_safe = false,
+                .mutating = entry.toolMutating(tool),
+            });
+        }
+        if (self.skill_index.items.items.len > 0) try self.appendSpec(.{
+            .name = skills.spec_name,
+            .description = skills.spec_description,
+            .schema_json = skills.spec_schema,
+            .parallel_safe = true,
+            .mutating = false,
+        });
+    }
+
+    fn appendSpec(self: *Runtime, spec: Spec) !void {
+        if (registry.find(spec.name) != null or self.find(spec.name) != null)
+            return error.ExtensionToolNameConflict;
+        try self.specs_list.append(self.gpa, spec);
     }
 
     /// Null means the name is not an extension and the caller should try the
@@ -230,7 +308,7 @@ pub const Runtime = struct {
         for (self.mcp_servers.items) |entry| {
             if (entry.server.findPublicTool(name)) {
                 const result = entry.server.call(name, args_json, cancel);
-                return .{ .output = result.output, .status = result.status };
+                return .{ .output = result.output, .status = result.status, .media = result.media };
             }
         }
         return null;
@@ -327,6 +405,11 @@ fn expandPaths(
     return out;
 }
 
+fn containsString(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |candidate| if (std.mem.eql(u8, candidate, needle)) return true;
+    return false;
+}
+
 fn expandPath(arena: std.mem.Allocator, path: ?[]const u8, home: ?[]const u8) !?[]const u8 {
     const value = path orelse return null;
     if (!std.mem.startsWith(u8, value, "~/")) return value;
@@ -377,4 +460,45 @@ test "runtime registers and dispatches exec tools and skills" {
     defer gpa.free(result.output);
     try std.testing.expectEqual(block.ToolStatus.ok, result.status);
     try std.testing.expectEqualStrings("{\"ok\":true}", result.output);
+}
+
+test "MCP discovery failures are isolated and tool policy is per-tool" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/bin:/bin");
+
+    const script =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[{"name":"inspect","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"change","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false}},{"name":"forced_read","inputSchema":{"type":"object"}},{"name":"forced_write","inputSchema":{"type":"object"}}]}}' ;;
+        \\  esac
+        \\done
+    ;
+    const cfg = config.Config{ .mcp_servers = &.{
+        .{
+            .name = "healthy",
+            .cmd = &.{ "sh", "-c", script },
+            .mutating = true,
+            .readonly_tools = &.{"forced_read"},
+            .mutating_tools = &.{"forced_write"},
+        },
+        .{ .name = "broken", .cmd = &.{ "sh", "-c", "exit 7" }, .mutating = true },
+    } };
+    var runtime = try Runtime.init(gpa, threaded.io(), cfg, &environ);
+    defer runtime.deinit();
+
+    const statuses = try runtime.mcpStatuses(gpa);
+    defer gpa.free(statuses);
+    try std.testing.expectEqual(@as(usize, 2), statuses.len);
+    try std.testing.expect(statuses[0].ready);
+    try std.testing.expect(!statuses[1].ready);
+    try std.testing.expect(!runtime.find("mcp__healthy__inspect").?.mutating);
+    try std.testing.expect(runtime.find("mcp__healthy__change").?.mutating);
+    try std.testing.expect(!runtime.find("mcp__healthy__forced_read").?.mutating);
+    try std.testing.expect(runtime.find("mcp__healthy__forced_write").?.mutating);
+    try std.testing.expectError(error.UnknownMcpServer, runtime.restartMcp("missing"));
+    try std.testing.expect(runtime.find("mcp__healthy__inspect") != null);
 }

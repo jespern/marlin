@@ -138,16 +138,14 @@ const Appender = struct {
     history_arena: ?std.mem.Allocator = null,
 
     fn append(self: *Appender, body: block.Body) !u64 {
-        return self.appendMaybeBlob(body, null);
+        return self.appendWithBlobs(body, &.{});
     }
 
     fn appendWithBlob(self: *Appender, body: block.Body, hash: []const u8, bytes: []const u8) !u64 {
-        return self.appendMaybeBlob(body, .{ .hash = hash, .bytes = bytes });
+        return self.appendWithBlobs(body, &.{.{ .hash = hash, .bytes = bytes }});
     }
 
-    const BlobPayload = struct { hash: []const u8, bytes: []const u8 };
-
-    fn appendMaybeBlob(self: *Appender, body: block.Body, blob_payload: ?BlobPayload) !u64 {
+    fn appendWithBlobs(self: *Appender, body: block.Body, blobs: []const Store.BlobPayload) !u64 {
         self.seq += 1;
         errdefer self.seq -= 1;
         var cached_body: ?block.Body = null;
@@ -160,8 +158,8 @@ const Appender = struct {
             .ts = nowMs(self.io),
             .body = body,
         };
-        if (blob_payload) |blob_value|
-            try self.store.appendBlockWithBlob(b, blob_value.hash, blob_value.bytes)
+        if (blobs.len > 0)
+            try self.store.appendBlockWithBlobs(b, blobs)
         else
             try self.store.appendBlock(b);
         if (self.history) |history| {
@@ -193,6 +191,7 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .status = value.status,
             .inline_body = try arena.dupe(u8, value.inline_body),
             .full_body_ref = if (value.full_body_ref) |reference| try arena.dupe(u8, reference) else null,
+            .attachments = try cloneMediaRefs(arena, value.attachments),
         } },
         .approval => |value| .{ .approval = .{
             .approval_id = try arena.dupe(u8, value.approval_id),
@@ -646,16 +645,50 @@ pub fn runTurn(
             const inline_body = try context.capInline(gpa, exec.output, cap);
             defer if (inline_body.ptr != exec.output.ptr) gpa.free(@constCast(inline_body));
 
+            const media_refs = try gpa.alloc(block.MediaRef, exec.media.len);
+            defer gpa.free(media_refs);
+            const media_hashes = try gpa.alloc([]u8, exec.media.len);
+            var media_hashed: usize = 0;
+            defer {
+                for (media_hashes[0..media_hashed]) |hash| gpa.free(hash);
+                gpa.free(media_hashes);
+            }
+            for (exec.media, 0..) |item, index| {
+                const hash = try Store.blobHashAlloc(gpa, item.bytes);
+                media_hashes[index] = hash;
+                media_hashed += 1;
+                media_refs[index] = .{
+                    .hash = hash,
+                    .mime = item.mime,
+                    .name = item.name,
+                    .byte_len = item.bytes.len,
+                };
+            }
+
             const result_body: block.Body = .{ .tool_result = .{
                 .call_id = call.call_id,
                 .status = exec.status,
                 .inline_body = inline_body,
                 .full_body_ref = full_ref,
+                .attachments = media_refs,
             } };
-            _ = if (full_ref) |hash|
-                try ap.appendWithBlob(result_body, hash, exec.output)
-            else
-                try ap.append(result_body);
+            const blob_count = exec.media.len + @intFromBool(full_ref != null);
+            if (blob_count == 0) {
+                _ = try ap.append(result_body);
+            } else {
+                const blobs = try gpa.alloc(Store.BlobPayload, blob_count);
+                defer gpa.free(blobs);
+                var blob_index: usize = 0;
+                if (full_ref) |hash| {
+                    blobs[blob_index] = .{ .hash = hash, .bytes = exec.output };
+                    blob_index += 1;
+                }
+                for (exec.media, media_hashes) |item, hash| {
+                    blobs[blob_index] = .{ .hash = hash, .bytes = item.bytes };
+                    blob_index += 1;
+                }
+                _ = try ap.appendWithBlobs(result_body, blobs);
+            }
         }
         // Loop: next round re-assembles including the new tool results.
     }
@@ -1319,7 +1352,7 @@ const BatchTaskCall = struct {
 
     fn deinit(self: *BatchTaskCall, gpa: std.mem.Allocator) void {
         gpa.free(self.args_json);
-        if (self.result) |result| gpa.free(result.output);
+        if (self.result) |result| result.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -1428,7 +1461,7 @@ const PreparedCall = struct {
 
     fn deinit(self: *PreparedCall, gpa: std.mem.Allocator) void {
         gpa.free(self.args_json);
-        if (self.exec) |result| gpa.free(result.output);
+        if (self.exec) |result| result.deinit(gpa);
         self.* = undefined;
     }
 
@@ -1839,12 +1872,12 @@ test "delegated turn recovers when claude has never seen the derived session" {
         .approval_mode = .auto,
     };
     // A prior turn makes the session look resumable on the marlin side.
-    const first = try runTurn(gpa, io, &store, opts, "first turn");
+    const first = try runTurn(gpa, io, &store, opts, "first turn", &.{});
     gpa.free(first.text);
 
     // Second turn: --resume fails the way the real binary does; the retry
     // must flip to --session-id and succeed instead of persisting "".
-    const second = try runTurn(gpa, io, &store, opts, "hello fable");
+    const second = try runTurn(gpa, io, &store, opts, "hello fable", &.{});
     defer gpa.free(second.text);
     try std.testing.expectEqualStrings("RECOVERED-OK", second.text);
 }

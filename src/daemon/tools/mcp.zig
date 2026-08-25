@@ -6,17 +6,23 @@ const std = @import("std");
 const Io = std.Io;
 
 const block = @import("../../core/block.zig");
+const registry = @import("registry.zig");
 
 pub const current_protocol = "2026-07-28";
 pub const legacy_protocol = "2025-11-25";
 pub const request_timeout_ms: u32 = 15_000;
 pub const max_message_bytes: usize = 8 * 1024 * 1024;
+pub const max_media_items: usize = 4;
+pub const max_media_bytes: usize = 10 * 1024 * 1024;
 
 pub const Tool = struct {
     public_name: []u8,
     remote_name: []u8,
     description: []u8,
     schema_json: []u8,
+    /// MCP's optional ToolAnnotations.readOnlyHint. Null means the server did
+    /// not classify the tool and Marlin should use configured policy.
+    read_only_hint: ?bool = null,
 
     fn deinit(self: *Tool, gpa: std.mem.Allocator) void {
         gpa.free(self.public_name);
@@ -29,6 +35,13 @@ pub const Tool = struct {
 pub const CallResult = struct {
     output: []u8,
     status: block.ToolStatus,
+    media: []registry.MediaOutput = &.{},
+
+    pub fn deinit(self: CallResult, gpa: std.mem.Allocator) void {
+        gpa.free(self.output);
+        for (self.media) |item| item.deinit(gpa);
+        if (self.media.len > 0) gpa.free(self.media);
+    }
 };
 
 const ProtocolMode = enum { modern, legacy };
@@ -100,6 +113,13 @@ pub const Server = struct {
     pub fn discover(self: *Server) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        self.discoverLocked() catch |err| {
+            self.reset();
+            return err;
+        };
+    }
+
+    fn discoverLocked(self: *Server) !void {
         for (self.tools.items) |*tool| tool.deinit(self.gpa);
         self.tools.clearRetainingCapacity();
 
@@ -230,11 +250,22 @@ pub const Server = struct {
         errdefer self.gpa.free(remote_owned);
         const description_owned = try self.gpa.dupe(u8, description);
         errdefer self.gpa.free(description_owned);
+        const read_only_hint: ?bool = if (value.object.get("annotations")) |annotations|
+            if (annotations == .object)
+                if (annotations.object.get("readOnlyHint")) |hint|
+                    if (hint == .bool) hint.bool else null
+                else
+                    null
+            else
+                null
+        else
+            null;
         try self.tools.append(self.gpa, .{
             .public_name = public,
             .remote_name = remote_owned,
             .description = description_owned,
             .schema_json = schema,
+            .read_only_hint = read_only_hint,
         });
     }
 
@@ -340,6 +371,11 @@ pub const Server = struct {
         }
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.gpa);
+        var media: std.ArrayList(registry.MediaOutput) = .empty;
+        errdefer {
+            for (media.items) |item| item.deinit(self.gpa);
+            media.deinit(self.gpa);
+        }
         if (result.get("content")) |content| {
             if (content != .array) return error.InvalidMcpResponse;
             for (content.array.items) |item| {
@@ -362,8 +398,41 @@ pub const Server = struct {
                         const uri = stringField(resource.object, "uri") orelse "resource";
                         try out.print(self.gpa, "[MCP resource: {s}]", .{uri});
                     }
-                } else if (std.mem.eql(u8, kind, "image") or std.mem.eql(u8, kind, "audio")) {
-                    try out.print(self.gpa, "[MCP {s} content omitted]", .{kind});
+                } else if (std.mem.eql(u8, kind, "image")) {
+                    if (media.items.len >= max_media_items) {
+                        try appendResultText(self.gpa, &out, "[additional MCP image omitted: four-image limit]");
+                        continue;
+                    }
+                    const encoded = stringField(item.object, "data") orelse {
+                        try appendResultText(self.gpa, &out, "[invalid MCP image: missing data]");
+                        continue;
+                    };
+                    const mime = stringField(item.object, "mimeType") orelse "application/octet-stream";
+                    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch {
+                        try appendResultText(self.gpa, &out, "[invalid MCP image: malformed base64]");
+                        continue;
+                    };
+                    if (decoded_len == 0 or decoded_len > max_media_bytes) {
+                        try appendResultText(self.gpa, &out, "[MCP image omitted: invalid size]");
+                        continue;
+                    }
+                    const media_item = decodeImage(self.gpa, self.name, media.items.len + 1, mime, encoded, decoded_len) catch |err| switch (err) {
+                        error.InvalidBase64 => {
+                            try appendResultText(self.gpa, &out, "[invalid MCP image: malformed base64]");
+                            continue;
+                        },
+                        error.UnsupportedImage => {
+                            try appendResultText(self.gpa, &out, "[unsupported MCP image format]");
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    media.append(self.gpa, media_item) catch |err| {
+                        media_item.deinit(self.gpa);
+                        return err;
+                    };
+                } else if (std.mem.eql(u8, kind, "audio")) {
+                    try appendResultText(self.gpa, &out, "[MCP audio content is not yet provider-compatible]");
                 }
             }
         }
@@ -374,11 +443,17 @@ pub const Server = struct {
                 try out.appendSlice(self.gpa, encoded);
             }
         }
-        if (out.items.len == 0) try out.appendSlice(self.gpa, "MCP tool completed with no text output");
+        if (out.items.len == 0) {
+            if (media.items.len > 0)
+                try out.print(self.gpa, "MCP tool returned {d} image(s)", .{media.items.len})
+            else
+                try out.appendSlice(self.gpa, "MCP tool completed with no text output");
+        }
         const is_error = if (result.get("isError")) |flag| flag == .bool and flag.bool else false;
         return .{
             .output = try out.toOwnedSlice(self.gpa),
             .status = if (is_error) .err else .ok,
+            .media = try media.toOwnedSlice(self.gpa),
         };
     }
 
@@ -396,6 +471,49 @@ pub const Server = struct {
         };
     }
 };
+
+fn appendResultText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    if (out.items.len > 0) try out.append(gpa, '\n');
+    try out.appendSlice(gpa, text);
+}
+
+fn decodeImage(
+    gpa: std.mem.Allocator,
+    server_name: []const u8,
+    index: usize,
+    mime: []const u8,
+    encoded: []const u8,
+    decoded_len: usize,
+) !registry.MediaOutput {
+    const bytes = try gpa.alloc(u8, decoded_len);
+    errdefer gpa.free(bytes);
+    std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidBase64;
+    if (!validImage(mime, bytes)) return error.UnsupportedImage;
+    const mime_owned = try gpa.dupe(u8, mime);
+    errdefer gpa.free(mime_owned);
+    const name = try std.fmt.allocPrint(gpa, "{s}-image-{d}{s}", .{ server_name, index, imageExtension(mime) });
+    return .{ .bytes = bytes, .mime = mime_owned, .name = name };
+}
+
+fn validImage(mime: []const u8, bytes: []const u8) bool {
+    if (std.mem.eql(u8, mime, "image/png"))
+        return bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n");
+    if (std.mem.eql(u8, mime, "image/jpeg"))
+        return bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "\xff\xd8\xff");
+    if (std.mem.eql(u8, mime, "image/gif"))
+        return bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"));
+    if (std.mem.eql(u8, mime, "image/webp"))
+        return bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP");
+    return false;
+}
+
+fn imageExtension(mime: []const u8) []const u8 {
+    if (std.mem.eql(u8, mime, "image/png")) return ".png";
+    if (std.mem.eql(u8, mime, "image/jpeg")) return ".jpg";
+    if (std.mem.eql(u8, mime, "image/gif")) return ".gif";
+    if (std.mem.eql(u8, mime, "image/webp")) return ".webp";
+    return ".img";
+}
 
 const ModernMeta = struct {
     @"io.modelcontextprotocol/protocolVersion": []const u8,
@@ -505,7 +623,7 @@ test "modern stdio server discovery and tool call" {
     const script =
         \\while IFS= read -r line; do
         \\  case "$line" in
-        \\    *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[{"name":"echo","description":"Echo input","inputSchema":{"type":"object"}}]}}' ;;
+        \\    *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[{"name":"echo","description":"Echo input","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}}' ;;
         \\    *'"method":"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"from mcp"}]}}' ;;
         \\  esac
         \\done
@@ -515,8 +633,9 @@ test "modern stdio server discovery and tool call" {
     try server.discover();
     try std.testing.expectEqual(@as(usize, 1), server.tools.items.len);
     try std.testing.expectEqualStrings("mcp__demo__echo", server.tools.items[0].public_name);
+    try std.testing.expectEqual(true, server.tools.items[0].read_only_hint.?);
     const result = server.call("mcp__demo__echo", "{\"value\":1}", null);
-    defer gpa.free(result.output);
+    defer result.deinit(gpa);
     try std.testing.expectEqual(block.ToolStatus.ok, result.status);
     try std.testing.expectEqualStrings("from mcp", result.output);
 }
@@ -560,7 +679,7 @@ test "MCP deadline is absolute across unrelated stdout messages" {
     try server.discover();
 
     const result = server.call("mcp__chatty__chatty", "{}", null);
-    defer gpa.free(result.output);
+    defer result.deinit(gpa);
     try std.testing.expectEqual(block.ToolStatus.err, result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Timeout") != null);
 }
@@ -585,9 +704,33 @@ test "MCP deadline covers a server that stops consuming stdin" {
     const args_json = try std.fmt.allocPrint(gpa, "{{\"payload\":\"{s}\"}}", .{payload});
     defer gpa.free(args_json);
     const result = server.call("mcp__blocked__blocked", args_json, null);
-    defer gpa.free(result.output);
+    defer result.deinit(gpa);
     try std.testing.expectEqual(block.ToolStatus.err, result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Timeout") != null);
+}
+
+test "MCP image results retain decoded provider-compatible media" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const script =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[{"name":"shot","inputSchema":{"type":"object"}}]}}' ;;
+        \\    *'"method":"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"image","mimeType":"image/gif","data":"R0lGODlhTUFSTElO"}]}}' ;;
+        \\  esac
+        \\done
+    ;
+    const server = try Server.init(gpa, threaded.io(), "vision", &.{ "sh", "-c", script }, null);
+    defer server.deinit();
+    try server.discover();
+
+    const result = server.call("mcp__vision__shot", "{}", null);
+    defer result.deinit(gpa);
+    try std.testing.expectEqual(block.ToolStatus.ok, result.status);
+    try std.testing.expectEqual(@as(usize, 1), result.media.len);
+    try std.testing.expectEqualStrings("image/gif", result.media[0].mime);
+    try std.testing.expectEqualStrings("GIF89aMARLIN", result.media[0].bytes);
 }
 
 const CancelMcpCall = struct {
@@ -623,7 +766,7 @@ test "turn cancellation kills an active MCP call" {
     }});
     defer cancel_thread.join();
     const result = server.call("mcp__cancel__wait", "{}", &cancel);
-    defer gpa.free(result.output);
+    defer result.deinit(gpa);
     try std.testing.expectEqual(block.ToolStatus.interrupted, result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "interrupted") != null);
 }

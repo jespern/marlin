@@ -297,6 +297,10 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
             text = tr.inline_body;
             status = tr.status;
             full_body_ref = tr.full_body_ref;
+            if (tr.attachments.len > 0) {
+                generated_label = try mediaLabel(gpa, tr.attachments);
+                label = generated_label.?;
+            }
         },
         .approval => |ap| text = if (ap.decision) |decision| @tagName(decision) else "pending",
         .system_note => |sn| {

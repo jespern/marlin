@@ -128,6 +128,7 @@ const Check = struct {
     /// kind|has_parent|has_parent_block|max_rounds.
     db_session_meta: []const []const u8 = &.{},
     db_media_refs: u32 = 0,
+    db_tool_media_refs: u32 = 0,
     image_fixture: bool = false,
     runs: u8 = 1,
     /// Optional per-scenario M5 config and executable hook fixture.
@@ -516,6 +517,18 @@ fn runScenario(
         const got = std.fmt.parseInt(u32, std.mem.trim(u8, res.stdout, " \t\r\n"), 10) catch
             return error.MediaRefQueryFailed;
         if (got != sf.check.db_media_refs) return error.MediaRefCountMismatch;
+    }
+    if (sf.check.db_tool_media_refs > 0) {
+        const db_path = try std.fmt.allocPrint(arena, "{s}/marlin/marlin.db", .{state_dir});
+        const res = try process_io.run(gpa, io, .{
+            .argv = &.{ "sqlite3", db_path, "SELECT count(*) FROM blob_refs r JOIN blocks b ON b.id=r.block_id WHERE b.kind='tool_result';" },
+            .stdout_limit = 64 * 1024,
+            .stderr_limit = 64 * 1024,
+            .timeout_ms = helper_timeout_ms,
+        });
+        defer res.deinit(gpa);
+        const count = std.fmt.parseUnsigned(u32, std.mem.trim(u8, res.stdout, " \t\r\n"), 10) catch 0;
+        if (count != sf.check.db_tool_media_refs) return error.DbToolMediaRefsMismatch;
     }
 
     // 6. Graceful shutdown must actually END the daemon process. `shutdown`

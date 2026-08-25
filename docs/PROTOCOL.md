@@ -55,6 +55,11 @@ policy that failed open. Both default false when decoding an older daemon.
 | sub | sid, from_seq, tail_limit?, before_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
 | unsub | sid | ok |
 | input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer (running/awaiting approval) |
+| mcp_list | — | mcp_list_result with per-server readiness, tool count, and discovery error |
+| mcp_add | name, cmd[] | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
+| mcp_remove | name | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
+| mcp_restart | name | mcp_list_result after rediscovery; failure is reported as server health, not daemon failure |
+| mcp_reload | — | mcp_list_result after atomic registry replacement; old registry survives invalid config/build failure |
 | approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |
 | session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn |
 | interrupt | sid, report? | ok, or interrupt_result with phase/elapsed diagnostics when report=true (cooperative cancel; also denies a pending approval) |

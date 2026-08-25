@@ -166,7 +166,21 @@ fn writeBlocks(ws: *std.Io.Writer, m: provider.Message) !void {
             try ws.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
             try enc(tr.call_id, .{}, ws);
             try ws.writeAll(",\"content\":");
-            try enc(tr.text, .{}, ws);
+            if (tr.media.len == 0) {
+                try enc(tr.text, .{}, ws);
+            } else {
+                try ws.writeAll("[{\"type\":\"text\",\"text\":");
+                try enc(tr.text, .{}, ws);
+                try ws.writeAll("}");
+                for (tr.media) |media| {
+                    try ws.writeAll(",{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
+                    try enc(media.mime, .{}, ws);
+                    try ws.writeAll(",\"data\":\"");
+                    try ws.writeAll(media.data_base64);
+                    try ws.writeAll("\"}}");
+                }
+                try ws.writeAll("]");
+            }
             try cacheSuffix(ws, m);
             try ws.writeAll("}");
         },
@@ -399,6 +413,23 @@ test "request body maps user images to Anthropic source blocks" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+}
+
+test "request body maps tool images inside Anthropic tool results" {
+    const gpa = std.testing.allocator;
+    const messages = [_]provider.Message{.{
+        .role = .tool,
+        .payload = .{ .tool_result = .{
+            .call_id = "shot-1",
+            .text = "screenshot",
+            .media = &.{.{ .name = "shot.png", .mime = "image/png", .data_base64 = "iVBORw0KGgo=" }},
+        } },
+    }};
+    const body = try buildRequestBody(gpa, "claude", &messages, &.{}, 1024);
+    defer gpa.free(body);
+    try std.testing.expect(try std.json.validate(gpa, body));
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
 }
 
 test "stream decode: text, thinking, tool_use reassembly, usage, stop reason" {

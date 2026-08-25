@@ -23,6 +23,8 @@ pub const McpServer = struct {
     name: []const u8,
     cmd: []const []const u8,
     mutating: bool,
+    readonly_tools: []const []const u8 = &.{},
+    mutating_tools: []const []const u8 = &.{},
 };
 
 pub const Hooks = struct {
@@ -86,6 +88,8 @@ const PendingMcp = struct {
     name: ?[]const u8 = null,
     cmd: ?[]const []const u8 = null,
     mutating: bool = true,
+    readonly_tools: []const []const u8 = &.{},
+    mutating_tools: []const []const u8 = &.{},
 };
 
 pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
@@ -186,6 +190,8 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
                 if (std.mem.eql(u8, key, "name")) current.name = try string(arena, value);
                 if (std.mem.eql(u8, key, "cmd")) current.cmd = try command(arena, value);
                 if (std.mem.eql(u8, key, "mutating")) current.mutating = try boolean(value);
+                if (std.mem.eql(u8, key, "readonly_tools")) current.readonly_tools = try stringArray(arena, value);
+                if (std.mem.eql(u8, key, "mutating_tools")) current.mutating_tools = try stringArray(arena, value);
             },
             .unknown => {},
         }
@@ -222,7 +228,13 @@ fn finishPending(
         const name = pending.name orelse return error.McpServerMissingName;
         const cmd = pending.cmd orelse return error.McpServerMissingCommand;
         if (cmd.len == 0) return error.McpServerMissingCommand;
-        try mcp_servers.append(arena, .{ .name = name, .cmd = cmd, .mutating = pending.mutating });
+        try mcp_servers.append(arena, .{
+            .name = name,
+            .cmd = cmd,
+            .mutating = pending.mutating,
+            .readonly_tools = pending.readonly_tools,
+            .mutating_tools = pending.mutating_tools,
+        });
         pending_mcp.* = null;
     }
 }
@@ -373,6 +385,8 @@ test "parse Marlin config surface" {
         \\[[mcp]]
         \\name = "files"
         \\cmd = "mcp-files"
+        \\readonly_tools = ["read", "list"]
+        \\mutating_tools = ["write"]
         \\[hooks]
         \\on_turn_done = "/tmp/notify"
         \\[skills]
@@ -387,6 +401,8 @@ test "parse Marlin config surface" {
     try std.testing.expectEqualStrings("status-tool", doc.exec_tools[0].cmd[0]);
     try std.testing.expect(!doc.exec_tools[0].mutating);
     try std.testing.expectEqualStrings("mcp-files", doc.mcp_servers[0].cmd[0]);
+    try std.testing.expectEqualStrings("read", doc.mcp_servers[0].readonly_tools[0]);
+    try std.testing.expectEqualStrings("write", doc.mcp_servers[0].mutating_tools[0]);
     try std.testing.expectEqualStrings("/tmp/notify", doc.hooks.on_turn_done.?);
     try std.testing.expectEqualStrings("latency", doc.openrouter_sort.?.?);
 }

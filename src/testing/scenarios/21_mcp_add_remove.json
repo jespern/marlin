@@ -1,0 +1,11 @@
+{
+  "steps": [],
+  "check": {
+    "argv": ["mcp", "add", "temporary", "--", "sh", "-c", "exit 7"],
+    "argv2": ["mcp", "remove", "temporary"],
+    "runs": 2,
+    "exit_code": 0,
+    "stdout_contains": ["no MCP servers configured"],
+    "config_toml": "# existing config content must survive daemon-owned edits\n"
+  }
+}

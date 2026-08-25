@@ -55,6 +55,25 @@ pub fn find(name: []const u8) ?*const Spec {
 pub const ExecOut = struct {
     output: []u8,
     status: block.ToolStatus,
+    media: []MediaOutput = &.{},
+
+    pub fn deinit(self: ExecOut, gpa: std.mem.Allocator) void {
+        gpa.free(self.output);
+        for (self.media) |item| item.deinit(gpa);
+        if (self.media.len > 0) gpa.free(self.media);
+    }
+};
+
+pub const MediaOutput = struct {
+    bytes: []u8,
+    mime: []u8,
+    name: []u8,
+
+    pub fn deinit(self: MediaOutput, gpa: std.mem.Allocator) void {
+        gpa.free(self.bytes);
+        gpa.free(self.mime);
+        gpa.free(self.name);
+    }
 };
 
 /// Execute a tool by name with raw (repaired) JSON args. Unknown tools and

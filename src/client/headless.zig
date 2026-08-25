@@ -31,6 +31,57 @@ const ResolvedSession = struct {
     }
 };
 
+pub fn mcp(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |err| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{err});
+        return 1;
+    };
+    defer conn.deinit();
+    var command_args: ?[][]const u8 = null;
+    defer if (command_args) |owned| gpa.free(owned);
+    if (args.len == 0 or (args.len == 1 and std.mem.eql(u8, args[0], "list"))) {
+        try conn.send(.{ .mcp_list = .{} });
+    } else if (args.len == 2 and std.mem.eql(u8, args[0], "restart")) {
+        try conn.send(.{ .mcp_restart = .{ .name = args[1] } });
+    } else if (args.len >= 4 and std.mem.eql(u8, args[0], "add") and std.mem.eql(u8, args[2], "--")) {
+        const owned = try gpa.alloc([]const u8, args.len - 3);
+        command_args = owned;
+        for (args[3..], owned) |arg, *dest| dest.* = arg;
+        try conn.send(.{ .mcp_add = .{ .name = args[1], .cmd = owned } });
+    } else if (args.len == 2 and std.mem.eql(u8, args[0], "remove")) {
+        try conn.send(.{ .mcp_remove = .{ .name = args[1] } });
+    } else if (args.len == 1 and std.mem.eql(u8, args[0], "reload")) {
+        try conn.send(.{ .mcp_reload = .{} });
+    } else {
+        try eprint(io, "usage: marlin mcp [list|add <name> -- <command> [args...]|remove <name>|restart <name>|reload]\n", .{});
+        return 2;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const result = conn.recvUntil(arena_state.allocator(), .mcp_list_result) catch return 1;
+    if (result.servers.len == 0) {
+        try print(io, "no MCP servers configured\n", .{});
+        return 0;
+    }
+    var healthy = true;
+    for (result.servers) |server| {
+        if (server.ready) {
+            try print(io, "{s}\tready\t{d} tools\n", .{ server.name, server.tool_count });
+        } else {
+            healthy = false;
+            try print(io, "{s}\tunavailable\t{s}\n", .{ server.name, server.error_message orelse "unknown error" });
+        }
+    }
+    return if (healthy) 0 else 1;
+}
+
 fn sessionIds(arena: std.mem.Allocator, sessions: []const proto.SessionInfo) ![]u64 {
     const ids = try arena.alloc(u64, sessions.len);
     for (sessions, 0..) |session, i| ids[i] = session.sid;

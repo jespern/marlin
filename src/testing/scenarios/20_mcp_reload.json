@@ -1,0 +1,10 @@
+{
+  "steps": [],
+  "check": {
+    "argv": ["mcp", "reload"],
+    "exit_code": 0,
+    "stdout_contains": ["fixture\tready\t1 tools"],
+    "config_toml": "[[mcp]]\nname = \"fixture\"\ncmd = [\"~/mcp.sh\"]\nmutating = false\n",
+    "mcp_script": "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"tools/list\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"answer\",\"inputSchema\":{\"type\":\"object\"}}]}}' ;;\n  esac\ndone\n"
+  }
+}

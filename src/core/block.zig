@@ -72,6 +72,9 @@ pub const Body = union(BlockKind) {
         /// Content hash into the blobs table for the FULL output; null when
         /// the output fit inline uncapped. `!c` and scrollback prefer this.
         full_body_ref: ?[]const u8,
+        /// Binary tool output (currently MCP images), stored in the same
+        /// content-addressed blob table as user-authored attachments.
+        attachments: []const MediaRef = &.{},
     },
     approval: struct {
         approval_id: []const u8,

@@ -191,6 +191,24 @@ pub const MediaLoader = *const fn (
     hash: []const u8,
 ) anyerror![]const u8;
 
+fn resolveMedia(arena: std.mem.Allocator, refs: []const block.MediaRef, opts: AssembleOpts) ![]const provider.Media {
+    const loader = opts.media_loader orelse return &.{};
+    const loader_ctx = opts.media_loader_ctx orelse return &.{};
+    var media: std.ArrayList(provider.Media) = .empty;
+    for (refs) |attachment| {
+        const raw = loader(loader_ctx, arena, attachment.hash) catch continue;
+        const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
+        const encoded = try arena.alloc(u8, encoded_len);
+        _ = std.base64.standard.Encoder.encode(encoded, raw);
+        try media.append(arena, .{
+            .name = attachment.name,
+            .mime = attachment.mime,
+            .data_base64 = encoded,
+        });
+    }
+    return media.items;
+}
+
 /// Assemble provider messages from a block log slice. All returned message
 /// payloads reference either `blocks` memory or `arena` allocations — use an
 /// arena scoped to the turn.
@@ -284,23 +302,12 @@ pub fn assemble(
                         u.text;
                     try msgs.append(arena, .{ .role = .user, .payload = .{ .text = text } });
                 } else {
-                    var media: std.ArrayList(provider.Media) = .empty;
-                    for (u.attachments) |attachment| {
-                        const raw = opts.media_loader.?(opts.media_loader_ctx.?, arena, attachment.hash) catch continue;
-                        const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
-                        const encoded = try arena.alloc(u8, encoded_len);
-                        _ = std.base64.standard.Encoder.encode(encoded, raw);
-                        try media.append(arena, .{
-                            .name = attachment.name,
-                            .mime = attachment.mime,
-                            .data_base64 = encoded,
-                        });
-                    }
-                    if (media.items.len == 0) {
+                    const media = try resolveMedia(arena, u.attachments, opts);
+                    if (media.len == 0) {
                         const text = try std.fmt.allocPrint(arena, "{s}\n\n[image attachments unavailable]", .{u.text});
                         try msgs.append(arena, .{ .role = .user, .payload = .{ .text = text } });
                     } else try msgs.append(arena, .{ .role = .user, .payload = .{
-                        .user_content = .{ .text = u.text, .media = media.items },
+                        .user_content = .{ .text = u.text, .media = media },
                     } });
                 }
             },
@@ -332,10 +339,22 @@ pub fn assemble(
                 results: while (j < blocks.len and results_seen < calls.items.len) : (j += 1) {
                     switch (blocks[j].body) {
                         .tool_result => |tr| {
+                            var result_text = pruneBody(blocks[j].seq, tr.inline_body, opts);
+                            var media: []const provider.Media = &.{};
+                            if (tr.attachments.len > 0) {
+                                if (blocks[j].seq < opts.prune_before_seq) {
+                                    result_text = try std.fmt.allocPrint(arena, "{s}\n\n[{d} tool image attachment(s) elided from active context]", .{ result_text, tr.attachments.len });
+                                } else {
+                                    media = try resolveMedia(arena, tr.attachments, opts);
+                                    if (media.len == 0)
+                                        result_text = try std.fmt.allocPrint(arena, "{s}\n\n[tool image attachments unavailable]", .{result_text});
+                                }
+                            }
                             try msgs.append(arena, .{ .role = .tool, .payload = .{
                                 .tool_result = .{
                                     .call_id = tr.call_id,
-                                    .text = pruneBody(blocks[j].seq, tr.inline_body, opts),
+                                    .text = result_text,
+                                    .media = media,
                                 },
                             } });
                             results_seen += 1;

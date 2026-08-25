@@ -177,6 +177,156 @@ pub fn load(
     return .{ .gpa = gpa, .arena_state = arena_state, .value = cfg };
 }
 
+const max_config_bytes = 2 * 1024 * 1024;
+
+/// Read the exact config bytes so daemon-owned MCP edits can be rolled back if
+/// rebuilding the live extension registry fails.
+pub fn readRawAlloc(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+) ![]u8 {
+    const dir = try credentials.configDir(gpa, environ);
+    defer gpa.free(dir);
+    const path = try std.fs.path.join(gpa, &.{ dir, "config.toml" });
+    defer gpa.free(path);
+    return Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes));
+}
+
+/// Replace config.toml atomically. Readers see either the complete old file or
+/// the complete new file, never a partially written MCP table.
+pub fn replaceRaw(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    bytes: []const u8,
+) !void {
+    if (bytes.len > max_config_bytes) return error.StreamTooLong;
+    const dir = try credentials.configDir(gpa, environ);
+    defer gpa.free(dir);
+    const path = try std.fs.path.join(gpa, &.{ dir, "config.toml" });
+    defer gpa.free(path);
+    var atomic = try Io.Dir.cwd().createFileAtomic(io, path, .{ .make_path = true, .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, bytes);
+    try atomic.file.sync(io);
+    try atomic.replace(io);
+}
+
+pub fn addMcpServer(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    name: []const u8,
+    cmd: []const []const u8,
+) !void {
+    const current = try readRawAlloc(gpa, io, environ);
+    defer gpa.free(current);
+    const updated = try addMcpServerText(gpa, current, name, cmd);
+    defer gpa.free(updated);
+    try replaceRaw(gpa, io, environ, updated);
+}
+
+pub fn removeMcpServer(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    name: []const u8,
+) !void {
+    const current = try readRawAlloc(gpa, io, environ);
+    defer gpa.free(current);
+    const updated = try removeMcpServerText(gpa, current, name);
+    defer gpa.free(updated);
+    try replaceRaw(gpa, io, environ, updated);
+}
+
+fn addMcpServerText(
+    gpa: std.mem.Allocator,
+    current: []const u8,
+    name: []const u8,
+    cmd: []const []const u8,
+) ![]u8 {
+    try validateToolName(name);
+    if (cmd.len == 0) return error.McpServerMissingCommand;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const doc = try toml.parse(arena_state.allocator(), current);
+    for (doc.mcp_servers) |server| {
+        if (std.mem.eql(u8, server.name, name)) return error.DuplicateMcpServer;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, current);
+    if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(gpa, '\n');
+    if (out.items.len > 0) try out.append(gpa, '\n');
+    try out.appendSlice(gpa, "[[mcp]]\nname = ");
+    try appendTomlString(&out, gpa, name);
+    try out.appendSlice(gpa, "\ncmd = [");
+    for (cmd, 0..) |arg, i| {
+        if (i > 0) try out.appendSlice(gpa, ", ");
+        try appendTomlString(&out, gpa, arg);
+    }
+    try out.appendSlice(gpa, "]\n");
+
+    // Validate the generated document before it can replace the user's file.
+    var verify_arena = std.heap.ArenaAllocator.init(gpa);
+    defer verify_arena.deinit();
+    _ = try toml.parse(verify_arena.allocator(), out.items);
+    return out.toOwnedSlice(gpa);
+}
+
+fn removeMcpServerText(gpa: std.mem.Allocator, current: []const u8, name: []const u8) ![]u8 {
+    try validateToolName(name);
+    var offset: usize = 0;
+    while (offset < current.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, current, offset, '\n') orelse current.len;
+        const next = if (line_end < current.len) line_end + 1 else line_end;
+        const line = std.mem.trim(u8, current[offset..line_end], " \t\r");
+        if (!std.mem.startsWith(u8, line, "[[mcp]]")) {
+            offset = next;
+            continue;
+        }
+
+        var table_end = next;
+        while (table_end < current.len) {
+            const candidate_end = std.mem.indexOfScalarPos(u8, current, table_end, '\n') orelse current.len;
+            const candidate = std.mem.trim(u8, current[table_end..candidate_end], " \t\r");
+            if (candidate.len > 0 and candidate[0] == '[') break;
+            table_end = if (candidate_end < current.len) candidate_end + 1 else candidate_end;
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const table = try toml.parse(arena_state.allocator(), current[offset..table_end]);
+        if (table.mcp_servers.len == 1 and std.mem.eql(u8, table.mcp_servers[0].name, name)) {
+            const out = try gpa.alloc(u8, current.len - (table_end - offset));
+            @memcpy(out[0..offset], current[0..offset]);
+            @memcpy(out[offset..], current[table_end..]);
+            return out;
+        }
+        offset = table_end;
+    }
+    return error.UnknownMcpServer;
+}
+
+fn appendTomlString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, value: []const u8) !void {
+    try out.append(gpa, '"');
+    for (value) |byte| switch (byte) {
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\x08' => try out.appendSlice(gpa, "\\b"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        '\x0c' => try out.appendSlice(gpa, "\\f"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        0...7, 11, 14...31, 127 => try out.print(gpa, "\\u00{X:0>2}", .{byte}),
+        else => try out.append(gpa, byte),
+    };
+    try out.append(gpa, '"');
+}
+
 test "web ui stays off unless deliberately enabled" {
     const gpa = std.testing.allocator;
     var environ = std.process.Environ.Map.init(gpa);
@@ -385,4 +535,38 @@ test "load reads XDG config and environment wins" {
     try std.testing.expectEqualStrings("from-config.example", loaded.value.network_deny.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.value.exec_tools.len);
     try std.testing.expectEqualStrings("echo_json", loaded.value.exec_tools[0].name);
+}
+
+test "MCP config edits round-trip escaped commands and preserve other tables" {
+    const gpa = std.testing.allocator;
+    const original =
+        \\[model]
+        \\default = "local/test"
+        \\[[mcp]]
+        \\name = "keep"
+        \\cmd = ["keep-server"]
+        \\[network]
+        \\deny = "blocked.example"
+    ;
+    const added = try addMcpServerText(gpa, original, "new-server", &.{ "server path", "--label=\"quoted\"", "line\nbreak" });
+    defer gpa.free(added);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const doc = try toml.parse(arena_state.allocator(), added);
+    try std.testing.expectEqual(@as(usize, 2), doc.mcp_servers.len);
+    try std.testing.expectEqualStrings("server path", doc.mcp_servers[1].cmd[0]);
+    try std.testing.expectEqualStrings("--label=\"quoted\"", doc.mcp_servers[1].cmd[1]);
+    try std.testing.expectEqualStrings("line\nbreak", doc.mcp_servers[1].cmd[2]);
+    try std.testing.expectError(error.DuplicateMcpServer, addMcpServerText(gpa, added, "new-server", &.{"nope"}));
+
+    const removed = try removeMcpServerText(gpa, added, "keep");
+    defer gpa.free(removed);
+    var removed_arena = std.heap.ArenaAllocator.init(gpa);
+    defer removed_arena.deinit();
+    const after = try toml.parse(removed_arena.allocator(), removed);
+    try std.testing.expectEqual(@as(usize, 1), after.mcp_servers.len);
+    try std.testing.expectEqualStrings("new-server", after.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("blocked.example", after.network_deny.?);
+    try std.testing.expectError(error.UnknownMcpServer, removeMcpServerText(gpa, removed, "missing"));
 }

@@ -151,6 +151,34 @@ pub fn buildRequestBody(
             },
         }
         try ws.writeAll("}");
+
+        // Chat Completions only portably guarantees image parts on user
+        // messages. Keep every required tool response contiguous, then append
+        // one user media message for the completed batch. Anthropic's native
+        // builder can embed the same media directly inside tool_result.
+        if (m.role == .tool and (i + 1 == messages.len or messages[i + 1].role != .tool)) {
+            var first_tool = i;
+            while (first_tool > 0 and messages[first_tool - 1].role == .tool) first_tool -= 1;
+            var media_count: usize = 0;
+            for (messages[first_tool .. i + 1]) |tool_message| switch (tool_message.payload) {
+                .tool_result => |result| media_count += result.media.len,
+                else => {},
+            };
+            if (media_count > 0) {
+                try ws.writeAll(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Images returned by the preceding tool results, in the same order:\"}");
+                for (messages[first_tool .. i + 1]) |tool_message| switch (tool_message.payload) {
+                    .tool_result => |result| for (result.media) |media| {
+                        try ws.writeAll(",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                        try ws.writeAll(media.mime);
+                        try ws.writeAll(";base64,");
+                        try ws.writeAll(media.data_base64);
+                        try ws.writeAll("\"}}");
+                    },
+                    else => {},
+                };
+                try ws.writeAll("]}");
+            }
+        }
     }
     try ws.writeAll("]");
     const include_web_search = dialect == .openrouter and opts.openrouter_web_search;
@@ -786,5 +814,24 @@ test "request body maps user images to OpenAI content parts" {
     defer arena_state.deinit();
     _ = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image_url\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "data:image/png;base64,iVBORw0KGgo=") != null);
+}
+
+test "request body maps tool images to OpenAI content parts" {
+    const gpa = std.testing.allocator;
+    const messages = [_]provider.Message{.{
+        .role = .tool,
+        .payload = .{ .tool_result = .{
+            .call_id = "shot-1",
+            .text = "screenshot",
+            .media = &.{.{ .name = "shot.png", .mime = "image/png", .data_base64 = "iVBORw0KGgo=" }},
+        } },
+    }};
+    const body = try buildRequestBody(gpa, "vision", .openrouter, .auto, &messages, &.{}, .{});
+    defer gpa.free(body);
+    try std.testing.expect(try std.json.validate(gpa, body));
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":\"shot-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\",\"tool_call_id\":\"shot-1\",\"content\":\"screenshot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\",\"content\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "data:image/png;base64,iVBORw0KGgo=") != null);
 }

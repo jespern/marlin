@@ -135,6 +135,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
     .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
+    .{ .name = "/mcp", .usage = " [add|remove|restart|reload]", .description = "inspect and manage MCP servers", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
@@ -1146,9 +1147,10 @@ const App = struct {
         text: []const u8,
         status: block.ToolStatus,
         full_body_ref: ?[]const u8,
+        label: []const u8,
     ) void {
         const before = self.blocks.items.len;
-        self.pushDurableBlock(b, .tool_result, text, "", status);
+        self.pushDurableBlock(b, .tool_result, text, label, status);
         if (self.blocks.items.len == before) return;
         if (full_body_ref) |ref| {
             self.blocks.items[self.blocks.items.len - 1].full_body_ref = self.gpa.dupe(u8, ref) catch null;
@@ -1382,6 +1384,7 @@ const App = struct {
                     }) catch self.gpa.free(model);
                 }
             },
+            .mcp_list_result => |result| self.showMcpStatus(result.servers),
             .session_meta => |m| {
                 if (m.sid != self.sid) return;
                 self.tokens_in = m.tokens_in;
@@ -1465,7 +1468,12 @@ const App = struct {
                 }
             },
             .tool_result => |tr| {
-                self.pushDurableToolResult(b, tr.inline_body, tr.status, tr.full_body_ref);
+                const label = if (tr.attachments.len > 0)
+                    layout_mod.mediaLabel(self.gpa, tr.attachments) catch null
+                else
+                    null;
+                defer if (label) |owned| self.gpa.free(owned);
+                self.pushDurableToolResult(b, tr.inline_body, tr.status, tr.full_body_ref, label orelse "");
                 self.call_started_ms = if (self.currentInflightCall() != null)
                     nowWallMs(self.io)
                 else
@@ -1634,6 +1642,61 @@ const App = struct {
             self.toggleSandbox(it.rest());
         } else if (std.mem.eql(u8, head, "/network")) {
             self.networkCommand(it.rest());
+        } else if (std.mem.eql(u8, head, "/mcp")) {
+            const action = it.next();
+            if (action == null) {
+                self.conn.send(.{ .mcp_list = .{} }) catch {
+                    self.setNotice("could not request MCP status", .{});
+                };
+            } else if (std.mem.eql(u8, action.?, "restart")) {
+                const name = it.next() orelse {
+                    self.setNotice("usage: /mcp restart <name>", .{});
+                    return;
+                };
+                if (it.next() != null) {
+                    self.setNotice("usage: /mcp restart <name>", .{});
+                    return;
+                }
+                self.conn.send(.{ .mcp_restart = .{ .name = name } }) catch {
+                    self.setNotice("could not restart MCP server", .{});
+                };
+            } else if (std.mem.eql(u8, action.?, "add")) {
+                const name = it.next() orelse {
+                    self.setNotice("usage: /mcp add <name> <command> [args...]", .{});
+                    return;
+                };
+                var command: std.ArrayList([]const u8) = .empty;
+                defer command.deinit(self.gpa);
+                while (it.next()) |arg| command.append(self.gpa, arg) catch {
+                    self.setNotice("could not allocate MCP command", .{});
+                    return;
+                };
+                if (command.items.len == 0) {
+                    self.setNotice("usage: /mcp add <name> <command> [args...]", .{});
+                    return;
+                }
+                self.conn.send(.{ .mcp_add = .{ .name = name, .cmd = command.items } }) catch {
+                    self.setNotice("could not add MCP server", .{});
+                };
+            } else if (std.mem.eql(u8, action.?, "remove")) {
+                const name = it.next() orelse {
+                    self.setNotice("usage: /mcp remove <name>", .{});
+                    return;
+                };
+                if (it.next() != null) {
+                    self.setNotice("usage: /mcp remove <name>", .{});
+                    return;
+                }
+                self.conn.send(.{ .mcp_remove = .{ .name = name } }) catch {
+                    self.setNotice("could not remove MCP server", .{});
+                };
+            } else if (std.mem.eql(u8, action.?, "reload") and it.next() == null) {
+                self.conn.send(.{ .mcp_reload = .{} }) catch {
+                    self.setNotice("could not reload MCP config", .{});
+                };
+            } else {
+                self.setNotice("usage: /mcp [add <name> <command> [args...]|remove <name>|restart <name>|reload]", .{});
+            }
         } else if (std.mem.eql(u8, head, "/sessions")) {
             self.openPicker(.session);
         } else if (std.mem.eql(u8, head, "/new")) {
@@ -1690,9 +1753,27 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /new · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /new · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
+        }
+    }
+
+    fn showMcpStatus(self: *App, servers: []const proto.McpServerInfo) void {
+        self.notice.clearRetainingCapacity();
+        if (servers.len == 0) {
+            self.notice.appendSlice(self.gpa, "MCP · no servers configured") catch {};
+            return;
+        }
+        self.notice.appendSlice(self.gpa, "MCP · ") catch return;
+        for (servers, 0..) |server, i| {
+            if (i > 0) self.notice.appendSlice(self.gpa, " · ") catch return;
+            if (server.ready) {
+                self.notice.print(self.gpa, "{s} ✓ {d} tools", .{ server.name, server.tool_count }) catch return;
+            } else {
+                const message = server.error_message orelse "unavailable";
+                self.notice.print(self.gpa, "{s} ✗ {s}", .{ server.name, message[0..@min(message.len, 96)] }) catch return;
+            }
         }
     }
 

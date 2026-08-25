@@ -82,6 +82,26 @@ multiplexed by a TUI that is just another client.**
    structured data we render ourselves. No terminal emulation tarpit. (If an
    embedded terminal is ever truly needed: libghostty-vt, not hand-rolled.)
 
+## MCP servers
+
+MCP is daemon-owned rather than a client-side plugin shim. Stdio servers are
+discovered independently, so one broken server is reported as unavailable
+without taking down Marlin or hiding healthy servers. Manage the durable config
+from either client surface:
+
+```sh
+marlin mcp add playwright -- npx @playwright/mcp
+marlin mcp list
+marlin mcp restart playwright
+marlin mcp remove playwright
+```
+
+The TUI equivalents are `/mcp`, `/mcp add`, `/mcp restart`, `/mcp remove`, and
+`/mcp reload`. Tool read/write policy follows MCP annotations with exact
+`readonly_tools` and `mutating_tools` config overrides. Image results are stored
+as transcript media and sent back to vision-capable providers. Streamable HTTP
+transport remains later work; stdio is the supported product path today.
+
 ## Context management today
 
 Marlin implements a three-stage structural cascade:
@@ -105,7 +125,7 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
   localhost-only, **unauthenticated** HTTP/SSE bridge — anything reaching the
   port can drive marlin, including reboot/shutdown. It's just another client
   on the same protocol, and it is not a deploy surface.)
-- No voice, vision pipelines, themes, cron, profiles.
+- No voice, OCR/video pipelines, themes, cron, profiles.
 - No embedded terminal emulator / editor panes.
 - No Tailscale embedding — your tailnet already reaches the daemon socket.
 

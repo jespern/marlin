@@ -310,8 +310,9 @@
       <li><b>one binary</b>: no Node runtime, no Python environment, no terminal scraping</li>
       <li><b>structured multiplexer</b>: switch sessions without losing drafts, scroll position, or actionable state</li>
       <li><b>append-only truth</b>: context may compact; durable history and full tool output do not pretend they never happened</li>
-      <li><b>process-boundary extensions</b>: MCP stdio servers, executable tools, hooks, and Markdown skills</li>
-      <li><b>durable child sessions</b>: a parent can delegate focused read-only work to an inspectable child</li>
+      <li><b>process-boundary extensions</b>: managed MCP stdio servers, executable tools, hooks, and Markdown skills</li>
+      <li><b>durable child fan-out</b>: a parent can delegate two to eight concurrent read-only jobs to inspectable children</li>
+      <li><b>real image input</b>: local clipboard paste and remote-safe path upload stay durable and reach vision models</li>
     </ul>
   </div>
 
@@ -319,8 +320,8 @@
     <span class="badge">DEVELOPMENT PREVIEW</span>
     Marlin is already self-hosting and useful for real work, but it is not a
     stable 1.0 product. The multiplexer and extension foundations are built;
-    M6 is actively widening child sessions into concurrent delegation and
-    review councils. Config and protocol details may still move.
+    bounded concurrent child delegation is built, and M6 is turning those
+    primitives into review councils. Config and protocol details may still move.
   </div>
 
   <div class="panel">
@@ -330,9 +331,10 @@
       <div class="feature"><b>Real multiplexer</b>Durable concurrent sessions, an always-visible clickable tab strip, short stable handles, <code class="inline">/sessions</code>, per-session view state, and rolled-up child activity.</div>
       <div class="feature"><b>Context that admits reality</b>Inline output caps, full content-addressed blobs, pruning, compaction, usage accounting, and durable reconnect replay.</div>
       <div class="feature"><b>Self-hosting loop</b>Headless runs, steering, approvals, interruption, and coordinated <code class="inline">/reboot --build</code> while developing Marlin inside Marlin.</div>
-      <div class="feature"><b>Extension boundaries</b>Owned TOML config, executable tools, MCP stdio, asynchronous hooks, and on-demand skills through one schema + approval path.</div>
+      <div class="feature"><b>MCP as a product</b>Isolated health, daemon-owned add/remove/restart/reload, per-tool policy, durable image results, and one schema + approval path.</div>
       <div class="feature"><b>Permission foundation</b>Scrubbed tool environments, approval policy, protected-path rules, managed network filtering, and verified macOS shell sandboxing with safe fallback.</div>
-      <div class="feature"><b>First child-agent slice</b>A synchronous <code class="inline">task</code> call creates a durable, attachable, read-only child with a budget, cancellation cascade, and structured result.</div>
+      <div class="feature"><b>Bounded agent fan-out</b><code class="inline">task</code> and <code class="inline">task_batch</code> create up to eight durable, attachable, read-only children with budgets, cancellation cascade, and ordered results.</div>
+      <div class="feature"><b>Image-aware sessions</b>Ctrl+V or <code class="inline">/attach</code> uploads signed image data through the client boundary, stores it by content hash, and maps it to native provider vision blocks.</div>
       <div class="feature"><b>Provider choice</b>OpenRouter-first model catalog plus OpenAI-compatible and Anthropic provider paths, with per-session model and reasoning effort.</div>
     </div>
   </div>
@@ -364,9 +366,9 @@ $ marlin attach 63df <span class="c"># any unique prefix (minimum four)</span></
       <tr><td>M0–M3</td><td>agent loop, daemon, TUI, context engine, self-hosting reboot</td><td>✅ BUILT</td></tr>
       <tr><td>M3.5</td><td>permissions + secret boundary</td><td>🔧 HARDENING</td></tr>
       <tr><td>M4</td><td>structured session multiplexer</td><td>✅ VERIFIED</td></tr>
-      <tr><td>M5</td><td>MCP, executable tools, hooks, skills</td><td>🐕 DOGFOODING</td></tr>
-      <tr><td>M6a</td><td>durable child sessions + task primitive</td><td>🐟 FIRST SLICE</td></tr>
-      <tr><td>M6 next</td><td>ordered concurrent children + review councils</td><td>🔨 ACTIVE</td></tr>
+      <tr><td>M5</td><td>managed MCP, executable tools, hooks, skills</td><td>✅ PRODUCTIZED</td></tr>
+      <tr><td>M6a</td><td>durable child sessions + bounded task fan-out</td><td>✅ VERIFIED</td></tr>
+      <tr><td>M6 next</td><td>review councils over the child primitive</td><td>🔨 ACTIVE</td></tr>
       <tr><td>later</td><td>workspace snapshots/isolation + remote/PWA decisions</td><td>📋 EVIDENCE FIRST</td></tr>
     </table></div>
     <p class="fineprint">
@@ -379,7 +381,8 @@ $ marlin attach 63df <span class="c"># any unique prefix (minimum four)</span></
   <div class="panel">
     <h2>&gt;&gt; NOT shipped yet (honesty zone)</h2>
     <ul class="starlist">
-      <li><b>review councils</b>: designed, but named councils and concurrent reviewer fan-out are next—not marketing-present-tense</li>
+      <li><b>review councils</b>: bounded fan-out exists, but named councils and reviewer synthesis are next—not marketing-present-tense</li>
+      <li><b>MCP streamable HTTP</b>: stdio is managed and supported today; remote HTTP transport remains later</li>
       <li><b>native remote transport or web UI</b>: use SSH/mosh today; raw TCP and a PWA wait for a concrete trust boundary and workflow</li>
       <li><b>workspace undo/isolation</b>: snapshots, leases, worktrees, <code class="inline">/land</code>, and <code class="inline">/discard</code> remain one deliberately later track</li>
       <li><b>kitchen sink surfaces</b>: no messaging gateway, voice stack, embedded terminal emulator, or dashboard empire</li>

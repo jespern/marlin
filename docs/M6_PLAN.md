@@ -1,8 +1,8 @@
 # M6 execution plan
 
 Status: **active**. M6a's durable synchronous read-only child and bounded
-fan-out primitives are implemented and verified. M4 is verified; M5 mechanics are
-verified and still need a short real-server/hook dogfood pass. The workspace
+fan-out primitives are implemented and verified. M4 is verified; M5 is
+productized and still needs a short real-server/hook dogfood pass. The workspace
 recovery/isolation track formerly called M4.5 is deliberately Later.
 
 ## What exists now
@@ -10,8 +10,9 @@ recovery/isolation track formerly called M4.5 is deliberately Later.
 - The daemon already owns concurrent durable sessions, status watch/fan-out,
   approvals, reconnect replay, cancellation flags, and per-session UI state.
 - M5 supplies one dynamic tool-schema and dispatch path for exec, MCP, and
-  skills. MCP calls serialize safely per server; hooks run outside turn and
-  dispatcher critical paths.
+  skills. MCP calls serialize safely per server; discovery failures are
+  isolated, lifecycle/config changes are daemon-owned and atomic, and hooks run
+  outside turn and dispatcher critical paths.
 - Schema v4 and the protocol carry `parent_sid`, `kind`, `parent_block_id`, and
   the child round budget. Existing sessions migrate as roots; stale in-flight
   state becomes `err` after daemon restart.
@@ -47,7 +48,8 @@ Also close these bounded hardening debts when they intersect M6 work:
    retaining provider-call result order and per-call cancellation.
 2. Give built-in bash and extension subprocesses one cancellation/deadline
    primitive (TERM, grace, KILL) instead of a mixture of blocking helpers.
-3. Make config/MCP startup errors name the table, server/tool, and bad field.
+3. **Partly done:** `/mcp` reports the named server and isolated discovery
+   failure. Parser diagnostics still need the exact TOML table/field location.
 4. Keep Fable's permission matrix separate; do not make child sessions a way
    around sandbox, protected-path, network, or secret-environment policy.
 
