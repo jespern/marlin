@@ -47,6 +47,30 @@ fn mapConnect(err: anyerror) Error {
     return error.ConnectFailed;
 }
 
+/// std.http.Client loads its CA bundle and certificate clock (`client.now`)
+/// lazily inside request(). The DNS-preflight path dials TLS connections
+/// directly via connectTcpOptions, which skips that init — and
+/// Connection.Tls.create unwraps `client.now.?`: a panic in Debug and
+/// undefined behavior in release (observed live as every provider request
+/// on a cold pool failing ConnectFailed). Mirror request()'s init, with the
+/// same locking discipline, before any direct TLS connect.
+fn ensureTlsReady(client: *std.http.Client) Error!void {
+    const io = client.io;
+    {
+        client.ca_bundle_lock.lockShared(io) catch return error.Cancelled;
+        defer client.ca_bundle_lock.unlockShared(io);
+        if (client.now != null) return;
+    }
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(client.allocator);
+    const now = Io.Clock.real.now(io);
+    bundle.rescan(client.allocator, io, now) catch return error.ConnectFailed;
+    client.ca_bundle_lock.lock(io) catch return error.Cancelled;
+    defer client.ca_bundle_lock.unlock(io);
+    client.now = now;
+    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+}
+
 pub const Response = struct {
     status: i64,
     /// Collected error body when status >= 400 (allocated, caller frees).
@@ -618,10 +642,12 @@ fn acquirePooledOrPreflightDns(
         return error.ConnectFailed;
     const resolved_text = std.mem.trim(u8, result.stdout, " \t\r\n");
     const resolved_host = Io.net.HostName.init(resolved_text) catch return error.ConnectFailed;
+    const connect_protocol = if (proxy) |configured| configured.protocol else protocol;
+    if (connect_protocol == .tls) try ensureTlsReady(client);
     const connection = client.connectTcpOptions(.{
         .host = resolved_host,
         .port = resolve_port,
-        .protocol = if (proxy) |configured| configured.protocol else protocol,
+        .protocol = connect_protocol,
         // Connection identity remains the logical hostname: HTTPS still
         // verifies/SNI-routes the certificate for the requested origin (or
         // proxy), never for the numeric address used by connect(2).
@@ -635,6 +661,44 @@ fn acquirePooledOrPreflightDns(
         return null;
     }
     return connection;
+}
+
+fn acceptAndClose(io: Io, server: *Io.net.Server) void {
+    var stream = server.accept(io) catch return;
+    stream.close(io);
+}
+
+test "direct TLS connect initializes the certificate clock (no null-now panic)" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pool = try Pool.init(gpa, io, null);
+    defer pool.deinit();
+    // A fresh pool has no certificate clock; request() would set it lazily,
+    // but the DNS-preflight path connects TLS directly.
+    try std.testing.expect(pool.client.now == null);
+    try ensureTlsReady(&pool.client);
+    try std.testing.expect(pool.client.now != null);
+
+    // With the clock set, a direct TLS connect to a peer that immediately
+    // hangs up must fail with an ordinary error. Before the fix this path
+    // panicked on `client.now.?` in Debug and was UB in release.
+    var server = try testServer(io);
+    defer server.deinit(io);
+    const t = try std.Thread.spawn(.{}, acceptAndClose, .{ io, &server });
+    defer t.join();
+    const host = Io.net.HostName.init("127.0.0.1") catch unreachable;
+    const result = pool.client.connectTcpOptions(.{
+        .host = host,
+        .port = server.socket.address.getPort(),
+        .protocol = .tls,
+    });
+    if (result) |connection| {
+        pool.client.connection_pool.release(connection, io);
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 fn testServer(io: Io) !Io.net.Server {
