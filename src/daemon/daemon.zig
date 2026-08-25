@@ -1125,14 +1125,20 @@ pub const Daemon = struct {
                         self.sendTo(client, .{ .blk = .{ .sid = s.sid, .b = replayed } });
                     }
                     if (s.tail_limit > 0 or s.replay_done or bounded_forward) {
+                        const replay_has_newer = bounded_forward and !caught_up;
+                        const plan_items = if (!replay_has_newer)
+                            (try self.store.loadLatestPlan(replay_arena_state.allocator(), s.sid)) orelse &.{}
+                        else
+                            &.{};
                         self.sendTo(client, .{ .replay_done = .{
                             .sid = s.sid,
                             .oldest_seq = if (send_count > 0) sent[0].seq else 0,
                             .newest_seq = if (send_count > 0) sent[send_count - 1].seq else 0,
                             .has_older = s.tail_limit > 0 and
                                 (page_has_older or (send_count > 0 and sent[0].seq > 1)),
-                            .has_newer = bounded_forward and !caught_up,
+                            .has_newer = replay_has_newer,
                             .forward = bounded_forward,
+                            .plan_items = plan_items,
                         } });
                     }
                 }

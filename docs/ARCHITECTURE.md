@@ -202,6 +202,7 @@ const BlockKind = enum {
     tool_result,     // id, status, inline_body (capped), full_body_ref
     approval,        // request + resolution (granted/denied/timeout, by whom)
     steer,           // mid-turn user interrupt text
+    plan,            // immutable execution-plan revision; newest wins
     compaction,      // summary text + range of blocks it replaces in context
     system_note,     // model switch, error, session config change
 };
@@ -217,6 +218,9 @@ Key decisions:
   lost. (Hermes pattern.)
 - **`compaction` is a block, not an edit.** It records "blocks [a..b] are
   represented by this summary in context from now on." History is untouched.
+- **`plan` is durable state, not assistant prose.** `plan_update` appends a new
+  revision; assembly retains the newest unfinished revision across compaction,
+  and bounded replay restores it separately from scrollback depth.
 - **Synthetic `user_msg` blocks are model context, not user authorship.** File
   windows rehydrated after compaction carry `synthetic=true`; clients collapse
   them to a filename note and exclude them from input history. The default is
@@ -357,7 +361,8 @@ Two stream disciplines worth locking in now:
 - **Bounded attach + paged `from_seq` resume.** Clients remember the last block seq
   they've seen per session and replay only the gap when revisiting a cached
   view. A cold TUI attach asks for the newest 256 blocks; `replay_done`
-  advertises whether more durable history exists. Reaching the loaded top asks
+  advertises whether more durable history exists and carries the newest plan
+  revision. Reaching the loaded top asks
   for another 256 blocks with `before_seq=oldest_seq`, buffers them off-screen,
   then prepends the page atomically. Attach and scrollback work are therefore
   bounded without weakening the block log as source of truth. Revisiting a
@@ -754,10 +759,13 @@ get these right; Hermes is the counter-example):
   things that change a decision *right now*. No session-duration counters, no
   feature-toggle indicators, no diagnostic chrome. Every candidate status item
   answers "would I act on this mid-turn?" or it stays out.
-- **Todo/plan list pinned above the input** when the agent maintains one:
-  current step highlighted, done items dimmed/checked. Always visible without
-  scrolling — "where is it in the plan" must never require leaving the live
-  region. Collapses to nothing when there's no plan.
+- **Todo/plan list pinned above the input** when the agent maintains one
+  (**shipped**): `plan_update` appends immutable revisions to the block log;
+  the daemon restores the latest revision independently of bounded replay and
+  injects unfinished work after compaction. The current step is highlighted
+  and done items are dimmed/checked. Always visible without scrolling — "where
+  is it in the plan" must never require leaving the live region. Collapses to
+  nothing when there's no plan.
 - **Progress chrome is a capped stack of live strips.** The region between
   session view and input holds one-line strips: the todo strip, a review
   fan-out row (`sol ✓ · grok … · glm ✓`), later background-task rows. Rules

@@ -303,6 +303,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
             }
         },
         .approval => |ap| text = if (ap.decision) |decision| @tagName(decision) else "pending",
+        .plan => return null,
         .system_note => |sn| {
             if (isCompactionStatusNote(sn.text)) return null;
             text = sn.text;
@@ -908,6 +909,7 @@ pub fn layoutBlockRange(
                 try flushRanSummary(alloc, lines, &pending_ran);
                 try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w);
             },
+            .plan => {},
             .system_note => {
                 const txt = try std.fmt.allocPrint(alloc, "[{s}]", .{try clipText(alloc, rb.text, 480)});
                 try wrapPrefixed(alloc, lines, "  ", txt, Palette.note, w);

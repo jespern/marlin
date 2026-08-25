@@ -207,6 +207,10 @@ pub const DaemonMsg = union(enum) {
         has_older: bool = false,
         has_newer: bool = false,
         forward: bool = false,
+        /// Latest plan state, independent of the bounded transcript window.
+        /// This message is already explicitly opted into by current clients;
+        /// older decoders safely ignore the additive field.
+        plan_items: []const block.PlanItem = &.{},
     },
     status: struct { sid: u64, state: SessionState },
     approval_request: struct {
@@ -422,6 +426,24 @@ test "round trip: client messages" {
     defer gpa.free(interrupt_line);
     const interrupt_back = try decode(ClientMsg, arena, interrupt_line);
     try std.testing.expect(interrupt_back.interrupt.report);
+}
+
+test "latest plan survives the replay marker wire" {
+    const gpa = std.testing.allocator;
+    const line = try encode(gpa, DaemonMsg{ .replay_done = .{
+        .sid = 7,
+        .plan_items = &.{
+            .{ .step = "Inspect", .status = .completed },
+            .{ .step = "Implement", .status = .in_progress },
+        },
+    } });
+    defer gpa.free(line);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const decoded = try decode(DaemonMsg, arena_state.allocator(), line);
+    try std.testing.expectEqual(@as(u64, 7), decoded.replay_done.sid);
+    try std.testing.expectEqual(@as(usize, 2), decoded.replay_done.plan_items.len);
+    try std.testing.expectEqual(block.PlanStatus.in_progress, decoded.replay_done.plan_items[1].status);
 }
 
 test "input attachments survive the remote-client wire" {

@@ -291,6 +291,17 @@ const TabLayout = struct {
     hidden_right: bool = false,
 };
 
+const PlanItemOwned = struct {
+    step: []u8,
+    status: block.PlanStatus,
+};
+
+fn deinitPlan(gpa: std.mem.Allocator, items: *std.ArrayList(PlanItemOwned)) void {
+    for (items.items) |item| gpa.free(item.step);
+    items.deinit(gpa);
+    items.* = .empty;
+}
+
 /// Inactive sessions keep their complete client-side view state without
 /// remaining subscribed to their block streams. Moving these containers in
 /// and out of App is allocation-free after the first visit.
@@ -299,6 +310,7 @@ const SavedSessionView = struct {
     blocks: std.ArrayList(RenderBlock),
     delta: std.ArrayList(u8),
     reasoning_delta: std.ArrayList(u8),
+    plan: std.ArrayList(PlanItemOwned) = .empty,
     state: proto.SessionState,
     model: std.ArrayList(u8),
     effort: proto.ReasoningEffort,
@@ -331,6 +343,7 @@ const SavedSessionView = struct {
         self.blocks.deinit(gpa);
         self.delta.deinit(gpa);
         self.reasoning_delta.deinit(gpa);
+        deinitPlan(gpa, &self.plan);
         self.model.deinit(gpa);
         self.cwd.deinit(gpa);
     }
@@ -359,6 +372,9 @@ const App = struct {
     blocks: std.ArrayList(RenderBlock) = .empty,
     delta: std.ArrayList(u8) = .empty,
     reasoning_delta: std.ArrayList(u8) = .empty,
+    /// Latest durable plan revision. It is rendered outside transcript
+    /// scrollback and therefore survives folding and bounded replay.
+    plan: std.ArrayList(PlanItemOwned) = .empty,
     state: proto.SessionState = .idle,
     model: std.ArrayList(u8) = .empty,
     effort: proto.ReasoningEffort = .auto,
@@ -553,6 +569,7 @@ const App = struct {
         self.blocks.deinit(self.gpa);
         self.delta.deinit(self.gpa);
         self.reasoning_delta.deinit(self.gpa);
+        deinitPlan(self.gpa, &self.plan);
         self.model.deinit(self.gpa);
         self.cwd.deinit(self.gpa);
         self.home.deinit(self.gpa);
@@ -625,6 +642,23 @@ const App = struct {
     fn setCwdStr(self: *App, cwd: []const u8) void {
         self.cwd.clearRetainingCapacity();
         self.cwd.appendSlice(self.gpa, cwd) catch {};
+    }
+
+    fn setPlan(self: *App, source: []const block.PlanItem) void {
+        var replacement: std.ArrayList(PlanItemOwned) = .empty;
+        for (source) |item| {
+            const step = self.gpa.dupe(u8, item.step) catch {
+                deinitPlan(self.gpa, &replacement);
+                return;
+            };
+            replacement.append(self.gpa, .{ .step = step, .status = item.status }) catch {
+                self.gpa.free(step);
+                deinitPlan(self.gpa, &replacement);
+                return;
+            };
+        }
+        deinitPlan(self.gpa, &self.plan);
+        self.plan = replacement;
     }
 
     fn setHomeStr(self: *App, home: []const u8) void {
@@ -700,6 +734,7 @@ const App = struct {
         self.blocks = .empty;
         self.delta = .empty;
         self.reasoning_delta = .empty;
+        self.plan = .empty;
         self.state = .idle;
         self.model = .empty;
         self.effort = .auto;
@@ -739,6 +774,7 @@ const App = struct {
             .blocks = self.blocks,
             .delta = self.delta,
             .reasoning_delta = self.reasoning_delta,
+            .plan = self.plan,
             .state = self.state,
             .model = self.model,
             .effort = self.effort,
@@ -803,6 +839,7 @@ const App = struct {
         self.blocks = saved.blocks;
         self.delta = saved.delta;
         self.reasoning_delta = saved.reasoning_delta;
+        self.plan = saved.plan;
         self.state = saved.state;
         self.model = saved.model;
         self.effort = saved.effort;
@@ -1270,6 +1307,7 @@ const App = struct {
             },
             .replay_done => |replay| {
                 if (replay.sid != self.sid) return;
+                if (!replay.has_newer) self.setPlan(replay.plan_items);
                 if (replay.forward) {
                     if (replay.has_newer and replay.newest_seq > 0) {
                         self.conn.send(.{ .sub = .{
@@ -1483,6 +1521,7 @@ const App = struct {
                 const txt = if (ap.decision) |d| @tagName(d) else "pending";
                 self.pushDurableBlock(b, .approval, txt, "", .ok);
             },
+            .plan => |plan| self.setPlan(plan.items),
             .system_note => |sn| {
                 if (!isCompactionStatusNote(sn.text))
                     self.pushDurableBlock(b, .system_note, sn.text, "", .ok);
@@ -3031,6 +3070,73 @@ fn drawTabBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
     }
 }
 
+const PlanDisplayRange = struct { start: usize = 0, len: usize = 0 };
+
+fn planDisplayRange(items: []const PlanItemOwned, max_rows: usize) PlanDisplayRange {
+    if (max_rows == 0 or items.len == 0) return .{};
+    var focus: ?usize = null;
+    for (items, 0..) |item, index| {
+        if (item.status == .in_progress) {
+            focus = index;
+            break;
+        }
+        if (focus == null and item.status == .pending) focus = index;
+    }
+    const at = focus orelse return .{};
+    const len = @min(items.len, max_rows);
+    var start = at -| (len / 2);
+    if (start + len > items.len) start = items.len - len;
+    return .{ .start = start, .len = len };
+}
+
+fn drawPlan(
+    app: *const App,
+    win: vaxis.Window,
+    arena: std.mem.Allocator,
+    top: u16,
+    height: u16,
+) !void {
+    if (height == 0) return;
+    const panel = win.child(.{ .y_off = top, .height = height, .width = win.width });
+    panel.fill(.{ .style = Palette.plan_panel });
+    const range = planDisplayRange(app.plan.items, height);
+
+    var child_running: usize = 0;
+    for (app.sessions.items) |session| {
+        if (session.parent_sid == app.sid and
+            (session.state == .running or session.state == .awaiting_approval))
+            child_running += 1;
+    }
+
+    for (app.plan.items[range.start .. range.start + range.len], 0..) |item, row| {
+        const marker: []const u8 = switch (item.status) {
+            .pending => "  · ",
+            .in_progress => "  ▸ ",
+            .completed => "  ✓ ",
+        };
+        const style: vaxis.Style = switch (item.status) {
+            .pending => Palette.plan_pending,
+            .in_progress => Palette.plan_active,
+            .completed => Palette.plan_done,
+        };
+        const suffix = if (item.status == .in_progress and child_running > 0)
+            try std.fmt.allocPrint(arena, " · {d} child{s} working", .{
+                child_running,
+                if (child_running == 1) "" else "ren",
+            })
+        else
+            "";
+        const available = @as(usize, win.width) -| (4 + suffix.len);
+        const end = hardCellBreak(item.step, 0, available);
+        const segments = [_]vaxis.Segment{
+            .{ .text = marker, .style = style },
+            .{ .text = item.step[0..end], .style = style },
+            .{ .text = suffix, .style = style },
+        };
+        _ = panel.print(&segments, .{ .row_offset = @intCast(row), .wrap = .none });
+    }
+}
+
 fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const win = vx.window();
     win.clear();
@@ -3048,7 +3154,11 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const content_h: u16 = @intCast(app.editor.displayHeight(panel_inner_w -| 2));
     const input_h: u16 = @intCast(inputPanelHeight(content_h));
     const input_gap: u16 = 1;
-    const view_h: u16 = h -| (@as(u16, @intCast(tab_bar_height)) + input_h + input_gap + 1); // tabs + input + gap + status
+    const fixed_h = @as(u16, @intCast(tab_bar_height)) + input_h + input_gap + 1;
+    const plan_capacity = h -| (fixed_h + 2); // retain a usable transcript viewport
+    const plan_range = planDisplayRange(app.plan.items, @min(@as(usize, 5), plan_capacity));
+    const plan_h: u16 = @intCast(plan_range.len);
+    const view_h: u16 = h -| (fixed_h + plan_h); // tabs + plan + input + gap + status
 
     // ---- session view ----
     var lines = try layoutLines(arena, app, w);
@@ -3133,8 +3243,11 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         }
     }
 
-    // ---- input box ----
     const input_top = h - 1 - input_h;
+    const plan_top = input_top -| input_gap -| plan_h;
+    try drawPlan(app, win, arena, plan_top, plan_h);
+
+    // ---- input box ----
     const input_panel = win.child(.{ .y_off = input_top, .height = input_h, .width = w });
     input_panel.fill(.{ .style = Palette.prompt_panel });
     const input_win = input_panel.child(.{
@@ -5327,10 +5440,17 @@ test "replay marker completes a bounded tail without needing a connection" {
         .oldest_seq = 20,
         .newest_seq = 275,
         .has_older = true,
+        .plan_items = &.{
+            .{ .step = "Inspect", .status = .completed },
+            .{ .step = "Implement", .status = .in_progress },
+        },
     } }));
     try std.testing.expectEqual(@as(u64, 20), app.oldest_seq);
     try std.testing.expect(!app.history_complete);
     try std.testing.expect(!app.history_loading);
+    try std.testing.expectEqual(@as(usize, 2), app.plan.items.len);
+    try std.testing.expectEqualStrings("Implement", app.plan.items[1].step);
+    try std.testing.expectEqual(block.PlanStatus.in_progress, app.plan.items[1].status);
 }
 
 test "older replay page is prepended atomically in transcript order" {
@@ -6427,4 +6547,25 @@ test "J joins lines; gg tops; gt cycles sessions" {
     try std.testing.expect(app.copy_cursor == null);
     try std.testing.expect(app.copy_pending);
     try std.testing.expect(app.sel_clear_after_copy);
+}
+
+test "plan strip centers unfinished work and collapses when complete" {
+    const items = [_]PlanItemOwned{
+        .{ .step = @constCast("one"), .status = .completed },
+        .{ .step = @constCast("two"), .status = .completed },
+        .{ .step = @constCast("three"), .status = .in_progress },
+        .{ .step = @constCast("four"), .status = .pending },
+        .{ .step = @constCast("five"), .status = .pending },
+        .{ .step = @constCast("six"), .status = .pending },
+    };
+    const visible = planDisplayRange(&items, 3);
+    try std.testing.expectEqual(@as(usize, 1), visible.start);
+    try std.testing.expectEqual(@as(usize, 3), visible.len);
+
+    const completed = [_]PlanItemOwned{
+        .{ .step = @constCast("one"), .status = .completed },
+        .{ .step = @constCast("two"), .status = .completed },
+    };
+    try std.testing.expectEqual(@as(usize, 0), planDisplayRange(&completed, 5).len);
+    try std.testing.expectEqual(@as(usize, 0), planDisplayRange(&items, 0).len);
 }

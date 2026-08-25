@@ -785,16 +785,19 @@ pub const Store = struct {
             \\WITH frontier(value) AS (
             \\  SELECT COALESCE(MAX(CAST(json_extract(body_json, '$.compaction.covers_to_seq') AS INTEGER)), 0)
             \\  FROM blocks WHERE session_id=? AND kind='compaction'
+            \\), latest_plan(value) AS (
+            \\  SELECT COALESCE(MAX(seq), 0) FROM blocks WHERE session_id=? AND kind='plan'
             \\)
             \\SELECT id, turn_id, seq, ts, body_json
-            \\FROM blocks, frontier
-            \\WHERE session_id=? AND (kind='compaction' OR seq>frontier.value)
+            \\FROM blocks, frontier, latest_plan
+            \\WHERE session_id=? AND (kind='compaction' OR seq>frontier.value OR seq=latest_plan.value)
             \\ORDER BY seq ASC LIMIT ?
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
         bindInt(stmt, 2, @bitCast(session_id));
-        bindInt(stmt, 3, @intCast(limit));
+        bindInt(stmt, 3, @bitCast(session_id));
+        bindInt(stmt, 4, @intCast(limit));
 
         while (true) {
             const rc = c.sqlite3_step(stmt);
@@ -815,6 +818,33 @@ pub const Store = struct {
                 .body = body,
             });
         }
+    }
+
+    /// Decode the newest durable plan revision for a freshly subscribed
+    /// client. This is independent of its bounded transcript replay window.
+    pub fn loadLatestPlan(
+        self: Store,
+        arena: std.mem.Allocator,
+        session_id: u64,
+    ) Error!?[]const block.PlanItem {
+        const stmt = try self.prepare(
+            "SELECT body_json FROM blocks WHERE session_id=? AND kind='plan' ORDER BY seq DESC LIMIT 1",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        const body_ptr = c.sqlite3_column_text(stmt, 0);
+        const body_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        const body_json = try arena.dupe(u8, body_ptr[0..body_len]);
+        const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.SqliteStep;
+        return switch (body) {
+            .plan => |plan| plan.items,
+            else => error.SqliteStep,
+        };
     }
 
     /// Load the newest block window while returning it in transcript order.
@@ -1380,6 +1410,55 @@ test "context load skips durable rows superseded by nested compactions" {
     try std.testing.expectEqual(@as(u64, 5), relevant.items[0].seq);
     try std.testing.expectEqual(@as(u64, 9), relevant.items[1].seq);
     try std.testing.expectEqual(@as(u64, 10), relevant.items[2].seq);
+}
+
+test "latest plan remains context-relevant after compaction" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+    try store.appendBlock(.{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 0,
+        .body = .{ .user_msg = .{ .text = "work" } },
+    });
+    const items = [_]block.PlanItem{
+        .{ .step = "Inspect", .status = .completed },
+        .{ .step = "Implement", .status = .in_progress },
+    };
+    try store.appendBlock(.{
+        .id = 2,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 2,
+        .ts = 0,
+        .body = .{ .plan = .{ .items = &items } },
+    });
+    try store.appendBlock(.{
+        .id = 3,
+        .session_id = 1,
+        .turn_id = 2,
+        .seq = 3,
+        .ts = 0,
+        .body = .{ .compaction = .{ .summary = "work started", .covers_from_seq = 1, .covers_to_seq = 2 } },
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var relevant: std.ArrayList(block.Block) = .empty;
+    try store.loadContextBlocksInto(arena, &relevant, 1, 100);
+    try std.testing.expectEqual(@as(usize, 2), relevant.items.len);
+    try std.testing.expectEqual(block.BlockKind.plan, relevant.items[0].kind());
+    try std.testing.expectEqual(block.BlockKind.compaction, relevant.items[1].kind());
+
+    const latest = (try store.loadLatestPlan(arena, 1)).?;
+    try std.testing.expectEqual(@as(usize, 2), latest.len);
+    try std.testing.expectEqualStrings("Implement", latest[1].step);
+    try std.testing.expectEqual(block.PlanStatus.in_progress, latest[1].status);
 }
 
 test "one connection survives concurrent turn writes and dispatcher reads" {

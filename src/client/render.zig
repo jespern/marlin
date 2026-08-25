@@ -27,6 +27,11 @@ pub const Palette = struct {
     pub const command_selected: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 7 } };
     pub const command_selected_name: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 6 }, .bold = true };
     pub const command_selected_description: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 7 } };
+    pub const plan_bg: vaxis.Color = .{ .rgb = .{ 0x28, 0x2d, 0x34 } };
+    pub const plan_panel: vaxis.Style = .{ .bg = plan_bg };
+    pub const plan_pending: vaxis.Style = .{ .bg = plan_bg, .fg = .{ .index = 7 } };
+    pub const plan_active: vaxis.Style = .{ .bg = plan_bg, .fg = soft_blue, .bold = true };
+    pub const plan_done: vaxis.Style = .{ .bg = plan_bg, .fg = .{ .index = 8 }, .dim = true };
     pub const shortcut_panel: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 7 } };
     pub const shortcut_key: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 6 }, .bold = true };
     pub const shortcut_text: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 7 } };

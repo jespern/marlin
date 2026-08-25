@@ -18,6 +18,7 @@ const files = @import("files.zig");
 const search = @import("search.zig");
 const fetch_tool = @import("fetch.zig");
 const task = @import("task.zig");
+const plan = @import("plan.zig");
 
 pub const Spec = struct {
     name: []const u8,
@@ -39,6 +40,7 @@ pub const specs = [_]Spec{
     .{ .name = search.grep_spec_name, .description = search.grep_spec_description, .schema_json = search.grep_spec_schema, .parallel_safe = true, .mutating = false },
     .{ .name = search.glob_spec_name, .description = search.glob_spec_description, .schema_json = search.glob_spec_schema, .parallel_safe = true, .mutating = false },
     .{ .name = fetch_tool.spec_name, .description = fetch_tool.spec_description, .schema_json = fetch_tool.spec_schema, .parallel_safe = true, .mutating = false },
+    .{ .name = plan.spec_name, .description = plan.spec_description, .schema_json = plan.spec_schema, .parallel_safe = false, .mutating = false },
     // Execution crosses back to the daemon dispatcher through RunOpts.on_task;
     // generic dispatch intentionally has no session/store access.
     .{ .name = task.spec_name, .description = task.spec_description, .schema_json = task.spec_schema, .parallel_safe = false, .mutating = false },
@@ -56,11 +58,16 @@ pub const ExecOut = struct {
     output: []u8,
     status: block.ToolStatus,
     media: []MediaOutput = &.{},
+    plan_items: ?[]block.PlanItem = null,
 
     pub fn deinit(self: ExecOut, gpa: std.mem.Allocator) void {
         gpa.free(self.output);
         for (self.media) |item| item.deinit(gpa);
         if (self.media.len > 0) gpa.free(self.media);
+        if (self.plan_items) |items| {
+            for (items) |item| gpa.free(@constCast(item.step));
+            gpa.free(items);
+        }
     }
 };
 
@@ -175,6 +182,14 @@ pub fn dispatch(
         const parsed = parseArgs(fetch_tool.Args, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
         return cancellableTextResult(fetch_tool.fetch(gpa, io, source_environ, parsed.value, policy, cancel), gpa);
+    }
+    if (std.mem.eql(u8, name, plan.spec_name)) {
+        const result = plan.run(gpa, args_json);
+        return .{
+            .output = result.output,
+            .status = result.status,
+            .plan_items = result.items,
+        };
     }
     const msg = std.fmt.allocPrint(gpa, "error: unknown tool '{s}'", .{name}) catch @panic("oom");
     return .{ .output = msg, .status = .err };

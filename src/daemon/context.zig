@@ -71,6 +71,20 @@ pub const system_prompt_base =
     \\  running programs.
     \\- Read a file before editing it; after a change, re-run a focused check.
     \\
+    \\PLANNING
+    \\- For substantial work with multiple dependent steps, call `plan_update`
+    \\  once initial inspection is sufficient to name concrete outcomes. Skip
+    \\  plans for trivial questions and single-action changes.
+    \\- Keep the plan operational and current: exactly one step in_progress
+    \\  while work remains, mark completed steps promptly, and revise the
+    \\  remaining steps when evidence changes the path. Do not merely announce
+    \\  a plan in prose or repeat the displayed plan in progress commentary.
+    \\- Execute the plan through completion. Use `task` or `task_batch` within
+    \\  a step when independent read-only work benefits from parallelism, then
+    \\  synthesize the children before advancing the plan.
+    \\- Before a final answer, mark every finished step completed. Never claim
+    \\  the work is done while leaving its plan in_progress.
+    \\
     \\DELEGATION AND PARALLELISM
     \\- When `task` and `task_batch` are available, use them proactively for
     \\  substantial read-only work. Invoke `task_batch` without waiting for the
@@ -256,9 +270,11 @@ pub fn assemble(
     // skipped if ANY compaction covers it. Summaries of covered compaction
     // blocks are superseded and not emitted.
     var covered_max: u64 = 0; // highest covers_to_seq seen
+    var current_plan: ?[]const block.PlanItem = null;
     for (blocks) |b| {
         switch (b.body) {
             .compaction => |cp| covered_max = @max(covered_max, cp.covers_to_seq),
+            .plan => |plan| current_plan = plan.items,
             else => {},
         }
     }
@@ -381,7 +397,7 @@ pub fn assemble(
                                 }
                             }
                         },
-                        .reasoning, .approval, .system_note => {},
+                        .reasoning, .approval, .plan, .system_note => {},
                         else => break :results,
                     }
                 }
@@ -405,7 +421,7 @@ pub fn assemble(
             // input. Old compactions could bisect a parallel batch and leave
             // exactly this shape; omit it so those sessions self-heal.
             .tool_result => {},
-            .reasoning, .approval, .system_note => {}, // not sent to the model
+            .reasoning, .approval, .plan, .system_note => {}, // not sent to the model
             .compaction => {}, // handled above
         }
     }
@@ -413,7 +429,27 @@ pub fn assemble(
     // round; unlike a bare user prompt, it is known to have a follow-up.
     if (msgs.items.len > 0 and msgs.items[msgs.items.len - 1].role == .tool)
         msgs.items[msgs.items.len - 1].cache_breakpoint = true;
+    if (current_plan) |items| {
+        if (planHasWork(items)) {
+            var text: std.ArrayList(u8) = .empty;
+            try text.appendSlice(arena, "CURRENT PLAN (durable execution state; revise with plan_update)\n");
+            for (items) |item| try text.print(arena, "- [{s}] {s}\n", .{
+                switch (item.status) {
+                    .pending => " ",
+                    .in_progress => ">",
+                    .completed => "x",
+                },
+                item.step,
+            });
+            try msgs.append(arena, .{ .role = .system, .payload = .{ .text = text.items } });
+        }
+    }
     return msgs.toOwnedSlice(arena);
+}
+
+fn planHasWork(items: []const block.PlanItem) bool {
+    for (items) |item| if (item.status != .completed) return true;
+    return false;
 }
 
 const legacy_rehydration_prefix = "[rehydrated after compaction]";
@@ -629,7 +665,7 @@ pub fn renderForSummary(
             .tool_call => |tc| try out.print(arena, "TOOL CALL {s}: {s}\n", .{ tc.name, tc.args_json[0..@min(tc.args_json.len, 500)] }),
             .tool_result => |tr| try out.print(arena, "RESULT ({t}): {s}\n\n", .{ tr.status, tr.inline_body[0..@min(tr.inline_body.len, 1500)] }),
             .compaction => |cp| try out.print(arena, "[EARLIER SUMMARY]\n{s}\n\n", .{cp.summary}),
-            .reasoning, .approval, .system_note => {},
+            .reasoning, .approval, .plan, .system_note => {},
         }
         if (out.items.len > byte_budget) {
             try out.appendSlice(arena, "\n[... transcript truncated for summarization ...]\n");
@@ -825,6 +861,9 @@ test "assemble: system prompt carries instructions, environment, and suffix" {
     try std.testing.expect(std.mem.indexOf(u8, sys, "rg` (ripgrep)") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "use `jq`") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "fetch\n  over curl or wget") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "PLANNING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "call `plan_update`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "Do not merely announce") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "DELEGATION AND PARALLELISM") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "Invoke `task_batch` without waiting") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "parent remains responsible") != null);
@@ -839,6 +878,45 @@ test "assemble: system prompt carries instructions, environment, and suffix" {
     const bare = try assemble(arena, &blocks, .{});
     try std.testing.expect(std.mem.indexOf(u8, bare[0].payload.text, "PROJECT INSTRUCTIONS") == null);
     try std.testing.expect(std.mem.indexOf(u8, bare[0].payload.text, "ENVIRONMENT\n-") == null);
+}
+
+test "assemble: latest unfinished plan survives compaction as current state" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const items = [_]block.PlanItem{
+        .{ .step = "Inspect the failure", .status = .completed },
+        .{ .step = "Implement the fix", .status = .in_progress },
+        .{ .step = "Verify end to end", .status = .pending },
+    };
+    const blocks = [_]block.Block{
+        tb(2, .{ .plan = .{ .items = &items } }),
+        tb(4, .{ .compaction = .{ .summary = "Earlier work", .covers_from_seq = 1, .covers_to_seq = 3 } }),
+        tb(5, .{ .user_msg = .{ .text = "continue" } }),
+    };
+    const msgs = try assemble(arena, &blocks, .{});
+    const current = msgs[msgs.len - 1];
+    try std.testing.expectEqual(provider.Role.system, current.role);
+    try std.testing.expect(std.mem.indexOf(u8, current.payload.text, "CURRENT PLAN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current.payload.text, "[>] Implement the fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current.payload.text, "[ ] Verify end to end") != null);
+}
+
+test "assemble: completed plan collapses out of model context" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const items = [_]block.PlanItem{.{ .step = "Done", .status = .completed }};
+    const blocks = [_]block.Block{
+        tb(1, .{ .user_msg = .{ .text = "work" } }),
+        tb(2, .{ .plan = .{ .items = &items } }),
+    };
+    const msgs = try assemble(arena, &blocks, .{});
+    for (msgs) |msg| switch (msg.payload) {
+        .text => |text| try std.testing.expect(std.mem.indexOf(u8, text, "CURRENT PLAN") == null),
+        else => {},
+    };
 }
 
 test "assemble: volatile environment follows stable history" {

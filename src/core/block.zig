@@ -20,6 +20,7 @@ pub const BlockKind = enum {
     tool_result,
     approval,
     steer,
+    plan,
     compaction,
     system_note,
 };
@@ -27,6 +28,13 @@ pub const BlockKind = enum {
 pub const ToolStatus = enum { ok, err, denied, interrupted };
 
 pub const ApprovalDecision = enum { granted, denied, timeout };
+
+pub const PlanStatus = enum { pending, in_progress, completed };
+
+pub const PlanItem = struct {
+    step: []const u8,
+    status: PlanStatus,
+};
 
 /// Durable reference to binary media stored in the content-addressed blob
 /// table. Blocks carry only metadata; replay never inflates the transcript
@@ -83,6 +91,9 @@ pub const Body = union(BlockKind) {
         decided_by: ?[]const u8, // client id
     },
     steer: struct { text: []const u8 },
+    /// One immutable plan revision. The newest revision is the current plan;
+    /// completed revisions remain in the log as execution history.
+    plan: struct { items: []const PlanItem },
     compaction: struct {
         /// Reconstruction-grade summary (see context.zig contract).
         summary: []const u8,

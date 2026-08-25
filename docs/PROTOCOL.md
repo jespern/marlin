@@ -82,7 +82,9 @@ the window is additionally restricted to blocks with seq < N. This keeps both
 initial attach and backwards scrollback independent of session length: Marlin
 requests 256 blocks at a time and atomically prepends another page when the
 user reaches the loaded top. Every bounded replay ends with
-`replay_done{oldest_seq,newest_seq,has_older}`.
+`replay_done{oldest_seq,newest_seq,has_older,plan_items}`. `plan_items` carries
+the latest durable plan revision independently of the bounded block window, so
+the pinned plan is correct immediately after attach.
 
 `sub.replay_limit`: when non-zero with `from_seq`, replay at most 512 blocks
 forward and return `replay_done{...,has_newer,forward:true}`. If `has_newer` is
@@ -140,7 +142,7 @@ descendants.
 | delta {sid, turn_id, text} | streaming assistant text (ephemeral) |
 | reasoning_delta {sid, turn_id, text} | provider reasoning stream (ephemeral, rendered separately from assistant text) |
 | stream_status {sid, bytes, quiet_ms} | stream liveness while receiving from the provider: cumulative body bytes this round + ms since the last visible delta; throttled to ~1/s (ephemeral) |
-| replay_done {sid, oldest_seq, newest_seq, has_older, has_newer, forward} | requested replay page finished; bounded clients page backward with `has_older` or forward with `has_newer` |
+| replay_done {sid, oldest_seq, newest_seq, has_older, has_newer, forward, plan_items} | requested replay page finished; bounded clients page backward with `has_older` or forward with `has_newer`; the final page restores the latest plan |
 | status {sid, state} | session state change: idle/running/awaiting_approval/err/done |
 | approval_request {sid, approval_id, call_id, tool, args_json} | a mutating tool call parked on the gate; answer with `approve` |
 | session_meta {sid, tokens_in, tokens_out, context_used, context_limit} | after each turn; ALWAYS sent before the closing status. context_* feed the status-bar gauge (0 = unmeasured) |

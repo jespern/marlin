@@ -77,6 +77,7 @@ test {
     _ = @import("daemon/tools/files.zig");
     _ = @import("daemon/tools/search.zig");
     _ = @import("daemon/tools/fetch.zig");
+    _ = @import("daemon/tools/plan.zig");
     _ = @import("daemon/tools/exec_tool.zig");
     _ = @import("daemon/tools/mcp.zig");
     _ = @import("daemon/provider/provider.zig");

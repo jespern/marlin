@@ -1,0 +1,43 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["deliver a planned change", "\"name\":\"plan_update\""],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_plan_1\",\"function\":{\"name\":\"plan_update\",\"arguments\":\"{\\\"explanation\\\":\\\"starting\\\",\\\"plan\\\":[{\\\"step\\\":\\\"Inspect\\\",\\\"status\\\":\\\"in_progress\\\"},{\\\"step\\\":\\\"Report\\\",\\\"status\\\":\\\"pending\\\"}]}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["\"tool_call_id\":\"call_plan_1\"", "plan updated: 0/2 completed", "CURRENT PLAN", "Inspect", "Report"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_plan_2\",\"function\":{\"name\":\"plan_update\",\"arguments\":\"{\\\"explanation\\\":\\\"inspection complete\\\",\\\"plan\\\":[{\\\"step\\\":\\\"Inspect\\\",\\\"status\\\":\\\"completed\\\"},{\\\"step\\\":\\\"Report\\\",\\\"status\\\":\\\"in_progress\\\"}]}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["\"tool_call_id\":\"call_plan_2\"", "plan updated: 1/2 completed", "CURRENT PLAN", "[>] Report"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_plan_3\",\"function\":{\"name\":\"plan_update\",\"arguments\":\"{\\\"explanation\\\":\\\"work complete\\\",\\\"plan\\\":[{\\\"step\\\":\\\"Inspect\\\",\\\"status\\\":\\\"completed\\\"},{\\\"step\\\":\\\"Report\\\",\\\"status\\\":\\\"completed\\\"}]}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":8}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["\"tool_call_id\":\"call_plan_3\"", "plan updated: 2/2 completed"],
+      "expect_not_contains": ["CURRENT PLAN"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"planned change delivered\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":60,\"completion_tokens\":4}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "deliver a planned change"],
+    "exit_code": 0,
+    "stdout_contains": ["planned change delivered"],
+    "db_kinds": ["user_msg", "tool_call", "tool_result", "plan", "tool_call", "tool_result", "plan", "tool_call", "tool_result", "plan", "assistant_msg"]
+  }
+}

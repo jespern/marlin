@@ -200,6 +200,14 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .decided_by = if (value.decided_by) |client| try arena.dupe(u8, client) else null,
         } },
         .steer => |value| .{ .steer = .{ .text = try arena.dupe(u8, value.text) } },
+        .plan => |value| blk: {
+            const items = try arena.alloc(block.PlanItem, value.items.len);
+            for (value.items, items) |item, *copy| copy.* = .{
+                .step = try arena.dupe(u8, item.step),
+                .status = item.status,
+            };
+            break :blk .{ .plan = .{ .items = items } };
+        },
         .compaction => |value| .{ .compaction = .{
             .summary = try arena.dupe(u8, value.summary),
             .covers_from_seq = value.covers_from_seq,
@@ -688,6 +696,11 @@ pub fn runTurn(
                     blob_index += 1;
                 }
                 _ = try ap.appendWithBlobs(result_body, blobs);
+            }
+            if (exec.status == .ok) {
+                if (exec.plan_items) |items| {
+                    _ = try ap.append(.{ .plan = .{ .items = items } });
+                }
             }
         }
         // Loop: next round re-assembles including the new tool results.
