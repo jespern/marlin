@@ -24,8 +24,96 @@
 
 const std = @import("std");
 const Io = std.Io;
+const process_io = @import("process_io");
 const temp_dir = @import("temp_dir.zig");
 const TempDir = temp_dir.Dir;
+
+const scenario_timeout_ms: u32 = 30_000;
+const shutdown_timeout_ms: u32 = 3_000;
+const helper_timeout_ms: u32 = 5_000;
+
+const ProviderPortJob = struct {
+    io: Io,
+    file: Io.File,
+    done: std.atomic.Value(bool) = .init(false),
+    port: ?u16 = null,
+
+    fn run(job: *ProviderPortJob) void {
+        defer job.done.store(true, .release);
+        var buffer: [64]u8 = undefined;
+        var reader = job.file.reader(job.io, &buffer);
+        const line = reader.interface.takeDelimiterExclusive('\n') catch return;
+        if (!std.mem.startsWith(u8, line, "PORT ")) return;
+        job.port = std.fmt.parseInt(u16, std.mem.trim(u8, line[5..], " \r\n"), 10) catch null;
+    }
+};
+
+const ProviderWaitJob = struct {
+    io: Io,
+    child: *std.process.Child,
+    done: std.atomic.Value(bool) = .init(false),
+    term: ?std.process.Child.Term = null,
+
+    fn run(job: *ProviderWaitJob) void {
+        job.term = job.child.wait(job.io) catch null;
+        job.done.store(true, .release);
+    }
+};
+
+fn waitForFlag(io: Io, flag: *const std.atomic.Value(bool), timeout_ms: u32) bool {
+    const deadline = Io.Timestamp.now(io, .awake).nanoseconds +
+        @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (!flag.load(.acquire)) {
+        if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline) return false;
+        io.sleep(.fromMilliseconds(10), .awake) catch return false;
+    }
+    return true;
+}
+
+fn reapChild(io: Io, child: *std.process.Child) void {
+    if (child.id == null) return;
+    _ = child.wait(io) catch {
+        child.kill(io);
+        return;
+    };
+}
+
+fn readProviderPort(io: Io, child: *std.process.Child) !u16 {
+    const group_id = child.id orelse return error.ProviderExitedBeforePort;
+    var job = ProviderPortJob{ .io = io, .file = child.stdout.? };
+    const thread = std.Thread.spawn(.{}, ProviderPortJob.run, .{&job}) catch {
+        process_io.terminateProcessTree(child, io, 50);
+        return error.ProviderPortReaderFailed;
+    };
+    if (!waitForFlag(io, &job.done, helper_timeout_ms)) {
+        process_io.terminateProcessGroup(io, group_id, 50);
+        thread.join();
+        reapChild(io, child);
+        return error.ProviderStartTimedOut;
+    }
+    thread.join();
+    return job.port orelse {
+        process_io.terminateProcessTree(child, io, 50);
+        return error.NoPortLine;
+    };
+}
+
+fn waitProvider(io: Io, child: *std.process.Child) !std.process.Child.Term {
+    const group_id = child.id orelse return error.ProviderAlreadyReaped;
+    var job = ProviderWaitJob{ .io = io, .child = child };
+    const thread = std.Thread.spawn(.{}, ProviderWaitJob.run, .{&job}) catch {
+        process_io.terminateProcessTree(child, io, 50);
+        return error.ProviderWaitThreadFailed;
+    };
+    const completed = waitForFlag(io, &job.done, helper_timeout_ms);
+    if (!completed) process_io.terminateProcessGroup(io, group_id, 50);
+    thread.join();
+    if (!completed) return error.ProviderCompletionTimedOut;
+    return job.term orelse {
+        if (child.id != null) process_io.terminateProcessTree(child, io, 50);
+        return error.ProviderWaitFailed;
+    };
+}
 
 const Check = struct {
     argv: []const []const u8,
@@ -156,19 +244,22 @@ fn runScenario(
     var prov = try std.process.spawn(io, .{
         .argv = &.{ fakeprov_bin, scenario_path },
         .stdout = .pipe,
-        .stderr = .inherit,
+        // Never inherit the runner's stderr: an accidentally surviving
+        // provider must not retain a caller's `tee`/pipeline write end.
+        .stderr = .ignore,
+        .pgid = 0,
     });
     // Ensure cleanup even on failure paths.
     var prov_done = false;
     defer if (!prov_done) {
-        prov.kill(io);
+        process_io.terminateProcessTree(&prov, io, 50);
+        prov_done = true;
     };
 
-    var port_buf: [64]u8 = undefined;
-    var prov_reader = prov.stdout.?.reader(io, &port_buf);
-    const port_line = try prov_reader.interface.takeDelimiterExclusive('\n');
-    if (!std.mem.startsWith(u8, port_line, "PORT ")) return error.NoPortLine;
-    const port = try std.fmt.parseInt(u16, std.mem.trim(u8, port_line[5..], " \r\n"), 10);
+    const port = readProviderPort(io, &prov) catch |err| {
+        prov_done = prov.id == null;
+        return err;
+    };
 
     const base_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/v1", .{port});
 
@@ -180,6 +271,9 @@ fn runScenario(
     const sock_path = try std.fmt.allocPrint(arena, "{s}/daemon.sock", .{state_dir});
     try env.put("MARLIN_SOCKET", sock_path);
     try env.put("MARLIN_BASE_URL_OPENROUTER", base_url);
+    // Test daemons remain in the runner's process group. That makes Ctrl+C or
+    // an outer tool cancellation clean up the entire scenario tree.
+    try env.put("MARLIN_DAEMON_PGID", "inherit");
     try env.put("OPENROUTER_API_KEY", "test-key-e2e");
     try env.put("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     // Fixtures assert the LEGACY approval transcript (an M3.5 exit
@@ -193,17 +287,31 @@ fn runScenario(
     while (env_it.next()) |kv| {
         try env.put(kv.key_ptr.*, kv.value_ptr.*);
     }
-    // Always stop the per-scenario daemon (autostarted by marlin run).
+    // A successful client command may leave its intentionally daemonized
+    // child alive in the command's owned process group. Remember every group
+    // so cleanup can sweep it after the graceful shutdown attempt.
+    var process_groups: std.ArrayList(std.posix.pid_t) = .empty;
+    defer process_groups.deinit(gpa);
+    // Always stop the provider first, then the per-scenario daemon. The order
+    // matters: a failed shutdown must never postpone provider pipe cleanup.
     defer {
-        const res = std.process.run(gpa, io, .{
+        if (!prov_done) {
+            process_io.terminateProcessTree(&prov, io, 50);
+            prov_done = true;
+        }
+        const res = process_io.run(gpa, io, .{
             .argv = &.{ marlin_bin, "shutdown" },
             .environ_map = &env,
             .cwd = .{ .path = state_dir },
-            .stdout_limit = .limited(64 * 1024),
+            .stdout_limit = 64 * 1024,
+            .stderr_limit = 64 * 1024,
+            .timeout_ms = shutdown_timeout_ms,
         }) catch null;
         if (res) |r| {
-            gpa.free(r.stdout);
-            gpa.free(r.stderr);
+            r.deinit(gpa);
+        }
+        for (process_groups.items) |group_id| {
+            process_io.terminateProcessGroup(io, group_id, 50);
         }
     }
 
@@ -215,15 +323,22 @@ fn runScenario(
         try argv.append(arena, marlin_bin);
         for (argv_cfg) |a| try argv.append(arena, a);
 
-        const res = try std.process.run(gpa, io, .{
+        const res = process_io.run(gpa, io, .{
             .argv = argv.items,
             .environ_map = &env,
             .cwd = .{ .path = state_dir },
-            .stdout_limit = .limited(4 * 1024 * 1024),
-            .stderr_limit = .limited(4 * 1024 * 1024),
-        });
-        defer gpa.free(res.stdout);
-        defer gpa.free(res.stderr);
+            .stdout_limit = 4 * 1024 * 1024,
+            .stderr_limit = 4 * 1024 * 1024,
+            .timeout_ms = scenario_timeout_ms,
+        }) catch |err| {
+            if (err == error.Timeout) {
+                print(io, "\n  scenario command exceeded {d}ms and its process tree was terminated\n", .{scenario_timeout_ms});
+                return error.ScenarioTimedOut;
+            }
+            return err;
+        };
+        defer res.deinit(gpa);
+        if (res.process_group_id) |group_id| try process_groups.append(gpa, group_id);
 
         const is_last = runs == sf.check.runs - 1;
         if (is_last) {
@@ -274,7 +389,10 @@ fn runScenario(
     }
 
     // 4. Fake provider must have consumed all steps and validated them.
-    const prov_term = try prov.wait(io);
+    const prov_term = waitProvider(io, &prov) catch |err| {
+        prov_done = true;
+        return err;
+    };
     prov_done = true;
     switch (prov_term) {
         .exited => |c| if (c != 0) return error.ProviderExpectationsFailed,
@@ -288,12 +406,13 @@ fn runScenario(
     // 5. DB assertions via the sqlite3 CLI (avoids linking sqlite here).
     if (sf.check.db_kinds.len > 0) {
         const db_path = try std.fmt.allocPrint(arena, "{s}/marlin/marlin.db", .{state_dir});
-        const res = try std.process.run(gpa, io, .{
+        const res = try process_io.run(gpa, io, .{
             .argv = &.{ "sqlite3", db_path, "SELECT kind FROM blocks ORDER BY seq;" },
-            .stdout_limit = .limited(1024 * 1024),
+            .stdout_limit = 1024 * 1024,
+            .stderr_limit = 64 * 1024,
+            .timeout_ms = helper_timeout_ms,
         });
-        defer gpa.free(res.stdout);
-        defer gpa.free(res.stderr);
+        defer res.deinit(gpa);
 
         var lines: std.ArrayList([]const u8) = .empty;
         var lit = std.mem.splitScalar(u8, std.mem.trim(u8, res.stdout, "\n"), '\n');
@@ -318,12 +437,13 @@ fn runScenario(
             "SELECT kind || '|' || (parent_sid IS NOT NULL) || '|' || " ++
             "(parent_block_id IS NOT NULL) || '|' || COALESCE(max_rounds,0) " ++
             "FROM sessions ORDER BY CASE WHEN parent_sid IS NULL THEN 0 ELSE 1 END, created_at;";
-        const res = try std.process.run(gpa, io, .{
+        const res = try process_io.run(gpa, io, .{
             .argv = &.{ "sqlite3", db_path, query },
-            .stdout_limit = .limited(1024 * 1024),
+            .stdout_limit = 1024 * 1024,
+            .stderr_limit = 64 * 1024,
+            .timeout_ms = helper_timeout_ms,
         });
-        defer gpa.free(res.stdout);
-        defer gpa.free(res.stderr);
+        defer res.deinit(gpa);
 
         var lines: std.ArrayList([]const u8) = .empty;
         var lit = std.mem.splitScalar(u8, std.mem.trim(u8, res.stdout, "\n"), '\n');
@@ -350,15 +470,15 @@ fn checkSessionHandleFlow(
     env: *const std.process.Environ.Map,
     state_dir: []const u8,
 ) !void {
-    const listed = try std.process.run(gpa, io, .{
+    const listed = try process_io.run(gpa, io, .{
         .argv = &.{ marlin_bin, "ls" },
         .environ_map = env,
         .cwd = .{ .path = state_dir },
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(256 * 1024),
+        .stdout_limit = 256 * 1024,
+        .stderr_limit = 256 * 1024,
+        .timeout_ms = helper_timeout_ms,
     });
-    defer gpa.free(listed.stdout);
-    defer gpa.free(listed.stderr);
+    defer listed.deinit(gpa);
     if (listed.term != .exited or listed.term.exited != 0) return error.SessionHandleListFailed;
 
     const line_end = std.mem.indexOfScalar(u8, listed.stdout, '\n') orelse listed.stdout.len;
@@ -368,45 +488,45 @@ fn checkSessionHandleFlow(
     for (handle) |c| if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) return error.SessionHandleBadSyntax;
     const prefix = handle[0..4];
 
-    const archived = try std.process.run(gpa, io, .{
+    const archived = try process_io.run(gpa, io, .{
         .argv = &.{ marlin_bin, "archive", prefix },
         .environ_map = env,
         .cwd = .{ .path = state_dir },
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(256 * 1024),
+        .stdout_limit = 256 * 1024,
+        .stderr_limit = 256 * 1024,
+        .timeout_ms = helper_timeout_ms,
     });
-    defer gpa.free(archived.stdout);
-    defer gpa.free(archived.stderr);
+    defer archived.deinit(gpa);
     if (archived.term != .exited or archived.term.exited != 0 or
         std.mem.indexOf(u8, archived.stdout, handle) == null)
     {
         return error.SessionHandleArchiveFailed;
     }
 
-    const hidden = try std.process.run(gpa, io, .{
+    const hidden = try process_io.run(gpa, io, .{
         .argv = &.{ marlin_bin, "ls" },
         .environ_map = env,
         .cwd = .{ .path = state_dir },
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(256 * 1024),
+        .stdout_limit = 256 * 1024,
+        .stderr_limit = 256 * 1024,
+        .timeout_ms = helper_timeout_ms,
     });
-    defer gpa.free(hidden.stdout);
-    defer gpa.free(hidden.stderr);
+    defer hidden.deinit(gpa);
     if (hidden.term != .exited or hidden.term.exited != 0 or
         !std.mem.eql(u8, hidden.stdout, "no sessions\n"))
     {
         return error.SessionHandleArchiveVisibilityFailed;
     }
 
-    const inclusive = try std.process.run(gpa, io, .{
+    const inclusive = try process_io.run(gpa, io, .{
         .argv = &.{ marlin_bin, "ls", "--all" },
         .environ_map = env,
         .cwd = .{ .path = state_dir },
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(256 * 1024),
+        .stdout_limit = 256 * 1024,
+        .stderr_limit = 256 * 1024,
+        .timeout_ms = helper_timeout_ms,
     });
-    defer gpa.free(inclusive.stdout);
-    defer gpa.free(inclusive.stderr);
+    defer inclusive.deinit(gpa);
     if (inclusive.term != .exited or inclusive.term.exited != 0 or
         std.mem.indexOf(u8, inclusive.stdout, handle) == null or
         std.mem.indexOf(u8, inclusive.stdout, "archived") == null)
@@ -414,15 +534,15 @@ fn checkSessionHandleFlow(
         return error.SessionHandleInclusiveListFailed;
     }
 
-    const restored = try std.process.run(gpa, io, .{
+    const restored = try process_io.run(gpa, io, .{
         .argv = &.{ marlin_bin, "unarchive", prefix },
         .environ_map = env,
         .cwd = .{ .path = state_dir },
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(256 * 1024),
+        .stdout_limit = 256 * 1024,
+        .stderr_limit = 256 * 1024,
+        .timeout_ms = helper_timeout_ms,
     });
-    defer gpa.free(restored.stdout);
-    defer gpa.free(restored.stderr);
+    defer restored.deinit(gpa);
     if (restored.term != .exited or restored.term.exited != 0 or
         std.mem.indexOf(u8, restored.stdout, handle) == null)
     {
@@ -432,13 +552,13 @@ fn checkSessionHandleFlow(
 
 fn writeExecutable(gpa: std.mem.Allocator, io: Io, path: []const u8, contents: []const u8) !void {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
-    const chmod = try std.process.run(gpa, io, .{
+    const chmod = try process_io.run(gpa, io, .{
         .argv = &.{ "/bin/chmod", "700", path },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
+        .stdout_limit = 4096,
+        .stderr_limit = 4096,
+        .timeout_ms = helper_timeout_ms,
     });
-    defer gpa.free(chmod.stdout);
-    defer gpa.free(chmod.stderr);
+    defer chmod.deinit(gpa);
     if (chmod.term != .exited or chmod.term.exited != 0) return error.ExecutableFixtureSetupFailed;
 }
 

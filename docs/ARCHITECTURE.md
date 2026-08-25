@@ -309,9 +309,11 @@ loop:
   barriers. Calls and results are each persisted as contiguous ordered groups,
   matching the provider transcript even when completion order differs.
 - **Cancellation**: interrupt sets an atomic flag; the HTTP read loop and tool
-  subprocess waits poll it. Subprocesses get SIGTERM → grace → SIGKILL. The
-  half-finished turn is finalized as an interrupted `system_note` + whatever
-  blocks completed (the log stays consistent).
+  subprocess waits poll it. Every tool subprocess owns a process group, so
+  interrupt/timeout sends SIGTERM → grace → SIGKILL to the complete
+  pipeline and its descendants, then reaps the direct child. The half-finished
+  turn is finalized as an interrupted `system_note` + whatever blocks completed
+  (the log stays consistent).
 - **Retry/backoff**: on 429/5xx/mid-stream disconnect: exponential backoff w/
   jitter, max N attempts. A turn that dies mid-stream discards the partial
   assistant text (deltas were never truth) and re-requests — context is

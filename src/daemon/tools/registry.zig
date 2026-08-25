@@ -111,7 +111,11 @@ pub fn dispatch(
                 return .{ .output = output, .status = .denied };
             }
         }
-        const r = bash.run(gpa, io, parsed.value, cwd, child_environ_ptr, sandbox_options) catch |e| {
+        const r = bash.run(gpa, io, parsed.value, cwd, child_environ_ptr, sandbox_options, cancel) catch |e| {
+            if (e == error.Cancelled) return .{
+                .output = gpa.dupe(u8, "command interrupted by user") catch @panic("oom"),
+                .status = .interrupted,
+            };
             return .{ .output = errText(gpa, e), .status = .err };
         };
         if (r.exit_code != 0) {
@@ -140,12 +144,12 @@ pub fn dispatch(
     if (std.mem.eql(u8, name, search.grep_spec_name)) {
         const parsed = parseArgs(search.GrepArgs, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        return textResult(search.grep(gpa, io, parsed.value, cwd, child_environ_ptr), gpa);
+        return cancellableTextResult(search.grep(gpa, io, parsed.value, cwd, child_environ_ptr, cancel), gpa);
     }
     if (std.mem.eql(u8, name, search.glob_spec_name)) {
         const parsed = parseArgs(search.GlobArgs, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        return textResult(search.glob(gpa, io, parsed.value, cwd), gpa);
+        return cancellableTextResult(search.glob(gpa, io, parsed.value, cwd, cancel), gpa);
     }
     if (std.mem.eql(u8, name, fetch_tool.spec_name)) {
         const parsed = parseArgs(fetch_tool.Args, gpa, args_json) orelse return argError(gpa, args_json);
@@ -164,6 +168,18 @@ fn parseArgs(comptime T: type, gpa: std.mem.Allocator, args_json: []const u8) ?s
 /// "error: ..." for model-visible failures.
 fn textResult(out_or_err: anyerror![]u8, gpa: std.mem.Allocator) ExecOut {
     const out = out_or_err catch |e| return .{ .output = errText(gpa, e), .status = .err };
+    const is_err = std.mem.startsWith(u8, out, "error:");
+    return .{ .output = out, .status = if (is_err) .err else .ok };
+}
+
+fn cancellableTextResult(out_or_err: anyerror![]u8, gpa: std.mem.Allocator) ExecOut {
+    const out = out_or_err catch |e| {
+        if (e == error.Cancelled) return .{
+            .output = gpa.dupe(u8, "tool interrupted by user") catch @panic("oom"),
+            .status = .interrupted,
+        };
+        return .{ .output = errText(gpa, e), .status = .err };
+    };
     const is_err = std.mem.startsWith(u8, out, "error:");
     return .{ .output = out, .status = if (is_err) .err else .ok };
 }
@@ -297,6 +313,45 @@ test "dispatch: tool subprocess cannot see provider credentials" {
 
     try std.testing.expectEqual(block.ToolStatus.ok, r.status);
     try std.testing.expectEqualStrings("unset|visible", r.output);
+}
+
+test "dispatch: cancelled subprocess and walker tools are reported as interrupted" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cancel = std.atomic.Value(bool).init(true);
+
+    const r = dispatch(
+        gpa,
+        threaded.io(),
+        "bash",
+        \\{"command":"sleep 30"}
+    ,
+        "/tmp",
+        null,
+        .{},
+        null,
+        &cancel,
+    );
+    defer gpa.free(r.output);
+    try std.testing.expectEqual(block.ToolStatus.interrupted, r.status);
+    try std.testing.expectEqualStrings("command interrupted by user", r.output);
+
+    const globbed = dispatch(
+        gpa,
+        threaded.io(),
+        "glob",
+        \\{"pattern":"*.zig"}
+    ,
+        "/tmp",
+        null,
+        .{},
+        null,
+        &cancel,
+    );
+    defer gpa.free(globbed.output);
+    try std.testing.expectEqual(block.ToolStatus.interrupted, globbed.status);
+    try std.testing.expectEqualStrings("tool interrupted by user", globbed.output);
 }
 
 test {

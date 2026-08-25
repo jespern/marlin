@@ -1,10 +1,10 @@
 //! bash tool: subprocess execution with capture caps.
 //!
-//! M0: foreground execution via std.process.run with a byte cap on captured
-//! output. The FULL output goes to the caller (which blobs it); the inline
-//! context cap is applied by the loop via context.zig.
-//! TODO(M1): cancellation flag → SIGTERM → grace → SIGKILL (needs spawn API
-//! + poll loop instead of the blocking run helper).
+//! Foreground execution uses an owned process group, bounded capture, and
+//! cooperative cancellation. Cancellation sends SIGTERM to the complete tree,
+//! follows with SIGKILL after a short grace period, and reaps the direct child.
+//! The FULL output goes to the caller (which blobs it); the inline context cap
+//! is applied by the loop via context.zig.
 //! M3.5: subprocess environment is scrubbed at the registry boundary;
 //! macOS Seatbelt wraps execution when the daemon's canary verified it.
 //! TODO: Landlock adapter for Linux.
@@ -12,6 +12,7 @@
 const std = @import("std");
 const Io = std.Io;
 const sandbox = @import("../sandbox.zig");
+const process_io = @import("../process_io.zig");
 
 pub const spec_name = "bash";
 pub const spec_description =
@@ -47,6 +48,7 @@ pub fn run(
     cwd: []const u8,
     child_environ: ?*const std.process.Environ.Map,
     sandbox_options: sandbox.Options,
+    cancel: ?*const std.atomic.Value(bool),
 ) !Result {
     const direct_argv = [_][]const u8{ "bash", "-c", args.command };
     var argv: []const []const u8 = &direct_argv;
@@ -71,18 +73,20 @@ pub fn run(
             .protected = protected,
         }, args.command, &.{});
     }
-    const res = std.process.run(gpa, io, .{
+    const res = process_io.run(gpa, io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .environ_map = child_environ,
-        .stdout_limit = .limited(max_capture_bytes),
-        .stderr_limit = .limited(max_capture_bytes),
+        .stdout_limit = max_capture_bytes,
+        .stderr_limit = max_capture_bytes,
+        .timeout_ms = null,
+        .cancel = cancel,
     }) catch |e| {
+        if (e == error.Cancelled) return e;
         const msg = try std.fmt.allocPrint(gpa, "failed to spawn bash: {t}", .{e});
         return .{ .output = msg, .exit_code = -1, .truncated = false };
     };
-    defer gpa.free(res.stdout);
-    defer gpa.free(res.stderr);
+    defer res.deinit(gpa);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -158,14 +162,14 @@ test "sandboxed bash enforces write scope and protected reads (macOS)" {
     , .{ base, secret_file });
     defer gpa.free(script);
 
-    const r = try run(gpa, io, .{ .command = script }, workspace, null, options);
+    const r = try run(gpa, io, .{ .command = script }, workspace, null, options, null);
     defer r.deinit(gpa);
     try std.testing.expectEqual(@as(i64, 0), r.exit_code);
 
     // A workspace inside a protected root is refused, not run half-enforced.
     try std.testing.expectError(
         error.SandboxWorkspaceProtected,
-        run(gpa, io, .{ .command = "true" }, secret_dir, null, options),
+        run(gpa, io, .{ .command = "true" }, secret_dir, null, options, null),
     );
 }
 

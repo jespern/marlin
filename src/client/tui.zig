@@ -263,6 +263,7 @@ const SavedSessionView = struct {
     show_tool_transcript: bool,
     spinner_frame: usize,
     turn_started_ms: i64,
+    call_started_ms: i64,
     last_seq: u64,
 
     fn deinit(self: *SavedSessionView, gpa: std.mem.Allocator) void {
@@ -364,6 +365,10 @@ const App = struct {
     /// Wall-clock ms when the active session's current turn entered
     /// .running; drives the elapsed counter on the Working line.
     turn_started_ms: i64 = 0,
+    /// Wall ms when the tool call now executing began (0 = none). Stamped
+    /// as call/result blocks stream in; drives the per-call timer on the
+    /// Working line.
+    call_started_ms: i64 = 0,
     animation_active: std.atomic.Value(bool) = .init(false),
     animation_stop: std.atomic.Value(bool) = .init(false),
     cfg: config.Config = .{},
@@ -517,6 +522,7 @@ const App = struct {
         self.show_tool_transcript = false;
         self.spinner_frame = 0;
         self.turn_started_ms = 0;
+        self.call_started_ms = 0;
     }
 
     fn saveActiveView(self: *App) !void {
@@ -547,6 +553,7 @@ const App = struct {
             .show_tool_transcript = self.show_tool_transcript,
             .spinner_frame = self.spinner_frame,
             .turn_started_ms = self.turn_started_ms,
+            .call_started_ms = self.call_started_ms,
             .last_seq = self.last_seq,
         };
         try self.saved_views.put(self.gpa, self.sid, saved);
@@ -580,6 +587,7 @@ const App = struct {
         self.show_tool_transcript = saved.show_tool_transcript;
         self.spinner_frame = saved.spinner_frame;
         self.turn_started_ms = saved.turn_started_ms;
+        self.call_started_ms = saved.call_started_ms;
         self.last_seq = saved.last_seq;
     }
 
@@ -730,6 +738,35 @@ const App = struct {
             }
         }
         self.recent_cursor = 0;
+    }
+
+    const InflightCall = struct { rb: *const RenderBlock, queued: usize };
+
+    /// The tool call executing right now. Within the active turn's tail
+    /// (after the last user_msg/steer), the daemon records calls before
+    /// running them in order, so the (results+1)-th call is live whenever
+    /// calls outnumber results.
+    fn currentInflightCall(self: *const App) ?InflightCall {
+        var start = self.blocks.items.len;
+        while (start > 0) : (start -= 1) {
+            const k = self.blocks.items[start - 1].kind;
+            if (k == .user_msg or k == .steer) break;
+        }
+        var calls: usize = 0;
+        var results: usize = 0;
+        for (self.blocks.items[start..]) |rb| switch (rb.kind) {
+            .tool_call => calls += 1,
+            .tool_result => results += 1,
+            else => {},
+        };
+        if (calls <= results) return null;
+        var seen: usize = 0;
+        for (self.blocks.items[start..]) |*rb| {
+            if (rb.kind != .tool_call) continue;
+            if (seen == results) return .{ .rb = rb, .queued = calls - results - 1 };
+            seen += 1;
+        }
+        return null;
     }
 
     fn pushBlock(self: *App, kind: block.BlockKind, text: []const u8, label: []const u8, status: block.ToolStatus) void {
@@ -906,8 +943,20 @@ const App = struct {
                     self.delta.clearRetainingCapacity();
                 self.pushDurableBlock(b, .reasoning, r.text, "", .ok);
             },
-            .tool_call => |tc| self.pushDurableBlock(b, .tool_call, tc.args_json, tc.name, .ok),
-            .tool_result => |tr| self.pushDurableToolResult(b, tr.inline_body, tr.status, tr.full_body_ref),
+            .tool_call => |tc| {
+                self.pushDurableBlock(b, .tool_call, tc.args_json, tc.name, .ok);
+                // A call with nothing queued ahead of it starts immediately.
+                if (self.currentInflightCall()) |cur| {
+                    if (cur.queued == 0) self.call_started_ms = nowWallMs(self.io);
+                }
+            },
+            .tool_result => |tr| {
+                self.pushDurableToolResult(b, tr.inline_body, tr.status, tr.full_body_ref);
+                self.call_started_ms = if (self.currentInflightCall() != null)
+                    nowWallMs(self.io)
+                else
+                    0;
+            },
             .approval => |ap| {
                 const txt = if (ap.decision) |d| @tagName(d) else "pending";
                 self.pushDurableBlock(b, .approval, txt, "", .ok);
@@ -3198,12 +3247,31 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
             try std.fmt.allocPrint(arena, " · {d}m {d}s", .{ @divTrunc(elapsed_s, 60), @mod(elapsed_s, 60) })
         else
             try std.fmt.allocPrint(arena, " · {d}s", .{elapsed_s});
+        // What is it actually doing? Show the executing tool call with its
+        // own timer so a long-running command is visible at a glance.
+        var detail = elapsed;
+        if (app.currentInflightCall()) |cur| {
+            const arg_full = extractHighlightArg(cur.rb.label, cur.rb.text) orelse "";
+            const arg = arg_full[0..utf8Floor(arg_full, @min(arg_full.len, 60))];
+            const call_s: i64 = if (app.call_started_ms > 0)
+                @max(0, @divTrunc(nowWallMs(app.io) - app.call_started_ms, 1000))
+            else
+                0;
+            const sep: []const u8 = if (arg.len > 0) " " else "";
+            const queued = if (cur.queued > 0)
+                try std.fmt.allocPrint(arena, " (+{d} queued)", .{cur.queued})
+            else
+                "";
+            detail = try std.fmt.allocPrint(arena, "{s} · {s}{s}{s} · {d}s{s}", .{
+                elapsed, cur.rb.label, sep, arg, call_s, queued,
+            });
+        }
         try lines.append(arena, .{
             .text = head,
             .style = Palette.working,
             .text2 = word,
             .style2 = Palette.working,
-            .text3 = elapsed,
+            .text3 = detail,
             .style3 = Palette.collapse_hint,
             .syntax = try shimmerSpans(arena, word, head.len, app.spinner_frame),
         });
@@ -7245,4 +7313,34 @@ test "J joins lines; gg tops; gt cycles sessions" {
     try std.testing.expect(app.copy_cursor == null);
     try std.testing.expect(app.copy_pending);
     try std.testing.expect(app.sel_clear_after_copy);
+}
+
+test "currentInflightCall tracks the executing call within the active turn" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    // Prior turn's dangling call must not leak into the current one.
+    app.pushBlock(.tool_call, "{\"command\":\"old\"}", "bash", .ok);
+    app.pushBlock(.user_msg, "do things", "", .ok);
+    try std.testing.expect(app.currentInflightCall() == null);
+
+    // Calls-first batch: two recorded, none answered → first runs, one queued.
+    app.pushBlock(.tool_call, "{\"command\":\"zig build test\"}", "bash", .ok);
+    app.pushBlock(.tool_call, "{\"path\":\"src/main.zig\"}", "read_file", .ok);
+    const first = app.currentInflightCall().?;
+    try std.testing.expectEqualStrings("bash", first.rb.label);
+    try std.testing.expectEqual(@as(usize, 1), first.queued);
+
+    // First result lands → the second call is now live.
+    app.pushBlock(.tool_result, "ok", "", .ok);
+    const second = app.currentInflightCall().?;
+    try std.testing.expectEqualStrings("read_file", second.rb.label);
+    try std.testing.expectEqual(@as(usize, 0), second.queued);
+
+    // All answered → nothing in flight.
+    app.pushBlock(.tool_result, "contents", "", .ok);
+    try std.testing.expect(app.currentInflightCall() == null);
 }

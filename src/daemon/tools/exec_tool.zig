@@ -26,6 +26,7 @@ pub fn run(
     cwd: []const u8,
     child_environ: ?*const std.process.Environ.Map,
     timeout_ms: u32,
+    cancel: ?*const std.atomic.Value(bool),
 ) Result {
     if (argv.len == 0) return failure(gpa, "exec tool has no command", .{});
     const result = process_io.run(gpa, io, .{
@@ -36,7 +37,14 @@ pub fn run(
         .stdout_limit = max_output_bytes,
         .stderr_limit = 256 * 1024,
         .timeout_ms = timeout_ms,
-    }) catch |err| return failure(gpa, "exec tool failed: {t}", .{err});
+        .cancel = cancel,
+    }) catch |err| {
+        if (err == error.Cancelled) return .{
+            .output = gpa.dupe(u8, "exec tool interrupted by user") catch @panic("oom"),
+            .status = .interrupted,
+        };
+        return failure(gpa, "exec tool failed: {t}", .{err});
+    };
     defer result.deinit(gpa);
 
     const exit_code: i64 = switch (result.term) {
@@ -81,6 +89,7 @@ test "exec tool receives JSON on stdin" {
         "/tmp",
         null,
         2_000,
+        null,
     );
     defer gpa.free(result.output);
     try std.testing.expectEqual(block.ToolStatus.ok, result.status);
@@ -91,7 +100,7 @@ test "exec tool makes nonzero exit model-visible" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const result = run(gpa, threaded.io(), &.{ "sh", "-c", "printf nope; exit 7" }, "{}", "/tmp", null, 2_000);
+    const result = run(gpa, threaded.io(), &.{ "sh", "-c", "printf nope; exit 7" }, "{}", "/tmp", null, 2_000, null);
     defer gpa.free(result.output);
     try std.testing.expectEqual(block.ToolStatus.err, result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "exit code: 7") != null);

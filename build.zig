@@ -87,12 +87,18 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(fakeprov);
 
     // ---- e2e ----
+    const process_io_module = b.createModule(.{
+        .root_source_file = b.path("src/daemon/process_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const e2e_runner = b.addExecutable(.{
         .name = "e2e-runner",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/testing/e2e_runner.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "process_io", .module = process_io_module }},
         }),
     });
 

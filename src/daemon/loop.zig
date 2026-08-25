@@ -761,7 +761,7 @@ fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, 
         };
     }
     if (opts.extensions) |ext| {
-        if (ext.dispatch(name, args_json, opts.cwd)) |result| return result;
+        if (ext.dispatch(name, args_json, opts.cwd, opts.cancel)) |result| return result;
     }
     return tools_registry.dispatch(
         gpa,

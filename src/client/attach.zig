@@ -144,7 +144,13 @@ pub fn connect(
                 .stdin = .ignore,
                 .stdout = .ignore,
                 .stderr = .ignore,
-                .pgid = 0,
+                // Production daemons detach into their own group. The E2E
+                // runner opts into inheritance so one outer cancellation can
+                // reliably terminate its complete scenario tree.
+                .pgid = if (environ.get("MARLIN_DAEMON_PGID")) |mode|
+                    if (std.mem.eql(u8, mode, "inherit")) null else 0
+                else
+                    0,
             });
             _ = &child; // deliberately not waited/killed
             spawned = true;

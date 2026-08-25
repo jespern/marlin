@@ -203,6 +203,7 @@ pub const Runtime = struct {
         name: []const u8,
         args_json: []const u8,
         cwd: []const u8,
+        cancel: ?*const std.atomic.Value(bool),
     ) ?ExecOut {
         for (self.exec_tools.items) |entry| {
             if (!std.mem.eql(u8, entry.spec.name, name)) continue;
@@ -214,6 +215,7 @@ pub const Runtime = struct {
                 cwd,
                 self.child_environ,
                 entry.timeout_ms,
+                cancel,
             );
             return .{ .output = result.output, .status = result.status };
         }
@@ -371,7 +373,7 @@ test "runtime registers and dispatches exec tools and skills" {
     try std.testing.expect(runtime.find("echo_json") != null);
     try std.testing.expect(runtime.find("skill") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime.systemPromptSuffix(), "demo: Demonstrate") != null);
-    const result = runtime.dispatch("echo_json", "{\"ok\":true}", "/tmp").?;
+    const result = runtime.dispatch("echo_json", "{\"ok\":true}", "/tmp", null).?;
     defer gpa.free(result.output);
     try std.testing.expectEqual(block.ToolStatus.ok, result.status);
     try std.testing.expectEqualStrings("{\"ok\":true}", result.output);

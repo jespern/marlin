@@ -6,6 +6,11 @@ const Io = std.Io;
 const regex_mod = @import("regex");
 
 const files = @import("files.zig");
+const process_io = @import("../process_io.zig");
+
+fn cancelled(flag: ?*const std.atomic.Value(bool)) bool {
+    return if (flag) |f| f.load(.acquire) else false;
+}
 
 // ------------------------------------------------------------------ grep --
 
@@ -33,7 +38,9 @@ pub fn grep(
     args: GrepArgs,
     cwd: []const u8,
     child_environ: ?*const std.process.Environ.Map,
+    cancel: ?*const std.atomic.Value(bool),
 ) ![]u8 {
+    if (cancelled(cancel)) return error.Cancelled;
     const search_path = try files.resolvePath(gpa, args.path orelse ".", cwd);
     defer gpa.free(search_path);
 
@@ -41,56 +48,74 @@ pub fn grep(
     // faster than interpreting a regex once per line, and is present on every
     // currently supported Marlin target. Keep the native walker as the final
     // dependency-free fallback for minimal environments.
-    if (rgAvailable(gpa, io, child_environ)) return rgGrep(gpa, io, args, search_path, child_environ);
-    if (systemGrepAvailable(gpa, io, child_environ)) {
-        return systemGrep(gpa, io, args, search_path, child_environ) catch
-            internalGrep(gpa, io, args, search_path);
+    if (try rgAvailable(gpa, io, child_environ, cancel)) return rgGrep(gpa, io, args, search_path, child_environ, cancel);
+    if (try systemGrepAvailable(gpa, io, child_environ, cancel)) {
+        return systemGrep(gpa, io, args, search_path, child_environ, cancel) catch |err| switch (err) {
+            error.Cancelled => return err,
+            else => internalGrep(gpa, io, args, search_path, cancel),
+        };
     }
-    return internalGrep(gpa, io, args, search_path);
+    return internalGrep(gpa, io, args, search_path, cancel);
 }
 
 var rg_checked = std.atomic.Value(u8).init(0); // 0=unknown 1=yes 2=no
 var system_grep_checked = std.atomic.Value(u8).init(0);
 
-fn rgAvailable(gpa: std.mem.Allocator, io: Io, child_environ: ?*const std.process.Environ.Map) bool {
+fn rgAvailable(
+    gpa: std.mem.Allocator,
+    io: Io,
+    child_environ: ?*const std.process.Environ.Map,
+    cancel: ?*const std.atomic.Value(bool),
+) !bool {
+    if (cancelled(cancel)) return error.Cancelled;
     switch (rg_checked.load(.acquire)) {
         1 => return true,
         2 => return false,
         else => {},
     }
-    const res = std.process.run(gpa, io, .{
+    const res = process_io.run(gpa, io, .{
         .argv = &.{ "rg", "--version" },
         .environ_map = child_environ,
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
-    }) catch {
+        .stdout_limit = 4096,
+        .stderr_limit = 4096,
+        .timeout_ms = 2_000,
+        .cancel = cancel,
+    }) catch |err| {
+        if (err == error.Cancelled) return err;
         rg_checked.store(2, .release);
         return false;
     };
-    defer gpa.free(res.stdout);
-    defer gpa.free(res.stderr);
+    defer res.deinit(gpa);
     const ok = res.term == .exited and res.term.exited == 0;
     rg_checked.store(if (ok) 1 else 2, .release);
     return ok;
 }
 
-fn systemGrepAvailable(gpa: std.mem.Allocator, io: Io, child_environ: ?*const std.process.Environ.Map) bool {
+fn systemGrepAvailable(
+    gpa: std.mem.Allocator,
+    io: Io,
+    child_environ: ?*const std.process.Environ.Map,
+    cancel: ?*const std.atomic.Value(bool),
+) !bool {
+    if (cancelled(cancel)) return error.Cancelled;
     switch (system_grep_checked.load(.acquire)) {
         1 => return true,
         2 => return false,
         else => {},
     }
-    const res = std.process.run(gpa, io, .{
+    const res = process_io.run(gpa, io, .{
         .argv = &.{ "grep", "--version" },
         .environ_map = child_environ,
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
-    }) catch {
+        .stdout_limit = 4096,
+        .stderr_limit = 4096,
+        .timeout_ms = 2_000,
+        .cancel = cancel,
+    }) catch |err| {
+        if (err == error.Cancelled) return err;
         system_grep_checked.store(2, .release);
         return false;
     };
-    defer gpa.free(res.stdout);
-    defer gpa.free(res.stderr);
+    defer res.deinit(gpa);
     const ok = res.term == .exited and res.term.exited == 0;
     system_grep_checked.store(if (ok) 1 else 2, .release);
     return ok;
@@ -102,6 +127,7 @@ fn rgGrep(
     args: GrepArgs,
     search_path: []const u8,
     child_environ: ?*const std.process.Environ.Map,
+    cancel: ?*const std.atomic.Value(bool),
 ) ![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
@@ -114,16 +140,18 @@ fn rgGrep(
     try argv.append(gpa, args.pattern);
     try argv.append(gpa, search_path);
 
-    const res = std.process.run(gpa, io, .{
+    const res = process_io.run(gpa, io, .{
         .argv = argv.items,
         .environ_map = child_environ,
-        .stdout_limit = .limited(max_output_bytes),
-        .stderr_limit = .limited(64 * 1024),
+        .stdout_limit = max_output_bytes,
+        .stderr_limit = 64 * 1024,
+        .timeout_ms = null,
+        .cancel = cancel,
     }) catch |e| {
+        if (e == error.Cancelled) return e;
         return std.fmt.allocPrint(gpa, "error: failed to run rg: {t}", .{e});
     };
-    defer gpa.free(res.stdout);
-    defer gpa.free(res.stderr);
+    defer res.deinit(gpa);
 
     const code: i64 = switch (res.term) {
         .exited => |cd| cd,
@@ -145,6 +173,7 @@ fn systemGrep(
     args: GrepArgs,
     search_path: []const u8,
     child_environ: ?*const std.process.Environ.Map,
+    cancel: ?*const std.atomic.Value(bool),
 ) ![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
@@ -164,14 +193,15 @@ fn systemGrep(
     try argv.append(gpa, args.pattern);
     try argv.append(gpa, search_path);
 
-    const res = try std.process.run(gpa, io, .{
+    const res = try process_io.run(gpa, io, .{
         .argv = argv.items,
         .environ_map = child_environ,
-        .stdout_limit = .limited(max_output_bytes),
-        .stderr_limit = .limited(64 * 1024),
+        .stdout_limit = max_output_bytes,
+        .stderr_limit = 64 * 1024,
+        .timeout_ms = null,
+        .cancel = cancel,
     });
-    defer gpa.free(res.stdout);
-    defer gpa.free(res.stderr);
+    defer res.deinit(gpa);
 
     const code: i64 = switch (res.term) {
         .exited => |exit_code| exit_code,
@@ -190,7 +220,14 @@ fn systemGrep(
 /// dirs (rg gets this from .gitignore), binary sniff, same output format.
 /// A pattern the engine cannot compile degrades to literal substring with
 /// an explicit note — tool errors are data.
-fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []const u8) ![]u8 {
+fn internalGrep(
+    gpa: std.mem.Allocator,
+    io: Io,
+    args: GrepArgs,
+    search_path: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) ![]u8 {
+    if (cancelled(cancel)) return error.Cancelled;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var matches: u64 = 0;
@@ -218,7 +255,7 @@ fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []c
         return std.fmt.allocPrint(gpa, "error: cannot access '{s}': {t}", .{ search_path, e });
     };
     if (stat.kind == .file) {
-        try grepOneFile(gpa, io, &out, &matches, matcher, args.limit, search_path, search_path);
+        try grepOneFile(gpa, io, &out, &matches, matcher, args.limit, search_path, search_path, cancel);
     } else {
         var dir = Io.Dir.cwd().openDir(io, search_path, .{ .iterate = true }) catch |e| {
             return std.fmt.allocPrint(gpa, "error: cannot open '{s}': {t}", .{ search_path, e });
@@ -227,6 +264,7 @@ fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []c
         var walker = try dir.walk(gpa);
         defer walker.deinit();
         while (walker.next(io) catch null) |entry| {
+            if (cancelled(cancel)) return error.Cancelled;
             if (matches >= args.limit) break;
             if (entry.kind != .file) continue;
             if (skipPath(entry.path)) continue;
@@ -235,7 +273,10 @@ fn internalGrep(gpa: std.mem.Allocator, io: Io, args: GrepArgs, search_path: []c
             }
             const full = try std.fs.path.join(gpa, &.{ search_path, entry.path });
             defer gpa.free(full);
-            grepOneFile(gpa, io, &out, &matches, matcher, args.limit, full, entry.path) catch continue;
+            grepOneFile(gpa, io, &out, &matches, matcher, args.limit, full, entry.path, cancel) catch |err| switch (err) {
+                error.Cancelled => return err,
+                else => continue,
+            };
         }
     }
     if (matches == 0) {
@@ -335,7 +376,9 @@ fn grepOneFile(
     limit: u64,
     full_path: []const u8,
     display_path: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
 ) !void {
+    if (cancelled(cancel)) return error.Cancelled;
     const contents = Io.Dir.cwd().readFileAlloc(io, full_path, gpa, .limited(files.max_read_bytes)) catch return;
     defer gpa.free(contents);
     if (std.mem.indexOfScalar(u8, contents[0..@min(contents.len, 4096)], 0) != null) return; // binary
@@ -343,6 +386,7 @@ fn grepOneFile(
     var line_no: u64 = 0;
     var it = std.mem.splitScalar(u8, contents, '\n');
     while (it.next()) |line| {
+        if (cancelled(cancel)) return error.Cancelled;
         line_no += 1;
         if (matches.* >= limit) return;
         if (!matcher.matches(gpa, line)) continue;
@@ -413,7 +457,14 @@ pub const GlobArgs = struct {
     limit: u64 = 200,
 };
 
-pub fn glob(gpa: std.mem.Allocator, io: Io, args: GlobArgs, cwd: []const u8) ![]u8 {
+pub fn glob(
+    gpa: std.mem.Allocator,
+    io: Io,
+    args: GlobArgs,
+    cwd: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) ![]u8 {
+    if (cancelled(cancel)) return error.Cancelled;
     const search_path = try files.resolvePath(gpa, args.path orelse ".", cwd);
     defer gpa.free(search_path);
 
@@ -432,6 +483,7 @@ pub fn glob(gpa: std.mem.Allocator, io: Io, args: GlobArgs, cwd: []const u8) ![]
     var walker = try dir.walk(gpa);
     defer walker.deinit();
     while (walker.next(io) catch null) |entry| {
+        if (cancelled(cancel)) return error.Cancelled;
         if (entry.kind != .file) continue;
         if (skipPath(entry.path)) continue;
         const target = if (std.mem.indexOfScalar(u8, args.pattern, '/') != null)
@@ -555,26 +607,26 @@ test "internal grep + glob on a temp tree" {
     gpa.free(w2);
 
     // Force the internal path (don't depend on rg in CI).
-    const g = try internalGrep(gpa, io, .{ .pattern = "needle" }, dir_path);
+    const g = try internalGrep(gpa, io, .{ .pattern = "needle" }, dir_path, null);
     defer gpa.free(g);
     try std.testing.expect(std.mem.indexOf(u8, g, "one.txt:1:") != null);
     try std.testing.expect(std.mem.indexOf(u8, g, "note:") == null);
 
     // Real regex works in the internal engine now.
-    const gr = try internalGrep(gpa, io, .{ .pattern = "hel+o nee.le" }, dir_path);
+    const gr = try internalGrep(gpa, io, .{ .pattern = "hel+o nee.le" }, dir_path, null);
     defer gpa.free(gr);
     try std.testing.expect(std.mem.indexOf(u8, gr, "one.txt:1:") != null);
 
-    const alternatives = try internalGrep(gpa, io, .{ .pattern = "missing|needle|also-missing" }, dir_path);
+    const alternatives = try internalGrep(gpa, io, .{ .pattern = "missing|needle|also-missing" }, dir_path, null);
     defer gpa.free(alternatives);
     try std.testing.expect(std.mem.indexOf(u8, alternatives, "one.txt:1:") != null);
 
     // Regex that matches nothing really is no matches (not a dialect artifact).
-    const gn = try internalGrep(gpa, io, .{ .pattern = "^needle$" }, dir_path);
+    const gn = try internalGrep(gpa, io, .{ .pattern = "^needle$" }, dir_path, null);
     defer gpa.free(gn);
     try std.testing.expect(std.mem.indexOf(u8, gn, "no matches") != null);
 
-    const gl = try glob(gpa, io, .{ .pattern = "*.txt" }, dir_path);
+    const gl = try glob(gpa, io, .{ .pattern = "*.txt" }, dir_path, null);
     defer gpa.free(gl);
     try std.testing.expect(std.mem.indexOf(u8, gl, "one.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, gl, "two.log") == null);
