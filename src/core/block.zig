@@ -38,7 +38,15 @@ pub const Body = union(BlockKind) {
         synthetic: bool = false,
     },
     assistant_msg: struct { text: []const u8 },
-    reasoning: struct { text: []const u8 },
+    reasoning: struct {
+        text: []const u8,
+        /// True for the model's deliberate mid-turn narration (content
+        /// emitted alongside tool calls); false for the provider's raw
+        /// reasoning stream, which some models (grok) fill with drafted
+        /// replies and summarizer fragments. Clients fold raw reasoning out
+        /// of the default view; narration stays. Old blocks decode as false.
+        commentary: bool = false,
+    },
     tool_call: struct {
         call_id: []const u8,
         name: []const u8,

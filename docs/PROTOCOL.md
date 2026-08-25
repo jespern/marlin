@@ -103,6 +103,12 @@ Inputs within 4 KiB of the 32 MiB record ceiling are rejected with
 `input_too_large`: the persisted block envelope is slightly larger than the
 command envelope, and every accepted message must remain replayable.
 
+`blk.reasoning.commentary` defaults to false. True marks the model's
+deliberate mid-turn narration (content emitted alongside tool calls), which
+clients keep visible; false is the raw provider reasoning stream, which
+clients fold out of the default transcript (some models draft entire replies
+inside it). Blocks persisted before the field decode as raw reasoning.
+
 `blk.user_msg.synthetic` defaults to false. When true, the text is internal
 model context rehydrated after compaction: clients render a compact note and
 must not treat it as user-authored input or add it to command history. For

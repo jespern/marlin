@@ -307,6 +307,9 @@ const RenderBlock = struct {
     /// Content-addressed uncapped tool output. Null means `text` is already
     /// the complete result and can be copied without another daemon query.
     full_body_ref: ?[]u8 = null,
+    /// reasoning blocks: true = deliberate mid-turn narration (visible);
+    /// false = raw provider reasoning (folded; ctrl+t reveals).
+    commentary: bool = false,
     /// Locally inserted for instant submit feedback. The matching durable
     /// block clears this bit instead of producing a duplicate render block.
     pending_echo: bool = false,
@@ -1662,7 +1665,10 @@ const App = struct {
                     self.delta.clearRetainingCapacity();
                     self.stream_layout_cache.reset(self.gpa);
                 }
+                const before = self.blocks.items.len;
                 self.pushDurableBlock(b, .reasoning, r.text, "", .ok);
+                if (self.blocks.items.len > before)
+                    self.blocks.items[self.blocks.items.len - 1].commentary = r.commentary;
             },
             .tool_call => |tc| {
                 self.pushDurableBlock(b, .tool_call, tc.args_json, tc.name, .ok);
@@ -4055,10 +4061,13 @@ fn layoutBlockRange(
                 try wrapMarkdown(alloc, lines, rb.text, w);
             },
             .reasoning => {
-                // Commentary is one short sentence by prompt contract;
-                // anything much longer is a provider reasoning summary —
-                // keep the card, clip the wall (full text stays in the log).
-                try wrapReasoningCard(alloc, lines, try clipText(alloc, rb.text, 280), w);
+                // Raw provider reasoning folds out of the default view: some
+                // models (grok) fill it with drafted replies and summarizer
+                // fragments, which reads as two narrators fighting. The
+                // model's deliberate one-line narration (commentary=true)
+                // stays; ctrl+t reveals everything.
+                if (app.show_tool_transcript or rb.commentary)
+                    try wrapReasoningCard(alloc, lines, try clipText(alloc, rb.text, 280), w);
             },
             .tool_call => {
                 try flushRanSummary(alloc, lines, &pending_ran);
@@ -9023,6 +9032,58 @@ test "layout remains bounded around a dangling call between turns" {
     }
     try std.testing.expect(saw_summary);
     try std.testing.expect(saw_dangling);
+}
+
+test "raw provider reasoning folds; commentary narration stays visible" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    // The grok shape: raw reasoning (with a drafted reply inside) followed
+    // by the model's deliberate one-line narration, both kind=reasoning.
+    try app.blocks.append(gpa, .{
+        .kind = .reasoning,
+        .seq = 1,
+        .turn_id = 7,
+        .text = try gpa.dupe(u8, "The user wants a review. Thanks for the update, solid work!"),
+        .label = try gpa.dupe(u8, ""),
+    });
+    try app.blocks.append(gpa, .{
+        .kind = .reasoning,
+        .seq = 2,
+        .turn_id = 7,
+        .text = try gpa.dupe(u8, "Re-reading the tree against the last review."),
+        .label = try gpa.dupe(u8, ""),
+        .commentary = true,
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const collapsed = try layoutLines(arena, &app, 120);
+    var saw_raw = false;
+    var saw_narration = false;
+    for (collapsed.items) |line| {
+        const text = try lineText(arena, line);
+        if (std.mem.indexOf(u8, text, "Thanks for the update") != null) saw_raw = true;
+        if (std.mem.indexOf(u8, text, "Re-reading the tree") != null) saw_narration = true;
+    }
+    try std.testing.expect(!saw_raw);
+    try std.testing.expect(saw_narration);
+
+    // ctrl+t (transcript view) reveals the raw reasoning again.
+    app.show_tool_transcript = true;
+    app.layout_epoch +%= 1;
+    const expanded = try layoutLines(arena, &app, 120);
+    saw_raw = false;
+    for (expanded.items) |line| {
+        const text = try lineText(arena, line);
+        if (std.mem.indexOf(u8, text, "Thanks for the update") != null) saw_raw = true;
+    }
+    try std.testing.expect(saw_raw);
 }
 
 test "layout line safety limit produces a visible truncation" {

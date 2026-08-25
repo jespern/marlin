@@ -179,7 +179,7 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .synthetic = value.synthetic,
         } },
         .assistant_msg => |value| .{ .assistant_msg = .{ .text = try arena.dupe(u8, value.text) } },
-        .reasoning => |value| .{ .reasoning = .{ .text = try arena.dupe(u8, value.text) } },
+        .reasoning => |value| .{ .reasoning = .{ .text = try arena.dupe(u8, value.text), .commentary = value.commentary } },
         .tool_call => |value| .{ .tool_call = .{
             .call_id = try arena.dupe(u8, value.call_id),
             .name = try arena.dupe(u8, value.name),
@@ -443,9 +443,11 @@ pub fn runTurn(
 
         // Text emitted alongside tool calls is user-facing progress commentary,
         // not the final answer. Persist it so the TUI does not briefly stream a
-        // useful update and then erase it when the tool round starts.
+        // useful update and then erase it when the tool round starts. Marked
+        // commentary=true: clients keep these visible while folding the raw
+        // provider reasoning above.
         if (acc.text.items.len > 0) {
-            _ = try ap.append(.{ .reasoning = .{ .text = acc.text.items } });
+            _ = try ap.append(.{ .reasoning = .{ .text = acc.text.items, .commentary = true } });
         }
 
         // Persist the provider's complete assistant tool batch before any
