@@ -123,8 +123,10 @@ Sequence:
    on success. Either way the candidate is sanity-exec'd (`--version`) before committing —
    exec-into-broken-binary is the one unrecoverable failure (daemon gone,
    nothing to reattach), so it must be impossible.
-2. **Quiesce.** Default: wait for running turns to reach a block boundary.
-   `/reboot!` interrupts instead: finalized blocks are truth, partial delta
+2. **Quiesce.** Default: wait for running turns to reach a block boundary. A
+   parked approval refuses a plain reboot visibly: once the requesting TUI
+   exits there would be nobody left to answer it. `/reboot --force` interrupts
+   instead: finalized blocks are truth, partial delta
    buffers are discardable; interrupted sessions get a `system_note`
    ("interrupted by reboot") and resume with `--continue`. Running
    background bash tasks are listed for confirmation (they get orphaned).
@@ -165,6 +167,14 @@ header, which is where it must be kept current:
 - **Store is shared.** The single sqlite connection is opened FULLMUTEX
   (serialized); turn threads append blocks while the dispatcher answers
   queries.
+- **Loaded sessions are a working set.** SQLite owns the durable catalog. An
+  idle session is unloaded after its last subscriber leaves; running sessions
+  unload after completion, and completed task children always unload. Opening
+  or continuing one rehydrates its small live state lazily.
+- **Catalog snapshots are structural.** Create/archive/model/config changes
+  rebuild the session list. Running/approval/idle transitions fan out one
+  compact `status{sid,state}` to subscribers and session watchers, so turn
+  latency does not grow with the durable session count.
 - **Session identity/config is dispatcher-owned.** Turn threads snapshot
   those fields inside `startTurn` (still on the dispatcher thread); protocol
   mutations of them are rejected with `err{busy}` while a turn runs, which
@@ -234,6 +244,16 @@ and remove the C compile, but those features would require sidecars, migration
 machinery, checkpoints, and locking of their own. The block-log abstraction
 still keeps the choice isolated: nothing outside `store.zig` knows SQL.
 
+The shared connection is opened in SQLite serialized/FULLMUTEX mode. Ordinary
+blocks cost one insert; an oversized tool result writes its content-addressed
+blob, durable block, and blob reference in one `BEGIN IMMEDIATE` transaction,
+so it is both one WAL commit and crash-atomic. The `(session_id, seq)` unique
+constraint supplies the block-range index; migrations remove the historical
+duplicate index rather than paying twice on every append.
+The append/status/usage statements are retained and reset under the same
+connection mutex, avoiding hot-path prepare/finalize churn without allowing
+two turn threads to interleave bindings on one statement.
+
 Local and test builds link the platform SQLite library to keep rebuilds fast.
 Official release builds pass `-Dembedded-sqlite=true` and compile the vendored
 amalgamation into the distributable binary. FTS5 is not compiled in or used
@@ -269,7 +289,7 @@ regenerable/low-value with age; block structure is not.
 - Blobs carry `created_at` + `tombstone`; refs live in `blob_refs` so
   orphan detection is a join, not a scan of block bodies.
 
-**Trimming design (post-v1, lands when the DB first annoys someone):**
+**Trimming implementation and remaining design:**
 
 - **Session lifecycle: archive → delete.** Archive is implemented: `/archive`
   and `marlin archive <session>` hide a durable session hierarchy from default
@@ -279,19 +299,19 @@ regenerable/low-value with age; block structure is not.
   blob refs.
   Optional retention config (`delete_archived_after = "180d"`, off by default)
   remains future work. Explicit or policy-driven, never silent.
-- **Blob demotion.** Blobs past an age horizon whose only referents sit in
-  idle sessions get truncated to a tombstone ("full output expired <date>,
-  was 412KB, hash …"). Every block and ref stays resolvable — scrollback
-  never breaks, `!c` on ancient output says "expired" instead of lying.
-  Images get their own (shorter) horizon or thumbnail-only demotion.
-- **`marlin gc`**: orphan-blob sweep → expired-blob demotion →
-  `PRAGMA incremental_vacuum` → future search-index optimize → WAL checkpoint; reports
-  bytes freed. Optionally auto-runs on daemon idle at low cadence.
-- DB size surfaces in `marlin ls` / dump-state — not the status bar (it is
-  never a mid-turn decision).
-- Test hooks: tombstones are first-class in the dump-state oracle (a
-  tombstone survives reboot as a tombstone); gc→reboot→dump joins the
-  reboot matrix.
+- **Blob demotion is explicit.** `marlin gc` safely sweeps orphan blobs. Adding
+  `--expire-days N` also truncates older full bodies to tombstones, but only
+  when every reference is also older than the horizon and none of their
+  sessions is running or awaiting approval. Every
+  block and ref remains resolvable — scrollback never breaks, and `!c` says
+  "expired or missing" instead of returning empty data. There is no silent
+  default retention horizon.
+- The GC transaction is: orphan sweep → optional expired-body demotion →
+  `PRAGMA incremental_vacuum` → WAL checkpoint; it reports logical bytes
+  reclaimed. Future search indexing adds its optimize step here. Optional
+  idle-time auto-GC remains future work.
+- DB size in `marlin ls` / dump-state remains future work; it does not belong
+  in the status bar because it is never a mid-turn decision.
 
 ## 3. Wire protocol (client ⇄ daemon)
 
@@ -299,17 +319,33 @@ Newline-delimited JSON over the socket. Length-prefixed binary is a premature
 optimization; NDJSON is debuggable with `nc` + `jq` and fast enough for
 terminal-rate traffic.
 
+The transport has a real boundary rather than buffer-shaped accidents: one
+record is at most 32 MiB, dynamically assembled through small reader scratch
+buffers. Outbound encoding enforces the same cap. Each client outbox is capped
+at 64 MiB; crossing it disconnects that stale client so durable blocks can be
+replayed instead of consuming unbounded daemon memory. Client teardown shuts
+down both socket directions before joining its owned reader/writer threads.
+An accepted socket must finish the version handshake within two seconds. An
+advisory instance lock serializes startup before either process can remove the
+socket; reboot releases it only after retiring the old listener.
+
 **The message catalog lives in `docs/PROTOCOL.md` (semantics) and
 `src/core/proto.zig` (types) — those are the source of truth**, and the wire
 shape is std.json's tagged-union form `{"<type>":{...payload}}`, not the
 `{"t": ...}` sketch this section originally carried. Highlights, using the
 real names: `session_create`/`session_list`/`session_kill`, `sub {sid,
-from_seq}`, `input` (message or steer), `approve`, `interrupt`,
+from_seq, tail_limit?, before_seq?, replay_done?}`, `input` (message or steer), `approve`, `interrupt`,
 `session_compact`, and `blob_get {hash}` for full tool output (`!c`); daemon
 → client is `blk`, `delta`/`reasoning_delta`/`stream_status` (ephemeral),
 `status`, `approval_request`, `session_meta`, `err`. There is no
 `copy.query` and no `blocks.get` — copy is content-addressed blob fetch, and
-scrollback beyond client memory re-replays with `sub.from_seq`.
+scrollback beyond client memory replays from the durable log.
+
+Inputs carry an additive client request id. The daemon echoes it in exactly one
+terminal `ok`/`err`, including internal failures, so optimistic UI is a
+reconciled protocol state rather than a guess: acceptance waits for the
+durable block, while rejection removes only that echo and restores its prior
+session state.
 
 Two stream disciplines worth locking in now:
 
@@ -317,10 +353,13 @@ Two stream disciplines worth locking in now:
   liveness, then replace the streaming region with the finalized block. A
   client that attaches mid-turn gets replayed blocks + current partial delta
   buffer. This makes reconnect/multi-client trivial.
-- **`from_seq` resume.** Clients remember the last block seq they've seen per
-  session; reattach replays only the gap. Scrollback beyond what's in client
-  memory is recovered by re-subscribing with an earlier `from_seq` (a
-  dedicated backfill message is future work if replay ever gets expensive).
+- **Bounded attach + `from_seq` resume.** Clients remember the last block seq
+  they've seen per session and replay only the gap when revisiting a cached
+  view. A cold TUI attach asks for the newest 256 blocks; `replay_done`
+  advertises whether more durable history exists. Reaching the loaded top asks
+  for another 256 blocks with `before_seq=oldest_seq`, buffers them off-screen,
+  then prepends the page atomically. Attach and scrollback work are therefore
+  bounded without weakening the block log as source of truth.
 
 ## 4. Agent loop
 
@@ -347,8 +386,10 @@ loop:
   Consecutive safe calls overlap; mutations and unknown tools remain ordering
   barriers. Calls and results are each persisted as contiguous ordered groups,
   matching the provider transcript even when completion order differs.
-- **Cancellation**: interrupt sets an atomic flag; the HTTP read loop and tool
-  subprocess waits poll it. Every tool subprocess owns a process group, so
+- **Cancellation**: interrupt sets an atomic flag; HTTP, MCP, search, and file
+  tools observe it before/after blocking operations and during their own
+  loops. A kernel filesystem syscall itself cannot be forcibly unwound; all
+  user-space work and external processes remain bounded. Every tool subprocess owns a process group, so
   interrupt/timeout sends SIGTERM → grace → SIGKILL to the complete
   pipeline and its descendants, then reaps the direct child. The half-finished
   turn is finalized as an interrupted `system_note` + whatever blocks completed
@@ -364,10 +405,10 @@ loop:
   into the ordinary `.shutdown` dispatcher event — socket removed, store
   closed — the same path `/quit` and reboot use. (SIGHUP stays ignored so
   the daemon survives its spawning terminal.)
-- **Retry/backoff**: on 429/5xx/mid-stream disconnect: exponential backoff w/
-  jitter, max N attempts. A turn that dies mid-stream discards the partial
-  assistant text (deltas were never truth) and re-requests — context is
-  unchanged, so this is safe and cache-friendly.
+- **Transport failures**: a turn that dies mid-stream discards the partial
+  assistant text because deltas were never truth, then persists a concise
+  failure note. Automatic retry/backoff remains future work; Marlin does not
+  currently conceal an ambiguous provider failure behind silent retries.
 - **Malformed tool JSON**: lenient repair pass (strip trailing commas/garbage,
   balance braces, unescape common damage) before failing; on failure, feed the
   parse error back to the model as the tool result — models self-correct.
@@ -455,9 +496,21 @@ input/output rates directly and leaves local or unpublished rates unknown.
 - HTTP uses a daemon-owned `std.http.Client` pool shared by provider requests,
   bounded fetches, catalogs, and network blocklists. It retains reusable
   connections across rounds while the transport remains isolated behind one
-  interface. The layer's failure vocabulary is a typed `http.Error`
+  interface. One absolute connect/idle deadline owns each request and can
+  shut down its live socket; it does not consume a second threaded-I/O slot or
+  wait for a discarded request to return. On Darwin, uncached DNS resolution
+  is preflighted in a deadline-bound helper process because libc
+  `getaddrinfo` itself is not cancellable; the resolved numeric address is
+  handed to the actual connection while the original hostname remains the TLS
+  SNI/certificate identity. Pre-header liveness is emitted immediately and
+  refreshed while the provider is pending, so the TUI distinguishes that
+  phase from an unexplained spinner. A 30-minute wall deadline cannot be
+  extended by chatty bytes, and decoded assistant/reasoning/tool fields are
+  capped at 4 MiB so a broken stream cannot grow the turn heap indefinitely;
+  crossing a cap closes the socket and persists a visible turn failure. The
+  layer's failure vocabulary is a typed `http.Error`
   (Cancelled / HttpTimeout / InvalidRequest / ConnectFailed / ReadFailed /
-  UnsupportedEncoding / ConcurrencyUnavailable / OutOfMemory), so a
+  UnsupportedEncoding / ConsumerAborted / ConcurrencyUnavailable / OutOfMemory), so a
   "turn failed:" system_note distinguishes user interrupt, hung provider,
   and mid-body transport death instead of leaking std.http error soup.
 
@@ -518,10 +571,16 @@ The cascade (in order; each layer only fires if the previous wasn't enough):
   ordered fan-out is the next widening step.
 
 Cache discipline, stated once: between L1/L2 events the stable prefix is
-strictly append-only. Volatile date/git/sandbox state is inserted immediately
+strictly append-only. Volatile date/git-branch/sandbox state is inserted immediately
 before the newest user/steer input, so it cannot invalidate cached prior
 history. L1/L2 are the only deliberate stable-prefix breaks; both are rare and
 logged as `system_note` blocks so cost anomalies are explainable.
+
+The turn thread loads its context working set once into one arena: every
+compaction record needed to resolve nested summaries plus blocks after the
+greatest compacted seq. Superseded rows remain durable but are not parsed into
+the turn heap. The thread extends that slice after every persisted block, so
+provider tool rounds never re-read/re-parse SQLite history.
 
 ## 7. Tools & safety
 
@@ -559,9 +618,11 @@ explicit note. Rejected: bundling an `rg` sidecar; Marlin remains one binary.
   risk boundary.
 - `--yolo` skips legacy convenience prompts; it does not bypass protected
   paths, secret-environment isolation, or kernel sandbox boundaries.
-- An `ask` emits `approval.request` to *all* subscribed clients; first decision
-  wins; timeout (default: none — turn parks in `awaiting_approval`, exactly the
-  state the session picker, actionable status summary, and phone surface).
+- An `ask` arms its gate before emitting `approval.request`, so a fast answer
+  cannot race the pending id. The complete live request is retained and sent
+  to subscribed and session-watch clients on reconnect; first decision wins.
+  Timeout defaults to none — the turn parks in `awaiting_approval`, exactly the
+  state the session picker, actionable status summary, and phone surface.
 - bash sandboxing (M3.5, stolen from zag): Seatbelt profile on macOS
   (shipped, canary-verified at daemon start); Landlock + seccomp on Linux is
   **not yet implemented** — on Linux the sandbox backend reports unavailable
@@ -613,7 +674,10 @@ secret IMMORTAL):
   their tools appear in the registry with provider-safe names
   (`mcp__playwright__click`). Approval policy applies identically. The client
   speaks the current stateless protocol and falls back to the deployed legacy
-  initialize lifecycle.
+  initialize lifecycle. One absolute deadline spans lock acquisition, stdin
+  write, and response matching; unrelated stdout cannot extend it. Turn
+  cancellation kills the server process so one wedged call cannot serialize
+  every session behind an uncancellable server mutex.
 - **Exec tools**: a config entry maps name+JSON-schema → executable; marlin
   passes args as JSON on stdin, stdout is the result. A shell script is a tool.
 - **Hooks**: `on_session_done`, `on_approval_needed`, `on_error`, `on_turn_done`
@@ -663,6 +727,12 @@ get these right; Hermes is the counter-example):
   an animated gradient/shimmer on the status word (the Claude/Codex rainbow
   effect), not spinner characters and not log lines. Cheap in a cell grid:
   cycle fg color across the word per frame.
+- **Optimism must reconcile.** Submitted messages/steers render immediately,
+  but each has a wire request id. A matching daemon error removes precisely
+  that echo and restores the pre-submit state; generic errors cannot strand a
+  false running indicator. If the socket dies, the TUI restores the terminal
+  first and then prints the read failure at the shell, where alt-screen teardown
+  cannot erase it.
 - **Diffs render like a diff tool, not like raw patch output.** Gutter
   `+`/`-`, restrained full-row green/red surfaces, and language-aware syntax
   foregrounds keep the change shape obvious without washing out the code.
@@ -709,16 +779,22 @@ A split pane identifies its session with a compact pane label.
 ```
 
 - **Modes**: insert (typing → input box), normal (vim motions: j/k scroll,
-  gg top, `gt`/`gT` with count for recent-session cycling, J join lines in
-  the composer, `a` archive the focused session and advance, `A` archive
-  every finished child while preserving active children, `/sessions` for
-  arbitrary attach, v visual-select, y yank).
+  gg top, `gt`/`gT` with count for recent-session cycling, J join lines and
+  a/A/I enter insert mode in the composer, `/archive [children]` for explicit
+  lifecycle changes, `/sessions` for arbitrary attach, v visual-select,
+  y yank).
 - **Splits (not yet implemented)**: binary-tree layout, each pane = a
   session view (or the same session twice). No VTE anywhere.
 - **Scrollback**: virtual list over the block log. Selection is ours (mouse
   mode on): drag selects logical text within/across blocks; double-click =
   word, triple = block. Copy → OSC 52 (works through ssh/mosh); shift+drag
   falls through to the terminal for native selection as escape hatch.
+  The active turn's durable layout is cached until blocks/state/width change,
+  while provisional assistant text wraps append-only and receives full
+  Markdown treatment when its block finalizes. Spinner/token frames therefore
+  do not re-layout the accumulated turn. Inactive full
+  session views are an eight-entry MRU cache; evicted views reopen from a
+  bounded durable tail instead of accumulating for the lifetime of the TUI.
 - **Copy commands**: `!c` last tool result (full blob via `blob_get`, not
   the inline cap; the notice names the source tool since folding may hide
   it). The `!c msg`/`!c code`/`!c all` variants and the `!y`/`!p` daemon-side
@@ -842,8 +918,11 @@ on_session_done = "~/.config/marlin/hooks/notify.sh"
 | focused internal TOML decoder | config | only supported Marlin shapes; no runtime dep |
 | std.json | strict parse + our lenient-repair layer on top | — |
 
-Everything else: std. No async framework, no allocator exotica (GPA +
-arena-per-turn; blocks are write-once so arenas fit naturally).
+Everything else: std. No async framework or custom allocator. Runtime-owned
+objects use libc's process-wide allocator because their ownership deliberately
+crosses threads; turn/block parsing uses arenas because blocks are write-once.
+This avoids stranding small allocations in the ReleaseFast SMP allocator's
+per-thread free lists when dispatcher allocations are freed by socket writers.
 
 ## 11. Testing strategy (from day one, zag-inspired)
 

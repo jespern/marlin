@@ -252,12 +252,14 @@ fn internalGrep(
 
     // Single file?
     const stat = Io.Dir.cwd().statFile(io, search_path, .{}) catch |e| {
+        out.deinit(gpa);
         return std.fmt.allocPrint(gpa, "error: cannot access '{s}': {t}", .{ search_path, e });
     };
     if (stat.kind == .file) {
         try grepOneFile(gpa, io, &out, &matches, matcher, args.limit, search_path, search_path, cancel);
     } else {
         var dir = Io.Dir.cwd().openDir(io, search_path, .{ .iterate = true }) catch |e| {
+            out.deinit(gpa);
             return std.fmt.allocPrint(gpa, "error: cannot open '{s}': {t}", .{ search_path, e });
         };
         defer dir.close(io);
@@ -269,7 +271,7 @@ fn internalGrep(
             if (entry.kind != .file) continue;
             if (skipPath(entry.path)) continue;
             if (args.glob) |g| {
-                if (!globMatch(g, std.fs.path.basename(entry.path))) continue;
+                if (!try globMatchAlloc(gpa, g, std.fs.path.basename(entry.path), cancel)) continue;
             }
             const full = try std.fs.path.join(gpa, &.{ search_path, entry.path });
             defer gpa.free(full);
@@ -490,7 +492,7 @@ pub fn glob(
             entry.path
         else
             std.fs.path.basename(entry.path);
-        if (!globMatch(args.pattern, target)) continue;
+        if (!try globMatchAlloc(gpa, args.pattern, target, cancel)) continue;
         const st = dir.statFile(io, entry.path, .{}) catch continue;
         try hits.append(gpa, .{ .path = try gpa.dupe(u8, entry.path), .mtime = st.mtime.nanoseconds });
         if (hits.items.len >= 5000) break; // hard safety cap pre-sort
@@ -517,64 +519,81 @@ pub fn glob(
     return out.toOwnedSlice(gpa);
 }
 
-/// Glob matcher: *, ?, ** (across separators). Iterative backtracking.
+/// Glob matcher: *, ?, ** (across separators). The allocator-backed engine
+/// is O(pattern * path), avoiding the recursive/exponential `**` backtracking
+/// that used to make a malicious pattern effectively uninterruptible.
 pub fn globMatch(pattern: []const u8, name: []const u8) bool {
-    return globMatchInner(pattern, name);
+    return globMatchAlloc(std.heap.page_allocator, pattern, name, null) catch false;
 }
 
-fn globMatchInner(pat: []const u8, str: []const u8) bool {
-    // Handle the leftmost ** by splitting: head must match a prefix, then
-    // ** swallows any run (including '/'), then the tail matches a suffix.
-    if (std.mem.indexOf(u8, pat, "**")) |at| {
-        const head = pat[0..at];
-        const tail = pat[at + 2 ..];
-        // "head**/x" also matches with the '/' elided ("src/**/*.zig" must
-        // match "src/main.zig"), so try the tail without its leading '/'.
-        const tail_no_slash: ?[]const u8 = if (std.mem.startsWith(u8, tail, "/")) tail[1..] else null;
-        var h: usize = 0;
-        while (h <= str.len) : (h += 1) {
-            if (!simpleMatch(head, str[0..h], false)) continue;
-            // ** consumes str[h..j] for any j; tail matches the rest.
-            var j: usize = h;
-            while (j <= str.len) : (j += 1) {
-                if (globMatchInner(tail, str[j..])) return true;
-                if (tail_no_slash) |tns| {
-                    if (globMatchInner(tns, str[j..])) return true;
+fn globMatchAlloc(
+    gpa: std.mem.Allocator,
+    pat: []const u8,
+    str: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) !bool {
+    var current = try gpa.alloc(bool, str.len + 1);
+    defer gpa.free(current);
+    var next = try gpa.alloc(bool, str.len + 1);
+    defer gpa.free(next);
+    @memset(current, false);
+    current[0] = true;
+
+    var p: usize = 0;
+    var work: usize = 0;
+    while (p < pat.len) {
+        if (cancelled(cancel)) return error.Cancelled;
+        @memset(next, false);
+        if (pat[p] == '*' and p + 1 < pat.len and pat[p + 1] == '*') {
+            if (p + 2 < pat.len and pat[p + 2] == '/') {
+                // `**/` consumes zero path segments, or a prefix ending in
+                // '/'. Treating the slash as part of this token is what lets
+                // src/**/*.zig also match src/main.zig.
+                for (current, 0..) |reachable, start| {
+                    if (!reachable) continue;
+                    next[start] = true;
+                    var end = start;
+                    while (end < str.len) {
+                        end += 1;
+                        if (str[end - 1] == '/') next[end] = true;
+                        work += 1;
+                        if (work & 0x3ff == 0 and cancelled(cancel)) return error.Cancelled;
+                    }
+                }
+                p += 3;
+            } else {
+                // Bare `**` may consume any byte, including separators.
+                var reachable = false;
+                for (current, 0..) |value, i| {
+                    reachable = reachable or value;
+                    next[i] = reachable;
+                }
+                p += 2;
+            }
+        } else if (pat[p] == '*') {
+            // A single star cannot cross a path separator.
+            for (current, 0..) |reachable, start| {
+                if (!reachable) continue;
+                next[start] = true;
+                var end = start;
+                while (end < str.len and str[end] != '/') {
+                    end += 1;
+                    next[end] = true;
+                    work += 1;
+                    if (work & 0x3ff == 0 and cancelled(cancel)) return error.Cancelled;
                 }
             }
-        }
-        return false;
-    }
-    return simpleMatch(pat, str, true);
-}
-
-/// Match without **: * stops at '/', ? matches one non-'/' char.
-/// `full` = must consume the whole string.
-fn simpleMatch(pat: []const u8, str: []const u8, full: bool) bool {
-    _ = full;
-    var p: usize = 0;
-    var s: usize = 0;
-    var star_p: ?usize = null;
-    var star_s: usize = 0;
-    while (s < str.len) {
-        if (p < pat.len and (pat[p] == str[s] or (pat[p] == '?' and str[s] != '/'))) {
             p += 1;
-            s += 1;
-        } else if (p < pat.len and pat[p] == '*') {
-            star_p = p;
-            star_s = s;
-            p += 1;
-        } else if (star_p) |sp| {
-            if (str[star_s] == '/') return false; // * does not cross separators
-            star_s += 1;
-            s = star_s;
-            p = sp + 1;
         } else {
-            return false;
+            const token = pat[p];
+            for (current[0..str.len], 0..) |reachable, i| {
+                if (reachable and (token == str[i] or (token == '?' and str[i] != '/'))) next[i + 1] = true;
+            }
+            p += 1;
         }
+        std.mem.swap([]bool, &current, &next);
     }
-    while (p < pat.len and pat[p] == '*') p += 1;
-    return p == pat.len;
+    return current[str.len];
 }
 
 // ---------------------------------------------------------------- tests --
@@ -589,6 +608,33 @@ test "globMatch basics" {
     try std.testing.expect(globMatch("**/*.json", "a/b/c.json"));
     try std.testing.expect(globMatch("**/*.json", "c.json"));
     try std.testing.expect(!globMatch("**/*.json", "c.jsonx"));
+}
+
+test "globMatch remains bounded for many globstars and observes cancellation" {
+    const pattern = "**/**/**/**/**/**/**/**/**/**/missing";
+    const path = "a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/file";
+    try std.testing.expect(!globMatch(pattern, path));
+
+    var cancel: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        globMatchAlloc(std.testing.allocator, pattern, path, &cancel),
+    );
+}
+
+test "internal grep diagnostic path releases any partial output" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const result = try internalGrep(
+        gpa,
+        threaded.io(),
+        .{ .pattern = "(" },
+        "/definitely/not/a/marlin/path",
+        null,
+    );
+    defer gpa.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cannot access") != null);
 }
 
 test "internal grep + glob on a temp tree" {

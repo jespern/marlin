@@ -117,13 +117,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const proto_module = b.createModule(.{
+        .root_source_file = b.path("src/core/proto.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const e2e_runner = b.addExecutable(.{
         .name = "e2e-runner",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/testing/e2e_runner.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "process_io", .module = process_io_module }},
+            .imports = &.{
+                .{ .name = "process_io", .module = process_io_module },
+                .{ .name = "proto", .module = proto_module },
+            },
         }),
     });
 

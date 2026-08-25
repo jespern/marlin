@@ -25,9 +25,24 @@ pub const ReadArgs = struct {
 
 pub const max_read_bytes: usize = 2 * 1024 * 1024;
 
+fn cancelled(flag: ?*const std.atomic.Value(bool)) bool {
+    return if (flag) |value| value.load(.acquire) else false;
+}
+
 /// Returns formatted output (caller frees). Errors are returned as text so
 /// the model can react (missing file, binary, etc.) — tool errors are data.
 pub fn readFile(gpa: std.mem.Allocator, io: Io, args: ReadArgs, cwd: []const u8) ![]u8 {
+    return readFileCancelable(gpa, io, args, cwd, null);
+}
+
+pub fn readFileCancelable(
+    gpa: std.mem.Allocator,
+    io: Io,
+    args: ReadArgs,
+    cwd: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) ![]u8 {
+    if (cancelled(cancel)) return error.Cancelled;
     // Resolve relative to session cwd.
     const abs = if (std.fs.path.isAbsolute(args.path))
         try gpa.dupe(u8, args.path)
@@ -40,6 +55,7 @@ pub fn readFile(gpa: std.mem.Allocator, io: Io, args: ReadArgs, cwd: []const u8)
         return std.fmt.allocPrint(gpa, "error: cannot read '{s}': {t}", .{ args.path, e });
     };
     defer gpa.free(contents);
+    if (cancelled(cancel)) return error.Cancelled;
 
     // Binary sniff: NUL byte in the first 4k.
     const sniff = contents[0..@min(contents.len, 4096)];
@@ -53,6 +69,7 @@ pub fn readFile(gpa: std.mem.Allocator, io: Io, args: ReadArgs, cwd: []const u8)
     var shown: u64 = 0;
     var it = std.mem.splitScalar(u8, contents, '\n');
     while (it.next()) |line| {
+        if (line_no & 0x3ff == 0 and cancelled(cancel)) return error.Cancelled;
         line_no += 1;
         if (line_no < args.offset) continue;
         if (shown >= args.limit) {
@@ -88,6 +105,17 @@ pub const WriteArgs = struct {
 };
 
 pub fn writeFile(gpa: std.mem.Allocator, io: Io, args: WriteArgs, cwd: []const u8) ![]u8 {
+    return writeFileCancelable(gpa, io, args, cwd, null);
+}
+
+pub fn writeFileCancelable(
+    gpa: std.mem.Allocator,
+    io: Io,
+    args: WriteArgs,
+    cwd: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) ![]u8 {
+    if (cancelled(cancel)) return error.Cancelled;
     const abs = try resolvePath(gpa, args.path, cwd);
     defer gpa.free(abs);
 
@@ -96,12 +124,14 @@ pub fn writeFile(gpa: std.mem.Allocator, io: Io, args: WriteArgs, cwd: []const u
     // change itself is reviewable in the transcript, not just a byte count.
     const previous: ?[]u8 = dir.readFileAlloc(io, abs, gpa, .limited(4 * 1024 * 1024)) catch null;
     defer if (previous) |prev| gpa.free(prev);
+    if (cancelled(cancel)) return error.Cancelled;
 
     if (std.fs.path.dirname(abs)) |parent| {
         dir.createDirPath(io, parent) catch |e| {
             return std.fmt.allocPrint(gpa, "error: cannot create parent dirs for '{s}': {t}", .{ args.path, e });
         };
     }
+    if (cancelled(cancel)) return error.Cancelled;
     dir.writeFile(io, .{ .sub_path = abs, .data = args.content }) catch |e| {
         return std.fmt.allocPrint(gpa, "error: cannot write '{s}': {t}", .{ args.path, e });
     };
@@ -135,6 +165,7 @@ pub fn writeFile(gpa: std.mem.Allocator, io: Io, args: WriteArgs, cwd: []const u
     var shown: usize = 0;
     var it = std.mem.splitScalar(u8, args.content, '\n');
     while (it.next()) |line| {
+        if (shown & 0x3ff == 0 and cancelled(cancel)) return error.Cancelled;
         if (shown == total or shown == creation_preview_lines) break;
         try out.append(gpa, '+');
         try out.appendSlice(gpa, line);
@@ -170,6 +201,17 @@ pub const EditArgs = struct {
 };
 
 pub fn editFile(gpa: std.mem.Allocator, io: Io, args: EditArgs, cwd: []const u8) ![]u8 {
+    return editFileCancelable(gpa, io, args, cwd, null);
+}
+
+pub fn editFileCancelable(
+    gpa: std.mem.Allocator,
+    io: Io,
+    args: EditArgs,
+    cwd: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) ![]u8 {
+    if (cancelled(cancel)) return error.Cancelled;
     if (args.old_string.len == 0)
         return gpa.dupe(u8, "error: old_string must not be empty");
     if (std.mem.eql(u8, args.old_string, args.new_string))
@@ -183,6 +225,7 @@ pub fn editFile(gpa: std.mem.Allocator, io: Io, args: EditArgs, cwd: []const u8)
         return std.fmt.allocPrint(gpa, "error: cannot read '{s}': {t}", .{ args.path, e });
     };
     defer gpa.free(contents);
+    if (cancelled(cancel)) return error.Cancelled;
 
     const rr = replaceExact(gpa, contents, args.old_string, args.new_string, args.replace_all) catch |e| switch (e) {
         error.NotFound => blk: {
@@ -200,6 +243,7 @@ pub fn editFile(gpa: std.mem.Allocator, io: Io, args: EditArgs, cwd: []const u8)
     };
     defer gpa.free(rr.text);
 
+    if (cancelled(cancel)) return error.Cancelled;
     dir.writeFile(io, .{ .sub_path = abs, .data = rr.text }) catch |e| {
         return std.fmt.allocPrint(gpa, "error: cannot write '{s}': {t}", .{ args.path, e });
     };

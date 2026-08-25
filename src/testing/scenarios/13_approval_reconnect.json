@@ -1,0 +1,25 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["approval reconnect task"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_reconnect\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf approval-reconnected\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["approval-reconnected", "queued while awaiting approval"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"approval reconnect completed\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": [],
+    "approval_reconnect_flow": true,
+    "db_kinds": ["user_msg", "tool_call", "approval", "tool_result", "steer", "assistant_msg"]
+  }
+}

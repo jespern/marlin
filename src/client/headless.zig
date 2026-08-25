@@ -17,6 +17,7 @@ const Io = std.Io;
 const config = @import("../core/config.zig");
 const proto = @import("../core/proto.zig");
 const session_handle = @import("../core/session_handle.zig");
+const store_mod = @import("../daemon/store.zig");
 const attach = @import("attach.zig");
 
 const ResolvedSession = struct {
@@ -375,6 +376,53 @@ pub fn shutdown(
     return 0;
 }
 
+/// `marlin gc [--expire-days N]` — safe orphan sweep by default. Full blob
+/// bodies are demoted only when the operator supplies an explicit horizon.
+pub fn gc(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    args: []const [:0]const u8,
+) !u8 {
+    var expire_before_ms: ?i64 = null;
+    if (args.len != 0) {
+        if (args.len != 2 or !std.mem.eql(u8, args[0], "--expire-days")) {
+            try eprint(io, "usage: marlin gc [--expire-days N]\n", .{});
+            return 2;
+        }
+        const days = std.fmt.parseInt(i64, args[1], 10) catch {
+            try eprint(io, "marlin gc: expiry days must be a positive integer\n", .{});
+            return 2;
+        };
+        const ms_per_day: i64 = 24 * 60 * 60 * 1000;
+        if (days <= 0 or days > @divTrunc(std.math.maxInt(i64), ms_per_day)) {
+            try eprint(io, "marlin gc: expiry days must be a positive integer\n", .{});
+            return 2;
+        }
+        const now = Io.Timestamp.now(io, .real);
+        const now_ms: i64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
+        expire_before_ms = now_ms - days * ms_per_day;
+    }
+
+    const db_path = try store_mod.defaultDbPath(gpa, io, environ);
+    defer gpa.free(db_path);
+    var store = store_mod.Store.open(gpa, db_path) catch |err| {
+        try eprint(io, "marlin gc: could not open store: {t}\n", .{err});
+        return 1;
+    };
+    defer store.close();
+    const report = store.gc(expire_before_ms) catch |err| {
+        try eprint(io, "marlin gc: maintenance failed: {t}\n", .{err});
+        return 1;
+    };
+    try print(io, "reclaimed {d} bytes ({d} orphan blobs, {d} expired bodies)\n", .{
+        report.bytes_reclaimed,
+        report.orphan_blobs,
+        report.expired_blobs,
+    });
+    return 0;
+}
+
 /// `marlin compact [handle]` — manual L2 compaction. Without one: newest
 /// session. Waits for the daemon to finish (status returns to idle/err).
 pub fn compact(
@@ -541,7 +589,11 @@ pub fn reboot(
         try conn.send(.{ .hello = .{ .proto_version = proto.proto_version, .client_kind = "reboot" } });
         _ = try conn.recvUntil(arena, .hello_ok);
         try conn.send(.{ .reboot = .{ .force = force } });
-        _ = conn.recvUntil(arena, .ok) catch {
+        _ = conn.recvUntil(arena, .ok) catch |err| {
+            if (err == error.DaemonError) {
+                try eprint(io, "marlin: reboot refused; daemon remains running\n", .{});
+                return 1;
+            }
             try eprint(io, "marlin: daemon did not ack reboot (crashed?) — proceeding\n", .{});
         };
     }

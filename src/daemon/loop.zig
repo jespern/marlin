@@ -10,6 +10,7 @@ const ids = @import("../core/ids.zig");
 const jsonx = @import("../core/jsonx.zig");
 const config = @import("../core/config.zig");
 const Store = @import("store.zig").Store;
+const process_io = @import("process_io.zig");
 const context = @import("context.zig");
 const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
@@ -72,10 +73,10 @@ pub const RunOpts = struct {
     /// Gate the turn parks on while a client decides. Required when
     /// approval_mode may produce `ask` decisions.
     gate: ?*approval.Gate = null,
-    /// Called when an `ask` decision needs a client answer, BEFORE parking.
-    /// The callback must deliver approval_request to clients (and flip the
-    /// session status to awaiting_approval). `id` is the approval id.
-    on_approval_needed: ?*const fn (ctx: ?*anyopaque, id: u64, call_id: []const u8, tool: []const u8, args_json: []const u8) void = null,
+    /// Called after the gate is armed but before parking. Returns false when
+    /// the request could not be published; the call is then denied rather than
+    /// leaving an unreachable waiter. `id` is the approval id.
+    on_approval_needed: ?*const fn (ctx: ?*anyopaque, id: u64, call_id: []const u8, tool: []const u8, args_json: []const u8) bool = null,
     /// Called after the gate resolves (status back to running).
     on_approval_done: ?*const fn (ctx: ?*anyopaque, id: u64, verdict: approval.Verdict) void = null,
     /// Called with streaming assistant text for UI liveness.
@@ -123,10 +124,25 @@ const Appender = struct {
     opts: *const RunOpts,
     seq: u64,
     turn_id: u64,
+    history: ?*std.ArrayList(block.Block) = null,
+    history_arena: ?std.mem.Allocator = null,
 
     fn append(self: *Appender, body: block.Body) !u64 {
+        return self.appendMaybeBlob(body, null);
+    }
+
+    fn appendWithBlob(self: *Appender, body: block.Body, hash: []const u8, bytes: []const u8) !u64 {
+        return self.appendMaybeBlob(body, .{ .hash = hash, .bytes = bytes });
+    }
+
+    const BlobPayload = struct { hash: []const u8, bytes: []const u8 };
+
+    fn appendMaybeBlob(self: *Appender, body: block.Body, blob_payload: ?BlobPayload) !u64 {
         self.seq += 1;
-        const b = block.Block{
+        errdefer self.seq -= 1;
+        var cached_body: ?block.Body = null;
+        if (self.history_arena) |arena| cached_body = try cloneBody(arena, body);
+        const b: block.Block = .{
             .id = ids.next(self.io),
             .session_id = self.opts.session_id,
             .turn_id = self.turn_id,
@@ -134,11 +150,54 @@ const Appender = struct {
             .ts = nowMs(self.io),
             .body = body,
         };
-        try self.store.appendBlock(b);
+        if (blob_payload) |blob_value|
+            try self.store.appendBlockWithBlob(b, blob_value.hash, blob_value.bytes)
+        else
+            try self.store.appendBlock(b);
+        if (self.history) |history| {
+            var cached = b;
+            cached.body = cached_body.?;
+            try history.append(self.history_arena.?, cached);
+        }
         if (self.opts.on_block) |cb| cb(self.opts.on_delta_ctx, b);
         return b.id;
     }
 };
+
+fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
+    return switch (body) {
+        .user_msg => |value| .{ .user_msg = .{
+            .text = try arena.dupe(u8, value.text),
+            .synthetic = value.synthetic,
+        } },
+        .assistant_msg => |value| .{ .assistant_msg = .{ .text = try arena.dupe(u8, value.text) } },
+        .reasoning => |value| .{ .reasoning = .{ .text = try arena.dupe(u8, value.text) } },
+        .tool_call => |value| .{ .tool_call = .{
+            .call_id = try arena.dupe(u8, value.call_id),
+            .name = try arena.dupe(u8, value.name),
+            .args_json = try arena.dupe(u8, value.args_json),
+        } },
+        .tool_result => |value| .{ .tool_result = .{
+            .call_id = try arena.dupe(u8, value.call_id),
+            .status = value.status,
+            .inline_body = try arena.dupe(u8, value.inline_body),
+            .full_body_ref = if (value.full_body_ref) |reference| try arena.dupe(u8, reference) else null,
+        } },
+        .approval => |value| .{ .approval = .{
+            .approval_id = try arena.dupe(u8, value.approval_id),
+            .call_id = try arena.dupe(u8, value.call_id),
+            .decision = value.decision,
+            .decided_by = if (value.decided_by) |client| try arena.dupe(u8, client) else null,
+        } },
+        .steer => |value| .{ .steer = .{ .text = try arena.dupe(u8, value.text) } },
+        .compaction => |value| .{ .compaction = .{
+            .summary = try arena.dupe(u8, value.summary),
+            .covers_from_seq = value.covers_from_seq,
+            .covers_to_seq = value.covers_to_seq,
+        } },
+        .system_note => |value| .{ .system_note = .{ .text = try arena.dupe(u8, value.text) } },
+    };
+}
 
 /// Run one full agent turn: user text in → tool roundtrips → final text out.
 /// All blocks are persisted as they happen; a crash mid-turn leaves a
@@ -150,12 +209,20 @@ pub fn runTurn(
     opts: RunOpts,
     user_text: []const u8,
 ) !TurnResult {
+    var history_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer history_arena_state.deinit();
+    const history_arena = history_arena_state.allocator();
+    var history: std.ArrayList(block.Block) = .empty;
+    try store.loadContextBlocksInto(history_arena, &history, opts.session_id, 1_000_000);
+
     var ap = Appender{
         .store = store,
         .io = io,
         .opts = &opts,
         .seq = try store.lastSeq(opts.session_id),
         .turn_id = ids.next(io),
+        .history = &history,
+        .history_arena = history_arena,
     };
 
     var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
@@ -189,18 +256,12 @@ pub fn runTurn(
             }
         }
 
-        // -- assemble context from the full block log (arena per request) --
+        // -- assemble context from the turn-local append-only history --
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const loaded = try store.getBlocks(opts.session_id, 1, 1_000_000);
-        defer {
-            for (loaded) |*lb| lb.deinit();
-            gpa.free(loaded);
-        }
-        var blocks = try arena.alloc(block.Block, loaded.len);
-        for (loaded, 0..) |lb, i| blocks[i] = lb.blk;
+        var blocks = history.items;
 
         const frontier: u64 = if (opts.prune_frontier) |pf| pf.* else 0;
         const system_prompt_suffix = if (opts.extensions) |ext| ext.systemPromptSuffix() else "";
@@ -216,14 +277,9 @@ pub fn runTurn(
         var est_used = context.estimateAssembled(msgs);
         if (context.needsCompaction(est_used, opts.endpoint.model, opts.cfg)) {
             if (try maybeCompact(gpa, io, arena, &ap, &http_client, opts, blocks, .auto)) {
-                // Re-load + re-assemble on top of the new compaction block.
-                const loaded2 = try store.getBlocks(opts.session_id, 1, 1_000_000);
-                defer {
-                    for (loaded2) |*lb| lb.deinit();
-                    gpa.free(loaded2);
-                }
-                blocks = try arena.alloc(block.Block, loaded2.len);
-                for (loaded2, 0..) |lb, i| blocks[i] = lb.blk;
+                // Appender placed the new compaction block directly into the
+                // cache; refresh the slice in case ArrayList reallocated.
+                blocks = history.items;
                 msgs = try context.assemble(arena, blocks, asm_opts);
             } else if (opts.prune_frontier) |pf| {
                 // Compaction not possible (session too small / no progress):
@@ -311,12 +367,18 @@ pub fn runTurn(
             .body_json = body,
             .extra_headers = observabilityHeaders(opts.endpoint.dialect),
             .cancel = opts.cancel,
+            .on_wait = Pump.onProviderWait,
+            .on_wait_ctx = &pump,
         }, &pump, Pump.onChunk) catch |e| switch (e) {
             error.Cancelled => {
                 _ = try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
                 try store.updateSessionUsage(opts.session_id, total_in, total_out);
                 return .{ .text = try gpa.dupe(u8, ""), .rounds = round, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
             },
+            error.ConsumerAborted => if (acc.response_too_large)
+                return error.ProviderResponseTooLarge
+            else
+                return e,
             else => return e,
         };
 
@@ -449,13 +511,17 @@ pub fn runTurn(
                     const id_str = try std.fmt.allocPrint(gpa, "{d}", .{approval_id});
                     defer gpa.free(id_str);
 
-                    if (opts.on_approval_needed) |cb|
-                        cb(opts.on_delta_ctx, approval_id, call.call_id, call.name, call.args_json);
-
-                    const verdict: approval.Verdict = if (opts.gate) |g|
-                        g.wait(io, approval_id, opts.cancel)
-                    else
-                        .approved; // no gate wired (tests) → auto
+                    const verdict: approval.Verdict = if (opts.gate) |g| blk: {
+                        if (!g.arm(io, approval_id, opts.cancel)) break :blk .denied;
+                        const published = if (opts.on_approval_needed) |cb|
+                            cb(opts.on_delta_ctx, approval_id, call.call_id, call.name, call.args_json)
+                        else
+                            false;
+                        if (!published) {
+                            _ = g.resolve(io, approval_id, .denied);
+                        }
+                        break :blk g.wait(io, approval_id);
+                    } else .approved; // no gate wired (tests) → auto
 
                     if (opts.on_approval_done) |cb| cb(opts.on_delta_ctx, approval_id, verdict);
 
@@ -496,17 +562,20 @@ pub fn runTurn(
             const cap: usize = opts.cfg.inline_tool_cap_bytes;
             var full_ref: ?[]const u8 = null;
             defer if (full_ref) |r| gpa.free(@constCast(r));
-            if (exec.output.len > cap) full_ref = try store.putBlob(exec.output, nowMs(io));
+            if (exec.output.len > cap) full_ref = try Store.blobHashAlloc(gpa, exec.output);
             const inline_body = try context.capInline(gpa, exec.output, cap);
             defer if (inline_body.ptr != exec.output.ptr) gpa.free(@constCast(inline_body));
 
-            const tr_block_id = try ap.append(.{ .tool_result = .{
+            const result_body: block.Body = .{ .tool_result = .{
                 .call_id = call.call_id,
                 .status = exec.status,
                 .inline_body = inline_body,
                 .full_body_ref = full_ref,
-            } });
-            if (full_ref) |r| try store.addBlobRef(r, tr_block_id);
+            } };
+            _ = if (full_ref) |hash|
+                try ap.appendWithBlob(result_body, hash, exec.output)
+            else
+                try ap.append(result_body);
         }
         // Loop: next round re-assembles including the new tool results.
     }
@@ -687,13 +756,17 @@ fn summarize(
     var pump = Pump{ .parser = sse.Parser.init(gpa), .acc = &acc };
     defer pump.parser.deinit();
 
-    const resp = try http_client.streamPost(gpa, .{
+    const resp = http_client.streamPost(gpa, .{
         .url = ep.url,
         .bearer = ep.bearer,
         .body_json = body,
         .extra_headers = observabilityHeaders(ep.dialect),
         .cancel = cancel,
-    }, &pump, Pump.onChunk);
+    }, &pump, Pump.onChunk) catch |err| {
+        if (err == error.ConsumerAborted and acc.response_too_large)
+            return error.ProviderResponseTooLarge;
+        return err;
+    };
     if (resp.status >= 400) {
         if (resp.error_body) |eb| gpa.free(eb);
         return error.SummarizerHttpError;
@@ -717,13 +790,9 @@ pub fn compactSession(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const loaded = try store.getBlocks(opts.session_id, 1, 1_000_000);
-    defer {
-        for (loaded) |*lb| lb.deinit();
-        gpa.free(loaded);
-    }
-    const blocks = try arena.alloc(block.Block, loaded.len);
-    for (loaded, 0..) |lb, i| blocks[i] = lb.blk;
+    var relevant: std.ArrayList(block.Block) = .empty;
+    try store.loadContextBlocksInto(arena, &relevant, opts.session_id, 1_000_000);
+    const blocks = relevant.items;
 
     var ap = Appender{
         .store = store,
@@ -885,12 +954,14 @@ fn gitProbe(
     argv: []const []const u8,
     stdout_limit: usize,
 ) ?[]u8 {
-    const res = std.process.run(gpa, io, .{
+    const res = process_io.run(gpa, io, .{
         .argv = argv,
         .cwd = .{ .path = opts.cwd },
         .environ_map = opts.tool_environ,
-        .stdout_limit = .limited(stdout_limit),
-        .stderr_limit = .limited(4096),
+        .stdout_limit = stdout_limit,
+        .stderr_limit = 4096,
+        .timeout_ms = 500,
+        .cancel = opts.cancel,
     }) catch return null;
     defer gpa.free(res.stderr);
     if (res.term != .exited or res.term.exited != 0) {
@@ -910,26 +981,25 @@ fn environmentBlock(gpa: std.mem.Allocator, io: Io, opts: *const RunOpts) ![]u8 
     const year_day = (std.time.epoch.EpochSeconds{ .secs = secs }).getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
 
-    var git_owned: ?[]u8 = null;
-    defer if (git_owned) |g| gpa.free(g);
     var git_desc: []const u8 = "not a git repository";
-    if (gitProbe(gpa, io, opts, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }, 4096)) |branch_raw| {
-        defer gpa.free(branch_raw);
-        const branch = std.mem.trim(u8, branch_raw, " \r\n");
-        var dirty: usize = 0;
-        if (gitProbe(gpa, io, opts, &.{ "git", "status", "--porcelain" }, 256 * 1024)) |status_raw| {
-            defer gpa.free(status_raw);
-            var it = std.mem.splitScalar(u8, status_raw, '\n');
-            while (it.next()) |line| {
-                if (line.len > 0) dirty += 1;
-            }
+    const git_probe = gitProbe(
+        gpa,
+        io,
+        opts,
+        &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
+        4096,
+    );
+    defer if (git_probe) |g| gpa.free(g);
+    var git_summary: ?[]u8 = null;
+    defer if (git_summary) |summary| gpa.free(summary);
+    if (git_probe) |branch_raw| {
+        const branch = std.mem.trim(u8, branch_raw, " \t\r\n");
+        if (branch.len > 0 and !std.mem.eql(u8, branch, "HEAD")) {
+            git_summary = try std.fmt.allocPrint(gpa, "a git repository, branch {s}", .{branch});
+            git_desc = git_summary.?;
+        } else {
+            git_desc = "a git repository (detached HEAD)";
         }
-        git_owned = try std.fmt.allocPrint(
-            gpa,
-            "a git repository, branch {s}, {d} changed/untracked files",
-            .{ branch, dirty },
-        );
-        git_desc = git_owned.?;
     }
 
     const sandbox_desc: []const u8 = switch (opts.sandbox_options.backend) {
@@ -985,10 +1055,14 @@ const Pump = struct {
     last_visible_ms: i64 = 0,
     last_emit_ms: i64 = 0,
 
-    fn onChunk(self: *Pump, bytes: []const u8) void {
+    fn onChunk(self: *Pump, bytes: []const u8) bool {
         self.bytes_total += bytes.len;
-        self.parser.feed(bytes, self, onEvent) catch {};
+        self.parser.feed(bytes, self, onEvent) catch {
+            self.acc.response_too_large = true;
+            return false;
+        };
         self.maybeEmitStatus();
+        return !self.acc.response_too_large;
     }
 
     fn onEvent(self: *Pump, ev: sse.Event) void {
@@ -1007,6 +1081,12 @@ const Pump = struct {
         self.markVisible();
         const opts = self.opts orelse return;
         if (opts.on_reasoning_delta) |cb| cb(opts.on_delta_ctx, text);
+    }
+
+    fn onProviderWait(ctx: ?*anyopaque, elapsed_ms: u64) void {
+        const self: *Pump = @ptrCast(@alignCast(ctx.?));
+        const opts = self.opts orelse return;
+        if (opts.on_stream_status) |cb| cb(opts.on_delta_ctx, 0, elapsed_ms);
     }
 
     fn markVisible(self: *Pump) void {

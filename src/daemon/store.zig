@@ -65,7 +65,6 @@ const schema_sql =
     \\  body_json TEXT NOT NULL,
     \\  UNIQUE(session_id, seq)
     \\);
-    \\CREATE INDEX IF NOT EXISTS blocks_by_session ON blocks(session_id, seq);
     \\CREATE TABLE IF NOT EXISTS blobs(
     \\  hash TEXT PRIMARY KEY,
     \\  bytes BLOB NOT NULL,
@@ -77,7 +76,7 @@ const schema_sql =
     \\  block_id INTEGER NOT NULL,
     \\  PRIMARY KEY(hash, block_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','5');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','6');
 ;
 
 pub const SessionRow = struct {
@@ -96,9 +95,16 @@ pub const SessionRow = struct {
     archived: bool,
 };
 
+pub const GcReport = struct {
+    orphan_blobs: u64,
+    expired_blobs: u64,
+    bytes_reclaimed: u64,
+};
+
 pub const Store = struct {
     db: *c.sqlite3,
     gpa: std.mem.Allocator,
+    statements: *StatementCache,
 
     /// Open (creating schema if needed). `path` null → in-memory (tests).
     pub fn open(gpa: std.mem.Allocator, path: ?[:0]const u8) Error!Store {
@@ -130,7 +136,13 @@ pub const Store = struct {
             _ = c.sqlite3_close(db.?);
             return error.SqliteOpen;
         }
-        const store = Store{ .db = db.?, .gpa = gpa };
+        const statements = gpa.create(StatementCache) catch {
+            _ = c.sqlite3_close(db.?);
+            return error.OutOfMemory;
+        };
+        statements.* = .{};
+        var store = Store{ .db = db.?, .gpa = gpa, .statements = statements };
+        errdefer store.close();
         try store.execAll(schema_sql);
         try store.migrate();
         return store;
@@ -179,6 +191,15 @@ pub const Store = struct {
                 \\UPDATE kv SET value='5' WHERE key='schema_version';
             );
         }
+        if (ver < 6) {
+            // UNIQUE(session_id, seq) already creates the exact covering
+            // index used by block scans. The explicit duplicate doubled
+            // every block insert's index work and disk footprint.
+            try self.execAll(
+                \\DROP INDEX IF EXISTS blocks_by_session;
+                \\UPDATE kv SET value='6' WHERE key='schema_version';
+            );
+        }
     }
 
     fn kvGetInt(self: Store, key: []const u8) Error!i64 {
@@ -194,7 +215,10 @@ pub const Store = struct {
     }
 
     pub fn close(self: *Store) void {
+        self.statements.deinit();
+        self.gpa.destroy(self.statements);
         _ = c.sqlite3_close(self.db);
+        self.* = undefined;
     }
 
     fn execAll(self: Store, sql: [:0]const u8) Error!void {
@@ -250,8 +274,14 @@ pub const Store = struct {
     }
 
     pub fn setSessionStatus(self: Store, id: u64, status: []const u8) Error!void {
-        const stmt = try self.prepare("UPDATE sessions SET status=? WHERE id=?");
-        defer finalize(stmt);
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(
+            &self.statements.set_session_status,
+            "UPDATE sessions SET status=? WHERE id=?",
+        );
+        defer resetStatement(stmt);
         bindText(stmt, 1, status);
         bindInt(stmt, 2, @bitCast(id));
         try stepDone(stmt);
@@ -284,10 +314,14 @@ pub const Store = struct {
     }
 
     pub fn updateSessionUsage(self: Store, id: u64, tokens_in: u64, tokens_out: u64) Error!void {
-        const stmt = try self.prepare(
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(
+            &self.statements.update_session_usage,
             "UPDATE sessions SET tokens_in=?, tokens_out=? WHERE id=?",
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, @intCast(tokens_in));
         bindInt(stmt, 2, @intCast(tokens_out));
         bindInt(stmt, 3, @bitCast(id));
@@ -429,10 +463,14 @@ pub const Store = struct {
             return error.OutOfMemory;
         defer self.gpa.free(body_json);
 
-        const stmt = try self.prepare(
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(
+            &self.statements.append_block,
             "INSERT INTO blocks(id, session_id, turn_id, seq, kind, ts, body_json) VALUES(?,?,?,?,?,?,?)",
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, @bitCast(blk.id));
         bindInt(stmt, 2, @bitCast(blk.session_id));
         bindInt(stmt, 3, @bitCast(blk.turn_id));
@@ -441,6 +479,66 @@ pub const Store = struct {
         bindInt(stmt, 6, blk.ts);
         bindText(stmt, 7, body_json);
         try stepDone(stmt);
+    }
+
+    /// Persist one oversized tool result as a single crash-consistent unit.
+    /// The database mutex is recursive in FULLMUTEX mode; holding it across
+    /// BEGIN..COMMIT prevents another daemon thread from interleaving work on
+    /// this shared connection inside our transaction.
+    pub fn appendBlockWithBlob(
+        self: Store,
+        blk: block.Block,
+        hash: []const u8,
+        bytes: []const u8,
+    ) Error!void {
+        const body_json = std.json.Stringify.valueAlloc(self.gpa, blk.body, .{}) catch
+            return error.OutOfMemory;
+        defer self.gpa.free(body_json);
+
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        try self.execAll("BEGIN IMMEDIATE;");
+        var committed = false;
+        defer if (!committed) self.execAll("ROLLBACK;") catch {};
+
+        {
+            const stmt = try self.prepare(
+                \\INSERT INTO blobs(hash, bytes, created_at) VALUES(?,?,?)
+                \\ON CONFLICT(hash) DO UPDATE SET
+                \\  bytes=excluded.bytes, created_at=excluded.created_at, tombstone=0
+                \\WHERE blobs.tombstone=1
+            );
+            defer finalize(stmt);
+            bindText(stmt, 1, hash);
+            _ = c.sqlite3_bind_blob(stmt, 2, bytes.ptr, @intCast(bytes.len), static_destructor);
+            bindInt(stmt, 3, blk.ts);
+            try stepDone(stmt);
+        }
+        {
+            const stmt = try self.cachedStatement(
+                &self.statements.append_block,
+                "INSERT INTO blocks(id, session_id, turn_id, seq, kind, ts, body_json) VALUES(?,?,?,?,?,?,?)",
+            );
+            defer resetStatement(stmt);
+            bindInt(stmt, 1, @bitCast(blk.id));
+            bindInt(stmt, 2, @bitCast(blk.session_id));
+            bindInt(stmt, 3, @bitCast(blk.turn_id));
+            bindInt(stmt, 4, @bitCast(blk.seq));
+            bindText(stmt, 5, @tagName(blk.kind()));
+            bindInt(stmt, 6, blk.ts);
+            bindText(stmt, 7, body_json);
+            try stepDone(stmt);
+        }
+        {
+            const stmt = try self.prepare("INSERT OR IGNORE INTO blob_refs(hash, block_id) VALUES(?,?)");
+            defer finalize(stmt);
+            bindText(stmt, 1, hash);
+            bindInt(stmt, 2, @bitCast(blk.id));
+            try stepDone(stmt);
+        }
+        try self.execAll("COMMIT;");
+        committed = true;
     }
 
     pub const LoadedBlock = struct {
@@ -503,6 +601,173 @@ pub const Store = struct {
         return out.toOwnedSlice(self.gpa);
     }
 
+    /// Parse a block range directly into one caller-owned arena. Turn loops
+    /// use this to load an append-only history once instead of constructing
+    /// one heap arena per row on every provider round.
+    pub fn loadBlocksInto(
+        self: Store,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(block.Block),
+        session_id: u64,
+        from_seq: u64,
+        limit: u32,
+    ) Error!void {
+        const stmt = try self.prepare(
+            "SELECT id, turn_id, seq, ts, body_json FROM blocks WHERE session_id=? AND seq>=? ORDER BY seq ASC LIMIT ?",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(from_seq));
+        bindInt(stmt, 3, @intCast(limit));
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            const body_ptr = c.sqlite3_column_text(stmt, 4);
+            const body_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+            const body_json = try arena.dupe(u8, body_ptr[0..body_len]);
+            const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.SqliteStep;
+            try out.append(arena, .{
+                .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .session_id = session_id,
+                .turn_id = @bitCast(c.sqlite3_column_int64(stmt, 1)),
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 2)),
+                .ts = c.sqlite3_column_int64(stmt, 3),
+                .body = body,
+            });
+        }
+    }
+
+    /// Load exactly the context-relevant working set: every compaction record
+    /// (needed to resolve nested summaries) plus blocks after the greatest
+    /// compacted seq. The durable log remains untouched and full replay still
+    /// uses loadBlocksInto; turn threads avoid parsing history they will skip.
+    pub fn loadContextBlocksInto(
+        self: Store,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(block.Block),
+        session_id: u64,
+        limit: u32,
+    ) Error!void {
+        const stmt = try self.prepare(
+            \\WITH frontier(value) AS (
+            \\  SELECT COALESCE(MAX(CAST(json_extract(body_json, '$.compaction.covers_to_seq') AS INTEGER)), 0)
+            \\  FROM blocks WHERE session_id=? AND kind='compaction'
+            \\)
+            \\SELECT id, turn_id, seq, ts, body_json
+            \\FROM blocks, frontier
+            \\WHERE session_id=? AND (kind='compaction' OR seq>frontier.value)
+            \\ORDER BY seq ASC LIMIT ?
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(session_id));
+        bindInt(stmt, 3, @intCast(limit));
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            const body_ptr = c.sqlite3_column_text(stmt, 4);
+            const body_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+            const body_json = try arena.dupe(u8, body_ptr[0..body_len]);
+            const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.SqliteStep;
+            try out.append(arena, .{
+                .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .session_id = session_id,
+                .turn_id = @bitCast(c.sqlite3_column_int64(stmt, 1)),
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 2)),
+                .ts = c.sqlite3_column_int64(stmt, 3),
+                .body = body,
+            });
+        }
+    }
+
+    /// Load the newest block window while returning it in transcript order.
+    pub fn loadTailInto(
+        self: Store,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(block.Block),
+        session_id: u64,
+        limit: u32,
+    ) Error!void {
+        const stmt = try self.prepare(
+            \\SELECT id, turn_id, seq, ts, body_json FROM (
+            \\  SELECT id, turn_id, seq, ts, body_json
+            \\  FROM blocks WHERE session_id=? ORDER BY seq DESC LIMIT ?
+            \\) ORDER BY seq ASC
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @intCast(limit));
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            const body_ptr = c.sqlite3_column_text(stmt, 4);
+            const body_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+            const body_json = try arena.dupe(u8, body_ptr[0..body_len]);
+            const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.SqliteStep;
+            try out.append(arena, .{
+                .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .session_id = session_id,
+                .turn_id = @bitCast(c.sqlite3_column_int64(stmt, 1)),
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 2)),
+                .ts = c.sqlite3_column_int64(stmt, 3),
+                .body = body,
+            });
+        }
+    }
+
+    /// Load the newest block window strictly before `before_seq`, returning
+    /// it in transcript order. This is the backwards-pagination counterpart
+    /// to loadTailInto; every request has bounded DB and protocol work.
+    pub fn loadTailBeforeInto(
+        self: Store,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(block.Block),
+        session_id: u64,
+        before_seq: u64,
+        limit: u32,
+    ) Error!void {
+        const stmt = try self.prepare(
+            \\SELECT id, turn_id, seq, ts, body_json FROM (
+            \\  SELECT id, turn_id, seq, ts, body_json
+            \\  FROM blocks WHERE session_id=? AND seq<? ORDER BY seq DESC LIMIT ?
+            \\) ORDER BY seq ASC
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(before_seq));
+        bindInt(stmt, 3, @intCast(limit));
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            const body_ptr = c.sqlite3_column_text(stmt, 4);
+            const body_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+            const body_json = try arena.dupe(u8, body_ptr[0..body_len]);
+            const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.SqliteStep;
+            try out.append(arena, .{
+                .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .session_id = session_id,
+                .turn_id = @bitCast(c.sqlite3_column_int64(stmt, 1)),
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 2)),
+                .ts = c.sqlite3_column_int64(stmt, 3),
+                .body = body,
+            });
+        }
+    }
+
     /// Highest seq in a session (0 when empty).
     pub fn lastSeq(self: Store, session_id: u64) Error!u64 {
         const stmt = try self.prepare(
@@ -520,19 +785,28 @@ pub const Store = struct {
     /// Store bytes content-addressed; returns hex hash (allocated, caller frees).
     /// `now_ms` stamps created_at on first insert (dedup keeps the original).
     pub fn putBlob(self: Store, bytes: []const u8, now_ms: i64) Error![]const u8 {
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        const hex = std.fmt.allocPrint(self.gpa, "{x}", .{&digest}) catch
-            return error.OutOfMemory;
+        const hex = try blobHashAlloc(self.gpa, bytes);
         errdefer self.gpa.free(hex);
 
-        const stmt = try self.prepare("INSERT OR IGNORE INTO blobs(hash, bytes, created_at) VALUES(?,?,?)");
+        const stmt = try self.prepare(
+            \\INSERT INTO blobs(hash, bytes, created_at) VALUES(?,?,?)
+            \\ON CONFLICT(hash) DO UPDATE SET
+            \\  bytes=excluded.bytes, created_at=excluded.created_at, tombstone=0
+            \\WHERE blobs.tombstone=1
+        );
         defer finalize(stmt);
         bindText(stmt, 1, hex);
         _ = c.sqlite3_bind_blob(stmt, 2, bytes.ptr, @intCast(bytes.len), static_destructor);
         bindInt(stmt, 3, now_ms);
         try stepDone(stmt);
         return hex;
+    }
+
+    pub fn blobHashAlloc(gpa: std.mem.Allocator, bytes: []const u8) Error![]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return std.fmt.allocPrint(gpa, "{x}", .{&digest}) catch
+            return error.OutOfMemory;
     }
 
     /// Record that `block_id` references blob `hash` (for GC refcounting).
@@ -545,17 +819,69 @@ pub const Store = struct {
     }
 
     pub fn getBlob(self: Store, hash: []const u8) Error![]const u8 {
-        const stmt = try self.prepare("SELECT bytes FROM blobs WHERE hash=?");
+        const stmt = try self.prepare("SELECT bytes, tombstone FROM blobs WHERE hash=?");
         defer finalize(stmt);
         bindText(stmt, 1, hash);
         const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) return error.NotFound;
         if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        if (c.sqlite3_column_int(stmt, 1) != 0) return error.NotFound;
         const ptr = c.sqlite3_column_blob(stmt, 0);
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
         if (len == 0) return try self.gpa.dupe(u8, "");
         const bytes: [*]const u8 = @ptrCast(ptr.?);
         return try self.gpa.dupe(u8, bytes[0..len]);
+    }
+
+    /// Reclaim unreferenced blobs and, when explicitly requested, demote old
+    /// full bodies whose every durable session is idle. The block/ref rows
+    /// remain untouched, so scrollback and causal structure stay complete.
+    pub fn gc(self: Store, expire_before_ms: ?i64) Error!GcReport {
+        try self.execAll("BEGIN IMMEDIATE;");
+        errdefer self.execAll("ROLLBACK;") catch {};
+
+        const orphan = try self.blobStats(
+            "SELECT count(*), COALESCE(sum(length(bytes)),0) FROM blobs " ++
+                "WHERE NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.hash=blobs.hash)",
+            null,
+        );
+        try self.execAll(
+            "DELETE FROM blobs WHERE NOT EXISTS " ++
+                "(SELECT 1 FROM blob_refs r WHERE r.hash=blobs.hash);",
+        );
+
+        var expired = BlobStats{};
+        if (expire_before_ms) |cutoff| {
+            const eligible =
+                "tombstone=0 AND created_at>0 AND created_at<?1 " ++
+                "AND EXISTS (SELECT 1 FROM blob_refs r WHERE r.hash=blobs.hash) " ++
+                "AND NOT EXISTS (SELECT 1 FROM blob_refs r " ++
+                "JOIN blocks b ON b.id=r.block_id " ++
+                "JOIN sessions s ON s.id=b.session_id " ++
+                "WHERE r.hash=blobs.hash AND " ++
+                "(b.ts>=?1 OR s.status IN ('running','awaiting_approval')))";
+            expired = try self.blobStats(
+                "SELECT count(*), COALESCE(sum(length(bytes)),0) FROM blobs WHERE " ++ eligible,
+                cutoff,
+            );
+            const stmt = try self.prepare(
+                "UPDATE blobs SET bytes=X'', tombstone=1 WHERE " ++ eligible,
+            );
+            defer finalize(stmt);
+            bindInt(stmt, 1, cutoff);
+            try stepDone(stmt);
+        }
+
+        try self.execAll("COMMIT;");
+        // These maintenance operations are deliberately outside the write
+        // transaction so normal daemon work is not held behind them.
+        try self.execAll("PRAGMA incremental_vacuum;");
+        try self.execAll("PRAGMA wal_checkpoint(PASSIVE);");
+        return .{
+            .orphan_blobs = orphan.count,
+            .expired_blobs = expired.count,
+            .bytes_reclaimed = orphan.bytes +| expired.bytes,
+        };
     }
 
     // ----------------------------------------------------------- helpers --
@@ -567,15 +893,56 @@ pub const Store = struct {
         return stmt.?;
     }
 
+    /// Caller holds sqlite3_db_mutex: cached statements are connection-wide
+    /// and must never have their bindings interleaved by another turn thread.
+    fn cachedStatement(
+        self: Store,
+        slot: *?*c.sqlite3_stmt,
+        comptime sql: [:0]const u8,
+    ) Error!*c.sqlite3_stmt {
+        if (slot.* == null) slot.* = try self.prepare(sql);
+        return slot.*.?;
+    }
+
     fn dupeCol(self: Store, stmt: *c.sqlite3_stmt, col: c_int) Error![]const u8 {
         const ptr = c.sqlite3_column_text(stmt, col);
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
         return self.gpa.dupe(u8, ptr[0..len]);
     }
+
+    const BlobStats = struct { count: u64 = 0, bytes: u64 = 0 };
+
+    fn blobStats(self: Store, comptime sql: [:0]const u8, cutoff: ?i64) Error!BlobStats {
+        const stmt = try self.prepare(sql);
+        defer finalize(stmt);
+        if (cutoff) |value| bindInt(stmt, 1, value);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SqliteStep;
+        return .{
+            .count = @intCast(c.sqlite3_column_int64(stmt, 0)),
+            .bytes = @intCast(c.sqlite3_column_int64(stmt, 1)),
+        };
+    }
+};
+
+const StatementCache = struct {
+    append_block: ?*c.sqlite3_stmt = null,
+    set_session_status: ?*c.sqlite3_stmt = null,
+    update_session_usage: ?*c.sqlite3_stmt = null,
+
+    fn deinit(self: *StatementCache) void {
+        inline for (.{ self.append_block, self.set_session_status, self.update_session_usage }) |stmt|
+            if (stmt) |value| finalize(value);
+        self.* = undefined;
+    }
 };
 
 fn finalize(stmt: *c.sqlite3_stmt) void {
     _ = c.sqlite3_finalize(stmt);
+}
+
+fn resetStatement(stmt: *c.sqlite3_stmt) void {
+    _ = c.sqlite3_reset(stmt);
+    _ = c.sqlite3_clear_bindings(stmt);
 }
 
 fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {
@@ -657,6 +1024,7 @@ test "session + block round trip (in-memory)" {
         .body = .{ .user_msg = .{ .text = "hello world" } },
     };
     try store.appendBlock(blk1);
+    const append_stmt = store.statements.append_block.?;
     const blk2 = block.Block{
         .id = 2,
         .session_id = 42,
@@ -671,6 +1039,16 @@ test "session + block round trip (in-memory)" {
         } },
     };
     try store.appendBlock(blk2);
+    try std.testing.expectEqual(append_stmt, store.statements.append_block.?);
+
+    try store.setSessionStatus(42, "running");
+    const status_stmt = store.statements.set_session_status.?;
+    try store.setSessionStatus(42, "idle");
+    try std.testing.expectEqual(status_stmt, store.statements.set_session_status.?);
+    try store.updateSessionUsage(42, 10, 20);
+    const usage_stmt = store.statements.update_session_usage.?;
+    try store.updateSessionUsage(42, 30, 40);
+    try std.testing.expectEqual(usage_stmt, store.statements.update_session_usage.?);
 
     try std.testing.expectEqual(@as(u64, 2), try store.lastSeq(42));
 
@@ -697,6 +1075,92 @@ test "duplicate seq rejected (append-only integrity)" {
     };
     try store.appendBlock(mk.blk(1));
     try std.testing.expectError(error.SqliteStep, store.appendBlock(mk.blk(1)));
+    try store.appendBlock(mk.blk(2));
+}
+
+test "tail replay is bounded and remains in ascending transcript order" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+    for (1..7) |seq| try store.appendBlock(.{
+        .id = seq,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = seq,
+        .ts = 0,
+        .body = .{ .user_msg = .{ .text = "x" } },
+    });
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var tail: std.ArrayList(block.Block) = .empty;
+    try store.loadTailInto(arena_state.allocator(), &tail, 1, 3);
+    try std.testing.expectEqual(@as(usize, 3), tail.items.len);
+    try std.testing.expectEqual(@as(u64, 4), tail.items[0].seq);
+    try std.testing.expectEqual(@as(u64, 6), tail.items[2].seq);
+
+    var older: std.ArrayList(block.Block) = .empty;
+    try store.loadTailBeforeInto(arena_state.allocator(), &older, 1, 4, 2);
+    try std.testing.expectEqual(@as(usize, 2), older.items.len);
+    try std.testing.expectEqual(@as(u64, 2), older.items[0].seq);
+    try std.testing.expectEqual(@as(u64, 3), older.items[1].seq);
+}
+
+test "context load skips durable rows superseded by nested compactions" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+
+    for (1..5) |seq| try store.appendBlock(.{
+        .id = seq,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = seq,
+        .ts = 0,
+        .body = .{ .user_msg = .{ .text = "covered" } },
+    });
+    try store.appendBlock(.{
+        .id = 5,
+        .session_id = 1,
+        .turn_id = 2,
+        .seq = 5,
+        .ts = 0,
+        .body = .{ .compaction = .{ .summary = "first", .covers_from_seq = 1, .covers_to_seq = 4 } },
+    });
+    for (6..9) |seq| try store.appendBlock(.{
+        .id = seq,
+        .session_id = 1,
+        .turn_id = 3,
+        .seq = seq,
+        .ts = 0,
+        .body = .{ .assistant_msg = .{ .text = "also covered" } },
+    });
+    try store.appendBlock(.{
+        .id = 9,
+        .session_id = 1,
+        .turn_id = 4,
+        .seq = 9,
+        .ts = 0,
+        .body = .{ .compaction = .{ .summary = "second", .covers_from_seq = 1, .covers_to_seq = 8 } },
+    });
+    try store.appendBlock(.{
+        .id = 10,
+        .session_id = 1,
+        .turn_id = 5,
+        .seq = 10,
+        .ts = 0,
+        .body = .{ .user_msg = .{ .text = "live tail" } },
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var relevant: std.ArrayList(block.Block) = .empty;
+    try store.loadContextBlocksInto(arena_state.allocator(), &relevant, 1, 100);
+    try std.testing.expectEqual(@as(usize, 3), relevant.items.len);
+    try std.testing.expectEqual(@as(u64, 5), relevant.items[0].seq);
+    try std.testing.expectEqual(@as(u64, 9), relevant.items[1].seq);
+    try std.testing.expectEqual(@as(u64, 10), relevant.items[2].seq);
 }
 
 test "one connection survives concurrent turn writes and dispatcher reads" {
@@ -758,15 +1222,109 @@ test "blob round trip is content-addressed and idempotent" {
     try store.addBlobRef(h1, 202);
 }
 
-test "schema is v5 with session archiving and auto_vacuum incremental" {
+test "oversized tool result persists blob block and ref atomically" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+
+    const hash = try Store.blobHashAlloc(gpa, "atomic body");
+    defer gpa.free(hash);
+    const first: block.Block = .{
+        .id = 10,
+        .session_id = 1,
+        .turn_id = 2,
+        .seq = 1,
+        .ts = 100,
+        .body = .{ .tool_result = .{
+            .call_id = "c1",
+            .status = .ok,
+            .inline_body = "atomic",
+            .full_body_ref = hash,
+        } },
+    };
+    try store.appendBlockWithBlob(first, hash, "atomic body");
+    const bytes = try store.getBlob(hash);
+    defer gpa.free(bytes);
+    try std.testing.expectEqualStrings("atomic body", bytes);
+    const report = try store.gc(null);
+    try std.testing.expectEqual(@as(u64, 0), report.orphan_blobs);
+
+    // Duplicate seq makes the block insert fail after the blob insert. The
+    // transaction must roll that new blob back rather than leave an orphan.
+    const rejected_hash = try Store.blobHashAlloc(gpa, "must roll back");
+    defer gpa.free(rejected_hash);
+    var rejected = first;
+    rejected.id = 11;
+    rejected.body.tool_result.full_body_ref = rejected_hash;
+    try std.testing.expectError(
+        error.SqliteStep,
+        store.appendBlockWithBlob(rejected, rejected_hash, "must roll back"),
+    );
+    try std.testing.expectError(error.NotFound, store.getBlob(rejected_hash));
+}
+
+test "gc removes orphans and explicitly demotes old idle blob bodies" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+    try store.appendBlock(.{
+        .id = 101,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 100,
+        .body = .{ .tool_result = .{
+            .call_id = "call",
+            .status = .ok,
+            .inline_body = "short",
+            .full_body_ref = null,
+        } },
+    });
+    const kept = try store.putBlob("referenced old output", 100);
+    defer gpa.free(kept);
+    try store.addBlobRef(kept, 101);
+    const orphan = try store.putBlob("orphan output", 100);
+    defer gpa.free(orphan);
+
+    const swept = try store.gc(null);
+    try std.testing.expectEqual(@as(u64, 1), swept.orphan_blobs);
+    try std.testing.expectEqual(@as(u64, 0), swept.expired_blobs);
+    try std.testing.expectError(error.NotFound, store.getBlob(orphan));
+    const body = try store.getBlob(kept);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("referenced old output", body);
+
+    const demoted = try store.gc(200);
+    try std.testing.expectEqual(@as(u64, 0), demoted.orphan_blobs);
+    try std.testing.expectEqual(@as(u64, 1), demoted.expired_blobs);
+    try std.testing.expect(demoted.bytes_reclaimed >= "referenced old output".len);
+    try std.testing.expectError(error.NotFound, store.getBlob(kept));
+
+    // Content addressing must not make expiry permanent: producing the exact
+    // bytes again is fresh evidence and resurrects the shared hash.
+    const resurrected = try store.putBlob("referenced old output", 300);
+    defer gpa.free(resurrected);
+    try std.testing.expectEqualStrings(kept, resurrected);
+    const fresh = try store.getBlob(resurrected);
+    defer gpa.free(fresh);
+    try std.testing.expectEqualStrings("referenced old output", fresh);
+}
+
+test "schema is v6 without the duplicate block index" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 5), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 6), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 5), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 6), try store.kvGetInt("schema_version"));
+    const stmt = try store.prepare("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='blocks_by_session'");
+    defer finalize(stmt);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
 }
 
 test "child session metadata is durable and grouped beneath its root" {

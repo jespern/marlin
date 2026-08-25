@@ -3,7 +3,7 @@
 //! Routes:
 //!   GET  /               embedded single-page UI (webui.html)
 //!   GET  /events?sid=N   SSE stream on a dedicated daemon connection:
-//!                        session_watch + sub(sid, from_seq=1); every daemon
+//!                        session_watch + bounded sub(sid); every daemon
 //!                        NDJSON line is forwarded verbatim as one event.
 //!   POST /send           body = ONE ClientMsg JSON line, forwarded on a
 //!                        fresh daemon connection; the first daemon reply
@@ -183,12 +183,13 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     try conn.writer.interface.writeAll(trimmed);
     try conn.writer.interface.writeAll("\n");
     try conn.writer.interface.flush();
-    const reply = conn.reader.interface.takeDelimiterInclusive('\n') catch {
+    const reply = conn.readLine() catch {
         try req.respond(
             \\{"err":{"code":"daemon","msg":"daemon closed the connection"}}
         , .{ .status = .bad_gateway, .extra_headers = &json_header });
         return;
     };
+    defer ctx.gpa.free(reply);
     try req.respond(reply, .{ .extra_headers = &json_header });
 }
 
@@ -208,7 +209,7 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     var sub_buf: [96]u8 = undefined;
     const sub_line = std.fmt.bufPrint(
         &sub_buf,
-        "{{\"sub\":{{\"sid\":{d},\"from_seq\":1}}}}\n",
+        "{{\"sub\":{{\"sid\":{d},\"tail_limit\":512}}}}\n",
         .{sid},
     ) catch unreachable;
     try conn.writer.interface.writeAll("{\"session_watch\":{}}\n");
@@ -225,7 +226,8 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     } });
 
     while (true) {
-        const line = conn.reader.interface.takeDelimiterInclusive('\n') catch break;
+        const line = conn.readLine() catch break;
+        defer ctx.gpa.free(line);
         const body = std.mem.trimEnd(u8, line, "\r\n");
         response.writer.writeAll("data: ") catch break;
         response.writer.writeAll(body) catch break;

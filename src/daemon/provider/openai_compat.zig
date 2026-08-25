@@ -173,6 +173,10 @@ pub const StreamAccum = struct {
     saw_done: bool = false,
     /// Set on JSON we couldn't parse (provider bug / mid-stream garbage).
     parse_errors: u32 = 0,
+    /// Sticky: the response crossed a memory/protocol safety ceiling. The
+    /// HTTP consumer observes this and closes the stream immediately.
+    response_too_large: bool = false,
+    tool_bytes: usize = 0,
 
     /// Immediate delta sink for UI liveness; may be null in headless tests.
     on_delta: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
@@ -182,6 +186,11 @@ pub const StreamAccum = struct {
     reasoning_forwarded: usize = 0,
 
     const forward_batch_bytes: usize = 48;
+    /// JSON string escaping can expand one decoded byte to six wire bytes.
+    /// Four MiB therefore remains replayable inside the 32 MiB record limit.
+    pub const max_field_bytes: usize = 4 * 1024 * 1024;
+    const max_metadata_bytes: usize = 4 * 1024;
+    const max_tool_calls: usize = 128;
 
     pub const FinishReason = enum { stop, tool_calls, length, content_filter, other };
 
@@ -211,12 +220,16 @@ pub const StreamAccum = struct {
 
     /// SSE sink: feed each `data:` event payload here.
     pub fn onEvent(self: *StreamAccum, ev: sse.Event) void {
+        if (self.response_too_large) return;
         if (std.mem.eql(u8, ev.data, "[DONE]")) {
             self.saw_done = true;
             return;
         }
-        self.handleChunk(ev.data) catch {
-            self.parse_errors += 1;
+        self.handleChunk(ev.data) catch |err| {
+            if (err == error.ResponseTooLarge)
+                self.response_too_large = true
+            else
+                self.parse_errors += 1;
         };
     }
 
@@ -233,11 +246,11 @@ pub const StreamAccum = struct {
 
         if (self.generation_id.items.len == 0) {
             if (root.get("id")) |id| if (id == .string)
-                try self.generation_id.appendSlice(self.gpa, id.string);
+                try appendBounded(self.gpa, &self.generation_id, id.string, max_metadata_bytes);
         }
         if (self.provider_name.items.len == 0) {
             if (root.get("provider")) |name| if (name == .string)
-                try self.provider_name.appendSlice(self.gpa, name.string);
+                try appendBounded(self.gpa, &self.provider_name, name.string, max_metadata_bytes);
         }
 
         // usage: on the final chunk (or OpenRouter's usage-only tail chunk)
@@ -270,11 +283,11 @@ pub const StreamAccum = struct {
         if (delta != .object) return;
 
         if (delta.object.get("content")) |ct| if (ct == .string and ct.string.len > 0) {
-            try self.text.appendSlice(self.gpa, ct.string);
+            try appendBounded(self.gpa, &self.text, ct.string, max_field_bytes);
             self.maybeForwardText();
         };
         if (delta.object.get("reasoning")) |rs| if (rs == .string and rs.string.len > 0) {
-            try self.reasoning.appendSlice(self.gpa, rs.string);
+            try appendBounded(self.gpa, &self.reasoning, rs.string, max_field_bytes);
             self.maybeForwardReasoning();
         };
 
@@ -284,12 +297,12 @@ pub const StreamAccum = struct {
                 const idx: u32 = @intCast(intField(tc.object, "index") orelse 0);
                 const pc = try self.callAt(idx);
                 if (tc.object.get("id")) |id| if (id == .string)
-                    try pc.call_id.appendSlice(self.gpa, id.string);
+                    try self.appendToolFragment(&pc.call_id, id.string);
                 if (tc.object.get("function")) |f| if (f == .object) {
                     if (f.object.get("name")) |n| if (n == .string)
-                        try pc.name.appendSlice(self.gpa, n.string);
+                        try self.appendToolFragment(&pc.name, n.string);
                     if (f.object.get("arguments")) |a| if (a == .string)
-                        try pc.args.appendSlice(self.gpa, a.string);
+                        try self.appendToolFragment(&pc.args, a.string);
                 };
             }
         };
@@ -299,8 +312,15 @@ pub const StreamAccum = struct {
         for (self.calls.items) |*pc| {
             if (pc.index == index) return pc;
         }
+        if (self.calls.items.len >= max_tool_calls) return error.ResponseTooLarge;
         try self.calls.append(self.gpa, .{ .index = index });
         return &self.calls.items[self.calls.items.len - 1];
+    }
+
+    fn appendToolFragment(self: *StreamAccum, list: *std.ArrayList(u8), bytes: []const u8) !void {
+        if (bytes.len > max_field_bytes -| self.tool_bytes) return error.ResponseTooLarge;
+        try list.appendSlice(self.gpa, bytes);
+        self.tool_bytes += bytes.len;
     }
 
     /// Providers often stream one token per SSE event. Coalescing a small
@@ -356,6 +376,16 @@ pub const StreamAccum = struct {
     }
 };
 
+fn appendBounded(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    bytes: []const u8,
+    limit: usize,
+) !void {
+    if (bytes.len > limit -| list.items.len) return error.ResponseTooLarge;
+    try list.appendSlice(gpa, bytes);
+}
+
 // ---------------------------------------------------------------- tests --
 
 fn feedEvents(acc: *StreamAccum, events: []const []const u8) void {
@@ -384,6 +414,26 @@ test "text deltas accumulate; usage and finish captured" {
     try std.testing.expectEqualStrings("OpenAI", acc.provider_name.items);
     try std.testing.expect(acc.saw_done);
     try std.testing.expectEqual(@as(u32, 0), acc.parse_errors);
+}
+
+test "stream accumulators reject growth past the replay-safe ceiling" {
+    const gpa = std.testing.allocator;
+    var acc = StreamAccum.init(gpa);
+    defer acc.deinit();
+
+    const oversized = try gpa.alloc(u8, StreamAccum.max_field_bytes + 1);
+    defer gpa.free(oversized);
+    @memset(oversized, 'x');
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        appendBounded(gpa, &acc.text, oversized, StreamAccum.max_field_bytes),
+    );
+    try std.testing.expectEqual(@as(usize, 0), acc.text.items.len);
+
+    acc.tool_bytes = StreamAccum.max_field_bytes;
+    var fragment: std.ArrayList(u8) = .empty;
+    defer fragment.deinit(gpa);
+    try std.testing.expectError(error.ResponseTooLarge, acc.appendToolFragment(&fragment, "x"));
 }
 
 test "tool call fragments reassemble across chunks (two calls interleaved)" {

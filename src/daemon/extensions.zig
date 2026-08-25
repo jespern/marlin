@@ -229,7 +229,7 @@ pub const Runtime = struct {
         }
         for (self.mcp_servers.items) |entry| {
             if (entry.server.findPublicTool(name)) {
-                const result = entry.server.call(name, args_json);
+                const result = entry.server.call(name, args_json, cancel);
                 return .{ .output = result.output, .status = result.status };
             }
         }

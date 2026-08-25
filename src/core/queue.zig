@@ -14,6 +14,7 @@ pub fn Mpsc(comptime T: type) type {
         mutex: Io.Mutex = .init,
         cond: Io.Condition = .init,
         items: std.ArrayList(T) = .empty,
+        head: usize = 0,
         closed: bool = false,
         gpa: std.mem.Allocator,
 
@@ -38,19 +39,34 @@ pub fn Mpsc(comptime T: type) type {
         pub fn pop(self: *Self, io: Io) ?T {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            while (self.items.items.len == 0) {
+            while (self.head == self.items.items.len) {
                 if (self.closed) return null;
                 self.cond.waitUncancelable(io, &self.mutex);
             }
-            return self.items.orderedRemove(0);
+            return self.popLocked();
         }
 
         /// Non-blocking pop; null when empty (regardless of closed state).
         pub fn tryPop(self: *Self, io: Io) ?T {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            if (self.items.items.len == 0) return null;
-            return self.items.orderedRemove(0);
+            if (self.head == self.items.items.len) return null;
+            return self.popLocked();
+        }
+
+        fn popLocked(self: *Self) T {
+            const item = self.items.items[self.head];
+            self.head += 1;
+            if (self.head == self.items.items.len) {
+                self.items.clearRetainingCapacity();
+                self.head = 0;
+            } else if (self.head >= 1024 and self.head * 2 >= self.items.items.len) {
+                const remaining = self.items.items.len - self.head;
+                std.mem.copyForwards(T, self.items.items[0..remaining], self.items.items[self.head..]);
+                self.items.shrinkRetainingCapacity(remaining);
+                self.head = 0;
+            }
+            return item;
         }
 
         /// Wake all waiters; subsequent pushes fail, pops drain then null.
@@ -109,4 +125,17 @@ test "cross-thread produce/consume" {
     }
     try std.testing.expectEqual(@as(usize, 200), count);
     try std.testing.expectEqual(@as(u64, 4950 + 104950), sum);
+}
+
+test "large backlog drains in FIFO order without shifting each pop" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var q = Mpsc(u32).init(std.testing.allocator);
+    defer q.deinit();
+
+    for (0..20_000) |i| try q.push(io, @intCast(i));
+    for (0..20_000) |i| try std.testing.expectEqual(@as(?u32, @intCast(i)), q.pop(io));
+    try std.testing.expectEqual(@as(usize, 0), q.head);
+    try std.testing.expectEqual(@as(usize, 0), q.items.items.len);
 }

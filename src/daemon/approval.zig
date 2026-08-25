@@ -8,8 +8,9 @@
 //! decision wins; no timeout — the turn parks in awaiting_approval (that
 //! parked state is exactly what the session picker/status summary/phone surfaces).
 //!
-//! Threading: the TURN thread blocks in Gate.wait(); the DISPATCHER thread
-//! resolves via Gate.resolve() when a client answers (or on interrupt).
+//! Threading: the TURN thread arms the gate before publishing the request,
+//! then blocks in Gate.wait(); the DISPATCHER thread resolves via
+//! Gate.resolve() when a client answers (or on interrupt).
 //! TODO(M3.5): capability-scoped once/session grants and sandbox escalations.
 
 const std = @import("std");
@@ -53,8 +54,8 @@ pub fn policyFor(cfg: config.Config, mode: Mode, mutating: bool, sandboxed: bool
     };
 }
 
-/// One-shot blocking gate: turn thread waits, dispatcher resolves.
-/// Reused across calls within a session (re-armed by wait()).
+/// One-shot blocking gate: turn thread arms then waits, dispatcher resolves.
+/// Reused across calls within a session.
 pub const Gate = struct {
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -62,20 +63,33 @@ pub const Gate = struct {
     pending_id: ?u64 = null,
     verdict: ?Verdict = null,
 
-    /// Called on the TURN thread. Arms the gate for `id` and blocks until
-    /// resolve(). Interrupt paths must call denyPending() — there is no
-    /// timed wait on Io.Condition, so cancellation is a resolve, not a poll.
-    pub fn wait(self: *Gate, io: Io, id: u64, cancel: ?*std.atomic.Value(bool)) Verdict {
+    /// Publish must happen only after this succeeds: a client can otherwise
+    /// answer before pending_id exists and have a valid decision discarded.
+    pub fn arm(self: *Gate, io: Io, id: u64, cancel: ?*std.atomic.Value(bool)) bool {
         self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         // If cancellation already happened, don't park at all.
         if (cancel) |f| {
-            if (f.load(.acquire)) {
-                self.mutex.unlock(io);
-                return .denied;
-            }
+            if (f.load(.acquire)) return false;
         }
+        // One session has one turn, and one turn asks about one call at a time.
+        // Refuse to overwrite live state if either invariant is ever violated.
+        if (self.pending_id != null) return false;
         self.pending_id = id;
         self.verdict = null;
+        return true;
+    }
+
+    /// Called on the TURN thread after arm() and request publication. A valid
+    /// answer may already have arrived; in that case this returns immediately.
+    /// Interrupt paths call denyPending() because Io.Condition has no timed
+    /// wait and cancellation is therefore a resolution, not a poll.
+    pub fn wait(self: *Gate, io: Io, id: u64) Verdict {
+        self.mutex.lockUncancelable(io);
+        if (self.pending_id == null or self.pending_id.? != id) {
+            self.mutex.unlock(io);
+            return .denied;
+        }
         while (self.verdict == null) {
             self.cond.waitUncancelable(io, &self.mutex);
         }
@@ -166,9 +180,22 @@ test "gate: cross-thread resolve" {
         }
     };
     const t = try std.Thread.spawn(.{}, Resolver.run, .{ &gate, io });
-    const v = gate.wait(io, 42, null);
+    try std.testing.expect(gate.arm(io, 42, null));
+    const v = gate.wait(io, 42);
     t.join();
     try std.testing.expectEqual(Verdict.approved, v);
+}
+
+test "gate: answer after arm but before wait is retained" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var gate = Gate{};
+
+    try std.testing.expect(gate.arm(io, 42, null));
+    try std.testing.expect(gate.resolve(io, 42, .approved));
+    try std.testing.expectEqual(Verdict.approved, gate.wait(io, 42));
+    try std.testing.expectEqual(@as(?u64, null), gate.isPending(io));
 }
 
 test "gate: stale id rejected" {
@@ -185,6 +212,6 @@ test "gate: cancel unparks with denied" {
     const io = threaded.io();
     var gate = Gate{};
     var cancel = std.atomic.Value(bool).init(true);
-    const v = gate.wait(io, 1, &cancel);
-    try std.testing.expectEqual(Verdict.denied, v);
+    try std.testing.expect(!gate.arm(io, 1, &cancel));
+    try std.testing.expectEqual(@as(?u64, null), gate.isPending(io));
 }

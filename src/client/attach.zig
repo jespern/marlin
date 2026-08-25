@@ -37,9 +37,16 @@ pub const Conn = struct {
         try self.writer.interface.flush();
     }
 
+    /// Read one owned wire record. Callers that need to retain the raw JSON
+    /// (the TUI reader/SSE bridge) free it with this connection's allocator.
+    pub fn readLine(self: *Conn) ![]u8 {
+        return proto.readLineAlloc(self.gpa, &self.reader.interface);
+    }
+
     /// Read one DaemonMsg. Returned value references `arena` memory.
     pub fn recv(self: *Conn, arena: std.mem.Allocator) !proto.DaemonMsg {
-        const line = try self.reader.interface.takeDelimiterInclusive('\n');
+        const line = try self.readLine();
+        defer self.gpa.free(line);
         return proto.decode(proto.DaemonMsg, arena, line);
     }
 
@@ -73,7 +80,9 @@ pub fn tryConnect(gpa: std.mem.Allocator, io: Io, environ: *const std.process.En
 
     const conn = try gpa.create(Conn);
     errdefer gpa.destroy(conn);
-    const rbuf = try gpa.alloc(u8, 1024 * 1024);
+    // Scratch space is intentionally much smaller than max_line_bytes;
+    // readLine grows only for the occasional large record.
+    const rbuf = try gpa.alloc(u8, 64 * 1024);
     errdefer gpa.free(rbuf);
     const wbuf = try gpa.alloc(u8, 256 * 1024);
     errdefer gpa.free(wbuf);
@@ -102,11 +111,50 @@ fn isTransientHandshakeError(err: anyerror) bool {
     };
 }
 
+const handshake_timeout_ms: u32 = 2_000;
+
+const HandshakeDeadline = struct {
+    conn: *Conn,
+    done: Io.Event = .unset,
+    fired: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn start(self: *HandshakeDeadline) !void {
+        self.thread = try std.Thread.spawn(.{}, watch, .{self});
+    }
+
+    fn finish(self: *HandshakeDeadline) void {
+        self.done.set(self.conn.io);
+        self.thread.join();
+    }
+
+    fn watch(self: *HandshakeDeadline) void {
+        self.done.waitTimeout(self.conn.io, .{ .duration = .{
+            .raw = .fromMilliseconds(handshake_timeout_ms),
+            .clock = .awake,
+        } }) catch |err| switch (err) {
+            error.Timeout => {
+                self.fired.store(true, .release);
+                self.conn.stream.shutdown(self.conn.io, .both) catch {};
+            },
+            error.Canceled => return,
+        };
+    }
+};
+
 fn handshake(conn: *Conn) !void {
+    var deadline = HandshakeDeadline{ .conn = conn };
+    try deadline.start();
+    defer deadline.finish();
+
     try conn.send(.{ .hello = .{ .proto_version = proto.proto_version } });
     var arena_state = std.heap.ArenaAllocator.init(conn.gpa);
     defer arena_state.deinit();
-    const hello = try conn.recvUntil(arena_state.allocator(), .hello_ok);
+    const hello = conn.recvUntil(arena_state.allocator(), .hello_ok) catch |err| {
+        if (deadline.fired.load(.acquire)) return error.DaemonHandshakeTimedOut;
+        return err;
+    };
+    if (deadline.fired.load(.acquire)) return error.DaemonHandshakeTimedOut;
     conn.sandbox_available = hello.sandbox_available;
     conn.network_filtering = hello.network_filtering;
     conn.network_configured = hello.network_configured;
@@ -195,6 +243,28 @@ const FlakyHelloServer = struct {
     }
 };
 
+const SilentHelloServer = struct {
+    io: Io,
+    server: *Io.net.Server,
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn serve(self: *SilentHelloServer) !void {
+        var stream = try self.server.accept(self.io);
+        defer stream.close(self.io);
+        var rbuf: [4096]u8 = undefined;
+        var reader = Io.net.Stream.Reader.init(stream, self.io, &rbuf);
+        _ = try reader.interface.takeDelimiterInclusive('\n');
+        // Deliberately never send hello_ok. The client's absolute handshake
+        // deadline shuts down both directions and releases this read.
+        _ = reader.interface.takeDelimiterInclusive('\n') catch return;
+        return error.UnexpectedSecondMessage;
+    }
+
+    fn run(self: *SilentHelloServer) void {
+        self.serve() catch self.failed.store(true, .release);
+    }
+};
+
 test "connect retries when a dying daemon closes during hello" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -228,6 +298,35 @@ test "connect retries when a dying daemon closes during hello" {
 
     try std.testing.expect(!flaky.failed.load(.acquire));
     try std.testing.expect(conn.network_filtering);
+}
+
+test "connect times out when an accepted socket never completes hello" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-attach-timeout");
+    defer temp.deinit();
+    const socket_path = try std.fs.path.join(gpa, &.{ temp.path, "daemon.sock" });
+    defer gpa.free(socket_path);
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("MARLIN_SOCKET", socket_path);
+
+    const ua = try Io.net.UnixAddress.init(socket_path);
+    var server = try ua.listen(io, .{});
+    defer server.deinit(io);
+    var silent = SilentHelloServer{ .io = io, .server = &server };
+    const thread = try std.Thread.spawn(.{}, SilentHelloServer.run, .{&silent});
+    defer thread.join();
+
+    try std.testing.expectError(
+        error.DaemonHandshakeTimedOut,
+        connect(gpa, io, &environ, "/unused/marlin"),
+    );
+    try std.testing.expect(!silent.failed.load(.acquire));
 }
 
 test {

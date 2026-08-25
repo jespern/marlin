@@ -135,7 +135,7 @@
 // raw JSON before parsing and send them back unquoted via raw templates.
 const bigints = raw => raw.replace(/"(sid|parent_sid|session_id)":(\d{12,})/g, '"$1":"$2"');
 const $ = s => document.querySelector(s);
-let sid = null, cur = null, es = null, lastSeq = 0, deltaEl = null, deltaText = '', reasoningEl = null, reasoningText = '', approvalId = null;
+let sid = null, cur = null, es = null, lastSeq = 0, deltaEl = null, deltaText = '', reasoningEl = null, reasoningText = '', approvalId = null, sessionsCache = [];
 // Set on each session open; replayed history stays collapsed while blocks
 // stamped after this moment count as live (block ts is ms epoch).
 let openedAt = 0;
@@ -364,8 +364,10 @@ function handle(m) {
     reasoningEl.innerHTML = renderMd(reasoningText);
     scrollBottom();
   } else if (m.status) {
-    if (m.status.sid !== sid) return;
-    setState(m.status.state);
+    const summary = sessionsCache.find(s => s.sid === m.status.sid);
+    if (summary) summary.state = m.status.state;
+    renderSessions(sessionsCache);
+    if (m.status.sid === sid) setState(m.status.state);
   } else if (m.approval_request) {
     if (m.approval_request.sid !== sid) return;
     approvalId = m.approval_request.approval_id;
@@ -380,6 +382,7 @@ function handle(m) {
 }
 
 function renderSessions(list) {
+  sessionsCache = list;
   const box = $('#sessions');
   box.innerHTML = '';
   for (const s of list) {

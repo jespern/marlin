@@ -51,6 +51,10 @@ pub const Server = struct {
     mode: ProtocolMode = .modern,
     mutex: Io.Mutex = .init,
     tools: std.ArrayList(Tool) = .empty,
+    /// Absolute budget for one complete JSON-RPC exchange, including a
+    /// blocked stdin write and any unrelated stdout records. Kept as a field
+    /// so the failure paths can be exercised without 15-second tests.
+    timeout_ms: u32 = request_timeout_ms,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -117,9 +121,15 @@ pub const Server = struct {
         }.less);
     }
 
-    pub fn call(self: *Server, public_name: []const u8, args_json: []const u8) CallResult {
-        self.mutex.lockUncancelable(self.io);
+    pub fn call(
+        self: *Server,
+        public_name: []const u8,
+        args_json: []const u8,
+        cancel: ?*const std.atomic.Value(bool),
+    ) CallResult {
+        if (!self.lockForCall(cancel)) return self.interrupted();
         defer self.mutex.unlock(self.io);
+        if (isCancelled(cancel)) return self.interrupted();
         const tool = self.findTool(public_name) orelse return self.fail("unknown MCP tool '{s}'", .{public_name});
         self.ensureReady() catch |err| return self.fail("MCP server '{s}' failed to start: {t}", .{ self.name, err });
 
@@ -128,12 +138,24 @@ pub const Server = struct {
         const arena = arena_state.allocator();
         const params = self.callParams(arena, tool.remote_name, args_json) catch |err|
             return self.fail("could not encode MCP call: {t}", .{err});
-        const response = self.request(arena, "tools/call", params) catch |err| {
+        const response = self.requestCancelable(arena, "tools/call", params, cancel) catch |err| {
             self.reset();
+            if (err == error.Cancelled) return self.interrupted();
             return self.fail("MCP call failed: {t}", .{err});
         };
         return self.renderCallResult(response) catch |err|
             self.fail("invalid MCP tool result: {t}", .{err});
+    }
+
+    /// A session queued behind another call must remain interruptible. The
+    /// active holder has its own absolute deadline, so polling here cannot
+    /// leave the server mutex permanently wedged.
+    fn lockForCall(self: *Server, cancel: ?*const std.atomic.Value(bool)) bool {
+        while (!self.mutex.tryLock()) {
+            if (isCancelled(cancel)) return false;
+            self.io.sleep(.fromMilliseconds(25), .awake) catch return false;
+        }
+        return true;
     }
 
     fn start(self: *Server) !void {
@@ -253,13 +275,30 @@ pub const Server = struct {
     }
 
     fn request(self: *Server, arena: std.mem.Allocator, method: []const u8, params_json: []const u8) !std.json.Value {
+        return self.requestCancelable(arena, method, params_json, null);
+    }
+
+    fn requestCancelable(
+        self: *Server,
+        arena: std.mem.Allocator,
+        method: []const u8,
+        params_json: []const u8,
+        cancel: ?*const std.atomic.Value(bool),
+    ) !std.json.Value {
         const id = self.next_id;
         self.next_id +%= 1;
         const line = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}", .{ id, method, params_json });
-        try self.writeMessage(line);
+        // One watchdog covers the complete exchange. In particular, chatty
+        // notifications cannot reset it and a server that stops consuming
+        // stdin cannot trap the caller in flush forever.
+        var deadline = Deadline{ .server = self, .cancel = cancel, .thread = undefined };
+        try deadline.start();
+        defer deadline.finish();
+
+        self.writeMessage(line) catch |err| return deadline.mapFailure(err);
 
         while (true) {
-            const response_line = try self.readMessage(self.gpa);
+            const response_line = self.readMessage(self.gpa) catch |err| return deadline.mapFailure(err);
             defer self.gpa.free(response_line);
             const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, response_line, .{
                 .allocate = .alloc_always,
@@ -286,22 +325,11 @@ pub const Server = struct {
 
     fn readMessage(self: *Server, gpa: std.mem.Allocator) ![]u8 {
         const reader = if (self.reader) |*value| value else return error.McpServerNotRunning;
-        var deadline = Deadline{ .server = self, .thread = undefined };
-        try deadline.start();
-        defer deadline.finish();
-
         var output: std.Io.Writer.Allocating = .init(gpa);
         defer output.deinit();
-        _ = reader.interface.streamDelimiterLimit(&output.writer, '\n', .limited(max_message_bytes)) catch |err| {
-            if (deadline.fired.load(.acquire)) return error.Timeout;
-            return err;
-        };
-        const delimiter = reader.interface.takeByte() catch {
-            if (deadline.fired.load(.acquire)) return error.Timeout;
-            return error.McpServerExited;
-        };
+        _ = try reader.interface.streamDelimiterLimit(&output.writer, '\n', .limited(max_message_bytes));
+        const delimiter = reader.interface.takeByte() catch return error.McpServerExited;
         if (delimiter != '\n') return error.InvalidMcpResponse;
-        if (deadline.fired.load(.acquire)) return error.Timeout;
         return output.toOwnedSlice();
     }
 
@@ -360,6 +388,13 @@ pub const Server = struct {
             .status = .err,
         };
     }
+
+    fn interrupted(self: *Server) CallResult {
+        return .{
+            .output = self.gpa.dupe(u8, "error: MCP call interrupted by user") catch @panic("oom"),
+            .status = .interrupted,
+        };
+    }
 };
 
 const ModernMeta = struct {
@@ -379,10 +414,13 @@ fn modernMeta() ModernMeta {
 /// Deadline watchdog for blocking stdio reads. Killing the child closes its
 /// stdout pipe, which unblocks the reader; finish() always joins before the
 /// Server mutates the child again.
+const DeadlineReason = enum(u8) { none, timed_out, cancelled };
+
 const Deadline = struct {
     server: *Server,
+    cancel: ?*const std.atomic.Value(bool) = null,
     done: std.atomic.Value(bool) = .init(false),
-    fired: std.atomic.Value(bool) = .init(false),
+    reason: std.atomic.Value(DeadlineReason) = .init(.none),
     thread: std.Thread,
 
     fn start(self: *Deadline) !void {
@@ -396,15 +434,33 @@ const Deadline = struct {
 
     fn watch(self: *Deadline) void {
         var elapsed: u32 = 0;
-        while (elapsed < request_timeout_ms) : (elapsed += 25) {
+        while (elapsed < self.server.timeout_ms) : (elapsed += 25) {
             if (self.done.load(.acquire)) return;
+            if (isCancelled(self.cancel)) return self.abort(.cancelled);
             self.server.io.sleep(.fromMilliseconds(25), .awake) catch return;
         }
         if (self.done.load(.acquire)) return;
-        self.fired.store(true, .release);
+        if (isCancelled(self.cancel)) return self.abort(.cancelled);
+        self.abort(.timed_out);
+    }
+
+    fn abort(self: *Deadline, reason: DeadlineReason) void {
+        self.reason.store(reason, .release);
         if (self.server.child) |*child| child.kill(self.server.io);
     }
+
+    fn mapFailure(self: *Deadline, fallback: anyerror) anyerror {
+        return switch (self.reason.load(.acquire)) {
+            .none => fallback,
+            .timed_out => error.Timeout,
+            .cancelled => error.Cancelled,
+        };
+    }
 };
+
+fn isCancelled(cancel: ?*const std.atomic.Value(bool)) bool {
+    return if (cancel) |flag| flag.load(.acquire) else false;
+}
 
 fn resultObject(response: std.json.Value) ?std.json.ObjectMap {
     if (response != .object) return null;
@@ -459,7 +515,7 @@ test "modern stdio server discovery and tool call" {
     try server.discover();
     try std.testing.expectEqual(@as(usize, 1), server.tools.items.len);
     try std.testing.expectEqualStrings("mcp__demo__echo", server.tools.items[0].public_name);
-    const result = server.call("mcp__demo__echo", "{\"value\":1}");
+    const result = server.call("mcp__demo__echo", "{\"value\":1}", null);
     defer gpa.free(result.output);
     try std.testing.expectEqual(block.ToolStatus.ok, result.status);
     try std.testing.expectEqualStrings("from mcp", result.output);
@@ -484,6 +540,92 @@ test "stdio discovery falls back to the legacy initialize lifecycle" {
     try server.discover();
     try std.testing.expectEqual(ProtocolMode.legacy, server.mode);
     try std.testing.expectEqual(@as(usize, 0), server.tools.items.len);
+}
+
+test "MCP deadline is absolute across unrelated stdout messages" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const script =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[{"name":"chatty","inputSchema":{"type":"object"}}]}}' ;;
+        \\    *'"method":"tools/call"'*) while :; do printf '%s\n' '{"jsonrpc":"2.0","id":999,"result":{}}'; done ;;
+        \\  esac
+        \\done
+    ;
+    const server = try Server.init(gpa, threaded.io(), "chatty", &.{ "sh", "-c", script }, null);
+    defer server.deinit();
+    server.timeout_ms = 150;
+    try server.discover();
+
+    const result = server.call("mcp__chatty__chatty", "{}", null);
+    defer gpa.free(result.output);
+    try std.testing.expectEqual(block.ToolStatus.err, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Timeout") != null);
+}
+
+test "MCP deadline covers a server that stops consuming stdin" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const script =
+        \\IFS= read -r line
+        \\printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[{"name":"blocked","inputSchema":{"type":"object"}}]}}'
+        \\while :; do :; done
+    ;
+    const server = try Server.init(gpa, threaded.io(), "blocked", &.{ "sh", "-c", script }, null);
+    defer server.deinit();
+    server.timeout_ms = 150;
+    try server.discover();
+
+    const payload = try gpa.alloc(u8, 1024 * 1024);
+    defer gpa.free(payload);
+    @memset(payload, 'x');
+    const args_json = try std.fmt.allocPrint(gpa, "{{\"payload\":\"{s}\"}}", .{payload});
+    defer gpa.free(args_json);
+    const result = server.call("mcp__blocked__blocked", args_json, null);
+    defer gpa.free(result.output);
+    try std.testing.expectEqual(block.ToolStatus.err, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Timeout") != null);
+}
+
+const CancelMcpCall = struct {
+    io: Io,
+    flag: *std.atomic.Value(bool),
+
+    fn run(self: CancelMcpCall) void {
+        self.io.sleep(.fromMilliseconds(100), .awake) catch return;
+        self.flag.store(true, .release);
+    }
+};
+
+test "turn cancellation kills an active MCP call" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const script =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[{"name":"wait","inputSchema":{"type":"object"}}]}}' ;;
+        \\    *'"method":"tools/call"'*) while :; do :; done ;;
+        \\  esac
+        \\done
+    ;
+    const server = try Server.init(gpa, threaded.io(), "cancel", &.{ "sh", "-c", script }, null);
+    defer server.deinit();
+    try server.discover();
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const cancel_thread = try std.Thread.spawn(.{}, CancelMcpCall.run, .{CancelMcpCall{
+        .io = threaded.io(),
+        .flag = &cancel,
+    }});
+    defer cancel_thread.join();
+    const result = server.call("mcp__cancel__wait", "{}", &cancel);
+    defer gpa.free(result.output);
+    try std.testing.expectEqual(block.ToolStatus.interrupted, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "interrupted") != null);
 }
 
 test {

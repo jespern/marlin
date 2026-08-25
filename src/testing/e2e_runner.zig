@@ -4,7 +4,7 @@
 //! in src/testing/scenarios/:
 //!   1. spawn marlin-fakeprov <scenario.json>, read "PORT <n>"
 //!   2. spawn marlin with an isolated $XDG_STATE_HOME (temp dir) and
-//!      MARLIN_BASE_URL_OPENROUTER=http://127.0.0.1:<port>/v1
+//!      MARLIN_BASE_URL_OPENROUTER=http://localhost:<port>/v1
 //!   3. assert marlin's exit code + stdout expectations (from the scenario's
 //!      companion "check" object)
 //!   4. assert fake provider exited 0 (all request expectations matched)
@@ -25,6 +25,7 @@
 const std = @import("std");
 const Io = std.Io;
 const process_io = @import("process_io");
+const proto = @import("proto");
 const temp_dir = @import("temp_dir.zig");
 const TempDir = temp_dir.Dir;
 
@@ -133,6 +134,12 @@ const Check = struct {
     mcp_script: ?[]const u8 = null,
     hook_output_contains: ?[]const u8 = null,
     session_handle_flow: bool = false,
+    /// Direct socket regression: approval publication, reconnect replay,
+    /// steering while parked, and reboot refusal are one state-machine flow.
+    approval_reconnect_flow: bool = false,
+    /// Fetch a stored full tool-output blob over the daemon protocol and
+    /// require at least this many decoded bytes (exercises large replies).
+    blob_roundtrip_min_bytes: u64 = 0,
 };
 
 const ScenarioFile = struct {
@@ -261,7 +268,9 @@ fn runScenario(
         return err;
     };
 
-    const base_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/v1", .{port});
+    // Use a hostname deliberately: every scenario exercises the bounded DNS
+    // helper and resolved-address handoff before the real provider request.
+    const base_url = try std.fmt.allocPrint(arena, "http://localhost:{d}/v1", .{port});
 
     // 2. Environment for marlin: isolated state, socket, fake endpoint.
     var env = std.process.Environ.Map.init(arena);
@@ -320,58 +329,74 @@ fn runScenario(
         }
     }
 
-    // 3. Run marlin (1 or 2 invocations).
-    var runs: u8 = 0;
-    while (runs < sf.check.runs) : (runs += 1) {
-        const argv_cfg = if (runs == 0) sf.check.argv else sf.check.argv2;
-        var argv: std.ArrayList([]const u8) = .empty;
-        try argv.append(arena, marlin_bin);
-        for (argv_cfg) |a| try argv.append(arena, a);
-
-        const res = process_io.run(gpa, io, .{
-            .argv = argv.items,
+    // 3. Run ordinary CLI scenarios, or the direct multi-connection protocol
+    // regression that cannot be expressed as a one-shot headless command.
+    if (sf.check.approval_reconnect_flow) {
+        const started = try process_io.run(gpa, io, .{
+            .argv = &.{ marlin_bin, "ls" },
             .environ_map = &env,
             .cwd = .{ .path = state_dir },
-            .stdout_limit = 4 * 1024 * 1024,
-            .stderr_limit = 4 * 1024 * 1024,
-            .timeout_ms = scenario_timeout_ms,
-        }) catch |err| {
-            if (err == error.Timeout) {
-                print(io, "\n  scenario command exceeded {d}ms and its process tree was terminated\n", .{scenario_timeout_ms});
-                return error.ScenarioTimedOut;
-            }
-            return err;
-        };
-        defer res.deinit(gpa);
-        if (res.process_group_id) |group_id| try process_groups.append(gpa, group_id);
+            .stdout_limit = 256 * 1024,
+            .stderr_limit = 256 * 1024,
+            .timeout_ms = helper_timeout_ms,
+        });
+        defer started.deinit(gpa);
+        if (started.process_group_id) |group_id| try process_groups.append(gpa, group_id);
+        if (started.term != .exited or started.term.exited != 0) return error.DaemonStartFailed;
+        try checkApprovalReconnectFlow(gpa, io, &env, state_dir);
+    } else {
+        var runs: u8 = 0;
+        while (runs < sf.check.runs) : (runs += 1) {
+            const argv_cfg = if (runs == 0) sf.check.argv else sf.check.argv2;
+            var argv: std.ArrayList([]const u8) = .empty;
+            try argv.append(arena, marlin_bin);
+            for (argv_cfg) |a| try argv.append(arena, a);
 
-        const is_last = runs == sf.check.runs - 1;
-        if (is_last) {
-            const code: u8 = switch (res.term) {
-                .exited => |c| c,
-                else => 255,
-            };
-            if (code != sf.check.exit_code) {
-                print(io, "\n  marlin exit {d}, want {d}\n  stdout: {s}\n  stderr: {s}\n", .{
-                    code,                                      sf.check.exit_code,
-                    res.stdout[0..@min(res.stdout.len, 2000)], res.stderr[0..@min(res.stderr.len, 2000)],
-                });
-                return error.ExitCodeMismatch;
-            }
-            for (sf.check.stdout_contains) |needle| {
-                if (std.mem.indexOf(u8, res.stdout, needle) == null) {
-                    print(io, "\n  stdout missing '{s}'\n  stdout: {s}\n", .{
-                        needle, res.stdout[0..@min(res.stdout.len, 2000)],
-                    });
-                    return error.StdoutMismatch;
+            const res = process_io.run(gpa, io, .{
+                .argv = argv.items,
+                .environ_map = &env,
+                .cwd = .{ .path = state_dir },
+                .stdout_limit = 4 * 1024 * 1024,
+                .stderr_limit = 4 * 1024 * 1024,
+                .timeout_ms = scenario_timeout_ms,
+            }) catch |err| {
+                if (err == error.Timeout) {
+                    print(io, "\n  scenario command exceeded {d}ms and its process tree was terminated\n", .{scenario_timeout_ms});
+                    return error.ScenarioTimedOut;
                 }
-            }
-            for (sf.check.stderr_contains) |needle| {
-                if (std.mem.indexOf(u8, res.stderr, needle) == null) {
-                    print(io, "\n  stderr missing '{s}'\n  stderr: {s}\n", .{
-                        needle, res.stderr[0..@min(res.stderr.len, 2000)],
+                return err;
+            };
+            defer res.deinit(gpa);
+            if (res.process_group_id) |group_id| try process_groups.append(gpa, group_id);
+
+            const is_last = runs == sf.check.runs - 1;
+            if (is_last) {
+                const code: u8 = switch (res.term) {
+                    .exited => |c| c,
+                    else => 255,
+                };
+                if (code != sf.check.exit_code) {
+                    print(io, "\n  marlin exit {d}, want {d}\n  stdout: {s}\n  stderr: {s}\n", .{
+                        code,                                      sf.check.exit_code,
+                        res.stdout[0..@min(res.stdout.len, 2000)], res.stderr[0..@min(res.stderr.len, 2000)],
                     });
-                    return error.StderrMismatch;
+                    return error.ExitCodeMismatch;
+                }
+                for (sf.check.stdout_contains) |needle| {
+                    if (std.mem.indexOf(u8, res.stdout, needle) == null) {
+                        print(io, "\n  stdout missing '{s}'\n  stdout: {s}\n", .{
+                            needle, res.stdout[0..@min(res.stdout.len, 2000)],
+                        });
+                        return error.StdoutMismatch;
+                    }
+                }
+                for (sf.check.stderr_contains) |needle| {
+                    if (std.mem.indexOf(u8, res.stderr, needle) == null) {
+                        print(io, "\n  stderr missing '{s}'\n  stderr: {s}\n", .{
+                            needle, res.stderr[0..@min(res.stderr.len, 2000)],
+                        });
+                        return error.StderrMismatch;
+                    }
                 }
             }
         }
@@ -406,6 +431,15 @@ fn runScenario(
 
     if (sf.check.session_handle_flow) {
         try checkSessionHandleFlow(gpa, io, marlin_bin, &env, state_dir);
+    }
+    if (sf.check.blob_roundtrip_min_bytes > 0) {
+        try checkBlobRoundtrip(
+            gpa,
+            io,
+            &env,
+            state_dir,
+            sf.check.blob_roundtrip_min_bytes,
+        );
     }
 
     // 5. DB assertions via the sqlite3 CLI (avoids linking sqlite here).
@@ -505,6 +539,365 @@ fn waitGroupGone(io: Io, group_id: std.posix.pid_t, timeout_ms: u32) bool {
         if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline) return false;
         io.sleep(.fromMilliseconds(25), .awake) catch return false;
     }
+}
+
+const ProtocolConn = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    stream: Io.net.Stream,
+    reader: Io.net.Stream.Reader,
+    writer: Io.net.Stream.Writer,
+    rbuf: []u8,
+    wbuf: []u8,
+
+    fn connect(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map) !*ProtocolConn {
+        const sock_path = env.get("MARLIN_SOCKET") orelse return error.ProtocolSocketMissing;
+        const address = try Io.net.UnixAddress.init(sock_path);
+        var attempt: u8 = 0;
+        const stream = while (attempt < 100) : (attempt += 1) {
+            if (address.connect(io)) |candidate| break candidate else |_| {}
+            io.sleep(.fromMilliseconds(10), .awake) catch {};
+        } else return error.ProtocolConnectTimedOut;
+        errdefer stream.close(io);
+
+        const self = try gpa.create(ProtocolConn);
+        errdefer gpa.destroy(self);
+        const rbuf = try gpa.alloc(u8, 1024 * 1024);
+        errdefer gpa.free(rbuf);
+        const wbuf = try gpa.alloc(u8, 256 * 1024);
+        errdefer gpa.free(wbuf);
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .stream = stream,
+            .reader = Io.net.Stream.Reader.init(stream, io, rbuf),
+            .writer = Io.net.Stream.Writer.init(stream, io, wbuf),
+            .rbuf = rbuf,
+            .wbuf = wbuf,
+        };
+        return self;
+    }
+
+    fn deinit(self: *ProtocolConn) void {
+        self.stream.close(self.io);
+        self.gpa.free(self.rbuf);
+        self.gpa.free(self.wbuf);
+        self.gpa.destroy(self);
+    }
+
+    fn send(self: *ProtocolConn, value: anytype) !void {
+        const json = try std.json.Stringify.valueAlloc(self.gpa, value, .{});
+        defer self.gpa.free(json);
+        try self.writer.interface.writeAll(json);
+        try self.writer.interface.writeByte('\n');
+        try self.writer.interface.flush();
+    }
+
+    fn recv(self: *ProtocolConn, arena: std.mem.Allocator) !std.json.Value {
+        const line = try proto.readLineAlloc(self.gpa, &self.reader.interface);
+        defer self.gpa.free(line);
+        return std.json.parseFromSliceLeaky(std.json.Value, arena, std.mem.trim(u8, line, " \r\n"), .{
+            .allocate = .alloc_always,
+        });
+    }
+};
+
+const RecvJob = struct {
+    conn: *ProtocolConn,
+    arena: std.mem.Allocator,
+    done: std.atomic.Value(bool) = .init(false),
+    msg: ?std.json.Value = null,
+    err: ?anyerror = null,
+
+    fn run(job: *RecvJob) void {
+        job.msg = job.conn.recv(job.arena) catch |err| {
+            job.err = err;
+            job.done.store(true, .release);
+            return;
+        };
+        job.done.store(true, .release);
+    }
+};
+
+fn recvBounded(conn: *ProtocolConn, arena: std.mem.Allocator) !std.json.Value {
+    var job = RecvJob{ .conn = conn, .arena = arena };
+    const thread = try std.Thread.spawn(.{}, RecvJob.run, .{&job});
+    if (!waitForFlag(conn.io, &job.done, helper_timeout_ms)) {
+        conn.stream.shutdown(conn.io, .both) catch {};
+        thread.join();
+        return error.ProtocolReceiveTimedOut;
+    }
+    thread.join();
+    if (job.err) |err| return err;
+    return job.msg orelse error.ProtocolReceiveFailed;
+}
+
+fn recvTagBounded(
+    conn: *ProtocolConn,
+    arena: std.mem.Allocator,
+    tag: []const u8,
+) !std.json.ObjectMap {
+    while (true) {
+        const msg = try recvBounded(conn, arena);
+        if (tagObject(msg, tag)) |object| return object;
+        if (tagObject(msg, "err")) |daemon_err| {
+            reportDaemonError(conn.io, daemon_err);
+            return error.UnexpectedDaemonError;
+        }
+    }
+}
+
+fn connectProtocol(
+    gpa: std.mem.Allocator,
+    io: Io,
+    env: *const std.process.Environ.Map,
+) !*ProtocolConn {
+    const conn = try ProtocolConn.connect(gpa, io, env);
+    errdefer conn.deinit();
+    try conn.send(.{ .hello = .{ .proto_version = 1, .client_kind = "e2e-protocol" } });
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    _ = try recvTagBounded(conn, arena_state.allocator(), "hello_ok");
+    return conn;
+}
+
+fn waitApproval(
+    conn: *ProtocolConn,
+    arena: std.mem.Allocator,
+    sid: u64,
+    id_out: []u8,
+) ![]const u8 {
+    while (true) {
+        const msg = try recvBounded(conn, arena);
+        if (tagObject(msg, "err")) |daemon_err| {
+            reportDaemonError(conn.io, daemon_err);
+            return error.UnexpectedDaemonError;
+        }
+        const request = tagObject(msg, "approval_request") orelse continue;
+        if (uintField(request, "sid") != sid) continue;
+        const approval_id = stringField(request, "approval_id") orelse return error.ApprovalIdMissing;
+        if (approval_id.len > id_out.len) return error.ApprovalIdTooLong;
+        @memcpy(id_out[0..approval_id.len], approval_id);
+        return id_out[0..approval_id.len];
+    }
+}
+
+fn expectDaemonError(
+    conn: *ProtocolConn,
+    arena: std.mem.Allocator,
+    code: []const u8,
+) !void {
+    while (true) {
+        const msg = try recvBounded(conn, arena);
+        const daemon_err = tagObject(msg, "err") orelse continue;
+        if (!std.mem.eql(u8, stringField(daemon_err, "code") orelse "", code)) return error.WrongDaemonError;
+        return;
+    }
+}
+
+fn tagObject(msg: std.json.Value, tag: []const u8) ?std.json.ObjectMap {
+    if (msg != .object) return null;
+    const payload = msg.object.get(tag) orelse return null;
+    return if (payload == .object) payload.object else null;
+}
+
+fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn objectField(object: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = object.get(key) orelse return null;
+    return if (value == .object) value.object else null;
+}
+
+fn uintField(object: std.json.ObjectMap, key: []const u8) ?u64 {
+    const value = object.get(key) orelse return null;
+    if (value != .integer or value.integer < 0) return null;
+    return @intCast(value.integer);
+}
+
+fn reportDaemonError(io: Io, daemon_err: std.json.ObjectMap) void {
+    print(io, "\n  unexpected daemon error {s}: {s}\n", .{
+        stringField(daemon_err, "code") orelse "unknown",
+        stringField(daemon_err, "msg") orelse "no message",
+    });
+}
+
+fn checkApprovalReconnectFlow(
+    gpa: std.mem.Allocator,
+    io: Io,
+    env: *const std.process.Environ.Map,
+    state_dir: []const u8,
+) !void {
+    var approval_buf: [32]u8 = undefined;
+    const approval_id = first: {
+        const conn = try connectProtocol(gpa, io, env);
+        defer conn.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        try conn.send(.{ .session_create = .{
+            .cwd = state_dir,
+            .model = "openrouter/test/model",
+            .approvals = "default",
+        } });
+        const created = try recvTagBounded(conn, arena, "session_created");
+        const sid = uintField(created, "sid") orelse return error.SessionIdMissing;
+        try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+        try conn.send(.{ .input = .{ .sid = sid, .text = "approval reconnect task" } });
+        const id = try waitApproval(conn, arena, sid, &approval_buf);
+        break :first .{ sid, id.len };
+    };
+    const sid = approval_id[0];
+    const id = approval_buf[0..approval_id[1]];
+
+    // A session watcher must recover actionable background approval state.
+    {
+        const conn = try connectProtocol(gpa, io, env);
+        defer conn.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        var watcher_id_buf: [32]u8 = undefined;
+        try conn.send(.{ .session_watch = struct {}{} });
+        const watcher_id = try waitApproval(conn, arena_state.allocator(), sid, &watcher_id_buf);
+        if (!std.mem.eql(u8, watcher_id, id)) return error.ApprovalReplayMismatch;
+    }
+
+    // A focused reattach gets the same request, and input remains a steer for
+    // the parked turn. Plain reboot refuses; the approval can still resolve.
+    const conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var sub_id_buf: [32]u8 = undefined;
+    try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 1 } });
+    const sub_id = try waitApproval(conn, arena, sid, &sub_id_buf);
+    if (!std.mem.eql(u8, sub_id, id)) return error.ApprovalReplayMismatch;
+
+    const large_steer = try gpa.alloc(u8, 300 * 1024);
+    defer gpa.free(large_steer);
+    const steer_prefix = "queued while awaiting approval";
+    @memcpy(large_steer[0..steer_prefix.len], steer_prefix);
+    @memset(large_steer[steer_prefix.len..], 'x');
+    try conn.send(.{ .input = .{
+        .sid = sid,
+        .text = large_steer,
+        .request_id = 102,
+    } });
+    const steer_ok = try recvTagBounded(conn, arena, "ok");
+    if (uintField(steer_ok, "request_id") != 102) return error.InputAckMismatch;
+    try conn.send(.{ .reboot = .{ .force = false } });
+    try expectDaemonError(conn, arena, "approval_pending");
+    try conn.send(.{ .approve = .{ .sid = sid, .approval_id = id, .decision = "granted" } });
+    _ = try recvTagBounded(conn, arena, "ok");
+
+    while (true) {
+        const msg = try recvBounded(conn, arena);
+        if (tagObject(msg, "err")) |daemon_err| {
+            reportDaemonError(conn.io, daemon_err);
+            return error.UnexpectedDaemonError;
+        }
+        const status = tagObject(msg, "status") orelse continue;
+        if (uintField(status, "sid") != sid) continue;
+        const state = stringField(status, "state") orelse continue;
+        if (std.mem.eql(u8, state, "err")) return error.ApprovalFlowTurnFailed;
+        if (std.mem.eql(u8, state, "idle")) break;
+    }
+
+    // A bounded attach emits exactly its newest window followed by an
+    // explicit marker. This is the TUI cold-attach contract and must stay
+    // distinct from legacy from_seq replays, whose clients know no marker.
+    {
+        const tail_conn = try connectProtocol(gpa, io, env);
+        defer tail_conn.deinit();
+        var tail_arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer tail_arena_state.deinit();
+        const tail_arena = tail_arena_state.allocator();
+        try tail_conn.send(.{ .sub = .{ .sid = sid, .from_seq = 1, .tail_limit = 1 } });
+        const newest = try recvTagBounded(tail_conn, tail_arena, "blk");
+        if (uintField(newest, "sid") != sid) return error.TailReplaySessionMismatch;
+        const newest_block = objectField(newest, "b") orelse return error.TailReplayMarkerMissing;
+        const newest_block_seq = uintField(newest_block, "seq") orelse return error.TailReplayMarkerMissing;
+        const marker = try recvTagBounded(tail_conn, tail_arena, "replay_done");
+        if (uintField(marker, "sid") != sid) return error.TailReplaySessionMismatch;
+        const oldest_seq = uintField(marker, "oldest_seq") orelse return error.TailReplayMarkerMissing;
+        const newest_seq = uintField(marker, "newest_seq") orelse return error.TailReplayMarkerMissing;
+        if (oldest_seq == 0 or oldest_seq != newest_seq) return error.TailReplayMarkerMismatch;
+        if (newest_block_seq != newest_seq) return error.TailReplayMarkerMismatch;
+        const has_older = marker.get("has_older") orelse return error.TailReplayMarkerMissing;
+        if (has_older != .bool or !has_older.bool) return error.TailReplayMarkerMismatch;
+
+        // Reaching the loaded top requests another bounded page before the
+        // current oldest seq; it must never fall back to a full replay.
+        try tail_conn.send(.{ .sub = .{
+            .sid = sid,
+            .tail_limit = 1,
+            .before_seq = oldest_seq,
+        } });
+        const older = try recvTagBounded(tail_conn, tail_arena, "blk");
+        const older_block = objectField(older, "b") orelse return error.TailReplayMarkerMissing;
+        const older_seq = uintField(older_block, "seq") orelse return error.TailReplayMarkerMissing;
+        if (older_seq >= oldest_seq) return error.TailReplayMarkerMismatch;
+        const older_marker = try recvTagBounded(tail_conn, tail_arena, "replay_done");
+        if (uintField(older_marker, "oldest_seq") != older_seq or
+            uintField(older_marker, "newest_seq") != older_seq)
+            return error.TailReplayMarkerMismatch;
+    }
+
+    // Rejected input returns the same identity, so an optimistic client can
+    // remove precisely that echo and restore its pre-submit state.
+    try conn.send(.{ .session_archive = .{ .sid = sid, .archived = true } });
+    _ = try recvTagBounded(conn, arena, "ok");
+    try conn.send(.{ .input = .{
+        .sid = sid,
+        .text = "must be rejected",
+        .request_id = 103,
+    } });
+    while (true) {
+        const msg = try recvBounded(conn, arena);
+        const daemon_err = tagObject(msg, "err") orelse continue;
+        if (!std.mem.eql(u8, stringField(daemon_err, "code") orelse "", "archived"))
+            return error.WrongDaemonError;
+        if (uintField(daemon_err, "request_id") != 103) return error.InputAckMismatch;
+        break;
+    }
+}
+
+fn checkBlobRoundtrip(
+    gpa: std.mem.Allocator,
+    io: Io,
+    env: *const std.process.Environ.Map,
+    state_dir: []const u8,
+    min_bytes: u64,
+) !void {
+    const db_path = try std.fmt.allocPrint(gpa, "{s}/marlin/marlin.db", .{state_dir});
+    defer gpa.free(db_path);
+    const query =
+        "SELECT json_extract(body_json,'$.tool_result.full_body_ref') " ++
+        "FROM blocks WHERE kind='tool_result' AND " ++
+        "json_extract(body_json,'$.tool_result.full_body_ref') IS NOT NULL LIMIT 1;";
+    const lookup = try process_io.run(gpa, io, .{
+        .argv = &.{ "sqlite3", db_path, query },
+        .stdout_limit = 4096,
+        .stderr_limit = 4096,
+        .timeout_ms = helper_timeout_ms,
+    });
+    defer lookup.deinit(gpa);
+    if (lookup.term != .exited or lookup.term.exited != 0) return error.BlobRefLookupFailed;
+    const hash = std.mem.trim(u8, lookup.stdout, " \t\r\n");
+    if (hash.len == 0) return error.BlobRefMissing;
+
+    const conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try conn.send(.{ .blob_get = .{ .hash = hash } });
+    const result = try recvTagBounded(conn, arena_state.allocator(), "blob_result");
+    const bytes = stringField(result, "bytes") orelse return error.BlobBytesMissing;
+    if (bytes.len < min_bytes) return error.BlobRoundtripTooSmall;
 }
 
 fn checkSessionHandleFlow(

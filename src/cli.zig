@@ -18,11 +18,13 @@ pub const Command = enum {
     unarchive,
     kill,
     compact,
+    gc,
     reboot,
     shutdown,
     web,
     help,
     version,
+    resolve_host,
 
     pub fn parse(word: []const u8) ?Command {
         inline for (@typeInfo(Command).@"enum".fields) |f| {
@@ -47,6 +49,7 @@ pub fn dispatch(
 
     switch (cmd) {
         .version => try stdoutPrint(io, "marlin {s}\n", .{build_options.version}),
+        .resolve_host => return resolveHost(io, rest),
         .help => try stdoutPrint(io, help_text, .{}),
         .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
@@ -55,6 +58,7 @@ pub fn dispatch(
         .unarchive => return headless.setArchived(gpa, io, environ, self_exe, rest, false),
         .kill => return headless.kill(gpa, io, environ, self_exe, rest),
         .compact => return headless.compact(gpa, io, environ, self_exe, rest),
+        .gc => return headless.gc(gpa, io, environ, rest),
         .reboot => return headless.reboot(gpa, io, environ, self_exe, rest),
         .shutdown => return headless.shutdown(gpa, io, environ),
         .web => return web.serve(gpa, io, environ, self_exe, rest),
@@ -76,7 +80,8 @@ pub fn dispatch(
                 const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{plan.sid});
                 var argv: std.ArrayList([:0]const u8) = .empty;
                 defer argv.deinit(gpa);
-                if (plan.request == .build) try argv.append(gpa, "--build");
+                if (plan.request.builds()) try argv.append(gpa, "--build");
+                if (plan.request.forced()) try argv.append(gpa, "--force");
                 try argv.append(gpa, "--then");
                 try argv.append(gpa, "attach");
                 try argv.append(gpa, sid_str);
@@ -86,6 +91,31 @@ pub fn dispatch(
         },
     }
     return 0;
+}
+
+/// Internal resolver worker. The daemon invokes this in a killable subprocess
+/// because Darwin's getaddrinfo cannot be cancelled safely in a multithreaded
+/// process. It intentionally emits one IPv4 address and is omitted from help.
+fn resolveHost(io: Io, args: []const [:0]const u8) !u8 {
+    if (args.len != 2) return 2;
+    const port = std.fmt.parseInt(u16, args[1], 10) catch return 2;
+    const host = Io.net.HostName.init(args[0]) catch return 2;
+    var storage: [16]Io.net.HostName.LookupResult = undefined;
+    var resolved: Io.Queue(Io.net.HostName.LookupResult) = .init(&storage);
+    host.lookup(io, &resolved, .{ .port = port, .family = .ip4 }) catch return 1;
+    while (resolved.getOneUncancelable(io)) |result| switch (result) {
+        .canonical_name => {},
+        .address => |address| switch (address) {
+            .ip4 => |ip4| {
+                try stdoutPrint(io, "{d}.{d}.{d}.{d}\n", .{
+                    ip4.bytes[0], ip4.bytes[1], ip4.bytes[2], ip4.bytes[3],
+                });
+                return 0;
+            },
+            .ip6 => {},
+        },
+    } else |_| {}
+    return 1;
 }
 
 const help_text =
@@ -101,6 +131,7 @@ const help_text =
     \\  marlin unarchive <handle> restore an archived session tree
     \\  marlin kill <handle>   interrupt a session's running turn
     \\  marlin compact [handle] manually compact a session's context
+    \\  marlin gc [--expire-days N] reclaim orphan/old full-output blobs
     \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
     \\  marlin shutdown        stop the daemon
     \\  marlin web [--port N]  local web UI — opt-in via [web] enabled = true
@@ -121,5 +152,7 @@ test "command parse" {
     try std.testing.expectEqual(Command.archive, Command.parse("archive").?);
     try std.testing.expectEqual(Command.unarchive, Command.parse("unarchive").?);
     try std.testing.expectEqual(Command.shutdown, Command.parse("shutdown").?);
+    try std.testing.expectEqual(Command.gc, Command.parse("gc").?);
+    try std.testing.expectEqual(Command.resolve_host, Command.parse("resolve_host").?);
     try std.testing.expectEqual(@as(?Command, null), Command.parse("bogus"));
 }

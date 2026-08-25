@@ -3,7 +3,7 @@
     {
       "expect_contains": ["produce big output"],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_big\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"yes A | head -c 100000\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_big\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"yes A | head -c 1200000\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]
@@ -20,6 +20,7 @@
   "check": {
     "argv": ["run", "--quiet", "--model", "openrouter/test/model", "produce big output"],
     "exit_code": 0,
+    "blob_roundtrip_min_bytes": 1200000,
     "stdout_contains": ["handled the big output"],
     "db_kinds": ["user_msg", "tool_call", "tool_result", "assistant_msg"]
   }

@@ -4,6 +4,12 @@ NDJSON over a unix socket. One JSON object per line, encoded as std.json's
 tagged-union form: `{"<type>":{...payload}}`. Source of truth:
 `src/core/proto.zig` (types) — this document records semantics.
 
+Each complete record, including its newline, is capped at 32 MiB. Readers use
+small scratch buffers plus bounded dynamic assembly, so scratch capacity is
+never an accidental wire limit. Clients reject oversized outbound messages
+before optimistic UI state; the daemon drains an oversized inbound record and
+returns `err{line_too_long}` instead of silently dropping the connection.
+
 proto_version: 1
 
 ## Connection lifecycle
@@ -16,11 +22,16 @@ proto_version: 1
 4. Disconnect is detected by EOF on either side. All client state
    (subscriptions) dies with the connection; sessions do NOT.
 
+An accepted socket has two seconds to complete `hello`; the client shuts down
+both directions and reports `DaemonHandshakeTimedOut` if a listener accepts but
+never speaks. This prevents a wedged daemon from presenting a blank terminal.
+
 Autostart: clients try to connect; on failure they spawn `marlin daemon`,
 poll the socket (50ms × 100), then handshake. The daemon holds a single
-instance implicitly: a second daemon fails to bind the socket... after
-deleting it. KNOWN GAP (M1): concurrent autostart can race; flock-based
-single-instancing is listed for hardening.
+instance with a non-blocking advisory lock beside the socket. Only the lock
+owner may remove a stale socket and bind; crashes release ownership in the
+kernel. Coordinated reboot removes the old socket and releases the lock before
+acknowledging the handoff, so the replacement can bind immediately.
 
 `hello_ok.network_configured` reports whether a blocklist or explicit deny was
 requested, while `network_filtering` reports whether blocking rules actually
@@ -40,13 +51,13 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable |
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded |
-| sub | sid, from_seq | replayed blk×N (if from_seq ≥ 1), then status |
+| sub | sid, from_seq, tail_limit?, before_seq?, replay_done? | replayed blk×N, optional replay_done marker, then status |
 | unsub | sid | ok |
-| input | sid, text | ok; starts a turn (idle) or queues steer (running) |
+| input | sid, text, request_id? | ok/err echoing request_id; starts a turn (idle) or queues steer (running/awaiting approval) |
 | approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |
 | session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn |
 | interrupt | sid | ok (cooperative cancel; also denies a pending approval) |
-| reboot | force? | quiesce (wait for turns; force interrupts), retire the listening socket, then ok RIGHT BEFORE daemon exit — requester's cue to re-exec; autostart brings up the new binary |
+| reboot | force? | quiesce (wait for turns; force interrupts), retire the listening socket, then ok RIGHT BEFORE daemon exit — requester's cue to re-exec; non-force returns err{approval_pending} rather than wait on an approval with no client |
 | shutdown | — | ok, then daemon exits cleanly |
 
 `session_create.approvals`: `"default"` (mutating tools ask) or `"auto"`
@@ -58,6 +69,29 @@ default. Explicit values are `"none"`, `"minimal"`, `"low"`, `"medium"`,
 
 `sub.from_seq`: 0 = live-only. N ≥ 1 = replay stored blocks with seq ≥ N
 first, then live. Clients that reconnect pass last_seen_seq + 1.
+
+`sub.tail_limit`: when non-zero, replay only the newest N stored blocks in
+ascending transcript order (the daemon caps N at 512). With `before_seq=N`,
+the window is additionally restricted to blocks with seq < N. This keeps both
+initial attach and backwards scrollback independent of session length: Marlin
+requests 256 blocks at a time and atomically prepends another page when the
+user reaches the loaded top. Every bounded replay ends with
+`replay_done{oldest_seq,newest_seq,has_older}`.
+
+`sub.replay_done`: requests the same terminal marker for a normal from-seq
+replay. It defaults false so a new daemon never sends an unknown union tag to
+an older client. Older daemons ignore the additive request fields; the client
+still gets a correct, possibly unbounded replay.
+
+`input.request_id` is an additive client-generated correlation id. For every
+non-zero id the daemon sends exactly one terminal `ok` or `err` carrying the
+same id, including load/allocation/start failures that previously escaped as
+dispatcher logs. This lets a client optimistically render immediately, then
+remove only the rejected echo and restore its prior state. Zero is the legacy
+untracked value; all three fields default to zero when talking to older peers.
+Inputs within 4 KiB of the 32 MiB record ceiling are rejected with
+`input_too_large`: the persisted block envelope is slightly larger than the
+command envelope, and every accepted message must remain replayable.
 
 `blk.user_msg.synthetic` defaults to false. When true, the text is internal
 model context rehydrated after compaction: clients render a compact note and
@@ -83,12 +117,13 @@ descendants.
 | delta {sid, turn_id, text} | streaming assistant text (ephemeral) |
 | reasoning_delta {sid, turn_id, text} | provider reasoning stream (ephemeral, rendered separately from assistant text) |
 | stream_status {sid, bytes, quiet_ms} | stream liveness while receiving from the provider: cumulative body bytes this round + ms since the last visible delta; throttled to ~1/s (ephemeral) |
+| replay_done {sid, oldest_seq, newest_seq, has_older} | requested replay finished; `has_older` tells a bounded-page client that durable history precedes its window |
 | status {sid, state} | session state change: idle/running/awaiting_approval/err/done |
 | approval_request {sid, approval_id, call_id, tool, args_json} | a mutating tool call parked on the gate; answer with `approve` |
 | session_meta {sid, tokens_in, tokens_out, context_used, context_limit} | after each turn; ALWAYS sent before the closing status. context_* feed the status-bar gauge (0 = unmeasured) |
 | model_list_result {models, pricing} | reply to `model_list`; `pricing` optionally supplies input/output USD per million tokens and a tiered-rate flag keyed by model id |
-| ok | generic ack |
-| err {code, msg} | bad_msg, no_hello, version, no_session, busy, bad_approval |
+| ok {request_id?} | generic ack; non-zero for a correlated input reply |
+| err {code, msg, request_id?} | bad_msg, no_hello, version, no_session, busy, archived, bad_approval, approval_pending, reboot_pending, line_too_long, response_too_large; non-zero for a correlated input rejection |
 
 Each entry in `session_list_result.sessions` includes `sid`, `title`, `cwd`,
 `model`, `effort`, persisted `status`, `created_at`, whether the session is
@@ -112,8 +147,10 @@ trade readability for a second identity or a storage migration.
 ## Approval flow (M2)
 
 1. Turn thread hits a mutating tool call in an `approvals="default"` session.
-2. `approval_request` fans out to ALL subscribed clients; session status
-   flips to `awaiting_approval`. The turn thread parks on the session gate.
+2. The turn thread arms the gate, then `approval_request` fans out to ALL
+   subscribed clients and session-watch clients; session status flips to
+   `awaiting_approval`. The turn thread then parks. Arming before publication
+   means an immediate answer cannot be lost.
 3. Any client answers with `approve{approval_id, granted|denied}`. First
    decision wins; later/stale answers get `ok` but are ignored.
 4. An `approval` block is persisted with the decision; status returns to
@@ -122,6 +159,9 @@ trade readability for a second identity or a storage migration.
 5. `interrupt`/`session_kill`/daemon shutdown deny the pending gate so the
    turn never hangs. No timeout otherwise — parked is a feature (phone hook
    in M5 surfaces it).
+6. The daemon retains the complete live request until resolution. `sub`
+   replays it for a focused reconnect and `session_watch` replays background
+   requests, so `awaiting_approval` always has an actionable card.
 
 ## Ordering guarantees
 
@@ -130,17 +170,22 @@ trade readability for a second identity or a storage migration.
   beyond arrival order; they are presentation sugar. Blocks are truth.
 - End of turn is: `session_meta` then `status{idle|err}`. Clients treating
   status as end-of-turn will already have the usage numbers.
-- Replay (`sub` with from_seq ≥ 1) completes before any live message for
+- A correlated `input` receives one `ok` or `err` with its request id. Session
+  status and durable blocks may precede the `ok`; `err` means no turn/steer was
+  accepted for that request.
+- Replay (`sub` with from_seq ≥ 1 or tail_limit > 0) and its requested marker complete before any live message for
   that session reaches the client (both are written by the dispatcher in
   order onto the same outbox).
 
 ## Slow clients
 
-Per-client outbox is unbounded in M1 (memory-backed). A wedged client's
-outbox grows until the daemon OOMs in theory; hardening item: cap outbox
-depth, drop deltas first, mark the client stale and force re-sync via
-from_seq. Blocks are never silently dropped — a stale client is disconnected
-instead.
+Each memory-backed client outbox is capped at 64 MiB (two maximum records). If
+a client stops reading and crosses the cap, the daemon shuts down its socket
+and releases the queue; reconnect replays durable blocks with `from_seq`.
+Blocks are therefore never silently dropped while daemon memory remains
+bounded. Teardown calls `shutdown(2)` before joining both the writer and reader
+threads, so a kernel-blocked write cannot wedge daemon shutdown or leave the
+socket owned by a zombie process.
 
 ## Testing
 

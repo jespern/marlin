@@ -129,17 +129,17 @@ pub fn dispatch(
     if (std.mem.eql(u8, name, files.read_spec_name)) {
         const parsed = parseArgs(files.ReadArgs, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        return textResult(files.readFile(gpa, io, parsed.value, cwd), gpa);
+        return cancellableTextResult(files.readFileCancelable(gpa, io, parsed.value, cwd, cancel), gpa);
     }
     if (std.mem.eql(u8, name, files.write_spec_name)) {
         const parsed = parseArgs(files.WriteArgs, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        return textResult(files.writeFile(gpa, io, parsed.value, cwd), gpa);
+        return cancellableTextResult(files.writeFileCancelable(gpa, io, parsed.value, cwd, cancel), gpa);
     }
     if (std.mem.eql(u8, name, files.edit_spec_name)) {
         const parsed = parseArgs(files.EditArgs, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        return textResult(files.editFile(gpa, io, parsed.value, cwd), gpa);
+        return cancellableTextResult(files.editFileCancelable(gpa, io, parsed.value, cwd, cancel), gpa);
     }
     if (std.mem.eql(u8, name, search.grep_spec_name)) {
         const parsed = parseArgs(search.GrepArgs, gpa, args_json) orelse return argError(gpa, args_json);
@@ -229,6 +229,26 @@ test "dispatch: bad args json returns error text" {
     const r = dispatch(gpa, io, "read_file", "{not json", "/tmp", null, .{}, null, null);
     defer gpa.free(r.output);
     try std.testing.expectEqual(block.ToolStatus.err, r.status);
+}
+
+test "dispatch: file tools observe a turn already cancelled" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cancel: std.atomic.Value(bool) = .init(true);
+    const r = dispatch(
+        gpa,
+        threaded.io(),
+        "read_file",
+        "{\"path\":\"never-opened\"}",
+        "/tmp",
+        null,
+        .{},
+        null,
+        &cancel,
+    );
+    defer gpa.free(r.output);
+    try std.testing.expectEqual(block.ToolStatus.interrupted, r.status);
 }
 
 test "dispatch: bash policy denies atomically and null policy bypasses screening" {

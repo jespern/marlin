@@ -32,10 +32,17 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     const self_exe = if (args.len > 0) args[0] else "marlin";
+    // std.process.Init.gpa is the SMP allocator in ReleaseFast. Its small
+    // frees return to the *freeing thread's* private lists, but Marlin's
+    // message ownership intentionally crosses threads (dispatcher allocates,
+    // socket writers free). That asymmetry strands slabs indefinitely. libc's
+    // process-wide allocator preserves cross-thread reuse and releases large
+    // transient buffers normally.
+    const runtime_allocator = std.heap.c_allocator;
     // Fill env gaps from ~/.config/marlin/credentials (env always wins).
-    credentials.loadInto(init.gpa, init.io, init.environ_map) catch {};
+    credentials.loadInto(runtime_allocator, init.io, init.environ_map) catch {};
     return cli.dispatch(
-        init.gpa,
+        runtime_allocator,
         init.io,
         init.environ_map,
         self_exe,

@@ -33,6 +33,7 @@ cursor: usize = 0,
 pastes: std.ArrayList([]u8) = .empty,
 /// Previous submissions, oldest first.
 history: std.ArrayList([]u8) = .empty,
+history_bytes: usize = 0,
 /// Non-null while walking history: index into `history`.
 hist_idx: ?usize = null,
 /// Draft saved when history walking began.
@@ -47,6 +48,9 @@ redo_stack: std.ArrayList(UndoState) = .empty,
 
 const UndoState = struct { text: []u8, cursor: usize };
 const max_undo_states = 100;
+pub const max_history_entries: usize = 256;
+pub const max_history_bytes: usize = 2 * 1024 * 1024;
+pub const max_history_entry_bytes: usize = 256 * 1024;
 
 pub fn init(gpa: std.mem.Allocator) Editor {
     return .{ .gpa = gpa };
@@ -79,12 +83,33 @@ pub fn isWalkingHistory(self: *const Editor) bool {
 /// user_msg blocks, so history persists across reboots). Consecutive
 /// duplicates are skipped.
 pub fn pushHistory(self: *Editor, entry: []const u8) void {
-    if (entry.len == 0) return;
+    if (entry.len == 0 or entry.len > max_history_entry_bytes) return;
     if (self.history.items.len > 0 and
         std.mem.eql(u8, self.history.items[self.history.items.len - 1], entry))
         return;
+    while (self.history.items.len >= max_history_entries or
+        self.history_bytes > max_history_bytes - entry.len)
+    {
+        const oldest = self.history.orderedRemove(0);
+        self.history_bytes -= oldest.len;
+        self.gpa.free(oldest);
+        if (self.hist_idx) |idx| self.hist_idx = if (idx == 0) null else idx - 1;
+    }
     const owned = self.gpa.dupe(u8, entry) catch return;
-    self.history.append(self.gpa, owned) catch self.gpa.free(owned);
+    self.history_bytes += owned.len;
+    self.history.append(self.gpa, owned) catch {
+        self.history_bytes -= owned.len;
+        self.gpa.free(owned);
+    };
+}
+
+pub fn clearHistory(self: *Editor) void {
+    for (self.history.items) |entry| self.gpa.free(entry);
+    self.history.clearRetainingCapacity();
+    self.history_bytes = 0;
+    self.hist_idx = null;
+    if (self.draft) |draft| self.gpa.free(draft);
+    self.draft = null;
 }
 
 fn histPrev(self: *Editor) void {
@@ -660,6 +685,24 @@ test "history dedupes consecutive" {
     ed.pushHistory("same");
     ed.pushHistory("same");
     try testing.expectEqual(@as(usize, 1), ed.history.items.len);
+}
+
+test "history evicts old entries and refuses megabyte submissions" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    var buf: [32]u8 = undefined;
+    for (0..max_history_entries + 10) |i| {
+        const entry = try std.fmt.bufPrint(&buf, "entry-{d}", .{i});
+        ed.pushHistory(entry);
+    }
+    try testing.expectEqual(max_history_entries, ed.history.items.len);
+    try testing.expectEqualStrings("entry-10", ed.history.items[0]);
+
+    const huge = try testing.allocator.alloc(u8, max_history_entry_bytes + 1);
+    defer testing.allocator.free(huge);
+    @memset(huge, 'x');
+    ed.pushHistory(huge);
+    try testing.expectEqual(max_history_entries, ed.history.items.len);
 }
 
 test "vertical movement and edge detection" {

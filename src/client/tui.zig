@@ -37,6 +37,10 @@ const attach = @import("attach.zig");
 const credentials = @import("../core/credentials.zig");
 const Editor = @import("editor.zig");
 
+/// Keep startup and first session-switch latency independent of transcript
+/// length. Reaching the top explicitly backfills the complete durable log.
+const initial_replay_blocks: u32 = 256;
+
 const Event = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
@@ -48,12 +52,27 @@ const Event = union(enum) {
     paste: []const u8,
     /// One raw NDJSON line from the daemon (gpa-owned; handler frees).
     daemon_line: []u8,
-    daemon_gone,
+    /// Stable error name from the reader thread (for example EndOfStream).
+    daemon_gone: []const u8,
 };
 
 const Mode = enum { insert, normal };
 
-pub const RebootRequest = enum { none, plain, build };
+pub const RebootRequest = enum {
+    none,
+    plain,
+    build,
+    force,
+    build_force,
+
+    pub fn builds(self: RebootRequest) bool {
+        return self == .build or self == .build_force;
+    }
+
+    pub fn forced(self: RebootRequest) bool {
+        return self == .force or self == .build_force;
+    }
+};
 
 const ComposerCommand = struct {
     name: []const u8,
@@ -74,7 +93,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/compact", .description = "compact the current context" },
-    .{ .name = "/reboot", .usage = " [--build]", .description = "restart Marlin", .accepts_args = true },
+    .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
     .{ .name = "/quit", .description = "leave Marlin" },
     .{ .name = "!c", .description = "copy the last full tool output" },
@@ -121,6 +140,158 @@ const LayoutCache = struct {
     }
 };
 
+/// Durable layout for the mutable tail (normally the current turn). It is
+/// rebuilt only when a block or relevant state changes; spinner and stream
+/// frames simply append their ephemeral lines. This keeps frame cost O(1)
+/// with respect to even a very large active turn.
+const TailLayoutCache = struct {
+    arena_state: ?*std.heap.ArenaAllocator = null,
+    lines: std.ArrayList(Line) = .empty,
+    start: usize = 0,
+    end: usize = 0,
+    width: usize = 0,
+    expanded: bool = false,
+    epoch: u64 = 0,
+    state: proto.SessionState = .idle,
+
+    fn allocator(self: *TailLayoutCache, gpa: std.mem.Allocator) !std.mem.Allocator {
+        if (self.arena_state == null) {
+            const arena = try gpa.create(std.heap.ArenaAllocator);
+            arena.* = .init(gpa);
+            self.arena_state = arena;
+        }
+        return self.arena_state.?.allocator();
+    }
+
+    fn reset(self: *TailLayoutCache, gpa: std.mem.Allocator) void {
+        if (self.arena_state) |arena| {
+            arena.deinit();
+            gpa.destroy(arena);
+        }
+        self.* = .{};
+    }
+};
+
+/// Append-only live assistant layout. Streaming text is provisional, so it
+/// uses a light prose rail and receives full Markdown treatment only when the
+/// finalized durable block arrives. Complete wrapped rows are baked once;
+/// only the short unfinished row is reconsidered as new deltas arrive.
+const StreamLayoutCache = struct {
+    arena_state: ?*std.heap.ArenaAllocator = null,
+    lines: std.ArrayList(Line) = .empty,
+    pending: std.ArrayList(u8) = .empty,
+    source_len: usize = 0,
+    width: usize = 0,
+    first_prefix: []const u8 = "",
+    continuation_prefix: []const u8 = "",
+    at_line_start: bool = true,
+
+    fn allocator(self: *StreamLayoutCache, gpa: std.mem.Allocator) !std.mem.Allocator {
+        if (self.arena_state == null) {
+            const arena = try gpa.create(std.heap.ArenaAllocator);
+            arena.* = .init(gpa);
+            self.arena_state = arena;
+        }
+        return self.arena_state.?.allocator();
+    }
+
+    fn reset(self: *StreamLayoutCache, gpa: std.mem.Allocator) void {
+        self.pending.deinit(gpa);
+        if (self.arena_state) |arena| {
+            arena.deinit();
+            gpa.destroy(arena);
+        }
+        self.* = .{};
+    }
+
+    fn prepare(self: *StreamLayoutCache, gpa: std.mem.Allocator, width: usize) !void {
+        if (self.width == width and self.first_prefix.len > 0) return;
+        const arena = try self.allocator(gpa);
+        self.width = width;
+        self.first_prefix = try std.fmt.allocPrint(arena, "{s}• ", .{markdownGutter(width)});
+        self.continuation_prefix = try spaces(arena, displayWidth(self.first_prefix));
+    }
+
+    fn discardPendingPrefix(self: *StreamLayoutCache, count: usize) void {
+        const remaining = self.pending.items.len - count;
+        std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[count..]);
+        self.pending.items.len = remaining;
+    }
+
+    fn appendRow(self: *StreamLayoutCache, gpa: std.mem.Allocator, text: []const u8) !void {
+        const arena = try self.allocator(gpa);
+        const prefix = if (self.at_line_start) self.first_prefix else self.continuation_prefix;
+        const rendered = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, text });
+        try self.lines.append(arena, .{ .text = rendered, .style = Palette.assistant });
+        self.at_line_start = false;
+    }
+
+    fn appendBlank(self: *StreamLayoutCache, gpa: std.mem.Allocator) !void {
+        const arena = try self.allocator(gpa);
+        if (self.lines.items.len == 0 or lineWidthBytes(self.lines.items[self.lines.items.len - 1]) != 0)
+            try self.lines.append(arena, .{ .text = "", .style = .{} });
+    }
+
+    fn commitCompleteLine(self: *StreamLayoutCache, gpa: std.mem.Allocator, text: []const u8) !void {
+        if (text.len == 0) {
+            try self.appendBlank(gpa);
+            self.at_line_start = true;
+            return;
+        }
+        var start: usize = 0;
+        while (start < text.len) {
+            const prefix = if (self.at_line_start) self.first_prefix else self.continuation_prefix;
+            const capacity = markdownMeasure(self.width) -| displayWidth(prefix);
+            if (capacity == 0) return;
+            var end = wordBreak(text, start, capacity);
+            if (end == start) end = hardCellBreak(text, start, capacity);
+            try self.appendRow(gpa, text[start..end]);
+            start = end;
+            while (start < text.len and (text[start] == ' ' or text[start] == '\t')) start += 1;
+        }
+        self.at_line_start = true;
+    }
+
+    fn commitFullPendingRows(self: *StreamLayoutCache, gpa: std.mem.Allocator) !void {
+        while (self.pending.items.len > 0) {
+            const prefix = if (self.at_line_start) self.first_prefix else self.continuation_prefix;
+            const capacity = markdownMeasure(self.width) -| displayWidth(prefix);
+            if (capacity == 0) return;
+            var end = wordBreak(self.pending.items, 0, capacity);
+            if (end >= self.pending.items.len) return;
+            if (end == 0) end = hardCellBreak(self.pending.items, 0, capacity);
+            try self.appendRow(gpa, self.pending.items[0..end]);
+            while (end < self.pending.items.len and
+                (self.pending.items[end] == ' ' or self.pending.items[end] == '\t')) end += 1;
+            self.discardPendingPrefix(end);
+        }
+    }
+
+    fn update(self: *StreamLayoutCache, gpa: std.mem.Allocator, text: []const u8, width: usize) !void {
+        if (self.width != width or text.len < self.source_len) self.reset(gpa);
+        try self.prepare(gpa, width);
+        try self.pending.appendSlice(gpa, text[self.source_len..]);
+        self.source_len = text.len;
+
+        while (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |newline| {
+            try self.commitCompleteLine(gpa, self.pending.items[0..newline]);
+            self.discardPendingPrefix(newline + 1);
+        }
+        try self.commitFullPendingRows(gpa);
+    }
+
+    fn appendTo(self: *const StreamLayoutCache, arena: std.mem.Allocator, out: *std.ArrayList(Line)) !void {
+        try out.appendSlice(arena, self.lines.items);
+        if (self.pending.items.len == 0) return;
+        try out.append(arena, .{
+            .text = if (self.at_line_start) self.first_prefix else self.continuation_prefix,
+            .style = Palette.assistant,
+            .text2 = self.pending.items,
+            .style2 = Palette.assistant,
+        });
+    }
+};
+
 /// A block reduced to what the renderer needs (owned copies).
 const RenderBlock = struct {
     kind: block.BlockKind,
@@ -139,6 +310,11 @@ const RenderBlock = struct {
     /// Locally inserted for instant submit feedback. The matching durable
     /// block clears this bit instead of producing a duplicate render block.
     pending_echo: bool = false,
+    /// Identity of the input awaiting its daemon ok/err. Zero after ack.
+    pending_request_id: u64 = 0,
+    /// Non-null only for a new-turn echo whose optimistic running state must
+    /// be restored if the daemon rejects that exact request.
+    pending_prior_state: ?proto.SessionState = null,
 
     fn deinit(self: *RenderBlock, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
@@ -146,6 +322,66 @@ const RenderBlock = struct {
         if (self.full_body_ref) |ref| gpa.free(ref);
     }
 };
+
+/// Convert a durable block into its owned presentation form without the live
+/// side effects in App.applyBlock. Older history pages are buffered off-screen
+/// and prepended atomically only after their replay marker arrives.
+fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderBlock {
+    var kind = b.kind();
+    var text: []const u8 = "";
+    var label: []const u8 = "";
+    var status: block.ToolStatus = .ok;
+    var full_body_ref: ?[]const u8 = null;
+    var generated_text: ?[]u8 = null;
+    defer if (generated_text) |owned| gpa.free(owned);
+
+    switch (b.body) {
+        .user_msg => |u| {
+            if (u.synthetic or isLegacyRehydration(u.text)) {
+                kind = .system_note;
+                generated_text = try rehydrationLabel(gpa, u.text);
+                text = generated_text.?;
+            } else text = u.text;
+        },
+        .steer => |s| text = s.text,
+        .assistant_msg => |a| text = a.text,
+        .reasoning => |r| text = r.text,
+        .tool_call => |tc| {
+            text = tc.args_json;
+            label = tc.name;
+        },
+        .tool_result => |tr| {
+            text = tr.inline_body;
+            status = tr.status;
+            full_body_ref = tr.full_body_ref;
+        },
+        .approval => |ap| text = if (ap.decision) |decision| @tagName(decision) else "pending",
+        .system_note => |sn| {
+            if (isCompactionStatusNote(sn.text)) return null;
+            text = sn.text;
+        },
+        .compaction => text = "context compacted",
+    }
+
+    const owned_text = if (generated_text) |owned| blk: {
+        generated_text = null;
+        break :blk owned;
+    } else try gpa.dupe(u8, text);
+    errdefer gpa.free(owned_text);
+    const owned_label = try gpa.dupe(u8, label);
+    errdefer gpa.free(owned_label);
+    const owned_ref = if (full_body_ref) |ref| try gpa.dupe(u8, ref) else null;
+
+    return .{
+        .kind = kind,
+        .seq = b.seq,
+        .turn_id = b.turn_id,
+        .text = owned_text,
+        .label = owned_label,
+        .status = status,
+        .full_body_ref = owned_ref,
+    };
+}
 
 fn reconcilePendingEcho(
     blocks: []RenderBlock,
@@ -157,12 +393,43 @@ fn reconcilePendingEcho(
     for (blocks) |*rendered| {
         if (rendered.pending_echo and rendered.kind == kind and std.mem.eql(u8, rendered.text, text)) {
             rendered.pending_echo = false;
+            rendered.pending_request_id = 0;
+            rendered.pending_prior_state = null;
             rendered.seq = seq;
             rendered.turn_id = turn_id;
             return true;
         }
     }
     return false;
+}
+
+fn acknowledgeInputInBlocks(blocks: []RenderBlock, request_id: u64) bool {
+    for (blocks) |*rendered| {
+        if (rendered.pending_request_id != request_id) continue;
+        rendered.pending_request_id = 0;
+        rendered.pending_prior_state = null;
+        return true;
+    }
+    return false;
+}
+
+const RejectedInput = struct {
+    prior_state: ?proto.SessionState,
+};
+
+fn rejectInputInBlocks(
+    gpa: std.mem.Allocator,
+    blocks: *std.ArrayList(RenderBlock),
+    request_id: u64,
+) ?RejectedInput {
+    for (blocks.items, 0..) |*rendered, i| {
+        if (rendered.pending_request_id != request_id) continue;
+        const rejected = RejectedInput{ .prior_state = rendered.pending_prior_state };
+        rendered.deinit(gpa);
+        _ = blocks.orderedRemove(i);
+        return rejected;
+    }
+    return null;
 }
 
 const PendingApproval = struct {
@@ -306,6 +573,9 @@ const SavedSessionView = struct {
     turn_started_ms: i64,
     call_started_ms: i64,
     last_seq: u64,
+    oldest_seq: u64,
+    history_complete: bool,
+    last_used: u64 = 0,
 
     fn deinit(self: *SavedSessionView, gpa: std.mem.Allocator) void {
         self.editor.deinit();
@@ -315,6 +585,13 @@ const SavedSessionView = struct {
         self.reasoning_delta.deinit(gpa);
         self.model.deinit(gpa);
         self.cwd.deinit(gpa);
+    }
+
+    fn releaseStreamingBuffers(self: *SavedSessionView, gpa: std.mem.Allocator) void {
+        self.delta.deinit(gpa);
+        self.delta = .empty;
+        self.reasoning_delta.deinit(gpa);
+        self.reasoning_delta = .empty;
     }
 };
 
@@ -346,6 +623,16 @@ const App = struct {
     context_limit: u64 = 0,
     /// Highest durable block incorporated for the active session.
     last_seq: u64 = 0,
+    /// Initial attach is a bounded tail. `history_complete=false` means a
+    /// trip to the loaded top should request another bounded older page.
+    oldest_seq: u64 = 0,
+    history_complete: bool = true,
+    history_loading: bool = false,
+    /// Zero identifies the initial tail replay; non-zero is the exclusive
+    /// upper bound of an older page currently being buffered.
+    history_before_seq: u64 = 0,
+    history_backfill: std.ArrayList(RenderBlock) = .empty,
+    history_page_failed: bool = false,
     /// 0 = pinned to bottom; N = scrolled up N lines.
     scroll_up: usize = 0,
     /// Line count of the last rendered frame; used to keep the view
@@ -381,6 +668,7 @@ const App = struct {
     /// though session_watch intentionally omits archived rows.
     known_session_ids: std.ArrayList(u64) = .empty,
     saved_views: std.AutoHashMapUnmanaged(u64, *SavedSessionView) = .empty,
+    saved_view_clock: u64 = 0,
     background_approvals: std.AutoHashMapUnmanaged(u64, PendingApproval) = .empty,
     recent_sessions: std.ArrayList(u64) = .empty,
     recent_cursor: usize = 0,
@@ -430,6 +718,11 @@ const App = struct {
     cfg: config.Config = .{},
     /// Baked layout of completed turns; see LayoutCache.
     layout_cache: LayoutCache = .{},
+    /// Baked durable portion of the active turn; see TailLayoutCache.
+    tail_layout_cache: TailLayoutCache = .{},
+    /// Incremental provisional assistant text; finalized blocks use the full
+    /// Markdown layout caches above.
+    stream_layout_cache: StreamLayoutCache = .{},
     /// Bumped whenever existing blocks mutate in place or the block list is
     /// replaced (session switch) — invalidates layout_cache.
     layout_epoch: u64 = 0,
@@ -473,10 +766,13 @@ const App = struct {
     /// Set by /reboot: after clean TUI teardown, run() returns this to
     /// cli.zig which execs `marlin reboot [--build] --then attach @<sid>`.
     reboot_request: RebootRequest = .none,
+    next_input_request_id: u64 = 1,
 
     fn deinit(self: *App) void {
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
+        self.tail_layout_cache.reset(self.gpa);
+        self.stream_layout_cache.reset(self.gpa);
         self.layout_cache.reset(self.gpa);
         self.picker_filter.deinit(self.gpa);
         for (self.catalog.items) |m| self.gpa.free(m);
@@ -499,6 +795,8 @@ const App = struct {
         self.pending_new_cwd.deinit(self.gpa);
         self.clipboard_pending.deinit(self.gpa);
         self.clipboard_desc.deinit(self.gpa);
+        self.clearHistoryBackfill();
+        self.history_backfill.deinit(self.gpa);
         for (self.blocks.items) |*rb| rb.deinit(self.gpa);
         self.blocks.deinit(self.gpa);
         self.delta.deinit(self.gpa);
@@ -513,6 +811,19 @@ const App = struct {
     fn setNotice(self: *App, comptime fmt: []const u8, args: anytype) void {
         self.notice.clearRetainingCapacity();
         self.notice.print(self.gpa, fmt, args) catch {};
+    }
+
+    fn clearHistoryBackfill(self: *App) void {
+        for (self.history_backfill.items) |*rendered| rendered.deinit(self.gpa);
+        self.history_backfill.clearRetainingCapacity();
+    }
+
+    fn releaseStreamingBuffers(self: *App) void {
+        self.delta.deinit(self.gpa);
+        self.delta = .empty;
+        self.reasoning_delta.deinit(self.gpa);
+        self.reasoning_delta = .empty;
+        self.stream_layout_cache.reset(self.gpa);
     }
 
     fn setModelStr(self: *App, m: []const u8) void {
@@ -535,6 +846,15 @@ const App = struct {
             if (session.sid == sid) return session;
         }
         return null;
+    }
+
+    fn updateSessionSummaryState(self: *App, sid: u64, state: proto.SessionState) void {
+        for (self.sessions.items) |*session| {
+            if (session.sid == sid) {
+                session.state = state;
+                return;
+            }
+        }
     }
 
     fn rootSessionId(self: *const App, sid: u64) u64 {
@@ -581,7 +901,9 @@ const App = struct {
     }
 
     fn resetActiveAfterMove(self: *App) void {
+        self.clearHistoryBackfill();
         self.copy_cursor = null;
+        self.stream_layout_cache.reset(self.gpa);
         self.layout_epoch +%= 1;
         self.editor = Editor.init(self.gpa);
         self.blocks = .empty;
@@ -596,6 +918,11 @@ const App = struct {
         self.context_used = 0;
         self.context_limit = 0;
         self.last_seq = 0;
+        self.oldest_seq = 0;
+        self.history_complete = true;
+        self.history_loading = false;
+        self.history_before_seq = 0;
+        self.history_page_failed = false;
         self.scroll_up = 0;
         self.last_total_lines = 0;
         self.last_first_visible = 0;
@@ -615,6 +942,7 @@ const App = struct {
     fn saveActiveView(self: *App) !void {
         const saved = try self.gpa.create(SavedSessionView);
         errdefer self.gpa.destroy(saved);
+        self.saved_view_clock +%= 1;
         saved.* = .{
             .editor = self.editor,
             .blocks = self.blocks,
@@ -642,9 +970,39 @@ const App = struct {
             .turn_started_ms = self.turn_started_ms,
             .call_started_ms = self.call_started_ms,
             .last_seq = self.last_seq,
+            .oldest_seq = self.oldest_seq,
+            .history_complete = self.history_complete,
+            .last_used = self.saved_view_clock,
         };
         try self.saved_views.put(self.gpa, self.sid, saved);
+        self.trimSavedViews();
         self.resetActiveAfterMove();
+    }
+
+    const max_saved_views = 8;
+
+    /// Inactive views are a cache, not durable state. Keep a small MRU set;
+    /// an evicted session replays from seq 1 when reopened. This bounds the
+    /// number of full transcripts retained by a long-lived TUI.
+    fn trimSavedViews(self: *App) void {
+        while (self.saved_views.count() > max_saved_views) {
+            var oldest_sid: ?u64 = null;
+            var oldest_tick: u64 = std.math.maxInt(u64);
+            var it = self.saved_views.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.*.last_used < oldest_tick) {
+                    oldest_tick = entry.value_ptr.*.last_used;
+                    oldest_sid = entry.key_ptr.*;
+                }
+            }
+            const sid = oldest_sid orelse return;
+            const saved = self.saved_views.get(sid) orelse return;
+            if (saved.pending) |pending|
+                self.background_approvals.put(self.gpa, sid, pending) catch {};
+            _ = self.saved_views.remove(sid);
+            saved.deinit(self.gpa);
+            self.gpa.destroy(saved);
+        }
     }
 
     fn restoreSavedView(self: *App, saved: *SavedSessionView) void {
@@ -676,6 +1034,11 @@ const App = struct {
         self.turn_started_ms = saved.turn_started_ms;
         self.call_started_ms = saved.call_started_ms;
         self.last_seq = saved.last_seq;
+        self.oldest_seq = saved.oldest_seq;
+        self.history_complete = saved.history_complete;
+        self.history_loading = false;
+        self.history_before_seq = 0;
+        self.history_page_failed = false;
     }
 
     fn touchRecentSession(self: *App, sid: u64) void {
@@ -713,8 +1076,18 @@ const App = struct {
 
         if (touch_recent) self.touchRecentSession(sid);
         self.animation_active.store(self.state == .running, .release);
-        const from_seq = if (self.last_seq == 0) 1 else self.last_seq +| 1;
-        self.conn.send(.{ .sub = .{ .sid = sid, .from_seq = from_seq } }) catch {};
+        if (self.last_seq == 0) {
+            self.history_complete = false;
+            self.history_loading = true;
+            self.history_before_seq = 0;
+            self.conn.send(.{ .sub = .{
+                .sid = sid,
+                .from_seq = 1,
+                .tail_limit = initial_replay_blocks,
+            } }) catch {};
+        } else {
+            self.conn.send(.{ .sub = .{ .sid = sid, .from_seq = self.last_seq +| 1 } }) catch {};
+        }
         self.rememberSession(sid);
         var handle_buf: session_handle.Full = undefined;
         self.setNotice("session → {s}", .{self.displaySessionHandle(&handle_buf, sid)});
@@ -835,6 +1208,30 @@ const App = struct {
             }
         }
         self.recent_cursor = 0;
+
+        // session_watch omits archived sessions. Any inactive view absent
+        // from the authoritative snapshot is unreachable UI state, so release
+        // its transcript/editor allocations instead of retaining it forever.
+        var stale: std.ArrayList(u64) = .empty;
+        defer stale.deinit(self.gpa);
+        var saved_it = self.saved_views.iterator();
+        while (saved_it.next()) |entry| {
+            var present = false;
+            for (incoming) |info| {
+                if (info.sid == entry.key_ptr.*) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) stale.append(self.gpa, entry.key_ptr.*) catch {};
+        }
+        for (stale.items) |sid| {
+            const saved = self.saved_views.get(sid) orelse continue;
+            _ = self.saved_views.remove(sid);
+            saved.deinit(self.gpa);
+            self.gpa.destroy(saved);
+            _ = self.background_approvals.remove(sid);
+        }
     }
 
     const InflightCall = struct { rb: *const RenderBlock, queued: usize };
@@ -927,6 +1324,52 @@ const App = struct {
         };
     }
 
+    fn pushInputEcho(
+        self: *App,
+        kind: block.BlockKind,
+        text: []const u8,
+        request_id: u64,
+        prior_state: ?proto.SessionState,
+    ) void {
+        const before = self.blocks.items.len;
+        self.pushBlockPending(kind, text, "", .ok, true);
+        if (self.blocks.items.len == before) return;
+        const rendered = &self.blocks.items[self.blocks.items.len - 1];
+        rendered.pending_request_id = request_id;
+        rendered.pending_prior_state = prior_state;
+    }
+
+    fn acknowledgeInput(self: *App, request_id: u64) void {
+        if (request_id == 0) return;
+        if (acknowledgeInputInBlocks(self.blocks.items, request_id)) return;
+        var it = self.saved_views.valueIterator();
+        while (it.next()) |saved| {
+            if (acknowledgeInputInBlocks(saved.*.blocks.items, request_id)) return;
+        }
+    }
+
+    fn rejectInput(self: *App, request_id: u64) void {
+        if (request_id == 0) return;
+        if (rejectInputInBlocks(self.gpa, &self.blocks, request_id)) |rejected| {
+            if (rejected.prior_state) |state| {
+                self.state = state;
+                self.releaseStreamingBuffers();
+                self.stream_status_at_ms = 0;
+                self.turn_started_ms = 0;
+                self.animation_active.store(state == .running, .release);
+            }
+            self.layout_epoch +%= 1;
+            return;
+        }
+        var it = self.saved_views.valueIterator();
+        while (it.next()) |saved| {
+            if (rejectInputInBlocks(self.gpa, &saved.*.blocks, request_id)) |rejected| {
+                if (rejected.prior_state) |state| saved.*.state = state;
+                return;
+            }
+        }
+    }
+
     // ------------------------------------------------------ daemon input --
 
     fn handleDaemonLine(self: *App, line: []u8) void {
@@ -938,9 +1381,35 @@ const App = struct {
         switch (msg) {
             .blk => |b| {
                 if (b.sid != self.sid) return;
+                if (self.history_loading and self.history_before_seq > 0 and b.b.seq < self.history_before_seq) {
+                    self.bufferOlderBlock(b.b);
+                    return;
+                }
                 if (b.b.seq <= self.last_seq) return;
+                if (self.oldest_seq == 0) {
+                    self.oldest_seq = b.b.seq;
+                    // Compatibility with an older daemon that ignores the
+                    // tail request and performs a full replay without a
+                    // replay_done marker.
+                    if (b.b.seq == 1) {
+                        self.history_complete = true;
+                        if (self.history_before_seq == 0) self.history_loading = false;
+                    }
+                }
                 self.last_seq = b.b.seq;
                 self.applyBlock(b.b);
+            },
+            .replay_done => |replay| {
+                if (replay.sid != self.sid) return;
+                if (self.history_before_seq > 0) {
+                    self.finishOlderHistoryPage(replay.oldest_seq, replay.has_older);
+                    return;
+                }
+                if (replay.oldest_seq > 0) self.oldest_seq = replay.oldest_seq;
+                self.history_complete = !replay.has_older;
+                self.history_loading = false;
+                self.history_before_seq = 0;
+                if (self.scroll_up > 0) self.scroll_up = std.math.maxInt(usize);
             },
             .delta => |d| {
                 if (d.sid != self.sid) return;
@@ -957,9 +1426,20 @@ const App = struct {
                 self.stream_status_at_ms = nowWallMs(self.io);
             },
             .status => |s| {
+                self.updateSessionSummaryState(s.sid, s.state);
                 if (s.sid != self.sid) {
-                    if (self.saved_views.get(s.sid)) |saved| saved.state = s.state;
+                    if (self.saved_views.get(s.sid)) |saved| {
+                        saved.state = s.state;
+                        if (s.state == .idle or s.state == .err or s.state == .done)
+                            saved.releaseStreamingBuffers(self.gpa);
+                    }
                     return;
+                }
+                // Old daemons ignore tail_limit/replay_done and finish their
+                // full replay with status. Recognize that safe fallback.
+                if (self.history_loading and self.history_before_seq == 0 and self.oldest_seq <= 1) {
+                    self.history_complete = true;
+                    self.history_loading = false;
                 }
                 if (s.state == .running and self.state != .running) {
                     self.spinner_frame = 0;
@@ -969,6 +1449,8 @@ const App = struct {
                 self.state = s.state;
                 self.animation_active.store(s.state == .running, .release);
                 if (s.state != .awaiting_approval) self.pending = null;
+                if (s.state == .idle or s.state == .err or s.state == .done)
+                    self.releaseStreamingBuffers();
             },
             .approval_request => |ar| {
                 var p = PendingApproval{};
@@ -1013,8 +1495,16 @@ const App = struct {
                 if (m.context_limit > 0) self.context_limit = m.context_limit;
             },
             .err => |e| {
+                self.rejectInput(e.request_id);
+                if (self.history_loading and std.mem.eql(u8, e.code, "request_failed")) {
+                    self.clearHistoryBackfill();
+                    self.history_loading = false;
+                    self.history_before_seq = 0;
+                    self.history_page_failed = false;
+                }
                 self.setNotice("daemon error {s}: {s}", .{ e.code, e.msg });
             },
+            .ok => |ok| self.acknowledgeInput(ok.request_id),
             else => {},
         }
     }
@@ -1027,9 +1517,7 @@ const App = struct {
                     defer self.gpa.free(label);
                     self.pushDurableBlock(b, .system_note, label, "", .ok);
                 } else {
-                    if (reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id))
-                        self.layout_epoch +%= 1
-                    else
+                    if (!reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id))
                         self.pushDurableBlock(b, .user_msg, u.text, "", .ok);
                     // Seed input history from the log (replay covers pre-reboot
                     // messages; live blocks cover this session's submits).
@@ -1037,25 +1525,24 @@ const App = struct {
                 }
             },
             .steer => |s| {
-                if (reconcilePendingEcho(self.blocks.items, .steer, s.text, b.seq, b.turn_id))
-                    self.layout_epoch +%= 1
-                else
+                if (!reconcilePendingEcho(self.blocks.items, .steer, s.text, b.seq, b.turn_id))
                     self.pushDurableBlock(b, .steer, s.text, "", .ok);
             },
             .assistant_msg => |a| {
                 // Finalized text replaces the streaming delta.
-                self.delta.clearRetainingCapacity();
-                self.reasoning_delta.clearRetainingCapacity();
+                self.releaseStreamingBuffers();
                 self.pushDurableBlock(b, .assistant_msg, a.text, "", .ok);
             },
             .reasoning => |r| {
                 // Reasoning and progress commentary use distinct live streams
                 // but the same durable card type. Clear whichever buffer this
                 // finalized block exactly replaces.
-                if (std.mem.eql(u8, self.reasoning_delta.items, r.text))
-                    self.reasoning_delta.clearRetainingCapacity()
-                else if (std.mem.eql(u8, self.delta.items, r.text))
+                if (std.mem.eql(u8, self.reasoning_delta.items, r.text)) {
+                    self.reasoning_delta.clearRetainingCapacity();
+                } else if (std.mem.eql(u8, self.delta.items, r.text)) {
                     self.delta.clearRetainingCapacity();
+                    self.stream_layout_cache.reset(self.gpa);
+                }
                 self.pushDurableBlock(b, .reasoning, r.text, "", .ok);
             },
             .tool_call => |tc| {
@@ -1086,6 +1573,62 @@ const App = struct {
         if (self.scroll_up > 0) self.scroll_up +|= 0; // stay where they are
     }
 
+    fn bufferOlderBlock(self: *App, b: block.Block) void {
+        if (self.history_page_failed) return;
+        if (self.history_backfill.items.len > 0 and
+            self.history_backfill.items[self.history_backfill.items.len - 1].seq >= b.seq) return;
+        const rendered = allocDurableRenderBlock(self.gpa, b) catch {
+            self.history_page_failed = true;
+            self.clearHistoryBackfill();
+            return;
+        } orelse return;
+        self.history_backfill.append(self.gpa, rendered) catch {
+            var owned = rendered;
+            owned.deinit(self.gpa);
+            self.history_page_failed = true;
+            self.clearHistoryBackfill();
+        };
+    }
+
+    fn finishOlderHistoryPage(self: *App, oldest_seq: u64, has_older: bool) void {
+        defer {
+            self.history_loading = false;
+            self.history_before_seq = 0;
+            self.history_page_failed = false;
+        }
+        if (self.history_page_failed) {
+            self.clearHistoryBackfill();
+            self.setNotice("could not load older history", .{});
+            return;
+        }
+
+        const loaded = self.history_backfill.items.len;
+        self.blocks.insertSlice(self.gpa, 0, self.history_backfill.items) catch {
+            self.clearHistoryBackfill();
+            self.setNotice("could not load older history", .{});
+            return;
+        };
+        // Ownership moved into blocks; retain only the scratch allocation.
+        self.history_backfill.items.len = 0;
+        if (oldest_seq > 0) self.oldest_seq = oldest_seq;
+        self.history_complete = !has_older;
+
+        // History is bounded by Editor; rebuilding restores chronological
+        // order now that older user messages were prepended.
+        self.editor.clearHistory();
+        for (self.blocks.items) |rendered| {
+            if (rendered.kind == .user_msg) self.editor.pushHistory(rendered.text);
+        }
+        self.copy_cursor = null;
+        self.sel_anchor = null;
+        self.sel_dragging = false;
+        self.layout_epoch +%= 1;
+        self.layout_cache.reset(self.gpa);
+        self.tail_layout_cache.reset(self.gpa);
+        if (self.scroll_up > 0) self.scroll_up = std.math.maxInt(usize);
+        self.setNotice("loaded {d} older blocks", .{loaded});
+    }
+
     // -------------------------------------------------------- user input --
 
     fn submitInput(self: *App, text: []const u8) void {
@@ -1099,18 +1642,28 @@ const App = struct {
             self.runCommand(trimmed);
             return;
         }
-        const was_running = self.state == .running;
-        self.conn.send(.{ .input = .{ .sid = self.sid, .text = trimmed } }) catch {
-            self.setNotice("send failed — daemon gone?", .{});
+        const was_busy = self.state == .running or self.state == .awaiting_approval;
+        const request_id = self.next_input_request_id;
+        self.next_input_request_id +%= 1;
+        if (self.next_input_request_id == 0) self.next_input_request_id = 1;
+        self.conn.send(.{ .input = .{
+            .sid = self.sid,
+            .text = trimmed,
+            .request_id = request_id,
+        } }) catch |err| {
+            if (err == error.ProtocolLineTooLong)
+                self.setNotice("message exceeds the {d} MiB protocol limit", .{proto.max_line_bytes / (1024 * 1024)})
+            else
+                self.setNotice("send failed — daemon gone? ({t})", .{err});
             return;
         };
-        if (was_running) {
-            self.pushBlockPending(.steer, trimmed, "", .ok, true);
-            self.setNotice("queued as steer (turn running)", .{});
+        if (was_busy) {
+            self.pushInputEcho(.steer, trimmed, request_id, null);
+            self.setNotice("queued as steer for active turn", .{});
         } else {
             // The composer becomes a scrollback card immediately. The turn
             // thread's persisted user_msg will reconcile this local echo.
-            self.pushBlockPending(.user_msg, trimmed, "", .ok, true);
+            self.pushInputEcho(.user_msg, trimmed, request_id, self.state);
             self.state = .running;
             self.spinner_frame = 0;
             self.turn_started_ms = nowWallMs(self.io);
@@ -1172,11 +1725,33 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "!c")) {
             self.copyLastToolOutput();
         } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
-            const arg = it.rest();
-            if (self.state == .running or self.state == .awaiting_approval) {
+            var build = std.mem.eql(u8, head, "!rb");
+            var force = false;
+            while (it.next()) |arg| {
+                if (std.mem.eql(u8, arg, "--build")) {
+                    build = true;
+                } else if (std.mem.eql(u8, arg, "--force")) {
+                    force = true;
+                } else {
+                    self.setNotice("usage: /reboot [--build] [--force]", .{});
+                    return;
+                }
+            }
+            if (self.state == .awaiting_approval and !force) {
+                self.setNotice("approval pending — answer it, interrupt, or /reboot --force", .{});
+                return;
+            }
+            if (self.state == .running) {
                 self.setNotice("turn running — /reboot waits for it (interrupt first if you want force)", .{});
             }
-            self.reboot_request = if (std.mem.eql(u8, head, "!rb") or std.mem.eql(u8, arg, "--build")) .build else .plain;
+            self.reboot_request = if (build and force)
+                .build_force
+            else if (build)
+                .build
+            else if (force)
+                .force
+            else
+                .plain;
             self.should_quit = true;
         } else if (std.mem.eql(u8, head, "/compact")) {
             if (self.state == .running or self.state == .awaiting_approval) {
@@ -1186,7 +1761,7 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /new · /archive [children] · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /compact · /reboot [--build] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /new · /archive [children] · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -1546,11 +2121,13 @@ const App = struct {
         } else if (key.matches(vaxis.Key.up, .{})) {
             self.scroll_up +|= 1;
             self.clampCopyCursorToView();
+            self.maybeRequestHistoryAtTop();
             return;
         } else return;
         self.copy_cursor = cursor;
         if (self.sel_anchor != null) self.updateCopySelection(cursor);
         self.followCopyCursor();
+        self.maybeRequestHistoryAtTop();
     }
 
     fn selection(self: *const App) ?Selection {
@@ -1891,6 +2468,38 @@ const App = struct {
         self.sel_clear_after_copy = false;
         self.notice.clearRetainingCapacity();
         self.refresh_requested = true;
+    }
+
+    fn requestOlderHistory(self: *App) void {
+        if (self.history_complete or self.history_loading) return;
+        if (self.oldest_seq <= 1) {
+            self.history_complete = true;
+            return;
+        }
+        self.copy_cursor = null;
+        self.sel_anchor = null;
+        self.sel_dragging = false;
+        self.clearHistoryBackfill();
+        self.history_loading = true;
+        self.history_before_seq = self.oldest_seq;
+        self.history_page_failed = false;
+        self.conn.send(.{ .sub = .{
+            .sid = self.sid,
+            .tail_limit = initial_replay_blocks,
+            .before_seq = self.history_before_seq,
+        } }) catch {
+            self.history_loading = false;
+            self.history_before_seq = 0;
+            self.setNotice("could not load older history", .{});
+            return;
+        };
+        self.setNotice("loading older history…", .{});
+    }
+
+    fn maybeRequestHistoryAtTop(self: *App) void {
+        if (self.history_complete or self.history_loading) return;
+        const max_scroll = self.last_total_lines -| self.last_view_h;
+        if (self.scroll_up >= max_scroll) self.requestOlderHistory();
     }
 };
 
@@ -3363,6 +3972,11 @@ fn layoutBlockRange(
 fn stableBlockCount(app: *const App) usize {
     const items = app.blocks.items;
     if (items.len == 0) return 0;
+    if (app.state != .running and app.state != .awaiting_approval) {
+        var has_pending = false;
+        for (items) |item| has_pending = has_pending or item.pending_echo;
+        if (!has_pending) return items.len;
+    }
     const last_turn = items[items.len - 1].turn_id;
     var i = items.len;
     while (i > 0 and items[i - 1].turn_id == last_turn) i -= 1;
@@ -3396,8 +4010,27 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         cache.covered = stable;
     }
     try lines.appendSlice(arena, cache.lines.items);
-    var label_state = cache.label_state;
-    try layoutBlockRange(arena, app, &lines, cache.covered, app.blocks.items.len, w, &label_state, true);
+
+    const tail_cache = &app.tail_layout_cache;
+    if (tail_cache.start != cache.covered or tail_cache.end != app.blocks.items.len or
+        tail_cache.width != w or tail_cache.expanded != app.show_tool_transcript or
+        tail_cache.epoch != app.layout_epoch or tail_cache.state != app.state)
+    {
+        tail_cache.reset(app.gpa);
+        tail_cache.start = cache.covered;
+        tail_cache.end = app.blocks.items.len;
+        tail_cache.width = w;
+        tail_cache.expanded = app.show_tool_transcript;
+        tail_cache.epoch = app.layout_epoch;
+        tail_cache.state = app.state;
+        if (tail_cache.start < tail_cache.end) {
+            const tail_alloc = try tail_cache.allocator(app.gpa);
+            var label_state = cache.label_state;
+            try layoutBlockRange(tail_alloc, app, &tail_cache.lines, tail_cache.start, tail_cache.end, w, &label_state, true);
+            try resolveLineLinks(tail_alloc, tail_cache.lines.items);
+        }
+    }
+    try lines.appendSlice(arena, tail_cache.lines.items);
 
     // Streaming region: provider reasoning summaries are verbose by nature
     // (first-person deliberation), so the live view is a one-line ticker
@@ -3415,7 +4048,8 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
     }
     if (app.delta.items.len > 0) {
         try blankLine(arena, &lines);
-        try wrapMarkdown(arena, &lines, app.delta.items, w);
+        try app.stream_layout_cache.update(app.gpa, app.delta.items, w);
+        try app.stream_layout_cache.appendTo(arena, &lines);
     } else if (app.reasoning_delta.items.len == 0 and app.state == .running) {
         try blankLine(arena, &lines);
         const head = try std.fmt.allocPrint(arena, "{s} ", .{
@@ -3437,10 +4071,15 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         // nothing is visible yet (long thinking, tool-call assembly). Hidden
         // once reports go stale (between rounds, during tool execution).
         const stream_fresh = app.stream_status_at_ms > 0 and
-            nowWallMs(app.io) - app.stream_status_at_ms < 3000;
+            nowWallMs(app.io) - app.stream_status_at_ms <
+                (if (app.stream_bytes == 0) @as(i64, 15_000) else 3000);
         if (stream_fresh and app.currentInflightCall() == null) {
             const quiet_s = app.stream_quiet_ms / 1000;
-            if (quiet_s >= 3) {
+            if (app.stream_bytes == 0) {
+                detail = try std.fmt.allocPrint(arena, "{s} · waiting for provider · {d}s", .{
+                    elapsed, quiet_s,
+                });
+            } else if (quiet_s >= 3) {
                 detail = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1} · last token {d}s ago", .{
                     elapsed, app.stream_bytes, quiet_s,
                 });
@@ -5363,8 +6002,11 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             .session => "sessions",
         };
 
+        const list_max: u16 = @min(@as(u16, 14), h -| 6);
+        const win_start = if (sel >= list_max) sel + 1 - list_max else 0;
+        const visible_end = @min(items.len, win_start + list_max);
         var widest: usize = 30;
-        for (items) |f| {
+        for (items[win_start..visible_end]) |f| {
             var row_width = displayWidth(f);
             if (app.picker_kind == .model) {
                 if (app.pricingForModel(f)) |pricing| {
@@ -5374,7 +6016,6 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             widest = @max(widest, @min(row_width, 96));
         }
         const box_w: u16 = @intCast(@min(widest + 8, @as(usize, w -| 4)));
-        const list_max: u16 = @min(@as(u16, 14), h -| 6);
         const shown: u16 = @intCast(@min(items.len, list_max));
         const box_h: u16 = shown + 3; // filter line + list + hint line
         const px: i17 = @intCast((w -| box_w) / 2);
@@ -5401,7 +6042,6 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         _ = box.printSegment(.{ .text = fline, .style = Palette.user }, .{ .wrap = .none });
 
         // Windowed list around the selection.
-        const win_start = if (sel >= list_max) sel + 1 - list_max else 0;
         var row: u16 = 1;
         var i: usize = win_start;
         while (i < items.len and row <= shown) : (i += 1) {
@@ -5434,15 +6074,18 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
 /// Reader thread: daemon socket lines → vaxis event queue.
 fn readerThread(app: *App, loop: *vaxis.Loop(Event)) void {
+    var disconnect_reason: []const u8 = "reader stopped";
     while (true) {
-        const line = app.conn.reader.interface.takeDelimiterInclusive('\n') catch break;
-        const owned = app.gpa.dupe(u8, line) catch break;
-        loop.postEvent(.{ .daemon_line = owned }) catch {
-            app.gpa.free(owned);
+        const owned = app.conn.readLine() catch |err| {
+            disconnect_reason = @errorName(err);
             break;
         };
+        loop.postEvent(.{ .daemon_line = owned }) catch {
+            app.gpa.free(owned);
+            return;
+        };
     }
-    loop.postEvent(.daemon_gone) catch {};
+    loop.postEvent(.{ .daemon_gone = disconnect_reason }) catch {};
 }
 
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
@@ -5596,8 +6239,13 @@ pub fn run(
             const created = try conn.recvUntil(arena, .session_created);
             sid = created.sid;
         }
-        // Full replay: seq 1 onward.
-        try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 1 } });
+        // Fast initial attach: the newest bounded window. The TUI backfills
+        // the durable log if the user actually reaches this window's top.
+        try conn.send(.{ .sub = .{
+            .sid = sid,
+            .from_seq = 1,
+            .tail_limit = initial_replay_blocks,
+        } });
     }
 
     var app = App{
@@ -5608,6 +6256,8 @@ pub fn run(
         .editor = Editor.init(gpa),
         .known_session_ids = initial_known_ids,
         .cfg = cfg,
+        .history_complete = false,
+        .history_loading = true,
     };
     initial_ids_transferred = true;
     defer app.deinit();
@@ -5622,169 +6272,191 @@ pub fn run(
         app.setNotice("dnsblock configured but unavailable — feed load failed; networking is fail-open", .{});
     }
 
-    // -- vaxis init --
-    var tty_buf: [4096]u8 = undefined;
-    var tty = try vaxis.Tty.init(io, &tty_buf);
-    defer tty.deinit();
-    const writer = tty.writer();
-
-    var vx = try vaxis.init(io, gpa, environ, .{
-        // Doubles as the bracketed-paste allocator: Loop passes it when
-        // parsing paste bodies into .paste events.
-        .system_clipboard_allocator = gpa,
-    });
-    defer vx.deinit(gpa, tty.writer());
-
-    var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
-    try loop.installResizeHandler();
-    try loop.start();
-    defer loop.stop();
-
-    try vx.enterAltScreen(writer);
-    try writer.flush();
-    try vx.queryTerminal(tty.writer(), .fromSeconds(1));
-    try vx.setBracketedPaste(writer, true);
-    // Mouse: wheel scrolls the session view; native cell-precise selection
-    // copies through OSC52. Shift+drag remains the terminal's escape hatch.
-    try vx.setMouseMode(writer, true);
-    try writer.flush();
-
-    // Initial size: not all paths deliver a winsize event up-front (and a
-    // PTY may report late); fetch it directly so the first frame renders.
+    var daemon_disconnect_reason: ?[]const u8 = null;
     {
-        var ws = tty.getWinsize() catch vaxis.Winsize{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 };
-        if (ws.rows == 0 or ws.cols == 0) ws = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 };
-        app.term_cols = ws.cols;
-        try vx.resize(gpa, tty.writer(), ws);
-    }
+        // -- vaxis init --
+        var tty_buf: [4096]u8 = undefined;
+        var tty = try vaxis.Tty.init(io, &tty_buf);
+        defer tty.deinit();
+        const writer = tty.writer();
 
-    // -- daemon reader thread --
-    const rt = try std.Thread.spawn(.{}, readerThread, .{ &app, &loop });
-    // Joined at exit: we shutdown() the socket which EOFs the reader —
-    // closing the fd under a live read is a BADF panic on the Threaded Io.
-    defer rt.join();
-    defer conn.stream.shutdown(io, .both) catch {};
-    // Lightweight catalog/status updates for every session; block streams
-    // remain subscribed only for the focused session.
-    try conn.send(.{ .session_watch = .{} });
+        var vx = try vaxis.init(io, gpa, environ, .{
+            // Doubles as the bracketed-paste allocator: Loop passes it when
+            // parsing paste bodies into .paste events.
+            .system_clipboard_allocator = gpa,
+        });
+        defer vx.deinit(gpa, tty.writer());
 
-    const animation_thread = try std.Thread.spawn(.{}, animationThread, .{ &app, &loop });
-    defer animation_thread.join();
-    defer app.animation_stop.store(true, .release);
+        var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
+        try loop.installResizeHandler();
+        try loop.start();
+        defer loop.stop();
 
-    // First frame before any event arrives.
-    {
-        var frame_arena = std.heap.ArenaAllocator.init(gpa);
-        defer frame_arena.deinit();
-        try draw(&app, &vx, frame_arena.allocator());
-        try vx.render(writer);
+        try vx.enterAltScreen(writer);
         try writer.flush();
-    }
+        try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+        try vx.setBracketedPaste(writer, true);
+        // Mouse: wheel scrolls the session view; native cell-precise selection
+        // copies through OSC52. Shift+drag remains the terminal's escape hatch.
+        try vx.setMouseMode(writer, true);
+        try writer.flush();
 
-    // -- main event loop --
-    while (!app.should_quit) {
-        const event = try loop.nextEvent();
-        switch (event) {
-            .key_press => |key| try handleKey(&app, key),
-            .mouse => |m| handleMouse(&app, m),
-            .tick => app.spinner_frame +%= 1,
-            .winsize => |ws| {
-                app.term_cols = ws.cols;
-                try vx.resize(gpa, tty.writer(), ws);
-            },
-            .paste => |text| {
-                app.editor.paste(text);
-                gpa.free(@constCast(text));
-            },
-            .daemon_line => |line| {
-                app.handleDaemonLine(line);
-                // Drain any additional queued lines before redrawing.
-                while (try loop.tryEvent()) |ev2| {
-                    switch (ev2) {
-                        .daemon_line => |l2| app.handleDaemonLine(l2),
-                        .daemon_gone => app.should_quit = true,
-                        .key_press => |k2| try handleKey(&app, k2),
-                        .mouse => |m2| handleMouse(&app, m2),
-                        .tick => app.spinner_frame +%= 1,
-                        .winsize => |ws2| {
-                            app.term_cols = ws2.cols;
-                            try vx.resize(gpa, tty.writer(), ws2);
-                        },
-                        .paste => |t2| {
-                            app.editor.paste(t2);
-                            gpa.free(@constCast(t2));
-                        },
+        // Initial size: not all paths deliver a winsize event up-front (and a
+        // PTY may report late); fetch it directly so the first frame renders.
+        {
+            var ws = tty.getWinsize() catch vaxis.Winsize{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 };
+            if (ws.rows == 0 or ws.cols == 0) ws = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 };
+            app.term_cols = ws.cols;
+            try vx.resize(gpa, tty.writer(), ws);
+        }
+
+        // -- daemon reader thread --
+        const rt = try std.Thread.spawn(.{}, readerThread, .{ &app, &loop });
+        // Joined at exit: we shutdown() the socket which EOFs the reader —
+        // closing the fd under a live read is a BADF panic on the Threaded Io.
+        defer rt.join();
+        defer conn.stream.shutdown(io, .both) catch {};
+        // Lightweight catalog/status updates for every session; block streams
+        // remain subscribed only for the focused session.
+        try conn.send(.{ .session_watch = .{} });
+
+        const animation_thread = try std.Thread.spawn(.{}, animationThread, .{ &app, &loop });
+        defer animation_thread.join();
+        defer app.animation_stop.store(true, .release);
+
+        // First frame before any event arrives.
+        {
+            var frame_arena = std.heap.ArenaAllocator.init(gpa);
+            defer frame_arena.deinit();
+            try draw(&app, &vx, frame_arena.allocator());
+            try vx.render(writer);
+            try writer.flush();
+        }
+
+        // -- main event loop --
+        while (!app.should_quit) {
+            const event = try loop.nextEvent();
+            switch (event) {
+                .key_press => |key| try handleKey(&app, key),
+                .mouse => |m| handleMouse(&app, m),
+                .tick => app.spinner_frame +%= 1,
+                .winsize => |ws| {
+                    app.term_cols = ws.cols;
+                    try vx.resize(gpa, tty.writer(), ws);
+                },
+                .paste => |text| {
+                    app.editor.paste(text);
+                    gpa.free(@constCast(text));
+                },
+                .daemon_line => |line| {
+                    app.handleDaemonLine(line);
+                    // Drain any additional queued lines before redrawing.
+                    while (try loop.tryEvent()) |ev2| {
+                        switch (ev2) {
+                            .daemon_line => |l2| app.handleDaemonLine(l2),
+                            .daemon_gone => |reason| {
+                                daemon_disconnect_reason = reason;
+                                app.should_quit = true;
+                            },
+                            .key_press => |k2| try handleKey(&app, k2),
+                            .mouse => |m2| handleMouse(&app, m2),
+                            .tick => app.spinner_frame +%= 1,
+                            .winsize => |ws2| {
+                                app.term_cols = ws2.cols;
+                                try vx.resize(gpa, tty.writer(), ws2);
+                            },
+                            .paste => |t2| {
+                                app.editor.paste(t2);
+                                gpa.free(@constCast(t2));
+                            },
+                        }
+                    }
+                },
+                .daemon_gone => |reason| {
+                    daemon_disconnect_reason = reason;
+                    app.setNotice("daemon connection lost", .{});
+                    app.should_quit = true;
+                },
+            }
+
+            if (app.refresh_requested) {
+                app.refresh_requested = false;
+                vx.queueRefresh();
+            }
+
+            var frame_arena = std.heap.ArenaAllocator.init(gpa);
+            defer frame_arena.deinit();
+
+            // Completed mouse selection → OSC52 copy (before draw so the
+            // notice shows this frame; selection stays highlighted).
+            if (app.copy_pending) {
+                app.copy_pending = false;
+                if (app.selection()) |selection| {
+                    const farena = frame_arena.allocator();
+                    const sel_lines = try layoutLines(farena, &app, @intCast(app.term_cols));
+                    const text = try selectedText(farena, vx.window(), sel_lines.items, selection);
+                    if (text.len > 0) {
+                        app.yank_register.clearRetainingCapacity();
+                        app.yank_register.appendSlice(app.gpa, text) catch {};
+                        var copied = true;
+                        vx.copyToSystemClipboard(writer, text, farena) catch {
+                            copied = false;
+                        };
+                        if (copied)
+                            app.setNotice("copied selection", .{})
+                        else
+                            app.setNotice("clipboard copy failed", .{});
                     }
                 }
-            },
-            .daemon_gone => {
-                app.setNotice("daemon connection lost", .{});
-                app.should_quit = true;
-            },
-        }
-
-        if (app.refresh_requested) {
-            app.refresh_requested = false;
-            vx.queueRefresh();
-        }
-
-        var frame_arena = std.heap.ArenaAllocator.init(gpa);
-        defer frame_arena.deinit();
-
-        // Completed mouse selection → OSC52 copy (before draw so the
-        // notice shows this frame; selection stays highlighted).
-        if (app.copy_pending) {
-            app.copy_pending = false;
-            if (app.selection()) |selection| {
-                const farena = frame_arena.allocator();
-                const sel_lines = try layoutLines(farena, &app, @intCast(app.term_cols));
-                const text = try selectedText(farena, vx.window(), sel_lines.items, selection);
-                if (text.len > 0) {
-                    app.yank_register.clearRetainingCapacity();
-                    app.yank_register.appendSlice(app.gpa, text) catch {};
-                    var copied = true;
-                    vx.copyToSystemClipboard(writer, text, farena) catch {
-                        copied = false;
-                    };
-                    if (copied)
-                        app.setNotice("copied selection", .{})
-                    else
-                        app.setNotice("clipboard copy failed", .{});
+                if (app.sel_clear_after_copy) {
+                    app.sel_clear_after_copy = false;
+                    app.sel_anchor = null;
                 }
             }
-            if (app.sel_clear_after_copy) {
-                app.sel_clear_after_copy = false;
-                app.sel_anchor = null;
-            }
-        }
 
-        if (app.clipboard_pending.items.len > 0) {
-            var copied = true;
-            vx.copyToSystemClipboard(
-                writer,
-                app.clipboard_pending.items,
-                frame_arena.allocator(),
-            ) catch {
-                copied = false;
-            };
-            const staged_bytes: u64 = app.clipboard_pending.items.len;
-            app.clipboard_pending.clearRetainingCapacity();
-            if (!copied) {
-                app.setNotice("clipboard copy failed", .{});
-            } else if (app.clipboard_desc.items.len > 0) {
-                app.setNotice("copied {s} output · {Bi:.1}", .{ app.clipboard_desc.items, staged_bytes });
-            } else {
-                app.setNotice("copied last tool output", .{});
+            if (app.clipboard_pending.items.len > 0) {
+                var copied = true;
+                vx.copyToSystemClipboard(
+                    writer,
+                    app.clipboard_pending.items,
+                    frame_arena.allocator(),
+                ) catch {
+                    copied = false;
+                };
+                const staged_bytes: u64 = app.clipboard_pending.items.len;
+                app.clipboard_pending.clearRetainingCapacity();
+                if (!copied) {
+                    app.setNotice("clipboard copy failed", .{});
+                } else if (app.clipboard_desc.items.len > 0) {
+                    app.setNotice("copied {s} output · {Bi:.1}", .{ app.clipboard_desc.items, staged_bytes });
+                } else {
+                    app.setNotice("copied last tool output", .{});
+                }
+                app.clipboard_desc.clearRetainingCapacity();
             }
-            app.clipboard_desc.clearRetainingCapacity();
-        }
 
-        try draw(&app, &vx, frame_arena.allocator());
-        try vx.render(writer);
-        try writer.flush();
+            try draw(&app, &vx, frame_arena.allocator());
+            try vx.render(writer);
+            try writer.flush();
+        }
     }
     if (reboot_out) |ro| ro.* = .{ .request = app.reboot_request, .sid = app.sid };
+    if (daemon_disconnect_reason) |reason| {
+        try eprint(
+            io,
+            "marlin: daemon connection lost ({s}); session is durable — reattach to continue\n",
+            .{reason},
+        );
+        return 1;
+    }
     return 0;
+}
+
+fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    var writer: Io.File.Writer = .init(.stderr(), io, &buf);
+    try writer.interface.print(fmt, args);
+    try writer.interface.flush();
 }
 
 fn tabMouseAction(m: vaxis.Mouse) ?TabMouseAction {
@@ -5839,7 +6511,10 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
     }
 
     switch (m.button) {
-        .wheel_up => app.scroll_up +|= 3,
+        .wheel_up => {
+            app.scroll_up +|= 3;
+            app.maybeRequestHistoryAtTop();
+        },
         .wheel_down => app.scroll_up -|= 3,
         .left => {
             const row = terminal_row - tab_bar_height;
@@ -6126,6 +6801,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.pending_count = 0;
                 if (key.matches('g', .{})) {
                     app.scroll_up = std.math.maxInt(usize); // clamped in draw
+                    app.maybeRequestHistoryAtTop();
                 } else if (key.matches('t', .{})) {
                     // vim Ngt is absolute; here N indexes the recency list.
                     if (count > 0) app.jumpToSession(count) else app.cycleSession(1);
@@ -6200,10 +6876,12 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.scroll_up -|= 1;
             } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
                 app.scroll_up +|= 1;
+                app.maybeRequestHistoryAtTop();
             } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
                 app.scroll_up -|= 20;
             } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
                 app.scroll_up +|= 20;
+                app.maybeRequestHistoryAtTop();
             } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
                 app.scroll_up = 0;
             } else if (key.matches('g', .{})) {
@@ -6496,6 +7174,30 @@ test "bang rb expands to reboot with build" {
     try std.testing.expectEqual(RebootRequest.build, app.reboot_request);
     try std.testing.expect(app.should_quit);
     try std.testing.expectEqualStrings("!rb", app.editor.history.items[0]);
+}
+
+test "plain reboot refuses a focused approval unless forced" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .state = .awaiting_approval,
+    };
+    defer app.deinit();
+
+    app.runCommand("/reboot");
+    try std.testing.expectEqual(RebootRequest.none, app.reboot_request);
+    try std.testing.expect(!app.should_quit);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "approval pending") != null);
+
+    app.runCommand("/reboot --build --force");
+    try std.testing.expectEqual(RebootRequest.build_force, app.reboot_request);
+    try std.testing.expect(app.should_quit);
 }
 
 test "standard editor key bindings map to commands" {
@@ -7333,6 +8035,186 @@ test "durable user block reconciles optimistic local echo" {
     try std.testing.expect(!reconcilePendingEcho(&rendered, .user_msg, "hello", 9, 3));
 }
 
+test "correlated daemon error removes only its optimistic input and restores state" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.state = .done;
+    app.pushInputEcho(.user_msg, "rejected", 41, app.state);
+    app.pushInputEcho(.steer, "unrelated", 42, null);
+    app.state = .running;
+    app.animation_active.store(true, .release);
+
+    const line = try proto.encode(gpa, proto.DaemonMsg{ .err = .{
+        .code = "archived",
+        .msg = "read only",
+        .request_id = 41,
+    } });
+    app.handleDaemonLine(line);
+
+    try std.testing.expectEqual(proto.SessionState.done, app.state);
+    try std.testing.expect(!app.animation_active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
+    try std.testing.expectEqualStrings("unrelated", app.blocks.items[0].text);
+    try std.testing.expectEqual(@as(u64, 42), app.blocks.items[0].pending_request_id);
+}
+
+test "correlated ok accepts the echo while generic errors cannot reject it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.pushInputEcho(.user_msg, "accepted", 55, .idle);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .ok = .{ .request_id = 55 } }));
+    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
+    try std.testing.expect(app.blocks.items[0].pending_echo);
+    try std.testing.expectEqual(@as(u64, 0), app.blocks.items[0].pending_request_id);
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .err = .{
+        .code = "other_command",
+        .msg = "unrelated",
+    } }));
+    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
+}
+
+test "replay marker completes a bounded tail without needing a connection" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .history_complete = false,
+        .history_loading = true,
+    };
+    defer app.deinit();
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{
+        .sid = 7,
+        .oldest_seq = 20,
+        .newest_seq = 275,
+        .has_older = true,
+    } }));
+    try std.testing.expectEqual(@as(u64, 20), app.oldest_seq);
+    try std.testing.expect(!app.history_complete);
+    try std.testing.expect(!app.history_loading);
+}
+
+test "older replay page is prepended atomically in transcript order" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .last_seq = 3,
+        .oldest_seq = 3,
+        .history_complete = false,
+        .history_loading = true,
+        .history_before_seq = 3,
+    };
+    defer app.deinit();
+    try app.blocks.append(gpa, .{
+        .kind = .user_msg,
+        .seq = 3,
+        .turn_id = 2,
+        .text = try gpa.dupe(u8, "newest"),
+        .label = try gpa.dupe(u8, ""),
+    });
+
+    for ([_]struct { u64, []const u8 }{
+        .{ 1, "oldest" },
+        .{ 2, "middle" },
+    }) |entry| {
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{
+            .sid = 7,
+            .b = .{
+                .id = entry[0],
+                .session_id = 7,
+                .turn_id = 1,
+                .seq = entry[0],
+                .ts = 0,
+                .body = .{ .user_msg = .{ .text = entry[1] } },
+            },
+        } }));
+    }
+    // The visible list does not change before the page marker.
+    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.history_backfill.items.len);
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{
+        .sid = 7,
+        .oldest_seq = 1,
+        .newest_seq = 2,
+        .has_older = false,
+    } }));
+    try std.testing.expectEqual(@as(usize, 3), app.blocks.items.len);
+    try std.testing.expectEqualStrings("oldest", app.blocks.items[0].text);
+    try std.testing.expectEqualStrings("middle", app.blocks.items[1].text);
+    try std.testing.expectEqualStrings("newest", app.blocks.items[2].text);
+    try std.testing.expectEqual(@as(u64, 1), app.oldest_seq);
+    try std.testing.expect(app.history_complete);
+    try std.testing.expect(!app.history_loading);
+    try std.testing.expectEqual(@as(usize, 0), app.history_backfill.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.editor.history.items.len);
+}
+
+test "failed replay request releases buffered page and can be retried" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .oldest_seq = 3,
+        .history_complete = false,
+        .history_loading = true,
+        .history_before_seq = 3,
+    };
+    defer app.deinit();
+    try app.history_backfill.append(gpa, .{
+        .kind = .user_msg,
+        .seq = 2,
+        .text = try gpa.dupe(u8, "owned page text"),
+        .label = try gpa.dupe(u8, ""),
+    });
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .err = .{
+        .code = "request_failed",
+        .msg = "store unavailable",
+    } }));
+    try std.testing.expect(!app.history_loading);
+    try std.testing.expectEqual(@as(u64, 0), app.history_before_seq);
+    try std.testing.expectEqual(@as(usize, 0), app.history_backfill.items.len);
+    try std.testing.expect(!app.history_complete);
+}
+
 test "synthetic and legacy rehydration render as notes, not prompts or history" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -7488,6 +8370,29 @@ test "session labels round-trip ids and preserve inactive view state" {
     try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
     try std.testing.expectEqual(@as(usize, 17), app.scroll_up);
     try std.testing.expectEqualStrings("scrollback survives", app.blocks.items[0].text);
+}
+
+test "inactive session view cache evicts least recently used transcripts" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    for (1..App.max_saved_views + 4) |sid| {
+        app.sid = sid;
+        app.pushBlock(.assistant_msg, "cached transcript", "", .ok);
+        try app.saveActiveView();
+    }
+    try std.testing.expectEqual(@as(usize, App.max_saved_views), app.saved_views.count());
+    try std.testing.expect(app.saved_views.get(1) == null);
+    try std.testing.expect(app.saved_views.get(App.max_saved_views + 3) != null);
 }
 
 test "tab bar is permanent, root-only, chronological, and rolls up child activity" {
@@ -7746,6 +8651,60 @@ test "local commands enter editor history" {
     try std.testing.expectEqual(@as(usize, 1), app.editor.history.items.len);
     app.editor.histUp();
     try std.testing.expectEqualStrings("/help", app.editor.text.items);
+}
+
+test "stream layout is append-only and matches a one-shot provisional wrap" {
+    const gpa = std.testing.allocator;
+    const source =
+        "This is a deliberately long streamed paragraph with enough words to wrap several times " ++
+        "without reconsidering the completed rows on every provider delta.\n\n" ++
+        "A second line keeps the prose rail stable while the durable block will later render **Markdown**.";
+
+    var incremental = StreamLayoutCache{};
+    defer incremental.reset(gpa);
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(gpa);
+    var at: usize = 0;
+    while (at < source.len) {
+        const end = @min(at + 7, source.len);
+        try received.appendSlice(gpa, source[at..end]);
+        try incremental.update(gpa, received.items, 52);
+        at = end;
+    }
+    try std.testing.expectEqual(source.len, incremental.source_len);
+    try std.testing.expect(incremental.lines.items.len > 2);
+
+    var one_shot = StreamLayoutCache{};
+    defer one_shot.reset(gpa);
+    try one_shot.update(gpa, source, 52);
+
+    const Render = struct {
+        fn text(gpa_inner: std.mem.Allocator, cache: *const StreamLayoutCache) ![]u8 {
+            var arena_state = std.heap.ArenaAllocator.init(gpa_inner);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var lines: std.ArrayList(Line) = .empty;
+            try cache.appendTo(arena, &lines);
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(gpa_inner);
+            for (lines.items) |line| {
+                try out.appendSlice(gpa_inner, try lineText(arena, line));
+                try out.append(gpa_inner, '\n');
+            }
+            return out.toOwnedSlice(gpa_inner);
+        }
+    };
+    const incremental_text = try Render.text(gpa, &incremental);
+    defer gpa.free(incremental_text);
+    const one_shot_text = try Render.text(gpa, &one_shot);
+    defer gpa.free(one_shot_text);
+    try std.testing.expectEqualStrings(one_shot_text, incremental_text);
+
+    // A finalized/error-cleared delta restarts the cache instead of retaining
+    // either its copied rows or a stale source cursor.
+    try incremental.update(gpa, "", 52);
+    try std.testing.expectEqual(@as(usize, 0), incremental.source_len);
+    try std.testing.expectEqual(@as(usize, 0), incremental.lines.items.len);
 }
 
 test "layout cache: incremental result equals fresh one-shot layout" {

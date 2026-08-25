@@ -165,8 +165,8 @@ Kept as a decision record; none of these are open.
 1. **Single binary or two?** DECIDED: single binary, `marlin daemon`
    subcommand.
 2. **Autostart semantics**: DECIDED: autostart on first `marlin` invocation.
-   (Concurrent-autostart flock hardening is still listed in PROTOCOL.md as a
-   known gap.)
+   An advisory exclusive instance lock serializes concurrent autostarts before
+   either process can replace the Unix socket.
 3. **Block body schema versioning**: DECIDED: store schema migrations at
    daemon boot + `proto_version` handshake rejection; block bodies are
    std.json tagged unions.

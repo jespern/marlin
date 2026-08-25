@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const process_io = @import("../process_io.zig");
 
 /// The complete failure vocabulary of this layer. Typed on purpose: the
 /// block log must be able to distinguish "user interrupted" from "provider
@@ -30,8 +31,11 @@ pub const Error = error{
     ReadFailed,
     /// The response used a content-encoding this path refuses.
     UnsupportedEncoding,
-    /// A request/watchdog task pair could not be started; the request was
-    /// not attempted.
+    /// The streaming consumer rejected further bytes (for example because a
+    /// provider response exceeded its bounded accumulator).
+    ConsumerAborted,
+    /// The request's dedicated deadline thread could not be started; the
+    /// request was not attempted.
     ConcurrencyUnavailable,
     OutOfMemory,
 };
@@ -58,7 +62,13 @@ pub const StreamRequest = struct {
     connect_timeout_ms: i64 = 10_000,
     /// Abort if no response bytes arrive for this long.
     idle_timeout_ms: i64 = 120_000,
+    /// Absolute wall-clock bound for one streaming request. Unlike the idle
+    /// deadline, chatty bytes cannot extend it forever.
+    total_timeout_ms: i64 = 30 * 60 * 1000,
     cancel: ?*std.atomic.Value(bool) = null,
+    /// Pre-body liveness for callers that want an informative status line.
+    on_wait: ?*const fn (ctx: ?*anyopaque, elapsed_ms: u64) void = null,
+    on_wait_ctx: ?*anyopaque = null,
 };
 
 /// Daemon-owned std.http client. std.http's connection pool is threadsafe;
@@ -121,7 +131,7 @@ pub const Client = struct {
         gpa: std.mem.Allocator,
         req: StreamRequest,
         ctx: anytype,
-        comptime on_chunk: fn (@TypeOf(ctx), []const u8) void,
+        comptime on_chunk: fn (@TypeOf(ctx), []const u8) bool,
     ) Error!Response {
         return streamPostTimed(self.client, gpa, req, ctx, on_chunk);
     }
@@ -132,18 +142,106 @@ pub fn streamPost(
     io: Io,
     req: StreamRequest,
     ctx: anytype,
-    comptime on_chunk: fn (@TypeOf(ctx), []const u8) void,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) bool,
 ) Error!Response {
     var client = try Client.init(gpa, io);
     defer client.deinit();
     return client.streamPost(gpa, req, ctx, on_chunk);
 }
 
-const Abort = enum { cancelled, timed_out };
-
 const StreamProgress = struct {
     response_started: std.atomic.Value(bool) = .init(false),
     activity_generation: std.atomic.Value(u64) = .init(0),
+    aborted: std.atomic.Value(bool) = .init(false),
+    connection_mutex: Io.Mutex = .init,
+    connection: ?*std.http.Client.Connection = null,
+
+    fn registerConnection(self: *StreamProgress, io: Io, connection: *std.http.Client.Connection) void {
+        self.connection_mutex.lockUncancelable(io);
+        defer self.connection_mutex.unlock(io);
+        self.connection = connection;
+        if (self.aborted.load(.acquire)) shutdownConnection(io, connection);
+    }
+
+    fn clearConnection(self: *StreamProgress, io: Io) void {
+        self.connection_mutex.lockUncancelable(io);
+        defer self.connection_mutex.unlock(io);
+        self.connection = null;
+    }
+
+    fn abort(self: *StreamProgress, io: Io) void {
+        self.aborted.store(true, .release);
+        self.connection_mutex.lockUncancelable(io);
+        defer self.connection_mutex.unlock(io);
+        if (self.connection) |connection| shutdownConnection(io, connection);
+    }
+};
+
+fn shutdownConnection(io: Io, connection: *std.http.Client.Connection) void {
+    connection.closing = true;
+    connection.stream_reader.stream.shutdown(io, .both) catch {};
+}
+
+const DeadlineReason = enum(u8) { none, cancelled, timed_out };
+
+const StreamDeadline = struct {
+    io: Io,
+    cancel: ?*std.atomic.Value(bool),
+    progress: *StreamProgress,
+    connect_timeout_ms: i64,
+    idle_timeout_ms: i64,
+    total_timeout_ms: i64,
+    on_wait: ?*const fn (ctx: ?*anyopaque, elapsed_ms: u64) void = null,
+    on_wait_ctx: ?*anyopaque = null,
+    done: std.atomic.Value(bool) = .init(false),
+    reason: std.atomic.Value(DeadlineReason) = .init(.none),
+    thread: std.Thread = undefined,
+
+    fn start(self: *StreamDeadline) !void {
+        self.thread = try std.Thread.spawn(.{}, watch, .{self});
+    }
+
+    fn finish(self: *StreamDeadline) DeadlineReason {
+        self.done.store(true, .release);
+        self.thread.join();
+        return self.reason.load(.acquire);
+    }
+
+    fn watch(self: *StreamDeadline) void {
+        var response_started = self.progress.response_started.load(.acquire);
+        var activity_generation = self.progress.activity_generation.load(.acquire);
+        var elapsed_ms: i64 = 0;
+        var total_elapsed_ms: i64 = 0;
+        var last_wait_report_ms: i64 = 0;
+        while (!self.done.load(.acquire)) {
+            if (isCancelled(self.cancel)) return self.fire(.cancelled);
+            const current_started = self.progress.response_started.load(.acquire);
+            const current_generation = self.progress.activity_generation.load(.acquire);
+            if (current_started != response_started or current_generation != activity_generation) {
+                response_started = current_started;
+                activity_generation = current_generation;
+                elapsed_ms = 0;
+            }
+            const timeout_ms = @max(if (response_started) self.idle_timeout_ms else self.connect_timeout_ms, 1);
+            const total_timeout_ms = @max(self.total_timeout_ms, 1);
+            if (elapsed_ms >= timeout_ms or total_elapsed_ms >= total_timeout_ms)
+                return self.fire(.timed_out);
+            if (!response_started and elapsed_ms - last_wait_report_ms >= 1000) {
+                if (self.on_wait) |cb| cb(self.on_wait_ctx, @intCast(elapsed_ms));
+                last_wait_report_ms = elapsed_ms;
+            }
+            const sleep_ms = @min(@min(timeout_ms - elapsed_ms, total_timeout_ms - total_elapsed_ms), 25);
+            self.io.sleep(.fromMilliseconds(sleep_ms), .awake) catch return self.fire(.cancelled);
+            elapsed_ms += sleep_ms;
+            total_elapsed_ms += sleep_ms;
+        }
+    }
+
+    fn fire(self: *StreamDeadline, reason: DeadlineReason) void {
+        if (self.done.load(.acquire)) return;
+        self.reason.store(reason, .release);
+        self.progress.abort(self.io);
+    }
 };
 
 fn streamPostTimed(
@@ -151,53 +249,44 @@ fn streamPostTimed(
     gpa: std.mem.Allocator,
     stream_req: StreamRequest,
     ctx: anytype,
-    comptime on_chunk: fn (@TypeOf(ctx), []const u8) void,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) bool,
 ) Error!Response {
-    const RunResult = Error!Response;
-    const Select = Io.Select(union(enum) {
-        request: RunResult,
-        watchdog: Abort,
-    });
+    if (stream_req.on_wait) |cb| cb(stream_req.on_wait_ctx, 0);
+    const pooled = try acquirePooledOrPreflightDns(
+        client,
+        gpa,
+        stream_req.url,
+        stream_req.connect_timeout_ms,
+        stream_req.cancel,
+    );
     var progress = StreamProgress{};
-    var results: [2]Select.Union = undefined;
-    var select = Select.init(client.io, &results);
-    select.concurrent(.request, streamPostImpl(@TypeOf(ctx), on_chunk), .{ client, gpa, stream_req, ctx, &progress }) catch
-        return error.ConcurrencyUnavailable;
-    select.concurrent(.watchdog, waitForStreamAbort, .{ client.io, stream_req.cancel, &progress, stream_req.connect_timeout_ms, stream_req.idle_timeout_ms }) catch
-        return error.ConcurrencyUnavailable;
-
-    // Io-level cancellation (daemon shutdown) folds into Cancelled.
-    const first = select.await() catch return error.Cancelled;
-    return switch (first) {
-        .request => |result| blk: {
-            select.cancelDiscard();
-            break :blk result;
-        },
-        .watchdog => |reason| blk: {
-            select.cancelDiscard();
-            break :blk switch (reason) {
-                .cancelled => error.Cancelled,
-                .timed_out => error.HttpTimeout,
-            };
-        },
+    var deadline = StreamDeadline{
+        .io = client.io,
+        .cancel = stream_req.cancel,
+        .progress = &progress,
+        .connect_timeout_ms = stream_req.connect_timeout_ms,
+        .idle_timeout_ms = stream_req.idle_timeout_ms,
+        .total_timeout_ms = stream_req.total_timeout_ms,
+        .on_wait = stream_req.on_wait,
+        .on_wait_ctx = stream_req.on_wait_ctx,
     };
-}
-
-fn streamPostImpl(
-    comptime Ctx: type,
-    comptime on_chunk: fn (Ctx, []const u8) void,
-) fn (*std.http.Client, std.mem.Allocator, StreamRequest, Ctx, *StreamProgress) Error!Response {
-    return struct {
-        fn run(
-            client: *std.http.Client,
-            gpa: std.mem.Allocator,
-            stream_req: StreamRequest,
-            ctx: Ctx,
-            progress: *StreamProgress,
-        ) Error!Response {
-            return streamPostRun(client, gpa, stream_req, ctx, progress, on_chunk);
-        }
-    }.run;
+    deadline.start() catch {
+        if (pooled) |connection| client.connection_pool.release(connection, client.io);
+        return error.ConcurrencyUnavailable;
+    };
+    const result = streamPostRun(client, gpa, stream_req, ctx, &progress, pooled, on_chunk);
+    const reason = deadline.finish();
+    if (reason != .none) {
+        if (result) |response| {
+            if (response.error_body) |body| gpa.free(body);
+        } else |_| {}
+        return switch (reason) {
+            .cancelled => error.Cancelled,
+            .timed_out => error.HttpTimeout,
+            .none => unreachable,
+        };
+    }
+    return result;
 }
 
 fn streamPostRun(
@@ -206,8 +295,12 @@ fn streamPostRun(
     stream_req: StreamRequest,
     ctx: anytype,
     progress: *StreamProgress,
-    comptime on_chunk: fn (@TypeOf(ctx), []const u8) void,
+    pooled_connection: ?*std.http.Client.Connection,
+    comptime on_chunk: fn (@TypeOf(ctx), []const u8) bool,
 ) Error!Response {
+    var owns_pooled_connection = pooled_connection != null;
+    errdefer if (owns_pooled_connection)
+        client.connection_pool.release(pooled_connection.?, client.io);
     if (isCancelled(stream_req.cancel)) return error.Cancelled;
 
     const uri = std.Uri.parse(stream_req.url) catch return error.InvalidRequest;
@@ -230,6 +323,7 @@ fn streamPostRun(
     } else .omit;
 
     var request = client.request(.POST, uri, .{
+        .connection = pooled_connection,
         .redirect_behavior = .unhandled,
         .headers = .{
             .authorization = authorization,
@@ -242,7 +336,11 @@ fn streamPostRun(
         },
         .extra_headers = header_storage,
     }) catch |err| return mapConnect(err);
+    owns_pooled_connection = false;
     defer request.deinit();
+    progress.registerConnection(client.io, request.connection.?);
+    defer progress.clearConnection(client.io);
+    if (progress.aborted.load(.acquire)) return error.Cancelled;
 
     request.transfer_encoding = .{ .content_length = stream_req.body_json.len };
     var body_writer = request.sendBodyUnflushed(&.{}) catch |err| return mapConnect(err);
@@ -282,7 +380,10 @@ fn streamPostRun(
             const room = 64 * 1024 - error_body.items.len;
             if (room > 0) try error_body.appendSlice(gpa, bytes[0..@min(bytes.len, room)]);
         } else {
-            on_chunk(ctx, bytes);
+            if (!on_chunk(ctx, bytes)) {
+                if (request.connection) |connection| connection.closing = true;
+                return error.ConsumerAborted;
+            }
         }
         reader.toss(bytes.len);
     }
@@ -348,33 +449,35 @@ fn getImpl(
     cancel: ?*std.atomic.Value(bool),
     redirect_behavior: std.http.Client.Request.RedirectBehavior,
 ) Error!GetOneResult {
-    const RunResult = Error!GetOneResult;
-    const Select = Io.Select(union(enum) {
-        request: RunResult,
-        watchdog: Abort,
-    });
-    var results: [2]Select.Union = undefined;
-    var select = Select.init(client.io, &results);
-    select.concurrent(.request, getRun, .{ client, gpa, url, max_bytes, cancel, redirect_behavior }) catch
-        return error.ConcurrencyUnavailable;
-    select.concurrent(.watchdog, waitForAbort, .{ client.io, cancel, timeout_ms }) catch
-        return error.ConcurrencyUnavailable;
-
-    // Io-level cancellation (daemon shutdown) folds into Cancelled.
-    const first = select.await() catch return error.Cancelled;
-    return switch (first) {
-        .request => |result| blk: {
-            select.cancelDiscard();
-            break :blk result;
-        },
-        .watchdog => |reason| blk: {
-            select.cancelDiscard();
-            break :blk switch (reason) {
-                .cancelled => error.Cancelled,
-                .timed_out => error.HttpTimeout,
-            };
-        },
+    const pooled = try acquirePooledOrPreflightDns(client, gpa, url, timeout_ms, cancel);
+    var progress = StreamProgress{};
+    var deadline = StreamDeadline{
+        .io = client.io,
+        .cancel = cancel,
+        .progress = &progress,
+        .connect_timeout_ms = timeout_ms,
+        .idle_timeout_ms = timeout_ms,
+        .total_timeout_ms = timeout_ms,
     };
+    deadline.start() catch {
+        if (pooled) |connection| client.connection_pool.release(connection, client.io);
+        return error.ConcurrencyUnavailable;
+    };
+    const result = getRun(client, gpa, url, max_bytes, cancel, redirect_behavior, &progress, pooled);
+    const reason = deadline.finish();
+    if (reason != .none) {
+        if (result) |response| {
+            gpa.free(response.body);
+            if (response.content_type) |value| gpa.free(value);
+            if (response.location) |value| gpa.free(value);
+        } else |_| {}
+        return switch (reason) {
+            .cancelled => error.Cancelled,
+            .timed_out => error.HttpTimeout,
+            .none => unreachable,
+        };
+    }
+    return result;
 }
 
 fn getRun(
@@ -384,15 +487,25 @@ fn getRun(
     max_bytes: usize,
     cancel: ?*std.atomic.Value(bool),
     redirect_behavior: std.http.Client.Request.RedirectBehavior,
+    progress: *StreamProgress,
+    pooled_connection: ?*std.http.Client.Connection,
 ) Error!GetOneResult {
+    var owns_pooled_connection = pooled_connection != null;
+    errdefer if (owns_pooled_connection)
+        client.connection_pool.release(pooled_connection.?, client.io);
     if (isCancelled(cancel)) return error.Cancelled;
 
     const uri = std.Uri.parse(url) catch return error.InvalidRequest;
     var request = client.request(.GET, uri, .{
+        .connection = pooled_connection,
         .redirect_behavior = redirect_behavior,
         .headers = .{ .user_agent = .{ .override = "marlin/0.0" } },
     }) catch |err| return mapConnect(err);
+    owns_pooled_connection = false;
     defer request.deinit();
+    progress.registerConnection(client.io, request.connection.?);
+    defer progress.clearConnection(client.io);
+    if (progress.aborted.load(.acquire)) return error.Cancelled;
     request.sendBodiless() catch return error.ConnectFailed;
 
     var redirect_buffer: [8192]u8 = undefined;
@@ -438,52 +551,90 @@ fn getRun(
     };
 }
 
-fn waitForStreamAbort(
-    io: Io,
-    cancel: ?*std.atomic.Value(bool),
-    progress: *const StreamProgress,
-    connect_timeout_ms: i64,
-    idle_timeout_ms: i64,
-) Abort {
-    var response_started = progress.response_started.load(.acquire);
-    var activity_generation = progress.activity_generation.load(.acquire);
-    var elapsed_ms: i64 = 0;
-    while (!isCancelled(cancel)) {
-        const current_response_started = progress.response_started.load(.acquire);
-        const current_generation = progress.activity_generation.load(.acquire);
-        if (current_response_started != response_started or current_generation != activity_generation) {
-            response_started = current_response_started;
-            activity_generation = current_generation;
-            elapsed_ms = 0;
-        }
-
-        const timeout_ms = @max(if (response_started) idle_timeout_ms else connect_timeout_ms, 1);
-        if (elapsed_ms >= timeout_ms) return .timed_out;
-        const sleep_ms = @min(timeout_ms - elapsed_ms, 50);
-        io.sleep(.fromMilliseconds(sleep_ms), .awake) catch return .cancelled;
-        elapsed_ms += sleep_ms;
-    }
-    return .cancelled;
-}
-
-fn waitForAbort(io: Io, cancel: ?*std.atomic.Value(bool), timeout_ms: i64) Abort {
-    const bounded_timeout_ms = @max(timeout_ms, 1);
-    var elapsed_ms: i64 = 0;
-    while (!isCancelled(cancel)) {
-        if (elapsed_ms >= bounded_timeout_ms) return .timed_out;
-        const sleep_ms = @min(bounded_timeout_ms - elapsed_ms, 50);
-        io.sleep(.fromMilliseconds(sleep_ms), .awake) catch return .cancelled;
-        elapsed_ms += sleep_ms;
-    }
-    return .cancelled;
-}
-
 fn markActivity(progress: *StreamProgress) void {
     _ = progress.activity_generation.fetchAdd(1, .release);
 }
 
 fn isCancelled(cancel: ?*std.atomic.Value(bool)) bool {
     return if (cancel) |flag| flag.load(.acquire) else false;
+}
+
+/// Darwin's threaded Io backend ultimately calls synchronous getaddrinfo,
+/// which cannot be cancelled. Resolve uncached hostnames in a killable helper
+/// process, then connect std.http using that numeric address while retaining
+/// the original host for TLS SNI/certificate checks. Warm connections skip
+/// the helper entirely.
+fn acquirePooledOrPreflightDns(
+    client: *std.http.Client,
+    gpa: std.mem.Allocator,
+    url: []const u8,
+    timeout_ms: i64,
+    cancel: ?*std.atomic.Value(bool),
+) Error!?*std.http.Client.Connection {
+    const uri = std.Uri.parse(url) catch return error.InvalidRequest;
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.InvalidRequest;
+    var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+    const destination = uri.getHost(&host_buffer) catch return error.InvalidRequest;
+    const port: u16 = uri.port orelse switch (protocol) {
+        .plain => @as(u16, 80),
+        .tls => @as(u16, 443),
+    };
+    const proxy = switch (protocol) {
+        .plain => client.http_proxy,
+        .tls => client.https_proxy,
+    };
+
+    if (proxy == null) {
+        if (client.connection_pool.findConnection(client.io, .{
+            .host = destination,
+            .port = port,
+            .protocol = protocol,
+        })) |connection| return connection;
+    }
+
+    const host = if (proxy) |configured| configured.host else destination;
+    const resolve_port = if (proxy) |configured| configured.port else port;
+    if (Io.net.IpAddress.parse(host.bytes, resolve_port)) |_| return null else |_| {}
+    if (isCancelled(cancel)) return error.Cancelled;
+
+    const executable = std.process.executablePathAlloc(client.io, gpa) catch return error.ConnectFailed;
+    defer gpa.free(executable);
+    var port_buffer: [8]u8 = undefined;
+    const port_text = std.fmt.bufPrint(&port_buffer, "{d}", .{resolve_port}) catch return error.InvalidRequest;
+    const bounded_ms: u32 = @intCast(@min(@max(timeout_ms, 1), std.math.maxInt(u32)));
+    const result = process_io.run(gpa, client.io, .{
+        .argv = &.{ executable, "resolve_host", host.bytes, port_text },
+        .stdout_limit = 128,
+        .stderr_limit = 4096,
+        .timeout_ms = bounded_ms,
+        .cancel = cancel,
+    }) catch |err| switch (err) {
+        error.Cancelled => return error.Cancelled,
+        else => return error.ConnectFailed,
+    };
+    defer result.deinit(gpa);
+    if (result.timed_out) return error.HttpTimeout;
+    if (result.term != .exited or result.term.exited != 0)
+        return error.ConnectFailed;
+    const resolved_text = std.mem.trim(u8, result.stdout, " \t\r\n");
+    const resolved_host = Io.net.HostName.init(resolved_text) catch return error.ConnectFailed;
+    const connection = client.connectTcpOptions(.{
+        .host = resolved_host,
+        .port = resolve_port,
+        .protocol = if (proxy) |configured| configured.protocol else protocol,
+        // Connection identity remains the logical hostname: HTTPS still
+        // verifies/SNI-routes the certificate for the requested origin (or
+        // proxy), never for the numeric address used by connect(2).
+        .proxied_host = host,
+        .proxied_port = resolve_port,
+    }) catch |err| return mapConnect(err);
+    if (proxy != null) {
+        // Prime the proxy connection under its logical hostname. client.connect
+        // will acquire it and apply CONNECT/ordinary-proxy semantics itself.
+        client.connection_pool.release(connection, client.io);
+        return null;
+    }
+    return connection;
 }
 
 fn testServer(io: Io) !Io.net.Server {
@@ -511,7 +662,13 @@ fn serveDelayedResponse(io: Io, server: *Io.net.Server, delay_ms: i64, body: []c
     writer.interface.flush() catch return;
 }
 
-fn discardChunk(_: void, _: []const u8) void {}
+fn discardChunk(_: void, _: []const u8) bool {
+    return true;
+}
+
+fn rejectChunk(_: void, _: []const u8) bool {
+    return false;
+}
 
 fn requestCompletes(
     io: Io,
@@ -601,7 +758,7 @@ test "stream connect timeout aborts before response headers" {
 
 fn streamPostTask(
     comptime Ctx: type,
-    comptime on_chunk: fn (Ctx, []const u8) void,
+    comptime on_chunk: fn (Ctx, []const u8) bool,
 ) fn (std.mem.Allocator, Io, StreamRequest, Ctx) Error!Response {
     return struct {
         fn run(gpa: std.mem.Allocator, io: Io, request: StreamRequest, ctx: Ctx) Error!Response {
@@ -679,9 +836,10 @@ test "streaming delivers every burst to on_chunk, promptly and in full" {
     const Collector = struct {
         var collected: std.ArrayList(u8) = .empty;
         var chunks: usize = 0;
-        fn onChunk(alloc: std.mem.Allocator, bytes: []const u8) void {
+        fn onChunk(alloc: std.mem.Allocator, bytes: []const u8) bool {
             collected.appendSlice(alloc, bytes) catch {};
             chunks += 1;
+            return true;
         }
     };
     defer Collector.collected.deinit(gpa);
@@ -717,4 +875,69 @@ test "streaming delivers every burst to on_chunk, promptly and in full" {
         Collector.collected.items,
     );
     try std.testing.expect(Collector.chunks >= 3);
+}
+
+test "streaming consumer can abort a live response immediately" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testServer(io);
+    defer server.deinit(io);
+    const url = try testUrl(gpa, &server);
+    defer gpa.free(url);
+
+    const Select = Io.Select(union(enum) { serve: void, request: Error!Response });
+    var results: [2]Select.Union = undefined;
+    var select = Select.init(io, &results);
+    defer select.cancelDiscard();
+    select.async(.serve, serveSseInBursts, .{ io, &server });
+    select.async(.request, streamPostTask(void, rejectChunk), .{ gpa, io, StreamRequest{
+        .url = url,
+        .bearer = null,
+        .body_json = "{}",
+        .connect_timeout_ms = 5_000,
+        .idle_timeout_ms = 5_000,
+    }, {} });
+
+    while (true) switch (try select.await()) {
+        .serve => {},
+        .request => |result| {
+            try std.testing.expectError(error.ConsumerAborted, result);
+            return;
+        },
+    };
+}
+
+test "absolute stream deadline cannot be extended by request activity" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testServer(io);
+    defer server.deinit(io);
+    const url = try testUrl(gpa, &server);
+    defer gpa.free(url);
+
+    const Select = Io.Select(union(enum) { serve: void, request: Error!Response });
+    var results: [2]Select.Union = undefined;
+    var select = Select.init(io, &results);
+    defer select.cancelDiscard();
+    select.async(.serve, serveDelayedResponse, .{ io, &server, 5_000, "ok" });
+    select.async(.request, streamPostTask(void, discardChunk), .{ gpa, io, StreamRequest{
+        .url = url,
+        .bearer = null,
+        .body_json = "{}",
+        .connect_timeout_ms = 10_000,
+        .idle_timeout_ms = 10_000,
+        .total_timeout_ms = 100,
+    }, {} });
+
+    while (true) switch (try select.await()) {
+        .serve => {},
+        .request => |result| {
+            try std.testing.expectError(error.HttpTimeout, result);
+            return;
+        },
+    };
 }

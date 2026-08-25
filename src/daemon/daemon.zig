@@ -3,9 +3,8 @@
 //!
 //! Thread model (M1):
 //!   main thread        accept() loop on the unix socket; spawns client threads
-//!   client thread ×N   reads NDJSON lines from one client, translates them
-//!                      into dispatcher commands; writes fan-out messages from
-//!                      its per-client outbox
+//!   client reader ×N   reads bounded NDJSON records into dispatcher commands
+//!   client writer ×N   drains one bounded outbox into that client's socket
 //!   dispatcher thread  single consumer of the central MPSC queue; owns ALL
 //!                      session state and the store; fans events out to
 //!                      subscribed clients' outboxes
@@ -32,8 +31,8 @@
 //!                                                  only between turns
 //!     Adding a turn-visible field means adding it to THIS list with a
 //!     stated discipline — TurnJob.session is a live pointer, not a copy.
-//!   - Client outboxes are Mpsc(owned []u8 line); the client thread writes
-//!     them to the socket and frees.
+//!   - Client outboxes are Mpsc(owned OutboundLine); the client thread writes
+//!     them to the socket, publishes the last flushed sequence, and frees.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -103,11 +102,20 @@ const Event = union(enum) {
     shutdown,
 };
 
+const OutboundLine = struct {
+    bytes: []u8,
+    seq: u64,
+};
+
 const Client = struct {
     id: u64,
     stream: Io.net.Stream,
-    outbox: queue.Mpsc([]u8),
+    outbox: queue.Mpsc(OutboundLine),
     writer_thread: ?std.Thread = null,
+    reader_thread: ?std.Thread = null,
+    queued_outbox_bytes: std.atomic.Value(usize) = .init(0),
+    next_outbox_seq: std.atomic.Value(u64) = .init(0),
+    flushed_outbox_seq: std.atomic.Value(u64) = .init(0),
     subs: std.ArrayList(u64) = .empty, // subscribed session ids
     said_hello: bool = false,
     /// Receives refreshed session-list snapshots without subscribing to every
@@ -121,6 +129,15 @@ const Client = struct {
         return false;
     }
 };
+
+/// Enough room for two maximum-sized records. A client that stops reading is
+/// disconnected and replays durable blocks on reconnect instead of growing
+/// daemon memory without bound.
+const max_client_outbox_bytes: usize = 2 * proto.max_line_bytes;
+/// A persisted user/steer block has more JSON envelope than its input
+/// command. Keep a fixed wrapper margin so every accepted input is guaranteed
+/// to remain replayable under the same protocol record limit.
+const max_replayable_input_line_bytes: usize = proto.max_line_bytes - 4096;
 
 const TaskFuture = struct {
     mutex: Io.Mutex = .init,
@@ -178,6 +195,10 @@ const Session = struct {
     network_filtering_enabled: bool = false,
     /// Gate the turn thread parks on for `ask` decisions.
     gate: approval.Gate = .{},
+    /// Complete encoded approval_request retained while the gate is armed.
+    /// Dispatcher-owned; reconnecting subscribers/watchers receive this exact
+    /// actionable state instead of only an unexplained awaiting status.
+    pending_approval_line: ?[]u8 = null,
     /// L1 prune frontier (context.zig): tool_results with seq < this are
     /// stubbed at assembly. Advanced by the turn thread, read by it only —
     /// but stored here so it survives across turns. In-memory only: after a
@@ -191,6 +212,9 @@ const Session = struct {
     steer_mutex: Io.Mutex = .init,
     /// Non-null only while a task child is running for a parked parent call.
     task_waiter: ?*TaskFuture = null,
+    /// session_kill releases the in-memory object after its active turn has
+    /// acknowledged cancellation. Durable state remains reloadable.
+    evict_when_idle: bool = false,
 };
 
 // ---------------------------------------------------------------- daemon --
@@ -212,6 +236,9 @@ pub const Daemon = struct {
     protected_roots: ?sandbox.ProtectedRoots = null,
     events: queue.Mpsc(Event),
     clients: std.AutoHashMapUnmanaged(u64, *Client) = .empty,
+    /// Protected by clients_mutex. Prevents an accept already in flight from
+    /// registering after shutdown has begun draining the registry.
+    accepting_clients: bool = true,
     sessions: std.AutoHashMapUnmanaged(u64, *Session) = .empty,
     next_client_id: u64 = 1,
     running: bool = true,
@@ -221,12 +248,18 @@ pub const Daemon = struct {
     /// Set when reboot unlinks the listener before ACK. Cleanup must not
     /// unlink the same pathname again after the replacement daemon binds it.
     socket_retired: bool = false,
+    /// Advisory lock held for the public socket's lifetime. A crash releases
+    /// it in the kernel; coordinated reboot releases it before ACK so the
+    /// replacement daemon can acquire it immediately.
+    instance_lock: ?Io.File = null,
     /// Model catalog cache (registry-form ids and normalized pricing,
     /// gpa-owned). Refreshed at most once per catalog_ttl_ms; fetch runs on a
     /// worker thread.
     catalog: std.ArrayList(CatalogModel) = .empty,
     catalog_fetched_at: i64 = 0,
     catalog_fetching: bool = false,
+    catalog_cancel: std.atomic.Value(bool) = .init(false),
+    catalog_thread: ?std.Thread = null,
 
     const catalog_ttl_ms: i64 = 60 * 60 * 1000; // 1h
 
@@ -242,6 +275,20 @@ pub const Daemon = struct {
         // our own process group, and we ignore SIGHUP for the case where the
         // user runs `marlin daemon` in a terminal that later goes away.
         ignoreSighup();
+
+        // Serialize startup before touching the database or stale socket.
+        // The lock file may remain on disk; ownership is the kernel lock, so
+        // crashes cannot strand it and a loser can never unlink a live socket.
+        const sock_path = try proto.socketPath(gpa, environ);
+        defer gpa.free(sock_path);
+        if (std.fs.path.dirname(sock_path)) |dir| {
+            Io.Dir.cwd().createDirPath(io, dir) catch {};
+        }
+        const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{sock_path});
+        defer gpa.free(lock_path);
+        var instance_lock = try acquireInstanceLock(io, lock_path);
+        var lock_moved = false;
+        defer if (!lock_moved) instance_lock.close(io);
 
         const db_path = try store_mod.defaultDbPath(gpa, io, environ);
         defer gpa.free(db_path);
@@ -308,18 +355,16 @@ pub const Daemon = struct {
             .sandbox_backend = sandbox_backend,
             .protected_roots = protected_roots,
             .events = queue.Mpsc(Event).init(gpa),
+            .instance_lock = instance_lock,
         };
+        lock_moved = true;
+        defer self.releaseInstanceLock();
         store_moved = true;
         defer self.store.close();
         defer self.events.deinit();
         defer self.network.deinit();
 
-        // Socket setup: mkdir -p, remove stale socket, listen, chmod 0600.
-        const sock_path = try proto.socketPath(gpa, environ);
-        defer gpa.free(sock_path);
-        if (std.fs.path.dirname(sock_path)) |dir| {
-            Io.Dir.cwd().createDirPath(io, dir) catch {};
-        }
+        // The instance lock makes this socket provably stale.
         Io.Dir.cwd().deleteFile(io, sock_path) catch {};
 
         const ua = try Io.net.UnixAddress.init(sock_path);
@@ -391,38 +436,45 @@ pub const Daemon = struct {
 
     fn spawnClient(self: *Daemon, stream: Io.net.Stream) !void {
         const client = try self.gpa.create(Client);
-        errdefer self.gpa.destroy(client);
         client.* = .{
             .id = self.next_client_id,
             .stream = stream,
-            .outbox = queue.Mpsc([]u8).init(self.gpa),
+            .outbox = queue.Mpsc(OutboundLine).init(self.gpa),
         };
         self.next_client_id += 1;
-        client.writer_thread = try std.Thread.spawn(.{}, clientWriter, .{ self, client });
-        const reader_thread = try std.Thread.spawn(.{}, clientReader, .{ self, client });
-        reader_thread.detach();
-        // Registration in self.clients happens on the dispatcher thread via
-        // the first client_msg (hello) — but fan-out needs the map earlier.
-        // Simplest safe order: register through the event queue too.
-        // (clientReader sends hello as its first line or the connection dies.)
-        // We add to the map here under the dispatcher's ownership rule by
-        // pushing a registration disguised as the first message; instead we
-        // keep it simpler: the maps are ONLY touched by dispatchLoop, so we
-        // push a synthetic "client_msg" carrying the pointer via id table…
-        // Pragmatic M1 cut: a dedicated mutex-protected registry.
-        self.registerClient(client);
+        client.writer_thread = std.Thread.spawn(.{}, clientWriter, .{ self, client }) catch |err| {
+            client.outbox.deinit();
+            self.gpa.destroy(client);
+            return err;
+        };
+
+        // Publish only once the writer exists, and start the reader while the
+        // registry lock prevents shutdown from freeing this client. A fast
+        // hello may queue immediately; lookup waits for this lock to release.
+        clients_mutex.lockUncancelable(self.io);
+        if (!self.accepting_clients) {
+            clients_mutex.unlock(self.io);
+            self.cleanupFailedClientSetup(client);
+            return error.DaemonShuttingDown;
+        }
+        self.clients.put(self.gpa, client.id, client) catch |err| {
+            clients_mutex.unlock(self.io);
+            self.cleanupFailedClientSetup(client);
+            return err;
+        };
+        client.reader_thread = std.Thread.spawn(.{}, clientReader, .{ self, client }) catch |err| {
+            _ = self.clients.remove(client.id);
+            clients_mutex.unlock(self.io);
+            self.cleanupFailedClientSetup(client);
+            return err;
+        };
+        clients_mutex.unlock(self.io);
     }
 
     // Client registry has its own tiny mutex because both the accept path
     // (add) and dispatcher (lookup/remove) touch it. Values are only
     // *mutated* by their owning threads per the rules above.
     var clients_mutex: Io.Mutex = .init;
-
-    fn registerClient(self: *Daemon, client: *Client) void {
-        clients_mutex.lockUncancelable(self.io);
-        defer clients_mutex.unlock(self.io);
-        self.clients.put(self.gpa, client.id, client) catch {};
-    }
 
     fn lookupClient(self: *Daemon, id: u64) ?*Client {
         clients_mutex.lockUncancelable(self.io);
@@ -448,16 +500,55 @@ pub const Daemon = struct {
 
     // ---------------------------------------------------------- client IO --
 
+    /// Stop both directions before joining either thread. shutdown(2) is the
+    /// cancellation mechanism for a writer blocked in write(2) and a reader
+    /// blocked waiting for its next record.
+    fn stopClientIo(self: *Daemon, client: *Client) void {
+        client.outbox.close(self.io);
+        client.stream.shutdown(self.io, .both) catch {};
+        if (client.writer_thread) |thread| {
+            thread.join();
+            client.writer_thread = null;
+        }
+        if (client.reader_thread) |thread| {
+            thread.join();
+            client.reader_thread = null;
+        }
+    }
+
+    fn cleanupFailedClientSetup(self: *Daemon, client: *Client) void {
+        self.stopClientIo(client);
+        client.subs.deinit(self.gpa);
+        client.outbox.deinit();
+        self.gpa.destroy(client);
+    }
+
+    fn destroyClient(self: *Daemon, client: *Client) void {
+        self.stopClientIo(client);
+        client.stream.close(self.io);
+        client.subs.deinit(self.gpa);
+        client.outbox.deinit();
+        self.gpa.destroy(client);
+    }
+
     /// Reader thread: one per client. Socket lines → event queue.
     fn clientReader(self: *Daemon, client: *Client) void {
-        var rbuf: [256 * 1024]u8 = undefined;
+        var rbuf: [64 * 1024]u8 = undefined;
         var reader = Io.net.Stream.Reader.init(client.stream, self.io, &rbuf);
         const r = &reader.interface;
         while (true) {
-            const line = r.takeDelimiterInclusive('\n') catch break;
-            const owned = self.gpa.dupe(u8, line) catch break;
-            self.events.push(self.io, .{ .client_msg = .{ .client_id = client.id, .msg_line = owned } }) catch {
-                self.gpa.free(owned);
+            const line = proto.readLineAlloc(self.gpa, r) catch |err| switch (err) {
+                error.ProtocolLineTooLong => {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "line_too_long",
+                        .msg = "protocol record exceeds 32 MiB",
+                    } });
+                    continue;
+                },
+                else => break,
+            };
+            self.events.push(self.io, .{ .client_msg = .{ .client_id = client.id, .msg_line = line } }) catch {
+                self.gpa.free(line);
                 break;
             };
         }
@@ -469,18 +560,72 @@ pub const Daemon = struct {
         var wbuf: [256 * 1024]u8 = undefined;
         var writer = Io.net.Stream.Writer.init(client.stream, self.io, &wbuf);
         const w = &writer.interface;
-        while (client.outbox.pop(self.io)) |line| {
-            defer self.gpa.free(line);
-            w.writeAll(line) catch break;
+        writer_loop: while (client.outbox.pop(self.io)) |line| {
+            if (!self.writeClientLine(client, w, line)) break;
+            var last_written_seq = line.seq;
+            // Replay and fan-out bursts share one flush instead of one syscall
+            // per block. A lone live delta still flushes immediately.
+            while (client.outbox.tryPop(self.io)) |queued| {
+                if (!self.writeClientLine(client, w, queued)) break :writer_loop;
+                last_written_seq = queued.seq;
+            }
             w.flush() catch break;
+            client.flushed_outbox_seq.store(last_written_seq, .release);
         }
         // Drain anything left after close without writing.
-        while (client.outbox.tryPop(self.io)) |line| self.gpa.free(line);
+        while (client.outbox.tryPop(self.io)) |line| {
+            _ = client.queued_outbox_bytes.fetchSub(line.bytes.len, .acq_rel);
+            self.gpa.free(line.bytes);
+        }
+    }
+
+    fn writeClientLine(self: *Daemon, client: *Client, writer: *std.Io.Writer, line: OutboundLine) bool {
+        defer self.gpa.free(line.bytes);
+        _ = client.queued_outbox_bytes.fetchSub(line.bytes.len, .acq_rel);
+        writer.writeAll(line.bytes) catch return false;
+        return true;
+    }
+
+    fn enqueueLine(self: *Daemon, client: *Client, line: []u8) ?u64 {
+        const previous = client.queued_outbox_bytes.fetchAdd(line.len, .acq_rel);
+        if (line.len > max_client_outbox_bytes or previous > max_client_outbox_bytes - line.len) {
+            _ = client.queued_outbox_bytes.fetchSub(line.len, .acq_rel);
+            self.gpa.free(line);
+            std.log.warn("disconnecting slow client {d}: outbox exceeded {Bi}", .{
+                client.id,
+                max_client_outbox_bytes,
+            });
+            client.outbox.close(self.io);
+            client.stream.shutdown(self.io, .both) catch {};
+            return null;
+        }
+        const seq = client.next_outbox_seq.fetchAdd(1, .acq_rel) +% 1;
+        client.outbox.push(self.io, .{ .bytes = line, .seq = seq }) catch {
+            _ = client.queued_outbox_bytes.fetchSub(line.len, .acq_rel);
+            self.gpa.free(line);
+            return null;
+        };
+        return seq;
     }
 
     fn sendTo(self: *Daemon, client: *Client, msg: proto.DaemonMsg) void {
-        const line = proto.encode(self.gpa, msg) catch return;
-        client.outbox.push(self.io, line) catch self.gpa.free(line);
+        _ = self.sendToTracked(client, msg);
+    }
+
+    fn sendToTracked(self: *Daemon, client: *Client, msg: proto.DaemonMsg) ?u64 {
+        const line = proto.encode(self.gpa, msg) catch |err| {
+            if (err == error.ProtocolLineTooLong) self.sendResponseTooLarge(client);
+            return null;
+        };
+        return self.enqueueLine(client, line);
+    }
+
+    fn sendResponseTooLarge(self: *Daemon, client: *Client) void {
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .err = .{
+            .code = "response_too_large",
+            .msg = "response exceeds the 32 MiB protocol limit",
+        } }) catch return;
+        _ = self.enqueueLine(client, line);
     }
 
     // --------------------------------------------------------- dispatcher --
@@ -506,16 +651,40 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "bad_msg", .msg = "could not parse message" } });
                     return;
                 };
-                try self.handleClientMsg(client, msg);
+                switch (msg) {
+                    .input => |input| if (cm.msg_line.len > max_replayable_input_line_bytes) {
+                        self.sendInputError(
+                            client,
+                            input.request_id,
+                            "input_too_large",
+                            "message is too close to the protocol limit to persist and replay safely",
+                        );
+                        return;
+                    },
+                    else => {},
+                }
+                self.handleClientMsg(client, msg) catch |err| {
+                    // A protocol request must always terminate visibly. Do not
+                    // let allocator/store/thread failures escape only to the
+                    // daemon log while the client waits forever for its ack.
+                    std.log.warn("{t} request from client {d} failed: {t}", .{
+                        std.meta.activeTag(msg),
+                        client.id,
+                        err,
+                    });
+                    self.sendTo(client, .{ .err = .{
+                        .code = "request_failed",
+                        .msg = "daemon could not complete the request; durable state was left consistent",
+                    } });
+                };
             },
             .client_gone => |cg| {
                 if (self.removeClient(cg.client_id)) |client| {
-                    client.outbox.close(self.io);
-                    if (client.writer_thread) |t| t.join();
-                    client.stream.close(self.io);
-                    client.subs.deinit(self.gpa);
-                    client.outbox.deinit();
-                    self.gpa.destroy(client);
+                    // The registry no longer contains this client, so each
+                    // subscription can now be tested against the remaining
+                    // live set before its arrays are destroyed.
+                    for (client.subs.items) |sid| self.releaseSessionIfUnused(sid);
+                    self.destroyClient(client);
                 }
             },
             .turn_block => |tb| {
@@ -527,22 +696,32 @@ pub const Daemon = struct {
                 self.fanOutLine(td.sid, td.line);
             },
             .turn_awaiting => |ta| {
-                defer self.gpa.free(ta.line);
                 if (self.sessions.get(ta.sid)) |session| {
+                    if (session.pending_approval_line) |old| self.gpa.free(old);
+                    session.pending_approval_line = ta.line;
                     session.state = .awaiting_approval;
                     self.store.setSessionStatus(ta.sid, "awaiting_approval") catch {};
+                    // A turn can reach its first approval after a plain reboot
+                    // has begun quiescing. Refuse that reboot now rather than
+                    // strand an approval whose TUI already exited.
+                    self.refusePendingRebootForApproval();
+                    self.fanOutActionableLine(ta.sid, ta.line);
+                    self.broadcastStatus(ta.sid, .awaiting_approval);
+                } else {
+                    self.gpa.free(ta.line);
                 }
-                self.fanOutActionableLine(ta.sid, ta.line);
-                self.broadcastStatus(ta.sid, .awaiting_approval);
             },
             .turn_resumed => |tr| {
                 if (self.sessions.get(tr.sid)) |session| {
+                    self.clearPendingApproval(session);
                     session.state = .running;
                     self.store.setSessionStatus(tr.sid, "running") catch {};
                 }
                 self.broadcastStatus(tr.sid, .running);
             },
             .catalog_ready => |cr| {
+                if (self.catalog_thread) |thread| thread.join();
+                self.catalog_thread = null;
                 // Replace the cache (dispatcher owns it now).
                 for (self.catalog.items) |m| self.gpa.free(m.id);
                 self.catalog.clearRetainingCapacity();
@@ -560,6 +739,7 @@ pub const Daemon = struct {
                     t.join();
                     session.turn_thread = null;
                 }
+                self.clearPendingApproval(session);
                 session.cancel.store(false, .release);
                 session.state = if (td.err_text != null) .err else .idle;
                 self.store.setSessionStatus(td.sid, @tagName(session.state)) catch {};
@@ -606,6 +786,12 @@ pub const Daemon = struct {
                 }
                 // A pending /reboot proceeds once the last turn drains.
                 self.maybeFinishReboot();
+                // Task children are one-shot workers. Their durable transcript
+                // remains attachable, but keeping every completed child's
+                // mutexes, queues, model and cwd resident makes fan-out grow
+                // forever. Rehydrate lazily if somebody opens the child.
+                if (session.evict_when_idle or session.kind == .task_child)
+                    self.unloadSession(td.sid);
             },
             .child_start => |cs| {
                 defer self.gpa.free(cs.prompt);
@@ -616,6 +802,11 @@ pub const Daemon = struct {
                 };
             },
             .shutdown => {
+                // Freeze the producer boundary before leaving the dispatcher.
+                // In particular, a task child queued just behind this event
+                // owns a future on its parent turn's stack; cleanup must
+                // resolve it rather than joining that parent forever.
+                self.events.close(self.io);
                 // Nudge AFTER the flag flips: the accept loop re-checks
                 // running per connection, so a nudge that lands while running
                 // is still true is consumed as an ordinary client and the
@@ -651,19 +842,28 @@ pub const Daemon = struct {
             },
             .session_create => |sc| {
                 const sid = ids.next(self.io);
-                try self.store.createSession(sid, nowMs(self.io), sc.cwd, sc.model, sc.effort);
                 const session = try self.gpa.create(Session);
+                errdefer self.gpa.destroy(session);
+                const model = try self.gpa.dupe(u8, sc.model);
+                errdefer self.gpa.free(model);
+                const cwd = try self.gpa.dupe(u8, sc.cwd);
+                errdefer self.gpa.free(cwd);
                 session.* = .{
                     .id = sid,
-                    .model = try self.gpa.dupe(u8, sc.model),
+                    .model = model,
                     .effort = sc.effort,
-                    .cwd = try self.gpa.dupe(u8, sc.cwd),
+                    .cwd = cwd,
                     .approval_mode = approval.Mode.parse(sc.approvals),
                     .sandbox_enabled = self.cfg.permissions_enabled,
                     .network_filtering_enabled = self.network.isActive(),
                 };
                 session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
-                try self.sessions.put(self.gpa, sid, session);
+                // Reserve every fallible in-memory resource before committing
+                // the durable row. After createSession succeeds, publishing to
+                // the map cannot fail and no ghost session can be left behind.
+                try self.sessions.ensureUnusedCapacity(self.gpa, 1);
+                try self.store.createSession(sid, nowMs(self.io), sc.cwd, sc.model, sc.effort);
+                self.sessions.putAssumeCapacityNoClobber(sid, session);
                 self.sendTo(client, .{ .session_created = .{ .sid = sid } });
                 self.broadcastSessionList();
             },
@@ -671,9 +871,11 @@ pub const Daemon = struct {
             .session_watch => {
                 client.watches_sessions = true;
                 try self.sendSessionList(client, false);
+                self.sendPendingApprovals(client);
             },
             .session_kill => |sk| {
                 self.cancelSessionTree(sk.sid);
+                self.requestSessionTreeEviction(sk.sid);
                 self.sendTo(client, .{ .ok = .{} });
             },
             .session_archive => |sa| {
@@ -690,6 +892,7 @@ pub const Daemon = struct {
                     return;
                 };
                 self.markLoadedSessionTreeArchived(sa.sid, sa.archived);
+                if (sa.archived) self.requestSessionTreeEviction(sa.sid);
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionList();
             },
@@ -704,9 +907,10 @@ pub const Daemon = struct {
                     return;
                 }
                 const new_model = try self.gpa.dupe(u8, sm.model);
+                errdefer self.gpa.free(new_model);
+                try self.store.setSessionModel(sm.sid, sm.model);
                 self.gpa.free(session.model);
                 session.model = new_model;
-                self.store.setSessionModel(sm.sid, sm.model) catch {};
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionList();
             },
@@ -720,8 +924,8 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot switch effort mid-turn" } });
                     return;
                 }
+                try self.store.setSessionEffort(se.sid, se.effort);
                 session.effort = se.effort;
-                self.store.setSessionEffort(se.sid, se.effort) catch {};
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionList();
             },
@@ -802,18 +1006,45 @@ pub const Daemon = struct {
             },
             .sub => |s| {
                 if (!client.subscribed(s.sid)) try client.subs.append(self.gpa, s.sid);
-                // Replay stored blocks from from_seq (0 = live-only).
-                if (s.from_seq > 0) {
-                    const loaded = try self.store.getBlocks(s.sid, s.from_seq, 1_000_000);
-                    defer {
-                        for (loaded) |*lb| lb.deinit();
-                        self.gpa.free(loaded);
+                // Replay either a bounded newest window or from_seq onward.
+                if (s.from_seq > 0 or s.tail_limit > 0) {
+                    var replay_arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                    defer replay_arena_state.deinit();
+                    var replay: std.ArrayList(block.Block) = .empty;
+                    if (s.tail_limit > 0)
+                        if (s.before_seq > 0)
+                            try self.store.loadTailBeforeInto(
+                                replay_arena_state.allocator(),
+                                &replay,
+                                s.sid,
+                                s.before_seq,
+                                @min(s.tail_limit, 512),
+                            )
+                        else
+                            try self.store.loadTailInto(
+                                replay_arena_state.allocator(),
+                                &replay,
+                                s.sid,
+                                @min(s.tail_limit, 512),
+                            )
+                    else
+                        try self.store.loadBlocksInto(replay_arena_state.allocator(), &replay, s.sid, s.from_seq, 1_000_000);
+                    for (replay.items) |replayed| {
+                        self.sendTo(client, .{ .blk = .{ .sid = s.sid, .b = replayed } });
                     }
-                    for (loaded) |lb| {
-                        self.sendTo(client, .{ .blk = .{ .sid = s.sid, .b = lb.blk } });
+                    if (s.tail_limit > 0 or s.replay_done) {
+                        self.sendTo(client, .{ .replay_done = .{
+                            .sid = s.sid,
+                            .oldest_seq = if (replay.items.len > 0) replay.items[0].seq else 0,
+                            .newest_seq = if (replay.items.len > 0) replay.items[replay.items.len - 1].seq else 0,
+                            .has_older = s.tail_limit > 0 and replay.items.len > 0 and replay.items[0].seq > 1,
+                        } });
                     }
                 }
-                const state: proto.SessionState = if (self.sessions.get(s.sid)) |ses| ses.state else .idle;
+                const state: proto.SessionState = if (self.sessions.get(s.sid)) |ses| blk: {
+                    if (ses.pending_approval_line) |line| self.sendLine(client, line);
+                    break :blk ses.state;
+                } else .idle;
                 self.sendTo(client, .{ .status = .{ .sid = s.sid, .state = state } });
             },
             .unsub => |u| {
@@ -824,24 +1055,52 @@ pub const Daemon = struct {
                     }
                 }
                 self.sendTo(client, .{ .ok = .{} });
+                self.releaseSessionIfUnused(u.sid);
             },
             .input => |inp| {
-                const session = (try self.getOrLoadSession(inp.sid)) orelse {
-                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                const session = (self.getOrLoadSession(inp.sid) catch {
+                    self.sendInputError(client, inp.request_id, "store", "could not load session");
+                    return;
+                }) orelse {
+                    self.sendInputError(client, inp.request_id, "no_session", "unknown session");
                     return;
                 };
-                if (self.rejectArchivedSession(client, session)) return;
-                if (session.state == .running) {
-                    // Steer: queue for the running turn.
-                    const owned = try self.gpa.dupe(u8, inp.text);
-                    session.steer_mutex.lockUncancelable(self.io);
-                    defer session.steer_mutex.unlock(self.io);
-                    try session.steer_queue.append(self.gpa, owned);
-                    self.sendTo(client, .{ .ok = .{} });
+                if (session.archived) {
+                    self.sendInputError(
+                        client,
+                        inp.request_id,
+                        "archived",
+                        "unarchive the session before modifying it",
+                    );
                     return;
                 }
-                try self.startTurn(session, inp.text);
-                self.sendTo(client, .{ .ok = .{} });
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    // Approval is a parked phase of the same turn. Input stays
+                    // a steer for that turn; it must never create a competitor.
+                    const owned = self.gpa.dupe(u8, inp.text) catch {
+                        self.sendInputError(client, inp.request_id, "internal", "could not queue input");
+                        return;
+                    };
+                    session.steer_mutex.lockUncancelable(self.io);
+                    session.steer_queue.append(self.gpa, owned) catch {
+                        session.steer_mutex.unlock(self.io);
+                        self.gpa.free(owned);
+                        self.sendInputError(client, inp.request_id, "internal", "could not queue input");
+                        return;
+                    };
+                    session.steer_mutex.unlock(self.io);
+                    self.sendTo(client, .{ .ok = .{ .request_id = inp.request_id } });
+                    return;
+                }
+                self.startTurn(session, inp.text) catch |err| {
+                    if (err == error.SessionBusy) {
+                        self.sendInputError(client, inp.request_id, "busy", "session already has an active turn");
+                        return;
+                    }
+                    self.sendInputError(client, inp.request_id, "internal", "could not start turn");
+                    return;
+                };
+                self.sendTo(client, .{ .ok = .{ .request_id = inp.request_id } });
             },
             .approve => |a| {
                 const session = self.sessions.get(a.sid) orelse {
@@ -876,18 +1135,25 @@ pub const Daemon = struct {
                 }
                 const job = try self.gpa.create(TurnJob);
                 errdefer self.gpa.destroy(job);
+                const cwd = try self.gpa.dupe(u8, session.cwd);
+                errdefer self.gpa.free(cwd);
+                const model = try self.gpa.dupe(u8, session.model);
+                errdefer self.gpa.free(model);
+                const text = try self.gpa.dupe(u8, "");
+                errdefer self.gpa.free(text);
                 job.* = .{
                     .daemon = self,
                     .sid = session.id,
-                    .cwd = try self.gpa.dupe(u8, session.cwd),
-                    .model = try self.gpa.dupe(u8, session.model),
+                    .cwd = cwd,
+                    .model = model,
                     .effort = session.effort,
-                    .text = try self.gpa.dupe(u8, ""),
+                    .text = text,
                     .cancel = &session.cancel,
                     .session = session,
                 };
+                const thread = try std.Thread.spawn(.{}, compactMain, .{job});
+                session.turn_thread = thread;
                 session.state = .running;
-                session.turn_thread = try std.Thread.spawn(.{}, compactMain, .{job});
                 self.store.setSessionStatus(session.id, "running") catch {};
                 self.broadcastStatus(session.id, .running);
                 self.sendTo(client, .{ .ok = .{} });
@@ -907,12 +1173,12 @@ pub const Daemon = struct {
                     return;
                 }
                 self.catalog_fetching = true;
-                const t = std.Thread.spawn(.{}, catalogFetchMain, .{ self, client.id }) catch {
+                self.catalog_cancel.store(false, .release);
+                self.catalog_thread = std.Thread.spawn(.{}, catalogFetchMain, .{ self, client.id }) catch {
                     self.catalog_fetching = false;
                     self.sendCatalog(client);
                     return;
                 };
-                t.detach();
             },
             .interrupt => |i| {
                 self.cancelSessionTree(i.sid);
@@ -932,6 +1198,20 @@ pub const Daemon = struct {
                 // §self-hosting reboot). Quiesce: by default wait for running
                 // turns to finish; force interrupts them (blocks are truth,
                 // partial deltas are discardable).
+                if (self.pending_reboot != null) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "reboot_pending",
+                        .msg = "another client already requested reboot",
+                    } });
+                    return;
+                }
+                if (!r.force and self.hasPendingApproval()) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "approval_pending",
+                        .msg = "cannot reboot while approval is pending; answer it, interrupt it, or use --force",
+                    } });
+                    return;
+                }
                 self.pending_reboot = client.id;
                 if (r.force) {
                     var sit = self.sessions.valueIterator();
@@ -991,6 +1271,20 @@ pub const Daemon = struct {
         return true;
     }
 
+    fn sendInputError(
+        self: *Daemon,
+        client: *Client,
+        request_id: u64,
+        code: []const u8,
+        msg: []const u8,
+    ) void {
+        self.sendTo(client, .{ .err = .{
+            .code = code,
+            .msg = msg,
+            .request_id = request_id,
+        } });
+    }
+
     fn cancelSessionTree(self: *Daemon, sid: u64) void {
         if (self.sessions.get(sid)) |session| cancelActiveSession(self, session);
         // Nesting is deliberately limited to one level in this M6 slice.
@@ -1031,6 +1325,62 @@ pub const Daemon = struct {
         }
     }
 
+    /// Mark a loaded tree for eviction, releasing idle members immediately
+    /// and deferring active ones until turn_done. Durable rows remain intact
+    /// and are reconstructed by getOrLoadSession on the next access.
+    fn requestSessionTreeEviction(self: *Daemon, sid: u64) void {
+        var idle: std.ArrayList(u64) = .empty;
+        defer idle.deinit(self.gpa);
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            const session = sp.*;
+            if (!self.loadedSessionBelongsToTree(session, sid)) continue;
+            session.evict_when_idle = true;
+            if (session.state != .running and session.state != .awaiting_approval)
+                idle.append(self.gpa, session.id) catch {};
+        }
+        for (idle.items) |idle_sid| self.unloadSession(idle_sid);
+    }
+
+    fn unloadSession(self: *Daemon, sid: u64) void {
+        const removed = self.sessions.fetchRemove(sid) orelse return;
+        self.destroySession(removed.value);
+    }
+
+    fn sessionHasSubscriber(self: *Daemon, sid: u64) bool {
+        clients_mutex.lockUncancelable(self.io);
+        defer clients_mutex.unlock(self.io);
+        var it = self.clients.valueIterator();
+        while (it.next()) |client| if (client.*.subscribed(sid)) return true;
+        return false;
+    }
+
+    /// Loaded sessions are a working set, not a second durable catalog. Once
+    /// the last focused client leaves, release idle roots immediately and
+    /// release active ones after their turn completes. Reopening rehydrates
+    /// from SQLite without changing the visible transcript.
+    fn releaseSessionIfUnused(self: *Daemon, sid: u64) void {
+        if (self.sessionHasSubscriber(sid)) return;
+        const session = self.sessions.get(sid) orelse return;
+        if (session.state == .running or session.state == .awaiting_approval) {
+            session.evict_when_idle = true;
+        } else {
+            self.unloadSession(sid);
+        }
+    }
+
+    fn destroySession(self: *Daemon, session: *Session) void {
+        if (session.turn_thread) |thread| thread.join();
+        self.clearPendingApproval(session);
+        session.steer_mutex.lockUncancelable(self.io);
+        for (session.steer_queue.items) |steer| self.gpa.free(steer);
+        session.steer_queue.deinit(self.gpa);
+        session.steer_mutex.unlock(self.io);
+        self.gpa.free(session.model);
+        self.gpa.free(session.cwd);
+        self.gpa.destroy(session);
+    }
+
     /// Dispatcher-only child creation. The caller is a parent turn thread,
     /// but it reaches this function solely through Event.child_start.
     fn startChild(self: *Daemon, cs: ChildStart) !void {
@@ -1066,6 +1416,9 @@ pub const Daemon = struct {
             .task_waiter = cs.future,
         };
 
+        // As with root creation, reserve the map slot before the durable
+        // commit so allocation failure cannot leave an unreachable child row.
+        try self.sessions.ensureUnusedCapacity(self.gpa, 1);
         try self.store.createChildSession(
             sid,
             nowMs(self.io),
@@ -1077,8 +1430,11 @@ pub const Daemon = struct {
             effort,
             cs.max_rounds,
         );
-        try self.sessions.put(self.gpa, sid, session);
+        self.sessions.putAssumeCapacityNoClobber(sid, session);
         session_transferred = true;
+        // Structural catalog change: publish the new child once. Subsequent
+        // state changes use the compact status watcher path.
+        self.broadcastSessionList();
         self.startTurn(session, cs.prompt) catch |e| {
             session.task_waiter = null;
             session.state = .err;
@@ -1102,6 +1458,8 @@ pub const Daemon = struct {
     };
 
     fn startTurn(self: *Daemon, session: *Session, text: []const u8) !void {
+        if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
+            return error.SessionBusy;
         const job = try self.gpa.create(TurnJob);
         errdefer self.gpa.destroy(job);
         const cwd = try self.gpa.dupe(u8, session.cwd);
@@ -1436,28 +1794,32 @@ pub const Daemon = struct {
             return text;
         }
 
-        fn onApprovalNeeded(ctx: ?*anyopaque, id: u64, call_id: []const u8, tool: []const u8, args_json: []const u8) void {
+        fn onApprovalNeeded(ctx: ?*anyopaque, id: u64, call_id: []const u8, tool: []const u8, args_json: []const u8) bool {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
             var id_buf: [24]u8 = undefined;
-            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch return;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch return false;
             const line = proto.encode(self.gpa, proto.DaemonMsg{ .approval_request = .{
                 .sid = job.sid,
                 .approval_id = id_str,
                 .call_id = call_id,
                 .tool = tool,
                 .args_json = args_json,
-            } }) catch return;
-            self.events.push(self.io, .{ .turn_awaiting = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+            } }) catch return false;
+            self.events.push(self.io, .{ .turn_awaiting = .{ .sid = job.sid, .line = line } }) catch {
+                self.gpa.free(line);
+                return false;
+            };
             const payload = std.json.Stringify.valueAlloc(self.gpa, .{
                 .sid = job.sid,
                 .approval_id = id,
                 .call_id = call_id,
                 .tool = tool,
                 .args_json = args_json,
-            }, .{}) catch return;
-            defer self.gpa.free(payload);
+            }, .{}) catch return true;
             self.extensions.fireHook(.on_approval_needed, payload);
+            self.gpa.free(payload);
+            return true;
         }
 
         fn onApprovalDone(ctx: ?*anyopaque, id: u64, verdict: approval.Verdict) void {
@@ -1480,8 +1842,7 @@ pub const Daemon = struct {
 
     fn fanOne(ctx: FanCtx, client: *Client) void {
         if (!client.said_hello or !client.subscribed(ctx.sid)) return;
-        const copy = ctx.self.gpa.dupe(u8, ctx.line) catch return;
-        client.outbox.push(ctx.self.io, copy) catch ctx.self.gpa.free(copy);
+        ctx.self.sendLine(client, ctx.line);
     }
 
     /// Approval requests are actionable multiplexer state, not transcript
@@ -1492,17 +1853,44 @@ pub const Daemon = struct {
         self.forEachClient(ctx, struct {
             fn send(c: FanCtx, client: *Client) void {
                 if (!client.said_hello or (!client.subscribed(c.sid) and !client.watches_sessions)) return;
-                const copy = c.self.gpa.dupe(u8, c.line) catch return;
-                client.outbox.push(c.self.io, copy) catch c.self.gpa.free(copy);
+                c.self.sendLine(client, c.line);
             }
         }.send);
+    }
+
+    fn sendLine(self: *Daemon, client: *Client, line: []const u8) void {
+        if (line.len > proto.max_line_bytes) {
+            self.sendResponseTooLarge(client);
+            return;
+        }
+        const copy = self.gpa.dupe(u8, line) catch return;
+        _ = self.enqueueLine(client, copy);
+    }
+
+    fn clearPendingApproval(self: *Daemon, session: *Session) void {
+        if (session.pending_approval_line) |line| self.gpa.free(line);
+        session.pending_approval_line = null;
+    }
+
+    fn sendPendingApprovals(self: *Daemon, client: *Client) void {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            const session = sp.*;
+            if (session.archived or client.subscribed(session.id)) continue;
+            if (session.pending_approval_line) |line| self.sendLine(client, line);
+        }
     }
 
     fn broadcastStatus(self: *Daemon, sid: u64, state: proto.SessionState) void {
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{ .sid = sid, .state = state } }) catch return;
         defer self.gpa.free(line);
-        self.fanOutLine(sid, line);
-        self.broadcastSessionList();
+        const ctx = FanCtx{ .self = self, .sid = sid, .line = line };
+        self.forEachClient(ctx, struct {
+            fn send(value: FanCtx, client: *Client) void {
+                if (!client.said_hello or (!client.subscribed(value.sid) and !client.watches_sessions)) return;
+                value.self.sendLine(client, value.line);
+            }
+        }.send);
     }
 
     fn sendSessionList(self: *Daemon, client: *Client, include_archived: bool) !void {
@@ -1511,8 +1899,16 @@ pub const Daemon = struct {
             for (rows) |row| row.deinit(self.gpa);
             self.gpa.free(rows);
         }
-        const infos = try self.gpa.alloc(proto.SessionInfo, rows.len);
+        const infos = try self.sessionInfos(rows);
         defer self.gpa.free(infos);
+        self.sendTo(client, .{ .session_list_result = .{ .sessions = infos } });
+    }
+
+    /// Project durable rows through the live in-memory state. Returned info
+    /// borrows row strings and owns only its outer slice.
+    fn sessionInfos(self: *Daemon, rows: []const store_mod.Store.SessionListing) ![]proto.SessionInfo {
+        const infos = try self.gpa.alloc(proto.SessionInfo, rows.len);
+        errdefer self.gpa.free(infos);
         for (rows, 0..) |row, i| {
             const live = self.sessions.get(row.id);
             const state = if (live) |session|
@@ -1540,16 +1936,29 @@ pub const Daemon = struct {
                 .archived = row.archived,
             };
         }
-        self.sendTo(client, .{ .session_list_result = .{ .sessions = infos } });
+        return infos;
     }
 
     fn broadcastSessionList(self: *Daemon) void {
-        var it = self.clients.valueIterator();
-        while (it.next()) |cp| {
-            const client = cp.*;
-            if (!client.said_hello or !client.watches_sessions) continue;
-            self.sendSessionList(client, false) catch {};
+        // Build one authoritative snapshot, then fan the encoded line out
+        // while holding the registry lock. The accept thread mutates clients,
+        // so an unlocked valueIterator is a real map data race.
+        const rows = self.store.listSessions(false) catch return;
+        defer {
+            for (rows) |row| row.deinit(self.gpa);
+            self.gpa.free(rows);
         }
+        const infos = self.sessionInfos(rows) catch return;
+        defer self.gpa.free(infos);
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .session_list_result = .{ .sessions = infos } }) catch return;
+        defer self.gpa.free(line);
+        const ctx = struct { daemon: *Daemon, encoded: []const u8 }{ .daemon = self, .encoded = line };
+        self.forEachClient(ctx, struct {
+            fn send(value: @TypeOf(ctx), client: *Client) void {
+                if (!client.said_hello or !client.watches_sessions) return;
+                value.daemon.sendLine(client, value.encoded);
+            }
+        }.send);
     }
 
     /// Send the current catalog (possibly empty → client falls back to
@@ -1586,7 +1995,15 @@ pub const Daemon = struct {
         const url = try registry.openrouterModelsUrl(self.gpa, self.environ);
         defer self.gpa.free(url);
 
-        const res = try http.get(self.gpa, self.io, self.environ, url, 8 * 1024 * 1024, 30_000, null);
+        const res = try http.get(
+            self.gpa,
+            self.io,
+            self.environ,
+            url,
+            8 * 1024 * 1024,
+            30_000,
+            &self.catalog_cancel,
+        );
         defer self.gpa.free(res.body);
         defer if (res.content_type) |ct| self.gpa.free(ct);
         if (res.status >= 400) return error.CatalogHttp;
@@ -1626,15 +2043,54 @@ pub const Daemon = struct {
             if (state == .running or state == .awaiting_approval) return; // not yet
         }
         self.pending_reboot = null;
+        // Wake OUR still-linked listener before releasing the instance lock.
+        // Once the ACK reaches the client a replacement daemon may bind the
+        // public path; nudging after that can connect to the replacement and
+        // leave this accept loop blocked forever on its unlinked old socket.
+        // The dispatcher remains inside this handler until the ACK flushes,
+        // so running=false cannot start cleanup underneath the writer.
+        self.running = false;
+        self.nudgeAcceptLoop();
         // Retire the public socket before ACKing. The ACK tells the client it
         // may exec immediately, so no new process may still connect to this
         // dying daemon and lose its hello request during cleanup.
-        self.running = false;
-        self.nudgeAcceptLoop();
         self.removeSocketFile();
         self.socket_retired = true;
+        self.releaseInstanceLock();
         if (self.lookupClient(requester)) |client| {
-            self.sendTo(client, .{ .ok = .{} });
+            if (self.sendToTracked(client, .{ .ok = .{} })) |ack_seq| {
+                if (!self.waitForClientFlush(client, ack_seq, 2_000))
+                    std.log.warn("reboot ACK did not flush to client {d}", .{requester});
+            }
+        }
+    }
+
+    fn waitForClientFlush(self: *Daemon, client: *Client, target_seq: u64, timeout_ms: u32) bool {
+        var elapsed_ms: u32 = 0;
+        while (elapsed_ms < timeout_ms) : (elapsed_ms += 5) {
+            if (client.flushed_outbox_seq.load(.acquire) >= target_seq) return true;
+            self.io.sleep(.fromMilliseconds(5), .awake) catch return false;
+        }
+        return client.flushed_outbox_seq.load(.acquire) >= target_seq;
+    }
+
+    fn hasPendingApproval(self: *Daemon) bool {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            const session = sp.*;
+            if (session.state == .awaiting_approval or session.gate.isPending(self.io) != null) return true;
+        }
+        return false;
+    }
+
+    fn refusePendingRebootForApproval(self: *Daemon) void {
+        const requester = self.pending_reboot orelse return;
+        self.pending_reboot = null;
+        if (self.lookupClient(requester)) |client| {
+            self.sendTo(client, .{ .err = .{
+                .code = "approval_pending",
+                .msg = "reboot stopped because a running turn now needs approval; answer it, interrupt it, or retry with --force",
+            } });
         }
     }
 
@@ -1653,6 +2109,23 @@ pub const Daemon = struct {
     }
 
     fn shutdownCleanup(self: *Daemon) void {
+        clients_mutex.lockUncancelable(self.io);
+        self.accepting_clients = false;
+        clients_mutex.unlock(self.io);
+
+        // Stop the one non-turn worker before draining its completion event;
+        // it owns the daemon HTTP/config pointers until joined.
+        self.catalog_cancel.store(true, .release);
+        if (self.catalog_thread) |thread| thread.join();
+        self.catalog_thread = null;
+        self.catalog_fetching = false;
+
+        // The dispatcher stops at the shutdown marker, so producers that won
+        // the queue lock immediately before close may still have payloads
+        // behind it. Resolve child futures first and release every owned
+        // payload; Mpsc only owns the value slots, not their allocations.
+        while (self.events.tryPop(self.io)) |event| self.discardShutdownEvent(event);
+
         for (self.catalog.items) |m| self.gpa.free(m.id);
         self.catalog.deinit(self.gpa);
         // Cancel running turns. Resolve child rendezvous before joining: the
@@ -1672,17 +2145,7 @@ pub const Daemon = struct {
         // Join and release sessions after every parked parent can make
         // progress independently of dispatcher event processing.
         var sit = self.sessions.valueIterator();
-        while (sit.next()) |sp| {
-            const session = sp.*;
-            if (session.turn_thread) |t| t.join();
-            session.steer_mutex.lockUncancelable(self.io);
-            for (session.steer_queue.items) |s| self.gpa.free(s);
-            session.steer_queue.deinit(self.gpa);
-            session.steer_mutex.unlock(self.io);
-            self.gpa.free(session.model);
-            self.gpa.free(session.cwd);
-            self.gpa.destroy(session);
-        }
+        while (sit.next()) |sp| self.destroySession(sp.*);
         self.sessions.deinit(self.gpa);
         self.http_pool.deinit();
 
@@ -1691,20 +2154,57 @@ pub const Daemon = struct {
         var cit = self.clients.valueIterator();
         while (cit.next()) |cp| {
             const client = cp.*;
-            client.outbox.close(self.io);
-            if (client.writer_thread) |t| t.join();
-            client.stream.close(self.io);
-            client.subs.deinit(self.gpa);
-            client.outbox.deinit();
-            self.gpa.destroy(client);
+            self.destroyClient(client);
         }
         self.clients.deinit(self.gpa);
         clients_mutex.unlock(self.io);
 
         // Remove the socket so the (blocked) accept loop errors out.
         if (!self.socket_retired) self.removeSocketFile();
+        self.releaseInstanceLock();
+    }
+
+    fn releaseInstanceLock(self: *Daemon) void {
+        if (self.instance_lock) |file| file.close(self.io);
+        self.instance_lock = null;
+    }
+
+    fn discardShutdownEvent(self: *Daemon, event: Event) void {
+        switch (event) {
+            .client_msg => |value| self.gpa.free(value.msg_line),
+            .client_gone, .turn_resumed, .shutdown => {},
+            .turn_block => |value| self.gpa.free(value.line),
+            .turn_delta => |value| self.gpa.free(value.line),
+            .turn_awaiting => |value| self.gpa.free(value.line),
+            .catalog_ready => |value| {
+                for (value.models) |model| self.gpa.free(model.id);
+                self.gpa.free(value.models);
+            },
+            .turn_done => |value| {
+                if (value.err_text) |text| self.gpa.free(text);
+                if (value.final_text) |text| self.gpa.free(text);
+            },
+            .child_start => |value| {
+                defer self.gpa.free(value.prompt);
+                defer if (value.model) |model| self.gpa.free(model);
+                const output = self.gpa.dupe(u8, "error: child interrupted by daemon shutdown") catch return;
+                if (!value.future.resolve(self.io, output, .interrupted)) self.gpa.free(output);
+            },
+        }
     }
 };
+
+fn acquireInstanceLock(io: Io, path: []const u8) !Io.File {
+    return Io.Dir.cwd().createFile(io, path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.WouldBlock => error.DaemonAlreadyRunning,
+        else => err,
+    };
+}
 
 /// Decode OpenRouter's catalog without coupling the wire protocol to its
 /// per-token string representation. Bad individual price fields degrade to
@@ -1855,6 +2355,120 @@ fn taskTitle(prompt: []const u8) []const u8 {
 fn nowMs(io: Io) i64 {
     const ts = Io.Timestamp.now(io, .real);
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+const StopClientIoTestJob = struct {
+    daemon: *Daemon,
+    client: *Client,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(job: *StopClientIoTestJob) void {
+        job.daemon.stopClientIo(job.client);
+        job.done.store(true, .release);
+    }
+};
+
+fn waitTestFlag(io: Io, flag: *const std.atomic.Value(bool), timeout_ms: u32) bool {
+    var elapsed: u32 = 0;
+    while (elapsed < timeout_ms) : (elapsed += 10) {
+        if (flag.load(.acquire)) return true;
+        io.sleep(.fromMilliseconds(10), .awake) catch return false;
+    }
+    return flag.load(.acquire);
+}
+
+test "instance lock rejects a second daemon and recovers on close" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-instance-lock");
+    defer temp.deinit();
+    const path = try std.fs.path.join(gpa, &.{ temp.path, "daemon.lock" });
+    defer gpa.free(path);
+
+    var first = try acquireInstanceLock(io, path);
+    try std.testing.expectError(error.DaemonAlreadyRunning, acquireInstanceLock(io, path));
+    first.close(io);
+    var replacement = try acquireInstanceLock(io, path);
+    replacement.close(io);
+}
+
+test "client teardown interrupts a writer blocked on a non-reading peer" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const address = Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var peer = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer peer.close(io);
+    var client_stream = try server.accept(io);
+    defer client_stream.close(io);
+
+    var daemon: Daemon = undefined;
+    daemon.gpa = gpa;
+    daemon.io = io;
+    var client = Client{
+        .id = 1,
+        .stream = client_stream,
+        .outbox = queue.Mpsc(OutboundLine).init(gpa),
+    };
+    defer client.outbox.deinit();
+    client.writer_thread = try std.Thread.spawn(.{}, Daemon.clientWriter, .{ &daemon, &client });
+
+    const line = try gpa.alloc(u8, 8 * 1024 * 1024);
+    @memset(line, 'x');
+    const queued_seq = daemon.enqueueLine(&client, line).?;
+    var spin: u32 = 0;
+    while (client.queued_outbox_bytes.load(.acquire) != 0 and spin < 100) : (spin += 1)
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 0), client.queued_outbox_bytes.load(.acquire));
+    // Dequeue/write-start is not delivery: the writer is blocked in write(2)
+    // and must not publish this sequence as flushed.
+    try std.testing.expect(client.flushed_outbox_seq.load(.acquire) < queued_seq);
+
+    var stop = StopClientIoTestJob{ .daemon = &daemon, .client = &client };
+    const stop_thread = try std.Thread.spawn(.{}, StopClientIoTestJob.run, .{&stop});
+    if (!waitTestFlag(io, &stop.done, 2_000)) {
+        // Test cleanup must remain finite even if the regression returns.
+        peer.shutdown(io, .both) catch {};
+        stop_thread.join();
+        return error.ClientWriterTeardownHung;
+    }
+    stop_thread.join();
+}
+
+test "slow-client outbox is bounded" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const address = Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var peer = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer peer.close(io);
+    var client_stream = try server.accept(io);
+    defer client_stream.close(io);
+
+    var daemon: Daemon = undefined;
+    daemon.gpa = gpa;
+    daemon.io = io;
+    var client = Client{
+        .id = 9,
+        .stream = client_stream,
+        .outbox = queue.Mpsc(OutboundLine).init(gpa),
+        .queued_outbox_bytes = .init(max_client_outbox_bytes),
+    };
+    defer client.outbox.deinit();
+    const rejected = try gpa.dupe(u8, "x");
+    _ = daemon.enqueueLine(&client, rejected);
+    try std.testing.expect(client.outbox.closed);
+    try std.testing.expectEqual(max_client_outbox_bytes, client.queued_outbox_bytes.load(.acquire));
 }
 
 test "OpenRouter catalog normalizes pricing and tolerates bad entries" {

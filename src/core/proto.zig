@@ -16,6 +16,11 @@ const block = @import("block.zig");
 pub const ReasoningEffort = @import("effort.zig").Effort;
 
 pub const proto_version: u32 = 1;
+/// Maximum complete NDJSON record, including its trailing newline. Large
+/// blob replies can JSON-escape to several times their raw size, so this is
+/// deliberately larger than any supported tool capture while still bounding
+/// memory per connection.
+pub const max_line_bytes: usize = 32 * 1024 * 1024;
 
 pub const SessionState = enum { idle, running, awaiting_approval, err, done };
 
@@ -72,9 +77,23 @@ pub const ClientMsg = union(enum) {
     /// Fetch an uncapped tool result by its content-addressed blob hash.
     /// Used by `!c`; the inline block body may be intentionally truncated.
     blob_get: struct { hash: []const u8 },
-    sub: struct { sid: u64, from_seq: u64 = 0 },
+    /// `tail_limit>0` requests the newest N blocks (ascending) instead of an
+    /// unbounded replay from `from_seq`. `before_seq>0` bounds that window to
+    /// older blocks, enabling fixed-size backwards pagination. `replay_done`
+    /// opts into the terminal marker for a from-seq replay; old clients
+    /// therefore never receive a union tag they cannot decode. These fields
+    /// are additive for older peers.
+    sub: struct {
+        sid: u64,
+        from_seq: u64 = 0,
+        tail_limit: u32 = 0,
+        before_seq: u64 = 0,
+        replay_done: bool = false,
+    },
     unsub: struct { sid: u64 },
-    input: struct { sid: u64, text: []const u8 },
+    /// `request_id` correlates the optimistic client echo with the one
+    /// terminal ok/err reply. Zero is the legacy/untracked value.
+    input: struct { sid: u64, text: []const u8, request_id: u64 = 0 },
     approve: struct { sid: u64, approval_id: []const u8, decision: ApprovalAnswer },
     /// Manual L2 compaction (/compact). Rejected while a turn is running.
     session_compact: struct { sid: u64 },
@@ -119,6 +138,12 @@ pub const DaemonMsg = union(enum) {
     /// provider: cumulative body bytes this round and ms since the last
     /// visible (text/reasoning) delta. Emitted at most ~1/s.
     stream_status: struct { sid: u64, bytes: u64, quiet_ms: u64 },
+    replay_done: struct {
+        sid: u64,
+        oldest_seq: u64 = 0,
+        newest_seq: u64 = 0,
+        has_older: bool = false,
+    },
     status: struct { sid: u64, state: SessionState },
     approval_request: struct {
         sid: u64,
@@ -148,8 +173,10 @@ pub const DaemonMsg = union(enum) {
     /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
     /// contain arbitrary command output (including NULs).
     blob_result: struct { hash: []const u8, bytes: []const u8 },
-    ok: struct {},
-    err: struct { code: []const u8, msg: []const u8 },
+    /// `request_id` is non-zero only when replying to a correlated request
+    /// (currently input). Defaults preserve compatibility in both directions.
+    ok: struct { request_id: u64 = 0 },
+    err: struct { code: []const u8, msg: []const u8, request_id: u64 = 0 },
 };
 
 pub const SessionInfo = struct {
@@ -187,10 +214,48 @@ pub const SessionInfo = struct {
 pub fn encode(gpa: std.mem.Allocator, msg: anytype) ![]u8 {
     const json = try std.json.Stringify.valueAlloc(gpa, msg, .{});
     defer gpa.free(json);
+    try ensureLineLength(json.len + 1, max_line_bytes);
     const line = try gpa.alloc(u8, json.len + 1);
     @memcpy(line[0..json.len], json);
     line[json.len] = '\n';
     return line;
+}
+
+fn ensureLineLength(line_len: usize, limit: usize) !void {
+    if (line_len > limit) return error.ProtocolLineTooLong;
+}
+
+/// Read one NDJSON record into owned memory. Unlike takeDelimiterInclusive,
+/// the Reader's scratch-buffer size is not the protocol limit. Oversized
+/// records are drained through their newline so a peer can receive a visible
+/// error and continue on the same connection.
+pub fn readLineAlloc(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    return readLineAllocLimit(gpa, reader, max_line_bytes);
+}
+
+fn readLineAllocLimit(
+    gpa: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    limit: usize,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    _ = reader.streamDelimiterLimit(&output.writer, '\n', .limited(limit)) catch |err| switch (err) {
+        error.StreamTooLong => {
+            _ = reader.discardDelimiterInclusive('\n') catch |discard_err| switch (discard_err) {
+                error.EndOfStream => {},
+                else => |e| return e,
+            };
+            return error.ProtocolLineTooLong;
+        },
+        // Allocating is the only writer and WriteFailed means its growth
+        // failed; preserve the useful cause at this abstraction boundary.
+        error.WriteFailed => return error.OutOfMemory,
+        else => |e| return e,
+    };
+    const delimiter = try reader.takeByte();
+    if (delimiter != '\n') return error.InvalidProtocolDelimiter;
+    return output.toOwnedSlice();
 }
 
 /// Decode one NDJSON line (with or without trailing newline) into T.
@@ -226,7 +291,11 @@ test "round trip: client messages" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const original: ClientMsg = .{ .input = .{ .sid = 0xDEAD_BEEF_0000_1111, .text = "hi \"there\"\nline2" } };
+    const original: ClientMsg = .{ .input = .{
+        .sid = 0xDEAD_BEEF_0000_1111,
+        .text = "hi \"there\"\nline2",
+        .request_id = 42,
+    } };
     const line = try encode(gpa, original);
     defer gpa.free(line);
     try std.testing.expect(line[line.len - 1] == '\n');
@@ -234,6 +303,7 @@ test "round trip: client messages" {
     const back = try decode(ClientMsg, arena, line);
     try std.testing.expectEqual(@as(u64, 0xDEAD_BEEF_0000_1111), back.input.sid);
     try std.testing.expectEqualStrings("hi \"there\"\nline2", back.input.text);
+    try std.testing.expectEqual(@as(u64, 42), back.input.request_id);
 
     const effort_msg: ClientMsg = .{ .session_set_effort = .{ .sid = 9, .effort = .xhigh } };
     const effort_line = try encode(gpa, effort_msg);
@@ -265,6 +335,19 @@ test "round trip: client messages" {
     defer gpa.free(blob_line);
     const blob_back = try decode(ClientMsg, arena, blob_line);
     try std.testing.expectEqualStrings("abc123", blob_back.blob_get.hash);
+
+    const tail_line = try encode(gpa, ClientMsg{ .sub = .{
+        .sid = 7,
+        .from_seq = 1,
+        .tail_limit = 256,
+        .before_seq = 1024,
+        .replay_done = true,
+    } });
+    defer gpa.free(tail_line);
+    const tail_back = try decode(ClientMsg, arena, tail_line);
+    try std.testing.expectEqual(@as(u32, 256), tail_back.sub.tail_limit);
+    try std.testing.expectEqual(@as(u64, 1024), tail_back.sub.before_seq);
+    try std.testing.expect(tail_back.sub.replay_done);
 }
 
 test "round trip: daemon block message with tool_result body" {
@@ -296,7 +379,61 @@ test "decode ignores unknown fields; defaults apply" {
         \\{"sub":{"sid":5,"future_field":true}}
     );
     try std.testing.expectEqual(@as(u64, 0), m.sub.from_seq);
+    try std.testing.expectEqual(@as(u32, 0), m.sub.tail_limit);
+    try std.testing.expectEqual(@as(u64, 0), m.sub.before_seq);
+    try std.testing.expect(!m.sub.replay_done);
     try std.testing.expectEqual(@as(u64, 5), m.sub.sid);
+}
+
+test "correlation ids are additive and legacy messages default to zero" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const legacy_input = try decode(ClientMsg, arena,
+        \\{"input":{"sid":5,"text":"hello"}}
+    );
+    try std.testing.expectEqual(@as(u64, 0), legacy_input.input.request_id);
+
+    const legacy_err = try decode(DaemonMsg, arena,
+        \\{"err":{"code":"busy","msg":"no"}}
+    );
+    try std.testing.expectEqual(@as(u64, 0), legacy_err.err.request_id);
+
+    const correlated_ok = try decode(DaemonMsg, arena,
+        \\{"ok":{"request_id":91}}
+    );
+    try std.testing.expectEqual(@as(u64, 91), correlated_ok.ok.request_id);
+}
+
+test "bounded line reader supports records larger than legacy buffers" {
+    const gpa = std.testing.allocator;
+    const input = try gpa.alloc(u8, 300 * 1024 + 1);
+    defer gpa.free(input);
+    @memset(input[0 .. input.len - 1], 'x');
+    input[input.len - 1] = '\n';
+    var reader = std.Io.Reader.fixed(input);
+    const line = try readLineAllocLimit(gpa, &reader, 512 * 1024);
+    defer gpa.free(line);
+    try std.testing.expectEqual(@as(usize, 300 * 1024), line.len);
+    try std.testing.expect(line[0] == 'x' and line[line.len - 1] == 'x');
+}
+
+test "oversized line is rejected, drained, and followed by a valid record" {
+    const gpa = std.testing.allocator;
+    var reader = std.Io.Reader.fixed("123456789\n{}\n");
+    try std.testing.expectError(
+        error.ProtocolLineTooLong,
+        readLineAllocLimit(gpa, &reader, 8),
+    );
+    const next = try readLineAllocLimit(gpa, &reader, 8);
+    defer gpa.free(next);
+    try std.testing.expectEqualStrings("{}", next);
+}
+
+test "encoded line length includes its newline" {
+    try ensureLineLength(16, 16);
+    try std.testing.expectError(error.ProtocolLineTooLong, ensureLineLength(17, 16));
 }
 
 test "older hello defaults network configuration state" {
