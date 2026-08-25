@@ -90,7 +90,8 @@ test_checksum_failure_preserves_existing_binary() {
     printf '#!/bin/sh\nprintf "old marlin\\n"\n' > "$home/.local/bin/marlin"
     chmod 755 "$home/.local/bin/marlin"
     make_release "$release" marlin-x86_64-linux 2.0.0
-    printf 'not-the-right-checksum\n' > "$release/marlin-x86_64-linux.sha256"
+    printf '0000000000000000000000000000000000000000000000000000000000000000\n' \
+        > "$release/marlin-x86_64-linux.sha256"
     make_curl_mock "$mocks"
 
     if HOME="$home" \
@@ -110,6 +111,35 @@ test_checksum_failure_preserves_existing_binary() {
     assert_contains "$case_root/output" 'checksum verification failed'
 }
 
+test_installs_pinned_release_assets() {
+    case_root="$TEST_ROOT/pinned"
+    home="$case_root/home"
+    release="$case_root/release"
+    mocks="$case_root/mocks"
+    url_log="$case_root/urls"
+    mkdir -p "$home"
+    make_release "$release" marlin-x86_64-linux 3.4.5
+    make_curl_mock "$mocks"
+
+    HOME="$home" \
+    SHELL=/bin/sh \
+    PATH="$mocks:/usr/bin:/bin" \
+    MARLIN_OS=linux \
+    MARLIN_ARCH=x86_64 \
+    MARLIN_VERSION=v3.4.5 \
+    MARLIN_MOCK_RELEASE_DIR="$release" \
+    MARLIN_MOCK_URL_LOG="$url_log" \
+    MARLIN_ADD_TO_PATH=0 \
+        sh "$ROOT/site/install.sh" > "$case_root/output"
+
+    [ "$("$home/.local/bin/marlin" version)" = "marlin 3.4.5" ] || \
+        fail "pinned release binary did not run"
+    assert_contains "$url_log" \
+        'https://github.com/jespern/marlin/releases/download/v3.4.5/marlin-x86_64-linux'
+    assert_contains "$url_log" \
+        'https://github.com/jespern/marlin/releases/download/v3.4.5/marlin-x86_64-linux.sha256'
+}
+
 test_rejects_unsupported_platform() {
     case_root="$TEST_ROOT/platform"
     mkdir -p "$case_root/home" "$case_root/mocks"
@@ -127,6 +157,7 @@ test_rejects_unsupported_platform() {
 
 test_installs_and_configures_zsh
 test_checksum_failure_preserves_existing_binary
+test_installs_pinned_release_assets
 test_rejects_unsupported_platform
 
 printf 'installer tests passed\n'

@@ -96,6 +96,18 @@ jobs:
             gh release create "$MARLIN_VERSION" dist/* --verify-tag --generate-notes --title "Marlin $MARLIN_VERSION"
           fi
 
+      - name: Verify curl installer against published assets
+        env:
+          MARLIN_VERSION: ${{ github.ref_name }}
+        run: |
+          install_root=$(mktemp -d)
+          trap 'rm -r "$install_root"' EXIT
+          MARLIN_INSTALL_DIR="$install_root/bin" \
+          MARLIN_ADD_TO_PATH=0 \
+          MARLIN_RELEASE_BASE="https://github.com/${{ github.repository }}/releases/download/$MARLIN_VERSION" \
+            sh site/install.sh
+          test "$("$install_root/bin/marlin" version)" = "marlin ${MARLIN_VERSION#v}"
+
       - name: Check out Homebrew tap
         uses: actions/checkout@v6
         with:

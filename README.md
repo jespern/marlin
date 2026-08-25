@@ -8,16 +8,19 @@ sees structured events instead of scraping a character grid.
 
 ## Install
 
-With [Homebrew](https://brew.sh/) on macOS or Linux:
-
-```sh
-brew install jespern/tap/marlin
-```
-
-Or install the latest release in `~/.local/bin` without sudo:
+Install the latest macOS or Linux release in `~/.local/bin` without sudo:
 
 ```sh
 curl -fsSL https://marlin.wtf/install.sh | sh
+```
+
+The installer selects the release for your architecture and verifies its
+SHA-256 checksum. To pin a version, pipe into `MARLIN_VERSION=0.1.0 sh`.
+
+Or use [Homebrew](https://brew.sh/) on macOS or Linux:
+
+```sh
+brew install jespern/tap/marlin
 ```
 
 ## The pitch

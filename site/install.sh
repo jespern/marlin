@@ -1,13 +1,14 @@
 #!/bin/sh
 # marlin installer, https://marlin.wtf
 #
-# Installs one release binary in ~/.local/bin (or $MARLIN_INSTALL_DIR),
-# verifies its checksum, and offers to add that directory to the user's PATH.
+# Downloads the matching GitHub release asset into ~/.local/bin (or
+# $MARLIN_INSTALL_DIR), verifies its checksum, and offers to add that directory
+# to the user's PATH. Set MARLIN_VERSION to pin a release (for example, 0.1.0).
 # No sudo and no system-wide writes. Uninstall with: rm ~/.local/bin/marlin
 
 set -eu
 
-RELEASE_BASE="${MARLIN_RELEASE_BASE:-https://github.com/jespern/marlin/releases/latest/download}"
+RELEASE_ROOT="https://github.com/jespern/marlin/releases"
 INSTALL_DIR="${MARLIN_INSTALL_DIR:-${HOME:?HOME is required}/.local/bin}"
 ADD_TO_PATH="${MARLIN_ADD_TO_PATH:-ask}"
 
@@ -17,6 +18,7 @@ main() {
     os=$(detect_os)
     arch=$(detect_arch)
     artifact="marlin-${arch}-${os}"
+    release_base=$(resolve_release_base)
 
     mkdir -p "$INSTALL_DIR"
     if [ -d "$INSTALL_DIR/marlin" ]; then
@@ -30,8 +32,8 @@ main() {
     checksum_file="$work_dir/$artifact.sha256"
 
     printf 'Downloading %s...\n' "$artifact"
-    download "$RELEASE_BASE/$artifact" "$candidate"
-    download "$RELEASE_BASE/$artifact.sha256" "$checksum_file"
+    download "$release_base/$artifact" "$candidate"
+    download "$release_base/$artifact.sha256" "$checksum_file"
     verify_checksum "$candidate" "$checksum_file"
 
     chmod 755 "$candidate"
@@ -57,6 +59,24 @@ main() {
     fi
 
     printf '\nNext: export OPENROUTER_API_KEY=... && marlin run "hello fish"\n'
+}
+
+resolve_release_base() {
+    if [ -n "${MARLIN_RELEASE_BASE:-}" ]; then
+        printf '%s' "${MARLIN_RELEASE_BASE%/}"
+        return
+    fi
+
+    if [ -n "${MARLIN_VERSION:-}" ]; then
+        version=${MARLIN_VERSION#v}
+        case "$version" in
+            ''|*[!0-9A-Za-z._+-]*) err "invalid MARLIN_VERSION: $MARLIN_VERSION" ;;
+        esac
+        printf '%s/download/v%s' "$RELEASE_ROOT" "$version"
+        return
+    fi
+
+    printf '%s/latest/download' "$RELEASE_ROOT"
 }
 
 detect_os() {
@@ -87,7 +107,10 @@ verify_checksum() {
     file=$1
     checksum_path=$2
     expected=$(awk 'NR == 1 { print $1 }' "$checksum_path" | tr '[:upper:]' '[:lower:]')
-    [ -n "$expected" ] || err "release checksum is empty"
+    case "$expected" in
+        ''|*[!0-9a-f]*) err "release checksum is invalid" ;;
+    esac
+    [ "${#expected}" -eq 64 ] || err "release checksum is invalid"
 
     if command -v sha256sum >/dev/null 2>&1; then
         actual=$(sha256sum "$file" | awk '{ print $1 }')
