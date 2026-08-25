@@ -4158,8 +4158,7 @@ const ShortcutHelpRow = struct {
 const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Esc / i", .description = "return to insert mode" },
     .{ .key = "J / K", .description = "switch recent sessions" },
-    .{ .key = "a", .description = "archive session and move on" },
-    .{ .key = "A", .description = "archive all finished children" },
+    .{ .key = "a / A / I", .description = "insert after cursor / line end / line start" },
     .{ .key = "j / k", .description = "scroll one line" },
     .{ .key = "Ctrl+d / Ctrl+u", .description = "scroll one page" },
     .{ .key = "g / G", .description = "jump to top / bottom" },
@@ -5135,15 +5134,6 @@ fn applyEditCommand(ed: *Editor, command: EditCommand) void {
     }
 }
 
-const NormalSessionAction = enum { archive_current, archive_finished_children };
-
-fn normalSessionAction(key: vaxis.Key) ?NormalSessionAction {
-    if (key.matches('a', .{})) return .archive_current;
-    if (key.matches('A', .{ .shift = true }) or key.matches('A', .{}))
-        return .archive_finished_children;
-    return null;
-}
-
 fn handleKey(app: *App, key: vaxis.Key) !void {
     if (key.matches('t', .{ .ctrl = true })) {
         app.show_tool_transcript = !app.show_tool_transcript;
@@ -5301,11 +5291,17 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.shortcut_help = true;
             } else if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{})) {
                 app.mode = .insert;
-            } else if (normalSessionAction(key)) |action| {
-                switch (action) {
-                    .archive_current => app.archiveCurrentSession(),
-                    .archive_finished_children => app.archiveFinishedChildren(),
-                }
+            } else if (key.matches('a', .{})) {
+                // Vim append: archive moved to /archive — a destructive-ish
+                // action must not sit on the muscle-memory insert key.
+                app.editor.moveRight();
+                app.mode = .insert;
+            } else if (key.matches('A', .{ .shift = true }) or key.matches('A', .{})) {
+                app.editor.moveLineEnd();
+                app.mode = .insert;
+            } else if (key.matches('I', .{ .shift = true }) or key.matches('I', .{})) {
+                app.editor.moveLineStart();
+                app.mode = .insert;
             } else if (key.matches('q', .{})) {
                 app.should_quit = true;
             } else if (key.matches('J', .{ .shift = true }) or key.matches('J', .{})) {
@@ -5628,20 +5624,32 @@ test "question mark opens modal shortcut help in normal mode" {
     try std.testing.expectEqual(Mode.normal, app.mode);
 }
 
-test "normal mode archive shortcuts distinguish current from child sweep" {
-    try std.testing.expectEqual(
-        NormalSessionAction.archive_current,
-        normalSessionAction(.{ .codepoint = 'a' }).?,
-    );
-    try std.testing.expectEqual(
-        NormalSessionAction.archive_finished_children,
-        normalSessionAction(.{ .codepoint = 'A', .mods = .{ .shift = true } }).?,
-    );
-    try std.testing.expect(normalSessionAction(.{ .codepoint = 'a', .mods = .{ .ctrl = true } }) == null);
-    try std.testing.expect(normalSessionAction(.{ .codepoint = 'j' }) == null);
+test "a A I enter insert mode with vim cursor placement" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.editor.insertSlice("hello");
+    app.editor.moveLineStart();
+    app.mode = .normal;
+
+    try handleKey(&app, .{ .codepoint = 'A', .mods = .{ .shift = true } });
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expectEqual(app.editor.text.items.len, app.editor.cursor);
+
+    app.mode = .normal;
+    try handleKey(&app, .{ .codepoint = 'I', .mods = .{ .shift = true } });
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.editor.cursor);
+
+    app.mode = .normal;
+    try handleKey(&app, .{ .codepoint = 'a' });
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expectEqual(@as(usize, 1), app.editor.cursor);
 }
 
-test "normal archive keys dispatch through session safety checks" {
+test "archive has no single-key binding; a enters insert even mid-turn" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -5657,11 +5665,8 @@ test "normal archive keys dispatch through session safety checks" {
     defer app.deinit();
 
     try handleKey(&app, .{ .codepoint = 'a' });
-    try std.testing.expectEqualStrings("cannot archive a running session — interrupt it first", app.notice.items);
-
-    app.notice.clearRetainingCapacity();
-    try handleKey(&app, .{ .codepoint = 'A', .mods = .{ .shift = true } });
-    try std.testing.expectEqualStrings("no children to archive", app.notice.items);
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.notice.items.len);
 }
 
 test "selection is character precise on one or many lines" {
