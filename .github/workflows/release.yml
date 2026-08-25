@@ -41,15 +41,24 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           MARLIN_VERSION: ${{ github.ref_name }}
         run: |
-          mkdir dist
+          mkdir -p dist/package
           cp zig-out/bin/marlin "dist/$ARTIFACT"
           chmod 755 "dist/$ARTIFACT"
           test "$("dist/$ARTIFACT" version)" = "marlin ${MARLIN_VERSION#v}"
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "$ARTIFACT" > "$ARTIFACT.sha256")
-          else
-            (cd dist && shasum -a 256 "$ARTIFACT" > "$ARTIFACT.sha256")
-          fi
+
+          cp zig-out/bin/marlin LICENSE NOTICE THIRD_PARTY_NOTICES dist/package/
+          chmod 755 dist/package/marlin
+          tar -czf "dist/$ARTIFACT.tar.gz" -C dist/package \
+            marlin LICENSE NOTICE THIRD_PARTY_NOTICES
+          rm -r dist/package
+
+          for asset in "$ARTIFACT" "$ARTIFACT.tar.gz"; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              (cd dist && sha256sum "$asset" > "$asset.sha256")
+            else
+              (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+            fi
+          done
 
       - name: Upload release assets
         uses: actions/upload-artifact@v4
@@ -63,6 +72,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v5
         with:
           path: dist
@@ -78,4 +89,42 @@ jobs:
             gh release upload "$MARLIN_VERSION" dist/* --clobber
           else
             gh release create "$MARLIN_VERSION" dist/* --verify-tag --generate-notes --title "Marlin $MARLIN_VERSION"
+          fi
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v6
+        with:
+          repository: jespern/homebrew-tap
+          path: homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+
+      - name: Update Homebrew formula
+        env:
+          MARLIN_VERSION: ${{ github.ref_name }}
+        run: |
+          version=${MARLIN_VERSION#v}
+          darwin_arm_sha=$(awk '{ print $1 }' dist/marlin-aarch64-darwin.tar.gz.sha256)
+          darwin_intel_sha=$(awk '{ print $1 }' dist/marlin-x86_64-darwin.tar.gz.sha256)
+          linux_arm_sha=$(awk '{ print $1 }' dist/marlin-aarch64-linux.tar.gz.sha256)
+          linux_intel_sha=$(awk '{ print $1 }' dist/marlin-x86_64-linux.tar.gz.sha256)
+
+          for sha in "$darwin_arm_sha" "$darwin_intel_sha" "$linux_arm_sha" "$linux_intel_sha"; do
+            test "${#sha}" -eq 64
+          done
+
+          mkdir -p homebrew-tap/Formula
+          sed \
+            -e "s/@VERSION@/$version/g" \
+            -e "s/@DARWIN_ARM_SHA256@/$darwin_arm_sha/g" \
+            -e "s/@DARWIN_INTEL_SHA256@/$darwin_intel_sha/g" \
+            -e "s/@LINUX_ARM_SHA256@/$linux_arm_sha/g" \
+            -e "s/@LINUX_INTEL_SHA256@/$linux_intel_sha/g" \
+            scripts/homebrew/marlin.rb.in > homebrew-tap/Formula/marlin.rb
+
+          git -C homebrew-tap config user.name "github-actions[bot]"
+          git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C homebrew-tap add Formula/marlin.rb
+          if ! git -C homebrew-tap diff --cached --quiet; then
+            git -C homebrew-tap commit -m "marlin $version"
+            git -C homebrew-tap push
           fi

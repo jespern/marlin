@@ -1,0 +1,40 @@
+class Marlin < Formula
+  desc "Fast, simple AI agent harness with durable, multiplexed sessions"
+  homepage "https://marlin.wtf"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/jespern/marlin/releases/download/v#{version}/marlin-aarch64-darwin.tar.gz"
+      sha256 "@DARWIN_ARM_SHA256@"
+    end
+
+    on_intel do
+      url "https://github.com/jespern/marlin/releases/download/v#{version}/marlin-x86_64-darwin.tar.gz"
+      sha256 "@DARWIN_INTEL_SHA256@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/jespern/marlin/releases/download/v#{version}/marlin-aarch64-linux.tar.gz"
+      sha256 "@LINUX_ARM_SHA256@"
+    end
+
+    on_intel do
+      url "https://github.com/jespern/marlin/releases/download/v#{version}/marlin-x86_64-linux.tar.gz"
+      sha256 "@LINUX_INTEL_SHA256@"
+    end
+  end
+
+  def install
+    bin.install "marlin"
+    doc.install "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES"
+  end
+
+  test do
+    assert_equal "marlin #{version}", shell_output("#{bin}/marlin version").strip
+    assert_match "fast, simple AI agent harness", shell_output("#{bin}/marlin help")
+  end
+end

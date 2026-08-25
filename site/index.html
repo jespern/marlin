@@ -274,9 +274,9 @@
   </header>
 
   <div class="install">
-    <span class="label">⚡ install the latest tagged build (macOS + Linux):</span>
+    <span class="label">⚡ install with Homebrew (macOS + Linux):</span>
     <div class="cmdrow">
-      <code id="installcmd">curl -fsSL https://marlin.wtf/install.sh | sh</code>
+      <code id="installcmd">brew install jespern/tap/marlin</code>
       <button id="copybtn" type="button" title="copy to clipboard">copy</button>
     </div>
   </div>
@@ -327,7 +327,7 @@
 
   <div class="panel">
     <h2>&gt;&gt; take it for a swim</h2>
-    <pre class="term">$ curl -fsSL https://marlin.wtf/install.sh | sh
+    <pre class="term">$ brew install jespern/tap/marlin
 $ export OPENROUTER_API_KEY=...
 $ marlin run "why is my build broken"
 <span class="c"># ...the daemon keeps the structured session...</span>
@@ -335,9 +335,10 @@ $ marlin             <span class="c"># attach the TUI</span>
 $ marlin ls          <span class="c"># short stable handles, including children</span>
 $ marlin attach 63df <span class="c"># any unique prefix (minimum four)</span></pre>
     <p class="fineprint">
-      Tagged builds target macOS and Linux on aarch64 and x86_64. The installer
-      verifies a published SHA-256 checksum and writes to
-      <code class="inline">~/.local/bin</code> without sudo.
+      Tagged builds target macOS and Linux on aarch64 and x86_64. Prefer the
+      Homebrew formula, or use
+      <code class="inline">curl -fsSL https://marlin.wtf/install.sh | sh</code>
+      to install in <code class="inline">~/.local/bin</code> without sudo.
       Tracking main instead? Clone the
       <a href="https://github.com/jespern/marlin">repository</a> and run
       <code class="inline">zig build</code> with Zig 0.16.0.

@@ -6,6 +6,20 @@ One static binary. A daemon that owns your agent sessions and keeps them running
 thin clients that attach from anywhere. herdr's ergonomics, but the multiplexer
 sees structured events instead of scraping a character grid.
 
+## Install
+
+With [Homebrew](https://brew.sh/) on macOS or Linux:
+
+```sh
+brew install jespern/tap/marlin
+```
+
+Or install the latest release in `~/.local/bin` without sudo:
+
+```sh
+curl -fsSL https://marlin.wtf/install.sh | sh
+```
+
 ## The pitch
 
 Every agent harness today picks one of two shapes:
@@ -130,3 +144,10 @@ the binary. To reproduce that configuration locally:
 ```sh
 zig build -Doptimize=ReleaseSafe -Dembedded-sqlite=true
 ```
+
+## License
+
+Marlin is licensed under the [Apache License 2.0](LICENSE).
+Copyright 2026 Jesper Noehr <jesper@noehr.org>.
+
+Third-party attributions are listed in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
