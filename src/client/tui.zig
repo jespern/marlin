@@ -814,13 +814,19 @@ const App = struct {
     fn applyBlock(self: *App, b: block.Block) void {
         switch (b.body) {
             .user_msg => |u| {
-                if (reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id))
-                    self.layout_epoch +%= 1
-                else
-                    self.pushDurableBlock(b, .user_msg, u.text, "", .ok);
-                // Seed input history from the log (replay covers pre-reboot
-                // messages; live blocks cover this session's submits).
-                self.editor.pushHistory(u.text);
+                if (u.synthetic or isLegacyRehydration(u.text)) {
+                    const label = rehydrationLabel(self.gpa, u.text) catch return;
+                    defer self.gpa.free(label);
+                    self.pushDurableBlock(b, .system_note, label, "", .ok);
+                } else {
+                    if (reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id))
+                        self.layout_epoch +%= 1
+                    else
+                        self.pushDurableBlock(b, .user_msg, u.text, "", .ok);
+                    // Seed input history from the log (replay covers pre-reboot
+                    // messages; live blocks cover this session's submits).
+                    self.editor.pushHistory(u.text);
+                }
             },
             .steer => |s| {
                 if (reconcilePendingEcho(self.blocks.items, .steer, s.text, b.seq, b.turn_id))
@@ -850,8 +856,11 @@ const App = struct {
                 const txt = if (ap.decision) |d| @tagName(d) else "pending";
                 self.pushDurableBlock(b, .approval, txt, "", .ok);
             },
-            .system_note => |sn| self.pushDurableBlock(b, .system_note, sn.text, "", .ok),
-            .compaction => |cp| self.pushDurableBlock(b, .compaction, cp.summary, "", .ok),
+            .system_note => |sn| {
+                if (!isCompactionStatusNote(sn.text))
+                    self.pushDurableBlock(b, .system_note, sn.text, "", .ok);
+            },
+            .compaction => self.pushDurableBlock(b, .compaction, "context compacted", "", .ok),
         }
         // New content: keep pinned to bottom unless the user scrolled up.
         if (self.scroll_up > 0) self.scroll_up +|= 0; // stay where they are
@@ -1570,6 +1579,27 @@ fn utf8Floor(text: []const u8, max: usize) usize {
 fn clipText(arena: std.mem.Allocator, text: []const u8, max: usize) ![]const u8 {
     if (text.len <= max) return text;
     return std.fmt.allocPrint(arena, "{s} …", .{text[0..utf8Floor(text, max)]});
+}
+
+const legacy_rehydration_prefix = "[rehydrated after compaction]";
+
+fn isLegacyRehydration(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, legacy_rehydration_prefix);
+}
+
+fn rehydrationLabel(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (!isLegacyRehydration(text))
+        return allocator.dupe(u8, "rehydrated file context");
+    const rest = std.mem.trimStart(u8, text[legacy_rehydration_prefix.len..], " \t");
+    const first_line = if (std.mem.indexOfScalar(u8, rest, '\n')) |end| rest[0..end] else rest;
+    const path = std.mem.trim(u8, std.mem.trimEnd(u8, first_line, ":"), " \t");
+    if (path.len == 0) return allocator.dupe(u8, "rehydrated file context");
+    return std.fmt.allocPrint(allocator, "rehydrated {s}", .{path});
+}
+
+fn isCompactionStatusNote(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, "context compacted automatically") or
+        std.mem.startsWith(u8, text, "context compacted by /compact");
 }
 
 fn nowWallMs(io: Io) i64 {
@@ -2303,78 +2333,6 @@ fn isSalientToolErrorLine(line: []const u8) bool {
         std.ascii.indexOfIgnoreCase(trimmed, ": access denied") != null;
 }
 
-/// Return the consecutive successful tool pairs that are safe to summarize.
-/// Provider tool batches are persisted as all calls followed by all results;
-/// older transcripts may still alternate call/result. A failure — or a diff
-/// produced by a file-edit tool — keeps the batch expanded.
-fn collapsibleToolRun(blocks: []const RenderBlock, start: usize) CollapsedToolRun {
-    if (start >= blocks.len or blocks[start].kind != .tool_call)
-        return .{ .count = 0, .next = start };
-    const turn_id = blocks[start].turn_id;
-
-    // Never mistake a suffix of a calls-first batch for an alternating pair.
-    if (start > 0 and
-        blocks[start - 1].kind == .tool_call and
-        blocks[start - 1].turn_id == turn_id)
-    {
-        return .{ .count = 0, .next = start };
-    }
-
-    var calls_end = start;
-    while (calls_end < blocks.len and
-        blocks[calls_end].kind == .tool_call and
-        blocks[calls_end].turn_id == turn_id) : (calls_end += 1)
-    {}
-    const batch_count = calls_end - start;
-    if (batch_count > 1) {
-        var result_idx = calls_end;
-        while (result_idx < blocks.len and
-            blocks[result_idx].kind == .approval and
-            blocks[result_idx].turn_id == turn_id) : (result_idx += 1)
-        {}
-        var result_count: usize = 0;
-        while (result_count < batch_count and
-            result_idx < blocks.len and
-            blocks[result_idx].kind == .tool_result and
-            blocks[result_idx].turn_id == turn_id)
-        {
-            const result = blocks[result_idx];
-            const call = blocks[start + result_count];
-            if (result.status != .ok or
-                (isDiffOutput(result.text) and isFileEditTool(call.label)))
-            {
-                return .{ .count = 0, .next = start };
-            }
-            result_count += 1;
-            result_idx += 1;
-        }
-        if (result_count == batch_count) return .{ .count = batch_count, .next = result_idx };
-        return .{ .count = 0, .next = start };
-    }
-
-    // Compatibility with transcripts written before calls-first batching.
-    var i = start;
-    var count: usize = 0;
-    while (i < blocks.len and
-        blocks[i].kind == .tool_call and
-        blocks[i].turn_id == turn_id)
-    {
-        var result_idx = i + 1;
-        while (result_idx < blocks.len and
-            blocks[result_idx].kind == .approval and
-            blocks[result_idx].turn_id == turn_id) : (result_idx += 1)
-        {}
-        if (result_idx >= blocks.len or
-            blocks[result_idx].kind != .tool_result or
-            blocks[result_idx].turn_id != turn_id) break;
-        const result = blocks[result_idx];
-        if (result.status != .ok or (isDiffOutput(result.text) and isFileEditTool(blocks[i].label))) break;
-        count += 1;
-        i = result_idx + 1;
-    }
-    return .{ .count = count, .next = i };
-}
-
 /// A calls-first batch can be visible while its tools are still running.
 /// Return its extent only when it is the incomplete tail of the transcript.
 fn pendingToolBatch(blocks: []const RenderBlock, start: usize) ?CollapsedToolRun {
@@ -2415,6 +2373,149 @@ fn pendingToolBatch(blocks: []const RenderBlock, start: usize) ?CollapsedToolRun
 /// string: the frame arena for the live tail, the layout cache's arena for
 /// baked completed turns. `allow_fold` enables the running-command fold,
 /// which reads live session state and therefore applies only to the tail.
+/// The collapsed-transcript machinery renders call/result pairs from two
+/// places (the sequential walk and batch-failure expansion); one renderer
+/// each keeps them identical.
+fn appendToolCallLine(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, w: usize) !void {
+    // Keep the machinery subdued. Bash commands receive semantic shell
+    // roles; for file tools the emphasized value is a path.
+    const hi = extractHighlightArg(rb.label, rb.text);
+    const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{rb.label});
+    if (hi) |h| {
+        const hi_capped = h[0..@min(h.len, w -| (head.len + 2))];
+        const is_bash = std.mem.eql(u8, rb.label, "bash");
+        try lines.append(alloc, .{
+            .text = head,
+            .style = Palette.tool,
+            .text2 = hi_capped,
+            .style2 = if (is_bash) Palette.shell_command else Palette.tool_cmd,
+            .syntax = if (is_bash)
+                try shellCommandSpans(alloc, hi_capped, head.len)
+            else
+                &.{},
+        });
+    } else {
+        const preview_len = @min(rb.text.len, @min(w -| (rb.label.len + 4), 120));
+        try lines.append(alloc, .{
+            .text = head,
+            .style = Palette.tool,
+            .text2 = rb.text[0..preview_len],
+            .style2 = Palette.tool,
+        });
+    }
+}
+
+fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, tool_label: []const u8) !void {
+    // Collapsed: show at most 8 lines — but a diff the agent
+    // AUTHORED (edit/write tools) shows whole (up to 24) because
+    // a truncated diff misleads. Diffs merely read via bash keep
+    // diff coloring but the ordinary cap.
+    const is_diff = isDiffOutput(rb.text);
+    const max_shown: usize = if (is_diff and isFileEditTool(tool_label)) 24 else 8;
+    const language = if (is_diff) diffLanguage(rb.text) else SyntaxLanguage.generic;
+    var shown: usize = 0;
+    var total: usize = 0;
+    var it = std.mem.splitScalar(u8, rb.text, '\n');
+    while (it.next()) |l| {
+        total += 1;
+        if (shown < max_shown) {
+            if (rb.status == .ok and is_diff) {
+                try appendDiffLine(alloc, lines, "    ", l, language, Palette.tool_out);
+            } else if (rb.status != .ok) {
+                // One failure marker establishes the section;
+                // repeating it for every stack-frame line creates
+                // a solid red wall with no visual hierarchy.
+                const prefix: []const u8 = if (shown == 0) switch (rb.status) {
+                    .err => "    ✗ ",
+                    .denied => "    ⊘ ",
+                    .interrupted => "    ⏹ ",
+                    .ok => unreachable,
+                } else "      ";
+                const salient = isSalientToolErrorLine(l) or
+                    (rb.status == .denied and shown == 0);
+                try lines.append(alloc, .{
+                    .text = prefix,
+                    .style = if (shown == 0) Palette.tool_err else Palette.tool_out,
+                    .text2 = l,
+                    .style2 = if (salient) Palette.tool_err else Palette.tool_out,
+                });
+            } else {
+                const glyph = "    ";
+                const git_syntax = try gitLogSpans(alloc, l, glyph.len);
+                if (git_syntax.len > 0) {
+                    try lines.append(alloc, .{
+                        .text = glyph,
+                        .style = Palette.tool_out,
+                        .text2 = l,
+                        .style2 = Palette.git_subject,
+                        .syntax = git_syntax,
+                    });
+                } else {
+                    const prefixed = try std.fmt.allocPrint(alloc, "{s}{s}", .{ glyph, l });
+                    try lines.append(alloc, .{ .text = prefixed, .style = Palette.tool_out });
+                }
+            }
+            shown += 1;
+        }
+    }
+    if (total > shown) {
+        const more = try std.fmt.allocPrint(alloc, "    … {d} more lines", .{total - shown});
+        try lines.append(alloc, .{ .text = more, .style = Palette.tool_out });
+    }
+}
+
+/// One completed tool batch: N consecutive same-turn calls followed by
+/// their N results (approval/reasoning/note blocks may interleave). Results
+/// are persisted in call order, so pairing is positional.
+const ScannedBatch = struct {
+    next: usize,
+    complete: bool,
+    ok_count: usize,
+};
+
+const ExpandPair = struct { call: usize, result: usize };
+
+/// Scan the batch starting at `start`; pairs that must stay visible (failed
+/// results, or author-diffs from the edit/write tools whose truncation would
+/// mislead) are appended to `expand`.
+fn scanToolBatch(
+    alloc: std.mem.Allocator,
+    blocks: []const RenderBlock,
+    start: usize,
+    expand: *std.ArrayList(ExpandPair),
+) !ScannedBatch {
+    const turn_id = blocks[start].turn_id;
+    var calls_end = start;
+    while (calls_end < blocks.len and
+        blocks[calls_end].kind == .tool_call and
+        blocks[calls_end].turn_id == turn_id) : (calls_end += 1)
+    {}
+    const call_count = calls_end - start;
+
+    var matched: usize = 0;
+    var ok_count: usize = 0;
+    var i = calls_end;
+    while (i < blocks.len and matched < call_count) : (i += 1) {
+        switch (blocks[i].kind) {
+            .approval, .reasoning, .system_note => {},
+            .tool_result => {
+                const call_idx = start + matched;
+                const failed = blocks[i].status != .ok;
+                const author_diff = isDiffOutput(blocks[i].text) and
+                    isFileEditTool(blocks[call_idx].label);
+                if (failed or author_diff) {
+                    try expand.append(alloc, .{ .call = call_idx, .result = i });
+                } else {
+                    ok_count += 1;
+                }
+                matched += 1;
+            },
+            else => break,
+        }
+    }
+    return .{ .next = i, .complete = matched == call_count, .ok_count = ok_count };
+}
+
 fn layoutBlockRange(
     alloc: std.mem.Allocator,
     app: *App,
@@ -2430,41 +2531,69 @@ fn layoutBlockRange(
         const rb = app.blocks.items[block_idx];
         if (!app.show_tool_transcript and rb.kind == .tool_call) {
             const blocks_all = app.blocks.items;
-            const collapsed = collapsibleToolRun(blocks_all, block_idx);
-            const pending_batch = if (allow_fold and app.state == .running and collapsed.count == 0)
-                pendingToolBatch(blocks_all, block_idx)
-            else
-                null;
-            // A trailing call with no result yet is still executing: fold it
-            // into the summary line instead of flashing a ⚙ detail line that
-            // vanishes the moment a fast command completes (the flash reads
-            // as the page jolting). Approval-parked calls keep their detail
-            // line — the user must see what they are deciding on.
-            var in_flight = pending_batch != null;
-            var running_call_idx = block_idx;
-            if (!in_flight and allow_fold and app.state == .running and
-                collapsed.next < blocks_all.len and
-                blocks_all[collapsed.next].kind == .tool_call and
-                blocks_all[collapsed.next].turn_id == rb.turn_id)
+            // Fold completed batches into one summary, merging consecutive
+            // batches of this turn. Failed pairs (and author-diffs) stay
+            // visible INDIVIDUALLY — one failing sibling must not dump the
+            // whole group into the transcript.
+            var expand: std.ArrayList(ExpandPair) = .empty;
+            var folded: usize = 0;
+            var scan_idx = block_idx;
+            var scan_end = block_idx;
+            while (scan_idx < end and
+                blocks_all[scan_idx].kind == .tool_call and
+                blocks_all[scan_idx].turn_id == rb.turn_id)
             {
-                var j = collapsed.next + 1;
-                while (j < blocks_all.len and blocks_all[j].kind == .approval) : (j += 1) {}
-                in_flight = j == blocks_all.len;
-                running_call_idx = collapsed.next;
+                const batch = try scanToolBatch(alloc, blocks_all, scan_idx, &expand);
+                if (!batch.complete) break;
+                folded += batch.ok_count;
+                scan_end = batch.next;
+                scan_idx = batch.next;
+                if (expand.items.len > 0) break; // surface failures promptly
             }
-            if (collapsed.count > 0 or in_flight) {
-                const displayed_count = if (pending_batch) |batch| batch.count else collapsed.count;
-                const summary = if (!in_flight)
+
+            // A trailing call/batch with no results yet is still executing:
+            // fold it into the summary line instead of flashing detail lines
+            // that vanish when a fast command completes. Approval-parked
+            // calls keep their detail line — the user must see what they
+            // are deciding on.
+            var running_count: usize = 0;
+            var running_call_idx: usize = 0;
+            if (allow_fold and app.state == .running and expand.items.len == 0 and
+                scan_idx < blocks_all.len and
+                blocks_all[scan_idx].kind == .tool_call and
+                blocks_all[scan_idx].turn_id == rb.turn_id)
+            {
+                if (pendingToolBatch(blocks_all, scan_idx)) |batch| {
+                    running_count = batch.count;
+                    scan_end = blocks_all.len;
+                } else {
+                    var j = scan_idx + 1;
+                    while (j < blocks_all.len and blocks_all[j].kind == .approval) : (j += 1) {}
+                    if (j == blocks_all.len) {
+                        running_count = 1;
+                        running_call_idx = scan_idx;
+                        scan_end = blocks_all.len;
+                    }
+                }
+            }
+
+            if (folded > 0 or expand.items.len > 0 or running_count > 0) {
+                const summary = if (folded > 0)
                     try std.fmt.allocPrint(alloc, "Ran {d} {s}", .{
-                        displayed_count,
-                        if (displayed_count == 1) "command" else "commands",
+                        folded,
+                        if (folded == 1) "command" else "commands",
                     })
-                else if (displayed_count > 1)
-                    try std.fmt.allocPrint(alloc, "Running {d} commands", .{displayed_count})
+                else if (running_count > 1)
+                    try std.fmt.allocPrint(alloc, "Running {d} commands", .{running_count})
+                else if (running_count == 1)
+                    "Running"
                 else
-                    "Running";
+                    try std.fmt.allocPrint(alloc, "{d} {s} failed", .{
+                        expand.items.len,
+                        if (expand.items.len == 1) "command" else "commands",
+                    });
                 var hint: []const u8 = " · ctrl+t to view transcript";
-                if (in_flight and pending_batch == null) {
+                if (running_count == 1) {
                     const call = blocks_all[running_call_idx];
                     const hi = extractHighlightArg(call.label, call.text) orelse
                         call.text[0..@min(call.text.len, 40)];
@@ -2474,16 +2603,24 @@ fn layoutBlockRange(
                         capped,
                         if (capped.len < hi.len) "…" else "",
                     });
+                } else if (folded > 0 and running_count > 1) {
+                    hint = try std.fmt.allocPrint(alloc, " · running {d} more", .{running_count});
                 }
-                try lines.append(alloc, .{
-                    .text = "  • ",
-                    .style = Palette.note,
-                    .text2 = summary,
-                    .style2 = Palette.assistant,
-                    .text3 = hint,
-                    .style3 = Palette.collapse_hint,
-                });
-                block_idx = if (in_flight) blocks_all.len - 1 else collapsed.next - 1;
+                if (folded > 0 or running_count > 0) {
+                    try lines.append(alloc, .{
+                        .text = "  • ",
+                        .style = Palette.note,
+                        .text2 = summary,
+                        .style2 = Palette.assistant,
+                        .text3 = hint,
+                        .style3 = Palette.collapse_hint,
+                    });
+                }
+                for (expand.items) |pair| {
+                    try appendToolCallLine(alloc, lines, blocks_all[pair.call], w);
+                    try appendToolResultLines(alloc, lines, blocks_all[pair.result], blocks_all[pair.call].label);
+                }
+                block_idx = scan_end - 1;
                 continue;
             }
         }
@@ -2504,101 +2641,19 @@ fn layoutBlockRange(
             },
             .tool_call => {
                 last_tool_label.* = rb.label;
-                // Keep the machinery subdued. Bash commands receive semantic
-                // shell roles; for file tools the emphasized value is a path.
-                const hi = extractHighlightArg(rb.label, rb.text);
-                const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{rb.label});
-                if (hi) |h| {
-                    const hi_capped = h[0..@min(h.len, w -| (head.len + 2))];
-                    const is_bash = std.mem.eql(u8, rb.label, "bash");
-                    try lines.append(alloc, .{
-                        .text = head,
-                        .style = Palette.tool,
-                        .text2 = hi_capped,
-                        .style2 = if (is_bash) Palette.shell_command else Palette.tool_cmd,
-                        .syntax = if (is_bash)
-                            try shellCommandSpans(alloc, hi_capped, head.len)
-                        else
-                            &.{},
-                    });
-                } else {
-                    const preview_len = @min(rb.text.len, @min(w -| (rb.label.len + 4), 120));
-                    try lines.append(alloc, .{
-                        .text = head,
-                        .style = Palette.tool,
-                        .text2 = rb.text[0..preview_len],
-                        .style2 = Palette.tool,
-                    });
-                }
+                try appendToolCallLine(alloc, lines, rb, w);
             },
-            .tool_result => {
-                // Collapsed: show at most 8 lines — but a diff the agent
-                // AUTHORED (edit/write tools) shows whole (up to 24) because
-                // a truncated diff misleads. Diffs merely read via bash keep
-                // diff coloring but the ordinary cap.
-                const is_diff = isDiffOutput(rb.text);
-                const max_shown: usize = if (is_diff and isFileEditTool(last_tool_label.*)) 24 else 8;
-                const language = if (is_diff) diffLanguage(rb.text) else SyntaxLanguage.generic;
-                var shown: usize = 0;
-                var total: usize = 0;
-                var it = std.mem.splitScalar(u8, rb.text, '\n');
-                while (it.next()) |l| {
-                    total += 1;
-                    if (shown < max_shown) {
-                        if (rb.status == .ok and is_diff) {
-                            try appendDiffLine(alloc, lines, "    ", l, language, Palette.tool_out);
-                        } else if (rb.status != .ok) {
-                            // One failure marker establishes the section;
-                            // repeating it for every stack-frame line creates
-                            // a solid red wall with no visual hierarchy.
-                            const prefix: []const u8 = if (shown == 0) switch (rb.status) {
-                                .err => "    ✗ ",
-                                .denied => "    ⊘ ",
-                                .interrupted => "    ⏹ ",
-                                .ok => unreachable,
-                            } else "      ";
-                            const salient = isSalientToolErrorLine(l) or
-                                (rb.status == .denied and shown == 0);
-                            try lines.append(alloc, .{
-                                .text = prefix,
-                                .style = if (shown == 0) Palette.tool_err else Palette.tool_out,
-                                .text2 = l,
-                                .style2 = if (salient) Palette.tool_err else Palette.tool_out,
-                            });
-                        } else {
-                            const glyph = "    ";
-                            const git_syntax = try gitLogSpans(alloc, l, glyph.len);
-                            if (git_syntax.len > 0) {
-                                try lines.append(alloc, .{
-                                    .text = glyph,
-                                    .style = Palette.tool_out,
-                                    .text2 = l,
-                                    .style2 = Palette.git_subject,
-                                    .syntax = git_syntax,
-                                });
-                            } else {
-                                const prefixed = try std.fmt.allocPrint(alloc, "{s}{s}", .{ glyph, l });
-                                try lines.append(alloc, .{ .text = prefixed, .style = Palette.tool_out });
-                            }
-                        }
-                        shown += 1;
-                    }
-                }
-                if (total > shown) {
-                    const more = try std.fmt.allocPrint(alloc, "    … {d} more lines", .{total - shown});
-                    try lines.append(alloc, .{ .text = more, .style = Palette.tool_out });
-                }
-            },
+            .tool_result => try appendToolResultLines(alloc, lines, rb, last_tool_label.*),
             .approval => {
                 const txt = try std.fmt.allocPrint(alloc, "    [approval: {s}]", .{rb.text});
                 try wrapInto(alloc, lines, txt, .{ .text = txt, .style = Palette.note });
             },
             .steer => try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w),
             .system_note => {
-                const txt = try std.fmt.allocPrint(alloc, "[{s}]", .{rb.text});
+                const txt = try std.fmt.allocPrint(alloc, "[{s}]", .{try clipText(alloc, rb.text, 480)});
                 try wrapPrefixed(alloc, lines, "  ", txt, Palette.note, w);
             },
-            .compaction => try wrapPrefixed(alloc, lines, "  ≋ ", rb.text, Palette.note, w),
+            .compaction => try wrapPrefixed(alloc, lines, "  ≋ ", "context compacted", Palette.note, w),
         }
     }
 }
@@ -5592,10 +5647,19 @@ test "successful tools collapse but diffs and failures stop the run" {
         .{ .kind = .tool_result, .text = try arena.dupe(u8, "@@ fn main()\n-old\n+new"), .label = try arena.dupe(u8, "") },
     };
 
-    const collapsed = collapsibleToolRun(&blocks, 0);
-    try std.testing.expectEqual(@as(usize, 2), collapsed.count);
-    try std.testing.expectEqual(@as(usize, 4), collapsed.next);
-    try std.testing.expectEqual(@as(usize, 0), collapsibleToolRun(&blocks, 4).count);
+    var expand: std.ArrayList(ExpandPair) = .empty;
+    defer expand.deinit(arena);
+    const first = try scanToolBatch(arena, &blocks, 0, &expand);
+    try std.testing.expectEqual(@as(usize, 1), first.ok_count);
+    try std.testing.expectEqual(@as(usize, 2), first.next);
+    const second = try scanToolBatch(arena, &blocks, 2, &expand);
+    try std.testing.expectEqual(@as(usize, 1), second.ok_count);
+    try std.testing.expect(expand.items.len == 0);
+    // The edit diff must stay visible: zero foldable, one expanded pair.
+    const third = try scanToolBatch(arena, &blocks, 4, &expand);
+    try std.testing.expectEqual(@as(usize, 0), third.ok_count);
+    try std.testing.expectEqual(@as(usize, 1), expand.items.len);
+    try std.testing.expectEqual(@as(usize, 4), expand.items[0].call);
 }
 
 test "calls-first parallel tool batches collapse as one transcript run" {
@@ -5628,10 +5692,13 @@ test "calls-first parallel tool batches collapse as one transcript run" {
         });
     }
 
-    const collapsed = collapsibleToolRun(app.blocks.items, 0);
-    try std.testing.expectEqual(@as(usize, 3), collapsed.count);
-    try std.testing.expectEqual(@as(usize, 6), collapsed.next);
-    try std.testing.expectEqual(@as(usize, 0), collapsibleToolRun(app.blocks.items, 1).count);
+    var expand: std.ArrayList(ExpandPair) = .empty;
+    defer expand.deinit(gpa);
+    const batch = try scanToolBatch(gpa, app.blocks.items, 0, &expand);
+    try std.testing.expectEqual(@as(usize, 3), batch.ok_count);
+    try std.testing.expectEqual(@as(usize, 6), batch.next);
+    try std.testing.expect(batch.complete);
+    try std.testing.expect(expand.items.len == 0);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -5748,10 +5815,12 @@ test "diffs merely read via bash collapse like any other success" {
     };
 
     // The bash `git diff` output looks like a diff but the agent changed
-    // nothing — the whole run summarizes.
-    const collapsed = collapsibleToolRun(&blocks, 0);
-    try std.testing.expectEqual(@as(usize, 2), collapsed.count);
-    try std.testing.expectEqual(@as(usize, 4), collapsed.next);
+    // nothing — it folds like any other success.
+    var expand: std.ArrayList(ExpandPair) = .empty;
+    defer expand.deinit(arena);
+    const batch = try scanToolBatch(arena, &blocks, 0, &expand);
+    try std.testing.expectEqual(@as(usize, 1), batch.ok_count);
+    try std.testing.expect(expand.items.len == 0);
 }
 
 test "tool collapse never crosses a durable turn boundary" {
@@ -5765,9 +5834,11 @@ test "tool collapse never crosses a durable turn boundary" {
         .{ .kind = .tool_result, .turn_id = 12, .text = try arena.dupe(u8, "contents"), .label = try arena.dupe(u8, "") },
     };
 
-    const collapsed = collapsibleToolRun(&blocks, 0);
-    try std.testing.expectEqual(@as(usize, 1), collapsed.count);
-    try std.testing.expectEqual(@as(usize, 2), collapsed.next);
+    var expand: std.ArrayList(ExpandPair) = .empty;
+    defer expand.deinit(arena);
+    const batch = try scanToolBatch(arena, &blocks, 0, &expand);
+    try std.testing.expectEqual(@as(usize, 1), batch.ok_count);
+    try std.testing.expectEqual(@as(usize, 2), batch.next);
 }
 
 test "durable user block reconciles optimistic local echo" {
@@ -5785,6 +5856,121 @@ test "durable user block reconciles optimistic local echo" {
     try std.testing.expectEqual(@as(u64, 9), rendered[0].seq);
     try std.testing.expectEqual(@as(u64, 3), rendered[0].turn_id);
     try std.testing.expect(!reconcilePendingEcho(&rendered, .user_msg, "hello", 9, 3));
+}
+
+test "synthetic and legacy rehydration render as notes, not prompts or history" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.applyBlock(.{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 4,
+        .seq = 1,
+        .ts = 0,
+        .body = .{ .user_msg = .{
+            .text = "[rehydrated after compaction] docs/PLAN.md:\nprivate contents",
+            .synthetic = true,
+        } },
+    });
+    app.applyBlock(.{
+        .id = 2,
+        .session_id = 1,
+        .turn_id = 4,
+        .seq = 2,
+        .ts = 0,
+        // Pre-marker durable blocks are recognized by their legacy prefix.
+        .body = .{ .user_msg = .{ .text = "[rehydrated after compaction] src/main.zig:\nold contents" } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), app.blocks.items.len);
+    try std.testing.expectEqual(block.BlockKind.system_note, app.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("rehydrated docs/PLAN.md", app.blocks.items[0].text);
+    try std.testing.expectEqualStrings("rehydrated src/main.zig", app.blocks.items[1].text);
+    try std.testing.expectEqual(@as(usize, 0), app.editor.history.items.len);
+}
+
+test "compaction renders one marker without exposing its summary" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    app.applyBlock(.{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 4,
+        .seq = 1,
+        .ts = 0,
+        .body = .{ .compaction = .{
+            .summary = "## Accomplished\nA huge internal summary that must stay hidden",
+            .covers_from_seq = 1,
+            .covers_to_seq = 10,
+        } },
+    });
+    app.applyBlock(.{
+        .id = 2,
+        .session_id = 1,
+        .turn_id = 4,
+        .seq = 2,
+        .ts = 0,
+        .body = .{ .system_note = .{ .text = "context compacted automatically (headroom); summary + rehydrated files above replace the older conversation" } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = try layoutLines(arena_state.allocator(), &app, 100);
+    var markers: usize = 0;
+    for (lines.items) |line| {
+        const rendered = try lineText(arena_state.allocator(), line);
+        if (std.mem.indexOf(u8, rendered, "context compacted") != null) markers += 1;
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "Accomplished") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "huge internal summary") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), markers);
+}
+
+test "legacy provider error notes are display-bounded" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    const old_raw_error = "provider returned HTTP 400: " ++ ("x" ** 1600) ++ " NEVER_RENDER_THIS_TAIL";
+    app.pushBlock(.system_note, old_raw_error, "", .ok);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = try layoutLines(arena_state.allocator(), &app, 100);
+    var rendered_len: usize = 0;
+    for (lines.items) |line| {
+        const rendered = try lineText(arena_state.allocator(), line);
+        rendered_len += rendered.len;
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "NEVER_RENDER_THIS_TAIL") == null);
+    }
+    try std.testing.expect(rendered_len < 550);
 }
 
 test "session labels round-trip ids and preserve inactive view state" {
@@ -5947,4 +6133,53 @@ test "layout cache: incremental result equals fresh one-shot layout" {
     const cold = try Fixture.rendered(arena4.allocator(), &fresh);
 
     try std.testing.expectEqualStrings(cold, incremental);
+}
+
+test "a failing sibling expands alone; healthy batch members stay folded" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    // Calls-first batch of three; the second result fails.
+    const entries = [_]struct { block.BlockKind, []const u8, []const u8, block.ToolStatus }{
+        .{ .tool_call, "{\"command\":\"zig version\"}", "bash", .ok },
+        .{ .tool_call, "{\"command\":\"jq .lib_dir\"}", "bash", .ok },
+        .{ .tool_call, "{\"pattern\":\"curl_easy\"}", "grep", .ok },
+        .{ .tool_result, "0.16.0", "", .ok },
+        .{ .tool_result, "jq: parse error", "", .err },
+        .{ .tool_result, "141: curl_easy_setopt", "", .ok },
+    };
+    var seq: u64 = 1;
+    for (entries) |entry| {
+        try app.blocks.append(gpa, .{
+            .kind = entry[0],
+            .seq = seq,
+            .turn_id = 7,
+            .status = entry[3],
+            .text = try gpa.dupe(u8, entry[1]),
+            .label = try gpa.dupe(u8, entry[2]),
+        });
+        seq += 1;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const lines = try layoutLines(arena, &app, 120);
+
+    var gear_lines: usize = 0;
+    var saw_summary = false;
+    var saw_failure = false;
+    for (lines.items) |line| {
+        const text = try lineText(arena, line);
+        if (std.mem.indexOf(u8, text, "⚙") != null) gear_lines += 1;
+        if (std.mem.indexOf(u8, text, "Ran 2 commands") != null) saw_summary = true;
+        if (std.mem.indexOf(u8, text, "jq: parse error") != null) saw_failure = true;
+    }
+    // Exactly one expanded call (the failure); the two healthy pairs fold.
+    try std.testing.expectEqual(@as(usize, 1), gear_lines);
+    try std.testing.expect(saw_summary);
+    try std.testing.expect(saw_failure);
 }
