@@ -109,6 +109,13 @@ pub fn streamPost(
     return client.streamPost(gpa, req, ctx, on_chunk);
 }
 
+const Abort = enum { cancelled, timed_out };
+
+const StreamProgress = struct {
+    response_started: std.atomic.Value(bool) = .init(false),
+    last_activity_ms: std.atomic.Value(i64),
+};
+
 fn streamPostTimed(
     client: *std.http.Client,
     gpa: std.mem.Allocator,
@@ -117,15 +124,17 @@ fn streamPostTimed(
     comptime on_chunk: fn (@TypeOf(ctx), []const u8) void,
 ) Error!Response {
     const RunResult = Error!Response;
-    const WaitResult = error{Canceled}!void;
     const Select = Io.Select(union(enum) {
         request: RunResult,
-        watchdog: WaitResult,
+        watchdog: Abort,
     });
+    var progress = StreamProgress{
+        .last_activity_ms = .init(Io.Timestamp.now(client.io, .awake).toMilliseconds()),
+    };
     var results: [2]Select.Union = undefined;
     var select = Select.init(client.io, &results);
-    select.async(.request, streamPostImpl(@TypeOf(ctx), on_chunk), .{ client, gpa, stream_req, ctx });
-    select.async(.watchdog, waitForAbort, .{ client.io, stream_req.cancel, stream_req.idle_timeout_ms });
+    select.async(.request, streamPostImpl(@TypeOf(ctx), on_chunk), .{ client, gpa, stream_req, ctx, &progress });
+    select.async(.watchdog, waitForStreamAbort, .{ client.io, stream_req.cancel, &progress, stream_req.connect_timeout_ms, stream_req.idle_timeout_ms });
 
     const first = try select.await();
     return switch (first) {
@@ -133,10 +142,12 @@ fn streamPostTimed(
             select.cancelDiscard();
             break :blk result;
         },
-        .watchdog => |wait_result| blk: {
-            try wait_result;
+        .watchdog => |reason| blk: {
             select.cancelDiscard();
-            break :blk if (isCancelled(stream_req.cancel)) error.Cancelled else error.HttpTimeout;
+            break :blk switch (reason) {
+                .cancelled => error.Cancelled,
+                .timed_out => error.HttpTimeout,
+            };
         },
     };
 }
@@ -144,15 +155,16 @@ fn streamPostTimed(
 fn streamPostImpl(
     comptime Ctx: type,
     comptime on_chunk: fn (Ctx, []const u8) void,
-) fn (*std.http.Client, std.mem.Allocator, StreamRequest, Ctx) Error!Response {
+) fn (*std.http.Client, std.mem.Allocator, StreamRequest, Ctx, *StreamProgress) Error!Response {
     return struct {
         fn run(
             client: *std.http.Client,
             gpa: std.mem.Allocator,
             stream_req: StreamRequest,
             ctx: Ctx,
+            progress: *StreamProgress,
         ) Error!Response {
-            return streamPostRun(client, gpa, stream_req, ctx, on_chunk);
+            return streamPostRun(client, gpa, stream_req, ctx, progress, on_chunk);
         }
     }.run;
 }
@@ -162,6 +174,7 @@ fn streamPostRun(
     gpa: std.mem.Allocator,
     stream_req: StreamRequest,
     ctx: anytype,
+    progress: *StreamProgress,
     comptime on_chunk: fn (@TypeOf(ctx), []const u8) void,
 ) Error!Response {
     if (isCancelled(stream_req.cancel)) return error.Cancelled;
@@ -203,6 +216,8 @@ fn streamPostRun(
     try request.connection.?.flush();
 
     var response = try request.receiveHead(&.{});
+    progress.response_started.store(true, .release);
+    markActivity(client.io, progress);
     const status: i64 = @intFromEnum(response.head.status);
     const is_error = status >= 400;
 
@@ -221,6 +236,7 @@ fn streamPostRun(
             error.ReadFailed => return response.bodyErr() orelse error.HttpReadFailed,
         };
         if (n == 0) break;
+        markActivity(client.io, progress);
         if (is_error) {
             const room = 64 * 1024 - error_body.items.len;
             if (room > 0) try error_body.appendSlice(gpa, chunk[0..@min(n, room)]);
@@ -290,7 +306,40 @@ fn getImpl(
     cancel: ?*std.atomic.Value(bool),
     redirect_behavior: std.http.Client.Request.RedirectBehavior,
 ) Error!GetOneResult {
-    _ = timeout_ms;
+    const RunResult = Error!GetOneResult;
+    const Select = Io.Select(union(enum) {
+        request: RunResult,
+        watchdog: Abort,
+    });
+    var results: [2]Select.Union = undefined;
+    var select = Select.init(client.io, &results);
+    select.async(.request, getRun, .{ client, gpa, url, max_bytes, cancel, redirect_behavior });
+    select.async(.watchdog, waitForAbort, .{ client.io, cancel, timeout_ms });
+
+    const first = try select.await();
+    return switch (first) {
+        .request => |result| blk: {
+            select.cancelDiscard();
+            break :blk result;
+        },
+        .watchdog => |reason| blk: {
+            select.cancelDiscard();
+            break :blk switch (reason) {
+                .cancelled => error.Cancelled,
+                .timed_out => error.HttpTimeout,
+            };
+        },
+    };
+}
+
+fn getRun(
+    client: *std.http.Client,
+    gpa: std.mem.Allocator,
+    url: []const u8,
+    max_bytes: usize,
+    cancel: ?*std.atomic.Value(bool),
+    redirect_behavior: std.http.Client.Request.RedirectBehavior,
+) Error!GetOneResult {
     if (isCancelled(cancel)) return error.Cancelled;
 
     const uri = try std.Uri.parse(url);
@@ -341,17 +390,159 @@ fn getImpl(
     };
 }
 
-fn waitForAbort(io: Io, cancel: ?*std.atomic.Value(bool), timeout_ms: i64) error{Canceled}!void {
+fn waitForStreamAbort(
+    io: Io,
+    cancel: ?*std.atomic.Value(bool),
+    progress: *const StreamProgress,
+    connect_timeout_ms: i64,
+    idle_timeout_ms: i64,
+) Abort {
+    const started_ms = progress.last_activity_ms.load(.acquire);
+    while (!isCancelled(cancel)) {
+        const now_ms = Io.Timestamp.now(io, .awake).toMilliseconds();
+        const timeout_ms = if (progress.response_started.load(.acquire)) idle_timeout_ms else connect_timeout_ms;
+        const baseline_ms = if (progress.response_started.load(.acquire)) progress.last_activity_ms.load(.acquire) else started_ms;
+        if (now_ms - baseline_ms >= @max(timeout_ms, 1)) return .timed_out;
+        io.sleep(.fromMilliseconds(50), .awake) catch return .cancelled;
+    }
+    return .cancelled;
+}
+
+fn waitForAbort(io: Io, cancel: ?*std.atomic.Value(bool), timeout_ms: i64) Abort {
     const started = Io.Timestamp.now(io, .awake).nanoseconds;
     const timeout_ns = @as(i96, @max(timeout_ms, 1)) * std.time.ns_per_ms;
     while (!isCancelled(cancel)) {
-        if (Io.Timestamp.now(io, .awake).nanoseconds - started >= timeout_ns) return;
-        io.sleep(.fromMilliseconds(50), .awake) catch return error.Canceled;
+        if (Io.Timestamp.now(io, .awake).nanoseconds - started >= timeout_ns) return .timed_out;
+        io.sleep(.fromMilliseconds(50), .awake) catch return .cancelled;
     }
+    return .cancelled;
+}
+
+fn markActivity(io: Io, progress: *StreamProgress) void {
+    progress.last_activity_ms.store(Io.Timestamp.now(io, .awake).toMilliseconds(), .release);
 }
 
 fn isCancelled(cancel: ?*std.atomic.Value(bool)) bool {
     return if (cancel) |flag| flag.load(.acquire) else false;
+}
+
+fn testServer(io: Io) !Io.net.Server {
+    const address = Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    return address.listen(io, .{ .reuse_address = true });
+}
+
+fn testUrl(allocator: std.mem.Allocator, server: *const Io.net.Server) ![:0]u8 {
+    return std.fmt.allocPrintSentinel(allocator, "http://127.0.0.1:{d}/test", .{server.socket.address.getPort()}, 0);
+}
+
+fn serveDelayedResponse(io: Io, server: *Io.net.Server, delay_ms: i64, body: []const u8) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var read_buffer: [4096]u8 = undefined;
+    var reader = Io.net.Stream.Reader.init(stream, io, &read_buffer);
+    _ = reader.interface.takeDelimiterInclusive('\n') catch return;
+    io.sleep(.fromMilliseconds(delay_ms), .awake) catch return;
+    var write_buffer: [4096]u8 = undefined;
+    var writer = Io.net.Stream.Writer.init(stream, io, &write_buffer);
+    writer.interface.print(
+        "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    ) catch return;
+    writer.interface.flush() catch return;
+}
+
+fn discardChunk(_: void, _: []const u8) void {}
+
+fn requestCompletes(
+    io: Io,
+    server: *Io.net.Server,
+    cancel: *std.atomic.Value(bool),
+    timeout_ms: i64,
+) !void {
+    const gpa = std.testing.allocator;
+    const url = try testUrl(gpa, server);
+    defer gpa.free(url);
+    const RequestResult = Error!Response;
+    const Select = Io.Select(union(enum) { serve: void, request: RequestResult });
+    var results: [2]Select.Union = undefined;
+    var select = Select.init(io, &results);
+    defer select.cancelDiscard();
+    select.async(.serve, serveDelayedResponse, .{ io, server, 5_000, "ok" });
+    select.async(.request, streamPostTask(void, discardChunk), .{ gpa, io, StreamRequest{
+        .url = url,
+        .bearer = null,
+        .body_json = "{}",
+        .connect_timeout_ms = timeout_ms,
+        .idle_timeout_ms = timeout_ms,
+        .cancel = cancel,
+    }, {} });
+
+    while (true) switch (try select.await()) {
+        .request => |result| {
+            const response = try result;
+            if (response.error_body) |body| gpa.free(body);
+        },
+        .serve => break,
+    };
+}
+
+test "stream cancellation interrupts a blocked response" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testServer(io);
+    defer server.deinit(io);
+    const url = try testUrl(gpa, &server);
+    defer gpa.free(url);
+    var cancel: std.atomic.Value(bool) = .init(false);
+
+    const RequestResult = Error!Response;
+    const Select = Io.Select(union(enum) { serve: void, request: RequestResult });
+    var results: [2]Select.Union = undefined;
+    var select = Select.init(io, &results);
+    defer select.cancelDiscard();
+    select.async(.serve, serveDelayedResponse, .{ io, &server, 5_000, "ok" });
+    select.async(.request, streamPostTask(void, discardChunk), .{ gpa, io, StreamRequest{
+        .url = url,
+        .bearer = null,
+        .body_json = "{}",
+        .idle_timeout_ms = 10_000,
+        .cancel = &cancel,
+    }, {} });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    cancel.store(true, .release);
+
+    while (true) switch (try select.await()) {
+        .request => |result| try std.testing.expectError(error.Cancelled, result),
+        .serve => break,
+    };
+}
+
+test "stream connect timeout aborts before response headers" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testServer(io);
+    defer server.deinit(io);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    try std.testing.expectError(error.HttpTimeout, requestCompletes(io, &server, &cancel, 100));
+}
+
+fn streamPostTask(
+    comptime Ctx: type,
+    comptime on_chunk: fn (Ctx, []const u8) void,
+) fn (std.mem.Allocator, Io, StreamRequest, Ctx) Error!Response {
+    return struct {
+        fn run(gpa: std.mem.Allocator, io: Io, request: StreamRequest, ctx: Ctx) Error!Response {
+            return @This().call(gpa, io, request, ctx);
+        }
+
+        fn call(gpa: std.mem.Allocator, io: Io, request: StreamRequest, ctx: Ctx) Error!Response {
+            return @import("http.zig").streamPost(gpa, io, request, ctx, on_chunk);
+        }
+    }.run;
 }
 
 test "std HTTP pool returns clients sharing one connection pool" {
