@@ -537,7 +537,7 @@ pub fn appendToolCallLine(
     const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{toolDisplayName(rb.label)});
     if (hi) |h| {
         const hi_capped = h[0..@min(h.len, w -| (head.len + 2))];
-        const is_bash = std.mem.eql(u8, rb.label, "bash");
+        const is_bash = std.ascii.eqlIgnoreCase(rb.label, "bash");
         try lines.append(alloc, .{
             .text = head,
             .style = Palette.tool,
@@ -548,16 +548,8 @@ pub fn appendToolCallLine(
             else
                 &.{},
         });
-    } else if (isReadTool(rb.label)) {
-        try lines.append(alloc, .{ .text = head, .style = Palette.tool });
     } else {
-        const preview_len = @min(rb.text.len, @min(w -| (rb.label.len + 4), 120));
-        try lines.append(alloc, .{
-            .text = head,
-            .style = Palette.tool,
-            .text2 = rb.text[0..preview_len],
-            .style2 = Palette.tool,
-        });
+        try lines.append(alloc, .{ .text = head, .style = Palette.tool });
     }
 }
 
@@ -851,8 +843,7 @@ pub fn layoutBlockRange(
                 var hint: []const u8 = " · ctrl+t to view transcript";
                 if (running_count == 1) {
                     const call = blocks_all[running_call_idx];
-                    const hi = toolDisplayArg(call.label, call.text, transcript.cwd) orelse
-                        if (isReadTool(call.label)) "" else call.text[0..@min(call.text.len, 40)];
+                    const hi = toolDisplayArg(call.label, call.text, transcript.cwd) orelse "";
                     const capped = hi[0..@min(hi.len, 60)];
                     hint = try std.fmt.allocPrint(alloc, " · {s} {s}{s}", .{
                         toolDisplayName(call.label),
@@ -1091,7 +1082,12 @@ pub fn layoutLines(
     // Approval card.
     if (transcript.approval) |approval| {
         try blankLine(arena, &lines);
-        const card = try std.fmt.allocPrint(arena, "⚠ approve {s} {s} ?  [y]es / [n]o", .{ approval.tool, approval.args });
+        const arg = toolDisplayArg(approval.tool, approval.args, transcript.cwd) orelse "";
+        const card = try std.fmt.allocPrint(arena, "⚠ approve {s}{s}{s} ?  [y]es / [n]o", .{
+            toolDisplayName(approval.tool),
+            if (arg.len > 0) " " else "",
+            arg,
+        });
         try wrapPrefixed(arena, &lines, "", card, Palette.approval_card, w);
     }
     try resolveLineLinks(arena, lines.items);
@@ -1099,18 +1095,26 @@ pub fn layoutLines(
 }
 
 pub fn extractHighlightArg(tool_name: []const u8, args_json: []const u8) ?[]const u8 {
-    const key: []const u8 = if (std.ascii.eqlIgnoreCase(tool_name, "bash"))
-        "command"
-    else if (std.ascii.eqlIgnoreCase(tool_name, "grep") or std.ascii.eqlIgnoreCase(tool_name, "glob"))
-        "pattern"
-    else if (std.ascii.eqlIgnoreCase(tool_name, "fetch"))
-        "url"
-    else if (isFileTool(tool_name))
-        "path"
-    else
-        return null;
-    return extractJsonStringRaw(args_json, key) orelse
-        if (isFileTool(tool_name)) extractJsonStringRaw(args_json, "file_path") else null;
+    if (isFileTool(tool_name))
+        return extractJsonStringRaw(args_json, "path") orelse
+            extractJsonStringRaw(args_json, "file_path");
+    if (std.ascii.eqlIgnoreCase(tool_name, "bash"))
+        return extractJsonStringRaw(args_json, "command");
+    if (std.ascii.eqlIgnoreCase(tool_name, "grep") or std.ascii.eqlIgnoreCase(tool_name, "glob"))
+        return extractJsonStringRaw(args_json, "pattern");
+    if (std.ascii.eqlIgnoreCase(tool_name, "fetch") or std.ascii.eqlIgnoreCase(tool_name, "webfetch"))
+        return extractJsonStringRaw(args_json, "url");
+    if (std.ascii.eqlIgnoreCase(tool_name, "websearch"))
+        return extractJsonStringRaw(args_json, "query");
+    if (std.ascii.eqlIgnoreCase(tool_name, "task"))
+        return extractJsonStringRaw(args_json, "description") orelse
+            extractJsonStringRaw(args_json, "prompt");
+    if (std.mem.eql(u8, tool_name, "plan_update"))
+        return extractJsonStringRaw(args_json, "explanation");
+    for ([_][]const u8{ "path", "file_path", "command", "pattern", "url", "query", "description", "prompt" }) |key| {
+        if (extractJsonStringRaw(args_json, key)) |value| return value;
+    }
+    return null;
 }
 
 fn isReadTool(tool_name: []const u8) bool {
@@ -1126,7 +1130,18 @@ fn isFileTool(tool_name: []const u8) bool {
 }
 
 pub fn toolDisplayName(tool_name: []const u8) []const u8 {
-    return if (isReadTool(tool_name)) "Read" else tool_name;
+    if (isReadTool(tool_name)) return "Read";
+    if (std.ascii.eqlIgnoreCase(tool_name, "write") or std.mem.eql(u8, tool_name, "write_file")) return "Write";
+    if (std.ascii.eqlIgnoreCase(tool_name, "edit")) return "Edit";
+    if (std.ascii.eqlIgnoreCase(tool_name, "bash")) return "Bash";
+    if (std.ascii.eqlIgnoreCase(tool_name, "grep")) return "Grep";
+    if (std.ascii.eqlIgnoreCase(tool_name, "glob")) return "Glob";
+    if (std.ascii.eqlIgnoreCase(tool_name, "fetch") or std.ascii.eqlIgnoreCase(tool_name, "webfetch")) return "Fetch";
+    if (std.ascii.eqlIgnoreCase(tool_name, "websearch")) return "Search";
+    if (std.ascii.eqlIgnoreCase(tool_name, "task")) return "Task";
+    if (std.mem.eql(u8, tool_name, "task_batch")) return "Tasks";
+    if (std.mem.eql(u8, tool_name, "plan_update")) return "Plan";
+    return tool_name;
 }
 
 /// Reduce file-tool targets to session-relative paths. Absolute targets
@@ -1134,7 +1149,11 @@ pub fn toolDisplayName(tool_name: []const u8) []const u8 {
 /// transcript with a machine-specific prefix.
 pub fn toolDisplayArg(tool_name: []const u8, args_json: []const u8, cwd: []const u8) ?[]const u8 {
     const arg = extractHighlightArg(tool_name, args_json) orelse return null;
-    if (!isFileTool(tool_name) or !std.fs.path.isAbsolute(arg)) return arg;
+    const generic_path = extractJsonStringRaw(args_json, "path") orelse
+        extractJsonStringRaw(args_json, "file_path");
+    const is_path = isFileTool(tool_name) or
+        (generic_path != null and generic_path.?.ptr == arg.ptr and generic_path.?.len == arg.len);
+    if (!is_path or !std.fs.path.isAbsolute(arg)) return arg;
 
     const root = if (std.mem.eql(u8, cwd, "/")) cwd else std.mem.trimEnd(u8, cwd, "/");
     if (root.len > 0 and std.mem.startsWith(u8, arg, root)) {
@@ -1167,14 +1186,26 @@ pub fn extractJsonStringRaw(json: []const u8, key: []const u8) ?[]const u8 {
     return json[at..end];
 }
 
-test "Claude Code Read calls render a relative path instead of raw JSON" {
+test "tool calls render semantic arguments instead of raw JSON" {
     const cwd = "/Users/example/Work/marlin";
     const args =
         \\{"file_path":"/Users/example/Work/marlin/src/client/layout.zig","offset":20}
     ;
     try std.testing.expectEqualStrings("Read", toolDisplayName("Read"));
     try std.testing.expectEqualStrings("Read", toolDisplayName("read_file"));
+    try std.testing.expectEqualStrings("Edit", toolDisplayName("edit"));
+    try std.testing.expectEqualStrings("Write", toolDisplayName("write_file"));
+    try std.testing.expectEqualStrings("Bash", toolDisplayName("bash"));
     try std.testing.expectEqualStrings("src/client/layout.zig", toolDisplayArg("Read", args, cwd).?);
+    try std.testing.expectEqualStrings("src/client/layout.zig", toolDisplayArg("Edit",
+        \\{"file_path":"/Users/example/Work/marlin/src/client/layout.zig","old_string":"x","new_string":"y"}
+    , cwd).?);
+    try std.testing.expectEqualStrings("zig build test", toolDisplayArg("Bash",
+        \\{"command":"zig build test","description":"verify"}
+    , cwd).?);
+    try std.testing.expectEqualStrings("src/main.zig", toolDisplayArg("mcp_read_source",
+        \\{"path":"/Users/example/Work/marlin/src/main.zig"}
+    , cwd).?);
     try std.testing.expectEqualStrings("secrets.txt", toolDisplayArg("Read",
         \\{"file_path":"/outside/private/secrets.txt"}
     , cwd).?);
@@ -1199,6 +1230,15 @@ test "Claude Code Read calls render a relative path instead of raw JSON" {
         .text = try arena.dupe(u8, "{malformed}"),
         .label = try arena.dupe(u8, "Read"),
     }, cwd, 100);
+    try std.testing.expectEqualStrings("", lines.items[0].text2);
+
+    lines.clearRetainingCapacity();
+    try appendToolCallLine(arena, &lines, .{
+        .kind = .tool_call,
+        .text = try arena.dupe(u8, "{\"anything\":\"still private\"}"),
+        .label = try arena.dupe(u8, "custom_tool"),
+    }, cwd, 100);
+    try std.testing.expectEqualStrings("  ⚙ custom_tool ", lines.items[0].text);
     try std.testing.expectEqualStrings("", lines.items[0].text2);
 }
 

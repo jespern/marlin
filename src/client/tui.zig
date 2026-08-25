@@ -6180,7 +6180,7 @@ test "layout remains bounded around a dangling call between turns" {
     for (lines.items) |line| {
         const text = try lineText(arena, line);
         if (std.mem.indexOf(u8, text, "Ran 3 commands") != null) saw_summary = true;
-        if (std.mem.indexOf(u8, text, "⚙ edit") != null) saw_dangling = true;
+        if (std.mem.indexOf(u8, text, "⚙ Edit") != null) saw_dangling = true;
     }
     try std.testing.expect(saw_summary);
     try std.testing.expect(saw_dangling);
