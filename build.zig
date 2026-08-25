@@ -16,9 +16,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // The installed binary is the daily driver: default it to ReleaseFast so
     // a plain `zig build` can never silently replace it with a Debug build
-    // (5-10x slower TUI/JSON/sqlite). Unit tests keep their own Debug module
-    // below for full safety checks and fast compile iteration.
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    // (5-10x slower TUI/JSON/sqlite). Deliberately NOT standardOptimizeOption
+    // with preferred_optimize_mode: that replaces -Doptimize with -Drelease
+    // and still defaults to Debug, which broke `marlin reboot --build`'s
+    // explicit -Doptimize=ReleaseFast. Unit tests keep their own Debug
+    // module below for safety checks and fast compile iteration.
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
     const version = b.option([]const u8, "version", "Marlin version embedded in the binary") orelse "0.0.0-dev";
 
     // ---- marlin ----
