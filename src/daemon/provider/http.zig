@@ -113,7 +113,7 @@ const Abort = enum { cancelled, timed_out };
 
 const StreamProgress = struct {
     response_started: std.atomic.Value(bool) = .init(false),
-    last_activity_ms: std.atomic.Value(i64),
+    activity_generation: std.atomic.Value(u64) = .init(0),
 };
 
 fn streamPostTimed(
@@ -128,9 +128,7 @@ fn streamPostTimed(
         request: RunResult,
         watchdog: Abort,
     });
-    var progress = StreamProgress{
-        .last_activity_ms = .init(Io.Timestamp.now(client.io, .awake).toMilliseconds()),
-    };
+    var progress = StreamProgress{};
     var results: [2]Select.Union = undefined;
     var select = Select.init(client.io, &results);
     select.async(.request, streamPostImpl(@TypeOf(ctx), on_chunk), .{ client, gpa, stream_req, ctx, &progress });
@@ -221,7 +219,7 @@ fn streamPostRun(
 
     var response = try request.receiveHead(&.{});
     progress.response_started.store(true, .release);
-    markActivity(client.io, progress);
+    markActivity(progress);
     const status: i64 = @intFromEnum(response.head.status);
     const is_error = status >= 400;
 
@@ -243,7 +241,7 @@ fn streamPostRun(
             error.ReadFailed => return response.bodyErr() orelse error.HttpReadFailed,
         };
         const bytes = reader.buffered();
-        markActivity(client.io, progress);
+        markActivity(progress);
         if (is_error) {
             const room = 64 * 1024 - error_body.items.len;
             if (room > 0) try error_body.appendSlice(gpa, bytes[0..@min(bytes.len, room)]);
@@ -405,29 +403,41 @@ fn waitForStreamAbort(
     connect_timeout_ms: i64,
     idle_timeout_ms: i64,
 ) Abort {
-    const started_ms = progress.last_activity_ms.load(.acquire);
+    var response_started = progress.response_started.load(.acquire);
+    var activity_generation = progress.activity_generation.load(.acquire);
+    var elapsed_ms: i64 = 0;
     while (!isCancelled(cancel)) {
-        const now_ms = Io.Timestamp.now(io, .awake).toMilliseconds();
-        const timeout_ms = if (progress.response_started.load(.acquire)) idle_timeout_ms else connect_timeout_ms;
-        const baseline_ms = if (progress.response_started.load(.acquire)) progress.last_activity_ms.load(.acquire) else started_ms;
-        if (now_ms - baseline_ms >= @max(timeout_ms, 1)) return .timed_out;
-        io.sleep(.fromMilliseconds(50), .awake) catch return .cancelled;
+        const current_response_started = progress.response_started.load(.acquire);
+        const current_generation = progress.activity_generation.load(.acquire);
+        if (current_response_started != response_started or current_generation != activity_generation) {
+            response_started = current_response_started;
+            activity_generation = current_generation;
+            elapsed_ms = 0;
+        }
+
+        const timeout_ms = @max(if (response_started) idle_timeout_ms else connect_timeout_ms, 1);
+        if (elapsed_ms >= timeout_ms) return .timed_out;
+        const sleep_ms = @min(timeout_ms - elapsed_ms, 50);
+        io.sleep(.fromMilliseconds(sleep_ms), .awake) catch return .cancelled;
+        elapsed_ms += sleep_ms;
     }
     return .cancelled;
 }
 
 fn waitForAbort(io: Io, cancel: ?*std.atomic.Value(bool), timeout_ms: i64) Abort {
-    const started = Io.Timestamp.now(io, .awake).nanoseconds;
-    const timeout_ns = @as(i96, @max(timeout_ms, 1)) * std.time.ns_per_ms;
+    const bounded_timeout_ms = @max(timeout_ms, 1);
+    var elapsed_ms: i64 = 0;
     while (!isCancelled(cancel)) {
-        if (Io.Timestamp.now(io, .awake).nanoseconds - started >= timeout_ns) return .timed_out;
-        io.sleep(.fromMilliseconds(50), .awake) catch return .cancelled;
+        if (elapsed_ms >= bounded_timeout_ms) return .timed_out;
+        const sleep_ms = @min(bounded_timeout_ms - elapsed_ms, 50);
+        io.sleep(.fromMilliseconds(sleep_ms), .awake) catch return .cancelled;
+        elapsed_ms += sleep_ms;
     }
     return .cancelled;
 }
 
-fn markActivity(io: Io, progress: *StreamProgress) void {
-    progress.last_activity_ms.store(Io.Timestamp.now(io, .awake).toMilliseconds(), .release);
+fn markActivity(progress: *StreamProgress) void {
+    _ = progress.activity_generation.fetchAdd(1, .release);
 }
 
 fn isCancelled(cancel: ?*std.atomic.Value(bool)) bool {
