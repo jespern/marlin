@@ -16,7 +16,8 @@ remain optional future slices.
 Post-M4 dogfood added a permanent one-row tab strip. Every unarchived root is
 a tab, child activity rolls up to its root, overflow retains the focused tab,
 and left-click switches through the same state-preserving path as `gt`/`gT`.
-The strip stays visible for a single session so the layout never jumps.
+Normal-mode `>`/`<` and Right/Left move directly through the chronological tab
+order. The strip stays visible for a single session so the layout never jumps.
 
 Workspace snapshots, drift, undo, leases, and worktree isolation are deferred
 as one coherent Later track. Their design remains below and in `WORKSPACE.md`;

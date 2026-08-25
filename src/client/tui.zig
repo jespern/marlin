@@ -15,7 +15,7 @@
 //!            readline/macOS movement and deletion chords are supported;
 //!            Esc → normal (draft survives); Ctrl+C interrupts active work
 //!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom;
-//!            a archive current + advance; A archive finished children; q quit
+//!            </> or Left/Right switch tabs; q quit
 //!   global:  Ctrl+L clears/redraws and returns to bottom; Ctrl+T toggles
 //!            the expanded tool transcript
 //!   approval pending: y approve, n deny (both modes, input empty)
@@ -730,6 +730,16 @@ const App = struct {
         }
         const sid = self.recent_sessions.items[self.recent_cursor];
         self.switchSession(sid, false) catch self.setNotice("could not switch session", .{});
+    }
+
+    /// Move in the same chronological root-session order shown by the tab
+    /// strip. This is deliberately separate from gt/gT, whose useful Vim-like
+    /// contract is MRU navigation across every session (including children).
+    fn cycleTab(self: *App, direction: i8) void {
+        const active_root = self.rootSessionId(self.sid);
+        const sid = nextRootTabSid(self.sessions.items, active_root, direction) orelse return;
+        if (sid == self.sid) return;
+        self.switchSession(sid, true) catch self.setNotice("could not switch tab", .{});
     }
 
     /// Ngt: jump to the Nth most-recent session (1 = current top of the
@@ -3929,6 +3939,39 @@ const TabCandidate = struct {
     }
 };
 
+fn rootTabPrecedes(a: *const SessionSummary, b: *const SessionSummary) bool {
+    return a.created_at < b.created_at or (a.created_at == b.created_at and a.sid < b.sid);
+}
+
+/// Return the adjacent root in the tab strip's chronological order, wrapping
+/// at either edge. Child sessions never become standalone keyboard targets.
+fn nextRootTabSid(sessions: []const SessionSummary, active_sid: u64, direction: i8) ?u64 {
+    var first: ?*const SessionSummary = null;
+    var last: ?*const SessionSummary = null;
+    var active: ?*const SessionSummary = null;
+
+    for (sessions) |*session| {
+        if (session.parent_sid != null or session.kind != .root) continue;
+        if (first == null or rootTabPrecedes(session, first.?)) first = session;
+        if (last == null or rootTabPrecedes(last.?, session)) last = session;
+        if (session.sid == active_sid) active = session;
+    }
+    const current = active orelse return if (direction < 0) (last orelse return null).sid else (first orelse return null).sid;
+
+    var adjacent: ?*const SessionSummary = null;
+    for (sessions) |*session| {
+        if (session.parent_sid != null or session.kind != .root or session.sid == current.sid) continue;
+        if (direction < 0) {
+            if (rootTabPrecedes(session, current) and
+                (adjacent == null or rootTabPrecedes(adjacent.?, session))) adjacent = session;
+        } else {
+            if (rootTabPrecedes(current, session) and
+                (adjacent == null or rootTabPrecedes(session, adjacent.?))) adjacent = session;
+        }
+    }
+    return if (adjacent) |session| session.sid else if (direction < 0) last.?.sid else first.?.sid;
+}
+
 fn tabLabel(
     arena: std.mem.Allocator,
     app: *const App,
@@ -4831,6 +4874,7 @@ const ShortcutHelpRow = struct {
 
 const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Esc / i", .description = "return to insert mode" },
+    .{ .key = "</> or ←/→", .description = "previous / next tab" },
     .{ .key = "gt / gT", .description = "switch sessions · Ngt = Nth recent" },
     .{ .key = "J", .description = "join lines" },
     .{ .key = "a / A / I", .description = "insert after cursor / line end / line start" },
@@ -5917,6 +5961,12 @@ fn applyEditCommand(ed: *Editor, command: EditCommand) void {
     }
 }
 
+fn tabNavigationDirection(key: vaxis.Key) ?i8 {
+    if (key.matches('>', .{}) or key.matches(vaxis.Key.right, .{})) return 1;
+    if (key.matches('<', .{}) or key.matches(vaxis.Key.left, .{})) return -1;
+    return null;
+}
+
 fn handleKey(app: *App, key: vaxis.Key) !void {
     if (key.matches('t', .{ .ctrl = true })) {
         app.show_tool_transcript = !app.show_tool_transcript;
@@ -6114,7 +6164,10 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.pending_count = app.pending_count * 10 + @as(usize, @intCast(key.codepoint - '0'));
                 return;
             }
-            if (key.matches('?', .{})) {
+            if (tabNavigationDirection(key)) |direction| {
+                var steps = app.takeCount();
+                while (steps > 0) : (steps -= 1) app.cycleTab(direction);
+            } else if (key.matches('?', .{})) {
                 app.shortcut_help = true;
             } else if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{})) {
                 app.editor.pushUndo();
@@ -6157,10 +6210,10 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.pending_g = true;
             } else if (key.matches('v', .{}) or key.matches('V', .{ .shift = true }) or key.matches('V', .{})) {
                 app.enterCopyMode();
-            } else if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
+            } else if (key.matches('h', .{})) {
                 var n = app.takeCount();
                 while (n > 0) : (n -= 1) app.editor.moveLeft();
-            } else if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
+            } else if (key.matches('l', .{})) {
                 var n = app.takeCount();
                 while (n > 0) : (n -= 1) app.editor.moveRight();
             } else if (key.matches('w', .{})) {
@@ -6477,6 +6530,22 @@ test "standard editor key bindings map to commands" {
     try std.testing.expect(isPreviousInputRowKey(.{ .codepoint = 'p', .mods = .{ .ctrl = true } }));
     try std.testing.expect(isNextInputRowKey(.{ .codepoint = vaxis.Key.down }));
     try std.testing.expect(isNextInputRowKey(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
+}
+
+test "normal-mode tab shortcuts recognize angle brackets and arrows" {
+    try std.testing.expectEqual(@as(?i8, 1), tabNavigationDirection(.{ .codepoint = '>' }));
+    try std.testing.expectEqual(@as(?i8, -1), tabNavigationDirection(.{ .codepoint = '<' }));
+    try std.testing.expectEqual(@as(?i8, 1), tabNavigationDirection(.{ .codepoint = vaxis.Key.right }));
+    try std.testing.expectEqual(@as(?i8, -1), tabNavigationDirection(.{ .codepoint = vaxis.Key.left }));
+    // Kitty reports the physical key plus shifted codepoint in its enhanced
+    // keyboard mode; Key.matches must recognize that real terminal shape too.
+    try std.testing.expectEqual(@as(?i8, 1), tabNavigationDirection(.{
+        .codepoint = '.',
+        .shifted_codepoint = '>',
+        .text = ">",
+        .mods = .{ .shift = true },
+    }));
+    try std.testing.expectEqual(@as(?i8, null), tabNavigationDirection(.{ .codepoint = 'h' }));
 }
 
 test "Ctrl+L clears transient view state without touching the draft" {
@@ -7451,6 +7520,43 @@ test "tab bar is permanent, root-only, chronological, and rolls up child activit
     try std.testing.expectEqual(@as(usize, 1), fallback.items.len);
     try std.testing.expect(fallback.items[0].active);
     try std.testing.expectEqual(@as(u64, 99), fallback.items[0].sid);
+}
+
+test "normal-mode tab navigation follows chronological roots and wraps" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 30, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 20, .title = "second", .model = "m", .status = "idle", .created_at = 20, .running = false },
+        .{ .sid = 30, .parent_sid = 20, .kind = .task_child, .title = "child", .model = "m", .status = "idle", .created_at = 21, .running = false },
+        .{ .sid = 40, .title = "third", .model = "m", .status = "idle", .created_at = 20, .running = false },
+        .{ .sid = 10, .title = "first", .model = "m", .status = "idle", .created_at = 10, .running = false },
+    });
+
+    // Focused children navigate relative to their highlighted root. Equal
+    // timestamps use sid as the same deterministic tie-break as the renderer.
+    try std.testing.expectEqual(@as(?u64, 40), nextRootTabSid(app.sessions.items, app.rootSessionId(30), 1));
+    try std.testing.expectEqual(@as(?u64, 10), nextRootTabSid(app.sessions.items, app.rootSessionId(30), -1));
+    try std.testing.expectEqual(@as(?u64, 20), nextRootTabSid(app.sessions.items, 10, 1));
+    try std.testing.expectEqual(@as(?u64, 40), nextRootTabSid(app.sessions.items, 10, -1));
+    try std.testing.expectEqual(@as(?u64, 10), nextRootTabSid(app.sessions.items, 40, 1));
+
+    // With one visible root, every shortcut is a no-op and never repurposes
+    // Left/Right as composer movement in normal mode.
+    var one = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 10, .editor = Editor.init(gpa) };
+    defer one.deinit();
+    one.replaceSessionSummaries(&.{.{ .sid = 10, .title = "only", .model = "m", .status = "idle", .created_at = 10, .running = false }});
+    one.editor.insertSlice("draft");
+    one.editor.cursor = 2;
+    one.mode = .normal;
+    try handleKey(&one, .{ .codepoint = '>' });
+    try handleKey(&one, .{ .codepoint = vaxis.Key.left });
+    try handleKey(&one, .{ .codepoint = '<' });
+    try handleKey(&one, .{ .codepoint = vaxis.Key.right });
+    try std.testing.expectEqual(@as(usize, 2), one.editor.cursor);
 }
 
 test "tab overflow retains the active tab and tab hit testing is button-extensible" {

@@ -687,10 +687,11 @@ get these right; Hermes is the counter-example):
 
 **Permanent tabs; no persistent sidebar.** Every unarchived root session has a
 tab in a one-row strip that remains visible even when only one session exists.
-Tabs are clickable; `gt`/`gT` (with optional count, vim tab-style) cycles
-recent sessions in normal mode. Child activity rolls up to its root tab and
-overflow keeps the focused tab visible. `/sessions` remains the fuzzy complete
-hierarchy picker showing title, workspace, recency, and state. The status bar
+Tabs are clickable; normal-mode `>`/`<` and Right/Left move through the visible
+tab order, while `gt`/`gT` (with optional count) retains MRU session navigation.
+Child activity rolls up to its root tab and overflow keeps the focused tab
+visible. `/sessions` remains the fuzzy complete hierarchy picker showing title,
+workspace, recency, and state. The status bar
 reports background sessions only when actionable (`2 running · 1 approval`).
 A split pane identifies its session with a compact pane label.
 
