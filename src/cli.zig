@@ -124,7 +124,7 @@ const help_text =
     \\usage:
     \\  marlin                 attach to the daemon (TUI, newest session)
     \\  marlin attach <handle> attach TUI to a session (unique prefix, min 4)
-    \\  marlin run [--continue] [--model <m>] [--quiet] [--ask] "task"
+    \\  marlin run [--continue] [--model <m>] [--image <path>] [--quiet] [--ask] "task"
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls [--all]      list sessions
     \\  marlin archive <handle> hide a session tree without deleting it

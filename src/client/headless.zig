@@ -19,6 +19,7 @@ const proto = @import("../core/proto.zig");
 const session_handle = @import("../core/session_handle.zig");
 const store_mod = @import("../daemon/store.zig");
 const attach = @import("attach.zig");
+const media = @import("media.zig");
 
 const ResolvedSession = struct {
     sid: u64,
@@ -79,6 +80,7 @@ pub const Flags = struct {
     model: ?[]const u8 = null,
     quiet: bool = false,
     ask: bool = false,
+    image: ?[]const u8 = null,
     task: ?[]const u8 = null,
 };
 
@@ -97,6 +99,10 @@ pub fn parseFlags(args: []const [:0]const u8) !Flags {
             i += 1;
             if (i >= args.len) return error.MissingModelArg;
             f.model = args[i];
+        } else if (std.mem.eql(u8, a, "--image")) {
+            i += 1;
+            if (i >= args.len) return error.MissingImageArg;
+            f.image = args[i];
         } else if (f.task == null) {
             f.task = a;
         } else {
@@ -114,7 +120,7 @@ pub fn run(
     args: []const [:0]const u8,
 ) !u8 {
     const flags = parseFlags(args) catch {
-        try eprint(io, "usage: marlin run [--continue] [--model <m>] [--quiet] \"task\"\n", .{});
+        try eprint(io, "usage: marlin run [--continue] [--model <m>] [--image <path>] [--quiet] \"task\"\n", .{});
         return 2;
     };
     const task = flags.task orelse {
@@ -126,6 +132,17 @@ pub fn run(
     defer loaded_config.deinit();
     const cfg = loaded_config.value;
     const model_str = flags.model orelse cfg.model_default;
+
+    var pending_image: ?media.Pending = null;
+    defer if (pending_image) |*image| image.deinit(gpa);
+    if (flags.image) |path| {
+        var local_cwd_buf: [4096]u8 = undefined;
+        const local_cwd_len = try std.process.currentPath(io, &local_cwd_buf);
+        pending_image = media.fromPath(gpa, io, local_cwd_buf[0..local_cwd_len], path) catch |err| {
+            try eprint(io, "marlin: cannot attach image '{s}': {t}\n", .{ path, err });
+            return 2;
+        };
+    }
 
     const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
         try eprint(io, "marlin: cannot reach daemon: {t}\n", .{e});
@@ -164,7 +181,12 @@ pub fn run(
 
     // Subscribe live-only (we don't need history replayed) and start the turn.
     try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
-    try conn.send(.{ .input = .{ .sid = sid, .text = task } });
+    var uploads: [1]proto.AttachmentUpload = undefined;
+    const upload_slice: []const proto.AttachmentUpload = if (pending_image) |image| blk: {
+        uploads[0] = .{ .name = image.name, .mime = image.mime, .data_base64 = image.data_base64 };
+        break :blk uploads[0..1];
+    } else &.{};
+    try conn.send(.{ .input = .{ .sid = sid, .text = task, .attachments = upload_slice } });
 
     // Stream until the session goes idle/err again.
     var final_text: ?[]u8 = null;

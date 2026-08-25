@@ -1165,6 +1165,10 @@ pub const Daemon = struct {
                     return;
                 }
                 if (session.state == .running or session.state == .awaiting_approval) {
+                    if (inp.attachments.len > 0) {
+                        self.sendInputError(client, inp.request_id, "busy", "image attachments require a new turn");
+                        return;
+                    }
                     // Approval is a parked phase of the same turn. Input stays
                     // a steer for that turn; it must never create a competitor.
                     const owned = self.gpa.dupe(u8, inp.text) catch {
@@ -1182,7 +1186,12 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .ok = .{ .request_id = inp.request_id } });
                     return;
                 }
-                self.startTurn(session, inp.text) catch |err| {
+                const attachments = self.prepareAttachments(inp.attachments) catch |err| {
+                    self.sendInputError(client, inp.request_id, "attachment", attachmentErrorMessage(err));
+                    return;
+                };
+                defer freeMediaRefs(self.gpa, attachments);
+                self.startTurn(session, inp.text, attachments) catch |err| {
                     if (err == error.SessionBusy) {
                         self.sendInputError(client, inp.request_id, "busy", "session already has an active turn");
                         return;
@@ -1238,6 +1247,7 @@ pub const Daemon = struct {
                     .model = model,
                     .effort = session.effort,
                     .text = text,
+                    .attachments = &.{},
                     .sandbox_enabled = session.sandbox_enabled,
                     .network_filtering_enabled = session.network_filtering_enabled,
                     .kind = session.kind,
@@ -1389,6 +1399,54 @@ pub const Daemon = struct {
             .msg = msg,
             .request_id = request_id,
         } });
+    }
+
+    fn prepareAttachments(self: *Daemon, uploads: []const proto.AttachmentUpload) ![]block.MediaRef {
+        if (uploads.len > max_message_attachments) return error.TooManyAttachments;
+        const refs = try self.gpa.alloc(block.MediaRef, uploads.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (refs[0..initialized]) |ref| {
+                self.gpa.free(ref.hash);
+                self.gpa.free(ref.mime);
+                self.gpa.free(ref.name);
+            }
+            self.gpa.free(refs);
+        }
+
+        var total_bytes: usize = 0;
+        for (uploads, 0..) |upload, i| {
+            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(upload.data_base64) catch
+                return error.InvalidAttachmentEncoding;
+            if (decoded_len == 0) return error.EmptyAttachment;
+            if (decoded_len > max_attachment_bytes or total_bytes > max_message_attachment_bytes - decoded_len)
+                return error.AttachmentTooLarge;
+            total_bytes += decoded_len;
+
+            const bytes = try self.gpa.alloc(u8, decoded_len);
+            defer self.gpa.free(bytes);
+            std.base64.standard.Decoder.decode(bytes, upload.data_base64) catch
+                return error.InvalidAttachmentEncoding;
+            const mime = detectImageMime(bytes) orelse return error.UnsupportedAttachment;
+            if (upload.mime.len > 0 and !std.mem.eql(u8, upload.mime, mime))
+                return error.AttachmentMimeMismatch;
+
+            const raw_name = std.fs.path.basename(upload.name);
+            const safe_name = if (raw_name.len == 0) "image" else raw_name[0..@min(raw_name.len, 255)];
+            const hash = try self.store.putBlob(bytes, nowMs(self.io));
+            errdefer self.gpa.free(hash);
+            const owned_mime = try self.gpa.dupe(u8, mime);
+            errdefer self.gpa.free(owned_mime);
+            const owned_name = try self.gpa.dupe(u8, safe_name);
+            refs[i] = .{
+                .hash = hash,
+                .mime = owned_mime,
+                .name = owned_name,
+                .byte_len = decoded_len,
+            };
+            initialized += 1;
+        }
+        return refs;
     }
 
     fn requestUserCancel(self: *Daemon, session: *Session, now: i64) ?proto.InterruptResult {
@@ -1577,7 +1635,7 @@ pub const Daemon = struct {
         // Structural catalog change: publish the new child once. Subsequent
         // state changes use the compact status watcher path.
         self.broadcastSessionUpsert(sid);
-        self.startTurn(session, cs.prompt) catch |e| {
+        self.startTurn(session, cs.prompt, &.{}) catch |e| {
             session.task_waiter = null;
             session.state = .err;
             self.store.setSessionStatus(sid, "err") catch {};
@@ -1595,6 +1653,7 @@ pub const Daemon = struct {
         model: []u8,
         effort: proto.ReasoningEffort,
         text: []u8,
+        attachments: []const block.MediaRef,
         sandbox_enabled: bool,
         network_filtering_enabled: bool,
         kind: proto.SessionKind,
@@ -1605,7 +1664,7 @@ pub const Daemon = struct {
         session: *Session,
     };
 
-    fn startTurn(self: *Daemon, session: *Session, text: []const u8) !void {
+    fn startTurn(self: *Daemon, session: *Session, text: []const u8, attachments: []const block.MediaRef) !void {
         if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
             return error.SessionBusy;
         const job = try self.gpa.create(TurnJob);
@@ -1616,6 +1675,8 @@ pub const Daemon = struct {
         errdefer self.gpa.free(model);
         const owned_text = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(owned_text);
+        const owned_attachments = try dupeMediaRefs(self.gpa, attachments);
+        errdefer freeMediaRefs(self.gpa, owned_attachments);
         job.* = .{
             .daemon = self,
             .sid = session.id,
@@ -1623,6 +1684,7 @@ pub const Daemon = struct {
             .model = model,
             .effort = session.effort,
             .text = owned_text,
+            .attachments = owned_attachments,
             .sandbox_enabled = session.sandbox_enabled,
             .network_filtering_enabled = session.network_filtering_enabled,
             .kind = session.kind,
@@ -1655,7 +1717,7 @@ pub const Daemon = struct {
         const turn_id = ids.next(self.io);
         var seq = self.store.lastSeq(job.sid) catch return;
         const bodies = [_]block.Body{
-            .{ .user_msg = .{ .text = job.text } },
+            .{ .user_msg = .{ .text = job.text, .attachments = job.attachments } },
             .{ .system_note = .{ .text = note } },
         };
         for (bodies) |body| {
@@ -1669,6 +1731,9 @@ pub const Daemon = struct {
                 .body = body,
             };
             self.store.appendBlock(b) catch return;
+            if (body == .user_msg) {
+                for (job.attachments) |attachment| self.store.addBlobRef(attachment.hash, b.id) catch return;
+            }
             TurnHooks.onBlock(job, b);
         }
     }
@@ -1695,6 +1760,7 @@ pub const Daemon = struct {
             self.gpa.free(job.cwd);
             self.gpa.free(job.model);
             self.gpa.free(job.text);
+            freeMediaRefs(self.gpa, job.attachments);
             self.gpa.destroy(job);
         }
 
@@ -1773,7 +1839,7 @@ pub const Daemon = struct {
             .cancel = job.cancel,
             .poll_steer = TurnHooks.pollSteer,
             .max_rounds = job.max_rounds,
-        }, job.text) catch |e| {
+        }, job.text, job.attachments) catch |e| {
             // Transport errors are flattened by the http layer; the recorded
             // cause turns "ConnectFailed" into "ConnectFailed
             // (TlsInitializationFailed)" — the difference between a shrug
@@ -1810,6 +1876,7 @@ pub const Daemon = struct {
             self.gpa.free(job.cwd);
             self.gpa.free(job.model);
             self.gpa.free(job.text);
+            freeMediaRefs(self.gpa, job.attachments);
             self.gpa.destroy(job);
         }
 
@@ -2518,6 +2585,64 @@ pub const Daemon = struct {
         }
     }
 };
+
+const max_message_attachments: usize = 4;
+const max_attachment_bytes: usize = 10 * 1024 * 1024;
+const max_message_attachment_bytes: usize = 20 * 1024 * 1024;
+
+fn detectImageMime(bytes: []const u8) ?[]const u8 {
+    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
+    if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "\xff\xd8\xff")) return "image/jpeg";
+    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a")))
+        return "image/gif";
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP"))
+        return "image/webp";
+    return null;
+}
+
+fn dupeMediaRefs(gpa: std.mem.Allocator, refs: []const block.MediaRef) ![]block.MediaRef {
+    const out = try gpa.alloc(block.MediaRef, refs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |ref| {
+            gpa.free(ref.hash);
+            gpa.free(ref.mime);
+            gpa.free(ref.name);
+        }
+        gpa.free(out);
+    }
+    for (refs, 0..) |ref, i| {
+        const hash = try gpa.dupe(u8, ref.hash);
+        errdefer gpa.free(hash);
+        const mime = try gpa.dupe(u8, ref.mime);
+        errdefer gpa.free(mime);
+        const name = try gpa.dupe(u8, ref.name);
+        out[i] = .{ .hash = hash, .mime = mime, .name = name, .byte_len = ref.byte_len };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeMediaRefs(gpa: std.mem.Allocator, refs: []const block.MediaRef) void {
+    for (refs) |ref| {
+        gpa.free(ref.hash);
+        gpa.free(ref.mime);
+        gpa.free(ref.name);
+    }
+    if (refs.len > 0) gpa.free(refs);
+}
+
+fn attachmentErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.TooManyAttachments => "at most four images may be attached to one message",
+        error.AttachmentTooLarge => "image exceeds the 10 MiB per-image or 20 MiB per-message limit",
+        error.InvalidAttachmentEncoding => "image upload is not valid base64",
+        error.EmptyAttachment => "image attachment is empty",
+        error.UnsupportedAttachment => "supported image formats are PNG, JPEG, GIF, and WebP",
+        error.AttachmentMimeMismatch => "image MIME metadata does not match its bytes",
+        else => "could not store image attachment",
+    };
+}
 
 fn acquireInstanceLock(io: Io, path: []const u8) !Io.File {
     return Io.Dir.cwd().createFile(io, path, .{

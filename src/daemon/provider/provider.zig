@@ -23,6 +23,12 @@ pub const ToolCall = struct {
     args_json: []const u8,
 };
 
+pub const Media = struct {
+    name: []const u8,
+    mime: []const u8,
+    data_base64: []const u8,
+};
+
 pub const Message = struct {
     role: Role,
     payload: Payload,
@@ -33,6 +39,12 @@ pub const Message = struct {
     pub const Payload = union(enum) {
         /// Plain text content (system/user/assistant text messages).
         text: []const u8,
+        /// User-authored text plus durable binary attachments resolved from
+        /// the blob store for this provider request.
+        user_content: struct {
+            text: []const u8,
+            media: []const Media,
+        },
         /// Assistant turn that requested tool calls (text may be empty).
         assistant_tool_calls: struct {
             text: []const u8,

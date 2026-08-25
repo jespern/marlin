@@ -91,5 +91,6 @@ test {
     _ = @import("client/render.zig");
     _ = @import("client/markdown.zig");
     _ = @import("client/layout.zig");
+    _ = @import("client/media.zig");
     _ = @import("client/tui.zig");
 }

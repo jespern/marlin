@@ -28,11 +28,22 @@ pub const ToolStatus = enum { ok, err, denied, interrupted };
 
 pub const ApprovalDecision = enum { granted, denied, timeout };
 
+/// Durable reference to binary media stored in the content-addressed blob
+/// table. Blocks carry only metadata; replay never inflates the transcript
+/// with base64 image bodies.
+pub const MediaRef = struct {
+    hash: []const u8,
+    mime: []const u8,
+    name: []const u8,
+    byte_len: u64,
+};
+
 /// Kind-specific payloads. Serialized as JSON into blocks.body_json;
 /// unknown fields are ignored on read (forward compat, see MILESTONES open Q3).
 pub const Body = union(BlockKind) {
     user_msg: struct {
         text: []const u8,
+        attachments: []const MediaRef = &.{},
         /// Internal context injected after compaction. It remains model-visible
         /// but clients must not present it as authored user input or history.
         synthetic: bool = false,
@@ -119,4 +130,24 @@ test "older user blocks decode with synthetic disabled" {
     );
     try std.testing.expectEqualStrings("hello", body.user_msg.text);
     try std.testing.expect(!body.user_msg.synthetic);
+}
+
+test "user message attachments round trip as durable blob references" {
+    const gpa = std.testing.allocator;
+    const body: Body = .{ .user_msg = .{
+        .text = "inspect this",
+        .attachments = &.{.{
+            .hash = "abc123",
+            .mime = "image/png",
+            .name = "shot.png",
+            .byte_len = 42,
+        }},
+    } };
+    const encoded = try std.json.Stringify.valueAlloc(gpa, body, .{});
+    defer gpa.free(encoded);
+    const parsed = try std.json.parseFromSlice(Body, gpa, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.user_msg.attachments.len);
+    try std.testing.expectEqualStrings("abc123", parsed.value.user_msg.attachments[0].hash);
+    try std.testing.expectEqualStrings("image/png", parsed.value.user_msg.attachments[0].mime);
 }

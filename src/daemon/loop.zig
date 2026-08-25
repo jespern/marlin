@@ -178,6 +178,7 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
     return switch (body) {
         .user_msg => |value| .{ .user_msg = .{
             .text = try arena.dupe(u8, value.text),
+            .attachments = try cloneMediaRefs(arena, value.attachments),
             .synthetic = value.synthetic,
         } },
         .assistant_msg => |value| .{ .assistant_msg = .{ .text = try arena.dupe(u8, value.text) } },
@@ -209,6 +210,22 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
     };
 }
 
+fn cloneMediaRefs(arena: std.mem.Allocator, refs: []const block.MediaRef) ![]const block.MediaRef {
+    const out = try arena.alloc(block.MediaRef, refs.len);
+    for (refs, 0..) |ref, i| out[i] = .{
+        .hash = try arena.dupe(u8, ref.hash),
+        .mime = try arena.dupe(u8, ref.mime),
+        .name = try arena.dupe(u8, ref.name),
+        .byte_len = ref.byte_len,
+    };
+    return out;
+}
+
+fn loadMedia(ctx: *const anyopaque, allocator: std.mem.Allocator, hash: []const u8) ![]const u8 {
+    const store: *const Store = @ptrCast(@alignCast(ctx));
+    return store.getBlobAlloc(allocator, hash);
+}
+
 /// Run one full agent turn: user text in → tool roundtrips → final text out.
 /// All blocks are persisted as they happen; a crash mid-turn leaves a
 /// consistent log.
@@ -218,6 +235,7 @@ pub fn runTurn(
     store: *Store,
     opts: RunOpts,
     user_text: []const u8,
+    attachments: []const block.MediaRef,
 ) !TurnResult {
     // Delegated sessions: the official `claude` binary is the agent loop;
     // no context assembly, HTTP, or marlin tool dispatch happens here.
@@ -230,8 +248,14 @@ pub fn runTurn(
             .turn_id = ids.next(io),
         };
         const fresh = ap.seq == 0;
-        _ = try ap.append(.{ .user_msg = .{ .text = user_text } });
-        return runClaudeCodeTurn(gpa, io, store, opts, &ap, user_text, fresh);
+        const user_block_id = try ap.append(.{ .user_msg = .{ .text = user_text, .attachments = attachments } });
+        for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
+        const delegated_prompt = if (attachments.len > 0)
+            try std.fmt.allocPrint(gpa, "{s}\n\n[{d} image attachment(s) are stored in Marlin but unavailable to the delegated Claude Code route]", .{ user_text, attachments.len })
+        else
+            null;
+        defer if (delegated_prompt) |prompt| gpa.free(prompt);
+        return runClaudeCodeTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text, fresh);
     }
 
     var history_arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -253,7 +277,8 @@ pub fn runTurn(
     var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
     defer http_client.deinit();
 
-    _ = try ap.append(.{ .user_msg = .{ .text = user_text } });
+    const user_block_id = try ap.append(.{ .user_msg = .{ .text = user_text, .attachments = attachments } });
+    for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
 
     // System-prompt context built once per turn: repo-local instructions and
     // the dynamic environment (cwd, git, date, sandbox/network regime).
@@ -303,6 +328,8 @@ pub fn runTurn(
             .system_prompt_suffix = system_prompt_suffix,
             .project_instructions = project_instructions orelse "",
             .environment = environment orelse "",
+            .media_loader = loadMedia,
+            .media_loader_ctx = store,
         };
         var msgs = try context.assemble(arena, blocks, asm_opts);
 
@@ -1627,7 +1654,7 @@ test "delegated claude code turn persists the event stream as blocks" {
         .cfg = .{},
         .tool_environ = &env,
         .approval_mode = .auto,
-    }, "do the thing");
+    }, "do the thing", &.{});
     defer gpa.free(result.text);
 
     try std.testing.expectEqualStrings("DELEGATE-OK", result.text);

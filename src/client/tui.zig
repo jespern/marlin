@@ -36,6 +36,7 @@ const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const credentials = @import("../core/credentials.zig");
 const Editor = @import("editor.zig");
+const media = @import("media.zig");
 const render = @import("render.zig");
 const markdown = @import("markdown.zig");
 const layout_mod = @import("layout.zig");
@@ -137,6 +138,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
+    .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
     .{ .name = "/compact", .description = "compact the current context" },
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
@@ -344,8 +346,10 @@ const App = struct {
     gpa: std.mem.Allocator,
     io: Io,
     conn: *attach.Conn,
+    environ: ?*const std.process.Environ.Map = null,
     sid: u64,
     editor: Editor,
+    attachments: std.ArrayList(media.Pending) = .empty,
 
     mode: Mode = .insert,
     /// Terminal columns (updated on every winsize event); used by handleKey
@@ -514,6 +518,8 @@ const App = struct {
     next_input_request_id: u64 = 1,
 
     fn deinit(self: *App) void {
+        self.clearAttachments();
+        self.attachments.deinit(self.gpa);
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
         self.tail_layout_cache.reset(self.gpa);
@@ -551,6 +557,45 @@ const App = struct {
         self.home.deinit(self.gpa);
         self.notice.deinit(self.gpa);
         self.editor.deinit();
+    }
+
+    fn clearAttachments(self: *App) void {
+        for (self.attachments.items) |*attachment| attachment.deinit(self.gpa);
+        self.attachments.clearRetainingCapacity();
+    }
+
+    fn addAttachment(self: *App, pending_value: media.Pending) void {
+        var pending = pending_value;
+        if (self.attachments.items.len >= 4) {
+            pending.deinit(self.gpa);
+            self.setNotice("at most four images may be attached to one message", .{});
+            return;
+        }
+        self.attachments.append(self.gpa, pending) catch {
+            pending.deinit(self.gpa);
+            self.setNotice("could not stage image", .{});
+            return;
+        };
+        self.setNotice("attached {s} · {d}/4 · Ctrl+V or /attach adds another", .{
+            self.attachments.items[self.attachments.items.len - 1].name,
+            self.attachments.items.len,
+        });
+    }
+
+    fn attachPath(self: *App, path: []const u8) void {
+        const pending = media.fromPath(self.gpa, self.io, self.cwd.items, path) catch |err| {
+            self.setNotice("could not attach image: {s}", .{mediaErrorMessage(err)});
+            return;
+        };
+        self.addAttachment(pending);
+    }
+
+    fn attachClipboard(self: *App) void {
+        const pending = media.fromClipboard(self.gpa, self.io, self.environ) catch |err| {
+            self.setNotice("image paste failed: {s}", .{mediaErrorMessage(err)});
+            return;
+        };
+        self.addAttachment(pending);
     }
 
     fn setNotice(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -1142,8 +1187,19 @@ const App = struct {
         request_id: u64,
         prior_state: ?proto.SessionState,
     ) void {
+        self.pushInputEchoLabel(kind, text, "", request_id, prior_state);
+    }
+
+    fn pushInputEchoLabel(
+        self: *App,
+        kind: block.BlockKind,
+        text: []const u8,
+        label: []const u8,
+        request_id: u64,
+        prior_state: ?proto.SessionState,
+    ) void {
         const before = self.blocks.items.len;
-        self.pushBlockPending(kind, text, "", .ok, true);
+        self.pushBlockPending(kind, text, label, .ok, true);
         if (self.blocks.items.len == before) return;
         const rendered = &self.blocks.items[self.blocks.items.len - 1];
         rendered.pending_request_id = request_id;
@@ -1356,8 +1412,22 @@ const App = struct {
                     defer self.gpa.free(label);
                     self.pushDurableBlock(b, .system_note, label, "", .ok);
                 } else {
-                    if (!reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id))
-                        self.pushDurableBlock(b, .user_msg, u.text, "", .ok);
+                    const label = if (u.attachments.len > 0)
+                        layout_mod.mediaLabel(self.gpa, u.attachments) catch null
+                    else
+                        null;
+                    defer if (label) |owned| self.gpa.free(owned);
+                    if (!reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id)) {
+                        self.pushDurableBlock(b, .user_msg, u.text, label orelse "", .ok);
+                    } else if (label) |owned| {
+                        for (self.blocks.items) |*rendered| {
+                            if (rendered.seq != b.seq) continue;
+                            const replacement = self.gpa.dupe(u8, owned) catch return;
+                            self.gpa.free(rendered.label);
+                            rendered.label = replacement;
+                            break;
+                        }
+                    }
                     // Seed input history from the log (replay covers pre-reboot
                     // messages; live blocks cover this session's submits).
                     self.editor.pushHistory(u.text);
@@ -1475,8 +1545,8 @@ const App = struct {
 
     fn submitInput(self: *App, text: []const u8) void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
-        if (trimmed.len == 0) return;
-        if (trimmed[0] == '/' or trimmed[0] == '!') {
+        if (trimmed.len == 0 and self.attachments.items.len == 0) return;
+        if (trimmed.len > 0 and (trimmed[0] == '/' or trimmed[0] == '!')) {
             // Commands are client actions rather than durable user_msg
             // blocks, but they still belong in the local editor history so
             // Up then Enter can repeat them during this client lifetime.
@@ -1485,6 +1555,19 @@ const App = struct {
             return;
         }
         const was_busy = self.state == .running or self.state == .awaiting_approval;
+        if (was_busy and self.attachments.items.len > 0) {
+            self.setNotice("images attach to a new turn; interrupt or wait before sending", .{});
+            return;
+        }
+        var uploads_buf: [4]proto.AttachmentUpload = undefined;
+        for (self.attachments.items, 0..) |attachment, i| uploads_buf[i] = .{
+            .name = attachment.name,
+            .mime = attachment.mime,
+            .data_base64 = attachment.data_base64,
+        };
+        const uploads = uploads_buf[0..self.attachments.items.len];
+        const attachment_label = pendingMediaLabel(self.gpa, self.attachments.items) catch null;
+        defer if (attachment_label) |label| self.gpa.free(label);
         const request_id = self.next_input_request_id;
         self.next_input_request_id +%= 1;
         if (self.next_input_request_id == 0) self.next_input_request_id = 1;
@@ -1492,6 +1575,7 @@ const App = struct {
             .sid = self.sid,
             .text = trimmed,
             .request_id = request_id,
+            .attachments = uploads,
         } }) catch |err| {
             if (err == error.ProtocolLineTooLong)
                 self.setNotice("message exceeds the {d} MiB protocol limit", .{proto.max_line_bytes / (1024 * 1024)})
@@ -1499,13 +1583,14 @@ const App = struct {
                 self.setNotice("send failed — daemon gone? ({t})", .{err});
             return;
         };
+        self.clearAttachments();
         if (was_busy) {
             self.pushInputEcho(.steer, trimmed, request_id, null);
             self.setNotice("queued as steer for active turn", .{});
         } else {
             // The composer becomes a scrollback card immediately. The turn
             // thread's persisted user_msg will reconcile this local echo.
-            self.pushInputEcho(.user_msg, trimmed, request_id, self.state);
+            self.pushInputEchoLabel(.user_msg, trimmed, attachment_label orelse "", request_id, self.state);
             self.state = .running;
             self.spinner_frame = 0;
             self.turn_started_ms = nowWallMs(self.io);
@@ -1564,6 +1649,8 @@ const App = struct {
             } else {
                 self.setNotice("usage: /archive [children]", .{});
             }
+        } else if (std.mem.eql(u8, head, "/attach")) {
+            self.attachPath(it.rest());
         } else if (std.mem.eql(u8, head, "!c")) {
             self.copyLastToolOutput();
         } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
@@ -1603,7 +1690,7 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /new · /archive [children] · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /new · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -3472,6 +3559,7 @@ pub fn run(
         .gpa = gpa,
         .io = io,
         .conn = conn,
+        .environ = environ,
         .sid = sid,
         .editor = Editor.init(gpa),
         .known_session_ids = initial_known_ids,
@@ -3862,6 +3950,31 @@ fn tabNavigationDirection(key: vaxis.Key) ?i8 {
     return null;
 }
 
+fn pendingMediaLabel(gpa: std.mem.Allocator, attachments: []const media.Pending) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (attachments, 0..) |attachment, i| {
+        if (i > 0) try out.append(gpa, '\n');
+        const byte_len = std.base64.standard.Decoder.calcSizeForSlice(attachment.data_base64) catch 0;
+        try out.print(gpa, "▣ {s} · {s} · {Bi:.1}", .{ attachment.name, attachment.mime, byte_len });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn mediaErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NoImageOnClipboard => "clipboard contains no image",
+        error.ClipboardImageUnsupported => "clipboard image capture is unavailable on this platform; use /attach",
+        error.ClipboardReadFailed => "could not read the system clipboard",
+        error.ImageTooLarge, error.StreamTooLong => "image exceeds the 10 MiB limit",
+        error.UnsupportedImage => "supported formats are PNG, JPEG, GIF, and WebP",
+        error.FileNotFound => "file not found",
+        error.AccessDenied => "file is not readable",
+        error.EmptyPath => "usage: /attach <image-path>",
+        else => @errorName(err),
+    };
+}
+
 fn handleKey(app: *App, key: vaxis.Key) !void {
     if (key.matches('t', .{ .ctrl = true })) {
         app.show_tool_transcript = !app.show_tool_transcript;
@@ -3874,6 +3987,11 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
 
     if (key.matches('l', .{ .ctrl = true })) {
         app.clearView();
+        return;
+    }
+
+    if (key.matches('v', .{ .ctrl = true })) {
+        app.attachClipboard();
         return;
     }
 

@@ -98,6 +98,19 @@ pub fn buildRequestBody(
                     try enc(t, .{}, ws);
                 }
             },
+            .user_content => |content| {
+                try ws.writeAll(",\"content\":[{\"type\":\"text\",\"text\":");
+                try enc(content.text, .{}, ws);
+                try ws.writeAll("}");
+                for (content.media) |media| {
+                    try ws.writeAll(",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                    try ws.writeAll(media.mime);
+                    try ws.writeAll(";base64,");
+                    try ws.writeAll(media.data_base64);
+                    try ws.writeAll("\"}}");
+                }
+                try ws.writeAll("]");
+            },
             .assistant_tool_calls => |calls| {
                 // content may be present alongside tool_calls
                 if (calls.text.len > 0) {
@@ -752,4 +765,26 @@ test "request body builds valid json" {
     const cached_tool_body = try buildRequestBody(gpa, "anthropic/claude", .openrouter, .auto, &cached_tool_msgs, &.{}, .{ .explicit_cache = true });
     defer gpa.free(cached_tool_body);
     try std.testing.expect(std.mem.indexOf(u8, cached_tool_body, "\"role\":\"tool\",\"tool_call_id\":\"call-1\",\"content\":[{\"type\":\"text\",\"text\":\"result\",\"cache_control\":{\"type\":\"ephemeral\"}}]") != null);
+}
+
+test "request body maps user images to OpenAI content parts" {
+    const gpa = std.testing.allocator;
+    const messages = [_]provider.Message{.{
+        .role = .user,
+        .payload = .{ .user_content = .{
+            .text = "inspect",
+            .media = &.{.{
+                .name = "shot.png",
+                .mime = "image/png",
+                .data_base64 = "iVBORw0KGgo=",
+            }},
+        } },
+    }};
+    const body = try buildRequestBody(gpa, "vision-model", .openrouter, .auto, &messages, &.{}, .{});
+    defer gpa.free(body);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    _ = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image_url\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "data:image/png;base64,iVBORw0KGgo=") != null);
 }

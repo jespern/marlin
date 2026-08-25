@@ -268,7 +268,9 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     var status: block.ToolStatus = .ok;
     var full_body_ref: ?[]const u8 = null;
     var generated_text: ?[]u8 = null;
+    var generated_label: ?[]u8 = null;
     defer if (generated_text) |owned| gpa.free(owned);
+    defer if (generated_label) |owned| gpa.free(owned);
 
     switch (b.body) {
         .user_msg => |u| {
@@ -276,7 +278,13 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
                 kind = .system_note;
                 generated_text = try rehydrationLabel(gpa, u.text);
                 text = generated_text.?;
-            } else text = u.text;
+            } else {
+                text = u.text;
+                if (u.attachments.len > 0) {
+                    generated_label = try mediaLabel(gpa, u.attachments);
+                    label = generated_label.?;
+                }
+            }
         },
         .steer => |s| text = s.text,
         .assistant_msg => |a| text = a.text,
@@ -303,7 +311,10 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         break :blk owned;
     } else try gpa.dupe(u8, text);
     errdefer gpa.free(owned_text);
-    const owned_label = try gpa.dupe(u8, label);
+    const owned_label = if (generated_label) |owned| blk: {
+        generated_label = null;
+        break :blk owned;
+    } else try gpa.dupe(u8, label);
     errdefer gpa.free(owned_label);
     const owned_ref = if (full_body_ref) |ref| try gpa.dupe(u8, ref) else null;
 
@@ -316,6 +327,16 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .status = status,
         .full_body_ref = owned_ref,
     };
+}
+
+pub fn mediaLabel(gpa: std.mem.Allocator, refs: []const block.MediaRef) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (refs, 0..) |ref, i| {
+        if (i > 0) try out.append(gpa, '\n');
+        try out.print(gpa, "▣ {s} · {s} · {Bi:.1}", .{ ref.name, ref.mime, ref.byte_len });
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 pub fn wrapPromptCard(
@@ -852,6 +873,8 @@ pub fn layoutBlockRange(
                 try flushRanSummary(alloc, lines, &pending_ran);
                 try blankLine(alloc, lines);
                 try wrapPromptCard(alloc, lines, rb.text, w);
+                if (rb.label.len > 0)
+                    try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
             },
             .assistant_msg => {
                 try flushRanSummary(alloc, lines, &pending_ran);

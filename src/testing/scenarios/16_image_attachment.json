@@ -1,0 +1,24 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "inspect image",
+        "\"type\":\"image_url\"",
+        "data:image/gif;base64,R0lGODlhTUFSTElO"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"image received\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "--image", "tiny.gif", "inspect image"],
+    "image_fixture": true,
+    "exit_code": 0,
+    "stdout_contains": ["image received"],
+    "db_kinds": ["user_msg", "assistant_msg"],
+    "db_media_refs": 1
+  }
+}

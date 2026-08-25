@@ -992,6 +992,10 @@ pub const Store = struct {
     }
 
     pub fn getBlob(self: Store, hash: []const u8) Error![]const u8 {
+        return self.getBlobAlloc(self.gpa, hash);
+    }
+
+    pub fn getBlobAlloc(self: Store, allocator: std.mem.Allocator, hash: []const u8) Error![]const u8 {
         const stmt = try self.prepare("SELECT bytes, tombstone FROM blobs WHERE hash=?");
         defer finalize(stmt);
         bindText(stmt, 1, hash);
@@ -1001,9 +1005,9 @@ pub const Store = struct {
         if (c.sqlite3_column_int(stmt, 1) != 0) return error.NotFound;
         const ptr = c.sqlite3_column_blob(stmt, 0);
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-        if (len == 0) return try self.gpa.dupe(u8, "");
+        if (len == 0) return try allocator.dupe(u8, "");
         const bytes: [*]const u8 = @ptrCast(ptr.?);
-        return try self.gpa.dupe(u8, bytes[0..len]);
+        return try allocator.dupe(u8, bytes[0..len]);
     }
 
     /// Reclaim unreferenced blobs and, when explicitly requested, demote old

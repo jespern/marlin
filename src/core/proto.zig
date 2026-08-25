@@ -56,6 +56,15 @@ pub const ModelPricing = struct {
     tiered: bool = false,
 };
 
+/// Client-owned media submitted with one user message. Base64 keeps NDJSON
+/// valid for arbitrary binary data and lets a local client upload directly
+/// to a remote daemon without sharing a filesystem.
+pub const AttachmentUpload = struct {
+    name: []const u8,
+    mime: []const u8,
+    data_base64: []const u8,
+};
+
 /// Client → daemon.
 pub const ClientMsg = union(enum) {
     hello: struct { proto_version: u32, client_kind: []const u8 = "generic" },
@@ -117,7 +126,12 @@ pub const ClientMsg = union(enum) {
     unsub: struct { sid: u64 },
     /// `request_id` correlates the optimistic client echo with the one
     /// terminal ok/err reply. Zero is the legacy/untracked value.
-    input: struct { sid: u64, text: []const u8, request_id: u64 = 0 },
+    input: struct {
+        sid: u64,
+        text: []const u8,
+        request_id: u64 = 0,
+        attachments: []const AttachmentUpload = &.{},
+    },
     approve: struct { sid: u64, approval_id: []const u8, decision: ApprovalAnswer },
     /// Manual L2 compaction (/compact). Rejected while a turn is running.
     session_compact: struct { sid: u64 },
@@ -391,6 +405,27 @@ test "round trip: client messages" {
     defer gpa.free(interrupt_line);
     const interrupt_back = try decode(ClientMsg, arena, interrupt_line);
     try std.testing.expect(interrupt_back.interrupt.report);
+}
+
+test "input attachments survive the remote-client wire" {
+    const gpa = std.testing.allocator;
+    const line = try encode(gpa, ClientMsg{ .input = .{
+        .sid = 7,
+        .text = "look",
+        .request_id = 9,
+        .attachments = &.{.{
+            .name = "shot.png",
+            .mime = "image/png",
+            .data_base64 = "iVBORw0KGgo=",
+        }},
+    } });
+    defer gpa.free(line);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const decoded = try decode(ClientMsg, arena_state.allocator(), line);
+    try std.testing.expectEqual(@as(usize, 1), decoded.input.attachments.len);
+    try std.testing.expectEqualStrings("shot.png", decoded.input.attachments[0].name);
+    try std.testing.expectEqualStrings("iVBORw0KGgo=", decoded.input.attachments[0].data_base64);
 }
 
 test "round trip: daemon block message with tool_result body" {

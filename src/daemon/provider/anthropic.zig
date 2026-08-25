@@ -113,6 +113,7 @@ fn mapRole(role: provider.Role) Role {
 fn systemText(m: provider.Message) []const u8 {
     return switch (m.payload) {
         .text => |t| t,
+        .user_content => |content| content.text,
         else => "",
     };
 }
@@ -126,6 +127,21 @@ fn writeBlocks(ws: *std.Io.Writer, m: provider.Message) !void {
             try enc(t, .{}, ws);
             try cacheSuffix(ws, m);
             try ws.writeAll("}");
+        },
+        .user_content => |content| {
+            try ws.writeAll("{\"type\":\"text\",\"text\":");
+            try enc(content.text, .{}, ws);
+            if (content.media.len == 0) try cacheSuffix(ws, m);
+            try ws.writeAll("}");
+            for (content.media, 0..) |media, i| {
+                try ws.writeAll(",{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
+                try enc(media.mime, .{}, ws);
+                try ws.writeAll(",\"data\":\"");
+                try ws.writeAll(media.data_base64);
+                try ws.writeAll("\"}");
+                if (i + 1 == content.media.len) try cacheSuffix(ws, m);
+                try ws.writeAll("}");
+            }
         },
         .assistant_tool_calls => |calls| {
             if (calls.text.len > 0) {
@@ -359,6 +375,30 @@ test "request body: system cache, role merging, tool_use and tool_result" {
         "{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_2\",\"content\":\"m2\",\"cache_control\":{\"type\":\"ephemeral\"}}]}]," ++
         "\"tools\":[{\"name\":\"grep\",\"description\":\"search\",\"input_schema\":{\"type\":\"object\"}}]}";
     try std.testing.expectEqualStrings(expected, body);
+}
+
+test "request body maps user images to Anthropic source blocks" {
+    const gpa = std.testing.allocator;
+    const messages = [_]provider.Message{.{
+        .role = .user,
+        .payload = .{ .user_content = .{
+            .text = "inspect",
+            .media = &.{.{
+                .name = "shot.png",
+                .mime = "image/png",
+                .data_base64 = "iVBORw0KGgo=",
+            }},
+        } },
+        .cache_breakpoint = true,
+    }};
+    const body = try buildRequestBody(gpa, "claude", &messages, &.{}, 1024);
+    defer gpa.free(body);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    _ = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
 }
 
 test "stream decode: text, thinking, tool_use reassembly, usage, stop reason" {

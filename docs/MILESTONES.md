@@ -125,9 +125,10 @@ switch recent sessions. Child activity rolls up to its root tab and the status
 bar shows only actionable background totals. Session switching preserves each
 session's view and draft. Mouse selection + OSC52 and the `!c` family finish
 the focused terminal workflow. Two-pane
-splits, image input, cross-session registers, and remote attach are candidate
+splits, cross-session registers, and remote attach are candidate
 slices, not exit requirements; decide them in `docs/M4_PLAN.md` before work
-starts.
+starts. The post-M4 rich-input slice now supplies remote-safe clipboard/path
+image attachments and provider vision mapping.
 *Exit: several local sessions can run and be revisited from one full-width
 Marlin UI without losing their place or hiding actionable background state.*
 

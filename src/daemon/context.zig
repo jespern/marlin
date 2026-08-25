@@ -181,7 +181,15 @@ pub const AssembleOpts = struct {
     /// Per-turn dynamic facts (cwd, platform, date, git, sandbox, network),
     /// pre-rendered by the loop including its ENVIRONMENT header.
     environment: []const u8 = "",
+    media_loader: ?MediaLoader = null,
+    media_loader_ctx: ?*const anyopaque = null,
 };
+
+pub const MediaLoader = *const fn (
+    ctx: *const anyopaque,
+    allocator: std.mem.Allocator,
+    hash: []const u8,
+) anyerror![]const u8;
 
 /// Assemble provider messages from a block log slice. All returned message
 /// payloads reference either `blocks` memory or `arena` allocations — use an
@@ -266,7 +274,36 @@ pub fn assemble(
             try msgs.append(arena, .{ .role = .system, .payload = .{ .text = opts.environment } });
         }
         switch (b.body) {
-            .user_msg => |u| try msgs.append(arena, .{ .role = .user, .payload = .{ .text = u.text } }),
+            .user_msg => |u| {
+                if (u.attachments.len == 0 or b.seq < opts.prune_before_seq or
+                    opts.media_loader == null or opts.media_loader_ctx == null)
+                {
+                    const text = if (u.attachments.len > 0 and b.seq < opts.prune_before_seq)
+                        try std.fmt.allocPrint(arena, "{s}\n\n[{d} image attachment(s) elided from active context]", .{ u.text, u.attachments.len })
+                    else
+                        u.text;
+                    try msgs.append(arena, .{ .role = .user, .payload = .{ .text = text } });
+                } else {
+                    var media: std.ArrayList(provider.Media) = .empty;
+                    for (u.attachments) |attachment| {
+                        const raw = opts.media_loader.?(opts.media_loader_ctx.?, arena, attachment.hash) catch continue;
+                        const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
+                        const encoded = try arena.alloc(u8, encoded_len);
+                        _ = std.base64.standard.Encoder.encode(encoded, raw);
+                        try media.append(arena, .{
+                            .name = attachment.name,
+                            .mime = attachment.mime,
+                            .data_base64 = encoded,
+                        });
+                    }
+                    if (media.items.len == 0) {
+                        const text = try std.fmt.allocPrint(arena, "{s}\n\n[image attachments unavailable]", .{u.text});
+                        try msgs.append(arena, .{ .role = .user, .payload = .{ .text = text } });
+                    } else try msgs.append(arena, .{ .role = .user, .payload = .{
+                        .user_content = .{ .text = u.text, .media = media.items },
+                    } });
+                }
+            },
             .steer => |s| try msgs.append(arena, .{ .role = .user, .payload = .{ .text = s.text } }),
             .assistant_msg => |a| try msgs.append(arena, .{ .role = .assistant, .payload = .{ .text = a.text } }),
             .tool_call => {
@@ -377,6 +414,10 @@ pub fn estimateAssembled(msgs: []const provider.Message) u64 {
     for (msgs) |m| {
         switch (m.payload) {
             .text => |t| total += estimateTokens(t),
+            .user_content => |content| {
+                total += estimateTokens(content.text);
+                total += @as(u64, @intCast(content.media.len)) * 2048;
+            },
             .assistant_tool_calls => |atc| {
                 total += estimateTokens(atc.text);
                 for (atc.calls) |c| total += estimateTokens(c.args_json) + estimateTokens(c.name) + 8;
@@ -871,6 +912,45 @@ test "assemble: prune frontier stubs old tool bodies only" {
     };
     try std.testing.expectEqual(@as(usize, 1), stubbed);
     try std.testing.expectEqual(@as(usize, 1), intact);
+}
+
+test "assemble resolves durable image refs only for active provider context" {
+    const Loader = struct {
+        fn load(_: *const anyopaque, allocator: std.mem.Allocator, hash: []const u8) ![]const u8 {
+            try std.testing.expectEqualStrings("image-hash", hash);
+            return allocator.dupe(u8, "\x89PNG\r\n\x1a\nbody");
+        }
+    };
+    var marker: u8 = 0;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocks = [_]block.Block{tb(1, .{ .user_msg = .{
+        .text = "inspect",
+        .attachments = &.{.{
+            .hash = "image-hash",
+            .mime = "image/png",
+            .name = "shot.png",
+            .byte_len = 12,
+        }},
+    } })};
+    const msgs = try assemble(arena, &blocks, .{
+        .media_loader = Loader.load,
+        .media_loader_ctx = &marker,
+    });
+    try std.testing.expectEqual(@as(usize, 2), msgs.len);
+    try std.testing.expect(msgs[1].payload == .user_content);
+    try std.testing.expectEqualStrings("inspect", msgs[1].payload.user_content.text);
+    try std.testing.expectEqual(@as(usize, 1), msgs[1].payload.user_content.media.len);
+    try std.testing.expectEqualStrings("image/png", msgs[1].payload.user_content.media[0].mime);
+
+    const pruned = try assemble(arena, &blocks, .{
+        .prune_before_seq = 2,
+        .media_loader = Loader.load,
+        .media_loader_ctx = &marker,
+    });
+    try std.testing.expect(pruned[1].payload == .text);
+    try std.testing.expect(std.mem.indexOf(u8, pruned[1].payload.text, "elided") != null);
 }
 
 test "planPrune: protects recent output, hysteresis on small reclaim" {

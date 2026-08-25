@@ -843,29 +843,26 @@ A split pane identifies its session with a compact pane label.
 
 ### Image / asset paste
 
-Bracketed paste is text-only, so complex assets are grabbed out-of-band
-(the Claude Code approach):
+**Status: image input shipped.** Bracketed paste is text-only, so complex
+assets are grabbed out-of-band:
 
-- **Capture (client).** On paste keystroke, check the OS clipboard for image
-  data before falling back to text: NSPasteboard/pngpaste (macOS),
-  `wl-paste -t image/png` (Wayland), `xclip -t image/png` (X11). Pasted TEXT
-  that resolves to an existing image/PDF path (which is what drag-onto-
-  terminal produces) offers attach-by-path — that variant works over ssh too.
-- **Wire + store.** Chunked attachment-upload protocol message (base64 body,
-  stays nc+jq debuggable); daemon writes to the existing blob store (an
-  image is a blob with a mime type). `user_msg` gains
-  `attachments: []BlobRef` — a pasted image is part of the message, not a
-  new block kind.
-- **Context assembly.** Provider layer maps attachments to image content
-  parts (both dialects take base64). Non-vision model → degrade to
-  `[image: 1.2MB png]` + status-line warning. Images are prime L1 prune
-  targets: huge in tokens, regenerable from the blob — old image parts get
-  stubbed first.
-- **Rendering.** Kitty graphics protocol where available (Ghostty/Kitty/
-  WezTerm/iTerm2; vaxis has support) for inline thumbnails; elsewhere a
-  placeholder card `▣ image.png 1.4MB [o: open]` with `o` → open/xdg-open
-  on the blob. No sixel — the terminal set that has sixel but not kitty
-  protocol is not worth the code.
+- **Capture (client).** Ctrl+V reads PNG data from NSPasteboard on macOS and
+  `wl-paste`/`xclip` on Linux. `/attach <path>` and `marlin run --image <path>`
+  accept PNG, JPEG, GIF, and WebP. Capture happens in the client, never the
+  daemon, preserving the correct clipboard boundary for a future remote
+  transport.
+- **Wire + store.** An input carries bounded base64 upload records. The daemon
+  verifies MIME signatures and writes bytes to the existing content-addressed
+  blob store; `user_msg.attachments` carries only metadata and blob hashes.
+  Replay therefore never inflates with base64.
+- **Context assembly.** OpenAI/OpenRouter and Anthropic requests map active
+  attachments to native image content blocks. L1 removes old image bodies
+  from active provider context while the durable blob remains available. The
+  delegated Claude Code route records an explicit unsupported note rather
+  than silently dropping media.
+- **Rendering.** User cards show a durable `▣ name · mime · size` attachment
+  row. Inline terminal thumbnails remain optional polish over the same media
+  reference; they are not required for provider vision or replay correctness.
 - **Known limitation (by design):** clipboard-image paste requires the
   client to run where the clipboard lives. Under `ssh box → marlin` the
   client is remote and the local clipboard image cannot reach it (no

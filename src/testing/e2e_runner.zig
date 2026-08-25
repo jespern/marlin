@@ -127,6 +127,8 @@ const Check = struct {
     /// Expected durable session hierarchy rows:
     /// kind|has_parent|has_parent_block|max_rounds.
     db_session_meta: []const []const u8 = &.{},
+    db_media_refs: u32 = 0,
+    image_fixture: bool = false,
     runs: u8 = 1,
     /// Optional per-scenario M5 config and executable hook fixture.
     config_toml: ?[]const u8 = null,
@@ -245,6 +247,10 @@ fn runScenario(
     if (sf.check.mcp_script) |contents| {
         const mcp_path = try std.fs.path.join(arena, &.{ state_dir, "mcp.sh" });
         try writeExecutable(gpa, io, mcp_path, contents);
+    }
+    if (sf.check.image_fixture) {
+        const image_path = try std.fs.path.join(arena, &.{ state_dir, "tiny.gif" });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "GIF89aMARLIN" });
     }
 
     // 1. Spawn the fake provider; read PORT line.
@@ -497,6 +503,19 @@ fn runScenario(
                 return error.DbSessionMetaMismatch;
             }
         }
+    }
+    if (sf.check.db_media_refs > 0) {
+        const db_path = try std.fmt.allocPrint(arena, "{s}/marlin/marlin.db", .{state_dir});
+        const res = try process_io.run(gpa, io, .{
+            .argv = &.{ "sqlite3", db_path, "SELECT count(*) FROM blob_refs r JOIN blocks b ON b.id=r.block_id WHERE b.kind='user_msg';" },
+            .stdout_limit = 64 * 1024,
+            .stderr_limit = 64 * 1024,
+            .timeout_ms = helper_timeout_ms,
+        });
+        defer res.deinit(gpa);
+        const got = std.fmt.parseInt(u32, std.mem.trim(u8, res.stdout, " \t\r\n"), 10) catch
+            return error.MediaRefQueryFailed;
+        if (got != sf.check.db_media_refs) return error.MediaRefCountMismatch;
     }
 
     // 6. Graceful shutdown must actually END the daemon process. `shutdown`
