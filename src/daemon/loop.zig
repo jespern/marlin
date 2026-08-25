@@ -902,6 +902,12 @@ const ToolWorker = struct {
     }
 };
 
+const max_parallel_tool_workers: usize = 8;
+
+fn parallelChunkEnd(start: usize, group_end: usize) usize {
+    return @min(start +| max_parallel_tool_workers, group_end);
+}
+
 /// Execute maximal contiguous groups of parallel-safe calls concurrently.
 /// Unsafe calls are ordering barriers, preserving model-requested mutation
 /// semantics. Results are only persisted by the parent turn thread.
@@ -928,15 +934,26 @@ fn executePrepared(gpa: std.mem.Allocator, io: Io, opts: RunOpts, calls: []Prepa
 
         var threads: std.ArrayList(std.Thread) = .empty;
         defer threads.deinit(gpa);
-        try threads.ensureTotalCapacity(gpa, end - i);
-        for (calls[i..end]) |*call| {
-            const thread = std.Thread.spawn(.{}, ToolWorker.run, .{ gpa, io, opts, call }) catch {
-                ToolWorker.run(gpa, io, opts, call);
-                continue;
-            };
-            threads.appendAssumeCapacity(thread);
+        try threads.ensureTotalCapacity(gpa, max_parallel_tool_workers);
+        var chunk_start = i;
+        while (chunk_start < end) {
+            threads.clearRetainingCapacity();
+            const chunk_end = parallelChunkEnd(chunk_start, end);
+            var at = chunk_start;
+            while (at < chunk_end) : (at += 1) {
+                const thread = std.Thread.spawn(.{}, ToolWorker.run, .{ gpa, io, opts, &calls[at] }) catch break;
+                threads.appendAssumeCapacity(thread);
+            }
+            for (threads.items) |thread| thread.join();
+
+            if (at < chunk_end) {
+                // A partial chunk is joined before serial fallback; no worker
+                // remains live while the rest of this safe group executes.
+                for (calls[at..end]) |*call| ToolWorker.run(gpa, io, opts, call);
+                break;
+            }
+            chunk_start = chunk_end;
         }
-        for (threads.items) |thread| thread.join();
         i = end;
     }
 }
@@ -1190,6 +1207,24 @@ test "provider error note clips malformed response bodies" {
     defer std.testing.allocator.free(note);
     try std.testing.expect(note.len < 540);
     try std.testing.expect(std.mem.indexOfScalar(u8, note, '\n') == null);
+}
+
+test "parallel-safe groups are chunked at the worker cap" {
+    var start: usize = 0;
+    var chunks: usize = 0;
+    var largest: usize = 0;
+    while (start < 20) {
+        const end = parallelChunkEnd(start, 20);
+        const width = end - start;
+        try std.testing.expect(width > 0);
+        try std.testing.expect(width <= max_parallel_tool_workers);
+        largest = @max(largest, width);
+        chunks += 1;
+        start = end;
+    }
+    try std.testing.expectEqual(@as(usize, 8), max_parallel_tool_workers);
+    try std.testing.expectEqual(@as(usize, 3), chunks);
+    try std.testing.expectEqual(max_parallel_tool_workers, largest);
 }
 
 test {

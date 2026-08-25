@@ -17,11 +17,10 @@
 //!     connection is opened FULLMUTEX (serialized mode); turn threads append
 //!     blocks while the dispatcher answers queries. See store.zig.
 //!   - Session identity and configuration (id, kind, parent_*, cwd, model,
-//!     effort, approval_mode, sandbox/network toggles, archived) are
-//!     dispatcher-owned. Turn threads read them ONLY inside startTurn, on
-//!     the dispatcher thread, before the thread spawns; every protocol
-//!     mutation of these fields is rejected with err{busy} while a turn
-//!     runs, which is what makes the snapshot sound.
+//!     effort, initial approval_mode, sandbox/network toggles, archived) are
+//!     dispatcher-owned. startTurn snapshots every turn-visible value into
+//!     TurnJob before setting state=running and spawning; every protocol
+//!     mutation of these fields is rejected with err{busy} while a turn runs.
 //!   - Fields a RUNNING turn may touch, each with its own discipline:
 //!       cancel, approval_mode_live, context_used,
 //!       phase, phase_started_at_ms                 atomics
@@ -1238,12 +1237,25 @@ pub const Daemon = struct {
                     .model = model,
                     .effort = session.effort,
                     .text = text,
+                    .sandbox_enabled = session.sandbox_enabled,
+                    .network_filtering_enabled = session.network_filtering_enabled,
+                    .kind = session.kind,
+                    .max_rounds = session.max_rounds,
+                    .approval_mode = session.approval_mode,
                     .cancel = &session.cancel,
                     .session = session,
                 };
-                const thread = try std.Thread.spawn(.{}, compactMain, .{job});
-                session.turn_thread = thread;
+                session.phase_started_at_ms.store(nowMs(self.io), .release);
+                session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
                 session.state = .running;
+                const thread = std.Thread.spawn(.{}, compactMain, .{job}) catch |err| {
+                    session.state = .idle;
+                    session.turn_thread = null;
+                    session.phase_started_at_ms.store(nowMs(self.io), .release);
+                    session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+                    return err;
+                };
+                session.turn_thread = thread;
                 self.store.setSessionStatus(session.id, "running") catch {};
                 self.broadcastStatus(session.id, .running);
                 self.sendTo(client, .{ .ok = .{} });
@@ -1582,7 +1594,13 @@ pub const Daemon = struct {
         model: []u8,
         effort: proto.ReasoningEffort,
         text: []u8,
+        sandbox_enabled: bool,
+        network_filtering_enabled: bool,
+        kind: proto.SessionKind,
+        max_rounds: u32,
+        approval_mode: approval.Mode,
         cancel: *std.atomic.Value(bool),
+        /// Live turn state only; configuration must use the value fields above.
         session: *Session,
     };
 
@@ -1604,18 +1622,25 @@ pub const Daemon = struct {
             .model = model,
             .effort = session.effort,
             .text = owned_text,
+            .sandbox_enabled = session.sandbox_enabled,
+            .network_filtering_enabled = session.network_filtering_enabled,
+            .kind = session.kind,
+            .max_rounds = session.max_rounds,
+            .approval_mode = session.approval_mode,
             .cancel = &session.cancel,
             .session = session,
         };
         session.phase_started_at_ms.store(nowMs(self.io), .release);
         session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
-        errdefer {
+        session.state = .running;
+        const thread = std.Thread.spawn(.{}, turnMain, .{job}) catch |err| {
+            session.state = .idle;
+            session.turn_thread = null;
             session.phase_started_at_ms.store(nowMs(self.io), .release);
             session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
-        }
-        const thread = try std.Thread.spawn(.{}, turnMain, .{job});
+            return err;
+        };
         session.turn_thread = thread;
-        session.state = .running;
         self.store.setSessionStatus(session.id, "running") catch {};
         self.broadcastStatus(session.id, .running);
     }
@@ -1696,7 +1721,7 @@ pub const Daemon = struct {
         var sandbox_temp: ?[]u8 = null;
         defer if (sandbox_temp) |path| self.gpa.free(path);
         var sandbox_options = sandbox.Options{};
-        if (self.sandbox_backend == .seatbelt and job.session.sandbox_enabled) {
+        if (self.sandbox_backend == .seatbelt and job.sandbox_enabled) {
             const tmp_root = self.environ.get("TMPDIR") orelse "/private/tmp";
             sandbox_temp = std.fmt.allocPrint(self.gpa, "{s}{c}marlin-tools{c}{d}", .{
                 std.mem.trimEnd(u8, tmp_root, std.fs.path.sep_str),
@@ -1726,12 +1751,12 @@ pub const Daemon = struct {
             .cfg = self.cfg,
             .tool_environ = self.environ,
             .sandbox_options = sandbox_options,
-            .network_policy = if (job.session.network_filtering_enabled) &self.network else null,
+            .network_policy = if (job.network_filtering_enabled) &self.network else null,
             .extensions = self.extensions,
             .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .dialect = c.dialect } else null,
             .prune_frontier = &job.session.prune_frontier,
             .context_used_out = &job.session.context_used,
-            .approval_mode = job.session.approval_mode,
+            .approval_mode = job.approval_mode,
             .approval_mode_live = &job.session.approval_mode_live,
             .gate = &job.session.gate,
             .on_approval_needed = TurnHooks.onApprovalNeeded,
@@ -1742,11 +1767,11 @@ pub const Daemon = struct {
             .on_phase = TurnHooks.onPhase,
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
-            .on_task = if (job.session.kind == .root) TurnHooks.onTask else null,
-            .tool_profile = if (job.session.kind == .root) .full else .read_only,
+            .on_task = if (job.kind == .root) TurnHooks.onTask else null,
+            .tool_profile = if (job.kind == .root) .full else .read_only,
             .cancel = job.cancel,
             .poll_steer = TurnHooks.pollSteer,
-            .max_rounds = job.session.max_rounds,
+            .max_rounds = job.max_rounds,
         }, job.text) catch |e| {
             // Transport errors are flattened by the http layer; the recorded
             // cause turns "ConnectFailed" into "ConnectFailed
@@ -1880,7 +1905,7 @@ pub const Daemon = struct {
             const self = job.daemon;
             onPhase(ctx, .child);
             defer onPhase(ctx, .tool);
-            if (job.session.kind != .root) return taskError(self.gpa, "nested task calls are disabled");
+            if (job.kind != .root) return taskError(self.gpa, "nested task calls are disabled");
 
             const parsed = std.json.parseFromSlice(task_tool.Args, self.gpa, args_json, .{
                 .ignore_unknown_fields = false,

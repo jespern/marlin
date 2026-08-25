@@ -39,9 +39,8 @@ classification. This is operational proof, not another feature phase.
 
 Also close these bounded hardening debts when they intersect M6 work:
 
-1. After the single-child path is stable, honor `parallel_safe` by executing
-   consecutive safe calls concurrently, retaining provider-call result order
-   and per-call cancellation.
+1. Cap consecutive `parallel_safe` execution at eight workers while retaining
+   provider-call result order and per-call cancellation.
 2. Give built-in bash and extension subprocesses one cancellation/deadline
    primitive (TERM, grace, KILL) instead of a mixture of blocking helpers.
 3. Make config/MCP startup errors name the table, server/tool, and bad field.

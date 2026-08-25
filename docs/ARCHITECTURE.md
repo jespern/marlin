@@ -386,9 +386,10 @@ loop:
 ```
 
 - **Parallel tool execution**: `.parallel_safe` is enforced by the scheduler.
-  Consecutive safe calls overlap; mutations and unknown tools remain ordering
-  barriers. Calls and results are each persisted as contiguous ordered groups,
-  matching the provider transcript even when completion order differs.
+  Consecutive safe calls overlap in chunks of at most eight workers; mutations
+  and unknown tools remain ordering barriers. Calls and results are each
+  persisted as contiguous ordered groups, matching the provider transcript
+  even when completion order differs.
 - **Cancellation**: interrupt sets an atomic flag; HTTP, MCP, search, and file
   tools observe it before/after blocking operations and during their own
   loops. A kernel filesystem syscall itself cannot be forcibly unwound; all
