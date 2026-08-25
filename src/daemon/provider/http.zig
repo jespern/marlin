@@ -489,8 +489,11 @@ fn requestCompletes(
         .request => |result| {
             const response = try result;
             if (response.error_body) |body| gpa.free(body);
+            return;
         },
-        .serve => break,
+        // The server task can finish first if the peer closes early. The
+        // request result is the assertion target, so always wait for it.
+        .serve => {},
     };
 }
 
@@ -522,8 +525,11 @@ test "stream cancellation interrupts a blocked response" {
     cancel.store(true, .release);
 
     while (true) switch (try select.await()) {
-        .request => |result| try std.testing.expectError(error.Cancelled, result),
-        .serve => break,
+        .request => |result| {
+            try std.testing.expectError(error.Cancelled, result);
+            return;
+        },
+        .serve => {},
     };
 }
 
