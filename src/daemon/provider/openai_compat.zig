@@ -55,6 +55,8 @@ pub fn buildRequestBody(
         switch (dialect) {
             .openrouter => try ws.writeAll(",\"reasoning\":{\"effort\":"),
             .openai_compatible => try ws.writeAll(",\"reasoning_effort\":"),
+            // Anthropic requests are built by anthropic.buildRequestBody.
+            .anthropic => unreachable,
         }
         try enc(value, .{}, ws);
         if (dialect == .openrouter) try ws.writeByte('}');
@@ -216,6 +218,39 @@ pub const StreamAccum = struct {
             pc.args.deinit(self.gpa);
         }
         self.calls.deinit(self.gpa);
+    }
+
+    // ------------------------------------------------ dialect decoder API --
+    // The accumulator is dialect-neutral; onEvent below is the OpenAI-shape
+    // decoder. Other dialects (anthropic.zig) fill the same accumulator
+    // through these, inheriting bounds and delta coalescing.
+
+    pub fn addText(self: *StreamAccum, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try appendBounded(self.gpa, &self.text, bytes, max_field_bytes);
+        self.maybeForwardText();
+    }
+
+    pub fn addReasoning(self: *StreamAccum, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try appendBounded(self.gpa, &self.reasoning, bytes, max_field_bytes);
+        self.maybeForwardReasoning();
+    }
+
+    pub fn beginToolCall(self: *StreamAccum, index: u32, id: []const u8, name: []const u8) !void {
+        const pc = try self.callAt(index);
+        try self.appendToolFragment(&pc.call_id, id);
+        try self.appendToolFragment(&pc.name, name);
+    }
+
+    pub fn addToolArgs(self: *StreamAccum, index: u32, fragment: []const u8) !void {
+        const pc = try self.callAt(index);
+        try self.appendToolFragment(&pc.args, fragment);
+    }
+
+    pub fn setGenerationId(self: *StreamAccum, id: []const u8) !void {
+        if (self.generation_id.items.len > 0) return;
+        try appendBounded(self.gpa, &self.generation_id, id, max_metadata_bytes);
     }
 
     /// SSE sink: feed each `data:` event payload here.

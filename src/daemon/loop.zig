@@ -20,6 +20,7 @@ const network_policy = @import("network_policy.zig");
 const extensions = @import("extensions.zig");
 const provider = @import("provider/provider.zig");
 const openai = @import("provider/openai_compat.zig");
+const anthropic = @import("provider/anthropic.zig");
 const http = @import("provider/http.zig");
 const sse = @import("provider/sse.zig");
 const tools_registry = @import("tools/registry.zig");
@@ -340,23 +341,25 @@ pub fn runTurn(
             tool_i += 1;
         }
 
-        const body = try openai.buildRequestBody(
+        const body = try buildProviderBody(
             arena,
-            opts.endpoint.model,
-            opts.endpoint.dialect,
+            opts.endpoint,
             opts.effort,
             msgs,
             tools,
             try providerRequestOptions(arena, opts, opts.endpoint),
+            opts.cfg.output_headroom_tokens,
         );
 
         // -- stream the response --
         var acc = openai.StreamAccum.init(gpa);
         defer acc.deinit();
+        var anthropic_stream = anthropic.Stream{ .acc = &acc };
 
         var pump = Pump{
             .parser = sse.Parser.init(gpa),
             .acc = &acc,
+            .anthropic_stream = if (opts.endpoint.dialect == .anthropic) &anthropic_stream else null,
             .io = io,
             .opts = &opts,
             .started_ms = nowMs(io),
@@ -373,9 +376,9 @@ pub fn runTurn(
         publishPhase(opts, .provider);
         const resp = http_client.streamPost(gpa, .{
             .url = opts.endpoint.url,
-            .bearer = opts.endpoint.bearer,
+            .bearer = requestBearer(opts.endpoint),
             .body_json = body,
-            .extra_headers = observabilityHeaders(opts.endpoint.dialect),
+            .extra_headers = try dialectHeaders(arena, opts.endpoint),
             .cancel = opts.cancel,
             .on_wait = Pump.onProviderWait,
             .on_wait_ctx = &pump,
@@ -753,6 +756,10 @@ fn maybeCompact(
     return true;
 }
 
+/// Summaries are bounded prose, not agent output; a fixed budget keeps the
+/// anthropic max_tokens requirement independent of the session's headroom.
+const summary_max_tokens: u64 = 8192;
+
 /// One non-tool provider round: transcript in, summary text out.
 /// Allocated into `arena`.
 fn summarize(
@@ -768,18 +775,23 @@ fn summarize(
         .{ .role = .system, .payload = .{ .text = context.compaction_prompt } },
         .{ .role = .user, .payload = .{ .text = transcript } },
     };
-    const body = try openai.buildRequestBody(arena, ep.model, ep.dialect, .auto, &msgs, &.{}, request_opts);
+    const body = try buildProviderBody(arena, ep, .auto, &msgs, &.{}, request_opts, summary_max_tokens);
 
     var acc = openai.StreamAccum.init(gpa);
     defer acc.deinit();
-    var pump = Pump{ .parser = sse.Parser.init(gpa), .acc = &acc };
+    var anthropic_stream = anthropic.Stream{ .acc = &acc };
+    var pump = Pump{
+        .parser = sse.Parser.init(gpa),
+        .acc = &acc,
+        .anthropic_stream = if (ep.dialect == .anthropic) &anthropic_stream else null,
+    };
     defer pump.parser.deinit();
 
     const resp = http_client.streamPost(gpa, .{
         .url = ep.url,
-        .bearer = ep.bearer,
+        .bearer = requestBearer(ep),
         .body_json = body,
-        .extra_headers = observabilityHeaders(ep.dialect),
+        .extra_headers = try dialectHeaders(arena, ep),
         .cancel = cancel,
     }, &pump, Pump.onChunk) catch |err| {
         if (err == error.ConsumerAborted and acc.response_too_large)
@@ -849,6 +861,39 @@ const openrouter_observability_headers = [_][]const u8{"X-OpenRouter-Metadata: e
 
 fn observabilityHeaders(dialect: provider.Dialect) []const []const u8 {
     return if (dialect == .openrouter) &openrouter_observability_headers else &.{};
+}
+
+/// The bearer the HTTP layer should send. Anthropic's Messages API has no
+/// bearer auth; its key travels in x-api-key via dialectHeaders instead.
+fn requestBearer(ep: Endpoint) ?[]const u8 {
+    return if (ep.dialect == .anthropic) null else ep.bearer;
+}
+
+fn dialectHeaders(arena: std.mem.Allocator, ep: Endpoint) ![]const []const u8 {
+    if (ep.dialect != .anthropic) return observabilityHeaders(ep.dialect);
+    const headers = try arena.alloc([]const u8, 2);
+    headers[0] = try std.fmt.allocPrint(arena, "x-api-key: {s}", .{ep.bearer orelse ""});
+    headers[1] = anthropic.version_header;
+    return headers;
+}
+
+/// Dialect-dispatched request body. Anthropic requires max_tokens; the
+/// output headroom the context engine already reserves is exactly that
+/// budget. Reasoning effort is OpenAI-shape only for now (see anthropic.zig
+/// header for why thinking is deferred).
+fn buildProviderBody(
+    arena: std.mem.Allocator,
+    ep: Endpoint,
+    effort: Effort,
+    msgs: []const provider.Message,
+    tools: []const openai.ToolSpec,
+    request_opts: openai.RequestOptions,
+    max_tokens: u64,
+) ![]u8 {
+    return switch (ep.dialect) {
+        .anthropic => anthropic.buildRequestBody(arena, ep.model, msgs, tools, @max(1024, max_tokens)),
+        .openrouter, .openai_compatible => openai.buildRequestBody(arena, ep.model, ep.dialect, effort, msgs, tools, request_opts),
+    };
 }
 
 fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, name: []const u8, args_json: []const u8) tools_registry.ExecOut {
@@ -1084,6 +1129,9 @@ fn environmentBlock(gpa: std.mem.Allocator, io: Io, opts: *const RunOpts) ![]u8 
 const Pump = struct {
     parser: sse.Parser,
     acc: *openai.StreamAccum,
+    /// Non-null for the anthropic dialect: events route through its decoder
+    /// into the same accumulator instead of the OpenAI-shape decoder.
+    anthropic_stream: ?*anthropic.Stream = null,
     io: ?Io = null,
     opts: ?*const RunOpts = null,
     started_ms: i64 = 0,
@@ -1102,7 +1150,7 @@ const Pump = struct {
     }
 
     fn onEvent(self: *Pump, ev: sse.Event) void {
-        self.acc.onEvent(ev);
+        if (self.anthropic_stream) |stream| stream.onEvent(ev) else self.acc.onEvent(ev);
     }
 
     fn onVisibleText(ctx: ?*anyopaque, text: []const u8) void {
@@ -1178,6 +1226,89 @@ test "environment block reports cwd, git absence, and inactive regimes" {
     const instructions = projectInstructions(gpa, io, dir);
     defer if (instructions) |text| gpa.free(text);
     try std.testing.expectEqualStrings("Use spaces, not tabs.", instructions.?);
+}
+
+const AnthropicWireChecks = struct {
+    saw_api_key: bool = false,
+    saw_version: bool = false,
+    saw_authorization: bool = false,
+    body_ok: bool = false,
+};
+
+fn serveAnthropicMessages(io: Io, server: *Io.net.Server, checks: *AnthropicWireChecks) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var read_buffer: [16384]u8 = undefined;
+    var reader = Io.net.Stream.Reader.init(stream, io, &read_buffer);
+    var content_length: usize = 0;
+    while (reader.interface.takeDelimiterInclusive('\n') catch null) |line| {
+        const trimmed = std.mem.trim(u8, line, "\r\n");
+        if (trimmed.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(trimmed, "x-api-key: sk-ant-test")) checks.saw_api_key = true;
+        if (std.ascii.startsWithIgnoreCase(trimmed, "anthropic-version:")) checks.saw_version = true;
+        if (std.ascii.startsWithIgnoreCase(trimmed, "authorization:")) checks.saw_authorization = true;
+        if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:")) {
+            content_length = std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[15..], " "), 10) catch 0;
+        }
+    }
+    var body_buf: [16384]u8 = undefined;
+    var got: usize = 0;
+    while (got < @min(content_length, body_buf.len)) {
+        const n = reader.interface.readSliceShort(body_buf[got..@min(content_length, body_buf.len)]) catch break;
+        if (n == 0) break;
+        got += n;
+    }
+    const body = body_buf[0..got];
+    checks.body_ok = std.mem.indexOf(u8, body, "\"max_tokens\":8192") != null and
+        std.mem.indexOf(u8, body, "\"system\":[{\"type\":\"text\"") != null and
+        std.mem.indexOf(u8, body, "\"stream\":true") != null;
+
+    var write_buffer: [4096]u8 = undefined;
+    var writer = Io.net.Stream.Writer.init(stream, io, &write_buffer);
+    writer.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n" ++
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t\",\"usage\":{\"input_tokens\":10}}}\n\n" ++
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"SUMMARY-OK\"}}\n\n" ++
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n" ++
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") catch return;
+    writer.interface.flush() catch return;
+}
+
+test "anthropic dialect end-to-end: headers, body shape, and SSE decode" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const address = Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var checks = AnthropicWireChecks{};
+    const server_thread = try std.Thread.spawn(.{}, serveAnthropicMessages, .{ io, &server, &checks });
+    defer server_thread.join();
+
+    const url = try std.fmt.allocPrintSentinel(gpa, "http://127.0.0.1:{d}/v1/messages", .{server.socket.address.getPort()}, 0);
+    defer gpa.free(url);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var http_client = try http.Client.init(gpa, io);
+    defer http_client.deinit();
+
+    const summary = try summarize(gpa, arena_state.allocator(), &http_client, .{
+        .url = url,
+        .bearer = "sk-ant-test",
+        .model = "claude-sonnet-4-5",
+        .dialect = .anthropic,
+    }, "transcript to summarize", null, .{});
+
+    try std.testing.expectEqualStrings("SUMMARY-OK", summary);
+    try std.testing.expect(checks.saw_api_key);
+    try std.testing.expect(checks.saw_version);
+    // The Messages API authenticates via x-api-key; a stray bearer would be
+    // sent to Anthropic's servers as a foreign credential.
+    try std.testing.expect(!checks.saw_authorization);
+    try std.testing.expect(checks.body_ok);
 }
 
 test "provider error note extracts direct message" {

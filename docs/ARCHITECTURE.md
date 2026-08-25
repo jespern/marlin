@@ -424,17 +424,19 @@ loop:
 
 ## 5. Providers
 
-One internal chat representation (blocks → messages). ONE wire dialect ships
-today — everything goes through openai_compat (OpenRouter carries
-cache_control to Anthropic models):
+One internal chat representation (blocks → messages), two wire dialects:
 
 ```
 provider/
   openai_compat.zig   // OpenRouter, OpenAI, DeepSeek, Groq, local llama.cpp, ...
-  anthropic.zig       // Messages API: STUB, not yet implemented. Still the
-                      // one non-OpenAI dialect worth building (direct line to
-                      // the most-used family + native cache_control), but do
-                      // not describe marlin as two-dialect until it exists.
+  anthropic.zig       // Messages API (SHIPPED): anthropic/<model> via
+                      // ANTHROPIC_API_KEY. x-api-key auth, role-merged
+                      // content blocks, native cache_control on the
+                      // assembler's breakpoints, content-block SSE decode
+                      // into the shared accumulator. Not yet: extended
+                      // thinking (requires persisting signed thinking blocks
+                      // for tool-round replay; effort is ignored on the
+                      // direct dialect until then — it works via OpenRouter).
   registry.zig        // model string "openrouter/anthropic/claude-..." → dialect + base_url + key env
 ```
 

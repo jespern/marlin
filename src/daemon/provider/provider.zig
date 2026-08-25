@@ -7,8 +7,9 @@
 const std = @import("std");
 
 /// Reasoning-effort fields differ between OpenRouter and the OpenAI Chat
-/// Completions-compatible endpoints used for local models.
-pub const Dialect = enum { openrouter, openai_compatible };
+/// Completions-compatible endpoints used for local models; `anthropic` is
+/// the Messages API (anthropic.zig), the one non-OpenAI wire shape shipped.
+pub const Dialect = enum { openrouter, openai_compatible, anthropic };
 
 pub const Role = enum { system, user, assistant, tool };
 

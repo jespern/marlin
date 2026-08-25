@@ -56,6 +56,19 @@ pub fn resolve(
             .dialect = .openrouter,
         };
     }
+    if (std.mem.eql(u8, provider_name, "anthropic")) {
+        const base = overrideBaseUrl(environ, "ANTHROPIC") orelse "https://api.anthropic.com/v1";
+        const key = environ.get("ANTHROPIC_API_KEY") orelse return error.MissingApiKey;
+        if (key.len == 0) return error.MissingApiKey;
+        return .{
+            .url = try joinMessagesUrl(gpa, base),
+            // Carried as `bearer` but sent as x-api-key: the loop routes it
+            // into headers for this dialect (Messages API has no bearer auth).
+            .bearer = try gpa.dupe(u8, key),
+            .model = try gpa.dupe(u8, model),
+            .dialect = .anthropic,
+        };
+    }
     if (std.mem.eql(u8, provider_name, "local")) {
         const base = overrideBaseUrl(environ, "LOCAL") orelse
             (environ.get("MARLIN_LOCAL_BASE_URL") orelse return error.MissingBaseUrl);
@@ -84,12 +97,35 @@ fn joinChatUrl(gpa: std.mem.Allocator, base: []const u8) Error![:0]u8 {
     return std.fmt.allocPrintSentinel(gpa, "{s}/chat/completions", .{trimmed}, 0) catch error.OutOfMemory;
 }
 
+/// base ("https://api.anthropic.com/v1") → ".../messages"
+fn joinMessagesUrl(gpa: std.mem.Allocator, base: []const u8) Error![:0]u8 {
+    const trimmed = std.mem.trimEnd(u8, base, "/");
+    return std.fmt.allocPrintSentinel(gpa, "{s}/messages", .{trimmed}, 0) catch error.OutOfMemory;
+}
+
 /// The OpenRouter models-catalog endpoint (honors the same base-url
 /// override the chat endpoint uses, so e2e can fake it). Caller frees.
 pub fn openrouterModelsUrl(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) Error![:0]u8 {
     const base = overrideBaseUrl(environ, "OPENROUTER") orelse "https://openrouter.ai/api/v1";
     const trimmed = std.mem.trimEnd(u8, base, "/");
     return std.fmt.allocPrintSentinel(gpa, "{s}/models", .{trimmed}, 0) catch error.OutOfMemory;
+}
+
+test "anthropic models resolve to the Messages endpoint with x-api-key material" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("ANTHROPIC_API_KEY", "sk-ant-test");
+    const ep = try resolve(gpa, &env, "anthropic/claude-sonnet-4-5");
+    defer ep.deinit(gpa);
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep.url);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", ep.model);
+    try std.testing.expectEqual(provider.Dialect.anthropic, ep.dialect);
+    try std.testing.expectEqualStrings("sk-ant-test", ep.bearer.?);
+
+    var empty = std.process.Environ.Map.init(gpa);
+    defer empty.deinit();
+    try std.testing.expectError(error.MissingApiKey, resolve(gpa, &empty, "anthropic/claude-sonnet-4-5"));
 }
 
 test "joinChatUrl normalizes trailing slash" {
