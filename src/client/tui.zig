@@ -347,6 +347,9 @@ const App = struct {
     /// Set when a selection was completed (mouse released): next frame
     /// copies the selected cells via OSC52 and clears the flag.
     copy_pending: bool = false,
+    /// Keyboard yanks clear the selection highlight once copied (vim visual-
+    /// mode y); mouse selections keep theirs.
+    sel_clear_after_copy: bool = false,
     /// Text ready for the event loop to send through OSC52. Blob responses
     /// arrive in the daemon reader path, where the terminal writer is not
     /// available, so `!c` stages the bytes here for the next frame.
@@ -510,6 +513,7 @@ const App = struct {
         self.sel_head = .{ .line = 0, .col = 0 };
         self.sel_dragging = false;
         self.copy_pending = false;
+        self.sel_clear_after_copy = false;
         self.show_tool_transcript = false;
         self.spinner_frame = 0;
         self.turn_started_ms = 0;
@@ -631,6 +635,20 @@ const App = struct {
         }
         const sid = self.recent_sessions.items[self.recent_cursor];
         self.switchSession(sid, false) catch self.setNotice("could not switch session", .{});
+    }
+
+    /// Ngt: jump to the Nth most-recent session (1 = current top of the
+    /// recency list). Counts past the end clamp to the oldest, like vim.
+    fn jumpToSession(self: *App, ordinal: usize) void {
+        const idx = recentOrdinalIndex(self.recent_sessions.items.len, ordinal) orelse return;
+        self.recent_cursor = idx;
+        const sid = self.recent_sessions.items[idx];
+        self.switchSession(sid, false) catch self.setNotice("could not switch session", .{});
+    }
+
+    fn recentOrdinalIndex(len: usize, ordinal: usize) ?usize {
+        if (len == 0 or ordinal == 0) return null;
+        return @min(ordinal - 1, len - 1);
     }
 
     fn replaceSessionSummaries(self: *App, incoming: []const proto.SessionInfo) void {
@@ -1267,6 +1285,7 @@ const App = struct {
         self.updateCopySelection(cursor);
         if (!self.copy_linewise) self.sel_head = cursor;
         self.copy_pending = true;
+        self.sel_clear_after_copy = true;
         self.copy_cursor = null; // yank ends copy mode
     }
 
@@ -1659,6 +1678,7 @@ const App = struct {
         self.sel_anchor = null;
         self.sel_dragging = false;
         self.copy_pending = false;
+        self.sel_clear_after_copy = false;
         self.notice.clearRetainingCapacity();
         self.refresh_requested = true;
     }
@@ -4346,7 +4366,7 @@ const ShortcutHelpRow = struct {
 
 const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Esc / i", .description = "return to insert mode" },
-    .{ .key = "gt / gT", .description = "switch recent sessions (vim tab keys)" },
+    .{ .key = "gt / gT", .description = "switch sessions · Ngt = Nth recent" },
     .{ .key = "J", .description = "join lines" },
     .{ .key = "a / A / I", .description = "insert after cursor / line end / line start" },
     .{ .key = "j / k", .description = "scroll one line" },
@@ -5155,6 +5175,10 @@ pub fn run(
                         app.setNotice("clipboard copy failed", .{});
                 }
             }
+            if (app.sel_clear_after_copy) {
+                app.sel_clear_after_copy = false;
+                app.sel_anchor = null;
+            }
         }
 
         if (app.clipboard_pending.items.len > 0) {
@@ -5483,12 +5507,16 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             }
             if (app.pending_g) {
                 app.pending_g = false;
+                const count = app.pending_count;
+                app.pending_count = 0;
                 if (key.matches('g', .{})) {
                     app.scroll_up = std.math.maxInt(usize); // clamped in draw
                 } else if (key.matches('t', .{})) {
-                    app.cycleSession(1);
+                    // vim Ngt is absolute; here N indexes the recency list.
+                    if (count > 0) app.jumpToSession(count) else app.cycleSession(1);
                 } else if (key.matches('T', .{ .shift = true }) or key.matches('T', .{})) {
-                    app.cycleSession(-1);
+                    var steps = @max(count, 1);
+                    while (steps > 0) : (steps -= 1) app.cycleSession(-1);
                 }
                 return;
             }
@@ -7203,4 +7231,18 @@ test "J joins lines; gg tops; gt cycles sessions" {
     try handleKey(&app, .{ .codepoint = 'g' });
     try std.testing.expect(!app.pending_g);
     try std.testing.expect(app.scroll_up > 0);
+
+    // Ngt ordinal math: 1-based, clamps past the end, no-ops on empty.
+    try std.testing.expectEqual(@as(?usize, 1), App.recentOrdinalIndex(3, 2));
+    try std.testing.expectEqual(@as(?usize, 2), App.recentOrdinalIndex(3, 9));
+    try std.testing.expectEqual(@as(?usize, null), App.recentOrdinalIndex(0, 2));
+    try std.testing.expectEqual(@as(?usize, null), App.recentOrdinalIndex(3, 0));
+
+    // Yank from copy mode exits it and schedules the highlight clear.
+    app.last_total_lines = 5;
+    app.copy_cursor = .{ .line = 1, .col = 0 };
+    try handleKey(&app, .{ .codepoint = 'y' });
+    try std.testing.expect(app.copy_cursor == null);
+    try std.testing.expect(app.copy_pending);
+    try std.testing.expect(app.sel_clear_after_copy);
 }
