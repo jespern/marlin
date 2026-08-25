@@ -2573,6 +2573,26 @@ fn scanToolBatch(
     return .{ .next = i, .complete = matched == call_count, .ok_count = ok_count };
 }
 
+/// Emit and reset the accumulated "Ran N commands" summary. Deferred so
+/// consecutive tool stretches merge across interleaved commentary cards
+/// instead of stacking one summary line per provider round.
+fn flushRanSummary(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), pending: *usize) !void {
+    if (pending.* == 0) return;
+    const summary = try std.fmt.allocPrint(alloc, "Ran {d} {s}", .{
+        pending.*,
+        if (pending.* == 1) "command" else "commands",
+    });
+    try lines.append(alloc, .{
+        .text = "  • ",
+        .style = Palette.note,
+        .text2 = summary,
+        .style2 = Palette.assistant,
+        .text3 = " · ctrl+t to view transcript",
+        .style3 = Palette.collapse_hint,
+    });
+    pending.* = 0;
+}
+
 fn layoutBlockRange(
     alloc: std.mem.Allocator,
     app: *App,
@@ -2583,6 +2603,7 @@ fn layoutBlockRange(
     last_tool_label: *[]const u8,
     allow_fold: bool,
 ) !void {
+    var pending_ran: usize = 0;
     var block_idx: usize = start;
     while (block_idx < end) : (block_idx += 1) {
         const rb = app.blocks.items[block_idx];
@@ -2634,11 +2655,18 @@ fn layoutBlockRange(
                 }
             }
 
-            if (folded > 0 or expand.items.len > 0 or running_count > 0) {
-                const summary = if (folded > 0)
+            if (expand.items.len == 0 and running_count == 0 and folded > 0) {
+                pending_ran += folded;
+                block_idx = scan_end - 1;
+                continue;
+            }
+            const total_ran = pending_ran + folded;
+            if (total_ran > 0 or expand.items.len > 0 or running_count > 0) {
+                pending_ran = 0;
+                const summary = if (total_ran > 0)
                     try std.fmt.allocPrint(alloc, "Ran {d} {s}", .{
-                        folded,
-                        if (folded == 1) "command" else "commands",
+                        total_ran,
+                        if (total_ran == 1) "command" else "commands",
                     })
                 else if (running_count > 1)
                     try std.fmt.allocPrint(alloc, "Running {d} commands", .{running_count})
@@ -2660,10 +2688,10 @@ fn layoutBlockRange(
                         capped,
                         if (capped.len < hi.len) "…" else "",
                     });
-                } else if (folded > 0 and running_count > 1) {
+                } else if (total_ran > 0 and running_count > 1) {
                     hint = try std.fmt.allocPrint(alloc, " · running {d} more", .{running_count});
                 }
-                if (folded > 0 or running_count > 0) {
+                if (total_ran > 0 or running_count > 0) {
                     try lines.append(alloc, .{
                         .text = "  • ",
                         .style = Palette.note,
@@ -2683,10 +2711,12 @@ fn layoutBlockRange(
         }
         switch (rb.kind) {
             .user_msg => {
+                try flushRanSummary(alloc, lines, &pending_ran);
                 try blankLine(alloc, lines);
                 try wrapPromptCard(alloc, lines, rb.text, w);
             },
             .assistant_msg => {
+                try flushRanSummary(alloc, lines, &pending_ran);
                 try blankLine(alloc, lines);
                 try wrapMarkdown(alloc, lines, rb.text, w);
             },
@@ -2697,6 +2727,7 @@ fn layoutBlockRange(
                 try wrapReasoningCard(alloc, lines, try clipText(alloc, rb.text, 280), w);
             },
             .tool_call => {
+                try flushRanSummary(alloc, lines, &pending_ran);
                 last_tool_label.* = rb.label;
                 try appendToolCallLine(alloc, lines, rb, w);
             },
@@ -2705,14 +2736,21 @@ fn layoutBlockRange(
                 const txt = try std.fmt.allocPrint(alloc, "    [approval: {s}]", .{rb.text});
                 try wrapInto(alloc, lines, txt, .{ .text = txt, .style = Palette.note });
             },
-            .steer => try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w),
+            .steer => {
+                try flushRanSummary(alloc, lines, &pending_ran);
+                try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w);
+            },
             .system_note => {
                 const txt = try std.fmt.allocPrint(alloc, "[{s}]", .{try clipText(alloc, rb.text, 480)});
                 try wrapPrefixed(alloc, lines, "  ", txt, Palette.note, w);
             },
-            .compaction => try wrapPrefixed(alloc, lines, "  ≋ ", "context compacted", Palette.note, w),
+            .compaction => {
+                try flushRanSummary(alloc, lines, &pending_ran);
+                try wrapPrefixed(alloc, lines, "  ≋ ", "context compacted", Palette.note, w);
+            },
         }
     }
+    try flushRanSummary(alloc, lines, &pending_ran);
 }
 
 /// Blocks of COMPLETED turns are immutable layout input: collapse runs never
@@ -6256,4 +6294,41 @@ test "a failing sibling expands alone; healthy batch members stay folded" {
     try std.testing.expectEqual(@as(usize, 1), gear_lines);
     try std.testing.expect(saw_summary);
     try std.testing.expect(saw_failure);
+}
+
+test "tool summaries merge across commentary into one line" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    // Three rounds: commentary + one successful pair each. Previously this
+    // rendered three separate "Ran 1 command" lines.
+    var seq: u64 = 1;
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        try app.blocks.append(gpa, .{ .kind = .reasoning, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "checking things"), .label = try gpa.dupe(u8, "") });
+        seq += 1;
+        try app.blocks.append(gpa, .{ .kind = .tool_call, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "{\"command\":\"true\"}"), .label = try gpa.dupe(u8, "bash") });
+        seq += 1;
+        try app.blocks.append(gpa, .{ .kind = .tool_result, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "ok"), .label = try gpa.dupe(u8, "") });
+        seq += 1;
+    }
+    try app.blocks.append(gpa, .{ .kind = .assistant_msg, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "done"), .label = try gpa.dupe(u8, "") });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const lines = try layoutLines(arena, &app, 120);
+
+    var summaries: usize = 0;
+    var merged = false;
+    for (lines.items) |line| {
+        const text = try lineText(arena, line);
+        if (std.mem.indexOf(u8, text, "Ran ") != null) summaries += 1;
+        if (std.mem.indexOf(u8, text, "Ran 3 commands") != null) merged = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), summaries);
+    try std.testing.expect(merged);
 }

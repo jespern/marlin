@@ -129,7 +129,7 @@ const Session = struct {
     parent_sid: ?u64 = null,
     kind: proto.SessionKind = .root,
     parent_block_id: ?u64 = null,
-    max_rounds: u32 = 32,
+    max_rounds: u32 = 128,
     archived: bool = false,
     model: []u8, // gpa-owned
     effort: proto.ReasoningEffort = .auto,
@@ -178,8 +178,8 @@ pub const Daemon = struct {
     cfg: config.Config,
     extensions: *extensions.Runtime,
     network: network_policy.Policy,
-    /// Reusable libcurl easy handles. Checked out exclusively by turn threads;
-    /// idle handles keep provider HTTP/TLS connections warm across turns.
+    /// Shared std.http connection pool. Requests are turn-thread-owned while
+    /// idle HTTP/TLS connections remain warm across turns.
     http_pool: http.Pool,
     sandbox_backend: sandbox.Backend = .unavailable,
     /// Non-null exactly when sandbox_backend is .seatbelt: the profile's
@@ -281,7 +281,7 @@ pub const Daemon = struct {
             .cfg = cfg,
             .extensions = extension_runtime,
             .network = network,
-            .http_pool = http.Pool.init(gpa, io),
+            .http_pool = try http.Pool.init(gpa, io, environ),
             .sandbox_backend = sandbox_backend,
             .protected_roots = protected_roots,
             .events = queue.Mpsc(Event).init(gpa),
@@ -911,7 +911,7 @@ pub const Daemon = struct {
             .parent_sid = row.parent_sid,
             .kind = row.kind,
             .parent_block_id = row.parent_block_id,
-            .max_rounds = if (row.max_rounds > 0) row.max_rounds else 32,
+            .max_rounds = if (row.max_rounds > 0) row.max_rounds else 128,
             .archived = row.archived,
             .model = model,
             .effort = row.effort,
@@ -1509,7 +1509,7 @@ pub const Daemon = struct {
         const url = try registry.openrouterModelsUrl(self.gpa, self.environ);
         defer self.gpa.free(url);
 
-        const res = try http.get(self.gpa, url, 8 * 1024 * 1024, 30_000, null);
+        const res = try http.get(self.gpa, self.io, self.environ, url, 8 * 1024 * 1024, 30_000, null);
         defer self.gpa.free(res.body);
         defer if (res.content_type) |ct| self.gpa.free(ct);
         if (res.status >= 400) return error.CatalogHttp;

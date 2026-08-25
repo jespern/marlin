@@ -9,7 +9,7 @@
       ]
     },
     {
-      "expect_contains": ["\"tool_call_id\":\"call_w\"", "wrote 12 bytes"],
+      "expect_contains": ["\"tool_call_id\":\"call_w\"", "created ", "(12 bytes)"],
       "sse": [
         "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_e\",\"function\":{\"name\":\"edit\",\"arguments\":\"{\\\"path\\\":\\\"greet.txt\\\",\\\"old_string\\\":\\\"world\\\",\\\"new_string\\\":\\\"marlin\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":60,\"completion_tokens\":8}}",

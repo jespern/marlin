@@ -92,6 +92,11 @@ pub fn writeFile(gpa: std.mem.Allocator, io: Io, args: WriteArgs, cwd: []const u
     defer gpa.free(abs);
 
     const dir = Io.Dir.cwd();
+    // Read the previous contents first: the result renders as a diff so the
+    // change itself is reviewable in the transcript, not just a byte count.
+    const previous: ?[]u8 = dir.readFileAlloc(io, abs, gpa, .limited(4 * 1024 * 1024)) catch null;
+    defer if (previous) |prev| gpa.free(prev);
+
     if (std.fs.path.dirname(abs)) |parent| {
         dir.createDirPath(io, parent) catch |e| {
             return std.fmt.allocPrint(gpa, "error: cannot create parent dirs for '{s}': {t}", .{ args.path, e });
@@ -100,7 +105,16 @@ pub fn writeFile(gpa: std.mem.Allocator, io: Io, args: WriteArgs, cwd: []const u
     dir.writeFile(io, .{ .sub_path = abs, .data = args.content }) catch |e| {
         return std.fmt.allocPrint(gpa, "error: cannot write '{s}': {t}", .{ args.path, e });
     };
-    return std.fmt.allocPrint(gpa, "wrote {d} bytes to {s}", .{ args.content.len, args.path });
+    if (previous) |old_content| {
+        if (std.mem.eql(u8, old_content, args.content))
+            return std.fmt.allocPrint(gpa, "wrote {d} bytes to {s} (content unchanged)", .{ args.content.len, args.path });
+        const diff = try unifiedDiff(gpa, old_content, 0, old_content.len, args.content);
+        defer gpa.free(diff);
+        return std.fmt.allocPrint(gpa, "wrote {d} bytes to {s}\n{s}", .{ args.content.len, args.path, diff });
+    }
+    const diff = try unifiedDiff(gpa, "", 0, 0, args.content);
+    defer gpa.free(diff);
+    return std.fmt.allocPrint(gpa, "created {s} ({d} bytes)\n{s}", .{ args.path, args.content.len, diff });
 }
 
 // ------------------------------------------------------------------ edit --
@@ -430,7 +444,23 @@ test "write + edit + read round trip on disk" {
 
     const w = try writeFile(gpa, io, .{ .path = "sub/f.txt", .content = "hello world\n" }, dir_path);
     defer gpa.free(w);
-    try std.testing.expect(std.mem.startsWith(u8, w, "wrote "));
+    // A new file reports creation with an all-additions diff.
+    try std.testing.expect(std.mem.startsWith(u8, w, "created "));
+    try std.testing.expect(std.mem.indexOf(u8, w, "+hello world") != null);
+
+    // Overwriting renders the change as a reviewable diff, not a byte count.
+    const w2 = try writeFile(gpa, io, .{ .path = "sub/f.txt", .content = "hello there\n" }, dir_path);
+    defer gpa.free(w2);
+    try std.testing.expect(std.mem.startsWith(u8, w2, "wrote "));
+    try std.testing.expect(std.mem.indexOf(u8, w2, "-hello world") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w2, "+hello there") != null);
+
+    const w3 = try writeFile(gpa, io, .{ .path = "sub/f.txt", .content = "hello there\n" }, dir_path);
+    defer gpa.free(w3);
+    try std.testing.expect(std.mem.indexOf(u8, w3, "(content unchanged)") != null);
+
+    const w4 = try writeFile(gpa, io, .{ .path = "sub/f.txt", .content = "hello world\n" }, dir_path);
+    defer gpa.free(w4);
 
     const e = try editFile(gpa, io, .{ .path = "sub/f.txt", .old_string = "world", .new_string = "marlin" }, dir_path);
     defer gpa.free(e);

@@ -40,8 +40,7 @@ pub const RunOpts = struct {
     session_id: u64,
     cwd: []const u8,
     endpoint: Endpoint,
-    /// Daemon-owned curl easy-handle pool. Each turn checks out one exclusive
-    /// handle and reuses it for every provider/compaction round.
+    /// Daemon-owned HTTP connection pool shared across provider rounds.
     http_pool: ?*http.Pool = null,
     effort: Effort = .auto,
     cfg: config.Config,
@@ -156,7 +155,7 @@ pub fn runTurn(
         .turn_id = ids.next(io),
     };
 
-    var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init();
+    var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
     defer http_client.deinit();
 
     _ = try ap.append(.{ .user_msg = .{ .text = user_text } });
@@ -499,7 +498,18 @@ pub fn runTurn(
         // Loop: next round re-assembles including the new tool results.
     }
 
-    return error.TooManyRounds;
+    // Running out of round budget on a long task is an end-of-turn, not an
+    // error: the session stays usable and a plain "continue" resumes with
+    // full context. The note is durable; the returned text feeds task
+    // children their partial-result contract.
+    _ = try ap.append(.{ .system_note = .{ .text = "round budget reached — say 'continue' to keep going" } });
+    try store.updateSessionUsage(opts.session_id, total_in, total_out);
+    return .{
+        .text = try gpa.dupe(u8, "[round budget reached before a final answer; partial work is in the transcript]"),
+        .rounds = round,
+        .tokens_in = total_in,
+        .tokens_out = total_out,
+    };
 }
 
 /// The mode consulted per call: the session's live value when wired (so a
@@ -687,7 +697,7 @@ pub fn compactSession(
     store: *Store,
     opts: RunOpts,
 ) !bool {
-    var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init();
+    var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
     defer http_client.deinit();
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
