@@ -2221,11 +2221,22 @@ pub const Daemon = struct {
         // this machine, not in any remote list, and are only offered when
         // actually usable (binary installed / key configured). Pricing stays
         // null — unknown, never free.
-        var local_buf: [3][]const u8 = undefined;
+        var local_buf: [6][]const u8 = undefined;
         var local_n: usize = 0;
         if (self.claudeCodeAvailable()) {
-            local_buf[local_n] = "claudecode/default";
-            local_n += 1;
+            // The documented `claude --model` aliases (latest of each family)
+            // plus "default" = whatever the user's Claude Code config picks.
+            // Any full model name still works typed by hand — these are the
+            // picker's curation, not a validation list.
+            for ([_][]const u8{
+                "claudecode/fable",
+                "claudecode/opus",
+                "claudecode/sonnet",
+                "claudecode/default",
+            }) |id| {
+                local_buf[local_n] = id;
+                local_n += 1;
+            }
         }
         if (self.environ.get("ANTHROPIC_API_KEY")) |key| if (key.len > 0) {
             local_buf[local_n] = "anthropic/claude-fable-5";

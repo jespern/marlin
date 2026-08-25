@@ -27,9 +27,11 @@ pub const Config = struct {
     /// OpenRouter exposes 300+ models and a dump of that is not a picker.
     /// User-defined favorites replace these defaults when present in TOML.
     model_favorites: []const []const u8 = &.{
-        // Delegated Claude Code sessions (subscription inference; picking it
-        // errors clearly when the binary is absent).
-        "claudecode/default",
+        // Delegated Claude Code sessions (subscription inference; picking one
+        // errors clearly when the binary is absent). Aliases resolve to the
+        // latest model of each family, per `claude --help`.
+        "claudecode/fable",
+        "claudecode/sonnet",
         "openrouter/anthropic/claude-sonnet-4.5",
         "openrouter/anthropic/claude-opus-4.5",
         "openrouter/openai/gpt-5.2",
