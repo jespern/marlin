@@ -369,6 +369,18 @@ const App = struct {
     /// Bumped whenever existing blocks mutate in place or the block list is
     /// replaced (session switch) — invalidates layout_cache.
     layout_epoch: u64 = 0,
+    /// Copy-mode (vim-style keyboard selection over the transcript):
+    /// non-null = active. Coordinates are absolute layout lines, like the
+    /// mouse selection.
+    copy_cursor: ?SelectionPoint = null,
+    /// Whether the pending selection is line-wise (V / bare y).
+    copy_linewise: bool = false,
+    /// Rendered width and text of the cursor's line, captured by draw() so
+    /// $/w/b know the line without recomputing layout in the key handler.
+    copy_cursor_line_width: usize = 0,
+    copy_cursor_line_text: std.ArrayList(u8) = .empty,
+    /// Last yanked text; p in the composer pastes it.
+    yank_register: std.ArrayList(u8) = .empty,
     /// /permissions full is active for this session (client-side mirror of
     /// the daemon's approval mode; a daemon restart resets both to default).
     permissions_full: bool = false,
@@ -382,6 +394,8 @@ const App = struct {
     reboot_request: RebootRequest = .none,
 
     fn deinit(self: *App) void {
+        self.copy_cursor_line_text.deinit(self.gpa);
+        self.yank_register.deinit(self.gpa);
         self.layout_cache.reset(self.gpa);
         self.picker_filter.deinit(self.gpa);
         for (self.catalog.items) |m| self.gpa.free(m);
@@ -455,6 +469,7 @@ const App = struct {
     }
 
     fn resetActiveAfterMove(self: *App) void {
+        self.copy_cursor = null;
         self.layout_epoch +%= 1;
         self.editor = Editor.init(self.gpa);
         self.blocks = .empty;
@@ -518,6 +533,7 @@ const App = struct {
     }
 
     fn restoreSavedView(self: *App, saved: *SavedSessionView) void {
+        self.copy_cursor = null;
         self.layout_epoch +%= 1;
         self.editor = saved.editor;
         self.blocks = saved.blocks;
@@ -1006,6 +1022,132 @@ const App = struct {
             return;
         }
         self.setNotice("no tool output to copy", .{});
+    }
+
+    /// Enter transcript copy mode with the cursor on the bottom visible line.
+    fn enterCopyMode(self: *App) void {
+        if (self.last_total_lines == 0) return;
+        const line = self.last_first_visible + self.last_view_h -| 1;
+        self.copy_cursor = .{ .line = @min(line, self.last_total_lines - 1), .col = 0 };
+        self.copy_linewise = false;
+        self.setNotice("copy mode · hjkl move · v/V select · y yank · Esc exit", .{});
+    }
+
+    /// Keep the copy cursor inside the visible window by adjusting scroll_up
+    /// (geometry from the previous frame; draw clamps the rest).
+    fn followCopyCursor(self: *App) void {
+        const cursor = self.copy_cursor orelse return;
+        const total = self.last_total_lines;
+        const view = @max(self.last_view_h, 1);
+        if (total <= view) {
+            self.scroll_up = 0;
+            return;
+        }
+        const max_scroll = total - view;
+        var first = total - view - @min(self.scroll_up, max_scroll);
+        if (cursor.line < first) first = cursor.line;
+        if (cursor.line >= first + view) first = cursor.line + 1 - view;
+        self.scroll_up = max_scroll - @min(first, max_scroll);
+    }
+
+    /// Clamp the cursor into the (possibly just scrolled) view.
+    fn clampCopyCursorToView(self: *App) void {
+        var cursor = self.copy_cursor orelse return;
+        const total = self.last_total_lines;
+        const view = @max(self.last_view_h, 1);
+        if (total == 0) return;
+        const max_scroll = total -| view;
+        const first = total -| view -| @min(self.scroll_up, max_scroll);
+        if (cursor.line < first) cursor.line = first;
+        if (cursor.line >= first + view) cursor.line = first + view - 1;
+        cursor.line = @min(cursor.line, total - 1);
+        self.copy_cursor = cursor;
+        if (self.sel_anchor != null) self.updateCopySelection(cursor);
+    }
+
+    fn updateCopySelection(self: *App, cursor: SelectionPoint) void {
+        const a = self.sel_anchor orelse return;
+        if (self.copy_linewise) {
+            const lo = @min(a.line, cursor.line);
+            const hi = @max(a.line, cursor.line);
+            self.sel_anchor = .{ .line = lo, .col = 0 };
+            self.sel_head = .{ .line = hi, .col = std.math.maxInt(usize) };
+        } else {
+            self.sel_head = cursor;
+        }
+    }
+
+    fn yankSelection(self: *App, cursor: SelectionPoint) void {
+        if (self.sel_anchor == null) {
+            // Bare y yanks the whole cursor line, vim's yy in spirit.
+            self.copy_linewise = true;
+            self.sel_anchor = cursor;
+        }
+        self.updateCopySelection(cursor);
+        if (!self.copy_linewise) self.sel_head = cursor;
+        self.copy_pending = true;
+        self.copy_cursor = null; // yank ends copy mode
+    }
+
+    fn copyModeKey(self: *App, key: vaxis.Key) void {
+        var cursor = self.copy_cursor orelse return;
+        const total = if (self.last_total_lines > 0) self.last_total_lines else 1;
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+            if (self.sel_anchor != null) {
+                self.sel_anchor = null;
+            } else {
+                self.copy_cursor = null;
+            }
+            return;
+        } else if (key.matches('y', .{})) {
+            self.yankSelection(cursor);
+            return;
+        } else if (key.matches('v', .{})) {
+            self.copy_linewise = false;
+            self.sel_anchor = cursor;
+            self.sel_head = cursor;
+            return;
+        } else if (key.matches('V', .{ .shift = true }) or key.matches('V', .{})) {
+            self.copy_linewise = true;
+            self.sel_anchor = cursor;
+            self.updateCopySelection(cursor);
+            return;
+        } else if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
+            cursor.col -|= 1;
+        } else if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
+            cursor.col +|= 1;
+        } else if (key.matches('j', .{})) {
+            cursor.line = @min(cursor.line + 1, total - 1);
+        } else if (key.matches('k', .{})) {
+            cursor.line -|= 1;
+        } else if (key.matches('0', .{})) {
+            cursor.col = 0;
+        } else if (key.matches('$', .{})) {
+            cursor.col = self.copy_cursor_line_width -| 1;
+        } else if (key.matches('w', .{})) {
+            cursor.col = nextWordCol(self.copy_cursor_line_text.items, cursor.col);
+        } else if (key.matches('b', .{})) {
+            cursor.col = prevWordCol(self.copy_cursor_line_text.items, cursor.col);
+        } else if (key.matches('g', .{})) {
+            cursor.line = 0;
+        } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+            cursor.line = total - 1;
+        } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
+            cursor.line = @min(cursor.line + 20, total - 1);
+        } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
+            cursor.line -|= 20;
+        } else if (key.matches(vaxis.Key.down, .{})) {
+            self.scroll_up -|= 1;
+            self.clampCopyCursorToView();
+            return;
+        } else if (key.matches(vaxis.Key.up, .{})) {
+            self.scroll_up +|= 1;
+            self.clampCopyCursorToView();
+            return;
+        } else return;
+        self.copy_cursor = cursor;
+        if (self.sel_anchor != null) self.updateCopySelection(cursor);
+        self.followCopyCursor();
     }
 
     fn selection(self: *const App) ?Selection {
@@ -1590,6 +1732,24 @@ fn shimmerSpans(
         char_index += 1;
     }
     return spans.toOwnedSlice(arena);
+}
+
+/// Next word start at or after `col` (ASCII word boundaries over the
+/// rendered line text; columns approximate bytes, which holds for the
+/// transcript's overwhelmingly ASCII content).
+fn nextWordCol(text: []const u8, col: usize) usize {
+    var i = @min(col, text.len);
+    while (i < text.len and text[i] != ' ') i += 1;
+    while (i < text.len and text[i] == ' ') i += 1;
+    return if (i == text.len and text.len > 0) text.len - 1 else i;
+}
+
+/// Previous word start strictly before `col`.
+fn prevWordCol(text: []const u8, col: usize) usize {
+    var i = @min(col, text.len);
+    while (i > 0 and (i > text.len - 1 or i >= text.len or text[i - 1] == ' ')) i -= 1;
+    while (i > 0 and text[i - 1] != ' ') i -= 1;
+    return i;
 }
 
 /// Freshest complete-ish line of a streaming text (for the reasoning ticker).
@@ -4005,6 +4165,16 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "g / G", .description = "jump to top / bottom" },
     .{ .key = "?", .description = "toggle shortcut help" },
     .{ .key = "q", .description = "quit Marlin" },
+    .{ .description = "COMPOSER (vim)", .heading = true },
+    .{ .key = "h l w b 0 $", .description = "move in the input line" },
+    .{ .key = "x / D", .description = "delete char / to line end" },
+    .{ .key = "p", .description = "paste the yank register" },
+    .{ .description = "COPY MODE", .heading = true },
+    .{ .key = "v", .description = "enter copy mode (cursor over transcript)" },
+    .{ .key = "hjkl w b 0 $ g G", .description = "move the cursor" },
+    .{ .key = "v / V", .description = "select char-wise / line-wise" },
+    .{ .key = "y", .description = "yank: clipboard + paste register" },
+    .{ .key = "arrows", .description = "scroll the view" },
     .{ .description = "GLOBAL", .heading = true },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
@@ -4132,6 +4302,26 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
                     var selected_cell = cell;
                     selected_cell.style.reverse = true;
                     win.writeCell(@intCast(col), @intCast(row), selected_cell);
+                }
+            }
+        }
+        if (app.copy_cursor) |cursor| {
+            if (cursor.line == abs_line) {
+                // Capture the cursor line's geometry for $/w/b, then draw a
+                // block cursor (reverse; inside a selection the un-reversed
+                // cell reads as the cursor, exactly like vim).
+                app.copy_cursor_line_width = lineWidth(win, ln);
+                app.copy_cursor_line_text.clearRetainingCapacity();
+                if (lineText(arena, ln)) |txt| {
+                    app.copy_cursor_line_text.appendSlice(app.gpa, txt) catch {};
+                } else |_| {}
+                const col = @min(cursor.col, @max(app.copy_cursor_line_width, 1) - 1);
+                if (col < @as(usize, w)) {
+                    if (win.readCell(@intCast(col), @intCast(row))) |cell| {
+                        var cursor_cell = cell;
+                        cursor_cell.style.reverse = !cursor_cell.style.reverse;
+                        win.writeCell(@intCast(col), @intCast(row), cursor_cell);
+                    }
                 }
             }
         }
@@ -4760,6 +4950,8 @@ pub fn run(
                 const sel_lines = try layoutLines(farena, &app, @intCast(app.term_cols));
                 const text = try selectedText(farena, vx.window(), sel_lines.items, selection);
                 if (text.len > 0) {
+                    app.yank_register.clearRetainingCapacity();
+                    app.yank_register.appendSlice(app.gpa, text) catch {};
                     var copied = true;
                     vx.copyToSystemClipboard(writer, text, farena) catch {
                         copied = false;
@@ -5101,6 +5293,10 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             }
         },
         .normal => {
+            if (app.copy_cursor != null) {
+                app.copyModeKey(key);
+                return;
+            }
             if (key.matches('?', .{})) {
                 app.shortcut_help = true;
             } else if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{})) {
@@ -5128,6 +5324,30 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.scroll_up = 0;
             } else if (key.matches('g', .{})) {
                 app.scroll_up = std.math.maxInt(usize); // clamped in draw
+            } else if (key.matches('v', .{}) or key.matches('V', .{ .shift = true }) or key.matches('V', .{})) {
+                app.enterCopyMode();
+            } else if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
+                app.editor.moveLeft();
+            } else if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
+                app.editor.moveRight();
+            } else if (key.matches('w', .{})) {
+                app.editor.moveWordRight();
+            } else if (key.matches('b', .{})) {
+                app.editor.moveWordLeft();
+            } else if (key.matches('0', .{})) {
+                app.editor.moveLineStart();
+            } else if (key.matches('$', .{})) {
+                app.editor.moveLineEnd();
+            } else if (key.matches('x', .{})) {
+                app.editor.deleteAfter();
+            } else if (key.matches('D', .{ .shift = true }) or key.matches('D', .{})) {
+                app.editor.deleteToLineEnd();
+            } else if (key.matches('p', .{})) {
+                if (app.yank_register.items.len > 0) {
+                    app.editor.insertSlice(app.yank_register.items);
+                } else {
+                    app.setNotice("yank register empty — y in copy mode (v) fills it", .{});
+                }
             }
         },
     }
@@ -6437,4 +6657,59 @@ test "tool summaries merge across commentary into one line" {
     }
     try std.testing.expectEqual(@as(usize, 1), summaries);
     try std.testing.expect(merged);
+}
+
+test "copy mode: enter, select, yank fills selection and requests copy" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.mode = .normal;
+    app.last_total_lines = 50;
+    app.last_view_h = 10;
+    app.last_first_visible = 40;
+
+    try handleKey(&app, .{ .codepoint = 'v' });
+    try std.testing.expect(app.copy_cursor != null);
+    try std.testing.expectEqual(@as(usize, 49), app.copy_cursor.?.line);
+
+    try handleKey(&app, .{ .codepoint = 'k' });
+    try handleKey(&app, .{ .codepoint = 'k' });
+    try std.testing.expectEqual(@as(usize, 47), app.copy_cursor.?.line);
+
+    // Anchor char-wise, extend down one line, yank.
+    try handleKey(&app, .{ .codepoint = 'v' });
+    try std.testing.expect(app.sel_anchor != null);
+    try handleKey(&app, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(usize, 48), app.sel_head.line);
+    try handleKey(&app, .{ .codepoint = 'y' });
+    try std.testing.expect(app.copy_pending);
+    try std.testing.expect(app.copy_cursor == null); // yank exits copy mode
+
+    // Line-wise: V spans full lines in the selection endpoints.
+    try handleKey(&app, .{ .codepoint = 'v' });
+    try handleKey(&app, .{ .codepoint = 'V', .mods = .{ .shift = true } });
+    try handleKey(&app, .{ .codepoint = 'k' });
+    try handleKey(&app, .{ .codepoint = 'y' });
+    try std.testing.expectEqual(@as(usize, 0), app.sel_anchor.?.col);
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), app.sel_head.col);
+}
+
+test "normal mode: p pastes the yank register into the composer" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.mode = .normal;
+    try app.yank_register.appendSlice(gpa, "zig build test");
+    try handleKey(&app, .{ .codepoint = 'p' });
+    try std.testing.expectEqualStrings("zig build test", app.editor.text.items);
+
+    // Motions operate on the composer: 0 then w lands after the first word.
+    try handleKey(&app, .{ .codepoint = '0' });
+    try handleKey(&app, .{ .codepoint = 'w' });
+    try handleKey(&app, .{ .codepoint = 'D' });
+    try std.testing.expectEqualStrings("zig", app.editor.text.items);
 }
