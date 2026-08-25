@@ -56,6 +56,17 @@ pub fn resolve(
             .dialect = .openrouter,
         };
     }
+    if (std.mem.eql(u8, provider_name, "claudecode")) {
+        // No wire endpoint: turns run through the official `claude` binary
+        // under the user's own subscription login. "claudecode/default"
+        // keeps Claude Code's configured model.
+        return .{
+            .url = std.fmt.allocPrintSentinel(gpa, "", .{}, 0) catch return error.OutOfMemory,
+            .bearer = null,
+            .model = try gpa.dupe(u8, model),
+            .dialect = .claude_code,
+        };
+    }
     if (std.mem.eql(u8, provider_name, "anthropic")) {
         const base = overrideBaseUrl(environ, "ANTHROPIC") orelse "https://api.anthropic.com/v1";
         const key = environ.get("ANTHROPIC_API_KEY") orelse return error.MissingApiKey;

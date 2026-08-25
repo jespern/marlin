@@ -9,7 +9,10 @@ const std = @import("std");
 /// Reasoning-effort fields differ between OpenRouter and the OpenAI Chat
 /// Completions-compatible endpoints used for local models; `anthropic` is
 /// the Messages API (anthropic.zig), the one non-OpenAI wire shape shipped.
-pub const Dialect = enum { openrouter, openai_compatible, anthropic };
+/// `claude_code` is not a wire dialect at all: turns are delegated to the
+/// official `claude` binary (claude_code.zig) so subscription inference
+/// stays inside Anthropic's sanctioned surface.
+pub const Dialect = enum { openrouter, openai_compatible, anthropic, claude_code };
 
 pub const Role = enum { system, user, assistant, tool };
 

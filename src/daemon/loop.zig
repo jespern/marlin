@@ -21,6 +21,7 @@ const extensions = @import("extensions.zig");
 const provider = @import("provider/provider.zig");
 const openai = @import("provider/openai_compat.zig");
 const anthropic = @import("provider/anthropic.zig");
+const claude_code = @import("provider/claude_code.zig");
 const http = @import("provider/http.zig");
 const sse = @import("provider/sse.zig");
 const tools_registry = @import("tools/registry.zig");
@@ -218,6 +219,21 @@ pub fn runTurn(
     opts: RunOpts,
     user_text: []const u8,
 ) !TurnResult {
+    // Delegated sessions: the official `claude` binary is the agent loop;
+    // no context assembly, HTTP, or marlin tool dispatch happens here.
+    if (opts.endpoint.dialect == .claude_code) {
+        var ap = Appender{
+            .store = store,
+            .io = io,
+            .opts = &opts,
+            .seq = try store.lastSeq(opts.session_id),
+            .turn_id = ids.next(io),
+        };
+        const fresh = ap.seq == 0;
+        _ = try ap.append(.{ .user_msg = .{ .text = user_text } });
+        return runClaudeCodeTurn(gpa, io, store, opts, &ap, user_text, fresh);
+    }
+
     var history_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer history_arena_state.deinit();
     const history_arena = history_arena_state.allocator();
@@ -756,6 +772,294 @@ fn maybeCompact(
     return true;
 }
 
+// ---------------------------------------------------- claude code turns --
+
+/// Wall-clock ceiling for one delegated invocation; Claude Code has its own
+/// internal turn management, this only prevents an unkillable zombie run.
+const claude_code_deadline_ms: i64 = 60 * 60 * 1000;
+
+const CcWatcher = struct {
+    io: Io,
+    cancel: ?*const std.atomic.Value(bool),
+    group: std.posix.pid_t,
+    deadline_at: i64,
+    done: std.atomic.Value(bool) = .init(false),
+    cancelled: std.atomic.Value(bool) = .init(false),
+    timed_out: std.atomic.Value(bool) = .init(false),
+
+    fn run(w: *CcWatcher) void {
+        while (!w.done.load(.acquire)) {
+            const cancel_hit = if (w.cancel) |c| c.load(.acquire) else false;
+            const deadline_hit = nowMs(w.io) >= w.deadline_at;
+            if (cancel_hit or deadline_hit) {
+                if (cancel_hit) w.cancelled.store(true, .release);
+                if (deadline_hit) w.timed_out.store(true, .release);
+                process_io.terminateProcessGroup(w.io, w.group, 500);
+                return;
+            }
+            w.io.sleep(.fromMilliseconds(200), .awake) catch return;
+        }
+    }
+};
+
+const CcStderrDrain = struct {
+    io: Io,
+    file: Io.File,
+    tail: [4096]u8 = undefined,
+    len: usize = 0,
+
+    fn run(d: *CcStderrDrain) void {
+        var buf: [4096]u8 = undefined;
+        var reader = d.file.reader(d.io, &buf);
+        while (true) {
+            const line = reader.interface.takeDelimiterInclusive('\n') catch return;
+            const room = d.tail.len - d.len;
+            const n = @min(room, line.len);
+            @memcpy(d.tail[d.len .. d.len + n], line[0..n]);
+            d.len += n;
+        }
+    }
+};
+
+const CcOutcome = struct {
+    got_init: bool = false,
+    got_result: bool = false,
+    result_is_error: bool = false,
+    cancelled: bool = false,
+    timed_out: bool = false,
+    exit_code: i64 = -1,
+    tokens_in: u64 = 0,
+    tokens_out: u64 = 0,
+    /// gpa-owned final text (may be empty).
+    final_text: std.ArrayList(u8) = .empty,
+    stderr_tail: [4096]u8 = undefined,
+    stderr_len: usize = 0,
+};
+
+/// One `claude -p` invocation: spawn, decode stream-json, persist blocks.
+fn ccInvoke(
+    gpa: std.mem.Allocator,
+    io: Io,
+    opts: RunOpts,
+    ap: *Appender,
+    prompt: []const u8,
+    fresh: bool,
+) !CcOutcome {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var uuid_buf: [36]u8 = undefined;
+    const argv = try claude_code.buildArgv(arena, .{
+        .binary = claude_code.binaryPath(opts.tool_environ),
+        .prompt = prompt,
+        .model = opts.endpoint.model,
+        .session_uuid = claude_code.sessionUuid(&uuid_buf, opts.session_id),
+        .fresh = fresh,
+        .permissions = if (opts.approval_mode == .auto) .bypass else .accept_edits,
+        .max_turns = opts.max_rounds,
+    });
+
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = opts.cwd },
+        .environ_map = opts.tool_environ,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    }) catch |err| {
+        _ = try ap.append(.{ .system_note = .{
+            .text = if (err == error.FileNotFound)
+                "claude binary not found — install Claude Code (or set MARLIN_CLAUDE_CODE_BIN)"
+            else
+                "failed to spawn claude",
+        } });
+        return error.DelegateSpawnFailed;
+    };
+
+    var outcome = CcOutcome{};
+    errdefer outcome.final_text.deinit(gpa);
+
+    var watcher = CcWatcher{
+        .io = io,
+        .cancel = opts.cancel,
+        .group = child.id.?,
+        .deadline_at = nowMs(io) + claude_code_deadline_ms,
+    };
+    const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
+    var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
+    const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
+
+    // Commentary between tool rounds; flushed when the next tool begins so
+    // the final prose is never double-persisted next to the assistant_msg.
+    var pending_text: std.ArrayList(u8) = .empty;
+    defer pending_text.deinit(gpa);
+
+    {
+        const line_buf = try gpa.alloc(u8, 512 * 1024);
+        defer gpa.free(line_buf);
+        var reader = child.stdout.?.reader(io, line_buf);
+        var line_arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer line_arena_state.deinit();
+        while (true) {
+            const line = reader.interface.takeDelimiterInclusive('\n') catch break;
+            _ = line_arena_state.reset(.retain_capacity);
+            const line_arena = line_arena_state.allocator();
+            var events: std.ArrayList(claude_code.Event) = .empty;
+            claude_code.decodeLine(line_arena, line, &events) catch continue;
+            for (events.items) |ev| switch (ev) {
+                .init => outcome.got_init = true,
+                .text => |text| {
+                    if (pending_text.items.len > 0) try pending_text.append(gpa, '\n');
+                    try pending_text.appendSlice(gpa, text);
+                },
+                .tool_use => |tu| {
+                    if (pending_text.items.len > 0) {
+                        _ = try ap.append(.{ .reasoning = .{ .text = pending_text.items, .commentary = true } });
+                        pending_text.clearRetainingCapacity();
+                    }
+                    _ = try ap.append(.{ .tool_call = .{
+                        .call_id = tu.id,
+                        .name = tu.name,
+                        .args_json = tu.input_json,
+                    } });
+                    if (opts.on_tool) |cb| cb(opts.on_delta_ctx, tu.name, .start);
+                },
+                .tool_result => |tr| {
+                    const cap = opts.cfg.inline_tool_cap_bytes;
+                    _ = try ap.append(.{ .tool_result = .{
+                        .call_id = tr.tool_use_id,
+                        .status = if (tr.is_error) .err else .ok,
+                        .inline_body = tr.text[0..@min(tr.text.len, cap)],
+                        .full_body_ref = null,
+                    } });
+                    if (opts.on_tool) |cb| cb(opts.on_delta_ctx, "claude", .done);
+                },
+                .result => |r| {
+                    outcome.got_result = true;
+                    outcome.result_is_error = r.is_error;
+                    outcome.tokens_in = r.tokens_in;
+                    outcome.tokens_out = r.tokens_out;
+                    outcome.final_text.clearRetainingCapacity();
+                    try outcome.final_text.appendSlice(gpa, if (r.text.len > 0) r.text else pending_text.items);
+                    pending_text.clearRetainingCapacity();
+                },
+            };
+        }
+    }
+
+    watcher.done.store(true, .release);
+    watcher_thread.join();
+    if (drain_thread) |t| t.join();
+    outcome.cancelled = watcher.cancelled.load(.acquire);
+    outcome.timed_out = watcher.timed_out.load(.acquire);
+    const term: std.process.Child.Term = child.wait(io) catch .{ .exited = 255 };
+    outcome.exit_code = switch (term) {
+        .exited => |code| code,
+        else => -1,
+    };
+    @memcpy(outcome.stderr_tail[0..drain.len], drain.tail[0..drain.len]);
+    outcome.stderr_len = drain.len;
+    return outcome;
+}
+
+/// A delegated turn: one or more `claude -p` invocations (steers queued
+/// mid-run become follow-up invocations against the same Claude Code
+/// session), with marlin persisting the structured event stream as blocks.
+fn runClaudeCodeTurn(
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *Store,
+    opts: RunOpts,
+    ap: *Appender,
+    first_text: []const u8,
+    fresh_first: bool,
+) !TurnResult {
+    publishPhase(opts, .provider);
+    var total_in: u64 = 0;
+    var total_out: u64 = 0;
+    var rounds: u32 = 0;
+    var fresh = fresh_first;
+
+    var prompt: std.ArrayList(u8) = .empty;
+    defer prompt.deinit(gpa);
+    try prompt.appendSlice(gpa, first_text);
+
+    var final_text: std.ArrayList(u8) = .empty;
+    defer final_text.deinit(gpa);
+
+    while (true) {
+        rounds += 1;
+        var outcome = try ccInvoke(gpa, io, opts, ap, prompt.items, fresh);
+        // Session-identity mismatch (e.g. the durable log has turns but the
+        // Claude Code session store was cleaned, or vice versa): retry once
+        // in the opposite mode before declaring failure.
+        if (!outcome.got_init and !outcome.got_result and !outcome.cancelled and !outcome.timed_out) {
+            outcome.final_text.deinit(gpa);
+            fresh = !fresh;
+            outcome = try ccInvoke(gpa, io, opts, ap, prompt.items, fresh);
+        }
+        defer outcome.final_text.deinit(gpa);
+
+        total_in += outcome.tokens_in;
+        total_out += outcome.tokens_out;
+
+        if (outcome.cancelled) {
+            _ = try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
+            try store.updateSessionUsage(opts.session_id, total_in, total_out);
+            return .{ .text = try gpa.dupe(u8, ""), .rounds = rounds, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
+        }
+        if (outcome.timed_out) {
+            _ = try ap.append(.{ .system_note = .{ .text = "claude code run exceeded the 60-minute ceiling and was terminated" } });
+            try store.updateSessionUsage(opts.session_id, total_in, total_out);
+            return error.DelegateTimeout;
+        }
+        if (!outcome.got_result) {
+            const note = try std.fmt.allocPrint(
+                gpa,
+                "claude code exited without a result (exit {d}){s}{s}",
+                .{
+                    outcome.exit_code,
+                    if (outcome.stderr_len > 0) ": " else "",
+                    outcome.stderr_tail[0..outcome.stderr_len],
+                },
+            );
+            defer gpa.free(note);
+            _ = try ap.append(.{ .system_note = .{ .text = note } });
+            try store.updateSessionUsage(opts.session_id, total_in, total_out);
+            return error.DelegateFailed;
+        }
+
+        fresh = false;
+        _ = try ap.append(.{ .assistant_msg = .{ .text = outcome.final_text.items } });
+        final_text.clearRetainingCapacity();
+        try final_text.appendSlice(gpa, outcome.final_text.items);
+
+        // Steers queued while the subprocess ran become follow-up rounds.
+        var steered = false;
+        if (opts.poll_steer) |poll| {
+            if (poll(opts.on_delta_ctx, gpa)) |steer_text| {
+                defer gpa.free(steer_text);
+                _ = try ap.append(.{ .steer = .{ .text = steer_text } });
+                prompt.clearRetainingCapacity();
+                try prompt.appendSlice(gpa, steer_text);
+                steered = true;
+            }
+        }
+        if (!steered) break;
+    }
+
+    publishPhase(opts, .finishing);
+    try store.updateSessionUsage(opts.session_id, total_in, total_out);
+    return .{
+        .text = try gpa.dupe(u8, final_text.items),
+        .rounds = rounds,
+        .tokens_in = total_in,
+        .tokens_out = total_out,
+    };
+}
+
 /// Summaries are bounded prose, not agent output; a fixed budget keeps the
 /// anthropic max_tokens requirement independent of the session's headroom.
 const summary_max_tokens: u64 = 8192;
@@ -814,6 +1118,9 @@ pub fn compactSession(
     store: *Store,
     opts: RunOpts,
 ) !bool {
+    // Delegated sessions carry no marlin-assembled context to compact;
+    // Claude Code manages its own.
+    if (opts.endpoint.dialect == .claude_code) return error.DelegatedContext;
     var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
     defer http_client.deinit();
 
@@ -893,6 +1200,8 @@ fn buildProviderBody(
     return switch (ep.dialect) {
         .anthropic => anthropic.buildRequestBody(arena, ep.model, msgs, tools, @max(1024, max_tokens)),
         .openrouter, .openai_compatible => openai.buildRequestBody(arena, ep.model, ep.dialect, effort, msgs, tools, request_opts),
+        // Delegated turns never reach the HTTP request path.
+        .claude_code => unreachable,
     };
 }
 
@@ -1226,6 +1535,75 @@ test "environment block reports cwd, git absence, and inactive regimes" {
     const instructions = projectInstructions(gpa, io, dir);
     defer if (instructions) |text| gpa.free(text);
     try std.testing.expectEqualStrings("Use spaces, not tabs.", instructions.?);
+}
+
+test "delegated claude code turn persists the event stream as blocks" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-cc-turn-test");
+    defer temp.deinit();
+
+    // Fixture `claude`: validates the sanctioned invocation shape, then
+    // emits a canned stream-json transcript (one tool round + result).
+    const script =
+        \\#!/bin/sh
+        \\case "$*" in *"--output-format stream-json"*) ;; *) exit 9 ;; esac
+        \\case "$*" in *"--session-id "*) ;; *) exit 9 ;; esac
+        \\case "$*" in *"--dangerously-skip-permissions"*) ;; *) exit 9 ;; esac
+        \\case "$*" in *"--model fable-5"*) ;; *) exit 9 ;; esac
+        \\echo '{"type":"system","subtype":"init","session_id":"x"}'
+        \\echo '{"type":"assistant","message":{"content":[{"type":"text","text":"scanning repo"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}'
+        \\echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"file.txt"}]}}'
+        \\echo '{"type":"result","subtype":"success","result":"DELEGATE-OK","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":90}}'
+        \\
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-claude" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(claude_code.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, temp.path, "claudecode/fable-5", .auto);
+
+    const result = try runTurn(gpa, io, &store, .{
+        .session_id = 1,
+        .cwd = temp.path,
+        .endpoint = .{ .url = "", .bearer = null, .model = "fable-5", .dialect = .claude_code },
+        .cfg = .{},
+        .tool_environ = &env,
+        .approval_mode = .auto,
+    }, "do the thing");
+    defer gpa.free(result.text);
+
+    try std.testing.expectEqualStrings("DELEGATE-OK", result.text);
+    try std.testing.expectEqual(@as(u64, 100), result.tokens_in);
+    try std.testing.expectEqual(@as(u64, 5), result.tokens_out);
+
+    const loaded = try store.getBlocks(1, 1, 1000);
+    defer {
+        for (loaded) |*lb| lb.deinit();
+        gpa.free(loaded);
+    }
+    const expected_kinds = [_][]const u8{ "user_msg", "reasoning", "tool_call", "tool_result", "assistant_msg" };
+    try std.testing.expectEqual(expected_kinds.len, loaded.len);
+    for (expected_kinds, loaded) |want, lb| {
+        try std.testing.expectEqualStrings(want, @tagName(lb.blk.body));
+    }
+    // The between-rounds prose became visible commentary, not raw reasoning.
+    try std.testing.expect(loaded[1].blk.body.reasoning.commentary);
+    try std.testing.expectEqualStrings("scanning repo", loaded[1].blk.body.reasoning.text);
+    try std.testing.expectEqualStrings("Bash", loaded[2].blk.body.tool_call.name);
+    try std.testing.expectEqualStrings("file.txt", loaded[3].blk.body.tool_result.inline_body);
 }
 
 const AnthropicWireChecks = struct {

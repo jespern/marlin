@@ -437,6 +437,19 @@ provider/
                       // thinking (requires persisting signed thinking blocks
                       // for tool-round replay; effort is ignored on the
                       // direct dialect until then — it works via OpenRouter).
+  claude_code.zig     // claudecode/<model> (SHIPPED): turns delegated to the
+                      // OFFICIAL `claude` binary in headless stream-json mode
+                      // under the user's subscription login — the only
+                      // sanctioned way to use plan-included inference outside
+                      // claude.ai. Claude Code is the agent loop (its tools,
+                      // its permission system, its context management);
+                      // marlin persists the structured event stream as blocks
+                      // and remains the multiplexer. Marlin's approval gate,
+                      // sandbox, network screening, and L0/L1/L2 do NOT reach
+                      // inside the subprocess: session approval mode maps to
+                      // --permission-mode acceptEdits (default) or
+                      // --dangerously-skip-permissions (auto), stated here so
+                      // nobody mistakes delegation for marlin-native policy.
   registry.zig        // model string "openrouter/anthropic/claude-..." → dialect + base_url + key env
 ```
 
