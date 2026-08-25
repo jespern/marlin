@@ -372,6 +372,12 @@ const App = struct {
     /// as call/result blocks stream in; drives the per-call timer on the
     /// Working line.
     call_started_ms: i64 = 0,
+    /// Provider stream telemetry (ephemeral, ~1/s while receiving):
+    /// cumulative bytes this round, ms since the last visible delta, and
+    /// when the last report arrived (0 = none; stale reports are hidden).
+    stream_bytes: u64 = 0,
+    stream_quiet_ms: u64 = 0,
+    stream_status_at_ms: i64 = 0,
     animation_active: std.atomic.Value(bool) = .init(false),
     animation_stop: std.atomic.Value(bool) = .init(false),
     cfg: config.Config = .{},
@@ -858,6 +864,12 @@ const App = struct {
                 if (d.sid != self.sid) return;
                 self.reasoning_delta.appendSlice(self.gpa, d.text) catch {};
             },
+            .stream_status => |ss| {
+                if (ss.sid != self.sid) return;
+                self.stream_bytes = ss.bytes;
+                self.stream_quiet_ms = ss.quiet_ms;
+                self.stream_status_at_ms = nowWallMs(self.io);
+            },
             .status => |s| {
                 if (s.sid != self.sid) {
                     if (self.saved_views.get(s.sid)) |saved| saved.state = s.state;
@@ -867,6 +879,7 @@ const App = struct {
                     self.spinner_frame = 0;
                     self.turn_started_ms = nowWallMs(self.io);
                 }
+                if (s.state != .running) self.stream_status_at_ms = 0;
                 self.state = s.state;
                 self.animation_active.store(s.state == .running, .release);
                 if (s.state != .awaiting_approval) self.pending = null;
@@ -3291,6 +3304,23 @@ fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(L
         // What is it actually doing? Show the executing tool call with its
         // own timer so a long-running command is visible at a glance.
         var detail = elapsed;
+        // Stream telemetry: proves liveness when the provider is sending but
+        // nothing is visible yet (long thinking, tool-call assembly). Hidden
+        // once reports go stale (between rounds, during tool execution).
+        const stream_fresh = app.stream_status_at_ms > 0 and
+            nowWallMs(app.io) - app.stream_status_at_ms < 3000;
+        if (stream_fresh and app.currentInflightCall() == null) {
+            const quiet_s = app.stream_quiet_ms / 1000;
+            if (quiet_s >= 3) {
+                detail = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1} · last token {d}s ago", .{
+                    elapsed, app.stream_bytes, quiet_s,
+                });
+            } else {
+                detail = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1}", .{
+                    elapsed, app.stream_bytes,
+                });
+            }
+        }
         if (app.currentInflightCall()) |cur| {
             const arg_full = extractHighlightArg(cur.rb.label, cur.rb.text) orelse "";
             const arg = arg_full[0..utf8Floor(arg_full, @min(arg_full.len, 60))];

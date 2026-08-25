@@ -83,6 +83,9 @@ pub const RunOpts = struct {
     /// Separate provider reasoning stream; clients render it as a progress
     /// card instead of mixing it into final assistant prose.
     on_reasoning_delta: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    /// Stream liveness: cumulative response bytes this round + ms since the
+    /// last visible delta. Throttled to ~1/s; drives the client status line.
+    on_stream_status: ?*const fn (ctx: ?*anyopaque, bytes: u64, quiet_ms: u64) void = null,
     on_delta_ctx: ?*anyopaque = null,
     /// Called when a tool starts/finishes (for progress display).
     on_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, phase: ToolPhase) void = null,
@@ -285,12 +288,22 @@ pub fn runTurn(
         // -- stream the response --
         var acc = openai.StreamAccum.init(gpa);
         defer acc.deinit();
-        acc.on_delta = opts.on_delta;
-        acc.on_reasoning_delta = opts.on_reasoning_delta;
-        acc.on_delta_ctx = opts.on_delta_ctx;
 
-        var pump = Pump{ .parser = sse.Parser.init(gpa), .acc = &acc };
+        var pump = Pump{
+            .parser = sse.Parser.init(gpa),
+            .acc = &acc,
+            .io = io,
+            .opts = &opts,
+            .started_ms = nowMs(io),
+        };
+        pump.last_visible_ms = pump.started_ms;
+        pump.last_emit_ms = pump.started_ms;
         defer pump.parser.deinit();
+        // Visible deltas route through the pump so it can stamp liveness
+        // before chaining to the caller's callbacks.
+        acc.on_delta = Pump.onVisibleText;
+        acc.on_reasoning_delta = Pump.onVisibleReasoning;
+        acc.on_delta_ctx = &pump;
 
         const resp = http_client.streamPost(gpa, .{
             .url = opts.endpoint.url,
@@ -965,13 +978,52 @@ fn environmentBlock(gpa: std.mem.Allocator, io: Io, opts: *const RunOpts) ![]u8 
 const Pump = struct {
     parser: sse.Parser,
     acc: *openai.StreamAccum,
+    io: ?Io = null,
+    opts: ?*const RunOpts = null,
+    started_ms: i64 = 0,
+    bytes_total: u64 = 0,
+    last_visible_ms: i64 = 0,
+    last_emit_ms: i64 = 0,
 
     fn onChunk(self: *Pump, bytes: []const u8) void {
-        self.parser.feed(bytes, self.acc, onEvent) catch {};
+        self.bytes_total += bytes.len;
+        self.parser.feed(bytes, self, onEvent) catch {};
+        self.maybeEmitStatus();
     }
 
-    fn onEvent(acc: *openai.StreamAccum, ev: sse.Event) void {
-        acc.onEvent(ev);
+    fn onEvent(self: *Pump, ev: sse.Event) void {
+        self.acc.onEvent(ev);
+    }
+
+    fn onVisibleText(ctx: ?*anyopaque, text: []const u8) void {
+        const self: *Pump = @ptrCast(@alignCast(ctx.?));
+        self.markVisible();
+        const opts = self.opts orelse return;
+        if (opts.on_delta) |cb| cb(opts.on_delta_ctx, text);
+    }
+
+    fn onVisibleReasoning(ctx: ?*anyopaque, text: []const u8) void {
+        const self: *Pump = @ptrCast(@alignCast(ctx.?));
+        self.markVisible();
+        const opts = self.opts orelse return;
+        if (opts.on_reasoning_delta) |cb| cb(opts.on_delta_ctx, text);
+    }
+
+    fn markVisible(self: *Pump) void {
+        const io = self.io orelse return;
+        self.last_visible_ms = nowMs(io);
+    }
+
+    /// At most one status per second, and only while bytes actually flow —
+    /// silence is the idle watchdog's business, not telemetry's.
+    fn maybeEmitStatus(self: *Pump) void {
+        const io = self.io orelse return;
+        const opts = self.opts orelse return;
+        const cb = opts.on_stream_status orelse return;
+        const now = nowMs(io);
+        if (now - self.last_emit_ms < 1000) return;
+        self.last_emit_ms = now;
+        cb(opts.on_delta_ctx, self.bytes_total, @intCast(@max(0, now - self.last_visible_ms)));
     }
 };
 

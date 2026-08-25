@@ -1217,6 +1217,7 @@ pub const Daemon = struct {
             .on_approval_done = TurnHooks.onApprovalDone,
             .on_delta = TurnHooks.onDelta,
             .on_reasoning_delta = TurnHooks.onReasoningDelta,
+            .on_stream_status = TurnHooks.onStreamStatus,
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
             .on_task = if (job.session.kind == .root) TurnHooks.onTask else null,
@@ -1322,6 +1323,13 @@ pub const Daemon = struct {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
             const line = proto.encode(self.gpa, proto.DaemonMsg{ .reasoning_delta = .{ .sid = job.sid, .turn_id = 0, .text = text } }) catch return;
+            self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+        }
+
+        fn onStreamStatus(ctx: ?*anyopaque, bytes: u64, quiet_ms: u64) void {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            const line = proto.encode(self.gpa, proto.DaemonMsg{ .stream_status = .{ .sid = job.sid, .bytes = bytes, .quiet_ms = quiet_ms } }) catch return;
             self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
         }
 

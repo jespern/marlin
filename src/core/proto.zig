@@ -115,6 +115,10 @@ pub const DaemonMsg = union(enum) {
     blk: struct { sid: u64, b: block.Block },
     delta: struct { sid: u64, turn_id: u64, text: []const u8 },
     reasoning_delta: struct { sid: u64, turn_id: u64, text: []const u8 },
+    /// Ephemeral stream telemetry while a turn is receiving from the
+    /// provider: cumulative body bytes this round and ms since the last
+    /// visible (text/reasoning) delta. Emitted at most ~1/s.
+    stream_status: struct { sid: u64, bytes: u64, quiet_ms: u64 },
     status: struct { sid: u64, state: SessionState },
     approval_request: struct {
         sid: u64,

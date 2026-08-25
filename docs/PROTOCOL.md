@@ -82,6 +82,7 @@ descendants.
 | blk {sid, b} | a block was persisted (replay AND live fan-out) |
 | delta {sid, turn_id, text} | streaming assistant text (ephemeral) |
 | reasoning_delta {sid, turn_id, text} | provider reasoning stream (ephemeral, rendered separately from assistant text) |
+| stream_status {sid, bytes, quiet_ms} | stream liveness while receiving from the provider: cumulative body bytes this round + ms since the last visible delta; throttled to ~1/s (ephemeral) |
 | status {sid, state} | session state change: idle/running/awaiting_approval/err/done |
 | approval_request {sid, approval_id, call_id, tool, args_json} | a mutating tool call parked on the gate; answer with `approve` |
 | session_meta {sid, tokens_in, tokens_out, context_used, context_limit} | after each turn; ALWAYS sent before the closing status. context_* feed the status-bar gauge (0 = unmeasured) |

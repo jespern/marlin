@@ -571,9 +571,23 @@ fn serveSseInBursts(io: Io, server: *Io.net.Server) void {
     defer stream.close(io);
     var read_buffer: [8192]u8 = undefined;
     var reader = Io.net.Stream.Reader.init(stream, io, &read_buffer);
-    _ = reader.interface.takeDelimiterInclusive('\n') catch return;
+    // Streaming requests must refuse compression: behind a gzip window,
+    // deltas arrive in whole-window bursts. 406 fails the test if the
+    // identity requirement ever regresses.
+    var asked_identity = false;
+    while (reader.interface.takeDelimiterInclusive('\n') catch null) |line| {
+        const trimmed = std.mem.trim(u8, line, "\r\n");
+        if (trimmed.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(trimmed, "accept-encoding:") and
+            std.mem.indexOf(u8, trimmed, "identity") != null) asked_identity = true;
+    }
     var write_buffer: [8192]u8 = undefined;
     var writer = Io.net.Stream.Writer.init(stream, io, &write_buffer);
+    if (!asked_identity) {
+        writer.interface.writeAll("HTTP/1.1 406 Not Acceptable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch return;
+        writer.interface.flush() catch return;
+        return;
+    }
     writer.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n") catch return;
     writer.interface.flush() catch return;
     // Three bursts with pauses, like a live provider: each must reach the
