@@ -137,7 +137,8 @@ const Session = struct {
     state: proto.SessionState = .idle,
     turn_thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = .init(false),
-    /// Approval mode fixed at creation (headless "auto" vs interactive).
+    /// Approval mode: set at creation (headless "auto" vs interactive),
+    /// switchable per session via /permissions (session_set_approvals).
     approval_mode: approval.Mode = .default,
     /// Kernel shell sandbox + prompt-free shell execution (/sandbox).
     /// Seeded from cfg.permissions_enabled; effective only with a verified
@@ -681,6 +682,18 @@ pub const Daemon = struct {
                 session.sandbox_enabled = ss.enabled;
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionList();
+            },
+            .session_set_approvals => |sa| {
+                const session = (try self.getOrLoadSession(sa.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot change approvals mid-turn" } });
+                    return;
+                }
+                session.approval_mode = approval.Mode.parse(sa.approvals);
+                self.sendTo(client, .{ .ok = .{} });
             },
             .session_set_network_filtering => |sn| {
                 const session = (try self.getOrLoadSession(sn.sid)) orelse {

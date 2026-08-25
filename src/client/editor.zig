@@ -422,10 +422,27 @@ pub fn layoutRows(self: *const Editor, width: usize) []Row {
         const end = nextCpEnd(t, i);
         const cpw = cpDisplayWidth(t[i..end]);
         if (col + cpw > w) {
-            if (n < row_buf.len) row_buf[n] = .{ .start = start, .end = i };
+            // Word-aware: when the overflow lands mid-word, break after the
+            // row's last space so the whole word moves down; a word longer
+            // than the row still hard-splits.
+            var break_pos = i;
+            var scan = i;
+            while (scan > start) : (scan -= 1) {
+                if (t[scan - 1] == ' ') {
+                    break_pos = scan;
+                    break;
+                }
+            }
+            if (n < row_buf.len) row_buf[n] = .{ .start = start, .end = break_pos };
             n += 1;
-            start = i;
+            start = break_pos;
             col = 0;
+            var carried = break_pos;
+            while (carried < i) {
+                const ce = nextCpEnd(t, carried);
+                col += cpDisplayWidth(t[carried..ce]);
+                carried = ce;
+            }
         }
         col += cpw;
         i = end;
@@ -648,6 +665,22 @@ test "soft wrap heights" {
     try testing.expectEqual(@as(usize, 1), ed.displayHeight(10));
     ed.insertSlice("aaaaaaaaaaaaaaaaaaaaaaaaa"); // 25 chars at width 10 = 3 rows
     try testing.expectEqual(@as(usize, 3), ed.displayHeight(10));
+}
+
+test "soft wrap moves whole words to the next row" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("hello marlin"); // width 10: "marlin" must not split
+    const rows = ed.layoutRows(10);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("hello ", ed.text.items[rows[0].start..rows[0].end]);
+    try testing.expectEqualStrings("marlin", ed.text.items[rows[1].start..rows[1].end]);
+
+    // A word longer than the row still hard-splits rather than looping.
+    var long = Editor.init(testing.allocator);
+    defer long.deinit();
+    long.insertSlice("abcdefghijklmnop");
+    try testing.expectEqual(@as(usize, 2), long.layoutRows(10).len);
 }
 
 test "delete word and line ops" {

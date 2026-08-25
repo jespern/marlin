@@ -51,6 +51,9 @@ pub const ClientMsg = union(enum) {
     /// for one session. Enabling requires the daemon's verified backend
     /// (hello_ok.sandbox_available); the daemon rejects it otherwise.
     session_set_sandbox: struct { sid: u64, enabled: bool },
+    /// Switch a session's approval mode: "default" = boundary-crossing tools
+    /// ask; "auto" = full access, nothing asks (/permissions full).
+    session_set_approvals: struct { sid: u64, approvals: []const u8 },
     /// Toggle managed-tool hostname filtering for one session. Enabling
     /// requires a loaded policy (hello_ok.network_filtering).
     session_set_network_filtering: struct { sid: u64, enabled: bool },

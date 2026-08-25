@@ -66,6 +66,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/model", .usage = " [model]", .description = "switch model or open the picker", .accepts_args = true },
     .{ .name = "/effort", .usage = " [level]", .description = "set reasoning effort or open the picker", .accepts_args = true },
     .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
+    .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/new", .description = "start a new session" },
@@ -367,6 +368,9 @@ const App = struct {
     /// Bumped whenever existing blocks mutate in place or the block list is
     /// replaced (session switch) — invalidates layout_cache.
     layout_epoch: u64 = 0,
+    /// /permissions full is active for this session (client-side mirror of
+    /// the daemon's approval mode; a daemon restart resets both to default).
+    permissions_full: bool = false,
     /// Transient one-line notice shown in the status bar.
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
@@ -928,6 +932,8 @@ const App = struct {
                 return;
             };
             self.applyEffort(selected);
+        } else if (std.mem.eql(u8, head, "/permissions")) {
+            self.setPermissions(it.rest());
         } else if (std.mem.eql(u8, head, "/sandbox")) {
             self.toggleSandbox(it.rest());
         } else if (std.mem.eql(u8, head, "/network")) {
@@ -964,7 +970,7 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /new · /archive · /model <m> · /effort <level> · /sandbox [on|off] · /network [on|off|status] · /compact · /reboot [--build] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /new · /archive · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /compact · /reboot [--build] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -1077,6 +1083,31 @@ const App = struct {
     fn currentSandboxed(self: *const App) bool {
         if (self.sessionSummary(self.sid)) |summary| return summary.sandboxed;
         return self.conn.sandbox_available;
+    }
+
+    /// /permissions full|default — session-wide approval switch. Full
+    /// access means NOTHING asks (the --yolo mode, chosen mid-session);
+    /// default restores boundary-crossing prompts. Tracked optimistically:
+    /// the daemon rejects mid-turn switches with a visible err notice.
+    fn setPermissions(self: *App, arg: []const u8) void {
+        const full = if (std.mem.eql(u8, arg, "full"))
+            true
+        else if (std.mem.eql(u8, arg, "default"))
+            false
+        else if (arg.len == 0)
+            !self.permissions_full
+        else {
+            self.setNotice("usage: /permissions [full|default]", .{});
+            return;
+        };
+        const mode: []const u8 = if (full) "auto" else "default";
+        self.conn.send(.{ .session_set_approvals = .{ .sid = self.sid, .approvals = mode } }) catch return;
+        self.permissions_full = full;
+        if (full) {
+            self.setNotice("permissions: FULL ACCESS — nothing will ask for approval", .{});
+        } else {
+            self.setNotice("permissions: default — boundary-crossing tools ask again", .{});
+        }
     }
 
     fn toggleSandbox(self: *App, arg: []const u8) void {
@@ -1341,6 +1372,9 @@ const Palette = struct {
     const md_code_panel: vaxis.Style = .{ .bg = md_inline_code_bg };
     const md_code_border: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = md_inline_code_bg, .dim = true };
     const md_table_header_bg: vaxis.Color = .{ .rgb = .{ 0x32, 0x35, 0x3b } };
+    /// Table borders and cell separators recede; bright default-fg chrome
+    /// made every table louder than its contents.
+    const md_table_border: vaxis.Style = .{ .fg = .{ .index = 8 } };
     const md_table_header: vaxis.Style = .{ .fg = .{ .index = 7 }, .bg = md_table_header_bg, .bold = true };
     const md_quote: vaxis.Style = .{ .fg = .{ .index = 8 }, .italic = true };
     const md_rule: vaxis.Style = .{ .fg = .{ .index = 8 }, .dim = true };
@@ -2275,17 +2309,40 @@ fn wrapReasoningCard(
     width: usize,
 ) !void {
     const prefix = "  · ";
+    const cont = "    ";
     try lines.append(arena, .{ .text = "", .style = Palette.reasoning_panel, .fill_style = Palette.reasoning_panel });
-    const body_start = lines.items.len;
-    try wrapPrefixed(arena, lines, prefix, text, Palette.reasoning, width -| 2);
-    for (lines.items[body_start..]) |*line| line.fill_style = Palette.reasoning_panel;
 
-    if (body_start < lines.items.len and std.mem.startsWith(u8, lines.items[body_start].text, prefix)) {
-        const full = lines.items[body_start].text;
-        lines.items[body_start].text = full[0..prefix.len];
-        lines.items[body_start].style = Palette.reasoning_mark;
-        lines.items[body_start].text2 = full[prefix.len..];
-        lines.items[body_start].style2 = Palette.reasoning;
+    // Commentary arrives with inline markdown (**bold**, `code`, links);
+    // render it instead of showing the markers verbatim. Newlines flatten
+    // to spaces — the card is prose, not layout.
+    const flat = try arena.dupe(u8, text);
+    std.mem.replaceScalar(u8, flat, '\n', ' ');
+    const im = try inlineMarkdown(arena, flat);
+
+    const avail = @max(@as(usize, 8), (width -| 2) -| prefix.len);
+    var start: usize = 0;
+    var first = true;
+    while (first or start < im.text.len) {
+        var end = wordBreak(im.text, start, avail);
+        if (end == start and start < im.text.len) end = hardCellBreak(im.text, start, avail);
+        const head: []const u8 = if (first) prefix else cont;
+        var styles: std.ArrayList(SyntaxSpan) = .empty;
+        var links: std.ArrayList(LinkSpan) = .empty;
+        try appendTranslatedInline(arena, &styles, &links, im, start, end, head.len);
+        try lines.append(arena, .{
+            .text = head,
+            .style = if (first) Palette.reasoning_mark else Palette.reasoning,
+            .text2 = im.text[start..end],
+            .style2 = Palette.reasoning,
+            .fill_style = Palette.reasoning_panel,
+            .syntax = styles.items,
+            .links = links.items,
+            .links_resolved = true,
+        });
+        first = false;
+        start = end;
+        while (start < im.text.len and im.text[start] == ' ') start += 1;
+        if (start >= im.text.len) break;
     }
     try lines.append(arena, .{ .text = "", .style = Palette.reasoning_panel, .fill_style = Palette.reasoning_panel });
 }
@@ -3198,7 +3255,7 @@ fn appendTableBorder(
         .text = gutter,
         .style = .{},
         .text2 = out.items,
-        .style2 = Palette.md_rule,
+        .style2 = Palette.md_table_border,
         .links_resolved = true,
     });
 }
@@ -3281,6 +3338,13 @@ fn appendTableRow(
             }
         }
         try out.appendSlice(arena, " │");
+        {
+            var pos: usize = 0;
+            while (std.mem.indexOfPos(u8, out.items, pos, "│")) |sep| {
+                try appendSyntaxSpan(arena, &styles, sep, sep + "│".len, gutter.len, Palette.md_table_border);
+                pos = sep + "│".len;
+            }
+        }
         try lines.append(arena, .{
             .text = gutter,
             .style = .{},
@@ -4022,7 +4086,6 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     else
         0;
     const ctx_txt = try std.fmt.allocPrint(arena, "ctx {d}%", .{context_percent});
-    const effort_txt = try std.fmt.allocPrint(arena, "effort {s}", .{@tagName(app.effort)});
     const ctx_style = if (context_percent >= 90)
         Palette.status_context_hot
     else if (context_percent >= 70)
@@ -4123,10 +4186,13 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     status_n += 1;
     status_segments[status_n] = .{ .text = statusModel(app.model.items), .style = Palette.status_model };
     status_n += 1;
-    status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
-    status_n += 1;
-    status_segments[status_n] = .{ .text = effort_txt, .style = Palette.status_effort };
-    status_n += 1;
+    if (app.effort != .auto) {
+        status_segments[status_n] = .{
+            .text = try std.fmt.allocPrint(arena, " {s}", .{@tagName(app.effort)}),
+            .style = Palette.status_effort,
+        };
+        status_n += 1;
+    }
     if (app.context_limit > 0) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
@@ -4204,14 +4270,22 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         Palette.status_context_warn
     else
         Palette.status_sep;
-    const right_w: u16 = sandbox_cols + 1 + @as(u16, @intCast(dns_txt.len)) + 3;
+    const full_txt: []const u8 = if (app.permissions_full) "FULL ACCESS" else "";
+    var right_w: u16 = sandbox_cols + 1 + @as(u16, @intCast(dns_txt.len)) + 3;
+    if (full_txt.len > 0) right_w += @intCast(full_txt.len + 3);
     if (status_win.width > right_w) {
         const right_win = status_win.child(.{
             .x_off = @intCast(status_win.width - right_w),
             .width = right_w,
         });
-        var right_segments: [4]vaxis.Segment = undefined;
+        var right_segments: [6]vaxis.Segment = undefined;
         var right_n: usize = 0;
+        if (full_txt.len > 0) {
+            right_segments[right_n] = .{ .text = full_txt, .style = Palette.status_approval };
+            right_n += 1;
+            right_segments[right_n] = .{ .text = " · ", .style = Palette.status_sep };
+            right_n += 1;
+        }
         right_segments[right_n] = .{ .text = dns_txt, .style = dns_style };
         right_n += 1;
         right_segments[right_n] = .{ .text = " · ", .style = Palette.status_sep };
