@@ -843,6 +843,8 @@ const CcOutcome = struct {
     got_init: bool = false,
     got_result: bool = false,
     result_is_error: bool = false,
+    result_error: [512]u8 = undefined,
+    result_error_len: usize = 0,
     cancelled: bool = false,
     timed_out: bool = false,
     exit_code: i64 = -1,
@@ -957,6 +959,8 @@ fn ccInvoke(
                 .result => |r| {
                     outcome.got_result = true;
                     outcome.result_is_error = r.is_error;
+                    outcome.result_error_len = @min(r.error_text.len, outcome.result_error.len);
+                    @memcpy(outcome.result_error[0..outcome.result_error_len], r.error_text[0..outcome.result_error_len]);
                     outcome.tokens_in = r.tokens_in;
                     outcome.tokens_out = r.tokens_out;
                     outcome.final_text.clearRetainingCapacity();
@@ -1010,10 +1014,12 @@ fn runClaudeCodeTurn(
     while (true) {
         rounds += 1;
         var outcome = try ccInvoke(gpa, io, opts, ap, prompt.items, fresh);
-        // Session-identity mismatch (e.g. the durable log has turns but the
-        // Claude Code session store was cleaned, or vice versa): retry once
+        // Session-identity mismatch: an invocation that never INITIALIZED
+        // didn't run at all — `--resume` of an id Claude Code has never seen
+        // exits 0 with an is_error result and no init event (observed live),
+        // and `--session-id` of an existing one is the converse. Retry once
         // in the opposite mode before declaring failure.
-        if (!outcome.got_init and !outcome.got_result and !outcome.cancelled and !outcome.timed_out) {
+        if (!outcome.got_init and !outcome.cancelled and !outcome.timed_out) {
             outcome.final_text.deinit(gpa);
             fresh = !fresh;
             outcome = try ccInvoke(gpa, io, opts, ap, prompt.items, fresh);
@@ -1043,6 +1049,20 @@ fn runClaudeCodeTurn(
                     outcome.stderr_tail[0..outcome.stderr_len],
                 },
             );
+            defer gpa.free(note);
+            _ = try ap.append(.{ .system_note = .{ .text = note } });
+            try store.updateSessionUsage(opts.session_id, total_in, total_out);
+            return error.DelegateFailed;
+        }
+        if (outcome.result_is_error) {
+            // An error result must never masquerade as an empty answer.
+            const detail = if (outcome.result_error_len > 0)
+                outcome.result_error[0..outcome.result_error_len]
+            else if (outcome.final_text.items.len > 0)
+                outcome.final_text.items
+            else
+                "no detail reported";
+            const note = try std.fmt.allocPrint(gpa, "claude code error: {s}", .{detail});
             defer gpa.free(note);
             _ = try ap.append(.{ .system_note = .{ .text = note } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
@@ -1629,6 +1649,62 @@ test "delegated claude code turn persists the event stream as blocks" {
     try std.testing.expectEqualStrings("scanning repo", loaded[1].blk.body.reasoning.text);
     try std.testing.expectEqualStrings("Bash", loaded[2].blk.body.tool_call.name);
     try std.testing.expectEqualStrings("file.txt", loaded[3].blk.body.tool_result.inline_body);
+}
+
+test "delegated turn recovers when claude has never seen the derived session" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-cc-resume-test");
+    defer temp.deinit();
+
+    // The observed live behavior: `--resume <unknown>` exits 0 with an
+    // is_error result and NO init event; `--session-id` then works.
+    const script =
+        \\#!/bin/sh
+        \\case "$*" in
+        \\*"--resume "*)
+        \\  echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","usage":{"input_tokens":0,"output_tokens":0},"errors":["No conversation found with session ID: x"]}'
+        \\  exit 0 ;;
+        \\esac
+        \\echo '{"type":"system","subtype":"init","session_id":"x"}'
+        \\echo '{"type":"result","subtype":"success","result":"RECOVERED-OK","usage":{"input_tokens":3,"output_tokens":2}}'
+        \\
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-claude" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(claude_code.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, temp.path, "claudecode/claude-fable-5", .auto);
+
+    const opts = RunOpts{
+        .session_id = 1,
+        .cwd = temp.path,
+        .endpoint = .{ .url = "", .bearer = null, .model = "claude-fable-5", .dialect = .claude_code },
+        .cfg = .{},
+        .tool_environ = &env,
+        .approval_mode = .auto,
+    };
+    // A prior turn makes the session look resumable on the marlin side.
+    const first = try runTurn(gpa, io, &store, opts, "first turn");
+    gpa.free(first.text);
+
+    // Second turn: --resume fails the way the real binary does; the retry
+    // must flip to --session-id and succeed instead of persisting "".
+    const second = try runTurn(gpa, io, &store, opts, "hello fable");
+    defer gpa.free(second.text);
+    try std.testing.expectEqualStrings("RECOVERED-OK", second.text);
 }
 
 const AnthropicWireChecks = struct {

@@ -122,6 +122,9 @@ pub const Event = union(enum) {
     result: struct {
         text: []const u8,
         is_error: bool,
+        /// Joined `errors` array (e.g. "No conversation found with session
+        /// ID: …"); empty on success.
+        error_text: []const u8,
         tokens_in: u64,
         tokens_out: u64,
         cached_tokens: u64,
@@ -193,9 +196,18 @@ pub fn decodeLine(
             cached = uintField(u.object, "cache_read_input_tokens") orelse 0;
         };
         const subtype = strField(root, "subtype") orelse "";
+        var error_text: std.ArrayList(u8) = .empty;
+        if (root.get("errors")) |errs| if (errs == .array) {
+            for (errs.array.items) |item| {
+                if (item != .string) continue;
+                if (error_text.items.len > 0) try error_text.appendSlice(arena, "; ");
+                try error_text.appendSlice(arena, item.string);
+            }
+        };
         try out.append(arena, .{ .result = .{
             .text = strField(root, "result") orelse "",
             .is_error = !std.mem.eql(u8, subtype, "success"),
+            .error_text = error_text.items,
             .tokens_in = tokens_in + cached,
             .tokens_out = tokens_out,
             .cached_tokens = cached,
