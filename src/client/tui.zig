@@ -381,6 +381,10 @@ const App = struct {
     copy_cursor_line_text: std.ArrayList(u8) = .empty,
     /// Last yanked text; p in the composer pastes it.
     yank_register: std.ArrayList(u8) = .empty,
+    /// Composer operator-pending state: 'd'/'c'/'y' awaiting a motion or
+    /// text object; pending_obj holds 'i'/'a' awaiting the object key.
+    pending_op: u8 = 0,
+    pending_obj: u8 = 0,
     /// /permissions full is active for this session (client-side mirror of
     /// the daemon's approval mode; a daemon restart resets both to default).
     permissions_full: bool = false,
@@ -1022,6 +1026,76 @@ const App = struct {
             return;
         }
         self.setNotice("no tool output to copy", .{});
+    }
+
+    fn applyOperator(self: *App, op: u8, range: Editor.Range) void {
+        if (range.end <= range.start) return;
+        const slice = self.editor.text.items[range.start..range.end];
+        self.yank_register.clearRetainingCapacity();
+        self.yank_register.appendSlice(self.gpa, slice) catch {};
+        switch (op) {
+            'y' => self.editor.cursor = range.start,
+            'd' => self.editor.deleteRange(range.start, range.end),
+            'c' => {
+                self.editor.deleteRange(range.start, range.end);
+                self.mode = .insert;
+            },
+            else => {},
+        }
+    }
+
+    /// Second (and third) key of a d/c/y sequence: a motion, a doubled
+    /// operator for the whole line, or an i/a text object. Anything else
+    /// cancels, vim-style.
+    fn operatorKey(self: *App, key: vaxis.Key) void {
+        const op = self.pending_op;
+        const ed = &self.editor;
+        if (self.pending_obj != 0) {
+            const around = self.pending_obj == 'a';
+            self.pending_op = 0;
+            self.pending_obj = 0;
+            const range: ?Editor.Range = if (key.matches('w', .{}))
+                ed.innerWordRange(around)
+            else if (key.matches('"', .{}))
+                ed.quoteRange('"', around)
+            else if (key.matches('\'', .{}))
+                ed.quoteRange('\'', around)
+            else if (key.matches('`', .{}))
+                ed.quoteRange('`', around)
+            else if (key.matches('(', .{}) or key.matches(')', .{}) or key.matches('b', .{}))
+                ed.delimRange('(', ')', around)
+            else if (key.matches('[', .{}) or key.matches(']', .{}))
+                ed.delimRange('[', ']', around)
+            else if (key.matches('{', .{}) or key.matches('}', .{}))
+                ed.delimRange('{', '}', around)
+            else
+                null;
+            if (range) |r| self.applyOperator(op, r);
+            return;
+        }
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.pending_op = 0;
+            return;
+        }
+        if (key.matches('i', .{}) or key.matches('a', .{})) {
+            self.pending_obj = if (key.matches('a', .{})) 'a' else 'i';
+            return;
+        }
+        self.pending_op = 0;
+        const range: ?Editor.Range = if (key.codepoint == op)
+            // dd deletes the line including its newline; cc keeps the shell.
+            ed.lineRangeAt(op != 'c')
+        else if (key.matches('w', .{}))
+            ed.wordForwardRange()
+        else if (key.matches('b', .{}))
+            ed.wordBackRange()
+        else if (key.matches('$', .{}))
+            ed.toLineEndRange()
+        else if (key.matches('0', .{}))
+            ed.toLineStartRange()
+        else
+            null;
+        if (range) |r| self.applyOperator(op, r);
     }
 
     /// Enter transcript copy mode with the cursor on the bottom visible line.
@@ -4167,6 +4241,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .description = "COMPOSER (vim)", .heading = true },
     .{ .key = "h l w b 0 $", .description = "move in the input line" },
     .{ .key = "x / D", .description = "delete char / to line end" },
+    .{ .key = "d c y + motion", .description = "operators: w b 0 $, dd/cc/yy, iw i\" i( …" },
     .{ .key = "p", .description = "paste the yank register" },
     .{ .description = "COPY MODE", .heading = true },
     .{ .key = "v", .description = "enter copy mode (cursor over transcript)" },
@@ -5287,6 +5362,10 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.copyModeKey(key);
                 return;
             }
+            if (app.pending_op != 0) {
+                app.operatorKey(key);
+                return;
+            }
             if (key.matches('?', .{})) {
                 app.shortcut_help = true;
             } else if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{})) {
@@ -5338,6 +5417,12 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.editor.deleteAfter();
             } else if (key.matches('D', .{ .shift = true }) or key.matches('D', .{})) {
                 app.editor.deleteToLineEnd();
+            } else if (key.matches('d', .{})) {
+                app.pending_op = 'd';
+            } else if (key.matches('c', .{})) {
+                app.pending_op = 'c';
+            } else if (key.matches('y', .{})) {
+                app.pending_op = 'y';
             } else if (key.matches('p', .{})) {
                 if (app.yank_register.items.len > 0) {
                     app.editor.insertSlice(app.yank_register.items);
@@ -6717,4 +6802,64 @@ test "normal mode: p pastes the yank register into the composer" {
     try handleKey(&app, .{ .codepoint = 'w' });
     try handleKey(&app, .{ .codepoint = 'D' });
     try std.testing.expectEqualStrings("zig", app.editor.text.items);
+}
+
+test "composer operators: dw ci\" yy dd" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.mode = .normal;
+
+    // dw from the start eats the first word and its trailing space.
+    app.editor.insertSlice("zig build test");
+    app.editor.moveLineStart();
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = 'w' });
+    try std.testing.expectEqualStrings("build test", app.editor.text.items);
+    try std.testing.expectEqualStrings("zig ", app.yank_register.items);
+
+    // ci" clears the quoted span and enters insert mode.
+    app.editor.clear();
+    app.editor.insertSlice("run \"the old thing\" now");
+    app.editor.cursor = 8;
+    try handleKey(&app, .{ .codepoint = 'c' });
+    try handleKey(&app, .{ .codepoint = 'i' });
+    try handleKey(&app, .{ .codepoint = '"' });
+    try std.testing.expectEqualStrings("run \"\" now", app.editor.text.items);
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expectEqual(@as(usize, 5), app.editor.cursor);
+
+    // yy fills the register without touching the text.
+    app.mode = .normal;
+    app.editor.clear();
+    app.editor.insertSlice("keep me");
+    try handleKey(&app, .{ .codepoint = 'y' });
+    try handleKey(&app, .{ .codepoint = 'y' });
+    try std.testing.expectEqualStrings("keep me", app.editor.text.items);
+    try std.testing.expectEqualStrings("keep me", app.yank_register.items);
+
+    // dd removes the cursor's line including its newline.
+    app.editor.clear();
+    app.editor.insertSlice("one\ntwo\nthree");
+    app.editor.cursor = 5;
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try std.testing.expectEqualStrings("one\nthree", app.editor.text.items);
+
+    // An unknown motion cancels cleanly.
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = 'z' });
+    try std.testing.expectEqualStrings("one\nthree", app.editor.text.items);
+    try std.testing.expectEqual(@as(u8, 0), app.pending_op);
+
+    // di( around the cursor inside brackets.
+    app.editor.clear();
+    app.editor.insertSlice("call(alpha, beta)");
+    app.editor.cursor = 7;
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = 'i' });
+    try handleKey(&app, .{ .codepoint = '(' });
+    try std.testing.expectEqualStrings("call()", app.editor.text.items);
 }

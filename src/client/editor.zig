@@ -737,3 +737,220 @@ test "wordwise cursor movement crosses punctuation and unicode" {
     ed.moveWordRight();
     try testing.expectEqual(@as(usize, "one, two café".len), ed.cursor);
 }
+
+// ------------------------------------------------- vim operator ranges --
+
+/// Half-open byte range in `text`, produced by the motion/text-object
+/// helpers below and consumed by the composer's d/c/y operators.
+pub const Range = struct { start: usize, end: usize };
+
+/// Delete [start, end) and leave the cursor at the excision point.
+pub fn deleteRange(self: *Editor, start: usize, end: usize) void {
+    const t = self.text.items;
+    const lo = @min(start, t.len);
+    const hi = @min(@max(end, lo), t.len);
+    if (hi == lo) return;
+    self.text.replaceRange(self.gpa, lo, hi - lo, "") catch return;
+    self.cursor = lo;
+    self.goal_col = null;
+}
+
+/// vim `w` as an operator target: from the cursor to the start of the next
+/// word (dw eats the word under the cursor plus trailing separators).
+pub fn wordForwardRange(self: *const Editor) Range {
+    const t = self.text.items;
+    var i = self.cursor;
+    if (i >= t.len) return .{ .start = i, .end = i };
+    if (isWordCodepoint(t[i..nextCpEnd(t, i)])) {
+        while (i < t.len and isWordCodepoint(t[i..nextCpEnd(t, i)])) i = nextCpEnd(t, i);
+    } else {
+        while (i < t.len and t[i] != ' ' and t[i] != '\n' and !isWordCodepoint(t[i..nextCpEnd(t, i)])) i = nextCpEnd(t, i);
+    }
+    while (i < t.len and t[i] == ' ') i += 1;
+    return .{ .start = self.cursor, .end = i };
+}
+
+/// vim `b` as an operator target: from the previous word start to the cursor.
+pub fn wordBackRange(self: *const Editor) Range {
+    const t = self.text.items;
+    var i = self.cursor;
+    while (i > 0 and (t[i - 1] == ' ' or t[i - 1] == '\n')) i -= 1;
+    while (i > 0) {
+        const start = prevCpStart(t, i);
+        if (!isWordCodepoint(t[start..i])) break;
+        i = start;
+    }
+    return .{ .start = i, .end = self.cursor };
+}
+
+/// The logical line under the cursor. `with_newline` includes the trailing
+/// '\n' (dd); cc keeps it so the line survives as an empty shell.
+pub fn lineRangeAt(self: *const Editor, with_newline: bool) Range {
+    const t = self.text.items;
+    const start = lineStart(t, self.cursor);
+    var end = if (std.mem.indexOfScalarPos(u8, t, @min(self.cursor, t.len), '\n')) |nl| nl else t.len;
+    if (with_newline and end < t.len) end += 1;
+    return .{ .start = start, .end = end };
+}
+
+pub fn toLineEndRange(self: *const Editor) Range {
+    const t = self.text.items;
+    const end = if (std.mem.indexOfScalarPos(u8, t, @min(self.cursor, t.len), '\n')) |nl| nl else t.len;
+    return .{ .start = self.cursor, .end = end };
+}
+
+pub fn toLineStartRange(self: *const Editor) Range {
+    return .{ .start = lineStart(self.text.items, self.cursor), .end = self.cursor };
+}
+
+/// iw / aw: the word under the cursor; `around` extends over trailing
+/// spaces (or leading when there are none trailing), vim-style.
+pub fn innerWordRange(self: *const Editor, around: bool) ?Range {
+    const t = self.text.items;
+    if (t.len == 0) return null;
+    var lo = @min(self.cursor, t.len - 1);
+    if (!isWordCodepoint(t[lo..nextCpEnd(t, lo)])) {
+        // On a separator, the object is the separator run.
+        var hi = lo;
+        while (hi < t.len and !isWordCodepoint(t[hi..nextCpEnd(t, hi)]) and t[hi] != '\n') hi = nextCpEnd(t, hi);
+        while (lo > 0) {
+            const p = prevCpStart(t, lo);
+            if (isWordCodepoint(t[p..lo]) or t[p] == '\n') break;
+            lo = p;
+        }
+        return .{ .start = lo, .end = hi };
+    }
+    while (lo > 0) {
+        const p = prevCpStart(t, lo);
+        if (!isWordCodepoint(t[p..lo])) break;
+        lo = p;
+    }
+    var hi = self.cursor;
+    while (hi < t.len and isWordCodepoint(t[hi..nextCpEnd(t, hi)])) hi = nextCpEnd(t, hi);
+    if (around) {
+        var padded = hi;
+        while (padded < t.len and t[padded] == ' ') padded += 1;
+        if (padded > hi) {
+            hi = padded;
+        } else {
+            while (lo > 0 and t[lo - 1] == ' ') lo -= 1;
+        }
+    }
+    return .{ .start = lo, .end = hi };
+}
+
+/// i"/a" (and friends): the quoted span on the cursor's line — the pair
+/// enclosing the cursor, or the first pair after it.
+pub fn quoteRange(self: *const Editor, quote: u8, around: bool) ?Range {
+    const t = self.text.items;
+    const line = self.lineRangeAt(false);
+    var positions_buf: [128]usize = undefined;
+    var n: usize = 0;
+    var i = line.start;
+    while (i < line.end and n < positions_buf.len) : (i += 1) {
+        if (t[i] == quote) {
+            positions_buf[n] = i;
+            n += 1;
+        }
+    }
+    if (n < 2) return null;
+    var pair: usize = 0;
+    while (pair + 1 < n) : (pair += 2) {
+        const open = positions_buf[pair];
+        const close = positions_buf[pair + 1];
+        if (self.cursor <= close or pair + 3 >= n + 1 and pair + 2 >= n) {
+            if (self.cursor <= close) {
+                return if (around)
+                    .{ .start = open, .end = close + 1 }
+                else
+                    .{ .start = open + 1, .end = close };
+            }
+        }
+    }
+    return null;
+}
+
+/// i(/a( and bracket friends: nearest enclosing pair with nesting, across
+/// the whole (possibly multi-line) draft.
+pub fn delimRange(self: *const Editor, open: u8, close: u8, around: bool) ?Range {
+    const t = self.text.items;
+    if (t.len == 0) return null;
+    const at = @min(self.cursor, t.len - 1);
+    var open_idx: ?usize = if (t[at] == open) at else null;
+    if (open_idx == null) {
+        var depth: usize = 0;
+        var i = at;
+        while (i > 0) {
+            i -= 1;
+            if (t[i] == close) {
+                depth += 1;
+            } else if (t[i] == open) {
+                if (depth == 0) {
+                    open_idx = i;
+                    break;
+                }
+                depth -= 1;
+            }
+        }
+    }
+    const o = open_idx orelse return null;
+    var depth: usize = 0;
+    var j = o + 1;
+    while (j < t.len) : (j += 1) {
+        if (t[j] == open) {
+            depth += 1;
+        } else if (t[j] == close) {
+            if (depth == 0) {
+                return if (around)
+                    .{ .start = o, .end = j + 1 }
+                else
+                    .{ .start = o + 1, .end = j };
+            }
+            depth -= 1;
+        }
+    }
+    return null;
+}
+
+test "operator ranges: words, lines, quotes, brackets" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("zig build test");
+    ed.cursor = 0;
+    var r = ed.wordForwardRange();
+    try testing.expectEqualStrings("zig ", ed.text.items[r.start..r.end]);
+    ed.cursor = 9; // inside "build"? no: "zig build test": 9 = ' ' after build
+    ed.cursor = 5; // inside "build"
+    r = ed.innerWordRange(false).?;
+    try testing.expectEqualStrings("build", ed.text.items[r.start..r.end]);
+    r = ed.innerWordRange(true).?;
+    try testing.expectEqualStrings("build ", ed.text.items[r.start..r.end]);
+    r = ed.wordBackRange();
+    try testing.expectEqualStrings("b", ed.text.items[r.start..r.end]);
+
+    ed.clear();
+    ed.insertSlice("say \"hello there\" now");
+    ed.cursor = 8; // inside the quotes
+    r = ed.quoteRange('"', false).?;
+    try testing.expectEqualStrings("hello there", ed.text.items[r.start..r.end]);
+    r = ed.quoteRange('"', true).?;
+    try testing.expectEqualStrings("\"hello there\"", ed.text.items[r.start..r.end]);
+
+    ed.clear();
+    ed.insertSlice("f(a, g(b), c)");
+    ed.cursor = 7; // inside g(...)
+    r = ed.delimRange('(', ')', false).?;
+    try testing.expectEqualStrings("b", ed.text.items[r.start..r.end]);
+    ed.cursor = 3; // inside f's parens
+    r = ed.delimRange('(', ')', false).?;
+    try testing.expectEqualStrings("a, g(b), c", ed.text.items[r.start..r.end]);
+
+    ed.clear();
+    ed.insertSlice("one\ntwo\nthree");
+    ed.cursor = 5; // on "two"
+    r = ed.lineRangeAt(true);
+    try testing.expectEqualStrings("two\n", ed.text.items[r.start..r.end]);
+    ed.deleteRange(r.start, r.end);
+    try testing.expectEqualStrings("one\nthree", ed.text.items);
+    try testing.expectEqual(@as(usize, 4), ed.cursor);
+}
