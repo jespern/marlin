@@ -337,7 +337,11 @@ loop:
   interrupt/timeout sends SIGTERM → grace → SIGKILL to the complete
   pipeline and its descendants, then reaps the direct child. The half-finished
   turn is finalized as an interrupted `system_note` + whatever blocks completed
-  (the log stays consistent).
+  (the log stays consistent). Caveat: a descendant that calls setpgid (notably
+  `timeout(1)`) escapes the group kill and can orphan.
+- **bash wall-clock limit**: commands are killed after `timeout_seconds`
+  (default 600, max 3600 — the model raises it for long builds). A command
+  that hangs becomes a failed tool result instead of a silently stuck turn.
 - **Retry/backoff**: on 429/5xx/mid-stream disconnect: exponential backoff w/
   jitter, max N attempts. A turn that dies mid-stream discards the partial
   assistant text (deltas were never truth) and re-requests — context is
@@ -526,6 +530,9 @@ explicit note. Rejected: bundling an `rg` sidecar; Marlin remains one binary.
   state the session picker, actionable status summary, and phone surface).
 - bash sandboxing (M3.5, stolen from zag): Seatbelt profile on macOS, Landlock
   + seccomp on Linux; deny-by-default on `~/.ssh`, key files, browser profiles.
+  The profile allows `signal (target same-sandbox)` — SBPL's `signal` is a
+  distinct operation `process*` does NOT cover, and without it `kill`/`timeout`
+  inside the sandbox get EPERM and hang (the canary has a leg for this).
 
 **Secrets** (threat: prompt injection or buggy tool logic exfiltrates
 credentials; hazard multiplier: the append-only store makes any leaked

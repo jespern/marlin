@@ -79,6 +79,7 @@ pub const seatbelt_profile =
     \\(import "system.sb")
     \\(allow file-read*)
     \\(allow process*)
+    \\(allow signal (target same-sandbox))
     \\(allow network*)
     \\(allow file-write*
     \\    (subpath (param "WORKSPACE"))
@@ -235,6 +236,7 @@ fn runCanary(
         \\if printf outside > "$1/outside/blocked"; then exit 12; fi
         \\if cat "$1/secret/marker" > /dev/null; then exit 13; fi
         \\if cat "$1/secret.key" > /dev/null; then exit 14; fi
+        \\sleep 5 & if ! kill $! 2>/dev/null; then exit 15; fi
         \\exit 0
     , &.{real_base});
 
@@ -254,6 +256,9 @@ fn runCanary(
 
 test "Seatbelt profile grants parameterized write roots and denies protected reads" {
     try std.testing.expect(std.mem.indexOf(u8, seatbelt_profile, "(deny default)") != null);
+    // signal is its own SBPL operation (process* does not cover it); without
+    // this rule, timeout/kill inside the sandbox get EPERM and hang forever.
+    try std.testing.expect(std.mem.indexOf(u8, seatbelt_profile, "(allow signal (target same-sandbox))") != null);
     try std.testing.expect(std.mem.indexOf(u8, seatbelt_profile, "(param \"WORKSPACE\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seatbelt_profile, "(param \"TEMP_ROOT\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seatbelt_profile, "(param \"PROTECTED_SSH\")") != null);

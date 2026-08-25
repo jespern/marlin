@@ -18,12 +18,16 @@ pub const spec_name = "bash";
 pub const spec_description =
     "Run a shell command with bash -c. Returns interleaved stdout/stderr and the exit code. " ++
     "The working directory is the session's cwd. When network filtering is enabled, " ++
-    "literal destinations used by common network commands are screened before execution.";
+    "literal destinations used by common network commands are screened before execution. " ++
+    "Commands are killed after timeout_seconds (default 600, max 3600); raise it for long builds.";
 pub const spec_schema =
-    \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to run"}},"required":["command"]}
+    \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to run"},"timeout_seconds":{"type":"integer","description":"Wall-clock limit in seconds (default 600, max 3600)"}},"required":["command"]}
 ;
 
-pub const Args = struct { command: []const u8 };
+pub const Args = struct { command: []const u8, timeout_seconds: ?u32 = null };
+
+pub const default_timeout_seconds: u32 = 600;
+pub const max_timeout_seconds: u32 = 3600;
 
 pub const Result = struct {
     /// Combined output (stdout then stderr), possibly truncated at max_bytes.
@@ -73,16 +77,28 @@ pub fn run(
             .protected = protected,
         }, args.command, &.{});
     }
+    // Explicit type: @min with a comptime-known bound narrows to u12,
+    // which the *1000 below would overflow.
+    const timeout_s: u32 = @min(args.timeout_seconds orelse default_timeout_seconds, max_timeout_seconds);
     const res = process_io.run(gpa, io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .environ_map = child_environ,
         .stdout_limit = max_capture_bytes,
         .stderr_limit = max_capture_bytes,
-        .timeout_ms = null,
+        .timeout_ms = timeout_s * std.time.ms_per_s,
         .cancel = cancel,
     }) catch |e| {
         if (e == error.Cancelled) return e;
+        if (e == error.Timeout) {
+            const msg = try std.fmt.allocPrint(
+                gpa,
+                "[command timed out after {d}s; its process tree was killed. " ++
+                    "Pass timeout_seconds (max {d}) for longer-running commands.]",
+                .{ timeout_s, max_timeout_seconds },
+            );
+            return .{ .output = msg, .exit_code = -1, .truncated = false };
+        }
         const msg = try std.fmt.allocPrint(gpa, "failed to spawn bash: {t}", .{e});
         return .{ .output = msg, .exit_code = -1, .truncated = false };
     };
@@ -175,4 +191,57 @@ test "sandboxed bash enforces write scope and protected reads (macOS)" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "bash tool enforces its wall-clock timeout and reports it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const r = try run(
+        gpa,
+        threaded.io(),
+        .{ .command = "sleep 30", .timeout_seconds = 1 },
+        ".",
+        null,
+        .{},
+        null,
+    );
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, -1), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "timed out after 1s") != null);
+}
+
+test "sandboxed processes can signal within their own job (macOS)" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-bash-signal-test");
+    defer temp.deinit();
+    const options = sandbox.Options{
+        .backend = .seatbelt,
+        .temp_root = temp.path,
+        .protected = .{
+            .ssh = temp.path,
+            .aws = temp.path,
+            .gnupg = temp.path,
+            .marlin_credentials = temp.path,
+        },
+    };
+    // The shape that hung a real session: a sandboxed supervisor (timeout,
+    // kill) must be able to TERM its own child. Exit 0 proves it landed;
+    // 15 is the guarded failure. (timeout(1) itself is not stock macOS.)
+    const r = try run(
+        gpa,
+        io,
+        .{ .command = "sleep 30 & if kill $! 2>/dev/null; then exit 0; else exit 15; fi", .timeout_seconds = 10 },
+        temp.path,
+        null,
+        options,
+        null,
+    );
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 0), r.exit_code);
 }
