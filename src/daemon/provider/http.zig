@@ -204,6 +204,10 @@ fn streamPostRun(
             .authorization = authorization,
             .user_agent = .{ .override = "marlin/0.0" },
             .content_type = .{ .override = "application/json" },
+            // Streaming must never sit behind a decompression window: a
+            // gzipped SSE stream buffers whole windows before yielding, so
+            // deltas arrive in bursts minutes late (or only at stream end).
+            .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = header_storage,
     });
@@ -225,24 +229,28 @@ fn streamPostRun(
     errdefer error_body.deinit(gpa);
     var transfer_buffer: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    var chunk: [16 * 1024]u8 = undefined;
 
     while (true) {
         if (isCancelled(stream_req.cancel)) {
             if (request.connection) |connection| connection.closing = true;
             return error.Cancelled;
         }
-        const n = reader.readSliceShort(&chunk) catch |err| switch (err) {
+        // Deliver whatever has arrived, as soon as one byte exists.
+        // readSliceShort would block until its whole buffer filled, holding
+        // live deltas hostage to a fill quota (worst case: until EOF).
+        reader.fill(1) catch |err| switch (err) {
+            error.EndOfStream => break,
             error.ReadFailed => return response.bodyErr() orelse error.HttpReadFailed,
         };
-        if (n == 0) break;
+        const bytes = reader.buffered();
         markActivity(client.io, progress);
         if (is_error) {
             const room = 64 * 1024 - error_body.items.len;
-            if (room > 0) try error_body.appendSlice(gpa, chunk[0..@min(n, room)]);
+            if (room > 0) try error_body.appendSlice(gpa, bytes[0..@min(bytes.len, room)]);
         } else {
-            on_chunk(ctx, chunk[0..n]);
+            on_chunk(ctx, bytes);
         }
+        reader.toss(bytes.len);
     }
 
     return .{
@@ -556,4 +564,82 @@ test "std HTTP pool returns clients sharing one connection pool" {
     var second = try pool.acquire();
     defer second.deinit();
     try std.testing.expectEqual(first.client, second.client);
+}
+
+fn serveSseInBursts(io: Io, server: *Io.net.Server) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var read_buffer: [8192]u8 = undefined;
+    var reader = Io.net.Stream.Reader.init(stream, io, &read_buffer);
+    _ = reader.interface.takeDelimiterInclusive('\n') catch return;
+    var write_buffer: [8192]u8 = undefined;
+    var writer = Io.net.Stream.Writer.init(stream, io, &write_buffer);
+    writer.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n") catch return;
+    writer.interface.flush() catch return;
+    // Three bursts with pauses, like a live provider: each must reach the
+    // caller's on_chunk promptly, not be held for a fill quota or EOF.
+    const bursts = [_][]const u8{
+        "data: {\"one\":1}\n\n",
+        "data: {\"two\":2}\n\n",
+        "data: [DONE]\n\n",
+    };
+    for (bursts) |burst| {
+        writer.interface.writeAll(burst) catch return;
+        writer.interface.flush() catch return;
+        io.sleep(.fromMilliseconds(150), .awake) catch return;
+    }
+}
+
+test "streaming delivers every burst to on_chunk, promptly and in full" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try testServer(io);
+    defer server.deinit(io);
+    const url = try testUrl(gpa, &server);
+    defer gpa.free(url);
+
+    const Collector = struct {
+        var collected: std.ArrayList(u8) = .empty;
+        var chunks: usize = 0;
+        fn onChunk(alloc: std.mem.Allocator, bytes: []const u8) void {
+            collected.appendSlice(alloc, bytes) catch {};
+            chunks += 1;
+        }
+    };
+    defer Collector.collected.deinit(gpa);
+
+    const Select = Io.Select(union(enum) { serve: void, request: Error!Response });
+    var results: [2]Select.Union = undefined;
+    var select = Select.init(io, &results);
+    defer select.cancelDiscard();
+    select.async(.serve, serveSseInBursts, .{ io, &server });
+    select.async(.request, streamPostTask(std.mem.Allocator, Collector.onChunk), .{ gpa, io, StreamRequest{
+        .url = url,
+        .bearer = null,
+        .body_json = "{}",
+        .connect_timeout_ms = 5_000,
+        .idle_timeout_ms = 5_000,
+    }, gpa });
+
+    var status: i64 = 0;
+    var served = false;
+    var requested = false;
+    while (!served or !requested) switch (try select.await()) {
+        .serve => served = true,
+        .request => |result| {
+            const response = try result;
+            if (response.error_body) |body| gpa.free(body);
+            status = response.status;
+            requested = true;
+        },
+    };
+    try std.testing.expectEqual(@as(i64, 200), status);
+    try std.testing.expectEqualStrings(
+        "data: {\"one\":1}\n\ndata: {\"two\":2}\n\ndata: [DONE]\n\n",
+        Collector.collected.items,
+    );
+    try std.testing.expect(Collector.chunks >= 3);
 }
