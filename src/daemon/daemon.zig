@@ -1612,7 +1612,18 @@ pub const Daemon = struct {
             .poll_steer = TurnHooks.pollSteer,
             .max_rounds = job.session.max_rounds,
         }, job.text) catch |e| {
-            err_text = std.fmt.allocPrint(self.gpa, "turn failed: {t}", .{e}) catch null;
+            // Transport errors are flattened by the http layer; the recorded
+            // cause turns "ConnectFailed" into "ConnectFailed
+            // (TlsInitializationFailed)" — the difference between a shrug
+            // and a diagnosis. Same thread: the request ran on this turn.
+            const cause: ?anyerror = switch (e) {
+                error.ConnectFailed, error.ReadFailed => http.lastTransportCause(),
+                else => null,
+            };
+            err_text = if (cause) |c|
+                std.fmt.allocPrint(self.gpa, "turn failed: {t} ({t})", .{ e, c }) catch null
+            else
+                std.fmt.allocPrint(self.gpa, "turn failed: {t}", .{e}) catch null;
             // The reason must survive in the transcript: turn_done frees
             // err_text after status fan-out, so without a durable note the
             // user sees a bare "error" state with no explanation.

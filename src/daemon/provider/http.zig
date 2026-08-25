@@ -40,9 +40,25 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Zig errors carry no payload, so the flattening in mapConnect would erase
+/// the underlying std error — which is exactly what made a broken TLS clock
+/// surface as an opaque "turn failed: ConnectFailed". The cause is recorded
+/// here instead; failure notes read it via lastTransportCause() to render
+/// "ConnectFailed (TlsInitializationFailed)". Thread-local because requests
+/// run inline on the turn thread that reports the failure; cleared at the
+/// start of every request so a stale cause can never label a later error.
+threadlocal var transport_cause: ?anyerror = null;
+
+/// The std-level error behind this thread's most recent flattened transport
+/// failure, or null when the current request never recorded one.
+pub fn lastTransportCause() ?anyerror {
+    return transport_cause;
+}
+
 /// Classify a transport failure from before any body bytes arrived.
 fn mapConnect(err: anyerror) Error {
     if (err == error.OutOfMemory) return error.OutOfMemory;
+    transport_cause = err;
     std.log.debug("http connect-phase failure: {t}", .{err});
     return error.ConnectFailed;
 }
@@ -64,7 +80,10 @@ fn ensureTlsReady(client: *std.http.Client) Error!void {
     var bundle: std.crypto.Certificate.Bundle = .empty;
     defer bundle.deinit(client.allocator);
     const now = Io.Clock.real.now(io);
-    bundle.rescan(client.allocator, io, now) catch return error.ConnectFailed;
+    bundle.rescan(client.allocator, io, now) catch |err| {
+        transport_cause = err;
+        return error.ConnectFailed;
+    };
     client.ca_bundle_lock.lock(io) catch return error.Cancelled;
     defer client.ca_bundle_lock.unlock(io);
     client.now = now;
@@ -275,6 +294,7 @@ fn streamPostTimed(
     ctx: anytype,
     comptime on_chunk: fn (@TypeOf(ctx), []const u8) bool,
 ) Error!Response {
+    transport_cause = null;
     if (stream_req.on_wait) |cb| cb(stream_req.on_wait_ctx, 0);
     const pooled = try acquirePooledOrPreflightDns(
         client,
@@ -394,7 +414,10 @@ fn streamPostRun(
         reader.fill(1) catch |err| switch (err) {
             error.EndOfStream => break,
             error.ReadFailed => {
-                if (response.bodyErr()) |cause| std.log.debug("stream body failure: {t}", .{cause});
+                if (response.bodyErr()) |cause| {
+                    transport_cause = cause;
+                    std.log.debug("stream body failure: {t}", .{cause});
+                }
                 return error.ReadFailed;
             },
         };
@@ -473,6 +496,7 @@ fn getImpl(
     cancel: ?*std.atomic.Value(bool),
     redirect_behavior: std.http.Client.Request.RedirectBehavior,
 ) Error!GetOneResult {
+    transport_cause = null;
     const pooled = try acquirePooledOrPreflightDns(client, gpa, url, timeout_ms, cancel);
     var progress = StreamProgress{};
     var deadline = StreamDeadline{
@@ -558,7 +582,10 @@ fn getRun(
         }
         const n = reader.readSliceShort(chunk[0..@min(chunk.len, max_bytes - body.items.len)]) catch |err| switch (err) {
             error.ReadFailed => {
-                if (response.bodyErr()) |cause| std.log.debug("get body failure: {t}", .{cause});
+                if (response.bodyErr()) |cause| {
+                    transport_cause = cause;
+                    std.log.debug("get body failure: {t}", .{cause});
+                }
                 return error.ReadFailed;
             },
         };
@@ -661,6 +688,32 @@ fn acquirePooledOrPreflightDns(
         return null;
     }
     return connection;
+}
+
+test "flattened transport errors record their underlying cause" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Bind a port, then free it: connecting to it is a guaranteed refusal.
+    var server = try testServer(io);
+    const port = server.socket.address.getPort();
+    server.deinit(io);
+    const url = try std.fmt.allocPrintSentinel(gpa, "http://127.0.0.1:{d}/x", .{port}, 0);
+    defer gpa.free(url);
+
+    const result = streamPost(gpa, io, .{
+        .url = url,
+        .bearer = null,
+        .body_json = "{}",
+        .connect_timeout_ms = 2_000,
+        .idle_timeout_ms = 2_000,
+    }, {}, discardChunk);
+    try std.testing.expectError(error.ConnectFailed, result);
+    // The whole point of the side channel: the flattened error still names
+    // the std-level cause for the failure note.
+    try std.testing.expect(lastTransportCause() != null);
 }
 
 fn acceptAndClose(io: Io, server: *Io.net.Server) void {
