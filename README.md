@@ -88,7 +88,10 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
 ## What v1 deliberately does NOT do
 
 - No messaging gateway (Telegram/Discord/...) — hook scripts cover notification.
-- No web UI (v2: it's just another client on the same protocol).
+- No supported web UI. (`marlin web` exists as an opt-in POC: a
+  localhost-only, **unauthenticated** HTTP/SSE bridge — anything reaching the
+  port can drive marlin, including reboot/shutdown. It's just another client
+  on the same protocol, and it is not a deploy surface.)
 - No voice, vision pipelines, themes, cron, profiles.
 - No embedded terminal emulator / editor panes.
 - No Tailscale embedding — your tailnet already reaches the daemon socket.

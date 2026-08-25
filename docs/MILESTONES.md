@@ -43,14 +43,13 @@ marlin/
 │   │
 │   ├── client/
 │   │   ├── attach.zig         # socket client, reconnect w/ from_seq, delta buffer
-│   │   ├── tui.zig            # vaxis init, event loop, mode state machine
-│   │   ├── ui/
-│   │   │   ├── layout.zig     # binary-tree splits, focus
-│   │   │   ├── session_view.zig  # virtual block list, streaming region, collapse
-│   │   │   ├── session_picker.zig # on-demand session switcher + activity state
-│   │   │   ├── input.zig      # prompt box, /-commands, !-commands, history
-│   │   │   ├── select.zig     # mouse selection over logical text, OSC52 copy
-│   │   │   └── markdown.zig   # minimal md render (headings, code, lists, inline)
+│   │   ├── tui.zig            # REALITY: everything below except editor.zig
+│   │   │                      # lives in this one file (~7.7k lines). The ui/
+│   │   │                      # split never happened; do it (layout + markdown
+│   │   │                      # first, tests moving in the same commit) before
+│   │   │                      # panes/councils grow the file further.
+│   │   ├── editor.zig         # composer editing + vim ops (the one extraction)
+│   │   ├── web.zig            # `marlin web`: localhost HTTP/SSE bridge (POC)
 │   │   └── headless.zig       # `marlin run`: same protocol, no UI
 │   │
 │   └── testing/
@@ -158,18 +157,19 @@ Feature-flagged `[workspace] enabled`, DEFAULT OFF.
 *Exit: concurrent Marlin sessions cannot silently clobber one another, external
 writes remain recoverable, and isolated work lands only through reviewed merge.*
 
-# Open questions (decide before M1, none block M0)
+# Former open questions — all decided in code
 
-1. **Single binary or two?** Start single (`marlin daemon` subcommand);
-   revisit if binary size or privilege separation ever matters.
-2. **Autostart semantics**: `marlin` spawns daemon if absent (flock race
-   handled), or explicit `marlin daemon` only? Lean: autostart, it's the
-   tmux-like ergonomic.
-3. **Block body schema versioning**: bump `proto_version` on breaking change
-   and migrate DB, or tagged unions with forward-compat unknowns? Lean:
-   version field per block, ignore-unknown on read.
-4. **Zig version pin**: pick the version libvaxis tracks (they follow master
-   closely); vendor deps in build.zig.zon and update deliberately.
-5. **Name check**: `marlin` — verify no collision that matters to you
-   (crates/brews/etc.) before publishing anything.
+Kept as a decision record; none of these are open.
+
+1. **Single binary or two?** DECIDED: single binary, `marlin daemon`
+   subcommand.
+2. **Autostart semantics**: DECIDED: autostart on first `marlin` invocation.
+   (Concurrent-autostart flock hardening is still listed in PROTOCOL.md as a
+   known gap.)
+3. **Block body schema versioning**: DECIDED: store schema migrations at
+   daemon boot + `proto_version` handshake rejection; block bodies are
+   std.json tagged unions.
+4. **Zig version pin**: DECIDED: track the Zig version libvaxis follows
+   (0.16-dev line); deps vendored via build.zig.zon.
+5. **Name check**: DECIDED: shipping as `marlin`.
 ```

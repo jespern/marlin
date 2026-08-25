@@ -1,6 +1,11 @@
 # marlin architecture
 
-Status: pre-code design. Everything here is v1 scope unless marked (v2).
+Status: implemented and verified through M6a (single-child `task`). This began
+as the pre-code design and most of it is now law — but not all of it: anything
+marked **(v2)**, **(design)**, or **(not yet implemented)** describes intent,
+not the binary. When this document and the code disagree on a shipped area,
+the code and the per-milestone docs (M*_PLAN.md, PERMISSIONS.md, PROTOCOL.md)
+win; fix this file rather than trusting it.
 
 ## 1. Process model
 
@@ -40,9 +45,12 @@ daemons, mutually invisible. Autostart/flock logic stays inside the user's
 runtime dir, never system-wide. Clients — local or remote — are ephemeral
 views: nothing lives in a client but a render cache and a draft input box.
 
-**Mode B — protocol over ssh (PRIMARY).** A local `marlin` client speaks
-the wire protocol to a remote daemon, ssh carrying NDJSON instead of
-terminal frames:
+**Mode B — protocol over ssh (design; not yet implemented).** Intended to
+become the primary remote path once built — today there is no `_pipe`
+subcommand, no named remotes, and no proto-over-ssh transport; Mode A is
+the only remote access that ships. The design: a local `marlin` client
+speaks the wire protocol to a remote daemon, ssh carrying NDJSON instead
+of terminal frames:
 
 ```
 marlin attach work      # ssh work ... → daemon.sock; blocks stream back
@@ -74,7 +82,8 @@ binary down (or the client's up): single static binary makes the fix a
 one-liner. Path semantics: tool output paths are daemon-side; any "open
 file" gesture must know it's remote (scp-on-demand or just don't).
 
-**Mode A — ssh as terminal transport (fallback).** `ssh -t box marlin` /
+**Mode A — ssh as terminal transport (SHIPPED; the only mode today).**
+`ssh -t box marlin` /
 `mosh box -- marlin`: the TUI runs next to the daemon, the local terminal
 just displays cells. Zero setup, works from machines that don't have
 marlin installed at all (or via scp-and-run: the binary travels
@@ -89,9 +98,12 @@ mosh box -- marlin      # roaming
 ```
 
 The daemon listens on a **unix socket** (`$XDG_RUNTIME_DIR/marlin/daemon.sock`,
-mode 0600) by default. An optional TCP listener (`--listen host:port`, token
-auth) exists for the (v2) web client; unix-socket-only is the v1 default and
-the tailnet covers remote machines via ssh.
+mode 0600) — that is the only listener; the TCP listener with token auth is
+(v2) design that does not exist. What DOES ship today is `marlin web`: a
+localhost-only HTTP/SSE bridge in front of the daemon socket (POC,
+`src/client/web.zig`). It binds 127.0.0.1, has **no authentication** — anything
+reaching the port can drive marlin, including reboot/shutdown — and therefore
+requires the explicit `[web] enabled = true` (or `MARLIN_WEB=1`) opt-in.
 
 ### Self-hosting reboot (`/reboot`)
 
@@ -140,12 +152,29 @@ turns (resumable), MCP server processes (spawn-on-use), UI state
 ### Concurrency model
 
 One OS thread per running agent turn (they're 99% blocked on network/subprocess),
-plus the main daemon thread multiplexing client I/O with poll/kqueue/epoll.
-Session state is owned by the daemon thread; agent threads communicate with it
-exclusively via a mutex-protected event queue (agent thread produces events,
-daemon thread applies them to state, persists, and fans out to clients).
-No shared mutable session state across threads. Zig's std.Thread + a small
-MPSC queue is enough; no async runtime needed in v1.
+one dispatcher thread owning session lifecycle, one client thread per
+connection, plus the accept loop. Turn threads produce events into a
+mutex-protected MPSC queue; the dispatcher applies them, persists, and fans
+out to clients. Zig's std.Thread + a small MPSC queue; no async runtime.
+
+The original "no shared mutable session state across threads" rule was
+deliberately relaxed to ship mid-turn features (steering, live /permissions,
+context gauges). The REAL protocol — normative copy in the `daemon.zig`
+header, which is where it must be kept current:
+
+- **Store is shared.** The single sqlite connection is opened FULLMUTEX
+  (serialized); turn threads append blocks while the dispatcher answers
+  queries.
+- **Session identity/config is dispatcher-owned.** Turn threads snapshot
+  those fields inside `startTurn` (still on the dispatcher thread); protocol
+  mutations of them are rejected with `err{busy}` while a turn runs, which
+  is what makes the snapshot sound.
+- **A running turn may touch exactly the listed shared fields**, each with a
+  stated discipline: atomics (`cancel`, `approval_mode_live`,
+  `context_used`), the internally-synchronized approval `gate`, the
+  `steer_queue` under `steer_mutex`, and `prune_frontier` (turn-thread
+  exclusive while running). `TurnJob.session` is a live pointer, not a copy;
+  a new turn-visible field must be added to that list with its discipline.
 
 ## 2. Data model: the block log
 
@@ -268,34 +297,19 @@ regenerable/low-value with age; block structure is not.
 
 Newline-delimited JSON over the socket. Length-prefixed binary is a premature
 optimization; NDJSON is debuggable with `nc` + `jq` and fast enough for
-terminal-rate traffic. Every message: `{"t": "<type>", "sid": ..., ...}`.
+terminal-rate traffic.
 
-Client → daemon:
-
-```
-hello {proto_version, client_kind}
-session.create {cwd, model?, title?}
-session.list / session.kill / session.rename
-sub {sid, from_seq}        // subscribe; daemon replays blocks from seq, then live
-unsub {sid}
-input {sid, text}          // user message (or steer, if a turn is running)
-approve {sid, approval_id, decision}
-interrupt {sid}            // cancel in-flight turn (Ctrl+C semantics)
-compact {sid, instructions?}
-copy.query {sid, what}     // "last_tool_result" | "last_msg" | "last_code" | ...
-                           // returns full text; client does OSC 52 locally
-```
-
-Daemon → client:
-
-```
-block {sid, block}             // a finalized block was appended
-delta {sid, turn_id, text}     // streaming assistant/reasoning text
-status {sid, state}            // idle | running | awaiting_approval | error
-approval.request {sid, approval_id, tool, args_preview, risk}
-session.meta {sid, title, model, token_usage, ...}
-err {code, msg}
-```
+**The message catalog lives in `docs/PROTOCOL.md` (semantics) and
+`src/core/proto.zig` (types) — those are the source of truth**, and the wire
+shape is std.json's tagged-union form `{"<type>":{...payload}}`, not the
+`{"t": ...}` sketch this section originally carried. Highlights, using the
+real names: `session_create`/`session_list`/`session_kill`, `sub {sid,
+from_seq}`, `input` (message or steer), `approve`, `interrupt`,
+`session_compact`, and `blob_get {hash}` for full tool output (`!c`); daemon
+→ client is `blk`, `delta`/`reasoning_delta`/`stream_status` (ephemeral),
+`status`, `approval_request`, `session_meta`, `err`. There is no
+`copy.query` and no `blocks.get` — copy is content-addressed blob fetch, and
+scrollback beyond client memory re-replays with `sub.from_seq`.
 
 Two stream disciplines worth locking in now:
 
@@ -305,7 +319,8 @@ Two stream disciplines worth locking in now:
   buffer. This makes reconnect/multi-client trivial.
 - **`from_seq` resume.** Clients remember the last block seq they've seen per
   session; reattach replays only the gap. Scrollback beyond what's in client
-  memory is fetched with `blocks.get {sid, before_seq, limit}`.
+  memory is recovered by re-subscribing with an earlier `from_seq` (a
+  dedicated backfill message is future work if replay ever gets expensive).
 
 ## 4. Agent loop
 
@@ -359,12 +374,17 @@ loop:
 
 ## 5. Providers
 
-One internal chat representation (blocks → messages), three wire dialects:
+One internal chat representation (blocks → messages). ONE wire dialect ships
+today — everything goes through openai_compat (OpenRouter carries
+cache_control to Anthropic models):
 
 ```
 provider/
   openai_compat.zig   // OpenRouter, OpenAI, DeepSeek, Groq, local llama.cpp, ...
-  anthropic.zig       // Messages API: explicit cache_control breakpoints
+  anthropic.zig       // Messages API: STUB, not yet implemented. Still the
+                      // one non-OpenAI dialect worth building (direct line to
+                      // the most-used family + native cache_control), but do
+                      // not describe marlin as two-dialect until it exists.
   registry.zig        // model string "openrouter/anthropic/claude-..." → dialect + base_url + key env
 ```
 
@@ -396,7 +416,8 @@ Four distinct failure layers, four distinct answers:
    exercise it in the smoke suite once so it's KNOWN working, not
    theoretically working.
 
-**Failover policy** (the one piece of real code):
+**Failover policy** (design — no failover path exists in `provider/` yet;
+today a persistent provider failure fails the turn visibly):
 
 ```toml
 [model]
@@ -537,8 +558,12 @@ explicit note. Rejected: bundling an `rg` sidecar; Marlin remains one binary.
 - An `ask` emits `approval.request` to *all* subscribed clients; first decision
   wins; timeout (default: none — turn parks in `awaiting_approval`, exactly the
   state the session picker, actionable status summary, and phone surface).
-- bash sandboxing (M3.5, stolen from zag): Seatbelt profile on macOS, Landlock
-  + seccomp on Linux; deny-by-default on `~/.ssh`, key files, browser profiles.
+- bash sandboxing (M3.5, stolen from zag): Seatbelt profile on macOS
+  (shipped, canary-verified at daemon start); Landlock + seccomp on Linux is
+  **not yet implemented** — on Linux the sandbox backend reports unavailable
+  and execution falls back to legacy ask-gating, so Linux is currently a
+  macOS tool that happens to compile. Deny-by-default on `~/.ssh`, key
+  files, browser profiles.
   The profile allows `signal (target same-sandbox)` — SBPL's `signal` is a
   distinct operation `process*` does NOT cover, and without it `kill`/`timeout`
   inside the sandbox get EPERM and hang (the canary has a leg for this).
@@ -658,8 +683,8 @@ get these right; Hermes is the counter-example):
 
 **No persistent sidebar.** Session navigation is occasional; it must not tax
 every frame with permanent horizontal chrome. `/sessions` opens a fuzzy picker
-showing title, workspace, recency, and state. J/K switches recent sessions in
-normal mode. The status bar reports background sessions only when actionable
+showing title, workspace, recency, and state. `gt`/`gT` (with optional count,
+vim tab-style) cycles recent sessions in normal mode. The status bar reports background sessions only when actionable
 (`2 running · 1 approval`), and narrow terminals lose nothing. A split pane
 identifies its session with a compact pane label.
 
@@ -675,21 +700,21 @@ identifies its session with a compact pane label.
 └─ status: model · ctx% · $ · state · 1 approval ─────┘
 ```
 
-- **Modes**: insert (typing → input box), normal (j/k scroll blocks, J/K
-  recent sessions, `a` archive the focused session and advance, `A` archive
+- **Modes**: insert (typing → input box), normal (vim motions: j/k scroll,
+  gg top, `gt`/`gT` with count for recent-session cycling, J join lines in
+  the composer, `a` archive the focused session and advance, `A` archive
   every finished child while preserving active children, `/sessions` for
-  arbitrary attach, v visual-select, y yank, s/x split, tab cycle panes).
-  Prefix-key compat layer later if muscle memory demands it.
-- **Splits**: binary-tree layout, each pane = a session view (or the same
-  session twice). No VTE anywhere.
-- **Scrollback**: virtual list over the block log; lazy `blocks.get` when
-  scrolling past memory. Selection is ours (mouse mode on): drag selects
-  logical text within/across blocks; double-click = word, triple = block.
-  Copy → OSC 52 (works through ssh/mosh); shift+drag falls through to the
-  terminal for native selection as escape hatch.
-- **Copy commands**: `!c` last tool result (full blob, not inline cap),
-  `!c msg` / `!c code` / `!c cmd` / `!c all`; `!y` / `!p [sid]` for the
-  daemon-side register (cross-session paste, no OS clipboard).
+  arbitrary attach, v visual-select, y yank).
+- **Splits (not yet implemented)**: binary-tree layout, each pane = a
+  session view (or the same session twice). No VTE anywhere.
+- **Scrollback**: virtual list over the block log. Selection is ours (mouse
+  mode on): drag selects logical text within/across blocks; double-click =
+  word, triple = block. Copy → OSC 52 (works through ssh/mosh); shift+drag
+  falls through to the terminal for native selection as escape hatch.
+- **Copy commands**: `!c` last tool result (full blob via `blob_get`, not
+  the inline cap; the notice names the source tool since folding may hide
+  it). The `!c msg`/`!c code`/`!c all` variants and the `!y`/`!p` daemon-side
+  register are future work.
 - **Command namespace**: `/` = session & harness commands (`/sessions`,
   `/model`, `/compact`, `/new`, `/archive`, `/allow`); `!` = terse aliases for
   frequent actions (`!rb` expands to `/reboot --build`, `!c` copies the last

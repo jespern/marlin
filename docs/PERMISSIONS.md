@@ -1,8 +1,11 @@
 # Permissions and secret boundary
 
-Status: **active M3.5 plan**. This work precedes M4. Workspace snapshots,
-drift detection, undo, and write leases remain deferred to M4.5; permissions
-must not quietly depend on them.
+Status: **largely landed** (the M3.5 track; M4–M6a have since shipped on top
+of it). The "Landed in the working tree" items below are in tree and tested;
+the genuinely open items are once/session capability grants, typed
+protected-read refusals, and the Linux (Landlock) backend. Workspace
+snapshots, drift detection, undo, and write leases remain deferred to the
+workspace track; permissions must not quietly depend on them.
 
 Current progress:
 

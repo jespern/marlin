@@ -12,11 +12,28 @@
 //!   turn thread ×M     one per running agent turn; produces events into the
 //!                      central queue via loop.zig callbacks
 //!
-//! Ownership rules:
-//!   - Store and Session structs are touched ONLY by the dispatcher thread.
+//! Ownership rules (the REAL protocol — mid-turn /permissions, steering,
+//! and status all require the turn thread to share parts of the Session):
+//!   - Store: shared across dispatcher and turn threads. The single sqlite
+//!     connection is opened FULLMUTEX (serialized mode); turn threads append
+//!     blocks while the dispatcher answers queries. See store.zig.
+//!   - Session identity and configuration (id, kind, parent_*, cwd, model,
+//!     effort, approval_mode, sandbox/network toggles, archived) are
+//!     dispatcher-owned. Turn threads read them ONLY inside startTurn, on
+//!     the dispatcher thread, before the thread spawns; every protocol
+//!     mutation of these fields is rejected with err{busy} while a turn
+//!     runs, which is what makes the snapshot sound.
+//!   - Fields a RUNNING turn may touch, each with its own discipline:
+//!       cancel, approval_mode_live, context_used   atomics
+//!       gate                                       internally synchronized
+//!       steer_queue                                under steer_mutex
+//!       prune_frontier                             turn-thread exclusive
+//!                                                  while running; dispatcher
+//!                                                  only between turns
+//!     Adding a turn-visible field means adding it to THIS list with a
+//!     stated discipline — TurnJob.session is a live pointer, not a copy.
 //!   - Client outboxes are Mpsc(owned []u8 line); the client thread writes
 //!     them to the socket and frees.
-//!   - Turn threads never see sessions; they get a TurnJob value copy.
 
 const std = @import("std");
 const builtin = @import("builtin");

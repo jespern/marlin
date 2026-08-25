@@ -21,9 +21,12 @@ recovery/isolation track formerly called M4.5 is deliberately Later.
   attachable sessions grouped beneath their root in session listings.
 - Council product behavior is specified in `REVIEW.md`, but `/council`,
   `/review`, concurrent child fan-out, and review blocks are not implemented.
-- `parallel_safe` is metadata only today: the loop still runs every tool call
-  serially. This no longer blocks proving the child ownership path; it is the
-  next M6a widening step.
+- `parallel_safe` is **enforced** (this superseded the earlier
+  "metadata-only" state): `loop.zig` runs each maximal consecutive safe group
+  on worker threads and joins before persisting results in provider-call
+  order; e2e scenario 15_parallel_tool_batch covers it. Architecture §4 is
+  the current description. Remaining hardening: cap worker fan-out (spawn is
+  unbounded today; spawn failure falls back to serial mid-batch).
 - The daemon listens only on its local Unix socket. Raw TCP/token auth and a
   PWA remain architectural doors, not partially shipped surfaces.
 
