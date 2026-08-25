@@ -3,10 +3,11 @@
 //! land in M4. This client is a pure protocol consumer: attach.Conn in,
 //! blocks out. Deltas are ephemeral; finalized blocks replace them.
 //!
-//! Layout (M3):
-//!   ┌─ session view: blocks, streaming region ─┐
+//! Layout:
+//!   ┌─ permanent clickable root-session tab strip ─┐
+//!   ├─ session view: blocks, streaming region ─────┤
 //!   ├─ prompt panel (3-10 lines, grows with content) ┤
-//!   └─ status: state · model · tokens · ctx ────┤
+//!   └─ status: state · model · tokens · ctx ───────┤
 //!
 //! Keys:
 //!   insert:  type → input; Enter send; Shift+Enter/Alt+Enter/Ctrl+J newline;
@@ -235,6 +236,46 @@ const SessionSummary = struct {
     }
 };
 
+const tab_bar_height: usize = 1;
+const tab_label_max_cells: usize = 24;
+
+const TabActivity = enum {
+    idle,
+    done,
+    running,
+    err,
+    approval,
+};
+
+const TabHit = struct {
+    start_col: usize,
+    end_col: usize,
+    sid: u64,
+
+    fn contains(self: TabHit, col: usize) bool {
+        return col >= self.start_col and col < self.end_col;
+    }
+};
+
+/// Mouse intent is separate from tab geometry so a context menu can be added
+/// later without changing hit testing or the renderer's layout contract.
+const TabMouseAction = enum { activate, context_menu };
+
+const TabLayoutItem = struct {
+    sid: u64,
+    label: []const u8,
+    activity: TabActivity,
+    active: bool,
+    x: usize,
+    width: usize,
+};
+
+const TabLayout = struct {
+    items: []const TabLayoutItem,
+    hidden_left: bool = false,
+    hidden_right: bool = false,
+};
+
 /// Inactive sessions keep their complete client-side view state without
 /// remaining subscribed to their block streams. Moving these containers in
 /// and out of App is allocation-free after the first visit.
@@ -343,6 +384,9 @@ const App = struct {
     background_approvals: std.AutoHashMapUnmanaged(u64, PendingApproval) = .empty,
     recent_sessions: std.ArrayList(u64) = .empty,
     recent_cursor: usize = 0,
+    /// Click targets from the most recently rendered tab strip. The entries
+    /// contain no behavior, leaving room for button-specific actions later.
+    tab_hits: std.ArrayList(TabHit) = .empty,
     /// Character-precise mouse selection over the session view. Lines are
     /// absolute layout indices; columns are terminal cells within the line.
     sel_anchor: ?SelectionPoint = null,
@@ -451,6 +495,7 @@ const App = struct {
         self.saved_views.deinit(self.gpa);
         self.background_approvals.deinit(self.gpa);
         self.recent_sessions.deinit(self.gpa);
+        self.tab_hits.deinit(self.gpa);
         self.pending_new_cwd.deinit(self.gpa);
         self.clipboard_pending.deinit(self.gpa);
         self.clipboard_desc.deinit(self.gpa);
@@ -488,6 +533,33 @@ const App = struct {
     fn sessionSummary(self: *const App, sid: u64) ?*const SessionSummary {
         for (self.sessions.items) |*session| {
             if (session.sid == sid) return session;
+        }
+        return null;
+    }
+
+    fn rootSessionId(self: *const App, sid: u64) u64 {
+        var cursor = sid;
+        var remaining = self.sessions.items.len + 1;
+        while (remaining > 0) : (remaining -= 1) {
+            const summary = self.sessionSummary(cursor) orelse return cursor;
+            cursor = summary.parent_sid orelse return cursor;
+        }
+        return sid; // malformed cycle: retain a safe, deterministic focus
+    }
+
+    fn tabActivity(self: *const App, root_sid: u64) TabActivity {
+        var activity: TabActivity = .idle;
+        for (self.sessions.items) |session| {
+            if (!self.sessionBelongsToTree(session.sid, root_sid)) continue;
+            const candidate = tabActivityForState(session.state);
+            if (tabActivityRank(candidate) > tabActivityRank(activity)) activity = candidate;
+        }
+        return activity;
+    }
+
+    fn tabAtColumn(self: *const App, col: usize) ?u64 {
+        for (self.tab_hits.items) |hit| {
+            if (hit.contains(col)) return hit.sid;
         }
         return null;
     }
@@ -1824,6 +1896,10 @@ const Palette = struct {
     const prompt_text: vaxis.Style = .{ .bg = prompt_bg };
     const prompt_mark: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 6 }, .bold = true };
     const command_bg: vaxis.Color = .{ .rgb = .{ 0x2d, 0x30, 0x35 } };
+    const tab_bar: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 8 } };
+    const tab_inactive: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 7 } };
+    const tab_active: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 7 }, .bold = true };
+    const tab_overflow: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 8 }, .dim = true };
     const command_menu: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 7 } };
     const command_name: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 6 }, .bold = true };
     const command_description: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 8 }, .dim = true };
@@ -3810,6 +3886,164 @@ fn hardCellBreak(text: []const u8, start: usize, capacity: usize) usize {
     return start + bytes_used;
 }
 
+fn tabActivityForState(state: proto.SessionState) TabActivity {
+    return switch (state) {
+        .idle => .idle,
+        .done => .done,
+        .running => .running,
+        .err => .err,
+        .awaiting_approval => .approval,
+    };
+}
+
+fn tabActivityRank(activity: TabActivity) u8 {
+    return switch (activity) {
+        .idle => 0,
+        .done => 1,
+        .running => 2,
+        .err => 3,
+        .approval => 4,
+    };
+}
+
+fn tabActivityText(activity: TabActivity) []const u8 {
+    return switch (activity) {
+        .idle => " ·",
+        .done => " ✓",
+        .running => " ●",
+        .err => " ×",
+        .approval => " !",
+    };
+}
+
+const TabCandidate = struct {
+    sid: u64,
+    label: []const u8,
+    activity: TabActivity,
+    active: bool,
+    created_at: i64,
+
+    fn width(self: TabCandidate) usize {
+        // leading space + label + fixed-width activity + trailing space
+        return displayWidth(self.label) + 4;
+    }
+};
+
+fn tabLabel(
+    arena: std.mem.Allocator,
+    app: *const App,
+    sid: u64,
+    summary: ?*const SessionSummary,
+) ![]const u8 {
+    var handle_buf: session_handle.Full = undefined;
+    const handle = app.displaySessionHandle(&handle_buf, sid);
+    const short_handle = handle[0..@min(handle.len, 4)];
+    const identity = if (summary) |session|
+        if (session.title.len > 0)
+            session.title
+        else if (std.fs.path.basename(session.cwd).len > 0)
+            std.fs.path.basename(session.cwd)
+        else
+            "session"
+    else if (std.fs.path.basename(app.cwd.items).len > 0)
+        std.fs.path.basename(app.cwd.items)
+    else
+        "session";
+    const raw = try std.fmt.allocPrint(arena, "{s} · {s}", .{ identity, short_handle });
+    return raw[0..hardCellBreak(raw, 0, tab_label_max_cells)];
+}
+
+/// Build a chronological, root-only tab window. When the full strip does not
+/// fit, retain a contiguous neighborhood around the active root and reserve
+/// two cells at either edge for overflow markers.
+fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !TabLayout {
+    if (width == 0) return .{ .items = &.{} };
+
+    const active_root = app.rootSessionId(app.sid);
+    var candidates: std.ArrayList(TabCandidate) = .empty;
+    for (app.sessions.items) |*session| {
+        if (session.parent_sid != null or session.kind != .root) continue;
+        try candidates.append(arena, .{
+            .sid = session.sid,
+            .label = try tabLabel(arena, app, session.sid, session),
+            .activity = app.tabActivity(session.sid),
+            .active = session.sid == active_root,
+            .created_at = session.created_at,
+        });
+    }
+    if (candidates.items.len == 0) {
+        try candidates.append(arena, .{
+            .sid = app.sid,
+            .label = try tabLabel(arena, app, app.sid, null),
+            .activity = tabActivityForState(app.state),
+            .active = true,
+            .created_at = 0,
+        });
+    }
+    std.mem.sort(TabCandidate, candidates.items, {}, struct {
+        fn lessThan(_: void, a: TabCandidate, b: TabCandidate) bool {
+            return a.created_at < b.created_at or (a.created_at == b.created_at and a.sid < b.sid);
+        }
+    }.lessThan);
+
+    var active_index: usize = 0;
+    var total_width: usize = candidates.items.len - 1; // one-cell gaps
+    for (candidates.items, 0..) |candidate, i| {
+        total_width += candidate.width();
+        if (candidate.active) active_index = i;
+    }
+
+    var start: usize = 0;
+    var end: usize = candidates.items.len;
+    if (total_width > width) {
+        const budget = width -| 4;
+        start = active_index;
+        end = active_index + 1;
+        var used = @min(candidates.items[active_index].width(), budget);
+        while (true) {
+            var changed = false;
+            if (end < candidates.items.len) {
+                const cost = 1 + candidates.items[end].width();
+                if (used + cost <= budget) {
+                    used += cost;
+                    end += 1;
+                    changed = true;
+                }
+            }
+            if (start > 0) {
+                const cost = 1 + candidates.items[start - 1].width();
+                if (used + cost <= budget) {
+                    used += cost;
+                    start -= 1;
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+    }
+
+    const hidden_left = start > 0;
+    const hidden_right = end < candidates.items.len;
+    const right_limit = width -| (if (hidden_right) @as(usize, 2) else 0);
+    var x: usize = if (hidden_left) 2 else 0;
+    var items: std.ArrayList(TabLayoutItem) = .empty;
+    for (candidates.items[start..end], 0..) |candidate, i| {
+        if (x >= right_limit) break;
+        const item_width = @min(candidate.width(), right_limit - x);
+        try items.append(arena, .{
+            .sid = candidate.sid,
+            .label = candidate.label,
+            .activity = candidate.activity,
+            .active = candidate.active,
+            .x = x,
+            .width = item_width,
+        });
+        x += item_width;
+        if (i + 1 < end - start and x < right_limit) x += 1;
+    }
+    return .{ .items = items.items, .hidden_left = hidden_left, .hidden_right = hidden_right };
+}
+
 /// Word-aware cell-width break for prose. Long tokens fall back to a hard
 /// grapheme break, so emoji and CJK never corrupt wrapping or table sizing.
 fn wordBreak(text: []const u8, start: usize, capacity: usize) usize {
@@ -4672,12 +4906,69 @@ fn drawShortcutHelp(win: vaxis.Window, arena: std.mem.Allocator) !void {
     }, .{ .row_offset = shown + 1, .wrap = .none });
 }
 
+fn tabActivityStyle(activity: TabActivity, active: bool) vaxis.Style {
+    var style: vaxis.Style = switch (activity) {
+        .idle => .{ .fg = .{ .index = 8 }, .dim = true },
+        .done => .{ .fg = .{ .index = 2 } },
+        .running => .{ .fg = .{ .index = 3 }, .bold = true },
+        .err => .{ .fg = .{ .index = 1 }, .bold = true },
+        .approval => .{ .fg = .{ .index = 3 }, .bold = true },
+    };
+    style.bg = if (active) Palette.prompt_bg else Palette.command_bg;
+    return style;
+}
+
+fn drawTabBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
+    const bar = win.child(.{ .height = tab_bar_height, .width = win.width });
+    bar.fill(.{ .style = Palette.tab_bar });
+    app.tab_hits.clearRetainingCapacity();
+
+    const layout = try layoutTabBar(arena, app, win.width);
+    if (layout.hidden_left) {
+        _ = bar.printSegment(.{ .text = "‹ ", .style = Palette.tab_overflow }, .{ .wrap = .none });
+    }
+    if (layout.hidden_right and win.width >= 2) {
+        _ = bar.printSegment(.{ .text = " ›", .style = Palette.tab_overflow }, .{
+            .col_offset = win.width - 2,
+            .wrap = .none,
+        });
+    }
+
+    for (layout.items) |item| {
+        if (item.width == 0) continue;
+        const style = if (item.active) Palette.tab_active else Palette.tab_inactive;
+        const tab = bar.child(.{
+            .x_off = @intCast(item.x),
+            .width = @intCast(item.width),
+            .height = 1,
+        });
+        tab.fill(.{ .style = style });
+        const label_capacity = item.width -| 4;
+        const label_end = hardCellBreak(item.label, 0, label_capacity);
+        const segments = [_]vaxis.Segment{
+            .{ .text = " ", .style = style },
+            .{ .text = item.label[0..label_end], .style = style },
+            .{ .text = tabActivityText(item.activity), .style = tabActivityStyle(item.activity, item.active) },
+            .{ .text = " ", .style = style },
+        };
+        _ = tab.print(&segments, .{ .wrap = .none });
+        app.tab_hits.append(app.gpa, .{
+            .start_col = item.x,
+            .end_col = item.x + item.width,
+            .sid = item.sid,
+        }) catch {};
+    }
+}
+
 fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const win = vx.window();
     win.clear();
+    app.tab_hits.clearRetainingCapacity();
     const h = win.height;
     const w = win.width;
     if (h < 4 or w < 20) return;
+
+    try drawTabBar(app, win, arena);
 
     // The composer is a three-row panel for a one-line prompt (padding,
     // content, padding) and grows with multiline input.
@@ -4686,7 +4977,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const content_h: u16 = @intCast(app.editor.displayHeight(panel_inner_w -| 2));
     const input_h: u16 = @intCast(inputPanelHeight(content_h));
     const input_gap: u16 = 1;
-    const view_h: u16 = h -| (input_h + input_gap + 1); // input + gap + status
+    const view_h: u16 = h -| (@as(u16, @intCast(tab_bar_height)) + input_h + input_gap + 1); // tabs + input + gap + status
 
     // ---- session view ----
     var lines = try layoutLines(arena, app, w);
@@ -4712,7 +5003,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             const fill_width = @min(ln.fill_width orelse (w -| fill_start), w -| fill_start);
             const row_win = win.child(.{
                 .x_off = @intCast(fill_start),
-                .y_off = @intCast(row),
+                .y_off = @intCast(tab_bar_height + row),
                 .height = 1,
                 .width = fill_width,
             });
@@ -4731,21 +5022,21 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             n += 1;
         }
         _ = win.print(segs_buf[0..n], .{
-            .row_offset = @intCast(row),
+            .row_offset = @intCast(tab_bar_height + row),
             .wrap = .none,
         });
-        applyLineSyntax(win, @intCast(row), ln);
-        applyLineLinks(win, @intCast(row), ln);
+        applyLineSyntax(win, @intCast(tab_bar_height + row), ln);
+        applyLineLinks(win, @intCast(tab_bar_height + row), ln);
         // Apply selection after printing so partial-cell highlighting keeps
         // each segment's original syntax color and other style attributes.
         if (app.selection()) |sel| {
             if (sel.columns(abs_line, lineWidth(win, ln))) |cols| {
                 var col = cols.start;
                 while (col < cols.end and col < @as(usize, w)) : (col += 1) {
-                    const cell = win.readCell(@intCast(col), @intCast(row)) orelse continue;
+                    const cell = win.readCell(@intCast(col), @intCast(tab_bar_height + row)) orelse continue;
                     var selected_cell = cell;
                     selected_cell.style.reverse = true;
-                    win.writeCell(@intCast(col), @intCast(row), selected_cell);
+                    win.writeCell(@intCast(col), @intCast(tab_bar_height + row), selected_cell);
                 }
             }
         }
@@ -4761,10 +5052,10 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
                 } else |_| {}
                 const col = @min(cursor.col, @max(app.copy_cursor_line_width, 1) - 1);
                 if (col < @as(usize, w)) {
-                    if (win.readCell(@intCast(col), @intCast(row))) |cell| {
+                    if (win.readCell(@intCast(col), @intCast(tab_bar_height + row))) |cell| {
                         var cursor_cell = cell;
                         cursor_cell.style.reverse = !cursor_cell.style.reverse;
-                        win.writeCell(@intCast(col), @intCast(row), cursor_cell);
+                        win.writeCell(@intCast(col), @intCast(tab_bar_height + row), cursor_cell);
                     }
                 }
             }
@@ -5452,15 +5743,26 @@ pub fn run(
     return 0;
 }
 
+fn tabMouseAction(m: vaxis.Mouse) ?TabMouseAction {
+    if (m.type != .press) return null;
+    return switch (m.button) {
+        .left => .activate,
+        .right => .context_menu,
+        else => null,
+    };
+}
+
 /// Mouse: the wheel ALWAYS scrolls the session view — never the input box,
-/// never history. Left press/drag/release selects terminal-cell ranges in
-/// the session view; release copies the precise range via OSC52.
+/// never history. A left click on the permanent top strip activates its tab.
+/// Left press/drag/release below it selects terminal-cell ranges; release
+/// copies the precise range via OSC52.
 fn handleMouse(app: *App, m: vaxis.Mouse) void {
     // Some terminals report the release button as `none`, so complete an
     // active left-button drag based on event type before switching on button.
     if (m.type == .release and app.sel_dragging) {
         if (app.last_view_h > 0) {
-            const raw_row: usize = if (m.row < 0) 0 else @intCast(m.row);
+            const terminal_row: usize = if (m.row < 0) 0 else @intCast(m.row);
+            const raw_row = terminal_row -| tab_bar_height;
             const row = @min(raw_row, app.last_view_h - 1);
             const col: usize = if (m.col < 0) 0 else @intCast(m.col);
             app.sel_head = .{ .line = app.last_first_visible + row, .col = col };
@@ -5476,11 +5778,27 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
         return;
     }
 
+    const terminal_row: usize = if (m.row < 0) 0 else @intCast(m.row);
+    if (terminal_row < tab_bar_height) {
+        const col: usize = if (m.col < 0) 0 else @intCast(m.col);
+        if (app.tabAtColumn(col)) |sid| {
+            if (tabMouseAction(m)) |action| switch (action) {
+                .activate => app.switchSession(sid, true) catch app.setNotice("could not switch session", .{}),
+                // Reserved for a future tab menu; right-click intentionally
+                // has no product behavior yet.
+                .context_menu => {},
+            };
+        }
+        // Preserve the global wheel contract even when the pointer happens
+        // to be over the strip; other non-click events belong to no view.
+        if (m.button != .wheel_up and m.button != .wheel_down) return;
+    }
+
     switch (m.button) {
         .wheel_up => app.scroll_up +|= 3,
         .wheel_down => app.scroll_up -|= 3,
         .left => {
-            const row: usize = if (m.row < 0) 0 else @intCast(m.row);
+            const row = terminal_row - tab_bar_height;
             // Only rows inside the session view participate.
             if (row >= app.last_view_h) {
                 if (m.type == .press) app.sel_anchor = null; // click below view clears
@@ -7101,6 +7419,116 @@ test "session labels round-trip ids and preserve inactive view state" {
     try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
     try std.testing.expectEqual(@as(usize, 17), app.scroll_up);
     try std.testing.expectEqualStrings("scrollback survives", app.blocks.items[0].text);
+}
+
+test "tab bar is permanent, root-only, chronological, and rolls up child activity" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 30, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 20, .title = "", .cwd = "/work/beta", .model = "m", .status = "running", .state = .running, .created_at = 20, .running = true },
+        .{ .sid = 30, .parent_sid = 20, .kind = .task_child, .title = "review crypto", .cwd = "/work/beta", .model = "m", .status = "err", .state = .err, .created_at = 21, .running = false },
+        .{ .sid = 10, .title = "", .cwd = "/work/alpha", .model = "m", .status = "idle", .created_at = 10, .running = false },
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const layout = try layoutTabBar(arena_state.allocator(), &app, 120);
+    try std.testing.expectEqual(@as(usize, 2), layout.items.len);
+    try std.testing.expectEqual(@as(u64, 10), layout.items[0].sid);
+    try std.testing.expectEqual(@as(u64, 20), layout.items[1].sid);
+    try std.testing.expect(!layout.items[0].active);
+    try std.testing.expect(layout.items[1].active); // focused child highlights its root
+    try std.testing.expectEqual(TabActivity.err, layout.items[1].activity);
+    try std.testing.expect(std.mem.indexOf(u8, layout.items[0].label, "alpha") != null);
+
+    var empty = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 99, .editor = Editor.init(gpa) };
+    defer empty.deinit();
+    const fallback = try layoutTabBar(arena_state.allocator(), &empty, 80);
+    try std.testing.expectEqual(@as(usize, 1), fallback.items.len);
+    try std.testing.expect(fallback.items[0].active);
+    try std.testing.expectEqual(@as(u64, 99), fallback.items[0].sid);
+}
+
+test "tab overflow retains the active tab and tab hit testing is button-extensible" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 4, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 1, .title = "one", .model = "m", .status = "idle", .created_at = 1, .running = false },
+        .{ .sid = 2, .title = "two", .model = "m", .status = "idle", .created_at = 2, .running = false },
+        .{ .sid = 3, .title = "three", .model = "m", .status = "idle", .created_at = 3, .running = false },
+        .{ .sid = 4, .title = "four", .model = "m", .status = "running", .state = .running, .created_at = 4, .running = true },
+        .{ .sid = 5, .title = "five", .model = "m", .status = "idle", .created_at = 5, .running = false },
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const layout = try layoutTabBar(arena_state.allocator(), &app, 24);
+    try std.testing.expect(layout.hidden_left or layout.hidden_right);
+    var found_active = false;
+    for (layout.items) |item| {
+        if (item.sid == 4) found_active = item.active;
+        try std.testing.expect(item.x + item.width <= 24);
+    }
+    try std.testing.expect(found_active);
+
+    try app.tab_hits.append(gpa, .{ .start_col = 3, .end_col = 11, .sid = 4 });
+    try std.testing.expectEqual(@as(?u64, 4), app.tabAtColumn(3));
+    try std.testing.expectEqual(@as(?u64, 4), app.tabAtColumn(10));
+    try std.testing.expectEqual(@as(?u64, null), app.tabAtColumn(11));
+    try std.testing.expectEqual(TabMouseAction.activate, tabMouseAction(.{ .row = 0, .col = 4, .button = .left, .mods = .{}, .type = .press }).?);
+    try std.testing.expectEqual(TabMouseAction.context_menu, tabMouseAction(.{ .row = 0, .col = 4, .button = .right, .mods = .{}, .type = .press }).?);
+    try std.testing.expect(tabMouseAction(.{ .row = 0, .col = 4, .button = .left, .mods = .{}, .type = .release }) == null);
+
+    // Clicking the already-active tab is a complete no-op and must not begin
+    // transcript selection even when no connection object is available.
+    handleMouse(&app, .{ .row = 0, .col = 4, .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(app.sel_anchor == null);
+    handleMouse(&app, .{ .row = 0, .col = 4, .button = .wheel_up, .mods = .{}, .type = .press });
+    try std.testing.expectEqual(@as(usize, 3), app.scroll_up);
+
+    app.last_first_visible = 40;
+    app.last_view_h = 5;
+    handleMouse(&app, .{ .row = 1, .col = 7, .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expectEqual(@as(usize, 40), app.sel_anchor.?.line); // row 0 is the tab strip
+}
+
+test "draw permanently reserves and paints the clickable tab row" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var vx = try vaxis.init(threaded.io(), gpa, &environ, .{});
+    defer vx.deinit(gpa, &output.writer);
+    try vx.resize(gpa, &output.writer, .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+
+    var conn: attach.Conn = undefined;
+    conn.sandbox_available = false;
+    conn.network_filtering = false;
+    conn.network_configured = false;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.setCwdStr("/work/marlin");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try draw(&app, &vx, arena_state.allocator());
+
+    try std.testing.expectEqual(@as(usize, 1), app.tab_hits.items.len);
+    try std.testing.expectEqual(@as(u64, 1), app.tab_hits.items[0].sid);
+    try std.testing.expectEqual(@as(usize, 6), app.last_view_h);
+    const tab_cell = vx.window().readCell(0, 0).?;
+    try std.testing.expect(vaxis.Color.eql(tab_cell.style.bg, Palette.prompt_bg));
 }
 
 test "tool results retain full blob refs and inline !c stages clipboard text" {

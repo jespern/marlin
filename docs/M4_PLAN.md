@@ -7,11 +7,16 @@ Later track, after M6, rather than pretending phase 2 can precede phase 1.
 
 ## Current position
 
-M4a/M4b are complete: session-status watch, `/sessions`, MRU J/K switching,
+M4a/M4b are complete: session-status watch, `/sessions`, MRU `gt`/`gT` switching,
 actionable background status, per-session drafts/view state, durable turn/seq
 identity, background approvals, and uncapped `!c` retrieval all pass the unit
 and E2E gates. Splits, image input, remote attach, and cross-session registers
 remain optional future slices.
+
+Post-M4 dogfood added a permanent one-row tab strip. Every unarchived root is
+a tab, child activity rolls up to its root, overflow retains the focused tab,
+and left-click switches through the same state-preserving path as `gt`/`gT`.
+The strip stays visible for a single session so the layout never jumps.
 
 Workspace snapshots, drift, undo, leases, and worktree isolation are deferred
 as one coherent Later track. Their design remains below and in `WORKSPACE.md`;
@@ -19,10 +24,11 @@ reopen it using actual multiplexer collision/recovery evidence.
 
 ## Decisions already made
 
-1. **No persistent sidebar.** Session navigation is on demand through a fuzzy
-   `/sessions` picker. Normal-mode J/K switches recent sessions. Actionable
-   background state appears temporarily in the status bar. Split panes, if we
-   keep them, identify their session with a compact pane label.
+1. **No persistent sidebar.** A permanent one-row tab strip provides direct
+   root-session navigation without consuming horizontal working space.
+   `/sessions` remains the fuzzy full-hierarchy picker, while `gt`/`gT` and
+   mouse clicks switch tabs. Split panes, if retained, identify their session
+   with a compact pane label.
 2. **Workspace safety is deferred, not half-built.** M4 does not implement
    snapshots, drift detection, `/undo`, `waiting_workspace`, or write leases.
    M3.5 capability permissions remain in force and the workspace feature flag

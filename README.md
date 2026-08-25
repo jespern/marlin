@@ -40,6 +40,8 @@ multiplexed by a TUI that is just another client.**
 
 - Sessions live in the daemon. Detach, reboot your laptop, ssh in from another
   machine, reattach — the agent never noticed.
+- Unarchived root sessions are always visible as clickable tabs; child work
+  rolls up into the root's running, approval, or error indicator.
 - Sessions have short stable handles: `marlin ls` prints eight characters and
   `marlin attach 63df` accepts any unique prefix of four or more.
 - The multiplexer knows "session 3 is awaiting approval for `rm -rf`" as a

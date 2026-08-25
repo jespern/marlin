@@ -685,15 +685,18 @@ get these right; Hermes is the counter-example):
   of a hardcoded rainbow. (Check what libvaxis exposes for OSC queries;
   it's Ghostty-adjacent so likely most of it.)
 
-**No persistent sidebar.** Session navigation is occasional; it must not tax
-every frame with permanent horizontal chrome. `/sessions` opens a fuzzy picker
-showing title, workspace, recency, and state. `gt`/`gT` (with optional count,
-vim tab-style) cycles recent sessions in normal mode. The status bar reports background sessions only when actionable
-(`2 running · 1 approval`), and narrow terminals lose nothing. A split pane
-identifies its session with a compact pane label.
+**Permanent tabs; no persistent sidebar.** Every unarchived root session has a
+tab in a one-row strip that remains visible even when only one session exists.
+Tabs are clickable; `gt`/`gT` (with optional count, vim tab-style) cycles
+recent sessions in normal mode. Child activity rolls up to its root tab and
+overflow keeps the focused tab visible. `/sessions` remains the fuzzy complete
+hierarchy picker showing title, workspace, recency, and state. The status bar
+reports background sessions only when actionable (`2 running · 1 approval`).
+A split pane identifies its session with a compact pane label.
 
 ```
-┌─ main: api-fix ● ───────────────────────────────────┐
+┌ api-fix · 63df ● │ crypto-review · a82c ! ──────────┐
+├─ main: api-fix ● ───────────────────────────────────┤
 │ blocks rendered as cards:                           │
 │ user / assistant md / collapsed tools               │
 │ [streaming region at bottom]                        │
