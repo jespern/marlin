@@ -52,7 +52,8 @@ const scanToolBatch = layout_mod.scanToolBatch;
 const Transcript = layout_mod.Transcript;
 const InflightCall = layout_mod.InflightCall;
 const currentInflightCall = layout_mod.currentInflightCall;
-const extractHighlightArg = layout_mod.extractHighlightArg;
+const toolDisplayArg = layout_mod.toolDisplayArg;
+const toolDisplayName = layout_mod.toolDisplayName;
 const DiffLineNumbers = layout_mod.DiffLineNumbers;
 const appendDiffLine = layout_mod.appendDiffLine;
 const Palette = render.Palette;
@@ -1843,8 +1844,10 @@ const App = struct {
         var seen: usize = 0;
         for (self.blocks.items[start..]) |rb| {
             if (rb.kind != .tool_call) continue;
-            if (seen == result_ord)
-                return .{ .name = rb.label, .arg = extractHighlightArg(rb.label, rb.text) };
+            if (seen == result_ord) return .{
+                .name = toolDisplayName(rb.label),
+                .arg = toolDisplayArg(rb.label, rb.text, self.cwd.items),
+            };
             seen += 1;
         }
         return .{ .name = "tool", .arg = null };
@@ -2619,6 +2622,7 @@ fn transcriptView(app: *App) Transcript {
         .stream_bytes = app.stream_bytes,
         .stream_quiet_ms = app.stream_quiet_ms,
         .stream_status_at_ms = app.stream_status_at_ms,
+        .cwd = app.cwd.items,
         .approval = if (app.pending) |*pending| .{
             .tool = pending.tool(),
             .args = pending.args(),
@@ -6049,7 +6053,7 @@ test "!c names the folded source it copies (positional batch pairing)" {
 
     app.runCommand("!c");
     try std.testing.expectEqualStrings("259|## Implementation slices", app.clipboard_pending.items);
-    try std.testing.expectEqualStrings("read_file docs/PERMISSIONS.md", app.clipboard_desc.items);
+    try std.testing.expectEqualStrings("Read docs/PERMISSIONS.md", app.clipboard_desc.items);
 }
 
 test "local commands enter editor history" {

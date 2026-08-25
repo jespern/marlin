@@ -524,11 +524,17 @@ pub fn pendingToolBatch(blocks: []const RenderBlock, start: usize) ?CollapsedToo
 /// The collapsed-transcript machinery renders call/result pairs from two
 /// places (the sequential walk and batch-failure expansion); one renderer
 /// each keeps them identical.
-pub fn appendToolCallLine(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, w: usize) !void {
+pub fn appendToolCallLine(
+    alloc: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    rb: RenderBlock,
+    cwd: []const u8,
+    w: usize,
+) !void {
     // Keep the machinery subdued. Bash commands receive semantic shell
     // roles; for file tools the emphasized value is a path.
-    const hi = extractHighlightArg(rb.label, rb.text);
-    const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{rb.label});
+    const hi = toolDisplayArg(rb.label, rb.text, cwd);
+    const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{toolDisplayName(rb.label)});
     if (hi) |h| {
         const hi_capped = h[0..@min(h.len, w -| (head.len + 2))];
         const is_bash = std.mem.eql(u8, rb.label, "bash");
@@ -542,6 +548,8 @@ pub fn appendToolCallLine(alloc: std.mem.Allocator, lines: *std.ArrayList(Line),
             else
                 &.{},
         });
+    } else if (isReadTool(rb.label)) {
+        try lines.append(alloc, .{ .text = head, .style = Palette.tool });
     } else {
         const preview_len = @min(rb.text.len, @min(w -| (rb.label.len + 4), 120));
         try lines.append(alloc, .{
@@ -708,6 +716,7 @@ pub const Transcript = struct {
     stream_bytes: u64,
     stream_quiet_ms: u64,
     stream_status_at_ms: i64,
+    cwd: []const u8 = "",
     approval: ?ApprovalView,
     layout_cache: *LayoutCache,
     tail_layout_cache: *TailLayoutCache,
@@ -842,11 +851,11 @@ pub fn layoutBlockRange(
                 var hint: []const u8 = " · ctrl+t to view transcript";
                 if (running_count == 1) {
                     const call = blocks_all[running_call_idx];
-                    const hi = extractHighlightArg(call.label, call.text) orelse
-                        call.text[0..@min(call.text.len, 40)];
+                    const hi = toolDisplayArg(call.label, call.text, transcript.cwd) orelse
+                        if (isReadTool(call.label)) "" else call.text[0..@min(call.text.len, 40)];
                     const capped = hi[0..@min(hi.len, 60)];
                     hint = try std.fmt.allocPrint(alloc, " · {s} {s}{s}", .{
-                        call.label,
+                        toolDisplayName(call.label),
                         capped,
                         if (capped.len < hi.len) "…" else "",
                     });
@@ -864,7 +873,7 @@ pub fn layoutBlockRange(
                     });
                 }
                 for (expand.items) |pair| {
-                    try appendToolCallLine(alloc, lines, blocks_all[pair.call], w);
+                    try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w);
                     try appendToolResultLines(alloc, lines, blocks_all[pair.result], blocks_all[pair.call].label);
                 }
                 if (scan_end > block_idx) {
@@ -898,7 +907,7 @@ pub fn layoutBlockRange(
             .tool_call => {
                 try flushRanSummary(alloc, lines, &pending_ran);
                 last_tool_label.* = rb.label;
-                try appendToolCallLine(alloc, lines, rb, w);
+                try appendToolCallLine(alloc, lines, rb, transcript.cwd, w);
             },
             .tool_result => try appendToolResultLines(alloc, lines, rb, last_tool_label.*),
             .approval => {
@@ -1053,7 +1062,7 @@ pub fn layoutLines(
             }
         }
         if (currentInflightCall(transcript.blocks)) |cur| {
-            const arg_full = extractHighlightArg(cur.rb.label, cur.rb.text) orelse "";
+            const arg_full = toolDisplayArg(cur.rb.label, cur.rb.text, transcript.cwd) orelse "";
             const arg = arg_full[0..utf8Floor(arg_full, @min(arg_full.len, 60))];
             const call_s: i64 = if (transcript.call_started_ms > 0)
                 @max(0, @divTrunc(nowWallMs(transcript.io) - transcript.call_started_ms, 1000))
@@ -1065,7 +1074,7 @@ pub fn layoutLines(
             else
                 "";
             detail = try std.fmt.allocPrint(arena, "{s} · {s}{s}{s} · {d}s{s}", .{
-                elapsed, cur.rb.label, sep, arg, call_s, queued,
+                elapsed, toolDisplayName(cur.rb.label), sep, arg, call_s, queued,
             });
         }
         try lines.append(arena, .{
@@ -1090,19 +1099,50 @@ pub fn layoutLines(
 }
 
 pub fn extractHighlightArg(tool_name: []const u8, args_json: []const u8) ?[]const u8 {
-    const key: []const u8 = if (std.mem.eql(u8, tool_name, "bash"))
+    const key: []const u8 = if (std.ascii.eqlIgnoreCase(tool_name, "bash"))
         "command"
-    else if (std.mem.eql(u8, tool_name, "grep") or std.mem.eql(u8, tool_name, "glob"))
+    else if (std.ascii.eqlIgnoreCase(tool_name, "grep") or std.ascii.eqlIgnoreCase(tool_name, "glob"))
         "pattern"
-    else if (std.mem.eql(u8, tool_name, "fetch"))
+    else if (std.ascii.eqlIgnoreCase(tool_name, "fetch"))
         "url"
-    else if (std.mem.eql(u8, tool_name, "read_file") or
-        std.mem.eql(u8, tool_name, "write_file") or
-        std.mem.eql(u8, tool_name, "edit"))
+    else if (isFileTool(tool_name))
         "path"
     else
         return null;
-    return extractJsonStringRaw(args_json, key);
+    return extractJsonStringRaw(args_json, key) orelse
+        if (isFileTool(tool_name)) extractJsonStringRaw(args_json, "file_path") else null;
+}
+
+fn isReadTool(tool_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(tool_name, "read") or
+        std.mem.eql(u8, tool_name, "read_file");
+}
+
+fn isFileTool(tool_name: []const u8) bool {
+    return isReadTool(tool_name) or
+        std.ascii.eqlIgnoreCase(tool_name, "write") or
+        std.mem.eql(u8, tool_name, "write_file") or
+        std.ascii.eqlIgnoreCase(tool_name, "edit");
+}
+
+pub fn toolDisplayName(tool_name: []const u8) []const u8 {
+    return if (isReadTool(tool_name)) "Read" else tool_name;
+}
+
+/// Reduce file-tool targets to session-relative paths. Absolute targets
+/// outside the session retain only their basename rather than filling the
+/// transcript with a machine-specific prefix.
+pub fn toolDisplayArg(tool_name: []const u8, args_json: []const u8, cwd: []const u8) ?[]const u8 {
+    const arg = extractHighlightArg(tool_name, args_json) orelse return null;
+    if (!isFileTool(tool_name) or !std.fs.path.isAbsolute(arg)) return arg;
+
+    const root = if (std.mem.eql(u8, cwd, "/")) cwd else std.mem.trimEnd(u8, cwd, "/");
+    if (root.len > 0 and std.mem.startsWith(u8, arg, root)) {
+        if (arg.len == root.len) return ".";
+        if (std.mem.eql(u8, root, "/")) return arg[1..];
+        if (arg[root.len] == '/') return arg[root.len + 1 ..];
+    }
+    return std.fs.path.basename(arg);
 }
 
 /// Find "key":"..." and return the raw (still-escaped) string contents.
@@ -1125,6 +1165,41 @@ pub fn extractJsonStringRaw(json: []const u8, key: []const u8) ?[]const u8 {
     }
     if (end > json.len) return null;
     return json[at..end];
+}
+
+test "Claude Code Read calls render a relative path instead of raw JSON" {
+    const cwd = "/Users/example/Work/marlin";
+    const args =
+        \\{"file_path":"/Users/example/Work/marlin/src/client/layout.zig","offset":20}
+    ;
+    try std.testing.expectEqualStrings("Read", toolDisplayName("Read"));
+    try std.testing.expectEqualStrings("Read", toolDisplayName("read_file"));
+    try std.testing.expectEqualStrings("src/client/layout.zig", toolDisplayArg("Read", args, cwd).?);
+    try std.testing.expectEqualStrings("secrets.txt", toolDisplayArg("Read",
+        \\{"file_path":"/outside/private/secrets.txt"}
+    , cwd).?);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+    try appendToolCallLine(arena, &lines, .{
+        .kind = .tool_call,
+        .text = try arena.dupe(u8, args),
+        .label = try arena.dupe(u8, "Read"),
+    }, cwd, 100);
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqualStrings("  ⚙ Read ", lines.items[0].text);
+    try std.testing.expectEqualStrings("src/client/layout.zig", lines.items[0].text2);
+    try std.testing.expect(std.mem.indexOfScalar(u8, lines.items[0].text2, '{') == null);
+
+    lines.clearRetainingCapacity();
+    try appendToolCallLine(arena, &lines, .{
+        .kind = .tool_call,
+        .text = try arena.dupe(u8, "{malformed}"),
+        .label = try arena.dupe(u8, "Read"),
+    }, cwd, 100);
+    try std.testing.expectEqualStrings("", lines.items[0].text2);
 }
 
 pub fn hunkContextStart(line: []const u8) ?usize {
