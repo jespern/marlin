@@ -53,6 +53,7 @@ const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const extensions = @import("extensions.zig");
 const registry = @import("provider/registry.zig");
+const claude_code = @import("provider/claude_code.zig");
 const http = @import("provider/http.zig");
 const task_tool = @import("tools/task.zig");
 const tools_registry = @import("tools/registry.zig");
@@ -2216,13 +2217,35 @@ pub const Daemon = struct {
     /// Send the current catalog (possibly empty → client falls back to
     /// favorites).
     fn sendCatalog(self: *Daemon, client: *Client) void {
-        const models = self.gpa.alloc([]const u8, self.catalog.items.len) catch return;
+        // Local dialects lead the fetched OpenRouter catalog: they exist on
+        // this machine, not in any remote list, and are only offered when
+        // actually usable (binary installed / key configured). Pricing stays
+        // null — unknown, never free.
+        var local_buf: [3][]const u8 = undefined;
+        var local_n: usize = 0;
+        if (self.claudeCodeAvailable()) {
+            local_buf[local_n] = "claudecode/default";
+            local_n += 1;
+        }
+        if (self.environ.get("ANTHROPIC_API_KEY")) |key| if (key.len > 0) {
+            local_buf[local_n] = "anthropic/claude-fable-5";
+            local_buf[local_n + 1] = "anthropic/claude-sonnet-4-5";
+            local_n += 2;
+        };
+        const locals = local_buf[0..local_n];
+
+        const total = locals.len + self.catalog.items.len;
+        const models = self.gpa.alloc([]const u8, total) catch return;
         defer self.gpa.free(models);
-        const pricing = self.gpa.alloc(proto.ModelPricing, self.catalog.items.len) catch return;
+        const pricing = self.gpa.alloc(proto.ModelPricing, total) catch return;
         defer self.gpa.free(pricing);
+        for (locals, 0..) |id, i| {
+            models[i] = id;
+            pricing[i] = .{ .model = id };
+        }
         for (self.catalog.items, 0..) |m, i| {
-            models[i] = m.id;
-            pricing[i] = .{
+            models[locals.len + i] = m.id;
+            pricing[locals.len + i] = .{
                 .model = m.id,
                 .input_per_million = m.input_per_million,
                 .output_per_million = m.output_per_million,
@@ -2230,6 +2253,22 @@ pub const Daemon = struct {
             };
         }
         self.sendTo(client, .{ .model_list_result = .{ .models = models, .pricing = pricing } });
+    }
+
+    /// True when delegated sessions can actually run: an explicit binary
+    /// override, or `claude` executable somewhere on the daemon's PATH.
+    fn claudeCodeAvailable(self: *Daemon) bool {
+        if (self.environ.get(claude_code.binary_env)) |override| {
+            if (override.len > 0) return true;
+        }
+        const path = self.environ.get("PATH") orelse return false;
+        var it = std.mem.tokenizeScalar(u8, path, ':');
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        while (it.next()) |dir| {
+            const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, claude_code.default_binary }) catch continue;
+            if (std.c.access(full, 1) == 0) return true; // 1 = X_OK
+        }
+        return false;
     }
 
     /// Worker thread: GET /models from OpenRouter, parse ids, hand the
