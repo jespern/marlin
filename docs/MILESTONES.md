@@ -43,12 +43,11 @@ marlin/
 │   │
 │   ├── client/
 │   │   ├── attach.zig         # socket client, reconnect w/ from_seq, delta buffer
-│   │   ├── tui.zig            # REALITY: everything below except editor.zig
-│   │   │                      # lives in this one file (~7.7k lines). The ui/
-│   │   │                      # split never happened; do it (layout + markdown
-│   │   │                      # first, tests moving in the same commit) before
-│   │   │                      # panes/councils grow the file further.
-│   │   ├── editor.zig         # composer editing + vim ops (the one extraction)
+│   │   ├── tui.zig            # App, draw orchestration, protocol, tabs, keys
+│   │   ├── render.zig         # terminal lines, palette, syntax, wrapping
+│   │   ├── markdown.zig       # inline/block Markdown, tables, panels, callouts
+│   │   ├── layout.zig         # transcript view, caches, tool folding, diffs
+│   │   ├── editor.zig         # composer editing + vim ops
 │   │   ├── web.zig            # `marlin web`: localhost HTTP/SSE bridge (POC)
 │   │   └── headless.zig       # `marlin run`: same protocol, no UI
 │   │
