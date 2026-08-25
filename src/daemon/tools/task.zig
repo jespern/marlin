@@ -20,3 +20,17 @@ pub const Args = struct {
     effort: ?Effort = null,
     max_rounds: u32 = 16,
 };
+
+pub const batch_spec_name = "task_batch";
+pub const batch_spec_description =
+    "Run two to eight focused prompts concurrently in durable read-only child sessions. " ++
+    "Results return in input order; each child remains inspectable in the session picker.";
+pub const batch_spec_schema =
+    \\{"type":"object","properties":{"tasks":{"type":"array","minItems":2,"maxItems":8,"items":{"type":"object","properties":{"prompt":{"type":"string","minLength":1},"model":{"type":"string","minLength":1,"description":"Registry-form model id; omit to inherit the parent model."},"effort":{"type":"string","enum":["auto","none","minimal","low","medium","high","xhigh","max"]},"max_rounds":{"type":"integer","minimum":1,"maximum":32}},"required":["prompt"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false}
+;
+
+pub const BatchArgs = struct {
+    tasks: []const Args,
+};
+
+pub const max_batch_tasks: usize = 8;

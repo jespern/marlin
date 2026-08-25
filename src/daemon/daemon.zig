@@ -1971,8 +1971,6 @@ pub const Daemon = struct {
         fn onTask(ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
-            onPhase(ctx, .child);
-            defer onPhase(ctx, .tool);
             if (job.kind != .root) return taskError(self.gpa, "nested task calls are disabled");
 
             const parsed = std.json.parseFromSlice(task_tool.Args, self.gpa, args_json, .{

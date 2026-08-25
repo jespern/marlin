@@ -1,6 +1,6 @@
 # marlin architecture
 
-Status: implemented and verified through M6a (single-child `task`). This began
+Status: implemented and verified through M6a (`task` plus bounded `task_batch`). This began
 as the pre-code design and most of it is now law — but not all of it: anything
 marked **(v2)**, **(design)**, or **(not yet implemented)** describes intent,
 not the binary. When this document and the code disagree on a shipped area,
@@ -600,9 +600,10 @@ The cascade (in order; each layer only fires if the previous wasn't enough):
   dispatcher with its own context, optional model/effort, read-only tools, and
   a round budget; only its structured final result enters the parent as a
   tool_result. Child sessions are ordinary sessions (visible in `marlin ls`
-  and attachable) and the multiplexer groups them beneath the parent. The
-  first slice waits on one child and forbids recursive task calls; concurrent
-  ordered fan-out is the next widening step.
+  and attachable) and the multiplexer groups them beneath the parent.
+  `task_batch` launches two to eight through the same dispatcher-owned path,
+  waits concurrently, and returns results in input order. Child profiles still
+  forbid recursive delegation.
 
 Cache discipline, stated once: between L1/L2 events the stable prefix is
 strictly append-only. Volatile date/git-branch/sandbox state is inserted immediately
@@ -629,6 +630,7 @@ grep        (rg → system grep → native walker; parallel_safe)
 glob        (parallel_safe)
 fetch       (HTTP GET → markdown-ish text; parallel_safe)
 task        (durable read-only child; M6a)
+task_batch  (2–8 durable read-only children; ordered result)
 ```
 
 **grep engine policy.** Prefer `rg` when on PATH: best engine, native

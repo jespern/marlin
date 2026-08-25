@@ -1,0 +1,53 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["fan out three durable inspections", "\"name\":\"task_batch\""],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_batch\",\"function\":{\"name\":\"task_batch\",\"arguments\":\"{\\\"tasks\\\":[{\\\"prompt\\\":\\\"fanout worker inspect alpha\\\",\\\"max_rounds\\\":6},{\\\"prompt\\\":\\\"fanout worker inspect beta\\\",\\\"max_rounds\\\":6},{\\\"prompt\\\":\\\"fanout worker inspect gamma\\\",\\\"max_rounds\\\":6}]}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":12}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["fanout worker", "\"name\":\"read_file\""],
+      "expect_not_contains": ["\"name\":\"task\"", "\"name\":\"task_batch\"", "\"name\":\"bash\""],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"fanout result alpha\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["fanout worker", "\"name\":\"read_file\""],
+      "expect_not_contains": ["\"name\":\"task\"", "\"name\":\"task_batch\"", "\"name\":\"bash\""],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"fanout result beta\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["fanout worker", "\"name\":\"read_file\""],
+      "expect_not_contains": ["\"name\":\"task\"", "\"name\":\"task_batch\"", "\"name\":\"bash\""],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"fanout result gamma\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["results", "fanout result alpha", "fanout result beta", "fanout result gamma"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"bounded durable fanout complete\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":5}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "fan out three durable inspections"],
+    "exit_code": 0,
+    "stdout_contains": ["bounded durable fanout complete"],
+    "db_session_meta": ["root|0|0|0", "task_child|1|1|6", "task_child|1|1|6", "task_child|1|1|6"]
+  }
+}

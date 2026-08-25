@@ -42,6 +42,7 @@ pub const specs = [_]Spec{
     // Execution crosses back to the daemon dispatcher through RunOpts.on_task;
     // generic dispatch intentionally has no session/store access.
     .{ .name = task.spec_name, .description = task.spec_description, .schema_json = task.spec_schema, .parallel_safe = false, .mutating = false },
+    .{ .name = task.batch_spec_name, .description = task.batch_spec_description, .schema_json = task.batch_spec_schema, .parallel_safe = false, .mutating = false },
 };
 
 pub fn find(name: []const u8) ?*const Spec {

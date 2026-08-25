@@ -1208,7 +1208,9 @@ pub fn compactSession(
 }
 
 fn toolAllowed(opts: RunOpts, spec: *const tools_registry.Spec) bool {
-    if (std.mem.eql(u8, spec.name, task_tool.spec_name)) return opts.on_task != null and opts.tool_profile == .full;
+    if (std.mem.eql(u8, spec.name, task_tool.spec_name) or
+        std.mem.eql(u8, spec.name, task_tool.batch_spec_name))
+        return opts.on_task != null and opts.tool_profile == .full;
     if (opts.tool_profile == .read_only and spec.mutating) return false;
     return true;
 }
@@ -1280,8 +1282,16 @@ fn buildProviderBody(
 fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, name: []const u8, args_json: []const u8) tools_registry.ExecOut {
     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .start);
     defer if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .done);
-    if (std.mem.eql(u8, name, task_tool.spec_name)) {
-        if (opts.on_task) |cb| return cb(opts.on_delta_ctx, parent_block_id, args_json);
+    if (std.mem.eql(u8, name, task_tool.spec_name) or
+        std.mem.eql(u8, name, task_tool.batch_spec_name))
+    {
+        publishPhase(opts, .child);
+        defer publishPhase(opts, .tool);
+        if (opts.on_task) |cb| {
+            if (std.mem.eql(u8, name, task_tool.batch_spec_name))
+                return runTaskBatch(gpa, io, opts, parent_block_id, args_json, cb);
+            return cb(opts.on_delta_ctx, parent_block_id, args_json);
+        }
         return .{
             .output = gpa.dupe(u8, "error: task is unavailable in this session") catch @panic("oom"),
             .status = .denied,
@@ -1301,6 +1311,111 @@ fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, 
         opts.network_policy,
         opts.cancel,
     );
+}
+
+const BatchTaskCall = struct {
+    args_json: []u8,
+    result: ?tools_registry.ExecOut = null,
+
+    fn deinit(self: *BatchTaskCall, gpa: std.mem.Allocator) void {
+        gpa.free(self.args_json);
+        if (self.result) |result| gpa.free(result.output);
+        self.* = undefined;
+    }
+};
+
+const BatchTaskWorker = struct {
+    fn run(
+        cb: *const fn (?*anyopaque, u64, []const u8) tools_registry.ExecOut,
+        ctx: ?*anyopaque,
+        parent_block_id: u64,
+        call: *BatchTaskCall,
+    ) void {
+        call.result = cb(ctx, parent_block_id, call.args_json);
+    }
+};
+
+fn runTaskBatch(
+    gpa: std.mem.Allocator,
+    io: Io,
+    opts: RunOpts,
+    parent_block_id: u64,
+    args_json: []const u8,
+    cb: *const fn (?*anyopaque, u64, []const u8) tools_registry.ExecOut,
+) tools_registry.ExecOut {
+    _ = io;
+    const parsed = std.json.parseFromSlice(task_tool.BatchArgs, gpa, args_json, .{
+        .ignore_unknown_fields = false,
+    }) catch return taskBatchError(gpa, "arguments do not match the schema");
+    defer parsed.deinit();
+    if (parsed.value.tasks.len < 2 or parsed.value.tasks.len > task_tool.max_batch_tasks)
+        return taskBatchError(gpa, "requires between two and eight tasks");
+
+    const calls = gpa.alloc(BatchTaskCall, parsed.value.tasks.len) catch
+        return taskBatchError(gpa, "out of memory");
+    var initialized: usize = 0;
+    defer {
+        for (calls[0..initialized]) |*call| call.deinit(gpa);
+        gpa.free(calls);
+    }
+    for (parsed.value.tasks) |args| {
+        calls[initialized] = .{
+            .args_json = std.json.Stringify.valueAlloc(gpa, args, .{}) catch
+                return taskBatchError(gpa, "could not encode task arguments"),
+        };
+        initialized += 1;
+    }
+
+    var threads: std.ArrayList(std.Thread) = .empty;
+    defer threads.deinit(gpa);
+    threads.ensureTotalCapacity(gpa, calls.len) catch
+        return taskBatchError(gpa, "out of memory");
+    var at: usize = 0;
+    while (at < calls.len) : (at += 1) {
+        const thread = std.Thread.spawn(.{}, BatchTaskWorker.run, .{
+            cb,
+            opts.on_delta_ctx,
+            parent_block_id,
+            &calls[at],
+        }) catch break;
+        threads.appendAssumeCapacity(thread);
+    }
+    for (threads.items) |thread| thread.join();
+    // A resource-exhausted spawn never overlaps with serial fallback: every
+    // worker already started is joined before the remaining children begin.
+    for (calls[at..]) |*call| BatchTaskWorker.run(cb, opts.on_delta_ctx, parent_block_id, call);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const BatchResult = struct {
+        index: usize,
+        status: []const u8,
+        result: std.json.Value,
+    };
+    const results = arena.alloc(BatchResult, calls.len) catch
+        return taskBatchError(gpa, "out of memory");
+    var overall_status: block.ToolStatus = .ok;
+    for (calls, results, 0..) |call, *result, index| {
+        const child = call.result.?;
+        if (child.status == .interrupted) overall_status = .interrupted;
+        result.* = .{
+            .index = index,
+            .status = @tagName(child.status),
+            .result = std.json.parseFromSliceLeaky(std.json.Value, arena, child.output, .{}) catch
+                .{ .string = child.output },
+        };
+    }
+    const output = std.json.Stringify.valueAlloc(gpa, .{ .results = results }, .{}) catch
+        return taskBatchError(gpa, "could not encode results");
+    return .{ .output = output, .status = overall_status };
+}
+
+fn taskBatchError(gpa: std.mem.Allocator, message: []const u8) tools_registry.ExecOut {
+    return .{
+        .output = std.fmt.allocPrint(gpa, "error: task_batch {s}", .{message}) catch @panic("oom"),
+        .status = .err,
+    };
 }
 
 const PreparedCall = struct {
@@ -1862,6 +1977,51 @@ test "parallel-safe groups are chunked at the worker cap" {
     try std.testing.expectEqual(@as(usize, 8), max_parallel_tool_workers);
     try std.testing.expectEqual(@as(usize, 3), chunks);
     try std.testing.expectEqual(max_parallel_tool_workers, largest);
+}
+
+test "task_batch runs bounded children concurrently and preserves result order" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const BatchProbe = struct {
+        gpa: std.mem.Allocator,
+        io: Io,
+        live: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+
+        fn call(ctx: ?*anyopaque, _: u64, args_json: []const u8) tools_registry.ExecOut {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const live = self.live.fetchAdd(1, .acq_rel) + 1;
+            _ = self.peak.fetchMax(live, .acq_rel);
+            self.io.sleep(.fromMilliseconds(40), .awake) catch {};
+            _ = self.live.fetchSub(1, .acq_rel);
+            return .{
+                .output = self.gpa.dupe(u8, args_json) catch @panic("oom"),
+                .status = .ok,
+            };
+        }
+    };
+    var probe = BatchProbe{ .gpa = gpa, .io = io };
+    const result = runTaskBatch(gpa, io, .{
+        .session_id = 1,
+        .cwd = "/tmp",
+        .endpoint = .{ .url = "", .bearer = null, .model = "test", .dialect = .openai_compatible },
+        .cfg = config.defaults(),
+        .on_delta_ctx = &probe,
+    }, 9,
+        \\{"tasks":[{"prompt":"first"},{"prompt":"second"},{"prompt":"third"}]}
+    , BatchProbe.call);
+    defer gpa.free(result.output);
+
+    try std.testing.expectEqual(block.ToolStatus.ok, result.status);
+    try std.testing.expect(probe.peak.load(.acquire) > 1);
+    try std.testing.expect(probe.peak.load(.acquire) <= task_tool.max_batch_tasks);
+    const first = std.mem.indexOf(u8, result.output, "first").?;
+    const second = std.mem.indexOf(u8, result.output, "second").?;
+    const third = std.mem.indexOf(u8, result.output, "third").?;
+    try std.testing.expect(first < second and second < third);
 }
 
 test {

@@ -55,6 +55,9 @@ multiplexed by a TUI that is just another client.**
 - Paste an image with Ctrl+V or attach one by path. The client uploads it to
   the daemon through the protocol—no shared path assumption—and images remain
   durable, content-addressed transcript attachments.
+- Delegate one focused investigation with `task`, or fan out two to eight with
+  `task_batch`; every read-only child is durable, attachable, and grouped under
+  its parent while results return in requested order.
 - ssh/mosh remain the transport. We never reinvent them; we just put structure
   on the wire above them.
 

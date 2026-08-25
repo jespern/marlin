@@ -1,7 +1,7 @@
 # M6 execution plan
 
-Status: **active**. The first M6a vertical slice (one durable synchronous
-read-only child) is implemented and verified. M4 is verified; M5 mechanics are
+Status: **active**. M6a's durable synchronous read-only child and bounded
+fan-out primitives are implemented and verified. M4 is verified; M5 mechanics are
 verified and still need a short real-server/hook dogfood pass. The workspace
 recovery/isolation track formerly called M4.5 is deliberately Later.
 
@@ -19,8 +19,11 @@ recovery/isolation track formerly called M4.5 is deliberately Later.
   its structured result, cascades parent cancellation, and limits children to
   a read-only tool profile with no recursive `task`. Children are ordinary
   attachable sessions grouped beneath their root in session listings.
+- `task_batch` launches two to eight of those durable children concurrently,
+  joins every child, and returns structured results in requested task order.
+  A failed thread spawn joins existing workers before serial fallback.
 - Council product behavior is specified in `REVIEW.md`, but `/council`,
-  `/review`, concurrent child fan-out, and review blocks are not implemented.
+  `/review`, review-specific orchestration, and review blocks are not implemented.
 - `parallel_safe` is **enforced** (this superseded the earlier
   "metadata-only" state): `loop.zig` runs each maximal consecutive safe group
   in chunks of at most eight worker threads and joins before persisting results
@@ -61,9 +64,8 @@ The smallest general primitive councils can reuse now exists:
   its turn, and returns `{child_sid,status,final_text,error_message}` as the
   parent tool result.
 - Runtime: child creation crosses the dispatcher through a typed event/future;
-  turn threads never create session/store hierarchy state directly. The first
-  slice deliberately waits on one child. Multiple calls and council seats are
-  the next concurrency step.
+  turn threads never create session/store hierarchy state directly. `task`
+  waits on one child; `task_batch` manages a bounded group of two to eight.
 - Lifecycle: parent interrupt cancels children it is awaiting; daemon restart
   reconstructs hierarchy and marks genuinely orphaned work honestly. Child
   failures are result data and do not crash the parent turn.
@@ -73,14 +75,14 @@ The smallest general primitive councils can reuse now exists:
   a child is focused. Children remain ordinary attachable sessions; no
   permanent sidebar.
 
-Verified checkpoint: one parent completes a child through the real daemon and
-fake provider; the E2E asserts that task/bash/write/edit are absent from the
-child schema, the structured result returns to the parent, and hierarchy plus
-round budget are durable in SQLite.
+Verified checkpoint: one parent completes both a single child and a three-child
+batch through the real daemon and fake provider. E2E asserts that delegation,
+bash, and write tools are absent from child schemas, structured results return
+to the parent, and hierarchy plus round budgets are durable in SQLite. A unit
+concurrency probe proves overlap, the eight-child ceiling, and result ordering.
 
-Remaining exit: one parent launches at least three children concurrently,
-survives client disconnect/reconnect, receives ordered results, and
-cancellation/budgets hold under E2E fixtures.
+Remaining exit hardening: exercise batch disconnect/reconnect and cancellation
+while several children are live.
 
 ## M6b — councils as specialized tasks
 
