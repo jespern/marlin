@@ -115,6 +115,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/daemon/process_io.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     const e2e_runner = b.addExecutable(.{
         .name = "e2e-runner",
