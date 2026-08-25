@@ -328,6 +328,9 @@ const App = struct {
     /// Full model catalog from the daemon (owned copies). Empty until
     /// model_list_result arrives; picker falls back to cfg.model_favorites.
     catalog: std.ArrayList([]u8) = .empty,
+    /// Optional provider-published pricing keyed by model id. Model strings
+    /// are separately owned so legacy model-list replies remain valid.
+    catalog_pricing: std.ArrayList(proto.ModelPricing) = .empty,
     /// Live lightweight session catalog from session_watch. Labels back the
     /// existing fuzzy picker; full view state lives in saved_views.
     sessions: std.ArrayList(SessionSummary) = .empty,
@@ -425,6 +428,8 @@ const App = struct {
         self.picker_filter.deinit(self.gpa);
         for (self.catalog.items) |m| self.gpa.free(m);
         self.catalog.deinit(self.gpa);
+        for (self.catalog_pricing.items) |pricing| self.gpa.free(pricing.model);
+        self.catalog_pricing.deinit(self.gpa);
         for (self.sessions.items) |*session| session.deinit(self.gpa);
         self.sessions.deinit(self.gpa);
         self.session_labels.deinit(self.gpa);
@@ -885,9 +890,20 @@ const App = struct {
             .model_list_result => |ml| {
                 for (self.catalog.items) |old| self.gpa.free(old);
                 self.catalog.clearRetainingCapacity();
+                for (self.catalog_pricing.items) |old| self.gpa.free(old.model);
+                self.catalog_pricing.clearRetainingCapacity();
                 for (ml.models) |m| {
                     const copy = self.gpa.dupe(u8, m) catch continue;
                     self.catalog.append(self.gpa, copy) catch self.gpa.free(copy);
+                }
+                for (ml.pricing) |pricing| {
+                    const model = self.gpa.dupe(u8, pricing.model) catch continue;
+                    self.catalog_pricing.append(self.gpa, .{
+                        .model = model,
+                        .input_per_million = validCatalogRate(pricing.input_per_million),
+                        .output_per_million = validCatalogRate(pricing.output_per_million),
+                        .tiered = pricing.tiered,
+                    }) catch self.gpa.free(model);
                 }
             },
             .session_meta => |m| {
@@ -1447,6 +1463,13 @@ const App = struct {
             try out.append(arena, m);
         }
         return out.items;
+    }
+
+    fn pricingForModel(self: *const App, model: []const u8) ?proto.ModelPricing {
+        for (self.catalog_pricing.items) |pricing| {
+            if (std.mem.eql(u8, pricing.model, model)) return pricing;
+        }
+        return null;
     }
 
     fn applyModel(self: *App, m: []const u8) void {
@@ -3639,6 +3662,55 @@ fn displayWidth(text: []const u8) usize {
     return @intCast(vaxis.gwidth.gwidth(text, .unicode));
 }
 
+fn validCatalogRate(rate: ?f64) ?f64 {
+    const value = rate orelse return null;
+    return if (std.math.isFinite(value) and value >= 0) value else null;
+}
+
+fn formatCatalogRate(arena: std.mem.Allocator, rate: ?f64) ![]const u8 {
+    const value = validCatalogRate(rate) orelse return "—";
+    if (value > 0 and value < 0.000001) return "<$0.000001";
+    const rendered = try std.fmt.allocPrint(arena, "${d:.6}", .{value});
+    var end = rendered.len;
+    while (end > 0 and rendered[end - 1] == '0') end -= 1;
+    if (end > 0 and rendered[end - 1] == '.') end -= 1;
+    return rendered[0..end];
+}
+
+fn formatModelPricing(arena: std.mem.Allocator, pricing: proto.ModelPricing) ![]const u8 {
+    const input = validCatalogRate(pricing.input_per_million);
+    const output = validCatalogRate(pricing.output_per_million);
+    if (input == null and output == null) return "price n/a";
+    if (input == 0 and output == 0) return if (pricing.tiered) "free · tiered" else "free";
+    return std.fmt.allocPrint(arena, "{s} → {s} / 1M{s}", .{
+        try formatCatalogRate(arena, input),
+        try formatCatalogRate(arena, output),
+        if (pricing.tiered) " · tiered" else "",
+    });
+}
+
+fn pickerModelLine(
+    arena: std.mem.Allocator,
+    model: []const u8,
+    pricing: ?proto.ModelPricing,
+    current: bool,
+    content_width: usize,
+) ![]const u8 {
+    const marker = if (current) " ●" else "";
+    const price = if (pricing) |value| try formatModelPricing(arena, value) else "";
+    const price_width = displayWidth(price);
+    const price_gap: usize = if (price.len > 0) 2 else 0;
+    const model_capacity = content_width -| (price_width + price_gap);
+    const model_end = hardCellBreak(model, 0, model_capacity);
+    const model_text = model[0..model_end];
+    const used = displayWidth(model_text) + price_width;
+    const gap = if (price.len > 0)
+        try spaces(arena, content_width -| used)
+    else
+        "";
+    return std.fmt.allocPrint(arena, " {s}{s}{s}{s}", .{ model_text, gap, price, marker });
+}
+
 fn markdownGutter(width: usize) []const u8 {
     return if (width >= 32) markdown_gutter else "";
 }
@@ -4883,9 +4955,17 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             .session => "sessions",
         };
 
-        var widest: u16 = 30;
-        for (items) |f| widest = @max(widest, @as(u16, @intCast(@min(f.len, 70))));
-        const box_w: u16 = @min(widest + 8, w -| 4);
+        var widest: usize = 30;
+        for (items) |f| {
+            var row_width = displayWidth(f);
+            if (app.picker_kind == .model) {
+                if (app.pricingForModel(f)) |pricing| {
+                    row_width += 2 + displayWidth(try formatModelPricing(arena, pricing));
+                }
+            }
+            widest = @max(widest, @min(row_width, 96));
+        }
+        const box_w: u16 = @intCast(@min(widest + 8, @as(usize, w -| 4)));
         const list_max: u16 = @min(@as(u16, 14), h -| 6);
         const shown: u16 = @intCast(@min(items.len, list_max));
         const box_h: u16 = shown + 3; // filter line + list + hint line
@@ -4922,7 +5002,10 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
                 (app.sessionIdForLabel(f) orelse 0) == app.sid
             else
                 std.mem.eql(u8, f, current);
-            const line = try std.fmt.allocPrint(arena, " {s}{s}", .{ f[0..@min(f.len, box_w -| 4)], if (cur) " ●" else "" });
+            const line = if (app.picker_kind == .model)
+                try pickerModelLine(arena, f, app.pricingForModel(f), cur, box_w -| 4)
+            else
+                try std.fmt.allocPrint(arena, " {s}{s}", .{ f[0..@min(f.len, box_w -| 4)], if (cur) " ●" else "" });
             const style: vaxis.Style = if (i == sel)
                 .{ .fg = .{ .index = 6 }, .bold = true, .reverse = true }
             else if (cur)
@@ -5799,6 +5882,50 @@ test "modified enter inserts a newline while plain enter submits" {
     try std.testing.expect(isNewlineKey(.{ .codepoint = 'j', .mods = .{ .ctrl = true } }));
     try std.testing.expect(!isNewlineKey(.{ .codepoint = vaxis.Key.enter }));
     try std.testing.expect(!isNewlineKey(.{ .codepoint = vaxis.Key.enter, .text = "\r" }));
+}
+
+test "model picker formats provider pricing compactly" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings("$3 → $15 / 1M", try formatModelPricing(arena, .{
+        .model = "openrouter/paid",
+        .input_per_million = 3,
+        .output_per_million = 15,
+    }));
+    try std.testing.expectEqualStrings("$0.125 → $2.5 / 1M · tiered", try formatModelPricing(arena, .{
+        .model = "openrouter/tiered",
+        .input_per_million = 0.125,
+        .output_per_million = 2.5,
+        .tiered = true,
+    }));
+    try std.testing.expectEqualStrings("free", try formatModelPricing(arena, .{ .model = "openrouter/free", .input_per_million = 0, .output_per_million = 0 }));
+    try std.testing.expectEqualStrings("price n/a", try formatModelPricing(arena, .{ .model = "openrouter/unknown" }));
+    try std.testing.expectEqual(@as(?f64, null), validCatalogRate(-1));
+    try std.testing.expectEqual(@as(?f64, null), validCatalogRate(std.math.nan(f64)));
+}
+
+test "model picker accepts priced and legacy catalogs" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    app.handleDaemonLine(try gpa.dupe(u8,
+        \\{"model_list_result":{"models":["openrouter/example/model"],"pricing":[{"model":"openrouter/example/model","input_per_million":3,"output_per_million":15}]}}
+    ));
+    try std.testing.expectEqualStrings("openrouter/example/model", app.catalog.items[0]);
+    const pricing = app.pricingForModel("openrouter/example/model").?;
+    try std.testing.expectEqual(@as(?f64, 3), pricing.input_per_million);
+    try std.testing.expectEqual(@as(?f64, 15), pricing.output_per_million);
+
+    app.handleDaemonLine(try gpa.dupe(u8,
+        \\{"model_list_result":{"models":["openrouter/legacy/model"]}}
+    ));
+    try std.testing.expectEqualStrings("openrouter/legacy/model", app.catalog.items[0]);
+    try std.testing.expect(app.pricingForModel("openrouter/legacy/model") == null);
 }
 
 test "composer command catalog filters slash commands and bang shortcuts" {

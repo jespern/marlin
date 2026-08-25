@@ -85,6 +85,7 @@ descendants.
 | status {sid, state} | session state change: idle/running/awaiting_approval/err/done |
 | approval_request {sid, approval_id, call_id, tool, args_json} | a mutating tool call parked on the gate; answer with `approve` |
 | session_meta {sid, tokens_in, tokens_out, context_used, context_limit} | after each turn; ALWAYS sent before the closing status. context_* feed the status-bar gauge (0 = unmeasured) |
+| model_list_result {models, pricing} | reply to `model_list`; `pricing` optionally supplies input/output USD per million tokens and a tiered-rate flag keyed by model id |
 | ok | generic ack |
 | err {code, msg} | bad_msg, no_hello, version, no_session, busy, bad_approval |
 
@@ -95,6 +96,11 @@ states. M6 hierarchy fields are `parent_sid` (null for roots), `kind` (`root`,
 `task_child`, or reserved `review_child`), `parent_block_id`, and `max_rounds`.
 `archived` is true only in inclusive list results. Older clients may ignore
 these fields; older entries decode as active roots.
+
+`model_list_result.models` remains the compatibility source of registry-form
+model ids. `pricing` is additive and may be empty: clients must treat a
+missing rate as unknown, never as free. OpenRouter's per-token catalog rates
+are normalized to USD per million tokens by the daemon.
 
 `sid` remains the durable numeric protocol identity. Clients derive the
 human-facing session handle from it (domain-separated SHA-256, eight hex

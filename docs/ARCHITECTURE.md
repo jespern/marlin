@@ -418,6 +418,8 @@ auth for platforms not in use. The two-dialect rule holds.
 **Accounting footnote:** OpenRouter reports $ directly; direct providers
 report only tokens. The status-bar `$` needs a small local price table
 for direct routes (or degrades to tokens-only) — don't let it lie.
+The `/model` catalog does not need that table: it shows OpenRouter's published
+input/output rates directly and leaves local or unpublished rates unknown.
 
 - **Usage accounting is provider-reported**: every response's `usage` field is
   stored on the session (`session.meta` event carries it to clients). Token

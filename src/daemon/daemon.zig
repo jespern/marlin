@@ -55,6 +55,13 @@ const ChildStart = struct {
     future: *TaskFuture,
 };
 
+const CatalogModel = struct {
+    id: []u8,
+    input_per_million: ?f64 = null,
+    output_per_million: ?f64 = null,
+    tiered: bool = false,
+};
+
 /// Everything that flows into the dispatcher.
 const Event = union(enum) {
     client_msg: struct { client_id: u64, msg_line: []u8 }, // raw NDJSON from client
@@ -67,9 +74,9 @@ const Event = union(enum) {
     turn_awaiting: struct { sid: u64, line: []u8 },
     /// The gate resolved; session status back to running.
     turn_resumed: struct { sid: u64 },
-    /// Model catalog fetched by a worker thread (raw registry-form ids,
-    /// one allocation each, gpa-owned; dispatcher takes ownership).
-    catalog_ready: struct { client_id: u64, models: [][]u8 },
+    /// Model catalog fetched by a worker thread (registry-form ids plus
+    /// normalized pricing; id allocations are dispatcher-owned on receipt).
+    catalog_ready: struct { client_id: u64, models: []CatalogModel },
     /// Turn thread → dispatcher completion. final_text and err_text are
     /// separately owned because child task results serialize both fields.
     turn_done: struct { sid: u64, interrupted: bool, err_text: ?[]u8, final_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
@@ -197,9 +204,10 @@ pub const Daemon = struct {
     /// Set when reboot unlinks the listener before ACK. Cleanup must not
     /// unlink the same pathname again after the replacement daemon binds it.
     socket_retired: bool = false,
-    /// Model catalog cache (registry-form ids, gpa-owned). Refreshed at
-    /// most once per catalog_ttl_ms; fetch runs on a worker thread.
-    catalog: std.ArrayList([]u8) = .empty,
+    /// Model catalog cache (registry-form ids and normalized pricing,
+    /// gpa-owned). Refreshed at most once per catalog_ttl_ms; fetch runs on a
+    /// worker thread.
+    catalog: std.ArrayList(CatalogModel) = .empty,
     catalog_fetched_at: i64 = 0,
     catalog_fetching: bool = false,
 
@@ -514,9 +522,9 @@ pub const Daemon = struct {
             },
             .catalog_ready => |cr| {
                 // Replace the cache (dispatcher owns it now).
-                for (self.catalog.items) |m| self.gpa.free(m);
+                for (self.catalog.items) |m| self.gpa.free(m.id);
                 self.catalog.clearRetainingCapacity();
-                for (cr.models) |m| self.catalog.append(self.gpa, m) catch self.gpa.free(m);
+                for (cr.models) |m| self.catalog.append(self.gpa, m) catch self.gpa.free(m.id);
                 self.gpa.free(cr.models);
                 self.catalog_fetched_at = nowMs(self.io);
                 self.catalog_fetching = false;
@@ -1513,22 +1521,32 @@ pub const Daemon = struct {
     fn sendCatalog(self: *Daemon, client: *Client) void {
         const models = self.gpa.alloc([]const u8, self.catalog.items.len) catch return;
         defer self.gpa.free(models);
-        for (self.catalog.items, 0..) |m, i| models[i] = m;
-        self.sendTo(client, .{ .model_list_result = .{ .models = models } });
+        const pricing = self.gpa.alloc(proto.ModelPricing, self.catalog.items.len) catch return;
+        defer self.gpa.free(pricing);
+        for (self.catalog.items, 0..) |m, i| {
+            models[i] = m.id;
+            pricing[i] = .{
+                .model = m.id,
+                .input_per_million = m.input_per_million,
+                .output_per_million = m.output_per_million,
+                .tiered = m.tiered,
+            };
+        }
+        self.sendTo(client, .{ .model_list_result = .{ .models = models, .pricing = pricing } });
     }
 
     /// Worker thread: GET /models from OpenRouter, parse ids, hand the
     /// result to the dispatcher. Failure → empty list (client falls back).
     fn catalogFetchMain(self: *Daemon, client_id: u64) void {
         const models = self.fetchCatalog() catch
-            self.gpa.alloc([]u8, 0) catch return;
+            self.gpa.alloc(CatalogModel, 0) catch return;
         self.events.push(self.io, .{ .catalog_ready = .{ .client_id = client_id, .models = models } }) catch {
-            for (models) |m| self.gpa.free(m);
+            for (models) |m| self.gpa.free(m.id);
             self.gpa.free(models);
         };
     }
 
-    fn fetchCatalog(self: *Daemon) ![][]u8 {
+    fn fetchCatalog(self: *Daemon) ![]CatalogModel {
         const url = try registry.openrouterModelsUrl(self.gpa, self.environ);
         defer self.gpa.free(url);
 
@@ -1537,31 +1555,7 @@ pub const Daemon = struct {
         defer if (res.content_type) |ct| self.gpa.free(ct);
         if (res.status >= 400) return error.CatalogHttp;
 
-        // {"data":[{"id":"vendor/model",...},...]}
-        const Parsed = struct {
-            data: []const struct { id: []const u8 },
-        };
-        const parsed = try std.json.parseFromSlice(Parsed, self.gpa, res.body, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-
-        var out: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (out.items) |m| self.gpa.free(m);
-            out.deinit(self.gpa);
-        }
-        for (parsed.value.data) |entry| {
-            if (entry.id.len == 0) continue;
-            const full = try std.fmt.allocPrint(self.gpa, "openrouter/{s}", .{entry.id});
-            try out.append(self.gpa, full);
-        }
-        std.mem.sort([]u8, out.items, {}, struct {
-            fn lt(_: void, a: []u8, b: []u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lt);
-        return out.toOwnedSlice(self.gpa);
+        return parseCatalog(self.gpa, res.body);
     }
 
     fn broadcastMeta(self: *Daemon, sid: u64, tin: u64, tout: u64) void {
@@ -1623,7 +1617,7 @@ pub const Daemon = struct {
     }
 
     fn shutdownCleanup(self: *Daemon) void {
-        for (self.catalog.items) |m| self.gpa.free(m);
+        for (self.catalog.items) |m| self.gpa.free(m.id);
         self.catalog.deinit(self.gpa);
         // Cancel running turns. Resolve child rendezvous before joining: the
         // dispatcher is no longer consuming turn_done events, so a parent
@@ -1675,6 +1669,76 @@ pub const Daemon = struct {
         if (!self.socket_retired) self.removeSocketFile();
     }
 };
+
+/// Decode OpenRouter's catalog without coupling the wire protocol to its
+/// per-token string representation. Bad individual price fields degrade to
+/// unknown; a malformed catalog envelope still fails the fetch as a whole.
+fn parseCatalog(gpa: std.mem.Allocator, body: []const u8) ![]CatalogModel {
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.InvalidCatalog;
+    const data = parsed.value.object.get("data") orelse return error.InvalidCatalog;
+    if (data != .array) return error.InvalidCatalog;
+
+    var out: std.ArrayList(CatalogModel) = .empty;
+    errdefer {
+        for (out.items) |model| gpa.free(model.id);
+        out.deinit(gpa);
+    }
+    for (data.array.items) |entry| {
+        if (entry != .object) continue;
+        const raw_id = entry.object.get("id") orelse continue;
+        if (raw_id != .string or raw_id.string.len == 0) continue;
+        const raw_pricing = entry.object.get("pricing");
+        const full_id = try std.fmt.allocPrint(gpa, "openrouter/{s}", .{raw_id.string});
+        errdefer gpa.free(full_id);
+        try out.append(gpa, .{
+            .id = full_id,
+            .input_per_million = catalogRate(raw_pricing, "prompt"),
+            .output_per_million = catalogRate(raw_pricing, "completion"),
+            .tiered = catalogPricingIsTiered(raw_pricing),
+        });
+    }
+    std.mem.sort(CatalogModel, out.items, {}, struct {
+        fn lessThan(_: void, a: CatalogModel, b: CatalogModel) bool {
+            return std.mem.lessThan(u8, a.id, b.id);
+        }
+    }.lessThan);
+    return out.toOwnedSlice(gpa);
+}
+
+fn catalogPricingObject(value: ?std.json.Value) ?std.json.ObjectMap {
+    const pricing = value orelse return null;
+    return switch (pricing) {
+        .object => |object| object,
+        .array => |array| if (array.items.len > 0 and array.items[0] == .object)
+            array.items[0].object
+        else
+            null,
+        else => null,
+    };
+}
+
+fn catalogPricingIsTiered(value: ?std.json.Value) bool {
+    const pricing = value orelse return false;
+    return pricing == .array and pricing.array.items.len > 1;
+}
+
+fn catalogRate(pricing: ?std.json.Value, field: []const u8) ?f64 {
+    const object = catalogPricingObject(pricing) orelse return null;
+    const raw = object.get(field) orelse return null;
+    const per_token: f64 = switch (raw) {
+        .string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        .float => |value| value,
+        .integer => |value| @floatFromInt(value),
+        else => return null,
+    };
+    if (!std.math.isFinite(per_token) or per_token < 0) return null;
+    const per_million = per_token * 1_000_000;
+    return if (std.math.isFinite(per_million)) per_million else null;
+}
 
 /// Write end of the shutdown self-pipe, set before the TERM/INT handler is
 /// installed. The handler only writes one byte (async-signal-safe); a watcher
@@ -1754,6 +1818,46 @@ fn taskTitle(prompt: []const u8) []const u8 {
 fn nowMs(io: Io) i64 {
     const ts = Io.Timestamp.now(io, .real);
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+test "OpenRouter catalog normalizes pricing and tolerates bad entries" {
+    const gpa = std.testing.allocator;
+    const models = try parseCatalog(gpa,
+        \\{"data":[
+        \\  {"id":"paid","pricing":{"prompt":"0.000003","completion":"0.000015"}},
+        \\  {"id":"free","pricing":{"prompt":"0","completion":0}},
+        \\  {"id":"tiered","pricing":[{"prompt":"0.000002","completion":"0.000012"},{"prompt":"0.000004","completion":"0.000018","min_context":200000}]},
+        \\  {"id":"numeric","pricing":{"prompt":0.000001,"completion":0.0000025}},
+        \\  {"id":"broken","pricing":{"prompt":"not-a-number","completion":-1}},
+        \\  {"id":""}, 7, {"name":"missing id"}
+        \\]}
+    );
+    defer {
+        for (models) |model| gpa.free(model.id);
+        gpa.free(models);
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), models.len);
+    try std.testing.expectEqualStrings("openrouter/broken", models[0].id);
+    try std.testing.expectEqual(@as(?f64, null), models[0].input_per_million);
+    try std.testing.expectEqual(@as(?f64, null), models[0].output_per_million);
+    try std.testing.expectEqualStrings("openrouter/free", models[1].id);
+    try std.testing.expectEqual(@as(?f64, 0), models[1].input_per_million);
+    try std.testing.expectEqual(@as(?f64, 0), models[1].output_per_million);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), models[2].input_per_million.?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), models[2].output_per_million.?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), models[3].input_per_million.?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 15), models[3].output_per_million.?, 0.000001);
+    try std.testing.expect(models[4].tiered);
+    try std.testing.expectApproxEqAbs(@as(f64, 2), models[4].input_per_million.?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 12), models[4].output_per_million.?, 0.000001);
+}
+
+test "OpenRouter catalog rejects a malformed envelope" {
+    try std.testing.expectError(
+        error.InvalidCatalog,
+        parseCatalog(std.testing.allocator, "{\"data\":{}}"),
+    );
 }
 
 test {

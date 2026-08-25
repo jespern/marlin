@@ -24,6 +24,18 @@ pub const SessionState = enum { idle, running, awaiting_approval, err, done };
 /// the same storage/protocol shape.
 pub const SessionKind = enum { root, task_child, review_child };
 
+/// Optional catalog pricing attached to a model id. Rates are normalized to
+/// USD per million tokens so clients never have to know a provider catalog's
+/// native units. Null means the provider did not publish that rate.
+pub const ModelPricing = struct {
+    model: []const u8,
+    input_per_million: ?f64 = null,
+    output_per_million: ?f64 = null,
+    /// True when the advertised rates are only the base tier and may change
+    /// with context length.
+    tiered: bool = false,
+};
+
 /// Client → daemon.
 pub const ClientMsg = union(enum) {
     hello: struct { proto_version: u32, client_kind: []const u8 = "generic" },
@@ -123,8 +135,12 @@ pub const DaemonMsg = union(enum) {
     },
     /// Reply to model_list: full registry-form model ids
     /// ("openrouter/vendor/model"), sorted. Empty on fetch failure — the
-    /// client falls back to its curated favorites.
-    model_list_result: struct { models: []const []const u8 },
+    /// client falls back to its curated favorites. `pricing` is optional for
+    /// compatibility with older daemons and clients.
+    model_list_result: struct {
+        models: []const []const u8,
+        pricing: []const ModelPricing = &.{},
+    },
     /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
     /// contain arbitrary command output (including NULs).
     blob_result: struct { hash: []const u8, bytes: []const u8 },
@@ -287,6 +303,34 @@ test "older hello defaults network configuration state" {
     );
     try std.testing.expect(!m.hello_ok.network_configured);
     try std.testing.expect(!m.hello_ok.network_filtering);
+}
+
+test "model catalog pricing round trips and remains optional" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const original: DaemonMsg = .{ .model_list_result = .{
+        .models = &.{"openrouter/example/model"},
+        .pricing = &.{.{
+            .model = "openrouter/example/model",
+            .input_per_million = 3,
+            .output_per_million = 15,
+            .tiered = true,
+        }},
+    } };
+    const line = try encode(gpa, original);
+    defer gpa.free(line);
+    const back = try decode(DaemonMsg, arena_state.allocator(), line);
+    try std.testing.expectEqualStrings("openrouter/example/model", back.model_list_result.models[0]);
+    try std.testing.expectEqual(@as(?f64, 3), back.model_list_result.pricing[0].input_per_million);
+    try std.testing.expectEqual(@as(?f64, 15), back.model_list_result.pricing[0].output_per_million);
+    try std.testing.expect(back.model_list_result.pricing[0].tiered);
+
+    const legacy = try decode(DaemonMsg, arena_state.allocator(),
+        \\{"model_list_result":{"models":["openrouter/legacy/model"]}}
+    );
+    try std.testing.expectEqual(@as(usize, 0), legacy.model_list_result.pricing.len);
 }
 
 test "round trip: blob result preserves arbitrary bytes" {
