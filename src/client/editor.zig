@@ -1086,6 +1086,24 @@ pub fn openLine(self: *Editor, below: bool) void {
     self.goal_col = null;
 }
 
+/// vim J: join the next line onto this one — the newline (plus the next
+/// line's leading whitespace) collapses to a single space, or to nothing
+/// when either side is empty.
+pub fn joinLines(self: *Editor) bool {
+    const t = self.text.items;
+    const line = self.lineRangeAt(false);
+    if (line.end >= t.len) return false; // no next line
+    var cut_end = line.end + 1;
+    while (cut_end < t.len and (t[cut_end] == ' ' or t[cut_end] == '\t')) cut_end += 1;
+    const left_empty = line.end == line.start;
+    const right_empty = cut_end >= t.len or t[cut_end] == '\n';
+    const glue: []const u8 = if (left_empty or right_empty) "" else " ";
+    self.text.replaceRange(self.gpa, line.end, cut_end - line.end, glue) catch return false;
+    self.cursor = line.end;
+    self.goal_col = null;
+    return true;
+}
+
 /// Find a character on the cursor's line (vim f/t/F/T). Returns the byte
 /// index of the target character, honoring `count` occurrences.
 pub fn findOnLine(self: *const Editor, ch: u8, forward: bool, count: usize) ?usize {

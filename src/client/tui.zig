@@ -391,6 +391,8 @@ const App = struct {
     pending_find: u8 = 0,
     /// vim r awaiting the replacement character.
     pending_replace: bool = false,
+    /// g pressed, awaiting g/t/T (gg top, gt/gT session cycling).
+    pending_g: bool = false,
     /// Last f/t/F/T for ; and , repeats.
     last_find_kind: u8 = 0,
     last_find_ch: u8 = 0,
@@ -4344,11 +4346,12 @@ const ShortcutHelpRow = struct {
 
 const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Esc / i", .description = "return to insert mode" },
-    .{ .key = "J / K", .description = "switch recent sessions" },
+    .{ .key = "gt / gT", .description = "switch recent sessions (vim tab keys)" },
+    .{ .key = "J", .description = "join lines" },
     .{ .key = "a / A / I", .description = "insert after cursor / line end / line start" },
     .{ .key = "j / k", .description = "scroll one line" },
     .{ .key = "Ctrl+d / Ctrl+u", .description = "scroll one page" },
-    .{ .key = "g / G", .description = "jump to top / bottom" },
+    .{ .key = "gg / G", .description = "jump to top / bottom" },
     .{ .key = "?", .description = "toggle shortcut help" },
     .{ .key = "q", .description = "quit Marlin" },
     .{ .description = "COMPOSER (vim)", .heading = true },
@@ -5478,6 +5481,17 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.copyModeKey(key);
                 return;
             }
+            if (app.pending_g) {
+                app.pending_g = false;
+                if (key.matches('g', .{})) {
+                    app.scroll_up = std.math.maxInt(usize); // clamped in draw
+                } else if (key.matches('t', .{})) {
+                    app.cycleSession(1);
+                } else if (key.matches('T', .{ .shift = true }) or key.matches('T', .{})) {
+                    app.cycleSession(-1);
+                }
+                return;
+            }
             if (app.pending_replace) {
                 app.pending_replace = false;
                 if (key.text) |txt| {
@@ -5529,9 +5543,13 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (key.matches('q', .{})) {
                 app.should_quit = true;
             } else if (key.matches('J', .{ .shift = true }) or key.matches('J', .{})) {
-                app.cycleSession(1);
-            } else if (key.matches('K', .{ .shift = true }) or key.matches('K', .{})) {
-                app.cycleSession(-1);
+                // vim J: join lines. Sessions cycle on gt/gT (tab-style).
+                app.editor.pushUndo();
+                var joins = app.takeCount();
+                joins = if (joins > 1) joins - 1 else 1;
+                while (joins > 0) : (joins -= 1) {
+                    if (!app.editor.joinLines()) break;
+                }
             } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
                 app.scroll_up -|= 1;
             } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
@@ -5543,7 +5561,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
                 app.scroll_up = 0;
             } else if (key.matches('g', .{})) {
-                app.scroll_up = std.math.maxInt(usize); // clamped in draw
+                app.pending_g = true;
             } else if (key.matches('v', .{}) or key.matches('V', .{ .shift = true }) or key.matches('V', .{})) {
                 app.enterCopyMode();
             } else if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
@@ -7155,4 +7173,34 @@ test "vim completeness: counts, find, undo, synonyms, linewise paste" {
     try handleKey(&app, .{ .codepoint = 'o' });
     try std.testing.expectEqual(Mode.insert, app.mode);
     try std.testing.expect(std.mem.startsWith(u8, app.editor.text.items, "alpha\nalpha\n\n"));
+}
+
+test "J joins lines; gg tops; gt cycles sessions" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.mode = .normal;
+
+    app.editor.insertSlice("one\n  two\nthree");
+    app.editor.cursor = 0;
+    try handleKey(&app, .{ .codepoint = 'J', .mods = .{ .shift = true } });
+    try std.testing.expectEqualStrings("one two\nthree", app.editor.text.items);
+    // 3J from the top joins all three lines (two joins).
+    try handleKey(&app, .{ .codepoint = 'u' });
+    try std.testing.expectEqualStrings("one\n  two\nthree", app.editor.text.items);
+    app.editor.cursor = 0;
+    try handleKey(&app, .{ .codepoint = '3' });
+    try handleKey(&app, .{ .codepoint = 'J', .mods = .{ .shift = true } });
+    try std.testing.expectEqualStrings("one two three", app.editor.text.items);
+
+    // gg scrolls to top (clamped in draw); a lone g arms the prefix only.
+    app.scroll_up = 0;
+    try handleKey(&app, .{ .codepoint = 'g' });
+    try std.testing.expect(app.pending_g);
+    try std.testing.expectEqual(@as(usize, 0), app.scroll_up);
+    try handleKey(&app, .{ .codepoint = 'g' });
+    try std.testing.expect(!app.pending_g);
+    try std.testing.expect(app.scroll_up > 0);
 }
