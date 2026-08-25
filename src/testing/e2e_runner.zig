@@ -292,23 +292,28 @@ fn runScenario(
     // so cleanup can sweep it after the graceful shutdown attempt.
     var process_groups: std.ArrayList(std.posix.pid_t) = .empty;
     defer process_groups.deinit(gpa);
+    var graceful_shutdown_done = false;
     // Always stop the provider first, then the per-scenario daemon. The order
     // matters: a failed shutdown must never postpone provider pipe cleanup.
+    // The group sweep stays as a safety net for error paths — the happy path
+    // asserts graceful exit BEFORE any signal can mask a wedged daemon.
     defer {
         if (!prov_done) {
             process_io.terminateProcessTree(&prov, io, 50);
             prov_done = true;
         }
-        const res = process_io.run(gpa, io, .{
-            .argv = &.{ marlin_bin, "shutdown" },
-            .environ_map = &env,
-            .cwd = .{ .path = state_dir },
-            .stdout_limit = 64 * 1024,
-            .stderr_limit = 64 * 1024,
-            .timeout_ms = shutdown_timeout_ms,
-        }) catch null;
-        if (res) |r| {
-            r.deinit(gpa);
+        if (!graceful_shutdown_done) {
+            const res = process_io.run(gpa, io, .{
+                .argv = &.{ marlin_bin, "shutdown" },
+                .environ_map = &env,
+                .cwd = .{ .path = state_dir },
+                .stdout_limit = 64 * 1024,
+                .stderr_limit = 64 * 1024,
+                .timeout_ms = shutdown_timeout_ms,
+            }) catch null;
+            if (res) |r| {
+                r.deinit(gpa);
+            }
         }
         for (process_groups.items) |group_id| {
             process_io.terminateProcessGroup(io, group_id, 50);
@@ -460,7 +465,46 @@ fn runScenario(
         }
     }
 
+    // 6. Graceful shutdown must actually END the daemon process. `shutdown`
+    // acks right before daemon exit, so the ack alone proves nothing — a
+    // teardown deadlock after the ack leaves a zombie holding the store (the
+    // !rb zombie-daemon bug). The signal sweep in the defer would silently
+    // unwedge and mask it; assert real exit first.
+    {
+        const res = process_io.run(gpa, io, .{
+            .argv = &.{ marlin_bin, "shutdown" },
+            .environ_map = &env,
+            .cwd = .{ .path = state_dir },
+            .stdout_limit = 64 * 1024,
+            .stderr_limit = 64 * 1024,
+            .timeout_ms = shutdown_timeout_ms,
+        }) catch null;
+        if (res) |r| r.deinit(gpa);
+        graceful_shutdown_done = true;
+        for (process_groups.items) |group_id| {
+            if (!waitGroupGone(io, group_id, shutdown_timeout_ms)) {
+                print(io, "\n  daemon (group {d}) survived graceful shutdown\n", .{group_id});
+                return error.DaemonSurvivedShutdown;
+            }
+        }
+    }
+
     print(io, "ok\n", .{});
+}
+
+/// True once no process in the group remains (probe: CONT to -pgid until
+/// ProcessNotFound). Scenario daemons opt into group inheritance, so a
+/// wedged daemon keeps the group alive and is observable here.
+fn waitGroupGone(io: Io, group_id: std.posix.pid_t, timeout_ms: u32) bool {
+    const deadline = Io.Timestamp.now(io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (true) {
+        std.posix.kill(-group_id, .CONT) catch |err| switch (err) {
+            error.ProcessNotFound => return true,
+            else => return true, // no probe possible → do not block the suite
+        };
+        if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline) return false;
+        io.sleep(.fromMilliseconds(25), .awake) catch return false;
+    }
 }
 
 fn checkSessionHandleFlow(

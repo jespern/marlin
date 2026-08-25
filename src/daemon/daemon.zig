@@ -348,13 +348,21 @@ pub const Daemon = struct {
             pipe_fds
         else
             null;
+        var watcher: ?std.Thread = null;
+        // Teardown order is load-bearing (defers run LIFO): close the WRITE
+        // end first — that EOFs a watcher that never got a signal byte — THEN
+        // join it, THEN close the read end. Joining before the write-end
+        // close deadlocks serve() forever on protocol shutdown/reboot (the
+        // watcher sits in read(2)), leaving a zombie daemon after every !rb;
+        // and closing the read end does not wake a blocked read(2) on macOS.
+        defer if (shutdown_pipe) |fds| {
+            _ = std.c.close(fds[0]);
+        };
+        defer if (watcher) |w| w.join();
         defer if (shutdown_pipe) |fds| {
             shutdown_pipe_write.store(-1, .release);
             _ = std.c.close(fds[1]); // EOF wakes the watcher so it can exit
-            _ = std.c.close(fds[0]);
         };
-        var watcher: ?std.Thread = null;
-        defer if (watcher) |w| w.join();
         if (shutdown_pipe) |fds| {
             installShutdownSignals(fds[1]);
             watcher = std.Thread.spawn(.{}, ShutdownWatcher.run, .{ShutdownWatcher{
@@ -608,7 +616,13 @@ pub const Daemon = struct {
                 };
             },
             .shutdown => {
+                // Nudge AFTER the flag flips: the accept loop re-checks
+                // running per connection, so a nudge that lands while running
+                // is still true is consumed as an ordinary client and the
+                // loop re-blocks in accept(2) with nobody left to wake it
+                // (the observed SIGTERM hang).
                 self.running = false;
+                self.nudgeAcceptLoop();
             },
         }
     }
@@ -1795,7 +1809,8 @@ const ShutdownWatcher = struct {
         if (n == 0) return; // pipe closed: normal shutdown already underway
         std.log.info("marlind: shutdown signal received", .{});
         w.daemon.events.push(w.daemon.io, .shutdown) catch {};
-        w.daemon.nudgeAcceptLoop();
+        // The dispatcher nudges the accept loop after it flips running=false;
+        // nudging from here races the flag and can be eaten as a client.
     }
 };
 
