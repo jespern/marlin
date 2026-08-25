@@ -3013,6 +3013,8 @@ fn flushRanSummary(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), pendin
     pending.* = 0;
 }
 
+const max_layout_lines: usize = 50_000;
+
 fn layoutBlockRange(
     alloc: std.mem.Allocator,
     app: *App,
@@ -3023,9 +3025,21 @@ fn layoutBlockRange(
     last_tool_label: *[]const u8,
     allow_fold: bool,
 ) !void {
+    // A corrupt or unexpectedly pathological transcript must degrade to a
+    // visible truncation, never an unbounded allocation loop in the TUI.
+    const max_layout_steps = (end - start) *| 2 +| 1_024;
     var pending_ran: usize = 0;
     var block_idx: usize = start;
+    var layout_steps: usize = 0;
     while (block_idx < end) : (block_idx += 1) {
+        if (layout_steps >= max_layout_steps or lines.items.len >= max_layout_lines) {
+            try lines.append(alloc, .{
+                .text = "  [transcript rendering truncated at safety limit]",
+                .style = Palette.tool_err,
+            });
+            break;
+        }
+        layout_steps += 1;
         const rb = app.blocks.items[block_idx];
         if (!app.show_tool_transcript and rb.kind == .tool_call) {
             const blocks_all = app.blocks.items;
@@ -3077,8 +3091,10 @@ fn layoutBlockRange(
 
             if (expand.items.len == 0 and running_count == 0 and folded > 0) {
                 pending_ran += folded;
-                block_idx = scan_end - 1;
-                continue;
+                if (scan_end > block_idx) {
+                    block_idx = scan_end - 1;
+                    continue;
+                }
             }
             const total_ran = pending_ran + folded;
             if (total_ran > 0 or expand.items.len > 0 or running_count > 0) {
@@ -3125,8 +3141,10 @@ fn layoutBlockRange(
                     try appendToolCallLine(alloc, lines, blocks_all[pair.call], w);
                     try appendToolResultLines(alloc, lines, blocks_all[pair.result], blocks_all[pair.call].label);
                 }
-                block_idx = scan_end - 1;
-                continue;
+                if (scan_end > block_idx) {
+                    block_idx = scan_end - 1;
+                    continue;
+                }
             }
         }
         switch (rb.kind) {
@@ -6998,6 +7016,73 @@ test "layout cache: incremental result equals fresh one-shot layout" {
     const cold = try Fixture.rendered(arena4.allocator(), &fresh);
 
     try std.testing.expectEqualStrings(cold, incremental);
+}
+
+test "layout remains bounded around a dangling call between turns" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    const Entry = struct { block.BlockKind, u64, []const u8, []const u8 };
+    const entries = [_]Entry{
+        .{ .tool_call, 7, "{\"pattern\":\"one\"}", "grep" },
+        .{ .tool_result, 7, "ok", "" },
+        .{ .tool_call, 7, "{\"path\":\"one\"}", "read_file" },
+        .{ .tool_result, 7, "ok", "" },
+        .{ .tool_call, 7, "{\"path\":\"two\"}", "read_file" },
+        .{ .tool_result, 7, "ok", "" },
+        .{ .reasoning, 7, "editing", "" },
+        // Historical interrupted turns can end with an unmatched call.
+        .{ .tool_call, 7, "{\"path\":\"x\"}", "edit" },
+        .{ .user_msg, 8, "next turn", "" },
+        .{ .system_note, 8, "interrupted", "" },
+    };
+    for (entries, 0..) |entry, i| try app.blocks.append(gpa, .{
+        .kind = entry[0],
+        .seq = i + 1,
+        .turn_id = entry[1],
+        .text = try gpa.dupe(u8, entry[2]),
+        .label = try gpa.dupe(u8, entry[3]),
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const lines = try layoutLines(arena, &app, 120);
+    try std.testing.expect(lines.items.len < 100);
+    var saw_summary = false;
+    var saw_dangling = false;
+    for (lines.items) |line| {
+        const text = try lineText(arena, line);
+        if (std.mem.indexOf(u8, text, "Ran 3 commands") != null) saw_summary = true;
+        if (std.mem.indexOf(u8, text, "⚙ edit") != null) saw_dangling = true;
+    }
+    try std.testing.expect(saw_summary);
+    try std.testing.expect(saw_dangling);
+}
+
+test "layout line safety limit produces a visible truncation" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.pushBlock(.system_note, "after limit", "", .ok);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+    try lines.resize(arena, max_layout_lines);
+    var label: []const u8 = "";
+    try layoutBlockRange(arena, &app, &lines, 0, 1, 120, &label, false);
+    try std.testing.expectEqual(max_layout_lines + 1, lines.items.len);
+    try std.testing.expectEqualStrings(
+        "  [transcript rendering truncated at safety limit]",
+        lines.items[lines.items.len - 1].text,
+    );
 }
 
 test "a failing sibling expands alone; healthy batch members stay folded" {

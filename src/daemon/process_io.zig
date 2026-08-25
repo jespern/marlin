@@ -155,6 +155,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) Error!Result {
         null;
     while (true) {
         if (cancelled(options.cancel)) return error.Cancelled;
+        // MultiReader's timeout is a wait timeout, not a wall-clock budget:
+        // one chatty stream can keep satisfying the wait forever while a
+        // quiet sibling remains open. Check the absolute deadline before
+        // every wait so continuous output cannot starve timeout handling.
+        if (deadline_ns) |deadline| {
+            if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline)
+                return error.Timeout;
+        }
         multi_reader.fill(64, .{ .duration = .{
             .raw = .fromMilliseconds(50),
             .clock = .awake,
