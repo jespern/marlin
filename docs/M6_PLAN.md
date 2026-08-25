@@ -23,10 +23,11 @@ recovery/isolation track formerly called M4.5 is deliberately Later.
   `/review`, concurrent child fan-out, and review blocks are not implemented.
 - `parallel_safe` is **enforced** (this superseded the earlier
   "metadata-only" state): `loop.zig` runs each maximal consecutive safe group
-  on worker threads and joins before persisting results in provider-call
-  order; e2e scenario 15_parallel_tool_batch covers it. Architecture §4 is
-  the current description. Remaining hardening: cap worker fan-out (spawn is
-  unbounded today; spawn failure falls back to serial mid-batch).
+  in chunks of at most eight worker threads and joins before persisting results
+  in provider-call order. A spawn failure joins the partial chunk before the
+  remaining calls fall back to serial execution. E2e scenario
+  15_parallel_tool_batch covers ordering and overlap; Architecture §4 is the
+  current description.
 - The daemon listens only on its local Unix socket. Raw TCP/token auth and a
   PWA remain architectural doors, not partially shipped surfaces.
 
@@ -39,8 +40,8 @@ classification. This is operational proof, not another feature phase.
 
 Also close these bounded hardening debts when they intersect M6 work:
 
-1. Cap consecutive `parallel_safe` execution at eight workers while retaining
-   provider-call result order and per-call cancellation.
+1. **Done:** cap consecutive `parallel_safe` execution at eight workers while
+   retaining provider-call result order and per-call cancellation.
 2. Give built-in bash and extension subprocesses one cancellation/deadline
    primitive (TERM, grace, KILL) instead of a mixture of blocking helpers.
 3. Make config/MCP startup errors name the table, server/tool, and bad field.
