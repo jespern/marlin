@@ -131,8 +131,8 @@ fn streamPostTimed(
     var progress = StreamProgress{};
     var results: [2]Select.Union = undefined;
     var select = Select.init(client.io, &results);
-    select.async(.request, streamPostImpl(@TypeOf(ctx), on_chunk), .{ client, gpa, stream_req, ctx, &progress });
-    select.async(.watchdog, waitForStreamAbort, .{ client.io, stream_req.cancel, &progress, stream_req.connect_timeout_ms, stream_req.idle_timeout_ms });
+    try select.concurrent(.request, streamPostImpl(@TypeOf(ctx), on_chunk), .{ client, gpa, stream_req, ctx, &progress });
+    try select.concurrent(.watchdog, waitForStreamAbort, .{ client.io, stream_req.cancel, &progress, stream_req.connect_timeout_ms, stream_req.idle_timeout_ms });
 
     const first = try select.await();
     return switch (first) {
@@ -319,8 +319,8 @@ fn getImpl(
     });
     var results: [2]Select.Union = undefined;
     var select = Select.init(client.io, &results);
-    select.async(.request, getRun, .{ client, gpa, url, max_bytes, cancel, redirect_behavior });
-    select.async(.watchdog, waitForAbort, .{ client.io, cancel, timeout_ms });
+    try select.concurrent(.request, getRun, .{ client, gpa, url, max_bytes, cancel, redirect_behavior });
+    try select.concurrent(.watchdog, waitForAbort, .{ client.io, cancel, timeout_ms });
 
     const first = try select.await();
     return switch (first) {
@@ -509,7 +509,10 @@ fn requestCompletes(
 
 test "stream cancellation interrupts a blocked response" {
     const gpa = std.testing.allocator;
-    var threaded: Io.Threaded = .init(gpa, .{});
+    // Keep the async pool deliberately saturated so this test proves that the
+    // request and watchdog use guaranteed concurrency rather than running
+    // inline behind the mock server.
+    var threaded: Io.Threaded = .init(gpa, .{ .async_limit = .limited(2) });
     defer threaded.deinit();
     const io = threaded.io();
     var server = try testServer(io);
@@ -545,7 +548,7 @@ test "stream cancellation interrupts a blocked response" {
 
 test "stream connect timeout aborts before response headers" {
     const gpa = std.testing.allocator;
-    var threaded: Io.Threaded = .init(gpa, .{});
+    var threaded: Io.Threaded = .init(gpa, .{ .async_limit = .limited(2) });
     defer threaded.deinit();
     const io = threaded.io();
     var server = try testServer(io);
