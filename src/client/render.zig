@@ -5,6 +5,9 @@ const Io = std.Io;
 const vaxis = @import("vaxis");
 
 pub const Palette = struct {
+    /// Calm informational accent. Yellow is reserved for warnings and
+    /// approval states that actually require the user's attention.
+    pub const soft_blue: vaxis.Color = .{ .rgb = .{ 0x8a, 0xa6, 0xbf } };
     pub const user: vaxis.Style = .{ .fg = .{ .index = 6 }, .bold = true }; // cyan
     // Sampled from the Codex composer in the same terminal (#42454b), so
     // the raised surface has the same contrast instead of approximating it
@@ -34,7 +37,7 @@ pub const Palette = struct {
     pub const md_heading_3: vaxis.Style = .{ .bold = true };
     pub const md_lead: vaxis.Style = .{ .fg = .{ .index = 7 }, .bold = true };
     pub const md_inline_code_bg: vaxis.Color = .{ .rgb = .{ 0x2d, 0x30, 0x35 } };
-    pub const md_code: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } }, .bg = md_inline_code_bg };
+    pub const md_code: vaxis.Style = .{ .fg = soft_blue, .bg = md_inline_code_bg };
     pub const md_code_panel: vaxis.Style = .{ .bg = md_inline_code_bg };
     pub const md_code_border: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = md_inline_code_bg, .dim = true };
     pub const md_table_header_bg: vaxis.Color = .{ .rgb = .{ 0x32, 0x35, 0x3b } };
@@ -70,7 +73,7 @@ pub const Palette = struct {
     pub const shell_flag: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x89, 0xdd, 0xff } } };
     pub const shell_operator: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xc7, 0x92, 0xea } }, .bold = true };
     pub const shell_string: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xc3, 0xe8, 0x8d } } };
-    pub const shell_path: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
+    pub const shell_path: vaxis.Style = .{ .fg = soft_blue };
     pub const shell_variable: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xf7, 0x8c, 0x6c } } };
     pub const tool_out: vaxis.Style = .{ .fg = .{ .index = 8 }, .dim = true };
     /// Secondary text on collapse-summary and Working lines. Deliberately
@@ -80,7 +83,7 @@ pub const Palette = struct {
     pub const working: vaxis.Style = .{ .fg = .{ .index = 7 }, .bold = true };
     pub const tool_err: vaxis.Style = .{ .fg = .{ .index = 1 } }; // red
     pub const git_subject: vaxis.Style = .{ .fg = .{ .index = 7 } };
-    pub const git_hash: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
+    pub const git_hash: vaxis.Style = .{ .fg = soft_blue };
     pub const git_ref: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x89, 0xdd, 0xff } }, .bold = true };
     // Fixed dark surfaces match the current Codex-like composer and keep the
     // add/delete signal restrained enough for syntax colors to remain legible.
@@ -98,14 +101,14 @@ pub const Palette = struct {
     pub const syntax_comment: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x69, 0x70, 0x98 } }, .italic = true };
     pub const syntax_type: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x89, 0xdd, 0xff } } };
     pub const syntax_function: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x82, 0xaa, 0xff } } };
-    pub const syntax_constant: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
-    pub const note: vaxis.Style = .{ .fg = .{ .index = 3 } }; // yellow
+    pub const syntax_constant: vaxis.Style = .{ .fg = soft_blue };
+    pub const note: vaxis.Style = .{ .fg = soft_blue };
     pub const steer: vaxis.Style = .{ .fg = .{ .index = 5 } }; // magenta
     pub const status_bg: vaxis.Color = .{ .index = 0 };
     pub const status_bar: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 7 } };
     pub const status_sep: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 8 }, .dim = true };
     pub const status_idle: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 2 } };
-    pub const status_running: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 }, .bold = true };
+    pub const status_running: vaxis.Style = .{ .bg = status_bg, .fg = soft_blue, .bold = true };
     pub const status_approval: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 }, .bold = true };
     pub const status_error: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 1 }, .bold = true };
     pub const status_model: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 6 } };
@@ -115,7 +118,7 @@ pub const Palette = struct {
     pub const status_context_warn: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 } };
     pub const status_context_hot: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 1 } };
     pub const status_cwd: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 2 } };
-    pub const status_notice: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 } };
+    pub const status_notice: vaxis.Style = .{ .bg = status_bg, .fg = soft_blue };
     pub const approval_card: vaxis.Style = .{ .fg = .{ .index = 3 }, .bold = true };
     pub const delta_style: vaxis.Style = .{};
 };
@@ -1033,6 +1036,21 @@ pub fn appendGlyphNTimes(
     count: usize,
 ) !void {
     for (0..count) |_| try out.appendSlice(arena, glyph);
+}
+
+test "informational accents are blue while attention states remain yellow" {
+    try std.testing.expect(vaxis.Color.eql(Palette.note.fg, Palette.soft_blue));
+    try std.testing.expect(vaxis.Color.eql(Palette.md_code.fg, Palette.soft_blue));
+    try std.testing.expect(vaxis.Color.eql(Palette.shell_path.fg, Palette.soft_blue));
+    try std.testing.expect(vaxis.Color.eql(Palette.git_hash.fg, Palette.soft_blue));
+    try std.testing.expect(vaxis.Color.eql(Palette.syntax_constant.fg, Palette.soft_blue));
+    try std.testing.expect(vaxis.Color.eql(Palette.status_running.fg, Palette.soft_blue));
+    try std.testing.expect(vaxis.Color.eql(Palette.status_notice.fg, Palette.soft_blue));
+
+    const attention_yellow: vaxis.Color = .{ .index = 3 };
+    try std.testing.expect(vaxis.Color.eql(Palette.status_approval.fg, attention_yellow));
+    try std.testing.expect(vaxis.Color.eql(Palette.status_context_warn.fg, attention_yellow));
+    try std.testing.expect(vaxis.Color.eql(Palette.approval_card.fg, attention_yellow));
 }
 
 test {
