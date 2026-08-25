@@ -16,12 +16,16 @@ jobs:
         include:
           - runner: ubuntu-24.04
             artifact: marlin-x86_64-linux
+            target: x86_64-linux-musl
           - runner: ubuntu-24.04-arm
             artifact: marlin-aarch64-linux
+            target: aarch64-linux-musl
           - runner: macos-15-intel
             artifact: marlin-x86_64-darwin
+            target: x86_64-macos.13.0
           - runner: macos-15
             artifact: marlin-aarch64-darwin
+            target: aarch64-macos.13.0
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -34,7 +38,8 @@ jobs:
       - name: Build release binary
         env:
           MARLIN_VERSION: ${{ github.ref_name }}
-        run: zig build -Doptimize=ReleaseSafe -Dembedded-sqlite=true -Dversion="${MARLIN_VERSION#v}"
+          MARLIN_TARGET: ${{ matrix.target }}
+        run: zig build -Dtarget="$MARLIN_TARGET" -Doptimize=ReleaseSafe -Dembedded-sqlite=true -Dversion="${MARLIN_VERSION#v}"
 
       - name: Package release assets
         env:
