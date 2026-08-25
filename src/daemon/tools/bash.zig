@@ -90,15 +90,6 @@ pub fn run(
         .cancel = cancel,
     }) catch |e| {
         if (e == error.Cancelled) return e;
-        if (e == error.Timeout) {
-            const msg = try std.fmt.allocPrint(
-                gpa,
-                "[command timed out after {d}s; its process tree was killed. " ++
-                    "Pass timeout_seconds (max {d}) for longer-running commands.]",
-                .{ timeout_s, max_timeout_seconds },
-            );
-            return .{ .output = msg, .exit_code = -1, .truncated = false };
-        }
         const msg = try std.fmt.allocPrint(gpa, "failed to spawn bash: {t}", .{e});
         return .{ .output = msg, .exit_code = -1, .truncated = false };
     };
@@ -114,6 +105,18 @@ pub fn run(
     }
     const truncated = res.stdout.len >= max_capture_bytes or res.stderr.len >= max_capture_bytes;
     if (truncated) try out.appendSlice(gpa, "\n[output truncated at capture cap]");
+    if (res.timed_out) {
+        const note = try std.fmt.allocPrint(
+            gpa,
+            "{s}[command timed out after {d}s; its process tree was killed. " ++
+                "Output above is everything captured before the deadline. " ++
+                "Pass timeout_seconds (max {d}) for longer-running commands.]",
+            .{ if (out.items.len > 0) "\n" else "", timeout_s, max_timeout_seconds },
+        );
+        defer gpa.free(note);
+        try out.appendSlice(gpa, note);
+        return .{ .output = try out.toOwnedSlice(gpa), .exit_code = -1, .truncated = truncated };
+    }
 
     const exit_code: i64 = switch (res.term) {
         .exited => |code| code,
@@ -200,7 +203,7 @@ test "bash tool enforces its wall-clock timeout and reports it" {
     const r = try run(
         gpa,
         threaded.io(),
-        .{ .command = "sleep 30", .timeout_seconds = 1 },
+        .{ .command = "printf progress-so-far; sleep 30", .timeout_seconds = 1 },
         ".",
         null,
         .{},
@@ -208,6 +211,7 @@ test "bash tool enforces its wall-clock timeout and reports it" {
     );
     defer r.deinit(gpa);
     try std.testing.expectEqual(@as(i64, -1), r.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, r.output, "progress-so-far"));
     try std.testing.expect(std.mem.indexOf(u8, r.output, "timed out after 1s") != null);
 }
 

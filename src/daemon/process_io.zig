@@ -24,6 +24,9 @@ pub const Options = struct {
 
 pub const Result = struct {
     term: std.process.Child.Term,
+    /// The wall-clock deadline expired: the tree was killed and stdout/stderr
+    /// hold everything captured up to that point (term is the kill signal).
+    timed_out: bool = false,
     stdout: []u8,
     stderr: []u8,
     /// POSIX process group owned by this invocation. Descendants may outlive
@@ -56,6 +59,114 @@ const InputJob = struct {
         writer.interface.flush() catch {};
     }
 };
+
+/// Salvage captured output when the deadline expires. The caller's deferred
+/// cleanup (running after this return value is built) kills the tree and
+/// sweeps setpgid escapees; the buffers hold everything read so far.
+fn timedOutResult(
+    gpa: std.mem.Allocator,
+    multi_reader: *Io.File.MultiReader,
+    process_group_id: ?std.posix.pid_t,
+) Error!Result {
+    const stdout = try multi_reader.toOwnedSlice(0);
+    errdefer gpa.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    return .{
+        .term = .{ .signal = .KILL },
+        .timed_out = true,
+        .stdout = stdout,
+        .stderr = stderr,
+        .process_group_id = process_group_id,
+    };
+}
+
+/// Descendants that escaped the owned process group (setpgid), snapshotted
+/// while their parent chain is still alive so they stay attributable. A
+/// fixed cap keeps this allocation-free for the caller; more than 32
+/// escapees is a pathology we accept leaking rather than tracking.
+const Escapees = struct {
+    pids: [32]std.posix.pid_t = undefined,
+    len: usize = 0,
+};
+
+/// Enumerate live descendants of `root` whose pgid differs from the owned
+/// group, via one `ps` snapshot. Best-effort: any failure returns an empty
+/// set and the group kill proceeds as before. Guard: if `root` is no longer
+/// our child (pid reuse), return empty rather than sweep innocents.
+fn snapshotEscapees(io: Io, root: ?std.posix.pid_t, group: std.posix.pid_t) Escapees {
+    const empty: Escapees = .{};
+    const root_pid = root orelse return empty;
+    const gpa = std.heap.page_allocator;
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "ps", "-axo", "pid=,ppid=,pgid=" },
+        .stdout_limit = .limited(1 << 20),
+        .stderr_limit = .limited(4096),
+    }) catch return empty;
+    defer {
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
+    }
+
+    const Proc = struct { pid: i64, ppid: i64, pgid: i64 };
+    var procs: [4096]Proc = undefined;
+    var n: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (n >= procs.len) break;
+        var cols = std.mem.tokenizeAny(u8, line, " \t");
+        const pid = std.fmt.parseInt(i64, cols.next() orelse continue, 10) catch continue;
+        const ppid = std.fmt.parseInt(i64, cols.next() orelse continue, 10) catch continue;
+        const pgid = std.fmt.parseInt(i64, cols.next() orelse continue, 10) catch continue;
+        procs[n] = .{ .pid = pid, .ppid = ppid, .pgid = pgid };
+        n += 1;
+    }
+
+    // The direct child must still be ours; a recycled pid must not seed a BFS.
+    const self_pid: i64 = @intCast(std.c.getpid());
+    var root_ok = false;
+    for (procs[0..n]) |proc| {
+        if (proc.pid == root_pid) root_ok = proc.ppid == self_pid;
+    }
+    if (!root_ok) return empty;
+
+    // Transitive descendant closure by fixpoint (few passes in practice).
+    var descendant: [4096]bool = @splat(false);
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (procs[0..n], 0..) |proc, i| {
+            if (descendant[i]) continue;
+            if (proc.ppid == root_pid) {
+                descendant[i] = true;
+                changed = true;
+                continue;
+            }
+            for (procs[0..n], 0..) |parent, j| {
+                if (descendant[j] and parent.pid == proc.ppid) {
+                    descendant[i] = true;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    var out: Escapees = .{};
+    for (procs[0..n], 0..) |proc, i| {
+        if (!descendant[i] or proc.pgid == group) continue;
+        if (out.len >= out.pids.len) break;
+        out.pids[out.len] = @intCast(proc.pid);
+        out.len += 1;
+    }
+    return out;
+}
+
+fn killEscapees(io: Io, escapees: Escapees, grace_ms: u32) void {
+    if (escapees.len == 0) return;
+    for (escapees.pids[0..escapees.len]) |pid| std.posix.kill(pid, .TERM) catch {};
+    if (grace_ms > 0) io.sleep(.fromMilliseconds(grace_ms), .awake) catch {};
+    for (escapees.pids[0..escapees.len]) |pid| std.posix.kill(pid, .KILL) catch {};
+}
 
 /// Terminate a child and every descendant still in its owned process group,
 /// then reap the direct child. Safe to call after `wait` and from error defers.
@@ -138,8 +249,19 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) Error!Result {
     };
     // On an error, stop the child before waiting for a possibly blocked input
     // writer. On success wait() makes kill() an idempotent no-op.
+    // Forced exits (timeout/cancel/error) first snapshot live descendants:
+    // anything that left the owned group via setpgid — timeout(1) is the
+    // canonical case — would survive a group-only kill and orphan.
+    var forced_kill = true;
     defer input_thread.join();
-    defer terminateProcessTree(&child, io, options.termination_grace_ms);
+    defer {
+        const escapees: Escapees = if (forced_kill and builtin.os.tag != .windows)
+            snapshotEscapees(io, child.id, process_group_id.?)
+        else
+            .{};
+        terminateProcessTree(&child, io, options.termination_grace_ms);
+        killEscapees(io, escapees, options.termination_grace_ms);
+    }
 
     var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: Io.File.MultiReader = undefined;
@@ -161,7 +283,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) Error!Result {
         // every wait so continuous output cannot starve timeout handling.
         if (deadline_ns) |deadline| {
             if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline)
-                return error.Timeout;
+                return timedOutResult(gpa, &multi_reader, process_group_id);
         }
         multi_reader.fill(64, .{ .duration = .{
             .raw = .fromMilliseconds(50),
@@ -172,7 +294,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) Error!Result {
                 if (cancelled(options.cancel)) return error.Cancelled;
                 if (deadline_ns) |deadline| {
                     if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline)
-                        return error.Timeout;
+                        return timedOutResult(gpa, &multi_reader, process_group_id);
                 }
                 continue;
             },
@@ -188,6 +310,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) Error!Result {
     try multi_reader.checkAnyError();
 
     const term = try child.wait(io);
+    forced_kill = false;
     const stdout = try multi_reader.toOwnedSlice(0);
     errdefer gpa.free(stdout);
     const stderr = try multi_reader.toOwnedSlice(1);
@@ -224,14 +347,59 @@ test "run enforces its output cap" {
     }));
 }
 
-test "run uses one absolute deadline" {
+test "run uses one absolute deadline and salvages partial output" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    try std.testing.expectError(error.Timeout, run(gpa, threaded.io(), .{
-        .argv = &.{ "sh", "-c", "while true; do printf x; sleep 0.02; done" },
-        .timeout_ms = 80,
-    }));
+    const result = try run(gpa, threaded.io(), .{
+        .argv = &.{ "sh", "-c", "printf before-hang; sleep 30" },
+        .timeout_ms = 300,
+    });
+    defer result.deinit(gpa);
+    try std.testing.expect(result.timed_out);
+    try std.testing.expectEqualStrings("before-hang", result.stdout);
+}
+
+test "forced kill sweeps descendants that escaped the process group" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const pid_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &temp.sub_path, "escapee.pid" });
+    defer gpa.free(pid_path);
+
+    // set -m gives the background job its own process group (what timeout(1)
+    // does via setpgid), so a group-only kill would miss it; the TERM trap
+    // additionally forces the sweep's KILL escalation to be what lands.
+    const script =
+        \\set -m
+        \\(trap '' TERM; while :; do sleep 1; done) &
+        \\printf '%s' "$!" > "$1"
+        \\wait
+    ;
+    const result = try run(gpa, io, .{
+        .argv = &.{ "bash", "-c", script, "--", pid_path },
+        .timeout_ms = 500,
+        .termination_grace_ms = 50,
+    });
+    defer result.deinit(gpa);
+    try std.testing.expect(result.timed_out);
+
+    const pid_text = try Io.Dir.cwd().readFileAlloc(io, pid_path, gpa, .limited(64));
+    defer gpa.free(pid_text);
+    const escapee_pid = try std.fmt.parseInt(std.posix.pid_t, pid_text, 10);
+    var attempts: u8 = 0;
+    while (attempts < 50) : (attempts += 1) {
+        std.posix.kill(escapee_pid, .CONT) catch |err| switch (err) {
+            error.ProcessNotFound => break,
+            else => return err,
+        };
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    } else return error.EscapeeSurvivedForcedKill;
 }
 
 test "cancellation terminates and reaps the complete process tree" {

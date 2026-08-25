@@ -62,6 +62,12 @@ pub fn run(
             result.stderr,
         }) catch @panic("oom");
     }
+    if (result.timed_out) {
+        const noted = std.fmt.allocPrint(gpa, "{s}\n[exec tool timed out after {d}ms; partial output above]", .{ output, timeout_ms }) catch
+            return .{ .output = output, .status = .err };
+        gpa.free(output);
+        return .{ .output = noted, .status = .err };
+    }
     if (exit_code == 0) return .{ .output = output, .status = .ok };
 
     const with_code = std.fmt.allocPrint(gpa, "{s}\n[exit code: {d}]", .{ output, exit_code }) catch

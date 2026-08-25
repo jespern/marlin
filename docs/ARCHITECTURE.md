@@ -337,11 +337,18 @@ loop:
   interrupt/timeout sends SIGTERM → grace → SIGKILL to the complete
   pipeline and its descendants, then reaps the direct child. The half-finished
   turn is finalized as an interrupted `system_note` + whatever blocks completed
-  (the log stays consistent). Caveat: a descendant that calls setpgid (notably
-  `timeout(1)`) escapes the group kill and can orphan.
+  (the log stays consistent). Forced kills first snapshot live descendants
+  via `ps`, so processes that left the group via setpgid (`timeout(1)` is
+  the canonical case) are terminated individually instead of orphaning.
 - **bash wall-clock limit**: commands are killed after `timeout_seconds`
-  (default 600, max 3600 — the model raises it for long builds). A command
-  that hangs becomes a failed tool result instead of a silently stuck turn.
+  (default 600, max 3600 — the model raises it for long builds). Timeout is
+  a Result, not an error: everything captured before the deadline reaches
+  the model with a note naming the limit, so a timed-out build is
+  debuggable instead of a blank failure.
+- **Graceful SIGTERM/SIGINT**: a self-pipe watcher thread turns the signal
+  into the ordinary `.shutdown` dispatcher event — socket removed, store
+  closed — the same path `/quit` and reboot use. (SIGHUP stays ignored so
+  the daemon survives its spawning terminal.)
 - **Retry/backoff**: on 429/5xx/mid-stream disconnect: exponential backoff w/
   jitter, max N attempts. A turn that dies mid-stream discards the partial
   assistant text (deltas were never truth) and re-requests — context is

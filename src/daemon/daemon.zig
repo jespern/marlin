@@ -19,6 +19,7 @@
 //!   - Turn threads never see sessions; they get a TurnJob value copy.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Io = std.Io;
 
@@ -317,6 +318,28 @@ pub const Daemon = struct {
 
         // Dispatcher thread: consumes events, owns all state.
         const dispatcher = try std.Thread.spawn(.{}, dispatchLoop, .{&self});
+
+        // SIGTERM/SIGINT shut down gracefully (socket removed, store closed)
+        // instead of dying mid-write. Watcher exits when the pipe closes.
+        var pipe_fds: [2]std.posix.fd_t = undefined;
+        const shutdown_pipe: ?[2]std.posix.fd_t = if (builtin.os.tag != .windows and std.c.pipe(&pipe_fds) == 0)
+            pipe_fds
+        else
+            null;
+        defer if (shutdown_pipe) |fds| {
+            shutdown_pipe_write.store(-1, .release);
+            _ = std.c.close(fds[1]); // EOF wakes the watcher so it can exit
+            _ = std.c.close(fds[0]);
+        };
+        var watcher: ?std.Thread = null;
+        defer if (watcher) |w| w.join();
+        if (shutdown_pipe) |fds| {
+            installShutdownSignals(fds[1]);
+            watcher = std.Thread.spawn(.{}, ShutdownWatcher.run, .{ShutdownWatcher{
+                .daemon = &self,
+                .read_fd = fds[0],
+            }}) catch null;
+        }
 
         // Accept loop (main thread). Exits when the listener errors out
         // (dispatcher deletes the socket file on shutdown to unblock us).
@@ -1650,6 +1673,43 @@ pub const Daemon = struct {
 
         // Remove the socket so the (blocked) accept loop errors out.
         if (!self.socket_retired) self.removeSocketFile();
+    }
+};
+
+/// Write end of the shutdown self-pipe, set before the TERM/INT handler is
+/// installed. The handler only writes one byte (async-signal-safe); a watcher
+/// thread turns that byte into the ordinary .shutdown dispatcher event, so a
+/// signal shuts down through exactly the code path /quit and reboot use.
+var shutdown_pipe_write = std.atomic.Value(i32).init(-1);
+
+fn onShutdownSignal(_: std.c.SIG) callconv(.c) void {
+    const fd = shutdown_pipe_write.load(.acquire);
+    if (fd >= 0) _ = std.c.write(fd, "T", 1);
+}
+
+fn installShutdownSignals(write_fd: std.posix.fd_t) void {
+    if (std.posix.Sigaction == void) return;
+    shutdown_pipe_write.store(@intCast(write_fd), .release);
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onShutdownSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.TERM, &act, null);
+    std.posix.sigaction(.INT, &act, null);
+}
+
+const ShutdownWatcher = struct {
+    daemon: *Daemon,
+    read_fd: std.posix.fd_t,
+
+    fn run(w: ShutdownWatcher) void {
+        var buf: [1]u8 = undefined;
+        const n = std.posix.read(w.read_fd, &buf) catch return;
+        if (n == 0) return; // pipe closed: normal shutdown already underway
+        std.log.info("marlind: shutdown signal received", .{});
+        w.daemon.events.push(w.daemon.io, .shutdown) catch {};
+        w.daemon.nudgeAcceptLoop();
     }
 };
 
