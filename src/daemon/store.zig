@@ -366,6 +366,31 @@ pub const Store = struct {
         }
     };
 
+    fn sessionListingFromRow(self: Store, stmt: *c.sqlite3_stmt) Error!SessionListing {
+        const title = try self.dupeCol(stmt, 5);
+        errdefer self.gpa.free(title);
+        const cwd = try self.dupeCol(stmt, 6);
+        errdefer self.gpa.free(cwd);
+        const model = try self.dupeCol(stmt, 7);
+        errdefer self.gpa.free(model);
+        const status = try self.dupeCol(stmt, 9);
+        errdefer self.gpa.free(status);
+        return .{
+            .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+            .parent_sid = columnOptionalU64(stmt, 1),
+            .kind = std.meta.stringToEnum(proto.SessionKind, columnText(stmt, 2)) orelse .root,
+            .parent_block_id = columnOptionalU64(stmt, 3),
+            .max_rounds = @intCast(c.sqlite3_column_int64(stmt, 4)),
+            .title = title,
+            .cwd = cwd,
+            .model = model,
+            .effort = Effort.parse(columnText(stmt, 8)) orelse .auto,
+            .status = status,
+            .created_at = c.sqlite3_column_int64(stmt, 10),
+            .archived = c.sqlite3_column_int64(stmt, 11) != 0,
+        };
+    }
+
     /// Sessions, newest hierarchy first. Archived rows are omitted unless
     /// requested. Caller deinits each entry + frees the returned slice.
     pub fn listSessions(self: Store, include_archived: bool) Error![]SessionListing {
@@ -391,20 +416,60 @@ pub const Store = struct {
             const rc = c.sqlite3_step(stmt);
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return error.SqliteStep;
-            try out.append(self.gpa, .{
-                .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
-                .parent_sid = columnOptionalU64(stmt, 1),
-                .kind = std.meta.stringToEnum(proto.SessionKind, columnText(stmt, 2)) orelse .root,
-                .parent_block_id = columnOptionalU64(stmt, 3),
-                .max_rounds = @intCast(c.sqlite3_column_int64(stmt, 4)),
-                .title = try self.dupeCol(stmt, 5),
-                .cwd = try self.dupeCol(stmt, 6),
-                .model = try self.dupeCol(stmt, 7),
-                .effort = Effort.parse(columnText(stmt, 8)) orelse .auto,
-                .status = try self.dupeCol(stmt, 9),
-                .created_at = c.sqlite3_column_int64(stmt, 10),
-                .archived = c.sqlite3_column_int64(stmt, 11) != 0,
-            });
+            const row = try self.sessionListingFromRow(stmt);
+            errdefer row.deinit(self.gpa);
+            try out.append(self.gpa, row);
+        }
+        return out.toOwnedSlice(self.gpa);
+    }
+
+    /// Fetch one catalog row without scanning the durable session table.
+    /// The caller owns the returned strings via SessionListing.deinit().
+    pub fn getSessionListing(self: Store, id: u64) Error!SessionListing {
+        const stmt = try self.prepare(
+            \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
+            \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
+            \\       s.archived_at IS NOT NULL
+            \\FROM sessions s WHERE s.id=?
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return error.NotFound;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        return self.sessionListingFromRow(stmt);
+    }
+
+    /// Fetch a hierarchy for the rare archive/unarchive catalog mutation.
+    /// Ordinary single-session changes use getSessionListing and remain O(1).
+    pub fn listSessionTree(self: Store, id: u64) Error![]SessionListing {
+        const stmt = try self.prepare(
+            \\WITH RECURSIVE session_tree(id) AS (
+            \\  SELECT id FROM sessions WHERE id=?
+            \\  UNION ALL
+            \\  SELECT s.id FROM sessions s JOIN session_tree t ON s.parent_sid=t.id
+            \\)
+            \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
+            \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
+            \\       s.archived_at IS NOT NULL
+            \\FROM sessions s JOIN session_tree t ON t.id=s.id
+            \\ORDER BY CASE WHEN s.parent_sid IS NULL THEN 0 ELSE 1 END,
+            \\         s.created_at ASC, s.id ASC
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        var out: std.ArrayList(SessionListing) = .empty;
+        errdefer {
+            for (out.items) |row| row.deinit(self.gpa);
+            out.deinit(self.gpa);
+        }
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            const row = try self.sessionListingFromRow(stmt);
+            errdefer row.deinit(self.gpa);
+            try out.append(self.gpa, row);
         }
         return out.toOwnedSlice(self.gpa);
     }
@@ -641,6 +706,54 @@ pub const Store = struct {
         }
     }
 
+    /// Load one forward replay page without first materializing `limit` large
+    /// rows. Returns true when another row exists (or the body-byte budget
+    /// stopped this page). One first row may exceed max_body_bytes so every
+    /// durable block remains reachable.
+    pub fn loadForwardPageInto(
+        self: Store,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(block.Block),
+        session_id: u64,
+        from_seq: u64,
+        limit: u32,
+        max_body_bytes: usize,
+    ) Error!bool {
+        const stmt = try self.prepare(
+            "SELECT id, turn_id, seq, ts, body_json FROM blocks WHERE session_id=? AND seq>=? ORDER BY seq ASC LIMIT ?",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(from_seq));
+        bindInt(stmt, 3, @intCast(limit +| 1));
+
+        var loaded: u32 = 0;
+        var body_bytes: usize = 0;
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) return false;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            if (loaded >= limit) return true;
+            const body_ptr = c.sqlite3_column_text(stmt, 4);
+            const body_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+            if (loaded > 0 and body_len > max_body_bytes -| body_bytes) return true;
+            const body_json = try arena.dupe(u8, body_ptr[0..body_len]);
+            const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.SqliteStep;
+            try out.append(arena, .{
+                .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .session_id = session_id,
+                .turn_id = @bitCast(c.sqlite3_column_int64(stmt, 1)),
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 2)),
+                .ts = c.sqlite3_column_int64(stmt, 3),
+                .body = body,
+            });
+            loaded += 1;
+            body_bytes +|= body_len;
+        }
+    }
+
     /// Load exactly the context-relevant working set: every compaction record
     /// (needed to resolve nested summaries) plus blocks after the greatest
     /// compacted seq. The durable log remains untouched and full replay still
@@ -766,6 +879,66 @@ pub const Store = struct {
                 .body = body,
             });
         }
+    }
+
+    /// Load a newest suffix directly in DESC order, stopping before parsing
+    /// an over-budget older row, then reverse only the bounded result into
+    /// transcript order. `before_seq=0` means the live tail.
+    pub fn loadTailPageInto(
+        self: Store,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(block.Block),
+        session_id: u64,
+        before_seq: u64,
+        limit: u32,
+        max_body_bytes: usize,
+    ) Error!bool {
+        const stmt = try self.prepare(
+            \\SELECT id, turn_id, seq, ts, body_json FROM blocks
+            \\WHERE session_id=? AND (?=0 OR seq<?)
+            \\ORDER BY seq DESC LIMIT ?
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(before_seq));
+        bindInt(stmt, 3, @bitCast(before_seq));
+        bindInt(stmt, 4, @intCast(limit +| 1));
+
+        const start = out.items.len;
+        var loaded: u32 = 0;
+        var body_bytes: usize = 0;
+        var has_older = false;
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            if (loaded >= limit) {
+                has_older = true;
+                break;
+            }
+            const body_ptr = c.sqlite3_column_text(stmt, 4);
+            const body_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+            if (loaded > 0 and body_len > max_body_bytes -| body_bytes) {
+                has_older = true;
+                break;
+            }
+            const body_json = try arena.dupe(u8, body_ptr[0..body_len]);
+            const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.SqliteStep;
+            try out.append(arena, .{
+                .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .session_id = session_id,
+                .turn_id = @bitCast(c.sqlite3_column_int64(stmt, 1)),
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 2)),
+                .ts = c.sqlite3_column_int64(stmt, 3),
+                .body = body,
+            });
+            loaded += 1;
+            body_bytes +|= body_len;
+        }
+        std.mem.reverse(block.Block, out.items[start..]);
+        return has_older;
     }
 
     /// Highest seq in a session (0 when empty).
@@ -1104,6 +1277,32 @@ test "tail replay is bounded and remains in ascending transcript order" {
     try std.testing.expectEqual(@as(usize, 2), older.items.len);
     try std.testing.expectEqual(@as(u64, 2), older.items[0].seq);
     try std.testing.expectEqual(@as(u64, 3), older.items[1].seq);
+
+    var forward_page: std.ArrayList(block.Block) = .empty;
+    const has_newer = try store.loadForwardPageInto(
+        arena_state.allocator(),
+        &forward_page,
+        1,
+        1,
+        3,
+        1,
+    );
+    try std.testing.expect(has_newer);
+    try std.testing.expectEqual(@as(usize, 1), forward_page.items.len);
+    try std.testing.expectEqual(@as(u64, 1), forward_page.items[0].seq);
+
+    var tail_page: std.ArrayList(block.Block) = .empty;
+    const has_older = try store.loadTailPageInto(
+        arena_state.allocator(),
+        &tail_page,
+        1,
+        0,
+        3,
+        1,
+    );
+    try std.testing.expect(has_older);
+    try std.testing.expectEqual(@as(usize, 1), tail_page.items.len);
+    try std.testing.expectEqual(@as(u64, 6), tail_page.items[0].seq);
 }
 
 test "context load skips durable rows superseded by nested compactions" {
@@ -1358,6 +1557,20 @@ test "child session metadata is durable and grouped beneath its root" {
     try std.testing.expectEqual(@as(usize, 2), listed.len);
     try std.testing.expectEqual(@as(u64, 10), listed[0].id);
     try std.testing.expectEqual(@as(u64, 20), listed[1].id);
+
+    const one = try store.getSessionListing(20);
+    defer one.deinit(gpa);
+    try std.testing.expectEqual(@as(?u64, 10), one.parent_sid);
+    try std.testing.expectEqualStrings("inspect storage", one.title);
+
+    const tree = try store.listSessionTree(10);
+    defer {
+        for (tree) |row| row.deinit(gpa);
+        gpa.free(tree);
+    }
+    try std.testing.expectEqual(@as(usize, 2), tree.len);
+    try std.testing.expectEqual(@as(u64, 10), tree[0].id);
+    try std.testing.expectEqual(@as(u64, 20), tree[1].id);
 
     try store.setSessionStatus(20, "running");
     try store.recoverInterruptedSessions();

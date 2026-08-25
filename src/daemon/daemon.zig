@@ -23,7 +23,8 @@
 //!     mutation of these fields is rejected with err{busy} while a turn
 //!     runs, which is what makes the snapshot sound.
 //!   - Fields a RUNNING turn may touch, each with its own discipline:
-//!       cancel, approval_mode_live, context_used   atomics
+//!       cancel, approval_mode_live, context_used,
+//!       phase, phase_started_at_ms                 atomics
 //!       gate                                       internally synchronized
 //!       steer_queue                                under steer_mutex
 //!       prune_frontier                             turn-thread exclusive
@@ -121,6 +122,8 @@ const Client = struct {
     /// Receives refreshed session-list snapshots without subscribing to every
     /// session's block stream (M4 multiplexer/background activity contract).
     watches_sessions: bool = false,
+    /// Additive catalog events are opt-in for protocol-v1 compatibility.
+    watches_session_deltas: bool = false,
 
     fn subscribed(self: *const Client, sid: u64) bool {
         for (self.subs.items) |s| {
@@ -134,6 +137,10 @@ const Client = struct {
 /// disconnected and replays durable blocks on reconnect instead of growing
 /// daemon memory without bound.
 const max_client_outbox_bytes: usize = 2 * proto.max_line_bytes;
+/// Replay is bounded by bytes as well as rows. One exceptional record may
+/// exceed this budget (up to the protocol line limit), but the page then ends
+/// immediately so a few large pastes cannot overflow a healthy client outbox.
+const max_replay_page_bytes: usize = 16 * 1024 * 1024;
 /// A persisted user/steer block has more JSON envelope than its input
 /// command. Keep a fixed wrapper margin so every accepted input is guaranteed
 /// to remain replayable under the same protocol record limit.
@@ -179,6 +186,13 @@ const Session = struct {
     state: proto.SessionState = .idle,
     turn_thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = .init(false),
+    /// Turn-thread phase is atomically published for dispatcher-side
+    /// cancellation diagnostics. Cancellation request bookkeeping itself is
+    /// dispatcher-owned.
+    phase: std.atomic.Value(u8) = .init(@intFromEnum(proto.TurnPhase.idle)),
+    phase_started_at_ms: std.atomic.Value(i64) = .init(0),
+    cancel_requested_at_ms: i64 = 0,
+    cancel_requests: u32 = 0,
     /// Approval mode: set at creation (headless "auto" vs interactive),
     /// switchable per session via /permissions (session_set_approvals).
     approval_mode: approval.Mode = .default,
@@ -741,6 +755,10 @@ pub const Daemon = struct {
                 }
                 self.clearPendingApproval(session);
                 session.cancel.store(false, .release);
+                session.cancel_requested_at_ms = 0;
+                session.cancel_requests = 0;
+                session.phase_started_at_ms.store(nowMs(self.io), .release);
+                session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
                 session.state = if (td.err_text != null) .err else .idle;
                 self.store.setSessionStatus(td.sid, @tagName(session.state)) catch {};
                 // Meta BEFORE status: clients treat idle/err as end-of-turn
@@ -865,16 +883,17 @@ pub const Daemon = struct {
                 try self.store.createSession(sid, nowMs(self.io), sc.cwd, sc.model, sc.effort);
                 self.sessions.putAssumeCapacityNoClobber(sid, session);
                 self.sendTo(client, .{ .session_created = .{ .sid = sid } });
-                self.broadcastSessionList();
+                self.broadcastSessionUpsert(sid);
             },
             .session_list => |sl| try self.sendSessionList(client, sl.include_archived),
-            .session_watch => {
+            .session_watch => |sw| {
                 client.watches_sessions = true;
+                client.watches_session_deltas = sw.incremental;
                 try self.sendSessionList(client, false);
                 self.sendPendingApprovals(client);
             },
             .session_kill => |sk| {
-                self.cancelSessionTree(sk.sid);
+                _ = self.cancelSessionTree(sk.sid);
                 self.requestSessionTreeEviction(sk.sid);
                 self.sendTo(client, .{ .ok = .{} });
             },
@@ -894,7 +913,7 @@ pub const Daemon = struct {
                 self.markLoadedSessionTreeArchived(sa.sid, sa.archived);
                 if (sa.archived) self.requestSessionTreeEviction(sa.sid);
                 self.sendTo(client, .{ .ok = .{} });
-                self.broadcastSessionList();
+                self.broadcastSessionTree(sa.sid, sa.archived);
             },
             .session_set_model => |sm| {
                 const session = (try self.getOrLoadSession(sm.sid)) orelse {
@@ -912,7 +931,7 @@ pub const Daemon = struct {
                 self.gpa.free(session.model);
                 session.model = new_model;
                 self.sendTo(client, .{ .ok = .{} });
-                self.broadcastSessionList();
+                self.broadcastSessionUpsert(sm.sid);
             },
             .session_set_effort => |se| {
                 const session = (try self.getOrLoadSession(se.sid)) orelse {
@@ -927,7 +946,7 @@ pub const Daemon = struct {
                 try self.store.setSessionEffort(se.sid, se.effort);
                 session.effort = se.effort;
                 self.sendTo(client, .{ .ok = .{} });
-                self.broadcastSessionList();
+                self.broadcastSessionUpsert(se.sid);
             },
             .session_set_sandbox => |ss| {
                 const session = (try self.getOrLoadSession(ss.sid)) orelse {
@@ -948,7 +967,7 @@ pub const Daemon = struct {
                 }
                 session.sandbox_enabled = ss.enabled;
                 self.sendTo(client, .{ .ok = .{} });
-                self.broadcastSessionList();
+                self.broadcastSessionUpsert(ss.sid);
             },
             .session_set_approvals => |sa| {
                 const session = (try self.getOrLoadSession(sa.sid)) orelse {
@@ -991,7 +1010,7 @@ pub const Daemon = struct {
                 }
                 session.network_filtering_enabled = sn.enabled;
                 self.sendTo(client, .{ .ok = .{} });
-                self.broadcastSessionList();
+                self.broadcastSessionUpsert(sn.sid);
             },
             .blob_get => |bg| {
                 const bytes = self.store.getBlob(bg.hash) catch |err| {
@@ -1005,42 +1024,113 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .blob_result = .{ .hash = bg.hash, .bytes = bytes } });
             },
             .sub => |s| {
-                if (!client.subscribed(s.sid)) try client.subs.append(self.gpa, s.sid);
-                // Replay either a bounded newest window or from_seq onward.
+                if (s.tail_limit > 0 and s.replay_limit > 0) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "bad_replay",
+                        .msg = "tail_limit and replay_limit are mutually exclusive",
+                    } });
+                    return;
+                }
+                const bounded_forward = s.from_seq > 0 and s.replay_limit > 0;
+                var caught_up = true;
+                // Replay either a bounded newest/older window, a bounded
+                // forward page, or the compatibility from_seq range.
                 if (s.from_seq > 0 or s.tail_limit > 0) {
                     var replay_arena_state = std.heap.ArenaAllocator.init(self.gpa);
                     defer replay_arena_state.deinit();
                     var replay: std.ArrayList(block.Block) = .empty;
-                    if (s.tail_limit > 0)
-                        if (s.before_seq > 0)
-                            try self.store.loadTailBeforeInto(
-                                replay_arena_state.allocator(),
-                                &replay,
-                                s.sid,
-                                s.before_seq,
-                                @min(s.tail_limit, 512),
-                            )
-                        else
-                            try self.store.loadTailInto(
-                                replay_arena_state.allocator(),
-                                &replay,
-                                s.sid,
-                                @min(s.tail_limit, 512),
-                            )
-                    else
+                    var send_start: usize = 0;
+                    var send_count: usize = 0;
+                    var page_has_older = false;
+                    if (s.tail_limit > 0) {
+                        page_has_older = try self.store.loadTailPageInto(
+                            replay_arena_state.allocator(),
+                            &replay,
+                            s.sid,
+                            s.before_seq,
+                            @min(s.tail_limit, 512),
+                            max_replay_page_bytes,
+                        );
+                    } else if (bounded_forward) {
+                        const page_limit = @min(s.replay_limit, 512);
+                        const has_more = try self.store.loadForwardPageInto(
+                            replay_arena_state.allocator(),
+                            &replay,
+                            s.sid,
+                            s.from_seq,
+                            page_limit,
+                            max_replay_page_bytes,
+                        );
+                        send_count = replay.items.len;
+                        caught_up = !has_more;
+                    } else {
                         try self.store.loadBlocksInto(replay_arena_state.allocator(), &replay, s.sid, s.from_seq, 1_000_000);
-                    for (replay.items) |replayed| {
+                    }
+                    if (s.tail_limit > 0) {
+                        // Keep a newest suffix when the row window exceeds
+                        // the byte budget; backwards pagination can fetch the
+                        // omitted prefix later without losing the live edge.
+                        var selected_bytes: usize = 0;
+                        send_start = replay.items.len;
+                        while (send_start > 0) {
+                            const candidate = replay.items[send_start - 1];
+                            const line = try proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = s.sid, .b = candidate } });
+                            defer self.gpa.free(line);
+                            if (send_count > 0 and line.len > max_replay_page_bytes -| selected_bytes) break;
+                            selected_bytes +|= line.len;
+                            send_start -= 1;
+                            send_count += 1;
+                        }
+                    } else if (bounded_forward) {
+                        var selected_bytes: usize = 0;
+                        var byte_count: usize = 0;
+                        while (byte_count < send_count) : (byte_count += 1) {
+                            const candidate = replay.items[byte_count];
+                            const line = try proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = s.sid, .b = candidate } });
+                            defer self.gpa.free(line);
+                            if (byte_count > 0 and line.len > max_replay_page_bytes -| selected_bytes) {
+                                send_count = byte_count;
+                                caught_up = false;
+                                break;
+                            }
+                            selected_bytes +|= line.len;
+                        }
+                    } else {
+                        // Compatibility clients have no paging marker, so
+                        // truncating here would silently create a transcript
+                        // gap. Current clients use bounded forward replay.
+                        send_count = replay.items.len;
+                    }
+                    const sent = replay.items[send_start .. send_start + send_count];
+                    for (sent) |replayed| {
                         self.sendTo(client, .{ .blk = .{ .sid = s.sid, .b = replayed } });
                     }
-                    if (s.tail_limit > 0 or s.replay_done) {
+                    if (s.tail_limit > 0 or s.replay_done or bounded_forward) {
                         self.sendTo(client, .{ .replay_done = .{
                             .sid = s.sid,
-                            .oldest_seq = if (replay.items.len > 0) replay.items[0].seq else 0,
-                            .newest_seq = if (replay.items.len > 0) replay.items[replay.items.len - 1].seq else 0,
-                            .has_older = s.tail_limit > 0 and replay.items.len > 0 and replay.items[0].seq > 1,
+                            .oldest_seq = if (send_count > 0) sent[0].seq else 0,
+                            .newest_seq = if (send_count > 0) sent[send_count - 1].seq else 0,
+                            .has_older = s.tail_limit > 0 and
+                                (page_has_older or (send_count > 0 and sent[0].seq > 1)),
+                            .has_newer = bounded_forward and !caught_up,
+                            .forward = bounded_forward,
                         } });
                     }
                 }
+                if (bounded_forward and !caught_up) {
+                    // Do not fan live blocks into a partially replayed client:
+                    // a later seq would advance its de-dup cursor past the
+                    // next durable page. The final page atomically transitions
+                    // to live because this dispatcher serializes both paths.
+                    for (client.subs.items, 0..) |sid, i| {
+                        if (sid == s.sid) {
+                            _ = client.subs.swapRemove(i);
+                            break;
+                        }
+                    }
+                    return;
+                }
+                if (!client.subscribed(s.sid)) try client.subs.append(self.gpa, s.sid);
                 const state: proto.SessionState = if (self.sessions.get(s.sid)) |ses| blk: {
                     if (ses.pending_approval_line) |line| self.sendLine(client, line);
                     break :blk ses.state;
@@ -1181,8 +1271,11 @@ pub const Daemon = struct {
                 };
             },
             .interrupt => |i| {
-                self.cancelSessionTree(i.sid);
-                self.sendTo(client, .{ .ok = .{} });
+                const result = self.cancelSessionTree(i.sid);
+                if (i.report)
+                    self.sendTo(client, .{ .interrupt_result = result })
+                else
+                    self.sendTo(client, .{ .ok = .{} });
             },
             .shutdown => {
                 self.sendTo(client, .{ .ok = .{} });
@@ -1285,16 +1378,52 @@ pub const Daemon = struct {
         } });
     }
 
-    fn cancelSessionTree(self: *Daemon, sid: u64) void {
-        if (self.sessions.get(sid)) |session| cancelActiveSession(self, session);
+    fn requestUserCancel(self: *Daemon, session: *Session, now: i64) ?proto.InterruptResult {
+        if (session.state != .running and session.state != .awaiting_approval) return null;
+        const already_requested = session.cancel.load(.acquire);
+        if (session.cancel_requested_at_ms == 0) session.cancel_requested_at_ms = now;
+        session.cancel_requests +|= 1;
+        cancelActiveSession(self, session);
+        const started = session.cancel_requested_at_ms;
+        const pending_ms: u64 = if (now > started) @intCast(now - started) else 0;
+        const phase: proto.TurnPhase = @enumFromInt(session.phase.load(.acquire));
+        const phase_started = session.phase_started_at_ms.load(.acquire);
+        const phase_ms: u64 = if (now > phase_started) @intCast(now - phase_started) else 0;
+        return .{
+            .sid = session.id,
+            .active = true,
+            .already_requested = already_requested,
+            .request_count = session.cancel_requests,
+            .pending_ms = pending_ms,
+            .phase_ms = phase_ms,
+            .phase = phase,
+        };
+    }
+
+    fn cancelSessionTree(self: *Daemon, sid: u64) proto.InterruptResult {
+        const now = nowMs(self.io);
+        var result = proto.InterruptResult{
+            .sid = sid,
+            .active = false,
+        };
+        if (self.sessions.get(sid)) |session| {
+            if (self.requestUserCancel(session, now)) |requested| result = requested;
+        }
         // Nesting is deliberately limited to one level in this M6 slice.
         // Keeping the relation scan here makes the cascade explicit and easy
         // to generalize when deeper task trees become a product decision.
         var it = self.sessions.valueIterator();
         while (it.next()) |sp| {
             const child = sp.*;
-            if (child.parent_sid == sid) cancelActiveSession(self, child);
+            if (child.parent_sid != sid) continue;
+            if (self.requestUserCancel(child, now)) |requested| {
+                if (!result.active) result = requested;
+            }
         }
+        // The reply identifies the session the user addressed even when the
+        // active cancellation checkpoint lives in a task child.
+        result.sid = sid;
+        return result;
     }
 
     fn loadedSessionBelongsToTree(self: *Daemon, session: *const Session, root_sid: u64) bool {
@@ -1434,12 +1563,12 @@ pub const Daemon = struct {
         session_transferred = true;
         // Structural catalog change: publish the new child once. Subsequent
         // state changes use the compact status watcher path.
-        self.broadcastSessionList();
+        self.broadcastSessionUpsert(sid);
         self.startTurn(session, cs.prompt) catch |e| {
             session.task_waiter = null;
             session.state = .err;
             self.store.setSessionStatus(sid, "err") catch {};
-            self.broadcastSessionList();
+            self.broadcastStatus(sid, .err);
             return e;
         };
     }
@@ -1478,6 +1607,12 @@ pub const Daemon = struct {
             .cancel = &session.cancel,
             .session = session,
         };
+        session.phase_started_at_ms.store(nowMs(self.io), .release);
+        session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
+        errdefer {
+            session.phase_started_at_ms.store(nowMs(self.io), .release);
+            session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+        }
         const thread = try std.Thread.spawn(.{}, turnMain, .{job});
         session.turn_thread = thread;
         session.state = .running;
@@ -1604,6 +1739,7 @@ pub const Daemon = struct {
             .on_delta = TurnHooks.onDelta,
             .on_reasoning_delta = TurnHooks.onReasoningDelta,
             .on_stream_status = TurnHooks.onStreamStatus,
+            .on_phase = TurnHooks.onPhase,
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
             .on_task = if (job.session.kind == .root) TurnHooks.onTask else null,
@@ -1643,6 +1779,7 @@ pub const Daemon = struct {
     /// meta broadcast) so clients see a coherent lifecycle.
     fn compactMain(job: *TurnJob) void {
         const self = job.daemon;
+        TurnHooks.onPhase(job, .compaction);
         defer {
             self.gpa.free(job.cwd);
             self.gpa.free(job.model);
@@ -1673,6 +1810,7 @@ pub const Daemon = struct {
             .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .dialect = c.dialect } else null,
             .approval_mode = .auto, // compaction runs no tools
             .on_block = TurnHooks.onBlock,
+            .on_phase = TurnHooks.onPhase,
             .on_delta_ctx = job,
             .cancel = job.cancel,
         }) catch |e| {
@@ -1681,6 +1819,7 @@ pub const Daemon = struct {
             return;
         };
         _ = did; // "nothing to compact" already logged as a system_note
+        TurnHooks.onPhase(job, .finishing);
         self.finishTurn(job.sid, false, null, null, 0, 0);
     }
 
@@ -1730,9 +1869,17 @@ pub const Daemon = struct {
             self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
         }
 
+        fn onPhase(ctx: ?*anyopaque, phase: proto.TurnPhase) void {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            job.session.phase_started_at_ms.store(nowMs(job.daemon.io), .release);
+            job.session.phase.store(@intFromEnum(phase), .release);
+        }
+
         fn onTask(ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
+            onPhase(ctx, .child);
+            defer onPhase(ctx, .tool);
             if (job.session.kind != .root) return taskError(self.gpa, "nested task calls are disabled");
 
             const parsed = std.json.parseFromSlice(task_tool.Args, self.gpa, args_json, .{
@@ -1950,10 +2097,22 @@ pub const Daemon = struct {
         return infos;
     }
 
-    fn broadcastSessionList(self: *Daemon) void {
-        // Build one authoritative snapshot, then fan the encoded line out
-        // while holding the registry lock. The accept thread mutates clients,
-        // so an unlocked valueIterator is a real map data race.
+    fn hasLegacySessionWatcher(self: *Daemon) bool {
+        clients_mutex.lockUncancelable(self.io);
+        defer clients_mutex.unlock(self.io);
+        var it = self.clients.valueIterator();
+        while (it.next()) |client| {
+            if (client.*.said_hello and client.*.watches_sessions and
+                !client.*.watches_session_deltas) return true;
+        }
+        return false;
+    }
+
+    /// Compatibility path for already-running protocol-v1 clients. Current
+    /// clients opt into catalog deltas, so ordinary mutations never scan or
+    /// encode the complete durable session table.
+    fn broadcastLegacySessionList(self: *Daemon) void {
+        if (!self.hasLegacySessionWatcher()) return;
         const rows = self.store.listSessions(false) catch return;
         defer {
             for (rows) |row| row.deinit(self.gpa);
@@ -1966,10 +2125,67 @@ pub const Daemon = struct {
         const ctx = struct { daemon: *Daemon, encoded: []const u8 }{ .daemon = self, .encoded = line };
         self.forEachClient(ctx, struct {
             fn send(value: @TypeOf(ctx), client: *Client) void {
-                if (!client.said_hello or !client.watches_sessions) return;
+                if (!client.said_hello or !client.watches_sessions or client.watches_session_deltas) return;
                 value.daemon.sendLine(client, value.encoded);
             }
         }.send);
+    }
+
+    fn fanOutSessionDelta(self: *Daemon, line: []const u8) void {
+        const ctx = struct { daemon: *Daemon, encoded: []const u8 }{ .daemon = self, .encoded = line };
+        self.forEachClient(ctx, struct {
+            fn send(value: @TypeOf(ctx), client: *Client) void {
+                if (!client.said_hello or !client.watches_sessions or !client.watches_session_deltas) return;
+                value.daemon.sendLine(client, value.encoded);
+            }
+        }.send);
+    }
+
+    fn fanOutSessionUpsertRow(self: *Daemon, row: store_mod.Store.SessionListing) void {
+        const infos = self.sessionInfos(&.{row}) catch return;
+        defer self.gpa.free(infos);
+        const line = proto.encode(self.gpa, proto.DaemonMsg{
+            .session_upsert = .{ .session = infos[0] },
+        }) catch return;
+        defer self.gpa.free(line);
+        self.fanOutSessionDelta(line);
+    }
+
+    fn fanOutSessionRemove(self: *Daemon, sid: u64) void {
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .session_remove = .{ .sid = sid } }) catch return;
+        defer self.gpa.free(line);
+        self.fanOutSessionDelta(line);
+    }
+
+    fn broadcastSessionUpsert(self: *Daemon, sid: u64) void {
+        const row = self.store.getSessionListing(sid) catch {
+            self.broadcastLegacySessionList();
+            return;
+        };
+        defer row.deinit(self.gpa);
+        if (row.archived)
+            self.fanOutSessionRemove(sid)
+        else
+            self.fanOutSessionUpsertRow(row);
+        self.broadcastLegacySessionList();
+    }
+
+    fn broadcastSessionTree(self: *Daemon, sid: u64, archived: bool) void {
+        const rows = self.store.listSessionTree(sid) catch {
+            self.broadcastLegacySessionList();
+            return;
+        };
+        defer {
+            for (rows) |row| row.deinit(self.gpa);
+            self.gpa.free(rows);
+        }
+        for (rows) |row| {
+            if (archived or row.archived)
+                self.fanOutSessionRemove(row.id)
+            else
+                self.fanOutSessionUpsertRow(row);
+        }
+        self.broadcastLegacySessionList();
     }
 
     /// Send the current catalog (possibly empty → client falls back to

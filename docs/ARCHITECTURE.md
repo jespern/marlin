@@ -171,17 +171,18 @@ header, which is where it must be kept current:
   idle session is unloaded after its last subscriber leaves; running sessions
   unload after completion, and completed task children always unload. Opening
   or continuing one rehydrates its small live state lazily.
-- **Catalog snapshots are structural.** Create/archive/model/config changes
-  rebuild the session list. Running/approval/idle transitions fan out one
-  compact `status{sid,state}` to subscribers and session watchers, so turn
-  latency does not grow with the durable session count.
+- **Catalog snapshots establish authority; mutations are incremental.** A
+  session watcher receives one initial list. Current clients then consume
+  `session_upsert`/`session_remove`, so create/archive/model/config changes do
+  not rescan the durable catalog; legacy watchers retain refreshed snapshots.
+  Running/approval/idle transitions fan out compact `status{sid,state}` events.
 - **Session identity/config is dispatcher-owned.** Turn threads snapshot
   those fields inside `startTurn` (still on the dispatcher thread); protocol
   mutations of them are rejected with `err{busy}` while a turn runs, which
   is what makes the snapshot sound.
 - **A running turn may touch exactly the listed shared fields**, each with a
-  stated discipline: atomics (`cancel`, `approval_mode_live`,
-  `context_used`), the internally-synchronized approval `gate`, the
+  stated discipline: atomics (`cancel`, `approval_mode_live`, `context_used`,
+  `phase`, `phase_started_at_ms`), the internally-synchronized approval `gate`, the
   `steer_queue` under `steer_mutex`, and `prune_frontier` (turn-thread
   exclusive while running). `TurnJob.session` is a live pointer, not a copy;
   a new turn-visible field must be added to that list with its discipline.
@@ -353,13 +354,15 @@ Two stream disciplines worth locking in now:
   liveness, then replace the streaming region with the finalized block. A
   client that attaches mid-turn gets replayed blocks + current partial delta
   buffer. This makes reconnect/multi-client trivial.
-- **Bounded attach + `from_seq` resume.** Clients remember the last block seq
+- **Bounded attach + paged `from_seq` resume.** Clients remember the last block seq
   they've seen per session and replay only the gap when revisiting a cached
   view. A cold TUI attach asks for the newest 256 blocks; `replay_done`
   advertises whether more durable history exists. Reaching the loaded top asks
   for another 256 blocks with `before_seq=oldest_seq`, buffers them off-screen,
   then prepends the page atomically. Attach and scrollback work are therefore
-  bounded without weakening the block log as source of truth.
+  bounded without weakening the block log as source of truth. Revisiting a
+  cached view pages forward in 256-block windows and becomes live only at the
+  durable frontier, so live fan-out cannot leapfrog an older page.
 
 ## 4. Agent loop
 
@@ -396,6 +399,11 @@ loop:
   (the log stays consistent). Forced kills first snapshot live descendants
   via `ps`, so processes that left the group via setpgid (`timeout(1)` is
   the canonical case) are terminated individually instead of orphaning.
+  The turn thread also publishes a coarse atomic phase. Current clients opt
+  into `interrupt_result`, so the first interrupt confirms what is being
+  cancelled and repeated interrupts report the same phase plus elapsed time;
+  legacy clients retain the plain `ok` reply. Arbitrary native turn threads
+  are never killed unsafely—true hard isolation would require subprocess turns.
 - **bash wall-clock limit**: commands are killed after `timeout_seconds`
   (default 600, max 3600 — the model raises it for long builds). Timeout is
   a Result, not an error: everything captured before the deadline reaches

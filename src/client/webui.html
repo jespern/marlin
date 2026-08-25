@@ -35,6 +35,8 @@
   .sess.child .t::before { content: "↳ "; color: var(--dim); }
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #transcript { flex: 1; overflow-y: auto; padding: 18px 22px; }
+  #history-more { display: none; margin: 0 auto 14px; }
+  #history-more.show { display: block; }
   .block { margin: 0 0 10px; max-width: 100ch; }
   .user {
     background: var(--panel2); border-left: 3px solid var(--accent);
@@ -110,7 +112,7 @@
   <div id="sessions"></div>
 </div>
 <div id="main">
-  <div id="transcript"></div>
+  <div id="transcript"><button id="history-more" class="act">load older</button></div>
   <div id="approval">
     <span class="q"></span>
     <button class="act yes">approve</button>
@@ -135,7 +137,9 @@
 // raw JSON before parsing and send them back unquoted via raw templates.
 const bigints = raw => raw.replace(/"(sid|parent_sid|session_id)":(\d{12,})/g, '"$1":"$2"');
 const $ = s => document.querySelector(s);
-let sid = null, cur = null, es = null, lastSeq = 0, deltaEl = null, deltaText = '', reasoningEl = null, reasoningText = '', approvalId = null, sessionsCache = [];
+let sid = null, cur = null, es = null, lastSeq = 0, oldestSeq = 0, historyHasOlder = false,
+  historyLoading = false, historyBlocks = [], deltaEl = null, deltaText = '', reasoningEl = null,
+  reasoningText = '', approvalId = null, sessionsCache = [];
 // Set on each session open; replayed history stays collapsed while blocks
 // stamped after this moment count as live (block ts is ms epoch).
 let openedAt = 0;
@@ -280,8 +284,8 @@ function clippedNote(text) {
   return text.length <= 480 ? text : text.slice(0, 480) + ' …';
 }
 
-function addBlock(b) {
-  const t = $('#transcript');
+function addBlock(b, target = $('#transcript'), live = true) {
+  const t = target;
   const kind = Object.keys(b.body)[0];
   const v = b.body[kind];
   let node = null;
@@ -292,13 +296,12 @@ function addBlock(b) {
       node = el('div', 'block user', v.text);
   }
   else if (kind === 'assistant_msg') {
-    clearDelta();
-    clearReasoning();
+    if (live) { clearDelta(); clearReasoning(); }
     node = el('div', 'block md');
     node.innerHTML = renderMd(v.text);
   } else if (kind === 'reasoning') {
-    if (reasoningText === v.text) clearReasoning();
-    else if (deltaText === v.text) clearDelta();
+    if (live && reasoningText === v.text) clearReasoning();
+    else if (live && deltaText === v.text) clearDelta();
     node = el('div', 'block reasoning md');
     node.innerHTML = renderMd(v.text);
   } else if (kind === 'tool_call') {
@@ -319,7 +322,7 @@ function addBlock(b) {
         call.classList.add('err');
         // Auto-expand only LIVE failures; a replayed transcript full of
         // historical errors must not arrive as a wall of open sections.
-        if (typeof b.ts === 'number' && b.ts >= openedAt) call.open = true;
+        if (live && typeof b.ts === 'number' && b.ts >= openedAt) call.open = true;
       }
       call.appendChild(pre);
       return;
@@ -334,7 +337,17 @@ function addBlock(b) {
   else if (kind === 'compaction') node = el('div', 'block note', '≋ context compacted');
   else if (kind === 'approval') node = el('div', 'block note', 'approval: ' + (v.decision || 'pending'));
   else if (kind === 'steer') node = el('div', 'block user', '↪ ' + v.text);
-  if (node) { t.appendChild(node); scrollBottom(); }
+  if (node) {
+    t.appendChild(node);
+    if (live) scrollBottom();
+  }
+}
+
+function updateHistoryButton() {
+  const button = $('#history-more');
+  button.classList.toggle('show', historyHasOlder && oldestSeq > 1);
+  button.disabled = historyLoading;
+  button.textContent = historyLoading ? 'loading…' : 'load older';
 }
 
 function setState(state) {
@@ -349,9 +362,33 @@ function handle(m) {
   if (m.blk) {
     if (m.blk.sid !== sid) return;
     const b = m.blk.b;
+    if (historyLoading && b.seq < oldestSeq) {
+      historyBlocks.push(b);
+      return;
+    }
     if (b.seq <= lastSeq) return;
     lastSeq = b.seq;
+    if (!oldestSeq || b.seq < oldestSeq) oldestSeq = b.seq;
     addBlock(b);
+  } else if (m.replay_done) {
+    if (m.replay_done.sid !== sid) return;
+    if (historyLoading) {
+      const t = $('#transcript');
+      const oldHeight = t.scrollHeight;
+      const fragment = document.createDocumentFragment();
+      for (const b of historyBlocks) addBlock(b, fragment, false);
+      t.insertBefore(fragment, $('#history-more').nextSibling);
+      if (m.replay_done.oldest_seq) oldestSeq = m.replay_done.oldest_seq;
+      historyHasOlder = !!m.replay_done.has_older;
+      historyBlocks = [];
+      historyLoading = false;
+      updateHistoryButton();
+      t.scrollTop += t.scrollHeight - oldHeight;
+    } else {
+      if (m.replay_done.oldest_seq) oldestSeq = m.replay_done.oldest_seq;
+      historyHasOlder = !!m.replay_done.has_older;
+      updateHistoryButton();
+    }
   } else if (m.delta) {
     if (m.delta.sid !== sid) return;
     if (!deltaEl) { deltaEl = el('div', 'block md'); $('#transcript').appendChild(deltaEl); }
@@ -376,6 +413,42 @@ function handle(m) {
     $('#approval').classList.add('show');
   } else if (m.session_list_result) {
     renderSessions(m.session_list_result.sessions);
+  } else if (m.session_upsert) {
+    const next = sessionsCache.slice();
+    const changed = m.session_upsert.session;
+    const i = next.findIndex(s => s.sid === changed.sid);
+    if (i >= 0) next[i] = changed;
+    else if (changed.parent_sid) {
+      const parent = next.findIndex(s => s.sid === changed.parent_sid);
+      let at = parent >= 0 ? parent + 1 : next.length;
+      while (at < next.length && next[at].parent_sid) {
+        const sibling = next[at];
+        if (changed.created_at < sibling.created_at ||
+            (changed.created_at === sibling.created_at && BigInt(changed.sid) < BigInt(sibling.sid))) break;
+        at++;
+      }
+      next.splice(at, 0, changed);
+    } else {
+      let at = next.length;
+      for (let j = 0; j < next.length; j++) {
+        if (next[j].parent_sid) continue;
+        if (changed.created_at > next[j].created_at ||
+            (changed.created_at === next[j].created_at && BigInt(changed.sid) > BigInt(next[j].sid))) {
+          at = j; break;
+        }
+      }
+      next.splice(at, 0, changed);
+    }
+    renderSessions(next);
+  } else if (m.session_remove) {
+    renderSessions(sessionsCache.filter(s => s.sid !== m.session_remove.sid));
+  } else if (m.interrupt_result) {
+    const r = m.interrupt_result;
+    notice(r.active
+      ? (r.already_requested ? 'still cancelling ' : 'cancelling ') + r.phase +
+        (r.already_requested ? ' · ' + Math.floor(r.pending_ms / 1000) + 's' :
+          ' · phase ' + Math.floor(r.phase_ms / 1000) + 's')
+      : 'nothing to interrupt');
   } else if (m.err) {
     notice(m.err.code + ': ' + m.err.msg);
   }
@@ -403,11 +476,16 @@ function open(s) {
   sid = s.sid;
   cur = s;
   lastSeq = 0;
+  oldestSeq = 0;
+  historyHasOlder = false;
+  historyLoading = false;
+  historyBlocks = [];
   openedAt = Date.now();
   approvalId = null;
   clearDelta();
   clearReasoning();
-  $('#transcript').innerHTML = '';
+  $('#transcript').replaceChildren($('#history-more'));
+  updateHistoryButton();
   $('#approval').classList.remove('show');
   $('#status .model').textContent = s.model || '';
   setState(s.state);
@@ -438,7 +516,30 @@ $('#approval .yes').onclick = () =>
   send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"granted"}}');
 $('#approval .no').onclick = () =>
   send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"denied"}}');
-$('#interrupt').onclick = () => { if (sid) send('{"interrupt":{"sid":' + sid + '}}'); };
+$('#interrupt').onclick = async () => {
+  if (!sid) return;
+  const r = await send('{"interrupt":{"sid":' + sid + ',"report":true}}');
+  handle(r);
+};
+$('#history-more').onclick = () => {
+  if (!sid || !historyHasOlder || historyLoading || oldestSeq <= 1) return;
+  historyLoading = true;
+  historyBlocks = [];
+  updateHistoryButton();
+  const history = new EventSource('/history?sid=' + sid + '&before=' + oldestSeq);
+  history.onmessage = e => {
+    const message = JSON.parse(bigints(e.data));
+    handle(message);
+    if (message.replay_done) history.close();
+  };
+  history.onerror = () => {
+    history.close();
+    historyLoading = false;
+    historyBlocks = [];
+    updateHistoryButton();
+    notice('could not load older history');
+  };
+};
 $('#sandbox-btn').onclick = async () => {
   if (!sid || !cur) return;
   const r = await send('{"session_set_sandbox":{"sid":' + sid + ',"enabled":' + (!cur.sandboxed) + '}}');
@@ -452,7 +553,6 @@ $('#new-btn').onclick = async () => {
 };
 
 loadSessions();
-setInterval(loadSessions, 15000);
 </script>
 </body>
 </html>

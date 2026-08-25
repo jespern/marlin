@@ -807,6 +807,11 @@ fn checkApprovalReconnectFlow(
         if (std.mem.eql(u8, state, "idle")) break;
     }
 
+    try conn.send(.{ .interrupt = .{ .sid = sid, .report = true } });
+    const idle_interrupt = try recvTagBounded(conn, arena, "interrupt_result");
+    const active = idle_interrupt.get("active") orelse return error.InterruptResultMissing;
+    if (active != .bool or active.bool) return error.InterruptResultMismatch;
+
     // A bounded attach emits exactly its newest window followed by an
     // explicit marker. This is the TUI cold-attach contract and must stay
     // distinct from legacy from_seq replays, whose clients know no marker.
@@ -845,6 +850,73 @@ fn checkApprovalReconnectFlow(
         if (uintField(older_marker, "oldest_seq") != older_seq or
             uintField(older_marker, "newest_seq") != older_seq)
             return error.TailReplayMarkerMismatch;
+    }
+
+    // Forward catch-up is page-bounded too. A partial page must not become a
+    // live subscription (no status yet); the final page transitions to live
+    // and emits status only after the durable frontier marker.
+    {
+        const forward_conn = try connectProtocol(gpa, io, env);
+        defer forward_conn.deinit();
+        var forward_arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer forward_arena_state.deinit();
+        const forward_arena = forward_arena_state.allocator();
+        try forward_conn.send(.{ .sub = .{
+            .sid = sid,
+            .from_seq = 1,
+            .replay_limit = 1,
+        } });
+        const first = try recvTagBounded(forward_conn, forward_arena, "blk");
+        const first_block = objectField(first, "b") orelse return error.ForwardReplayMarkerMissing;
+        const first_seq = uintField(first_block, "seq") orelse return error.ForwardReplayMarkerMissing;
+        const first_marker = try recvTagBounded(forward_conn, forward_arena, "replay_done");
+        const forward = first_marker.get("forward") orelse return error.ForwardReplayMarkerMissing;
+        if (forward != .bool or !forward.bool) return error.ForwardReplayMarkerMismatch;
+        const has_newer = first_marker.get("has_newer") orelse return error.ForwardReplayMarkerMissing;
+        if (has_newer != .bool or !has_newer.bool) return error.ForwardReplayMarkerMismatch;
+        if (uintField(first_marker, "newest_seq") != first_seq)
+            return error.ForwardReplayMarkerMismatch;
+
+        try forward_conn.send(.{ .sub = .{
+            .sid = sid,
+            .from_seq = first_seq + 1,
+            .replay_limit = 512,
+        } });
+        const final_marker = try recvTagBounded(forward_conn, forward_arena, "replay_done");
+        const final_has_newer = final_marker.get("has_newer") orelse return error.ForwardReplayMarkerMissing;
+        if (final_has_newer != .bool or final_has_newer.bool) return error.ForwardReplayMarkerMismatch;
+        const live_status = try recvTagBounded(forward_conn, forward_arena, "status");
+        if (uintField(live_status, "sid") != sid) return error.ForwardReplaySessionMismatch;
+    }
+
+    // Opted-in catalog watchers receive one-row mutations rather than a
+    // complete session_list_result rebuild for every metadata change.
+    {
+        const watch_conn = try connectProtocol(gpa, io, env);
+        defer watch_conn.deinit();
+        var watch_arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer watch_arena_state.deinit();
+        const watch_arena = watch_arena_state.allocator();
+        try watch_conn.send(.{ .session_watch = .{ .incremental = true } });
+        _ = try recvTagBounded(watch_conn, watch_arena, "session_list_result");
+        try watch_conn.send(.{ .session_set_effort = .{ .sid = sid, .effort = "high" } });
+        _ = try recvTagBounded(watch_conn, watch_arena, "ok");
+        const upsert = try recvTagBounded(watch_conn, watch_arena, "session_upsert");
+        const changed = objectField(upsert, "session") orelse return error.SessionUpsertMissing;
+        if (uintField(changed, "sid") != sid) return error.SessionUpsertMismatch;
+        const effort = stringField(changed, "effort") orelse return error.SessionUpsertMismatch;
+        if (!std.mem.eql(u8, effort, "high")) return error.SessionUpsertMismatch;
+
+        try watch_conn.send(.{ .session_archive = .{ .sid = sid, .archived = true } });
+        _ = try recvTagBounded(watch_conn, watch_arena, "ok");
+        const removed = try recvTagBounded(watch_conn, watch_arena, "session_remove");
+        if (uintField(removed, "sid") != sid) return error.SessionRemoveMismatch;
+
+        try watch_conn.send(.{ .session_archive = .{ .sid = sid, .archived = false } });
+        _ = try recvTagBounded(watch_conn, watch_arena, "ok");
+        const restored = try recvTagBounded(watch_conn, watch_arena, "session_upsert");
+        const restored_session = objectField(restored, "session") orelse return error.SessionUpsertMissing;
+        if (uintField(restored_session, "sid") != sid) return error.SessionUpsertMismatch;
     }
 
     // Rejected input returns the same identity, so an optimistic client can

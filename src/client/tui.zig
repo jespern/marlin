@@ -1086,7 +1086,11 @@ const App = struct {
                 .tail_limit = initial_replay_blocks,
             } }) catch {};
         } else {
-            self.conn.send(.{ .sub = .{ .sid = sid, .from_seq = self.last_seq +| 1 } }) catch {};
+            self.conn.send(.{ .sub = .{
+                .sid = sid,
+                .from_seq = self.last_seq +| 1,
+                .replay_limit = initial_replay_blocks,
+            } }) catch {};
         }
         self.rememberSession(sid);
         var handle_buf: session_handle.Full = undefined;
@@ -1136,52 +1140,16 @@ const App = struct {
         self.session_labels.clearRetainingCapacity();
 
         for (incoming) |info| {
-            const title = self.gpa.dupe(u8, info.title) catch continue;
-            const cwd = self.gpa.dupe(u8, info.cwd) catch {
-                self.gpa.free(title);
+            var summary = self.allocSessionSummary(info) orelse continue;
+            self.sessions.append(self.gpa, summary) catch {
+                summary.deinit(self.gpa);
                 continue;
             };
-            const model = self.gpa.dupe(u8, info.model) catch {
-                self.gpa.free(title);
-                self.gpa.free(cwd);
+            self.session_labels.append(self.gpa, summary.label) catch {
+                var removed = self.sessions.pop().?;
+                removed.deinit(self.gpa);
                 continue;
             };
-            const identity = if (info.title.len > 0) info.title else info.model;
-            const hierarchy = if (info.parent_sid != null) @as([]const u8, "  ↳ ") else "";
-            var handle_buf: session_handle.Full = undefined;
-            const label = std.fmt.allocPrint(self.gpa, "{s}{s}  {s} · {s} · {s}", .{
-                hierarchy,
-                self.displaySessionHandle(&handle_buf, info.sid),
-                identity,
-                @tagName(info.state),
-                info.cwd,
-            }) catch {
-                self.gpa.free(title);
-                self.gpa.free(cwd);
-                self.gpa.free(model);
-                continue;
-            };
-            self.sessions.append(self.gpa, .{
-                .sid = info.sid,
-                .parent_sid = info.parent_sid,
-                .kind = info.kind,
-                .title = title,
-                .cwd = cwd,
-                .model = model,
-                .effort = info.effort,
-                .state = info.state,
-                .created_at = info.created_at,
-                .label = label,
-                .sandboxed = info.sandboxed,
-                .network_filtering = info.network_filtering,
-            }) catch {
-                self.gpa.free(title);
-                self.gpa.free(cwd);
-                self.gpa.free(model);
-                self.gpa.free(label);
-                continue;
-            };
-            self.session_labels.append(self.gpa, label) catch {};
 
             var known_recent = false;
             for (self.recent_sessions.items) |recent| {
@@ -1232,6 +1200,129 @@ const App = struct {
             self.gpa.destroy(saved);
             _ = self.background_approvals.remove(sid);
         }
+    }
+
+    fn allocSessionSummary(self: *App, info: proto.SessionInfo) ?SessionSummary {
+        const title = self.gpa.dupe(u8, info.title) catch return null;
+        const cwd = self.gpa.dupe(u8, info.cwd) catch {
+            self.gpa.free(title);
+            return null;
+        };
+        const model = self.gpa.dupe(u8, info.model) catch {
+            self.gpa.free(title);
+            self.gpa.free(cwd);
+            return null;
+        };
+        const identity = if (info.title.len > 0) info.title else info.model;
+        const hierarchy = if (info.parent_sid != null) @as([]const u8, "  ↳ ") else "";
+        var handle_buf: session_handle.Full = undefined;
+        const label = std.fmt.allocPrint(self.gpa, "{s}{s}  {s} · {s} · {s}", .{
+            hierarchy,
+            self.displaySessionHandle(&handle_buf, info.sid),
+            identity,
+            @tagName(info.state),
+            info.cwd,
+        }) catch {
+            self.gpa.free(title);
+            self.gpa.free(cwd);
+            self.gpa.free(model);
+            return null;
+        };
+        return .{
+            .sid = info.sid,
+            .parent_sid = info.parent_sid,
+            .kind = info.kind,
+            .title = title,
+            .cwd = cwd,
+            .model = model,
+            .effort = info.effort,
+            .state = info.state,
+            .created_at = info.created_at,
+            .label = label,
+            .sandboxed = info.sandboxed,
+            .network_filtering = info.network_filtering,
+        };
+    }
+
+    fn upsertSessionSummary(self: *App, info: proto.SessionInfo) void {
+        self.rememberSession(info.sid);
+        var summary = self.allocSessionSummary(info) orelse return;
+
+        for (self.sessions.items, 0..) |*existing, i| {
+            if (existing.sid != info.sid) continue;
+            existing.deinit(self.gpa);
+            existing.* = summary;
+            self.session_labels.items[i] = summary.label;
+            if (info.sid == self.sid) self.state = info.state;
+            if (self.saved_views.get(info.sid)) |saved| saved.state = info.state;
+            if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
+            return;
+        }
+
+        var insert_at: usize = self.sessions.items.len;
+        if (info.parent_sid) |parent_sid| {
+            for (self.sessions.items, 0..) |existing, i| {
+                if (existing.sid != parent_sid) continue;
+                insert_at = i + 1;
+                while (insert_at < self.sessions.items.len and self.sessions.items[insert_at].parent_sid != null) {
+                    const sibling = self.sessions.items[insert_at];
+                    if (info.created_at < sibling.created_at or
+                        (info.created_at == sibling.created_at and info.sid < sibling.sid)) break;
+                    insert_at += 1;
+                }
+                break;
+            }
+        } else {
+            for (self.sessions.items, 0..) |existing, i| {
+                if (existing.parent_sid != null) continue;
+                if (info.created_at > existing.created_at or
+                    (info.created_at == existing.created_at and info.sid > existing.sid))
+                {
+                    insert_at = i;
+                    break;
+                }
+            }
+        }
+        self.sessions.insert(self.gpa, insert_at, summary) catch {
+            summary.deinit(self.gpa);
+            return;
+        };
+        self.session_labels.insert(self.gpa, insert_at, summary.label) catch {
+            var removed = self.sessions.orderedRemove(insert_at);
+            removed.deinit(self.gpa);
+            return;
+        };
+        var known_recent = false;
+        for (self.recent_sessions.items) |recent| if (recent == info.sid) {
+            known_recent = true;
+            break;
+        };
+        if (!known_recent) self.recent_sessions.append(self.gpa, info.sid) catch {};
+        if (info.sid == self.sid) self.state = info.state;
+    }
+
+    fn removeSessionSummary(self: *App, sid: u64) void {
+        for (self.sessions.items, 0..) |*summary, i| {
+            if (summary.sid != sid) continue;
+            summary.deinit(self.gpa);
+            _ = self.sessions.orderedRemove(i);
+            _ = self.session_labels.orderedRemove(i);
+            break;
+        }
+        var recent_i: usize = 0;
+        while (recent_i < self.recent_sessions.items.len) {
+            if (self.recent_sessions.items[recent_i] == sid)
+                _ = self.recent_sessions.orderedRemove(recent_i)
+            else
+                recent_i += 1;
+        }
+        self.recent_cursor = 0;
+        if (self.saved_views.get(sid)) |saved| {
+            _ = self.saved_views.remove(sid);
+            saved.deinit(self.gpa);
+            self.gpa.destroy(saved);
+        }
+        _ = self.background_approvals.remove(sid);
     }
 
     const InflightCall = struct { rb: *const RenderBlock, queued: usize };
@@ -1401,6 +1492,16 @@ const App = struct {
             },
             .replay_done => |replay| {
                 if (replay.sid != self.sid) return;
+                if (replay.forward) {
+                    if (replay.has_newer and replay.newest_seq > 0) {
+                        self.conn.send(.{ .sub = .{
+                            .sid = self.sid,
+                            .from_seq = replay.newest_seq +| 1,
+                            .replay_limit = initial_replay_blocks,
+                        } }) catch self.setNotice("could not continue session replay", .{});
+                    }
+                    return;
+                }
                 if (self.history_before_seq > 0) {
                     self.finishOlderHistoryPage(replay.oldest_seq, replay.has_older);
                     return;
@@ -1467,6 +1568,24 @@ const App = struct {
             },
             .session_created => |sc| self.handleSessionCreated(sc.sid),
             .session_list_result => |sl| self.replaceSessionSummaries(sl.sessions),
+            .session_upsert => |su| self.upsertSessionSummary(su.session),
+            .session_remove => |sr| self.removeSessionSummary(sr.sid),
+            .interrupt_result => |result| {
+                if (result.sid != self.sid) return;
+                if (!result.active) {
+                    self.setNotice("nothing to interrupt", .{});
+                } else if (result.already_requested) {
+                    self.setNotice("still cancelling · {s} · {d}s", .{
+                        @tagName(result.phase),
+                        result.pending_ms / 1000,
+                    });
+                } else {
+                    self.setNotice("cancelling · {s} for {d}s", .{
+                        @tagName(result.phase),
+                        result.phase_ms / 1000,
+                    });
+                }
+            },
             .blob_result => |blob| self.stageClipboard(blob.bytes),
             .model_list_result => |ml| {
                 for (self.catalog.items) |old| self.gpa.free(old);
@@ -2456,8 +2575,11 @@ const App = struct {
     }
 
     fn interrupt(self: *App) void {
-        self.conn.send(.{ .interrupt = .{ .sid = self.sid } }) catch {};
-        self.setNotice("interrupt sent", .{});
+        self.conn.send(.{ .interrupt = .{ .sid = self.sid, .report = true } }) catch {
+            self.setNotice("could not send interrupt", .{});
+            return;
+        };
+        self.setNotice("interrupt requested", .{});
     }
 
     fn clearView(self: *App) void {
@@ -6318,7 +6440,7 @@ pub fn run(
         defer conn.stream.shutdown(io, .both) catch {};
         // Lightweight catalog/status updates for every session; block streams
         // remain subscribed only for the focused session.
-        try conn.send(.{ .session_watch = .{} });
+        try conn.send(.{ .session_watch = .{ .incremental = true } });
 
         const animation_thread = try std.Thread.spawn(.{}, animationThread, .{ &app, &loop });
         defer animation_thread.join();
@@ -8370,6 +8492,91 @@ test "session labels round-trip ids and preserve inactive view state" {
     try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
     try std.testing.expectEqual(@as(usize, 17), app.scroll_up);
     try std.testing.expectEqualStrings("scrollback survives", app.blocks.items[0].text);
+}
+
+test "incremental session catalog upserts preserve hierarchy and remove owned state" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 20,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.replaceSessionSummaries(&.{.{
+        .sid = 10,
+        .title = "older",
+        .model = "m",
+        .status = "idle",
+        .created_at = 10,
+        .running = false,
+    }});
+    app.upsertSessionSummary(.{
+        .sid = 20,
+        .title = "new root",
+        .cwd = "/work",
+        .model = "m",
+        .status = "idle",
+        .created_at = 20,
+        .running = false,
+    });
+    app.upsertSessionSummary(.{
+        .sid = 21,
+        .parent_sid = 20,
+        .kind = .task_child,
+        .title = "child",
+        .cwd = "/work",
+        .model = "m",
+        .status = "running",
+        .state = .running,
+        .created_at = 21,
+        .running = true,
+    });
+    try std.testing.expectEqualSlices(u64, &.{ 20, 21, 10 }, &.{
+        app.sessions.items[0].sid,
+        app.sessions.items[1].sid,
+        app.sessions.items[2].sid,
+    });
+    // Restoring an older archived root inserts by durable catalog order; it
+    // must not jump ahead of sessions created while it was hidden.
+    app.upsertSessionSummary(.{
+        .sid = 15,
+        .title = "restored",
+        .model = "m",
+        .status = "idle",
+        .created_at = 15,
+        .running = false,
+    });
+    try std.testing.expectEqualSlices(u64, &.{ 20, 21, 15, 10 }, &.{
+        app.sessions.items[0].sid,
+        app.sessions.items[1].sid,
+        app.sessions.items[2].sid,
+        app.sessions.items[3].sid,
+    });
+
+    app.upsertSessionSummary(.{
+        .sid = 20,
+        .title = "renamed",
+        .cwd = "/work",
+        .model = "new-model",
+        .status = "running",
+        .state = .running,
+        .created_at = 20,
+        .running = true,
+        .sandboxed = true,
+    });
+    try std.testing.expectEqual(proto.SessionState.running, app.state);
+    try std.testing.expectEqualStrings("new-model", app.sessions.items[0].model);
+    try std.testing.expect(app.sessions.items[0].sandboxed);
+    try std.testing.expect(app.session_labels.items[0].ptr == app.sessions.items[0].label.ptr);
+
+    app.removeSessionSummary(21);
+    try std.testing.expectEqual(@as(usize, 3), app.sessions.items.len);
+    try std.testing.expect(app.sessionSummary(21) == null);
 }
 
 test "inactive session view cache evicts least recently used transcripts" {

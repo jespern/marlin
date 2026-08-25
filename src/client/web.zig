@@ -5,6 +5,8 @@
 //!   GET  /events?sid=N   SSE stream on a dedicated daemon connection:
 //!                        session_watch + bounded sub(sid); every daemon
 //!                        NDJSON line is forwarded verbatim as one event.
+//!   GET  /history?sid=N&before=S
+//!                        one bounded older-history page as finite SSE
 //!   POST /send           body = ONE ClientMsg JSON line, forwarded on a
 //!                        fresh daemon connection; the first daemon reply
 //!                        line comes back as application/json.
@@ -137,6 +139,8 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         } });
     } else if (std.mem.startsWith(u8, target, "/events")) {
         try serveEvents(ctx, req);
+    } else if (std.mem.startsWith(u8, target, "/history")) {
+        try serveHistory(ctx, req);
     } else if (std.mem.eql(u8, target, "/send") and req.head.method == .POST) {
         try serveSend(ctx, req);
     } else {
@@ -212,7 +216,7 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         "{{\"sub\":{{\"sid\":{d},\"tail_limit\":512}}}}\n",
         .{sid},
     ) catch unreachable;
-    try conn.writer.interface.writeAll("{\"session_watch\":{}}\n");
+    try conn.writer.interface.writeAll("{\"session_watch\":{\"incremental\":true}}\n");
     try conn.writer.interface.writeAll(sub_line);
     try conn.writer.interface.flush();
 
@@ -241,14 +245,65 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     }
 }
 
+/// One bounded older-history page as SSE. Unlike /events this stream ends at
+/// replay_done; the browser opens it only when the user asks for more.
+fn serveHistory(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
+    const sid = queryU64(req.head.target, "sid") orelse {
+        try req.respond("missing or bad sid\n", .{ .status = .bad_request });
+        return;
+    };
+    const before = queryU64(req.head.target, "before") orelse {
+        try req.respond("missing or bad before seq\n", .{ .status = .bad_request });
+        return;
+    };
+    const conn = attach.connect(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe) catch {
+        try req.respond("cannot reach daemon\n", .{ .status = .bad_gateway });
+        return;
+    };
+    defer conn.deinit();
+
+    var sub_buf: [144]u8 = undefined;
+    const sub_line = std.fmt.bufPrint(
+        &sub_buf,
+        "{{\"sub\":{{\"sid\":{d},\"tail_limit\":512,\"before_seq\":{d}}}}}\n",
+        .{ sid, before },
+    ) catch unreachable;
+    try conn.writer.interface.writeAll(sub_line);
+    try conn.writer.interface.flush();
+
+    var stream_buf: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&stream_buf, .{ .respond_options = .{
+        .transfer_encoding = .none,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/event-stream" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        },
+    } });
+    while (true) {
+        const line = conn.readLine() catch break;
+        defer ctx.gpa.free(line);
+        const body = std.mem.trimEnd(u8, line, "\r\n");
+        response.writer.writeAll("data: ") catch break;
+        response.writer.writeAll(body) catch break;
+        response.writer.writeAll("\n\n") catch break;
+        response.writer.flush() catch break;
+        response.flush() catch break;
+        if (std.mem.startsWith(u8, body, "{\"replay_done\":")) break;
+    }
+}
+
 /// Extract `sid=<u64>` from a request target's query string.
 fn sidFromQuery(target: []const u8) ?u64 {
+    return queryU64(target, "sid");
+}
+
+fn queryU64(target: []const u8, name: []const u8) ?u64 {
     const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
     var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
     while (it.next()) |pair| {
-        if (std.mem.startsWith(u8, pair, "sid=")) {
-            return std.fmt.parseInt(u64, pair["sid=".len..], 10) catch null;
-        }
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], name)) continue;
+        return std.fmt.parseInt(u64, pair[eq + 1 ..], 10) catch null;
     }
     return null;
 }
@@ -262,6 +317,8 @@ test "sid query parsing accepts u64 and rejects garbage" {
     try std.testing.expectEqual(@as(?u64, null), sidFromQuery("/events"));
     try std.testing.expectEqual(@as(?u64, null), sidFromQuery("/events?sid=abc"));
     try std.testing.expectEqual(@as(?u64, null), sidFromQuery("/events?side=1"));
+    try std.testing.expectEqual(@as(?u64, 99), queryU64("/history?sid=42&before=99", "before"));
+    try std.testing.expectEqual(@as(?u64, null), queryU64("/history?sid=42&before=nope", "before"));
 }
 
 test {

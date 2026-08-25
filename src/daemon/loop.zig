@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 const block = @import("../core/block.zig");
+const proto = @import("../core/proto.zig");
 const ids = @import("../core/ids.zig");
 const jsonx = @import("../core/jsonx.zig");
 const config = @import("../core/config.zig");
@@ -87,6 +88,9 @@ pub const RunOpts = struct {
     /// Stream liveness: cumulative response bytes this round + ms since the
     /// last visible delta. Throttled to ~1/s; drives the client status line.
     on_stream_status: ?*const fn (ctx: ?*anyopaque, bytes: u64, quiet_ms: u64) void = null,
+    /// Coarse phase transitions for cancellation diagnostics. The callback
+    /// must be non-blocking; the daemon publishes it through atomics.
+    on_phase: ?*const fn (ctx: ?*anyopaque, phase: proto.TurnPhase) void = null,
     on_delta_ctx: ?*anyopaque = null,
     /// Called when a tool starts/finishes (for progress display).
     on_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, phase: ToolPhase) void = null,
@@ -116,6 +120,10 @@ pub const TurnResult = struct {
     tokens_out: u64,
     interrupted: bool = false,
 };
+
+fn publishPhase(opts: RunOpts, phase: proto.TurnPhase) void {
+    if (opts.on_phase) |cb| cb(opts.on_delta_ctx, phase);
+}
 
 /// Bundles the repetitive persist-then-notify step.
 const Appender = struct {
@@ -242,6 +250,7 @@ pub fn runTurn(
     var round: u32 = 0;
 
     while (round < opts.max_rounds) : (round += 1) {
+        publishPhase(opts, .context);
         // -- cancellation checkpoint --
         if (cancelled(opts.cancel)) {
             _ = try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
@@ -361,6 +370,7 @@ pub fn runTurn(
         acc.on_reasoning_delta = Pump.onVisibleReasoning;
         acc.on_delta_ctx = &pump;
 
+        publishPhase(opts, .provider);
         const resp = http_client.streamPost(gpa, .{
             .url = opts.endpoint.url,
             .bearer = opts.endpoint.bearer,
@@ -420,6 +430,7 @@ pub fn runTurn(
 
         // -- no tool calls → final answer --
         if (acc.calls.items.len == 0) {
+            publishPhase(opts, .finishing);
             _ = try ap.append(.{ .assistant_msg = .{ .text = acc.text.items } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return .{
@@ -507,6 +518,7 @@ pub fn runTurn(
                     };
                 },
                 .ask => {
+                    publishPhase(opts, .approval);
                     const approval_id = ids.next(io);
                     const id_str = try std.fmt.allocPrint(gpa, "{d}", .{approval_id});
                     defer gpa.free(id_str);
@@ -524,6 +536,7 @@ pub fn runTurn(
                     } else .approved; // no gate wired (tests) → auto
 
                     if (opts.on_approval_done) |cb| cb(opts.on_delta_ctx, approval_id, verdict);
+                    publishPhase(opts, .tool);
 
                     _ = try ap.append(.{ .approval = .{
                         .approval_id = id_str,
@@ -551,6 +564,7 @@ pub fn runTurn(
             }
         }
 
+        publishPhase(opts, .tool);
         try executePrepared(gpa, io, opts, prepared);
 
         // Results stay in provider call order even when execution completed
@@ -692,6 +706,9 @@ fn maybeCompact(
         }
         return false;
     };
+
+    publishPhase(opts, .compaction);
+    defer publishPhase(opts, .context);
 
     const transcript = try context.renderForSummary(arena, blocks, plan.from_seq, plan.to_seq, 400_000);
     const ep = opts.compaction_endpoint orelse opts.endpoint;

@@ -45,18 +45,19 @@ policy that failed open. Both default false when decoding an older daemon.
 | hello | proto_version, client_kind | hello_ok or err |
 | session_create | cwd, model, effort?, title?, approvals? | session_created{sid} |
 | session_list | include_archived? | session_list_result{sessions}; archived omitted by default |
+| session_watch | incremental? | initial session_list_result, then structural catalog updates; incremental clients receive session_upsert/session_remove, legacy clients receive refreshed snapshots |
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
 | session_set_model | sid, model | ok, or err{busy} mid-turn |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable |
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded |
-| sub | sid, from_seq, tail_limit?, before_seq?, replay_done? | replayed blk×N, optional replay_done marker, then status |
+| sub | sid, from_seq, tail_limit?, before_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
 | unsub | sid | ok |
 | input | sid, text, request_id? | ok/err echoing request_id; starts a turn (idle) or queues steer (running/awaiting approval) |
 | approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |
 | session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn |
-| interrupt | sid | ok (cooperative cancel; also denies a pending approval) |
+| interrupt | sid, report? | ok, or interrupt_result with phase/elapsed diagnostics when report=true (cooperative cancel; also denies a pending approval) |
 | reboot | force? | quiesce (wait for turns; force interrupts), retire the listening socket, then ok RIGHT BEFORE daemon exit — requester's cue to re-exec; non-force returns err{approval_pending} rather than wait on an approval with no client |
 | shutdown | — | ok, then daemon exits cleanly |
 
@@ -77,6 +78,15 @@ initial attach and backwards scrollback independent of session length: Marlin
 requests 256 blocks at a time and atomically prepends another page when the
 user reaches the loaded top. Every bounded replay ends with
 `replay_done{oldest_seq,newest_seq,has_older}`.
+
+`sub.replay_limit`: when non-zero with `from_seq`, replay at most 512 blocks
+forward and return `replay_done{...,has_newer,forward:true}`. If `has_newer` is
+true the client requests the next page from `newest_seq+1`. The daemon does not
+make that connection live until the final page: because replay and fan-out share
+the dispatcher, the final durable query → subscription handoff is gap-free.
+Forward and tail pages also target a 16 MiB encoded-byte budget (one exceptional
+record may consume a page alone), so a handful of large pastes cannot overflow
+the bounded client outbox.
 
 `sub.replay_done`: requests the same terminal marker for a normal from-seq
 replay. It defaults false so a new daemon never sends an unknown union tag to
@@ -113,15 +123,18 @@ descendants.
 | hello_ok | handshake |
 | session_created | reply to session_create |
 | session_list_result | reply to session_list |
+| session_upsert {session} | one added/restored/changed catalog row for an incremental session watcher |
+| session_remove {sid} | one archived catalog row removed from an incremental session watcher |
 | blk {sid, b} | a block was persisted (replay AND live fan-out) |
 | delta {sid, turn_id, text} | streaming assistant text (ephemeral) |
 | reasoning_delta {sid, turn_id, text} | provider reasoning stream (ephemeral, rendered separately from assistant text) |
 | stream_status {sid, bytes, quiet_ms} | stream liveness while receiving from the provider: cumulative body bytes this round + ms since the last visible delta; throttled to ~1/s (ephemeral) |
-| replay_done {sid, oldest_seq, newest_seq, has_older} | requested replay finished; `has_older` tells a bounded-page client that durable history precedes its window |
+| replay_done {sid, oldest_seq, newest_seq, has_older, has_newer, forward} | requested replay page finished; bounded clients page backward with `has_older` or forward with `has_newer` |
 | status {sid, state} | session state change: idle/running/awaiting_approval/err/done |
 | approval_request {sid, approval_id, call_id, tool, args_json} | a mutating tool call parked on the gate; answer with `approve` |
 | session_meta {sid, tokens_in, tokens_out, context_used, context_limit} | after each turn; ALWAYS sent before the closing status. context_* feed the status-bar gauge (0 = unmeasured) |
 | model_list_result {models, pricing} | reply to `model_list`; `pricing` optionally supplies input/output USD per million tokens and a tiered-rate flag keyed by model id |
+| interrupt_result {sid, active, already_requested, request_count, pending_ms, phase_ms, phase} | opt-in cancellation acknowledgement; reports the current starting/context/provider/approval/tool/child/compaction/finishing phase and its age; repeated interrupts also report elapsed cancellation time |
 | ok {request_id?} | generic ack; non-zero for a correlated input reply |
 | err {code, msg, request_id?} | bad_msg, no_hello, version, no_session, busy, archived, bad_approval, approval_pending, reboot_pending, line_too_long, response_too_large; non-zero for a correlated input rejection |
 
@@ -173,9 +186,10 @@ trade readability for a second identity or a storage migration.
 - A correlated `input` receives one `ok` or `err` with its request id. Session
   status and durable blocks may precede the `ok`; `err` means no turn/steer was
   accepted for that request.
-- Replay (`sub` with from_seq ≥ 1 or tail_limit > 0) and its requested marker complete before any live message for
-  that session reaches the client (both are written by the dispatcher in
-  order onto the same outbox).
+- Replay (`sub` with from_seq ≥ 1 or tail_limit > 0) and its requested marker
+  complete before any live message for that session reaches the client. A
+  partial forward page is not subscribed at all; the final page and live
+  registration are one serialized dispatcher operation.
 
 ## Slow clients
 

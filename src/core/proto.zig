@@ -8,7 +8,7 @@
 //!   - Deltas are ephemeral; blocks are truth. Clients render deltas for
 //!     liveness, then replace them with the finalized block.
 //!   - sub.from_seq: 0 = live-only (no replay); N >= 1 replays stored blocks
-//!     with seq >= N, then goes live. Reconnect is therefore trivial.
+//!     with seq >= N. Bounded pages go live only at the durable frontier.
 //!   - Unknown fields are ignored on read; unknown message types are an err.
 
 const std = @import("std");
@@ -23,6 +23,21 @@ pub const proto_version: u32 = 1;
 pub const max_line_bytes: usize = 32 * 1024 * 1024;
 
 pub const SessionState = enum { idle, running, awaiting_approval, err, done };
+
+/// Coarse, lock-free turn phase used for cancellation diagnostics. This is
+/// deliberately operational rather than provider-specific: clients can say
+/// what is being cancelled without coupling themselves to loop internals.
+pub const TurnPhase = enum { idle, starting, context, provider, approval, tool, child, compaction, finishing };
+
+pub const InterruptResult = struct {
+    sid: u64,
+    active: bool,
+    already_requested: bool = false,
+    request_count: u32 = 0,
+    pending_ms: u64 = 0,
+    phase_ms: u64 = 0,
+    phase: TurnPhase = .idle,
+};
 
 /// Durable role in the session hierarchy. M6 initially permits one level of
 /// task children; review_child is reserved for the council layer that reuses
@@ -58,7 +73,12 @@ pub const ClientMsg = union(enum) {
     /// any session enters an actionable state or its membership changes.
     /// The daemon replies with an immediate snapshot, then sends updates until
     /// the client disconnects. This is independent of per-session block subs.
-    session_watch: struct {},
+    session_watch: struct {
+        /// Opt into additive session_upsert/session_remove events after the
+        /// initial authoritative snapshot. Legacy watchers keep receiving
+        /// complete snapshots on structural changes.
+        incremental: bool = false,
+    },
     session_kill: struct { sid: u64 },
     /// Hide/restore a durable session hierarchy without deleting its log.
     session_archive: struct { sid: u64, archived: bool = true },
@@ -79,15 +99,19 @@ pub const ClientMsg = union(enum) {
     blob_get: struct { hash: []const u8 },
     /// `tail_limit>0` requests the newest N blocks (ascending) instead of an
     /// unbounded replay from `from_seq`. `before_seq>0` bounds that window to
-    /// older blocks, enabling fixed-size backwards pagination. `replay_done`
-    /// opts into the terminal marker for a from-seq replay; old clients
-    /// therefore never receive a union tag they cannot decode. These fields
-    /// are additive for older peers.
+    /// older blocks, enabling fixed-size backwards pagination. `replay_limit`
+    /// bounds forward catch-up. `replay_done` opts into the terminal marker
+    /// for a legacy from-seq replay; old clients therefore never receive a
+    /// union tag they cannot decode. These fields are additive for older peers.
     sub: struct {
         sid: u64,
         from_seq: u64 = 0,
         tail_limit: u32 = 0,
         before_seq: u64 = 0,
+        /// Bound forward replay. The daemon delays the live subscription
+        /// until paging reaches the durable frontier, so blocks cannot arrive
+        /// out of order between pages.
+        replay_limit: u32 = 0,
         replay_done: bool = false,
     },
     unsub: struct { sid: u64 },
@@ -100,7 +124,11 @@ pub const ClientMsg = union(enum) {
     /// Full model catalog for the /model picker: daemon fetches the
     /// provider's model list (cached ~1h) and replies model_list_result.
     model_list: struct {},
-    interrupt: struct { sid: u64 },
+    interrupt: struct {
+        sid: u64,
+        /// Opt into interrupt_result instead of the legacy ok reply.
+        report: bool = false,
+    },
     /// Coordinated shutdown for /reboot: quiesce (wait for running turns to
     /// hit a block boundary — or interrupt them when force=true), persist,
     /// release the socket, exit 0. Reply `ok` is sent RIGHT BEFORE exit; the
@@ -131,6 +159,10 @@ pub const DaemonMsg = union(enum) {
     },
     session_created: struct { sid: u64 },
     session_list_result: struct { sessions: []const SessionInfo },
+    /// Sent only to session watchers that explicitly opted in: older tagged
+    /// union decoders reject message types they do not know.
+    session_upsert: struct { session: SessionInfo },
+    session_remove: struct { sid: u64 },
     blk: struct { sid: u64, b: block.Block },
     delta: struct { sid: u64, turn_id: u64, text: []const u8 },
     reasoning_delta: struct { sid: u64, turn_id: u64, text: []const u8 },
@@ -143,6 +175,8 @@ pub const DaemonMsg = union(enum) {
         oldest_seq: u64 = 0,
         newest_seq: u64 = 0,
         has_older: bool = false,
+        has_newer: bool = false,
+        forward: bool = false,
     },
     status: struct { sid: u64, state: SessionState },
     approval_request: struct {
@@ -173,6 +207,7 @@ pub const DaemonMsg = union(enum) {
     /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
     /// contain arbitrary command output (including NULs).
     blob_result: struct { hash: []const u8, bytes: []const u8 },
+    interrupt_result: InterruptResult,
     /// `request_id` is non-zero only when replying to a correlated request
     /// (currently input). Defaults preserve compatibility in both directions.
     ok: struct { request_id: u64 = 0 },
@@ -323,13 +358,14 @@ test "round trip: client messages" {
     const network_back = try decode(ClientMsg, arena, network_line);
     try std.testing.expect(network_back.session_set_network_filtering.enabled);
 
-    const watch_line = try encode(gpa, ClientMsg{ .session_watch = .{} });
+    const watch_line = try encode(gpa, ClientMsg{ .session_watch = .{ .incremental = true } });
     defer gpa.free(watch_line);
     const watch_back = try decode(ClientMsg, arena, watch_line);
     try std.testing.expectEqual(
         std.meta.activeTag(ClientMsg{ .session_watch = .{} }),
         std.meta.activeTag(watch_back),
     );
+    try std.testing.expect(watch_back.session_watch.incremental);
 
     const blob_line = try encode(gpa, ClientMsg{ .blob_get = .{ .hash = "abc123" } });
     defer gpa.free(blob_line);
@@ -341,13 +377,20 @@ test "round trip: client messages" {
         .from_seq = 1,
         .tail_limit = 256,
         .before_seq = 1024,
+        .replay_limit = 128,
         .replay_done = true,
     } });
     defer gpa.free(tail_line);
     const tail_back = try decode(ClientMsg, arena, tail_line);
     try std.testing.expectEqual(@as(u32, 256), tail_back.sub.tail_limit);
     try std.testing.expectEqual(@as(u64, 1024), tail_back.sub.before_seq);
+    try std.testing.expectEqual(@as(u32, 128), tail_back.sub.replay_limit);
     try std.testing.expect(tail_back.sub.replay_done);
+
+    const interrupt_line = try encode(gpa, ClientMsg{ .interrupt = .{ .sid = 9, .report = true } });
+    defer gpa.free(interrupt_line);
+    const interrupt_back = try decode(ClientMsg, arena, interrupt_line);
+    try std.testing.expect(interrupt_back.interrupt.report);
 }
 
 test "round trip: daemon block message with tool_result body" {
@@ -372,6 +415,26 @@ test "round trip: daemon block message with tool_result body" {
     try std.testing.expectEqualStrings("out", back.blk.b.body.tool_result.inline_body);
 }
 
+test "round trip: interrupt diagnostics" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const line = try encode(gpa, DaemonMsg{ .interrupt_result = .{
+        .sid = 7,
+        .active = true,
+        .already_requested = true,
+        .request_count = 2,
+        .pending_ms = 1500,
+        .phase_ms = 4200,
+        .phase = .provider,
+    } });
+    defer gpa.free(line);
+    const back = try decode(DaemonMsg, arena_state.allocator(), line);
+    try std.testing.expect(back.interrupt_result.already_requested);
+    try std.testing.expectEqual(TurnPhase.provider, back.interrupt_result.phase);
+    try std.testing.expectEqual(@as(u64, 4200), back.interrupt_result.phase_ms);
+}
+
 test "decode ignores unknown fields; defaults apply" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -381,6 +444,7 @@ test "decode ignores unknown fields; defaults apply" {
     try std.testing.expectEqual(@as(u64, 0), m.sub.from_seq);
     try std.testing.expectEqual(@as(u32, 0), m.sub.tail_limit);
     try std.testing.expectEqual(@as(u64, 0), m.sub.before_seq);
+    try std.testing.expectEqual(@as(u32, 0), m.sub.replay_limit);
     try std.testing.expect(!m.sub.replay_done);
     try std.testing.expectEqual(@as(u64, 5), m.sub.sid);
 }
