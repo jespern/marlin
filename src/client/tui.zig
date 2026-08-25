@@ -358,6 +358,9 @@ const App = struct {
     /// arrive in the daemon reader path, where the terminal writer is not
     /// available, so `!c` stages the bytes here for the next frame.
     clipboard_pending: std.ArrayList(u8) = .empty,
+    /// What `!c` is copying ("read_file docs/FOO.md"); folded transcripts
+    /// hide the source block, so the notice must identify it.
+    clipboard_desc: std.ArrayList(u8) = .empty,
     /// Successful non-diff tool runs are rolled up by default. Errors and
     /// diffs remain visible even when the rest of the transcript is hidden.
     show_tool_transcript: bool = false,
@@ -450,6 +453,7 @@ const App = struct {
         self.recent_sessions.deinit(self.gpa);
         self.pending_new_cwd.deinit(self.gpa);
         self.clipboard_pending.deinit(self.gpa);
+        self.clipboard_desc.deinit(self.gpa);
         for (self.blocks.items) |*rb| rb.deinit(self.gpa);
         self.blocks.deinit(self.gpa);
         self.delta.deinit(self.gpa);
@@ -1117,18 +1121,57 @@ const App = struct {
         };
     }
 
+    const ToolResultSource = struct { name: []const u8, arg: ?[]const u8 };
+
+    /// Which call produced the tool_result at `idx`. Results persist in
+    /// call order within a turn, so the k-th result pairs with the turn's
+    /// k-th call (the same positional invariant scanToolBatch folds by).
+    fn toolResultSource(self: *const App, idx: usize) ToolResultSource {
+        const turn_id = self.blocks.items[idx].turn_id;
+        var start = idx;
+        while (start > 0 and self.blocks.items[start - 1].turn_id == turn_id) start -= 1;
+        var result_ord: usize = 0;
+        for (self.blocks.items[start..idx]) |rb| {
+            if (rb.kind == .tool_result) result_ord += 1;
+        }
+        var seen: usize = 0;
+        for (self.blocks.items[start..]) |rb| {
+            if (rb.kind != .tool_call) continue;
+            if (seen == result_ord)
+                return .{ .name = rb.label, .arg = extractHighlightArg(rb.label, rb.text) };
+            seen += 1;
+        }
+        return .{ .name = "tool", .arg = null };
+    }
+
+    /// Stage the human-readable copy source for the frame-loop notice.
+    fn setClipboardDesc(self: *App, src: ToolResultSource) void {
+        const max_arg = 48;
+        self.clipboard_desc.clearRetainingCapacity();
+        self.clipboard_desc.appendSlice(self.gpa, src.name) catch return;
+        const arg = src.arg orelse return;
+        if (arg.len == 0) return;
+        self.clipboard_desc.append(self.gpa, ' ') catch return;
+        self.clipboard_desc.appendSlice(self.gpa, arg[0..@min(arg.len, max_arg)]) catch return;
+        if (arg.len > max_arg) self.clipboard_desc.appendSlice(self.gpa, "…") catch return;
+    }
+
     fn copyLastToolOutput(self: *App) void {
         var i = self.blocks.items.len;
         while (i > 0) {
             i -= 1;
             const rendered = self.blocks.items[i];
             if (rendered.kind != .tool_result) continue;
+            // The result may be folded out of view ("Ran N commands"), so
+            // name its source; a silent copy of invisible bytes reads as
+            // clipboard corruption.
+            self.setClipboardDesc(self.toolResultSource(i));
             if (rendered.full_body_ref) |ref| {
                 self.conn.send(.{ .blob_get = .{ .hash = ref } }) catch {
                     self.setNotice("could not request full tool output", .{});
                     return;
                 };
-                self.setNotice("fetching full tool output…", .{});
+                self.setNotice("fetching full output of {s}…", .{self.clipboard_desc.items});
             } else {
                 self.stageClipboard(rendered.text);
             }
@@ -5389,11 +5432,16 @@ pub fn run(
             ) catch {
                 copied = false;
             };
+            const staged_bytes: u64 = app.clipboard_pending.items.len;
             app.clipboard_pending.clearRetainingCapacity();
-            if (copied)
-                app.setNotice("copied last tool output", .{})
-            else
+            if (!copied) {
                 app.setNotice("clipboard copy failed", .{});
+            } else if (app.clipboard_desc.items.len > 0) {
+                app.setNotice("copied {s} output · {Bi:.1}", .{ app.clipboard_desc.items, staged_bytes });
+            } else {
+                app.setNotice("copied last tool output", .{});
+            }
+            app.clipboard_desc.clearRetainingCapacity();
         }
 
         try draw(&app, &vx, frame_arena.allocator());
@@ -7088,6 +7136,63 @@ test "tool results retain full blob refs and inline !c stages clipboard text" {
     app.pushBlock(.tool_result, "complete output", "", .ok);
     app.runCommand("!c");
     try std.testing.expectEqualStrings("complete output", app.clipboard_pending.items);
+    // No paired call in view → generic source label.
+    try std.testing.expectEqualStrings("tool", app.clipboard_desc.items);
+}
+
+test "!c names the folded source it copies (positional batch pairing)" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined, // inline results only; !c never touches the socket
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    // One parallel batch: three calls then three results, same turn. The
+    // last result pairs with the last call even though the transcript
+    // folds all of them into a "Ran 3 commands" summary.
+    const calls = [_]struct { id: []const u8, name: []const u8, args: []const u8 }{
+        .{ .id = "c1", .name = "grep", .args = "{\"pattern\":\"foo\"}" },
+        .{ .id = "c2", .name = "bash", .args = "{\"command\":\"ls\"}" },
+        .{ .id = "c3", .name = "read_file", .args = "{\"path\":\"docs/PERMISSIONS.md\"}" },
+    };
+    var seq: u64 = 1;
+    for (calls) |c| {
+        app.applyBlock(.{
+            .id = seq,
+            .session_id = 1,
+            .turn_id = 9,
+            .seq = seq,
+            .ts = 0,
+            .body = .{ .tool_call = .{ .call_id = c.id, .name = c.name, .args_json = c.args } },
+        });
+        seq += 1;
+    }
+    for (calls) |c| {
+        app.applyBlock(.{
+            .id = seq,
+            .session_id = 1,
+            .turn_id = 9,
+            .seq = seq,
+            .ts = 0,
+            .body = .{ .tool_result = .{
+                .call_id = c.id,
+                .status = .ok,
+                .inline_body = "259|## Implementation slices",
+                .full_body_ref = null,
+            } },
+        });
+        seq += 1;
+    }
+
+    app.runCommand("!c");
+    try std.testing.expectEqualStrings("259|## Implementation slices", app.clipboard_pending.items);
+    try std.testing.expectEqualStrings("read_file docs/PERMISSIONS.md", app.clipboard_desc.items);
 }
 
 test "local commands enter editor history" {
