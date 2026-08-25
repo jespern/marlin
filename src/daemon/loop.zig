@@ -64,8 +64,12 @@ pub const RunOpts = struct {
     /// Written with the estimated assembled context tokens each round
     /// (status-bar accounting; provider-reported usage resyncs it per turn).
     context_used_out: ?*std.atomic.Value(u64) = null,
-    /// Session approval mode (default: mutating tools ask).
+    /// Session approval mode (default: mutating tools ask). Snapshot used
+    /// when no live pointer is wired (tests, compaction).
     approval_mode: approval.Mode = .auto,
+    /// Live session approval mode (@intFromEnum-encoded), read per call so
+    /// /permissions applies to the RUNNING turn, not just future ones.
+    approval_mode_live: ?*const std.atomic.Value(u8) = null,
     /// Gate the turn parks on while a client decides. Required when
     /// approval_mode may produce `ask` decisions.
     gate: ?*approval.Gate = null,
@@ -307,7 +311,7 @@ pub fn runTurn(
         if (resp.status >= 400) {
             const eb = resp.error_body orelse try gpa.dupe(u8, "");
             defer gpa.free(eb);
-            const msg = try std.fmt.allocPrint(gpa, "provider returned HTTP {d}: {s}", .{ resp.status, eb[0..@min(eb.len, 2000)] });
+            const msg = try providerErrorNote(gpa, resp.status, eb);
             defer gpa.free(msg);
             _ = try ap.append(.{ .system_note = .{ .text = msg } });
             return error.ProviderError;
@@ -417,7 +421,7 @@ pub fn runTurn(
                 if (opts.tool_profile == .read_only and s.mutating)
                     .deny
                 else
-                    approval.policyFor(opts.cfg, opts.approval_mode, s.mutating, sandboxed)
+                    approval.policyFor(opts.cfg, effectiveApprovalMode(opts), s.mutating, sandboxed)
             else
                 .run; // unknown tool → dispatch returns error text anyway
 
@@ -498,9 +502,77 @@ pub fn runTurn(
     return error.TooManyRounds;
 }
 
+/// The mode consulted per call: the session's live value when wired (so a
+/// mid-turn /permissions switch affects the very next call), else the
+/// turn-start snapshot.
+fn effectiveApprovalMode(opts: RunOpts) approval.Mode {
+    const live = opts.approval_mode_live orelse return opts.approval_mode;
+    return @enumFromInt(live.load(.acquire));
+}
+
 fn cancelled(flag: ?*std.atomic.Value(bool)) bool {
     const f = flag orelse return false;
     return f.load(.acquire);
+}
+
+fn errorMessage(value: std.json.Value) ?[]const u8 {
+    if (value != .object) return null;
+    const err = value.object.get("error") orelse return null;
+    if (err != .object) return null;
+    const message = err.object.get("message") orelse return null;
+    return if (message == .string) message.string else null;
+}
+
+fn utf8Prefix(text: []const u8, max: usize) []const u8 {
+    var end = @min(text.len, max);
+    while (end > 0 and end < text.len and (text[end] & 0xc0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+fn compactErrorText(arena: std.mem.Allocator, text: []const u8, max: usize) ![]const u8 {
+    const clipped = utf8Prefix(std.mem.trim(u8, text, " \t\r\n"), max);
+    var out = try arena.alloc(u8, clipped.len);
+    for (clipped, 0..) |ch, i| out[i] = switch (ch) {
+        '\r', '\n', '\t' => ' ',
+        else => ch,
+    };
+    return out;
+}
+
+/// Persist a useful provider failure, not an entire gateway response. For
+/// OpenRouter errors the actionable upstream message is nested as JSON in
+/// metadata.raw, while provider_name identifies the attempted backend.
+fn providerErrorNote(allocator: std.mem.Allocator, status: i64, body: []const u8) ![]u8 {
+    var parsed_state = std.heap.ArenaAllocator.init(allocator);
+    defer parsed_state.deinit();
+    const arena = parsed_state.allocator();
+
+    var message: ?[]const u8 = null;
+    var provider_name: ?[]const u8 = null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch null;
+    if (parsed) |root| {
+        message = errorMessage(root);
+        if (root == .object) {
+            if (root.object.get("error")) |err| if (err == .object) {
+                if (err.object.get("metadata")) |metadata| if (metadata == .object) {
+                    if (metadata.object.get("provider_name")) |name| {
+                        if (name == .string) provider_name = name.string;
+                    }
+                    if (metadata.object.get("raw")) |raw| if (raw == .string) {
+                        const nested = std.json.parseFromSliceLeaky(std.json.Value, arena, raw.string, .{}) catch null;
+                        if (nested) |value| message = errorMessage(value) orelse message;
+                    };
+                };
+            };
+        }
+    }
+
+    const useful = try compactErrorText(arena, message orelse if (body.len > 0) body else "request failed", 480);
+    if (provider_name) |name| {
+        const provider_short = try compactErrorText(arena, name, 80);
+        return std.fmt.allocPrint(allocator, "provider HTTP {d} via {s}: {s}", .{ status, provider_short, useful });
+    }
+    return std.fmt.allocPrint(allocator, "provider HTTP {d}: {s}", .{ status, useful });
 }
 
 // ------------------------------------------------------------ compaction --
@@ -522,7 +594,7 @@ fn maybeCompact(
     blocks: []const block.Block,
     trigger: CompactTrigger,
 ) !bool {
-    const plan = context.planCompaction(blocks) orelse {
+    const plan = context.planCompaction(blocks, trigger == .auto) orelse {
         if (trigger == .manual) {
             _ = try ap.append(.{ .system_note = .{ .text = "nothing to compact (session too small or no progress since last compaction)" } });
         }
@@ -560,8 +632,7 @@ fn maybeCompact(
         const contents = Io.Dir.cwd().readFileAlloc(io, abs, arena, .limited(64 * 1024)) catch continue;
         const windowed = try context.capInline(arena, contents, 4_000);
         const note = try std.fmt.allocPrint(arena, "[rehydrated after compaction] {s}:\n{s}", .{ p, windowed });
-        _ = try ap.append(.{ .system_note = .{ .text = "rehydrated file state after compaction" } });
-        _ = try ap.append(.{ .user_msg = .{ .text = note } });
+        _ = try ap.append(.{ .user_msg = .{ .text = note, .synthetic = true } });
     }
     const note_txt: []const u8 = switch (trigger) {
         .auto => "context compacted automatically (headroom); summary + rehydrated files above replace the older conversation",
@@ -929,6 +1000,35 @@ test "environment block reports cwd, git absence, and inactive regimes" {
     const instructions = projectInstructions(gpa, io, dir);
     defer if (instructions) |text| gpa.free(text);
     try std.testing.expectEqualStrings("Use spaces, not tabs.", instructions.?);
+}
+
+test "provider error note extracts direct message" {
+    const note = try providerErrorNote(
+        std.testing.allocator,
+        429,
+        "{\"error\":{\"message\":\"rate limit reached\"}}",
+    );
+    defer std.testing.allocator.free(note);
+    try std.testing.expectEqualStrings("provider HTTP 429: rate limit reached", note);
+}
+
+test "provider error note unwraps OpenRouter upstream error" {
+    const body =
+        \\{"error":{"message":"Provider returned error","metadata":{"raw":"{\"error\":{\"message\":\"Invalid input name\"}}","provider_name":"Azure","attempts":[{"status":400},{"status":400}]}}}
+    ;
+    const note = try providerErrorNote(std.testing.allocator, 400, body);
+    defer std.testing.allocator.free(note);
+    try std.testing.expectEqualStrings("provider HTTP 400 via Azure: Invalid input name", note);
+    try std.testing.expect(std.mem.indexOf(u8, note, "attempts") == null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "metadata") == null);
+}
+
+test "provider error note clips malformed response bodies" {
+    const body = ("gateway dump\n" ** 80);
+    const note = try providerErrorNote(std.testing.allocator, 502, body);
+    defer std.testing.allocator.free(note);
+    try std.testing.expect(note.len < 540);
+    try std.testing.expect(std.mem.indexOfScalar(u8, note, '\n') == null);
 }
 
 test {

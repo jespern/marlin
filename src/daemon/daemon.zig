@@ -140,6 +140,9 @@ const Session = struct {
     /// Approval mode: set at creation (headless "auto" vs interactive),
     /// switchable per session via /permissions (session_set_approvals).
     approval_mode: approval.Mode = .default,
+    /// Atomic mirror of approval_mode for the RUNNING turn thread; updated
+    /// together with it so /permissions applies mid-turn.
+    approval_mode_live: std.atomic.Value(u8) = .init(@intFromEnum(approval.Mode.default)),
     /// Kernel shell sandbox + prompt-free shell execution (/sandbox).
     /// Seeded from cfg.permissions_enabled; effective only with a verified
     /// backend. In-memory like approval_mode: a daemon restart returns the
@@ -600,6 +603,7 @@ pub const Daemon = struct {
                     .sandbox_enabled = self.cfg.permissions_enabled,
                     .network_filtering_enabled = self.network.isActive(),
                 };
+                session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
                 try self.sessions.put(self.gpa, sid, session);
                 self.sendTo(client, .{ .session_created = .{ .sid = sid } });
                 self.broadcastSessionList();
@@ -688,11 +692,18 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
-                if (session.state == .running or session.state == .awaiting_approval) {
-                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot change approvals mid-turn" } });
-                    return;
+                // Applies to the RUNNING turn too: the loop reads the live
+                // mirror per call, and granting full access while a call is
+                // parked on the gate resolves that prompt immediately —
+                // /permissions full is most wanted exactly then.
+                const mode = approval.Mode.parse(sa.approvals);
+                session.approval_mode = mode;
+                session.approval_mode_live.store(@intFromEnum(mode), .release);
+                if (mode == .auto) {
+                    if (session.gate.isPending(self.io)) |pending| {
+                        _ = session.gate.resolve(self.io, pending, .approved);
+                    }
                 }
-                session.approval_mode = approval.Mode.parse(sa.approvals);
                 self.sendTo(client, .{ .ok = .{} });
             },
             .session_set_network_filtering => |sn| {
@@ -1169,6 +1180,7 @@ pub const Daemon = struct {
             .prune_frontier = &job.session.prune_frontier,
             .context_used_out = &job.session.context_used,
             .approval_mode = job.session.approval_mode,
+            .approval_mode_live = &job.session.approval_mode_live,
             .gate = &job.session.gate,
             .on_approval_needed = TurnHooks.onApprovalNeeded,
             .on_approval_done = TurnHooks.onApprovalDone,

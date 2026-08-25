@@ -70,6 +70,13 @@ worsens; direct tools keep their legacy policy either way.
 Secret-environment isolation is a daemon boundary and remains active
 independently of this flag.
 
+`/permissions full|default` switches a session's approval mode and applies
+IMMEDIATELY, including the running turn: the loop reads the live mode per
+call, and granting full access while a call is parked on the approval gate
+resolves that prompt on the spot (that parked prompt is precisely when full
+access is wanted). The status bar shows a FULL ACCESS warning while active;
+a daemon restart returns the session to default.
+
 `/sandbox on|off` toggles the shell sandbox per session; the config flag only
 seeds each session's default. Off means prompts return AND approved shell
 calls run unwrapped — the two travel together so "off" is never silent yolo.
