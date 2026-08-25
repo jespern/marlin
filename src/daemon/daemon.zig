@@ -238,9 +238,6 @@ pub const Daemon = struct {
         environ: *const std.process.Environ.Map,
         ready_pipe: ?Io.File,
     ) !void {
-        http.globalInit();
-        defer http.globalDeinit();
-
         // The daemon must survive its spawning terminal: autostart puts us in
         // our own process group, and we ignore SIGHUP for the case where the
         // user runs `marlin daemon` in a terminal that later goes away.

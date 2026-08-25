@@ -7,7 +7,41 @@
 const std = @import("std");
 const Io = std.Io;
 
-pub const Error = anyerror;
+/// The complete failure vocabulary of this layer. Typed on purpose: the
+/// block log must be able to distinguish "user interrupted" from "provider
+/// hung" from "transport died mid-body" — anyerror soup misreported a hung
+/// stream as a model failure. Underlying std.http causes are flattened; the
+/// interesting ones are logged at debug before mapping.
+pub const Error = error{
+    /// The caller's cancel flag was observed, or the Io runtime cancelled us
+    /// (daemon shutdown).
+    Cancelled,
+    /// The watchdog fired: no response head within connect_timeout_ms, or no
+    /// body bytes within idle_timeout_ms.
+    HttpTimeout,
+    /// The request could not even be formed: unparseable URL or malformed
+    /// extra-header line.
+    InvalidRequest,
+    /// Connect/TLS/proxy/send failed, or the connection died before the
+    /// response head arrived — nothing of the response was received.
+    ConnectFailed,
+    /// The response head arrived but the body failed mid-read (peer reset,
+    /// TLS damage, protocol error).
+    ReadFailed,
+    /// The response used a content-encoding this path refuses.
+    UnsupportedEncoding,
+    /// A request/watchdog task pair could not be started; the request was
+    /// not attempted.
+    ConcurrencyUnavailable,
+    OutOfMemory,
+};
+
+/// Classify a transport failure from before any body bytes arrived.
+fn mapConnect(err: anyerror) Error {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    std.log.debug("http connect-phase failure: {t}", .{err});
+    return error.ConnectFailed;
+}
 
 pub const Response = struct {
     status: i64,
@@ -93,10 +127,6 @@ pub const Client = struct {
     }
 };
 
-/// Kept as no-ops so daemon lifecycle callers remain simple.
-pub fn globalInit() void {}
-pub fn globalDeinit() void {}
-
 pub fn streamPost(
     gpa: std.mem.Allocator,
     io: Io,
@@ -131,10 +161,13 @@ fn streamPostTimed(
     var progress = StreamProgress{};
     var results: [2]Select.Union = undefined;
     var select = Select.init(client.io, &results);
-    try select.concurrent(.request, streamPostImpl(@TypeOf(ctx), on_chunk), .{ client, gpa, stream_req, ctx, &progress });
-    try select.concurrent(.watchdog, waitForStreamAbort, .{ client.io, stream_req.cancel, &progress, stream_req.connect_timeout_ms, stream_req.idle_timeout_ms });
+    select.concurrent(.request, streamPostImpl(@TypeOf(ctx), on_chunk), .{ client, gpa, stream_req, ctx, &progress }) catch
+        return error.ConcurrencyUnavailable;
+    select.concurrent(.watchdog, waitForStreamAbort, .{ client.io, stream_req.cancel, &progress, stream_req.connect_timeout_ms, stream_req.idle_timeout_ms }) catch
+        return error.ConcurrencyUnavailable;
 
-    const first = try select.await();
+    // Io-level cancellation (daemon shutdown) folds into Cancelled.
+    const first = select.await() catch return error.Cancelled;
     return switch (first) {
         .request => |result| blk: {
             select.cancelDiscard();
@@ -177,16 +210,16 @@ fn streamPostRun(
 ) Error!Response {
     if (isCancelled(stream_req.cancel)) return error.Cancelled;
 
-    const uri = try std.Uri.parse(stream_req.url);
+    const uri = std.Uri.parse(stream_req.url) catch return error.InvalidRequest;
     var header_storage = try gpa.alloc(std.http.Header, stream_req.extra_headers.len);
     defer gpa.free(header_storage);
     for (stream_req.extra_headers, 0..) |line, i| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidRequest;
         header_storage[i] = .{
             .name = std.mem.trim(u8, line[0..colon], " \t"),
             .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
         };
-        if (header_storage[i].name.len == 0) return error.InvalidHeader;
+        if (header_storage[i].name.len == 0) return error.InvalidRequest;
     }
 
     var auth_storage: ?[]u8 = null;
@@ -196,7 +229,7 @@ fn streamPostRun(
         break :blk .{ .override = auth_storage.? };
     } else .omit;
 
-    var request = try client.request(.POST, uri, .{
+    var request = client.request(.POST, uri, .{
         .redirect_behavior = .unhandled,
         .headers = .{
             .authorization = authorization,
@@ -208,16 +241,16 @@ fn streamPostRun(
             .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = header_storage,
-    });
+    }) catch |err| return mapConnect(err);
     defer request.deinit();
 
     request.transfer_encoding = .{ .content_length = stream_req.body_json.len };
-    var body_writer = try request.sendBodyUnflushed(&.{});
-    try body_writer.writer.writeAll(stream_req.body_json);
-    try body_writer.end();
-    try request.connection.?.flush();
+    var body_writer = request.sendBodyUnflushed(&.{}) catch |err| return mapConnect(err);
+    body_writer.writer.writeAll(stream_req.body_json) catch return error.ConnectFailed;
+    body_writer.end() catch return error.ConnectFailed;
+    request.connection.?.flush() catch return error.ConnectFailed;
 
-    var response = try request.receiveHead(&.{});
+    var response = request.receiveHead(&.{}) catch |err| return mapConnect(err);
     progress.response_started.store(true, .release);
     markActivity(progress);
     const status: i64 = @intFromEnum(response.head.status);
@@ -238,7 +271,10 @@ fn streamPostRun(
         // live deltas hostage to a fill quota (worst case: until EOF).
         reader.fill(1) catch |err| switch (err) {
             error.EndOfStream => break,
-            error.ReadFailed => return response.bodyErr() orelse error.HttpReadFailed,
+            error.ReadFailed => {
+                if (response.bodyErr()) |cause| std.log.debug("stream body failure: {t}", .{cause});
+                return error.ReadFailed;
+            },
         };
         const bytes = reader.buffered();
         markActivity(progress);
@@ -280,7 +316,7 @@ pub fn get(
     timeout_ms: i64,
     cancel: ?*std.atomic.Value(bool),
 ) Error!GetResult {
-    var pool = try Pool.init(gpa, io, environ);
+    var pool = Pool.init(gpa, io, environ) catch |err| return mapConnect(err);
     defer pool.deinit();
     const result = try getImpl(&pool.client, gpa, url, max_bytes, timeout_ms, cancel, .init(5));
     if (result.location) |location| gpa.free(location);
@@ -298,7 +334,7 @@ pub fn getOne(
     timeout_ms: i64,
     cancel: ?*std.atomic.Value(bool),
 ) Error!GetOneResult {
-    var pool = try Pool.init(gpa, io, environ);
+    var pool = Pool.init(gpa, io, environ) catch |err| return mapConnect(err);
     defer pool.deinit();
     return getImpl(&pool.client, gpa, url, max_bytes, timeout_ms, cancel, .unhandled);
 }
@@ -319,10 +355,13 @@ fn getImpl(
     });
     var results: [2]Select.Union = undefined;
     var select = Select.init(client.io, &results);
-    try select.concurrent(.request, getRun, .{ client, gpa, url, max_bytes, cancel, redirect_behavior });
-    try select.concurrent(.watchdog, waitForAbort, .{ client.io, cancel, timeout_ms });
+    select.concurrent(.request, getRun, .{ client, gpa, url, max_bytes, cancel, redirect_behavior }) catch
+        return error.ConcurrencyUnavailable;
+    select.concurrent(.watchdog, waitForAbort, .{ client.io, cancel, timeout_ms }) catch
+        return error.ConcurrencyUnavailable;
 
-    const first = try select.await();
+    // Io-level cancellation (daemon shutdown) folds into Cancelled.
+    const first = select.await() catch return error.Cancelled;
     return switch (first) {
         .request => |result| blk: {
             select.cancelDiscard();
@@ -348,16 +387,16 @@ fn getRun(
 ) Error!GetOneResult {
     if (isCancelled(cancel)) return error.Cancelled;
 
-    const uri = try std.Uri.parse(url);
-    var request = try client.request(.GET, uri, .{
+    const uri = std.Uri.parse(url) catch return error.InvalidRequest;
+    var request = client.request(.GET, uri, .{
         .redirect_behavior = redirect_behavior,
         .headers = .{ .user_agent = .{ .override = "marlin/0.0" } },
-    });
+    }) catch |err| return mapConnect(err);
     defer request.deinit();
-    try request.sendBodiless();
+    request.sendBodiless() catch return error.ConnectFailed;
 
     var redirect_buffer: [8192]u8 = undefined;
-    var response = try request.receiveHead(if (redirect_behavior == .unhandled) &.{} else &redirect_buffer);
+    var response = request.receiveHead(if (redirect_behavior == .unhandled) &.{} else &redirect_buffer) catch |err| return mapConnect(err);
     const status: i64 = @intFromEnum(response.head.status);
     const content_type = if (response.head.content_type) |value| try gpa.dupe(u8, value) else null;
     errdefer if (content_type) |value| gpa.free(value);
@@ -372,7 +411,7 @@ fn getRun(
     const reader = switch (response.head.content_encoding) {
         .identity => response.reader(&transfer_buffer),
         .gzip, .deflate => response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer),
-        else => return error.UnsupportedCompressionMethod,
+        else => return error.UnsupportedEncoding,
     };
     var chunk: [16 * 1024]u8 = undefined;
     while (body.items.len < max_bytes) {
@@ -381,7 +420,10 @@ fn getRun(
             return error.Cancelled;
         }
         const n = reader.readSliceShort(chunk[0..@min(chunk.len, max_bytes - body.items.len)]) catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr() orelse error.HttpReadFailed,
+            error.ReadFailed => {
+                if (response.bodyErr()) |cause| std.log.debug("get body failure: {t}", .{cause});
+                return error.ReadFailed;
+            },
         };
         if (n == 0) break;
         try body.appendSlice(gpa, chunk[0..n]);

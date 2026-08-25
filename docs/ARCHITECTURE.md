@@ -455,7 +455,11 @@ input/output rates directly and leaves local or unpublished rates unknown.
 - HTTP uses a daemon-owned `std.http.Client` pool shared by provider requests,
   bounded fetches, catalogs, and network blocklists. It retains reusable
   connections across rounds while the transport remains isolated behind one
-  interface.
+  interface. The layer's failure vocabulary is a typed `http.Error`
+  (Cancelled / HttpTimeout / InvalidRequest / ConnectFailed / ReadFailed /
+  UnsupportedEncoding / ConcurrencyUnavailable / OutOfMemory), so a
+  "turn failed:" system_note distinguishes user interrupt, hung provider,
+  and mid-body transport death instead of leaking std.http error soup.
 
 ## 6. Context assembly & compaction
 
