@@ -39,12 +39,24 @@ hist_idx: ?usize = null,
 draft: ?[]u8 = null,
 /// Column the cursor "wants" during vertical movement.
 goal_col: ?usize = null,
+/// Undo/redo snapshots (vim `u` / Ctrl+R). Insert-mode typing is grouped:
+/// the TUI snapshots once at each normal→insert transition and before every
+/// normal-mode mutation.
+undo_stack: std.ArrayList(UndoState) = .empty,
+redo_stack: std.ArrayList(UndoState) = .empty,
+
+const UndoState = struct { text: []u8, cursor: usize };
+const max_undo_states = 100;
 
 pub fn init(gpa: std.mem.Allocator) Editor {
     return .{ .gpa = gpa };
 }
 
 pub fn deinit(self: *Editor) void {
+    for (self.undo_stack.items) |st| self.gpa.free(st.text);
+    self.undo_stack.deinit(self.gpa);
+    for (self.redo_stack.items) |st| self.gpa.free(st.text);
+    self.redo_stack.deinit(self.gpa);
     self.text.deinit(self.gpa);
     for (self.pastes.items) |p| self.gpa.free(p);
     self.pastes.deinit(self.gpa);
@@ -181,6 +193,10 @@ fn parseChipLabel(s: []const u8) ?ChipRef {
 }
 
 pub fn clear(self: *Editor) void {
+    for (self.undo_stack.items) |st| self.gpa.free(st.text);
+    self.undo_stack.clearRetainingCapacity();
+    for (self.redo_stack.items) |st| self.gpa.free(st.text);
+    self.redo_stack.clearRetainingCapacity();
     self.text.clearRetainingCapacity();
     self.cursor = 0;
     self.goal_col = null;
@@ -953,4 +969,187 @@ test "operator ranges: words, lines, quotes, brackets" {
     ed.deleteRange(r.start, r.end);
     try testing.expectEqualStrings("one\nthree", ed.text.items);
     try testing.expectEqual(@as(usize, 4), ed.cursor);
+}
+
+// -------------------------------------------------------------- undo/redo --
+
+/// Snapshot the current state as an undo point. Call BEFORE a mutation.
+pub fn pushUndo(self: *Editor) void {
+    if (self.undo_stack.items.len > 0) {
+        const top = self.undo_stack.items[self.undo_stack.items.len - 1];
+        if (std.mem.eql(u8, top.text, self.text.items)) return; // no-op edit
+    }
+    const snap = self.gpa.dupe(u8, self.text.items) catch return;
+    self.undo_stack.append(self.gpa, .{ .text = snap, .cursor = self.cursor }) catch {
+        self.gpa.free(snap);
+        return;
+    };
+    if (self.undo_stack.items.len > max_undo_states) {
+        const oldest = self.undo_stack.orderedRemove(0);
+        self.gpa.free(oldest.text);
+    }
+    for (self.redo_stack.items) |st| self.gpa.free(st.text);
+    self.redo_stack.clearRetainingCapacity();
+}
+
+fn restoreState(self: *Editor, st: UndoState) void {
+    self.text.clearRetainingCapacity();
+    self.text.appendSlice(self.gpa, st.text) catch {};
+    self.cursor = @min(st.cursor, self.text.items.len);
+    self.goal_col = null;
+}
+
+pub fn undo(self: *Editor) bool {
+    const st = self.undo_stack.pop() orelse return false;
+    const current = self.gpa.dupe(u8, self.text.items) catch {
+        self.gpa.free(st.text);
+        return false;
+    };
+    self.redo_stack.append(self.gpa, .{ .text = current, .cursor = self.cursor }) catch self.gpa.free(current);
+    self.restoreState(st);
+    self.gpa.free(st.text);
+    return true;
+}
+
+pub fn redo(self: *Editor) bool {
+    const st = self.redo_stack.pop() orelse return false;
+    const current = self.gpa.dupe(u8, self.text.items) catch {
+        self.gpa.free(st.text);
+        return false;
+    };
+    self.undo_stack.append(self.gpa, .{ .text = current, .cursor = self.cursor }) catch self.gpa.free(current);
+    self.restoreState(st);
+    self.gpa.free(st.text);
+    return true;
+}
+
+// ------------------------------------------------------- vim-mode helpers --
+
+/// vim `w`: cursor to the start of the NEXT word (moveWordRight is `e`).
+pub fn moveWordStart(self: *Editor) void {
+    self.cursor = self.wordForwardRange().end;
+    self.goal_col = null;
+}
+
+/// vim `e` as an operator target: cursor through the end of the word.
+pub fn wordEndRange(self: *const Editor) Range {
+    return .{ .start = self.cursor, .end = wordEndAfter(self.text.items, self.cursor) };
+}
+
+/// `count` logical lines starting at the cursor's line (for 2dd/3yy).
+pub fn linesRange(self: *const Editor, count: usize, with_newline: bool) Range {
+    const t = self.text.items;
+    const start = lineStart(t, self.cursor);
+    var end = start;
+    var remaining = @max(count, 1);
+    while (remaining > 0) : (remaining -= 1) {
+        end = if (std.mem.indexOfScalarPos(u8, t, end, '\n')) |nl| nl + 1 else t.len;
+        if (end == t.len) break;
+    }
+    if (!with_newline and end > start and end <= t.len and end > 0 and t[end - 1] == '\n') end -= 1;
+    return .{ .start = start, .end = end };
+}
+
+/// vim `r`: replace the codepoint under the cursor, cursor stays on it.
+pub fn replaceUnderCursor(self: *Editor, replacement: []const u8) void {
+    const t = self.text.items;
+    if (self.cursor >= t.len or replacement.len == 0) return;
+    const end = nextCpEnd(t, self.cursor);
+    self.text.replaceRange(self.gpa, self.cursor, end - self.cursor, replacement) catch return;
+    self.goal_col = null;
+}
+
+/// vim `~`: toggle ASCII case under the cursor and advance.
+pub fn toggleCaseUnderCursor(self: *Editor) void {
+    const t = self.text.items;
+    if (self.cursor >= t.len) return;
+    const ch = t[self.cursor];
+    if (std.ascii.isLower(ch)) {
+        self.text.items[self.cursor] = std.ascii.toUpper(ch);
+    } else if (std.ascii.isUpper(ch)) {
+        self.text.items[self.cursor] = std.ascii.toLower(ch);
+    }
+    self.cursor = nextCpEnd(t, self.cursor);
+    self.goal_col = null;
+}
+
+/// vim `o`/`O`: open a new line below/above and place the cursor on it.
+pub fn openLine(self: *Editor, below: bool) void {
+    const line = self.lineRangeAt(false);
+    if (below) {
+        self.text.insertSlice(self.gpa, line.end, "\n") catch return;
+        self.cursor = line.end + 1;
+    } else {
+        self.text.insertSlice(self.gpa, line.start, "\n") catch return;
+        self.cursor = line.start;
+    }
+    self.goal_col = null;
+}
+
+/// Find a character on the cursor's line (vim f/t/F/T). Returns the byte
+/// index of the target character, honoring `count` occurrences.
+pub fn findOnLine(self: *const Editor, ch: u8, forward: bool, count: usize) ?usize {
+    const t = self.text.items;
+    const line = self.lineRangeAt(false);
+    var remaining = @max(count, 1);
+    if (forward) {
+        var i = @min(self.cursor + 1, line.end);
+        while (i < line.end) : (i += 1) {
+            if (t[i] == ch) {
+                remaining -= 1;
+                if (remaining == 0) return i;
+            }
+        }
+    } else {
+        var i = self.cursor;
+        while (i > line.start) {
+            i -= 1;
+            if (t[i] == ch) {
+                remaining -= 1;
+                if (remaining == 0) return i;
+            }
+        }
+    }
+    return null;
+}
+
+test "undo groups and redo round trip" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("hello");
+    ed.pushUndo();
+    ed.insertSlice(" world");
+    try testing.expect(ed.undo());
+    try testing.expectEqualStrings("hello", ed.text.items);
+    try testing.expect(ed.redo());
+    try testing.expectEqualStrings("hello world", ed.text.items);
+    try testing.expect(ed.redo() == false);
+}
+
+test "vim helpers: word start, lines range, find, replace, open" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("zig build test");
+    ed.cursor = 0;
+    ed.moveWordStart();
+    try testing.expectEqual(@as(usize, 4), ed.cursor); // start of "build"
+
+    try testing.expectEqual(@as(?usize, 10), ed.findOnLine('t', true, 1));
+    try testing.expectEqual(@as(?usize, 13), ed.findOnLine('t', true, 2));
+    try testing.expectEqual(@as(?usize, null), ed.findOnLine('z', true, 1));
+
+    ed.cursor = 4;
+    ed.replaceUnderCursor("B");
+    try testing.expectEqualStrings("zig Build test", ed.text.items);
+    ed.toggleCaseUnderCursor();
+    try testing.expectEqualStrings("zig build test", ed.text.items);
+
+    ed.clear();
+    ed.insertSlice("one\ntwo\nthree");
+    ed.cursor = 5;
+    const two = ed.linesRange(2, true);
+    try testing.expectEqualStrings("two\nthree", ed.text.items[two.start..two.end]);
+    ed.openLine(true);
+    try testing.expectEqualStrings("one\ntwo\n\nthree", ed.text.items);
+    try testing.expectEqual(@as(usize, 8), ed.cursor);
 }

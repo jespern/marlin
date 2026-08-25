@@ -385,6 +385,17 @@ const App = struct {
     /// text object; pending_obj holds 'i'/'a' awaiting the object key.
     pending_op: u8 = 0,
     pending_obj: u8 = 0,
+    /// Numeric prefix under construction (3w, d2w, 2dd). 0 = none.
+    pending_count: usize = 0,
+    /// 'f'/'t'/'F'/'T' awaiting its target character.
+    pending_find: u8 = 0,
+    /// vim r awaiting the replacement character.
+    pending_replace: bool = false,
+    /// Last f/t/F/T for ; and , repeats.
+    last_find_kind: u8 = 0,
+    last_find_ch: u8 = 0,
+    /// The yank register holds whole lines (dd/yy/cc/V); p pastes below.
+    yank_linewise: bool = false,
     /// /permissions full is active for this session (client-side mirror of
     /// the daemon's approval mode; a daemon restart resets both to default).
     permissions_full: bool = false,
@@ -1028,15 +1039,92 @@ const App = struct {
         self.setNotice("no tool output to copy", .{});
     }
 
+    /// Consume the numeric prefix (default 1).
+    fn takeCount(self: *App) usize {
+        const n = if (self.pending_count == 0) 1 else self.pending_count;
+        self.pending_count = 0;
+        return n;
+    }
+
+    /// Repeat a forward range motion `n` times from the cursor by walking a
+    /// scratch cursor; the editor is restored before returning.
+    fn repeatForwardRange(self: *App, comptime range_fn: fn (*const Editor) Editor.Range, n: usize) Editor.Range {
+        const ed = &self.editor;
+        const saved = ed.cursor;
+        var end = saved;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const r = range_fn(ed);
+            if (r.end == end and i > 0) break;
+            end = r.end;
+            ed.cursor = @min(end, ed.text.items.len);
+        }
+        ed.cursor = saved;
+        return .{ .start = saved, .end = end };
+    }
+
+    fn repeatBackwardRange(self: *App, comptime range_fn: fn (*const Editor) Editor.Range, n: usize) Editor.Range {
+        const ed = &self.editor;
+        const saved = ed.cursor;
+        var start = saved;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const r = range_fn(ed);
+            if (r.start == start and i > 0) break;
+            start = r.start;
+            ed.cursor = start;
+        }
+        ed.cursor = saved;
+        return .{ .start = start, .end = saved };
+    }
+
+    /// Resolve a completed f/t/F/T: either move the cursor or feed the
+    /// pending operator (df" / ct)). Inclusive for f, exclusive for t.
+    fn resolveFind(self: *App, kind: u8, ch: u8, count: usize) void {
+        const ed = &self.editor;
+        const forward = kind == 'f' or kind == 't';
+        const target = ed.findOnLine(ch, forward, count) orelse {
+            self.pending_op = 0;
+            return;
+        };
+        self.last_find_kind = kind;
+        self.last_find_ch = ch;
+        const t = ed.text.items;
+        if (self.pending_op != 0) {
+            const op = self.pending_op;
+            self.pending_op = 0;
+            const range: Editor.Range = switch (kind) {
+                'f' => .{ .start = ed.cursor, .end = nextCpEndFor(t, target) },
+                't' => .{ .start = ed.cursor, .end = target },
+                'F' => .{ .start = target, .end = ed.cursor },
+                'T' => .{ .start = nextCpEndFor(t, target), .end = ed.cursor },
+                else => return,
+            };
+            self.applyOperator(op, range);
+            return;
+        }
+        ed.cursor = switch (kind) {
+            'f', 'F' => target,
+            't' => if (target > 0) target - 1 else 0,
+            'T' => nextCpEndFor(t, target),
+            else => target,
+        };
+    }
+
     fn applyOperator(self: *App, op: u8, range: Editor.Range) void {
         if (range.end <= range.start) return;
         const slice = self.editor.text.items[range.start..range.end];
         self.yank_register.clearRetainingCapacity();
         self.yank_register.appendSlice(self.gpa, slice) catch {};
+        self.yank_linewise = slice.len > 0 and slice[slice.len - 1] == '\n';
         switch (op) {
             'y' => self.editor.cursor = range.start,
-            'd' => self.editor.deleteRange(range.start, range.end),
+            'd' => {
+                self.editor.pushUndo();
+                self.editor.deleteRange(range.start, range.end);
+            },
             'c' => {
+                self.editor.pushUndo();
                 self.editor.deleteRange(range.start, range.end);
                 self.mode = .insert;
             },
@@ -1075,20 +1163,37 @@ const App = struct {
         }
         if (key.matches(vaxis.Key.escape, .{})) {
             self.pending_op = 0;
+            self.pending_count = 0;
+            return;
+        }
+        if ((key.codepoint >= '1' and key.codepoint <= '9') or
+            (key.codepoint == '0' and self.pending_count > 0))
+        {
+            self.pending_count = self.pending_count * 10 + @as(usize, @intCast(key.codepoint - '0'));
             return;
         }
         if (key.matches('i', .{}) or key.matches('a', .{})) {
             self.pending_obj = if (key.matches('a', .{})) 'a' else 'i';
             return;
         }
+        if (key.matches('f', .{}) or key.matches('t', .{}) or
+            key.matches('F', .{ .shift = true }) or key.matches('T', .{ .shift = true }))
+        {
+            // Operator + find: keep the operator pending, await the char.
+            self.pending_find = @intCast(key.codepoint);
+            return;
+        }
+        const count = self.takeCount();
         self.pending_op = 0;
         const range: ?Editor.Range = if (key.codepoint == op)
             // dd deletes the line including its newline; cc keeps the shell.
-            ed.lineRangeAt(op != 'c')
+            ed.linesRange(count, op != 'c')
         else if (key.matches('w', .{}))
-            ed.wordForwardRange()
+            self.repeatForwardRange(Editor.wordForwardRange, count)
+        else if (key.matches('e', .{}))
+            self.repeatForwardRange(Editor.wordEndRange, count)
         else if (key.matches('b', .{}))
-            ed.wordBackRange()
+            self.repeatBackwardRange(Editor.wordBackRange, count)
         else if (key.matches('$', .{}))
             ed.toLineEndRange()
         else if (key.matches('0', .{}))
@@ -1806,6 +1911,14 @@ fn shimmerSpans(
         char_index += 1;
     }
     return spans.toOwnedSlice(arena);
+}
+
+/// Codepoint end for byte index i (module-local mirror of the editor's).
+fn nextCpEndFor(t: []const u8, i: usize) usize {
+    if (i >= t.len) return t.len;
+    var j = i + 1;
+    while (j < t.len and (t[j] & 0b1100_0000) == 0b1000_0000) : (j += 1) {}
+    return j;
 }
 
 /// Next word start at or after `col` (ASCII word boundaries over the
@@ -4241,7 +4354,10 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .description = "COMPOSER (vim)", .heading = true },
     .{ .key = "h l w b 0 $", .description = "move in the input line" },
     .{ .key = "x / D", .description = "delete char / to line end" },
-    .{ .key = "d c y + motion", .description = "operators: w b 0 $, dd/cc/yy, iw i\" i( …" },
+    .{ .key = "d c y + motion", .description = "operators: w b e 0 $ f t, dd/cc/yy, iw i\" i( …" },
+    .{ .key = "counts f t ; ,", .description = "3w d2w 2dd · find char, repeat" },
+    .{ .key = "u / Ctrl+R", .description = "undo / redo" },
+    .{ .key = "s S C Y o O r ~", .description = "vim synonyms, open line, replace, case" },
     .{ .key = "p", .description = "paste the yank register" },
     .{ .description = "COPY MODE", .heading = true },
     .{ .key = "v", .description = "enter copy mode (cursor over transcript)" },
@@ -5362,23 +5478,52 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.copyModeKey(key);
                 return;
             }
+            if (app.pending_replace) {
+                app.pending_replace = false;
+                if (key.text) |txt| {
+                    app.editor.pushUndo();
+                    app.editor.replaceUnderCursor(txt);
+                }
+                return;
+            }
+            if (app.pending_find != 0) {
+                const kind = app.pending_find;
+                app.pending_find = 0;
+                if (key.codepoint <= 0x7f and key.codepoint >= 0x20) {
+                    app.resolveFind(kind, @intCast(key.codepoint), app.takeCount());
+                } else {
+                    app.pending_op = 0;
+                    app.pending_count = 0;
+                }
+                return;
+            }
             if (app.pending_op != 0) {
                 app.operatorKey(key);
+                return;
+            }
+            if ((key.codepoint >= '1' and key.codepoint <= '9') or
+                (key.codepoint == '0' and app.pending_count > 0))
+            {
+                app.pending_count = app.pending_count * 10 + @as(usize, @intCast(key.codepoint - '0'));
                 return;
             }
             if (key.matches('?', .{})) {
                 app.shortcut_help = true;
             } else if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{})) {
+                app.editor.pushUndo();
                 app.mode = .insert;
             } else if (key.matches('a', .{})) {
                 // Vim append: archive moved to /archive — a destructive-ish
                 // action must not sit on the muscle-memory insert key.
+                app.editor.pushUndo();
                 app.editor.moveRight();
                 app.mode = .insert;
             } else if (key.matches('A', .{ .shift = true }) or key.matches('A', .{})) {
+                app.editor.pushUndo();
                 app.editor.moveLineEnd();
                 app.mode = .insert;
             } else if (key.matches('I', .{ .shift = true }) or key.matches('I', .{})) {
+                app.editor.pushUndo();
                 app.editor.moveLineStart();
                 app.mode = .insert;
             } else if (key.matches('q', .{})) {
@@ -5402,30 +5547,108 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (key.matches('v', .{}) or key.matches('V', .{ .shift = true }) or key.matches('V', .{})) {
                 app.enterCopyMode();
             } else if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
-                app.editor.moveLeft();
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.moveLeft();
             } else if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
-                app.editor.moveRight();
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.moveRight();
             } else if (key.matches('w', .{})) {
-                app.editor.moveWordRight();
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.moveWordStart();
+            } else if (key.matches('e', .{})) {
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.moveWordRight();
             } else if (key.matches('b', .{})) {
-                app.editor.moveWordLeft();
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.moveWordLeft();
             } else if (key.matches('0', .{})) {
                 app.editor.moveLineStart();
             } else if (key.matches('$', .{})) {
                 app.editor.moveLineEnd();
+            } else if (key.matches('f', .{}) or key.matches('t', .{}) or
+                key.matches('F', .{ .shift = true }) or key.matches('T', .{ .shift = true }))
+            {
+                app.pending_find = @intCast(key.codepoint);
+            } else if (key.matches(';', .{}) or key.matches(',', .{})) {
+                if (app.last_find_kind != 0) {
+                    const kind = if (key.matches(';', .{}))
+                        app.last_find_kind
+                    else switch (app.last_find_kind) {
+                        'f' => @as(u8, 'F'),
+                        'F' => 'f',
+                        't' => 'T',
+                        'T' => 't',
+                        else => app.last_find_kind,
+                    };
+                    const remembered_ch = app.last_find_ch;
+                    app.resolveFind(kind, remembered_ch, app.takeCount());
+                    app.last_find_kind = if (key.matches(',', .{})) switch (kind) {
+                        'f' => @as(u8, 'F'),
+                        'F' => 'f',
+                        't' => 'T',
+                        'T' => 't',
+                        else => kind,
+                    } else kind;
+                }
+            } else if (key.matches('r', .{})) {
+                app.pending_replace = true;
+            } else if (key.matches('~', .{})) {
+                app.editor.pushUndo();
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.toggleCaseUnderCursor();
             } else if (key.matches('x', .{})) {
+                app.editor.pushUndo();
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.deleteAfter();
+            } else if (key.matches('X', .{ .shift = true })) {
+                app.editor.pushUndo();
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.deleteBefore();
+            } else if (key.matches('s', .{})) {
+                app.editor.pushUndo();
                 app.editor.deleteAfter();
+                app.mode = .insert;
+            } else if (key.matches('S', .{ .shift = true })) {
+                app.pending_op = 'c';
+                app.operatorKey(.{ .codepoint = 'c' });
+            } else if (key.matches('C', .{ .shift = true })) {
+                app.applyOperator('c', app.editor.toLineEndRange());
+            } else if (key.matches('Y', .{ .shift = true })) {
+                app.applyOperator('y', app.editor.lineRangeAt(true));
             } else if (key.matches('D', .{ .shift = true }) or key.matches('D', .{})) {
-                app.editor.deleteToLineEnd();
+                app.applyOperator('d', app.editor.toLineEndRange());
+            } else if (key.matches('o', .{})) {
+                app.editor.pushUndo();
+                app.editor.openLine(true);
+                app.mode = .insert;
+            } else if (key.matches('O', .{ .shift = true })) {
+                app.editor.pushUndo();
+                app.editor.openLine(false);
+                app.mode = .insert;
+            } else if (key.matches('u', .{})) {
+                if (!app.editor.undo()) app.setNotice("already at oldest change", .{});
+            } else if (key.matches('r', .{ .ctrl = true })) {
+                if (!app.editor.redo()) app.setNotice("already at newest change", .{});
             } else if (key.matches('d', .{})) {
                 app.pending_op = 'd';
             } else if (key.matches('c', .{})) {
                 app.pending_op = 'c';
             } else if (key.matches('y', .{})) {
                 app.pending_op = 'y';
-            } else if (key.matches('p', .{})) {
+            } else if (key.matches('p', .{}) or key.matches('P', .{ .shift = true })) {
                 if (app.yank_register.items.len > 0) {
-                    app.editor.insertSlice(app.yank_register.items);
+                    app.editor.pushUndo();
+                    const before = key.matches('P', .{ .shift = true });
+                    if (app.yank_linewise) {
+                        const line = app.editor.lineRangeAt(true);
+                        app.editor.cursor = if (before) line.start else line.end;
+                        const at = app.editor.cursor;
+                        app.editor.insertSlice(app.yank_register.items);
+                        app.editor.cursor = at;
+                    } else {
+                        if (!before) app.editor.moveRight();
+                        app.editor.insertSlice(app.yank_register.items);
+                    }
                 } else {
                     app.setNotice("yank register empty — y in copy mode (v) fills it", .{});
                 }
@@ -6801,7 +7024,8 @@ test "normal mode: p pastes the yank register into the composer" {
     try handleKey(&app, .{ .codepoint = '0' });
     try handleKey(&app, .{ .codepoint = 'w' });
     try handleKey(&app, .{ .codepoint = 'D' });
-    try std.testing.expectEqualStrings("zig", app.editor.text.items);
+    // True-vim w: next word START, so D leaves the separator behind.
+    try std.testing.expectEqualStrings("zig ", app.editor.text.items);
 }
 
 test "composer operators: dw ci\" yy dd" {
@@ -6862,4 +7086,73 @@ test "composer operators: dw ci\" yy dd" {
     try handleKey(&app, .{ .codepoint = 'i' });
     try handleKey(&app, .{ .codepoint = '(' });
     try std.testing.expectEqualStrings("call()", app.editor.text.items);
+}
+
+test "vim completeness: counts, find, undo, synonyms, linewise paste" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.mode = .normal;
+
+    // d2w with a count: two words and their separators.
+    app.editor.insertSlice("one two three four");
+    app.editor.moveLineStart();
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = '2' });
+    try handleKey(&app, .{ .codepoint = 'w' });
+    try std.testing.expectEqualStrings("three four", app.editor.text.items);
+
+    // u undoes it; ctrl+r redoes it.
+    try handleKey(&app, .{ .codepoint = 'u' });
+    try std.testing.expectEqualStrings("one two three four", app.editor.text.items);
+    try handleKey(&app, .{ .codepoint = 'r', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqualStrings("three four", app.editor.text.items);
+
+    // f/t with operator: dt<space> from start eats "three".
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = 't' });
+    try handleKey(&app, .{ .codepoint = ' ', .text = " " });
+    try std.testing.expectEqualStrings(" four", app.editor.text.items);
+
+    // 3w count motion, then x.
+    app.editor.clear();
+    app.editor.insertSlice("a bb ccc dddd");
+    app.editor.moveLineStart();
+    try handleKey(&app, .{ .codepoint = '3' });
+    try handleKey(&app, .{ .codepoint = 'w' });
+    try std.testing.expectEqual(@as(usize, 9), app.editor.cursor); // start of dddd
+    try handleKey(&app, .{ .codepoint = 'x' });
+    try std.testing.expectEqualStrings("a bb ccc ddd", app.editor.text.items);
+
+    // r replaces in place; ~ toggles case.
+    app.editor.moveLineStart();
+    try handleKey(&app, .{ .codepoint = 'r' });
+    try handleKey(&app, .{ .codepoint = 'A', .text = "A" });
+    try std.testing.expectEqualStrings("A bb ccc ddd", app.editor.text.items);
+    try handleKey(&app, .{ .codepoint = '~' });
+    try std.testing.expectEqualStrings("a bb ccc ddd", app.editor.text.items);
+
+    // C changes to end of line and enters insert.
+    app.editor.cursor = 2;
+    try handleKey(&app, .{ .codepoint = 'C', .mods = .{ .shift = true } });
+    try std.testing.expectEqualStrings("a ", app.editor.text.items);
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    app.mode = .normal;
+
+    // Linewise yank and paste below (Y then p).
+    app.editor.clear();
+    app.editor.insertSlice("alpha\nbeta");
+    app.editor.cursor = 0;
+    try handleKey(&app, .{ .codepoint = 'Y', .mods = .{ .shift = true } });
+    try std.testing.expect(app.yank_linewise);
+    try handleKey(&app, .{ .codepoint = 'p' });
+    try std.testing.expectEqualStrings("alpha\nalpha\nbeta", app.editor.text.items);
+
+    // o opens a line below and enters insert.
+    app.mode = .normal;
+    try handleKey(&app, .{ .codepoint = 'o' });
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expect(std.mem.startsWith(u8, app.editor.text.items, "alpha\nalpha\n\n"));
 }
