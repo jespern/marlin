@@ -32,6 +32,9 @@ pub const RequestOptions = struct {
     /// Emit explicit per-content cache breakpoints for model families that
     /// require them (Claude/Gemini/Qwen through OpenRouter).
     explicit_cache: bool = false,
+    /// OpenRouter executes this server tool inside the provider request. It is
+    /// never emitted for generic OpenAI-compatible endpoints.
+    openrouter_web_search: bool = false,
 };
 
 /// Build the request body JSON. Caller frees.
@@ -137,10 +140,16 @@ pub fn buildRequestBody(
         try ws.writeAll("}");
     }
     try ws.writeAll("]");
-    if (tools.len > 0) {
+    const include_web_search = dialect == .openrouter and opts.openrouter_web_search;
+    if (tools.len > 0 or include_web_search) {
         try ws.writeAll(",\"tools\":[");
-        for (tools, 0..) |t, i| {
-            if (i > 0) try ws.writeByte(',');
+        var wrote_tool = false;
+        if (include_web_search) {
+            try ws.writeAll("{\"type\":\"openrouter:web_search\",\"parameters\":{\"max_results\":5,\"max_total_results\":15,\"max_characters\":2000}}");
+            wrote_tool = true;
+        }
+        for (tools) |t| {
+            if (wrote_tool) try ws.writeByte(',');
             try ws.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
             try enc(t.name, .{}, ws);
             try ws.writeAll(",\"description\":");
@@ -148,9 +157,10 @@ pub fn buildRequestBody(
             try ws.writeAll(",\"parameters\":");
             try ws.writeAll(t.schema_json); // already JSON
             try ws.writeAll("}}");
+            wrote_tool = true;
         }
         try ws.writeAll("]");
-        if (dialect == .openrouter) try ws.writeAll(",\"parallel_tool_calls\":true");
+        if (dialect == .openrouter and tools.len > 0) try ws.writeAll(",\"parallel_tool_calls\":true");
     }
     try ws.writeAll("}");
     return aw.toOwnedSlice();
@@ -167,6 +177,7 @@ pub const StreamAccum = struct {
     /// Reasoning text if the provider emits it (OpenRouter: `reasoning`).
     reasoning: std.ArrayList(u8) = .empty,
     calls: std.ArrayList(PartialCall) = .empty,
+    citations: std.ArrayList(Citation) = .empty,
     /// OpenRouter identifiers make a request directly inspectable through its
     /// Activity/generation observability surfaces; kept only for live logs.
     generation_id: std.ArrayList(u8) = .empty,
@@ -180,6 +191,7 @@ pub const StreamAccum = struct {
     /// HTTP consumer observes this and closes the stream immediately.
     response_too_large: bool = false,
     tool_bytes: usize = 0,
+    citation_bytes: usize = 0,
 
     /// Immediate delta sink for UI liveness; may be null in headless tests.
     on_delta: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
@@ -194,6 +206,8 @@ pub const StreamAccum = struct {
     pub const max_field_bytes: usize = 4 * 1024 * 1024;
     const max_metadata_bytes: usize = 4 * 1024;
     const max_tool_calls: usize = 128;
+    const max_citations: usize = 64;
+    const max_citation_bytes: usize = 256 * 1024;
 
     pub const FinishReason = enum { stop, tool_calls, length, content_filter, other };
 
@@ -202,6 +216,11 @@ pub const StreamAccum = struct {
         call_id: std.ArrayList(u8) = .empty,
         name: std.ArrayList(u8) = .empty,
         args: std.ArrayList(u8) = .empty,
+    };
+
+    pub const Citation = struct {
+        url: []u8,
+        title: []u8,
     };
 
     pub fn init(gpa: std.mem.Allocator) StreamAccum {
@@ -219,6 +238,11 @@ pub const StreamAccum = struct {
             pc.args.deinit(self.gpa);
         }
         self.calls.deinit(self.gpa);
+        for (self.citations.items) |citation| {
+            self.gpa.free(citation.url);
+            self.gpa.free(citation.title);
+        }
+        self.citations.deinit(self.gpa);
     }
 
     // ------------------------------------------------ dialect decoder API --
@@ -291,18 +315,20 @@ pub const StreamAccum = struct {
 
         // usage: on the final chunk (or OpenRouter's usage-only tail chunk)
         if (root.get("usage")) |u| if (u == .object) {
-            const tin = intField(u.object, "prompt_tokens") orelse 0;
-            const tout = intField(u.object, "completion_tokens") orelse 0;
+            const tin = intField(u.object, "prompt_tokens") orelse intField(u.object, "input_tokens") orelse 0;
+            const tout = intField(u.object, "completion_tokens") orelse intField(u.object, "output_tokens") orelse 0;
             const cached = nestedIntField(u.object, "prompt_tokens_details", "cached_tokens") orelse 0;
             const cache_write = nestedIntField(u.object, "prompt_tokens_details", "cache_write_tokens") orelse 0;
             const reasoning_tokens = nestedIntField(u.object, "completion_tokens_details", "reasoning_tokens") orelse 0;
-            if (tin != 0 or tout != 0)
+            const web_search_requests = nestedIntField(u.object, "server_tool_use", "web_search_requests") orelse 0;
+            if (tin != 0 or tout != 0 or web_search_requests != 0)
                 self.usage = .{
                     .tokens_in = tin,
                     .tokens_out = tout,
                     .cached_tokens = cached,
                     .cache_write_tokens = cache_write,
                     .reasoning_tokens = reasoning_tokens,
+                    .web_search_requests = web_search_requests,
                 };
         };
 
@@ -310,6 +336,10 @@ pub const StreamAccum = struct {
         if (choices != .array or choices.array.items.len == 0) return;
         const choice0 = choices.array.items[0];
         if (choice0 != .object) return;
+        try self.collectAnnotations(choice0.object);
+        if (choice0.object.get("message")) |message| {
+            if (message == .object) try self.collectAnnotations(message.object);
+        }
 
         if (choice0.object.get("finish_reason")) |fr| if (fr == .string) {
             self.finish_reason = parseFinish(fr.string);
@@ -326,6 +356,7 @@ pub const StreamAccum = struct {
             try appendBounded(self.gpa, &self.reasoning, rs.string, max_field_bytes);
             self.maybeForwardReasoning();
         };
+        try self.collectAnnotations(delta.object);
 
         if (delta.object.get("tool_calls")) |tcs| if (tcs == .array) {
             for (tcs.array.items) |tc| {
@@ -389,6 +420,82 @@ pub const StreamAccum = struct {
         }
     }
 
+    fn collectAnnotations(self: *StreamAccum, object: std.json.ObjectMap) !void {
+        const annotations = object.get("annotations") orelse return;
+        if (annotations != .array) return;
+        for (annotations.array.items) |annotation| {
+            if (annotation != .object) continue;
+            const kind = annotation.object.get("type") orelse continue;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "url_citation")) continue;
+            const value = annotation.object.get("url_citation") orelse continue;
+            if (value != .object) continue;
+            const url_value = value.object.get("url") orelse continue;
+            if (url_value != .string or
+                (!std.mem.startsWith(u8, url_value.string, "https://") and
+                    !std.mem.startsWith(u8, url_value.string, "http://"))) continue;
+            var safe_url = true;
+            for (url_value.string) |byte| {
+                if (byte <= 0x20 or byte == 0x7f) {
+                    safe_url = false;
+                    break;
+                }
+            }
+            if (!safe_url) continue;
+            const title_value = value.object.get("title");
+            const title = if (title_value) |candidate|
+                if (candidate == .string) candidate.string else ""
+            else
+                "";
+            try self.addCitation(url_value.string, title);
+        }
+    }
+
+    fn addCitation(self: *StreamAccum, url: []const u8, title: []const u8) !void {
+        for (self.citations.items) |citation| {
+            if (std.mem.eql(u8, citation.url, url)) return;
+        }
+        if (self.citations.items.len >= max_citations or
+            url.len > max_citation_bytes -| self.citation_bytes or
+            title.len > max_citation_bytes -| self.citation_bytes -| url.len)
+        {
+            return error.ResponseTooLarge;
+        }
+        const owned_url = try self.gpa.dupe(u8, url);
+        errdefer self.gpa.free(owned_url);
+        const owned_title = try self.gpa.dupe(u8, title);
+        errdefer self.gpa.free(owned_title);
+        try self.citations.append(self.gpa, .{ .url = owned_url, .title = owned_title });
+        self.citation_bytes += url.len + title.len;
+    }
+
+    /// OpenRouter normally asks the model to write Markdown links itself. If
+    /// an annotation arrives without its URL in the answer, retain that source
+    /// explicitly so the durable transcript never loses the citation.
+    pub fn textWithCitationLinks(self: *const StreamAccum, allocator: std.mem.Allocator) ![]u8 {
+        var missing: usize = 0;
+        for (self.citations.items) |citation| {
+            if (std.mem.indexOf(u8, self.text.items, citation.url) == null) missing += 1;
+        }
+        if (missing == 0) return allocator.dupe(u8, self.text.items);
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, self.text.items);
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+        try out.appendSlice(allocator, "\nSources:\n");
+        for (self.citations.items) |citation| {
+            if (std.mem.indexOf(u8, self.text.items, citation.url) != null) continue;
+            try out.appendSlice(allocator, "- ");
+            if (citation.title.len > 0) {
+                try appendSafeTitle(&out, allocator, citation.title);
+                try out.appendSlice(allocator, " — ");
+            }
+            try out.appendSlice(allocator, citation.url);
+            try out.append(allocator, '\n');
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     fn parseFinish(s: []const u8) FinishReason {
         if (std.mem.eql(u8, s, "stop")) return .stop;
         if (std.mem.eql(u8, s, "tool_calls")) return .tool_calls;
@@ -411,6 +518,20 @@ pub const StreamAccum = struct {
         return intField(nested.object, key);
     }
 };
+
+fn appendSafeTitle(out: *std.ArrayList(u8), allocator: std.mem.Allocator, title: []const u8) !void {
+    var previous_space = false;
+    for (title[0..@min(title.len, 200)]) |byte| {
+        const current = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+        if (current == ' ') {
+            if (previous_space) continue;
+            previous_space = true;
+        } else {
+            previous_space = false;
+        }
+        try out.append(allocator, current);
+    }
+}
 
 fn appendBounded(
     gpa: std.mem.Allocator,
@@ -436,7 +557,7 @@ test "text deltas accumulate; usage and finish captured" {
         ,
         \\{"choices":[{"index":0,"delta":{"content":"lo"}}]}
         ,
-        \\{"id":"gen-test","provider":"OpenAI","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":3}}}
+        \\{"id":"gen-test","provider":"OpenAI","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":3},"server_tool_use":{"web_search_requests":2}}}
         ,
         "[DONE]",
     });
@@ -446,10 +567,40 @@ test "text deltas accumulate; usage and finish captured" {
     try std.testing.expectEqual(@as(u64, 8), acc.usage.?.cached_tokens);
     try std.testing.expectEqual(@as(u64, 1), acc.usage.?.cache_write_tokens);
     try std.testing.expectEqual(@as(u64, 3), acc.usage.?.reasoning_tokens);
+    try std.testing.expectEqual(@as(u64, 2), acc.usage.?.web_search_requests);
     try std.testing.expectEqualStrings("gen-test", acc.generation_id.items);
     try std.testing.expectEqualStrings("OpenAI", acc.provider_name.items);
     try std.testing.expect(acc.saw_done);
     try std.testing.expectEqual(@as(u32, 0), acc.parse_errors);
+}
+
+test "web citation annotations survive as durable source links" {
+    const gpa = std.testing.allocator;
+    var acc = StreamAccum.init(gpa);
+    defer acc.deinit();
+    feedEvents(&acc, &.{
+        \\{"choices":[{"delta":{"content":"A grounded answer.","annotations":[{"type":"url_citation","url_citation":{"url":"https://example.com/report","title":"Example\n Report"}},{"type":"url_citation","url_citation":{"url":"https://example.com/report","title":"duplicate"}},{"type":"url_citation","url_citation":{"url":"javascript:alert(1)","title":"unsafe"}}]}}]}
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), acc.citations.items.len);
+    const text = try acc.textWithCitationLinks(gpa);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Sources:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Example Report — https://example.com/report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "javascript:") == null);
+}
+
+test "web citation already linked by model is not duplicated" {
+    const gpa = std.testing.allocator;
+    var acc = StreamAccum.init(gpa);
+    defer acc.deinit();
+    feedEvents(&acc, &.{
+        \\{"choices":[{"delta":{"content":"See [the source](https://example.com/report).","annotations":[{"type":"url_citation","url_citation":{"url":"https://example.com/report","title":"Example"}}]}}]}
+    });
+
+    const text = try acc.textWithCitationLinks(gpa);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("See [the source](https://example.com/report).", text);
 }
 
 test "stream accumulators reject growth past the replay-safe ceiling" {
@@ -555,6 +706,7 @@ test "request body builds valid json" {
     const body = try buildRequestBody(gpa, "openai/gpt-4o", .openrouter, .high, &msgs, &tools, .{
         .session_id = "marlin-abc",
         .provider_sort = "throughput",
+        .openrouter_web_search = true,
     });
     defer gpa.free(body);
     // Must be valid JSON with the right top-level fields.
@@ -563,6 +715,9 @@ test "request body builds valid json" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"parallel_tool_calls\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"openrouter:web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_results\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_total_results\":15") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"high\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"session_id\":\"marlin-abc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"provider\":{\"sort\":\"throughput\"}") != null);
@@ -570,11 +725,13 @@ test "request body builds valid json" {
     const auto_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .auto, &msgs, &.{}, .{
         .session_id = "must-not-leak",
         .provider_sort = "throughput",
+        .openrouter_web_search = true,
     });
     defer gpa.free(auto_body);
     try std.testing.expect(std.mem.indexOf(u8, auto_body, "reasoning_effort") == null);
     try std.testing.expect(std.mem.indexOf(u8, auto_body, "session_id") == null);
     try std.testing.expect(std.mem.indexOf(u8, auto_body, "provider\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, auto_body, "openrouter:web_search") == null);
 
     const local_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .low, &msgs, &.{}, .{});
     defer gpa.free(local_body);

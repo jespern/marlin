@@ -50,6 +50,8 @@ multiplexed by a TUI that is just another client.**
 - Copy the last tool output with `!c` — a query over structured blocks, not a
   rectangle of screen cells. Paste it into another session without touching the
   OS clipboard.
+- OpenRouter sessions can search the web with the same API key and preserve
+  cited source URLs; `fetch` opens known pages for deeper reading.
 - ssh/mosh remain the transport. We never reinvent them; we just put structure
   on the wire above them.
 

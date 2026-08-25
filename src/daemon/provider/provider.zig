@@ -52,6 +52,7 @@ pub const Usage = struct {
     cached_tokens: u64 = 0,
     cache_write_tokens: u64 = 0,
     reasoning_tokens: u64 = 0,
+    web_search_requests: u64 = 0,
 };
 
 test {

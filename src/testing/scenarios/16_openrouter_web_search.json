@@ -1,0 +1,27 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["search then inspect", "\"type\":\"openrouter:web_search\"", "Web search is available for discovering sources"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"I found a source.\",\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.test/source\",\"title\":\"Example Source\"}}],\"tool_calls\":[{\"index\":0,\"id\":\"call_read\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"missing.txt\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["\"tool_call_id\":\"call_read\""],
+      "expect_not_contains": ["\"type\":\"openrouter:web_search\"", "Web search is available for discovering sources"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"search budget stayed bounded\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":5}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "search then inspect"],
+    "exit_code": 0,
+    "stdout_contains": ["search budget stayed bounded"],
+    "db_kinds": ["user_msg", "reasoning", "tool_call", "tool_result", "assistant_msg"]
+  }
+}

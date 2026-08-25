@@ -265,6 +265,7 @@ pub fn runTurn(
     var total_in: u64 = 0;
     var total_out: u64 = 0;
     var round: u32 = 0;
+    var web_search_available = opts.endpoint.dialect == .openrouter;
 
     while (round < opts.max_rounds) : (round += 1) {
         publishPhase(opts, .context);
@@ -290,7 +291,13 @@ pub fn runTurn(
         var blocks = history.items;
 
         const frontier: u64 = if (opts.prune_frontier) |pf| pf.* else 0;
-        const system_prompt_suffix = if (opts.extensions) |ext| ext.systemPromptSuffix() else "";
+        const extension_prompt_suffix = if (opts.extensions) |ext| ext.systemPromptSuffix() else "";
+        const system_prompt_suffix = if (!web_search_available)
+            extension_prompt_suffix
+        else if (extension_prompt_suffix.len == 0)
+            openrouter_web_search_prompt
+        else
+            try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ extension_prompt_suffix, openrouter_web_search_prompt });
         var asm_opts = context.AssembleOpts{
             .prune_before_seq = frontier,
             .system_prompt_suffix = system_prompt_suffix,
@@ -357,13 +364,15 @@ pub fn runTurn(
             tool_i += 1;
         }
 
+        var request_opts = try providerRequestOptions(arena, opts, opts.endpoint);
+        request_opts.openrouter_web_search = web_search_available;
         const body = try buildProviderBody(
             arena,
             opts.endpoint,
             opts.effort,
             msgs,
             tools,
-            try providerRequestOptions(arena, opts, opts.endpoint),
+            request_opts,
             opts.cfg.output_headroom_tokens,
         );
 
@@ -424,9 +433,10 @@ pub fn runTurn(
         if (acc.usage) |u| {
             total_in += u.tokens_in;
             total_out += u.tokens_out;
+            if (u.web_search_requests > 0) web_search_available = false;
             if (opts.endpoint.dialect == .openrouter) {
                 std.log.debug(
-                    "OpenRouter generation {s} via {s}: input={d} cached={d} cache_write={d} output={d} reasoning={d}",
+                    "OpenRouter generation {s} via {s}: input={d} cached={d} cache_write={d} output={d} reasoning={d} web_search={d}",
                     .{
                         if (acc.generation_id.items.len > 0) acc.generation_id.items else "unknown",
                         if (acc.provider_name.items.len > 0) acc.provider_name.items else "unknown",
@@ -435,10 +445,16 @@ pub fn runTurn(
                         u.cache_write_tokens,
                         u.tokens_out,
                         u.reasoning_tokens,
+                        u.web_search_requests,
                     },
                 );
             }
         }
+        // OpenRouter documents server-tool counts in usage, but some native
+        // search streams currently omit that field while still returning URL
+        // annotations. Either signal spends this turn's one search-bearing
+        // provider request, keeping later Marlin tool rounds bounded.
+        if (acc.citations.items.len > 0) web_search_available = false;
 
         // Provider-surfaced reasoning is useful liveness and durable context
         // for the human transcript, but is intentionally not sent back to the
@@ -447,13 +463,15 @@ pub fn runTurn(
             _ = try ap.append(.{ .reasoning = .{ .text = acc.reasoning.items } });
         }
 
+        const response_text = try acc.textWithCitationLinks(arena);
+
         // -- no tool calls → final answer --
         if (acc.calls.items.len == 0) {
             publishPhase(opts, .finishing);
-            _ = try ap.append(.{ .assistant_msg = .{ .text = acc.text.items } });
+            _ = try ap.append(.{ .assistant_msg = .{ .text = response_text } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return .{
-                .text = try gpa.dupe(u8, acc.text.items),
+                .text = try gpa.dupe(u8, response_text),
                 .rounds = round + 1,
                 .tokens_in = total_in,
                 .tokens_out = total_out,
@@ -465,8 +483,8 @@ pub fn runTurn(
         // useful update and then erase it when the tool round starts. Marked
         // commentary=true: clients keep these visible while folding the raw
         // provider reasoning above.
-        if (acc.text.items.len > 0) {
-            _ = try ap.append(.{ .reasoning = .{ .text = acc.text.items, .commentary = true } });
+        if (response_text.len > 0) {
+            _ = try ap.append(.{ .reasoning = .{ .text = response_text, .commentary = true } });
         }
 
         // Persist the provider's complete assistant tool batch before any
@@ -1165,6 +1183,13 @@ fn needsExplicitCache(model: []const u8) bool {
 }
 
 const openrouter_observability_headers = [_][]const u8{"X-OpenRouter-Metadata: enabled"};
+
+const openrouter_web_search_prompt =
+    \\WEB SEARCH
+    \\- Web search is available for discovering sources and verifying current
+    \\  information. Use `fetch` when you already have a specific URL. Preserve
+    \\  source URLs in the response.
+;
 
 fn observabilityHeaders(dialect: provider.Dialect) []const []const u8 {
     return if (dialect == .openrouter) &openrouter_observability_headers else &.{};

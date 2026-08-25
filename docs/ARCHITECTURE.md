@@ -459,6 +459,16 @@ provider/
   OpenRouter therefore keeps a session on the same provider/cache and groups
   its generations in Activity. `[providers.openrouter] sort` defaults to
   `"throughput"` (`"latency"`, `"price"`, or `null` are supported).
+- Ordinary OpenRouter turns also advertise the `openrouter:web_search` server
+  tool using the existing OpenRouter credential and briefly describes its use
+  in the system prompt. OpenRouter executes searches inside the provider
+  request; Marlin caps them at five results per search and fifteen total results
+  in one search-bearing request, decodes usage, and preserves annotation-only
+  source URLs in the durable assistant message. A usage count or returned
+  citation spends that turn's search budget, so later local-tool rounds stop
+  advertising the tool or its prompt guidance. Compaction and non-OpenRouter
+  routes do not advertise the tool; known URLs remain available through
+  `fetch`.
 
 ### No single point of failure
 
