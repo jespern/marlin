@@ -1,5 +1,5 @@
-//! fetch tool: HTTP GET → readable text. Uses provider/http.zig's curl
-//! wrapper (the only file that knows curl). For HTML responses, tags are
+//! fetch tool: HTTP GET → readable text. Uses the shared std.http transport.
+//! For HTML responses, tags are
 //! stripped crudely (script/style dropped, block tags → newlines, links kept
 //! as "text (url)"). parallel_safe.
 
@@ -22,6 +22,8 @@ pub const max_fetch_bytes: usize = 4 * 1024 * 1024;
 
 pub fn fetch(
     gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
     args: Args,
     policy: ?*const network_policy.Policy,
     cancel: ?*std.atomic.Value(bool),
@@ -51,7 +53,7 @@ pub fn fetch(
 
         const url_z = try gpa.dupeZ(u8, current_url);
         defer gpa.free(url_z);
-        var next = http.getOne(gpa, url_z, max_fetch_bytes, 60_000, cancel) catch |err| {
+        var next = http.getOne(gpa, io, environ, url_z, max_fetch_bytes, 60_000, cancel) catch |err| {
             return std.fmt.allocPrint(gpa, "error: fetch failed: {t}", .{err});
         };
 
@@ -322,7 +324,9 @@ test "htmlToText strips tags, keeps links, decodes entities" {
 
 test "fetch rejects non-http urls" {
     const gpa = std.testing.allocator;
-    const out = try fetch(gpa, .{ .url = "file:///etc/passwd" }, null, null);
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const out = try fetch(gpa, threaded.io(), null, .{ .url = "file:///etc/passwd" }, null, null);
     defer gpa.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "error:"));
 }
@@ -337,7 +341,7 @@ test "fetch blocks an explicit denied hostname before network I/O" {
     var policy = network_policy.Policy.init(gpa, io, &environ, .{ .deny = "blocked.test" });
     defer policy.deinit();
 
-    const out = try fetch(gpa, .{ .url = "https://sub.blocked.test/secret" }, &policy, null);
+    const out = try fetch(gpa, io, &environ, .{ .url = "https://sub.blocked.test/secret" }, &policy, null);
     defer gpa.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "error: network policy blocked"));
     try std.testing.expect(std.mem.indexOf(u8, out, "explicit deny") != null);

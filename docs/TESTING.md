@@ -83,6 +83,20 @@ Current coverage: basic completion, tool round-trip (fragmented args),
 tool output → blob + inline elision, and concurrent safe tool batches with
 provider-order transcript reconstruction.
 
+The runner is fail-bounded as well as hermetic. Each Marlin invocation has a
+30-second wall-clock deadline; timeout terminates its complete process group.
+Per-scenario daemons inherit that group in tests, fake providers never inherit
+the runner's output pipes, and every exit path terminates/reaps the provider
+before attempting daemon shutdown. Unit coverage deliberately cancels a shell
+whose grandchild ignores SIGTERM and proves the grandchild is gone, preventing
+a failed test from keeping `tee` (or an agent turn) alive indefinitely.
+
+Compaction regressions live at the lowest expressive layers: context unit
+tests prove range edges cannot bisect a calls-first parallel turn and legacy
+orphan results are omitted; TUI tests prove summaries/file contents never enter
+scrollback or editor history; provider-error tests prove gateway envelopes are
+reduced to a bounded actionable note.
+
 ## Layer 4 — live smoke
 
 ```bash

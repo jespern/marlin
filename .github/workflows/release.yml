@@ -31,14 +31,10 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Install system deps (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libsqlite3-dev
-
       - name: Build release binary
         env:
           MARLIN_VERSION: ${{ github.ref_name }}
-        run: zig build -Doptimize=ReleaseSafe -Dversion="${MARLIN_VERSION#v}"
+        run: zig build -Doptimize=ReleaseSafe -Dembedded-sqlite=true -Dversion="${MARLIN_VERSION#v}"
 
       - name: Package release assets
         env:

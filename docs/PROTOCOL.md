@@ -59,6 +59,13 @@ default. Explicit values are `"none"`, `"minimal"`, `"low"`, `"medium"`,
 `sub.from_seq`: 0 = live-only. N ≥ 1 = replay stored blocks with seq ≥ N
 first, then live. Clients that reconnect pass last_seen_seq + 1.
 
+`blk.user_msg.synthetic` defaults to false. When true, the text is internal
+model context rehydrated after compaction: clients render a compact note and
+must not treat it as user-authored input or add it to command history. For
+compatibility, clients should recognize the legacy
+`[rehydrated after compaction]` prefix as synthetic too. `compaction.summary`
+is likewise model context; transcript UIs render only a compaction marker.
+
 `session_archive.archived` defaults to true. Archiving is durable and
 non-destructive: blocks and blobs remain available, but archived sessions are
 read-only and omitted from ordinary list/watch snapshots. Send `archived:false`

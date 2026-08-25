@@ -246,7 +246,11 @@ pub fn assemble(
         for (blocks) |b| {
             if (b.seq <= covered_max) continue;
             switch (b.body) {
-                .user_msg, .steer => environment_before_seq = b.seq,
+                .user_msg => |u| {
+                    if (!u.synthetic and !isLegacyRehydration(u.text))
+                        environment_before_seq = b.seq;
+                },
+                .steer => environment_before_seq = b.seq,
                 else => {},
             }
         }
@@ -325,15 +329,10 @@ pub fn assemble(
                 }
                 i = j - 1;
             },
-            .tool_result => |tr| {
-                // Orphan result (shouldn't happen; be tolerant).
-                try msgs.append(arena, .{ .role = .tool, .payload = .{
-                    .tool_result = .{
-                        .call_id = tr.call_id,
-                        .text = pruneBody(b.seq, tr.inline_body, opts),
-                    },
-                } });
-            },
+            // A result without its assistant tool_call is invalid provider
+            // input. Old compactions could bisect a parallel batch and leave
+            // exactly this shape; omit it so those sessions self-heal.
+            .tool_result => {},
             .reasoning, .approval, .system_note => {}, // not sent to the model
             .compaction => {}, // handled above
         }
@@ -343,6 +342,12 @@ pub fn assemble(
     if (msgs.items.len > 0 and msgs.items[msgs.items.len - 1].role == .tool)
         msgs.items[msgs.items.len - 1].cache_breakpoint = true;
     return msgs.toOwnedSlice(arena);
+}
+
+const legacy_rehydration_prefix = "[rehydrated after compaction]";
+
+fn isLegacyRehydration(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, legacy_rehydration_prefix);
 }
 
 /// Is compaction block at `seq` covered by a DIFFERENT compaction's range?
@@ -439,21 +444,23 @@ pub fn needsCompaction(
 /// The structured summarization contract sent to the compaction model.
 pub const compaction_prompt =
     \\Summarize this agent conversation for continuation after context reset.
-    \\Structure your summary EXACTLY as:
+    \\Keep only state needed to continue accurately. Be concise: omit routine
+    \\reads, repeated status checks, superseded plans, and raw command output.
+    \\Structure the summary as:
     \\
     \\## Accomplished
     \\(completed work, with concrete outcomes)
     \\## In progress
     \\(what was mid-flight when this summary was taken)
     \\## Files touched
-    \\(every file path read or written, one per line, with a note of what/why)
+    \\(only materially changed or continuation-critical paths)
     \\## Next steps
     \\(planned or implied follow-up work, in order)
     \\## User constraints & decisions
-    \\(everything the user asked for, corrected, or decided — verbatim where short)
+    \\(durable constraints and decisions, paraphrased compactly)
     \\
-    \\Be dense and specific: paths, symbols, commands, error messages. This
-    \\summary is the ONLY memory of the covered conversation.
+    \\Include exact symbols, commands, and errors only when they are necessary
+    \\to resume the active work. This summary is the memory of the covered range.
 ;
 
 /// Don't compact sessions smaller than this many blocks.
@@ -466,7 +473,7 @@ pub const compaction_keep_tail_blocks: usize = 8;
 /// Pick the [from..to] seq range a new compaction should cover: everything
 /// after the previous covered range, minus the protected tail. Returns null
 /// when the session is too small or there's nothing new to compact.
-pub fn planCompaction(blocks: []const block.Block) ?struct { from_seq: u64, to_seq: u64 } {
+pub fn planCompaction(blocks: []const block.Block, protect_latest_turn: bool) ?struct { from_seq: u64, to_seq: u64 } {
     if (blocks.len < compaction_min_blocks) return null;
 
     var covered_max: u64 = 0;
@@ -475,18 +482,50 @@ pub fn planCompaction(blocks: []const block.Block) ?struct { from_seq: u64, to_s
         else => {},
     };
 
-    // Candidate range: first uncovered block .. len - keep_tail.
+    // Candidate range: first uncovered COMPLETE turn .. len - keep_tail,
+    // ending before the COMPLETE turn containing the nominal cut. Provider
+    // tool calls and their results share a turn_id, so this also guarantees
+    // compaction never bisects a parallel tool batch.
     if (blocks.len <= compaction_keep_tail_blocks) return null;
-    const cut_idx = blocks.len - compaction_keep_tail_blocks;
-    const to_seq = blocks[cut_idx - 1].seq;
-    var from_seq: u64 = 0;
-    for (blocks) |b| {
-        if (b.seq > covered_max) {
-            from_seq = b.seq;
-            break;
+    var from_idx: usize = 0;
+    while (from_idx < blocks.len and blocks[from_idx].seq <= covered_max) : (from_idx += 1) {}
+    if (from_idx == blocks.len) return null;
+    if (from_idx > 0 and blocks[from_idx - 1].turn_id == blocks[from_idx].turn_id) {
+        const partial_turn = blocks[from_idx].turn_id;
+        while (from_idx < blocks.len and blocks[from_idx].turn_id == partial_turn) : (from_idx += 1) {}
+    }
+    if (from_idx == blocks.len) return null;
+
+    var max_cut_idx = blocks.len;
+    if (protect_latest_turn) {
+        const latest_turn = blocks[blocks.len - 1].turn_id;
+        while (max_cut_idx > 0 and blocks[max_cut_idx - 1].turn_id == latest_turn) : (max_cut_idx -= 1) {}
+    }
+    if (max_cut_idx <= from_idx) return null;
+
+    const nominal_cut = @min(blocks.len - compaction_keep_tail_blocks, max_cut_idx);
+    var cut_idx = nominal_cut;
+    if (cut_idx < blocks.len) {
+        const retained_turn = blocks[cut_idx].turn_id;
+        while (cut_idx > from_idx and blocks[cut_idx - 1].turn_id == retained_turn) : (cut_idx -= 1) {}
+    }
+
+    // A single large turn can straddle the nominal block-count cut. When
+    // backing up leaves too little to summarize, take the boundary after that
+    // completed turn instead. Auto-compaction caps this at the start of the
+    // active latest turn; manual compaction may consume the whole log.
+    if (cut_idx <= from_idx or cut_idx - from_idx < compaction_min_blocks / 2) {
+        cut_idx = nominal_cut;
+        if (cut_idx < max_cut_idx) {
+            const split_turn = blocks[cut_idx].turn_id;
+            while (cut_idx < max_cut_idx and blocks[cut_idx].turn_id == split_turn) : (cut_idx += 1) {}
         }
     }
-    if (from_seq == 0 or to_seq <= covered_max or from_seq > to_seq) return null;
+    if (cut_idx <= from_idx) return null;
+
+    const from_seq = blocks[from_idx].seq;
+    const to_seq = blocks[cut_idx - 1].seq;
+    if (to_seq <= covered_max or from_seq > to_seq) return null;
     // Require some meat: at least min_blocks/2 blocks in range.
     var n: usize = 0;
     for (blocks) |b| {
@@ -591,7 +630,11 @@ test "cap inline: small output untouched, big output windowed" {
 }
 
 fn tb(seq: u64, body: block.Body) block.Block {
-    return .{ .id = seq, .session_id = 1, .turn_id = 1, .seq = seq, .ts = 0, .body = body };
+    return tbt(seq, 1, body);
+}
+
+fn tbt(seq: u64, turn_id: u64, body: block.Body) block.Block {
+    return .{ .id = seq, .session_id = 1, .turn_id = turn_id, .seq = seq, .ts = 0, .body = body };
 }
 
 test "assemble: user → tool round trip shape" {
@@ -656,6 +699,30 @@ test "assemble: dangling tool call gets a synthetic result" {
     try std.testing.expectEqual(provider.Role.user, msgs[4].role);
 }
 
+test "assemble: orphan results from a legacy split compaction are omitted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // This is the exact invalid legacy shape: compaction covered the user and
+    // calls but stopped before the calls-first batch's results.
+    const blocks = [_]block.Block{
+        tbt(1, 10, .{ .user_msg = .{ .text = "inspect both" } }),
+        tbt(2, 10, .{ .tool_call = .{ .call_id = "c1", .name = "read_file", .args_json = "{}" } }),
+        tbt(3, 10, .{ .tool_call = .{ .call_id = "c2", .name = "read_file", .args_json = "{}" } }),
+        tbt(4, 10, .{ .tool_result = .{ .call_id = "c1", .status = .ok, .inline_body = "one", .full_body_ref = null } }),
+        tbt(5, 10, .{ .tool_result = .{ .call_id = "c2", .status = .ok, .inline_body = "two", .full_body_ref = null } }),
+        tbt(6, 11, .{ .compaction = .{ .summary = "safe summary", .covers_from_seq = 1, .covers_to_seq = 3 } }),
+        tbt(7, 11, .{ .user_msg = .{ .text = "continue" } }),
+    };
+    const msgs = try assemble(arena, &blocks, .{});
+    try std.testing.expectEqual(@as(usize, 3), msgs.len);
+    try std.testing.expectEqual(provider.Role.system, msgs[0].role);
+    try std.testing.expectEqual(provider.Role.user, msgs[1].role);
+    try std.testing.expectEqualStrings("continue", msgs[2].payload.text);
+    for (msgs) |msg| try std.testing.expect(msg.role != .tool);
+}
+
 test "assemble: system prompt carries instructions, environment, and suffix" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -711,6 +778,35 @@ test "assemble: volatile environment follows stable history" {
     try std.testing.expectEqual(provider.Role.system, msgs[3].role);
     try std.testing.expectEqualStrings("ENVIRONMENT volatile", msgs[3].payload.text);
     try std.testing.expectEqualStrings("new question", msgs[4].payload.text);
+}
+
+test "assemble: synthetic rehydration does not displace the live environment" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocks = [_]block.Block{
+        tbt(1, 20, .{ .user_msg = .{ .text = "live question" } }),
+        tbt(2, 20, .{ .user_msg = .{ .text = "[rehydrated after compaction] old.txt:\nstate", .synthetic = true } }),
+    };
+    const msgs = try assemble(arena, &blocks, .{ .environment = "ENVIRONMENT current" });
+    try std.testing.expectEqual(@as(usize, 4), msgs.len);
+    try std.testing.expectEqual(provider.Role.system, msgs[1].role);
+    try std.testing.expectEqualStrings("ENVIRONMENT current", msgs[1].payload.text);
+    try std.testing.expectEqualStrings("live question", msgs[2].payload.text);
+    try std.testing.expect(std.mem.startsWith(u8, msgs[3].payload.text, legacy_rehydration_prefix));
+}
+
+test "assemble: legacy rehydration also leaves environment before real input" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocks = [_]block.Block{
+        tbt(1, 20, .{ .user_msg = .{ .text = "live question" } }),
+        tbt(2, 20, .{ .user_msg = .{ .text = "[rehydrated after compaction] old.txt:\nstate" } }),
+    };
+    const msgs = try assemble(arena, &blocks, .{ .environment = "ENVIRONMENT current" });
+    try std.testing.expectEqual(provider.Role.system, msgs[1].role);
+    try std.testing.expectEqualStrings("live question", msgs[2].payload.text);
 }
 
 test "assemble: compaction replaces covered range, summary emitted first" {
@@ -805,13 +901,56 @@ test "needsCompaction: headroom math" {
 test "planCompaction: too small, then covers up to tail" {
     var small: [4]block.Block = undefined;
     for (0..4) |i| small[i] = tb(i + 1, .{ .user_msg = .{ .text = "x" } });
-    try std.testing.expectEqual(@as(?@TypeOf(planCompaction(&small).?), null), planCompaction(&small));
+    try std.testing.expectEqual(@as(?@TypeOf(planCompaction(&small, false).?), null), planCompaction(&small, false));
 
     var big: [20]block.Block = undefined;
-    for (0..20) |i| big[i] = tb(i + 1, .{ .user_msg = .{ .text = "x" } });
-    const plan = planCompaction(&big).?;
+    for (0..20) |i| big[i] = tbt(i + 1, i + 1, .{ .user_msg = .{ .text = "x" } });
+    const plan = planCompaction(&big, false).?;
     try std.testing.expectEqual(@as(u64, 1), plan.from_seq);
     try std.testing.expectEqual(@as(u64, 12), plan.to_seq); // 20 - 8 tail
+}
+
+test "planCompaction: cut backs up before a parallel tool turn" {
+    var blocks: [20]block.Block = undefined;
+    for (0..20) |i| blocks[i] = tbt(i + 1, i + 1, .{ .system_note = .{ .text = "x" } });
+    blocks[8] = tbt(9, 99, .{ .user_msg = .{ .text = "inspect" } });
+    blocks[9] = tbt(10, 99, .{ .tool_call = .{ .call_id = "c1", .name = "read_file", .args_json = "{}" } });
+    blocks[10] = tbt(11, 99, .{ .tool_call = .{ .call_id = "c2", .name = "read_file", .args_json = "{}" } });
+    blocks[11] = tbt(12, 99, .{ .tool_result = .{ .call_id = "c1", .status = .ok, .inline_body = "one", .full_body_ref = null } });
+    blocks[12] = tbt(13, 99, .{ .tool_result = .{ .call_id = "c2", .status = .ok, .inline_body = "two", .full_body_ref = null } });
+    blocks[13] = tbt(14, 99, .{ .assistant_msg = .{ .text = "done" } });
+
+    const plan = planCompaction(&blocks, false).?;
+    // The nominal cut is after seq 12. Retain the whole seq 9..14 turn.
+    try std.testing.expectEqual(@as(u64, 8), plan.to_seq);
+}
+
+test "planCompaction: resumes after a legacy partially covered turn" {
+    var blocks: [22]block.Block = undefined;
+    for (0..22) |i| blocks[i] = tbt(i + 1, i + 1, .{ .system_note = .{ .text = "x" } });
+    blocks[0] = tbt(1, 50, .{ .tool_call = .{ .call_id = "c1", .name = "read_file", .args_json = "{}" } });
+    blocks[1] = tbt(2, 50, .{ .tool_call = .{ .call_id = "c2", .name = "read_file", .args_json = "{}" } });
+    blocks[2] = tbt(3, 50, .{ .tool_result = .{ .call_id = "c1", .status = .ok, .inline_body = "one", .full_body_ref = null } });
+    blocks[3] = tbt(4, 50, .{ .tool_result = .{ .call_id = "c2", .status = .ok, .inline_body = "two", .full_body_ref = null } });
+    blocks[4] = tbt(5, 51, .{ .compaction = .{ .summary = "legacy", .covers_from_seq = 1, .covers_to_seq = 2 } });
+
+    const plan = planCompaction(&blocks, false).?;
+    // seq 3..4 are the uncovered remainder of turn 50 and cannot become the
+    // beginning of another summary range.
+    try std.testing.expectEqual(@as(u64, 5), plan.from_seq);
+}
+
+test "planCompaction: long turn uses its end while auto protects active turn" {
+    var blocks: [15]block.Block = undefined;
+    for (0..14) |i| blocks[i] = tbt(i + 1, 70, .{ .system_note = .{ .text = "long completed turn" } });
+    blocks[14] = tbt(15, 71, .{ .user_msg = .{ .text = "active prompt" } });
+
+    const automatic = planCompaction(&blocks, true).?;
+    try std.testing.expectEqual(@as(u64, 14), automatic.to_seq);
+
+    const completed_only = planCompaction(blocks[0..14], false).?;
+    try std.testing.expectEqual(@as(u64, 14), completed_only.to_seq);
+    try std.testing.expect(planCompaction(blocks[0..14], true) == null);
 }
 
 test "recentWrittenFiles: newest first, deduped" {

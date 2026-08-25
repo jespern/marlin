@@ -31,7 +31,12 @@ pub const ApprovalDecision = enum { granted, denied, timeout };
 /// Kind-specific payloads. Serialized as JSON into blocks.body_json;
 /// unknown fields are ignored on read (forward compat, see MILESTONES open Q3).
 pub const Body = union(BlockKind) {
-    user_msg: struct { text: []const u8 },
+    user_msg: struct {
+        text: []const u8,
+        /// Internal context injected after compaction. It remains model-visible
+        /// but clients must not present it as authored user input or history.
+        synthetic: bool = false,
+    },
     assistant_msg: struct { text: []const u8 },
     reasoning: struct { text: []const u8 },
     tool_call: struct {
@@ -93,4 +98,17 @@ test "block kind follows body tag" {
         .body = .{ .user_msg = .{ .text = "hi" } },
     };
     try std.testing.expectEqual(BlockKind.user_msg, b.kind());
+}
+
+test "older user blocks decode with synthetic disabled" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const body = try std.json.parseFromSliceLeaky(
+        Body,
+        arena_state.allocator(),
+        "{\"user_msg\":{\"text\":\"hello\"}}",
+        .{ .ignore_unknown_fields = true },
+    );
+    try std.testing.expectEqualStrings("hello", body.user_msg.text);
+    try std.testing.expect(!body.user_msg.synthetic);
 }

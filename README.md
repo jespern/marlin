@@ -42,9 +42,9 @@ multiplexed by a TUI that is just another client.**
 2. **The store is append-only truth; context is a derived view.** Compaction,
    truncation, and pruning shape what the model sees — never what's on disk.
    Scrollback and copy always operate on full data.
-3. **Never break prompt caching.** Append-only context between compactions;
-   compaction is the one legitimate cache break, executed as a clean prefix
-   rebuild.
+3. **Keep prompt-cache breaks rare and explainable.** Context is prefix-stable
+   between explicit pruning and compaction boundaries. Both are coarse-grained,
+   logged events rather than incidental per-turn rewrites.
 4. **Extensibility at process boundaries.** MCP servers for tools, hook scripts
    for events, executables as custom tools. The Zig core stays small and stable;
    churn lives in scripts.
@@ -54,6 +54,22 @@ multiplexed by a TUI that is just another client.**
 6. **Agent panes only — no VTE.** Splits show marlin sessions, which are
    structured data we render ourselves. No terminal emulation tarpit. (If an
    embedded terminal is ever truly needed: libghostty-vt, not hand-rolled.)
+
+## Context management today
+
+Marlin implements a three-stage structural cascade:
+
+1. Tool output is capped before it enters model context; the complete output
+   remains available in the SQLite blob store.
+2. Once context crosses a soft threshold, old inline tool results are replaced
+   with short stubs while a recent-output window is protected.
+3. Near the model's context limit, Marlin writes an LLM-generated continuation
+   summary, preserves a recent tail, and rehydrates windows from recently
+   written files plus a continuation note.
+
+That is useful layered context management, but it is not yet a claim of mature
+semantic "microcompaction." Fixture tests cover the mechanics and boundary
+invariants; long-running quality and cost behavior still need M3 burn-in.
 
 ## What v1 deliberately does NOT do
 
@@ -76,7 +92,7 @@ multiplexed by a TUI that is just another client.**
   │marlin TUI├──────┤       ▼           ▼           ▼      │
   │ (phone,  │      │  ┌──────────────────────────────┐    │
   │  later:  │      │  │  SQLite: blocks, sessions,   │    │
-  │  PWA)    │      │  │  FTS5 search, full outputs   │    │
+  │  PWA)    │      │  │  indexed logs, full outputs  │    │
   └──────────┘      │  └──────────────────────────────┘    │
                     │   tools ─▶ bash/files/MCP/hooks       │
                     └──────────────┬───────────────────────┘
@@ -96,5 +112,21 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and
 | **pi** | Minimal-tool philosophy (~6 tools is enough), simplicity discipline |
 | **Hermes** | Skills-as-markdown, store-full/truncate-at-assembly, output caps w/ file pointers |
 | **OpenCode** | Pruning constants & algorithm (protect recent 40k tool-output tokens, stub older) |
-| **Claude Code** | Layered compaction: microcompaction → headroom-triggered auto → manual at task boundaries; rehydration (files+todos+continuation) |
+| **Claude Code** | Layered context reduction, headroom-triggered compaction, and continuation rehydration |
 | **KrillClaw / graff** | Proof of tiny Zig core; lenient JSON repair; SSE parsing in Zig |
+
+## SQLite and local builds
+
+SQLite remains Marlin's canonical store: WAL, indexed session/block queries,
+migrations, hierarchy, and content-addressed blobs would otherwise become a
+home-grown database layer around JSONL. FTS5 search is **not** implemented
+today; a cross-session `/search` is a future feature described in the
+[architecture notes](docs/ARCHITECTURE.md#future-cross-session-search).
+
+For fast local iteration, `zig build` and `zig build test` link the system
+SQLite library. Official release builds compile the vendored amalgamation into
+the binary. To reproduce that configuration locally:
+
+```sh
+zig build -Doptimize=ReleaseSafe -Dembedded-sqlite=true
+```

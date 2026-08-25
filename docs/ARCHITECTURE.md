@@ -171,12 +171,16 @@ Key decisions:
 
 - **`tool_result` stores full output out-of-band.** `inline_body` is the capped
   head+tail actually eligible for model context; `full_body_ref` points to a
-  content-addressed blob (SQLite blob table; files on disk if >1MB). `!c` and
+  content-addressed blob in SQLite. `!c` and
   scrollback read the full blob; context assembly reads `inline_body`. The cap
   happens at capture time for the *inline* copy only — the full output is never
   lost. (Hermes pattern.)
 - **`compaction` is a block, not an edit.** It records "blocks [a..b] are
   represented by this summary in context from now on." History is untouched.
+- **Synthetic `user_msg` blocks are model context, not user authorship.** File
+  windows rehydrated after compaction carry `synthetic=true`; clients collapse
+  them to a filename note and exclude them from input history. The default is
+  false so logs and clients from before the marker remain compatible.
 - **Turn grouping**: blocks carry `turn_id` so the UI can collapse/expand a
   whole turn (user msg → reasoning → N tool roundtrips → assistant msg).
 
@@ -191,20 +195,40 @@ sessions(id, title, created_at, cwd, model, effort, provider, status,
 blocks(id, session_id, turn_id, seq, kind, ts, body_json)
 blobs(hash, bytes, created_at, tombstone)  -- full tool outputs, content-addressed
 blob_refs(hash, block_id)                  -- refcounting for GC
-blocks_fts(...)                         -- FTS5 over user/assistant/tool text
 kv(key, value)                          -- daemon metadata, schema version
 ```
 
-WAL gives crash safety without JSONL's rewrite-on-vacuum issues, and FTS5 gives
-cross-session search for free. (zag uses JSONL+tail-recovery; we get the same
-crash property from WAL with better query power. If SQLite ever feels heavy,
-the block log abstraction makes swapping trivial — nothing outside `store/`
-knows it's SQLite.)
+WAL gives crash safety without JSONL tail repair, while indexes support range
+replay, session hierarchy, archive traversal, and blob references without
+rebuilding side indexes at startup. A JSONL store would be easier to inspect
+and remove the C compile, but those features would require sidecars, migration
+machinery, checkpoints, and locking of their own. The block-log abstraction
+still keeps the choice isolated: nothing outside `store.zig` knows SQL.
+
+Local and test builds link the platform SQLite library to keep rebuilds fast.
+Official release builds pass `-Dembedded-sqlite=true` and compile the vendored
+amalgamation into the distributable binary. FTS5 is not compiled in or used
+today.
+
+### Future: cross-session search
+
+A future `/search <query>` (with a headless `marlin search` equivalent) can use
+an SQLite FTS5 virtual table over user and assistant text plus compact tool
+summaries. Raw multi-megabyte tool blobs should stay out of the default index.
+Results should carry the session handle, turn/sequence, timestamp, and a short
+highlighted snippet so selecting one can attach to the session and jump to the
+matching block.
+
+This should land as a schema migration with a batched backfill, not as an
+unadvertised table in the initial schema. At implementation time the embedded
+release build can add `SQLITE_ENABLE_FTS5`; system-linked development builds
+must capability-check FTS5 or provide a slower scan fallback so local builds do
+not depend on platform-specific SQLite compile options.
 
 ### Growth & trimming
 
 Text blocks are cheap (~1GB/yr worst case); **blobs and images are the
-growers**, and FTS roughly doubles the text footprint. The append-only
+growers**. A future FTS index will add another copy of indexed text. The append-only
 invariant protects *causal block structure*, not every 400KB build log
 forever — same insight as L1 pruning, applied to disk: blob bodies are
 regenerable/low-value with age; block structure is not.
@@ -232,7 +256,7 @@ regenerable/low-value with age; block structure is not.
   never breaks, `!c` on ancient output says "expired" instead of lying.
   Images get their own (shorter) horizon or thumbnail-only demotion.
 - **`marlin gc`**: orphan-blob sweep → expired-blob demotion →
-  `PRAGMA incremental_vacuum` → FTS optimize → WAL checkpoint; reports
+  `PRAGMA incremental_vacuum` → future search-index optimize → WAL checkpoint; reports
   bytes freed. Optionally auto-runs on daemon idle at low cadence.
 - DB size surfaces in `marlin ls` / dump-state — not the status bar (it is
   never a mid-turn decision).
@@ -394,11 +418,10 @@ for direct routes (or degrades to tokens-only) — don't let it lie.
   caching use the same append-only prefix without extra parameters. Returned
   cached/write/reasoning token counts and generation/provider ids are decoded
   for diagnostics; OpenRouter remains the observability system of record.
-- HTTP: libcurl via C interop for v1 (TLS, HTTP/2, proxies, battle-tested SSE
-  chunking). Turn threads exclusively check out reusable easy handles from a
-  daemon pool, retaining live HTTP/TLS connections, DNS, and TLS-session caches
-  across provider rounds and turns. `std.http.Client` can replace it later
-  behind the same interface.
+- HTTP uses a daemon-owned `std.http.Client` pool shared by provider requests,
+  bounded fetches, catalogs, and network blocklists. It retains reusable
+  connections across rounds while the transport remains isolated behind one
+  interface.
 
 ## 6. Context assembly & compaction
 
@@ -430,13 +453,22 @@ The cascade (in order; each layer only fires if the previous wasn't enough):
   (defaults: 16k + 8k), checked at turn boundaries; effective trigger lands
   around 80–85% on big-window models. Also manual: `/compact [instructions]`.
   Mechanics:
-    1. Summarize blocks [start..cut] with the structured contract: accomplished /
-       in-progress / files touched (paths!) / next steps / user constraints &
-       decisions. Cheap model configurable (`compaction_model`).
+    1. Move both range edges to complete `turn_id` boundaries, then summarize
+       blocks [start..cut] with the concise structured contract: accomplished /
+       in-progress / continuation-critical files / next steps / durable user
+       constraints. A parallel tool-call batch can therefore never be split
+       from its results; automatic compaction additionally preserves the active
+       newest turn. Cheap model configurable (`compaction_model`).
     2. Append `compaction` block; context assembly now emits summary + tail.
     3. **Rehydrate**: re-inject head+tail of the N most recently *written*
-       files (from tool_call history) + open todos + a continuation note.
+       files (from tool_call history) as synthetic model-visible context plus
+       a continuation note. Clients show only `context compacted` and
+       the rehydrated filenames, never the summary or file contents.
        (Claude Code's insight: summary-only compaction is amnesia.)
+  Assembly also drops an unmatched `tool_result`: it is invalid without its
+  assistant `tool_call`, and this makes sessions damaged by the old block-count
+  cut recover on their next request. A dangling call takes the converse repair
+  path and receives a synthetic interrupted result.
   Don't compact tiny sessions (< min_blocks); don't compact twice in a row
   without progress between.
 - **L3 — subagents (M6a active).** `task` spawns a durable child through the
@@ -628,8 +660,9 @@ identifies its session with a compact pane label.
 ```
 
 - **Modes**: insert (typing → input box), normal (j/k scroll blocks, J/K
-  recent sessions, `/sessions` for arbitrary attach, v visual-select, y yank,
-  s/x split, tab cycle panes).
+  recent sessions, `a` archive the focused session and advance, `A` archive
+  every finished child while preserving active children, `/sessions` for
+  arbitrary attach, v visual-select, y yank, s/x split, tab cycle panes).
   Prefix-key compat layer later if muscle memory demands it.
 - **Splits**: binary-tree layout, each pane = a session view (or the same
   session twice). No VTE anywhere.
@@ -754,8 +787,8 @@ on_session_done = "~/.config/marlin/hooks/notify.sh"
 
 | Dep | Why | Risk hedge |
 |---|---|---|
-| libcurl (C) | HTTPS/SSE/HTTP2, everywhere already | swap for std.http later behind iface |
-| SQLite (C) | store + FTS5, everywhere already | block-log iface hides it |
+| std.http | HTTPS/SSE and bounded fetches through one daemon-owned pool | transport stays behind one interface |
+| SQLite (C) | durable block/session/blob store; future FTS5 search | system-linked locally, embedded in releases |
 | libvaxis (Zig) | TUI: input, mouse, OSC52, unicode width | active, Ghostty-adjacent |
 | focused internal TOML decoder | config | only supported Marlin shapes; no runtime dep |
 | std.json | strict parse + our lenient-repair layer on top | — |

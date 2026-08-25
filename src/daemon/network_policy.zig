@@ -185,7 +185,7 @@ pub const Policy = struct {
         if (fresh) body = cwd.readFileAlloc(io, cache_path, self.gpa, .limited(max_feed_bytes)) catch null;
 
         if (body == null) {
-            const response = http.get(self.gpa, feed.url, max_feed_bytes, 20_000, null) catch null;
+            const response = http.get(self.gpa, io, environ, feed.url, max_feed_bytes, 20_000, null) catch null;
             if (response) |res| {
                 defer if (res.content_type) |ct| self.gpa.free(ct);
                 if (res.status >= 200 and res.status < 300) {

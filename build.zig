@@ -12,6 +12,29 @@ const std = @import("std");
 ///   zig build test       unit + fixture tests
 ///   zig build e2e        end-to-end: real binary vs fake provider
 ///   zig build smoke      live tests against real OpenRouter (needs key)
+const sqlite_flags = &.{
+    "-std=c99",
+    "-DSQLITE_THREADSAFE=1",
+    "-DSQLITE_DEFAULT_MEMSTATUS=0",
+    "-DSQLITE_DQS=0",
+    "-DSQLITE_OMIT_DEPRECATED",
+    "-DSQLITE_OMIT_LOAD_EXTENSION",
+    "-DSQLITE_USE_URI",
+};
+
+fn configureSqlite(module: *std.Build.Module, b: *std.Build, embedded: bool) void {
+    module.link_libc = true;
+    if (embedded) {
+        module.addIncludePath(b.path("vendor/sqlite"));
+        module.addCSourceFile(.{
+            .file = b.path("vendor/sqlite/sqlite3.c"),
+            .flags = sqlite_flags,
+        });
+    } else {
+        module.linkSystemLibrary("sqlite3", .{});
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // The installed binary is the daily driver: default it to ReleaseFast so
@@ -23,6 +46,11 @@ pub fn build(b: *std.Build) void {
     // module below for safety checks and fast compile iteration.
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
     const version = b.option([]const u8, "version", "Marlin version embedded in the binary") orelse "0.0.0-dev";
+    const embedded_sqlite = b.option(
+        bool,
+        "embedded-sqlite",
+        "Compile vendored SQLite into Marlin (official releases enable this)",
+    ) orelse false;
 
     // ---- marlin ----
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
@@ -39,9 +67,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.root_module.linkSystemLibrary("curl", .{});
-    exe.root_module.linkSystemLibrary("sqlite3", .{});
-    exe.root_module.link_libc = true;
+    configureSqlite(exe.root_module, b, embedded_sqlite);
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     exe.root_module.addOptions("build_options", build_options);
@@ -65,9 +91,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "regex", .module = regex.module("regex") },
         },
     });
-    test_module.linkSystemLibrary("curl", .{});
-    test_module.linkSystemLibrary("sqlite3", .{});
-    test_module.link_libc = true;
+    configureSqlite(test_module, b, embedded_sqlite);
     test_module.addOptions("build_options", build_options);
     const exe_tests = b.addTest(.{ .root_module = test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);

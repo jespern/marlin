@@ -3,7 +3,7 @@
 ```
 marlin/
 ├── build.zig
-├── build.zig.zon              # deps: libvaxis, zig-toml (sqlite/curl via system C)
+├── build.zig.zon              # deps: libvaxis, regex; vendored SQLite for releases
 ├── src/
 │   ├── main.zig               # arg parse → daemon | attach | run | ls | ...
 │   │
@@ -17,7 +17,7 @@ marlin/
 │   ├── daemon/
 │   │   ├── daemon.zig         # listener, client registry, event fan-out, main loop
 │   │   ├── session.zig        # session state machine (idle/running/awaiting/...)
-│   │   ├── store.zig          # SQLite: blocks, sessions, blobs, FTS; the ONLY sqlite user
+│   │   ├── store.zig          # SQLite: blocks, sessions, blobs; the ONLY sqlite user
 │   │   ├── loop.zig           # agent turn: assemble→stream→tools→repeat; steer queue
 │   │   ├── context.zig        # assembly + L0 caps + L1 prune + L2 compaction + rehydrate
 │   │   ├── approval.zig       # policies, capability grants, pending approvals
@@ -28,7 +28,7 @@ marlin/
 │   │   │   ├── bash.zig       # subprocess, cancellation, (later: sandbox.zig)
 │   │   │   ├── files.zig      # read/write/edit (fuzzy string-replace)
 │   │   │   ├── search.zig     # grep (rg → system grep → native), glob
-│   │   │   ├── fetch.zig      # curl GET → text
+│   │   │   ├── fetch.zig      # bounded std.http GET → readable text
 │   │   │   ├── exec_tool.zig  # config-declared executable tools
 │   │   │   └── mcp.zig        # MCP client, stdio transport, tool bridging
 │   │   ├── provider/
@@ -36,7 +36,7 @@ marlin/
 │   │   │   ├── openai_compat.zig
 │   │   │   ├── anthropic.zig
 │   │   │   ├── sse.zig        # SSE parser (shared)
-│   │   │   ├── http.zig       # pooled libcurl wrapper, streaming, cancellation
+│   │   │   ├── http.zig       # pooled std.http transport, streaming, cancellation
 │   │   │   └── registry.zig   # model string → dialect+endpoint+key
 │   │   ├── hooks.zig          # event → script runner
 │   │   └── skills.zig         # index scan, frontmatter parse, skill tool
@@ -70,8 +70,8 @@ extraction clean):
 - `client/` never imports `daemon/` — only `core/` (protocol + blocks). This is
   what keeps "the TUI is just a client" true, and makes the (v2) web client a
   sibling, not a fork.
-- `daemon/store.zig` is the only file that knows SQL. `daemon/provider/http.zig`
-  is the only file that knows curl.
+- `daemon/store.zig` is the only file that knows SQL. HTTP transport is isolated
+  in `daemon/provider/http.zig`.
 
 # Milestones
 

@@ -2,7 +2,7 @@
 //!
 //! Schema (docs/ARCHITECTURE.md §2). WAL mode for crash safety. Blocks are
 //! INSERT-only; the sessions row is the only thing UPDATEd. Blob writes are
-//! idempotent (content-hash PK). FTS5 deferred to M1 (search lands with ls).
+//! idempotent (content-hash PK). FTS5 is a future cross-session search feature.
 //!
 //! DB path: ~/.local/state/marlin/marlin.db (respects XDG_STATE_HOME).
 

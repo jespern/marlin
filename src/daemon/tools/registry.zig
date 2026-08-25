@@ -154,7 +154,7 @@ pub fn dispatch(
     if (std.mem.eql(u8, name, fetch_tool.spec_name)) {
         const parsed = parseArgs(fetch_tool.Args, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        return textResult(fetch_tool.fetch(gpa, parsed.value, policy, cancel), gpa);
+        return cancellableTextResult(fetch_tool.fetch(gpa, io, source_environ, parsed.value, policy, cancel), gpa);
     }
     const msg = std.fmt.allocPrint(gpa, "error: unknown tool '{s}'", .{name}) catch @panic("oom");
     return .{ .output = msg, .status = .err };

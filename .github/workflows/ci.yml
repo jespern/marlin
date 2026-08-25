@@ -22,9 +22,9 @@ jobs:
 
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libsqlite3-dev sqlite3
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev sqlite3
 
-      # macOS ships curl + sqlite3 in the SDK; nothing to install.
+      # macOS ships sqlite3 in the SDK; nothing to install.
 
       - name: Format check
         run: zig fmt --check src build.zig
@@ -34,6 +34,10 @@ jobs:
 
       - name: Unit + fixture tests
         run: zig build test
+
+      - name: Verify embedded-SQLite release configuration
+        if: runner.os == 'Linux'
+        run: zig build -Doptimize=ReleaseSafe -Dembedded-sqlite=true
 
       - name: End-to-end scenarios
         run: zig build e2e
@@ -47,7 +51,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libsqlite3-dev sqlite3
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev sqlite3
       - name: Live smoke against OpenRouter
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}

@@ -263,12 +263,34 @@ function toolPreview(name, argsJson) {
   return (argsJson || '');
 }
 
+const rehydrationPrefix = '[rehydrated after compaction]';
+
+function rehydrationNote(text) {
+  const first = (text || '').slice(rehydrationPrefix.length).trimStart().split('\n', 1)[0];
+  const path = first.replace(/:\s*$/, '').trim();
+  return path ? 'rehydrated ' + path : 'rehydrated file context';
+}
+
+function isCompactionStatusNote(text) {
+  return text.startsWith('context compacted automatically') ||
+    text.startsWith('context compacted by /compact');
+}
+
+function clippedNote(text) {
+  return text.length <= 480 ? text : text.slice(0, 480) + ' …';
+}
+
 function addBlock(b) {
   const t = $('#transcript');
   const kind = Object.keys(b.body)[0];
   const v = b.body[kind];
   let node = null;
-  if (kind === 'user_msg') node = el('div', 'block user', v.text);
+  if (kind === 'user_msg') {
+    if (v.synthetic || (v.text || '').startsWith(rehydrationPrefix))
+      node = el('div', 'block note', '[' + rehydrationNote(v.text) + ']');
+    else
+      node = el('div', 'block user', v.text);
+  }
   else if (kind === 'assistant_msg') {
     clearDelta();
     clearReasoning();
@@ -305,7 +327,10 @@ function addBlock(b) {
     node = el('details', 'block tool' + (v.status !== 'ok' ? ' err' : ''));
     node.appendChild(el('summary', null, 'result'));
     node.appendChild(pre);
-  } else if (kind === 'system_note') node = el('div', 'block note', '[' + v.text + ']');
+  } else if (kind === 'system_note') {
+    if (isCompactionStatusNote(v.text || '')) return;
+    node = el('div', 'block note', '[' + clippedNote(v.text || '') + ']');
+  }
   else if (kind === 'compaction') node = el('div', 'block note', '≋ context compacted');
   else if (kind === 'approval') node = el('div', 'block note', 'approval: ' + (v.decision || 'pending'));
   else if (kind === 'steer') node = el('div', 'block user', '↪ ' + v.text);
