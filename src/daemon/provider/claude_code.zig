@@ -102,9 +102,9 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
                     } },
                 }, .{});
                 try argv.appendSlice(arena, &.{
-                    "--permission-mode",          "default",
-                    "--permission-prompt-tool",   "mcp__marlin__approve",
-                    "--mcp-config",               mcp_config,
+                    "--permission-mode",        "default",
+                    "--permission-prompt-tool", "mcp__marlin__approve",
+                    "--mcp-config",             mcp_config,
                 });
             } else {
                 try argv.appendSlice(arena, &.{ "--permission-mode", "acceptEdits" });

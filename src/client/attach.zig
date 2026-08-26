@@ -452,7 +452,7 @@ test "child transport handshakes over subprocess stdio" {
     // A fake `_pipe`: consume the hello line, answer hello_ok, then swallow
     // everything until stdin EOF (which deinit provides by closing it).
     const conn = try spawnChildConn(gpa, io, &.{
-        "/bin/sh", "-c",
+        "/bin/sh",                                                                                                                             "-c",
         "read line; printf '{\"hello_ok\":{\"proto_version\":1,\"daemon_version\":\"fake\",\"sandbox_available\":true}}\\n'; cat > /dev/null",
     });
     handshake(conn, 5_000) catch |err| {
