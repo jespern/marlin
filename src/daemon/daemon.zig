@@ -1488,6 +1488,29 @@ pub const Daemon = struct {
                 };
             },
             .mcp_list => self.sendMcpStatus(client),
+            .council_list => try self.sendCouncilList(client),
+            .council_set => |cs| {
+                config.setCouncil(self.gpa, self.io, self.environ, cs.name, cs.models) catch |err| {
+                    self.sendTo(client, .{ .err = .{ .code = "council", .msg = switch (err) {
+                        error.CouncilMissingModels => "a council needs at least one model",
+                        error.CouncilBadModel => "models must be registry-form ids (provider/model)",
+                        error.InvalidExtensionName => "council names are letters, digits, - and _",
+                        else => "could not persist council to config.toml",
+                    } } });
+                    return;
+                };
+                try self.sendCouncilList(client);
+            },
+            .council_remove => |cr| {
+                config.removeCouncil(self.gpa, self.io, self.environ, cr.name) catch |err| {
+                    self.sendTo(client, .{ .err = .{ .code = "council", .msg = switch (err) {
+                        error.UnknownCouncil => "no council by that name",
+                        else => "could not update config.toml",
+                    } } });
+                    return;
+                };
+                try self.sendCouncilList(client);
+            },
             .mcp_restart => |request| {
                 if (self.anySessionBusy()) {
                     self.sendTo(client, .{ .err = .{
@@ -2589,6 +2612,22 @@ pub const Daemon = struct {
                 value.self.sendLine(client, value.line);
             }
         }.send);
+    }
+
+    /// Councils are config, not daemon state: read fresh on every request so
+    /// hand-edits to config.toml are visible without a reload verb.
+    fn sendCouncilList(self: *Daemon, client: *Client) !void {
+        var loaded = config.load(self.gpa, self.io, self.environ) catch {
+            self.sendTo(client, .{ .err = .{ .code = "config", .msg = "could not read config.toml" } });
+            return;
+        };
+        defer loaded.deinit();
+        const infos = try self.gpa.alloc(proto.CouncilInfo, loaded.value.councils.len);
+        defer self.gpa.free(infos);
+        for (loaded.value.councils, 0..) |council, i| {
+            infos[i] = .{ .name = council.name, .models = council.models };
+        }
+        self.sendTo(client, .{ .council_list_result = .{ .councils = infos } });
     }
 
     fn sendSessionList(self: *Daemon, client: *Client, include_archived: bool) !void {

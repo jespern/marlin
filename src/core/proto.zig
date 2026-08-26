@@ -63,6 +63,14 @@ pub const ModelPricing = struct {
     tiered: bool = false,
 };
 
+/// A named review council: an ordered roster of registry-form model ids.
+/// Durable in config.toml ([[council]] tables); clients expand /review
+/// invocations from this.
+pub const CouncilInfo = struct {
+    name: []const u8,
+    models: []const []const u8,
+};
+
 pub const McpServerInfo = struct {
     name: []const u8,
     ready: bool,
@@ -175,6 +183,13 @@ pub const ClientMsg = union(enum) {
         /// Opt into interrupt_result instead of the legacy ok reply.
         report: bool = false,
     },
+    /// Define or replace a named review council (durable in config.toml,
+    /// daemon-owned like MCP servers). Replies council_list_result.
+    council_set: struct { name: []const u8, models: []const []const u8 },
+    /// Remove a named council. Replies council_list_result.
+    council_remove: struct { name: []const u8 },
+    /// List configured councils. Replies council_list_result.
+    council_list: struct {},
     /// Blob-store maintenance (`marlin gc`): sweep orphan blobs, and demote
     /// full bodies older than expire_before_ms when non-zero. Runs in the
     /// daemon so the store keeps its single-connection discipline; replies
@@ -267,6 +282,9 @@ pub const DaemonMsg = union(enum) {
     cc_approval_result: struct { sid: u64, decision: ApprovalAnswer },
     /// Terminal reply to gc.
     gc_result: struct { bytes_reclaimed: u64, orphan_blobs: u64, expired_blobs: u64 },
+    /// Reply to council_set/council_remove/council_list: the full current
+    /// council roster set, so clients replace their cache in one message.
+    council_list_result: struct { councils: []const CouncilInfo },
     interrupt_result: InterruptResult,
     /// `request_id` is non-zero only when replying to a correlated request
     /// (currently input). Defaults preserve compatibility in both directions.
@@ -485,6 +503,22 @@ test "round trip: client messages" {
     defer gpa.free(gc_reply);
     const gc_reply_back = try decode(DaemonMsg, arena, gc_reply);
     try std.testing.expectEqual(@as(u64, 9), gc_reply_back.gc_result.bytes_reclaimed);
+
+    const council_line = try encode(gpa, ClientMsg{ .council_set = .{
+        .name = "core",
+        .models = &.{ "openrouter/x-ai/grok-4.6", "openrouter/z-ai/glm-5.3" },
+    } });
+    defer gpa.free(council_line);
+    const council_back = try decode(ClientMsg, arena, council_line);
+    try std.testing.expectEqualStrings("core", council_back.council_set.name);
+    try std.testing.expectEqual(@as(usize, 2), council_back.council_set.models.len);
+
+    const council_reply = try encode(gpa, DaemonMsg{ .council_list_result = .{
+        .councils = &.{.{ .name = "core", .models = &.{"openrouter/x-ai/grok-4.6"} }},
+    } });
+    defer gpa.free(council_reply);
+    const council_reply_back = try decode(DaemonMsg, arena, council_reply);
+    try std.testing.expectEqualStrings("core", council_reply_back.council_list_result.councils[0].name);
 }
 
 test "latest plan survives the replay marker wire" {

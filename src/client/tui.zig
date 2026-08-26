@@ -137,6 +137,8 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
     .{ .name = "/mcp", .usage = " [add|remove|restart|reload]", .description = "inspect and manage MCP servers", .accepts_args = true },
+    .{ .name = "/council", .usage = " [set <name> <models...>|remove <name>]", .description = "list and manage named review councils", .accepts_args = true },
+    .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
@@ -252,6 +254,17 @@ const SessionSummary = struct {
         gpa.free(self.cwd);
         gpa.free(self.model);
         gpa.free(self.label);
+    }
+};
+
+const OwnedCouncil = struct {
+    name: []u8,
+    models: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *OwnedCouncil, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        for (self.models.items) |model| gpa.free(model);
+        self.models.deinit(gpa);
     }
 };
 
@@ -440,6 +453,11 @@ const App = struct {
     saved_views: std.AutoHashMapUnmanaged(u64, *SavedSessionView) = .empty,
     saved_view_clock: u64 = 0,
     background_approvals: std.AutoHashMapUnmanaged(u64, PendingApproval) = .empty,
+    /// Council cache from the daemon (durable config); refreshed by every
+    /// council_list_result. Names and models are gpa-owned.
+    councils: std.ArrayList(OwnedCouncil) = .empty,
+    /// The next council_list_result was user-requested (/council): show it.
+    council_notice_pending: bool = false,
     recent_sessions: std.ArrayList(u64) = .empty,
     recent_cursor: usize = 0,
     /// Click targets from the most recently rendered tab strip. The entries
@@ -562,6 +580,8 @@ const App = struct {
         }
         self.saved_views.deinit(self.gpa);
         self.background_approvals.deinit(self.gpa);
+        self.clearCouncils();
+        self.councils.deinit(self.gpa);
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.pending_new_cwd.deinit(self.gpa);
@@ -1468,6 +1488,7 @@ const App = struct {
                 }
             },
             .mcp_list_result => |result| self.showMcpStatus(result.servers),
+            .council_list_result => |result| self.applyCouncils(result.councils),
             .session_meta => |m| {
                 if (m.sid != self.sid) return;
                 self.tokens_in = m.tokens_in;
@@ -1781,6 +1802,74 @@ const App = struct {
             } else {
                 self.setNotice("usage: /mcp [add <name> <command> [args...]|remove <name>|restart <name>|reload]", .{});
             }
+        } else if (std.mem.eql(u8, head, "/council")) {
+            const action = it.next();
+            if (action == null or std.mem.eql(u8, action.?, "list")) {
+                self.council_notice_pending = true;
+                self.conn.send(.{ .council_list = .{} }) catch {
+                    self.setNotice("could not request councils", .{});
+                };
+            } else if (std.mem.eql(u8, action.?, "set") or std.mem.eql(u8, action.?, "add")) {
+                const name = it.next() orelse {
+                    self.setNotice("usage: /council set <name> <model> [model...]", .{});
+                    return;
+                };
+                var models: std.ArrayList([]const u8) = .empty;
+                defer models.deinit(self.gpa);
+                while (it.next()) |model| models.append(self.gpa, model) catch return;
+                if (models.items.len == 0) {
+                    self.setNotice("usage: /council set <name> <model> [model...]", .{});
+                    return;
+                }
+                self.council_notice_pending = true;
+                self.conn.send(.{ .council_set = .{ .name = name, .models = models.items } }) catch {
+                    self.setNotice("could not save council", .{});
+                };
+            } else if (std.mem.eql(u8, action.?, "remove")) {
+                const name = it.next() orelse {
+                    self.setNotice("usage: /council remove <name>", .{});
+                    return;
+                };
+                self.council_notice_pending = true;
+                self.conn.send(.{ .council_remove = .{ .name = name } }) catch {
+                    self.setNotice("could not remove council", .{});
+                };
+            } else {
+                self.setNotice("usage: /council [set <name> <model...>|remove <name>]", .{});
+            }
+        } else if (std.mem.eql(u8, head, "/review")) {
+            const name = it.next() orelse {
+                self.setNotice("usage: /review <council> <question>", .{});
+                return;
+            };
+            const question = std.mem.trim(u8, it.rest(), " \t");
+            if (question.len == 0) {
+                self.setNotice("usage: /review <council> <question>", .{});
+                return;
+            }
+            const council = self.councilByName(name) orelse {
+                if (self.councils.items.len == 0)
+                    self.setNotice("no councils configured — /council set <name> <model> [model...]", .{})
+                else
+                    self.setNotice("unknown council '{s}' — /council lists them", .{name});
+                return;
+            };
+            if (proto.isGuestModel(self.model.items)) {
+                self.setNotice("councils need a native session (guest sessions have no marlin tools)", .{});
+                return;
+            }
+            for (council.models.items) |model| {
+                if (proto.isGuestModel(model)) {
+                    self.setNotice("council '{s}' seats a guest model — not supported yet (see ARCHITECTURE, Native vs guest)", .{name});
+                    return;
+                }
+            }
+            const expanded = buildReviewPrompt(self.gpa, council, question) catch {
+                self.setNotice("could not compose review prompt", .{});
+                return;
+            };
+            defer self.gpa.free(expanded);
+            self.submitInput(expanded);
         } else if (std.mem.eql(u8, head, "/sessions")) {
             self.openPicker(.session);
         } else if (std.mem.eql(u8, head, "/new")) {
@@ -1852,7 +1941,7 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -1874,6 +1963,48 @@ const App = struct {
                 self.notice.print(self.gpa, "{s} ✗ {s}", .{ server.name, message[0..@min(message.len, 96)] }) catch return;
             }
         }
+    }
+
+    fn clearCouncils(self: *App) void {
+        for (self.councils.items) |*council| council.deinit(self.gpa);
+        self.councils.clearRetainingCapacity();
+    }
+
+    fn applyCouncils(self: *App, councils: []const proto.CouncilInfo) void {
+        self.clearCouncils();
+        for (councils) |info| {
+            var owned = OwnedCouncil{ .name = self.gpa.dupe(u8, info.name) catch return };
+            for (info.models) |model| {
+                const copy = self.gpa.dupe(u8, model) catch break;
+                owned.models.append(self.gpa, copy) catch {
+                    self.gpa.free(copy);
+                    break;
+                };
+            }
+            self.councils.append(self.gpa, owned) catch {
+                owned.deinit(self.gpa);
+                return;
+            };
+        }
+        if (!self.council_notice_pending) return;
+        self.council_notice_pending = false;
+        self.notice.clearRetainingCapacity();
+        if (self.councils.items.len == 0) {
+            self.notice.appendSlice(self.gpa, "councils · none — /council set <name> <model> [model...]") catch {};
+            return;
+        }
+        self.notice.appendSlice(self.gpa, "councils · ") catch return;
+        for (self.councils.items, 0..) |council, i| {
+            if (i > 0) self.notice.appendSlice(self.gpa, " · ") catch return;
+            self.notice.print(self.gpa, "{s} ({d} models)", .{ council.name, council.models.items.len }) catch return;
+        }
+    }
+
+    fn councilByName(self: *const App, name: []const u8) ?*const OwnedCouncil {
+        for (self.councils.items) |*council| {
+            if (std.mem.eql(u8, council.name, name)) return council;
+        }
+        return null;
     }
 
     fn stageClipboard(self: *App, text: []const u8) void {
@@ -2773,6 +2904,32 @@ fn pickerModelLine(
     else
         "";
     return std.fmt.allocPrint(arena, " {s}{s}{s}{s}{s}", .{ guest_prefix, model_text, gap, price, marker });
+}
+
+/// Expand `/review <council> <question>` into the parent agent's turn input:
+/// the named roster plus the council procedure, so invocation costs the user
+/// one line. Caller frees.
+fn buildReviewPrompt(gpa: std.mem.Allocator, council: *const OwnedCouncil, question: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.print(gpa, "Convene the review council \"{s}\". Reviewers, in order:\n", .{council.name});
+    for (council.models.items) |model| try out.print(gpa, "- {s}\n", .{model});
+    try out.appendSlice(gpa,
+        \\
+        \\Load the `council` skill and follow its procedure with exactly this
+        \\roster. If the skill is unavailable: write ONE self-contained review
+        \\prompt (paths the read-only reviewers can open; paste diff hunks for
+        \\anything uncommitted; require verdict, findings with file:line, and
+        \\confidence), fan it out with a single task_batch call — one task per
+        \\reviewer, identical prompt, the model ids above, max_rounds 12 — then
+        \\consolidate: agreements, disagreements attributed by model, false
+        \\positives, and your recommendation. Report reviewers that fail.
+        \\
+        \\Question for the council:
+    );
+    try out.append(gpa, ' ');
+    try out.appendSlice(gpa, question);
+    return out.toOwnedSlice(gpa);
 }
 
 fn tabActivityForState(state: proto.SessionState) TabActivity {
@@ -3940,10 +4097,12 @@ pub fn run(
         // Joined at exit: we shutdown() the socket which EOFs the reader —
         // closing the fd under a live read is a BADF panic on the Threaded Io.
         defer rt.join();
-        defer conn.stream.shutdown(io, .both) catch {};
+        defer conn.shutdown();
         // Lightweight catalog/status updates for every session; block streams
         // remain subscribed only for the focused session.
         try conn.send(.{ .session_watch = .{ .incremental = true } });
+        // Council cache for /review expansion; silent (no notice pending).
+        conn.send(.{ .council_list = .{} }) catch {};
 
         const animation_thread = try std.Thread.spawn(.{}, animationThread, .{ &app, &loop });
         defer animation_thread.join();
@@ -4747,10 +4906,15 @@ test "composer command catalog filters slash commands and bang shortcuts" {
     ed.insertSlice("/");
     try std.testing.expectEqual(composer_commands.len - 2, commandMatches(&ed).len);
     ed.clear();
-    ed.insertSlice("/co");
+    ed.insertSlice("/com");
     const compact = commandMatches(&ed);
     try std.testing.expectEqual(@as(usize, 1), compact.len);
     try std.testing.expectEqualStrings("/compact", composer_commands[compact.indices[0]].name);
+    ed.clear();
+    ed.insertSlice("/cou");
+    const council = commandMatches(&ed);
+    try std.testing.expectEqual(@as(usize, 1), council.len);
+    try std.testing.expectEqualStrings("/council", composer_commands[council.indices[0]].name);
     ed.clear();
     ed.insertSlice("/q");
     const quit = commandMatches(&ed);
@@ -6810,4 +6974,19 @@ test "parked approvals are findable per tree and globally; badge follows the ses
         .full_access = false,
     });
     try std.testing.expect(!app.permissions_full);
+}
+
+test "review prompt expansion names the council, roster, and question" {
+    const gpa = std.testing.allocator;
+    var council = OwnedCouncil{ .name = try gpa.dupe(u8, "core") };
+    defer council.deinit(gpa);
+    try council.models.append(gpa, try gpa.dupe(u8, "openrouter/x-ai/grok-4.6"));
+    try council.models.append(gpa, try gpa.dupe(u8, "openrouter/z-ai/glm-5.3"));
+
+    const prompt = try buildReviewPrompt(gpa, &council, "is the cache safe?");
+    defer gpa.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "council \"core\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "- openrouter/x-ai/grok-4.6\n- openrouter/z-ai/glm-5.3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "task_batch") != null);
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "Question for the council: is the cache safe?"));
 }

@@ -34,6 +34,13 @@ pub const Hooks = struct {
     on_turn_done: ?[]const u8 = null,
 };
 
+/// Named review council (`[[council]]`): an ordered roster of registry-form
+/// model ids, expanded by clients when the user invokes /review <name>.
+pub const Council = struct {
+    name: []const u8,
+    models: []const []const u8,
+};
+
 pub const Document = struct {
     model_default: ?[]const u8 = null,
     model_compaction: ?[]const u8 = null,
@@ -55,6 +62,7 @@ pub const Document = struct {
     openrouter_sort: ??[]const u8 = null,
     exec_tools: []const ExecTool = &.{},
     mcp_servers: []const McpServer = &.{},
+    councils: []const Council = &.{},
     hooks: Hooks = .{},
 };
 
@@ -72,6 +80,7 @@ const Section = enum {
     openrouter,
     exec_tool,
     mcp,
+    council,
 };
 
 const PendingExec = struct {
@@ -92,12 +101,19 @@ const PendingMcp = struct {
     mutating_tools: []const []const u8 = &.{},
 };
 
+const PendingCouncil = struct {
+    name: ?[]const u8 = null,
+    models: ?[]const []const u8 = null,
+};
+
 pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
     var doc = Document{};
     var exec_tools: std.ArrayList(ExecTool) = .empty;
     var mcp_servers: std.ArrayList(McpServer) = .empty;
+    var councils: std.ArrayList(Council) = .empty;
     var pending_exec: ?PendingExec = null;
     var pending_mcp: ?PendingMcp = null;
+    var pending_council: ?PendingCouncil = null;
     var section: Section = .unknown;
 
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -107,7 +123,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
         if (line.len == 0) continue;
 
         if (line[0] == '[') {
-            try finishPending(arena, &exec_tools, &pending_exec, &mcp_servers, &pending_mcp);
+            try finishPending(arena, &exec_tools, &pending_exec, &mcp_servers, &pending_mcp, &councils, &pending_council);
             if (std.mem.startsWith(u8, line, "[[") and std.mem.endsWith(u8, line, "]]")) {
                 const name = std.mem.trim(u8, line[2 .. line.len - 2], " \t");
                 if (std.mem.eql(u8, name, "tools.exec")) {
@@ -116,6 +132,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
                 } else if (std.mem.eql(u8, name, "mcp")) {
                     section = .mcp;
                     pending_mcp = .{};
+                } else if (std.mem.eql(u8, name, "council")) {
+                    section = .council;
+                    pending_council = .{};
                 } else {
                     section = .unknown;
                 }
@@ -193,12 +212,18 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
                 if (std.mem.eql(u8, key, "readonly_tools")) current.readonly_tools = try stringArray(arena, value);
                 if (std.mem.eql(u8, key, "mutating_tools")) current.mutating_tools = try stringArray(arena, value);
             },
+            .council => {
+                const current = &(pending_council orelse return error.InvalidToml);
+                if (std.mem.eql(u8, key, "name")) current.name = try string(arena, value);
+                if (std.mem.eql(u8, key, "models")) current.models = try stringArray(arena, value);
+            },
             .unknown => {},
         }
     }
-    try finishPending(arena, &exec_tools, &pending_exec, &mcp_servers, &pending_mcp);
+    try finishPending(arena, &exec_tools, &pending_exec, &mcp_servers, &pending_mcp, &councils, &pending_council);
     doc.exec_tools = try exec_tools.toOwnedSlice(arena);
     doc.mcp_servers = try mcp_servers.toOwnedSlice(arena);
+    doc.councils = try councils.toOwnedSlice(arena);
     return doc;
 }
 
@@ -208,7 +233,16 @@ fn finishPending(
     pending_exec: *?PendingExec,
     mcp_servers: *std.ArrayList(McpServer),
     pending_mcp: *?PendingMcp,
+    councils: *std.ArrayList(Council),
+    pending_council: *?PendingCouncil,
 ) !void {
+    if (pending_council.*) |pending| {
+        const name = pending.name orelse return error.CouncilMissingName;
+        const models = pending.models orelse return error.CouncilMissingModels;
+        if (models.len == 0) return error.CouncilMissingModels;
+        try councils.append(arena, .{ .name = name, .models = models });
+        pending_council.* = null;
+    }
     if (pending_exec.*) |pending| {
         const name = pending.name orelse return error.ExecToolMissingName;
         const cmd = pending.cmd orelse return error.ExecToolMissingCommand;
@@ -417,5 +451,45 @@ test "known malformed values fail" {
     try std.testing.expectError(error.ExecToolMissingCommand, parse(arena_state.allocator(),
         \\[[tools.exec]]
         \\name = "broken"
+    ));
+}
+
+test "web tailscale flag parses" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const doc = try parse(arena_state.allocator(),
+        \\[web]
+        \\enabled = true
+        \\tailscale = false
+        \\[model]
+        \\default = "local/qwen"
+    );
+    try std.testing.expect(doc.web_enabled.?);
+    try std.testing.expect(!doc.web_tailscale.?);
+    try std.testing.expectEqualStrings("local/qwen", doc.model_default.?);
+}
+
+test "council tables parse name and roster" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const doc = try parse(arena_state.allocator(),
+        \\[[council]]
+        \\name = "core"
+        \\models = ["openrouter/x-ai/grok-4.6", "openrouter/z-ai/glm-5.3"]
+        \\
+        \\[[council]]
+        \\name = "cheap"
+        \\models = ["openrouter/z-ai/glm-5.3"]
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 2), doc.councils.len);
+    try std.testing.expectEqualStrings("core", doc.councils[0].name);
+    try std.testing.expectEqual(@as(usize, 2), doc.councils[0].models.len);
+    try std.testing.expectEqualStrings("openrouter/z-ai/glm-5.3", doc.councils[1].models[0]);
+
+    // A council without models is a config error, not a silent empty roster.
+    try std.testing.expectError(error.CouncilMissingModels, parse(
+        arena_state.allocator(),
+        "[[council]]\nname = \"empty\"\n",
     ));
 }

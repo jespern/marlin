@@ -11,6 +11,7 @@ const toml = @import("config_toml.zig");
 
 pub const ExecTool = toml.ExecTool;
 pub const McpServer = toml.McpServer;
+pub const Council = toml.Council;
 pub const Hooks = toml.Hooks;
 pub const Policy = toml.Policy;
 
@@ -71,6 +72,7 @@ pub const Config = struct {
     /// Process-boundary extensions (M5). All slices are owned by `Loaded`.
     exec_tools: []const ExecTool = &.{},
     mcp_servers: []const McpServer = &.{},
+    councils: []const Council = &.{},
     hooks: Hooks = .{},
     skill_directories: []const []const u8 = &.{},
 
@@ -240,6 +242,109 @@ pub fn removeMcpServer(
     try replaceRaw(gpa, io, environ, updated);
 }
 
+/// Define or replace a named review council (durable [[council]] table).
+/// Replace semantics make /council set the edit verb too.
+pub fn setCouncil(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    name: []const u8,
+    models: []const []const u8,
+) !void {
+    const current = try readRawAlloc(gpa, io, environ);
+    defer gpa.free(current);
+    const updated = try setCouncilText(gpa, current, name, models);
+    defer gpa.free(updated);
+    try replaceRaw(gpa, io, environ, updated);
+}
+
+pub fn removeCouncil(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    name: []const u8,
+) !void {
+    const current = try readRawAlloc(gpa, io, environ);
+    defer gpa.free(current);
+    const updated = try removeCouncilText(gpa, current, name);
+    defer gpa.free(updated);
+    try replaceRaw(gpa, io, environ, updated);
+}
+
+fn setCouncilText(
+    gpa: std.mem.Allocator,
+    current: []const u8,
+    name: []const u8,
+    models: []const []const u8,
+) ![]u8 {
+    try validateToolName(name);
+    if (models.len == 0) return error.CouncilMissingModels;
+    for (models) |model| {
+        if (std.mem.indexOfScalar(u8, model, '/') == null) return error.CouncilBadModel;
+    }
+
+    // Replace-or-append: strip any existing table with this name first.
+    const without = removeCouncilText(gpa, current, name) catch |err| switch (err) {
+        error.UnknownCouncil => try gpa.dupe(u8, current),
+        else => return err,
+    };
+    defer gpa.free(without);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, without);
+    if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(gpa, '\n');
+    if (out.items.len > 0) try out.append(gpa, '\n');
+    try out.appendSlice(gpa, "[[council]]\nname = ");
+    try appendTomlString(&out, gpa, name);
+    try out.appendSlice(gpa, "\nmodels = [");
+    for (models, 0..) |model, i| {
+        if (i > 0) try out.appendSlice(gpa, ", ");
+        try appendTomlString(&out, gpa, model);
+    }
+    try out.appendSlice(gpa, "]\n");
+
+    // Validate the generated document before it can replace the user's file.
+    var verify_arena = std.heap.ArenaAllocator.init(gpa);
+    defer verify_arena.deinit();
+    _ = try toml.parse(verify_arena.allocator(), out.items);
+    return out.toOwnedSlice(gpa);
+}
+
+fn removeCouncilText(gpa: std.mem.Allocator, current: []const u8, name: []const u8) ![]u8 {
+    try validateToolName(name);
+    var offset: usize = 0;
+    while (offset < current.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, current, offset, '\n') orelse current.len;
+        const next = if (line_end < current.len) line_end + 1 else line_end;
+        const line = std.mem.trim(u8, current[offset..line_end], " \t\r");
+        if (!std.mem.startsWith(u8, line, "[[council]]")) {
+            offset = next;
+            continue;
+        }
+
+        var table_end = next;
+        while (table_end < current.len) {
+            const candidate_end = std.mem.indexOfScalarPos(u8, current, table_end, '\n') orelse current.len;
+            const candidate = std.mem.trim(u8, current[table_end..candidate_end], " \t\r");
+            if (candidate.len > 0 and candidate[0] == '[') break;
+            table_end = if (candidate_end < current.len) candidate_end + 1 else candidate_end;
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const table = try toml.parse(arena_state.allocator(), current[offset..table_end]);
+        if (table.councils.len == 1 and std.mem.eql(u8, table.councils[0].name, name)) {
+            const out = try gpa.alloc(u8, current.len - (table_end - offset));
+            @memcpy(out[0..offset], current[0..offset]);
+            @memcpy(out[offset..], current[table_end..]);
+            return out;
+        }
+        offset = table_end;
+    }
+    return error.UnknownCouncil;
+}
+
 fn addMcpServerText(
     gpa: std.mem.Allocator,
     current: []const u8,
@@ -381,6 +486,7 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.openrouter_sort) |value| cfg.openrouter_sort = value;
     cfg.exec_tools = doc.exec_tools;
     cfg.mcp_servers = doc.mcp_servers;
+    cfg.councils = doc.councils;
     cfg.hooks = doc.hooks;
 }
 
@@ -569,4 +675,30 @@ test "MCP config edits round-trip escaped commands and preserve other tables" {
     try std.testing.expectEqualStrings("new-server", after.mcp_servers[0].name);
     try std.testing.expectEqualStrings("blocked.example", after.network_deny.?);
     try std.testing.expectError(error.UnknownMcpServer, removeMcpServerText(gpa, removed, "missing"));
+}
+
+test "council config text edits: set replaces, remove deletes, garbage rejected" {
+    const gpa = std.testing.allocator;
+    const base = "[model]\ndefault = \"openrouter/x\"\n";
+
+    const one = try setCouncilText(gpa, base, "core", &.{ "openrouter/a/b", "openrouter/c/d" });
+    defer gpa.free(one);
+    try std.testing.expect(std.mem.indexOf(u8, one, "[[council]]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"openrouter/a/b\", \"openrouter/c/d\"") != null);
+
+    // set again = replace, not duplicate
+    const two = try setCouncilText(gpa, one, "core", &.{"openrouter/e/f"});
+    defer gpa.free(two);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, two, "[[council]]"));
+    try std.testing.expect(std.mem.indexOf(u8, two, "openrouter/e/f") != null);
+    try std.testing.expect(std.mem.indexOf(u8, two, "openrouter/a/b") == null);
+
+    const removed = try removeCouncilText(gpa, two, "core");
+    defer gpa.free(removed);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "[[council]]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "default = ") != null);
+
+    try std.testing.expectError(error.UnknownCouncil, removeCouncilText(gpa, base, "nope"));
+    try std.testing.expectError(error.CouncilBadModel, setCouncilText(gpa, base, "bad", &.{"notamodel"}));
+    try std.testing.expectError(error.CouncilMissingModels, setCouncilText(gpa, base, "bad", &.{}));
 }
