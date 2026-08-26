@@ -121,12 +121,14 @@ then the wall is how Marlin stays small.
 - Do not spawn Marlin `task` children from a guest parent. Do not grow
   `ccAutoAllow`. Do not add guest-specific product (CC plan sync, wrapping
   Seatbelt around their bash, vision side-channel).
-- Guest models as council/task *children* are wanted (a council should be
-  able to seat Fable) but are blocked on one prerequisite: bridge-enforced
-  read-only for guest children. `cc_approval` already sees every guest
-  Bash/Edit, so a child-session policy can deny mutations outright rather
-  than ask; that is a deny mode on the bridge, not growth of `ccAutoAllow`.
-  Until it lands, councils are native-only and the skill says so.
+- Guest models as council/task *children* are allowed (SHIPPED): the
+  bridge enforces read-only for any non-root guest session —
+  `permissions.ccReadOnlyAllow` grants reads/searches and DENIES
+  everything else outright (never asks: a background child must not park
+  surprise prompts), checked before approval mode so neither yolo nor
+  /permissions can hand a reviewer write access. The deny carries a
+  policy message so the model reads it as policy, not a human's no. This
+  is a deny mode on the bridge, not growth of `ccAutoAllow`.
 - Type-system: `Dialect` is wire (`openrouter` | `openai_compatible` |
   `anthropic`). Guest is not a dialect; `runTurn` branching on
   `.claude_code` is the current implementation, not the target shape.

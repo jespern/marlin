@@ -182,6 +182,23 @@ pub fn ccAutoAllow(
     return false;
 }
 
+/// Bridge policy for GUEST CHILD sessions (council reviewers spawned via
+/// task/task_batch with a claudecode/ model): read-only by enforcement, the
+/// same posture marlin's dispatch loop hard-codes for native children.
+/// Marlin cannot reach inside the `claude -p` subprocess, but every one of
+/// its tool prompts flows through cc_approval — so the child policy DENIES
+/// mutations outright (never asks, never auto-allows). No shell at all:
+/// native read-only children have none either, and reads-vs-writes cannot
+/// be told apart in bash.
+pub fn ccReadOnlyAllow(tool_name: []const u8) bool {
+    const read_only = [_][]const u8{
+        "Read",     "Glob",      "Grep",      "LS", "NotebookRead",
+        "WebFetch", "WebSearch", "TodoWrite",
+    };
+    for (read_only) |name| if (std.mem.eql(u8, tool_name, name)) return true;
+    return false;
+}
+
 /// Lexical scan of a shell command for paths that leave the workspace or
 /// name protected files. Tokens that resolve inside the cwd (or into the
 /// usual scratch locations) pass; `~`, escaping relatives, and any other
@@ -601,4 +618,11 @@ test "secret collection and exact-value redaction" {
 
     // The common case (no secrets present) allocates nothing.
     try std.testing.expectEqual(@as(?[]u8, null), try redactSecrets(gpa, secrets, "ordinary tool output"));
+}
+
+test "guest child bridge policy: reads and searches only, nothing else" {
+    const allowed = [_][]const u8{ "Read", "Glob", "Grep", "WebFetch", "TodoWrite" };
+    for (allowed) |tool| try std.testing.expect(ccReadOnlyAllow(tool));
+    const denied = [_][]const u8{ "Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "Task", "mcp__x__y", "" };
+    for (denied) |tool| try std.testing.expect(!ccReadOnlyAllow(tool));
 }

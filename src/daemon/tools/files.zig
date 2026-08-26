@@ -56,7 +56,7 @@ pub fn readFileCancelable(
     // refused as tool-result data, checked on both the requested path and
     // its symlink-resolved target. Explicit capability grants are the
     // designed escape hatch, not silence.
-    if (protectedReadRefusal(gpa, io, abs, args.path)) |refusal| return refusal;
+    if (try protectedReadRefusal(gpa, io, abs, args.path)) |refusal| return refusal;
 
     var dir = Io.Dir.cwd();
     const contents = dir.readFileAlloc(io, abs, gpa, .limited(max_read_bytes)) catch |e| {
@@ -97,27 +97,33 @@ pub fn readFileCancelable(
     return out.toOwnedSlice(gpa);
 }
 
+/// True when `abs` (or its symlink-resolved target) is protected credential
+/// material. Split from the message formatting so an allocation failure can
+/// fail CLOSED (propagate) instead of silently permitting the access.
+pub fn protectedPathHit(gpa: std.mem.Allocator, io: Io, abs: []const u8) bool {
+    if (permissions.isProtectedPath(abs)) return true;
+    if (Io.Dir.realPathFileAbsoluteAlloc(io, abs, gpa)) |real| {
+        defer gpa.free(real);
+        return permissions.isProtectedPath(real);
+    } else |_| {}
+    return false;
+}
+
 /// Non-null when `abs` (or its symlink-resolved target) is protected: the
-/// refusal text to return as the tool result. Null when the read may proceed.
+/// refusal text to return as the tool result. Errors (OOM) propagate — the
+/// access must not proceed just because the refusal could not be printed.
 pub fn protectedReadRefusal(
     gpa: std.mem.Allocator,
     io: Io,
     abs: []const u8,
     display: []const u8,
-) ?[]u8 {
-    var hit = permissions.isProtectedPath(abs);
-    if (!hit) {
-        if (Io.Dir.realPathFileAbsoluteAlloc(io, abs, gpa)) |real| {
-            defer gpa.free(real);
-            hit = permissions.isProtectedPath(real);
-        } else |_| {}
-    }
-    if (!hit) return null;
-    return std.fmt.allocPrint(
+) !?[]u8 {
+    if (!protectedPathHit(gpa, io, abs)) return null;
+    return try std.fmt.allocPrint(
         gpa,
         "error: refusing to read protected path '{s}' (credential material; see docs/PERMISSIONS.md)",
         .{display},
-    ) catch null;
+    );
 }
 
 // ------------------------------------------------------------ write_file --
@@ -149,6 +155,17 @@ pub fn writeFileCancelable(
     if (cancelled(cancel)) return error.Cancelled;
     const abs = try resolvePath(gpa, args.path, cwd);
     defer gpa.free(abs);
+
+    // Protected paths are refused for writes too (first council finding):
+    // the result diff would render the PREVIOUS contents, so an unchecked
+    // `write_file .env` exfiltrates exactly what read_file refuses.
+    if (protectedPathHit(gpa, io, abs)) {
+        return std.fmt.allocPrint(
+            gpa,
+            "error: refusing to write protected path '{s}' (credential material; see docs/PERMISSIONS.md)",
+            .{args.path},
+        );
+    }
 
     const dir = Io.Dir.cwd();
     // Read the previous contents first: the result renders as a diff so the
@@ -250,6 +267,16 @@ pub fn editFileCancelable(
 
     const abs = try resolvePath(gpa, args.path, cwd);
     defer gpa.free(abs);
+
+    // Same protected-path refusal as write_file: the edit result renders
+    // surrounding context from the current contents.
+    if (protectedPathHit(gpa, io, abs)) {
+        return std.fmt.allocPrint(
+            gpa,
+            "error: refusing to edit protected path '{s}' (credential material; see docs/PERMISSIONS.md)",
+            .{args.path},
+        );
+    }
 
     const dir = Io.Dir.cwd();
     const contents = dir.readFileAlloc(io, abs, gpa, .limited(max_read_bytes)) catch |e| {
@@ -662,4 +689,62 @@ test "read_file refuses protected paths as tool-result data" {
     const rel = try readFile(gpa, io, .{ .path = ".ssh/id_ed25519" }, "/tmp");
     defer gpa.free(rel);
     try std.testing.expect(std.mem.indexOf(u8, rel, "refusing to read protected path") != null);
+}
+
+test "write and edit refuse protected paths and never leak prior contents" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-protected-write");
+    defer temp.deinit();
+    const dir_path = temp.path;
+
+    // Seed a protected file with a secret-looking body.
+    const env_path = try std.fs.path.join(gpa, &.{ dir_path, ".env" });
+    defer gpa.free(env_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = env_path, .data = "API_KEY=hunter2\n" });
+
+    const wrote = try writeFile(gpa, io, .{ .path = ".env", .content = "overwritten\n" }, dir_path);
+    defer gpa.free(wrote);
+    try std.testing.expect(std.mem.indexOf(u8, wrote, "refusing to write protected path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wrote, "hunter2") == null);
+
+    const edited = try editFile(gpa, io, .{
+        .path = ".env",
+        .old_string = "hunter2",
+        .new_string = "x",
+    }, dir_path);
+    defer gpa.free(edited);
+    try std.testing.expect(std.mem.indexOf(u8, edited, "refusing to edit protected path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edited, "hunter2") == null);
+
+    // The file was truly untouched.
+    const still = try Io.Dir.cwd().readFileAlloc(io, env_path, gpa, .limited(64));
+    defer gpa.free(still);
+    try std.testing.expectEqualStrings("API_KEY=hunter2\n", still);
+}
+
+test "symlink to protected material is refused for reads" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-protected-symlink");
+    defer temp.deinit();
+    const dir_path = temp.path;
+
+    const secret = try std.fs.path.join(gpa, &.{ dir_path, "id_ed25519" });
+    defer gpa.free(secret);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret, .data = "PRIVATE KEY" });
+    const link = try std.fs.path.join(gpa, &.{ dir_path, "innocent.txt" });
+    defer gpa.free(link);
+    try Io.Dir.cwd().symLink(io, secret, link, .{});
+
+    const refused = try readFile(gpa, io, .{ .path = "innocent.txt" }, dir_path);
+    defer gpa.free(refused);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "refusing to read protected path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "PRIVATE KEY") == null);
 }

@@ -13,9 +13,9 @@ one review prompt into several vendor CLIs and consolidating by hand.
 
 1. **Roster.** Use the models the user named. If they named none, use the
    default roster below. Two or three reviewers is the sweet spot; never more
-   than four. Guest models (`claudecode/...`) cannot sit on a council yet —
-   reviewers must be native registry models; if the user asks for a guest
-   reviewer, say so and offer the native roster instead.
+   than four. Guest models (`claudecode/...`) may sit on a council: they run
+   as read-only reviewers (the permission bridge denies every edit and shell
+   command outright), so treat them like any other seat.
 
 2. **Write ONE self-contained review prompt** and send the identical text to
    every reviewer. It must stand alone:
@@ -30,9 +30,10 @@ one review prompt into several vendor CLIs and consolidating by hand.
      confidence (low/medium/high).
 
 3. **Fan out** with a single `task_batch` call: one task per reviewer,
-   identical `prompt`, a distinct `model` per task, `max_rounds` 12. Tell
-   reviewers to budget their reading (a handful of targeted reads, then
-   answer) — a reviewer that burns its rounds on exploration returns
+   identical `prompt`, a distinct `model` per task, `max_rounds` 16. Tell
+   reviewers to budget their reading — state it as a hard rule in the
+   review prompt ("at most ten tool calls, then answer with what you
+   have"); a reviewer that burns its rounds on exploration returns
    nothing.
 
 4. **Consolidate** — never paste raw responses back at the user. Produce:

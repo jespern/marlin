@@ -21,10 +21,31 @@ const build_options = @import("build_options");
 const proto = @import("../core/proto.zig");
 const attach = @import("attach.zig");
 
+/// One verdict, with the daemon's optional policy message (copied into a
+/// fixed buffer: the wire arena dies before the reply is composed).
+pub const Decision = struct {
+    answer: proto.ApprovalAnswer,
+    message_buf: [256]u8 = undefined,
+    message_len: usize = 0,
+
+    fn init(answer: proto.ApprovalAnswer, text: ?[]const u8) Decision {
+        var self = Decision{ .answer = answer };
+        if (text) |value| {
+            self.message_len = @min(value.len, self.message_buf.len);
+            @memcpy(self.message_buf[0..self.message_len], value[0..self.message_len]);
+        }
+        return self;
+    }
+
+    fn message(self: *const Decision) ?[]const u8 {
+        return if (self.message_len == 0) null else self.message_buf[0..self.message_len];
+    }
+};
+
 /// Answers one forwarded prompt; injectable so tests need no daemon.
 pub const Decider = struct {
     ctx: ?*anyopaque = null,
-    decide: *const fn (ctx: ?*anyopaque, tool_name: []const u8, input_json: []const u8) proto.ApprovalAnswer,
+    decide: *const fn (ctx: ?*anyopaque, tool_name: []const u8, input_json: []const u8) Decision,
 };
 
 pub fn run(
@@ -83,12 +104,12 @@ const DaemonDecider = struct {
     self_exe: []const u8,
     sid: u64,
 
-    fn decide(ctx: ?*anyopaque, tool_name: []const u8, input_json: []const u8) proto.ApprovalAnswer {
+    fn decide(ctx: ?*anyopaque, tool_name: []const u8, input_json: []const u8) Decision {
         const self: *DaemonDecider = @ptrCast(@alignCast(ctx.?));
-        return self.ask(tool_name, input_json) catch .denied;
+        return self.ask(tool_name, input_json) catch Decision.init(.denied, null);
     }
 
-    fn ask(self: *DaemonDecider, tool_name: []const u8, input_json: []const u8) !proto.ApprovalAnswer {
+    fn ask(self: *DaemonDecider, tool_name: []const u8, input_json: []const u8) !Decision {
         const conn = try attach.connect(self.gpa, self.io, self.environ, self.self_exe);
         defer conn.deinit();
         try conn.send(.{ .cc_approval = .{
@@ -99,7 +120,7 @@ const DaemonDecider = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const result = try conn.recvUntil(arena_state.allocator(), .cc_approval_result);
-        return result.decision;
+        return Decision.init(result.decision, result.message);
     }
 };
 
@@ -168,18 +189,23 @@ fn handleToolCall(gpa: std.mem.Allocator, id: std.json.Value, params: ?std.json.
             }
         }
     }
-    const decision: proto.ApprovalAnswer = if (tool_name.len == 0)
-        .denied
+    const decision: Decision = if (tool_name.len == 0)
+        Decision.init(.denied, null)
     else
         decider.decide(decider.ctx, tool_name, input_json);
 
-    const payload = switch (decision) {
+    const payload = switch (decision.answer) {
         .granted => std.fmt.allocPrint(gpa,
             \\{{"behavior":"allow","updatedInput":{s}}}
         , .{input_json}) catch return null,
-        .denied => gpa.dupe(u8,
-            \\{"behavior":"deny","message":"denied via marlin approval"}
-        ) catch return null,
+        .denied => blk: {
+            const text = decision.message() orelse "denied via marlin approval";
+            const escaped_msg = std.json.Stringify.valueAlloc(gpa, text, .{}) catch return null;
+            defer gpa.free(escaped_msg);
+            break :blk std.fmt.allocPrint(gpa,
+                \\{{"behavior":"deny","message":{s}}}
+            , .{escaped_msg}) catch return null;
+        },
     };
     defer gpa.free(payload);
 
@@ -217,13 +243,14 @@ const TestDecider = struct {
     var last_input: [256]u8 = undefined;
     var last_input_len: usize = 0;
     var answer: proto.ApprovalAnswer = .granted;
+    var answer_message: ?[]const u8 = null;
 
-    fn decide(_: ?*anyopaque, tool_name: []const u8, input_json: []const u8) proto.ApprovalAnswer {
+    fn decide(_: ?*anyopaque, tool_name: []const u8, input_json: []const u8) Decision {
         last_tool_len = @min(tool_name.len, last_tool.len);
         @memcpy(last_tool[0..last_tool_len], tool_name[0..last_tool_len]);
         last_input_len = @min(input_json.len, last_input.len);
         @memcpy(last_input[0..last_input_len], input_json[0..last_input_len]);
-        return answer;
+        return Decision.init(answer, answer_message);
     }
 };
 

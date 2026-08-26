@@ -48,7 +48,7 @@ pub fn grep(
     // Protected-path refusal (ARCHITECTURE §7): searching credential
     // material directly is refused as data; matches from protected files
     // inside an ordinary tree are filtered out below (see capLines).
-    if (files.protectedReadRefusal(gpa, io, search_path, args.path orelse ".")) |refusal| return refusal;
+    if (try files.protectedReadRefusal(gpa, io, search_path, args.path orelse ".")) |refusal| return refusal;
 
     // ripgrep is the ideal path. A platform grep is still orders of magnitude
     // faster than interpreting a regex once per line, and is present on every

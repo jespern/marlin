@@ -1381,6 +1381,20 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                // Guest CHILDREN (council reviewers) are read-only by bridge
+                // enforcement — checked before any mode, so neither yolo nor
+                // /permissions can hand a reviewer write access. Mutations
+                // are denied outright, never parked: a background child must
+                // not raise surprise prompts mid-council.
+                if (session.kind != .root) {
+                    const allowed = permissions.ccReadOnlyAllow(ca.tool);
+                    self.sendTo(client, .{ .cc_approval_result = .{
+                        .sid = ca.sid,
+                        .decision = if (allowed) .granted else .denied,
+                        .message = if (allowed) null else "read-only reviewer: this child session may read and search, never edit or run commands — answer from what you can read",
+                    } });
+                    return;
+                }
                 // Policy first: auto sessions and workspace-scoped calls are
                 // answered instantly (docs/PERMISSIONS.md auto-inside).
                 const mode: approval.Mode = @enumFromInt(session.approval_mode_live.load(.acquire));

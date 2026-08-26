@@ -278,8 +278,10 @@ pub const DaemonMsg = union(enum) {
     /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
     /// contain arbitrary command output (including NULs).
     blob_result: struct { hash: []const u8, bytes: []const u8 },
-    /// Terminal reply to cc_approval.
-    cc_approval_result: struct { sid: u64, decision: ApprovalAnswer },
+    /// Terminal reply to cc_approval. `message` (additive; older bridges
+    /// ignore it) becomes the deny text Claude Code shows its model, so a
+    /// policy denial reads as policy, not as a human saying no.
+    cc_approval_result: struct { sid: u64, decision: ApprovalAnswer, message: ?[]const u8 = null },
     /// Terminal reply to gc.
     gc_result: struct { bytes_reclaimed: u64, orphan_blobs: u64, expired_blobs: u64 },
     /// Reply to council_set/council_remove/council_list: the full current
