@@ -15,8 +15,8 @@ marlin/
 │   │   └── ids.zig            # session/block/turn id generation
 │   │
 │   ├── daemon/
-│   │   ├── daemon.zig         # listener, client registry, event fan-out, main loop
-│   │   ├── session.zig        # session state machine (idle/running/awaiting/...)
+│   │   ├── daemon.zig         # listener, client registry, event fan-out, main loop;
+│   │   │                      #   owns the live Session structs (state machine incl.)
 │   │   ├── store.zig          # SQLite: blocks, sessions, blobs; the ONLY sqlite user
 │   │   ├── loop.zig           # agent turn: assemble→stream→tools→repeat; steer queue
 │   │   ├── context.zig        # assembly + L0 caps + L1 prune + L2 compaction + rehydrate

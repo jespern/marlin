@@ -266,6 +266,10 @@ pub const Daemon = struct {
     protected_roots: ?sandbox.ProtectedRoots = null,
     events: queue.Mpsc(Event),
     clients: std.AutoHashMapUnmanaged(u64, *Client) = .empty,
+    /// Client registry lock: both the accept path (add) and dispatcher
+    /// (lookup/remove) touch the registry. Values are only *mutated* by
+    /// their owning threads per the rules above.
+    clients_mutex: Io.Mutex = .init,
     /// Protected by clients_mutex. Prevents an accept already in flight from
     /// registering after shutdown has begun draining the registry.
     accepting_clients: bool = true,
@@ -511,40 +515,36 @@ pub const Daemon = struct {
         // Publish only once the writer exists, and start the reader while the
         // registry lock prevents shutdown from freeing this client. A fast
         // hello may queue immediately; lookup waits for this lock to release.
-        clients_mutex.lockUncancelable(self.io);
+        self.clients_mutex.lockUncancelable(self.io);
         if (!self.accepting_clients) {
-            clients_mutex.unlock(self.io);
+            self.clients_mutex.unlock(self.io);
             self.cleanupFailedClientSetup(client);
             return error.DaemonShuttingDown;
         }
         self.clients.put(self.gpa, client.id, client) catch |err| {
-            clients_mutex.unlock(self.io);
+            self.clients_mutex.unlock(self.io);
             self.cleanupFailedClientSetup(client);
             return err;
         };
         client.reader_thread = std.Thread.spawn(.{}, clientReader, .{ self, client }) catch |err| {
             _ = self.clients.remove(client.id);
-            clients_mutex.unlock(self.io);
+            self.clients_mutex.unlock(self.io);
             self.cleanupFailedClientSetup(client);
             return err;
         };
-        clients_mutex.unlock(self.io);
+        self.clients_mutex.unlock(self.io);
     }
 
-    // Client registry has its own tiny mutex because both the accept path
-    // (add) and dispatcher (lookup/remove) touch it. Values are only
-    // *mutated* by their owning threads per the rules above.
-    var clients_mutex: Io.Mutex = .init;
 
     fn lookupClient(self: *Daemon, id: u64) ?*Client {
-        clients_mutex.lockUncancelable(self.io);
-        defer clients_mutex.unlock(self.io);
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
         return self.clients.get(id);
     }
 
     fn removeClient(self: *Daemon, id: u64) ?*Client {
-        clients_mutex.lockUncancelable(self.io);
-        defer clients_mutex.unlock(self.io);
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
         const c = self.clients.get(id) orelse return null;
         _ = self.clients.remove(id);
         return c;
@@ -552,8 +552,8 @@ pub const Daemon = struct {
 
     /// Iterate clients under the registry lock, calling f for each.
     fn forEachClient(self: *Daemon, ctx: anytype, comptime f: fn (@TypeOf(ctx), *Client) void) void {
-        clients_mutex.lockUncancelable(self.io);
-        defer clients_mutex.unlock(self.io);
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
         var it = self.clients.valueIterator();
         while (it.next()) |cp| f(ctx, cp.*);
     }
@@ -1793,8 +1793,8 @@ pub const Daemon = struct {
     }
 
     fn sessionHasSubscriber(self: *Daemon, sid: u64) bool {
-        clients_mutex.lockUncancelable(self.io);
-        defer clients_mutex.unlock(self.io);
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
         var it = self.clients.valueIterator();
         while (it.next()) |client| if (client.*.subscribed(sid)) return true;
         return false;
@@ -2479,8 +2479,8 @@ pub const Daemon = struct {
     }
 
     fn hasLegacySessionWatcher(self: *Daemon) bool {
-        clients_mutex.lockUncancelable(self.io);
-        defer clients_mutex.unlock(self.io);
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
         var it = self.clients.valueIterator();
         while (it.next()) |client| {
             if (client.*.said_hello and client.*.watches_sessions and
@@ -2835,9 +2835,9 @@ pub const Daemon = struct {
     }
 
     fn shutdownCleanup(self: *Daemon) void {
-        clients_mutex.lockUncancelable(self.io);
+        self.clients_mutex.lockUncancelable(self.io);
         self.accepting_clients = false;
-        clients_mutex.unlock(self.io);
+        self.clients_mutex.unlock(self.io);
 
         // Stop the one non-turn worker before draining its completion event;
         // it owns the daemon HTTP/config pointers until joined.
@@ -2876,14 +2876,14 @@ pub const Daemon = struct {
         self.http_pool.deinit();
 
         // Close all client outboxes; writer threads exit, readers hit EOF.
-        clients_mutex.lockUncancelable(self.io);
+        self.clients_mutex.lockUncancelable(self.io);
         var cit = self.clients.valueIterator();
         while (cit.next()) |cp| {
             const client = cp.*;
             self.destroyClient(client);
         }
         self.clients.deinit(self.gpa);
-        clients_mutex.unlock(self.io);
+        self.clients_mutex.unlock(self.io);
 
         // Remove the socket so the (blocked) accept loop errors out.
         if (!self.socket_retired) self.removeSocketFile();
@@ -3325,6 +3325,7 @@ test "a dying bridge client unparks its session's parked cc approval" {
     daemon.store = try store_mod.Store.open(gpa, null);
     defer daemon.store.close();
     daemon.clients = .empty;
+    daemon.clients_mutex = .init;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);

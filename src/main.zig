@@ -61,7 +61,6 @@ test {
     _ = @import("core/ids.zig");
     _ = @import("core/session_handle.zig");
     _ = @import("core/queue.zig");
-    _ = @import("daemon/session.zig");
     _ = @import("daemon/store.zig");
     _ = @import("daemon/loop.zig");
     _ = @import("daemon/context.zig");
