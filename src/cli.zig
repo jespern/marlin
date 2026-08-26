@@ -145,7 +145,7 @@ const help_text =
     \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
     \\  marlin shutdown        stop the daemon
     \\  marlin web [--port N]  local web UI — opt-in via [web] enabled = true
-    \\                         (127.0.0.1:8377; UNAUTHENTICATED, localhost only)
+    \\                         (127.0.0.1:8377; token-gated, localhost only)
     \\  marlin help | version
     \\
 ;
