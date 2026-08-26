@@ -994,8 +994,9 @@ A split pane identifies its session with a compact pane label.
 
 - **Modes**: insert (typing → input box), normal (vim motions: j/k scroll,
   gg top, `gt`/`gT` with count for recent-session cycling, J join lines and
-  a/A/I enter insert mode in the composer, `/archive [children]` for explicit
-  lifecycle changes, `/sessions` for arbitrary attach, v visual-select,
+  a/A/I enter insert mode in the composer, Ctrl+D on an empty composer or
+  `/archive [children]` for explicit lifecycle changes, `/sessions` for
+  arbitrary attach, v visual-select,
   y yank).
 - **Splits (not yet implemented)**: binary-tree layout, each pane = a
   session view (or the same session twice). No VTE anywhere.

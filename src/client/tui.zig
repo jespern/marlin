@@ -16,8 +16,9 @@
 //!            Esc → normal (draft survives); Ctrl+C interrupts active work
 //!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom;
 //!            </> or Left/Right switch tabs; q quit
-//!   global:  Ctrl+N creates a session; Ctrl+L clears/redraws and returns to
-//!            bottom; Ctrl+T toggles the expanded tool transcript;
+//!   global:  Ctrl+N creates a session; Ctrl+D archives when input is empty;
+//!            Ctrl+L clears/redraws and returns to bottom;
+//!            Ctrl+T toggles the expanded tool transcript;
 //!            Alt/Option+1..9 jumps to that tab
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /new, /compact,
@@ -3415,6 +3416,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .description = "GLOBAL", .heading = true },
     .{ .key = "Enter while working", .description = "steer the active turn" },
     .{ .key = "Ctrl+N", .description = "create a new session" },
+    .{ .key = "Ctrl+D (empty)", .description = "archive the current session" },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
     .{ .key = "Ctrl+C", .description = "interrupt the active turn" },
@@ -4919,6 +4921,12 @@ fn isNewSessionKey(key: vaxis.Key) bool {
     return key.matches('n', .{ .ctrl = true });
 }
 
+fn isArchiveCurrentKey(app: *const App, key: vaxis.Key) bool {
+    return key.matches('d', .{ .ctrl = true }) and
+        app.editor.isEmpty() and app.attachments.items.len == 0 and
+        app.copy_cursor == null;
+}
+
 fn isArchivePickerKey(kind: PickerKind, key: vaxis.Key) bool {
     return kind == .session and
         (key.matches(vaxis.Key.delete, .{}) or key.matches('d', .{ .ctrl = true }));
@@ -5059,6 +5067,13 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     // Ctrl+n navigation because their modal block above consumes it first.
     if (isNewSessionKey(key)) {
         app.newSession() catch app.setNotice("could not create session", .{});
+        return;
+    }
+
+    // Match shell EOF muscle memory without risking a draft or attachment.
+    // Pickers consume Ctrl+D above; copy mode keeps its page-down binding.
+    if (isArchiveCurrentKey(app, key)) {
+        app.archiveCurrentSession();
         return;
     }
 
@@ -5751,6 +5766,45 @@ test "Ctrl+N aliases /new in either mode while pickers keep navigation" {
     try handleKey(&app, .{ .codepoint = 'n', .mods = .{ .ctrl = true } });
     try std.testing.expectEqual(@as(?usize, 1), app.picker);
     try std.testing.expect(!app.awaiting_new_session);
+}
+
+test "Ctrl+D archives only a truly empty composer outside copy mode" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    const ctrl_d = vaxis.Key{ .codepoint = 'd', .mods = .{ .ctrl = true } };
+
+    try std.testing.expect(isArchiveCurrentKey(&app, ctrl_d));
+    try std.testing.expect(!isArchiveCurrentKey(&app, .{ .codepoint = 'd' }));
+
+    app.editor.insertSlice("draft survives");
+    try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d));
+    app.editor.clear();
+
+    try app.attachments.append(gpa, .{
+        .name = try gpa.dupe(u8, "image.png"),
+        .mime = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, "AA=="),
+    });
+    try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d));
+    app.clearAttachments();
+
+    app.copy_cursor = .{ .line = 0, .col = 0 };
+    try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d));
+    app.copy_cursor = null;
+
+    // The shared /archive path retains its running-session guard.
+    app.state = .running;
+    try handleKey(&app, ctrl_d);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "interrupt it first") != null);
 }
 
 test "Escape leaves normal mode after closing any active picker" {
