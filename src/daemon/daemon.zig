@@ -1535,11 +1535,13 @@ pub const Daemon = struct {
             },
             .shutdown => {
                 self.sendTo(client, .{ .ok = .{} });
+                // Same sequence as Event.shutdown (the SIGTERM path): freeze
+                // the producer boundary FIRST, so a turn finishing after
+                // /quit cannot leak payloads into an open queue whose deinit
+                // does not free interiors — then flip running and nudge the
+                // accept loop with a dummy same-process connection.
+                self.events.close(self.io);
                 self.running = false;
-                // Unblock the accept loop: delete socket + connect to self is
-                // overkill; closing the listener from another thread is racy.
-                // Pragmatic: the accept loop checks self.running after accept;
-                // we nudge it with a dummy connection from here (same process).
                 self.nudgeAcceptLoop();
             },
             .reboot => |r| {
@@ -3301,4 +3303,46 @@ test "OpenRouter catalog rejects a malformed envelope" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "a dying bridge client unparks its session's parked cc approval" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var daemon: Daemon = undefined;
+    daemon.gpa = gpa;
+    daemon.io = io;
+    daemon.store = try store_mod.Store.open(gpa, null);
+    defer daemon.store.close();
+    daemon.clients = .empty;
+    defer daemon.clients.deinit(gpa);
+    daemon.sessions = .empty;
+    defer daemon.sessions.deinit(gpa);
+
+    var session = Session{
+        .id = 11,
+        .model = try gpa.dupe(u8, "claudecode/default"),
+        .cwd = try gpa.dupe(u8, "/tmp"),
+    };
+    defer gpa.free(session.model);
+    defer gpa.free(session.cwd);
+    session.state = .awaiting_approval;
+    session.cc_pending = .{ .approval_id = 7, .client_id = 3 };
+    session.pending_approval_line = try gpa.dupe(u8, "{\"approval_request\":{}}");
+    defer if (session.pending_approval_line) |line| gpa.free(line);
+    try daemon.sessions.put(gpa, session.id, &session);
+
+    // An unrelated client dying must not touch the parked prompt.
+    daemon.dropCcPendingForClient(2);
+    try std.testing.expect(session.cc_pending != null);
+    try std.testing.expectEqual(proto.SessionState.awaiting_approval, session.state);
+
+    // The bridge client dying must clear the prompt and return the session
+    // to running — the delegated turn itself never stopped.
+    daemon.dropCcPendingForClient(3);
+    try std.testing.expect(session.cc_pending == null);
+    try std.testing.expect(session.pending_approval_line == null);
+    try std.testing.expectEqual(proto.SessionState.running, session.state);
 }

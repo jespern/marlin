@@ -10,7 +10,7 @@
     },
     {
       "expect_contains": ["Inspect durable child metadata", "\"name\":\"read_file\""],
-      "expect_not_contains": ["\"name\":\"task\"", "\"name\":\"bash\"", "\"name\":\"write_file\"", "\"name\":\"edit_file\""],
+      "expect_not_contains": ["\"name\":\"task\"", "\"name\":\"bash\"", "\"name\":\"write_file\"", "\"name\":\"edit\""],
       "sse": [
         "{\"choices\":[{\"delta\":{\"content\":\"child found durable hierarchy metadata\"}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":5}}",
