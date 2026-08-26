@@ -92,8 +92,8 @@ pub const Config = struct {
     /// or logged out. `[web] tailscale = false` opts out.
     web_tailscale: bool = true,
 
-    /// TUI chrome (`[ui]`): the top tab strip. Toggleable live via /config,
-    /// which persists back here through setUiTabBar.
+    /// TUI chrome (`[ui]`): the top tab strip. Toggleable live via /config;
+    /// the daemon serializes persistence through setUiTabBar.
     ui_tab_bar: bool = true,
 };
 

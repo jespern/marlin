@@ -744,9 +744,15 @@ pub const Daemon = struct {
                         client.id,
                         err,
                     });
+                    const request_id: u64 = switch (msg) {
+                        .input => |input| input.request_id,
+                        .session_create => |create| create.request_id,
+                        else => 0,
+                    };
                     self.sendTo(client, .{ .err = .{
                         .code = "request_failed",
                         .msg = "daemon could not complete the request; durable state was left consistent",
+                        .request_id = request_id,
                     } });
                 };
             },
@@ -953,7 +959,7 @@ pub const Daemon = struct {
                 try self.sessions.ensureUnusedCapacity(self.gpa, 1);
                 try self.store.createSession(sid, nowMs(self.io), sc.cwd, sc.model, sc.effort);
                 self.sessions.putAssumeCapacityNoClobber(sid, session);
-                self.sendTo(client, .{ .session_created = .{ .sid = sid } });
+                self.sendTo(client, .{ .session_created = .{ .sid = sid, .request_id = sc.request_id } });
                 self.broadcastSessionUpsert(sid);
             },
             .session_list => |sl| try self.sendSessionList(client, sl.include_archived),
@@ -1233,10 +1239,10 @@ pub const Daemon = struct {
                     }
                     if (s.tail_limit > 0 or s.replay_done or bounded_forward) {
                         const replay_has_newer = bounded_forward and !caught_up;
-                        const plan_items = if (!replay_has_newer)
-                            (try self.store.loadLatestPlan(replay_arena_state.allocator(), s.sid)) orelse &.{}
+                        const latest_plan = if (!replay_has_newer)
+                            try self.store.loadLatestPlan(replay_arena_state.allocator(), s.sid)
                         else
-                            &.{};
+                            null;
                         self.sendTo(client, .{ .replay_done = .{
                             .sid = s.sid,
                             .oldest_seq = if (send_count > 0) sent[0].seq else 0,
@@ -1245,7 +1251,8 @@ pub const Daemon = struct {
                                 (page_has_older or (send_count > 0 and sent[0].seq > 1)),
                             .has_newer = replay_has_newer,
                             .forward = bounded_forward,
-                            .plan_items = plan_items,
+                            .plan_items = if (latest_plan) |plan| plan.items else &.{},
+                            .plan_pinned = if (latest_plan) |plan| plan.pinned else false,
                         } });
                     }
                 }
@@ -1594,6 +1601,18 @@ pub const Daemon = struct {
                     return;
                 };
                 self.sendMcpStatus(client);
+            },
+            .ui_set_tab_bar => |request| {
+                config.setUiTabBar(self.gpa, self.io, self.environ, request.enabled) catch |err| {
+                    std.log.warn("could not persist tab-bar preference: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{
+                        .code = "config",
+                        .msg = "could not save tab-bar preference to config.toml",
+                    } });
+                    return;
+                };
+                self.cfg.ui_tab_bar = request.enabled;
+                self.sendTo(client, .{ .ui_config_result = .{ .tab_bar = request.enabled } });
             },
             .mcp_remove => |request| {
                 if (self.anySessionBusy()) {

@@ -218,6 +218,8 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             for (value.items, items) |item, *copy| copy.* = .{
                 .step = try arena.dupe(u8, item.step),
                 .status = item.status,
+                .started_at_ms = item.started_at_ms,
+                .duration_ms = item.duration_ms,
             };
             break :blk .{ .plan = .{ .items = items } };
         },
@@ -239,6 +241,190 @@ fn cloneMediaRefs(arena: std.mem.Allocator, refs: []const block.MediaRef) ![]con
         .byte_len = ref.byte_len,
     };
     return out;
+}
+
+/// Attach daemon-clock timing to a model-authored plan revision. Active time
+/// is accumulated per turn, excluding idle wall-clock gaps between prompts.
+/// Step text is unique by the plan tool contract and survives reordering.
+fn stampPlanTimings(
+    store: *Store,
+    session_id: u64,
+    current_turn_id: u64,
+    items: []block.PlanItem,
+    history: []const block.Block,
+    now_ms: i64,
+) !void {
+    var previous: ?*const block.Block = null;
+    var history_index = history.len;
+    while (history_index > 0) {
+        history_index -= 1;
+        switch (history[history_index].body) {
+            .plan => {
+                previous = &history[history_index];
+                break;
+            },
+            else => {},
+        }
+    }
+
+    const current_start_ms = if (try store.turnTimeBounds(session_id, current_turn_id)) |bounds|
+        bounds.start_ms
+    else
+        now_ms;
+    var previous_end_ms: i64 = 0;
+    if (previous) |prior_block| {
+        previous_end_ms = prior_block.ts;
+        if (prior_block.turn_id != current_turn_id) {
+            if (try store.turnTimeBounds(session_id, prior_block.turn_id)) |bounds|
+                previous_end_ms = bounds.end_ms;
+        }
+    }
+
+    for (items) |*item| {
+        var prior: ?block.PlanItem = null;
+        if (previous) |prior_block| {
+            for (prior_block.body.plan.items) |candidate| {
+                if (std.mem.eql(u8, candidate.step, item.step)) {
+                    prior = candidate;
+                    break;
+                }
+            }
+        }
+
+        switch (item.status) {
+            .pending => {
+                item.started_at_ms = 0;
+                item.duration_ms = 0;
+            },
+            .in_progress => {
+                item.duration_ms = 0;
+                item.started_at_ms = now_ms;
+                if (prior) |old| {
+                    if (old.status == .in_progress) {
+                        const prior_block = previous.?;
+                        const old_start = if (old.started_at_ms > 0) old.started_at_ms else prior_block.ts;
+                        if (prior_block.turn_id == current_turn_id) {
+                            item.started_at_ms = old_start;
+                            item.duration_ms = old.duration_ms;
+                        } else {
+                            const prior_segment: u64 = if (old_start > 0 and previous_end_ms > old_start)
+                                @intCast(previous_end_ms - old_start)
+                            else
+                                0;
+                            item.duration_ms = old.duration_ms +| prior_segment;
+                            item.started_at_ms = current_start_ms;
+                        }
+                    }
+                }
+            },
+            .completed => {
+                item.started_at_ms = 0;
+                item.duration_ms = 0;
+                if (prior) |old| switch (old.status) {
+                    .completed => {
+                        item.duration_ms = old.duration_ms;
+                    },
+                    .in_progress => {
+                        const prior_block = previous.?;
+                        const old_start = if (old.started_at_ms > 0) old.started_at_ms else prior_block.ts;
+                        if (prior_block.turn_id == current_turn_id) {
+                            const segment: u64 = if (old_start > 0 and now_ms > old_start)
+                                @intCast(now_ms - old_start)
+                            else
+                                0;
+                            item.duration_ms = old.duration_ms +| segment;
+                        } else {
+                            const prior_segment: u64 = if (old_start > 0 and previous_end_ms > old_start)
+                                @intCast(previous_end_ms - old_start)
+                            else
+                                0;
+                            const current_segment: u64 = if (current_start_ms > 0 and now_ms > current_start_ms)
+                                @intCast(now_ms - current_start_ms)
+                            else
+                                0;
+                            item.duration_ms = old.duration_ms +| prior_segment +| current_segment;
+                        }
+                    },
+                    .pending => {},
+                };
+            },
+        }
+    }
+}
+
+test "plan timing survives revisions without counting idle gaps" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+    try store.appendBlock(.{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 10,
+        .seq = 1,
+        .ts = 900,
+        .body = .{ .user_msg = .{ .text = "start" } },
+    });
+
+    var first = [_]block.PlanItem{.{ .step = "Inspect", .status = .in_progress }};
+    try stampPlanTimings(&store, 1, 10, &first, &.{}, 1_000);
+    try std.testing.expectEqual(@as(i64, 1_000), first[0].started_at_ms);
+
+    const first_history = [_]block.Block{.{
+        .id = 2,
+        .session_id = 1,
+        .turn_id = 10,
+        .seq = 2,
+        .ts = 1_000,
+        .body = .{ .plan = .{ .items = &first } },
+    }};
+    var completed = [_]block.PlanItem{.{ .step = "Inspect", .status = .completed }};
+    try stampPlanTimings(&store, 1, 10, &completed, &first_history, 4_250);
+    try std.testing.expectEqual(@as(u64, 3_250), completed[0].duration_ms);
+
+    // An old untimed active plan ended at 4s. Resuming at 5s and completing
+    // at 5.5s counts 2s + 0.5s, not the idle second between turns.
+    const old_active = [_]block.PlanItem{.{ .step = "Legacy", .status = .in_progress }};
+    const old_plan = block.Block{
+        .id = 3,
+        .session_id = 1,
+        .turn_id = 20,
+        .seq = 3,
+        .ts = 2_000,
+        .body = .{ .plan = .{ .items = &old_active } },
+    };
+    try store.appendBlock(old_plan);
+    try store.appendBlock(.{
+        .id = 4,
+        .session_id = 1,
+        .turn_id = 20,
+        .seq = 4,
+        .ts = 4_000,
+        .body = .{ .assistant_msg = .{ .text = "pause" } },
+    });
+    try store.appendBlock(.{
+        .id = 5,
+        .session_id = 1,
+        .turn_id = 21,
+        .seq = 5,
+        .ts = 5_000,
+        .body = .{ .user_msg = .{ .text = "continue" } },
+    });
+    var legacy_done = [_]block.PlanItem{.{ .step = "Legacy", .status = .completed }};
+    try stampPlanTimings(&store, 1, 21, &legacy_done, &.{old_plan}, 5_500);
+    try std.testing.expectEqual(@as(u64, 2_500), legacy_done[0].duration_ms);
+
+    const completed_history = [_]block.Block{.{
+        .id = 6,
+        .session_id = 1,
+        .turn_id = 10,
+        .seq = 6,
+        .ts = 4_250,
+        .body = .{ .plan = .{ .items = &completed } },
+    }};
+    var unchanged = [_]block.PlanItem{.{ .step = "Inspect", .status = .completed }};
+    try stampPlanTimings(&store, 1, 30, &unchanged, &completed_history, 9_000);
+    try std.testing.expectEqual(@as(u64, 3_250), unchanged[0].duration_ms);
 }
 
 fn loadMedia(ctx: *const anyopaque, allocator: std.mem.Allocator, hash: []const u8) ![]const u8 {
@@ -720,6 +906,14 @@ pub fn runTurn(
             }
             if (exec.status == .ok) {
                 if (exec.plan_items) |items| {
+                    try stampPlanTimings(
+                        store,
+                        opts.session_id,
+                        ap.turn_id,
+                        items,
+                        history.items,
+                        nowMs(io),
+                    );
                     _ = try ap.append(.{ .plan = .{ .items = items } });
                 }
             }

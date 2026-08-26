@@ -8,9 +8,9 @@ recovery/isolation track formerly called M4.5 is deliberately Later.
 Guest Claude Code sessions (ARCHITECTURE.md, Native vs guest) are a
 multiplexer feature, not an M6 workstream. Do not schedule guest-parity
 work (wrapping Seatbelt around `claude -p`, Marlin `task` inside their
-loop, CC plan sync, extra guest agents) as M6. The adapter is frozen;
-remaining guest work is the durable agent field plus protocol refuses
-listed in that section. Councils (`REVIEW.md`) are native-loop only.
+loop, CC plan sync, extra guest agents) as M6. The adapter remains bounded;
+councils may seat guest models only through bridge-enforced read-only
+children. Marlin tools still do not enter the guest loop.
 
 ## What exists now
 
@@ -30,8 +30,9 @@ listed in that section. Councils (`REVIEW.md`) are native-loop only.
 - `task_batch` launches two to eight of those durable children concurrently,
   joins every child, and returns structured results in requested task order.
   A failed thread spawn joins existing workers before serial fallback.
-- Council product behavior is specified in `REVIEW.md`, but `/council`,
-  `/review`, review-specific orchestration, and review blocks are not implemented.
+- Named councils are shipped: daemon-owned atomic config, `/council`
+  management, `/review` fan-out, durable `review_child` sessions, parent
+  synthesis, and bridge-enforced read-only Claude Code seats.
 - `parallel_safe` is **enforced** (this superseded the earlier
   "metadata-only" state): `loop.zig` runs each maximal consecutive safe group
   in chunks of at most eight worker threads and joins before persisting results
@@ -39,8 +40,9 @@ listed in that section. Councils (`REVIEW.md`) are native-loop only.
   remaining calls fall back to serial execution. E2e scenario
   15_parallel_tool_batch covers ordering and overlap; Architecture §4 is the
   current description.
-- The daemon listens only on its local Unix socket. Raw TCP/token auth and a
-  PWA remain architectural doors, not partially shipped surfaces.
+- The daemon still listens only on its local Unix socket. Remote clients use
+  SSH-carried NDJSON (`--remote`/`_pipe`), while `marlin web` exposes the
+  tokenless browser UI through Tailscale Serve with Host/Origin validation.
 
 ## Entry gate: finish proving M5
 
@@ -95,22 +97,22 @@ while several children are live.
 
 ## M6b — councils as specialized tasks
 
-Build `REVIEW.md` on M6a instead of creating a second orchestration system:
+Implemented on M6a rather than as a second orchestration system:
 
 1. Durable named council config with daemon-mediated atomic writes and
-   `/council` list/create/edit/delete UI.
-2. `/review [council] <focus>` asks the primary to formulate the shared brief,
-   then shows a user-editable preview before fan-out.
-3. Spawn read-only `review_child` sessions in parallel with immutable model,
-   stance, deliberation, and budget settings recorded on the review run.
-4. Parse structured findings, retain unstructured fallbacks, cluster claims,
-   and have the primary verify evidence in the parent.
-5. Add the single-rebuttal deliberation path only after independent mode is
-   useful; `deep` is a budget/policy choice, not an unbounded group chat.
+   `/council` list/set/remove UI.
+2. `/review [council] <focus>` resolves a configured roster and launches the
+   shared review mission from the parent session.
+3. Read-only `review_child` sessions run in parallel with their model and
+   budget recorded durably; Claude Code seats use the permission bridge to
+   enforce the same no-write boundary.
+4. The parent receives ordered reviewer outputs, gathers empirical evidence,
+   and produces the final synthesis and recommendation.
 
-Exit: a named council can adversarially review a real repository with a custom
-focus, all reviewer sessions are inspectable/resumable, and the parent renders
-an evidence-backed triage table without granting reviewer write authority.
+Verified in unit/e2e coverage for named config, fan-out, durable review
+children, and guest read-only enforcement. A real-repository council dogfood
+also found and drove a sandbox fix. Interactive brief editing, claim clustering,
+and a rebuttal mode remain optional follow-up work, not exit blockers.
 
 ## M6c — remote door: DECIDED and shipped (2026-08)
 

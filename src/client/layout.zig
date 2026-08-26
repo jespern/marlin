@@ -235,6 +235,10 @@ pub const RenderBlock = struct {
     text: []u8,
     /// tool_call: "name" — used for the collapsed header line.
     label: []u8,
+    /// Terminal completed plan revision. Intermediate revisions stay in the
+    /// pinned App plan only; retaining all of them would waste memory and
+    /// render duplicate historical tables.
+    plan_items: []block.PlanItem = &.{},
     status: block.ToolStatus = .ok,
     /// Content-addressed uncapped tool output. Null means `text` is already
     /// the complete result and can be copied without another daemon query.
@@ -254,9 +258,33 @@ pub const RenderBlock = struct {
     pub fn deinit(self: *RenderBlock, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
         gpa.free(self.label);
+        for (self.plan_items) |item| gpa.free(item.step);
+        if (self.plan_items.len > 0) gpa.free(self.plan_items);
         if (self.full_body_ref) |ref| gpa.free(ref);
     }
 };
+
+fn completedPlan(items: []const block.PlanItem) bool {
+    if (items.len == 0) return false;
+    for (items) |item| if (item.status != .completed) return false;
+    return true;
+}
+
+fn clonePlanItems(gpa: std.mem.Allocator, source: []const block.PlanItem) ![]block.PlanItem {
+    if (source.len == 0) return &.{};
+    const items = try gpa.alloc(block.PlanItem, source.len);
+    var copied: usize = 0;
+    errdefer {
+        for (items[0..copied]) |item| gpa.free(item.step);
+        gpa.free(items);
+    }
+    for (source, items) |item, *copy| {
+        copy.* = item;
+        copy.step = try gpa.dupe(u8, item.step);
+        copied += 1;
+    }
+    return items;
+}
 
 /// Convert a durable block into its owned presentation form without the live
 /// side effects in App.applyBlock. Older history pages are buffered off-screen
@@ -269,8 +297,13 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     var full_body_ref: ?[]const u8 = null;
     var generated_text: ?[]u8 = null;
     var generated_label: ?[]u8 = null;
+    var plan_items: []block.PlanItem = &.{};
     defer if (generated_text) |owned| gpa.free(owned);
     defer if (generated_label) |owned| gpa.free(owned);
+    errdefer {
+        for (plan_items) |item| gpa.free(item.step);
+        if (plan_items.len > 0) gpa.free(plan_items);
+    }
 
     switch (b.body) {
         .user_msg => |u| {
@@ -303,7 +336,10 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
             }
         },
         .approval => |ap| text = if (ap.decision) |decision| @tagName(decision) else "pending",
-        .plan => return null,
+        .plan => |plan| {
+            if (!completedPlan(plan.items)) return null;
+            plan_items = try clonePlanItems(gpa, plan.items);
+        },
         .system_note => |sn| {
             if (isCompactionStatusNote(sn.text)) return null;
             text = sn.text;
@@ -329,6 +365,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .turn_id = b.turn_id,
         .text = owned_text,
         .label = owned_label,
+        .plan_items = plan_items,
         .status = status,
         .full_body_ref = owned_ref,
     };
@@ -502,17 +539,16 @@ pub fn pendingToolBatch(blocks: []const RenderBlock, start: usize) ?CollapsedToo
     if (count < 2) return null;
 
     var i = calls_end;
-    while (i < blocks.len and
-        blocks[i].kind == .approval and
-        blocks[i].turn_id == turn_id) : (i += 1)
-    {}
     var results: usize = 0;
-    while (i < blocks.len and
-        blocks[i].kind == .tool_result and
-        blocks[i].turn_id == turn_id and
-        results < count) : (i += 1)
-    {
-        results += 1;
+    scan_results: while (i < blocks.len and results < count and blocks[i].turn_id == turn_id) {
+        switch (blocks[i].kind) {
+            .approval, .reasoning, .system_note, .plan => i += 1,
+            .tool_result => {
+                results += 1;
+                i += 1;
+            },
+            else => break :scan_results,
+        }
     }
     if (results < count and i == blocks.len) return .{ .count = count, .next = i };
     return null;
@@ -751,7 +787,7 @@ pub fn scanToolBatch(
     var i = calls_end;
     while (i < blocks.len and matched < call_count) : (i += 1) {
         switch (blocks[i].kind) {
-            .approval, .reasoning, .system_note => {},
+            .approval, .reasoning, .system_note, .plan => {},
             .tool_result => {
                 const call_idx = start + matched;
                 const failed = blocks[i].status != .ok;
@@ -791,6 +827,114 @@ pub fn flushRanSummary(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), pe
     pending.* = 0;
 }
 
+const PlanTableWidths = struct { task: usize, time: usize };
+
+fn planTableWidths(total: usize) PlanTableWidths {
+    const time = @min(@as(usize, 10), @max(@as(usize, 7), total / 6));
+    return .{ .task = total -| (time + 3), .time = time };
+}
+
+fn formatPlanDuration(alloc: std.mem.Allocator, duration_ms: u64) ![]const u8 {
+    if (duration_ms == 0) return "";
+    if (duration_ms < 1_000) return "<1s";
+    const seconds = (duration_ms +| 500) / 1_000;
+    if (seconds < 60) return std.fmt.allocPrint(alloc, "{d}s", .{seconds});
+    const minutes = seconds / 60;
+    if (minutes < 60)
+        return std.fmt.allocPrint(alloc, "{d}m {d}s", .{ minutes, seconds % 60 });
+    return std.fmt.allocPrint(alloc, "{d}h {d}m", .{ minutes / 60, minutes % 60 });
+}
+
+fn planBorder(
+    alloc: std.mem.Allocator,
+    widths: PlanTableWidths,
+    left: []const u8,
+    join: []const u8,
+    right: []const u8,
+) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(alloc, left);
+    for (0..widths.task) |_| try out.appendSlice(alloc, "─");
+    try out.appendSlice(alloc, join);
+    for (0..widths.time) |_| try out.appendSlice(alloc, "─");
+    try out.appendSlice(alloc, right);
+    return out.toOwnedSlice(alloc);
+}
+
+/// A completed plan stays in the live bottom panel until the next human
+/// prompt. Only its last completed revision then appears in transcript
+/// history; intermediate plan updates remain implementation detail.
+fn archivedCompletedPlan(blocks: []const RenderBlock, index: usize) bool {
+    if (index >= blocks.len or !completedPlan(blocks[index].plan_items)) return false;
+    for (blocks[index + 1 ..]) |later| switch (later.kind) {
+        .plan => return false,
+        .user_msg => return true,
+        else => {},
+    };
+    return false;
+}
+
+fn appendArchivedPlanTable(
+    alloc: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    items: []const block.PlanItem,
+    width: usize,
+) !void {
+    try blankLine(alloc, lines);
+    if (width < 16) {
+        for (items) |item| {
+            const duration = try formatPlanDuration(alloc, item.duration_ms);
+            const suffix = if (duration.len > 0)
+                try std.fmt.allocPrint(alloc, "  {s}", .{duration})
+            else
+                "";
+            try lines.append(alloc, .{
+                .text = "  ✔ ",
+                .style = Palette.plan_done_mark,
+                .text2 = item.step,
+                .style2 = Palette.plan_pending,
+                .text3 = suffix,
+                .style3 = Palette.plan_pending,
+            });
+        }
+        return;
+    }
+
+    const widths = planTableWidths(width);
+    try lines.append(alloc, .{
+        .text = try planBorder(alloc, widths, "┌", "┬", "┐"),
+        .style = Palette.plan_header,
+    });
+    for (items) |item| {
+        const available = widths.task -| 3;
+        const end = hardCellBreak(item.step, 0, available);
+        const step = item.step[0..end];
+        const left = try std.fmt.allocPrint(alloc, "│ ✔ {s}", .{step});
+        const left_pad = try spaces(alloc, (widths.task + 1) -| displayWidth(left));
+        const duration = try formatPlanDuration(alloc, item.duration_ms);
+        const time_pad = try spaces(alloc, widths.time -| (displayWidth(duration) + 1));
+        const row = try std.fmt.allocPrint(alloc, "{s}{s}│{s}{s} │", .{
+            left, left_pad, time_pad, duration,
+        });
+        const middle = left.len + left_pad.len;
+        const check_start = "│ ".len;
+        const spans = try alloc.alloc(SyntaxSpan, 4);
+        spans[0] = .{ .start = 0, .end = "│".len, .style = Palette.plan_header };
+        spans[1] = .{ .start = check_start, .end = check_start + "✔".len, .style = Palette.plan_done_mark };
+        spans[2] = .{ .start = middle, .end = middle + "│".len, .style = Palette.plan_header };
+        spans[3] = .{ .start = row.len - "│".len, .end = row.len, .style = Palette.plan_header };
+        try lines.append(alloc, .{
+            .text = row,
+            .style = Palette.plan_pending,
+            .syntax = spans,
+        });
+    }
+    try lines.append(alloc, .{
+        .text = try planBorder(alloc, widths, "└", "┴", "┘"),
+        .style = Palette.plan_header,
+    });
+}
+
 pub const max_layout_lines: usize = 50_000;
 
 pub const ApprovalView = struct {
@@ -814,6 +958,9 @@ pub const Transcript = struct {
     stream_bytes: u64,
     stream_quiet_ms: u64,
     stream_status_at_ms: i64,
+    /// The TUI's TODO table supplies its own spinner and active-step timer;
+    /// suppress this competing live-status row while that table is visible.
+    show_working_ticker: bool = true,
     cwd: []const u8 = "",
     approval: ?ApprovalView,
     layout_cache: *LayoutCache,
@@ -846,6 +993,57 @@ pub fn currentInflightCall(blocks: []const RenderBlock) ?InflightCall {
         seen += 1;
     }
     return null;
+}
+
+/// Compact live telemetry for the transcript ticker. The returned text begins
+/// with a separator so it can be appended directly to the Working label.
+fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) ![]const u8 {
+    const elapsed_s: i64 = if (transcript.turn_started_ms > 0)
+        @max(0, @divTrunc(nowWallMs(transcript.io) - transcript.turn_started_ms, 1000))
+    else
+        0;
+    const elapsed = if (elapsed_s >= 60)
+        try std.fmt.allocPrint(arena, " · {d}m {d}s", .{ @divTrunc(elapsed_s, 60), @mod(elapsed_s, 60) })
+    else
+        try std.fmt.allocPrint(arena, " · {d}s", .{elapsed_s});
+
+    var detail = elapsed;
+    const stream_fresh = transcript.stream_status_at_ms > 0 and
+        nowWallMs(transcript.io) - transcript.stream_status_at_ms <
+            (if (transcript.stream_bytes == 0) @as(i64, 15_000) else 3000);
+    if (stream_fresh and currentInflightCall(transcript.blocks) == null) {
+        const quiet_s = transcript.stream_quiet_ms / 1000;
+        if (transcript.stream_bytes == 0) {
+            detail = try std.fmt.allocPrint(arena, "{s} · waiting for provider · {d}s", .{
+                elapsed, quiet_s,
+            });
+        } else if (quiet_s >= 3) {
+            detail = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1} · last token {d}s ago", .{
+                elapsed, transcript.stream_bytes, quiet_s,
+            });
+        } else {
+            detail = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1}", .{
+                elapsed, transcript.stream_bytes,
+            });
+        }
+    }
+    if (currentInflightCall(transcript.blocks)) |cur| {
+        const arg_full = toolDisplayArg(cur.rb.label, cur.rb.text, transcript.cwd) orelse "";
+        const arg = arg_full[0..utf8Floor(arg_full, @min(arg_full.len, 60))];
+        const call_s: i64 = if (transcript.call_started_ms > 0)
+            @max(0, @divTrunc(nowWallMs(transcript.io) - transcript.call_started_ms, 1000))
+        else
+            0;
+        const sep: []const u8 = if (arg.len > 0) " " else "";
+        const queued = if (cur.queued > 0)
+            try std.fmt.allocPrint(arena, " (+{d} queued)", .{cur.queued})
+        else
+            "";
+        detail = try std.fmt.allocPrint(arena, "{s} · {s}{s}{s} · {d}s{s}", .{
+            elapsed, toolDisplayName(cur.rb.label), sep, arg, call_s, queued,
+        });
+    }
+    return detail;
 }
 
 /// SECTION DISCIPLINE (the transcript's one spacing rule, pinned by the
@@ -1040,7 +1238,12 @@ pub fn layoutBlockRange(
                 try blankLine(alloc, lines);
                 try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w);
             },
-            .plan => {},
+            .plan => {
+                if (archivedCompletedPlan(transcript.blocks, block_idx)) {
+                    try flushRanSummary(alloc, lines, &pending_ran);
+                    try appendArchivedPlanTable(alloc, lines, rb.plan_items, w);
+                }
+            },
             .system_note => {
                 if (block.isHandoverNote(rb.text)) {
                     try flushRanSummary(alloc, lines, &pending_ran);
@@ -1177,7 +1380,7 @@ pub fn layoutLines(
         try blankLine(arena, &lines);
         try transcript.stream_layout_cache.update(gpa, transcript.delta, w);
         try transcript.stream_layout_cache.appendTo(arena, &lines);
-    } else if (transcript.reasoning_delta.len == 0 and transcript.state == .running) {
+    } else if (transcript.reasoning_delta.len == 0 and transcript.state == .running and transcript.show_working_ticker) {
         try blankLine(arena, &lines);
         const head = try std.fmt.allocPrint(arena, "{s} ", .{
             spinner_frames[transcript.spinner_frame % spinner_frames.len],
@@ -1186,55 +1389,7 @@ pub fn layoutLines(
             "Generating handover…"
         else
             "Working…";
-        const elapsed_s: i64 = if (transcript.turn_started_ms > 0)
-            @max(0, @divTrunc(nowWallMs(transcript.io) - transcript.turn_started_ms, 1000))
-        else
-            0;
-        const elapsed = if (elapsed_s >= 60)
-            try std.fmt.allocPrint(arena, " · {d}m {d}s", .{ @divTrunc(elapsed_s, 60), @mod(elapsed_s, 60) })
-        else
-            try std.fmt.allocPrint(arena, " · {d}s", .{elapsed_s});
-        // What is it actually doing? Show the executing tool call with its
-        // own timer so a long-running command is visible at a glance.
-        var detail = elapsed;
-        // Stream telemetry: proves liveness when the provider is sending but
-        // nothing is visible yet (long thinking, tool-call assembly). Hidden
-        // once reports go stale (between rounds, during tool execution).
-        const stream_fresh = transcript.stream_status_at_ms > 0 and
-            nowWallMs(transcript.io) - transcript.stream_status_at_ms <
-                (if (transcript.stream_bytes == 0) @as(i64, 15_000) else 3000);
-        if (stream_fresh and currentInflightCall(transcript.blocks) == null) {
-            const quiet_s = transcript.stream_quiet_ms / 1000;
-            if (transcript.stream_bytes == 0) {
-                detail = try std.fmt.allocPrint(arena, "{s} · waiting for provider · {d}s", .{
-                    elapsed, quiet_s,
-                });
-            } else if (quiet_s >= 3) {
-                detail = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1} · last token {d}s ago", .{
-                    elapsed, transcript.stream_bytes, quiet_s,
-                });
-            } else {
-                detail = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1}", .{
-                    elapsed, transcript.stream_bytes,
-                });
-            }
-        }
-        if (currentInflightCall(transcript.blocks)) |cur| {
-            const arg_full = toolDisplayArg(cur.rb.label, cur.rb.text, transcript.cwd) orelse "";
-            const arg = arg_full[0..utf8Floor(arg_full, @min(arg_full.len, 60))];
-            const call_s: i64 = if (transcript.call_started_ms > 0)
-                @max(0, @divTrunc(nowWallMs(transcript.io) - transcript.call_started_ms, 1000))
-            else
-                0;
-            const sep: []const u8 = if (arg.len > 0) " " else "";
-            const queued = if (cur.queued > 0)
-                try std.fmt.allocPrint(arena, " (+{d} queued)", .{cur.queued})
-            else
-                "";
-            detail = try std.fmt.allocPrint(arena, "{s} · {s}{s}{s} · {d}s{s}", .{
-                elapsed, toolDisplayName(cur.rb.label), sep, arg, call_s, queued,
-            });
-        }
+        const detail = try workingDetail(arena, transcript);
         try lines.append(arena, .{
             .text = head,
             .style = Palette.working,
@@ -1772,6 +1927,74 @@ test "layout line safety limit produces a visible truncation" {
     );
 }
 
+test "completed plan unpins into one closed transcript table after the next prompt" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var first_items = [_]block.PlanItem{
+        .{ .step = "Inspect", .status = .completed, .duration_ms = 18_400 },
+        .{ .step = "Implement", .status = .completed, .duration_ms = 65_000 },
+    };
+    var final_items = [_]block.PlanItem{
+        .{ .step = "Inspect", .status = .completed, .duration_ms = 18_400 },
+        .{ .step = "Implement", .status = .completed, .duration_ms = 68_000 },
+    };
+    const blocks = [_]RenderBlock{
+        .{ .kind = .plan, .turn_id = 1, .text = @constCast(""), .label = @constCast(""), .plan_items = &first_items },
+        .{ .kind = .plan, .turn_id = 1, .text = @constCast(""), .label = @constCast(""), .plan_items = &final_items },
+        .{ .kind = .user_msg, .turn_id = 2, .text = @constCast("keep going"), .label = @constCast("") },
+    };
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var pinned_lines: std.ArrayList(Line) = .empty;
+    var label: []const u8 = "";
+    transcript.blocks = blocks[0..2];
+    try layoutBlockRange(arena, &transcript, &pinned_lines, 0, 2, 80, &label, false);
+    try std.testing.expectEqual(@as(usize, 0), pinned_lines.items.len);
+
+    var archived_lines: std.ArrayList(Line) = .empty;
+    transcript.blocks = &blocks;
+    try layoutBlockRange(arena, &transcript, &archived_lines, 0, blocks.len, 80, &label, false);
+    var top_count: usize = 0;
+    var bottom_count: usize = 0;
+    var saw_latest_duration = false;
+    for (archived_lines.items) |line| {
+        if (std.mem.startsWith(u8, line.text, "┌")) top_count += 1;
+        if (std.mem.startsWith(u8, line.text, "└")) bottom_count += 1;
+        if (std.mem.indexOf(u8, line.text, "1m 8s") != null) saw_latest_duration = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), top_count);
+    try std.testing.expectEqual(@as(usize, 1), bottom_count);
+    try std.testing.expect(saw_latest_duration);
+}
+
 test "current in-flight call follows calls-first result order" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1890,6 +2113,13 @@ test "handover in progress uses the generating-handover working word" {
             found = true;
     }
     try std.testing.expect(found);
+
+    transcript.show_working_ticker = false;
+    const absorbed = try layoutLines(arena_state.allocator(), gpa, &transcript, 80);
+    for (absorbed.items) |line| {
+        try std.testing.expect(std.mem.indexOf(u8, line.text, "Generating handover") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line.text2, "Generating handover") == null);
+    }
 }
 
 test {

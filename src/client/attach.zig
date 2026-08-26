@@ -181,11 +181,29 @@ const handshake_timeout_ms: u32 = 2_000;
 /// deadline would kill every one of them.
 const remote_handshake_timeout_ms: u32 = 30_000;
 
+pub const ConnectCancel = struct {
+    requested: std.atomic.Value(bool) = .init(false),
+
+    pub fn cancel(self: *ConnectCancel) void {
+        self.requested.store(true, .release);
+    }
+
+    pub fn isCancelled(self: *const ConnectCancel) bool {
+        return self.requested.load(.acquire);
+    }
+};
+
+fn connectCancelled(cancel: ?*const ConnectCancel) bool {
+    return if (cancel) |signal| signal.isCancelled() else false;
+}
+
 const HandshakeDeadline = struct {
     conn: *Conn,
     timeout_ms: u32,
+    cancel: ?*const ConnectCancel = null,
     done: Io.Event = .unset,
     fired: std.atomic.Value(bool) = .init(false),
+    canceled: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 
     fn start(self: *HandshakeDeadline) !void {
@@ -198,21 +216,34 @@ const HandshakeDeadline = struct {
     }
 
     fn watch(self: *HandshakeDeadline) void {
-        self.done.waitTimeout(self.conn.io, .{ .duration = .{
-            .raw = .fromMilliseconds(self.timeout_ms),
-            .clock = .awake,
-        } }) catch |err| switch (err) {
-            error.Timeout => {
-                self.fired.store(true, .release);
+        var waited_ms: u32 = 0;
+        while (waited_ms < self.timeout_ms) {
+            if (connectCancelled(self.cancel)) {
+                self.canceled.store(true, .release);
                 self.conn.shutdown();
-            },
-            error.Canceled => return,
-        };
+                return;
+            }
+            const slice_ms = @min(@as(u32, 100), self.timeout_ms - waited_ms);
+            self.done.waitTimeout(self.conn.io, .{ .duration = .{
+                .raw = .fromMilliseconds(slice_ms),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {
+                    waited_ms += slice_ms;
+                    continue;
+                },
+                error.Canceled => return,
+            };
+            return;
+        }
+        self.fired.store(true, .release);
+        self.conn.shutdown();
     }
 };
 
-fn handshake(conn: *Conn, timeout_ms: u32) !void {
-    var deadline = HandshakeDeadline{ .conn = conn, .timeout_ms = timeout_ms };
+fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !void {
+    if (connectCancelled(cancel)) return error.ConnectCanceled;
+    var deadline = HandshakeDeadline{ .conn = conn, .timeout_ms = timeout_ms, .cancel = cancel };
     try deadline.start();
     defer deadline.finish();
 
@@ -220,9 +251,11 @@ fn handshake(conn: *Conn, timeout_ms: u32) !void {
     var arena_state = std.heap.ArenaAllocator.init(conn.gpa);
     defer arena_state.deinit();
     const hello = conn.recvUntil(arena_state.allocator(), .hello_ok) catch |err| {
+        if (deadline.canceled.load(.acquire)) return error.ConnectCanceled;
         if (deadline.fired.load(.acquire)) return error.DaemonHandshakeTimedOut;
         return err;
     };
+    if (deadline.canceled.load(.acquire)) return error.ConnectCanceled;
     if (deadline.fired.load(.acquire)) return error.DaemonHandshakeTimedOut;
     conn.sandbox_available = hello.sandbox_available;
     conn.network_filtering = hello.network_filtering;
@@ -241,17 +274,29 @@ pub fn connect(
     environ: *const std.process.Environ.Map,
     self_exe: []const u8,
 ) !*Conn {
+    return connectCancelable(gpa, io, environ, self_exe, null);
+}
+
+pub fn connectCancelable(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    cancel: ?*const ConnectCancel,
+) !*Conn {
+    if (connectCancelled(cancel)) return error.ConnectCanceled;
     if (environ.get(remote_env)) |host| {
-        if (host.len > 0) return connectRemote(gpa, io, host);
+        if (host.len > 0) return connectRemote(gpa, io, host, cancel);
     }
     var spawned = false;
     var attempt: u32 = 0;
     while (attempt < 100) : (attempt += 1) {
+        if (connectCancelled(cancel)) return error.ConnectCanceled;
         const conn = try tryConnect(gpa, io, environ);
         if (conn) |candidate| {
-            handshake(candidate, handshake_timeout_ms) catch |err| {
+            handshake(candidate, handshake_timeout_ms, cancel) catch |err| {
                 candidate.deinit();
-                if (!isTransientHandshakeError(err)) return err;
+                if (err == error.ConnectCanceled or !isTransientHandshakeError(err)) return err;
                 io.sleep(.fromMilliseconds(50), .awake) catch {};
                 continue;
             };
@@ -287,16 +332,18 @@ pub fn connect(
 /// agent, and jump hosts; marlin keeps no host registry. No BatchMode: ssh
 /// auth prompts use /dev/tty, so key-less setups still work at first
 /// connect; the remote handshake deadline is the hang backstop.
-fn connectRemote(gpa: std.mem.Allocator, io: Io, host: []const u8) !*Conn {
+fn connectRemote(gpa: std.mem.Allocator, io: Io, host: []const u8, cancel: ?*const ConnectCancel) !*Conn {
     // One transient retry, not the local loop's hundred: each attempt pays
     // full ssh session setup, and the case worth absorbing is a remote
     // daemon dying/rebooting mid-hello, not a slow start (the remote _pipe
     // owns autostart patience).
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
+        if (connectCancelled(cancel)) return error.ConnectCanceled;
         const conn = try spawnChildConn(gpa, io, &.{ "ssh", host, "marlin", "_pipe" });
-        handshake(conn, remote_handshake_timeout_ms) catch |err| {
+        handshake(conn, remote_handshake_timeout_ms, cancel) catch |err| {
             conn.deinit();
+            if (err == error.ConnectCanceled) return err;
             if (attempt < 1 and isTransientHandshakeError(err)) {
                 io.sleep(.fromMilliseconds(250), .awake) catch {};
                 continue;
@@ -455,13 +502,38 @@ test "child transport handshakes over subprocess stdio" {
         "/bin/sh",                                                                                                                             "-c",
         "read line; printf '{\"hello_ok\":{\"proto_version\":1,\"daemon_version\":\"fake\",\"sandbox_available\":true}}\\n'; cat > /dev/null",
     });
-    handshake(conn, 5_000) catch |err| {
+    handshake(conn, 5_000, null) catch |err| {
         conn.deinit();
         return err;
     };
     defer conn.deinit();
     try std.testing.expect(conn.sandbox_available);
     try std.testing.expect(conn.transport == .child);
+}
+
+test "handshake cancellation interrupts a blocked child transport" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const conn = try spawnChildConn(gpa, io, &.{ "/bin/sh", "-c", "read line; sleep 30" });
+    var cancel = ConnectCancel{};
+    const CancelJob = struct {
+        io: Io,
+        cancel: *ConnectCancel,
+
+        fn run(job: *@This()) void {
+            job.io.sleep(.fromMilliseconds(100), .awake) catch {};
+            job.cancel.cancel();
+        }
+    };
+    var job = CancelJob{ .io = io, .cancel = &cancel };
+    const thread = try std.Thread.spawn(.{}, CancelJob.run, .{&job});
+    defer thread.join();
+
+    try std.testing.expectError(error.ConnectCanceled, handshake(conn, 5_000, &cancel));
+    conn.deinit();
 }
 
 test "connect times out when an accepted socket never completes hello" {

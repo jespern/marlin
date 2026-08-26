@@ -34,6 +34,10 @@ pub const PlanStatus = enum { pending, in_progress, completed };
 pub const PlanItem = struct {
     step: []const u8,
     status: PlanStatus,
+    /// Daemon-owned timing metadata. The model-facing plan tool never sets
+    /// these; defaults keep old blocks and clients wire-compatible.
+    started_at_ms: i64 = 0,
+    duration_ms: u64 = 0,
 };
 
 /// Durable reference to binary media stored in the content-addressed blob
@@ -149,6 +153,19 @@ test "block kind follows body tag" {
         .body = .{ .user_msg = .{ .text = "hi" } },
     };
     try std.testing.expectEqual(BlockKind.user_msg, b.kind());
+}
+
+test "older plan items decode without timing metadata" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const item = try std.json.parseFromSliceLeaky(
+        PlanItem,
+        arena_state.allocator(),
+        "{\"step\":\"Inspect\",\"status\":\"completed\"}",
+        .{ .ignore_unknown_fields = true },
+    );
+    try std.testing.expectEqual(@as(i64, 0), item.started_at_ms);
+    try std.testing.expectEqual(@as(u64, 0), item.duration_ms);
 }
 
 test "older user blocks decode with synthetic disabled" {

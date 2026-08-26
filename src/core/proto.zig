@@ -95,6 +95,9 @@ pub const ClientMsg = union(enum) {
         model: []const u8,
         effort: ReasoningEffort = .auto,
         title: []const u8 = "",
+        /// Correlates interactive creation with its terminal reply. Zero is
+        /// the legacy/untracked value used by synchronous clients.
+        request_id: u64 = 0,
         /// "default" = mutating tools ask; "auto" = everything auto-approved
         /// (headless one-shots and --yolo).
         approvals: []const u8 = "default",
@@ -176,6 +179,8 @@ pub const ClientMsg = union(enum) {
     /// Persist a stdio server in config.toml, then rebuild the live registry.
     mcp_add: struct { name: []const u8, cmd: []const []const u8 },
     mcp_remove: struct { name: []const u8 },
+    /// Persist one client UI preference through the daemon-owned config path.
+    ui_set_tab_bar: struct { enabled: bool },
     /// Re-read config and atomically replace extensions while no turn is live.
     mcp_reload: struct {},
     interrupt: struct {
@@ -223,7 +228,7 @@ pub const DaemonMsg = union(enum) {
         network_feed_count: u64 = 0,
         network_rule_count: u64 = 0,
     },
-    session_created: struct { sid: u64 },
+    session_created: struct { sid: u64, request_id: u64 = 0 },
     session_list_result: struct { sessions: []const SessionInfo },
     /// Sent only to session watchers that explicitly opted in: older tagged
     /// union decoders reject message types they do not know.
@@ -247,6 +252,9 @@ pub const DaemonMsg = union(enum) {
         /// This message is already explicitly opted into by current clients;
         /// older decoders safely ignore the additive field.
         plan_items: []const block.PlanItem = &.{},
+        /// False once a later user turn has superseded the completed plan.
+        /// Old daemons omit this and preserve the historical pinned behavior.
+        plan_pinned: bool = true,
     },
     status: struct { sid: u64, state: SessionState },
     approval_request: struct {
@@ -275,6 +283,8 @@ pub const DaemonMsg = union(enum) {
         pricing: []const ModelPricing = &.{},
     },
     mcp_list_result: struct { servers: []const McpServerInfo },
+    /// Terminal reply to ui_set_tab_bar after config.toml is durable.
+    ui_config_result: struct { tab_bar: bool },
     /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
     /// contain arbitrary command output (including NULs).
     blob_result: struct { hash: []const u8, bytes: []const u8 },
@@ -450,6 +460,11 @@ test "round trip: client messages" {
     );
     try std.testing.expect(watch_back.session_watch.incremental);
 
+    const ui_line = try encode(gpa, ClientMsg{ .ui_set_tab_bar = .{ .enabled = false } });
+    defer gpa.free(ui_line);
+    const ui_back = try decode(ClientMsg, arena, ui_line);
+    try std.testing.expect(!ui_back.ui_set_tab_bar.enabled);
+
     const blob_line = try encode(gpa, ClientMsg{ .blob_get = .{ .hash = "abc123" } });
     defer gpa.free(blob_line);
     const blob_back = try decode(ClientMsg, arena, blob_line);
@@ -527,9 +542,10 @@ test "latest plan survives the replay marker wire" {
     const gpa = std.testing.allocator;
     const line = try encode(gpa, DaemonMsg{ .replay_done = .{
         .sid = 7,
+        .plan_pinned = false,
         .plan_items = &.{
-            .{ .step = "Inspect", .status = .completed },
-            .{ .step = "Implement", .status = .in_progress },
+            .{ .step = "Inspect", .status = .completed, .duration_ms = 18_400 },
+            .{ .step = "Implement", .status = .in_progress, .started_at_ms = 20_000 },
         },
     } });
     defer gpa.free(line);
@@ -538,7 +554,10 @@ test "latest plan survives the replay marker wire" {
     const decoded = try decode(DaemonMsg, arena_state.allocator(), line);
     try std.testing.expectEqual(@as(u64, 7), decoded.replay_done.sid);
     try std.testing.expectEqual(@as(usize, 2), decoded.replay_done.plan_items.len);
+    try std.testing.expectEqual(@as(u64, 18_400), decoded.replay_done.plan_items[0].duration_ms);
     try std.testing.expectEqual(block.PlanStatus.in_progress, decoded.replay_done.plan_items[1].status);
+    try std.testing.expectEqual(@as(i64, 20_000), decoded.replay_done.plan_items[1].started_at_ms);
+    try std.testing.expect(!decoded.replay_done.plan_pinned);
 }
 
 test "input attachments survive the remote-client wire" {
@@ -627,6 +646,16 @@ test "correlation ids are additive and legacy messages default to zero" {
         \\{"input":{"sid":5,"text":"hello"}}
     );
     try std.testing.expectEqual(@as(u64, 0), legacy_input.input.request_id);
+
+    const legacy_create = try decode(ClientMsg, arena,
+        \\{"session_create":{"cwd":"/tmp","model":"test/model"}}
+    );
+    try std.testing.expectEqual(@as(u64, 0), legacy_create.session_create.request_id);
+
+    const legacy_created = try decode(DaemonMsg, arena,
+        \\{"session_created":{"sid":7}}
+    );
+    try std.testing.expectEqual(@as(u64, 0), legacy_created.session_created.request_id);
 
     const legacy_err = try decode(DaemonMsg, arena,
         \\{"err":{"code":"busy","msg":"no"}}

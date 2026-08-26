@@ -828,15 +828,30 @@ pub const Store = struct {
         }
     }
 
+    pub const LatestPlan = struct {
+        items: []const block.PlanItem,
+        /// A later human turn moves a completed plan into transcript history.
+        pinned: bool,
+    };
+
     /// Decode the newest durable plan revision for a freshly subscribed
     /// client. This is independent of its bounded transcript replay window.
     pub fn loadLatestPlan(
         self: Store,
         arena: std.mem.Allocator,
         session_id: u64,
-    ) Error!?[]const block.PlanItem {
+    ) Error!?LatestPlan {
         const stmt = try self.prepare(
-            "SELECT body_json FROM blocks WHERE session_id=? AND kind='plan' ORDER BY seq DESC LIMIT 1",
+            \\SELECT p.body_json,
+            \\       EXISTS (
+            \\           SELECT 1 FROM blocks AS u
+            \\           WHERE u.session_id=p.session_id
+            \\             AND u.kind='user_msg'
+            \\             AND u.turn_id>p.turn_id
+            \\       )
+            \\FROM blocks AS p
+            \\WHERE p.session_id=? AND p.kind='plan'
+            \\ORDER BY p.seq DESC LIMIT 1
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
@@ -850,8 +865,36 @@ pub const Store = struct {
             .ignore_unknown_fields = true,
         }) catch return error.SqliteStep;
         return switch (body) {
-            .plan => |plan| plan.items,
+            .plan => |plan| blk: {
+                var complete = plan.items.len > 0;
+                for (plan.items) |item| complete = complete and item.status == .completed;
+                break :blk .{
+                    .items = plan.items,
+                    // An unfinished plan spans "continue" turns. Only a
+                    // terminal completed plan unpins on the next user turn.
+                    .pinned = !complete or c.sqlite3_column_int(stmt, 1) == 0,
+                };
+            },
             else => error.SqliteStep,
+        };
+    }
+
+    pub const TurnTimeBounds = struct { start_ms: i64, end_ms: i64 };
+
+    /// Durable active-time boundaries for one turn. Plan timers use these to
+    /// exclude the wall-clock gap while a session waits for the next prompt.
+    pub fn turnTimeBounds(self: Store, session_id: u64, turn_id: u64) Error!?TurnTimeBounds {
+        const stmt = try self.prepare(
+            "SELECT MIN(ts), MAX(ts) FROM blocks WHERE session_id=? AND turn_id=?",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(turn_id));
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SqliteStep;
+        if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+        return .{
+            .start_ms = c.sqlite3_column_int64(stmt, 0),
+            .end_ms = c.sqlite3_column_int64(stmt, 1),
         };
     }
 
@@ -1434,7 +1477,7 @@ test "latest plan remains context-relevant after compaction" {
         .body = .{ .user_msg = .{ .text = "work" } },
     });
     const items = [_]block.PlanItem{
-        .{ .step = "Inspect", .status = .completed },
+        .{ .step = "Inspect", .status = .completed, .started_at_ms = 1_000, .duration_ms = 18_400 },
         .{ .step = "Implement", .status = .in_progress },
     };
     try store.appendBlock(.{
@@ -1464,9 +1507,46 @@ test "latest plan remains context-relevant after compaction" {
     try std.testing.expectEqual(block.BlockKind.compaction, relevant.items[1].kind());
 
     const latest = (try store.loadLatestPlan(arena, 1)).?;
-    try std.testing.expectEqual(@as(usize, 2), latest.len);
-    try std.testing.expectEqualStrings("Implement", latest[1].step);
-    try std.testing.expectEqual(block.PlanStatus.in_progress, latest[1].status);
+    try std.testing.expectEqual(@as(usize, 2), latest.items.len);
+    try std.testing.expectEqual(@as(i64, 1_000), latest.items[0].started_at_ms);
+    try std.testing.expectEqual(@as(u64, 18_400), latest.items[0].duration_ms);
+    try std.testing.expectEqualStrings("Implement", latest.items[1].step);
+    try std.testing.expectEqual(block.PlanStatus.in_progress, latest.items[1].status);
+    try std.testing.expect(latest.pinned);
+
+    try store.appendBlock(.{
+        .id = 4,
+        .session_id = 1,
+        .turn_id = 3,
+        .seq = 4,
+        .ts = 0,
+        .body = .{ .user_msg = .{ .text = "continue" } },
+    });
+    const archived = (try store.loadLatestPlan(arena, 1)).?;
+    try std.testing.expect(archived.pinned);
+
+    var done_items = [_]block.PlanItem{
+        .{ .step = "Inspect", .status = .completed, .duration_ms = 18_400 },
+        .{ .step = "Implement", .status = .completed, .duration_ms = 3_000 },
+    };
+    try store.appendBlock(.{
+        .id = 5,
+        .session_id = 1,
+        .turn_id = 3,
+        .seq = 5,
+        .ts = 0,
+        .body = .{ .plan = .{ .items = &done_items } },
+    });
+    try std.testing.expect((try store.loadLatestPlan(arena, 1)).?.pinned);
+    try store.appendBlock(.{
+        .id = 6,
+        .session_id = 1,
+        .turn_id = 4,
+        .seq = 6,
+        .ts = 0,
+        .body = .{ .user_msg = .{ .text = "new work" } },
+    });
+    try std.testing.expect(!(try store.loadLatestPlan(arena, 1)).?.pinned);
 }
 
 test "one connection survives concurrent turn writes and dispatcher reads" {

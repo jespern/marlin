@@ -11,13 +11,14 @@
 //!
 //! Keys:
 //!   insert:  type → input; Enter send; Shift+Enter/Alt+Enter/Ctrl+J newline;
-//!            Up/Down or Ctrl+P/N move lines or walk history at the edges;
+//!            Up/Down move lines or walk history at the edges;
 //!            readline/macOS movement and deletion chords are supported;
 //!            Esc → normal (draft survives); Ctrl+C interrupts active work
 //!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom;
 //!            </> or Left/Right switch tabs; q quit
-//!   global:  Ctrl+L clears/redraws and returns to bottom; Ctrl+T toggles
-//!            the expanded tool transcript; Alt/Option+1..9 jumps to that tab
+//!   global:  Ctrl+N creates a session; Ctrl+L clears/redraws and returns to
+//!            bottom; Ctrl+T toggles the expanded tool transcript;
+//!            Alt/Option+1..9 jumps to that tab
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /new, /compact,
 //!             /archive, /reboot [--build], /help, /quit
@@ -83,6 +84,7 @@ const wrapPrefixed = render.wrapPrefixed;
 const displayWidth = render.displayWidth;
 const hardCellBreak = render.hardCellBreak;
 const spaces = render.spaces;
+const spinner_frames = render.spinner_frames;
 
 /// Keep startup and first session-switch latency independent of transcript
 /// length. Reaching the top explicitly backfills the complete durable log.
@@ -319,7 +321,14 @@ const TabLayout = struct {
 const PlanItemOwned = struct {
     step: []u8,
     status: block.PlanStatus,
+    started_at_ms: i64 = 0,
+    duration_ms: u64 = 0,
 };
+
+fn hasUnfinishedPlan(items: []const PlanItemOwned) bool {
+    for (items) |item| if (item.status != .completed) return true;
+    return false;
+}
 
 fn deinitPlan(gpa: std.mem.Allocator, items: *std.ArrayList(PlanItemOwned)) void {
     for (items.items) |item| gpa.free(item.step);
@@ -397,8 +406,9 @@ const App = struct {
     blocks: std.ArrayList(RenderBlock) = .empty,
     delta: std.ArrayList(u8) = .empty,
     reasoning_delta: std.ArrayList(u8) = .empty,
-    /// Latest durable plan revision. It is rendered outside transcript
-    /// scrollback and therefore survives folding and bounded replay.
+    /// Latest durable plan revision while it is pinned above the composer.
+    /// Its terminal completed revision also lives in blocks so the next user
+    /// turn can move the closed table into ordinary transcript scrollback.
     plan: std.ArrayList(PlanItemOwned) = .empty,
     state: proto.SessionState = .idle,
     model: std.ArrayList(u8) = .empty,
@@ -561,6 +571,7 @@ const App = struct {
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
     awaiting_new_session: bool = false,
+    pending_new_session_request_id: u64 = 0,
     pending_new_cwd: std.ArrayList(u8) = .empty,
     /// Set by /reboot: after clean TUI teardown, run() returns this to
     /// cli.zig which execs `marlin reboot [--build] --then attach @<sid>`.
@@ -686,7 +697,12 @@ const App = struct {
                 deinitPlan(self.gpa, &replacement);
                 return;
             };
-            replacement.append(self.gpa, .{ .step = step, .status = item.status }) catch {
+            replacement.append(self.gpa, .{
+                .step = step,
+                .status = item.status,
+                .started_at_ms = item.started_at_ms,
+                .duration_ms = item.duration_ms,
+            }) catch {
                 self.gpa.free(step);
                 deinitPlan(self.gpa, &replacement);
                 return;
@@ -694,6 +710,30 @@ const App = struct {
         }
         deinitPlan(self.gpa, &self.plan);
         self.plan = replacement;
+    }
+
+    fn clearCompletedPlan(self: *App) void {
+        if (self.plan.items.len > 0 and !hasUnfinishedPlan(self.plan.items)) {
+            deinitPlan(self.gpa, &self.plan);
+            // A completed plan block was previously cached as invisible.
+            // Rebuild now that a following prompt makes it historical.
+            self.layout_epoch +%= 1;
+        }
+    }
+
+    fn restoreLatestUnarchivedPlan(self: *App) void {
+        if (self.plan.items.len > 0) return;
+        var i = self.blocks.items.len;
+        while (i > 0) {
+            i -= 1;
+            const rendered = self.blocks.items[i];
+            if (rendered.kind != .plan) continue;
+            for (self.blocks.items[i + 1 ..]) |later| {
+                if (later.kind == .user_msg) return;
+            }
+            self.setPlan(rendered.plan_items);
+            return;
+        }
     }
 
     fn setHomeStr(self: *App, home: []const u8) void {
@@ -1350,6 +1390,7 @@ const App = struct {
                 self.turn_started_ms = 0;
                 self.animation_active.store(state == .running, .release);
             }
+            self.restoreLatestUnarchivedPlan();
             self.layout_epoch +%= 1;
             return;
         }
@@ -1395,7 +1436,13 @@ const App = struct {
             },
             .replay_done => |replay| {
                 if (replay.sid != self.sid) return;
-                if (!replay.has_newer) self.setPlan(replay.plan_items);
+                if (!replay.has_newer) {
+                    if (replay.plan_pinned) {
+                        self.setPlan(replay.plan_items);
+                    } else {
+                        deinitPlan(self.gpa, &self.plan);
+                    }
+                }
                 if (replay.forward) {
                     if (replay.has_newer and replay.newest_seq > 0) {
                         self.conn.send(.{ .sub = .{
@@ -1447,6 +1494,7 @@ const App = struct {
                     self.history_loading = false;
                 }
                 if (s.state == .running and self.state != .running) {
+                    self.clearCompletedPlan();
                     self.spinner_frame = 0;
                     self.turn_started_ms = nowWallMs(self.io);
                 }
@@ -1470,7 +1518,7 @@ const App = struct {
                 else
                     self.background_approvals.put(self.gpa, ar.sid, p) catch {};
             },
-            .session_created => |sc| self.handleSessionCreated(sc.sid),
+            .session_created => |sc| self.handleSessionCreated(sc.sid, sc.request_id),
             .session_list_result => |sl| self.replaceSessionSummaries(sl.sessions),
             .session_upsert => |su| self.upsertSessionSummary(su.session),
             .session_remove => |sr| self.removeSessionSummary(sr.sid),
@@ -1511,6 +1559,11 @@ const App = struct {
                 }
             },
             .mcp_list_result => |result| self.showMcpStatus(result.servers),
+            .ui_config_result => |result| {
+                self.show_tab_bar = result.tab_bar;
+                self.refresh_requested = true;
+                self.setNotice("tab bar {s} (saved to config.toml)", .{onOff(result.tab_bar)});
+            },
             .council_list_result => |result| self.applyCouncils(result.councils),
             .session_meta => |m| {
                 if (m.sid != self.sid) return;
@@ -1521,6 +1574,11 @@ const App = struct {
             },
             .err => |e| {
                 self.rejectInput(e.request_id);
+                if (self.awaiting_new_session and e.request_id != 0 and e.request_id == self.pending_new_session_request_id) {
+                    self.awaiting_new_session = false;
+                    self.pending_new_session_request_id = 0;
+                    self.pending_new_cwd.clearRetainingCapacity();
+                }
                 if (self.history_loading and std.mem.eql(u8, e.code, "request_failed")) {
                     self.clearHistoryBackfill();
                     self.history_loading = false;
@@ -1537,6 +1595,7 @@ const App = struct {
     fn applyBlock(self: *App, b: block.Block) void {
         switch (b.body) {
             .user_msg => |u| {
+                if (!u.synthetic and !isLegacyRehydration(u.text)) self.clearCompletedPlan();
                 if (u.synthetic or isLegacyRehydration(u.text)) {
                     const label = rehydrationLabel(self.gpa, u.text) catch return;
                     defer self.gpa.free(label);
@@ -1611,7 +1670,16 @@ const App = struct {
                 const txt = if (ap.decision) |d| @tagName(d) else "pending";
                 self.pushDurableBlock(b, .approval, txt, "", .ok);
             },
-            .plan => |plan| self.setPlan(plan.items),
+            .plan => |plan| {
+                self.setPlan(plan.items);
+                const rendered = allocDurableRenderBlock(self.gpa, b) catch return;
+                if (rendered) |owned| {
+                    self.blocks.append(self.gpa, owned) catch {
+                        var orphan = owned;
+                        orphan.deinit(self.gpa);
+                    };
+                }
+            },
             .system_note => |sn| {
                 if (!isCompactionStatusNote(sn.text))
                     self.pushDurableBlock(b, .system_note, sn.text, "", .ok);
@@ -1727,6 +1795,7 @@ const App = struct {
         } else {
             // The composer becomes a scrollback card immediately. The turn
             // thread's persisted user_msg will reconcile this local echo.
+            self.clearCompletedPlan();
             self.pushInputEchoLabel(.user_msg, trimmed, attachment_label orelse "", request_id, self.state);
             self.state = .running;
             self.spinner_frame = 0;
@@ -1987,15 +2056,11 @@ const App = struct {
         } else !self.show_tab_bar;
         self.show_tab_bar = enable;
         self.refresh_requested = true;
-        const environ = self.environ orelse {
-            self.setNotice("tab bar {s} (not saved: no environment)", .{onOff(enable)});
+        self.conn.send(.{ .ui_set_tab_bar = .{ .enabled = enable } }) catch |err| {
+            self.setNotice("tab bar {s} (not saved: {t})", .{ onOff(enable), err });
             return;
         };
-        if (config.setUiTabBar(self.gpa, self.io, environ, enable)) |_| {
-            self.setNotice("tab bar {s} (saved to config.toml)", .{onOff(enable)});
-        } else |err| {
-            self.setNotice("tab bar {s} (not saved: {t})", .{ onOff(enable), err });
-        }
+        self.setNotice("tab bar {s} (saving…)", .{onOff(enable)});
     }
 
     fn showMcpStatus(self: *App, servers: []const proto.McpServerInfo) void {
@@ -2638,12 +2703,20 @@ const App = struct {
     }
 
     fn newSession(self: *App) !void {
+        if (self.awaiting_new_session) {
+            self.setNotice("new session already being created", .{});
+            return;
+        }
         var cwd_buf: [4096]u8 = undefined;
         const cwd_len = try std.process.currentPath(self.io, &cwd_buf);
+        const request_id = self.next_input_request_id;
+        self.next_input_request_id +%= 1;
+        if (self.next_input_request_id == 0) self.next_input_request_id = 1;
         try self.conn.send(.{ .session_create = .{
             .cwd = cwd_buf[0..cwd_len],
             .model = self.model.items,
             .effort = self.effort,
+            .request_id = request_id,
         } });
         self.pending_new_cwd.clearRetainingCapacity();
         try self.pending_new_cwd.appendSlice(self.gpa, cwd_buf[0..cwd_len]);
@@ -2652,6 +2725,7 @@ const App = struct {
         // message has no sub; simplest correct M2 flow: remember we asked.
         // Handled in handleDaemonLineCreated below via the pending flag.
         self.awaiting_new_session = true;
+        self.pending_new_session_request_id = request_id;
     }
 
     fn sessionBelongsToTree(self: *const App, candidate_sid: u64, root_sid: u64) bool {
@@ -2731,9 +2805,11 @@ const App = struct {
         }
     }
 
-    fn handleSessionCreated(self: *App, sid: u64) void {
+    fn handleSessionCreated(self: *App, sid: u64, request_id: u64) void {
         if (!self.awaiting_new_session) return;
+        if (request_id != 0 and request_id != self.pending_new_session_request_id) return;
         self.awaiting_new_session = false;
+        self.pending_new_session_request_id = 0;
         self.rememberSession(sid);
         const model = self.gpa.dupe(u8, self.model.items) catch return;
         defer self.gpa.free(model);
@@ -2891,6 +2967,7 @@ fn transcriptView(app: *App) Transcript {
         .stream_bytes = app.stream_bytes,
         .stream_quiet_ms = app.stream_quiet_ms,
         .stream_status_at_ms = app.stream_status_at_ms,
+        .show_working_ticker = !hasUnfinishedPlan(app.plan.items),
         .cwd = app.cwd.items,
         .approval = if (app.pending) |*pending| .{
             .tool = pending.tool(),
@@ -3282,6 +3359,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "arrows", .description = "scroll the view" },
     .{ .description = "GLOBAL", .heading = true },
     .{ .key = "Enter while working", .description = "steer the active turn" },
+    .{ .key = "Ctrl+N", .description = "create a new session" },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
     .{ .key = "Ctrl+C", .description = "interrupt the active turn" },
@@ -3389,6 +3467,8 @@ fn drawTabBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
 }
 
 const PlanDisplayRange = struct { start: usize = 0, len: usize = 0 };
+const max_plan_items: usize = 5;
+const plan_frame_rows: usize = 1; // top border; open bottom joins composer
 
 fn planDisplayRange(items: []const PlanItemOwned, max_rows: usize) PlanDisplayRange {
     if (max_rows == 0 or items.len == 0) return .{};
@@ -3400,15 +3480,84 @@ fn planDisplayRange(items: []const PlanItemOwned, max_rows: usize) PlanDisplayRa
         }
         if (focus == null and item.status == .pending) focus = index;
     }
-    const at = focus orelse return .{};
+    // Keep a completed table inspectable until the next turn begins; that
+    // transition clears it before new work starts.
+    const at = focus orelse items.len - 1;
     const len = @min(items.len, max_rows);
     var start = at -| (len / 2);
     if (start + len > items.len) start = items.len - len;
     return .{ .start = start, .len = len };
 }
 
+const PlanMarker = struct {
+    glyph: []const u8,
+    glyph_style: vaxis.Style,
+    text_style: vaxis.Style,
+};
+
+fn planMarker(status: block.PlanStatus, spinner_frame: usize) PlanMarker {
+    return switch (status) {
+        .pending => .{
+            .glyph = "·",
+            .glyph_style = Palette.plan_pending,
+            .text_style = Palette.plan_pending,
+        },
+        .in_progress => .{
+            .glyph = spinner_frames[spinner_frame % spinner_frames.len],
+            .glyph_style = Palette.plan_active,
+            .text_style = Palette.plan_active,
+        },
+        .completed => .{
+            .glyph = "✔",
+            .glyph_style = Palette.plan_done_mark,
+            // Completion changes only the mark. Keep the task readable
+            // instead of fading the whole line into the panel background.
+            .text_style = Palette.plan_pending,
+        },
+    };
+}
+
+fn formatPlanDuration(arena: std.mem.Allocator, duration_ms: u64) ![]const u8 {
+    if (duration_ms < 1_000) return "<1s";
+    const seconds = (duration_ms +| 500) / 1_000;
+    if (seconds < 60) return std.fmt.allocPrint(arena, "{d}s", .{seconds});
+    const minutes = seconds / 60;
+    if (minutes < 60)
+        return std.fmt.allocPrint(arena, "{d}m {d}s", .{ minutes, seconds % 60 });
+    return std.fmt.allocPrint(arena, "{d}h {d}m", .{ minutes / 60, minutes % 60 });
+}
+
+const PlanTableWidths = struct { task: usize, time: usize };
+
+fn planTableWidths(total: usize) PlanTableWidths {
+    const time = @min(@as(usize, 10), @max(@as(usize, 7), total / 6));
+    return .{ .task = total -| (time + 3), .time = time };
+}
+
+fn planRule(arena: std.mem.Allocator, width: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var used: usize = 0;
+    while (used < width) : (used += 1) try out.appendSlice(arena, "─");
+    return out.toOwnedSlice(arena);
+}
+
+fn planItemTimeMs(app: *const App, item: PlanItemOwned, now_ms: i64) ?u64 {
+    if (item.status == .completed)
+        return if (item.duration_ms > 0) item.duration_ms else null;
+    if (item.status != .in_progress) return null;
+
+    var elapsed = item.duration_ms;
+    if (app.state == .running) {
+        const started = if (item.started_at_ms > 0) item.started_at_ms else app.turn_started_ms;
+        if (started > 0 and now_ms > started) elapsed +|= @intCast(now_ms - started);
+        // Render immediate feedback instead of a blank cell for the first ms.
+        if (elapsed == 0) elapsed = 1;
+    }
+    return if (elapsed > 0) elapsed else null;
+}
+
 fn drawPlan(
-    app: *const App,
+    app: *App,
     win: vaxis.Window,
     arena: std.mem.Allocator,
     top: u16,
@@ -3417,41 +3566,52 @@ fn drawPlan(
     if (height == 0) return;
     const panel = win.child(.{ .y_off = top, .height = height, .width = win.width });
     panel.fill(.{ .style = Palette.plan_panel });
-    const range = planDisplayRange(app.plan.items, height);
+    const item_rows = @as(usize, height) -| plan_frame_rows;
+    const range = planDisplayRange(app.plan.items, item_rows);
+    const widths = planTableWidths(win.width);
+    const task_header = try planRule(arena, widths.task);
+    const time_header = try planRule(arena, widths.time);
+    const top_border = [_]vaxis.Segment{
+        .{ .text = "┌", .style = Palette.plan_header },
+        .{ .text = task_header, .style = Palette.plan_header },
+        .{ .text = "┬", .style = Palette.plan_header },
+        .{ .text = time_header, .style = Palette.plan_header },
+        .{ .text = "┐", .style = Palette.plan_header },
+    };
+    _ = panel.print(&top_border, .{ .wrap = .none });
 
-    var child_running: usize = 0;
-    for (app.sessions.items) |session| {
-        if (session.parent_sid == app.sid and
-            (session.state == .running or session.state == .awaiting_approval))
-            child_running += 1;
-    }
-
+    const now_ms = nowWallMs(app.io);
     for (app.plan.items[range.start .. range.start + range.len], 0..) |item, row| {
-        const marker: []const u8 = switch (item.status) {
-            .pending => "  · ",
-            .in_progress => "  ▸ ",
-            .completed => "  ✓ ",
-        };
-        const style: vaxis.Style = switch (item.status) {
-            .pending => Palette.plan_pending,
-            .in_progress => Palette.plan_active,
-            .completed => Palette.plan_done,
-        };
-        const suffix = if (item.status == .in_progress and child_running > 0)
-            try std.fmt.allocPrint(arena, " · {d} child{s} working", .{
-                child_running,
-                if (child_running == 1) "" else "ren",
-            })
-        else
-            "";
-        const available = @as(usize, win.width) -| (4 + suffix.len);
+        const marker = planMarker(item.status, app.spinner_frame);
+        const available = widths.task -| 3;
         const end = hardCellBreak(item.step, 0, available);
-        const segments = [_]vaxis.Segment{
-            .{ .text = marker, .style = style },
-            .{ .text = item.step[0..end], .style = style },
-            .{ .text = suffix, .style = style },
+        const left = [_]vaxis.Segment{
+            .{ .text = "│ ", .style = Palette.plan_header },
+            .{ .text = marker.glyph, .style = marker.glyph_style },
+            .{ .text = " ", .style = marker.text_style },
+            .{ .text = item.step[0..end], .style = marker.text_style },
         };
-        _ = panel.print(&segments, .{ .row_offset = @intCast(row), .wrap = .none });
+        const row_offset: u16 = @intCast(row + 1);
+        _ = panel.print(&left, .{ .row_offset = row_offset, .wrap = .none });
+        _ = panel.printSegment(.{ .text = "│", .style = Palette.plan_header }, .{
+            .row_offset = row_offset,
+            .col_offset = @intCast(widths.task + 1),
+            .wrap = .none,
+        });
+        if (planItemTimeMs(app, item, now_ms)) |time_ms| {
+            const time = try formatPlanDuration(arena, time_ms);
+            const time_cells = displayWidth(time);
+            _ = panel.printSegment(.{ .text = time, .style = marker.text_style }, .{
+                .row_offset = row_offset,
+                .col_offset = @intCast(widths.task + 2 + widths.time -| (time_cells + 1)),
+                .wrap = .none,
+            });
+        }
+        _ = panel.printSegment(.{ .text = "│", .style = Palette.plan_header }, .{
+            .row_offset = row_offset,
+            .col_offset = win.width - 1,
+            .wrap = .none,
+        });
     }
 }
 
@@ -3472,15 +3632,23 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const panel_inner_w = w -| 2; // one cell of horizontal padding
     const content_h: u16 = @intCast(app.editor.displayHeight(panel_inner_w -| 2));
     const input_h: u16 = @intCast(inputPanelHeight(content_h));
-    const input_gap: u16 = 1;
-    const fixed_h = @as(u16, @intCast(top_rows)) + input_h + input_gap + 1;
+    // One breathing row belongs ABOVE the lowest surface. With a plan that
+    // means transcript → gap → table → composer, so the open-bottom
+    // table visually attaches to the input instead of floating between gaps.
+    const surface_gap: u16 = 1;
+    const fixed_h = @as(u16, @intCast(top_rows)) + input_h + surface_gap + 1;
     const plan_capacity = h -| (fixed_h + 2); // retain a usable transcript viewport
-    const plan_range = planDisplayRange(app.plan.items, @min(@as(usize, 5), plan_capacity));
-    const plan_h: u16 = @intCast(plan_range.len);
+    const plan_item_capacity = @min(max_plan_items, plan_capacity -| plan_frame_rows);
+    const plan_range = planDisplayRange(app.plan.items, plan_item_capacity);
+    const plan_h: u16 = @intCast(if (plan_range.len > 0) plan_range.len + plan_frame_rows else 0);
     const view_h: u16 = h -| (fixed_h + plan_h); // tabs + plan + input + gap + status
 
     // ---- session view ----
-    var lines = try layoutLines(arena, app, w);
+    var transcript = transcriptView(app);
+    // On very short terminals the TODO panel may not fit; keep the ordinary
+    // ticker in that case so liveness never disappears with the panel.
+    transcript.show_working_ticker = plan_h == 0;
+    var lines = try layout_mod.layoutLines(arena, app.gpa, &transcript, w);
     const total = lines.items.len;
     // Anchor while reading: scroll_up counts from the BOTTOM, so content
     // arriving while scrolled up would slide the view. Compensate by the
@@ -3563,7 +3731,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     }
 
     const input_top = h - 1 - input_h;
-    const plan_top = input_top -| input_gap -| plan_h;
+    const plan_top = input_top -| plan_h;
     try drawPlan(app, win, arena, plan_top, plan_h);
 
     // ---- input box ----
@@ -3907,15 +4075,15 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 // ------------------------------------------------------------ entry point --
 
 /// Reader thread: daemon socket lines → vaxis event queue.
-fn readerThread(app: *App, loop: *vaxis.Loop(Event)) void {
+fn readerThread(gpa: std.mem.Allocator, conn: *attach.Conn, loop: *vaxis.Loop(Event)) void {
     var disconnect_reason: []const u8 = "reader stopped";
     while (true) {
-        const owned = app.conn.readLine() catch |err| {
+        const owned = conn.readLine() catch |err| {
             disconnect_reason = @errorName(err);
             break;
         };
         loop.postEvent(.{ .daemon_line = owned }) catch {
-            app.gpa.free(owned);
+            gpa.free(owned);
             return;
         };
     }
@@ -3930,21 +4098,41 @@ const ReconnectJob = struct {
     app: *App,
     loop: *vaxis.Loop(Event),
     self_exe: []const u8,
+    cancel: attach.ConnectCancel = .{},
 
-    /// Bounded: each attach.connect already carries its own patience (local
-    /// autostart polling, the 30s remote handshake deadline), so a handful
-    /// of spaced attempts covers wake-from-sleep and daemon restarts without
-    /// making a deliberate quit wait minutes on a truly dead network.
+    fn stop(self: *ReconnectJob) void {
+        self.cancel.cancel();
+    }
+
+    fn waitBetweenAttempts(self: *ReconnectJob) bool {
+        var elapsed_ms: u32 = 0;
+        while (elapsed_ms < 1_500) : (elapsed_ms += 50) {
+            if (self.cancel.isCancelled()) return false;
+            self.app.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        }
+        return !self.cancel.isCancelled();
+    }
+
+    /// Bounded retries remain interruptible: quitting cancels an in-flight
+    /// local/SSH handshake and the spacing sleep, so teardown does not wait on
+    /// remote handshake deadlines.
     fn run(job: *ReconnectJob) void {
         var attempt: u32 = 0;
         while (attempt < 3) : (attempt += 1) {
-            if (attempt > 0) job.app.io.sleep(.fromMilliseconds(1_500), .awake) catch {};
+            if (attempt > 0 and !job.waitBetweenAttempts()) return;
             const environ = job.app.environ orelse break;
-            const conn = attach.connect(job.app.gpa, job.app.io, environ, job.self_exe) catch continue;
+            const conn = attach.connectCancelable(job.app.gpa, job.app.io, environ, job.self_exe, &job.cancel) catch |err| {
+                if (err == error.ConnectCanceled) return;
+                continue;
+            };
+            if (job.cancel.isCancelled()) {
+                conn.deinit();
+                return;
+            }
             job.loop.postEvent(.{ .reconnected = conn }) catch conn.deinit();
             return;
         }
-        job.loop.postEvent(.{ .reconnected = null }) catch {};
+        if (!job.cancel.isCancelled()) job.loop.postEvent(.{ .reconnected = null }) catch {};
     }
 };
 
@@ -3954,29 +4142,54 @@ const ReconnectJob = struct {
 /// transcript and scroll position survive untouched. Returns false when the
 /// TUI cannot be made whole (caller quits with the old semantics).
 fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, new_conn: *attach.Conn) bool {
-    // The old reader posted daemon_gone on its way out; join is immediate.
-    rt.join();
-    const old = app.conn;
-    app.conn = new_conn;
-    old.deinit();
-    rt.* = std.Thread.spawn(.{}, readerThread, .{ app, loop }) catch return false;
-
-    app.conn.send(.{ .session_watch = .{ .incremental = true } }) catch return false;
-    app.conn.send(.{ .council_list = .{} }) catch {};
+    // Restore subscriptions before publishing the transport to App. A failed
+    // replay request then leaves the dead connection as the sole owner and the
+    // fresh connection can be destroyed without a reader thread racing it.
+    new_conn.send(.{ .session_watch = .{ .incremental = true } }) catch {
+        new_conn.deinit();
+        return false;
+    };
+    new_conn.send(.{ .council_list = .{} }) catch {};
     if (app.last_seq == 0) {
-        app.conn.send(.{ .sub = .{
+        new_conn.send(.{ .sub = .{
             .sid = app.sid,
             .from_seq = 1,
             .tail_limit = initial_replay_blocks,
-        } }) catch return false;
+        } }) catch {
+            new_conn.deinit();
+            return false;
+        };
     } else {
-        app.conn.send(.{ .sub = .{
+        new_conn.send(.{ .sub = .{
             .sid = app.sid,
             .from_seq = app.last_seq +| 1,
             .replay_limit = initial_replay_blocks,
-        } }) catch return false;
+        } }) catch {
+            new_conn.deinit();
+            return false;
+        };
     }
-    app.setNotice("reconnected", .{});
+
+    // Start the replacement reader against its explicit Conn before swapping
+    // App ownership. If spawn fails, the deferred exit join still owns the old
+    // thread handle; otherwise its daemon_gone post means this join is immediate.
+    const new_rt = std.Thread.spawn(.{}, readerThread, .{ app.gpa, new_conn, loop }) catch {
+        new_conn.deinit();
+        return false;
+    };
+    rt.join();
+    const old = app.conn;
+    app.conn = new_conn;
+    rt.* = new_rt;
+    old.deinit();
+    if (app.awaiting_new_session) {
+        app.awaiting_new_session = false;
+        app.pending_new_session_request_id = 0;
+        app.pending_new_cwd.clearRetainingCapacity();
+        app.setNotice("reconnected · retry /new if the session was not created", .{});
+    } else {
+        app.setNotice("reconnected", .{});
+    }
     return true;
 }
 
@@ -4055,7 +4268,8 @@ pub fn run(
         std.log.err("cannot reach daemon: {t}", .{e});
         return 1;
     };
-    defer conn.deinit();
+    var conn_owned = true;
+    defer if (conn_owned) conn.deinit();
 
     var loaded_config = try config.load(gpa, io, environ);
     defer loaded_config.deinit();
@@ -4205,16 +4419,21 @@ pub fn run(
         }
 
         // -- daemon reader thread --
-        var rt = try std.Thread.spawn(.{}, readerThread, .{ &app, &loop });
+        var rt = try std.Thread.spawn(.{}, readerThread, .{ app.gpa, app.conn, &loop });
         // Joined at exit: we shutdown() the socket which EOFs the reader —
         // closing the fd under a live read is a BADF panic on the Threaded Io.
         // Both defers read their CURRENT values: reconnection replaces the
         // conn and respawns the reader mid-session.
+        defer app.conn.deinit();
         defer rt.join();
         defer app.conn.shutdown();
+        conn_owned = false;
         var reconnect_job: ReconnectJob = undefined;
         var reconnect_thread: ?std.Thread = null;
-        defer if (reconnect_thread) |t| t.join();
+        defer if (reconnect_thread) |t| {
+            reconnect_job.stop();
+            t.join();
+        };
         // Lightweight catalog/status updates for every session; block streams
         // remain subscribed only for the focused session.
         try conn.send(.{ .session_watch = .{ .incremental = true } });
@@ -4378,6 +4597,7 @@ pub fn run(
         // fresh Conn (and its ssh child) queued and unowned: join the worker
         // first, then reap anything it posted.
         if (reconnect_thread) |t| {
+            reconnect_job.stop();
             t.join();
             reconnect_thread = null;
         }
@@ -4572,7 +4792,11 @@ fn isPreviousInputRowKey(key: vaxis.Key) bool {
 }
 
 fn isNextInputRowKey(key: vaxis.Key) bool {
-    return key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true });
+    return key.matches(vaxis.Key.down, .{});
+}
+
+fn isNewSessionKey(key: vaxis.Key) bool {
+    return key.matches('n', .{ .ctrl = true });
 }
 
 fn applyEditCommand(ed: *Editor, command: EditCommand) void {
@@ -4701,6 +4925,13 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.picker = 0;
             }
         }
+        return;
+    }
+
+    // A mode-independent, single-chord alias for /new. Pickers retain Vim's
+    // Ctrl+n navigation because their modal block above consumes it first.
+    if (isNewSessionKey(key)) {
+        app.newSession() catch app.setNotice("could not create session", .{});
         return;
     }
 
@@ -5247,7 +5478,9 @@ test "standard editor key bindings map to commands" {
     try std.testing.expect(isPreviousInputRowKey(.{ .codepoint = vaxis.Key.up }));
     try std.testing.expect(isPreviousInputRowKey(.{ .codepoint = 'p', .mods = .{ .ctrl = true } }));
     try std.testing.expect(isNextInputRowKey(.{ .codepoint = vaxis.Key.down }));
-    try std.testing.expect(isNextInputRowKey(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
+    try std.testing.expect(!isNextInputRowKey(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
+    try std.testing.expect(isNewSessionKey(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
+    try std.testing.expect(!isNewSessionKey(.{ .codepoint = 'n' }));
 }
 
 test "normal-mode tab shortcuts recognize angle brackets and arrows" {
@@ -5315,6 +5548,74 @@ test "Ctrl+C never exits an idle TUI or destroys its draft" {
     try std.testing.expect(!app.should_quit);
     try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
     try std.testing.expectEqualStrings("nothing to interrupt · q or /quit exits", app.notice.items);
+}
+
+test "correlated session creation replies clear only the matching pending request" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .awaiting_new_session = true,
+        .pending_new_session_request_id = 77,
+    };
+    defer app.deinit();
+    try app.pending_new_cwd.appendSlice(gpa, "/work");
+
+    const unrelated = try proto.encode(gpa, proto.DaemonMsg{ .err = .{
+        .code = "request_failed",
+        .msg = "other request failed",
+        .request_id = 76,
+    } });
+    app.handleDaemonLine(unrelated);
+    try std.testing.expect(app.awaiting_new_session);
+    try std.testing.expectEqual(@as(u64, 77), app.pending_new_session_request_id);
+
+    const matching = try proto.encode(gpa, proto.DaemonMsg{ .err = .{
+        .code = "request_failed",
+        .msg = "create failed",
+        .request_id = 77,
+    } });
+    app.handleDaemonLine(matching);
+    try std.testing.expect(!app.awaiting_new_session);
+    try std.testing.expectEqual(@as(u64, 0), app.pending_new_session_request_id);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_new_cwd.items.len);
+}
+
+test "Ctrl+N aliases /new in either mode while pickers keep navigation" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        // Avoid touching the deliberately absent test connection: this also
+        // verifies key repeat cannot issue a second create request.
+        .awaiting_new_session = true,
+    };
+    defer app.deinit();
+    app.editor.insertSlice("draft survives");
+
+    for ([_]Mode{ .insert, .normal }) |mode| {
+        app.mode = mode;
+        try handleKey(&app, .{ .codepoint = 'n', .mods = .{ .ctrl = true } });
+        try std.testing.expectEqualStrings("new session already being created", app.notice.items);
+        try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
+    }
+
+    app.awaiting_new_session = false;
+    app.picker_kind = .effort;
+    app.picker = 0;
+    try handleKey(&app, .{ .codepoint = 'n', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqual(@as(?usize, 1), app.picker);
+    try std.testing.expect(!app.awaiting_new_session);
 }
 
 test "Escape leaves normal mode after closing any active picker" {
@@ -5940,16 +6241,40 @@ test "replay marker completes a bounded tail without needing a connection" {
         .newest_seq = 275,
         .has_older = true,
         .plan_items = &.{
-            .{ .step = "Inspect", .status = .completed },
-            .{ .step = "Implement", .status = .in_progress },
+            .{ .step = "Inspect", .status = .completed, .duration_ms = 18_400 },
+            .{ .step = "Implement", .status = .in_progress, .started_at_ms = 20_000 },
         },
     } }));
     try std.testing.expectEqual(@as(u64, 20), app.oldest_seq);
     try std.testing.expect(!app.history_complete);
     try std.testing.expect(!app.history_loading);
     try std.testing.expectEqual(@as(usize, 2), app.plan.items.len);
+    try std.testing.expectEqual(@as(u64, 18_400), app.plan.items[0].duration_ms);
     try std.testing.expectEqualStrings("Implement", app.plan.items[1].step);
     try std.testing.expectEqual(block.PlanStatus.in_progress, app.plan.items[1].status);
+    try std.testing.expectEqual(@as(i64, 20_000), app.plan.items[1].started_at_ms);
+}
+
+test "replay marker does not repin a completed plan archived by a later turn" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 7,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    app.setPlan(&.{.{ .step = "Done", .status = .completed, .duration_ms = 1_000 }});
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{
+        .sid = 7,
+        .plan_pinned = false,
+        .plan_items = &.{.{ .step = "Done", .status = .completed, .duration_ms = 1_000 }},
+    } }));
+    try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
 }
 
 test "older replay page is prepended atomically in transcript order" {
@@ -7056,7 +7381,7 @@ test "J joins lines; gg tops; gt cycles sessions" {
     try std.testing.expect(app.sel_clear_after_copy);
 }
 
-test "plan strip centers unfinished work and collapses when complete" {
+test "plan table centers current work and retains completed timings" {
     const items = [_]PlanItemOwned{
         .{ .step = @constCast("one"), .status = .completed },
         .{ .step = @constCast("two"), .status = .completed },
@@ -7073,8 +7398,121 @@ test "plan strip centers unfinished work and collapses when complete" {
         .{ .step = @constCast("one"), .status = .completed },
         .{ .step = @constCast("two"), .status = .completed },
     };
-    try std.testing.expectEqual(@as(usize, 0), planDisplayRange(&completed, 5).len);
+    try std.testing.expectEqual(@as(usize, 2), planDisplayRange(&completed, 5).len);
     try std.testing.expectEqual(@as(usize, 0), planDisplayRange(&items, 0).len);
+    try std.testing.expect(hasUnfinishedPlan(&items));
+    try std.testing.expect(!hasUnfinishedPlan(&completed));
+}
+
+test "completed plan remains durable when a new prompt unpins it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.applyBlock(.{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 0,
+        .body = .{ .plan = .{ .items = &.{.{ .step = "Inspect", .status = .in_progress }} } },
+    });
+    try std.testing.expectEqual(@as(usize, 0), app.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.plan.items.len);
+
+    app.applyBlock(.{
+        .id = 2,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 2,
+        .ts = 0,
+        .body = .{ .plan = .{ .items = &.{.{
+            .step = "Inspect",
+            .status = .completed,
+            .duration_ms = 4_200,
+        }} } },
+    });
+    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
+    try std.testing.expectEqual(block.BlockKind.plan, app.blocks.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), app.plan.items.len);
+
+    app.applyBlock(.{
+        .id = 3,
+        .session_id = 1,
+        .turn_id = 2,
+        .seq = 3,
+        .ts = 0,
+        .body = .{ .user_msg = .{ .text = "what next?" } },
+    });
+    try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.blocks.items.len);
+    try std.testing.expectEqual(block.BlockKind.plan, app.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("Inspect", app.blocks.items[0].plan_items[0].step);
+}
+
+test "plan table uses semantic markers, stable columns, and concise timing" {
+    const pending = planMarker(.pending, 0);
+    const active = planMarker(.in_progress, 3);
+    const completed = planMarker(.completed, 0);
+
+    try std.testing.expectEqualStrings("·", pending.glyph);
+    try std.testing.expectEqualStrings(spinner_frames[3], active.glyph);
+    try std.testing.expectEqualStrings("✔", completed.glyph);
+    try std.testing.expectEqual(@as(usize, 1), displayWidth(completed.glyph));
+    try std.testing.expect(vaxis.Color.eql(Palette.plan_done_mark.fg, completed.glyph_style.fg));
+    try std.testing.expect(vaxis.Color.eql(Palette.plan_pending.fg, completed.text_style.fg));
+    try std.testing.expect(!completed.text_style.dim);
+    try std.testing.expect(active.text_style.bold);
+
+    const wide = planTableWidths(80);
+    try std.testing.expectEqual(@as(usize, 67), wide.task);
+    try std.testing.expectEqual(@as(usize, 10), wide.time);
+    const narrow = planTableWidths(20);
+    try std.testing.expectEqual(@as(usize, 10), narrow.task);
+    try std.testing.expectEqual(@as(usize, 7), narrow.time);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("<1s", try formatPlanDuration(arena, 450));
+    try std.testing.expectEqualStrings("18s", try formatPlanDuration(arena, 18_400));
+    try std.testing.expectEqualStrings("2m 5s", try formatPlanDuration(arena, 125_000));
+    try std.testing.expectEqualStrings("1h 2m", try formatPlanDuration(arena, 3_720_000));
+    const task_rule = try planRule(arena, wide.task);
+    const time_rule = try planRule(arena, wide.time);
+    try std.testing.expectEqual(@as(usize, 67), displayWidth(task_rule));
+    try std.testing.expectEqual(@as(usize, 10), displayWidth(time_rule));
+    try std.testing.expect(std.mem.indexOf(u8, task_rule, "TODO") == null);
+    try std.testing.expect(std.mem.indexOf(u8, time_rule, "TIME") == null);
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = std.testing.allocator,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(std.testing.allocator),
+        .state = .running,
+    };
+    defer app.deinit();
+    const timed_active = PlanItemOwned{
+        .step = @constCast("work"),
+        .status = .in_progress,
+        .started_at_ms = 2_000,
+        .duration_ms = 3_000,
+    };
+    try std.testing.expectEqual(@as(?u64, 6_000), planItemTimeMs(&app, timed_active, 5_000));
+    app.state = .idle;
+    try std.testing.expectEqual(@as(?u64, 3_000), planItemTimeMs(&app, timed_active, 50_000));
 }
 
 test "parked approvals are findable per tree and globally; badge follows the session" {
