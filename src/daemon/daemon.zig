@@ -548,7 +548,6 @@ pub const Daemon = struct {
         self.clients_mutex.unlock(self.io);
     }
 
-
     fn lookupClient(self: *Daemon, id: u64) ?*Client {
         self.clients_mutex.lockUncancelable(self.io);
         defer self.clients_mutex.unlock(self.io);

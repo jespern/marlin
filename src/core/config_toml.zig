@@ -55,6 +55,7 @@ pub const Document = struct {
     permissions_enabled: ?bool = null,
     workspace_enabled: ?bool = null,
     web_enabled: ?bool = null,
+    web_tailscale: ?bool = null,
     network_blocklists: ?[]const u8 = null,
     network_allow: ?[]const u8 = null,
     network_deny: ?[]const u8 = null,
@@ -174,8 +175,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             .workspace => if (std.mem.eql(u8, key, "enabled")) {
                 doc.workspace_enabled = try boolean(value);
             },
-            .web => if (std.mem.eql(u8, key, "enabled")) {
-                doc.web_enabled = try boolean(value);
+            .web => {
+                if (std.mem.eql(u8, key, "enabled")) doc.web_enabled = try boolean(value);
+                if (std.mem.eql(u8, key, "tailscale")) doc.web_tailscale = try boolean(value);
             },
             .network => {
                 if (std.mem.eql(u8, key, "blocklists")) doc.network_blocklists = try string(arena, value);

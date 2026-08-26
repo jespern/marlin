@@ -152,38 +152,41 @@ daemons, mutually invisible. Autostart/flock logic stays inside the user's
 runtime dir, never system-wide. Clients — local or remote — are ephemeral
 views: nothing lives in a client but a render cache and a draft input box.
 
-**Mode B — protocol over ssh (design; not yet implemented).** Intended to
-become the primary remote path once built — today there is no `_pipe`
-subcommand, no named remotes, and no proto-over-ssh transport; Mode A is
-the only remote access that ships.
+**Mode B — protocol over ssh (SHIPPED; the primary remote path).**
 
-Decision (2026-08): Mode B is the herdr/tmux replacement and the next
-surface that opens. The end state is `marlin --remote <host>` as the ONLY
-terminal tool in the daily drive — full mux (tabs, approvals, drafts),
-local clipboard and image paste, OSC 52 — with ssh/mosh as dumb pipes
-underneath. No new transport protocol, ever. The web client is the
-companion for phones and terminal-less machines, exposed via tailscale
-(`tailscale serve` in front of the token-gated localhost port; at most a
-thin `marlin web --tailscale` convenience that shells out to it) rather
-than marlin-grown TLS/auth machinery.
+Decision (2026-08): Mode B is the herdr/tmux replacement. The end state is
+the remote-named invocation as the ONLY terminal tool in the daily drive —
+full mux (tabs, approvals, drafts), local clipboard and image paste,
+OSC 52 — with ssh as a dumb pipe underneath. No new transport protocol,
+ever. The web client is the companion for phones and terminal-less
+machines, exposed via automatic `tailscale serve` in front of the
+localhost port (Host/Origin-checked, tokenless — the tailnet is the trust
+boundary) rather than marlin-grown TLS/auth machinery.
 
-The design: a local `marlin` client
-speaks the wire protocol to a remote daemon, ssh carrying NDJSON instead
-of terminal frames:
+A local `marlin` client speaks the wire protocol to a remote daemon, ssh
+carrying NDJSON instead of terminal frames. `--remote <host>` routes the
+whole invocation, so every subcommand works remotely:
 
 ```
-marlin attach work      # ssh work ... → daemon.sock; blocks stream back
-marlin ls work
+marlin --remote work             # TUI attached to the work box's daemon
+marlin --remote work ls
+marlin --remote work run "task"
+marlin --remote work web         # browser UI served locally, remote daemon
 ```
 
-Transport is `ssh <host> nc -U <sock>` (or an equivalent stdio bridge
-subcommand, `marlin _pipe`, to drop the nc dependency). Named remotes in
-config:
+Transport is `ssh <host> marlin _pipe`: an internal stdio↔daemon.sock
+bridge on the remote (readiness-probed, with daemon autostart), spawned
+per connection as a child of the local client. Dispatch puts the host in
+MARLIN_REMOTE, which `attach.connect` reads — so the TUI, its reconnects,
+headless commands, and the web bridge all inherit remote support from the
+one connect path. Marlin keeps NO host registry: `<host>` goes to ssh
+verbatim, and ssh config owns naming, keys, agent, and jump hosts. A shell
+alias covers the daily case (`alias mw='marlin --remote work'`). mosh
+remains a Mode A transport only — it carries terminal frames, not stdio.
 
-```toml
-[remote.work]
-host = "work"           # ssh config name; keys/agent/jump hosts all apply
-```
+Known gaps: `marlin` must be on the remote's non-login-shell PATH (the
+connect error says so), and `/reboot --build` under a remote rebuilds the
+LOCAL binary; refreshing the remote daemon still means a shell there.
 
 Why primary: from_seq replay resynchronizes STATE, not a screen — a
 dropped connection reconnects with zero lost blocks (better than mosh for

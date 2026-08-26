@@ -4,9 +4,11 @@ const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
 
+const attach = @import("client/attach.zig");
 const cc_approve = @import("client/cc_approve.zig");
 const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
+const pipe = @import("client/pipe.zig");
 const landlock = @import("daemon/landlock.zig");
 const permissions = @import("daemon/permissions.zig");
 const sandbox = @import("daemon/sandbox.zig");
@@ -33,6 +35,7 @@ pub const Command = enum {
     cc_approve,
     landlock_exec,
     sandbox_probe,
+    _pipe,
 
     pub fn parse(word: []const u8) ?Command {
         inline for (@typeInfo(Command).@"enum".fields) |f| {
@@ -49,11 +52,21 @@ pub fn dispatch(
     self_exe: []const u8,
     args: []const [:0]const u8,
 ) !u8 {
-    const cmd: Command = if (args.len == 0)
+    // `marlin --remote <host> [command …]` routes the entire invocation at
+    // that host's daemon (Mode B). <host> is handed to ssh verbatim — ssh
+    // config owns naming, keys, and jump hosts; marlin adds no host registry.
+    // The host rides in MARLIN_REMOTE, which attach.connect reads, so
+    // TUI/headless/web all work unchanged over ssh.
+    var effective = args;
+    if (args.len >= 2 and std.mem.eql(u8, args[0], "--remote")) {
+        try environ.put(attach.remote_env, args[1]);
+        effective = args[2..];
+    }
+    const cmd: Command = if (effective.len == 0)
         .attach
     else
-        Command.parse(args[0]) orelse .help;
-    const rest = if (args.len == 0) args else args[1..];
+        Command.parse(effective[0]) orelse .help;
+    const rest = if (effective.len == 0) effective else effective[1..];
 
     switch (cmd) {
         .version => try stdoutPrint(io, "marlin {s}\n", .{build_options.version}),
@@ -66,6 +79,9 @@ pub fn dispatch(
         .landlock_exec => return landlock.run(gpa, io, rest),
         // Diagnostic: run the platform sandbox canary and report the verdict.
         .sandbox_probe => return sandboxProbe(gpa, io, environ),
+        // Internal stdio↔daemon.sock bridge, the far end of `ssh <host>
+        // marlin _pipe` remote attach; omitted from help.
+        ._pipe => return pipe.run(gpa, io, environ, self_exe),
         .help => try stdoutPrint(io, help_text, .{}),
         .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
@@ -174,7 +190,10 @@ const help_text =
     \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
     \\  marlin shutdown        stop the daemon
     \\  marlin web [--port N]  local web UI — opt-in via [web] enabled = true
-    \\                         (127.0.0.1:8377; token-gated, localhost only)
+    \\                         (127.0.0.1:8377; tailnet via tailscale serve)
+    \\  marlin --remote <host> [command …]  run any of the above against
+    \\                         <host>'s daemon over ssh (host is an ssh
+    \\                         destination; ssh config names apply)
     \\  marlin help | version
     \\
 ;

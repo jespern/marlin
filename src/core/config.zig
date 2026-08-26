@@ -85,6 +85,12 @@ pub const Config = struct {
     /// daemon capability (including shutdown). `[web] enabled = true` or
     /// MARLIN_WEB=1 turns it on.
     web_enabled: bool = false,
+
+    /// `marlin web` attempts `tailscale serve` so the UI is reachable at a
+    /// fixed tailnet https URL (the tailnet is the trust boundary). On by
+    /// default; degrades silently to localhost-only when tailscale is absent
+    /// or logged out. `[web] tailscale = false` opts out.
+    web_tailscale: bool = true,
 };
 
 pub fn defaults() Config {
@@ -479,6 +485,7 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.permissions_enabled) |value| cfg.permissions_enabled = value;
     if (doc.workspace_enabled) |value| cfg.workspace_enabled = value;
     if (doc.web_enabled) |value| cfg.web_enabled = value;
+    if (doc.web_tailscale) |value| cfg.web_tailscale = value;
     if (doc.network_blocklists) |value| cfg.network_blocklists = value;
     if (doc.network_allow) |value| cfg.network_allow = value;
     if (doc.network_deny) |value| cfg.network_deny = value;

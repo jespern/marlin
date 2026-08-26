@@ -112,18 +112,21 @@ Exit: a named council can adversarially review a real repository with a custom
 focus, all reviewer sessions are inspectable/resumable, and the parent renders
 an evidence-backed triage table without granting reviewer write authority.
 
-## M6c — remote door, scheduled on evidence
+## M6c — remote door: DECIDED and shipped (2026-08)
 
-Do not let transport delay children/councils. If remote attach becomes a real
-near-term workflow, decide the trust boundary first:
+The trust boundary decision, recorded:
 
-- Prefer SSH-carried NDJSON for machine-to-machine use already protected by
-  SSH configuration.
-- If TCP remains necessary, bind explicitly, authenticate before any session
-  metadata, use constant-time token checks and strict permissions, rate-limit
-  failures, and state where transport encryption comes from. A bearer token on
-  plaintext public TCP is not an acceptable remote story.
-- Only then evaluate a PWA as a sibling protocol client.
+- Terminals: SSH-carried NDJSON (`marlin --remote <host> …` → `ssh <host>
+  marlin _pipe`). SSH configuration is the entire naming and auth story;
+  marlin keeps no host registry and adds no credentials.
+- Phone/PWA: the tailnet. `marlin web` runs `tailscale serve` automatically
+  (opt-out via `[web] tailscale = false`), giving a fixed tokenless https
+  URL; the web layer validates Host and Origin to stop DNS rebinding and
+  cross-site POSTs, and that is ALL it does — device identity and transport
+  encryption belong to the tailnet.
+- marlin never grows its own TCP listener, TLS, or bearer tokens. A hostile
+  local user remains out of scope (single-user machines; loopback is
+  machine-wide, so do not enable [web] on shared boxes).
 
 ## Explicitly Later
 

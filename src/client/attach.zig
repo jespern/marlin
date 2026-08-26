@@ -1,6 +1,14 @@
 //! Socket client shared by TUI and headless: connect (with daemon autostart),
 //! handshake, NDJSON read/write.
 //!
+//! Two transports behind one Conn: the local unix socket, and a child
+//! process speaking NDJSON on its stdio — `ssh <host> marlin _pipe` — which
+//! is Mode B of ARCHITECTURE.md's remote-access design. The ssh destination
+//! rides in MARLIN_REMOTE (set by `marlin --remote <host>` dispatch) so
+//! every caller — TUI including reconnects, headless commands, the web
+//! bridge — inherits it without signature churn. Marlin keeps no host
+//! registry: naming, keys, agent, and jump hosts are all ssh config's.
+//!
 //! DEPENDENCY RULE: client/ imports only core/ (never daemon/). This is what
 //! keeps "the TUI is just a client" true.
 
@@ -8,12 +16,40 @@ const std = @import("std");
 const Io = std.Io;
 const proto = @import("../core/proto.zig");
 
+/// Environment key CLI dispatch uses to route a whole invocation at a
+/// remote daemon; the value is an ssh destination, passed to ssh verbatim.
+/// Empty/absent = local socket.
+pub const remote_env = "MARLIN_REMOTE";
+
+pub const Transport = union(enum) {
+    socket: Socket,
+    child: Child,
+
+    pub const Socket = struct {
+        stream: Io.net.Stream,
+        reader: Io.net.Stream.Reader,
+        writer: Io.net.Stream.Writer,
+    };
+
+    pub const Child = struct {
+        process: std.process.Child,
+        stdin: Io.File,
+        stdout: Io.File,
+        reader: Io.File.Reader,
+        writer: Io.File.Writer,
+        /// Set by the handshake watchdog; deinit must not kill twice.
+        killed: bool = false,
+    };
+};
+
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     io: Io,
-    stream: Io.net.Stream,
-    reader: Io.net.Stream.Reader,
-    writer: Io.net.Stream.Writer,
+    transport: Transport,
+    /// Generic NDJSON endpoints into the active transport. Stable for the
+    /// life of the Conn: they point into `transport`, and Conn is heap-pinned.
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
     rbuf: []u8,
     wbuf: []u8,
     /// Daemon capabilities from hello_ok; populated by connect().
@@ -24,23 +60,45 @@ pub const Conn = struct {
     network_rule_count: u64 = 0,
 
     pub fn deinit(self: *Conn) void {
-        self.stream.close(self.io);
+        switch (self.transport) {
+            .socket => |*s| s.stream.close(self.io),
+            .child => |*c| {
+                // Closing stdio first gives ssh/_pipe the EOF they exit on;
+                // kill covers hung transports and reaps either way.
+                c.stdin.close(self.io);
+                c.stdout.close(self.io);
+                if (!c.killed) c.process.kill(self.io);
+            },
+        }
         self.gpa.free(self.rbuf);
         self.gpa.free(self.wbuf);
         self.gpa.destroy(self);
     }
 
+    /// Force any blocked read/write on this connection to fail — the
+    /// transport-aware release for reader threads (TUI exit) and the
+    /// handshake watchdog. The owner deinits after joining those threads.
+    pub fn shutdown(self: *Conn) void {
+        switch (self.transport) {
+            .socket => |*s| s.stream.shutdown(self.io, .both) catch {},
+            .child => |*c| {
+                c.process.kill(self.io);
+                c.killed = true;
+            },
+        }
+    }
+
     pub fn send(self: *Conn, msg: proto.ClientMsg) !void {
         const line = try proto.encode(self.gpa, msg);
         defer self.gpa.free(line);
-        try self.writer.interface.writeAll(line);
-        try self.writer.interface.flush();
+        try self.writer.writeAll(line);
+        try self.writer.flush();
     }
 
     /// Read one owned wire record. Callers that need to retain the raw JSON
     /// (the TUI reader/SSE bridge) free it with this connection's allocator.
     pub fn readLine(self: *Conn) ![]u8 {
-        return proto.readLineAlloc(self.gpa, &self.reader.interface);
+        return proto.readLineAlloc(self.gpa, self.reader);
     }
 
     /// Read one DaemonMsg. Returned value references `arena` memory.
@@ -89,12 +147,18 @@ pub fn tryConnect(gpa: std.mem.Allocator, io: Io, environ: *const std.process.En
     conn.* = .{
         .gpa = gpa,
         .io = io,
-        .stream = stream,
-        .reader = Io.net.Stream.Reader.init(stream, io, rbuf),
-        .writer = Io.net.Stream.Writer.init(stream, io, wbuf),
+        .transport = .{ .socket = .{
+            .stream = stream,
+            .reader = Io.net.Stream.Reader.init(stream, io, rbuf),
+            .writer = Io.net.Stream.Writer.init(stream, io, wbuf),
+        } },
+        .reader = undefined,
+        .writer = undefined,
         .rbuf = rbuf,
         .wbuf = wbuf,
     };
+    conn.reader = &conn.transport.socket.reader.interface;
+    conn.writer = &conn.transport.socket.writer.interface;
     return conn;
 }
 
@@ -112,9 +176,14 @@ fn isTransientHandshakeError(err: anyerror) bool {
 }
 
 const handshake_timeout_ms: u32 = 2_000;
+/// Remote handshakes cover ssh session setup, remote daemon autostart, and
+/// possibly an interactive ssh auth prompt on /dev/tty; a local-socket
+/// deadline would kill every one of them.
+const remote_handshake_timeout_ms: u32 = 30_000;
 
 const HandshakeDeadline = struct {
     conn: *Conn,
+    timeout_ms: u32,
     done: Io.Event = .unset,
     fired: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
@@ -130,20 +199,20 @@ const HandshakeDeadline = struct {
 
     fn watch(self: *HandshakeDeadline) void {
         self.done.waitTimeout(self.conn.io, .{ .duration = .{
-            .raw = .fromMilliseconds(handshake_timeout_ms),
+            .raw = .fromMilliseconds(self.timeout_ms),
             .clock = .awake,
         } }) catch |err| switch (err) {
             error.Timeout => {
                 self.fired.store(true, .release);
-                self.conn.stream.shutdown(self.conn.io, .both) catch {};
+                self.conn.shutdown();
             },
             error.Canceled => return,
         };
     }
 };
 
-fn handshake(conn: *Conn) !void {
-    var deadline = HandshakeDeadline{ .conn = conn };
+fn handshake(conn: *Conn, timeout_ms: u32) !void {
+    var deadline = HandshakeDeadline{ .conn = conn, .timeout_ms = timeout_ms };
     try deadline.start();
     defer deadline.finish();
 
@@ -163,18 +232,24 @@ fn handshake(conn: *Conn) !void {
 }
 
 /// Connect, autostarting the daemon if needed. Handshakes (hello/hello_ok).
+/// With MARLIN_REMOTE set, the "daemon" is reached through `ssh <host>
+/// <bin> _pipe` instead of the local socket — autostart then happens on the
+/// remote box, inside _pipe's own connect.
 pub fn connect(
     gpa: std.mem.Allocator,
     io: Io,
     environ: *const std.process.Environ.Map,
     self_exe: []const u8,
 ) !*Conn {
+    if (environ.get(remote_env)) |host| {
+        if (host.len > 0) return connectRemote(gpa, io, host);
+    }
     var spawned = false;
     var attempt: u32 = 0;
     while (attempt < 100) : (attempt += 1) {
         const conn = try tryConnect(gpa, io, environ);
         if (conn) |candidate| {
-            handshake(candidate) catch |err| {
+            handshake(candidate, handshake_timeout_ms) catch |err| {
                 candidate.deinit();
                 if (!isTransientHandshakeError(err)) return err;
                 io.sleep(.fromMilliseconds(50), .awake) catch {};
@@ -206,6 +281,74 @@ pub fn connect(
         io.sleep(.fromMilliseconds(50), .awake) catch {};
     }
     return error.DaemonStartFailed;
+}
+
+/// `host` is an ssh destination, verbatim — ssh config owns naming, keys,
+/// agent, and jump hosts; marlin keeps no host registry. No BatchMode: ssh
+/// auth prompts use /dev/tty, so key-less setups still work at first
+/// connect; the remote handshake deadline is the hang backstop.
+fn connectRemote(gpa: std.mem.Allocator, io: Io, host: []const u8) !*Conn {
+    // One transient retry, not the local loop's hundred: each attempt pays
+    // full ssh session setup, and the case worth absorbing is a remote
+    // daemon dying/rebooting mid-hello, not a slow start (the remote _pipe
+    // owns autostart patience).
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        const conn = try spawnChildConn(gpa, io, &.{ "ssh", host, "marlin", "_pipe" });
+        handshake(conn, remote_handshake_timeout_ms) catch |err| {
+            conn.deinit();
+            if (attempt < 1 and isTransientHandshakeError(err)) {
+                io.sleep(.fromMilliseconds(250), .awake) catch {};
+                continue;
+            }
+            std.log.err(
+                "could not reach `ssh {s} marlin _pipe`: {t} (is marlin on {s}'s PATH for non-login shells?)",
+                .{ host, err, host },
+            );
+            return err;
+        };
+        return conn;
+    }
+}
+
+fn spawnChildConn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) !*Conn {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    errdefer child.kill(io);
+    const stdin_file = child.stdin.?;
+    child.stdin = null;
+    const stdout_file = child.stdout.?;
+    child.stdout = null;
+
+    const conn = try gpa.create(Conn);
+    errdefer gpa.destroy(conn);
+    const rbuf = try gpa.alloc(u8, 64 * 1024);
+    errdefer gpa.free(rbuf);
+    const wbuf = try gpa.alloc(u8, 256 * 1024);
+    errdefer gpa.free(wbuf);
+    conn.* = .{
+        .gpa = gpa,
+        .io = io,
+        .transport = .{ .child = .{
+            .process = child,
+            .stdin = stdin_file,
+            .stdout = stdout_file,
+            .reader = stdout_file.reader(io, rbuf),
+            .writer = stdin_file.writer(io, wbuf),
+        } },
+        .reader = undefined,
+        .writer = undefined,
+        .rbuf = rbuf,
+        .wbuf = wbuf,
+    };
+    conn.reader = &conn.transport.child.reader.interface;
+    conn.writer = &conn.transport.child.writer.interface;
+    return conn;
 }
 
 const FlakyHelloServer = struct {
@@ -298,6 +441,27 @@ test "connect retries when a dying daemon closes during hello" {
 
     try std.testing.expect(!flaky.failed.load(.acquire));
     try std.testing.expect(conn.network_filtering);
+}
+
+test "child transport handshakes over subprocess stdio" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A fake `_pipe`: consume the hello line, answer hello_ok, then swallow
+    // everything until stdin EOF (which deinit provides by closing it).
+    const conn = try spawnChildConn(gpa, io, &.{
+        "/bin/sh", "-c",
+        "read line; printf '{\"hello_ok\":{\"proto_version\":1,\"daemon_version\":\"fake\",\"sandbox_available\":true}}\\n'; cat > /dev/null",
+    });
+    handshake(conn, 5_000) catch |err| {
+        conn.deinit();
+        return err;
+    };
+    defer conn.deinit();
+    try std.testing.expect(conn.sandbox_available);
+    try std.testing.expect(conn.transport == .child);
 }
 
 test "connect times out when an accepted socket never completes hello" {
