@@ -18,6 +18,7 @@
 //! driver currently lives in loop.zig (a remaining wall leak).
 
 const std = @import("std");
+const Effort = @import("../../core/effort.zig").Effort;
 
 /// Env override for the binary; also the test seam for fixture scripts.
 pub const binary_env = "MARLIN_CLAUDE_CODE_BIN";
@@ -51,7 +52,23 @@ pub const ArgvOpts = struct {
     /// never prompts at all.
     bridge: ?Bridge = null,
     max_turns: u32,
+    /// Marlin effort; `auto` omits `--effort`. Claude Code accepts
+    /// low/medium/high/xhigh/max (`claude --help`).
+    effort: Effort = .auto,
 };
+
+/// Map Marlin effort onto Claude `--effort`. `auto` means omit the flag.
+/// `none`/`minimal` have no CC equivalent and collapse to `low`.
+pub fn effortFlag(effort: Effort) ?[]const u8 {
+    return switch (effort) {
+        .auto => null,
+        .none, .minimal, .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+        .max => "max",
+    };
+}
 
 pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
@@ -99,6 +116,9 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
         "--max-turns",
         try std.fmt.allocPrint(arena, "{d}", .{opts.max_turns}),
     });
+    if (effortFlag(opts.effort)) |level| {
+        try argv.appendSlice(arena, &.{ "--effort", level });
+    }
     return argv.items;
 }
 
@@ -204,6 +224,8 @@ pub fn decodeLine(
     }
     if (std.mem.eql(u8, t, "user")) {
         const content = messageContent(root) orelse return;
+        var first_result: ?usize = null;
+        var result_count: usize = 0;
         for (content) |item| {
             if (item != .object) continue;
             const bt = strField(item.object, "type") orelse continue;
@@ -213,6 +235,16 @@ pub fn decodeLine(
                 .text = try flattenContent(arena, item.object.get("content")),
                 .is_error = boolField(item.object, "is_error") orelse false,
             } });
+            if (first_result == null) first_result = out.items.len - 1;
+            result_count += 1;
+        }
+        // The event-level toolUseResult describes ONE result; only adopt it
+        // when the mapping is unambiguous, and never over an error text.
+        if (result_count == 1) {
+            const tr = &out.items[first_result.?].tool_result;
+            if (!tr.is_error) {
+                if (diffFromToolUseResult(arena, root)) |diff| tr.text = diff;
+            }
         }
         return;
     }
@@ -252,6 +284,44 @@ fn messageContent(root: std.json.ObjectMap) ?[]std.json.Value {
     if (msg != .object) return null;
     const content = msg.object.get("content") orelse return null;
     return if (content == .array) content.array.items else null;
+}
+
+/// Claude Code attaches rich tool metadata to the EVENT, not to the
+/// model-facing content: for Edit/Write/MultiEdit the top-level
+/// `toolUseResult.structuredPatch` carries the hunks its own UI renders as a
+/// diff, while `message.content` only says "The file … has been updated
+/// successfully". Reconstruct a unified diff so marlin's clients — which
+/// already colorize @@-hunk tool bodies — show the actual change. The field
+/// is undocumented CC internals: ANY shape surprise returns null and the
+/// caller keeps the flat text (fail soft, never error).
+fn diffFromToolUseResult(arena: std.mem.Allocator, root: std.json.ObjectMap) ?[]const u8 {
+    const tur = root.get("toolUseResult") orelse return null;
+    if (tur != .object) return null;
+    const patch = tur.object.get("structuredPatch") orelse return null;
+    if (patch != .array or patch.array.items.len == 0) return null;
+
+    var acc: std.Io.Writer.Allocating = .init(arena);
+    const w = &acc.writer;
+    if (strField(tur.object, "filePath")) |path| {
+        w.print("--- a{s}\n+++ b{s}\n", .{ path, path }) catch return null;
+    }
+    for (patch.array.items) |hunk_value| {
+        if (hunk_value != .object) return null;
+        const hunk = hunk_value.object;
+        const old_start = uintField(hunk, "oldStart") orelse return null;
+        const old_lines = uintField(hunk, "oldLines") orelse return null;
+        const new_start = uintField(hunk, "newStart") orelse return null;
+        const new_lines = uintField(hunk, "newLines") orelse return null;
+        const lines = hunk.get("lines") orelse return null;
+        if (lines != .array) return null;
+        w.print("@@ -{d},{d} +{d},{d} @@\n", .{ old_start, old_lines, new_start, new_lines }) catch return null;
+        for (lines.array.items) |line_value| {
+            if (line_value != .string) return null;
+            w.print("{s}\n", .{line_value.string}) catch return null;
+        }
+    }
+    const text = acc.toOwnedSlice() catch return null;
+    return std.mem.trimEnd(u8, text, "\n");
 }
 
 /// tool_result content is a string or an array of text blocks; flatten.
@@ -334,6 +404,23 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     try std.testing.expectEqualStrings("fable-5", fresh[7]);
     try std.testing.expectEqualStrings("--permission-mode", fresh[10]);
     try std.testing.expectEqualStrings("acceptEdits", fresh[11]);
+    for (fresh) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--effort"));
+
+    const high = try buildArgv(arena, .{
+        .binary = "claude",
+        .prompt = "hi",
+        .model = "fable-5",
+        .session_uuid = "u-u-i-d",
+        .fresh = true,
+        .permissions = .bypass,
+        .max_turns = 8,
+        .effort = .high,
+    });
+    try std.testing.expectEqualStrings("--effort", high[high.len - 2]);
+    try std.testing.expectEqualStrings("high", high[high.len - 1]);
+    try std.testing.expectEqualStrings("low", effortFlag(.none).?);
+    try std.testing.expectEqualStrings("low", effortFlag(.minimal).?);
+    try std.testing.expect(effortFlag(.auto) == null);
 
     const resumed = try buildArgv(arena, .{
         .binary = "claude",
@@ -412,6 +499,48 @@ test "decode: init, assistant blocks, tool_result shapes, result usage" {
     try std.testing.expectEqual(@as(u64, 5), result.tokens_out);
     try std.testing.expectEqual(@as(u64, 90), result.cached_tokens);
     try std.testing.expect(!result.is_error);
+}
+
+test "decode: tool_result adopts the structuredPatch diff when present" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+
+    try decodeLine(arena,
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"The file /tmp/a.zig has been updated successfully."}]},"toolUseResult":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":3,"oldLines":2,"newStart":3,"newLines":2,"lines":[" ctx","-old","+new"]}]}}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings(
+        "--- a/tmp/a.zig\n+++ b/tmp/a.zig\n@@ -3,2 +3,2 @@\n ctx\n-old\n+new",
+        events.items[0].tool_result.text,
+    );
+
+    // Fail soft: a shape surprise inside the patch keeps the flat text.
+    try decodeLine(arena,
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"flat"}]},"toolUseResult":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"lines":"not-an-array"}]}}
+    , &events);
+    try std.testing.expectEqualStrings("flat", events.items[1].tool_result.text);
+
+    // An empty patch (e.g. Write creating a new file) keeps the flat text.
+    try decodeLine(arena,
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"created"}]},"toolUseResult":{"filePath":"/tmp/b.zig","structuredPatch":[]}}
+    , &events);
+    try std.testing.expectEqualStrings("created", events.items[2].tool_result.text);
+
+    // Error results always keep their error text.
+    try decodeLine(arena,
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t4","content":"nope","is_error":true}]},"toolUseResult":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["+x"]}]}}
+    , &events);
+    try std.testing.expect(events.items[3].tool_result.is_error);
+    try std.testing.expectEqualStrings("nope", events.items[3].tool_result.text);
+
+    // Two results in one event: ambiguous mapping, nobody adopts the diff.
+    try decodeLine(arena,
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t5","content":"one"},{"type":"tool_result","tool_use_id":"t6","content":"two"}]},"toolUseResult":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["+x"]}]}}
+    , &events);
+    try std.testing.expectEqualStrings("one", events.items[4].tool_result.text);
+    try std.testing.expectEqualStrings("two", events.items[5].tool_result.text);
 }
 
 test {

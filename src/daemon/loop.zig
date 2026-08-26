@@ -847,6 +847,8 @@ fn maybeCompact(
         transcript,
         opts.cancel,
         try providerRequestOptions(arena, opts, ep),
+        context.compaction_prompt,
+        null,
     ) catch |e| {
         const msg = try std.fmt.allocPrint(arena, "compaction failed ({t}) — continuing uncompacted", .{e});
         _ = try ap.append(.{ .system_note = .{ .text = msg } });
@@ -970,6 +972,7 @@ fn ccInvoke(
         .permissions = if (opts.approval_mode == .auto) .bypass else .accept_edits,
         .bridge = bridge,
         .max_turns = opts.max_rounds,
+        .effort = opts.effort,
     });
 
     // A bridged permission prompt can park on a human for a long time;
@@ -1133,6 +1136,24 @@ fn runClaudeCodeTurn(
     var prompt: std.ArrayList(u8) = .empty;
     defer prompt.deinit(gpa);
     try prompt.appendSlice(gpa, first_text);
+    {
+        var history: std.ArrayList(block.Block) = .empty;
+        var history_arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer history_arena_state.deinit();
+        store.loadContextBlocksInto(history_arena_state.allocator(), &history, opts.session_id, 1_000_000) catch {};
+        if (context.latestHandover(history.items)) |briefing| {
+            const wrapped = try std.fmt.allocPrint(
+                gpa,
+                "HANDOVER FROM MARLIN (previous agent in this session). Continue from this briefing; you will not see its block log.\n\n{s}\n\n---\n\nUSER\n{s}",
+                .{ briefing, first_text },
+            );
+            prompt.deinit(gpa);
+            prompt = .empty;
+            errdefer gpa.free(wrapped);
+            try prompt.appendSlice(gpa, wrapped);
+            gpa.free(wrapped);
+        }
+    }
 
     var final_text: std.ArrayList(u8) = .empty;
     defer final_text.deinit(gpa);
@@ -1229,7 +1250,8 @@ fn runClaudeCodeTurn(
 const summary_max_tokens: u64 = 8192;
 
 /// One non-tool provider round: transcript in, summary text out.
-/// Allocated into `arena`.
+/// Allocated into `arena`. `stream_opts` fans visible deltas to the TUI
+/// when the caller wants the user to watch (native→guest handover).
 fn summarize(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -1238,9 +1260,11 @@ fn summarize(
     transcript: []const u8,
     cancel: ?*std.atomic.Value(bool),
     request_opts: openai.RequestOptions,
+    system_prompt: []const u8,
+    stream_opts: ?*const RunOpts,
 ) ![]const u8 {
     var msgs = [_]provider.Message{
-        .{ .role = .system, .payload = .{ .text = context.compaction_prompt } },
+        .{ .role = .system, .payload = .{ .text = system_prompt } },
         .{ .role = .user, .payload = .{ .text = transcript } },
     };
     const body = try buildProviderBody(arena, ep, .auto, &msgs, &.{}, request_opts, summary_max_tokens);
@@ -1252,8 +1276,14 @@ fn summarize(
         .parser = sse.Parser.init(gpa),
         .acc = &acc,
         .anthropic_stream = if (ep.dialect == .anthropic) &anthropic_stream else null,
+        .opts = stream_opts,
     };
     defer pump.parser.deinit();
+    if (stream_opts != null) {
+        acc.on_delta = Pump.onVisibleText;
+        acc.on_reasoning_delta = Pump.onVisibleReasoning;
+        acc.on_delta_ctx = &pump;
+    }
 
     const resp = http_client.streamPost(gpa, .{
         .url = ep.url,
@@ -1304,6 +1334,78 @@ pub fn compactSession(
         .turn_id = ids.next(io),
     };
     return maybeCompact(gpa, io, arena, &ap, &http_client, opts, blocks, .manual);
+}
+
+/// Native→guest handover: the CURRENT native model writes a visible briefing
+/// for Claude Code. Empty logs skip the LLM. Summarizer failure still
+/// switches; we persist a short mechanical note rather than blocking the user.
+pub fn writeHandover(
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *Store,
+    opts: RunOpts,
+    guest_model: []const u8,
+) !void {
+    if (opts.endpoint.dialect == .claude_code) return error.DelegatedContext;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var history: std.ArrayList(block.Block) = .empty;
+    try store.loadContextBlocksInto(arena, &history, opts.session_id, 1_000_000);
+
+    var ap = Appender{
+        .store = store,
+        .io = io,
+        .opts = &opts,
+        .seq = try store.lastSeq(opts.session_id),
+        .turn_id = ids.next(io),
+    };
+
+    const announce = try std.fmt.allocPrint(
+        arena,
+        "Switching to Claude Code ({s}). Generating a handover summary with the current model…",
+        .{guest_model},
+    );
+    _ = try ap.append(.{ .system_note = .{ .text = announce } });
+    publishPhase(opts, .provider);
+
+    if (history.items.len == 0) {
+        const empty_note = try std.fmt.allocPrint(
+            arena,
+            "{s}No prior native work to hand over.",
+            .{block.handover_prefix},
+        );
+        _ = try ap.append(.{ .system_note = .{ .text = empty_note } });
+        return;
+    }
+
+    var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
+    defer http_client.deinit();
+    const from_seq = history.items[0].seq;
+    const to_seq = history.items[history.items.len - 1].seq;
+    const transcript = try context.renderForSummary(arena, history.items, from_seq, to_seq, 400_000);
+    const summary = summarize(
+        gpa,
+        arena,
+        &http_client,
+        opts.endpoint,
+        transcript,
+        opts.cancel,
+        try providerRequestOptions(arena, opts, opts.endpoint),
+        context.handover_prompt,
+        &opts,
+    ) catch |e| {
+        const msg = try std.fmt.allocPrint(
+            arena,
+            "{s}Handover summary failed ({t}). Claude Code will start without a briefing; the Marlin transcript above is still the session log.",
+            .{ block.handover_prefix, e },
+        );
+        _ = try ap.append(.{ .system_note = .{ .text = msg } });
+        return;
+    };
+    const note = try std.fmt.allocPrint(arena, "{s}{s}", .{ block.handover_prefix, summary });
+    _ = try ap.append(.{ .system_note = .{ .text = note } });
 }
 
 fn toolAllowed(opts: RunOpts, spec: *const tools_registry.Spec) bool {
@@ -2020,7 +2122,7 @@ test "anthropic dialect end-to-end: headers, body shape, and SSE decode" {
         .bearer = "sk-ant-test",
         .model = "claude-sonnet-4-5",
         .dialect = .anthropic,
-    }, "transcript to summarize", null, .{});
+    }, "transcript to summarize", null, .{}, context.compaction_prompt, null);
 
     try std.testing.expectEqualStrings("SUMMARY-OK", summary);
     try std.testing.expect(checks.saw_api_key);

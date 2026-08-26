@@ -55,17 +55,32 @@ a guest tab feels like a native tab. The adapter is frozen at:
 
 Nothing else. Semantic rendering of unknown tools is a TUI fact, not a
 Claude Code catalogue. Images stay durable in Marlin and are not smuggled
-into the binary. `/compact`, `/sandbox`, `/effort`, and Marlin tool
-dispatch are native-only; a guest session that receives them must refuse
-at the protocol, not start a turn and fail with an internal name.
+into the binary. `/compact`, `/sandbox`, session `/network`, and Marlin
+tool dispatch are native-only; a guest session that receives them must
+refuse at the protocol, not start a turn and fail with an internal name.
+`/effort` is the exception that still applies: Claude Code's CLI takes
+`--effort`, so Marlin forwards it.
 
-`/new` is native. Guest is opt-in (`/model claudecode/…` on a **new**
-session, or an explicit first-run "I have a Claude subscription" path).
-Switching `/model` across the wall on a live transcript is a regime
-change, not a model change — refuse it (open a new session) once the
-durable agent field exists. Today the regime is inferred from the model
-string, which is the leak this section exists to close; see "Making the
-wall true" at the end of this subsection.
+`/new` is native. Guest is opt-in. `/model` **may cross the wall** on a
+live session: that is a regime change for the *next* turn, not a new
+thread. Harness verbs follow the current regime (`/compact` starts
+working after guest→native; it must refuse while the session is guest).
+The durable agent field updates with the model string.
+
+The real hazard is **context continuity**, not mixing logs:
+
+- **guest→native:** Marlin's loop already derives the next request from
+  the block log. Claude Code's tool names become history; that is fine.
+- **native→guest:** `claude -p` does not read Marlin's store. `/model
+  claudecode/…` starts a **native** handover turn before the regime
+  flips: the current model writes a visible briefing (streamed into the
+  transcript, persisted as a `[handover]` system_note). The TUI shows
+  "switching to a guest model, generating handover summary…". On
+  completion (or failure — the switch is not blocked) the session
+  becomes guest; the first `claude -p` prompt is that briefing plus the
+  user's next message. Empty native logs skip the LLM.
+
+Today the regime is inferred from the model prefix. See "Making the wall true."
 
 The day Anthropic ships a subscriber-legal Messages endpoint, guest
 sessions become a weekend deletion and Fable is a native model. Until
@@ -76,12 +91,17 @@ then the wall is how Marlin stays small.
 - Durable agent field (`native` | `claude_code`), not `claudecode/` as a
   dialect on `Endpoint`. `SessionKind` stays hierarchy (`root` /
   `task_child` / `review_child`); agent is orthogonal.
-- Protocol reject: `/compact`, `/sandbox`, `/network` (session toggle),
-  `/effort` on guest; `/model` that would cross the wall. `/mcp` stays
-  daemon-global. Guest `/compact` today starts a running turn and fails
-  as `DelegatedContext` — that is a bug against this section.
-- Picker and status name the regime. Do not lead the default favorites
-  list with `claudecode/`. Native remains the `/new` default.
+- Protocol reject: `/compact`, `/sandbox`, `/network` (session toggle)
+  **while the session is guest**. `/effort` is forwarded as Claude
+  `--effort` (low/medium/high/xhigh/max; Marlin `none`/`minimal` → `low`;
+  `auto` omits the flag). `/mcp` stays daemon-global.
+  `/model` that crosses native→guest runs the visible native handover
+  turn, then flips the model. Guest `/compact` refuses at the protocol
+  (`err{guest}`).
+- Picker and status name the regime: guest models keep their place in
+  the list, prefixed `(guest)`. Status shows `(guest) {name}` and dims
+  ctx/sandbox/dnsblock as `n/a` (unavailable, not off — Marlin does not
+  see Claude Code's window). Native remains the `/new` default.
 - Permission bridge (`marlin cc_approve`) is mux: fail-closed to *ask*,
   never a shell parser, never applied to native `read_file`. Auto-allow
   of CC `Read` (including paths outside the workspace) is CC's policy,
@@ -949,10 +969,10 @@ A split pane identifies its session with a compact pane label.
   frequent actions (`!rb` expands to `/reboot --build`, `!c` copies the last
   output). Plain text = message to agent. `Esc` during a turn = queue steer
   text; `Ctrl+C` = interrupt. Native-only harness verbs (`/compact`,
-  `/sandbox`, `/effort`, session `/network`) must refuse on a guest session
-  rather than no-op or fail internally (Native vs guest, §1). `/model`
-  that would cross the wall is a new session, not a live switch — once the
-  durable agent field exists.
+  `/sandbox`, session `/network`) must refuse on a guest session rather
+  than no-op or fail internally (Native vs guest, §1). `/effort` is
+  forwarded as `claude -p --effort`. `/model` may cross the wall; the next
+  turn runs the new regime.
 - Tool blocks render collapsed by default (name + one-line summary + status),
   expand on demand. Approvals render as inline prompt cards.
 

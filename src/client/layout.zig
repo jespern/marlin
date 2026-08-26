@@ -911,8 +911,14 @@ pub fn layoutBlockRange(
             },
             .plan => {},
             .system_note => {
-                const txt = try std.fmt.allocPrint(alloc, "[{s}]", .{try clipText(alloc, rb.text, 480)});
-                try wrapPrefixed(alloc, lines, "  ", txt, Palette.note, w);
+                if (block.isHandoverNote(rb.text)) {
+                    try flushRanSummary(alloc, lines, &pending_ran);
+                    try wrapPrefixed(alloc, lines, "  ", "handover for Claude Code", Palette.note, w);
+                    try wrapMarkdown(alloc, lines, block.handoverBody(rb.text), w);
+                } else {
+                    const txt = try std.fmt.allocPrint(alloc, "[{s}]", .{try clipText(alloc, rb.text, 480)});
+                    try wrapPrefixed(alloc, lines, "  ", txt, Palette.note, w);
+                }
             },
             .compaction => {
                 try flushRanSummary(alloc, lines, &pending_ran);
@@ -921,6 +927,16 @@ pub fn layoutBlockRange(
         }
     }
     try flushRanSummary(alloc, lines, &pending_ran);
+}
+
+fn handoverInProgress(blocks: []const RenderBlock) bool {
+    var awaiting_summary = false;
+    for (blocks) |rb| {
+        if (rb.kind != .system_note) continue;
+        if (block.isHandoverAnnounce(rb.text)) awaiting_summary = true;
+        if (block.isHandoverNote(rb.text)) awaiting_summary = false;
+    }
+    return awaiting_summary;
 }
 
 /// Blocks of COMPLETED turns are immutable layout input: collapse runs never
@@ -1018,7 +1034,10 @@ pub fn layoutLines(
         const head = try std.fmt.allocPrint(arena, "{s} ", .{
             spinner_frames[transcript.spinner_frame % spinner_frames.len],
         });
-        const word = "Working…";
+        const word: []const u8 = if (handoverInProgress(transcript.blocks))
+            "Generating handover…"
+        else
+            "Working…";
         const elapsed_s: i64 = if (transcript.turn_started_ms > 0)
             @max(0, @divTrunc(nowWallMs(transcript.io) - transcript.turn_started_ms, 1000))
         else
@@ -1540,6 +1559,101 @@ test "current in-flight call follows calls-first result order" {
 
     try blocks.append(arena, .{ .kind = .tool_result, .text = try arena.dupe(u8, "done"), .label = try arena.dupe(u8, "") });
     try std.testing.expect(currentInflightCall(blocks.items) == null);
+}
+
+test "handover notes render in full instead of a clipped system card" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const long_body = "A" ** 600;
+    const note = try std.fmt.allocPrint(gpa, "{s}{s}", .{ block.handover_prefix, long_body });
+    defer gpa.free(note);
+    const blocks = [_]RenderBlock{.{
+        .kind = .system_note,
+        .text = note,
+        .label = "",
+    }};
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+    var label: []const u8 = "";
+    try layoutBlockRange(arena, &transcript, &lines, 0, 1, 80, &label, false);
+    var joined: std.ArrayList(u8) = .empty;
+    for (lines.items) |line| try joined.appendSlice(arena, line.text);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "handover for Claude Code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "AAAA") != null);
+}
+
+test "handover in progress uses the generating-handover working word" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{.{
+        .kind = .system_note,
+        .text = @constCast("Switching to Claude Code (claudecode/fable). Generating a handover summary with the current model…"),
+        .label = @constCast(""),
+    }};
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = try layoutLines(arena_state.allocator(), gpa, &transcript, 80);
+    var found = false;
+    for (lines.items) |line| {
+        if (std.mem.indexOf(u8, line.text, "Generating handover") != null or
+            std.mem.indexOf(u8, line.text2, "Generating handover") != null)
+            found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test {

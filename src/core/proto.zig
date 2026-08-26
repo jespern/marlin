@@ -44,6 +44,13 @@ pub const InterruptResult = struct {
 /// the same storage/protocol shape.
 pub const SessionKind = enum { root, task_child, review_child };
 
+/// Guest sessions are Claude Code (`claudecode/<model>`). Native sessions are
+/// every other registry prefix. The regime is inferred from this prefix until
+/// a durable agent field exists (ARCHITECTURE.md, Native vs guest).
+pub fn isGuestModel(model: []const u8) bool {
+    return std.mem.startsWith(u8, model, "claudecode/");
+}
+
 /// Optional catalog pricing attached to a model id. Rates are normalized to
 /// USD per million tokens so clients never have to know a provider catalog's
 /// native units. Null means the provider did not publish that rate.
@@ -680,6 +687,14 @@ test "older session-list requests exclude archived sessions by default" {
         \\{"session_list":{}}
     );
     try std.testing.expect(!m.session_list.include_archived);
+}
+
+test "guest model prefix is the claudecode/ registry" {
+    try std.testing.expect(isGuestModel("claudecode/fable"));
+    try std.testing.expect(isGuestModel("claudecode/default"));
+    try std.testing.expect(!isGuestModel("openrouter/anthropic/claude-sonnet-4.5"));
+    try std.testing.expect(!isGuestModel("anthropic/claude-sonnet-4-5"));
+    try std.testing.expect(!isGuestModel("claudecode"));
 }
 
 test "garbage line is an error, not a crash" {

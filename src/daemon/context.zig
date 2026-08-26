@@ -575,6 +575,34 @@ pub const compaction_prompt =
     \\to resume the active work. This summary is the memory of the covered range.
 ;
 
+/// Native→guest handover: same structure as compaction, but this text is
+/// shown to the user and given to Claude Code as its first-turn briefing.
+/// It must not assume Marlin tool names — the guest has its own tools.
+pub const handover_prompt =
+    \\Write a handover briefing for another coding agent that will continue
+    \\this work in the same repository. The next agent is Claude Code: it has
+    \\its own tools and will not see Marlin's block log. Be concrete enough
+    \\that it can resume without re-discovering the repo.
+    \\
+    \\Structure the briefing as:
+    \\
+    \\## Goal
+    \\(what the user asked for, in their terms)
+    \\## Accomplished
+    \\(completed work, with concrete outcomes and paths)
+    \\## In progress
+    \\(what was mid-flight)
+    \\## Files
+    \\(continuation-critical paths only)
+    \\## Constraints
+    \\(durable user decisions)
+    \\## Next
+    \\(the immediate next action)
+    \\
+    \\Omit routine reads, raw logs, and Marlin-internal commands. Do not
+    \\continue the work yourself.
+;
+
 /// Don't compact sessions smaller than this many blocks.
 pub const compaction_min_blocks: usize = 12;
 
@@ -673,6 +701,19 @@ pub fn renderForSummary(
         }
     }
     return out.items;
+}
+
+/// Most recent native→guest handover body, if the log has one.
+pub fn latestHandover(blocks: []const block.Block) ?[]const u8 {
+    var i = blocks.len;
+    while (i > 0) {
+        i -= 1;
+        switch (blocks[i].body) {
+            .system_note => |sn| if (block.isHandoverNote(sn.text)) return block.handoverBody(sn.text),
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Extract the file paths of the N most recently WRITTEN files from
@@ -1164,6 +1205,17 @@ test "recentWrittenFiles: newest first, deduped" {
     try std.testing.expectEqual(@as(usize, 2), paths.len);
     try std.testing.expectEqualStrings("a.txt", paths[0]); // newest mention wins
     try std.testing.expectEqualStrings("b.txt", paths[1]);
+}
+
+test "latestHandover returns the most recent handover body" {
+    const blocks = [_]block.Block{
+        tb(1, .{ .system_note = .{ .text = "Switching to Claude Code (claudecode/fable). Generating a handover summary with the current model…" } }),
+        tb(2, .{ .system_note = .{ .text = "[handover]\n## Goal\nfirst" } }),
+        tb(3, .{ .assistant_msg = .{ .text = "noise" } }),
+        tb(4, .{ .system_note = .{ .text = "[handover]\n## Goal\nsecond" } }),
+    };
+    try std.testing.expectEqualStrings("## Goal\nsecond", latestHandover(&blocks).?);
+    try std.testing.expect(latestHandover(&.{tb(1, .{ .system_note = .{ .text = "other" } })}) == null);
 }
 
 test {

@@ -104,6 +104,24 @@ pub const Body = union(BlockKind) {
     system_note: struct { text: []const u8 },
 };
 
+/// Native→guest handover body. Clients render this in full (not the usual
+/// clipped system_note). The guest adapter prepends the latest one to the
+/// first `claude -p` prompt.
+pub const handover_prefix = "[handover]\n";
+pub const handover_announce_prefix = "Switching to Claude Code";
+
+pub fn isHandoverNote(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, handover_prefix);
+}
+
+pub fn isHandoverAnnounce(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, handover_announce_prefix);
+}
+
+pub fn handoverBody(text: []const u8) []const u8 {
+    return if (isHandoverNote(text)) text[handover_prefix.len..] else text;
+}
+
 pub const Block = struct {
     /// Globally unique block id.
     id: u64,
@@ -164,4 +182,11 @@ test "user message attachments round trip as durable blob references" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.user_msg.attachments.len);
     try std.testing.expectEqualStrings("abc123", parsed.value.user_msg.attachments[0].hash);
     try std.testing.expectEqualStrings("image/png", parsed.value.user_msg.attachments[0].mime);
+}
+
+test "handover note prefix splits body from marker" {
+    try std.testing.expect(isHandoverNote("[handover]\n## Goal\nship it"));
+    try std.testing.expect(!isHandoverNote("Switching to Claude Code (claudecode/fable)."));
+    try std.testing.expect(isHandoverAnnounce("Switching to Claude Code (claudecode/fable). Generating a handover summary…"));
+    try std.testing.expectEqualStrings("## Goal\nship it", handoverBody("[handover]\n## Goal\nship it"));
 }

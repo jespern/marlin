@@ -241,6 +241,10 @@ const Session = struct {
     /// session_kill releases the in-memory object after its active turn has
     /// acknowledged cancellation. Durable state remains reloadable.
     evict_when_idle: bool = false,
+    /// Native→guest `/model` while a handover summary is being written.
+    /// Applied on turn_done (success, fail, or interrupt) so the next turn
+    /// is guest. Dispatcher-owned.
+    pending_guest_model: ?[]u8 = null,
 };
 
 // ---------------------------------------------------------------- daemon --
@@ -805,6 +809,13 @@ pub const Daemon = struct {
                     t.join();
                     session.turn_thread = null;
                 }
+                if (session.pending_guest_model) |guest| {
+                    session.pending_guest_model = null;
+                    self.store.setSessionModel(td.sid, guest) catch {};
+                    self.gpa.free(session.model);
+                    session.model = guest;
+                    self.broadcastSessionUpsert(td.sid);
+                }
                 // A bridge prompt cannot outlive its turn; deny any stray one
                 // so the bridge (if still alive) unblocks instead of hanging.
                 if (session.cc_pending) |pending|
@@ -1005,6 +1016,25 @@ pub const Daemon = struct {
                 }
                 const new_model = try self.gpa.dupe(u8, sm.model);
                 errdefer self.gpa.free(new_model);
+                if (!proto.isGuestModel(session.model) and proto.isGuestModel(sm.model)) {
+                    // Keep the native model on the session until the handover
+                    // turn finishes; the dispatcher applies pending_guest_model
+                    // on turn_done. The native model writes a visible briefing.
+                    if (session.pending_guest_model) |old| self.gpa.free(old);
+                    session.pending_guest_model = new_model;
+                    self.startHandover(session, sm.model) catch |err| {
+                        session.pending_guest_model = null;
+                        self.gpa.free(new_model);
+                        if (err == error.SessionBusy) {
+                            self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot switch model mid-turn" } });
+                            return;
+                        }
+                        self.sendTo(client, .{ .err = .{ .code = "internal", .msg = "could not start handover" } });
+                        return;
+                    };
+                    self.sendTo(client, .{ .ok = .{} });
+                    return;
+                }
                 try self.store.setSessionModel(sm.sid, sm.model);
                 self.gpa.free(session.model);
                 session.model = new_model;
@@ -1032,6 +1062,13 @@ pub const Daemon = struct {
                     return;
                 };
                 if (self.rejectArchivedSession(client, session)) return;
+                if (proto.isGuestModel(session.model)) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "guest",
+                        .msg = "sandbox is Marlin's kernel profile; Claude Code has its own permissions",
+                    } });
+                    return;
+                }
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot toggle sandbox mid-turn" } });
                     return;
@@ -1072,6 +1109,13 @@ pub const Daemon = struct {
                     return;
                 };
                 if (self.rejectArchivedSession(client, session)) return;
+                if (proto.isGuestModel(session.model)) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "guest",
+                        .msg = "dnsblock is Marlin's; Claude Code's network is not filtered here",
+                    } });
+                    return;
+                }
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot toggle network filtering mid-turn" } });
                     return;
@@ -1367,6 +1411,13 @@ pub const Daemon = struct {
                     return;
                 };
                 if (self.rejectArchivedSession(client, session)) return;
+                if (proto.isGuestModel(session.model)) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "guest",
+                        .msg = "Claude Code manages its own context; /compact is a native-session command",
+                    } });
+                    return;
+                }
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot compact mid-turn" } });
                     return;
@@ -1828,6 +1879,7 @@ pub const Daemon = struct {
         session.steer_mutex.unlock(self.io);
         self.gpa.free(session.model);
         self.gpa.free(session.cwd);
+        if (session.pending_guest_model) |guest| self.gpa.free(guest);
         self.gpa.destroy(session);
     }
 
@@ -1948,6 +2000,48 @@ pub const Daemon = struct {
         session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
         session.state = .running;
         const thread = std.Thread.spawn(.{}, turnMain, .{job}) catch |err| {
+            session.state = .idle;
+            session.turn_thread = null;
+            session.phase_started_at_ms.store(nowMs(self.io), .release);
+            session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+            return err;
+        };
+        session.turn_thread = thread;
+        self.store.setSessionStatus(session.id, "running") catch {};
+        self.broadcastStatus(session.id, .running);
+    }
+
+    fn startHandover(self: *Daemon, session: *Session, guest_model: []const u8) !void {
+        if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
+            return error.SessionBusy;
+        const job = try self.gpa.create(TurnJob);
+        errdefer self.gpa.destroy(job);
+        const cwd = try self.gpa.dupe(u8, session.cwd);
+        errdefer self.gpa.free(cwd);
+        const model = try self.gpa.dupe(u8, session.model);
+        errdefer self.gpa.free(model);
+        const text = try self.gpa.dupe(u8, guest_model);
+        errdefer self.gpa.free(text);
+        job.* = .{
+            .daemon = self,
+            .sid = session.id,
+            .cwd = cwd,
+            .model = model,
+            .effort = session.effort,
+            .text = text,
+            .attachments = &.{},
+            .sandbox_enabled = session.sandbox_enabled,
+            .network_filtering_enabled = session.network_filtering_enabled,
+            .kind = session.kind,
+            .max_rounds = session.max_rounds,
+            .approval_mode = session.approval_mode,
+            .cancel = &session.cancel,
+            .session = session,
+        };
+        session.phase_started_at_ms.store(nowMs(self.io), .release);
+        session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+        session.state = .running;
+        const thread = std.Thread.spawn(.{}, handoverMain, .{job}) catch |err| {
             session.state = .idle;
             session.turn_thread = null;
             session.phase_started_at_ms.store(nowMs(self.io), .release);
@@ -2167,6 +2261,50 @@ pub const Daemon = struct {
             return;
         };
         _ = did; // "nothing to compact" already logged as a system_note
+        TurnHooks.onPhase(job, .finishing);
+        self.finishTurn(job.sid, false, null, null, 0, 0);
+    }
+
+    /// Native model writes a visible handover, then turn_done applies
+    /// pending_guest_model. Failures still switch: the briefing is best-effort.
+    fn handoverMain(job: *TurnJob) void {
+        const self = job.daemon;
+        TurnHooks.onPhase(job, .provider);
+        defer {
+            self.gpa.free(job.cwd);
+            self.gpa.free(job.model);
+            self.gpa.free(job.text);
+            freeMediaRefs(self.gpa, job.attachments);
+            self.gpa.destroy(job);
+        }
+
+        const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
+            const t = std.fmt.allocPrint(self.gpa, "handover provider resolve failed: {t}", .{e}) catch null;
+            self.finishTurn(job.sid, false, t, null, 0, 0);
+            return;
+        };
+        defer ep.deinit(self.gpa);
+
+        loop.writeHandover(self.gpa, self.io, &self.store, .{
+            .session_id = job.sid,
+            .cwd = job.cwd,
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
+            .http_pool = &self.http_pool,
+            .effort = job.effort,
+            .cfg = self.cfg,
+            .approval_mode = .auto,
+            .on_block = TurnHooks.onBlock,
+            .on_delta = TurnHooks.onDelta,
+            .on_reasoning_delta = TurnHooks.onReasoningDelta,
+            .on_stream_status = TurnHooks.onStreamStatus,
+            .on_phase = TurnHooks.onPhase,
+            .on_delta_ctx = job,
+            .cancel = job.cancel,
+        }, job.text) catch |e| {
+            const t = std.fmt.allocPrint(self.gpa, "handover failed: {t}", .{e}) catch null;
+            self.finishTurn(job.sid, false, t, null, 0, 0);
+            return;
+        };
         TurnHooks.onPhase(job, .finishing);
         self.finishTurn(job.sid, false, null, null, 0, 0);
     }
@@ -2702,8 +2840,13 @@ pub const Daemon = struct {
         var used: u64 = 0;
         var limit: u64 = 0;
         if (self.sessions.get(sid)) |session| {
-            used = session.context_used.load(.acquire);
-            limit = context.contextLimit(session.model);
+            // Guest turns never assemble Marlin context; a limit lookup on
+            // `claudecode/…` still returns a window (the "claude" substring)
+            // and the TUI would paint ctx 0%.
+            if (!proto.isGuestModel(session.model)) {
+                used = session.context_used.load(.acquire);
+                limit = context.contextLimit(session.model);
+            }
         }
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .session_meta = .{
             .sid = sid,

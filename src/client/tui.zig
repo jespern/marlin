@@ -1083,7 +1083,10 @@ const App = struct {
             existing.deinit(self.gpa);
             existing.* = summary;
             self.session_labels.items[i] = summary.label;
-            if (info.sid == self.sid) self.state = info.state;
+            if (info.sid == self.sid) {
+                self.state = info.state;
+                self.setModelStr(info.model);
+            }
             if (self.saved_views.get(info.sid)) |saved| saved.state = info.state;
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
             return;
@@ -1798,6 +1801,10 @@ const App = struct {
                 .plain;
             self.should_quit = true;
         } else if (std.mem.eql(u8, head, "/compact")) {
+            if (proto.isGuestModel(self.model.items)) {
+                self.setNotice("Claude Code manages its own context — /compact is native-only", .{});
+                return;
+            }
             if (self.state == .running or self.state == .awaiting_approval) {
                 self.setNotice("cannot compact mid-turn", .{});
                 return;
@@ -2257,8 +2264,13 @@ const App = struct {
             return;
         }
         self.conn.send(.{ .session_set_model = .{ .sid = self.sid, .model = m } }) catch return;
-        self.setModelStr(m);
-        self.setNotice("model → {s}", .{m});
+        if (!proto.isGuestModel(self.model.items) and proto.isGuestModel(m)) {
+            const guest_name = if (std.mem.startsWith(u8, m, "claudecode/")) m["claudecode/".len..] else m;
+            self.setNotice("switching to {s} — generating handover summary…", .{guest_name});
+        } else {
+            self.setModelStr(m);
+            self.setNotice("model → {s}", .{m});
+        }
     }
 
     fn applyEffort(self: *App, selected: proto.ReasoningEffort) void {
@@ -2305,6 +2317,10 @@ const App = struct {
     }
 
     fn toggleSandbox(self: *App, arg: []const u8) void {
+        if (proto.isGuestModel(self.model.items)) {
+            self.setNotice("sandbox is Marlin's; Claude Code has its own permissions — not available on a guest session", .{});
+            return;
+        }
         if (self.state == .running or self.state == .awaiting_approval) {
             self.setNotice("cannot toggle sandbox mid-turn", .{});
             return;
@@ -2337,6 +2353,10 @@ const App = struct {
     }
 
     fn networkCommand(self: *App, arg: []const u8) void {
+        if (proto.isGuestModel(self.model.items)) {
+            self.setNotice("dnsblock is Marlin's; Claude Code's network is its own — not available on a guest session", .{});
+            return;
+        }
         if (arg.len == 0 or std.mem.eql(u8, arg, "status")) {
             if (!self.conn.network_filtering) {
                 if (self.conn.network_configured) {
@@ -2572,9 +2592,24 @@ const App = struct {
 
 // ------------------------------------------------------------- rendering --
 
-fn statusModel(model: []const u8) []const u8 {
+fn statusModel(arena: std.mem.Allocator, model: []const u8) ![]const u8 {
+    if (proto.isGuestModel(model)) {
+        const name = if (std.mem.startsWith(u8, model, "claudecode/"))
+            model["claudecode/".len..]
+        else
+            model;
+        return std.fmt.allocPrint(arena, "(guest) {s}", .{name});
+    }
     const gateway = "openrouter/";
     return if (std.mem.startsWith(u8, model, gateway)) model[gateway.len..] else model;
+}
+
+/// Guest sessions do not run Marlin's assembler, so ctx% is always a lie
+/// (used stays 0; the limit lookup even matches `claudecode` as `claude`).
+fn statusContext(arena: std.mem.Allocator, guest: bool, used: u64, limit: u64) ![]const u8 {
+    if (guest) return "ctx n/a";
+    if (limit == 0) return "";
+    return std.fmt.allocPrint(arena, "ctx {d}%", .{used * 100 / limit});
 }
 
 fn statusCwd(arena: std.mem.Allocator, cwd: []const u8, home: []const u8) ![]const u8 {
@@ -2685,18 +2720,19 @@ fn pickerModelLine(
     content_width: usize,
 ) ![]const u8 {
     const marker = if (current) " ●" else "";
+    const guest_prefix: []const u8 = if (proto.isGuestModel(model)) "(guest) " else "";
     const price = if (pricing) |value| try formatModelPricing(arena, value) else "";
     const price_width = displayWidth(price);
     const price_gap: usize = if (price.len > 0) 2 else 0;
-    const model_capacity = content_width -| (price_width + price_gap);
+    const model_capacity = content_width -| (displayWidth(guest_prefix) + price_width + price_gap);
     const model_end = hardCellBreak(model, 0, model_capacity);
     const model_text = model[0..model_end];
-    const used = displayWidth(model_text) + price_width;
+    const used = displayWidth(guest_prefix) + displayWidth(model_text) + price_width;
     const gap = if (price.len > 0)
         try spaces(arena, content_width -| used)
     else
         "";
-    return std.fmt.allocPrint(arena, " {s}{s}{s}{s}", .{ model_text, gap, price, marker });
+    return std.fmt.allocPrint(arena, " {s}{s}{s}{s}{s}", .{ guest_prefix, model_text, gap, price, marker });
 }
 
 fn tabActivityForState(state: proto.SessionState) TabActivity {
@@ -3292,12 +3328,15 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         .awaiting_approval => Palette.status_approval,
         .err => Palette.status_error,
     };
+    const guest = proto.isGuestModel(app.model.items);
     const context_percent = if (app.context_limit > 0)
         app.context_used * 100 / app.context_limit
     else
         0;
-    const ctx_txt = try std.fmt.allocPrint(arena, "ctx {d}%", .{context_percent});
-    const ctx_style = if (context_percent >= 90)
+    const ctx_txt = try statusContext(arena, guest, app.context_used, app.context_limit);
+    const ctx_style = if (guest)
+        Palette.status_muted
+    else if (context_percent >= 90)
         Palette.status_context_hot
     else if (context_percent >= 70)
         Palette.status_context_warn
@@ -3395,7 +3434,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     status_n += 1;
     status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
     status_n += 1;
-    status_segments[status_n] = .{ .text = statusModel(app.model.items), .style = Palette.status_model };
+    status_segments[status_n] = .{ .text = try statusModel(arena, app.model.items), .style = Palette.status_model };
     status_n += 1;
     if (app.effort != .auto) {
         status_segments[status_n] = .{
@@ -3404,7 +3443,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         };
         status_n += 1;
     }
-    if (app.context_limit > 0) {
+    if (ctx_txt.len > 0) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
         status_segments[status_n] = .{ .text = ctx_txt, .style = ctx_style };
@@ -3449,14 +3488,20 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     // Far-right indicators: shell sandbox state and DNS blocklist filtering.
     // Drawn after the left segments so they win on narrow terminals.
+    // Guest sessions cannot use Marlin's sandbox or dnsblock — show the
+    // slots muted so they read as unavailable, not toggled off.
     const sandboxed_now = app.currentSandboxed();
-    const sandbox_txt: []const u8 = if (sandboxed_now)
+    const sandbox_txt: []const u8 = if (guest)
+        "⛨ sandbox n/a"
+    else if (sandboxed_now)
         "⛨ sandboxed"
     else if (app.conn.sandbox_available)
         "⛨ sandbox off"
     else
         "⛨ no sandbox";
-    const sandbox_style = if (sandboxed_now)
+    const sandbox_style = if (guest)
+        Palette.status_muted
+    else if (sandboxed_now)
         Palette.status_running
     else if (app.conn.sandbox_available)
         Palette.status_context_warn
@@ -3467,7 +3512,9 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const sandbox_cols: u16 = @intCast(sandbox_txt.len - "⛨".len + 1);
     const dns_available = app.conn.network_filtering;
     const dns_on = app.currentNetworkFiltering();
-    const dns_txt: []const u8 = if (dns_on)
+    const dns_txt: []const u8 = if (guest)
+        "dnsblock n/a"
+    else if (dns_on)
         "dnsblock on"
     else if (dns_available)
         "dnsblock off"
@@ -3475,7 +3522,9 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         "dnsblock err"
     else
         "dnsblock off";
-    const dns_style = if (dns_on)
+    const dns_style = if (guest)
+        Palette.status_muted
+    else if (dns_on)
         Palette.status_running
     else if (dns_available or app.conn.network_configured)
         Palette.status_context_warn
@@ -3526,6 +3575,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         for (items[win_start..visible_end]) |f| {
             var row_width = displayWidth(f);
             if (app.picker_kind == .model) {
+                if (proto.isGuestModel(f)) row_width += displayWidth("(guest) ");
                 if (app.pricingForModel(f)) |pricing| {
                     row_width += 2 + displayWidth(try formatModelPricing(arena, pricing));
                 }
@@ -4577,6 +4627,10 @@ test "model picker formats provider pricing compactly" {
     }));
     try std.testing.expectEqualStrings("free", try formatModelPricing(arena, .{ .model = "openrouter/free", .input_per_million = 0, .output_per_million = 0 }));
     try std.testing.expectEqualStrings("price n/a", try formatModelPricing(arena, .{ .model = "openrouter/unknown" }));
+    try std.testing.expectEqualStrings(
+        " (guest) claudecode/fable",
+        try pickerModelLine(arena, "claudecode/fable", null, false, 40),
+    );
     try std.testing.expectEqual(@as(?f64, null), validCatalogRate(-1));
     try std.testing.expectEqual(@as(?f64, null), validCatalogRate(std.math.nan(f64)));
 }
@@ -4986,7 +5040,7 @@ test "one-line composer and scrollback prompt cards are three rows" {
     try std.testing.expect(lines.items[2].fill_style != null);
 }
 
-test "reasoning cards are bright, padded, and inset" {
+test "reasoning cards are muted, padded, and inset" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5003,11 +5057,11 @@ test "reasoning cards are bright, padded, and inset" {
     try std.testing.expectEqualStrings("", lines.items[lines.items.len - 1].text);
     try std.testing.expectEqualStrings("  · ", lines.items[1].text);
     try std.testing.expect(lines.items[1].style.bold);
-    // Body text must never be dimmed or italicized — completed commentary
-    // renders bold true-RGB white, one step above the streaming default.
+    // Completed commentary is secondary narration: the same muted index-7
+    // grey it streamed in as, one step below the assistant's final prose.
     try std.testing.expect(!lines.items[1].style2.italic);
-    try std.testing.expect(lines.items[1].style2.bold);
-    try std.testing.expect(vaxis.Color.eql(lines.items[1].style2.fg, .{ .rgb = .{ 0xff, 0xff, 0xff } }));
+    try std.testing.expect(!lines.items[1].style2.bold);
+    try std.testing.expect(vaxis.Color.eql(lines.items[1].style2.fg, Palette.reasoning.fg));
     for (lines.items) |line| {
         try std.testing.expect(line.fill_style != null);
         try std.testing.expect(vaxis.Color.eql(line.fill_style.?.bg, Palette.reasoning_bg));
@@ -5058,8 +5112,15 @@ test "status metadata is compact without losing its identity" {
 
     try std.testing.expectEqualStrings(
         "anthropic/claude-sonnet-4.5",
-        statusModel("openrouter/anthropic/claude-sonnet-4.5"),
+        try statusModel(arena, "openrouter/anthropic/claude-sonnet-4.5"),
     );
+    try std.testing.expectEqualStrings(
+        "(guest) fable",
+        try statusModel(arena, "claudecode/fable"),
+    );
+    try std.testing.expectEqualStrings("ctx n/a", try statusContext(arena, true, 0, 200_000));
+    try std.testing.expectEqualStrings("ctx 12%", try statusContext(arena, false, 24_000, 200_000));
+    try std.testing.expectEqualStrings("", try statusContext(arena, false, 0, 0));
     try std.testing.expectEqualStrings(
         "~/Work/marlin",
         try statusCwd(arena, "/Users/jespern/Work/marlin", "/Users/jespern"),

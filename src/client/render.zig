@@ -14,7 +14,12 @@ pub const Palette = struct {
     // through theme-dependent ANSI grays.
     pub const prompt_bg: vaxis.Color = .{ .rgb = .{ 0x42, 0x45, 0x4b } };
     pub const prompt_panel: vaxis.Style = .{ .bg = prompt_bg };
-    pub const prompt_text: vaxis.Style = .{ .bg = prompt_bg };
+    /// The user's own words get the loudest text treatment in the
+    /// transcript: bold strokes read as brighter than any fg value at
+    /// terminal sizes, and RGB white pins the floor on themes whose default
+    /// foreground is grey. (This emphasis used to sit on reasoning cards;
+    /// prompts are the anchors a transcript is scanned by.)
+    pub const prompt_text: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } }, .bg = prompt_bg, .bold = true };
     pub const prompt_mark: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 6 }, .bold = true };
     pub const command_bg: vaxis.Color = .{ .rgb = .{ 0x2d, 0x30, 0x35 } };
     pub const tab_bar: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 8 } };
@@ -56,15 +61,12 @@ pub const Palette = struct {
     pub const md_callout: vaxis.Style = .{ .bg = md_callout_bg };
     pub const reasoning_bg: vaxis.Color = .{ .rgb = .{ 0x30, 0x33, 0x39 } };
     pub const reasoning_panel: vaxis.Style = .{ .bg = reasoning_bg };
-    /// Reasoning commentary sits one step ABOVE body text, never below it:
-    /// the same words were just streamed in the default style, and
-    /// dimming/italicizing them on completion reads as the text degrading.
-    /// Emphasis comes from WEIGHT, not color: measured on a real theme, the
-    /// default foreground is already pure white, so no fg value can be
-    /// brighter — but bold strokes light more pixels per glyph and read as
-    /// brighter at terminal sizes. RGB white is kept to pin the floor on
-    /// themes whose default fg actually is grey.
-    pub const reasoning: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } }, .bg = reasoning_bg, .bold = true };
+    /// Reasoning commentary is secondary narration and sits one step BELOW
+    /// the assistant's final prose, matching the dimmed web UI treatment.
+    /// Index 7 is also what the live ticker streams in (collapse_hint), so a
+    /// card no longer jumps to bold white when the round completes — the
+    /// text keeps the brightness it streamed in at.
+    pub const reasoning: vaxis.Style = .{ .fg = .{ .index = 7 }, .bg = reasoning_bg };
     pub const reasoning_mark: vaxis.Style = .{ .fg = .{ .index = 6 }, .bg = reasoning_bg, .bold = true };
     /// Tool machinery (the ⚙ glyph, arg previews, result bodies): dimmed
     /// gray so it reads as background activity, never as user input or as
@@ -112,6 +114,9 @@ pub const Palette = struct {
     pub const status_bg: vaxis.Color = .{ .index = 0 };
     pub const status_bar: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 7 } };
     pub const status_sep: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 8 }, .dim = true };
+    /// Guest sessions: Marlin sandbox/dnsblock do not apply. Dim+italic so
+    /// the slots stay visible but read as unavailable, not off-by-choice.
+    pub const status_muted: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 8 }, .dim = true, .italic = true };
     pub const status_idle: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 2 } };
     pub const status_running: vaxis.Style = .{ .bg = status_bg, .fg = soft_blue, .bold = true };
     pub const status_approval: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 }, .bold = true };
