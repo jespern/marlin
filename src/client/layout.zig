@@ -455,9 +455,15 @@ pub fn isDiffOutput(text: []const u8) bool {
 
 /// Tools whose diff output is a change the agent MADE. Only these stop the
 /// collapse run below; a diff the agent merely read (`bash git diff …`) is
-/// ordinary command output and collapses like any other success.
+/// ordinary command output and collapses like any other success. Covers both
+/// vocabularies: native (edit/write_file) and Claude Code guest sessions
+/// (Edit/Write/…), whose bridge emits diffs in the same dialect.
 pub fn isFileEditTool(label: []const u8) bool {
-    return std.mem.eql(u8, label, "edit") or std.mem.eql(u8, label, "write_file");
+    const authored = [_][]const u8{ "edit", "write_file", "Edit", "Write", "MultiEdit", "NotebookEdit" };
+    for (authored) |name| {
+        if (std.mem.eql(u8, label, name)) return true;
+    }
+    return false;
 }
 
 /// A failed command can emit hundreds of perfectly ordinary compiler or test
@@ -535,11 +541,18 @@ pub fn appendToolCallLine(
     rb: RenderBlock,
     cwd: []const u8,
     w: usize,
+    /// Dim annotation after the argument (e.g. "96 bytes" distilled from an
+    /// authored diff's intro line, which is not rendered as a body line).
+    note: ?[]const u8,
 ) !void {
     // Keep the machinery subdued. Bash commands receive semantic shell
     // roles; for file tools the emphasized value is a path.
     const hi = toolDisplayArg(rb.label, rb.text, cwd);
     const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{toolDisplayName(rb.label)});
+    const note_text: []const u8 = if (note) |n|
+        try std.fmt.allocPrint(alloc, " · {s}", .{n})
+    else
+        "";
     if (hi) |h| {
         const hi_capped = h[0..@min(h.len, w -| (head.len + 2))];
         const is_bash = std.ascii.eqlIgnoreCase(rb.label, "bash");
@@ -548,14 +561,43 @@ pub fn appendToolCallLine(
             .style = Palette.tool,
             .text2 = hi_capped,
             .style2 = if (is_bash) Palette.shell_command else Palette.tool_cmd,
+            .text3 = note_text,
+            .style3 = Palette.collapse_hint,
             .syntax = if (is_bash)
                 try shellCommandSpans(alloc, hi_capped, head.len)
             else
                 &.{},
         });
     } else {
-        try lines.append(alloc, .{ .text = head, .style = Palette.tool });
+        try lines.append(alloc, .{
+            .text = head,
+            .style = Palette.tool,
+            .text2 = note_text,
+            .style2 = Palette.collapse_hint,
+        });
     }
+}
+
+/// The ⚙-line annotation distilled from an authored diff's intro line:
+/// "created x (96 bytes)" → "96 bytes" · "edited 2 hunks in x" → "2 hunks" ·
+/// "wrote 84 bytes to x" → "84 bytes" · "replaced 3 occurrence(s) in x" →
+/// "3 occurrence(s)". Null when the first line matches no known intro.
+pub fn diffIntroNote(text: []const u8) ?[]const u8 {
+    const first = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    if (std.mem.endsWith(u8, first, " bytes)")) {
+        if (std.mem.lastIndexOfScalar(u8, first, '(')) |open|
+            return first[open + 1 .. first.len - 1];
+    }
+    if (std.mem.startsWith(u8, first, "wrote ")) {
+        if (std.mem.indexOf(u8, first, " bytes to ")) |at| return first[6 .. at + 6];
+    }
+    for ([_][]const u8{ " hunk", " occurrence" }) |word| {
+        const at = std.mem.indexOf(u8, first, word) orelse continue;
+        const count_start = (std.mem.lastIndexOfScalar(u8, first[0..at], ' ') orelse continue) + 1;
+        const in_at = std.mem.indexOfPos(u8, first, at, " in ") orelse continue;
+        return first[count_start..in_at];
+    }
+    return null;
 }
 
 pub fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, tool_label: []const u8) !void {
@@ -564,17 +606,27 @@ pub fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Lin
     // a truncated diff misleads. Diffs merely read via bash keep
     // diff coloring but the ordinary cap.
     const is_diff = isDiffOutput(rb.text);
-    const max_shown: usize = if (is_diff and isFileEditTool(tool_label)) 24 else 8;
+    const authored = is_diff and isFileEditTool(tool_label);
+    const max_shown: usize = if (authored) 24 else 8;
     const language = if (is_diff) diffLanguage(rb.text) else SyntaxLanguage.generic;
     var shown: usize = 0;
     var total: usize = 0;
     var diff_nums: DiffLineNumbers = .{};
+    var first = true;
     var it = std.mem.splitScalar(u8, rb.text, '\n');
     while (it.next()) |l| {
+        defer first = false;
+        // An authored diff's intro line ("created x (96 bytes)") is rendered
+        // as a dim note on the ⚙ line instead; the hunks speak for themselves.
+        if (first and authored and rb.status == .ok and !std.mem.startsWith(u8, l, "@@ ")) continue;
         total += 1;
         if (shown < max_shown) {
             if (rb.status == .ok and is_diff) {
-                try appendDiffLine(alloc, lines, "    ", l, language, Palette.tool_out, &diff_nums);
+                if (try appendDiffLine(alloc, lines, "    ", l, language, Palette.tool_out, &diff_nums))
+                    shown += 1
+                else
+                    total -= 1;
+                continue;
             } else if (rb.status != .ok) {
                 // One failure marker establishes the section;
                 // repeating it for every stack-frame line creates
@@ -869,9 +921,20 @@ pub fn layoutBlockRange(
                     });
                 }
                 for (expand.items) |pair| {
-                    try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w);
-                    try appendToolResultLines(alloc, lines, blocks_all[pair.result], blocks_all[pair.call].label);
+                    // Authored diffs and failures are sections the user reads,
+                    // not machinery: give them air instead of hugging the
+                    // summary line above.
+                    try blankLine(alloc, lines);
+                    const result = blocks_all[pair.result];
+                    const note = if (result.status == .ok) diffIntroNote(result.text) else null;
+                    try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note);
+                    try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
                 }
+                // Air below the last expanded pair too; whatever follows
+                // (summary line, reasoning card) must not sit flush against
+                // the diff. blankLine dedupes against sections that add
+                // their own leading blank.
+                if (expand.items.len > 0) try blankLine(alloc, lines);
                 if (scan_end > block_idx) {
                     block_idx = scan_end - 1;
                     continue;
@@ -903,7 +966,7 @@ pub fn layoutBlockRange(
             .tool_call => {
                 try flushRanSummary(alloc, lines, &pending_ran);
                 last_tool_label.* = rb.label;
-                try appendToolCallLine(alloc, lines, rb, transcript.cwd, w);
+                try appendToolCallLine(alloc, lines, rb, transcript.cwd, w, null);
             },
             .tool_result => try appendToolResultLines(alloc, lines, rb, last_tool_label.*),
             .approval => {
@@ -1266,7 +1329,7 @@ test "tool calls render semantic arguments instead of raw JSON" {
         .kind = .tool_call,
         .text = try arena.dupe(u8, args),
         .label = try arena.dupe(u8, "Read"),
-    }, cwd, 100);
+    }, cwd, 100, null);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     try std.testing.expectEqualStrings("  ⚙ Read ", lines.items[0].text);
     try std.testing.expectEqualStrings("src/client/layout.zig", lines.items[0].text2);
@@ -1277,7 +1340,7 @@ test "tool calls render semantic arguments instead of raw JSON" {
         .kind = .tool_call,
         .text = try arena.dupe(u8, "{malformed}"),
         .label = try arena.dupe(u8, "Read"),
-    }, cwd, 100);
+    }, cwd, 100, null);
     try std.testing.expectEqualStrings("", lines.items[0].text2);
 
     lines.clearRetainingCapacity();
@@ -1285,9 +1348,17 @@ test "tool calls render semantic arguments instead of raw JSON" {
         .kind = .tool_call,
         .text = try arena.dupe(u8, "{\"anything\":\"still private\"}"),
         .label = try arena.dupe(u8, "custom_tool"),
-    }, cwd, 100);
+    }, cwd, 100, null);
     try std.testing.expectEqualStrings("  ⚙ custom_tool ", lines.items[0].text);
     try std.testing.expectEqualStrings("", lines.items[0].text2);
+}
+
+test "diff intro notes distill to counts for the tool line" {
+    try std.testing.expectEqualStrings("96 bytes", diffIntroNote("created /tmp/a.zig (96 bytes)\n@@ -0,0 +1,5 @@").?);
+    try std.testing.expectEqualStrings("2 hunks", diffIntroNote("edited 2 hunks in src/x.zig\n@@ -1 +1 @@").?);
+    try std.testing.expectEqualStrings("84 bytes", diffIntroNote("wrote 84 bytes to x\n@@ -1 +1 @@").?);
+    try std.testing.expectEqualStrings("1 occurrence(s)", diffIntroNote("replaced 1 occurrence(s) in x\n@@ -1 +1 @@").?);
+    try std.testing.expect(diffIntroNote("The file has been updated successfully.") == null);
 }
 
 pub fn hunkContextStart(line: []const u8) ?usize {
@@ -1325,6 +1396,9 @@ pub const DiffLineNumbers = struct {
     }
 };
 
+/// Returns whether a display line was appended: @@ headers feed the
+/// line-number gutter but render at most their enclosing-declaration
+/// context — the raw hunk arithmetic is machinery the gutter replaces.
 pub fn appendDiffLine(
     arena: std.mem.Allocator,
     lines: *std.ArrayList(Line),
@@ -1333,16 +1407,19 @@ pub fn appendDiffLine(
     language: SyntaxLanguage,
     fallback_style: vaxis.Style,
     nums: *DiffLineNumbers,
-) !void {
+) !bool {
     if (std.mem.startsWith(u8, line, "@@ ")) {
         nums.onHunk(line);
-        const text = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, line });
-        const syntax = if (hunkContextStart(line)) |start|
-            try syntaxSpans(arena, line[start..], language, glyph.len + start)
-        else
-            &.{};
-        try lines.append(arena, .{ .text = text, .style = Palette.diff_hunk, .syntax = syntax });
-        return;
+        const start = hunkContextStart(line) orelse return false;
+        const head = try std.fmt.allocPrint(arena, "{s}… ", .{glyph});
+        try lines.append(arena, .{
+            .text = head,
+            .style = Palette.diff_hunk,
+            .text2 = line[start..],
+            .style2 = Palette.diff_hunk,
+            .syntax = try syntaxSpans(arena, line[start..], language, head.len),
+        });
+        return true;
     }
 
     const is_add = std.mem.startsWith(u8, line, "+") and !std.mem.startsWith(u8, line, "+++");
@@ -1389,11 +1466,12 @@ pub fn appendDiffLine(
             .fill_style = if (is_add or is_del) code_style else null,
             .syntax = syntax,
         });
-        return;
+        return true;
     }
 
     const text = try std.fmt.allocPrint(arena, "{s}{s}", .{ glyph, line });
     try lines.append(arena, .{ .text = text, .style = fallback_style });
+    return true;
 }
 
 test "successful tools collapse but diffs and failures stop the run" {
@@ -1422,6 +1500,18 @@ test "successful tools collapse but diffs and failures stop the run" {
     try std.testing.expectEqual(@as(usize, 0), third.ok_count);
     try std.testing.expectEqual(@as(usize, 1), expand.items.len);
     try std.testing.expectEqual(@as(usize, 4), expand.items[0].call);
+
+    // Guest sessions label the same authored change "Edit" (Claude Code
+    // vocabulary); it must stop the run exactly like the native "edit".
+    const guest = [_]RenderBlock{
+        .{ .kind = .tool_call, .text = try arena.dupe(u8, "{}"), .label = try arena.dupe(u8, "Edit") },
+        .{ .kind = .tool_result, .text = try arena.dupe(u8, "edited 1 hunk in a.zig\n@@ -1 +1 @@\n-old\n+new"), .label = try arena.dupe(u8, "") },
+    };
+    var guest_expand: std.ArrayList(ExpandPair) = .empty;
+    defer guest_expand.deinit(arena);
+    const guest_batch = try scanToolBatch(arena, &guest, 0, &guest_expand);
+    try std.testing.expectEqual(@as(usize, 0), guest_batch.ok_count);
+    try std.testing.expectEqual(@as(usize, 1), guest_expand.items.len);
 }
 
 test "diffs merely read via bash collapse like any other success" {

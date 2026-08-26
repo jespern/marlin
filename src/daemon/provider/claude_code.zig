@@ -287,25 +287,47 @@ fn messageContent(root: std.json.ObjectMap) ?[]std.json.Value {
 }
 
 /// Claude Code attaches rich tool metadata to the EVENT, not to the
-/// model-facing content: for Edit/Write/MultiEdit the top-level
-/// `toolUseResult.structuredPatch` carries the hunks its own UI renders as a
-/// diff, while `message.content` only says "The file … has been updated
-/// successfully". Reconstruct a unified diff so marlin's clients — which
-/// already colorize @@-hunk tool bodies — show the actual change. The field
-/// is undocumented CC internals: ANY shape surprise returns null and the
-/// caller keeps the flat text (fail soft, never error).
+/// model-facing content: for Edit/Write/MultiEdit its `structuredPatch`
+/// carries the hunks CC's own UI renders as a diff, while `message.content`
+/// only says "The file … has been updated successfully". Reconstruct that
+/// change in the NATIVE file tools' dialect — "<verb> … in <path>" intro plus
+/// bare @@ hunks, no ---/+++ headers — so every client treats guest edits
+/// exactly like native ones (collapse-stop, authored-diff line cap, language
+/// sniffing from the intro path). The field is undocumented CC internals, and
+/// even its NAME differs by surface: `tool_use_result` on -p stream-json
+/// stdout (what we read), `toolUseResult` in the on-disk session transcripts.
+/// Accept both; ANY shape surprise returns null and the caller keeps the
+/// flat text (fail soft, never error).
 fn diffFromToolUseResult(arena: std.mem.Allocator, root: std.json.ObjectMap) ?[]const u8 {
-    const tur = root.get("toolUseResult") orelse return null;
+    const tur = root.get("tool_use_result") orelse root.get("toolUseResult") orelse return null;
     if (tur != .object) return null;
+    const path = strField(tur.object, "filePath") orelse return null;
     const patch = tur.object.get("structuredPatch") orelse return null;
-    if (patch != .array or patch.array.items.len == 0) return null;
+    if (patch != .array) return null;
+    if (patch.array.items.len > 0)
+        return hunkDiff(arena, path, strField(tur.object, "originalFile"), patch.array.items);
+    // Write creating a new file carries no hunks, only the content; render
+    // the same all-additions preview the native write tool produces.
+    const kind = strField(tur.object, "type") orelse return null;
+    if (!std.mem.eql(u8, kind, "create")) return null;
+    const content = strField(tur.object, "content") orelse return null;
+    return creationDiff(arena, path, content);
+}
 
+fn hunkDiff(
+    arena: std.mem.Allocator,
+    path: []const u8,
+    original: ?[]const u8,
+    hunks: []const std.json.Value,
+) ?[]const u8 {
     var acc: std.Io.Writer.Allocating = .init(arena);
     const w = &acc.writer;
-    if (strField(tur.object, "filePath")) |path| {
-        w.print("--- a{s}\n+++ b{s}\n", .{ path, path }) catch return null;
-    }
-    for (patch.array.items) |hunk_value| {
+    w.print("edited {d} hunk{s} in {s}\n", .{
+        hunks.len,
+        if (hunks.len == 1) "" else "s",
+        path,
+    }) catch return null;
+    for (hunks) |hunk_value| {
         if (hunk_value != .object) return null;
         const hunk = hunk_value.object;
         const old_start = uintField(hunk, "oldStart") orelse return null;
@@ -314,11 +336,66 @@ fn diffFromToolUseResult(arena: std.mem.Allocator, root: std.json.ObjectMap) ?[]
         const new_lines = uintField(hunk, "newLines") orelse return null;
         const lines = hunk.get("lines") orelse return null;
         if (lines != .array) return null;
-        w.print("@@ -{d},{d} +{d},{d} @@\n", .{ old_start, old_lines, new_start, new_lines }) catch return null;
+        w.print("@@ -{d},{d} +{d},{d} @@", .{ old_start, old_lines, new_start, new_lines }) catch return null;
+        if (original) |orig| {
+            const ctx = enclosingDeclaration(orig, old_start, leadingContextLines(lines.array.items));
+            if (ctx.len > 0) w.print(" {s}", .{ctx[0..@min(ctx.len, 60)]}) catch return null;
+        }
+        w.print("\n", .{}) catch return null;
         for (lines.array.items) |line_value| {
             if (line_value != .string) return null;
             w.print("{s}\n", .{line_value.string}) catch return null;
         }
+    }
+    const text = acc.toOwnedSlice() catch return null;
+    return std.mem.trimEnd(u8, text, "\n");
+}
+
+/// Hunk-header context, matching the native unifiedDiff (git's -p
+/// heuristic): the nearest line at column 0 starting with a letter or
+/// underscore, at or above the hunk's first CHANGED line — the hunk's own
+/// leading context lines count as candidates, hence the offset.
+fn enclosingDeclaration(original: []const u8, old_start: u64, leading_context: usize) []const u8 {
+    if (old_start == 0) return "";
+    const last_candidate = old_start - 1 + leading_context;
+    var declaration: []const u8 = "";
+    var line_no: u64 = 1;
+    var it = std.mem.splitScalar(u8, original, '\n');
+    while (it.next()) |line| : (line_no += 1) {
+        if (line_no > last_candidate) break;
+        if (line.len > 0 and (std.ascii.isAlphabetic(line[0]) or line[0] == '_')) declaration = line;
+    }
+    return declaration;
+}
+
+fn leadingContextLines(lines: []const std.json.Value) usize {
+    var count: usize = 0;
+    for (lines) |line_value| {
+        if (line_value != .string or !std.mem.startsWith(u8, line_value.string, " ")) break;
+        count += 1;
+    }
+    return count;
+}
+
+/// Same shape and cap as the native write tool's creation preview.
+const creation_preview_lines = 40;
+
+fn creationDiff(arena: std.mem.Allocator, path: []const u8, content: []const u8) ?[]const u8 {
+    var total: usize = std.mem.count(u8, content, "\n");
+    if (content.len > 0 and content[content.len - 1] != '\n') total += 1;
+    if (total == 0) return null;
+    var acc: std.Io.Writer.Allocating = .init(arena);
+    const w = &acc.writer;
+    w.print("created {s} ({d} bytes)\n@@ -0,0 +1,{d} @@\n", .{ path, content.len, total }) catch return null;
+    var shown: usize = 0;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        if (shown == total or shown == creation_preview_lines) break;
+        w.print("+{s}\n", .{line}) catch return null;
+        shown += 1;
+    }
+    if (total > shown) {
+        w.print("… {d} more new lines\n", .{total - shown}) catch return null;
     }
     const text = acc.toOwnedSlice() catch return null;
     return std.mem.trimEnd(u8, text, "\n");
@@ -507,40 +584,69 @@ test "decode: tool_result adopts the structuredPatch diff when present" {
     const arena = arena_state.allocator();
     var events: std.ArrayList(Event) = .empty;
 
+    // -p stream-json stdout spells the metadata field tool_use_result. The
+    // reconstruction speaks the native file tools' dialect: "… in <path>"
+    // intro plus bare @@ hunks — no ---/+++ headers.
     try decodeLine(arena,
-        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"The file /tmp/a.zig has been updated successfully."}]},"toolUseResult":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":3,"oldLines":2,"newStart":3,"newLines":2,"lines":[" ctx","-old","+new"]}]}}
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"The file /tmp/a.zig has been updated successfully."}]},"tool_use_result":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":3,"oldLines":2,"newStart":3,"newLines":2,"lines":[" ctx","-old","+new"]}]}}
     , &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expectEqualStrings(
-        "--- a/tmp/a.zig\n+++ b/tmp/a.zig\n@@ -3,2 +3,2 @@\n ctx\n-old\n+new",
+        "edited 1 hunk in /tmp/a.zig\n@@ -3,2 +3,2 @@\n ctx\n-old\n+new",
         events.items[0].tool_result.text,
     );
 
+    // The on-disk transcript spelling (toolUseResult) is accepted too.
+    try decodeLine(arena,
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1b","content":"updated"}]},"toolUseResult":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["+x"]}]}}
+    , &events);
+    try std.testing.expect(std.mem.startsWith(u8, events.items[1].tool_result.text, "edited 1 hunk in /tmp/a.zig"));
+
     // Fail soft: a shape surprise inside the patch keeps the flat text.
     try decodeLine(arena,
-        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"flat"}]},"toolUseResult":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"lines":"not-an-array"}]}}
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"flat"}]},"tool_use_result":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"lines":"not-an-array"}]}}
     , &events);
-    try std.testing.expectEqualStrings("flat", events.items[1].tool_result.text);
+    try std.testing.expectEqualStrings("flat", events.items[2].tool_result.text);
 
-    // An empty patch (e.g. Write creating a new file) keeps the flat text.
+    // Write creating a new file: no hunks, but type/content are enough to
+    // render the native creation preview (all-additions pseudo-diff).
     try decodeLine(arena,
-        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"created"}]},"toolUseResult":{"filePath":"/tmp/b.zig","structuredPatch":[]}}
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"File created successfully"}]},"tool_use_result":{"type":"create","filePath":"/tmp/b.zig","content":"one\ntwo\n","structuredPatch":[]}}
     , &events);
-    try std.testing.expectEqualStrings("created", events.items[2].tool_result.text);
+    try std.testing.expectEqualStrings(
+        "created /tmp/b.zig (8 bytes)\n@@ -0,0 +1,2 @@\n+one\n+two",
+        events.items[3].tool_result.text,
+    );
+
+    // An empty patch WITHOUT creation content keeps the flat text.
+    try decodeLine(arena,
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3b","content":"created"}]},"tool_use_result":{"filePath":"/tmp/b.zig","structuredPatch":[]}}
+    , &events);
+    try std.testing.expectEqualStrings("created", events.items[4].tool_result.text);
 
     // Error results always keep their error text.
     try decodeLine(arena,
-        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t4","content":"nope","is_error":true}]},"toolUseResult":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["+x"]}]}}
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t4","content":"nope","is_error":true}]},"tool_use_result":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["+x"]}]}}
     , &events);
-    try std.testing.expect(events.items[3].tool_result.is_error);
-    try std.testing.expectEqualStrings("nope", events.items[3].tool_result.text);
+    try std.testing.expect(events.items[5].tool_result.is_error);
+    try std.testing.expectEqualStrings("nope", events.items[5].tool_result.text);
 
     // Two results in one event: ambiguous mapping, nobody adopts the diff.
     try decodeLine(arena,
-        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t5","content":"one"},{"type":"tool_result","tool_use_id":"t6","content":"two"}]},"toolUseResult":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["+x"]}]}}
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t5","content":"one"},{"type":"tool_result","tool_use_id":"t6","content":"two"}]},"tool_use_result":{"filePath":"/tmp/a.zig","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["+x"]}]}}
     , &events);
-    try std.testing.expectEqualStrings("one", events.items[4].tool_result.text);
-    try std.testing.expectEqualStrings("two", events.items[5].tool_result.text);
+    try std.testing.expectEqualStrings("one", events.items[6].tool_result.text);
+    try std.testing.expectEqualStrings("two", events.items[7].tool_result.text);
+
+    // With originalFile present, the hunk header carries the enclosing
+    // declaration, exactly like the native unifiedDiff.
+    try decodeLine(arena,
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t7","content":"ok"}]},"tool_use_result":{"filePath":"/tmp/a.zig","originalFile":"const a = 1;\n\npub fn greet() void {\n    old();\n}\n","structuredPatch":[{"oldStart":3,"oldLines":3,"newStart":3,"newLines":3,"lines":[" pub fn greet() void {","-    old();","+    new();"," }"]}]}}
+    , &events);
+    try std.testing.expectEqualStrings(
+        "edited 1 hunk in /tmp/a.zig\n@@ -3,3 +3,3 @@ pub fn greet() void {\n pub fn greet() void {\n-    old();\n+    new();\n }",
+        events.items[8].tool_result.text,
+    );
 }
 
 test {

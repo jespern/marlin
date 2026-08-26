@@ -5233,10 +5233,14 @@ test "diff rows combine subtle surfaces with syntax foregrounds" {
     var lines: std.ArrayList(Line) = .empty;
 
     var nums: DiffLineNumbers = .{};
-    try appendDiffLine(arena, &lines, "  ", "+    const msg = \"hello\";", .zig, Palette.tool_out, &nums);
-    try appendDiffLine(arena, &lines, "  ", "@@ -4,1 +4,1 @@ pub fn greet() void {", .zig, Palette.tool_out, &nums);
-    try appendDiffLine(arena, &lines, "  ", "+    greet();", .zig, Palette.tool_out, &nums);
-    try appendDiffLine(arena, &lines, "  ", "-    farewell();", .zig, Palette.tool_out, &nums);
+    _ = try appendDiffLine(arena, &lines, "  ", "+    const msg = \"hello\";", .zig, Palette.tool_out, &nums);
+    // A hunk header renders only its enclosing-declaration context…
+    try std.testing.expect(try appendDiffLine(arena, &lines, "  ", "@@ -4,1 +4,1 @@ pub fn greet() void {", .zig, Palette.tool_out, &nums));
+    _ = try appendDiffLine(arena, &lines, "  ", "+    greet();", .zig, Palette.tool_out, &nums);
+    _ = try appendDiffLine(arena, &lines, "  ", "-    farewell();", .zig, Palette.tool_out, &nums);
+    try std.testing.expectEqual(@as(usize, 4), lines.items.len);
+    // …while a bare one (no context) feeds the gutter and renders nothing.
+    try std.testing.expect(!try appendDiffLine(arena, &lines, "  ", "@@ -9,1 +9,1 @@", .zig, Palette.tool_out, &nums));
     try std.testing.expectEqual(@as(usize, 4), lines.items.len);
 
     // Before any hunk header: no number. After: new-file numbers for adds,
@@ -5252,7 +5256,8 @@ test "diff rows combine subtle surfaces with syntax foregrounds" {
     try std.testing.expect(added.syntax.len >= 2); // `const` + string
 
     const hunk = lines.items[1];
-    try std.testing.expect(std.mem.indexOf(u8, hunk.text, "pub fn greet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hunk.text, "@@") == null); // machinery hidden
+    try std.testing.expect(std.mem.indexOf(u8, hunk.text2, "pub fn greet") != null);
     try std.testing.expect(hunk.syntax.len >= 3); // pub + fn + greet
 
     var screen = try vaxis.Screen.init(gpa, .{
