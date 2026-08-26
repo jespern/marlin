@@ -91,6 +91,10 @@ pub const Config = struct {
     /// default; degrades silently to localhost-only when tailscale is absent
     /// or logged out. `[web] tailscale = false` opts out.
     web_tailscale: bool = true,
+
+    /// TUI chrome (`[ui]`): the top tab strip. Toggleable live via /config,
+    /// which persists back here through setUiTabBar.
+    ui_tab_bar: bool = true,
 };
 
 pub fn defaults() Config {
@@ -246,6 +250,87 @@ pub fn removeMcpServer(
     const updated = try removeMcpServerText(gpa, current, name);
     defer gpa.free(updated);
     try replaceRaw(gpa, io, environ, updated);
+}
+
+/// Persist the TUI tab-bar preference (`[ui] tab_bar`), editing the user's
+/// config.toml surgically: replace the existing key line, insert it into an
+/// existing [ui] table, or append a fresh table — everything else stays
+/// byte-for-byte, and the result must reparse before it may replace the file.
+pub fn setUiTabBar(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    enabled: bool,
+) !void {
+    const current = try readRawAlloc(gpa, io, environ);
+    defer gpa.free(current);
+    const updated = try setScalarText(gpa, current, "ui", "tab_bar", if (enabled) "true" else "false");
+    defer gpa.free(updated);
+    try replaceRaw(gpa, io, environ, updated);
+}
+
+/// Set `key = value` inside `[section]` of a TOML document, preserving all
+/// other bytes. Section/key matching mirrors the parser (trimmed lines,
+/// comments stripped); the produced text is parse-verified by the caller's
+/// value being a valid literal and a final toml.parse here.
+fn setScalarText(
+    gpa: std.mem.Allocator,
+    current: []const u8,
+    section: []const u8,
+    key: []const u8,
+    value: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    var in_section = false;
+    var replaced = false;
+    var offset: usize = 0;
+    while (offset < current.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, current, offset, '\n') orelse current.len;
+        const next = if (line_end < current.len) line_end + 1 else line_end;
+        const raw = current[offset..line_end];
+        const line = std.mem.trim(u8, raw, " \t\r");
+
+        if (line.len > 0 and line[0] == '[') {
+            if (in_section and !replaced) {
+                // Leaving the target section without having found the key:
+                // insert it at the section's end, before this next header.
+                try out.print(gpa, "{s} = {s}\n", .{ key, value });
+                replaced = true;
+            }
+            const header = std.mem.trim(u8, std.mem.trim(u8, line, "[]"), " \t");
+            in_section = std.mem.eql(u8, header, section);
+        } else if (in_section and !replaced) {
+            if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+                const line_key = std.mem.trim(u8, line[0..eq], " \t");
+                if (std.mem.eql(u8, line_key, key)) {
+                    try out.print(gpa, "{s} = {s}\n", .{ key, value });
+                    replaced = true;
+                    offset = next;
+                    continue;
+                }
+            }
+        }
+        try out.appendSlice(gpa, current[offset..next]);
+        if (next == line_end and line_end == current.len and raw.len > 0) try out.append(gpa, '\n');
+        offset = next;
+    }
+    if (!replaced) {
+        if (in_section) {
+            // Section was the last one in the file; append the key to it.
+            try out.print(gpa, "{s} = {s}\n", .{ key, value });
+        } else {
+            if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(gpa, '\n');
+            if (out.items.len > 0) try out.append(gpa, '\n');
+            try out.print(gpa, "[{s}]\n{s} = {s}\n", .{ section, key, value });
+        }
+    }
+
+    var verify_arena = std.heap.ArenaAllocator.init(gpa);
+    defer verify_arena.deinit();
+    _ = try toml.parse(verify_arena.allocator(), out.items);
+    return out.toOwnedSlice(gpa);
 }
 
 /// Define or replace a named review council (durable [[council]] table).
@@ -486,6 +571,7 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.workspace_enabled) |value| cfg.workspace_enabled = value;
     if (doc.web_enabled) |value| cfg.web_enabled = value;
     if (doc.web_tailscale) |value| cfg.web_tailscale = value;
+    if (doc.ui_tab_bar) |value| cfg.ui_tab_bar = value;
     if (doc.network_blocklists) |value| cfg.network_blocklists = value;
     if (doc.network_allow) |value| cfg.network_allow = value;
     if (doc.network_deny) |value| cfg.network_deny = value;
@@ -708,4 +794,32 @@ test "council config text edits: set replaces, remove deletes, garbage rejected"
     try std.testing.expectError(error.UnknownCouncil, removeCouncilText(gpa, base, "nope"));
     try std.testing.expectError(error.CouncilBadModel, setCouncilText(gpa, base, "bad", &.{"notamodel"}));
     try std.testing.expectError(error.CouncilMissingModels, setCouncilText(gpa, base, "bad", &.{}));
+}
+
+test "ui scalar edits: replace in place, insert into section, append section" {
+    const gpa = std.testing.allocator;
+
+    // No [ui] section: appended, other tables untouched byte-for-byte.
+    const base = "[model]\ndefault = \"openrouter/x\"\n";
+    const appended = try setScalarText(gpa, base, "ui", "tab_bar", "false");
+    defer gpa.free(appended);
+    try std.testing.expect(std.mem.startsWith(u8, appended, base));
+    try std.testing.expect(std.mem.indexOf(u8, appended, "[ui]\ntab_bar = false\n") != null);
+
+    // Existing key: replaced in place, once.
+    const replaced = try setScalarText(gpa, appended, "ui", "tab_bar", "true");
+    defer gpa.free(replaced);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, replaced, "tab_bar"));
+    try std.testing.expect(std.mem.indexOf(u8, replaced, "tab_bar = true") != null);
+
+    // Existing section without the key, followed by another section: the key
+    // lands inside [ui], not at the file end.
+    const sandwich = "[ui]\n# chrome prefs\n[web]\nenabled = true\n";
+    const inserted = try setScalarText(gpa, sandwich, "ui", "tab_bar", "false");
+    defer gpa.free(inserted);
+    const ui_at = std.mem.indexOf(u8, inserted, "[ui]").?;
+    const key_at = std.mem.indexOf(u8, inserted, "tab_bar = false").?;
+    const web_at = std.mem.indexOf(u8, inserted, "[web]").?;
+    try std.testing.expect(ui_at < key_at and key_at < web_at);
+    try std.testing.expect(std.mem.indexOf(u8, inserted, "# chrome prefs") != null);
 }

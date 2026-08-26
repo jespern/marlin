@@ -56,6 +56,7 @@ pub const Document = struct {
     workspace_enabled: ?bool = null,
     web_enabled: ?bool = null,
     web_tailscale: ?bool = null,
+    ui_tab_bar: ?bool = null,
     network_blocklists: ?[]const u8 = null,
     network_allow: ?[]const u8 = null,
     network_deny: ?[]const u8 = null,
@@ -75,6 +76,7 @@ const Section = enum {
     permissions,
     workspace,
     web,
+    ui,
     network,
     hooks,
     skills,
@@ -178,6 +180,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             .web => {
                 if (std.mem.eql(u8, key, "enabled")) doc.web_enabled = try boolean(value);
                 if (std.mem.eql(u8, key, "tailscale")) doc.web_tailscale = try boolean(value);
+            },
+            .ui => if (std.mem.eql(u8, key, "tab_bar")) {
+                doc.ui_tab_bar = try boolean(value);
             },
             .network => {
                 if (std.mem.eql(u8, key, "blocklists")) doc.network_blocklists = try string(arena, value);
@@ -283,6 +288,7 @@ fn sectionFor(name: []const u8) Section {
         .{ "permissions", Section.permissions },
         .{ "workspace", Section.workspace },
         .{ "web", Section.web },
+        .{ "ui", Section.ui },
         .{ "network", Section.network },
         .{ "hooks", Section.hooks },
         .{ "skills", Section.skills },
@@ -456,18 +462,21 @@ test "known malformed values fail" {
     ));
 }
 
-test "web tailscale flag parses" {
+test "web tailscale and ui tab_bar flags parse" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const doc = try parse(arena_state.allocator(),
         \\[web]
         \\enabled = true
         \\tailscale = false
+        \\[ui]
+        \\tab_bar = false
         \\[model]
         \\default = "local/qwen"
     );
     try std.testing.expect(doc.web_enabled.?);
     try std.testing.expect(!doc.web_tailscale.?);
+    try std.testing.expect(!doc.ui_tab_bar.?);
     try std.testing.expectEqualStrings("local/qwen", doc.model_default.?);
 }
 
