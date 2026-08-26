@@ -17,7 +17,6 @@ const Io = std.Io;
 const config = @import("../core/config.zig");
 const proto = @import("../core/proto.zig");
 const session_handle = @import("../core/session_handle.zig");
-const store_mod = @import("../daemon/store.zig");
 const attach = @import("attach.zig");
 const media = @import("media.zig");
 
@@ -455,6 +454,7 @@ pub fn gc(
     gpa: std.mem.Allocator,
     io: Io,
     environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
     args: []const [:0]const u8,
 ) !u8 {
     var expire_before_ms: ?i64 = null;
@@ -477,15 +477,18 @@ pub fn gc(
         expire_before_ms = now_ms - days * ms_per_day;
     }
 
-    const db_path = try store_mod.defaultDbPath(gpa, io, environ);
-    defer gpa.free(db_path);
-    var store = store_mod.Store.open(gpa, db_path) catch |err| {
-        try eprint(io, "marlin gc: could not open store: {t}\n", .{err});
+    // Through the daemon (autostarting it if needed): store.zig stays the
+    // only sqlite user and the single-connection discipline holds.
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
+        try eprint(io, "marlin gc: cannot reach daemon: {t}\n", .{e});
         return 1;
     };
-    defer store.close();
-    const report = store.gc(expire_before_ms) catch |err| {
-        try eprint(io, "marlin gc: maintenance failed: {t}\n", .{err});
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try conn.send(.{ .gc = .{ .expire_before_ms = expire_before_ms orelse 0 } });
+    const report = conn.recvUntil(arena_state.allocator(), .gc_result) catch {
+        try eprint(io, "marlin gc: maintenance failed\n", .{});
         return 1;
     };
     try print(io, "reclaimed {d} bytes ({d} orphan blobs, {d} expired bodies)\n", .{

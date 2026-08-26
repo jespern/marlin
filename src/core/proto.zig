@@ -175,6 +175,11 @@ pub const ClientMsg = union(enum) {
         /// Opt into interrupt_result instead of the legacy ok reply.
         report: bool = false,
     },
+    /// Blob-store maintenance (`marlin gc`): sweep orphan blobs, and demote
+    /// full bodies older than expire_before_ms when non-zero. Runs in the
+    /// daemon so the store keeps its single-connection discipline; replies
+    /// gc_result.
+    gc: struct { expire_before_ms: i64 = 0 },
     /// Coordinated shutdown for /reboot: quiesce (wait for running turns to
     /// hit a block boundary — or interrupt them when force=true), persist,
     /// release the socket, exit 0. Reply `ok` is sent RIGHT BEFORE exit; the
@@ -260,6 +265,8 @@ pub const DaemonMsg = union(enum) {
     blob_result: struct { hash: []const u8, bytes: []const u8 },
     /// Terminal reply to cc_approval.
     cc_approval_result: struct { sid: u64, decision: ApprovalAnswer },
+    /// Terminal reply to gc.
+    gc_result: struct { bytes_reclaimed: u64, orphan_blobs: u64, expired_blobs: u64 },
     interrupt_result: InterruptResult,
     /// `request_id` is non-zero only when replying to a correlated request
     /// (currently input). Defaults preserve compatibility in both directions.
@@ -291,6 +298,9 @@ pub const SessionInfo = struct {
     /// Effective shell-sandbox state: the session's toggle AND a verified
     /// backend. Defaults false when decoding older daemons.
     sandboxed: bool = false,
+    /// Approval mode is "auto" (/permissions full): nothing asks. Server
+    /// truth so clients never mirror this per-App instead of per-session.
+    full_access: bool = false,
     /// Whether Marlin-owned network tools enforce the loaded hostname policy
     /// for this session. Defaults false when decoding older daemons.
     network_filtering: bool = false,
@@ -465,6 +475,16 @@ test "round trip: client messages" {
     defer gpa.free(cc_reply);
     const cc_reply_back = try decode(DaemonMsg, arena, cc_reply);
     try std.testing.expectEqual(ApprovalAnswer.granted, cc_reply_back.cc_approval_result.decision);
+
+    const gc_line = try encode(gpa, ClientMsg{ .gc = .{ .expire_before_ms = 123 } });
+    defer gpa.free(gc_line);
+    const gc_back = try decode(ClientMsg, arena, gc_line);
+    try std.testing.expectEqual(@as(i64, 123), gc_back.gc.expire_before_ms);
+
+    const gc_reply = try encode(gpa, DaemonMsg{ .gc_result = .{ .bytes_reclaimed = 9, .orphan_blobs = 1, .expired_blobs = 0 } });
+    defer gpa.free(gc_reply);
+    const gc_reply_back = try decode(DaemonMsg, arena, gc_reply);
+    try std.testing.expectEqual(@as(u64, 9), gc_reply_back.gc_result.bytes_reclaimed);
 }
 
 test "latest plan survives the replay marker wire" {

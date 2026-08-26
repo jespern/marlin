@@ -1596,6 +1596,20 @@ pub const Daemon = struct {
                 else
                     self.sendTo(client, .{ .ok = .{} });
             },
+            .gc => |g| {
+                // Store maintenance on the dispatcher: gc is an explicit,
+                // rare operator action and the store is dispatcher-owned;
+                // briefly pausing fan-out beats a second sqlite connection.
+                const report = self.store.gc(if (g.expire_before_ms > 0) g.expire_before_ms else null) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "store", .msg = "gc maintenance failed" } });
+                    return;
+                };
+                self.sendTo(client, .{ .gc_result = .{
+                    .bytes_reclaimed = report.bytes_reclaimed,
+                    .orphan_blobs = report.orphan_blobs,
+                    .expired_blobs = report.expired_blobs,
+                } });
+            },
             .shutdown => {
                 self.sendTo(client, .{ .ok = .{} });
                 // Same sequence as Event.shutdown (the SIGTERM path): freeze
@@ -2615,6 +2629,7 @@ pub const Daemon = struct {
                 .running = state == .running,
                 .sandboxed = self.sandbox_backend != .unavailable and
                     (if (live) |session| session.sandbox_enabled else self.cfg.permissions_enabled),
+                .full_access = if (live) |session| session.approval_mode == .auto else false,
                 .network_filtering = self.network.isActive() and
                     (if (live) |session| session.network_filtering_enabled else true),
                 .archived = row.archived,

@@ -17,7 +17,7 @@
 //!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom;
 //!            </> or Left/Right switch tabs; q quit
 //!   global:  Ctrl+L clears/redraws and returns to bottom; Ctrl+T toggles
-//!            the expanded tool transcript
+//!            the expanded tool transcript; Alt/Option+1..9 jumps to that tab
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /new, /compact,
 //!             /archive, /reboot [--build], /help, /quit
@@ -244,6 +244,8 @@ const SessionSummary = struct {
     sandboxed: bool,
     /// Whether managed tools enforce the loaded hostname policy.
     network_filtering: bool,
+    /// Approval mode is "auto" (/permissions full) for this session.
+    full_access: bool,
 
     fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
@@ -711,6 +713,26 @@ const App = struct {
         return null;
     }
 
+    /// The session parked on an approval inside this tab's tree, if any —
+    /// the ! indicator aggregates over the tree, so activating the tab must
+    /// land where the approval can actually be answered.
+    fn awaitingSessionInTree(self: *const App, root_sid: u64) ?u64 {
+        for (self.sessions.items) |session| {
+            if (session.state != .awaiting_approval) continue;
+            if (self.sessionBelongsToTree(session.sid, root_sid)) return session.sid;
+        }
+        return null;
+    }
+
+    /// First non-focused session parked on an approval, anywhere.
+    fn firstAwaitingSid(self: *const App) ?u64 {
+        for (self.sessions.items) |session| {
+            if (session.sid == self.sid) continue;
+            if (session.state == .awaiting_approval) return session.sid;
+        }
+        return null;
+    }
+
     fn rememberSession(self: *App, sid: u64) void {
         for (self.known_session_ids.items) |known| if (known == sid) return;
         self.known_session_ids.append(self.gpa, sid) catch {};
@@ -903,6 +925,10 @@ const App = struct {
             self.pending = pending;
             _ = self.background_approvals.remove(sid);
         }
+        // Server truth, per session — the FULL ACCESS badge must never
+        // follow the App across tabs (a full A, default B switch used to
+        // keep the badge lit).
+        self.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
 
         if (touch_recent) self.touchRecentSession(sid);
         self.animation_active.store(self.state == .running, .release);
@@ -945,6 +971,18 @@ const App = struct {
     fn cycleTab(self: *App, direction: i8) void {
         const active_root = self.rootSessionId(self.sid);
         const sid = nextRootTabSid(self.sessions.items, active_root, direction) orelse return;
+        if (sid == self.sid) return;
+        self.switchSession(sid, true) catch self.setNotice("could not switch tab", .{});
+    }
+
+    /// Option/Alt+N: jump straight to the Nth tab in the strip's
+    /// chronological order (1-based), from any mode. From a focused child
+    /// this also jumps to its own root (the highlighted tab).
+    fn jumpToTab(self: *App, index: usize) void {
+        const sid = rootTabSidAtIndex(self.sessions.items, index) orelse {
+            self.setNotice("no tab {d}", .{index});
+            return;
+        };
         if (sid == self.sid) return;
         self.switchSession(sid, true) catch self.setNotice("could not switch tab", .{});
     }
@@ -1071,6 +1109,7 @@ const App = struct {
             .label = label,
             .sandboxed = info.sandboxed,
             .network_filtering = info.network_filtering,
+            .full_access = info.full_access,
         };
     }
 
@@ -1086,6 +1125,7 @@ const App = struct {
             if (info.sid == self.sid) {
                 self.state = info.state;
                 self.setModelStr(info.model);
+                self.permissions_full = info.full_access;
             }
             if (self.saved_views.get(info.sid)) |saved| saved.state = info.state;
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
@@ -2811,6 +2851,22 @@ fn nextRootTabSid(sessions: []const SessionSummary, active_sid: u64, direction: 
     return if (adjacent) |session| session.sid else if (direction < 0) last.?.sid else first.?.sid;
 }
 
+/// The Nth root tab (1-based) in the same order the strip renders:
+/// rootTabPrecedes over root sessions. Null when index is 0 or off the end.
+fn rootTabSidAtIndex(sessions: []const SessionSummary, index: usize) ?u64 {
+    if (index == 0) return null;
+    for (sessions) |*candidate| {
+        if (candidate.parent_sid != null or candidate.kind != .root) continue;
+        var preceding: usize = 0;
+        for (sessions) |*other| {
+            if (other.parent_sid != null or other.kind != .root or other == candidate) continue;
+            if (rootTabPrecedes(other, candidate)) preceding += 1;
+        }
+        if (preceding == index - 1) return candidate.sid;
+    }
+    return null;
+}
+
 fn tabLabel(
     arena: std.mem.Allocator,
     app: *const App,
@@ -2993,6 +3049,7 @@ const ShortcutHelpRow = struct {
 const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Esc / i", .description = "return to insert mode" },
     .{ .key = "</> or ←/→", .description = "previous / next tab" },
+    .{ .key = "⌥1–⌥9", .description = "jump to Nth tab (works in insert mode too)" },
     .{ .key = "gt / gT", .description = "switch sessions · Ngt = Nth recent" },
     .{ .key = "J", .description = "join lines" },
     .{ .key = "a / A / I", .description = "insert after cursor / line end / line start" },
@@ -4067,7 +4124,12 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
         const col: usize = if (m.col < 0) 0 else @intCast(m.col);
         if (app.tabAtColumn(col)) |sid| {
             if (tabMouseAction(m)) |action| switch (action) {
-                .activate => app.switchSession(sid, true) catch app.setNotice("could not switch session", .{}),
+                // A tab flagged ! takes you TO the parked approval, not to
+                // the tree's root; keyboard jumps (alt+N, gt) stay literal.
+                .activate => {
+                    const target = app.awaitingSessionInTree(sid) orelse sid;
+                    app.switchSession(target, true) catch app.setNotice("could not switch session", .{});
+                },
                 // Reserved for a future tab menu; right-click intentionally
                 // has no product behavior yet.
                 .context_menu => {},
@@ -4315,6 +4377,14 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
+    // Option/Alt+1..9 jumps straight to that tab (strip order) from either
+    // mode. Below the modal blocks on purpose: an open picker or help panel
+    // keeps swallowing every key.
+    if (key.mods.alt and !key.mods.ctrl and key.codepoint >= '1' and key.codepoint <= '9') {
+        app.jumpToTab(@intCast(key.codepoint - '0'));
+        return;
+    }
+
     // Approval hotkeys work in both modes when the input is empty.
     if (app.pending != null and app.editor.isEmpty()) {
         if (key.matches('y', .{})) {
@@ -4323,6 +4393,18 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         }
         if (key.matches('n', .{})) {
             app.approveReply(false);
+            return;
+        }
+    }
+    // Nothing parked HERE but something parked elsewhere: y/n jump to it
+    // instead of dead-keying. Deliberately never answers a background
+    // approval blind — you approve only what is on screen.
+    if (app.pending == null and app.editor.isEmpty() and
+        (key.matches('y', .{}) or key.matches('n', .{})))
+    {
+        if (app.firstAwaitingSid()) |awaiting_sid| {
+            app.switchSession(awaiting_sid, true) catch return;
+            app.setNotice("approval pending here — y approves, n denies", .{});
             return;
         }
     }
@@ -5936,6 +6018,14 @@ test "normal-mode tab navigation follows chronological roots and wraps" {
         .{ .sid = 10, .title = "first", .model = "m", .status = "idle", .created_at = 10, .running = false },
     });
 
+    // Alt+N indexing matches the rendered strip order: children never get a
+    // slot, ties break on sid, and out-of-range indices are null (notice).
+    try std.testing.expectEqual(@as(?u64, 10), rootTabSidAtIndex(app.sessions.items, 1));
+    try std.testing.expectEqual(@as(?u64, 20), rootTabSidAtIndex(app.sessions.items, 2));
+    try std.testing.expectEqual(@as(?u64, 40), rootTabSidAtIndex(app.sessions.items, 3));
+    try std.testing.expectEqual(@as(?u64, null), rootTabSidAtIndex(app.sessions.items, 4));
+    try std.testing.expectEqual(@as(?u64, null), rootTabSidAtIndex(app.sessions.items, 0));
+
     // Focused children navigate relative to their highlighted root. Equal
     // timestamps use sid as the same deterministic tie-break as the renderer.
     try std.testing.expectEqual(@as(?u64, 40), nextRootTabSid(app.sessions.items, app.rootSessionId(30), 1));
@@ -6645,4 +6735,74 @@ test "plan strip centers unfinished work and collapses when complete" {
     };
     try std.testing.expectEqual(@as(usize, 0), planDisplayRange(&completed, 5).len);
     try std.testing.expectEqual(@as(usize, 0), planDisplayRange(&items, 0).len);
+}
+
+test "parked approvals are findable per tree and globally; badge follows the session" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 10,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.replaceSessionSummaries(&.{ .{
+        .sid = 10,
+        .title = "focused root",
+        .model = "m",
+        .status = "idle",
+        .created_at = 10,
+        .running = false,
+        .full_access = true,
+    }, .{
+        .sid = 20,
+        .title = "other root",
+        .model = "m",
+        .status = "idle",
+        .created_at = 20,
+        .running = false,
+    }, .{
+        .sid = 21,
+        .parent_sid = 20,
+        .kind = .task_child,
+        .title = "parked child",
+        .model = "m",
+        .status = "awaiting_approval",
+        .state = .awaiting_approval,
+        .created_at = 21,
+        .running = false,
+    } });
+
+    // Activating the flagged tree lands on the parked child, not the root.
+    try std.testing.expectEqual(@as(?u64, 21), app.awaitingSessionInTree(20));
+    try std.testing.expectEqual(@as(?u64, null), app.awaitingSessionInTree(10));
+    // y/n with nothing parked here jumps to the parked session.
+    try std.testing.expectEqual(@as(?u64, 21), app.firstAwaitingSid());
+
+    // FULL ACCESS is per session (server truth), not App state: an upsert
+    // for the focused session updates the badge; other sessions never do.
+    app.upsertSessionSummary(.{
+        .sid = 10,
+        .title = "focused root",
+        .model = "m",
+        .status = "idle",
+        .created_at = 10,
+        .running = false,
+        .full_access = true,
+    });
+    try std.testing.expect(app.permissions_full);
+    app.upsertSessionSummary(.{
+        .sid = 10,
+        .title = "focused root",
+        .model = "m",
+        .status = "idle",
+        .created_at = 10,
+        .running = false,
+        .full_access = false,
+    });
+    try std.testing.expect(!app.permissions_full);
 }

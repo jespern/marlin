@@ -75,7 +75,7 @@ pub fn dispatch(
         .kill => return headless.kill(gpa, io, environ, self_exe, rest),
         .compact => return headless.compact(gpa, io, environ, self_exe, rest),
         .mcp => return headless.mcp(gpa, io, environ, self_exe, rest),
-        .gc => return headless.gc(gpa, io, environ, rest),
+        .gc => return headless.gc(gpa, io, environ, self_exe, rest),
         .reboot => return headless.reboot(gpa, io, environ, self_exe, rest),
         .shutdown => return headless.shutdown(gpa, io, environ),
         .web => return web.serve(gpa, io, environ, self_exe, rest),
