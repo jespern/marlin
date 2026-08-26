@@ -861,17 +861,20 @@ fn planBorder(
     return out.toOwnedSlice(alloc);
 }
 
-/// A completed plan stays in the live bottom panel until the next human
-/// prompt. Only its last completed revision then appears in transcript
-/// history; intermediate plan updates remain implementation detail.
-fn archivedCompletedPlan(blocks: []const RenderBlock, index: usize) bool {
+/// Only the latest completed revision appears in the transcript;
+/// intermediate plan updates remain implementation detail.
+fn visibleCompletedPlan(blocks: []const RenderBlock, index: usize) bool {
     if (index >= blocks.len or !completedPlan(blocks[index].plan_items)) return false;
-    for (blocks[index + 1 ..]) |later| switch (later.kind) {
-        .plan => return false,
-        .user_msg => return true,
-        else => {},
-    };
-    return false;
+    for (blocks[index + 1 ..]) |later| {
+        if (later.kind == .plan) return false;
+    }
+    return true;
+}
+
+fn completedPlanDuration(items: []const block.PlanItem) u64 {
+    var total: u64 = 0;
+    for (items) |item| total +|= item.duration_ms;
+    return total;
 }
 
 fn appendArchivedPlanTable(
@@ -897,42 +900,52 @@ fn appendArchivedPlanTable(
                 .style3 = Palette.plan_pending,
             });
         }
-        return;
+    } else {
+        const widths = planTableWidths(width);
+        try lines.append(alloc, .{
+            .text = try planBorder(alloc, widths, "┌", "┬", "┐"),
+            .style = Palette.plan_header,
+        });
+        for (items) |item| {
+            const available = widths.task -| 3;
+            const end = hardCellBreak(item.step, 0, available);
+            const step = item.step[0..end];
+            const left = try std.fmt.allocPrint(alloc, "│ ✔ {s}", .{step});
+            const left_pad = try spaces(alloc, (widths.task + 1) -| displayWidth(left));
+            const duration = try formatPlanDuration(alloc, item.duration_ms);
+            const time_pad = try spaces(alloc, widths.time -| (displayWidth(duration) + 1));
+            const row = try std.fmt.allocPrint(alloc, "{s}{s}│{s}{s} │", .{
+                left, left_pad, time_pad, duration,
+            });
+            const middle = left.len + left_pad.len;
+            const check_start = "│ ".len;
+            const spans = try alloc.alloc(SyntaxSpan, 4);
+            spans[0] = .{ .start = 0, .end = "│".len, .style = Palette.plan_header };
+            spans[1] = .{ .start = check_start, .end = check_start + "✔".len, .style = Palette.plan_done_mark };
+            spans[2] = .{ .start = middle, .end = middle + "│".len, .style = Palette.plan_header };
+            spans[3] = .{ .start = row.len - "│".len, .end = row.len, .style = Palette.plan_header };
+            try lines.append(alloc, .{
+                .text = row,
+                .style = Palette.plan_pending,
+                .syntax = spans,
+            });
+        }
+        try lines.append(alloc, .{
+            .text = try planBorder(alloc, widths, "└", "┴", "┘"),
+            .style = Palette.plan_header,
+        });
     }
 
-    const widths = planTableWidths(width);
-    try lines.append(alloc, .{
-        .text = try planBorder(alloc, widths, "┌", "┬", "┐"),
-        .style = Palette.plan_header,
-    });
-    for (items) |item| {
-        const available = widths.task -| 3;
-        const end = hardCellBreak(item.step, 0, available);
-        const step = item.step[0..end];
-        const left = try std.fmt.allocPrint(alloc, "│ ✔ {s}", .{step});
-        const left_pad = try spaces(alloc, (widths.task + 1) -| displayWidth(left));
-        const duration = try formatPlanDuration(alloc, item.duration_ms);
-        const time_pad = try spaces(alloc, widths.time -| (displayWidth(duration) + 1));
-        const row = try std.fmt.allocPrint(alloc, "{s}{s}│{s}{s} │", .{
-            left, left_pad, time_pad, duration,
+    const total_ms = completedPlanDuration(items);
+    if (total_ms > 0) {
+        const duration = try formatPlanDuration(alloc, total_ms);
+        const summary = try std.fmt.allocPrint(alloc, "Completed {d} {s} in {s}", .{
+            items.len,
+            if (items.len == 1) "step" else "steps",
+            duration,
         });
-        const middle = left.len + left_pad.len;
-        const check_start = "│ ".len;
-        const spans = try alloc.alloc(SyntaxSpan, 4);
-        spans[0] = .{ .start = 0, .end = "│".len, .style = Palette.plan_header };
-        spans[1] = .{ .start = check_start, .end = check_start + "✔".len, .style = Palette.plan_done_mark };
-        spans[2] = .{ .start = middle, .end = middle + "│".len, .style = Palette.plan_header };
-        spans[3] = .{ .start = row.len - "│".len, .end = row.len, .style = Palette.plan_header };
-        try lines.append(alloc, .{
-            .text = row,
-            .style = Palette.plan_pending,
-            .syntax = spans,
-        });
+        try wrapPrefixed(alloc, lines, "  ✓ ", summary, Palette.note, width);
     }
-    try lines.append(alloc, .{
-        .text = try planBorder(alloc, widths, "└", "┴", "┘"),
-        .style = Palette.plan_header,
-    });
 }
 
 pub const max_layout_lines: usize = 50_000;
@@ -1244,7 +1257,7 @@ pub fn layoutBlockRange(
                 try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w);
             },
             .plan => {
-                if (archivedCompletedPlan(transcript.blocks, block_idx)) {
+                if (visibleCompletedPlan(transcript.blocks, block_idx)) {
                     try flushRanSummary(alloc, lines, &pending_ran);
                     try appendArchivedPlanTable(alloc, lines, rb.plan_items, w);
                 }
@@ -2004,7 +2017,7 @@ test "active prompt range identifies the running turn card" {
     try std.testing.expect(activePromptLineRange(&transcript) == null);
 }
 
-test "completed plan unpins into one closed transcript table after the next prompt" {
+test "completed plan moves immediately into transcript with timing summary" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -2019,7 +2032,7 @@ test "completed plan unpins into one closed transcript table after the next prom
     const blocks = [_]RenderBlock{
         .{ .kind = .plan, .turn_id = 1, .text = @constCast(""), .label = @constCast(""), .plan_items = &first_items },
         .{ .kind = .plan, .turn_id = 1, .text = @constCast(""), .label = @constCast(""), .plan_items = &final_items },
-        .{ .kind = .user_msg, .turn_id = 2, .text = @constCast("keep going"), .label = @constCast("") },
+        .{ .kind = .assistant_msg, .turn_id = 1, .text = @constCast("Implemented and verified the change."), .label = @constCast("") },
     };
     var cache = LayoutCache{};
     defer cache.reset(gpa);
@@ -2050,26 +2063,36 @@ test "completed plan unpins into one closed transcript table after the next prom
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var pinned_lines: std.ArrayList(Line) = .empty;
-    var label: []const u8 = "";
-    transcript.blocks = blocks[0..2];
-    try layoutBlockRange(arena, &transcript, &pinned_lines, 0, 2, 80, &label, false);
-    try std.testing.expectEqual(@as(usize, 0), pinned_lines.items.len);
-
     var archived_lines: std.ArrayList(Line) = .empty;
+    var label: []const u8 = "";
     transcript.blocks = &blocks;
     try layoutBlockRange(arena, &transcript, &archived_lines, 0, blocks.len, 80, &label, false);
     var top_count: usize = 0;
     var bottom_count: usize = 0;
     var saw_latest_duration = false;
-    for (archived_lines.items) |line| {
+    var saw_summary = false;
+    var saw_recap = false;
+    var summary_line: ?usize = null;
+    var recap_line: ?usize = null;
+    for (archived_lines.items, 0..) |line, index| {
         if (std.mem.startsWith(u8, line.text, "┌")) top_count += 1;
         if (std.mem.startsWith(u8, line.text, "└")) bottom_count += 1;
         if (std.mem.indexOf(u8, line.text, "1m 8s") != null) saw_latest_duration = true;
+        if (std.mem.indexOf(u8, line.text, "Completed 2 steps in 1m 26s") != null) {
+            saw_summary = true;
+            summary_line = index;
+        }
+        if (std.mem.indexOf(u8, line.text, "Implemented and verified the change.") != null) {
+            saw_recap = true;
+            recap_line = index;
+        }
     }
     try std.testing.expectEqual(@as(usize, 1), top_count);
     try std.testing.expectEqual(@as(usize, 1), bottom_count);
     try std.testing.expect(saw_latest_duration);
+    try std.testing.expect(saw_summary);
+    try std.testing.expect(saw_recap);
+    try std.testing.expect(summary_line.? < recap_line.?);
 }
 
 test "current in-flight call follows calls-first result order" {

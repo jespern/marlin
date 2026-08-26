@@ -31,6 +31,23 @@ pub const Spec = struct {
     mutating: bool,
 };
 
+/// Route conventional subprocess scratch/cache state into the sandbox's
+/// existing writable temporary root. A command-local `VAR=value command`
+/// assignment still wins in bash; inherited host cache paths cannot be used
+/// because they sit outside the kernel write boundary.
+fn configureSandboxEnvironment(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    temp_root: []const u8,
+) !void {
+    const cache_root = try std.fs.path.join(gpa, &.{ temp_root, "cache" });
+    defer gpa.free(cache_root);
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    try environ.put("TMPDIR", temp_root);
+    try environ.put("XDG_CACHE_HOME", cache_root);
+}
+
 /// The built-in tool set (M2-complete, pi-minimalist).
 pub const specs = [_]Spec{
     .{ .name = bash.spec_name, .description = bash.spec_description, .schema_json = bash.spec_schema, .parallel_safe = false, .mutating = true },
@@ -111,11 +128,11 @@ pub fn dispatch(
         };
         has_child_environ = true;
     }
-    if (has_child_environ and sandbox_options.backend == .seatbelt) {
+    if (has_child_environ and sandbox_options.backend != .unavailable) {
         const temp_root = sandbox_options.temp_root orelse {
             return .{ .output = gpa.dupe(u8, "error: sandbox temp root unavailable") catch @panic("oom"), .status = .err };
         };
-        child_environ.put("TMPDIR", temp_root) catch |e| {
+        configureSandboxEnvironment(gpa, io, &child_environ, temp_root) catch |e| {
             return .{ .output = errText(gpa, e), .status = .err };
         };
     }
@@ -264,6 +281,27 @@ test "dispatch: bad args json returns error text" {
     const r = dispatch(gpa, io, "read_file", "{not json", "/tmp", null, .{}, null, null);
     defer gpa.free(r.output);
     try std.testing.expectEqual(block.ToolStatus.err, r.status);
+}
+
+test "sandbox subprocess environment routes XDG cache into writable temp" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-tool-cache");
+    defer temp.deinit();
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("TMPDIR", "/host/tmp");
+    try environ.put("XDG_CACHE_HOME", "/host/cache");
+    try configureSandboxEnvironment(gpa, io, &environ, temp.path);
+
+    const expected = try std.fs.path.join(gpa, &.{ temp.path, "cache" });
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(temp.path, environ.get("TMPDIR").?);
+    try std.testing.expectEqualStrings(expected, environ.get("XDG_CACHE_HOME").?);
+    _ = try Io.Dir.cwd().statFile(io, expected, .{});
 }
 
 test "dispatch: file tools observe a turn already cancelled" {

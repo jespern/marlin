@@ -325,7 +325,7 @@ const PlanItemOwned = struct {
     duration_ms: u64 = 0,
 };
 
-fn hasUnfinishedPlan(items: []const PlanItemOwned) bool {
+fn hasUnfinishedPlan(items: anytype) bool {
     for (items) |item| if (item.status != .completed) return true;
     return false;
 }
@@ -406,9 +406,8 @@ const App = struct {
     blocks: std.ArrayList(RenderBlock) = .empty,
     delta: std.ArrayList(u8) = .empty,
     reasoning_delta: std.ArrayList(u8) = .empty,
-    /// Latest durable plan revision while it is pinned above the composer.
-    /// Its terminal completed revision also lives in blocks so the next user
-    /// turn can move the closed table into ordinary transcript scrollback.
+    /// Latest unfinished durable plan revision while it is pinned above the
+    /// composer. Its terminal completed revision lives only in transcript.
     plan: std.ArrayList(PlanItemOwned) = .empty,
     state: proto.SessionState = .idle,
     model: std.ArrayList(u8) = .empty,
@@ -439,8 +438,8 @@ const App = struct {
     /// Line count of the last rendered frame; used to keep the view
     /// anchored (not sliding) when new lines arrive while scrolled up.
     last_total_lines: usize = 0,
-    /// View geometry of the last frame. A running turn may show a non-
-    /// contiguous viewport: its prompt card is pinned above the bottom tail.
+    /// View geometry of the last frame. Once a running turn's prompt reaches
+    /// the top, the viewport may become non-contiguous to keep it there.
     last_first_visible: usize = 0,
     last_view_h: usize = 0,
     last_pinned_start: usize = 0,
@@ -720,23 +719,18 @@ const App = struct {
     fn clearCompletedPlan(self: *App) void {
         if (self.plan.items.len > 0 and !hasUnfinishedPlan(self.plan.items)) {
             deinitPlan(self.gpa, &self.plan);
-            // A completed plan block was previously cached as invisible.
-            // Rebuild now that a following prompt makes it historical.
             self.layout_epoch +%= 1;
         }
     }
 
-    fn restoreLatestUnarchivedPlan(self: *App) void {
+    fn restoreLatestUnfinishedPlan(self: *App) void {
         if (self.plan.items.len > 0) return;
         var i = self.blocks.items.len;
         while (i > 0) {
             i -= 1;
             const rendered = self.blocks.items[i];
             if (rendered.kind != .plan) continue;
-            for (self.blocks.items[i + 1 ..]) |later| {
-                if (later.kind == .user_msg) return;
-            }
-            self.setPlan(rendered.plan_items);
+            if (hasUnfinishedPlan(rendered.plan_items)) self.setPlan(rendered.plan_items);
             return;
         }
     }
@@ -1399,7 +1393,7 @@ const App = struct {
                 self.turn_started_ms = 0;
                 self.animation_active.store(state == .running, .release);
             }
-            self.restoreLatestUnarchivedPlan();
+            self.restoreLatestUnfinishedPlan();
             self.layout_epoch +%= 1;
             return;
         }
@@ -1446,7 +1440,7 @@ const App = struct {
             .replay_done => |replay| {
                 if (replay.sid != self.sid) return;
                 if (!replay.has_newer) {
-                    if (replay.plan_pinned) {
+                    if (replay.plan_pinned and hasUnfinishedPlan(replay.plan_items)) {
                         self.setPlan(replay.plan_items);
                     } else {
                         deinitPlan(self.gpa, &self.plan);
@@ -1688,6 +1682,7 @@ const App = struct {
                         orphan.deinit(self.gpa);
                     };
                 }
+                self.clearCompletedPlan();
             },
             .system_note => |sn| {
                 if (!isCompactionStatusNote(sn.text))
@@ -3539,8 +3534,8 @@ fn planDisplayRange(items: []const PlanItemOwned, max_rows: usize) PlanDisplayRa
         }
         if (focus == null and item.status == .pending) focus = index;
     }
-    // Keep a completed table inspectable until the next turn begins; that
-    // transition clears it before new work starts.
+    // Completed plans normally leave live chrome immediately; retain this
+    // fallback so a restored legacy view remains inspectable.
     const at = focus orelse items.len - 1;
     const len = @min(items.len, max_rows);
     var start = at -| (len / 2);
@@ -3726,8 +3721,9 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     };
     var visible: std.ArrayList(DisplayLine) = .empty;
     const prompt_range = layout_mod.activePromptLineRange(&transcript);
+    const ordinary_first = total -| view_h;
     const pin_prompt = app.scroll_up == 0 and prompt_range != null and
-        prompt_range.?.len + 2 <= view_h;
+        prompt_range.?.len + 2 <= view_h and ordinary_first >= prompt_range.?.start;
     if (pin_prompt) {
         const sticky_prompt = prompt_range.?;
         for (lines.items[sticky_prompt.start..][0..sticky_prompt.len], sticky_prompt.start..) |ln, abs_line| {
@@ -6377,7 +6373,7 @@ test "replay marker completes a bounded tail without needing a connection" {
     try std.testing.expectEqual(@as(i64, 20_000), app.plan.items[1].started_at_ms);
 }
 
-test "replay marker does not repin a completed plan archived by a later turn" {
+test "replay marker never repins a completed plan" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -6393,7 +6389,7 @@ test "replay marker does not repin a completed plan archived by a later turn" {
 
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{
         .sid = 7,
-        .plan_pinned = false,
+        .plan_pinned = true,
         .plan_items = &.{.{ .step = "Done", .status = .completed, .duration_ms = 1_000 }},
     } }));
     try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
@@ -6884,7 +6880,7 @@ test "tab overflow retains the active tab and tab hit testing is button-extensib
     try std.testing.expectEqual(@as(usize, 40), app.sel_anchor.?.line); // row 0 is the tab strip
 }
 
-test "sticky prompt stays above live tail until the user scrolls" {
+test "active prompt scrolls normally before sticking at the top" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -6906,6 +6902,13 @@ test "sticky prompt stays above live tail until the user scrolls" {
     try app.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 1, .text = try gpa.dupe(u8, "old prompt"), .label = try gpa.dupe(u8, "") });
     try app.blocks.append(gpa, .{ .kind = .assistant_msg, .turn_id = 1, .text = try gpa.dupe(u8, "old answer"), .label = try gpa.dupe(u8, "") });
     try app.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 2, .text = try gpa.dupe(u8, "the active request"), .label = try gpa.dupe(u8, "") });
+
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expectEqual(@as(usize, 0), app.last_pinned_rows);
+    try std.testing.expectEqual(app.last_first_visible, app.visibleLineAtRow(0).?);
+
     var i: usize = 0;
     while (i < 12) : (i += 1) {
         try app.blocks.append(gpa, .{
@@ -6916,9 +6919,9 @@ test "sticky prompt stays above live tail until the user scrolls" {
             .commentary = true,
         });
     }
-
-    var frame = std.heap.ArenaAllocator.init(gpa);
-    defer frame.deinit();
+    app.layout_epoch +%= 1;
+    frame.deinit();
+    frame = std.heap.ArenaAllocator.init(gpa);
     try draw(&app, &vx, frame.allocator());
     try std.testing.expectEqual(@as(usize, 3), app.last_pinned_rows);
     try std.testing.expect(app.last_body_first > app.last_pinned_start + app.last_pinned_rows);
@@ -7576,7 +7579,7 @@ test "plan table centers current work and retains completed timings" {
     try std.testing.expect(!hasUnfinishedPlan(&completed));
 }
 
-test "completed plan remains durable when a new prompt unpins it" {
+test "completed plan leaves the live panel and remains durable in transcript" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -7614,7 +7617,7 @@ test "completed plan remains durable when a new prompt unpins it" {
     });
     try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
     try std.testing.expectEqual(block.BlockKind.plan, app.blocks.items[0].kind);
-    try std.testing.expectEqual(@as(usize, 1), app.plan.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
 
     app.applyBlock(.{
         .id = 3,

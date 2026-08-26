@@ -252,7 +252,7 @@ pub const DaemonMsg = union(enum) {
         /// This message is already explicitly opted into by current clients;
         /// older decoders safely ignore the additive field.
         plan_items: []const block.PlanItem = &.{},
-        /// False once a later user turn has superseded the completed plan.
+        /// False for completed plans, which render in transcript instead.
         /// Old daemons omit this and preserve the historical pinned behavior.
         plan_pinned: bool = true,
     },

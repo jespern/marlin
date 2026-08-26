@@ -283,7 +283,7 @@ fn enforcePlanTransitions(
     const step = skippedPlanCompletion(items, history) orelse return;
     const output = try std.fmt.allocPrint(
         gpa,
-        "error: plan_update step '{s}' was not in_progress in the preceding plan; mark it in_progress before doing the work, then complete it in a later update",
+        "error: plan_update step '{s}' was not in_progress in the preceding plan; omit work completed before planning, or mark the step in_progress before doing it and complete it in a later update",
         .{step},
     );
     gpa.free(exec.output);
@@ -509,6 +509,7 @@ test "plan completion requires a preceding in-progress revision" {
     try std.testing.expectEqual(block.ToolStatus.err, exec.status);
     try std.testing.expect(exec.plan_items == null);
     try std.testing.expect(std.mem.indexOf(u8, exec.output, "was not in_progress") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exec.output, "omit work completed before planning") != null);
 }
 
 fn loadMedia(ctx: *const anyopaque, allocator: std.mem.Allocator, hash: []const u8) ![]const u8 {

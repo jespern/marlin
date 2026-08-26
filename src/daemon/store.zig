@@ -830,7 +830,7 @@ pub const Store = struct {
 
     pub const LatestPlan = struct {
         items: []const block.PlanItem,
-        /// A later human turn moves a completed plan into transcript history.
+        /// Only unfinished work belongs in the live panel.
         pinned: bool,
     };
 
@@ -842,16 +842,9 @@ pub const Store = struct {
         session_id: u64,
     ) Error!?LatestPlan {
         const stmt = try self.prepare(
-            \\SELECT p.body_json,
-            \\       EXISTS (
-            \\           SELECT 1 FROM blocks AS u
-            \\           WHERE u.session_id=p.session_id
-            \\             AND u.kind='user_msg'
-            \\             AND u.turn_id>p.turn_id
-            \\       )
-            \\FROM blocks AS p
-            \\WHERE p.session_id=? AND p.kind='plan'
-            \\ORDER BY p.seq DESC LIMIT 1
+            \\SELECT body_json FROM blocks
+            \\WHERE session_id=? AND kind='plan'
+            \\ORDER BY seq DESC LIMIT 1
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
@@ -870,9 +863,7 @@ pub const Store = struct {
                 for (plan.items) |item| complete = complete and item.status == .completed;
                 break :blk .{
                     .items = plan.items,
-                    // An unfinished plan spans "continue" turns. Only a
-                    // terminal completed plan unpins on the next user turn.
-                    .pinned = !complete or c.sqlite3_column_int(stmt, 1) == 0,
+                    .pinned = !complete,
                 };
             },
             else => error.SqliteStep,
@@ -1537,7 +1528,7 @@ test "latest plan remains context-relevant after compaction" {
         .ts = 0,
         .body = .{ .plan = .{ .items = &done_items } },
     });
-    try std.testing.expect((try store.loadLatestPlan(arena, 1)).?.pinned);
+    try std.testing.expect(!(try store.loadLatestPlan(arena, 1)).?.pinned);
     try store.appendBlock(.{
         .id = 6,
         .session_id = 1,

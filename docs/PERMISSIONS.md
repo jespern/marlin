@@ -173,11 +173,13 @@ protected credential roots. The write boundary also covers implicit paths
 selected by subprocesses, including toolchain caches, package stores, config
 files, and temporary directories. Sandboxed tools receive a private writable
 `TMPDIR` below the host temporary root; they do not receive write access to the
-entire shared `/tmp`. Agents should use `$TMPDIR` for disposable state and keep
-persistent caches in the workspace (for Zig, for example,
-`ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-cache/global`) rather than treating the denial
-as a build failure. Network isolation is a later hardening decision; M3.5 must
-state clearly that allowed shell commands can still exfiltrate workspace data.
+entire shared `/tmp`. Marlin points `XDG_CACHE_HOME` at a `cache` subdirectory
+of that private root, covering toolchains that follow the XDG convention
+without introducing persistent workspace-cache semantics. Agents should use
+`$TMPDIR` for other disposable state and keep deliberately persistent caches
+in the workspace rather than treating an outside-write denial as a build
+failure. Network isolation is a later hardening decision; M3.5 must state
+clearly that allowed shell commands can still exfiltrate workspace data.
 
 Use Seatbelt on macOS and Landlock on Linux, with seccomp added only for a
 specific syscall threat model. `sandbox-exec` and its SBPL language are

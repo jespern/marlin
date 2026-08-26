@@ -347,7 +347,8 @@ Key decisions:
   represented by this summary in context from now on." History is untouched.
 - **`plan` is durable state, not assistant prose.** `plan_update` appends a new
   revision; assembly retains the newest unfinished revision across compaction,
-  and bounded replay restores it separately from scrollback depth. The daemon
+  and bounded replay restores it separately from scrollback depth. A terminal
+  completed revision becomes a closed transcript table immediately. The daemon
   times only `in_progress` work and rejects `pending` → `completed` jumps, so
   every displayed completion duration has an observed start.
 - **Synthetic `user_msg` blocks are model context, not user authorship.** File
@@ -916,13 +917,14 @@ get these right; Hermes is the counter-example):
   things that change a decision *right now*. No session-duration counters, no
   feature-toggle indicators, no diagnostic chrome. Every candidate status item
   answers "would I act on this mid-turn?" or it stays out.
-- **Todo/plan list pinned above the input** when the agent maintains one
-  (**shipped**): `plan_update` appends immutable revisions to the block log;
-  the daemon restores the latest revision independently of bounded replay and
+- **Todo/plan list pinned above the input** while work remains (**shipped**):
+  `plan_update` appends immutable revisions to the block log; the daemon
+  restores the latest unfinished revision independently of bounded replay and
   injects unfinished work after compaction. The current step is highlighted
-  and done items are dimmed/checked. Always visible without scrolling — "where
-  is it in the plan" must never require leaving the live region. Collapses to
-  nothing when there's no plan.
+  and done items are checked. Always visible without scrolling — "where is it
+  in the plan" must never require leaving the live region. Once every item is
+  checked, the closed table moves into transcript output with total active time;
+  the assistant's final response follows as the human-readable recap.
 - **Progress chrome is a capped stack of live strips.** The region between
   session view and input holds one-line strips: the todo strip, a review
   fan-out row (`sol ✓ · grok … · glm ✓`), later background-task rows. Rules
@@ -998,9 +1000,10 @@ A split pane identifies its session with a compact pane label.
 - **Splits (not yet implemented)**: binary-tree layout, each pane = a
   session view (or the same session twice). No VTE anywhere.
 - **Scrollback**: virtual list over the block log. While following the bottom
-  of a running turn, the initiating user prompt stays pinned above the live
-  tail; scrolling up restores ordinary contiguous scrollback. The pinned card
-  is a display duplicate, so selection and copy continue to address the
+  of a running turn, the initiating user prompt scrolls normally until it
+  reaches the top, then stays there above the growing live tail. Scrolling up
+  restores ordinary contiguous scrollback. The pinned card is a display
+  duplicate, so selection and copy continue to address the
   durable transcript rows. Selection is ours (mouse mode on): drag selects
   logical text within/across blocks; double-click = word, triple = block.
   Copy → OSC 52 (works through ssh/mosh); shift+drag falls through to the

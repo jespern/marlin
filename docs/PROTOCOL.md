@@ -96,8 +96,8 @@ requests 256 blocks at a time and atomically prepends another page when the
 user reaches the loaded top. Every bounded replay ends with
 `replay_done{oldest_seq,newest_seq,has_older,plan_items,plan_pinned}`.
 `plan_items` carries the latest durable plan revision independently of the
-bounded block window. `plan_pinned=false` means a later user turn has moved the
-completed plan into transcript history instead of restoring it above the input.
+bounded block window. `plan_pinned=false` means the plan is complete and belongs
+in transcript history instead of being restored above the input.
 
 `sub.replay_limit`: when non-zero with `from_seq`, replay at most 512 blocks
 forward and return `replay_done{...,has_newer,forward:true}`. If `has_newer` is

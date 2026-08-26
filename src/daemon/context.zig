@@ -75,6 +75,8 @@ pub const system_prompt_base =
     \\- For substantial work with multiple dependent steps, call `plan_update`
     \\  once initial inspection is sufficient to name concrete outcomes. Skip
     \\  plans for trivial questions and single-action changes.
+    \\- The first plan contains only current and remaining work. Do not add
+    \\  initial inspection or other already-finished work as completed steps.
     \\- Keep the plan operational and current: exactly one step in_progress
     \\  while work remains, mark completed steps promptly, and revise the
     \\  remaining steps when evidence changes the path. Do not merely announce
@@ -907,6 +909,7 @@ test "assemble: system prompt carries instructions, environment, and suffix" {
     try std.testing.expect(std.mem.indexOf(u8, sys, "fetch\n  over curl or wget") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "PLANNING") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "call `plan_update`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "only current and remaining work") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "step directly to completed") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "Do not merely announce") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "DELEGATION AND PARALLELISM") != null);
