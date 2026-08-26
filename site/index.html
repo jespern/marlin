@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>~*~ marlin ~*~ daemon-native terminal agents</title>
-<meta name="description" content="marlin is a daemon-native terminal AI agent harness in Zig: durable structured sessions, a focused TUI multiplexer, extensions, permissions, and child agents.">
+<title>~*~ marlin ~*~ durable terminal agents</title>
+<meta name="description" content="marlin is a fast, durable terminal AI agent harness in Zig: structured sessions, a developer-first TUI, execution plans, review councils, remote clients, extensions, and enforced permissions.">
 <link rel="icon" href="assets/marlin-tiny.gif">
 <style>
   /* ============================================================
@@ -68,6 +68,15 @@
     margin:18px 0;
     line-height:1.4;
   }
+  .car-analogy{
+    color:#fff;
+    background:#001144;
+    border:3px outset var(--lime);
+    padding:10px 12px;
+    margin:14px 0 16px;
+    line-height:1.4;
+  }
+  .car-analogy b{ color:var(--yellow); }
   .feature-grid{
     display:grid;
     grid-template-columns:1fr 1fr;
@@ -80,7 +89,31 @@
     padding:9px 10px;
     line-height:1.35;
   }
-  .feature b{ color:var(--cyan); display:block; margin-bottom:2px; }
+  .feature b{
+    color:var(--cyan);
+    display:flex;
+    align-items:center;
+    gap:7px;
+    margin-bottom:5px;
+  }
+  .feature-icon{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    width:25px;
+    height:25px;
+    flex:0 0 25px;
+    color:var(--lime);
+    background:#000;
+    border:2px outset #c0c0c0;
+    font-family:Verdana,sans-serif;
+    font-size:1rem;
+    line-height:1;
+    text-shadow:1px 1px 0 var(--purple);
+  }
+  .feature:nth-child(4n+2) .feature-icon{ color:var(--yellow); }
+  .feature:nth-child(4n+3) .feature-icon{ color:var(--cyan); }
+  .feature:nth-child(4n+4) .feature-icon{ color:var(--hot-pink); }
   .fineprint{ color:#c0c0c0; font-size:0.85rem; line-height:1.4; }
   code.inline{
     color:var(--lime);
@@ -281,7 +314,7 @@
   <header>
     <img class="fish" src="assets/marlin.gif" alt="a marlin leaping out of the ocean, majestically, at 64 colors">
     <h1><span class="tilde">~*~</span> marlin <span class="tilde">~*~</span></h1>
-    <p class="tagline">durable terminal agents that <b>SWIM</b> between clients &nbsp;🐟&nbsp; built in Zig</p>
+    <p class="tagline">fast, durable terminal agents that <b>SWIM</b> between clients &nbsp;🐟&nbsp; built in Zig</p>
   </header>
 
   <div class="install">
@@ -294,7 +327,7 @@
   </div>
 
   <marquee scrollamount="6">
-    ★★★ WELCOME to marlin.wtf ★★★ one binary ★ daemon-owned sessions ★ structured scrollback ★ TUI multiplexer ★ MCP + hooks + skills ★ CHILD AGENTS HAVE ENTERED THE WATER ★ written in ZIG ★★★
+    ★★★ WELCOME to marlin.wtf ★★★ one native binary ★ daemon-owned sessions ★ durable plans ★ review councils ★ SSH remote ★ tailnet web ★ MCP + hooks + skills ★ written in ZIG ★★★
   </marquee>
 
   <div class="panel">
@@ -302,16 +335,31 @@
     <p class="lede">
       marlin is a <b>daemon-native terminal AI agent harness</b>. The daemon
       owns structured sessions; the TUI and headless CLI are thin clients.
-      Close a terminal and the turn keeps running. Reattach later—or from
-      another terminal over SSH—and the transcript, status, approvals, and
-      full tool results are still there.
+      Close a terminal and the turn keeps running. Reattach later, or reach it
+      through SSH, mosh, or your tailnet. The transcript, plans, status,
+      approvals, and full tool results are still there.
+    </p>
+    <p class="lede">
+      Think <b>Claude Code and OpenAI Codex had a fast, stubborn terminal-native
+      baby</b>, then raised it on the best ideas from a handful of other agent
+      harnesses. Marlin borrows freely, keeps the parts that survive daily use,
+      and rebuilds them around one durable daemon instead of a pile of terminals.
+    </p>
+    <p class="car-analogy">
+      <span class="badge">GARAGE PICK</span>
+      If Marlin were a car, it would be a <b>first-generation Honda NSX</b>:
+      supercar fast, Honda reliable, usable every day, and direct enough that
+      the driver always knows what the machine is doing. No touchscreen maze,
+      no ornamental controls. Just a small, deliberate machine that starts every
+      time and wants to be driven hard.
     </p>
     <ul class="starlist">
-      <li><b>one binary</b>: no Node runtime, no Python environment, no terminal scraping</li>
+      <li><b>one native core binary</b>: no Node runtime, no Python environment, no terminal scraping</li>
       <li><b>structured multiplexer</b>: switch sessions without losing drafts, scroll position, or actionable state</li>
       <li><b>append-only truth</b>: context may compact; durable history and full tool output do not pretend they never happened</li>
       <li><b>process-boundary extensions</b>: managed MCP stdio servers, executable tools, hooks, and Markdown skills</li>
-      <li><b>durable child fan-out</b>: a parent can delegate two to eight concurrent read-only jobs to inspectable children</li>
+      <li><b>visible execution</b>: durable plans pin the active step and its timing while child work stays inspectable</li>
+      <li><b>durable review fan-out</b>: delegate two to eight concurrent read-only jobs, or convene a named multi-model council</li>
       <li><b>real image input</b>: local clipboard paste and remote-safe path upload stay durable and reach vision models</li>
       <li><b>NOT a kitchen sink</b>: marlin is a daily driver. a feature earns its place by surviving daily use, or it gets deleted. the default answer to a new surface is <i>no</i></li>
     </ul>
@@ -320,24 +368,30 @@
   <div class="status-note">
     <span class="badge">DEVELOPMENT PREVIEW</span>
     Marlin is already self-hosting and useful for real work, but it is not a
-    stable 1.0 product. The multiplexer and extension foundations are built;
-    bounded concurrent child delegation is built, and M6 is turning those
-    primitives into review councils. Config and protocol details may still move.
+    stable 1.0 product. The multiplexer, extension platform, child delegation,
+    named review councils, durable plans, SSH remote client, and tailnet web UI
+    are built. Current work is concentrated on hardening cancellation,
+    reconnect edges, diagnostics, and performance. Config and protocol details
+    may still move.
   </div>
 
   <div class="panel">
     <h2>&gt;&gt; what works TODAY</h2>
     <div class="feature-grid">
-      <div class="feature"><b>Focused TUI</b>Multiline composer, mouse selection + OSC52 copy, command completion, readable tool/reasoning output, model and effort controls.</div>
-      <div class="feature"><b>Real multiplexer</b>Durable concurrent sessions, an always-visible clickable tab strip, short stable handles, <code class="inline">/sessions</code>, per-session view state, and rolled-up child activity.</div>
-      <div class="feature"><b>Context that admits reality</b>Inline output caps, full content-addressed blobs, pruning, compaction, usage accounting, and durable reconnect replay.</div>
-      <div class="feature"><b>Self-hosting loop</b>Headless runs, steering, approvals, interruption, and coordinated <code class="inline">/reboot --build</code> while developing Marlin inside Marlin.</div>
-      <div class="feature"><b>MCP as a product</b>Isolated health, daemon-owned add/remove/restart/reload, per-tool policy, durable image results, and one schema + approval path.</div>
-      <div class="feature"><b>Permissions that enforce</b>Scrubbed tool environments, protected-path read refusals, capture-time secret redaction, managed network filtering, and canary-verified kernel shell sandboxing on macOS (Seatbelt) and Linux (Landlock) with safe fallback.</div>
-      <div class="feature"><b>Claude Code as a guest</b>Subscription models run through the official <code class="inline">claude</code> binary as first-class multiplexed sessions; their permission prompts park on marlin's approval bar, answerable from any client—including your phone.</div>
-      <div class="feature"><b>Bounded agent fan-out</b><code class="inline">task</code> and <code class="inline">task_batch</code> create up to eight durable, attachable, read-only children with budgets, cancellation cascade, and ordered results.</div>
-      <div class="feature"><b>Image-aware sessions</b>Ctrl+V or <code class="inline">/attach</code> uploads signed image data through the client boundary, stores it by content hash, and maps it to native provider vision blocks.</div>
-      <div class="feature"><b>Provider choice</b>OpenRouter-first model catalog plus OpenAI-compatible and Anthropic provider paths, with per-session model and reasoning effort.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">⌨</span>Developer-first TUI</b>Vim navigation, multiline editing, Ctrl+N for a new session, command completion, OSC52 copy, structured Markdown, syntax, diffs, reasoning, and foldable tool output.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">☷</span>Durable execution plans</b>The active step stays pinned in a timed two-column table with live progress and child activity. Completed plans close into scrollback; revisions survive reboot and compaction.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">▣</span>Real multiplexer</b>Durable concurrent sessions, a clickable configurable tab strip, short stable handles, <code class="inline">/sessions</code>, per-session view state, and rolled-up child activity.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">!</span>Actionable state</b>Running, approval, error, and child status are typed protocol events, not guesses scraped from a terminal. <code class="inline">!c</code> copies the last complete tool result.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">⇄</span>Remote without reinvention</b><code class="inline">marlin --remote host</code> carries the structured protocol over SSH. <code class="inline">marlin web</code> is an opt-in loopback UI exposed to your phone through Tailscale Serve.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">∞</span>Context that admits reality</b>Inline output caps, full content-addressed blobs, pruning, compaction, usage accounting, and durable reconnect replay.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">↻</span>Self-hosting loop</b>Headless runs, steering, approvals, interruption, automatic client reconnect, and coordinated <code class="inline">/reboot --build</code> while developing Marlin inside Marlin.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">⚙</span>MCP as a product</b>Isolated health, daemon-owned add/remove/restart/reload, per-tool policy, durable image results, and one schema + approval path.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">⛨</span>Permissions that enforce</b>Scrubbed tool environments, protected-path read refusals, capture-time secret redaction, managed network filtering, and canary-verified kernel shell sandboxing on macOS (Seatbelt) and Linux (Landlock) with safe fallback.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">◇</span>Claude Code as a guest</b>Subscription models run through the official <code class="inline">claude</code> binary as first-class multiplexed sessions; their permission prompts park on marlin's approval bar, answerable from any client, including your phone.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">⋈</span>Children + review councils</b><code class="inline">task</code> and <code class="inline">task_batch</code> create up to eight durable, attachable, read-only children. Named councils fan questions across models for parent synthesis.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">▧</span>Image-aware sessions</b>Ctrl+V or <code class="inline">/attach</code> uploads signed image data through the client boundary, stores it by content hash, and maps it to native provider vision blocks.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">⚡</span>Fast parallel tools</b>Consecutive tools marked <code class="inline">parallel_safe</code> really run concurrently, with at most eight workers. Durable results stay in provider-call order.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">◎</span>Provider choice</b>OpenRouter-first model catalog, built-in web search/fetch, and OpenAI-compatible and Anthropic paths, with per-session model and reasoning effort.</div>
     </div>
   </div>
 
@@ -348,8 +402,13 @@ $ export OPENROUTER_API_KEY=...
 $ marlin run "why is my build broken"
 <span class="c"># ...the daemon keeps the structured session...</span>
 $ marlin             <span class="c"># attach the TUI</span>
+$ marlin --remote devbox <span class="c"># same TUI, carried over SSH</span>
 $ marlin ls          <span class="c"># short stable handles, including children</span>
-$ marlin attach 63df <span class="c"># any unique prefix (minimum four)</span></pre>
+$ marlin attach 63df <span class="c"># any unique prefix (minimum four)</span>
+
+<span class="c"># inside the TUI:</span>
+/council set core openrouter/x-ai/grok-4.6 openrouter/z-ai/glm-5.3
+/review core audit this design before I ship it</pre>
     <p class="fineprint">
       The installer downloads the matching tagged release for macOS or Linux
       on aarch64 or x86_64, verifies its SHA-256 checksum, and installs it in
@@ -370,8 +429,10 @@ $ marlin attach 63df <span class="c"># any unique prefix (minimum four)</span></
       <tr><td>M4</td><td>structured session multiplexer</td><td>✅ VERIFIED</td></tr>
       <tr><td>M5</td><td>managed MCP, executable tools, hooks, skills</td><td>✅ PRODUCTIZED</td></tr>
       <tr><td>M6a</td><td>durable child sessions + bounded task fan-out</td><td>✅ VERIFIED</td></tr>
-      <tr><td>M6 next</td><td>review councils over the child primitive</td><td>🔨 ACTIVE</td></tr>
-      <tr><td>later</td><td>workspace snapshots/isolation + remote/PWA decisions</td><td>📋 EVIDENCE FIRST</td></tr>
+      <tr><td>M6b</td><td>named multi-model councils + durable reviewer sessions</td><td>✅ SHIPPED</td></tr>
+      <tr><td>M6c</td><td>SSH-carried remote clients + tailnet web UI</td><td>✅ SHIPPED</td></tr>
+      <tr><td>now</td><td>cancellation, reconnect, extension diagnostics, dogfood, and performance</td><td>🔨 HARDENING</td></tr>
+      <tr><td>later</td><td>workspace snapshots, isolation, leases, land/discard</td><td>📋 EVIDENCE FIRST</td></tr>
     </table></div>
     <p class="fineprint">
       The source-of-truth details live in the
@@ -381,11 +442,13 @@ $ marlin attach 63df <span class="c"># any unique prefix (minimum four)</span></
   </div>
 
   <div class="panel">
-    <h2>&gt;&gt; NOT shipped yet (honesty zone)</h2>
+    <h2>&gt;&gt; edges we're still sharpening (honesty zone)</h2>
     <ul class="starlist">
-      <li><b>review councils</b>: bounded fan-out exists, but named councils and reviewer synthesis are next—not marketing-present-tense</li>
+      <li><b>subprocess cancellation</b>: built-in shell and extension processes still need one consistent deadline, TERM, grace, and KILL primitive</li>
+      <li><b>extension burn-in</b>: MCP and hooks work today; real-world dogfood and exact field-level TOML diagnostics are still active work</li>
+      <li><b>child hardening</b>: durable batches and cancellation cascade are shipped; disconnect/reconnect and cancellation edges are still being tightened</li>
       <li><b>MCP streamable HTTP</b>: stdio is managed and supported today; remote HTTP transport remains later</li>
-      <li><b>native remote transport</b>: use SSH/mosh (or your tailnet) today; a raw TCP mode waits for a concrete trust boundary. <code class="inline">marlin web</code> exists as an opt-in, token-gated, localhost-only phone client—not a hosted product</li>
+      <li><b>hosted or multi-user web</b>: <code class="inline">marlin web</code> is an opt-in, tokenless loopback client exposed through Tailscale Serve; your tailnet is the trust boundary, and it is not a public deploy surface</li>
       <li><b>workspace undo/isolation</b>: snapshots, leases, worktrees, <code class="inline">/land</code>, and <code class="inline">/discard</code> remain one deliberately later track</li>
       <li><b>kitchen sink surfaces</b>: no messaging gateway, voice stack, embedded terminal emulator, or dashboard empire</li>
     </ul>
