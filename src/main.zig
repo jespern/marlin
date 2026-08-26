@@ -67,6 +67,7 @@ test {
     _ = @import("daemon/approval.zig");
     _ = @import("daemon/permissions.zig");
     _ = @import("daemon/sandbox.zig");
+    _ = @import("daemon/landlock.zig");
     _ = @import("daemon/network_policy.zig");
     _ = @import("daemon/extensions.zig");
     _ = @import("daemon/hooks.zig");

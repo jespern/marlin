@@ -13,3 +13,4 @@ zig-pkg/
 # Local scratch
 *.local.*
 /tmp/
+zig-out-linux/

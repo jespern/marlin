@@ -19,7 +19,7 @@ const Io = std.Io;
 const permissions = @import("permissions.zig");
 const credentials = @import("../core/credentials.zig");
 
-pub const Backend = enum { unavailable, seatbelt };
+pub const Backend = enum { unavailable, seatbelt, landlock };
 
 /// Credential roots denied to sandboxed shells. Owned, symlink-resolved
 /// where the path exists; nonexistent roots keep their lexical spelling so
@@ -50,6 +50,9 @@ pub const ProtectedRoots = struct {
 
 pub const Options = struct {
     backend: Backend = .unavailable,
+    /// Required when backend is .landlock: the sandbox wrapper is
+    /// `<marlin_exe> landlock_exec …`, applied in the child before exec.
+    marlin_exe: ?[]const u8 = null,
     /// Existing Marlin-owned directory. Sandboxed tools receive this as
     /// TMPDIR and may write there in addition to the workspace.
     temp_root: ?[]const u8 = null,
@@ -119,6 +122,37 @@ pub fn seatbeltArgv(
     return argv.toOwnedSlice(arena);
 }
 
+/// Build the `marlin landlock_exec` argv for one `/bin/bash -c` call: the
+/// helper applies the ruleset to itself (write scope = workspace + temp,
+/// read-everything-except-protected via the cover plan) and execs bash.
+/// Same Paths contract as Seatbelt: all fields symlink-resolved.
+pub fn landlockArgv(
+    arena: std.mem.Allocator,
+    marlin_exe: []const u8,
+    paths: Paths,
+    shell_command: []const u8,
+    extra_args: []const []const u8,
+) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{
+        marlin_exe,    "landlock_exec",
+        "--workspace", paths.workspace,
+        "--temp",      paths.temp_root,
+    });
+    for ([_][]const u8{
+        paths.protected.ssh,
+        paths.protected.aws,
+        paths.protected.gnupg,
+        paths.protected.marlin_credentials,
+    }) |root| {
+        try argv.append(arena, "--protect");
+        try argv.append(arena, root);
+    }
+    try argv.appendSlice(arena, &.{ "--", "/bin/bash", "-c", shell_command, "--" });
+    try argv.appendSlice(arena, extra_args);
+    return argv.toOwnedSlice(arena);
+}
+
 /// Resolve the protected roots for this daemon: ~/.ssh, ~/.aws, ~/.gnupg,
 /// and the Marlin credentials file (XDG-aware). Requires HOME; without it
 /// the sandbox must not claim the protected-path contract.
@@ -170,27 +204,57 @@ pub fn verifySeatbelt(
     child_environ: ?*const std.process.Environ.Map,
 ) Backend {
     if (builtin.os.tag != .macos) return .unavailable;
-    return runCanary(gpa, io, child_environ) catch .unavailable;
+    return runCanary(gpa, io, child_environ, .seatbelt, null) catch .unavailable;
+}
+
+/// Verify the Landlock contract on this exact kernel via the shared canary,
+/// wrapped through `<marlin_exe> landlock_exec`. Any failure — old kernel,
+/// seccomp-filtered landlock syscalls, LSM not enabled — is `unavailable`.
+pub fn verifyLandlock(
+    gpa: std.mem.Allocator,
+    io: Io,
+    child_environ: ?*const std.process.Environ.Map,
+    marlin_exe: []const u8,
+) Backend {
+    if (builtin.os.tag != .linux) return .unavailable;
+    return runCanary(gpa, io, child_environ, .landlock, marlin_exe) catch .unavailable;
+}
+
+/// Platform dispatch: the one entry point daemon startup uses.
+pub fn verify(
+    gpa: std.mem.Allocator,
+    io: Io,
+    child_environ: ?*const std.process.Environ.Map,
+    marlin_exe: ?[]const u8,
+) Backend {
+    return switch (builtin.os.tag) {
+        .macos => verifySeatbelt(gpa, io, child_environ),
+        .linux => verifyLandlock(gpa, io, child_environ, marlin_exe orelse return .unavailable),
+        else => .unavailable,
+    };
 }
 
 fn runCanary(
     gpa: std.mem.Allocator,
     io: Io,
     child_environ: ?*const std.process.Environ.Map,
+    kind: Backend,
+    marlin_exe: ?[]const u8,
 ) !Backend {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const default_tmp = if (builtin.os.tag == .macos) "/private/tmp" else "/tmp";
     const tmp_root = if (child_environ) |env|
-        env.get("TMPDIR") orelse "/private/tmp"
+        env.get("TMPDIR") orelse default_tmp
     else
-        "/private/tmp";
+        default_tmp;
 
     var random: [8]u8 = undefined;
     io.random(&random);
     const nonce = std.mem.readInt(u64, &random, .little);
-    const base = try std.fmt.allocPrint(arena, "{s}{c}marlin-seatbelt-probe-{x}", .{
+    const base = try std.fmt.allocPrint(arena, "{s}{c}marlin-sandbox-probe-{x}", .{
         std.mem.trimEnd(u8, tmp_root, std.fs.path.sep_str),
         std.fs.path.sep,
         nonce,
@@ -221,7 +285,7 @@ fn runCanary(
     // inside directory, so it cannot mask a broken workspace restriction.
     // Protected params cover a directory and a bare file: both subpath
     // shapes are used by real invocations.
-    const argv = try seatbeltArgv(arena, .{
+    const probe_paths = Paths{
         .workspace = inside,
         .temp_root = inside,
         .protected = .{
@@ -230,7 +294,8 @@ fn runCanary(
             .gnupg = secret_dir,
             .marlin_credentials = secret_file,
         },
-    },
+    };
+    const script =
         \\printf inside > "$1/inside/ok" || exit 10
         \\cat "$1/inside/ok" > /dev/null || exit 11
         \\if printf outside > "$1/outside/blocked"; then exit 12; fi
@@ -238,7 +303,12 @@ fn runCanary(
         \\if cat "$1/secret.key" > /dev/null; then exit 14; fi
         \\sleep 5 & if ! kill $! 2>/dev/null; then exit 15; fi
         \\exit 0
-    , &.{real_base});
+    ;
+    const argv = switch (kind) {
+        .seatbelt => try seatbeltArgv(arena, probe_paths, script, &.{real_base}),
+        .landlock => try landlockArgv(arena, marlin_exe.?, probe_paths, script, &.{real_base}),
+        .unavailable => unreachable,
+    };
 
     const result = try std.process.run(arena, io, .{
         .argv = argv,
@@ -251,7 +321,7 @@ fn runCanary(
     if (!exited_ok) return error.CanaryFailed;
     _ = try cwd.statFile(io, inside_marker, .{});
     if (cwd.statFile(io, outside_marker, .{})) |_| return error.CanaryFailed else |_| {}
-    return .seatbelt;
+    return kind;
 }
 
 test "Seatbelt profile grants parameterized write roots and denies protected reads" {

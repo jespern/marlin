@@ -741,12 +741,20 @@ explicit note. Rejected: bundling an `rg` sidecar; Marlin remains one binary.
   to subscribed and session-watch clients on reconnect; first decision wins.
   Timeout defaults to none — the turn parks in `awaiting_approval`, exactly the
   state the session picker, actionable status summary, and phone surface.
-- bash sandboxing (M3.5, stolen from zag): Seatbelt profile on macOS
-  (shipped, canary-verified at daemon start); Landlock + seccomp on Linux is
-  **not yet implemented** — on Linux the sandbox backend reports unavailable
-  and execution falls back to legacy ask-gating, so Linux is currently a
-  macOS tool that happens to compile. Deny-by-default on `~/.ssh`, key
-  files, browser profiles.
+- bash sandboxing (M3.5, stolen from zag): Seatbelt profile on macOS and a
+  Landlock ruleset on Linux (both SHIPPED, both canary-verified at daemon
+  start by the same probe: inside write succeeds, sibling write fails,
+  protected reads fail, signals work). The Linux wrapper is
+  `marlin landlock_exec`, which applies the ruleset to itself and execs
+  bash. Landlock has no deny rules, so "read everything except protected
+  roots" is a computed cover allowlist (landlock.zig `coverPlan`); the
+  documented cost is that entries created under a partially-granted
+  ancestor (typically $HOME) during one call are unreadable until the next
+  call. seccomp remains unimplemented and unplanned absent a specific
+  syscall threat model. On kernels/containers without Landlock the backend
+  reports unavailable and execution falls back to legacy ask-gating —
+  never claimed, never half-enforced. `marlin sandbox_probe` runs the
+  startup canary standalone for diagnostics.
   The profile allows `signal (target same-sandbox)` — SBPL's `signal` is a
   distinct operation `process*` does NOT cover, and without it `kill`/`timeout`
   inside the sandbox get EPERM and hang (the canary has a leg for this).

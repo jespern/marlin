@@ -60,22 +60,34 @@ pub fn run(
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    if (sandbox_options.backend == .seatbelt) {
+    if (sandbox_options.backend != .unavailable) {
         const arena = arena_state.allocator();
         const temp_root = sandbox_options.temp_root orelse return error.SandboxTempUnavailable;
         const protected = sandbox_options.protected orelse return error.SandboxProtectedUnavailable;
-        // Seatbelt subpath parameters match real paths only; the env
-        // spellings of cwd/temp may sit behind symlinks (/tmp, /var).
+        // Both backends match real paths only (Seatbelt subpath parameters,
+        // Landlock beneath-fd rules); the env spellings of cwd/temp may sit
+        // behind symlinks (/tmp, /var).
         const real_workspace = try Io.Dir.realPathFileAbsoluteAlloc(io, cwd, arena);
         const real_temp = try Io.Dir.realPathFileAbsoluteAlloc(io, temp_root, arena);
         // A workspace under a protected root cannot receive both its write
         // grant and the read denial; refuse rather than run half-enforced.
         if (protected.contains(real_workspace)) return error.SandboxWorkspaceProtected;
-        argv = try sandbox.seatbeltArgv(arena, .{
+        const paths = sandbox.Paths{
             .workspace = real_workspace,
             .temp_root = real_temp,
             .protected = protected,
-        }, args.command, &.{});
+        };
+        argv = switch (sandbox_options.backend) {
+            .seatbelt => try sandbox.seatbeltArgv(arena, paths, args.command, &.{}),
+            .landlock => try sandbox.landlockArgv(
+                arena,
+                sandbox_options.marlin_exe orelse return error.SandboxExeUnavailable,
+                paths,
+                args.command,
+                &.{},
+            ),
+            .unavailable => unreachable,
+        };
     }
     // Explicit type: @min with a comptime-known bound narrows to u12,
     // which the *1000 below would overflow.

@@ -575,9 +575,9 @@ pub fn runTurn(
             // target stays inside the real workspace (fs.write_workspace:
             // "allow when sandbox verified"). Outside-workspace or unprovable
             // targets keep the legacy prompt.
-            var sandboxed = opts.sandbox_options.backend == .seatbelt and
+            var sandboxed = opts.sandbox_options.backend != .unavailable and
                 std.mem.eql(u8, call.name, bash_tool.spec_name);
-            if (!sandboxed and opts.sandbox_options.backend == .seatbelt and
+            if (!sandboxed and opts.sandbox_options.backend != .unavailable and
                 (std.mem.eql(u8, call.name, files_tool.write_spec_name) or
                     std.mem.eql(u8, call.name, files_tool.edit_spec_name)))
             {
@@ -1679,7 +1679,7 @@ fn environmentBlock(gpa: std.mem.Allocator, io: Io, opts: *const RunOpts) ![]u8 
     }
 
     const sandbox_desc: []const u8 = switch (opts.sandbox_options.backend) {
-        .seatbelt => "active (kernel-enforced; workspace shell commands run without approval prompts)",
+        .seatbelt, .landlock => "active (kernel-enforced; workspace shell commands run without approval prompts)",
         .unavailable => "inactive (shell commands may require per-call user approval)",
     };
 

@@ -7,6 +7,9 @@ const build_options = @import("build_options");
 const cc_approve = @import("client/cc_approve.zig");
 const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
+const landlock = @import("daemon/landlock.zig");
+const permissions = @import("daemon/permissions.zig");
+const sandbox = @import("daemon/sandbox.zig");
 const tui = @import("client/tui.zig");
 const web = @import("client/web.zig");
 
@@ -28,6 +31,8 @@ pub const Command = enum {
     version,
     resolve_host,
     cc_approve,
+    landlock_exec,
+    sandbox_probe,
 
     pub fn parse(word: []const u8) ?Command {
         inline for (@typeInfo(Command).@"enum".fields) |f| {
@@ -56,6 +61,11 @@ pub fn dispatch(
         // Internal permission bridge for delegated Claude Code sessions
         // (spawned via --mcp-config by the daemon); omitted from help.
         .cc_approve => return cc_approve.run(gpa, io, environ, self_exe, rest),
+        // Internal Linux sandbox wrapper (spawned by the daemon's bash
+        // adapter): applies a Landlock ruleset to itself, then execs.
+        .landlock_exec => return landlock.run(gpa, io, rest),
+        // Diagnostic: run the platform sandbox canary and report the verdict.
+        .sandbox_probe => return sandboxProbe(gpa, io, environ),
         .help => try stdoutPrint(io, help_text, .{}),
         .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
@@ -123,6 +133,25 @@ fn resolveHost(io: Io, args: []const [:0]const u8) !u8 {
         },
     } else |_| {}
     return 1;
+}
+
+/// Run the platform sandbox canary exactly as daemon startup would and
+/// report the verdict. Exit 0 when a backend verified.
+fn sandboxProbe(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map) !u8 {
+    const marlin_exe: ?[:0]u8 = std.process.executablePathAlloc(io, gpa) catch null;
+    defer if (marlin_exe) |exe| gpa.free(exe);
+    var probe_environ = permissions.toolEnvironment(gpa, environ) catch {
+        try stdoutPrint(io, "sandbox: unavailable (environment scrub failed)\n", .{});
+        return 1;
+    };
+    defer probe_environ.deinit();
+    const backend = sandbox.verify(gpa, io, &probe_environ, marlin_exe);
+    try stdoutPrint(io, "sandbox: {s}\n", .{switch (backend) {
+        .seatbelt => @as([]const u8, "verified (seatbelt)"),
+        .landlock => "verified (landlock)",
+        .unavailable => "unavailable",
+    }});
+    return if (backend == .unavailable) 1 else 0;
 }
 
 const help_text =

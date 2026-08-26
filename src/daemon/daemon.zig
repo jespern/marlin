@@ -350,6 +350,10 @@ pub const Daemon = struct {
             .allow = cfg.network_allow,
             .deny = cfg.network_deny,
         });
+        // Needed before the sandbox probe: the Landlock wrapper and the
+        // Claude Code permission bridge both spawn this binary by path.
+        const marlin_exe: ?[:0]u8 = std.process.executablePathAlloc(io, gpa) catch null;
+
         var probe_environ: ?std.process.Environ.Map = null;
         defer if (probe_environ) |*env| env.deinit();
         // Probe unconditionally: the canary is cheap, and a verified backend
@@ -357,23 +361,24 @@ pub const Daemon = struct {
         // cfg.permissions_enabled only seeds each session's default.
         var sandbox_backend: sandbox.Backend = blk: {
             probe_environ = permissions.toolEnvironment(gpa, environ) catch break :blk .unavailable;
-            break :blk sandbox.verifySeatbelt(gpa, io, &probe_environ.?);
+            break :blk sandbox.verify(gpa, io, &probe_environ.?, marlin_exe);
         };
 
         // A verified backend without resolvable protected roots cannot honor
         // the protected-path contract, so it must not claim enforcement.
         var protected_roots: ?sandbox.ProtectedRoots = null;
         defer if (protected_roots) |*roots| roots.deinit(gpa);
-        if (sandbox_backend == .seatbelt) {
+        if (sandbox_backend != .unavailable) {
             protected_roots = sandbox.resolveProtectedRoots(gpa, io, environ) catch null;
             if (protected_roots == null) sandbox_backend = .unavailable;
         }
         std.log.info("shell sandbox {s}; new sessions {s}", .{
             switch (sandbox_backend) {
                 .seatbelt => @as([]const u8, "verified (seatbelt)"),
+                .landlock => "verified (landlock)",
                 .unavailable => "unavailable",
             },
-            if (cfg.permissions_enabled and sandbox_backend == .seatbelt)
+            if (cfg.permissions_enabled and sandbox_backend != .unavailable)
                 @as([]const u8, "run workspace shell without prompts")
             else
                 "keep per-call shell approvals",
@@ -400,7 +405,7 @@ pub const Daemon = struct {
             // Delegated Claude Code sessions spawn `<marlin> cc_approve` as
             // their permission bridge; an unresolvable path just means the
             // bridge stays unwired (headless prompts auto-deny as before).
-            .marlin_exe = std.process.executablePathAlloc(io, gpa) catch null,
+            .marlin_exe = marlin_exe,
             // Secret values this process holds, for capture-time redaction
             // of tool output before it reaches the append-only store.
             .secrets = permissions.collectSecrets(gpa, environ) catch &.{},
@@ -902,7 +907,7 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .hello_ok = .{
                     .proto_version = proto.proto_version,
                     .daemon_version = daemon_version,
-                    .sandbox_available = self.sandbox_backend == .seatbelt,
+                    .sandbox_available = self.sandbox_backend != .unavailable,
                     .network_filtering = self.network.isActive(),
                     .network_configured = config.networkPolicyConfigured(self.cfg),
                     .network_feed_count = self.network.feedCount(),
@@ -2034,8 +2039,9 @@ pub const Daemon = struct {
         var sandbox_temp: ?[]u8 = null;
         defer if (sandbox_temp) |path| self.gpa.free(path);
         var sandbox_options = sandbox.Options{};
-        if (self.sandbox_backend == .seatbelt and job.sandbox_enabled) {
-            const tmp_root = self.environ.get("TMPDIR") orelse "/private/tmp";
+        if (self.sandbox_backend != .unavailable and job.sandbox_enabled) {
+            const tmp_root = self.environ.get("TMPDIR") orelse
+                (if (@import("builtin").os.tag == .macos) "/private/tmp" else "/tmp");
             sandbox_temp = std.fmt.allocPrint(self.gpa, "{s}{c}marlin-tools{c}{d}", .{
                 std.mem.trimEnd(u8, tmp_root, std.fs.path.sep_str),
                 std.fs.path.sep,
@@ -2049,7 +2055,8 @@ pub const Daemon = struct {
                 };
             }
             if (sandbox_temp) |path| sandbox_options = .{
-                .backend = .seatbelt,
+                .backend = self.sandbox_backend,
+                .marlin_exe = self.marlin_exe,
                 .temp_root = path,
                 .protected = self.protected_roots,
             };
@@ -2468,7 +2475,7 @@ pub const Daemon = struct {
                 .state = state,
                 .created_at = row.created_at,
                 .running = state == .running,
-                .sandboxed = self.sandbox_backend == .seatbelt and
+                .sandboxed = self.sandbox_backend != .unavailable and
                     (if (live) |session| session.sandbox_enabled else self.cfg.permissions_enabled),
                 .network_filtering = self.network.isActive() and
                     (if (live) |session| session.network_filtering_enabled else true),
