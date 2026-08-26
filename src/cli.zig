@@ -20,6 +20,7 @@ pub const Command = enum {
     daemon,
     run,
     ls,
+    search,
     archive,
     unarchive,
     kill,
@@ -86,6 +87,7 @@ pub fn dispatch(
         .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
         .ls => return headless.ls(gpa, io, environ, self_exe, rest),
+        .search => return headless.search(gpa, io, environ, self_exe, rest),
         .archive => return headless.setArchived(gpa, io, environ, self_exe, rest, true),
         .unarchive => return headless.setArchived(gpa, io, environ, self_exe, rest, false),
         .kill => return headless.kill(gpa, io, environ, self_exe, rest),
@@ -179,6 +181,7 @@ const help_text =
     \\  marlin run [--continue] [--model <m>] [--image <path>] [--quiet] [--ask] "task"
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls [--all]      list sessions
+    \\  marlin search <query>  search durable transcripts across sessions
     \\  marlin archive <handle> hide a session tree without deleting it
     \\  marlin unarchive <handle> restore an archived session tree
     \\  marlin kill <handle>   interrupt a session's running turn

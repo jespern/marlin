@@ -2,7 +2,8 @@
 //!
 //! Schema (docs/ARCHITECTURE.md §2). WAL mode for crash safety. Blocks are
 //! INSERT-only; the sessions row is the only thing UPDATEd. Blob writes are
-//! idempotent (content-hash PK). FTS5 is a future cross-session search feature.
+//! idempotent (content-hash PK). Searchable block text is projected into a
+//! compact side table and, when supported by SQLite, an FTS5 index.
 //!
 //! DB path: ~/.local/state/marlin/marlin.db (respects XDG_STATE_HOME).
 
@@ -76,7 +77,16 @@ const schema_sql =
     \\  block_id INTEGER NOT NULL,
     \\  PRIMARY KEY(hash, block_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','6');
+    \\CREATE TABLE IF NOT EXISTS search_docs(
+    \\  block_id INTEGER PRIMARY KEY REFERENCES blocks(id),
+    \\  session_id INTEGER NOT NULL,
+    \\  seq INTEGER NOT NULL,
+    \\  kind TEXT NOT NULL,
+    \\  ts INTEGER NOT NULL,
+    \\  text TEXT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS search_docs_by_session ON search_docs(session_id, seq);
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','7');
 ;
 
 pub const SessionRow = struct {
@@ -105,6 +115,7 @@ pub const Store = struct {
     db: *c.sqlite3,
     gpa: std.mem.Allocator,
     statements: *StatementCache,
+    fts5: bool,
 
     /// Open (creating schema if needed). `path` null → in-memory (tests).
     pub fn open(gpa: std.mem.Allocator, path: ?[:0]const u8) Error!Store {
@@ -141,10 +152,11 @@ pub const Store = struct {
             return error.OutOfMemory;
         };
         statements.* = .{};
-        var store = Store{ .db = db.?, .gpa = gpa, .statements = statements };
+        var store = Store{ .db = db.?, .gpa = gpa, .statements = statements, .fts5 = false };
         errdefer store.close();
         try store.execAll(schema_sql);
         try store.migrate();
+        try store.initializeSearch();
         return store;
     }
 
@@ -200,6 +212,96 @@ pub const Store = struct {
                 \\UPDATE kv SET value='6' WHERE key='schema_version';
             );
         }
+        if (ver < 7) {
+            // The ordinary projection powers a portable slow-scan fallback
+            // when the platform SQLite library was compiled without FTS5.
+            try self.execAll(
+                \\CREATE TABLE IF NOT EXISTS search_docs(
+                \\  block_id INTEGER PRIMARY KEY REFERENCES blocks(id),
+                \\  session_id INTEGER NOT NULL,
+                \\  seq INTEGER NOT NULL,
+                \\  kind TEXT NOT NULL,
+                \\  ts INTEGER NOT NULL,
+                \\  text TEXT NOT NULL
+                \\);
+                \\CREATE INDEX IF NOT EXISTS search_docs_by_session ON search_docs(session_id, seq);
+                \\UPDATE kv SET value='7' WHERE key='schema_version';
+            );
+        }
+    }
+
+    fn initializeSearch(self: *Store) Error!void {
+        if (try self.kvGetInt("search_docs_version") < 1) {
+            try self.backfillSearchDocs();
+            try self.kvSetInt("search_docs_version", 1);
+        }
+
+        self.execAll(
+            \\CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+            \\  text,
+            \\  content='search_docs',
+            \\  content_rowid='block_id',
+            \\  tokenize='unicode61 remove_diacritics 2'
+            \\);
+        ) catch {
+            // Some system SQLite builds omit FTS5. search_docs remains fully
+            // maintained and search() falls back to a bounded LIKE scan.
+            self.fts5 = false;
+            return;
+        };
+        self.fts5 = true;
+        if (try self.kvGetInt("search_fts_version") < 1) {
+            try self.execAll("INSERT INTO search_fts(search_fts) VALUES('rebuild');");
+            try self.kvSetInt("search_fts_version", 1);
+        }
+    }
+
+    fn backfillSearchDocs(self: Store) Error!void {
+        const select = try self.prepare(
+            "SELECT id, session_id, turn_id, seq, ts, body_json FROM blocks ORDER BY id",
+        );
+        defer finalize(select);
+        const insert = try self.prepare(
+            "INSERT OR IGNORE INTO search_docs(block_id, session_id, seq, kind, ts, text) VALUES(?,?,?,?,?,?)",
+        );
+        defer finalize(insert);
+        try self.execAll("BEGIN IMMEDIATE;");
+        var committed = false;
+        defer if (!committed) self.execAll("ROLLBACK;") catch {};
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        while (true) {
+            const rc = c.sqlite3_step(select);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            _ = arena_state.reset(.retain_capacity);
+            const arena = arena_state.allocator();
+            const body_json = columnText(select, 5);
+            const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
+                .ignore_unknown_fields = true,
+            }) catch continue;
+            const blk = block.Block{
+                .id = @bitCast(c.sqlite3_column_int64(select, 0)),
+                .session_id = @bitCast(c.sqlite3_column_int64(select, 1)),
+                .turn_id = @bitCast(c.sqlite3_column_int64(select, 2)),
+                .seq = @bitCast(c.sqlite3_column_int64(select, 3)),
+                .ts = c.sqlite3_column_int64(select, 4),
+                .body = body,
+            };
+            const text_value = try searchTextAlloc(arena, blk);
+            const text = text_value orelse continue;
+            bindInt(insert, 1, @bitCast(blk.id));
+            bindInt(insert, 2, @bitCast(blk.session_id));
+            bindInt(insert, 3, @bitCast(blk.seq));
+            bindText(insert, 4, @tagName(blk.kind()));
+            bindInt(insert, 5, blk.ts);
+            bindText(insert, 6, text);
+            try stepDone(insert);
+            resetStatement(insert);
+        }
+        try self.execAll("COMMIT;");
+        committed = true;
     }
 
     fn kvGetInt(self: Store, key: []const u8) Error!i64 {
@@ -212,6 +314,18 @@ pub const Store = struct {
         const ptr = c.sqlite3_column_text(stmt, 0);
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
         return std.fmt.parseInt(i64, ptr[0..len], 10) catch 0;
+    }
+
+    fn kvSetInt(self: Store, key: []const u8, value: i64) Error!void {
+        var value_buf: [32]u8 = undefined;
+        const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch return error.OutOfMemory;
+        const stmt = try self.prepare(
+            "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        );
+        defer finalize(stmt);
+        bindText(stmt, 1, key);
+        bindText(stmt, 2, value_text);
+        try stepDone(stmt);
     }
 
     pub fn close(self: *Store) void {
@@ -530,15 +644,48 @@ pub const Store = struct {
 
     // ------------------------------------------------------------ blocks --
 
+    fn insertSearchDocLocked(self: Store, blk: block.Block, text: ?[]const u8) Error!void {
+        const searchable = text orelse return;
+        const doc_stmt = try self.cachedStatement(
+            &self.statements.append_search_doc,
+            "INSERT INTO search_docs(block_id, session_id, seq, kind, ts, text) VALUES(?,?,?,?,?,?)",
+        );
+        defer resetStatement(doc_stmt);
+        bindInt(doc_stmt, 1, @bitCast(blk.id));
+        bindInt(doc_stmt, 2, @bitCast(blk.session_id));
+        bindInt(doc_stmt, 3, @bitCast(blk.seq));
+        bindText(doc_stmt, 4, @tagName(blk.kind()));
+        bindInt(doc_stmt, 5, blk.ts);
+        bindText(doc_stmt, 6, searchable);
+        try stepDone(doc_stmt);
+
+        if (self.fts5) {
+            const fts_stmt = try self.cachedStatement(
+                &self.statements.append_search_fts,
+                "INSERT INTO search_fts(rowid, text) VALUES(?,?)",
+            );
+            defer resetStatement(fts_stmt);
+            bindInt(fts_stmt, 1, @bitCast(blk.id));
+            bindText(fts_stmt, 2, searchable);
+            try stepDone(fts_stmt);
+        }
+    }
+
     /// Append a block. body is serialized to JSON here.
     pub fn appendBlock(self: Store, blk: block.Block) Error!void {
         const body_json = std.json.Stringify.valueAlloc(self.gpa, blk.body, .{}) catch
             return error.OutOfMemory;
         defer self.gpa.free(body_json);
+        var search_arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer search_arena_state.deinit();
+        const search_text = try searchTextAlloc(search_arena_state.allocator(), blk);
 
         const db_mutex = c.sqlite3_db_mutex(self.db);
         c.sqlite3_mutex_enter(db_mutex);
         defer c.sqlite3_mutex_leave(db_mutex);
+        try self.execAll("BEGIN IMMEDIATE;");
+        var committed = false;
+        defer if (!committed) self.execAll("ROLLBACK;") catch {};
         const stmt = try self.cachedStatement(
             &self.statements.append_block,
             "INSERT INTO blocks(id, session_id, turn_id, seq, kind, ts, body_json) VALUES(?,?,?,?,?,?,?)",
@@ -552,6 +699,9 @@ pub const Store = struct {
         bindInt(stmt, 6, blk.ts);
         bindText(stmt, 7, body_json);
         try stepDone(stmt);
+        try self.insertSearchDocLocked(blk, search_text);
+        try self.execAll("COMMIT;");
+        committed = true;
     }
 
     /// Persist one oversized tool result as a single crash-consistent unit.
@@ -583,6 +733,9 @@ pub const Store = struct {
         const body_json = std.json.Stringify.valueAlloc(self.gpa, blk.body, .{}) catch
             return error.OutOfMemory;
         defer self.gpa.free(body_json);
+        var search_arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer search_arena_state.deinit();
+        const search_text = try searchTextAlloc(search_arena_state.allocator(), blk);
 
         const db_mutex = c.sqlite3_db_mutex(self.db);
         c.sqlite3_mutex_enter(db_mutex);
@@ -619,6 +772,7 @@ pub const Store = struct {
             bindText(stmt, 7, body_json);
             try stepDone(stmt);
         }
+        try self.insertSearchDocLocked(blk, search_text);
         for (blobs) |blob_value| {
             const stmt = try self.prepare("INSERT OR IGNORE INTO blob_refs(hash, block_id) VALUES(?,?)");
             defer finalize(stmt);
@@ -969,6 +1123,104 @@ pub const Store = struct {
         }
     }
 
+    /// Recent authored text for Ctrl+R. Fuzzy ranking remains client-side;
+    /// this query only provides a bounded, newest-first durable corpus.
+    pub fn recentInputs(
+        self: Store,
+        arena: std.mem.Allocator,
+        current_session_id: u64,
+        limit: u32,
+    ) Error![]const proto.InputHistoryEntry {
+        const stmt = try self.prepare(
+            \\SELECT session_id, seq, ts, text FROM search_docs
+            \\WHERE kind IN ('user_msg','steer')
+            \\ORDER BY (session_id=?) DESC, ts DESC, block_id DESC LIMIT ?
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(current_session_id));
+        bindInt(stmt, 2, @intCast(@min(limit, 1024)));
+        var entries: std.ArrayList(proto.InputHistoryEntry) = .empty;
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            try entries.append(arena, .{
+                .sid = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 1)),
+                .ts = c.sqlite3_column_int64(stmt, 2),
+                .text = try arena.dupe(u8, columnText(stmt, 3)),
+            });
+        }
+        return entries.items;
+    }
+
+    /// Search durable rendered text. FTS5 is preferred; search_docs provides
+    /// a portable bounded fallback for system SQLite builds without it.
+    pub fn search(
+        self: Store,
+        arena: std.mem.Allocator,
+        query: []const u8,
+        session_id: u64,
+        limit: u32,
+    ) Error![]const proto.SearchHit {
+        const trimmed = std.mem.trim(u8, query, " \t\r\n");
+        if (trimmed.len == 0) return &.{};
+        const capped_limit = @min(limit, 200);
+        if (capped_limit == 0) return &.{};
+
+        const stmt = if (self.fts5) fts: {
+            const expression = try ftsQueryAlloc(arena, trimmed);
+            const value = expression orelse return &.{};
+            const prepared = try self.prepare(
+                \\SELECT d.session_id, d.block_id, d.seq, d.ts, d.kind,
+                \\       s.title, s.cwd,
+                \\       snippet(search_fts, 0, '[', ']', ' … ', 24)
+                \\FROM search_fts
+                \\JOIN search_docs d ON d.block_id=search_fts.rowid
+                \\JOIN sessions s ON s.id=d.session_id
+                \\WHERE search_fts MATCH ? AND (?=0 OR d.session_id=?)
+                \\ORDER BY bm25(search_fts), d.ts DESC LIMIT ?
+            );
+            bindText(prepared, 1, value);
+            bindInt(prepared, 2, @bitCast(session_id));
+            bindInt(prepared, 3, @bitCast(session_id));
+            bindInt(prepared, 4, @intCast(capped_limit));
+            break :fts prepared;
+        } else fallback: {
+            const prepared = try self.prepare(
+                \\SELECT d.session_id, d.block_id, d.seq, d.ts, d.kind,
+                \\       s.title, s.cwd, substr(d.text, 1, 320)
+                \\FROM search_docs d JOIN sessions s ON s.id=d.session_id
+                \\WHERE (?=0 OR d.session_id=?) AND d.text LIKE '%' || ? || '%' COLLATE NOCASE
+                \\ORDER BY d.ts DESC LIMIT ?
+            );
+            bindInt(prepared, 1, @bitCast(session_id));
+            bindInt(prepared, 2, @bitCast(session_id));
+            bindText(prepared, 3, trimmed);
+            bindInt(prepared, 4, @intCast(capped_limit));
+            break :fallback prepared;
+        };
+        defer finalize(stmt);
+
+        var hits: std.ArrayList(proto.SearchHit) = .empty;
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            try hits.append(arena, .{
+                .sid = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .block_id = @bitCast(c.sqlite3_column_int64(stmt, 1)),
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 2)),
+                .ts = c.sqlite3_column_int64(stmt, 3),
+                .kind = std.meta.stringToEnum(block.BlockKind, columnText(stmt, 4)) orelse .system_note,
+                .title = try arena.dupe(u8, columnText(stmt, 5)),
+                .cwd = try arena.dupe(u8, columnText(stmt, 6)),
+                .snippet = try arena.dupe(u8, columnText(stmt, 7)),
+            });
+        }
+        return hits.items;
+    }
+
     /// Load a newest suffix directly in DESC order, stopping before parsing
     /// an over-budget older row, then reverse only the bounded result into
     /// transcript order. `before_seq=0` means the live tail.
@@ -1189,13 +1441,74 @@ pub const Store = struct {
     }
 };
 
+const max_search_text_bytes: usize = 256 * 1024;
+
+fn ftsQueryAlloc(allocator: std.mem.Allocator, query: []const u8) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var words = std.mem.tokenizeAny(u8, query, " \t\r\n");
+    while (words.next()) |word| {
+        if (out.items.len > 0) try out.append(allocator, ' ');
+        try out.append(allocator, '"');
+        for (word) |byte| {
+            if (byte == '"') try out.append(allocator, '"');
+            try out.append(allocator, byte);
+        }
+        try out.appendSlice(allocator, "\"*");
+    }
+    return if (out.items.len > 0) out.items else null;
+}
+
+fn appendSearchPart(out: *std.ArrayList(u8), allocator: std.mem.Allocator, part: []const u8) !void {
+    if (part.len == 0 or out.items.len >= max_search_text_bytes) return;
+    if (out.items.len > 0) try out.append(allocator, '\n');
+    const available = max_search_text_bytes - out.items.len;
+    try out.appendSlice(allocator, part[0..@min(part.len, available)]);
+}
+
+/// Project a durable block into the text users actually saw. Binary payloads,
+/// blob bodies, and synthetic compaction rehydration are deliberately absent.
+fn searchTextAlloc(allocator: std.mem.Allocator, blk: block.Block) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    switch (blk.body) {
+        .user_msg => |user| {
+            if (user.synthetic) return null;
+            try appendSearchPart(&out, allocator, user.text);
+            for (user.attachments) |attachment| try appendSearchPart(&out, allocator, attachment.name);
+        },
+        .assistant_msg => |assistant| try appendSearchPart(&out, allocator, assistant.text),
+        .reasoning => |reasoning| try appendSearchPart(&out, allocator, reasoning.text),
+        .steer => |steer| try appendSearchPart(&out, allocator, steer.text),
+        .tool_call => |call| {
+            try appendSearchPart(&out, allocator, call.name);
+            try appendSearchPart(&out, allocator, call.args_json);
+        },
+        .tool_result => |result| {
+            try appendSearchPart(&out, allocator, result.inline_body);
+            for (result.attachments) |attachment| try appendSearchPart(&out, allocator, attachment.name);
+        },
+        .plan => |plan| for (plan.items) |item| try appendSearchPart(&out, allocator, item.step),
+        .compaction => |compaction| try appendSearchPart(&out, allocator, compaction.summary),
+        .system_note => |note| try appendSearchPart(&out, allocator, note.text),
+        .approval => return null,
+    }
+    return if (out.items.len > 0) out.items else null;
+}
+
 const StatementCache = struct {
     append_block: ?*c.sqlite3_stmt = null,
+    append_search_doc: ?*c.sqlite3_stmt = null,
+    append_search_fts: ?*c.sqlite3_stmt = null,
     set_session_status: ?*c.sqlite3_stmt = null,
     update_session_usage: ?*c.sqlite3_stmt = null,
 
     fn deinit(self: *StatementCache) void {
-        inline for (.{ self.append_block, self.set_session_status, self.update_session_usage }) |stmt|
+        inline for (.{
+            self.append_block,
+            self.append_search_doc,
+            self.append_search_fts,
+            self.set_session_status,
+            self.update_session_usage,
+        }) |stmt|
             if (stmt) |value| finalize(value);
         self.* = undefined;
     }
@@ -1689,19 +2002,80 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v6 without the duplicate block index" {
+test "schema is v7 with search projection and without duplicate block index" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 6), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 7), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 6), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 7), try store.kvGetInt("schema_version"));
     const stmt = try store.prepare("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='blocks_by_session'");
     defer finalize(stmt);
     try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "durable search indexes visible text and recent authored inputs" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 1, "/one", "m", .auto);
+    try store.createSession(2, 2, "/two", "m", .auto);
+    try store.setSessionTitle(1, "fruit work");
+    try store.appendBlock(.{
+        .id = 11,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 10,
+        .body = .{ .user_msg = .{ .text = "build the banana launcher" } },
+    });
+    try store.appendBlock(.{
+        .id = 12,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 2,
+        .ts = 11,
+        .body = .{ .assistant_msg = .{ .text = "launcher implementation complete" } },
+    });
+    try store.appendBlock(.{
+        .id = 21,
+        .session_id = 2,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 12,
+        .body = .{ .user_msg = .{ .text = "private synthetic text", .synthetic = true } },
+    });
+    try store.appendBlock(.{
+        .id = 22,
+        .session_id = 2,
+        .turn_id = 1,
+        .seq = 2,
+        .ts = 13,
+        .body = .{ .steer = .{ .text = "add citrus support" } },
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const hits = try store.search(arena_state.allocator(), "banana launch", 0, 20);
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    try std.testing.expectEqual(@as(u64, 1), hits[0].sid);
+    try std.testing.expectEqual(block.BlockKind.user_msg, hits[0].kind);
+    try std.testing.expectEqualStrings("fruit work", hits[0].title);
+
+    const scoped = try store.search(arena_state.allocator(), "launcher", 2, 20);
+    try std.testing.expectEqual(@as(usize, 0), scoped.len);
+    const history = try store.recentInputs(arena_state.allocator(), 2, 20);
+    try std.testing.expectEqual(@as(usize, 2), history.len);
+    try std.testing.expectEqualStrings("add citrus support", history[0].text);
+    try std.testing.expectEqualStrings("build the banana launcher", history[1].text);
+
+    // Exercise the capability fallback against the same maintained corpus.
+    store.fts5 = false;
+    const fallback = try store.search(arena_state.allocator(), "banana launcher", 0, 20);
+    try std.testing.expectEqual(@as(usize, 1), fallback.len);
 }
 
 test "child session metadata is durable and grouped beneath its root" {

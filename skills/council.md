@@ -12,8 +12,8 @@ one review prompt into several vendor CLIs and consolidating by hand.
 ## Procedure
 
 1. **Roster.** Use the models the user named. If they named none, use the
-   default roster below. Two or three reviewers is the sweet spot; never more
-   than four. Guest models (`claudecode/...`) may sit on a council: they run
+   default roster below. Two or three reviewers is the sweet spot. Guest models
+   (`claudecode/...`) may sit on a council: they run
    as read-only reviewers (the permission bridge denies every edit and shell
    command outright), so treat them like any other seat.
 
@@ -34,8 +34,10 @@ one review prompt into several vendor CLIs and consolidating by hand.
      (file:line, severity, why it matters) · what you would do differently ·
      confidence (low/medium/high).
 
-3. **Fan out** with a single `task_batch` call: one task per reviewer,
-   identical `prompt`, a distinct `model` per task, `max_rounds` 16. Tell
+3. **Fan out** with `task_batch`: one task per reviewer, identical `prompt`,
+   a distinct `model` per task, `max_rounds` 16. Rosters above eight require
+   consecutive batches of at most eight while preserving roster order; use
+   `task` if the final remainder is one reviewer. Tell
    reviewers to budget their reading — state it as a hard rule in the
    review prompt ("at most ten tool calls, then answer with what you
    have"); a reviewer that burns its rounds on exploration returns

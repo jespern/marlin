@@ -976,6 +976,35 @@ pub const Daemon = struct {
                 self.broadcastSessionUpsert(sid);
             },
             .session_list => |sl| try self.sendSessionList(client, sl.include_archived),
+            .input_history => |request| {
+                var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena_state.deinit();
+                const entries = try self.store.recentInputs(
+                    arena_state.allocator(),
+                    request.sid,
+                    @min(request.limit, 1024),
+                );
+                self.sendTo(client, .{ .input_history_result = .{ .entries = entries } });
+            },
+            .search => |request| {
+                if (request.query.len > 4096) {
+                    self.sendTo(client, .{ .err = .{ .code = "bad_search", .msg = "search query is too long" } });
+                    return;
+                }
+                var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena_state.deinit();
+                const hits = try self.store.search(
+                    arena_state.allocator(),
+                    request.query,
+                    request.sid,
+                    @min(request.limit, 200),
+                );
+                self.sendTo(client, .{ .search_result = .{
+                    .query = request.query,
+                    .sid = request.sid,
+                    .hits = hits,
+                } });
+            },
             .session_watch => |sw| {
                 client.watches_sessions = true;
                 client.watches_session_deltas = sw.incremental;
@@ -1176,7 +1205,15 @@ pub const Daemon = struct {
                     } });
                     return;
                 }
+                if (s.around_seq > 0 and (s.tail_limit == 0 or s.before_seq > 0 or s.from_seq > 0)) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "bad_replay",
+                        .msg = "around_seq requires tail_limit and cannot be combined with replay bounds",
+                    } });
+                    return;
+                }
                 const bounded_forward = s.from_seq > 0 and s.replay_limit > 0;
+                const centered = s.around_seq > 0;
                 var caught_up = true;
                 // Replay either a bounded newest/older window, a bounded
                 // forward page, or the compatibility from_seq range.
@@ -1187,15 +1224,37 @@ pub const Daemon = struct {
                     var send_start: usize = 0;
                     var send_count: usize = 0;
                     var page_has_older = false;
+                    var page_has_newer = false;
                     if (s.tail_limit > 0) {
-                        page_has_older = try self.store.loadTailPageInto(
-                            replay_arena_state.allocator(),
-                            &replay,
-                            s.sid,
-                            s.before_seq,
-                            @min(s.tail_limit, 512),
-                            max_replay_page_bytes,
-                        );
+                        if (centered) {
+                            const page_limit = @min(s.tail_limit, 512);
+                            const older_limit = @max(@as(u32, 1), page_limit / 2);
+                            page_has_older = try self.store.loadTailPageInto(
+                                replay_arena_state.allocator(),
+                                &replay,
+                                s.sid,
+                                s.around_seq +| 1,
+                                older_limit,
+                                max_replay_page_bytes / 2,
+                            );
+                            page_has_newer = try self.store.loadForwardPageInto(
+                                replay_arena_state.allocator(),
+                                &replay,
+                                s.sid,
+                                s.around_seq +| 1,
+                                page_limit - older_limit,
+                                max_replay_page_bytes / 2,
+                            );
+                        } else {
+                            page_has_older = try self.store.loadTailPageInto(
+                                replay_arena_state.allocator(),
+                                &replay,
+                                s.sid,
+                                s.before_seq,
+                                @min(s.tail_limit, 512),
+                                max_replay_page_bytes,
+                            );
+                        }
                     } else if (bounded_forward) {
                         const page_limit = @min(s.replay_limit, 512);
                         const has_more = try self.store.loadForwardPageInto(
@@ -1211,7 +1270,10 @@ pub const Daemon = struct {
                     } else {
                         try self.store.loadBlocksInto(replay_arena_state.allocator(), &replay, s.sid, s.from_seq, 1_000_000);
                     }
-                    if (s.tail_limit > 0) {
+                    if (centered) {
+                        send_count = replay.items.len;
+                        caught_up = !page_has_newer;
+                    } else if (s.tail_limit > 0) {
                         // Keep a newest suffix when the row window exceeds
                         // the byte budget; backwards pagination can fetch the
                         // omitted prefix later without losing the live edge.
@@ -1251,7 +1313,7 @@ pub const Daemon = struct {
                         self.sendTo(client, .{ .blk = .{ .sid = s.sid, .b = replayed } });
                     }
                     if (s.tail_limit > 0 or s.replay_done or bounded_forward) {
-                        const replay_has_newer = bounded_forward and !caught_up;
+                        const replay_has_newer = (bounded_forward and !caught_up) or (centered and page_has_newer);
                         const latest_plan = if (!replay_has_newer)
                             try self.store.loadLatestPlan(replay_arena_state.allocator(), s.sid)
                         else
@@ -1269,7 +1331,7 @@ pub const Daemon = struct {
                         } });
                     }
                 }
-                if (bounded_forward and !caught_up) {
+                if ((bounded_forward and !caught_up) or (centered and !caught_up)) {
                     // Do not fan live blocks into a partially replayed client:
                     // a later seq would advance its de-dup cursor past the
                     // next durable page. The final page atomically transitions

@@ -71,6 +71,24 @@ pub const CouncilInfo = struct {
     models: []const []const u8,
 };
 
+pub const InputHistoryEntry = struct {
+    sid: u64,
+    seq: u64,
+    ts: i64,
+    text: []const u8,
+};
+
+pub const SearchHit = struct {
+    sid: u64,
+    block_id: u64,
+    seq: u64,
+    ts: i64,
+    kind: block.BlockKind,
+    title: []const u8,
+    cwd: []const u8,
+    snippet: []const u8,
+};
+
 pub const McpServerInfo = struct {
     name: []const u8,
     ready: bool,
@@ -103,6 +121,11 @@ pub const ClientMsg = union(enum) {
         approvals: []const u8 = "default",
     },
     session_list: struct { include_archived: bool = false },
+    /// Recent authored messages for client-side fuzzy Ctrl+R recall. Results
+    /// are newest-first and span sessions.
+    input_history: struct { sid: u64 = 0, limit: u32 = 256 },
+    /// Durable transcript search. sid=0 searches every session.
+    search: struct { query: []const u8, sid: u64 = 0, limit: u32 = 100 },
     /// Subscribe this client to refreshed session_list_result snapshots when
     /// any session enters an actionable state or its membership changes.
     /// The daemon replies with an immediate snapshot, then sends updates until
@@ -145,6 +168,9 @@ pub const ClientMsg = union(enum) {
         from_seq: u64 = 0,
         tail_limit: u32 = 0,
         before_seq: u64 = 0,
+        /// Center a bounded replay window on this durable sequence. This is
+        /// used when selecting a transcript-search result.
+        around_seq: u64 = 0,
         /// Bound forward replay. The daemon delays the live subscription
         /// until paging reaches the durable frontier, so blocks cannot arrive
         /// out of order between pages.
@@ -230,6 +256,8 @@ pub const DaemonMsg = union(enum) {
     },
     session_created: struct { sid: u64, request_id: u64 = 0 },
     session_list_result: struct { sessions: []const SessionInfo },
+    input_history_result: struct { entries: []const InputHistoryEntry },
+    search_result: struct { query: []const u8, sid: u64 = 0, hits: []const SearchHit },
     /// Sent only to session watchers that explicitly opted in: older tagged
     /// union decoders reject message types they do not know.
     session_upsert: struct { session: SessionInfo },
@@ -484,6 +512,31 @@ test "round trip: client messages" {
     try std.testing.expectEqual(@as(u64, 1024), tail_back.sub.before_seq);
     try std.testing.expectEqual(@as(u32, 128), tail_back.sub.replay_limit);
     try std.testing.expect(tail_back.sub.replay_done);
+
+    const centered_line = try encode(gpa, ClientMsg{ .sub = .{
+        .sid = 7,
+        .tail_limit = 256,
+        .around_seq = 42,
+    } });
+    defer gpa.free(centered_line);
+    const centered_back = try decode(ClientMsg, arena, centered_line);
+    try std.testing.expectEqual(@as(u64, 42), centered_back.sub.around_seq);
+
+    const search_line = try encode(gpa, ClientMsg{ .search = .{
+        .query = "banana launcher",
+        .sid = 7,
+        .limit = 20,
+    } });
+    defer gpa.free(search_line);
+    const search_back = try decode(ClientMsg, arena, search_line);
+    try std.testing.expectEqualStrings("banana launcher", search_back.search.query);
+    try std.testing.expectEqual(@as(u64, 7), search_back.search.sid);
+
+    const history_line = try encode(gpa, ClientMsg{ .input_history = .{ .sid = 7, .limit = 99 } });
+    defer gpa.free(history_line);
+    const history_back = try decode(ClientMsg, arena, history_line);
+    try std.testing.expectEqual(@as(u64, 7), history_back.input_history.sid);
+    try std.testing.expectEqual(@as(u32, 99), history_back.input_history.limit);
 
     const interrupt_line = try encode(gpa, ClientMsg{ .interrupt = .{ .sid = 9, .report = true } });
     defer gpa.free(interrupt_line);

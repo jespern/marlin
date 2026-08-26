@@ -45,6 +45,8 @@ policy that failed open. Both default false when decoding an older daemon.
 | hello | proto_version, client_kind | hello_ok or err |
 | session_create | cwd, model, effort?, title?, approvals?, request_id? | session_created{sid, request_id}; request_failed echoes request_id |
 | session_list | include_archived? | session_list_result{sessions}; archived omitted by default |
+| input_history | sid?, limit? | input_history_result{entries}; authored user/steer text across sessions, current sid first then newest, capped at 1024 |
+| search | query, sid?, limit? | search_result{query,sid,hits}; sid=0 searches all sessions, capped at 200 results |
 | session_watch | incremental? | initial session_list_result, then structural catalog updates; incremental clients receive session_upsert/session_remove, legacy clients receive refreshed snapshots |
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
@@ -52,7 +54,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on Claude Code sessions |
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded, err{guest} on Claude Code sessions |
-| sub | sid, from_seq, tail_limit?, before_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
+| sub | sid, from_seq, tail_limit?, before_seq?, around_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
 | unsub | sid | ok |
 | input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer while an agent turn is accepting them (running/awaiting approval); compact, handover, and the atomic finishing edge return `err{not_steerable}` |
 | council_list | — | council_list_result with every configured [[council]] roster |
@@ -98,6 +100,12 @@ user reaches the loaded top. Every bounded replay ends with
 `plan_items` carries the latest durable plan revision independently of the
 bounded block window. `plan_pinned=false` means the plan is complete and belongs
 in transcript history instead of being restored above the input.
+
+`sub.around_seq`: with `tail_limit`, requests a bounded window centered on a
+durable match. It cannot be combined with `from_seq` or `before_seq`. A centered
+page reports both `has_older` and `has_newer`; clients page forward from
+`newest_seq+1` before the daemon makes the connection live, preserving the same
+gap-free handoff as reconnect replay.
 
 `sub.replay_limit`: when non-zero with `from_seq`, replay at most 512 blocks
 forward and return `replay_done{...,has_newer,forward:true}`. If `has_newer` is
@@ -149,6 +157,8 @@ descendants.
 | hello_ok | handshake |
 | session_created | reply to session_create |
 | session_list_result | reply to session_list |
+| input_history_result {entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
+| search_result {query,sid,hits} | reply to search; each hit carries session/block identity, kind, location, timestamp, and an FTS-highlighted snippet |
 | session_upsert {session} | one added/restored/changed catalog row for an incremental session watcher |
 | session_remove {sid} | one archived catalog row removed from an incremental session watcher |
 | blk {sid, b} | a block was persisted (replay AND live fan-out) |

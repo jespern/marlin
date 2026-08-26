@@ -232,28 +232,24 @@ indistinguishable from actions.
 ### 5.1 Council manager
 
 ```
-/council                 # list/pick councils
-/council new             # open creation form
-/council crypto          # inspect/edit this council
-/council delete crypto   # confirm, then remove it
+/council                 # filtered list of councils; Enter inspects one
+/council crypto          # inspect the roster; e opens editing
+/council new crypto      # create via the model multi-select picker
+/council edit crypto     # edit the existing roster directly
+/council delete crypto   # remove it
 ```
 
-The creation/edit form contains:
+Autocomplete continues after `/council`, offering actions and configured
+council names. Inspection shows the complete model roster without entering an
+editing state. The creation/edit picker reuses the full model catalog with
+type-to-filter and pricing. Enter toggles a seat, the `Done` row at the top
+saves, and Esc cancels without writing. Existing seats open checked; a council
+must retain at least one model. The command fast path remains available as
+`/council set <name> <model...>`.
 
-```
-name          crypto
-models        [✓ sol] [✓ fable] [✓ grok] [✓ glm]
-effort        high
-stance        balanced | adversarial
-deliberation  independent | rebuttal
-tools         read-only
-budget        12 turns / 40k tokens per reviewer
-```
-
-Use the existing model catalog as a multi-select picker. The daemon validates
-model ids and writes council configuration atomically; the TUI must not edit
-TOML directly. Config-file edits and `/council` edits share one source of
-truth and become visible after daemon reload/acknowledgement.
+The daemon validates model ids and writes council configuration atomically; the
+TUI never edits TOML directly. Config-file edits and `/council` edits share one
+source of truth and become visible after daemon reload/acknowledgement.
 
 ### 5.2 Review invocation
 
@@ -261,6 +257,9 @@ truth and become visible after daemon reload/acknowledgement.
 /review
 /review crypto review the system from the top; adversarial, focus on crypto and UX
 ```
+
+After `/review `, autocomplete offers configured council names and leaves the
+cursor after the selected name for the review question.
 
 `/review` with no arguments opens a small form:
 

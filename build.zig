@@ -21,6 +21,7 @@ const sqlite_flags = &.{
     "-DSQLITE_OMIT_DEPRECATED",
     "-DSQLITE_OMIT_LOAD_EXTENSION",
     "-DSQLITE_USE_URI",
+    "-DSQLITE_ENABLE_FTS5",
 };
 
 fn configureSqlite(module: *std.Build.Module, b: *std.Build, embedded: bool) void {

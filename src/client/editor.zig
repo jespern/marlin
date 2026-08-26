@@ -5,9 +5,9 @@
 //!
 //! - Logical text may contain '\n' (Alt+Enter / Ctrl+J inserts one).
 //! - Display soft-wraps at the given width; the box grows 1..max_rows rows.
-//! - Large pastes become "[paste #N: X lines]" chips in the text; the raw
-//!   bytes live in `pastes` and are expanded on submit. The label is plain
-//!   editable text — mangling it just means it goes verbatim, no magic.
+//! - Large text pastes become "[paste #N: X lines]" chips whose raw bytes are
+//!   expanded on submit. Staged images appear as "[image #N]" placeholders;
+//!   intact placeholders are display-only and stripped from submitted text.
 //! - History: Up at the first row / Down at the last row walk previous
 //!   submissions; the in-progress draft is saved and restored. History is
 //!   seeded from replayed user_msg blocks, so it survives reboots.
@@ -80,13 +80,22 @@ pub fn isWalkingHistory(self: *const Editor) bool {
 // ---------------------------------------------------------------- history --
 
 /// Record a submitted message (called for our own submits AND for replayed
-/// user_msg blocks, so history persists across reboots). Consecutive
-/// duplicates are skipped.
+/// user_msg blocks, so history persists across reboots). Exact duplicates
+/// collapse to their newest occurrence, matching shell-history recall.
 pub fn pushHistory(self: *Editor, entry: []const u8) void {
     if (entry.len == 0 or entry.len > max_history_entry_bytes) return;
-    if (self.history.items.len > 0 and
-        std.mem.eql(u8, self.history.items[self.history.items.len - 1], entry))
-        return;
+    var i: usize = 0;
+    while (i < self.history.items.len) {
+        if (!std.mem.eql(u8, self.history.items[i], entry)) {
+            i += 1;
+            continue;
+        }
+        const duplicate = self.history.orderedRemove(i);
+        self.history_bytes -= duplicate.len;
+        self.gpa.free(duplicate);
+        if (self.hist_idx) |idx| self.hist_idx = if (idx <= i) idx else idx - 1;
+        break;
+    }
     while (self.history.items.len >= max_history_entries or
         self.history_bytes > max_history_bytes - entry.len)
     {
@@ -150,6 +159,17 @@ fn setText(self: *Editor, s: []const u8) void {
     self.goal_col = null;
 }
 
+/// Replace the current draft with a selected history entry. Unlike walking
+/// history with Up/Down, a picker selection is an explicit new draft.
+pub fn replaceText(self: *Editor, s: []const u8) void {
+    self.setText(s);
+    self.hist_idx = null;
+    if (self.draft) |draft| {
+        self.gpa.free(draft);
+        self.draft = null;
+    }
+}
+
 // ------------------------------------------------------------------ paste --
 
 /// Bracketed-paste arrival. Small pastes insert inline (newlines and all —
@@ -172,9 +192,18 @@ pub fn paste(self: *Editor, data: []const u8) void {
     self.insertSlice(label);
 }
 
-/// Submit-time expansion: replace intact "[paste #N: ...]" labels with their
-/// payloads. Caller owns the returned slice. Resets the editor.
-pub fn takeExpanded(self: *Editor) ![]u8 {
+pub fn insertImagePlaceholder(self: *Editor, index: usize) void {
+    var label_buf: [32]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buf, "[image #{d}]", .{index}) catch return;
+    if (self.cursor > 0 and !std.ascii.isWhitespace(self.text.items[self.cursor - 1])) self.insertSlice(" ");
+    self.insertSlice(label);
+    if (self.cursor == self.text.items.len or !std.ascii.isWhitespace(self.text.items[self.cursor])) self.insertSlice(" ");
+}
+
+/// Submit-time expansion replaces text-paste chips and removes image
+/// placeholders backed by the staged attachment count. Caller owns the
+/// returned slice. Resets the editor.
+pub fn takeExpandedWithImages(self: *Editor, image_count: usize) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(self.gpa);
     const t = self.text.items;
@@ -188,12 +217,26 @@ pub fn takeExpanded(self: *Editor) ![]u8 {
                     continue;
                 }
             }
+        } else if (t[i] == '[' and std.mem.startsWith(u8, t[i..], "[image #")) {
+            if (parseImageLabel(t[i..])) |image| {
+                if (image.index >= 1 and image.index <= image_count) {
+                    i += image.label_len;
+                    if (out.items.len > 0 and std.ascii.isWhitespace(out.items[out.items.len - 1])) {
+                        while (i < t.len and std.ascii.isWhitespace(t[i])) : (i += 1) {}
+                    }
+                    continue;
+                }
+            }
         }
         try out.append(self.gpa, t[i]);
         i += 1;
     }
     self.clear();
     return out.toOwnedSlice(self.gpa);
+}
+
+pub fn takeExpanded(self: *Editor) ![]u8 {
+    return self.takeExpandedWithImages(0);
 }
 
 const ChipRef = struct { index: usize, label_len: usize };
@@ -215,6 +258,19 @@ fn parseChipLabel(s: []const u8) ?ChipRef {
         if (s[j] == '\n' or s[j] == '[') return null;
     }
     return null;
+}
+
+fn parseImageLabel(s: []const u8) ?ChipRef {
+    const prefix = "[image #".len;
+    var j: usize = prefix;
+    var index: usize = 0;
+    var digits: usize = 0;
+    while (j < s.len and s[j] >= '0' and s[j] <= '9') : (j += 1) {
+        index = index * 10 + (s[j] - '0');
+        digits += 1;
+    }
+    if (digits == 0 or j >= s.len or s[j] != ']') return null;
+    return .{ .index = index, .label_len = j + 1 };
 }
 
 pub fn clear(self: *Editor) void {
@@ -663,6 +719,29 @@ test "mangled chip label passes through verbatim" {
     try testing.expectEqualStrings("[paste #9: 4 lines]", out);
 }
 
+test "image placeholders are visible drafts and stripped on submit" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("compare");
+    ed.insertImagePlaceholder(1);
+    ed.insertImagePlaceholder(2);
+    ed.insertSlice("these");
+    try testing.expectEqualStrings("compare [image #1] [image #2] these", ed.text.items);
+
+    const out = try ed.takeExpandedWithImages(2);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("compare these", out);
+}
+
+test "image placeholder without a staged attachment remains literal" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("look [image #2]");
+    const out = try ed.takeExpandedWithImages(1);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("look [image #2]", out);
+}
+
 test "history walk saves and restores draft" {
     var ed = Editor.init(testing.allocator);
     defer ed.deinit();
@@ -679,12 +758,15 @@ test "history walk saves and restores draft" {
     try testing.expectEqualStrings("draft in progress", ed.text.items);
 }
 
-test "history dedupes consecutive" {
+test "history dedupes to the newest occurrence" {
     var ed = Editor.init(testing.allocator);
     defer ed.deinit();
     ed.pushHistory("same");
+    ed.pushHistory("different");
     ed.pushHistory("same");
-    try testing.expectEqual(@as(usize, 1), ed.history.items.len);
+    try testing.expectEqual(@as(usize, 2), ed.history.items.len);
+    try testing.expectEqualStrings("different", ed.history.items[0]);
+    try testing.expectEqualStrings("same", ed.history.items[1]);
 }
 
 test "history evicts old entries and refuses megabyte submissions" {

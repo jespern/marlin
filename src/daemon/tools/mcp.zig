@@ -3,6 +3,7 @@
 //! `mcp__<server>__<tool>` names with the same approval policy machinery.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Io = std.Io;
 
 const block = @import("../../core/block.zig");
@@ -207,9 +208,10 @@ pub const Server = struct {
     fn initializeLegacy(self: *Server) !void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
-        _ = try self.request(arena_state.allocator(), "initialize",
-            \\{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"marlin","version":"0.1.0"}}
-        );
+        const params = try std.fmt.allocPrint(arena_state.allocator(),
+            \\{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"marlin","version":"{s}"}}}}
+        , .{build_options.version});
+        _ = try self.request(arena_state.allocator(), "initialize", params);
         try self.notify(
             \\{"jsonrpc":"2.0","method":"notifications/initialized"}
         );
@@ -524,7 +526,7 @@ const ModernMeta = struct {
 fn modernMeta() ModernMeta {
     return .{
         .@"io.modelcontextprotocol/protocolVersion" = current_protocol,
-        .@"io.modelcontextprotocol/clientInfo" = .{ .name = "marlin", .version = "0.1.0" },
+        .@"io.modelcontextprotocol/clientInfo" = .{ .name = "marlin", .version = build_options.version },
         .@"io.modelcontextprotocol/clientCapabilities" = .{},
     };
 }

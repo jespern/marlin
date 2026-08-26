@@ -101,10 +101,13 @@ while several children are live.
 
 Implemented on M6a rather than as a second orchestration system:
 
-1. Durable named council config with daemon-mediated atomic writes and
-   `/council` list/set/remove UI.
-2. `/review [council] <focus>` resolves a configured roster and launches the
-   shared review mission from the parent session.
+1. Durable named council config with daemon-mediated atomic writes and a
+   `/council` list/inspect/create/edit/remove UI. Contextual autocomplete offers
+   council actions and names; create/edit reuses the model catalog as a filtered
+   multi-select with checked seats, `Done` to save, and Esc to cancel. The
+   explicit `set <name> <model...>` fast path remains available.
+2. `/review [council] <focus>` autocompletes configured council names, resolves
+   the roster, and launches the shared review mission from the parent session.
 3. Read-only `review_child` sessions run in parallel with their model and
    budget recorded durably; Claude Code seats use the permission bridge to
    enforce the same no-write boundary.

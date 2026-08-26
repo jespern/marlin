@@ -12,16 +12,17 @@
 //! Keys:
 //!   insert:  type → input; Enter send; Shift+Enter/Alt+Enter/Ctrl+J newline;
 //!            Up/Down move lines or walk history at the edges;
+//!            Ctrl+R fuzzy-searches authored input history;
 //!            readline/macOS movement and deletion chords are supported;
 //!            Esc → normal (draft survives); Ctrl+C interrupts active work
 //!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom;
-//!            </> or Left/Right switch tabs; q quit
+//!            / searches this transcript; </> or Left/Right switch tabs; q quit
 //!   global:  Ctrl+N creates a session; Ctrl+D archives when input is empty;
 //!            Ctrl+L clears/redraws and returns to bottom;
 //!            Ctrl+T toggles the expanded tool transcript;
 //!            Alt/Option+1..9 jumps to that tab
 //!   approval pending: y approve, n deny (both modes, input empty)
-//!   commands: /model <m>, /effort <level>, /new, /compact,
+//!   commands: /model <m>, /effort <level>, /search <query>, /new, /compact,
 //!             /archive, /reboot [--build], /help, /quit
 //!   shortcuts: !c (copy last full tool output), !rb (reboot with build)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
@@ -47,6 +48,7 @@ const TailLayoutCache = layout_mod.TailLayoutCache;
 const StreamLayoutCache = layout_mod.StreamLayoutCache;
 const RenderBlock = layout_mod.RenderBlock;
 const allocDurableRenderBlock = layout_mod.allocDurableRenderBlock;
+const layoutBlockRange = layout_mod.layoutBlockRange;
 const wrapPromptCard = layout_mod.wrapPromptCard;
 const wrapReasoningCard = layout_mod.wrapReasoningCard;
 const ExpandPair = layout_mod.ExpandPair;
@@ -84,6 +86,7 @@ const selectedText = render.selectedText;
 const wrapPrefixed = render.wrapPrefixed;
 const displayWidth = render.displayWidth;
 const hardCellBreak = render.hardCellBreak;
+const utf8Floor = render.utf8Floor;
 const spaces = render.spaces;
 const spinner_frames = render.spinner_frames;
 
@@ -143,9 +146,10 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
     .{ .name = "/mcp", .usage = " [add|remove|restart|reload]", .description = "inspect and manage MCP servers", .accepts_args = true },
-    .{ .name = "/council", .usage = " [set <name> <models...>|remove <name>]", .description = "list and manage named review councils", .accepts_args = true },
+    .{ .name = "/council", .usage = " [<name>|new <name>|edit <name>|remove <name>]", .description = "list, inspect, or edit review councils", .accepts_args = true },
     .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
+    .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
@@ -159,12 +163,17 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "!rb", .description = "rebuild and restart Marlin" },
 };
 
-const CommandMatches = struct {
-    indices: [composer_commands.len]usize = undefined,
-    len: usize = 0,
+const CommandSuggestion = struct {
+    label: []const u8,
+    usage: []const u8 = "",
+    description: []const u8,
+    replacement: []const u8,
+    submit_on_enter: bool,
 };
 
-const PickerKind = enum { model, effort, session };
+const PickerKind = enum { model, effort, session, search_prompt, search, council, council_list };
+
+const council_done_item = "Done";
 
 /// Baked display lines for blocks of completed turns. Line contents point
 /// into `arena_state` (derived strings) or App-owned block text; both stay
@@ -391,6 +400,16 @@ const SavedSessionView = struct {
     }
 };
 
+const SearchHitOwned = struct {
+    sid: u64,
+    seq: u64,
+    label: []u8,
+
+    fn deinit(self: *SearchHitOwned, gpa: std.mem.Allocator) void {
+        gpa.free(self.label);
+    }
+};
+
 const App = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -454,11 +473,37 @@ const App = struct {
     picker_kind: PickerKind = .model,
     /// Compact normal-mode shortcut reference opened with `?`.
     shortcut_help: bool = false,
+    /// Council detail overlay. The name is owned so daemon cache refreshes do
+    /// not invalidate an open detail view.
+    council_detail_name: std.ArrayList(u8) = .empty,
     /// Highlighted row in the command/shortcut autocomplete menu. The menu
     /// itself is derived from editor text and therefore needs no open flag.
     command_selection: usize = 0,
     /// Type-to-filter query while the picker is open.
     picker_filter: std.ArrayList(u8) = .empty,
+    /// Inline readline-style reverse history search. The editor shows the
+    /// current candidate while these buffers preserve the original draft and
+    /// collect the query independently of the candidate text.
+    history_search_active: bool = false,
+    history_search_query: std.ArrayList(u8) = .empty,
+    history_search_draft: std.ArrayList(u8) = .empty,
+    history_search_draft_cursor: usize = 0,
+    history_search_match: ?usize = null,
+    /// Durable transcript-search results. Labels are separate so the generic
+    /// picker can filter them without knowing search metadata.
+    search_hits: std.ArrayList(SearchHitOwned) = .empty,
+    search_labels: std.ArrayList([]const u8) = .empty,
+    search_scope_sid: u64 = 0,
+    search_pending: bool = false,
+    search_cursor: usize = 0,
+    /// Non-zero while a centered search replay still needs viewport
+    /// positioning after its durable pages arrive.
+    search_target_seq: u64 = 0,
+    search_highlight_line: ?usize = null,
+    /// Council editor state. The draft survives filter changes and is sent
+    /// atomically only when the Done row is chosen; Esc discards it.
+    council_edit_name: std.ArrayList(u8) = .empty,
+    council_edit_models: std.ArrayList([]u8) = .empty,
     /// Full model catalog from the daemon (owned copies). Empty until
     /// model_list_result arrives; picker falls back to cfg.model_favorites.
     catalog: std.ArrayList([]u8) = .empty,
@@ -479,8 +524,10 @@ const App = struct {
     /// Council cache from the daemon (durable config); refreshed by every
     /// council_list_result. Names and models are gpa-owned.
     councils: std.ArrayList(OwnedCouncil) = .empty,
-    /// The next council_list_result was user-requested (/council): show it.
+    /// The next council_list_result follows a mutating command: summarize it.
     council_notice_pending: bool = false,
+    /// Open the council picker when the requested list refresh arrives.
+    council_list_pending: bool = false,
     recent_sessions: std.ArrayList(u64) = .empty,
     recent_cursor: usize = 0,
     /// Click targets from the most recently rendered tab strip. The entries
@@ -592,6 +639,15 @@ const App = struct {
         self.stream_layout_cache.reset(self.gpa);
         self.layout_cache.reset(self.gpa);
         self.picker_filter.deinit(self.gpa);
+        self.history_search_query.deinit(self.gpa);
+        self.history_search_draft.deinit(self.gpa);
+        self.clearSearchHits();
+        self.search_hits.deinit(self.gpa);
+        self.search_labels.deinit(self.gpa);
+        self.council_detail_name.deinit(self.gpa);
+        self.clearCouncilEdit();
+        self.council_edit_name.deinit(self.gpa);
+        self.council_edit_models.deinit(self.gpa);
         for (self.catalog.items) |m| self.gpa.free(m);
         self.catalog.deinit(self.gpa);
         for (self.catalog_pricing.items) |pricing| self.gpa.free(pricing.model);
@@ -645,6 +701,7 @@ const App = struct {
             self.setNotice("could not stage image", .{});
             return;
         };
+        self.editor.insertImagePlaceholder(self.attachments.items.len);
         self.setNotice("attached {s} · {d}/4 · Ctrl+V or /attach adds another", .{
             self.attachments.items[self.attachments.items.len - 1].name,
             self.attachments.items.len,
@@ -829,6 +886,10 @@ const App = struct {
 
     fn resetActiveAfterMove(self: *App) void {
         self.clearHistoryBackfill();
+        self.history_search_active = false;
+        self.history_search_query.clearRetainingCapacity();
+        self.history_search_draft.clearRetainingCapacity();
+        self.history_search_match = null;
         self.copy_cursor = null;
         self.stream_layout_cache.reset(self.gpa);
         self.layout_epoch +%= 1;
@@ -854,6 +915,7 @@ const App = struct {
         self.scroll_up = 0;
         self.last_total_lines = 0;
         self.last_first_visible = 0;
+        self.search_highlight_line = null;
         self.last_view_h = 0;
         self.last_pinned_start = 0;
         self.last_pinned_rows = 0;
@@ -1033,6 +1095,80 @@ const App = struct {
         self.rememberSession(sid);
         var handle_buf: session_handle.Full = undefined;
         self.setNotice("session → {s}", .{self.displaySessionHandle(&handle_buf, sid)});
+    }
+
+    fn clearTranscriptForSearch(self: *App) void {
+        self.clearHistoryBackfill();
+        for (self.blocks.items) |*rendered| rendered.deinit(self.gpa);
+        self.blocks.clearRetainingCapacity();
+        self.delta.clearRetainingCapacity();
+        self.reasoning_delta.clearRetainingCapacity();
+        deinitPlan(self.gpa, &self.plan);
+        self.layout_cache.reset(self.gpa);
+        self.tail_layout_cache.reset(self.gpa);
+        self.stream_layout_cache.reset(self.gpa);
+        self.layout_epoch +%= 1;
+        self.last_seq = 0;
+        self.oldest_seq = 0;
+        self.history_complete = false;
+        self.history_loading = true;
+        self.history_before_seq = 0;
+        self.history_page_failed = false;
+        self.scroll_up = 0;
+        self.last_total_lines = 0;
+        self.last_first_visible = 0;
+        self.search_highlight_line = null;
+        self.copy_cursor = null;
+        self.sel_anchor = null;
+    }
+
+    fn jumpToSearchHit(self: *App, sid: u64, seq: u64) !void {
+        if (sid == self.sid) {
+            for (self.blocks.items) |rendered| {
+                if (rendered.seq != seq) continue;
+                self.search_target_seq = seq;
+                self.search_highlight_line = null;
+                var handle_buf: session_handle.Full = undefined;
+                self.setNotice("match → {s}:{d}", .{ self.displaySessionHandle(&handle_buf, sid), seq });
+                return;
+            }
+        }
+        if (sid != self.sid) {
+            const old_sid = self.sid;
+            try self.saveActiveView();
+            self.conn.send(.{ .unsub = .{ .sid = old_sid } }) catch {};
+            self.sid = sid;
+            if (self.saved_views.get(sid)) |saved| {
+                _ = self.saved_views.remove(sid);
+                self.restoreSavedView(saved);
+                self.gpa.destroy(saved);
+            } else if (self.sessionSummary(sid)) |summary| {
+                try self.model.appendSlice(self.gpa, summary.model);
+                try self.cwd.appendSlice(self.gpa, summary.cwd);
+                self.effort = summary.effort;
+                self.state = summary.state;
+            }
+            if (self.background_approvals.get(sid)) |pending| {
+                self.pending = pending;
+                _ = self.background_approvals.remove(sid);
+            }
+            self.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
+            self.touchRecentSession(sid);
+            self.animation_active.store(self.state == .running, .release);
+        } else {
+            self.conn.send(.{ .unsub = .{ .sid = sid } }) catch {};
+        }
+
+        self.clearTranscriptForSearch();
+        self.search_target_seq = seq;
+        try self.conn.send(.{ .sub = .{
+            .sid = sid,
+            .tail_limit = initial_replay_blocks,
+            .around_seq = seq,
+        } });
+        self.rememberSession(sid);
+        var handle_buf: session_handle.Full = undefined;
+        self.setNotice("match → {s}:{d}", .{ self.displaySessionHandle(&handle_buf, sid), seq });
     }
 
     fn cycleSession(self: *App, direction: i8) void {
@@ -1447,6 +1583,16 @@ const App = struct {
                         deinitPlan(self.gpa, &self.plan);
                     }
                 }
+                if (!replay.forward and replay.has_newer and replay.newest_seq > 0) {
+                    if (replay.oldest_seq > 0) self.oldest_seq = replay.oldest_seq;
+                    self.history_complete = !replay.has_older;
+                    self.conn.send(.{ .sub = .{
+                        .sid = self.sid,
+                        .from_seq = replay.newest_seq +| 1,
+                        .replay_limit = initial_replay_blocks,
+                    } }) catch self.setNotice("could not continue session replay", .{});
+                    return;
+                }
                 if (replay.forward) {
                     if (replay.has_newer and replay.newest_seq > 0) {
                         self.conn.send(.{ .sub = .{
@@ -1454,6 +1600,8 @@ const App = struct {
                             .from_seq = replay.newest_seq +| 1,
                             .replay_limit = initial_replay_blocks,
                         } }) catch self.setNotice("could not continue session replay", .{});
+                    } else {
+                        self.history_loading = false;
                     }
                     return;
                 }
@@ -1524,6 +1672,17 @@ const App = struct {
             },
             .session_created => |sc| self.handleSessionCreated(sc.sid, sc.request_id),
             .session_list_result => |sl| self.replaceSessionSummaries(sl.sessions),
+            .input_history_result => |history| {
+                // The daemon sends newest-first. Push oldest-first so the
+                // editor's recency ordering and duplicate collapse agree.
+                var i = history.entries.len;
+                while (i > 0) {
+                    i -= 1;
+                    self.editor.pushHistory(history.entries[i].text);
+                }
+                if (self.history_search_active) self.refreshHistorySearch(true);
+            },
+            .search_result => |result| self.replaceSearchHits(result),
             .session_upsert => |su| self.upsertSessionSummary(su.session),
             .session_remove => |sr| self.removeSessionSummary(sr.sid),
             .interrupt_result => |result| {
@@ -1839,6 +1998,17 @@ const App = struct {
                 return;
             };
             self.applyEffort(selected);
+        } else if (std.mem.eql(u8, head, "/search")) {
+            const query = std.mem.trim(u8, it.rest(), " \t\r\n");
+            self.openSearchPrompt(0);
+            if (query.len > 0) {
+                self.picker_filter.appendSlice(self.gpa, query) catch {
+                    self.picker = null;
+                    self.setNotice("could not start search", .{});
+                    return;
+                };
+                self.submitSearch();
+            }
         } else if (std.mem.eql(u8, head, "/permissions")) {
             self.setPermissions(it.rest());
         } else if (std.mem.eql(u8, head, "/sandbox")) {
@@ -1903,27 +2073,45 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/council")) {
             const action = it.next();
             if (action == null or std.mem.eql(u8, action.?, "list")) {
-                self.council_notice_pending = true;
+                if (self.councils.items.len > 0)
+                    self.openCouncilList()
+                else
+                    self.council_list_pending = true;
                 self.conn.send(.{ .council_list = .{} }) catch {
+                    self.council_list_pending = false;
                     self.setNotice("could not request councils", .{});
                 };
+            } else if (std.mem.eql(u8, action.?, "new") or std.mem.eql(u8, action.?, "edit")) {
+                const name = it.next() orelse {
+                    self.setNotice("usage: /council {s} <name>", .{action.?});
+                    return;
+                };
+                if (it.next() != null) {
+                    self.setNotice("usage: /council {s} <name>", .{action.?});
+                    return;
+                }
+                if (std.mem.eql(u8, action.?, "new") and self.councilByName(name) != null) {
+                    self.setNotice("council '{s}' already exists — use /council edit {s}", .{ name, name });
+                    return;
+                }
+                self.openCouncilPicker(name);
             } else if (std.mem.eql(u8, action.?, "set") or std.mem.eql(u8, action.?, "add")) {
                 const name = it.next() orelse {
-                    self.setNotice("usage: /council set <name> <model> [model...]", .{});
+                    self.setNotice("usage: /council set <name> <model...>", .{});
                     return;
                 };
                 var models: std.ArrayList([]const u8) = .empty;
                 defer models.deinit(self.gpa);
                 while (it.next()) |model| models.append(self.gpa, model) catch return;
                 if (models.items.len == 0) {
-                    self.setNotice("usage: /council set <name> <model> [model...]", .{});
+                    self.setNotice("usage: /council set <name> <model...>", .{});
                     return;
                 }
                 self.council_notice_pending = true;
                 self.conn.send(.{ .council_set = .{ .name = name, .models = models.items } }) catch {
                     self.setNotice("could not save council", .{});
                 };
-            } else if (std.mem.eql(u8, action.?, "remove")) {
+            } else if (std.mem.eql(u8, action.?, "remove") or std.mem.eql(u8, action.?, "delete")) {
                 const name = it.next() orelse {
                     self.setNotice("usage: /council remove <name>", .{});
                     return;
@@ -1932,8 +2120,10 @@ const App = struct {
                 self.conn.send(.{ .council_remove = .{ .name = name } }) catch {
                     self.setNotice("could not remove council", .{});
                 };
+            } else if (it.next() == null) {
+                self.showCouncilDetail(action.?);
             } else {
-                self.setNotice("usage: /council [set <name> <model...>|remove <name>]", .{});
+                self.setNotice("usage: /council [<name>|new <name>|edit <name>|remove <name>]", .{});
             }
         } else if (std.mem.eql(u8, head, "/review")) {
             const name = it.next() orelse {
@@ -1947,7 +2137,7 @@ const App = struct {
             }
             const council = self.councilByName(name) orelse {
                 if (self.councils.items.len == 0)
-                    self.setNotice("no councils configured — /council set <name> <model> [model...]", .{})
+                    self.setNotice("no councils configured — /council new <name>", .{})
                 else
                     self.setNotice("unknown council '{s}' — /council lists them", .{name});
                 return;
@@ -2035,7 +2225,7 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/config")) {
             self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /search [query] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -2086,6 +2276,12 @@ const App = struct {
         }
     }
 
+    fn clearCouncilEdit(self: *App) void {
+        self.council_edit_name.clearRetainingCapacity();
+        for (self.council_edit_models.items) |model| self.gpa.free(model);
+        self.council_edit_models.clearRetainingCapacity();
+    }
+
     fn clearCouncils(self: *App) void {
         for (self.councils.items) |*council| council.deinit(self.gpa);
         self.councils.clearRetainingCapacity();
@@ -2107,11 +2303,23 @@ const App = struct {
                 return;
             };
         }
+        if (self.council_list_pending) {
+            self.council_list_pending = false;
+            self.openCouncilList();
+        } else if (self.picker_kind == .council_list and self.picker != null and self.councils.items.len == 0) {
+            self.picker = null;
+            self.picker_filter.clearRetainingCapacity();
+            self.setNotice("no councils configured — /council new <name>", .{});
+        }
+        if (self.council_detail_name.items.len > 0 and self.councilByName(self.council_detail_name.items) == null) {
+            self.closeCouncilDetail();
+            self.setNotice("that council no longer exists", .{});
+        }
         if (!self.council_notice_pending) return;
         self.council_notice_pending = false;
         self.notice.clearRetainingCapacity();
         if (self.councils.items.len == 0) {
-            self.notice.appendSlice(self.gpa, "councils · none — /council set <name> <model> [model...]") catch {};
+            self.notice.appendSlice(self.gpa, "councils · none — /council new <name>") catch {};
             return;
         }
         self.notice.appendSlice(self.gpa, "councils · ") catch return;
@@ -2530,6 +2738,7 @@ const App = struct {
         self.picker_kind = kind;
         self.picker = 0;
         self.picker_filter.clearRetainingCapacity();
+        if (kind == .council) return;
         const current = self.pickerCurrent();
         for (self.pickerSource(), 0..) |item, i| {
             const selected = if (kind == .session)
@@ -2543,13 +2752,172 @@ const App = struct {
         }
     }
 
+    fn beginHistorySearch(self: *App) void {
+        if (self.history_search_active) {
+            self.cycleHistorySearch();
+            return;
+        }
+        self.history_search_draft.clearRetainingCapacity();
+        self.history_search_draft.appendSlice(self.gpa, self.editor.text.items) catch return;
+        self.history_search_draft_cursor = self.editor.cursor;
+        self.history_search_query.clearRetainingCapacity();
+        self.history_search_match = null;
+        self.history_search_active = true;
+        self.refreshHistorySearch(true);
+        self.conn.send(.{ .input_history = .{
+            .sid = self.sid,
+            .limit = Editor.max_history_entries,
+        } }) catch {
+            // The already-seeded current-session history remains useful when
+            // a reconnect races the shortcut.
+            self.setNotice("global input history unavailable", .{});
+        };
+    }
+
+    fn refreshHistorySearch(self: *App, from_newest: bool) void {
+        if (!self.history_search_active) return;
+        const previous = self.history_search_match;
+        var index = if (from_newest)
+            self.editor.history.items.len
+        else
+            (self.history_search_match orelse self.editor.history.items.len);
+        while (index > 0) {
+            index -= 1;
+            const candidate = self.editor.history.items[index];
+            if (fuzzyHistoryScore(candidate, self.history_search_query.items) == null) continue;
+            self.history_search_match = index;
+            self.editor.replaceText(candidate);
+            return;
+        }
+        if (!from_newest and previous != null) return;
+        self.history_search_match = null;
+        self.editor.replaceText(self.history_search_draft.items);
+        self.editor.cursor = @min(self.history_search_draft_cursor, self.editor.text.items.len);
+    }
+
+    fn cycleHistorySearch(self: *App) void {
+        self.refreshHistorySearch(false);
+    }
+
+    fn cancelHistorySearch(self: *App) void {
+        if (!self.history_search_active) return;
+        self.editor.replaceText(self.history_search_draft.items);
+        self.editor.cursor = @min(self.history_search_draft_cursor, self.editor.text.items.len);
+        self.finishHistorySearch();
+    }
+
+    fn acceptHistorySearch(self: *App) void {
+        if (!self.history_search_active) return;
+        self.finishHistorySearch();
+    }
+
+    fn finishHistorySearch(self: *App) void {
+        self.history_search_active = false;
+        self.history_search_query.clearRetainingCapacity();
+        self.history_search_draft.clearRetainingCapacity();
+        self.history_search_match = null;
+    }
+
+    fn clearSearchHits(self: *App) void {
+        for (self.search_hits.items) |*hit| hit.deinit(self.gpa);
+        self.search_hits.clearRetainingCapacity();
+        self.search_labels.clearRetainingCapacity();
+        self.search_cursor = 0;
+    }
+
+    fn openSearchPrompt(self: *App, session_id: u64) void {
+        self.clearSearchHits();
+        self.search_scope_sid = session_id;
+        self.search_pending = false;
+        self.openPicker(.search_prompt);
+    }
+
+    fn submitSearch(self: *App) void {
+        const query = std.mem.trim(u8, self.picker_filter.items, " \t\r\n");
+        if (query.len == 0 or self.search_pending) return;
+        self.search_pending = true;
+        self.conn.send(.{ .search = .{
+            .query = query,
+            .sid = self.search_scope_sid,
+            .limit = 100,
+        } }) catch {
+            self.search_pending = false;
+            self.setNotice("could not search transcript", .{});
+        };
+    }
+
+    fn replaceSearchHits(self: *App, result: @FieldType(proto.DaemonMsg, "search_result")) void {
+        if (!self.search_pending or result.sid != self.search_scope_sid) return;
+        self.search_pending = false;
+        self.clearSearchHits();
+        for (result.hits) |hit| {
+            self.rememberSession(hit.sid);
+            var handle_buf: session_handle.Full = undefined;
+            const location = if (hit.title.len > 0) hit.title else hit.cwd;
+            const label = std.fmt.allocPrint(self.gpa, "{s}:{d} · {s} · {s} · {s}", .{
+                self.displaySessionHandle(&handle_buf, hit.sid),
+                hit.seq,
+                location,
+                @tagName(hit.kind),
+                hit.snippet,
+            }) catch continue;
+            self.search_hits.append(self.gpa, .{
+                .sid = hit.sid,
+                .seq = hit.seq,
+                .label = label,
+            }) catch {
+                self.gpa.free(label);
+                continue;
+            };
+            self.search_labels.append(self.gpa, label) catch {
+                var removed = self.search_hits.pop().?;
+                removed.deinit(self.gpa);
+            };
+        }
+        if (self.search_hits.items.len == 0) {
+            self.picker = null;
+            self.picker_filter.clearRetainingCapacity();
+            self.setNotice("no transcript matches", .{});
+            return;
+        }
+        self.picker_kind = .search;
+        self.picker = 0;
+        self.picker_filter.clearRetainingCapacity();
+    }
+
+    fn selectSearchHit(self: *App, label: []const u8) ?SearchHitOwned {
+        for (self.search_hits.items, 0..) |hit, index| {
+            if (!std.mem.eql(u8, hit.label, label)) continue;
+            self.search_cursor = index;
+            return hit;
+        }
+        return null;
+    }
+
+    fn nextSearchHit(self: *App, direction: i8) void {
+        const len = self.search_hits.items.len;
+        if (len == 0) {
+            self.setNotice("no active search · press /", .{});
+            return;
+        }
+        self.search_cursor = if (direction < 0)
+            (self.search_cursor + len - 1) % len
+        else
+            (self.search_cursor + 1) % len;
+        const hit = self.search_hits.items[self.search_cursor];
+        self.jumpToSearchHit(hit.sid, hit.seq) catch self.setNotice("could not open search match", .{});
+    }
+
     /// The picker's source list: full model catalog/favorites, or the fixed
     /// effort vocabulary shared with persistence and provider adapters.
     fn pickerSource(self: *const App) []const []const u8 {
         return switch (self.picker_kind) {
-            .model => if (self.catalog.items.len > 0) @ptrCast(self.catalog.items) else self.cfg.model_favorites,
+            .model, .council => if (self.catalog.items.len > 0) @ptrCast(self.catalog.items) else self.cfg.model_favorites,
             .effort => &proto.ReasoningEffort.choices,
             .session => self.session_labels.items,
+            .search => self.search_labels.items,
+            .search_prompt => &.{},
+            .council_list => &.{},
         };
     }
 
@@ -2559,8 +2927,21 @@ const App = struct {
     fn pickerItems(self: *const App, arena: std.mem.Allocator) ![]const []const u8 {
         const source = self.pickerSource();
         const q = self.picker_filter.items;
-        if (q.len == 0) return source;
+        if (self.picker_kind == .search_prompt) return &.{};
+        if (self.picker_kind == .council_list) {
+            var councils: std.ArrayList([]const u8) = .empty;
+            outer: for (self.councils.items) |council| {
+                var words = std.mem.tokenizeScalar(u8, q, ' ');
+                while (words.next()) |word| {
+                    if (containsIgnoreCase(council.name, word) == null) continue :outer;
+                }
+                try councils.append(arena, council.name);
+            }
+            return councils.items;
+        }
+        if (q.len == 0 and self.picker_kind != .council) return source;
         var out: std.ArrayList([]const u8) = .empty;
+        if (self.picker_kind == .council) try out.append(arena, council_done_item);
         outer: for (source) |m| {
             var words = std.mem.tokenizeScalar(u8, q, ' ');
             while (words.next()) |word| {
@@ -2568,7 +2949,31 @@ const App = struct {
             }
             try out.append(arena, m);
         }
+        if (self.picker_kind == .council) selected: for (self.council_edit_models.items) |selected| {
+            for (source) |m| {
+                if (std.mem.eql(u8, selected, m)) continue :selected;
+            }
+            var words = std.mem.tokenizeScalar(u8, q, ' ');
+            while (words.next()) |word| {
+                if (containsIgnoreCase(selected, word) == null) continue :selected;
+            }
+            try out.append(arena, selected);
+        };
         return out.items;
+    }
+
+    fn pickerSourceCount(self: *const App) usize {
+        if (self.picker_kind == .council_list) return self.councils.items.len;
+        const source = self.pickerSource();
+        if (self.picker_kind != .council) return source.len;
+        var total = source.len;
+        selected: for (self.council_edit_models.items) |selected| {
+            for (source) |m| {
+                if (std.mem.eql(u8, selected, m)) continue :selected;
+            }
+            total += 1;
+        }
+        return total;
     }
 
     fn pricingForModel(self: *const App, model: []const u8) ?proto.ModelPricing {
@@ -2718,12 +3123,127 @@ const App = struct {
         self.setNotice("network filter {s} for this session", .{if (target) @as([]const u8, "on") else "off"});
     }
 
+    fn councilModelSelected(self: *const App, model: []const u8) bool {
+        for (self.council_edit_models.items) |selected| {
+            if (std.mem.eql(u8, selected, model)) return true;
+        }
+        return false;
+    }
+
+    fn openCouncilPicker(self: *App, name: []const u8) void {
+        if (!validCouncilName(name)) {
+            self.setNotice("council names are letters, digits, - and _", .{});
+            return;
+        }
+        self.clearCouncilEdit();
+        self.council_edit_name.appendSlice(self.gpa, name) catch {
+            self.setNotice("could not open council editor", .{});
+            return;
+        };
+        if (self.councilByName(name)) |council| {
+            for (council.models.items) |model| {
+                const copy = self.gpa.dupe(u8, model) catch {
+                    self.clearCouncilEdit();
+                    self.setNotice("could not open council editor", .{});
+                    return;
+                };
+                self.council_edit_models.append(self.gpa, copy) catch {
+                    self.gpa.free(copy);
+                    self.clearCouncilEdit();
+                    self.setNotice("could not open council editor", .{});
+                    return;
+                };
+            }
+        }
+        self.openPicker(.council);
+        if (self.catalog.items.len == 0) self.conn.send(.{ .model_list = .{} }) catch {};
+    }
+
+    fn toggleCouncilModel(self: *App, model: []const u8) void {
+        for (self.council_edit_models.items, 0..) |selected, i| {
+            if (!std.mem.eql(u8, selected, model)) continue;
+            self.gpa.free(selected);
+            _ = self.council_edit_models.orderedRemove(i);
+            return;
+        }
+        const copy = self.gpa.dupe(u8, model) catch {
+            self.setNotice("could not update council", .{});
+            return;
+        };
+        self.council_edit_models.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+            self.setNotice("could not update council", .{});
+        };
+    }
+
+    fn saveCouncilEdit(self: *App) void {
+        if (self.council_edit_models.items.len == 0) {
+            self.setNotice("choose at least one model before Done", .{});
+            return;
+        }
+        const name = self.council_edit_name.items;
+        var models: std.ArrayList([]const u8) = .empty;
+        defer models.deinit(self.gpa);
+        for (self.council_edit_models.items) |model| models.append(self.gpa, model) catch {
+            self.setNotice("could not save council", .{});
+            return;
+        };
+        self.council_notice_pending = true;
+        self.conn.send(.{ .council_set = .{ .name = name, .models = models.items } }) catch {
+            self.setNotice("could not save council", .{});
+            return;
+        };
+        self.picker = null;
+        self.picker_filter.clearRetainingCapacity();
+        self.setNotice("saving council {s} ({d} models)…", .{ name, models.items.len });
+        self.clearCouncilEdit();
+    }
+
+    fn cancelCouncilEdit(self: *App) void {
+        const had_draft = self.council_edit_name.items.len > 0;
+        self.clearCouncilEdit();
+        self.picker = null;
+        self.picker_filter.clearRetainingCapacity();
+        if (had_draft) self.setNotice("council edit cancelled", .{});
+    }
+
+    fn openCouncilList(self: *App) void {
+        if (self.councils.items.len == 0) {
+            self.setNotice("no councils configured — /council new <name>", .{});
+            return;
+        }
+        self.openPicker(.council_list);
+    }
+
+    fn showCouncilDetail(self: *App, name: []const u8) void {
+        if (self.councilByName(name) == null) {
+            self.setNotice("unknown council '{s}' — /council lists them", .{name});
+            return;
+        }
+        self.council_detail_name.clearRetainingCapacity();
+        self.council_detail_name.appendSlice(self.gpa, name) catch {
+            self.council_detail_name.clearRetainingCapacity();
+            self.setNotice("could not show council", .{});
+        };
+    }
+
+    fn closeCouncilDetail(self: *App) void {
+        self.council_detail_name.clearRetainingCapacity();
+    }
+
     fn applyPickerItem(self: *App, item: []const u8) void {
         switch (self.picker_kind) {
             .model => self.applyModel(item),
             .effort => self.applyEffort(proto.ReasoningEffort.parse(item) orelse return),
             .session => self.switchSession(self.sessionIdForLabel(item) orelse return, true) catch
                 self.setNotice("could not switch session", .{}),
+            .search => {
+                const hit = self.selectSearchHit(item) orelse return;
+                self.jumpToSearchHit(hit.sid, hit.seq) catch self.setNotice("could not open search match", .{});
+            },
+            .search_prompt => {},
+            .council => self.toggleCouncilModel(item),
+            .council_list => self.showCouncilDetail(item),
         }
     }
 
@@ -2754,7 +3274,7 @@ const App = struct {
         return switch (self.picker_kind) {
             .model => self.model.items,
             .effort => @tagName(self.effort),
-            .session => "",
+            .session, .search_prompt, .search, .council, .council_list => "",
         };
     }
 
@@ -2977,35 +3497,107 @@ fn statusCwd(arena: std.mem.Allocator, cwd: []const u8, home: []const u8) ![]con
     return cwd;
 }
 
-/// Autocomplete is active only while the composer contains a command token;
-/// once an argument or newline starts, normal editor navigation takes over.
+fn validCouncilName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) return false;
+    }
+    return true;
+}
+
 fn commandQuery(editor: *const Editor) ?[]const u8 {
     const text = editor.text.items;
     if (text.len == 0 or (text[0] != '/' and text[0] != '!')) return null;
-    for (text) |c| {
-        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') return null;
+    if (std.mem.indexOfAny(u8, text, "\r\n") != null) return null;
+    if (std.mem.indexOfAny(u8, text, " \t")) |space| {
+        const head = text[0..space];
+        if (!std.mem.eql(u8, head, "/council") and !std.mem.eql(u8, head, "/review")) return null;
+        const rest = std.mem.trimStart(u8, text[space..], " \t");
+        if (std.mem.indexOfAny(u8, rest, " \t") != null) return null;
     }
     return text;
 }
 
-fn commandMatches(editor: *const Editor) CommandMatches {
-    var out = CommandMatches{};
-    const query = commandQuery(editor) orelse return out;
-    for (composer_commands, 0..) |command, i| {
-        if (query.len <= command.name.len and
-            std.ascii.eqlIgnoreCase(query, command.name[0..query.len]))
-        {
-            out.indices[out.len] = i;
-            out.len += 1;
+fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const CommandSuggestion {
+    const query = commandQuery(&app.editor) orelse return &.{};
+    var out: std.ArrayList(CommandSuggestion) = .empty;
+    if (query.len > "/council".len and
+        std.mem.eql(u8, query[0.."/council".len], "/council") and
+        (query["/council".len] == ' ' or query["/council".len] == '\t'))
+    {
+        const rest = std.mem.trimStart(u8, query["/council".len..], " \t");
+        const actions = [_]struct { name: []const u8, description: []const u8 }{
+            .{ .name = "new", .description = "create a council" },
+            .{ .name = "edit", .description = "edit a council roster" },
+            .{ .name = "remove", .description = "remove a council" },
+        };
+        for (actions) |action| {
+            if (rest.len <= action.name.len and std.ascii.eqlIgnoreCase(rest, action.name[0..rest.len])) {
+                const replacement = try std.fmt.allocPrint(arena, "/council {s} ", .{action.name});
+                try out.append(arena, .{
+                    .label = try std.fmt.allocPrint(arena, "/council {s}", .{action.name}),
+                    .description = action.description,
+                    .replacement = replacement,
+                    .submit_on_enter = false,
+                });
+            }
+        }
+        for (app.councils.items) |council| {
+            if (rest.len <= council.name.len and std.ascii.eqlIgnoreCase(rest, council.name[0..rest.len])) {
+                const replacement = try std.fmt.allocPrint(arena, "/council {s}", .{council.name});
+                try out.append(arena, .{
+                    .label = replacement,
+                    .description = try std.fmt.allocPrint(arena, "show council · {d} models", .{council.models.items.len}),
+                    .replacement = replacement,
+                    .submit_on_enter = true,
+                });
+            }
+        }
+        return out.items;
+    }
+    if (query.len > "/review".len and
+        std.mem.eql(u8, query[0.."/review".len], "/review") and
+        (query["/review".len] == ' ' or query["/review".len] == '\t'))
+    {
+        const rest = std.mem.trimStart(u8, query["/review".len..], " \t");
+        for (app.councils.items) |council| {
+            if (rest.len <= council.name.len and std.ascii.eqlIgnoreCase(rest, council.name[0..rest.len])) {
+                const replacement = try std.fmt.allocPrint(arena, "/review {s} ", .{council.name});
+                try out.append(arena, .{
+                    .label = try std.fmt.allocPrint(arena, "/review {s}", .{council.name}),
+                    .description = try std.fmt.allocPrint(arena, "review with council · {d} models", .{council.models.items.len}),
+                    .replacement = replacement,
+                    .submit_on_enter = false,
+                });
+            }
+        }
+        return out.items;
+    }
+    for (composer_commands) |command| {
+        if (query.len <= command.name.len and std.ascii.eqlIgnoreCase(query, command.name[0..query.len])) {
+            try out.append(arena, .{
+                .label = command.name,
+                .usage = command.usage,
+                .description = command.description,
+                .replacement = command.name,
+                .submit_on_enter = true,
+            });
         }
     }
-    return out;
+    return out.items;
 }
 
-fn completeCommand(editor: *Editor, command: ComposerCommand, add_argument_space: bool) void {
+fn completeSuggestion(editor: *Editor, suggestion: CommandSuggestion, tab: bool) void {
     editor.clear();
-    editor.insertSlice(command.name);
-    if (add_argument_space and command.accepts_args) editor.insertSlice(" ");
+    editor.insertSlice(suggestion.replacement);
+    if (tab and suggestion.submit_on_enter) {
+        for (composer_commands) |command| {
+            if (std.mem.eql(u8, suggestion.replacement, command.name) and command.accepts_args) {
+                editor.insertSlice(" ");
+                break;
+            }
+        }
+    }
 }
 
 fn transcriptView(app: *App) Transcript {
@@ -3071,23 +3663,40 @@ fn pickerModelLine(
     arena: std.mem.Allocator,
     model: []const u8,
     pricing: ?proto.ModelPricing,
-    current: bool,
+    marker: []const u8,
     content_width: usize,
 ) ![]const u8 {
-    const marker = if (current) " ●" else "";
     const guest_prefix: []const u8 = if (proto.isGuestModel(model)) "(guest) " else "";
     const price = if (pricing) |value| try formatModelPricing(arena, value) else "";
     const price_width = displayWidth(price);
     const price_gap: usize = if (price.len > 0) 2 else 0;
-    const model_capacity = content_width -| (displayWidth(guest_prefix) + price_width + price_gap);
+    const marker_width = displayWidth(marker);
+    const model_capacity = content_width -| (displayWidth(guest_prefix) + price_width + price_gap + marker_width);
     const model_end = hardCellBreak(model, 0, model_capacity);
     const model_text = model[0..model_end];
-    const used = displayWidth(guest_prefix) + displayWidth(model_text) + price_width;
+    const used = displayWidth(guest_prefix) + displayWidth(model_text) + price_width + marker_width;
     const gap = if (price.len > 0)
         try spaces(arena, content_width -| used)
     else
         "";
     return std.fmt.allocPrint(arena, " {s}{s}{s}{s}{s}", .{ guest_prefix, model_text, gap, price, marker });
+}
+
+fn pickerTextPreview(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const cap = utf8Floor(text, @min(text.len, 240));
+    var out: std.ArrayList(u8) = .empty;
+    var previous_space = false;
+    for (text[0..cap]) |byte| {
+        const space = byte == '\n' or byte == '\r' or byte == '\t';
+        if (space) {
+            if (!previous_space) try out.append(arena, ' ');
+        } else {
+            try out.append(arena, byte);
+        }
+        previous_space = space;
+    }
+    if (cap < text.len) try out.appendSlice(arena, "…");
+    return out.items;
 }
 
 /// Expand `/review <council> <question>` into the parent agent's turn input:
@@ -3104,9 +3713,11 @@ fn buildReviewPrompt(gpa: std.mem.Allocator, council: *const OwnedCouncil, quest
         \\roster. If the skill is unavailable: write ONE self-contained review
         \\prompt (paths the read-only reviewers can open; paste diff hunks for
         \\anything uncommitted; require verdict, findings with file:line, and
-        \\confidence), fan it out with a single task_batch call — one task per
-        \\reviewer, identical prompt, the model ids above, max_rounds 12 — then
-        \\consolidate: agreements, disagreements attributed by model, false
+        \\confidence), fan it out with task_batch calls of at most eight tasks
+        \\each — one task per reviewer, identical prompt, the model ids above,
+        \\and task for a final one-reviewer remainder, max_rounds 12 — then
+        \\consolidate: agreements and disagreements
+        \\attributed by model, false
         \\positives, and your recommendation. Report reviewers that fail.
         \\
         \\Question for the council:
@@ -3337,13 +3948,13 @@ fn drawCommandMenu(
     width: u16,
 ) !void {
     if (app.mode != .insert or app.picker != null or app.editor.isWalkingHistory() or commandQuery(&app.editor) == null) return;
-    const matches = commandMatches(&app.editor);
-    if (matches.len == 0) return;
+    const suggestions = try commandSuggestions(app, arena);
+    if (suggestions.len == 0) return;
 
-    const shown: u16 = @intCast(@min(matches.len, composer_commands.len));
-    const menu_h = shown + 1; // results + keyboard hint
+    const shown: u16 = @intCast(@min(suggestions.len, composer_commands.len));
+    const menu_h = shown + 1;
     if (input_top < menu_h) return;
-    app.command_selection = @min(app.command_selection, matches.len - 1);
+    app.command_selection = @min(app.command_selection, suggestions.len - 1);
 
     const menu = win.child(.{
         .x_off = 1,
@@ -3356,7 +3967,7 @@ fn drawCommandMenu(
     const pad = "                        ";
     var row: usize = 0;
     while (row < shown) : (row += 1) {
-        const command = composer_commands[matches.indices[row]];
+        const suggestion = suggestions[row];
         const selected = row == app.command_selection;
         const row_style = if (selected) Palette.command_selected else Palette.command_menu;
         const name_style = if (selected) Palette.command_selected_name else Palette.command_name;
@@ -3364,19 +3975,19 @@ fn drawCommandMenu(
         const row_win = menu.child(.{ .y_off = @intCast(row), .height = 1, .width = menu.width });
         row_win.fill(.{ .style = row_style });
 
-        const label = try std.fmt.allocPrint(arena, " {s}{s}", .{ command.name, command.usage });
+        const label = try std.fmt.allocPrint(arena, " {s}{s}", .{ suggestion.label, suggestion.usage });
         const pad_len: usize = if (label.len < pad.len) pad.len - label.len else 1;
         const segments = [_]vaxis.Segment{
             .{ .text = label, .style = name_style },
             .{ .text = pad[0..pad_len], .style = row_style },
-            .{ .text = command.description, .style = description_style },
+            .{ .text = suggestion.description, .style = description_style },
         };
         _ = row_win.print(&segments, .{ .wrap = .none });
     }
 
     const hint = menu.child(.{ .y_off = @intCast(shown), .height = 1, .width = menu.width });
     _ = hint.printSegment(.{
-        .text = " ↑↓ select · Tab complete · Enter run",
+        .text = " ↑↓ select · Tab complete · Enter choose",
         .style = Palette.command_description,
     }, .{ .wrap = .none });
 }
@@ -3391,12 +4002,14 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Esc / i", .description = "return to insert mode" },
     .{ .key = "</> or ←/→", .description = "previous / next tab" },
     .{ .key = "⌥1–⌥9", .description = "jump to Nth tab (works in insert mode too)" },
+    .{ .key = "Ctrl+V", .description = "attach clipboard image (Control, not Command)" },
     .{ .key = "gt / gT", .description = "switch sessions · Ngt = Nth recent" },
     .{ .key = "J", .description = "join lines" },
     .{ .key = "a / A / I", .description = "insert after cursor / line end / line start" },
     .{ .key = "j / k", .description = "scroll one line" },
     .{ .key = "Ctrl+d / Ctrl+u", .description = "scroll one page" },
     .{ .key = "gg / G", .description = "jump to top / bottom" },
+    .{ .key = "/ · n/N", .description = "search transcript · next/previous match" },
     .{ .key = "?", .description = "toggle shortcut help" },
     .{ .key = "q", .description = "quit Marlin" },
     .{ .description = "COMPOSER (vim)", .heading = true },
@@ -3404,7 +4017,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "x / D", .description = "delete char / to line end" },
     .{ .key = "d c y + motion", .description = "operators: w b e 0 $ f t, dd/cc/yy, iw i\" i( …" },
     .{ .key = "counts f t ; ,", .description = "3w d2w 2dd · find char, repeat" },
-    .{ .key = "u / Ctrl+R", .description = "undo / redo" },
+    .{ .key = "u / Ctrl+R", .description = "undo / redo (normal mode)" },
     .{ .key = "s S C Y o O r ~", .description = "vim synonyms, open line, replace, case" },
     .{ .key = "p", .description = "paste the yank register" },
     .{ .description = "COPY MODE", .heading = true },
@@ -3414,6 +4027,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "y", .description = "yank: clipboard + paste register" },
     .{ .key = "arrows", .description = "scroll the view" },
     .{ .description = "GLOBAL", .heading = true },
+    .{ .key = "Ctrl+R (insert)", .description = "fuzzy-search authored input history" },
     .{ .key = "Enter while working", .description = "steer the active turn" },
     .{ .key = "Ctrl+N", .description = "create a new session" },
     .{ .key = "Ctrl+D (empty)", .description = "archive the current session" },
@@ -3421,6 +4035,48 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
     .{ .key = "Ctrl+C", .description = "interrupt the active turn" },
 };
+
+fn drawCouncilDetail(app: *const App, win: vaxis.Window, arena: std.mem.Allocator) !void {
+    const council = app.councilByName(app.council_detail_name.items) orelse return;
+    const h = win.height;
+    const w = win.width;
+    if (h < 8 or w < 32) return;
+
+    var widest: usize = displayWidth(council.name) + 10;
+    for (council.models.items) |model| widest = @max(widest, displayWidth(model) + 4);
+    const box_w: u16 = @intCast(@min(@max(widest, 44) + 4, @as(usize, w -| 4)));
+    const shown: u16 = @intCast(@min(council.models.items.len, h -| 7));
+    const box_h: u16 = shown + 4;
+    const box = win.child(.{
+        .x_off = @intCast((w -| box_w) / 2),
+        .y_off = @intCast((h -| box_h) / 2),
+        .width = box_w,
+        .height = box_h,
+        .border = .{ .where = .all, .style = Palette.tool },
+    });
+    box.fill(.{ .style = .{} });
+
+    const title = try std.fmt.allocPrint(arena, " council {s} · {d} models", .{ council.name, council.models.items.len });
+    _ = box.printSegment(.{ .text = title, .style = Palette.user }, .{ .wrap = .none });
+    for (council.models.items[0..shown], 0..) |model, i| {
+        const line = try std.fmt.allocPrint(arena, " {d}. {s}", .{ i + 1, model });
+        _ = box.printSegment(.{ .text = line, .style = Palette.tool_out }, .{
+            .row_offset = @intCast(i + 1),
+            .wrap = .none,
+        });
+    }
+    if (shown < council.models.items.len) {
+        const remaining = try std.fmt.allocPrint(arena, " … {d} more", .{council.models.items.len - shown});
+        _ = box.printSegment(.{ .text = remaining, .style = Palette.status_muted }, .{
+            .row_offset = shown + 1,
+            .wrap = .none,
+        });
+    }
+    _ = box.printSegment(.{
+        .text = " e edit · Esc close",
+        .style = Palette.tool_out,
+    }, .{ .row_offset = box_h -| 2, .wrap = .none });
+}
 
 fn drawShortcutHelp(win: vaxis.Window, arena: std.mem.Allocator) !void {
     const h = win.height;
@@ -3525,7 +4181,8 @@ fn drawTabBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
 
 const PlanDisplayRange = struct { start: usize = 0, len: usize = 0 };
 const max_plan_items: usize = 5;
-const plan_frame_rows: usize = 1; // top border; open bottom joins composer
+const plan_frame_rows: usize = 2; // top border + open-bottom padding row
+const surface_gap_rows: u16 = 1;
 
 fn planDisplayRange(items: []const PlanItemOwned, max_rows: usize) PlanDisplayRange {
     if (max_rows == 0 or items.len == 0) return .{};
@@ -3544,6 +4201,28 @@ fn planDisplayRange(items: []const PlanItemOwned, max_rows: usize) PlanDisplayRa
     var start = at -| (len / 2);
     if (start + len > items.len) start = items.len - len;
     return .{ .start = start, .len = len };
+}
+
+const PlanSurfaceLayout = struct {
+    plan_h: u16,
+    view_h: u16,
+};
+
+fn planSurfaceLayout(
+    height: u16,
+    top_rows: usize,
+    input_h: u16,
+    items: []const PlanItemOwned,
+) PlanSurfaceLayout {
+    const fixed_h = @as(u16, @intCast(top_rows)) + input_h + surface_gap_rows + 1;
+    const plan_capacity = height -| (fixed_h + 2);
+    const item_capacity = @min(max_plan_items, plan_capacity -| plan_frame_rows);
+    const range = planDisplayRange(items, item_capacity);
+    const plan_h: u16 = @intCast(if (range.len > 0) range.len + plan_frame_rows else 0);
+    return .{
+        .plan_h = plan_h,
+        .view_h = height -| (fixed_h + plan_h),
+    };
 }
 
 const PlanMarker = struct {
@@ -3670,6 +4349,24 @@ fn drawPlan(
             .wrap = .none,
         });
     }
+
+    // The final row is breathing room inside the open-bottom table. Keep all
+    // three vertical rules so its frame reaches the composer below.
+    const padding_row = height - 1;
+    _ = panel.printSegment(.{ .text = "│", .style = Palette.plan_header }, .{
+        .row_offset = padding_row,
+        .wrap = .none,
+    });
+    _ = panel.printSegment(.{ .text = "│", .style = Palette.plan_header }, .{
+        .row_offset = padding_row,
+        .col_offset = @intCast(widths.task + 1),
+        .wrap = .none,
+    });
+    _ = panel.printSegment(.{ .text = "│", .style = Palette.plan_header }, .{
+        .row_offset = padding_row,
+        .col_offset = win.width - 1,
+        .wrap = .none,
+    });
 }
 
 fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
@@ -3685,20 +4382,23 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     // The composer is a three-row panel for a one-line prompt (padding,
     // content, padding) and grows with multiline input.
-    const prompt: []const u8 = if (app.mode == .insert) "❯ " else ": ";
+    const prompt: []const u8 = if (app.history_search_active) search_prompt: {
+        const query = app.history_search_query.items;
+        const query_end = hardCellBreak(query, 0, @max(@as(usize, w) / 3, 1));
+        break :search_prompt try std.fmt.allocPrint(arena, "⌕ '{s}'▏: ", .{query[0..query_end]});
+    } else if (app.mode == .insert)
+        "❯ "
+    else
+        ": ";
     const panel_inner_w = w -| 2; // one cell of horizontal padding
-    const content_h: u16 = @intCast(app.editor.displayHeight(panel_inner_w -| 2));
+    const editor_body_w = @max(panel_inner_w -| displayWidth(prompt), 1);
+    const content_h: u16 = @intCast(app.editor.displayHeight(editor_body_w));
     const input_h: u16 = @intCast(inputPanelHeight(content_h));
-    // One breathing row belongs ABOVE the lowest surface. With a plan that
-    // means transcript → gap → table → composer, so the open-bottom
-    // table visually attaches to the input instead of floating between gaps.
-    const surface_gap: u16 = 1;
-    const fixed_h = @as(u16, @intCast(top_rows)) + input_h + surface_gap + 1;
-    const plan_capacity = h -| (fixed_h + 2); // retain a usable transcript viewport
-    const plan_item_capacity = @min(max_plan_items, plan_capacity -| plan_frame_rows);
-    const plan_range = planDisplayRange(app.plan.items, plan_item_capacity);
-    const plan_h: u16 = @intCast(if (plan_range.len > 0) plan_range.len + plan_frame_rows else 0);
-    const view_h: u16 = h -| (fixed_h + plan_h); // tabs + plan + input + gap + status
+    // The plan's final framed row provides breathing room before the composer;
+    // the ordinary transcript gap remains above the lowest surface.
+    const surfaces = planSurfaceLayout(h, top_rows, input_h, app.plan.items);
+    const plan_h = surfaces.plan_h;
+    const view_h = surfaces.view_h;
 
     // ---- session view ----
     var transcript = transcriptView(app);
@@ -3707,6 +4407,37 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     transcript.show_working_ticker = plan_h == 0;
     var lines = try layout_mod.layoutLines(arena, app.gpa, &transcript, w);
     const total = lines.items.len;
+    if (app.search_target_seq > 0 and !app.history_loading) {
+        var target_index: ?usize = null;
+        for (app.blocks.items, 0..) |rendered, index| {
+            if (rendered.seq == app.search_target_seq) {
+                target_index = index;
+                break;
+            }
+        }
+        if (target_index) |index| {
+            var prefix_lines: std.ArrayList(Line) = .empty;
+            var last_tool_label: []const u8 = "";
+            try layoutBlockRange(
+                arena,
+                &transcript,
+                &prefix_lines,
+                0,
+                index + 1,
+                w,
+                &last_tool_label,
+                true,
+            );
+            const target_line = prefix_lines.items.len -| 1;
+            const max_scroll = total -| view_h;
+            const desired_first = target_line -| (@as(usize, view_h) / 3);
+            app.scroll_up = max_scroll -| @min(desired_first, max_scroll);
+            app.search_highlight_line = target_line;
+            // Avoid treating this deliberate reposition as transcript growth.
+            app.last_total_lines = total;
+        }
+        app.search_target_seq = 0;
+    }
     // Anchor while reading: scroll_up counts from the BOTTOM, so content
     // arriving while scrolled up would slide the view. Compensate by the
     // growth delta; pinned (scroll_up == 0) stays pinned.
@@ -3808,6 +4539,16 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         });
         applyLineSyntax(win, @intCast(top_rows + row), ln);
         applyLineLinks(win, @intCast(top_rows + row), ln);
+        if (display.selectable and app.search_highlight_line == abs_line) {
+            var col: usize = 0;
+            const width = @min(lineWidth(win, ln), @as(usize, w));
+            while (col < width) : (col += 1) {
+                const cell = win.readCell(@intCast(col), @intCast(top_rows + row)) orelse continue;
+                var highlighted = cell;
+                highlighted.style.reverse = true;
+                win.writeCell(@intCast(col), @intCast(top_rows + row), highlighted);
+            }
+        }
         // Apply selection after printing so partial-cell highlighting keeps
         // each segment's original syntax color and other style attributes.
         if (display.selectable) {
@@ -3861,7 +4602,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         .height = content_h,
     });
     app.editor.draw(input_win, prompt, Palette.prompt_mark, Palette.prompt_text);
-    if (app.mode == .normal) win.hideCursor();
+    if (app.mode == .normal or app.history_search_active) win.hideCursor();
     try drawCommandMenu(app, win, arena, input_top, w);
 
     // ---- status bar ----
@@ -4112,12 +4853,19 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // ---- model / reasoning-effort selector overlay ----
     if (app.picker) |sel| {
         const items = try app.pickerItems(arena);
-        const total_src = app.pickerSource().len;
+        const total_src = app.pickerSourceCount();
         const current = app.pickerCurrent();
         const picker_label: []const u8 = switch (app.picker_kind) {
             .model => "model",
             .effort => "effort",
             .session => "sessions",
+            .search_prompt => if (app.search_scope_sid == 0) "search all sessions" else "search this session",
+            .search => if (app.search_scope_sid == 0) "search results" else "session matches",
+            .council => try std.fmt.allocPrint(arena, "council {s} · {d} selected", .{
+                app.council_edit_name.items,
+                app.council_edit_models.items.len,
+            }),
+            .council_list => "councils",
         };
 
         const list_max: u16 = @min(@as(u16, 14), h -| 6);
@@ -4125,8 +4873,13 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         const visible_end = @min(items.len, win_start + list_max);
         var widest: usize = 30;
         for (items[win_start..visible_end]) |f| {
-            var row_width = displayWidth(f);
-            if (app.picker_kind == .model) {
+            const displayed = if (app.picker_kind == .search)
+                try pickerTextPreview(arena, f)
+            else
+                f;
+            var row_width = displayWidth(displayed);
+            if (app.picker_kind == .council and !std.mem.eql(u8, f, council_done_item)) row_width += 2;
+            if (app.picker_kind == .model or app.picker_kind == .council) {
                 if (proto.isGuestModel(f)) row_width += displayWidth("(guest) ");
                 if (app.pricingForModel(f)) |pricing| {
                     row_width += 2 + displayWidth(try formatModelPricing(arena, pricing));
@@ -4149,7 +4902,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         box.fill(.{ .style = .{} });
 
         // Filter line (acts as a mini prompt).
-        const src_note: []const u8 = if (app.picker_kind == .model and app.catalog.items.len == 0)
+        const src_note: []const u8 = if ((app.picker_kind == .model or app.picker_kind == .council) and app.catalog.items.len == 0)
             " (favorites — catalog loading…)"
         else
             "";
@@ -4165,12 +4918,27 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         var i: usize = win_start;
         while (i < items.len and row <= shown) : (i += 1) {
             const f = items[i];
+            const done = app.picker_kind == .council and std.mem.eql(u8, f, council_done_item);
             const cur = if (app.picker_kind == .session)
                 (app.sessionIdForLabel(f) orelse 0) == app.sid
+            else if (app.picker_kind == .council)
+                !done and app.councilModelSelected(f)
             else
                 std.mem.eql(u8, f, current);
             const line = if (app.picker_kind == .model)
-                try pickerModelLine(arena, f, app.pricingForModel(f), cur, box_w -| 4)
+                try pickerModelLine(arena, f, app.pricingForModel(f), if (cur) " ●" else "", box_w -| 4)
+            else if (app.picker_kind == .council)
+                if (done)
+                    try std.fmt.allocPrint(arena, " ✓ Done ({d} selected)", .{app.council_edit_models.items.len})
+                else
+                    try pickerModelLine(arena, f, app.pricingForModel(f), if (cur) " ☑" else " ☐", box_w -| 4)
+            else if (app.picker_kind == .council_list)
+                if (app.councilByName(f)) |council|
+                    try std.fmt.allocPrint(arena, " {s} · {d} models", .{ f, council.models.items.len })
+                else
+                    f
+            else if (app.picker_kind == .search)
+                try std.fmt.allocPrint(arena, " {s}", .{try pickerTextPreview(arena, f)})
             else
                 try std.fmt.allocPrint(arena, " {s}{s}", .{ f[0..@min(f.len, box_w -| 4)], if (cur) " ●" else "" });
             const style: vaxis.Style = if (i == sel)
@@ -4182,14 +4950,21 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             _ = box.printSegment(.{ .text = line, .style = style }, .{ .row_offset = row, .wrap = .none });
             row += 1;
         }
-        const hint = if (app.picker_kind == .session)
-            try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Del/Ctrl+D archive · Esc", .{ items.len, total_src })
-        else
-            try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Esc", .{ items.len, total_src });
+        const hint = switch (app.picker_kind) {
+            .session => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Del/Ctrl+D archive · Esc", .{ items.len, total_src }),
+            .search_prompt => if (app.search_pending) " searching… · Esc" else " type query · Enter search · Esc",
+            .search => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter jump · Esc", .{ items.len, total_src }),
+            .council => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter toggle/Done · Esc cancel", .{ items.len -| 1, total_src }),
+            .council_list => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter inspect · Esc", .{ items.len, total_src }),
+            else => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Esc", .{ items.len, total_src }),
+        };
         _ = box.printSegment(.{ .text = hint, .style = Palette.tool_out }, .{ .row_offset = shown + 1, .wrap = .none });
     }
 
-    if (app.shortcut_help and app.picker == null) try drawShortcutHelp(win, arena);
+    if (app.council_detail_name.items.len > 0 and app.picker == null)
+        try drawCouncilDetail(app, win, arena)
+    else if (app.shortcut_help and app.picker == null)
+        try drawShortcutHelp(win, arena);
 }
 
 // ------------------------------------------------------------ entry point --
@@ -4852,6 +5627,53 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
+/// Small, allocation-free fuzzy matcher for authored-input recall. FTS is
+/// intentionally not involved: Ctrl+R should match sparse subsequences and
+/// reward word starts/contiguous runs like a shell-history picker.
+fn fuzzyHistoryScore(candidate: []const u8, query: []const u8) ?i64 {
+    if (query.len == 0) return 0;
+    var at: usize = 0;
+    var previous: ?usize = null;
+    var score: i64 = 0;
+    for (query) |query_byte| {
+        const q = std.ascii.toLower(query_byte);
+        var found: ?usize = null;
+        while (at < candidate.len) : (at += 1) {
+            if (std.ascii.toLower(candidate[at]) == q) {
+                found = at;
+                break;
+            }
+        }
+        const index = found orelse return null;
+        score += 10;
+        if (previous) |prev| {
+            if (index == prev + 1) score += 12;
+        }
+        if (index == 0 or std.ascii.isWhitespace(candidate[index - 1]) or
+            std.mem.indexOfScalar(u8, "/_-.:", candidate[index - 1]) != null)
+            score += 8;
+        score -= @intCast(@min(index, 100));
+        previous = index;
+        at = index + 1;
+    }
+    score -= @intCast(@min(candidate.len / 16, 100));
+    return score;
+}
+
+fn popLastCodepoint(bytes: *std.ArrayList(u8)) void {
+    if (bytes.items.len == 0) return;
+    var new_len = bytes.items.len - 1;
+    while (new_len > 0 and bytes.items[new_len] & 0xc0 == 0x80) new_len -= 1;
+    bytes.shrinkRetainingCapacity(new_len);
+}
+
+fn isEnterKey(key: vaxis.Key) bool {
+    if (key.mods.shift or key.mods.alt or key.mods.ctrl or key.mods.super or key.mods.hyper or key.mods.meta) return false;
+    if (key.codepoint == vaxis.Key.enter or key.codepoint == '\n' or key.codepoint == vaxis.Key.kp_enter) return true;
+    const text = key.text orelse return false;
+    return std.mem.eql(u8, text, "\r") or std.mem.eql(u8, text, "\n");
+}
+
 fn isNewlineKey(key: vaxis.Key) bool {
     // Key.matches intentionally consumes Shift for printable text, which
     // could make plain Enter look shifted when a terminal attaches text to
@@ -5013,6 +5835,18 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
+    if (app.council_detail_name.items.len > 0) {
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+            app.closeCouncilDetail();
+        } else if (key.matches('e', .{})) {
+            const name = app.gpa.dupe(u8, app.council_detail_name.items) catch return;
+            defer app.gpa.free(name);
+            app.closeCouncilDetail();
+            app.openCouncilPicker(name);
+        }
+        return;
+    }
+
     // Shortcut help is modal: only explicit close keys act on it. Global
     // Ctrl commands above remain available for redraw, transcript, and abort.
     if (app.shortcut_help) {
@@ -5022,26 +5856,65 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    // Model/effort selector swallows all keys while open. Typing filters;
-    // Up/Down or Ctrl+n/p navigate; Enter applies; Esc closes.
+    // Readline-style reverse-i-search stays inside the composer. The editor
+    // displays the candidate; printable keys edit the independent query.
+    if (app.history_search_active) {
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('g', .{ .ctrl = true })) {
+            app.cancelHistorySearch();
+        } else if (key.matches('r', .{ .ctrl = true })) {
+            app.cycleHistorySearch();
+        } else if (isEnterKey(key)) {
+            app.acceptHistorySearch();
+        } else if (key.matches(vaxis.Key.backspace, .{}) or key.matches('h', .{ .ctrl = true })) {
+            popLastCodepoint(&app.history_search_query);
+            app.refreshHistorySearch(true);
+        } else if (key.text) |text| {
+            if (text.len > 0 and text[0] >= 0x20 and text[0] != 0x7f) {
+                app.history_search_query.appendSlice(app.gpa, text) catch {};
+                app.refreshHistorySearch(true);
+            }
+        }
+        return;
+    }
+
+    // Pickers swallow all keys while open. Typing filters; Up/Down or
+    // Ctrl+n/p navigate; Enter applies or toggles; Esc closes/cancels.
     if (app.picker) |sel| {
         if (key.matches(vaxis.Key.escape, .{})) {
-            app.picker = null;
-            app.picker_filter.clearRetainingCapacity();
+            if (app.picker_kind == .council)
+                app.cancelCouncilEdit()
+            else {
+                if (app.picker_kind == .search_prompt or app.picker_kind == .search) {
+                    app.search_pending = false;
+                    app.clearSearchHits();
+                }
+                app.picker = null;
+                app.picker_filter.clearRetainingCapacity();
+            }
             return;
         }
-        // Count filtered items to clamp navigation (cheap stack arena).
-        var fb: [4096]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&fb);
-        const items = app.pickerItems(fba.allocator()) catch app.pickerSource();
+        // The model catalog can exceed a small stack buffer; this arena lives
+        // only for the key event and keeps filtering allocation bounded there.
+        var picker_arena = std.heap.ArenaAllocator.init(app.gpa);
+        defer picker_arena.deinit();
+        const items = app.pickerItems(picker_arena.allocator()) catch return;
         const n = items.len;
 
-        if (key.matches(vaxis.Key.enter, .{})) {
+        if (isEnterKey(key) and app.picker_kind == .search_prompt) {
+            app.submitSearch();
+        } else if (isEnterKey(key)) {
             if (n > 0) {
                 const pick = items[@min(sel, n - 1)];
-                app.picker = null;
-                app.applyPickerItem(pick);
-                app.picker_filter.clearRetainingCapacity();
+                if (app.picker_kind == .council) {
+                    if (std.mem.eql(u8, pick, council_done_item))
+                        app.saveCouncilEdit()
+                    else
+                        app.toggleCouncilModel(pick);
+                } else {
+                    app.picker = null;
+                    app.applyPickerItem(pick);
+                    app.picker_filter.clearRetainingCapacity();
+                }
             }
         } else if (isArchivePickerKey(app.picker_kind, key)) {
             if (n > 0) app.archivePickerSession(items[@min(sel, n - 1)]);
@@ -5112,16 +5985,22 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     switch (app.mode) {
         .insert => {
             const ed = &app.editor;
+            if (key.matches('r', .{ .ctrl = true })) {
+                app.beginHistorySearch();
+                return;
+            }
             // Same width draw() gives the editor: terminal minus the prompt.
             const edit_w: usize = app.term_cols -| 2;
-            const command_matches = commandMatches(ed);
+            var command_arena = std.heap.ArenaAllocator.init(app.gpa);
+            defer command_arena.deinit();
+            const suggestions = commandSuggestions(app, command_arena.allocator()) catch &.{};
             // A recalled /command still looks like an autocomplete query.
             // While walking history, Up/Down must keep walking history rather
             // than being captured by the command menu.
-            if (command_matches.len > 0 and !ed.isWalkingHistory()) {
-                app.command_selection = @min(app.command_selection, command_matches.len - 1);
+            if (suggestions.len > 0 and !ed.isWalkingHistory()) {
+                app.command_selection = @min(app.command_selection, suggestions.len - 1);
                 if (isNextInputRowKey(key)) {
-                    app.command_selection = if (app.command_selection + 1 < command_matches.len)
+                    app.command_selection = if (app.command_selection + 1 < suggestions.len)
                         app.command_selection + 1
                     else
                         0;
@@ -5130,20 +6009,21 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                     app.command_selection = if (app.command_selection > 0)
                         app.command_selection - 1
                     else
-                        command_matches.len - 1;
+                        suggestions.len - 1;
                     return;
                 } else if (key.matches(vaxis.Key.tab, .{})) {
-                    const command = composer_commands[command_matches.indices[app.command_selection]];
-                    completeCommand(ed, command, true);
+                    completeSuggestion(ed, suggestions[app.command_selection], true);
                     app.command_selection = 0;
                     return;
-                } else if (key.matches(vaxis.Key.enter, .{})) {
-                    const command = composer_commands[command_matches.indices[app.command_selection]];
-                    completeCommand(ed, command, false);
-                    const text = try ed.takeExpanded();
-                    defer app.gpa.free(text);
+                } else if (isEnterKey(key)) {
+                    const suggestion = suggestions[app.command_selection];
+                    completeSuggestion(ed, suggestion, false);
                     app.command_selection = 0;
-                    app.submitInput(text);
+                    if (suggestion.submit_on_enter) {
+                        const text = try ed.takeExpandedWithImages(app.attachments.items.len);
+                        defer app.gpa.free(text);
+                        app.submitInput(text);
+                    }
                     return;
                 }
             }
@@ -5153,7 +6033,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (isNewlineKey(key)) {
                 ed.insertNewline();
             } else if (key.matches(vaxis.Key.enter, .{})) {
-                const text = try ed.takeExpanded();
+                const text = try ed.takeExpandedWithImages(app.attachments.items.len);
                 defer app.gpa.free(text);
                 app.submitInput(text);
             } else if (isPreviousInputRowKey(key)) {
@@ -5223,6 +6103,12 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             if (tabNavigationDirection(key)) |direction| {
                 var steps = app.takeCount();
                 while (steps > 0) : (steps -= 1) app.cycleTab(direction);
+            } else if (key.matches('/', .{})) {
+                app.openSearchPrompt(app.sid);
+            } else if (key.matches('n', .{})) {
+                app.nextSearchHit(1);
+            } else if (key.matches('N', .{ .shift = true }) or key.matches('N', .{})) {
+                app.nextSearchHit(-1);
             } else if (key.matches('?', .{})) {
                 app.shortcut_help = true;
             } else if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{})) {
@@ -5391,6 +6277,52 @@ test "modified enter inserts a newline while plain enter submits" {
     try std.testing.expect(!isNewlineKey(.{ .codepoint = vaxis.Key.enter, .text = "\r" }));
 }
 
+test "enter matching accepts terminal and keypad encodings" {
+    try std.testing.expect(isEnterKey(.{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expect(isEnterKey(.{ .codepoint = '\n' }));
+    try std.testing.expect(isEnterKey(.{ .codepoint = vaxis.Key.kp_enter }));
+    try std.testing.expect(isEnterKey(.{ .codepoint = vaxis.Key.multicodepoint, .text = "\r" }));
+    try std.testing.expect(isEnterKey(.{ .codepoint = vaxis.Key.multicodepoint, .text = "\n" }));
+    try std.testing.expect(!isEnterKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .shift = true } }));
+    try std.testing.expect(!isEnterKey(.{ .codepoint = 'x', .text = "x" }));
+}
+
+test "inline Ctrl+R search refines cycles and restores the draft" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    app.editor.pushHistory("banana launcher");
+    app.editor.pushHistory("build release assets");
+    app.editor.insertSlice("draft in progress");
+    try app.history_search_draft.appendSlice(gpa, app.editor.text.items);
+    app.history_search_draft_cursor = app.editor.cursor;
+    app.history_search_active = true;
+    app.refreshHistorySearch(true);
+    try std.testing.expectEqualStrings("build release assets", app.editor.text.items);
+
+    try app.history_search_query.append(gpa, 'b');
+    app.refreshHistorySearch(true);
+    app.cycleHistorySearch();
+    try std.testing.expectEqualStrings("banana launcher", app.editor.text.items);
+
+    app.history_search_query.clearRetainingCapacity();
+    try app.history_search_query.appendSlice(gpa, "bln");
+    app.refreshHistorySearch(true);
+    try std.testing.expectEqualStrings("banana launcher", app.editor.text.items);
+
+    app.cancelHistorySearch();
+    try std.testing.expect(!app.history_search_active);
+    try std.testing.expectEqualStrings("draft in progress", app.editor.text.items);
+}
+
 test "model picker formats provider pricing compactly" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -5411,8 +6343,13 @@ test "model picker formats provider pricing compactly" {
     try std.testing.expectEqualStrings("price n/a", try formatModelPricing(arena, .{ .model = "openrouter/unknown" }));
     try std.testing.expectEqualStrings(
         " (guest) claudecode/fable",
-        try pickerModelLine(arena, "claudecode/fable", null, false, 40),
+        try pickerModelLine(arena, "claudecode/fable", null, "", 40),
     );
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        try pickerModelLine(arena, "openrouter/example/model", null, " ☑", 40),
+        " ☑",
+    ));
     try std.testing.expectEqual(@as(?f64, null), validCatalogRate(-1));
     try std.testing.expectEqual(@as(?f64, null), validCatalogRate(std.math.nan(f64)));
 }
@@ -5439,39 +6376,62 @@ test "model picker accepts priced and legacy catalogs" {
     try std.testing.expect(app.pricingForModel("openrouter/legacy/model") == null);
 }
 
-test "composer command catalog filters slash commands and bang shortcuts" {
+test "composer suggestions include commands, council actions, and council names" {
     const gpa = std.testing.allocator;
-    var ed = Editor.init(gpa);
-    defer ed.deinit();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    var council = OwnedCouncil{ .name = try gpa.dupe(u8, "adversarial") };
+    try council.models.append(gpa, try gpa.dupe(u8, "openrouter/example/model"));
+    try app.councils.append(gpa, council);
 
-    ed.insertSlice("/");
-    try std.testing.expectEqual(composer_commands.len - 2, commandMatches(&ed).len);
-    ed.clear();
-    ed.insertSlice("/com");
-    const compact = commandMatches(&ed);
-    try std.testing.expectEqual(@as(usize, 1), compact.len);
-    try std.testing.expectEqualStrings("/compact", composer_commands[compact.indices[0]].name);
-    ed.clear();
-    ed.insertSlice("/cou");
-    const council = commandMatches(&ed);
-    try std.testing.expectEqual(@as(usize, 1), council.len);
-    try std.testing.expectEqualStrings("/council", composer_commands[council.indices[0]].name);
-    ed.clear();
-    ed.insertSlice("/q");
-    const quit = commandMatches(&ed);
-    try std.testing.expectEqual(@as(usize, 1), quit.len);
-    try std.testing.expectEqualStrings("/quit", composer_commands[quit.indices[0]].name);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    app.editor.insertSlice("/com");
+    var suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/compact", suggestions[0].label);
 
-    ed.clear();
-    ed.insertSlice("!");
-    const shortcuts = commandMatches(&ed);
-    try std.testing.expectEqual(@as(usize, 2), shortcuts.len);
-    try std.testing.expectEqualStrings("!c", composer_commands[shortcuts.indices[0]].name);
-    try std.testing.expectEqualStrings("!rb", composer_commands[shortcuts.indices[1]].name);
+    app.editor.clear();
+    app.editor.insertSlice("/council n");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/council new", suggestions[0].label);
+    try std.testing.expect(!suggestions[0].submit_on_enter);
 
-    completeCommand(&ed, composer_commands[0], true);
-    try std.testing.expectEqualStrings("/model ", ed.text.items);
-    try std.testing.expect(commandQuery(&ed) == null);
+    app.editor.clear();
+    app.editor.insertSlice("/council adv");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/council adversarial", suggestions[0].label);
+    try std.testing.expect(suggestions[0].submit_on_enter);
+
+    completeSuggestion(&app.editor, suggestions[0], false);
+    try std.testing.expectEqualStrings("/council adversarial", app.editor.text.items);
+
+    app.editor.clear();
+    app.editor.insertSlice("/review adv");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/review adversarial", suggestions[0].label);
+    try std.testing.expect(!suggestions[0].submit_on_enter);
+
+    completeSuggestion(&app.editor, suggestions[0], false);
+    try std.testing.expectEqualStrings("/review adversarial ", app.editor.text.items);
+    try std.testing.expect(commandQuery(&app.editor) == null);
 }
 
 test "command menu Tab completes and Enter runs the selection" {
@@ -5522,6 +6482,127 @@ test "history walks past recalled local commands without autocomplete capture" {
     // history because the text was recalled rather than freshly typed.
     try handleKey(&app, .{ .codepoint = vaxis.Key.up });
     try std.testing.expectEqualStrings("ordinary prompt", app.editor.text.items);
+}
+
+test "council list opens inspection before explicit editing" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    var council = OwnedCouncil{ .name = try gpa.dupe(u8, "core") };
+    try council.models.append(gpa, try gpa.dupe(u8, "openrouter/example/model"));
+    try app.councils.append(gpa, council);
+    try app.catalog.append(gpa, try gpa.dupe(u8, "openrouter/example/model"));
+
+    app.openCouncilList();
+    try std.testing.expectEqual(PickerKind.council_list, app.picker_kind);
+    try std.testing.expectEqual(@as(?usize, 0), app.picker);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const items = try app.pickerItems(arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("core", items[0]);
+
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(app.picker == null);
+    try std.testing.expectEqualStrings("core", app.council_detail_name.items);
+    try std.testing.expectEqual(@as(usize, 0), app.council_edit_models.items.len);
+
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(@as(usize, 0), app.council_detail_name.items.len);
+
+    app.runCommand("/council core");
+    try std.testing.expectEqualStrings("core", app.council_detail_name.items);
+    try std.testing.expectEqual(@as(usize, 0), app.council_edit_models.items.len);
+
+    try handleKey(&app, .{ .codepoint = 'e', .text = "e" });
+    try std.testing.expectEqual(@as(usize, 0), app.council_detail_name.items.len);
+    try std.testing.expectEqual(PickerKind.council, app.picker_kind);
+    try std.testing.expectEqualStrings("core", app.council_edit_name.items);
+    try std.testing.expect(app.councilModelSelected("openrouter/example/model"));
+}
+
+test "council picker reuses catalog with Done and checked multi-select seats" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    try app.catalog.append(gpa, try gpa.dupe(u8, "openrouter/x-ai/grok-4.6"));
+    try app.catalog.append(gpa, try gpa.dupe(u8, "openrouter/z-ai/glm-5.3"));
+    var council = OwnedCouncil{ .name = try gpa.dupe(u8, "core") };
+    try council.models.append(gpa, try gpa.dupe(u8, "openrouter/z-ai/glm-5.3"));
+    try council.models.append(gpa, try gpa.dupe(u8, "openrouter/legacy/retired-model"));
+    try app.councils.append(gpa, council);
+
+    app.runCommand("/council edit core");
+    try std.testing.expectEqual(PickerKind.council, app.picker_kind);
+    try std.testing.expectEqual(@as(?usize, 0), app.picker);
+    try std.testing.expectEqualStrings("core", app.council_edit_name.items);
+    try std.testing.expect(app.councilModelSelected("openrouter/z-ai/glm-5.3"));
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const items = try app.pickerItems(arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expectEqualStrings(council_done_item, items[0]);
+    try std.testing.expectEqualStrings("openrouter/legacy/retired-model", items[3]);
+
+    app.picker = 1;
+    try handleKey(&app, .{ .codepoint = vaxis.Key.multicodepoint, .text = "\r" });
+    try std.testing.expect(app.councilModelSelected("openrouter/x-ai/grok-4.6"));
+    try std.testing.expectEqual(@as(?usize, 1), app.picker);
+
+    try app.picker_filter.appendSlice(gpa, "glm");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    const filtered = try app.pickerItems(arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    try std.testing.expectEqualStrings(council_done_item, filtered[0]);
+    try std.testing.expectEqualStrings("openrouter/z-ai/glm-5.3", filtered[1]);
+
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(app.picker == null);
+    try std.testing.expectEqual(@as(usize, 0), app.council_edit_models.items.len);
+    try std.testing.expectEqualStrings("council edit cancelled", app.notice.items);
+    try std.testing.expectEqual(@as(usize, 2), app.councils.items[0].models.items.len);
+}
+
+test "council Done refuses an empty roster without closing the picker" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .picker_kind = .council,
+        .picker = 0,
+    };
+    defer app.deinit();
+    try app.council_edit_name.appendSlice(gpa, "empty");
+    try app.catalog.append(gpa, try gpa.dupe(u8, "openrouter/x-ai/grok-4.6"));
+
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqual(@as(?usize, 0), app.picker);
+    try std.testing.expectEqualStrings("choose at least one model before Done", app.notice.items);
 }
 
 test "/effort opens the shared selector vocabulary" {
@@ -5766,6 +6847,35 @@ test "Ctrl+N aliases /new in either mode while pickers keep navigation" {
     try handleKey(&app, .{ .codepoint = 'n', .mods = .{ .ctrl = true } });
     try std.testing.expectEqual(@as(?usize, 1), app.picker);
     try std.testing.expect(!app.awaiting_new_session);
+}
+
+test "staging images inserts numbered prompt placeholders" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.editor.insertSlice("compare");
+    app.addAttachment(.{
+        .name = try gpa.dupe(u8, "first.png"),
+        .mime = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, "AA=="),
+    });
+    app.addAttachment(.{
+        .name = try gpa.dupe(u8, "second.png"),
+        .mime = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, "AA=="),
+    });
+
+    try std.testing.expectEqualStrings("compare [image #1] [image #2] ", app.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 2), app.attachments.items.len);
 }
 
 test "Ctrl+D archives only a truly empty composer outside copy mode" {
@@ -7652,6 +8762,20 @@ test "plan table centers current work and retains completed timings" {
     try std.testing.expectEqual(@as(usize, 0), planDisplayRange(&items, 0).len);
     try std.testing.expect(hasUnfinishedPlan(&items));
     try std.testing.expect(!hasUnfinishedPlan(&completed));
+}
+
+test "live plan reserves a framed blank row above the composer" {
+    const items = [_]PlanItemOwned{.{
+        .step = @constCast("work"),
+        .status = .in_progress,
+    }};
+    const with_plan = planSurfaceLayout(20, 0, 3, &items);
+    try std.testing.expectEqual(@as(u16, 3), with_plan.plan_h);
+    try std.testing.expectEqual(@as(u16, 12), with_plan.view_h);
+
+    const without_plan = planSurfaceLayout(20, 0, 3, &.{});
+    try std.testing.expectEqual(@as(u16, 0), without_plan.plan_h);
+    try std.testing.expectEqual(@as(u16, 15), without_plan.view_h);
 }
 
 test "completed plan leaves the live panel and remains durable in transcript" {

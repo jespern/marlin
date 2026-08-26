@@ -6,6 +6,14 @@ const Io = std.Io;
 
 pub const max_image_bytes: usize = 10 * 1024 * 1024;
 
+const mac_clipboard_script =
+    \\ObjC.import('AppKit'); ObjC.import('Foundation');
+    \\var p=$.NSPasteboard.generalPasteboard; var t=ObjC.unwrap(p.types).map(ObjC.unwrap); var d=null;
+    \\if(t.indexOf('public.png')>=0){d=p.dataForType('public.png');}
+    \\else if(t.indexOf('public.tiff')>=0){var x=p.dataForType('public.tiff'); var r=$.NSBitmapImageRep.imageRepWithData(x); d=r.representationUsingTypeProperties($.NSBitmapImageFileTypePNG,$({}));}
+    \\d ? ObjC.unwrap(d.base64EncodedStringWithOptions(0)) : '';
+;
+
 pub const Pending = struct {
     name: []u8,
     mime: []u8,
@@ -54,15 +62,8 @@ fn fromMacClipboard(
     io: Io,
     environ: ?*const std.process.Environ.Map,
 ) !Pending {
-    const script =
-        \\ObjC.import('AppKit'); ObjC.import('Foundation');
-        \\var p=$.NSPasteboard.generalPasteboard; var t=ObjC.unwrap(p.types); var d=null;
-        \\if(t.indexOf('public.png')>=0){d=p.dataForType('public.png');}
-        \\else if(t.indexOf('public.tiff')>=0){var x=p.dataForType('public.tiff'); var r=$.NSBitmapImageRep.imageRepWithData(x); d=r.representationUsingTypeProperties($.NSBitmapImageFileTypePNG,$({}));}
-        \\d ? ObjC.unwrap(d.base64EncodedStringWithOptions(0)) : '';
-    ;
     const result = try std.process.run(gpa, io, .{
-        .argv = &.{ "/usr/bin/osascript", "-l", "JavaScript", "-e", script },
+        .argv = &.{ "/usr/bin/osascript", "-l", "JavaScript", "-e", mac_clipboard_script },
         .environ_map = environ,
         .stdout_limit = .limited(base64Limit()),
         .stderr_limit = .limited(16 * 1024),
@@ -150,6 +151,10 @@ test "path attachment detects and encodes PNG" {
     defer gpa.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, pending.data_base64);
     try std.testing.expectEqualStrings(bytes, decoded);
+}
+
+test "mac clipboard script unwraps individual pasteboard type names" {
+    try std.testing.expect(std.mem.indexOf(u8, mac_clipboard_script, "p.types).map(ObjC.unwrap)") != null);
 }
 
 test {

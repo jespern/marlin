@@ -30,6 +30,54 @@ const ResolvedSession = struct {
     }
 };
 
+/// `marlin search <query>` — durable cross-session transcript search.
+pub fn search(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    if (args.len == 0) {
+        try eprint(io, "usage: marlin search <query>\n", .{});
+        return 2;
+    }
+    var query: std.ArrayList(u8) = .empty;
+    defer query.deinit(gpa);
+    for (args, 0..) |arg, i| {
+        if (i > 0) try query.append(gpa, ' ');
+        try query.appendSlice(gpa, arg);
+    }
+
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |err| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{err});
+        return 1;
+    };
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try conn.send(.{ .session_list = .{ .include_archived = true } });
+    const list = try conn.recvUntil(arena, .session_list_result);
+    const ids = try sessionIds(arena, list.sessions);
+    try conn.send(.{ .search = .{ .query = query.items, .limit = 100 } });
+    const result = try conn.recvUntil(arena, .search_result);
+    for (result.hits) |hit| {
+        var handle_buf: session_handle.Full = undefined;
+        const handle = session_handle.display(&handle_buf, hit.sid, ids);
+        const location = if (hit.title.len > 0) hit.title else hit.cwd;
+        const snippet = try arena.dupe(u8, hit.snippet);
+        for (snippet) |*byte| if (byte.* == '\n' or byte.* == '\r' or byte.* == '\t') {
+            byte.* = ' ';
+        };
+        try print(io, "{s}:{d}\t{s}\t{s}\t{s}\n", .{
+            handle, hit.seq, @tagName(hit.kind), location, snippet,
+        });
+    }
+    return 0;
+}
+
 pub fn mcp(
     gpa: std.mem.Allocator,
     io: Io,

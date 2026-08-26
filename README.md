@@ -15,7 +15,7 @@ curl -fsSL https://marlin.wtf/install.sh | sh
 ```
 
 The installer selects the release for your architecture and verifies its
-SHA-256 checksum. To pin a version, pipe into `MARLIN_VERSION=0.1.0 sh`.
+SHA-256 checksum. To pin this release, pipe into `MARLIN_VERSION=0.1.1 sh`.
 
 Or use [Homebrew](https://brew.sh/) on macOS or Linux:
 
@@ -65,17 +65,23 @@ the old rooms?
 - Copy the last tool output with `!c` — a query over structured blocks, not a
   rectangle of screen cells. Paste it into another session without touching the
   OS clipboard.
+- Recall anything you previously wrote with insert-mode `Ctrl+R`: it searches
+  inline in the composer, repeated `Ctrl+R` walks older matches, and Esc
+  restores the draft. Normal-mode `/` searches the current transcript; `/search <query>` and
+  `marlin search <query>` search every durable session.
 - OpenRouter sessions can search the web with the same API key and preserve
   cited source URLs; `fetch` opens known pages for deeper reading.
-- Paste an image with Ctrl+V or attach one by path. The client uploads it to
-  the daemon through the protocol—no shared path assumption—and images remain
-  durable, content-addressed transcript attachments.
+- Paste an image with Ctrl+V (Control-V, not Command-V on macOS) or attach one
+  by path. Staged images appear in the prompt as `[image #1]`, `[image #2]`, and
+  so on. The client uploads them through the protocol—no shared path
+  assumption—and images remain durable, content-addressed transcript
+  attachments.
 - Delegate one focused investigation with `task`, or fan out two to eight with
   `task_batch`; every read-only child is durable, attachable, and grouped under
   its parent while results return in requested order.
-- Convene a multi-model review council in one line: `/council set core
-  openrouter/x-ai/grok-4.6 openrouter/z-ai/glm-5.3` once, then
-  `/review core <question>` fans a self-contained review prompt to the
+- Build a multi-model review council with `/council new core`: filter the
+  model catalog, toggle as many seats as you want, then choose `Done`. After
+  that, `/review core <question>` fans a self-contained review prompt to the
   roster via `task_batch` and the parent consolidates agreements, splits,
   and a recommendation. Councils are durable config (`[[council]]` in
   config.toml); the procedure is a markdown skill
@@ -210,9 +216,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and
 
 SQLite remains Marlin's canonical store: WAL, indexed session/block queries,
 migrations, hierarchy, and content-addressed blobs would otherwise become a
-home-grown database layer around JSONL. FTS5 search is **not** implemented
-today; a cross-session `/search` is a future feature described in the
-[architecture notes](docs/ARCHITECTURE.md#future-cross-session-search).
+home-grown database layer around JSONL. Searchable rendered text is projected
+into a compact side table; FTS5 powers transcript search when available, with a
+bounded scan fallback for system SQLite builds that omit it. Raw blobs and
+binary attachments are never indexed.
 
 For fast local iteration, `zig build` and `zig build test` link the system
 SQLite library. Official release builds compile the vendored amalgamation into

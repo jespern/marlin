@@ -391,28 +391,34 @@ two turn threads to interleave bindings on one statement.
 
 Local and test builds link the platform SQLite library to keep rebuilds fast.
 Official release builds pass `-Dembedded-sqlite=true` and compile the vendored
-amalgamation into the distributable binary. FTS5 is not compiled in or used
-today.
+amalgamation into the distributable binary with `SQLITE_ENABLE_FTS5`.
 
-### Future: cross-session search
+### Durable transcript search
 
-A future `/search <query>` (with a headless `marlin search` equivalent) can use
-an SQLite FTS5 virtual table over user and assistant text plus compact tool
-summaries. Raw multi-megabyte tool blobs should stay out of the default index.
-Results should carry the session handle, turn/sequence, timestamp, and a short
-highlighted snippet so selecting one can attach to the session and jump to the
-matching block.
+Insert-mode Ctrl+R runs an inline reverse-i-search in the composer with
+client-side fuzzy matching over a bounded newest-first corpus from the daemon:
+typing refines, repeated Ctrl+R walks older matches, Enter accepts, and Esc
+restores the untouched draft. Normal-mode `/` searches the
+current transcript; `/search <query>` and the headless `marlin search`
+equivalent search across sessions. Transcript results carry the session,
+sequence, timestamp, kind, location, and highlighted snippet. Selecting one
+requests a bounded replay centered on that sequence, catches forward to the
+live edge without a subscription gap, positions the viewport, and highlights
+the matching block. Normal-mode `n`/`N` advances through the retained result
+set without re-running the query.
 
-This should land as a schema migration with a batched backfill, not as an
-unadvertised table in the initial schema. At implementation time the embedded
-release build can add `SQLITE_ENABLE_FTS5`; system-linked development builds
-must capability-check FTS5 or provide a slower scan fallback so local builds do
-not depend on platform-specific SQLite compile options.
+Schema v7 projects visible text into `search_docs` in the same transaction as
+the append-only block. User/assistant text, reasoning, steers, plans, bounded
+tool arguments/results, compaction summaries, and notes are searchable;
+synthetic rehydration, approvals, binary data, base64, and uncapped blob bodies
+are not. Existing databases backfill once. At startup Marlin capability-checks
+FTS5 by creating the external-content index; system SQLite builds without it
+use a bounded `search_docs` scan instead.
 
 ### Growth & trimming
 
 Text blocks are cheap (~1GB/yr worst case); **blobs and images are the
-growers**. A future FTS index will add another copy of indexed text. The append-only
+growers**. The FTS index adds another copy of searchable text. The append-only
 invariant protects *causal block structure*, not every 400KB build log
 forever — same insight as L1 pruning, applied to disk: blob bodies are
 regenerable/low-value with age; block structure is not.
@@ -975,7 +981,12 @@ Tabs are clickable; normal-mode `>`/`<` and Right/Left move through the visible
 tab order, while `gt`/`gT` (with optional count) retains MRU session navigation.
 Child activity rolls up to its root tab and overflow keeps the focused tab
 visible. `/sessions` remains the fuzzy complete hierarchy picker showing title,
-workspace, recency, and state. The status bar
+workspace, recency, and state. `/council` opens a filtered council list, while
+`/council <name>` inspects the durable roster. Contextual command completion
+offers council actions and configured names for both `/council` and `/review`.
+Council create/edit reuses the model
+catalog as a filtered multi-select: Enter toggles seats, `Done` saves atomically
+through the daemon, and Esc discards the draft. The status bar
 reports background sessions only when actionable (`2 running · 1 approval`).
 A split pane identifies its session with a compact pane label.
 
@@ -1039,9 +1050,11 @@ assets are grabbed out-of-band:
 
 - **Capture (client).** Ctrl+V reads PNG data from NSPasteboard on macOS and
   `wl-paste`/`xclip` on Linux. `/attach <path>` and `marlin run --image <path>`
-  accept PNG, JPEG, GIF, and WebP. Capture happens in the client, never the
-  daemon, preserving the correct clipboard boundary for a future remote
-  transport.
+  accept PNG, JPEG, GIF, and WebP. Each staged TUI image inserts a compact
+  `[image #N]` placeholder at the cursor; intact placeholders are display-only
+  and are stripped from message text at submission. Capture happens in the
+  client, never the daemon, preserving the correct clipboard boundary for a
+  future remote transport.
 - **Wire + store.** An input carries bounded base64 upload records. The daemon
   verifies MIME signatures and writes bytes to the existing content-addressed
   blob store; `user_msg.attachments` carries only metadata and blob hashes.
@@ -1137,7 +1150,7 @@ on_session_done = "~/.config/marlin/hooks/notify.sh"
 | Dep | Why | Risk hedge |
 |---|---|---|
 | std.http | HTTPS/SSE and bounded fetches through one daemon-owned pool | transport stays behind one interface |
-| SQLite (C) | durable block/session/blob store; future FTS5 search | system-linked locally, embedded in releases |
+| SQLite (C) | durable block/session/blob store and FTS5 transcript search | system-linked locally, embedded in releases |
 | libvaxis (Zig) | TUI: input, mouse, OSC52, unicode width | active, Ghostty-adjacent |
 | focused internal TOML decoder | config | only supported Marlin shapes; no runtime dep |
 | std.json | strict parse + our lenient-repair layer on top | — |
