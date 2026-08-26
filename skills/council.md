@@ -25,6 +25,11 @@ one review prompt into several vendor CLIs and consolidating by hand.
      whole files;
    - for uncommitted work, paste the relevant diff hunks into the prompt
      (reviewers have no shell and cannot run `git diff`);
+   - if the question is empirical — does it build, do tests pass, does the
+     bug reproduce — run that verification yourself ONCE before fanning
+     out and paste the command and its output into the prompt. Reviewers
+     cannot execute anything and must not be left wanting to; give them
+     the evidence and ask them to interpret it;
    - the required output shape: verdict (one line) · top findings
      (file:line, severity, why it matters) · what you would do differently ·
      confidence (low/medium/high).
