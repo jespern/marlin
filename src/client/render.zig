@@ -939,16 +939,18 @@ pub fn selectedText(
     return out.items;
 }
 
-/// Append a plain separator row. Dedupes: sections may each request their
-/// own breathing room without stacking double blanks when they abut. Card
-/// padding rows (empty text but a fill background) are content, not
-/// separators, and never absorb the blank.
+/// Append a plain separator row — THE one spacing mechanism of the
+/// transcript. The discipline (see layoutBlockRange): every section requests
+/// exactly one leading blank through here; renderers emit content only and
+/// never trailing air. Dedupes against an existing plain blank so abutting
+/// sections cannot stack doubles, treats card padding rows (empty text but a
+/// fill background) as content that never absorbs the blank, and is a no-op
+/// at the very top — a separator needs something to separate.
 pub fn blankLine(arena: std.mem.Allocator, lines: *std.ArrayList(Line)) !void {
-    if (lines.items.len > 0) {
-        const last = lines.items[lines.items.len - 1];
-        if (last.text.len == 0 and last.text2.len == 0 and last.text3.len == 0 and
-            last.fill_style == null) return;
-    }
+    if (lines.items.len == 0) return;
+    const last = lines.items[lines.items.len - 1];
+    if (last.text.len == 0 and last.text2.len == 0 and last.text3.len == 0 and
+        last.fill_style == null) return;
     try lines.append(arena, .{ .text = "", .style = .{} });
 }
 

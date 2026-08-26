@@ -390,9 +390,9 @@ pub fn wrapPromptCard(
     try lines.append(arena, .{ .text = "", .style = Palette.prompt_text, .fill_style = Palette.prompt_panel });
 }
 
-/// Reasoning/progress updates are useful transcript landmarks, so give them
-/// a quiet full-width surface without competing with the stronger user-prompt
-/// cards. Reuse an existing separator row instead of doubling the gap.
+/// Reasoning/progress narration: a small mark and muted text, flat on the
+/// default background. CONTENT-ONLY like every renderer — the layout loop
+/// owns all separating air (see layoutBlockRange's section discipline).
 pub fn wrapReasoningCard(
     arena: std.mem.Allocator,
     lines: *std.ArrayList(Line),
@@ -401,12 +401,6 @@ pub fn wrapReasoningCard(
 ) !void {
     const prefix = "  · ";
     const cont = "    ";
-    const has_separator = if (lines.items.len > 0) blk: {
-        const previous = lines.items[lines.items.len - 1];
-        break :blk previous.text.len == 0 and previous.text2.len == 0 and previous.text3.len == 0;
-    } else false;
-    if (!has_separator)
-        try lines.append(arena, .{ .text = "", .style = .{} });
 
     // Commentary arrives with inline markdown (**bold**, `code`, links);
     // render it instead of showing the markers verbatim. Newlines flatten
@@ -439,7 +433,6 @@ pub fn wrapReasoningCard(
         while (start < im.text.len and im.text[start] == ' ') start += 1;
         if (start >= im.text.len) break;
     }
-    try lines.append(arena, .{ .text = "", .style = .{} });
 }
 
 pub const CollapsedToolRun = struct {
@@ -782,6 +775,7 @@ pub fn scanToolBatch(
 /// instead of stacking one summary line per provider round.
 pub fn flushRanSummary(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), pending: *usize) !void {
     if (pending.* == 0) return;
+    try blankLine(alloc, lines);
     const summary = try std.fmt.allocPrint(alloc, "Ran {d} {s}", .{
         pending.*,
         if (pending.* == 1) "command" else "commands",
@@ -854,6 +848,13 @@ pub fn currentInflightCall(blocks: []const RenderBlock) ?InflightCall {
     return null;
 }
 
+/// SECTION DISCIPLINE (the transcript's one spacing rule, pinned by the
+/// "transcript spacing invariant" test): every section — prompt card,
+/// assistant prose, reasoning line, Ran-N summary, expanded diff pair,
+/// steer, note, compaction — requests exactly ONE leading blank through
+/// blankLine (which dedupes and no-ops at the top). Dense tool rows stack
+/// flush within a group, but the group start breathes like any section.
+/// Renderers emit content only; nothing ever appends trailing air.
 pub fn layoutBlockRange(
     alloc: std.mem.Allocator,
     transcript: *const Transcript,
@@ -868,6 +869,10 @@ pub fn layoutBlockRange(
     // visible truncation, never an unbounded allocation loop in the TUI.
     const max_layout_steps = (end - start) *| 2 +| 1_024;
     var pending_ran: usize = 0;
+    // Dense tool rows stack flush within a group; the group START gets one
+    // blank like any other section. Tracks whether the last emitted row was
+    // dense machinery (tool call/result/approval) or prose.
+    var last_dense = false;
     var block_idx: usize = start;
     var layout_steps: usize = 0;
     while (block_idx < end) : (block_idx += 1) {
@@ -966,6 +971,7 @@ pub fn layoutBlockRange(
                     hint = try std.fmt.allocPrint(alloc, " · running {d} more", .{running_count});
                 }
                 if (total_ran > 0 or running_count > 0) {
+                    try blankLine(alloc, lines);
                     try lines.append(alloc, .{
                         .text = "  • ",
                         .style = Palette.note,
@@ -985,11 +991,9 @@ pub fn layoutBlockRange(
                     try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note);
                     try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
                 }
-                // Air below the last expanded pair too; whatever follows
-                // (summary line, reasoning card) must not sit flush against
-                // the diff. blankLine dedupes against sections that add
-                // their own leading blank.
-                if (expand.items.len > 0) try blankLine(alloc, lines);
+                // Whatever follows brings its own leading blank; nothing
+                // in the transcript appends trailing air.
+                last_dense = false;
                 if (scan_end > block_idx) {
                     block_idx = scan_end - 1;
                     continue;
@@ -1015,11 +1019,14 @@ pub fn layoutBlockRange(
                 // fragments, which reads as two narrators fighting. The
                 // model's deliberate one-line narration (commentary=true)
                 // stays; ctrl+t reveals everything.
-                if (transcript.show_tool_transcript or rb.commentary)
+                if (transcript.show_tool_transcript or rb.commentary) {
+                    try blankLine(alloc, lines);
                     try wrapReasoningCard(alloc, lines, try clipText(alloc, rb.text, 280), w);
+                }
             },
             .tool_call => {
                 try flushRanSummary(alloc, lines, &pending_ran);
+                if (!last_dense) try blankLine(alloc, lines);
                 last_tool_label.* = rb.label;
                 try appendToolCallLine(alloc, lines, rb, transcript.cwd, w, null);
             },
@@ -1030,21 +1037,25 @@ pub fn layoutBlockRange(
             },
             .steer => {
                 try flushRanSummary(alloc, lines, &pending_ran);
+                try blankLine(alloc, lines);
                 try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w);
             },
             .plan => {},
             .system_note => {
                 if (block.isHandoverNote(rb.text)) {
                     try flushRanSummary(alloc, lines, &pending_ran);
+                    try blankLine(alloc, lines);
                     try wrapPrefixed(alloc, lines, "  ", "handover for Claude Code", Palette.note, w);
                     try wrapMarkdown(alloc, lines, block.handoverBody(rb.text), w);
                 } else {
+                    try blankLine(alloc, lines);
                     const txt = try std.fmt.allocPrint(alloc, "[{s}]", .{try clipText(alloc, rb.text, 480)});
                     try wrapPrefixed(alloc, lines, "  ", txt, Palette.note, w);
                 }
             },
             .compaction => {
                 try flushRanSummary(alloc, lines, &pending_ran);
+                try blankLine(alloc, lines);
                 try wrapPrefixed(alloc, lines, "  ≋ ", "context compacted", Palette.note, w);
             },
         }

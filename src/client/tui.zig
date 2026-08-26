@@ -5416,16 +5416,16 @@ test "reasoning cards are muted, padded, and inset" {
         38,
     );
 
-    try std.testing.expect(lines.items.len >= 4); // top + wrapped body + bottom
-    try std.testing.expectEqualStrings("", lines.items[0].text);
-    try std.testing.expectEqualStrings("", lines.items[lines.items.len - 1].text);
-    try std.testing.expectEqualStrings("  · ", lines.items[1].text);
-    try std.testing.expect(lines.items[1].style.bold);
+    // Content-only: no leading/trailing blanks — the layout loop owns air.
+    try std.testing.expect(lines.items.len >= 2); // wrapped body
+    try std.testing.expectEqualStrings("  · ", lines.items[0].text);
+    try std.testing.expect(lines.items[0].style.bold);
+    try std.testing.expect(lines.items[lines.items.len - 1].text2.len > 0);
     // Completed commentary is secondary narration: the same muted index-7
     // grey it streamed in as, one step below the assistant's final prose.
-    try std.testing.expect(!lines.items[1].style2.italic);
-    try std.testing.expect(!lines.items[1].style2.bold);
-    try std.testing.expect(vaxis.Color.eql(lines.items[1].style2.fg, Palette.reasoning.fg));
+    try std.testing.expect(!lines.items[0].style2.italic);
+    try std.testing.expect(!lines.items[0].style2.bold);
+    try std.testing.expect(vaxis.Color.eql(lines.items[0].style2.fg, Palette.reasoning.fg));
     for (lines.items) |line| {
         // Flat CC-style narration: no background panel, ever — a filled
         // card highlighted the least important content and its padding
@@ -7110,4 +7110,103 @@ test "review prompt expansion names the council, roster, and question" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- openrouter/x-ai/grok-4.6\n- openrouter/z-ai/glm-5.3") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "task_batch") != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "Question for the council: is the cache safe?"));
+}
+
+test "transcript spacing invariant: every section breathes, nothing doubles" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    // Every block kind, in deliberately hostile adjacency: summaries after
+    // cards (the reported bug), commentary between tool stretches, notes and
+    // markers back to back.
+    const Entry = struct { block.BlockKind, u64, []const u8, []const u8, bool };
+    const entries = [_]Entry{
+        .{ .user_msg, 7, "start the work", "", false },
+        .{ .tool_call, 7, "{\"command\":\"zig build\"}", "bash", false },
+        .{ .tool_result, 7, "ok", "", false },
+        .{ .tool_call, 7, "{\"pattern\":\"x\"}", "grep", false },
+        .{ .tool_result, 7, "ok", "", false },
+        .{ .user_msg, 7, "and now?", "", false },
+        .{ .tool_call, 7, "{\"path\":\"a\"}", "read_file", false },
+        .{ .tool_result, 7, "ok", "", false },
+        .{ .reasoning, 7, "checking the gate before answering", "", true },
+        .{ .tool_call, 7, "{\"path\":\"b\"}", "read_file", false },
+        .{ .tool_result, 7, "ok", "", false },
+        .{ .assistant_msg, 7, "all good", "", false },
+        .{ .steer, 7, "also check the docs", "", false },
+        .{ .compaction, 7, "", "", false },
+        .{ .system_note, 7, "context compacted automatically", "", false },
+        .{ .user_msg, 8, "next round", "", false },
+        .{ .assistant_msg, 8, "done", "", false },
+    };
+    for (entries, 0..) |entry, i| try app.blocks.append(gpa, .{
+        .kind = entry[0],
+        .seq = i + 1,
+        .turn_id = entry[1],
+        .text = try gpa.dupe(u8, entry[2]),
+        .label = try gpa.dupe(u8, entry[3]),
+        .commentary = entry[4],
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_]bool{ false, true }) |show_transcript| {
+        app.show_tool_transcript = show_transcript;
+        app.layout_epoch +%= 1;
+        const lines = try layoutLines(arena, &app, 100);
+        try std.testing.expect(lines.items.len > 0);
+
+        var saw_dense_flush = false;
+        for (lines.items, 0..) |line, i| {
+            const plain_blank = line.text.len == 0 and line.text2.len == 0 and
+                line.text3.len == 0 and line.fill_style == null;
+            const prev: ?Line = if (i > 0) lines.items[i - 1] else null;
+            const prev_plain_blank = if (prev) |p|
+                p.text.len == 0 and p.text2.len == 0 and p.text3.len == 0 and p.fill_style == null
+            else
+                false;
+
+            // 1. Never two plain blanks in a row; never a leading blank.
+            if (plain_blank) try std.testing.expect(i > 0 and !prev_plain_blank);
+
+            // 2. Content never sits flush under a card: a filled padding row
+            //    is only ever followed by more card rows or a plain blank.
+            if (prev != null and prev.?.fill_style != null and line.fill_style == null) {
+                try std.testing.expect(plain_blank);
+            }
+
+            // 3. Section markers always breathe: one blank (or a card row,
+            //    for labels attached to cards) directly above.
+            const is_marker = std.mem.startsWith(u8, line.text, "  • ") or
+                std.mem.startsWith(u8, line.text, "  · ") or
+                std.mem.startsWith(u8, line.text, "  ↪ ") or
+                std.mem.startsWith(u8, line.text, "  ≋ ");
+            if (is_marker) {
+                try std.testing.expect(i > 0);
+                try std.testing.expect(prev_plain_blank or prev.?.fill_style != null);
+            }
+
+            // Dense grouping must survive: in the full transcript view a
+            // result row sits flush under its call row.
+            if (show_transcript and i > 0) {
+                const text = try lineText(arena, line);
+                const prev_text = try lineText(arena, prev.?);
+                if (std.mem.indexOf(u8, prev_text, "⚙") != null and !plain_blank and
+                    std.mem.indexOf(u8, text, "⚙") == null and text.len > 0)
+                {
+                    saw_dense_flush = true;
+                }
+            }
+        }
+        // 4. Nothing trails.
+        const last = lines.items[lines.items.len - 1];
+        try std.testing.expect(last.text.len > 0 or last.text2.len > 0 or
+            last.text3.len > 0 or last.fill_style != null);
+        if (show_transcript) try std.testing.expect(saw_dense_flush);
+    }
 }
