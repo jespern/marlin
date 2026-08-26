@@ -59,15 +59,15 @@ pub const Palette = struct {
     pub const md_rule: vaxis.Style = .{ .fg = .{ .index = 8 }, .dim = true };
     pub const md_callout_bg: vaxis.Color = .{ .rgb = .{ 0x28, 0x2c, 0x32 } };
     pub const md_callout: vaxis.Style = .{ .bg = md_callout_bg };
-    pub const reasoning_bg: vaxis.Color = .{ .rgb = .{ 0x30, 0x33, 0x39 } };
-    pub const reasoning_panel: vaxis.Style = .{ .bg = reasoning_bg };
     /// Reasoning commentary is secondary narration and sits one step BELOW
-    /// the assistant's final prose, matching the dimmed web UI treatment.
-    /// Index 7 is also what the live ticker streams in (collapse_hint), so a
-    /// card no longer jumps to bold white when the round completes — the
-    /// text keeps the brightness it streamed in at.
-    pub const reasoning: vaxis.Style = .{ .fg = .{ .index = 7 }, .bg = reasoning_bg };
-    pub const reasoning_mark: vaxis.Style = .{ .fg = .{ .index = 6 }, .bg = reasoning_bg, .bold = true };
+    /// the assistant's final prose: flat dim text with a small mark, no
+    /// background panel (a filled card drew the eye to the least important
+    /// content and its padding could never sit symmetric against reused
+    /// separator rows). Index 7 is also what the live ticker streams in
+    /// (collapse_hint), so a card no longer jumps brightness when the round
+    /// completes — the text keeps the brightness it streamed in at.
+    pub const reasoning: vaxis.Style = .{ .fg = .{ .index = 7 } };
+    pub const reasoning_mark: vaxis.Style = .{ .fg = .{ .index = 6 }, .bold = true };
     /// Tool machinery (the ⚙ glyph, arg previews, result bodies): dimmed
     /// gray so it reads as background activity, never as user input or as
     /// assistant prose meant for the human.

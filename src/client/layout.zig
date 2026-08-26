@@ -406,7 +406,7 @@ pub fn wrapReasoningCard(
         break :blk previous.text.len == 0 and previous.text2.len == 0 and previous.text3.len == 0;
     } else false;
     if (!has_separator)
-        try lines.append(arena, .{ .text = "", .style = Palette.reasoning_panel, .fill_style = Palette.reasoning_panel });
+        try lines.append(arena, .{ .text = "", .style = .{} });
 
     // Commentary arrives with inline markdown (**bold**, `code`, links);
     // render it instead of showing the markers verbatim. Newlines flatten
@@ -430,7 +430,6 @@ pub fn wrapReasoningCard(
             .style = if (first) Palette.reasoning_mark else Palette.reasoning,
             .text2 = im.text[start..end],
             .style2 = Palette.reasoning,
-            .fill_style = Palette.reasoning_panel,
             .syntax = styles.items,
             .links = links.items,
             .links_resolved = true,
@@ -440,7 +439,7 @@ pub fn wrapReasoningCard(
         while (start < im.text.len and im.text[start] == ' ') start += 1;
         if (start >= im.text.len) break;
     }
-    try lines.append(arena, .{ .text = "", .style = Palette.reasoning_panel, .fill_style = Palette.reasoning_panel });
+    try lines.append(arena, .{ .text = "", .style = .{} });
 }
 
 pub const CollapsedToolRun = struct {

@@ -5427,8 +5427,10 @@ test "reasoning cards are muted, padded, and inset" {
     try std.testing.expect(!lines.items[1].style2.bold);
     try std.testing.expect(vaxis.Color.eql(lines.items[1].style2.fg, Palette.reasoning.fg));
     for (lines.items) |line| {
-        try std.testing.expect(line.fill_style != null);
-        try std.testing.expect(vaxis.Color.eql(line.fill_style.?.bg, Palette.reasoning_bg));
+        // Flat CC-style narration: no background panel, ever — a filled
+        // card highlighted the least important content and its padding
+        // could not sit symmetric against reused separator rows.
+        try std.testing.expect(line.fill_style == null);
         try std.testing.expect(displayWidth(try lineText(arena, line)) <= 36);
     }
 }
