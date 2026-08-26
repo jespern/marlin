@@ -176,9 +176,13 @@ marlin --remote work run "task"
 marlin --remote work web         # browser UI served locally, remote daemon
 ```
 
-Transport is `ssh <host> marlin _pipe`: an internal stdio↔daemon.sock
-bridge on the remote (readiness-probed, with daemon autostart), spawned
-per connection as a child of the local client. Dispatch puts the host in
+Transport is `ssh <host> sh -lc 'exec marlin _pipe'`: an internal
+stdio↔daemon.sock bridge on the remote (readiness-probed, with daemon
+autostart), spawned per connection as a child of the local client. The
+login shell is deliberate — non-interactive ssh shells miss ~/.local/bin
+and homebrew on most setups — and ssh's stderr is inherited, so
+first-connect host-key prompts, passphrase prompts, and 'command not
+found' reach the terminal instead of dying invisibly into a timeout. Dispatch puts the host in
 MARLIN_REMOTE, which `attach.connect` reads — so the TUI, its reconnects,
 headless commands, and the web bridge all inherit remote support from the
 one connect path. Marlin keeps NO host registry: `<host>` goes to ssh
@@ -186,9 +190,12 @@ verbatim, and ssh config owns naming, keys, agent, and jump hosts. A shell
 alias covers the daily case (`alias mw='marlin --remote work'`). mosh
 remains a Mode A transport only — it carries terminal frames, not stdio.
 
-Known gaps: `marlin` must be on the remote's non-login-shell PATH (the
-connect error says so), and `/reboot --build` under a remote rebuilds the
-LOCAL binary; refreshing the remote daemon still means a shell there.
+Known gaps: `marlin` must be installed on the remote and findable by a
+login shell (the connect error says how to test), and `/reboot --build`
+under a remote rebuilds the LOCAL binary; refreshing the remote daemon
+still means a shell there. A remote client needs no local provider key —
+providers live with the daemon — so first-run onboarding is skipped when
+MARLIN_REMOTE is set.
 
 Why primary: from_seq replay resynchronizes STATE, not a screen — a
 dropped connection reconnects with zero lost blocks (better than mosh for

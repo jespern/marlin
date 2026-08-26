@@ -5154,7 +5154,13 @@ pub fn run(
     reboot_out: ?*RebootPlan,
 ) !u8 {
     // -- first-run bootstrap: no provider key → prompt before the TUI --
-    if (environ.get("OPENROUTER_API_KEY") == null and environ.get("MARLIN_LOCAL_BASE_URL") == null) {
+    // Not for remote attach: provider keys live with the DAEMON, and a
+    // remote client never talks to a provider itself. Demanding a local key
+    // before dialing another machine was pure friction.
+    if (environ.get(attach.remote_env) == null and
+        environ.get("OPENROUTER_API_KEY") == null and
+        environ.get("MARLIN_LOCAL_BASE_URL") == null)
+    {
         if (!try bootstrapKey(gpa, io, environ)) return 1;
     }
 

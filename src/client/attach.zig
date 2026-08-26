@@ -179,7 +179,10 @@ const handshake_timeout_ms: u32 = 2_000;
 /// Remote handshakes cover ssh session setup, remote daemon autostart, and
 /// possibly an interactive ssh auth prompt on /dev/tty; a local-socket
 /// deadline would kill every one of them.
-const remote_handshake_timeout_ms: u32 = 30_000;
+// Generous on purpose: the deadline spans the whole ssh session setup,
+// including a human answering a first-connect host-key prompt or typing a
+// key passphrase on /dev/tty.
+const remote_handshake_timeout_ms: u32 = 120_000;
 
 pub const ConnectCancel = struct {
     requested: std.atomic.Value(bool) = .init(false),
@@ -332,7 +335,12 @@ pub fn connectCancelable(
 /// agent, and jump hosts; marlin keeps no host registry. No BatchMode: ssh
 /// auth prompts use /dev/tty, so key-less setups still work at first
 /// connect; the remote handshake deadline is the hang backstop.
-fn connectRemote(gpa: std.mem.Allocator, io: Io, host: []const u8, cancel: ?*const ConnectCancel) !*Conn {
+fn connectRemote(
+    gpa: std.mem.Allocator,
+    io: Io,
+    host: []const u8,
+    cancel: ?*const ConnectCancel,
+) !*Conn {
     // One transient retry, not the local loop's hundred: each attempt pays
     // full ssh session setup, and the case worth absorbing is a remote
     // daemon dying/rebooting mid-hello, not a slow start (the remote _pipe
@@ -340,7 +348,11 @@ fn connectRemote(gpa: std.mem.Allocator, io: Io, host: []const u8, cancel: ?*con
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         if (connectCancelled(cancel)) return error.ConnectCanceled;
-        const conn = try spawnChildConn(gpa, io, &.{ "ssh", host, "marlin", "_pipe" });
+        // A login shell (`sh -lc`) so the remote profile sets PATH: plain
+        // `ssh host marlin _pipe` runs a non-interactive shell whose PATH
+        // usually misses ~/.local/bin and homebrew. ssh config owns naming,
+        // keys, agent, and jump hosts; marlin keeps no host registry.
+        const conn = try spawnChildConn(gpa, io, &.{ "ssh", host, "sh -lc 'exec marlin _pipe'" });
         handshake(conn, remote_handshake_timeout_ms, cancel) catch |err| {
             conn.deinit();
             if (err == error.ConnectCanceled) return err;
@@ -349,8 +361,12 @@ fn connectRemote(gpa: std.mem.Allocator, io: Io, host: []const u8, cancel: ?*con
                 continue;
             }
             std.log.err(
-                "could not reach `ssh {s} marlin _pipe`: {t} (is marlin on {s}'s PATH for non-login shells?)",
-                .{ host, err, host },
+                "could not reach `ssh {s} sh -lc 'exec marlin _pipe'`: {t}\n" ++
+                    "  ssh's own messages (host-key prompts, auth errors, 'command\n" ++
+                    "  not found') appear above this line. Most common cause: marlin\n" ++
+                    "  is not installed on {s}, or not on the login-shell PATH.\n" ++
+                    "  Test by hand:  ssh {s} \"sh -lc 'marlin version'\"",
+                .{ host, err, host, host },
             );
             return err;
         };
@@ -363,7 +379,14 @@ fn spawnChildConn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) !*Co
         .argv = argv,
         .stdin = .pipe,
         .stdout = .pipe,
-        .stderr = .ignore,
+        // Inherited on purpose: ssh's interactive prompts (first-connect
+        // host key confirmation, key passphrases) and its failure text all
+        // arrive on stderr. Swallowing them turned "unknown host key" into
+        // a silent 30s hang — the prompt was waiting on /dev/tty while its
+        // question went nowhere. During a mid-TUI reconnect this may
+        // scribble on the alternate screen; the next frame repaints, and a
+        // visible scribble beats an invisible prompt.
+        .stderr = .inherit,
         .pgid = 0,
     });
     errdefer child.kill(io);
