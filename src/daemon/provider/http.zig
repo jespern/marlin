@@ -63,6 +63,20 @@ fn mapConnect(err: anyerror) Error {
     return error.ConnectFailed;
 }
 
+/// A failed write makes the HTTP framing state unknowable. Never return that
+/// socket to the free pool: a later request would otherwise inherit the same
+/// broken connection and fail in a loop.
+fn mapRequestConnect(request: *std.http.Client.Request, err: anyerror) Error {
+    var cause = err;
+    if (request.connection) |connection| {
+        connection.closing = true;
+        if (err == error.WriteFailed) {
+            if (connection.stream_writer.err) |underlying| cause = underlying;
+        }
+    }
+    return mapConnect(cause);
+}
+
 /// std.http.Client loads its CA bundle and certificate clock (`client.now`)
 /// lazily inside request(). The DNS-preflight path dials TLS connections
 /// directly via connectTcpOptions, which skips that init — and
@@ -379,7 +393,10 @@ fn streamPostRun(
             .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = header_storage,
-    }) catch |err| return mapConnect(err);
+    }) catch |err| {
+        if (pooled_connection) |connection| connection.closing = true;
+        return mapConnect(err);
+    };
     owns_pooled_connection = false;
     defer request.deinit();
     progress.registerConnection(client.io, request.connection.?);
@@ -387,10 +404,10 @@ fn streamPostRun(
     if (progress.aborted.load(.acquire)) return error.Cancelled;
 
     request.transfer_encoding = .{ .content_length = stream_req.body_json.len };
-    var body_writer = request.sendBodyUnflushed(&.{}) catch |err| return mapConnect(err);
-    body_writer.writer.writeAll(stream_req.body_json) catch return error.ConnectFailed;
-    body_writer.end() catch return error.ConnectFailed;
-    request.connection.?.flush() catch return error.ConnectFailed;
+    var body_writer = request.sendBodyUnflushed(&.{}) catch |err| return mapRequestConnect(&request, err);
+    body_writer.writer.writeAll(stream_req.body_json) catch |err| return mapRequestConnect(&request, err);
+    body_writer.end() catch |err| return mapRequestConnect(&request, err);
+    request.connection.?.flush() catch |err| return mapRequestConnect(&request, err);
 
     var response = request.receiveHead(&.{}) catch |err| return mapConnect(err);
     progress.response_started.store(true, .release);
@@ -548,13 +565,16 @@ fn getRun(
         .connection = pooled_connection,
         .redirect_behavior = redirect_behavior,
         .headers = .{ .user_agent = .{ .override = "marlin/0.0" } },
-    }) catch |err| return mapConnect(err);
+    }) catch |err| {
+        if (pooled_connection) |connection| connection.closing = true;
+        return mapConnect(err);
+    };
     owns_pooled_connection = false;
     defer request.deinit();
     progress.registerConnection(client.io, request.connection.?);
     defer progress.clearConnection(client.io);
     if (progress.aborted.load(.acquire)) return error.Cancelled;
-    request.sendBodiless() catch return error.ConnectFailed;
+    request.sendBodiless() catch |err| return mapRequestConnect(&request, err);
 
     var redirect_buffer: [8192]u8 = undefined;
     var response = request.receiveHead(if (redirect_behavior == .unhandled) &.{} else &redirect_buffer) catch |err| return mapConnect(err);
@@ -610,6 +630,34 @@ fn isCancelled(cancel: ?*std.atomic.Value(bool)) bool {
     return if (cancel) |flag| flag.load(.acquire) else false;
 }
 
+/// A keep-alive entry can be closed by the peer while it sits idle in the
+/// pool. A non-blocking peek distinguishes that FIN/reset (or unexpected
+/// pending protocol bytes) from a healthy, quiet socket before a new request
+/// is written. This is intentionally only a pre-send check: retrying a POST
+/// after bytes leave Marlin could duplicate a paid generation.
+fn pooledConnectionIsReusable(io: Io, connection: *std.http.Client.Connection) bool {
+    // TLS and HTTP readers may already have read past the response boundary
+    // into an orderly shutdown record. Consult both before touching the raw
+    // socket so that buffered closure cannot masquerade as an idle peer.
+    if (connection.reader().bufferedLen() != 0 or
+        connection.stream_reader.interface.bufferedLen() != 0) return false;
+    var messages: [1]Io.net.IncomingMessage = @splat(.init);
+    var data: [1]u8 = undefined;
+    const maybe_err, const count = connection.stream_reader.stream.socket.receiveManyTimeout(
+        io,
+        &messages,
+        &data,
+        .{ .peek = true },
+        .{ .duration = .{ .raw = .zero, .clock = .awake } },
+    );
+    if (maybe_err) |err| return err == error.Timeout;
+    // count == 1 with an empty message is EOF; actual pending bytes are also
+    // unsafe between complete HTTP responses. Both cases require a fresh
+    // connection. Some Io backends may report EOF as zero messages.
+    _ = count;
+    return false;
+}
+
 /// Darwin's threaded Io backend ultimately calls synchronous getaddrinfo,
 /// which cannot be cancelled. Resolve uncached hostnames in a killable helper
 /// process, then connect std.http using that numeric address while retaining
@@ -636,11 +684,16 @@ fn acquirePooledOrPreflightDns(
     };
 
     if (proxy == null) {
-        if (client.connection_pool.findConnection(client.io, .{
+        while (client.connection_pool.findConnection(client.io, .{
             .host = destination,
             .port = port,
             .protocol = protocol,
-        })) |connection| return connection;
+        })) |connection| {
+            if (pooledConnectionIsReusable(client.io, connection)) return connection;
+            std.log.debug("discarding stale pooled HTTP connection to {s}:{d}", .{ destination.bytes, port });
+            connection.closing = true;
+            client.connection_pool.release(connection, client.io);
+        }
     }
 
     const host = if (proxy) |configured| configured.host else destination;
@@ -899,6 +952,136 @@ test "std HTTP pool returns clients sharing one connection pool" {
     var second = try pool.acquire();
     defer second.deinit();
     try std.testing.expectEqual(first.client, second.client);
+}
+
+fn readTestRequest(io: Io, stream: Io.net.Stream) !void {
+    var read_buffer: [8192]u8 = undefined;
+    var reader = Io.net.Stream.Reader.init(stream, io, &read_buffer);
+    var content_length: usize = 0;
+    while (true) {
+        const line = try reader.interface.takeDelimiterInclusive('\n');
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:")) {
+            const value = std.mem.trim(u8, trimmed["content-length:".len..], " \t");
+            content_length = try std.fmt.parseInt(usize, value, 10);
+        }
+    }
+    try reader.interface.discardAll(content_length);
+}
+
+fn writeTestResponse(io: Io, stream: Io.net.Stream, keep_alive: bool) !void {
+    var write_buffer: [1024]u8 = undefined;
+    var writer = Io.net.Stream.Writer.init(stream, io, &write_buffer);
+    try writer.interface.print(
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: {s}\r\n\r\nok",
+        .{if (keep_alive) "keep-alive" else "close"},
+    );
+    try writer.interface.flush();
+}
+
+fn serveClosedKeepAliveThenFresh(
+    io: Io,
+    server: *Io.net.Server,
+    first_closed: *std.atomic.Value(bool),
+    accepted: *std.atomic.Value(u32),
+) void {
+    var first = server.accept(io) catch return;
+    _ = accepted.fetchAdd(1, .release);
+    readTestRequest(io, first) catch {
+        first.close(io);
+        return;
+    };
+    writeTestResponse(io, first, true) catch {
+        first.close(io);
+        return;
+    };
+    // Deliberately violate the advertised keep-alive after completing the
+    // response, exactly like a CDN idle timeout does between turns.
+    first.close(io);
+    first_closed.store(true, .release);
+
+    var second = server.accept(io) catch return;
+    defer second.close(io);
+    _ = accepted.fetchAdd(1, .release);
+    readTestRequest(io, second) catch return;
+    writeTestResponse(io, second, false) catch return;
+}
+
+fn serveTwoRequestsOnOneConnection(
+    io: Io,
+    server: *Io.net.Server,
+    accepted: *std.atomic.Value(u32),
+) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    _ = accepted.fetchAdd(1, .release);
+    readTestRequest(io, stream) catch return;
+    writeTestResponse(io, stream, true) catch return;
+    readTestRequest(io, stream) catch return;
+    writeTestResponse(io, stream, false) catch return;
+}
+
+fn expectPostOk(client: *Client, gpa: std.mem.Allocator, url: [:0]const u8) !void {
+    const response = try client.streamPost(gpa, .{
+        .url = url,
+        .bearer = null,
+        .body_json = "{}",
+        .connect_timeout_ms = 2_000,
+        .idle_timeout_ms = 2_000,
+    }, {}, discardChunk);
+    defer if (response.error_body) |body| gpa.free(body);
+    try std.testing.expectEqual(@as(i64, 200), response.status);
+}
+
+test "stale keep-alive connection is evicted before the next POST" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testServer(io);
+    const url = try testUrl(gpa, &server);
+    defer gpa.free(url);
+    var first_closed: std.atomic.Value(bool) = .init(false);
+    var accepted: std.atomic.Value(u32) = .init(0);
+    const thread = try std.Thread.spawn(.{}, serveClosedKeepAliveThenFresh, .{ io, &server, &first_closed, &accepted });
+    defer thread.join();
+    defer server.deinit(io);
+
+    var pool = try Pool.init(gpa, io, null);
+    defer pool.deinit();
+    var client = try pool.acquire();
+    defer client.deinit();
+    try expectPostOk(&client, gpa, url);
+    for (0..200) |_| {
+        if (first_closed.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try std.testing.expect(first_closed.load(.acquire));
+    try expectPostOk(&client, gpa, url);
+    try std.testing.expectEqual(@as(u32, 2), accepted.load(.acquire));
+}
+
+test "healthy keep-alive connection is reused for the next POST" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testServer(io);
+    const url = try testUrl(gpa, &server);
+    defer gpa.free(url);
+    var accepted: std.atomic.Value(u32) = .init(0);
+    const thread = try std.Thread.spawn(.{}, serveTwoRequestsOnOneConnection, .{ io, &server, &accepted });
+    defer thread.join();
+    defer server.deinit(io);
+
+    var pool = try Pool.init(gpa, io, null);
+    defer pool.deinit();
+    var client = try pool.acquire();
+    defer client.deinit();
+    try expectPostOk(&client, gpa, url);
+    try expectPostOk(&client, gpa, url);
+    try std.testing.expectEqual(@as(u32, 1), accepted.load(.acquire));
 }
 
 fn serveSseInBursts(io: Io, server: *Io.net.Server) void {
