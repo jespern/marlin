@@ -177,6 +177,10 @@ const TaskFuture = struct {
 /// same approval_id namespace the native gate uses so `approve` answers both.
 const CcPending = struct { approval_id: u64, client_id: u64 };
 
+fn shouldAutoArchiveChild(kind: proto.SessionKind, interrupted: bool, err_text: ?[]const u8) bool {
+    return kind != .root and !interrupted and err_text == null;
+}
+
 const Session = struct {
     id: u64,
     parent_sid: ?u64 = null,
@@ -877,7 +881,16 @@ pub const Daemon = struct {
                         .final_text = td.final_text orelse "",
                         .error_message = td.err_text,
                     }, .{}) catch self.gpa.dupe(u8, "error: could not encode child result") catch @panic("oom");
-                    if (!future.resolve(self.io, result_json, outcome_status)) self.gpa.free(result_json);
+                    const result_delivered = future.resolve(self.io, result_json, outcome_status);
+                    if (!result_delivered) self.gpa.free(result_json);
+                    if (result_delivered and shouldAutoArchiveChild(session.kind, td.interrupted, td.err_text)) {
+                        if (self.store.setSessionTreeArchived(td.sid, nowMs(self.io))) |_| {
+                            session.archived = true;
+                            self.broadcastSessionTree(td.sid, true);
+                        } else |err| {
+                            std.log.warn("could not auto-archive completed child {d}: {t}", .{ td.sid, err });
+                        }
+                    }
                 }
                 // A pending /reboot proceeds once the last turn drains.
                 self.maybeFinishReboot();
@@ -3476,6 +3489,14 @@ fn taskTitle(prompt: []const u8) []const u8 {
     // Avoid cutting a valid UTF-8 title in the middle of a continuation run.
     while (end > 0 and end < trimmed.len and (trimmed[end] & 0xc0) == 0x80) end -= 1;
     return trimmed[0..end];
+}
+
+test "only successful child turns auto-archive" {
+    try std.testing.expect(shouldAutoArchiveChild(.task_child, false, null));
+    try std.testing.expect(shouldAutoArchiveChild(.review_child, false, null));
+    try std.testing.expect(!shouldAutoArchiveChild(.root, false, null));
+    try std.testing.expect(!shouldAutoArchiveChild(.task_child, true, null));
+    try std.testing.expect(!shouldAutoArchiveChild(.task_child, false, "provider failed"));
 }
 
 fn nowMs(io: Io) i64 {

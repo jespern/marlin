@@ -937,6 +937,11 @@ fn appendArchivedPlanTable(
 
 pub const max_layout_lines: usize = 50_000;
 
+pub const LineRange = struct {
+    start: usize,
+    len: usize,
+};
+
 pub const ApprovalView = struct {
     tool: []const u8,
     args: []const u8,
@@ -1294,6 +1299,36 @@ pub fn stableBlockCount(transcript: *const Transcript) usize {
     return i;
 }
 
+fn rangeSeamNeedsBlank(stable_lines: []const Line, tail_lines: []const Line) bool {
+    if (stable_lines.len == 0 or tail_lines.len == 0) return false;
+    const last = stable_lines[stable_lines.len - 1];
+    const first = tail_lines[0];
+    const last_blank = last.text.len == 0 and last.text2.len == 0 and
+        last.text3.len == 0 and last.fill_style == null;
+    const first_blank = first.text.len == 0 and first.text2.len == 0 and
+        first.text3.len == 0 and first.fill_style == null;
+    return !last_blank and !first_blank;
+}
+
+/// Range occupied by the active turn's prompt card in the most recent
+/// layoutLines result. The active turn starts with its user_msg; prompt-card
+/// rows are the contiguous filled rows at the head of the mutable tail.
+pub fn activePromptLineRange(transcript: *const Transcript) ?LineRange {
+    if (transcript.state != .running and transcript.state != .awaiting_approval) return null;
+    const stable = stableBlockCount(transcript);
+    if (stable >= transcript.blocks.len or transcript.blocks[stable].kind != .user_msg) return null;
+
+    const tail_lines = transcript.tail_layout_cache.lines.items;
+    var len: usize = 0;
+    while (len < tail_lines.len and tail_lines[len].fill_style != null) : (len += 1) {}
+    if (len == 0) return null;
+    return .{
+        .start = transcript.layout_cache.lines.items.len +
+            @intFromBool(rangeSeamNeedsBlank(transcript.layout_cache.lines.items, tail_lines)),
+        .len = len,
+    };
+}
+
 pub fn layoutLines(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -1350,16 +1385,8 @@ pub fn layoutLines(
     // own empty list, so its first section's leading blank (a no-op at the
     // top of any range) must be restored here. Ranges split at turn
     // boundaries, so the seam is always a section start, never mid-group.
-    if (lines.items.len > 0 and tail_cache.lines.items.len > 0) {
-        const last = lines.items[lines.items.len - 1];
-        const first = tail_cache.lines.items[0];
-        const last_blank = last.text.len == 0 and last.text2.len == 0 and
-            last.text3.len == 0 and last.fill_style == null;
-        const first_blank = first.text.len == 0 and first.text2.len == 0 and
-            first.text3.len == 0 and first.fill_style == null;
-        if (!last_blank and !first_blank)
-            try lines.append(arena, .{ .text = "", .style = .{} });
-    }
+    if (rangeSeamNeedsBlank(lines.items, tail_cache.lines.items))
+        try lines.append(arena, .{ .text = "", .style = .{} });
     try lines.appendSlice(arena, tail_cache.lines.items);
 
     // Streaming region: provider reasoning summaries are verbose by nature
@@ -1925,6 +1952,56 @@ test "layout line safety limit produces a visible truncation" {
         "  [transcript rendering truncated at safety limit]",
         lines.items[lines.items.len - 1].text,
     );
+}
+
+test "active prompt range identifies the running turn card" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("old prompt"), .label = @constCast("") },
+        .{ .kind = .assistant_msg, .turn_id = 1, .text = @constCast("old answer"), .label = @constCast("") },
+        .{ .kind = .user_msg, .turn_id = 2, .text = @constCast("keep this visible"), .label = @constCast("") },
+        .{ .kind = .reasoning, .turn_id = 2, .text = @constCast("working below it"), .label = @constCast(""), .commentary = true },
+    };
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = try layoutLines(arena_state.allocator(), gpa, &transcript, 80);
+    const prompt = activePromptLineRange(&transcript).?;
+    try std.testing.expect(prompt.start > 0);
+    try std.testing.expectEqual(@as(usize, 3), prompt.len);
+    try std.testing.expect(lines.items[prompt.start].fill_style != null);
+    try std.testing.expectEqualStrings("keep this visible", lines.items[prompt.start + 1].text2);
+    try std.testing.expect(lines.items[prompt.start + prompt.len].fill_style == null);
+
+    transcript.state = .idle;
+    try std.testing.expect(activePromptLineRange(&transcript) == null);
 }
 
 test "completed plan unpins into one closed transcript table after the next prompt" {

@@ -128,7 +128,7 @@ const Check = struct {
     stderr_equals: ?[]const u8 = null,
     db_kinds: []const []const u8 = &.{},
     /// Expected durable session hierarchy rows:
-    /// kind|has_parent|has_parent_block|max_rounds.
+    /// kind|has_parent|has_parent_block|max_rounds|archived.
     db_session_meta: []const []const u8 = &.{},
     db_media_refs: u32 = 0,
     db_tool_media_refs: u32 = 0,
@@ -504,8 +504,9 @@ fn runScenario(
         const db_path = try std.fmt.allocPrint(arena, "{s}/marlin/marlin.db", .{state_dir});
         const query =
             "SELECT kind || '|' || (parent_sid IS NOT NULL) || '|' || " ++
-            "(parent_block_id IS NOT NULL) || '|' || COALESCE(max_rounds,0) " ++
-            "FROM sessions ORDER BY CASE WHEN parent_sid IS NULL THEN 0 ELSE 1 END, created_at;";
+            "(parent_block_id IS NOT NULL) || '|' || COALESCE(max_rounds,0) || '|' || " ++
+            "(archived_at IS NOT NULL) FROM sessions " ++
+            "ORDER BY CASE WHEN parent_sid IS NULL THEN 0 ELSE 1 END, created_at;";
         const res = try process_io.run(gpa, io, .{
             .argv = &.{ "sqlite3", db_path, query },
             .stdout_limit = 1024 * 1024,

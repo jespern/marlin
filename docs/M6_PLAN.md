@@ -78,13 +78,15 @@ The smallest general primitive councils can reuse now exists:
   turn threads never create session/store hierarchy state directly. `task`
   waits on one child; `task_batch` manages a bounded group of two to eight.
 - Lifecycle: parent interrupt cancels children it is awaiting; daemon restart
-  reconstructs hierarchy and marks genuinely orphaned work honestly. Child
-  failures are result data and do not crash the parent turn.
+  reconstructs hierarchy and marks genuinely orphaned work honestly. Successful
+  children auto-archive after returning their result; failed or interrupted
+  children remain visible. Child failures are result data and do not crash the
+  parent turn.
 - UX: picker, short stable session handles, and `marlin ls` indentation are
-  implemented. The status bar shows
-  a parent's child count and actionable child activity, or the parent tag when
-  a child is focused. Children remain ordinary attachable sessions; no
-  permanent sidebar.
+  implemented. The status bar shows a parent's child count and actionable child
+  activity, or the parent tag when a child is focused. `/sessions` remains a
+  type-to-filter picker; Delete/Ctrl+D archives its selected row. Archived child
+  transcripts remain explicitly attachable and restorable; no permanent sidebar.
 
 Verified checkpoint: one parent completes both a single child and a three-child
 batch through the real daemon and fake provider. E2E asserts that delegation,

@@ -439,9 +439,14 @@ const App = struct {
     /// Line count of the last rendered frame; used to keep the view
     /// anchored (not sliding) when new lines arrive while scrolled up.
     last_total_lines: usize = 0,
-    /// View geometry of the last frame (for mouse row → line mapping).
+    /// View geometry of the last frame. A running turn may show a non-
+    /// contiguous viewport: its prompt card is pinned above the bottom tail.
     last_first_visible: usize = 0,
     last_view_h: usize = 0,
+    last_pinned_start: usize = 0,
+    last_pinned_rows: usize = 0,
+    last_body_first: usize = 0,
+    last_body_rows: usize = 0,
     pending: ?PendingApproval = null,
     /// Selector overlay: null = closed; value = highlighted index into the
     /// filtered model or effort list (see pickerItems).
@@ -855,6 +860,10 @@ const App = struct {
         self.last_total_lines = 0;
         self.last_first_visible = 0;
         self.last_view_h = 0;
+        self.last_pinned_start = 0;
+        self.last_pinned_rows = 0;
+        self.last_body_first = 0;
+        self.last_body_rows = 0;
         self.pending = null;
         self.sel_anchor = null;
         self.sel_head = .{ .line = 0, .col = 0 };
@@ -2359,19 +2368,49 @@ const App = struct {
         if (range) |r| self.applyOperator(op, r);
     }
 
+    /// Sticky prompt rows are decorative duplicates of durable transcript
+    /// lines. Mouse/copy coordinates map only the contiguous body below them;
+    /// the original prompt remains selectable through ordinary scrollback.
+    fn visibleLineAtRow(self: *const App, row: usize) ?usize {
+        if (row >= self.last_view_h) return null;
+        if (self.last_pinned_rows == 0 and self.last_body_rows == 0) {
+            const line = self.last_first_visible + row;
+            return if (line < self.last_total_lines) line else null;
+        }
+        if (row < self.last_pinned_rows) return null;
+        const body_row = row - self.last_pinned_rows;
+        if (body_row < self.last_body_rows)
+            return self.last_body_first + body_row;
+        return null;
+    }
+
+    fn lineVisible(self: *const App, line: usize) bool {
+        if (self.last_pinned_rows == 0 and self.last_body_rows == 0)
+            return line < self.last_total_lines and
+                line >= self.last_first_visible and line < self.last_first_visible + self.last_view_h;
+        return line >= self.last_body_first and line < self.last_body_first + self.last_body_rows;
+    }
+
     /// Enter transcript copy mode with the cursor on the bottom visible line.
     fn enterCopyMode(self: *App) void {
         if (self.last_total_lines == 0) return;
-        const line = self.last_first_visible + self.last_view_h -| 1;
-        self.copy_cursor = .{ .line = @min(line, self.last_total_lines - 1), .col = 0 };
-        self.copy_linewise = false;
-        self.setNotice("copy mode · hjkl move · v/V select · y yank · Esc exit", .{});
+        var row = self.last_view_h;
+        while (row > 0) {
+            row -= 1;
+            if (self.visibleLineAtRow(row)) |line| {
+                self.copy_cursor = .{ .line = line, .col = 0 };
+                self.copy_linewise = false;
+                self.setNotice("copy mode · hjkl move · v/V select · y yank · Esc exit", .{});
+                return;
+            }
+        }
     }
 
     /// Keep the copy cursor inside the visible window by adjusting scroll_up
     /// (geometry from the previous frame; draw clamps the rest).
     fn followCopyCursor(self: *App) void {
         const cursor = self.copy_cursor orelse return;
+        if (self.lineVisible(cursor.line)) return;
         const total = self.last_total_lines;
         const view = @max(self.last_view_h, 1);
         if (total <= view) {
@@ -2385,17 +2424,14 @@ const App = struct {
         self.scroll_up = max_scroll - @min(first, max_scroll);
     }
 
-    /// Clamp the cursor into the (possibly just scrolled) view.
+    /// Clamp the cursor into the (possibly non-contiguous) visible view.
     fn clampCopyCursorToView(self: *App) void {
         var cursor = self.copy_cursor orelse return;
-        const total = self.last_total_lines;
-        const view = @max(self.last_view_h, 1);
-        if (total == 0) return;
-        const max_scroll = total -| view;
-        const first = total -| view -| @min(self.scroll_up, max_scroll);
-        if (cursor.line < first) cursor.line = first;
-        if (cursor.line >= first + view) cursor.line = first + view - 1;
-        cursor.line = @min(cursor.line, total - 1);
+        if (self.lineVisible(cursor.line)) return;
+        if (self.last_view_h == 0) return;
+        const first = self.visibleLineAtRow(0) orelse return;
+        const last = self.visibleLineAtRow(self.last_view_h - 1) orelse first;
+        cursor.line = if (cursor.line < first) first else last;
         self.copy_cursor = cursor;
         if (self.sel_anchor != null) self.updateCopySelection(cursor);
     }
@@ -2692,6 +2728,29 @@ const App = struct {
             .session => self.switchSession(self.sessionIdForLabel(item) orelse return, true) catch
                 self.setNotice("could not switch session", .{}),
         }
+    }
+
+    fn archivePickerSession(self: *App, item: []const u8) void {
+        const sid = self.sessionIdForLabel(item) orelse return;
+        for (self.sessions.items) |session| {
+            if (!self.sessionBelongsToTree(session.sid, sid)) continue;
+            if (session.state == .running or session.state == .awaiting_approval) {
+                self.setNotice("cannot archive a running session tree", .{});
+                return;
+            }
+        }
+        if (sid == self.sid) {
+            self.picker = null;
+            self.picker_filter.clearRetainingCapacity();
+            self.archiveCurrentSession();
+            return;
+        }
+        self.conn.send(.{ .session_archive = .{ .sid = sid } }) catch {
+            self.setNotice("could not archive session", .{});
+            return;
+        };
+        var handle_buf: session_handle.Full = undefined;
+        self.setNotice("archiving session {s}", .{self.displaySessionHandle(&handle_buf, sid)});
     }
 
     fn pickerCurrent(self: *const App) []const u8 {
@@ -3659,13 +3718,52 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     app.last_total_lines = total;
     const max_scroll = total -| view_h;
     if (app.scroll_up > max_scroll) app.scroll_up = max_scroll;
-    const first_visible = (total -| view_h) -| app.scroll_up;
-    app.last_first_visible = first_visible;
-    app.last_view_h = view_h;
-    const visible = lines.items[first_visible..@min(first_visible + view_h, total)];
 
-    for (visible, 0..) |ln, row| {
-        const abs_line = first_visible + row;
+    const DisplayLine = struct {
+        line: Line,
+        abs_line: usize,
+        selectable: bool,
+    };
+    var visible: std.ArrayList(DisplayLine) = .empty;
+    const prompt_range = layout_mod.activePromptLineRange(&transcript);
+    const pin_prompt = app.scroll_up == 0 and prompt_range != null and
+        prompt_range.?.len + 2 <= view_h;
+    if (pin_prompt) {
+        const sticky_prompt = prompt_range.?;
+        for (lines.items[sticky_prompt.start..][0..sticky_prompt.len], sticky_prompt.start..) |ln, abs_line| {
+            try visible.append(arena, .{ .line = ln, .abs_line = abs_line, .selectable = false });
+        }
+        const body_capacity = view_h - sticky_prompt.len;
+        const body_floor = sticky_prompt.start + sticky_prompt.len;
+        const body_first = @max(body_floor, total -| body_capacity);
+        const body_end = @min(body_first + body_capacity, total);
+        for (lines.items[body_first..body_end], body_first..) |ln, abs_line| {
+            try visible.append(arena, .{ .line = ln, .abs_line = abs_line, .selectable = true });
+        }
+        app.last_pinned_start = sticky_prompt.start;
+        app.last_pinned_rows = sticky_prompt.len;
+        app.last_body_first = body_first;
+        app.last_body_rows = body_end - body_first;
+        app.last_first_visible = body_first;
+    } else {
+        const first_visible = (total -| view_h) -| app.scroll_up;
+        const end_visible = @min(first_visible + view_h, total);
+        for (lines.items[first_visible..end_visible], first_visible..) |ln, abs_line| {
+            try visible.append(arena, .{ .line = ln, .abs_line = abs_line, .selectable = true });
+        }
+        app.last_pinned_start = 0;
+        app.last_pinned_rows = 0;
+        app.last_body_first = first_visible;
+        app.last_body_rows = end_visible - first_visible;
+        app.last_first_visible = first_visible;
+    }
+    // Keep terminal viewport geometry even when the transcript has fewer
+    // rows; mouse/copy mapping separately rejects blank rows.
+    app.last_view_h = view_h;
+
+    for (visible.items, 0..) |display, row| {
+        const ln = display.line;
+        const abs_line = display.abs_line;
         if (ln.fill_style) |fill_style| {
             const fill_start = @min(ln.fill_start, w);
             const fill_width = @min(ln.fill_width orelse (w -| fill_start), w -| fill_start);
@@ -3697,33 +3795,37 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         applyLineLinks(win, @intCast(top_rows + row), ln);
         // Apply selection after printing so partial-cell highlighting keeps
         // each segment's original syntax color and other style attributes.
-        if (app.selection()) |sel| {
-            if (sel.columns(abs_line, lineWidth(win, ln))) |cols| {
-                var col = cols.start;
-                while (col < cols.end and col < @as(usize, w)) : (col += 1) {
-                    const cell = win.readCell(@intCast(col), @intCast(top_rows + row)) orelse continue;
-                    var selected_cell = cell;
-                    selected_cell.style.reverse = true;
-                    win.writeCell(@intCast(col), @intCast(top_rows + row), selected_cell);
+        if (display.selectable) {
+            if (app.selection()) |sel| {
+                if (sel.columns(abs_line, lineWidth(win, ln))) |cols| {
+                    var col = cols.start;
+                    while (col < cols.end and col < @as(usize, w)) : (col += 1) {
+                        const cell = win.readCell(@intCast(col), @intCast(top_rows + row)) orelse continue;
+                        var selected_cell = cell;
+                        selected_cell.style.reverse = true;
+                        win.writeCell(@intCast(col), @intCast(top_rows + row), selected_cell);
+                    }
                 }
             }
         }
-        if (app.copy_cursor) |cursor| {
-            if (cursor.line == abs_line) {
-                // Capture the cursor line's geometry for $/w/b, then draw a
-                // block cursor (reverse; inside a selection the un-reversed
-                // cell reads as the cursor, exactly like vim).
-                app.copy_cursor_line_width = lineWidth(win, ln);
-                app.copy_cursor_line_text.clearRetainingCapacity();
-                if (lineText(arena, ln)) |txt| {
-                    app.copy_cursor_line_text.appendSlice(app.gpa, txt) catch {};
-                } else |_| {}
-                const col = @min(cursor.col, @max(app.copy_cursor_line_width, 1) - 1);
-                if (col < @as(usize, w)) {
-                    if (win.readCell(@intCast(col), @intCast(top_rows + row))) |cell| {
-                        var cursor_cell = cell;
-                        cursor_cell.style.reverse = !cursor_cell.style.reverse;
-                        win.writeCell(@intCast(col), @intCast(top_rows + row), cursor_cell);
+        if (display.selectable) {
+            if (app.copy_cursor) |cursor| {
+                if (cursor.line == abs_line) {
+                    // Capture the cursor line's geometry for $/w/b, then draw a
+                    // block cursor (reverse; inside a selection the un-reversed
+                    // cell reads as the cursor, exactly like vim).
+                    app.copy_cursor_line_width = lineWidth(win, ln);
+                    app.copy_cursor_line_text.clearRetainingCapacity();
+                    if (lineText(arena, ln)) |txt| {
+                        app.copy_cursor_line_text.appendSlice(app.gpa, txt) catch {};
+                    } else |_| {}
+                    const col = @min(cursor.col, @max(app.copy_cursor_line_width, 1) - 1);
+                    if (col < @as(usize, w)) {
+                        if (win.readCell(@intCast(col), @intCast(top_rows + row))) |cell| {
+                            var cursor_cell = cell;
+                            cursor_cell.style.reverse = !cursor_cell.style.reverse;
+                            win.writeCell(@intCast(col), @intCast(top_rows + row), cursor_cell);
+                        }
                     }
                 }
             }
@@ -4065,7 +4167,10 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             _ = box.printSegment(.{ .text = line, .style = style }, .{ .row_offset = row, .wrap = .none });
             row += 1;
         }
-        const hint = try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Esc", .{ items.len, total_src });
+        const hint = if (app.picker_kind == .session)
+            try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Del/Ctrl+D archive · Esc", .{ items.len, total_src })
+        else
+            try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Esc", .{ items.len, total_src });
         _ = box.printSegment(.{ .text = hint, .style = Palette.tool_out }, .{ .row_offset = shown + 1, .wrap = .none });
     }
 
@@ -4653,7 +4758,8 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
             const raw_row = terminal_row -| app.tabBarRows();
             const row = @min(raw_row, app.last_view_h - 1);
             const col: usize = if (m.col < 0) 0 else @intCast(m.col);
-            app.sel_head = .{ .line = app.last_first_visible + row, .col = col };
+            if (app.visibleLineAtRow(row)) |line|
+                app.sel_head = .{ .line = line, .col = col };
         }
         app.sel_dragging = false;
         if (app.sel_anchor) |anchor| {
@@ -4695,13 +4801,14 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
         .wheel_down => app.scroll_up -|= 3,
         .left => {
             const row = terminal_row - app.tabBarRows();
-            // Only rows inside the session view participate.
-            if (row >= app.last_view_h) {
-                if (m.type == .press) app.sel_anchor = null; // click below view clears
+            // Only selectable body rows inside the session view participate;
+            // the sticky prompt is a duplicate of durable scrollback.
+            if (row >= app.last_view_h or app.visibleLineAtRow(row) == null) {
+                if (m.type == .press) app.sel_anchor = null;
                 return;
             }
             const point = SelectionPoint{
-                .line = app.last_first_visible + row,
+                .line = app.visibleLineAtRow(row).?,
                 .col = if (m.col < 0) 0 else @intCast(m.col),
             };
             switch (m.type) {
@@ -4797,6 +4904,11 @@ fn isNextInputRowKey(key: vaxis.Key) bool {
 
 fn isNewSessionKey(key: vaxis.Key) bool {
     return key.matches('n', .{ .ctrl = true });
+}
+
+fn isArchivePickerKey(kind: PickerKind, key: vaxis.Key) bool {
+    return kind == .session and
+        (key.matches(vaxis.Key.delete, .{}) or key.matches('d', .{ .ctrl = true }));
 }
 
 fn applyEditCommand(ed: *Editor, command: EditCommand) void {
@@ -4910,6 +5022,8 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.applyPickerItem(pick);
                 app.picker_filter.clearRetainingCapacity();
             }
+        } else if (isArchivePickerKey(app.picker_kind, key)) {
+            if (n > 0) app.archivePickerSession(items[@min(sel, n - 1)]);
         } else if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
             if (n > 0) app.picker = if (sel + 1 < n) sel + 1 else 0;
         } else if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
@@ -5584,6 +5698,14 @@ test "correlated session creation replies clear only the matching pending reques
     try std.testing.expect(!app.awaiting_new_session);
     try std.testing.expectEqual(@as(u64, 0), app.pending_new_session_request_id);
     try std.testing.expectEqual(@as(usize, 0), app.pending_new_cwd.items.len);
+}
+
+test "session picker reserves archive chords without stealing filter text" {
+    try std.testing.expect(isArchivePickerKey(.session, .{ .codepoint = vaxis.Key.delete }));
+    try std.testing.expect(isArchivePickerKey(.session, .{ .codepoint = 'd', .mods = .{ .ctrl = true } }));
+    try std.testing.expect(!isArchivePickerKey(.session, .{ .codepoint = 'a' }));
+    try std.testing.expect(!isArchivePickerKey(.session, .{ .codepoint = 'q' }));
+    try std.testing.expect(!isArchivePickerKey(.model, .{ .codepoint = vaxis.Key.delete }));
 }
 
 test "Ctrl+N aliases /new in either mode while pickers keep navigation" {
@@ -6755,10 +6877,60 @@ test "tab overflow retains the active tab and tab hit testing is button-extensib
     handleMouse(&app, .{ .row = 0, .col = 4, .button = .wheel_up, .mods = .{}, .type = .press });
     try std.testing.expectEqual(@as(usize, 3), app.scroll_up);
 
+    app.last_total_lines = 45;
     app.last_first_visible = 40;
     app.last_view_h = 5;
     handleMouse(&app, .{ .row = 1, .col = 7, .button = .left, .mods = .{}, .type = .press });
     try std.testing.expectEqual(@as(usize, 40), app.sel_anchor.?.line); // row 0 is the tab strip
+}
+
+test "sticky prompt stays above live tail until the user scrolls" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var vx = try vaxis.init(threaded.io(), gpa, &environ, .{});
+    defer vx.deinit(gpa, &output.writer);
+    try vx.resize(gpa, &output.writer, .{ .rows = 18, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+
+    var conn: attach.Conn = undefined;
+    conn.sandbox_available = false;
+    conn.network_filtering = false;
+    conn.network_configured = false;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.state = .running;
+    try app.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 1, .text = try gpa.dupe(u8, "old prompt"), .label = try gpa.dupe(u8, "") });
+    try app.blocks.append(gpa, .{ .kind = .assistant_msg, .turn_id = 1, .text = try gpa.dupe(u8, "old answer"), .label = try gpa.dupe(u8, "") });
+    try app.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 2, .text = try gpa.dupe(u8, "the active request"), .label = try gpa.dupe(u8, "") });
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        try app.blocks.append(gpa, .{
+            .kind = .reasoning,
+            .turn_id = 2,
+            .text = try std.fmt.allocPrint(gpa, "progress line {d}", .{i}),
+            .label = try gpa.dupe(u8, ""),
+            .commentary = true,
+        });
+    }
+
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expectEqual(@as(usize, 3), app.last_pinned_rows);
+    try std.testing.expect(app.last_body_first > app.last_pinned_start + app.last_pinned_rows);
+    try std.testing.expect(app.visibleLineAtRow(0) == null);
+    try std.testing.expectEqual(app.last_body_first, app.visibleLineAtRow(app.last_pinned_rows).?);
+
+    app.scroll_up = 1;
+    frame.deinit();
+    frame = std.heap.ArenaAllocator.init(gpa);
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expectEqual(@as(usize, 0), app.last_pinned_rows);
+    try std.testing.expectEqual(app.last_first_visible, app.visibleLineAtRow(0).?);
 }
 
 test "draw permanently reserves and paints the clickable tab row" {

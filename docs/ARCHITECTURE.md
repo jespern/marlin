@@ -293,8 +293,11 @@ header, which is where it must be kept current:
   queries.
 - **Loaded sessions are a working set.** SQLite owns the durable catalog. An
   idle session is unloaded after its last subscriber leaves; running sessions
-  unload after completion, and completed task children always unload. Opening
-  or continuing one rehydrates its small live state lazily.
+  unload after completion, and completed task children always unload. Successful
+  one-shot children are also archived after their result reaches the parent, so
+  they leave default navigation without losing their durable transcript. Failed
+  or interrupted children remain visible and actionable. Opening an archived
+  child explicitly rehydrates its small live state lazily.
 - **Catalog snapshots establish authority; mutations are incremental.** A
   session watcher receives one initial list. Current clients then consume
   `session_upsert`/`session_remove`, so create/archive/model/config changes do
@@ -420,10 +423,12 @@ regenerable/low-value with age; block structure is not.
 
 **Trimming implementation and remaining design:**
 
-- **Session lifecycle: archive → delete.** Archive is implemented: `/archive`
-  and `marlin archive <session>` hide a durable session hierarchy from default
-  navigation while retaining its complete log; `marlin ls --all` and
-  `marlin unarchive <session>` provide recovery. Permanent
+- **Session lifecycle: archive → delete.** Archive is implemented: `/archive`,
+  Delete/Ctrl+D on a `/sessions` row, and `marlin archive <session>` hide a
+  durable session hierarchy from default navigation while retaining its complete
+  log. Successful one-shot task children auto-archive; failures and interruptions
+  stay visible. `marlin ls --all` and `marlin unarchive <session>` provide
+  recovery. Permanent
   `marlin rm <session>` remains future work; it will delete blocks + decrement
   blob refs.
   Optional retention config (`delete_archived_after = "180d"`, off by default)
@@ -990,11 +995,15 @@ A split pane identifies its session with a compact pane label.
   y yank).
 - **Splits (not yet implemented)**: binary-tree layout, each pane = a
   session view (or the same session twice). No VTE anywhere.
-- **Scrollback**: virtual list over the block log. Selection is ours (mouse
-  mode on): drag selects logical text within/across blocks; double-click =
-  word, triple = block. Copy → OSC 52 (works through ssh/mosh); shift+drag
-  falls through to the terminal for native selection as escape hatch.
-  The active turn's durable layout is cached until blocks/state/width change,
+- **Scrollback**: virtual list over the block log. While following the bottom
+  of a running turn, the initiating user prompt stays pinned above the live
+  tail; scrolling up restores ordinary contiguous scrollback. The pinned card
+  is a display duplicate, so selection and copy continue to address the
+  durable transcript rows. Selection is ours (mouse mode on): drag selects
+  logical text within/across blocks; double-click = word, triple = block.
+  Copy → OSC 52 (works through ssh/mosh); shift+drag falls through to the
+  terminal for native selection as escape hatch. The active turn's durable
+  layout is cached until blocks/state/width change,
   while provisional assistant text wraps append-only and receives full
   Markdown treatment when its block finalizes. Spinner/token frames therefore
   do not re-layout the accumulated turn. Inactive full

@@ -84,10 +84,12 @@ feature and must be visible in the approved brief.
 
 ### 2.2 Fan-out
 
-One detached child session per council model. Ordinary sessions in the store
-(parent pointer set, grouped under the parent in `/sessions`, individually
-attachable/resumable — you can reopen grok's review afterwards and interrogate
-it: "walk me through the exploit"). Runs on the existing
+One detached child session per council model. Ordinary durable sessions in the
+store (parent pointer set, grouped under the parent while actionable, individually
+attachable/resumable). Successful reviewers auto-archive after returning their
+result; failed or interrupted reviewers stay in `/sessions`. You can restore a
+successful reviewer with `marlin ls --all` + `marlin unarchive` and interrogate
+it afterwards: "walk me through the exploit". Runs on the existing
 one-thread-per-turn model; status glyphs in the parent:
 `review #12: sol ✓ · fable ✓ · grok … · glm ✓`. Primary/user keep working.
 
