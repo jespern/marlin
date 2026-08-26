@@ -566,7 +566,7 @@ pub fn appendToolCallLine(
             .syntax = if (is_bash)
                 try shellCommandSpans(alloc, hi_capped, head.len)
             else
-                &.{},
+                try diffCountSpans(alloc, note_text, head.len + hi_capped.len),
         });
     } else {
         try lines.append(alloc, .{
@@ -574,8 +574,34 @@ pub fn appendToolCallLine(
             .style = Palette.tool,
             .text2 = note_text,
             .style2 = Palette.collapse_hint,
+            .syntax = try diffCountSpans(alloc, note_text, head.len),
         });
     }
+}
+
+/// Color the compact diffstat at the end of a tool-line note without
+/// sacrificing the separate machinery/path/note styles used by the row.
+fn diffCountSpans(alloc: std.mem.Allocator, note: []const u8, base: usize) ![]const SyntaxSpan {
+    const plus_space = std.mem.lastIndexOf(u8, note, " +") orelse return &.{};
+    const minus_space = std.mem.indexOfPos(u8, note, plus_space + 2, " -") orelse return &.{};
+    const plus = plus_space + 1;
+    const minus = minus_space + 1;
+    if (plus + 1 == minus_space or minus + 1 == note.len) return &.{};
+    for (note[plus + 1 .. minus_space]) |c| if (!std.ascii.isDigit(c)) return &.{};
+    for (note[minus + 1 ..]) |c| if (!std.ascii.isDigit(c)) return &.{};
+
+    const spans = try alloc.alloc(SyntaxSpan, 2);
+    spans[0] = .{
+        .start = base + plus,
+        .end = base + minus_space,
+        .style = .{ .fg = Palette.diff_add.fg, .bold = true },
+    };
+    spans[1] = .{
+        .start = base + minus,
+        .end = base + note.len,
+        .style = .{ .fg = Palette.diff_del.fg, .bold = true },
+    };
+    return spans;
 }
 
 /// The ⚙-line annotation distilled from an authored diff's intro line:
@@ -598,6 +624,36 @@ pub fn diffIntroNote(text: []const u8) ?[]const u8 {
         return first[count_start..in_at];
     }
     return null;
+}
+
+const DiffStats = struct {
+    added: usize = 0,
+    removed: usize = 0,
+};
+
+/// Count changed lines in native and guest-authored diffs. Creation previews
+/// carry their omitted-line count explicitly, so their diffstat remains exact.
+fn diffStats(text: []const u8) DiffStats {
+    var stats: DiffStats = .{};
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "+") and !std.mem.startsWith(u8, line, "+++")) {
+            stats.added += 1;
+        } else if (std.mem.startsWith(u8, line, "-") and !std.mem.startsWith(u8, line, "---")) {
+            stats.removed += 1;
+        } else if (std.mem.startsWith(u8, line, "… ") and std.mem.endsWith(u8, line, " more new lines")) {
+            const count = line["… ".len .. line.len - " more new lines".len];
+            stats.added += std.fmt.parseInt(usize, count, 10) catch 0;
+        }
+    }
+    return stats;
+}
+
+fn diffSummaryNote(alloc: std.mem.Allocator, text: []const u8) !?[]const u8 {
+    const intro = diffIntroNote(text) orelse return null;
+    const stats = diffStats(text);
+    if (stats.added == 0 and stats.removed == 0) return intro;
+    return try std.fmt.allocPrint(alloc, "{s} · +{d} -{d}", .{ intro, stats.added, stats.removed });
 }
 
 pub fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, tool_label: []const u8) !void {
@@ -926,7 +982,7 @@ pub fn layoutBlockRange(
                     // summary line above.
                     try blankLine(alloc, lines);
                     const result = blocks_all[pair.result];
-                    const note = if (result.status == .ok) diffIntroNote(result.text) else null;
+                    const note = if (result.status == .ok) try diffSummaryNote(alloc, result.text) else null;
                     try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note);
                     try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
                 }
@@ -1359,6 +1415,43 @@ test "diff intro notes distill to counts for the tool line" {
     try std.testing.expectEqualStrings("84 bytes", diffIntroNote("wrote 84 bytes to x\n@@ -1 +1 @@").?);
     try std.testing.expectEqualStrings("1 occurrence(s)", diffIntroNote("replaced 1 occurrence(s) in x\n@@ -1 +1 @@").?);
     try std.testing.expect(diffIntroNote("The file has been updated successfully.") == null);
+}
+
+test "authored diff notes include exact colored diffstats" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const native =
+        "replaced 1 occurrence(s) in src/x.zig\n" ++
+        "@@ -1,2 +1,3 @@\n" ++
+        "-old\n" ++
+        "+new\n" ++
+        "+another";
+    try std.testing.expectEqualStrings("1 occurrence(s) · +2 -1", (try diffSummaryNote(arena, native)).?);
+
+    const guest =
+        "edited 2 hunks in src/x.zig\n" ++
+        "@@ -1 +1 @@\n-old\n+new\n" ++
+        "@@ -8,2 +8,3 @@\n-gone\n+first\n+second";
+    try std.testing.expectEqualStrings("2 hunks · +3 -2", (try diffSummaryNote(arena, guest)).?);
+
+    const creation =
+        "created src/big.zig (1000 bytes)\n" ++
+        "@@ -0,0 +1,43 @@\n+one\n+two\n… 41 more new lines";
+    try std.testing.expectEqualStrings("1000 bytes · +43 -0", (try diffSummaryNote(arena, creation)).?);
+
+    var lines: std.ArrayList(Line) = .empty;
+    try appendToolCallLine(arena, &lines, .{
+        .kind = .tool_call,
+        .text = try arena.dupe(u8, "{\"path\":\"src/x.zig\"}"),
+        .label = try arena.dupe(u8, "edit"),
+    }, "/repo", 100, "1 occurrence(s) · +18 -5");
+    try std.testing.expectEqual(@as(usize, 2), lines.items[0].syntax.len);
+    try std.testing.expect(vaxis.Color.eql(Palette.diff_add.fg, lines.items[0].syntax[0].style.fg));
+    try std.testing.expect(vaxis.Color.eql(Palette.diff_del.fg, lines.items[0].syntax[1].style.fg));
+    try std.testing.expect(lines.items[0].syntax[0].style.bold);
+    try std.testing.expect(lines.items[0].syntax[1].style.bold);
 }
 
 pub fn hunkContextStart(line: []const u8) ?usize {
