@@ -73,6 +73,11 @@ the old rooms?
 - Delegate one focused investigation with `task`, or fan out two to eight with
   `task_batch`; every read-only child is durable, attachable, and grouped under
   its parent while results return in requested order.
+- Convene a review council as a markdown skill, no core machinery: one prompt
+  fans to several models via `task_batch` (each child a different registry
+  model) and the parent consolidates agreements, splits, and a
+  recommendation — see [skills/council.md](skills/council.md). The first live
+  council reviewed marlin's own sandbox policy and found a real bug.
 - Substantial work gets a durable execution plan: the active step stays pinned
   above the composer, revisions survive reboot and compaction, and delegated
   child activity attaches to the step it is helping complete.
@@ -97,7 +102,13 @@ the old rooms?
    OpenAI-compatible covers most models; Anthropic Messages is the one
    extra wire. Claude Code is not a dialect — it is a guest session
    because subscription Fable is only sanctioned through their binary.
-   Do not add a third wire, and do not add a second guest.
+   Do not add a third wire. OpenRouter is the default, not a hard
+   dependency: `anthropic/` and `local/` hit endpoints directly, and a
+   config-driven `[providers.*]` table is the designed door if direct
+   multi-endpoint becomes the daily norm. A second guest (codex, for
+   subscription-side economics) is a live question that gets decided in
+   writing — today OpenRouter carries the same models cheaper, so the
+   door stays shut, deliberately rather than by drift.
 6. **Agent panes only — no VTE.** Splits show marlin sessions, which are
    structured data we render ourselves. No terminal emulation tarpit. (If an
    embedded terminal is ever truly needed: libghostty-vt, not hand-rolled.)

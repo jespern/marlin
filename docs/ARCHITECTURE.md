@@ -121,6 +121,12 @@ then the wall is how Marlin stays small.
 - Do not spawn Marlin `task` children from a guest parent. Do not grow
   `ccAutoAllow`. Do not add guest-specific product (CC plan sync, wrapping
   Seatbelt around their bash, vision side-channel).
+- Guest models as council/task *children* are wanted (a council should be
+  able to seat Fable) but are blocked on one prerequisite: bridge-enforced
+  read-only for guest children. `cc_approval` already sees every guest
+  Bash/Edit, so a child-session policy can deny mutations outright rather
+  than ask; that is a deny mode on the bridge, not growth of `ccAutoAllow`.
+  Until it lands, councils are native-only and the skill says so.
 - Type-system: `Dialect` is wire (`openrouter` | `openai_compatible` |
   `anthropic`). Guest is not a dialect; `runTurn` branching on
   `.claude_code` is the current implementation, not the target shape.
@@ -149,7 +155,19 @@ views: nothing lives in a client but a render cache and a draft input box.
 **Mode B — protocol over ssh (design; not yet implemented).** Intended to
 become the primary remote path once built — today there is no `_pipe`
 subcommand, no named remotes, and no proto-over-ssh transport; Mode A is
-the only remote access that ships. The design: a local `marlin` client
+the only remote access that ships.
+
+Decision (2026-08): Mode B is the herdr/tmux replacement and the next
+surface that opens. The end state is `marlin --remote <host>` as the ONLY
+terminal tool in the daily drive — full mux (tabs, approvals, drafts),
+local clipboard and image paste, OSC 52 — with ssh/mosh as dumb pipes
+underneath. No new transport protocol, ever. The web client is the
+companion for phones and terminal-less machines, exposed via tailscale
+(`tailscale serve` in front of the token-gated localhost port; at most a
+thin `marlin web --tailscale` convenience that shells out to it) rather
+than marlin-grown TLS/auth machinery.
+
+The design: a local `marlin` client
 speaks the wire protocol to a remote daemon, ssh carrying NDJSON instead
 of terminal frames:
 
