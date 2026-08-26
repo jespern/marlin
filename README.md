@@ -91,6 +91,12 @@ still sees blocks, not pixels. See
 6. **Agent panes only — no VTE.** Splits show marlin sessions, which are
    structured data we render ourselves. No terminal emulation tarpit. (If an
    embedded terminal is ever truly needed: libghostty-vt, not hand-rolled.)
+7. **Daily driver, not kitchen sink.** Marlin exists to be driven all day,
+   and that is the whole test: a feature earns its place by surviving
+   dogfood, not by being well designed, and a surface that stops earning
+   its keep gets deleted rather than maintained. Designed doors (councils,
+   remote transport, workspace snapshots) stay shut until daily use — not
+   momentum — demands one. When in doubt, the answer is no.
 
 ## MCP servers
 
@@ -131,10 +137,10 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
 ## What v1 deliberately does NOT do
 
 - No messaging gateway (Telegram/Discord/...) — hook scripts cover notification.
-- No supported web UI. (`marlin web` exists as an opt-in POC: a
-  localhost-only, **unauthenticated** HTTP/SSE bridge — anything reaching the
-  port can drive marlin, including reboot/shutdown. It's just another client
-  on the same protocol, and it is not a deploy surface.)
+- No hosted or multi-user web product. `marlin web` is an opt-in,
+  token-gated, localhost-only client on the same protocol — install it to a
+  phone home screen to watch sessions and answer parked approvals over your
+  own tailnet. It is one embedded HTML file, and it is not a deploy surface.
 - No voice, OCR/video pipelines, themes, cron, profiles.
 - No embedded terminal emulator / editor panes.
 - No Tailscale embedding — your tailnet already reaches the daemon socket.
@@ -149,10 +155,10 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
   │marlin TUI├──────┼─▶│agent    │ │agent    │ │agent    │ │
   └──────────┘ unix │  │loop     │ │loop     │ │loop     │ │
   ┌──────────┐ sock │  └────┬────┘ └────┬────┘ └────┬────┘ │
-  │marlin TUI├──────┤       ▼           ▼           ▼      │
+  │marlin web├──────┤       ▼           ▼           ▼      │
   │ (phone,  │      │  ┌──────────────────────────────┐    │
-  │  later:  │      │  │  SQLite: blocks, sessions,   │    │
-  │  PWA)    │      │  │  indexed logs, full outputs  │    │
+  │  token-  │      │  │  SQLite: blocks, sessions,   │    │
+  │  gated)  │      │  │  indexed logs, full outputs  │    │
   └──────────┘      │  └──────────────────────────────┘    │
                     │  native loop  ·  guest: claude -p       │
                     └──────────────────┬──────────────────────┘

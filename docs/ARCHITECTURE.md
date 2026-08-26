@@ -7,6 +7,12 @@ not the binary. When this document and the code disagree on a shipped area,
 the code and the per-milestone docs (M*_PLAN.md, PERMISSIONS.md, PROTOCOL.md)
 win; fix this file rather than trusting it.
 
+Product thesis, standing over every section below: Marlin is a **daily
+driver** — a session multiplexer with one native agent and one guest,
+meant to be lived in all day, and nothing else. Designed doors open when
+daily use demands them, not because the last door felt good. A section of
+this document that reads like a second product is a bug in the document.
+
 ## 1. Process model
 
 Two binaries built from one codebase (or one binary with subcommands — start

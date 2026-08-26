@@ -5,6 +5,16 @@ state (sessions, agent loop, sqlite store, provider connections); the TUI and
 headless CLI are thin socket clients. Docs are the contract — start with
 `docs/ARCHITECTURE.md`, then the active milestone plan in `docs/`.
 
+## Product discipline
+
+Marlin is a **daily driver, not a kitchen sink**. Before adding a surface,
+tool, protocol message, or dependency, answer three questions: does daily
+use demand it (not "would it be nice"), can it live at a process boundary
+instead of in the Zig core, and what existing thing stops earning its keep
+to pay for it? "The last feature felt good" is not a reason; the default
+answer is no. Standing walls: README Principles, and ARCHITECTURE
+"Native vs guest" (frozen guest adapter — do not chase parity).
+
 ## Build and test
 
 - `zig build` — build AND install `zig-out/bin/marlin`, defaulting to
