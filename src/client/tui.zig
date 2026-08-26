@@ -101,6 +101,9 @@ const Event = union(enum) {
     daemon_line: []u8,
     /// Stable error name from the reader thread (for example EndOfStream).
     daemon_gone: []const u8,
+    /// Reconnect worker verdict: a fresh handshaked Conn to adopt, or null
+    /// when every attempt failed and the TUI should quit like before.
+    reconnected: ?*attach.Conn,
 };
 
 const Mode = enum { insert, normal };
@@ -1867,12 +1870,6 @@ const App = struct {
             if (proto.isGuestModel(self.model.items)) {
                 self.setNotice("councils need a native session (guest sessions have no marlin tools)", .{});
                 return;
-            }
-            for (council.models.items) |model| {
-                if (proto.isGuestModel(model)) {
-                    self.setNotice("council '{s}' seats a guest model — not supported yet (see ARCHITECTURE, Native vs guest)", .{name});
-                    return;
-                }
             }
             const expanded = buildReviewPrompt(self.gpa, council, question) catch {
                 self.setNotice("could not compose review prompt", .{});
@@ -3880,6 +3877,64 @@ fn readerThread(app: *App, loop: *vaxis.Loop(Event)) void {
     loop.postEvent(.{ .daemon_gone = disconnect_reason }) catch {};
 }
 
+/// Transport death is recoverable, not fatal: the daemon resyncs STATE on
+/// resubscribe (from_seq replay), so a dropped local socket (daemon restart)
+/// or ssh child (laptop sleep, network hop) just needs a new transport under
+/// the same view — the mosh-like behavior, with state instead of pixels.
+const ReconnectJob = struct {
+    app: *App,
+    loop: *vaxis.Loop(Event),
+    self_exe: []const u8,
+
+    /// Bounded: each attach.connect already carries its own patience (local
+    /// autostart polling, the 30s remote handshake deadline), so a handful
+    /// of spaced attempts covers wake-from-sleep and daemon restarts without
+    /// making a deliberate quit wait minutes on a truly dead network.
+    fn run(job: *ReconnectJob) void {
+        var attempt: u32 = 0;
+        while (attempt < 3) : (attempt += 1) {
+            if (attempt > 0) job.app.io.sleep(.fromMilliseconds(1_500), .awake) catch {};
+            const environ = job.app.environ orelse break;
+            const conn = attach.connect(job.app.gpa, job.app.io, environ, job.self_exe) catch continue;
+            job.loop.postEvent(.{ .reconnected = conn }) catch conn.deinit();
+            return;
+        }
+        job.loop.postEvent(.{ .reconnected = null }) catch {};
+    }
+};
+
+/// Swap the dead transport for the fresh one and restore the exact client
+/// state: catalog watch, council cache, and the focused session resumed from
+/// the last applied block — the same continuation a tab switch uses, so the
+/// transcript and scroll position survive untouched. Returns false when the
+/// TUI cannot be made whole (caller quits with the old semantics).
+fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, new_conn: *attach.Conn) bool {
+    // The old reader posted daemon_gone on its way out; join is immediate.
+    rt.join();
+    const old = app.conn;
+    app.conn = new_conn;
+    old.deinit();
+    rt.* = std.Thread.spawn(.{}, readerThread, .{ app, loop }) catch return false;
+
+    app.conn.send(.{ .session_watch = .{ .incremental = true } }) catch return false;
+    app.conn.send(.{ .council_list = .{} }) catch {};
+    if (app.last_seq == 0) {
+        app.conn.send(.{ .sub = .{
+            .sid = app.sid,
+            .from_seq = 1,
+            .tail_limit = initial_replay_blocks,
+        } }) catch return false;
+    } else {
+        app.conn.send(.{ .sub = .{
+            .sid = app.sid,
+            .from_seq = app.last_seq +| 1,
+            .replay_limit = initial_replay_blocks,
+        } }) catch return false;
+    }
+    app.setNotice("reconnected", .{});
+    return true;
+}
+
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     while (!app.animation_stop.load(.acquire)) {
         if (app.animation_active.load(.acquire)) {
@@ -4104,11 +4159,16 @@ pub fn run(
         }
 
         // -- daemon reader thread --
-        const rt = try std.Thread.spawn(.{}, readerThread, .{ &app, &loop });
+        var rt = try std.Thread.spawn(.{}, readerThread, .{ &app, &loop });
         // Joined at exit: we shutdown() the socket which EOFs the reader —
         // closing the fd under a live read is a BADF panic on the Threaded Io.
+        // Both defers read their CURRENT values: reconnection replaces the
+        // conn and respawns the reader mid-session.
         defer rt.join();
-        defer conn.shutdown();
+        defer app.conn.shutdown();
+        var reconnect_job: ReconnectJob = undefined;
+        var reconnect_thread: ?std.Thread = null;
+        defer if (reconnect_thread) |t| t.join();
         // Lightweight catalog/status updates for every session; block streams
         // remain subscribed only for the focused session.
         try conn.send(.{ .session_watch = .{ .incremental = true } });
@@ -4131,6 +4191,11 @@ pub fn run(
         // -- main event loop --
         while (!app.should_quit) {
             const event = try loop.nextEvent();
+            // Transport verdicts are collected here and handled once below
+            // the switch: daemon_gone can surface in the drain loop too, and
+            // starting/adopting a reconnect must happen exactly once a frame.
+            var conn_lost: ?[]const u8 = null;
+            var reconnect_verdict: ??*attach.Conn = null;
             switch (event) {
                 .key_press => |key| try handleKey(&app, key),
                 .mouse => |m| handleMouse(&app, m),
@@ -4149,10 +4214,8 @@ pub fn run(
                     while (try loop.tryEvent()) |ev2| {
                         switch (ev2) {
                             .daemon_line => |l2| app.handleDaemonLine(l2),
-                            .daemon_gone => |reason| {
-                                daemon_disconnect_reason = reason;
-                                app.should_quit = true;
-                            },
+                            .daemon_gone => |reason| conn_lost = reason,
+                            .reconnected => |maybe| reconnect_verdict = maybe,
                             .key_press => |k2| try handleKey(&app, k2),
                             .mouse => |m2| handleMouse(&app, m2),
                             .tick => app.spinner_frame +%= 1,
@@ -4167,11 +4230,41 @@ pub fn run(
                         }
                     }
                 },
-                .daemon_gone => |reason| {
+                .daemon_gone => |reason| conn_lost = reason,
+                .reconnected => |maybe| reconnect_verdict = maybe,
+            }
+
+            if (conn_lost) |reason| {
+                // A deliberate quit/reboot expects its transport to die; only
+                // an unexpected loss gets the reconnect treatment. The dead
+                // conn stays allocated until adoption so in-flight sends fail
+                // harmlessly instead of using freed memory.
+                if (app.should_quit or reconnect_thread != null) {
                     daemon_disconnect_reason = reason;
-                    app.setNotice("daemon connection lost", .{});
                     app.should_quit = true;
-                },
+                } else {
+                    app.setNotice("connection lost — reconnecting…", .{});
+                    reconnect_job = .{ .app = &app, .loop = &loop, .self_exe = self_exe };
+                    reconnect_thread = std.Thread.spawn(.{}, ReconnectJob.run, .{&reconnect_job}) catch blk: {
+                        daemon_disconnect_reason = reason;
+                        app.should_quit = true;
+                        break :blk null;
+                    };
+                }
+            }
+            if (reconnect_verdict) |maybe_conn| {
+                if (reconnect_thread) |t| {
+                    t.join();
+                    reconnect_thread = null;
+                }
+                const restored = if (maybe_conn) |new_conn|
+                    adoptReconnectedConn(&app, &loop, &rt, new_conn)
+                else
+                    false;
+                if (!restored) {
+                    daemon_disconnect_reason = "reconnect failed";
+                    app.should_quit = true;
+                }
             }
 
             if (app.refresh_requested) {
@@ -4234,6 +4327,20 @@ pub fn run(
             try vx.render(writer);
             try writer.flush();
         }
+
+        // A quit that raced an in-flight reconnect can leave the worker's
+        // fresh Conn (and its ssh child) queued and unowned: join the worker
+        // first, then reap anything it posted.
+        if (reconnect_thread) |t| {
+            t.join();
+            reconnect_thread = null;
+        }
+        while (loop.tryEvent() catch null) |ev| switch (ev) {
+            .reconnected => |maybe| if (maybe) |c| c.deinit(),
+            .daemon_line => |l| gpa.free(l),
+            .paste => |t| gpa.free(@constCast(t)),
+            else => {},
+        };
     }
     if (reboot_out) |ro| ro.* = .{ .request = app.reboot_request, .sid = app.sid };
     if (daemon_disconnect_reason) |reason| {
