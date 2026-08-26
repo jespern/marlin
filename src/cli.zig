@@ -4,6 +4,7 @@ const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
 
+const cc_approve = @import("client/cc_approve.zig");
 const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
 const tui = @import("client/tui.zig");
@@ -26,6 +27,7 @@ pub const Command = enum {
     help,
     version,
     resolve_host,
+    cc_approve,
 
     pub fn parse(word: []const u8) ?Command {
         inline for (@typeInfo(Command).@"enum".fields) |f| {
@@ -51,6 +53,9 @@ pub fn dispatch(
     switch (cmd) {
         .version => try stdoutPrint(io, "marlin {s}\n", .{build_options.version}),
         .resolve_host => return resolveHost(io, rest),
+        // Internal permission bridge for delegated Claude Code sessions
+        // (spawned via --mcp-config by the daemon); omitted from help.
+        .cc_approve => return cc_approve.run(gpa, io, environ, self_exe, rest),
         .help => try stdoutPrint(io, help_text, .{}),
         .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
         .run => return headless.run(gpa, io, environ, self_exe, rest),

@@ -91,8 +91,20 @@ pub fn workspaceWriteAllowed(
         .{ .ignore_unknown_fields = true },
     ) catch return false;
     defer parsed.deinit();
+    return realPathInWorkspace(gpa, io, cwd, parsed.value.path);
+}
 
-    var assessed = assessPath(gpa, cwd, parsed.value.path) catch return false;
+/// Symlink-safe workspace containment for one requested path: lexical
+/// normalization first, then realpath of the deepest EXISTING ancestor
+/// (nonexistent trailing components cannot be symlinks). True only when the
+/// REAL target provably stays inside the REAL workspace.
+pub fn realPathInWorkspace(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    requested: []const u8,
+) bool {
+    var assessed = assessPath(gpa, cwd, requested) catch return false;
     defer assessed.deinit(gpa);
     if (assessed.location != .workspace) return false;
 
@@ -109,6 +121,119 @@ pub fn workspaceWriteAllowed(
             candidate = std.fs.path.dirname(candidate) orelse return false;
         }
     }
+    return false;
+}
+
+/// Auto-approval policy for the Claude Code permission bridge
+/// (`marlin cc_approve`): mirror the native auto-inside posture for prompts a
+/// delegated `claude -p` routes to marlin. Reads and searches are always auto
+/// (native read-only policy). Edits must provably stay inside the real
+/// workspace and off protected paths. Shell commands are approved unless they
+/// mention a path outside the workspace or a protected name. The heuristics
+/// only ever need to catch, not perfectly parse: the failure mode is asking
+/// the human, never denying.
+pub fn ccAutoAllow(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    tool_name: []const u8,
+    input_json: []const u8,
+) bool {
+    const read_only = [_][]const u8{
+        "Read",     "Glob",      "Grep", "LS",           "NotebookRead",
+        "WebFetch", "WebSearch", "Task", "ExitPlanMode", "TodoWrite",
+    };
+    for (read_only) |name| if (std.mem.eql(u8, tool_name, name)) return true;
+
+    const edit_tools = [_][]const u8{ "Edit", "Write", "MultiEdit", "NotebookEdit" };
+    for (edit_tools) |name| {
+        if (!std.mem.eql(u8, tool_name, name)) continue;
+        const parsed = std.json.parseFromSlice(
+            struct {
+                file_path: ?[]const u8 = null,
+                notebook_path: ?[]const u8 = null,
+                path: ?[]const u8 = null,
+            },
+            gpa,
+            input_json,
+            .{ .ignore_unknown_fields = true },
+        ) catch return false;
+        defer parsed.deinit();
+        const path = parsed.value.file_path orelse
+            parsed.value.notebook_path orelse
+            parsed.value.path orelse return false;
+        if (isProtectedPath(path)) return false;
+        return realPathInWorkspace(gpa, io, cwd, path);
+    }
+
+    if (std.mem.eql(u8, tool_name, "Bash")) {
+        const parsed = std.json.parseFromSlice(
+            struct { command: ?[]const u8 = null },
+            gpa,
+            input_json,
+            .{ .ignore_unknown_fields = true },
+        ) catch return false;
+        defer parsed.deinit();
+        const command = parsed.value.command orelse return false;
+        return commandStaysInWorkspace(gpa, cwd, command);
+    }
+    return false;
+}
+
+/// Lexical scan of a shell command for paths that leave the workspace or
+/// name protected files. Tokens that resolve inside the cwd (or into the
+/// usual scratch locations) pass; `~`, escaping relatives, and any other
+/// absolute path make the command ask instead.
+fn commandStaysInWorkspace(gpa: std.mem.Allocator, cwd: []const u8, command: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, command, " \t\r\n");
+    while (it.next()) |raw| {
+        const tok = strippedPathToken(raw);
+        if (tok.len == 0) continue;
+        if (isProtectedPath(tok)) return false;
+        if (tok[0] == '~') return false;
+        if (tok[0] == '/' and benignAbsolutePrefix(tok)) continue;
+        if (tok[0] == '/' or std.mem.indexOf(u8, tok, "..") != null) {
+            var assessed = assessPath(gpa, cwd, tok) catch return false;
+            defer assessed.deinit(gpa);
+            if (assessed.location != .workspace) return false;
+        }
+    }
+    return true;
+}
+
+/// Strip shell noise so a token's path core is visible to the scan:
+/// surrounding quotes/grouping, redirection prefixes (2>/dev/null, >>out),
+/// and `--flag=/path` values.
+fn strippedPathToken(raw: []const u8) []const u8 {
+    var tok = std.mem.trim(u8, raw, "\"'`();,");
+    var i: usize = 0;
+    while (i < tok.len) : (i += 1) {
+        switch (tok[i]) {
+            '0'...'9', '<', '>', '&' => continue,
+            else => break,
+        }
+    }
+    if (i > 0 and i < tok.len and
+        (std.mem.indexOfScalar(u8, tok[0..i], '<') != null or
+            std.mem.indexOfScalar(u8, tok[0..i], '>') != null))
+    {
+        tok = tok[i..];
+    }
+    if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
+        const rhs = tok[eq + 1 ..];
+        if (rhs.len > 0 and (rhs[0] == '/' or rhs[0] == '~')) return rhs;
+    }
+    return tok;
+}
+
+/// Scratch locations every build tool touches; referencing them is not
+/// "leaving the workspace" in any sense a human would recognize.
+fn benignAbsolutePrefix(path: []const u8) bool {
+    const prefixes = [_][]const u8{
+        "/dev/", "/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/",
+    };
+    if (std.mem.eql(u8, path, "/dev/null") or std.mem.eql(u8, path, "/tmp")) return true;
+    for (prefixes) |p| if (std.mem.startsWith(u8, path, p)) return true;
     return false;
 }
 
@@ -329,4 +454,79 @@ test "protected path policy recognizes credential material by component and base
     var external = try assessPath(gpa, "/work/api", "/Users/example/.ssh/config");
     defer external.deinit(gpa);
     try std.testing.expectEqual(Capability.fs_read_protected, external.capability(.read));
+}
+
+test "cc bridge policy: reads auto, edits containment-checked, unknown asks" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try std.testing.expect(ccAutoAllow(gpa, io, "/work/api", "Read", "{\"file_path\":\"/etc/hosts\"}"));
+    try std.testing.expect(ccAutoAllow(gpa, io, "/work/api", "Grep", "{\"pattern\":\"x\"}"));
+    try std.testing.expect(ccAutoAllow(gpa, io, "/work/api", "WebFetch", "{\"url\":\"https://x\"}"));
+
+    // Edits outside the workspace or on protected names must ask.
+    try std.testing.expect(!ccAutoAllow(gpa, io, "/work/api", "Write", "{\"file_path\":\"/etc/hosts\"}"));
+    try std.testing.expect(!ccAutoAllow(gpa, io, "/work/api", "Edit", "{\"file_path\":\"/work/api/.env\"}"));
+    try std.testing.expect(!ccAutoAllow(gpa, io, "/work/api", "Edit", "{}"));
+
+    // Unknown tools (MCP and future ones) always ask.
+    try std.testing.expect(!ccAutoAllow(gpa, io, "/work/api", "mcp__x__y", "{}"));
+}
+
+test "cc bridge policy: workspace edits allowed on a real tree" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const ws = try std.fmt.allocPrint(gpa, "/tmp/marlin-ccpolicy-{x}", .{std.mem.readInt(u64, &rand, .little)});
+    defer gpa.free(ws);
+    defer std.Io.Dir.cwd().deleteTree(io, ws) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, ws);
+
+    const args = try std.fmt.allocPrint(gpa, "{{\"file_path\":\"{s}/src/new.zig\"}}", .{ws});
+    defer gpa.free(args);
+    try std.testing.expect(ccAutoAllow(gpa, io, ws, "Write", args));
+}
+
+test "cc bridge policy: shell commands inside the root run, escapes ask" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = "/work/api";
+
+    const allowed = [_][]const u8{
+        "zig build test",
+        "zig build test 2>/dev/null",
+        "git log --oneline -5 | head",
+        "rg -n 'pattern' src/main.zig",
+        "python3 /tmp/scratch.py",
+        "make -C src all",
+        "cat src/../README.md",
+        "git commit -m \"fix: paths like a/b in messages\"",
+    };
+    for (allowed) |cmd| {
+        const args = try std.json.Stringify.valueAlloc(gpa, .{ .command = cmd }, .{});
+        defer gpa.free(args);
+        try std.testing.expect(ccAutoAllow(gpa, io, cwd, "Bash", args));
+    }
+
+    const asks = [_][]const u8{
+        "rm -rf /Users/example/other-project",
+        "cat ~/.ssh/id_ed25519",
+        "cat ../sibling/secrets.txt",
+        "cp x.pem /work/api/", // protected basename mention
+        "git -C /work/other status",
+        "echo hi > ~/notes.txt",
+    };
+    for (asks) |cmd| {
+        const args = try std.json.Stringify.valueAlloc(gpa, .{ .command = cmd }, .{});
+        defer gpa.free(args);
+        try std.testing.expect(!ccAutoAllow(gpa, io, cwd, "Bash", args));
+    }
 }

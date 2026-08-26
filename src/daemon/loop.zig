@@ -51,6 +51,10 @@ pub const RunOpts = struct {
     /// Daemon-owned environment. Tool subprocesses receive a scrubbed copy;
     /// provider credentials never cross the daemon boundary.
     tool_environ: ?*const std.process.Environ.Map = null,
+    /// Absolute path to the marlin binary, for subprocesses that must call
+    /// back into the daemon (the Claude Code permission bridge). Null skips
+    /// bridge wiring (tests; exe path unresolvable).
+    marlin_exe: ?[]const u8 = null,
     /// Kernel sandbox selected only after its runtime canary passes.
     sandbox_options: sandbox.Options = .{},
     /// Allow-by-default hostname policy for structured network tools.
@@ -943,6 +947,10 @@ fn ccInvoke(
     const arena = arena_state.allocator();
 
     var uuid_buf: [36]u8 = undefined;
+    const bridge: ?claude_code.Bridge = if (opts.approval_mode != .auto and opts.marlin_exe != null)
+        .{ .marlin_exe = opts.marlin_exe.?, .sid = opts.session_id }
+    else
+        null;
     const argv = try claude_code.buildArgv(arena, .{
         .binary = claude_code.binaryPath(opts.tool_environ),
         .prompt = prompt,
@@ -950,13 +958,42 @@ fn ccInvoke(
         .session_uuid = claude_code.sessionUuid(&uuid_buf, opts.session_id),
         .fresh = fresh,
         .permissions = if (opts.approval_mode == .auto) .bypass else .accept_edits,
+        .bridge = bridge,
         .max_turns = opts.max_rounds,
     });
+
+    // A bridged permission prompt can park on a human for a long time;
+    // stretch Claude Code's MCP tool timeout so the call survives the wait
+    // instead of decaying into a deny. Existing values always win.
+    var bridge_environ: ?std.process.Environ.Map = null;
+    defer if (bridge_environ) |*map| map.deinit();
+    if (bridge != null) {
+        if (opts.tool_environ) |source| {
+            var map = std.process.Environ.Map.init(gpa);
+            var ok = true;
+            var it = source.iterator();
+            while (it.next()) |entry| {
+                map.put(entry.key_ptr.*, entry.value_ptr.*) catch {
+                    ok = false;
+                    break;
+                };
+            }
+            if (ok and map.get("MCP_TOOL_TIMEOUT") == null)
+                map.put("MCP_TOOL_TIMEOUT", "86400000") catch {
+                    ok = false;
+                };
+            if (ok and map.get("MCP_TIMEOUT") == null)
+                map.put("MCP_TIMEOUT", "30000") catch {
+                    ok = false;
+                };
+            if (ok) bridge_environ = map else map.deinit();
+        }
+    }
 
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = opts.cwd },
-        .environ_map = opts.tool_environ,
+        .environ_map = if (bridge_environ) |*map| map else opts.tool_environ,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,

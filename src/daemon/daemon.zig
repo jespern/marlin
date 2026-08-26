@@ -173,6 +173,10 @@ const TaskFuture = struct {
     }
 };
 
+/// A Claude Code permission prompt parked on the approval bar, keyed by the
+/// same approval_id namespace the native gate uses so `approve` answers both.
+const CcPending = struct { approval_id: u64, client_id: u64 };
+
 const Session = struct {
     id: u64,
     parent_sid: ?u64 = null,
@@ -216,6 +220,11 @@ const Session = struct {
     /// Dispatcher-owned; reconnecting subscribers/watchers receive this exact
     /// actionable state instead of only an unexplained awaiting status.
     pending_approval_line: ?[]u8 = null,
+    /// One parked Claude Code bridge prompt (cc_approval): the bridge client
+    /// waiting for its cc_approval_result. Dispatcher-owned. The bridge
+    /// serializes prompts, so one slot per session is an invariant, not a
+    /// queue that can overflow.
+    cc_pending: ?CcPending = null,
     /// L1 prune frontier (context.zig): tool_results with seq < this are
     /// stubbed at assembly. Advanced by the turn thread, read by it only —
     /// but stored here so it survives across turns. In-memory only: after a
@@ -273,6 +282,9 @@ pub const Daemon = struct {
     /// it in the kernel; coordinated reboot releases it before ACK so the
     /// replacement daemon can acquire it immediately.
     instance_lock: ?Io.File = null,
+    /// Absolute path to this marlin binary (gpa-owned), handed to delegated
+    /// Claude Code sessions so their permission bridge can call back here.
+    marlin_exe: ?[:0]u8 = null,
     /// Model catalog cache (registry-form ids and normalized pricing,
     /// gpa-owned). Refreshed at most once per catalog_ttl_ms; fetch runs on a
     /// worker thread.
@@ -378,6 +390,10 @@ pub const Daemon = struct {
             .protected_roots = protected_roots,
             .events = queue.Mpsc(Event).init(gpa),
             .instance_lock = instance_lock,
+            // Delegated Claude Code sessions spawn `<marlin> cc_approve` as
+            // their permission bridge; an unresolvable path just means the
+            // bridge stays unwired (headless prompts auto-deny as before).
+            .marlin_exe = std.process.executablePathAlloc(io, gpa) catch null,
         };
         extension_transferred = true;
         defer {
@@ -389,6 +405,7 @@ pub const Daemon = struct {
         store_moved = true;
         defer self.store.close();
         defer self.events.deinit();
+        defer if (self.marlin_exe) |exe| gpa.free(exe);
         defer self.network.deinit();
 
         // The instance lock makes this socket provably stale.
@@ -715,6 +732,7 @@ pub const Daemon = struct {
                 };
             },
             .client_gone => |cg| {
+                self.dropCcPendingForClient(cg.client_id);
                 if (self.removeClient(cg.client_id)) |client| {
                     // The registry no longer contains this client, so each
                     // subscription can now be tested against the remaining
@@ -775,6 +793,10 @@ pub const Daemon = struct {
                     t.join();
                     session.turn_thread = null;
                 }
+                // A bridge prompt cannot outlive its turn; deny any stray one
+                // so the bridge (if still alive) unblocks instead of hanging.
+                if (session.cc_pending) |pending|
+                    self.resolveCcPending(session, pending.approval_id, .denied);
                 self.clearPendingApproval(session);
                 session.cancel.store(false, .release);
                 session.cancel_requested_at_ms = 0;
@@ -1276,9 +1298,56 @@ pub const Daemon = struct {
                     .granted => .approved,
                     .denied => .denied,
                 };
-                // First decision wins; stale answers are ignored.
-                _ = session.gate.resolve(self.io, id, verdict);
+                // First decision wins; stale answers are ignored. An id the
+                // native gate does not know may be a parked Claude Code
+                // bridge prompt — same approval bar, different waiter.
+                if (!session.gate.resolve(self.io, id, verdict))
+                    self.resolveCcPending(session, id, verdict);
                 self.sendTo(client, .{ .ok = .{} });
+            },
+            .cc_approval => |ca| {
+                const session = self.sessions.get(ca.sid) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                // Policy first: auto sessions and workspace-scoped calls are
+                // answered instantly (docs/PERMISSIONS.md auto-inside).
+                const mode: approval.Mode = @enumFromInt(session.approval_mode_live.load(.acquire));
+                if (mode == .auto or
+                    permissions.ccAutoAllow(self.gpa, self.io, session.cwd, ca.tool, ca.args_json))
+                {
+                    self.sendTo(client, .{ .cc_approval_result = .{ .sid = ca.sid, .decision = .granted } });
+                    return;
+                }
+                if (session.cc_pending != null) {
+                    // The bridge serializes prompts; a second concurrent
+                    // asker is a protocol violation, not a queue.
+                    self.sendTo(client, .{ .cc_approval_result = .{ .sid = ca.sid, .decision = .denied } });
+                    return;
+                }
+                // Park it on the approval bar exactly like a native ask:
+                // same approval_request wire, same awaiting state, answered
+                // by the same approve message (see resolveCcPending).
+                const approval_id = ids.next(self.io);
+                var id_buf: [24]u8 = undefined;
+                const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{approval_id}) catch unreachable;
+                const line = try proto.encode(self.gpa, proto.DaemonMsg{ .approval_request = .{
+                    .sid = ca.sid,
+                    .approval_id = id_str,
+                    .call_id = "cc",
+                    .tool = ca.tool,
+                    .args_json = ca.args_json,
+                } });
+                session.cc_pending = .{ .approval_id = approval_id, .client_id = client.id };
+                if (session.pending_approval_line) |old| self.gpa.free(old);
+                session.pending_approval_line = line;
+                session.state = .awaiting_approval;
+                self.store.setSessionStatus(ca.sid, "awaiting_approval") catch {};
+                self.refusePendingRebootForApproval();
+                self.fanOutActionableLine(ca.sid, line);
+                self.broadcastStatus(ca.sid, .awaiting_approval);
+                // Deliberately no reply yet: cc_approval_result is sent when
+                // a client answers (or the bridge/turn goes away).
             },
             .session_compact => |sc| {
                 const session = (try self.getOrLoadSession(sc.sid)) orelse {
@@ -1500,6 +1569,8 @@ pub const Daemon = struct {
                         if (session.state == .running or session.state == .awaiting_approval) {
                             session.cancel.store(true, .release);
                             session.gate.denyPending(self.io);
+                            if (session.cc_pending) |pending|
+                                self.resolveCcPending(session, pending.approval_id, .denied);
                         }
                     }
                 }
@@ -1983,6 +2054,7 @@ pub const Daemon = struct {
             .effort = job.effort,
             .cfg = self.cfg,
             .tool_environ = self.environ,
+            .marlin_exe = self.marlin_exe,
             .sandbox_options = sandbox_options,
             .network_policy = if (job.network_filtering_enabled) &self.network else null,
             .extensions = self.extensions,
@@ -2285,6 +2357,48 @@ pub const Daemon = struct {
     fn clearPendingApproval(self: *Daemon, session: *Session) void {
         if (session.pending_approval_line) |line| self.gpa.free(line);
         session.pending_approval_line = null;
+    }
+
+    /// Answer a parked Claude Code bridge prompt (no-op for unknown ids).
+    /// Replies to the waiting bridge client and returns the session's public
+    /// state to running — the delegated turn itself never stopped.
+    fn resolveCcPending(self: *Daemon, session: *Session, approval_id: u64, verdict: approval.Verdict) void {
+        const pending = session.cc_pending orelse return;
+        if (pending.approval_id != approval_id) return;
+        session.cc_pending = null;
+        if (self.lookupClient(pending.client_id)) |bridge| {
+            self.sendTo(bridge, .{ .cc_approval_result = .{
+                .sid = session.id,
+                .decision = switch (verdict) {
+                    .approved => .granted,
+                    .denied => .denied,
+                },
+            } });
+        }
+        self.clearPendingApproval(session);
+        if (session.state == .awaiting_approval) {
+            session.state = .running;
+            self.store.setSessionStatus(session.id, "running") catch {};
+            self.broadcastStatus(session.id, .running);
+        }
+    }
+
+    /// A dying bridge client takes its parked prompt with it: without this,
+    /// the session would sit in awaiting_approval answering to nobody.
+    fn dropCcPendingForClient(self: *Daemon, client_id: u64) void {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |session_ptr| {
+            const session = session_ptr.*;
+            const pending = session.cc_pending orelse continue;
+            if (pending.client_id != client_id) continue;
+            session.cc_pending = null;
+            self.clearPendingApproval(session);
+            if (session.state == .awaiting_approval) {
+                session.state = .running;
+                self.store.setSessionStatus(session.id, "running") catch {};
+                self.broadcastStatus(session.id, .running);
+            }
+        }
     }
 
     fn sendPendingApprovals(self: *Daemon, client: *Client) void {
@@ -3008,6 +3122,8 @@ fn cancelActiveSession(self: *Daemon, session: *Session) void {
     if (session.state != .running and session.state != .awaiting_approval) return;
     session.cancel.store(true, .release);
     session.gate.denyPending(self.io);
+    if (session.cc_pending) |pending|
+        self.resolveCcPending(session, pending.approval_id, .denied);
 }
 
 fn taskError(gpa: std.mem.Allocator, message: []const u8) tools_registry.ExecOut {

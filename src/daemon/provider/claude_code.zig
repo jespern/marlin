@@ -31,6 +31,11 @@ pub fn binaryPath(environ: ?*const std.process.Environ.Map) []const u8 {
 /// Claude Code's own permission posture for the delegated session.
 pub const Permissions = enum { accept_edits, bypass };
 
+/// Wiring for the marlin permission bridge: instead of headless auto-deny,
+/// Claude Code's permission prompts route over MCP to
+/// `<marlin_exe> cc_approve --sid <sid>`, which asks the daemon.
+pub const Bridge = struct { marlin_exe: []const u8, sid: u64 };
+
 pub const ArgvOpts = struct {
     binary: []const u8,
     prompt: []const u8,
@@ -40,6 +45,10 @@ pub const ArgvOpts = struct {
     /// First turn creates the Claude Code session; later turns resume it.
     fresh: bool,
     permissions: Permissions,
+    /// Non-null routes permission prompts to marlin's approval gate instead
+    /// of the headless default (auto-deny). Ignored under .bypass, which
+    /// never prompts at all.
+    bridge: ?Bridge = null,
     max_turns: u32,
 };
 
@@ -62,7 +71,27 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
         try argv.appendSlice(arena, &.{ "--resume", opts.session_uuid });
     }
     switch (opts.permissions) {
-        .accept_edits => try argv.appendSlice(arena, &.{ "--permission-mode", "acceptEdits" }),
+        .accept_edits => {
+            if (opts.bridge) |bridge| {
+                // Bridge mode: default permissions, with every prompt routed
+                // to marlin over MCP. acceptEdits would silently skip the
+                // bridge for edits, losing outside-workspace protection.
+                const mcp_config = try std.json.Stringify.valueAlloc(arena, .{
+                    .mcpServers = .{ .marlin = .{
+                        .type = "stdio",
+                        .command = bridge.marlin_exe,
+                        .args = .{ "cc_approve", "--sid", try std.fmt.allocPrint(arena, "{d}", .{bridge.sid}) },
+                    } },
+                }, .{});
+                try argv.appendSlice(arena, &.{
+                    "--permission-mode",          "default",
+                    "--permission-prompt-tool",   "mcp__marlin__approve",
+                    "--mcp-config",               mcp_config,
+                });
+            } else {
+                try argv.appendSlice(arena, &.{ "--permission-mode", "acceptEdits" });
+            }
+        },
         .bypass => try argv.append(arena, "--dangerously-skip-permissions"),
     }
     try argv.appendSlice(arena, &.{
@@ -318,6 +347,37 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     for (resumed) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--model"));
     try std.testing.expectEqualStrings("--resume", resumed[6]);
     try std.testing.expectEqualStrings("--dangerously-skip-permissions", resumed[8]);
+
+    const bridged = try buildArgv(arena, .{
+        .binary = "claude",
+        .prompt = "hi",
+        .model = "default",
+        .session_uuid = "u-u-i-d",
+        .fresh = true,
+        .permissions = .accept_edits,
+        .bridge = .{ .marlin_exe = "/opt/marlin", .sid = 42 },
+        .max_turns = 8,
+    });
+    try std.testing.expectEqualStrings("--permission-mode", bridged[8]);
+    try std.testing.expectEqualStrings("default", bridged[9]);
+    try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[10]);
+    try std.testing.expectEqualStrings("mcp__marlin__approve", bridged[11]);
+    try std.testing.expectEqualStrings("--mcp-config", bridged[12]);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"command\":\"/opt/marlin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"--sid\",\"42\"") != null);
+
+    // Bridge wiring never overrides an explicit bypass.
+    const yolo = try buildArgv(arena, .{
+        .binary = "claude",
+        .prompt = "hi",
+        .model = "default",
+        .session_uuid = "u-u-i-d",
+        .fresh = true,
+        .permissions = .bypass,
+        .bridge = .{ .marlin_exe = "/opt/marlin", .sid = 42 },
+        .max_turns = 8,
+    });
+    for (yolo) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--permission-prompt-tool"));
 }
 
 test "decode: init, assistant blocks, tool_result shapes, result usage" {

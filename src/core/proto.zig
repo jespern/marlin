@@ -143,6 +143,12 @@ pub const ClientMsg = union(enum) {
         attachments: []const AttachmentUpload = &.{},
     },
     approve: struct { sid: u64, approval_id: []const u8, decision: ApprovalAnswer },
+    /// One Claude Code permission prompt forwarded by the `marlin cc_approve`
+    /// bridge subprocess of a delegated session. The daemon replies
+    /// cc_approval_result — immediately when policy auto-allows the call,
+    /// otherwise only after a human answers the parked approval_request
+    /// (the reply may be arbitrarily delayed; the bridge waits).
+    cc_approval: struct { sid: u64, tool: []const u8, args_json: []const u8 },
     /// Manual L2 compaction (/compact). Rejected while a turn is running.
     session_compact: struct { sid: u64 },
     /// Full model catalog for the /model picker: daemon fetches the
@@ -245,6 +251,8 @@ pub const DaemonMsg = union(enum) {
     /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
     /// contain arbitrary command output (including NULs).
     blob_result: struct { hash: []const u8, bytes: []const u8 },
+    /// Terminal reply to cc_approval.
+    cc_approval_result: struct { sid: u64, decision: ApprovalAnswer },
     interrupt_result: InterruptResult,
     /// `request_id` is non-zero only when replying to a correlated request
     /// (currently input). Defaults preserve compatibility in both directions.
@@ -429,6 +437,27 @@ test "round trip: client messages" {
     defer gpa.free(interrupt_line);
     const interrupt_back = try decode(ClientMsg, arena, interrupt_line);
     try std.testing.expect(interrupt_back.interrupt.report);
+
+    const rename_line = try encode(gpa, ClientMsg{ .session_rename = .{ .sid = 9, .title = "review web ui" } });
+    defer gpa.free(rename_line);
+    const rename_back = try decode(ClientMsg, arena, rename_line);
+    try std.testing.expectEqual(@as(u64, 9), rename_back.session_rename.sid);
+    try std.testing.expectEqualStrings("review web ui", rename_back.session_rename.title);
+
+    const cc_line = try encode(gpa, ClientMsg{ .cc_approval = .{
+        .sid = 4,
+        .tool = "Bash",
+        .args_json = "{\"command\":\"zig build test\"}",
+    } });
+    defer gpa.free(cc_line);
+    const cc_back = try decode(ClientMsg, arena, cc_line);
+    try std.testing.expectEqual(@as(u64, 4), cc_back.cc_approval.sid);
+    try std.testing.expectEqualStrings("Bash", cc_back.cc_approval.tool);
+
+    const cc_reply = try encode(gpa, DaemonMsg{ .cc_approval_result = .{ .sid = 4, .decision = .granted } });
+    defer gpa.free(cc_reply);
+    const cc_reply_back = try decode(DaemonMsg, arena, cc_reply);
+    try std.testing.expectEqual(ApprovalAnswer.granted, cc_reply_back.cc_approval_result.decision);
 }
 
 test "latest plan survives the replay marker wire" {

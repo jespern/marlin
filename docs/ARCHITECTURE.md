@@ -449,12 +449,18 @@ provider/
                       // claude.ai. Claude Code is the agent loop (its tools,
                       // its permission system, its context management);
                       // marlin persists the structured event stream as blocks
-                      // and remains the multiplexer. Marlin's approval gate,
-                      // sandbox, network screening, and L0/L1/L2 do NOT reach
-                      // inside the subprocess: session approval mode maps to
-                      // --permission-mode acceptEdits (default) or
-                      // --dangerously-skip-permissions (auto), stated here so
-                      // nobody mistakes delegation for marlin-native policy.
+                      // and remains the multiplexer. Marlin's sandbox,
+                      // network screening, and L0/L1/L2 do NOT reach inside
+                      // the subprocess — but its APPROVAL GATE does: default
+                      // sessions run --permission-mode default with
+                      // --permission-prompt-tool wired (over --mcp-config) to
+                      // `marlin cc_approve --sid N`, a stdio MCP bridge that
+                      // forwards each prompt to the daemon as cc_approval.
+                      // Policy (permissions.ccAutoAllow) answers workspace-
+                      // scoped calls instantly, mirroring native auto-inside;
+                      // everything else parks as a normal approval_request
+                      // answerable from any client. Auto sessions map to
+                      // --dangerously-skip-permissions as before.
   registry.zig        // model string "openrouter/anthropic/claude-..." → dialect + base_url + key env
 ```
 
