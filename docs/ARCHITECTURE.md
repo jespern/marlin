@@ -347,7 +347,9 @@ Key decisions:
   represented by this summary in context from now on." History is untouched.
 - **`plan` is durable state, not assistant prose.** `plan_update` appends a new
   revision; assembly retains the newest unfinished revision across compaction,
-  and bounded replay restores it separately from scrollback depth.
+  and bounded replay restores it separately from scrollback depth. The daemon
+  times only `in_progress` work and rejects `pending` → `completed` jumps, so
+  every displayed completion duration has an observed start.
 - **Synthetic `user_msg` blocks are model context, not user authorship.** File
   windows rehydrated after compaction carry `synthetic=true`; clients collapse
   them to a filename note and exclude them from input history. The default is

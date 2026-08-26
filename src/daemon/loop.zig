@@ -246,6 +246,54 @@ fn cloneMediaRefs(arena: std.mem.Allocator, refs: []const block.MediaRef) ![]con
 /// Attach daemon-clock timing to a model-authored plan revision. Active time
 /// is accumulated per turn, excluding idle wall-clock gaps between prompts.
 /// Step text is unique by the plan tool contract and survives reordering.
+fn latestPlanBlock(history: []const block.Block) ?*const block.Block {
+    var index = history.len;
+    while (index > 0) {
+        index -= 1;
+        if (history[index].kind() == .plan) return &history[index];
+    }
+    return null;
+}
+
+/// Completed work must have appeared as active in the immediately preceding
+/// plan revision. Without that transition the daemon has no honest start time
+/// from which to derive a duration.
+fn skippedPlanCompletion(items: []const block.PlanItem, history: []const block.Block) ?[]const u8 {
+    const previous = latestPlanBlock(history);
+    for (items) |item| {
+        if (item.status != .completed) continue;
+        const prior_status: ?block.PlanStatus = if (previous) |prior_block| status: {
+            for (prior_block.body.plan.items) |candidate| {
+                if (std.mem.eql(u8, candidate.step, item.step)) break :status candidate.status;
+            }
+            break :status null;
+        } else null;
+        if (prior_status == null or prior_status.? == .pending) return item.step;
+    }
+    return null;
+}
+
+fn enforcePlanTransitions(
+    gpa: std.mem.Allocator,
+    exec: *tools_registry.ExecOut,
+    history: []const block.Block,
+) !void {
+    if (exec.status != .ok) return;
+    const items = exec.plan_items orelse return;
+    const step = skippedPlanCompletion(items, history) orelse return;
+    const output = try std.fmt.allocPrint(
+        gpa,
+        "error: plan_update step '{s}' was not in_progress in the preceding plan; mark it in_progress before doing the work, then complete it in a later update",
+        .{step},
+    );
+    gpa.free(exec.output);
+    for (items) |item| gpa.free(@constCast(item.step));
+    gpa.free(items);
+    exec.output = output;
+    exec.status = .err;
+    exec.plan_items = null;
+}
+
 fn stampPlanTimings(
     store: *Store,
     session_id: u64,
@@ -254,18 +302,7 @@ fn stampPlanTimings(
     history: []const block.Block,
     now_ms: i64,
 ) !void {
-    var previous: ?*const block.Block = null;
-    var history_index = history.len;
-    while (history_index > 0) {
-        history_index -= 1;
-        switch (history[history_index].body) {
-            .plan => {
-                previous = &history[history_index];
-                break;
-            },
-            else => {},
-        }
-    }
+    const previous = latestPlanBlock(history);
 
     const current_start_ms = if (try store.turnTimeBounds(session_id, current_turn_id)) |bounds|
         bounds.start_ms
@@ -425,6 +462,53 @@ test "plan timing survives revisions without counting idle gaps" {
     var unchanged = [_]block.PlanItem{.{ .step = "Inspect", .status = .completed }};
     try stampPlanTimings(&store, 1, 30, &unchanged, &completed_history, 9_000);
     try std.testing.expectEqual(@as(u64, 3_250), unchanged[0].duration_ms);
+}
+
+test "plan completion requires a preceding in-progress revision" {
+    const prior_items = [_]block.PlanItem{
+        .{ .step = "Inspect", .status = .completed },
+        .{ .step = "Implement", .status = .in_progress },
+        .{ .step = "Verify", .status = .pending },
+    };
+    const history = [_]block.Block{.{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 1_000,
+        .body = .{ .plan = .{ .items = &prior_items } },
+    }};
+
+    const valid = [_]block.PlanItem{
+        .{ .step = "Inspect", .status = .completed },
+        .{ .step = "Implement", .status = .completed },
+        .{ .step = "Verify", .status = .in_progress },
+    };
+    try std.testing.expect(skippedPlanCompletion(&valid, &history) == null);
+
+    const skipped = [_]block.PlanItem{
+        .{ .step = "Inspect", .status = .completed },
+        .{ .step = "Implement", .status = .completed },
+        .{ .step = "Verify", .status = .completed },
+    };
+    try std.testing.expectEqualStrings("Verify", skippedPlanCompletion(&skipped, &history).?);
+
+    const retrospective = [_]block.PlanItem{.{ .step = "Already done", .status = .completed }};
+    try std.testing.expectEqualStrings("Already done", skippedPlanCompletion(&retrospective, &.{}).?);
+
+    const gpa = std.testing.allocator;
+    const owned_items = try gpa.alloc(block.PlanItem, 1);
+    owned_items[0] = .{ .step = try gpa.dupe(u8, "Verify"), .status = .completed };
+    var exec = tools_registry.ExecOut{
+        .output = try gpa.dupe(u8, "plan updated: 3/3 completed"),
+        .status = .ok,
+        .plan_items = owned_items,
+    };
+    defer exec.deinit(gpa);
+    try enforcePlanTransitions(gpa, &exec, &history);
+    try std.testing.expectEqual(block.ToolStatus.err, exec.status);
+    try std.testing.expect(exec.plan_items == null);
+    try std.testing.expect(std.mem.indexOf(u8, exec.output, "was not in_progress") != null);
 }
 
 fn loadMedia(ctx: *const anyopaque, allocator: std.mem.Allocator, hash: []const u8) ![]const u8 {
@@ -844,6 +928,8 @@ pub fn runTurn(
         // Results stay in provider call order even when execution completed
         // out of order. The transcript is therefore deterministic and valid.
         for (prepared) |*call| {
+            try enforcePlanTransitions(gpa, &call.exec.?, history.items);
+
             // Capture-time redaction, BEFORE hashing/capping/blobbing: the
             // append-only store makes anything persisted immortal.
             if (try permissions.redactSecrets(gpa, opts.secrets, call.exec.?.output)) |clean| {

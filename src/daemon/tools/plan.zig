@@ -6,7 +6,8 @@ const block = @import("../../core/block.zig");
 pub const spec_name = "plan_update";
 pub const spec_description =
     "Create or revise the session's durable execution plan. Use for substantial multi-step work; " ++
-    "keep exactly one item in_progress while work remains and update statuses as steps finish.";
+    "keep exactly one item in_progress while work remains. Every completed item must have been " ++
+    "in_progress in the preceding revision; never skip directly from pending to completed.";
 pub const spec_schema =
     \\{"type":"object","properties":{"explanation":{"type":"string","maxLength":500},"plan":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"step":{"type":"string","minLength":1,"maxLength":240},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["step","status"],"additionalProperties":false}}},"required":["plan"],"additionalProperties":false}
 ;
