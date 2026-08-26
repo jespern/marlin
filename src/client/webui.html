@@ -2,7 +2,15 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#17191d">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="marlin">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="icon" href="/icon-180.png">
 <title>marlin</title>
 <style>
   :root {
@@ -12,14 +20,19 @@
     --add-bg: #1f3729; --del-bg: #3b2429;
   }
   * { box-sizing: border-box; margin: 0; }
+  html { height: 100%; }
   body {
-    background: var(--bg); color: var(--fg); height: 100vh; display: flex;
+    background: var(--bg); color: var(--fg); height: 100vh; height: 100dvh; display: flex;
     font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    overscroll-behavior: none; -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
   }
   #side {
     width: 260px; min-width: 260px; background: var(--panel);
     border-right: 1px solid var(--line); display: flex; flex-direction: column;
   }
+  #backdrop { display: none; }
+  #topbar { display: none; }
   #side h1 { font-size: 14px; padding: 14px 16px 10px; color: var(--accent); letter-spacing: 1px; }
   #side h1 button {
     float: right; font: inherit; background: none; border: 1px solid var(--line);
@@ -27,10 +40,17 @@
   }
   #side h1 button:hover { color: var(--fg); }
   #sessions { overflow-y: auto; flex: 1; }
-  .sess { padding: 8px 16px; cursor: pointer; border-left: 2px solid transparent; }
+  .sess { position: relative; padding: 8px 16px; cursor: pointer; border-left: 2px solid transparent; }
   .sess:hover { background: var(--panel2); }
   .sess.active { background: var(--panel2); border-left-color: var(--accent); }
-  .sess .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 22px; }
+  .sess .rename {
+    display: none; position: absolute; top: 7px; right: 8px;
+    font: inherit; font-size: 12px; background: none; border: 0;
+    color: var(--dim); cursor: pointer; padding: 2px 4px;
+  }
+  .sess:hover .rename { display: block; }
+  .sess .rename:hover { color: var(--fg); }
   .sess .m { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sess.child .t::before { content: "↳ "; color: var(--dim); }
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -104,6 +124,57 @@
   #interrupt { display: none; }
   #interrupt.show { display: inline-block; }
   #sandbox-btn.on { color: var(--green); border-color: var(--green); }
+  /* ---- mobile: sidebar becomes an off-canvas drawer behind a top bar ---- */
+  @media (max-width: 700px) {
+    #topbar {
+      display: flex; align-items: center; gap: 10px; background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      padding: 8px 12px;
+      padding-top: calc(8px + env(safe-area-inset-top));
+    }
+    #topbar .title {
+      flex: 1; color: var(--accent); letter-spacing: 1px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      cursor: pointer; /* tap to rename */
+    }
+    #menu-btn {
+      font: inherit; font-size: 18px; line-height: 1; background: none;
+      border: 1px solid var(--line); color: var(--fg); border-radius: 6px;
+      padding: 8px 12px; cursor: pointer;
+    }
+    #side {
+      position: fixed; top: 0; bottom: 0; left: 0; z-index: 20;
+      width: min(82vw, 320px); min-width: 0;
+      transform: translateX(-105%); transition: transform .2s ease;
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      box-shadow: 4px 0 24px rgba(0,0,0,.5);
+    }
+    #side.open { transform: translateX(0); }
+    #backdrop {
+      position: fixed; inset: 0; z-index: 15; background: rgba(0,0,0,.5);
+    }
+    #backdrop:not(.show) { display: none; }
+    #backdrop.show { display: block; }
+    .sess { padding: 12px 16px; }
+    .sess .rename { display: block; font-size: 14px; top: 11px; } /* no hover on touch */
+    #side h1 { padding: 16px 16px 12px; }
+    #side h1 button { padding: 4px 10px; }
+    #transcript { padding: 12px; }
+    .block { max-width: none; }
+    #input { font-size: 16px; } /* <16px makes iOS zoom the page on focus */
+    #composer .prompt { padding-top: 13px; }
+    button.act { padding: 8px 14px; }
+    #approval { padding: 10px 12px; flex-wrap: wrap; }
+    #approval .q { flex-basis: 100%; white-space: normal; word-break: break-word; max-height: 4.5em; overflow-y: auto; }
+    #status .model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #status .right { flex-shrink: 0; }
+    #status {
+      padding-bottom: calc(6px + env(safe-area-inset-bottom));
+      padding-left: calc(16px + env(safe-area-inset-left));
+      padding-right: calc(16px + env(safe-area-inset-right));
+    }
+  }
 </style>
 </head>
 <body>
@@ -111,7 +182,12 @@
   <h1>MARLIN <button id="new-btn" title="new session">+ new</button></h1>
   <div id="sessions"></div>
 </div>
+<div id="backdrop"></div>
 <div id="main">
+  <div id="topbar">
+    <button id="menu-btn" title="sessions">☰</button>
+    <span class="title">marlin</span>
+  </div>
   <div id="transcript"><button id="history-more" class="act">load older</button></div>
   <div id="approval">
     <span class="q"></span>
@@ -120,7 +196,8 @@
   </div>
   <div id="composer">
     <span class="prompt">❯</span>
-    <input id="input" autocomplete="off" spellcheck="false" placeholder="message marlin…">
+    <input id="input" autocomplete="off" spellcheck="false" autocapitalize="off"
+      autocorrect="off" enterkeyhint="send" placeholder="message marlin…">
   </div>
   <div id="status">
     <span class="state">idle</span><span>·</span><span class="model"></span>
@@ -454,6 +531,18 @@ function handle(m) {
   }
 }
 
+async function renameSession(s) {
+  const name = window.prompt('rename session', s.title || '');
+  if (name === null || !name.trim()) return;
+  const r = await send('{"session_rename":{"sid":' + s.sid + ',"title":' + JSON.stringify(name.trim()) + '}}');
+  if (r.err) notice(r.err.code + ': ' + r.err.msg);
+  else loadSessions();
+}
+
+function tabTitle(s) {
+  document.title = s && s.title ? s.title + ' · marlin' : 'marlin';
+}
+
 function renderSessions(list) {
   sessionsCache = list;
   const box = $('#sessions');
@@ -462,17 +551,31 @@ function renderSessions(list) {
     const d = el('div', 'sess' + (s.parent_sid ? ' child' : '') + (s.sid === sid ? ' active' : ''));
     d.appendChild(el('div', 't', s.title || '(untitled)'));
     d.appendChild(el('div', 'm', s.state + ' · ' + (s.model || '').split('/').slice(-1)[0]));
+    const pen = el('button', 'rename', '✎');
+    pen.title = 'rename';
+    pen.onclick = ev => { ev.stopPropagation(); renameSession(s); };
+    d.appendChild(pen);
     d.onclick = () => open(s);
     box.appendChild(d);
     if (s.sid === sid) {
       cur = s;
+      $('#topbar .title').textContent = s.title || '(untitled)';
+      tabTitle(s);
       $('#sandbox-btn').classList.toggle('on', !!s.sandboxed);
       $('#sandbox-btn').textContent = s.sandboxed ? '⛨ sandboxed' : '⛨ sandbox off';
     }
   }
 }
 
+function drawer(show) {
+  $('#side').classList.toggle('open', show);
+  $('#backdrop').classList.toggle('show', show);
+}
+
 function open(s) {
+  drawer(false);
+  $('#topbar .title').textContent = s.title || '(untitled)';
+  tabTitle(s);
   sid = s.sid;
   cur = s;
   lastSeq = 0;
@@ -545,6 +648,32 @@ $('#sandbox-btn').onclick = async () => {
   const r = await send('{"session_set_sandbox":{"sid":' + sid + ',"enabled":' + (!cur.sandboxed) + '}}');
   if (r.err) notice(r.err.msg); else loadSessions();
 };
+$('#topbar .title').onclick = () => { if (cur) renameSession(cur); };
+$('#menu-btn').onclick = () => drawer(!$('#side').classList.contains('open'));
+$('#backdrop').onclick = () => drawer(false);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !sid) return;
+  // Mobile browsers suspend background pages and can leave the SSE stream
+  // dead without ever firing onerror; resubscribe on return — the seq
+  // dedupe in handle() drops the replayed tail.
+  if (es) es.close();
+  es = new EventSource('/events?sid=' + sid);
+  es.onmessage = e => handle(JSON.parse(bigints(e.data)));
+  loadSessions();
+});
+if (window.visualViewport) {
+  // iOS overlays the on-screen keyboard instead of resizing the layout
+  // viewport; pin the app to the visible height so the composer stays
+  // reachable while typing.
+  const vv = window.visualViewport;
+  vv.addEventListener('resize', () => {
+    if (matchMedia('(max-width: 700px)').matches) {
+      document.body.style.height = vv.height + 'px';
+      window.scrollTo(0, 0);
+      scrollBottom();
+    } else document.body.style.height = '';
+  });
+}
 $('#new-btn').onclick = async () => {
   const cwd = cur ? cur.cwd : '/tmp';
   const model = cur ? cur.model : '';

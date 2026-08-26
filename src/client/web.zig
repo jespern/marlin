@@ -28,6 +28,14 @@ const proto = @import("../core/proto.zig");
 const attach = @import("attach.zig");
 
 const html = @embedFile("webui.html");
+const icon_180 = @embedFile("webui-icon-180.png");
+const icon_512 = @embedFile("webui-icon-512.png");
+const manifest =
+    \\{"name":"marlin","short_name":"marlin","start_url":"/","display":"standalone",
+    \\"background_color":"#17191d","theme_color":"#17191d","icons":[
+    \\{"src":"/icon-180.png","sizes":"180x180","type":"image/png"},
+    \\{"src":"/icon-512.png","sizes":"512x512","type":"image/png"}]}
+;
 const default_port: u16 = 8377;
 
 pub fn serve(
@@ -136,6 +144,18 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     if (std.mem.eql(u8, target, "/") or std.mem.eql(u8, target, "/index.html")) {
         try req.respond(html, .{ .extra_headers = &.{
             .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+        } });
+    } else if (std.mem.eql(u8, target, "/manifest.webmanifest")) {
+        try req.respond(manifest, .{ .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/manifest+json" },
+        } });
+    } else if (std.mem.eql(u8, target, "/icon-180.png")) {
+        try req.respond(icon_180, .{ .extra_headers = &.{
+            .{ .name = "content-type", .value = "image/png" },
+        } });
+    } else if (std.mem.eql(u8, target, "/icon-512.png")) {
+        try req.respond(icon_512, .{ .extra_headers = &.{
+            .{ .name = "content-type", .value = "image/png" },
         } });
     } else if (std.mem.startsWith(u8, target, "/events")) {
         try serveEvents(ctx, req);
