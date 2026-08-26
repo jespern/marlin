@@ -490,11 +490,7 @@ pub fn appendCodeBlock(
     const panel_width = measure -| displayWidth(gutter);
     if (panel_width < 12) return;
     const language_label = std.mem.trim(u8, info, " \t\r");
-    const short_label = if (language_label.len > 0) language_label else "code";
-    const header = if (panel_width >= 34)
-        try std.fmt.allocPrint(arena, "{s} · select to copy", .{short_label})
-    else
-        short_label;
+    const header = if (language_label.len > 0) language_label else "code";
     try appendCodeBorder(arena, lines, gutter, panel_width, header);
 
     const language = languageForFence(language_label);
@@ -968,7 +964,7 @@ test "assistant Markdown renders code panels and semantic callouts" {
     var saw_warning = false;
     for (lines.items) |line| {
         const text = try lineText(arena, line);
-        if (std.mem.indexOf(u8, text, "zig · select to copy") != null) saw_code_header = true;
+        if (std.mem.indexOf(u8, text, "╭─ zig ") != null) saw_code_header = true;
         if (std.mem.indexOf(u8, text, "const answer") != null and line.syntax.len >= 2) saw_syntax = true;
         if (std.mem.indexOf(u8, text, "│ 1 │") != null) saw_code_gutter = true;
         if (std.mem.indexOf(u8, text, "WARNING") != null and line.fill_style != null) saw_warning = true;
