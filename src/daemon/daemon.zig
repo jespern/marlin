@@ -180,6 +180,9 @@ const Session = struct {
     parent_block_id: ?u64 = null,
     max_rounds: u32 = 128,
     archived: bool = false,
+    /// Whether the durable row already has a non-empty title. Cleared rows
+    /// get auto-titled from the first user message of a turn.
+    titled: bool = false,
     model: []u8, // gpa-owned
     effort: proto.ReasoningEffort = .auto,
     cwd: []u8, // gpa-owned
@@ -934,6 +937,28 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionTree(sa.sid, sa.archived);
             },
+            .session_rename => |sr| {
+                const session = (try self.getOrLoadSession(sr.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (self.rejectArchivedSession(client, session)) return;
+                // Same normalization as auto-generated task titles: first
+                // line, trimmed, UTF-8-safe length cap. A title never affects
+                // the running turn, so no busy check.
+                const title = taskTitle(sr.title);
+                if (title.len == 0) {
+                    self.sendTo(client, .{ .err = .{ .code = "bad_title", .msg = "title cannot be empty" } });
+                    return;
+                }
+                self.store.setSessionTitle(sr.sid, title) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "store", .msg = "could not update session title" } });
+                    return;
+                };
+                session.titled = true;
+                self.sendTo(client, .{ .ok = .{} });
+                self.broadcastSessionUpsert(sr.sid);
+            },
             .session_set_model => |sm| {
                 const session = (try self.getOrLoadSession(sm.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
@@ -1224,6 +1249,18 @@ pub const Daemon = struct {
                     self.sendInputError(client, inp.request_id, "internal", "could not start turn");
                     return;
                 };
+                // Root sessions are created without a title; adopt the first
+                // message the same way task children adopt their prompt. A
+                // store failure only delays titling to the next message.
+                if (!session.titled) {
+                    const title = taskTitle(inp.text);
+                    if (title.len > 0) {
+                        if (self.store.setSessionTitle(inp.sid, title)) |_| {
+                            session.titled = true;
+                            self.broadcastSessionUpsert(inp.sid);
+                        } else |_| {}
+                    }
+                }
                 self.sendTo(client, .{ .ok = .{ .request_id = inp.request_id } });
             },
             .approve => |a| {
@@ -1495,6 +1532,7 @@ pub const Daemon = struct {
             .parent_block_id = row.parent_block_id,
             .max_rounds = if (row.max_rounds > 0) row.max_rounds else 128,
             .archived = row.archived,
+            .titled = row.title.len > 0,
             .model = model,
             .effort = row.effort,
             .cwd = cwd,
@@ -1734,6 +1772,7 @@ pub const Daemon = struct {
             .kind = .task_child,
             .parent_block_id = cs.parent_block_id,
             .max_rounds = cs.max_rounds,
+            .titled = title.len > 0,
             .model = model,
             .effort = effort,
             .cwd = cwd,

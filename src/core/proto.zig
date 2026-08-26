@@ -98,6 +98,9 @@ pub const ClientMsg = union(enum) {
     session_kill: struct { sid: u64 },
     /// Hide/restore a durable session hierarchy without deleting its log.
     session_archive: struct { sid: u64, archived: bool = true },
+    /// Set a session's display title. The daemon normalizes it like
+    /// auto-generated titles (first line, trimmed, length-capped).
+    session_rename: struct { sid: u64, title: []const u8 },
     session_set_model: struct { sid: u64, model: []const u8 },
     session_set_effort: struct { sid: u64, effort: ReasoningEffort },
     /// Toggle the kernel shell sandbox (and its prompt-free shell execution)

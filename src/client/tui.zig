@@ -139,6 +139,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/mcp", .usage = " [add|remove|restart|reload]", .description = "inspect and manage MCP servers", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/new", .description = "start a new session" },
+    .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
     .{ .name = "/compact", .description = "compact the current context" },
@@ -1743,6 +1744,17 @@ const App = struct {
             self.newSession() catch {
                 self.setNotice("could not create session", .{});
             };
+        } else if (std.mem.eql(u8, head, "/rename")) {
+            const title = std.mem.trim(u8, it.rest(), " \t");
+            if (title.len == 0) {
+                self.setNotice("usage: /rename <title>", .{});
+                return;
+            }
+            self.conn.send(.{ .session_rename = .{ .sid = self.sid, .title = title } }) catch {
+                self.setNotice("could not rename session", .{});
+                return;
+            };
+            self.setNotice("renamed to {s}", .{title});
         } else if (std.mem.eql(u8, head, "/archive")) {
             const arg = it.rest();
             if (arg.len == 0) {
@@ -1793,7 +1805,7 @@ const App = struct {
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /new · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
