@@ -2363,9 +2363,10 @@ const App = struct {
         if (range) |r| self.applyOperator(op, r);
     }
 
-    /// Sticky prompt rows are decorative duplicates of durable transcript
-    /// lines. Mouse/copy coordinates map only the contiguous body below them;
-    /// the original prompt remains selectable through ordinary scrollback.
+    /// Sticky prompt rows and their separator are decorative duplicates of
+    /// durable transcript lines. Mouse/copy coordinates map only the
+    /// contiguous body below them; the original prompt remains selectable
+    /// through ordinary scrollback.
     fn visibleLineAtRow(self: *const App, row: usize) ?usize {
         if (row >= self.last_view_h) return null;
         if (self.last_pinned_rows == 0 and self.last_body_rows == 0) {
@@ -3727,9 +3728,25 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     if (pin_prompt) {
         const sticky_prompt = prompt_range.?;
         for (lines.items[sticky_prompt.start..][0..sticky_prompt.len], sticky_prompt.start..) |ln, abs_line| {
-            try visible.append(arena, .{ .line = ln, .abs_line = abs_line, .selectable = false });
+            var pinned_line = ln;
+            // The sticky copy is navigation chrome rather than an editable
+            // composer. Give its first content row a distinct anchored mark;
+            // the durable prompt in ordinary scrollback keeps the usual ❯.
+            if (abs_line == sticky_prompt.start + 1) {
+                pinned_line.text = " # ";
+                pinned_line.style = Palette.pinned_prompt_mark;
+            }
+            try visible.append(arena, .{ .line = pinned_line, .abs_line = abs_line, .selectable = false });
         }
-        const body_capacity = view_h - sticky_prompt.len;
+        // One blank, non-selectable row keeps the pinned surface visually
+        // separate from the live scrollback immediately below it.
+        try visible.append(arena, .{
+            .line = .{ .text = "", .style = .{} },
+            .abs_line = sticky_prompt.start + sticky_prompt.len,
+            .selectable = false,
+        });
+        const pinned_rows = sticky_prompt.len + 1;
+        const body_capacity = view_h - pinned_rows;
         const body_floor = sticky_prompt.start + sticky_prompt.len;
         const body_first = @max(body_floor, total -| body_capacity);
         const body_end = @min(body_first + body_capacity, total);
@@ -3737,7 +3754,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             try visible.append(arena, .{ .line = ln, .abs_line = abs_line, .selectable = true });
         }
         app.last_pinned_start = sticky_prompt.start;
-        app.last_pinned_rows = sticky_prompt.len;
+        app.last_pinned_rows = pinned_rows;
         app.last_body_first = body_first;
         app.last_body_rows = body_end - body_first;
         app.last_first_visible = body_first;
@@ -6923,10 +6940,14 @@ test "active prompt scrolls normally before sticking at the top" {
     frame.deinit();
     frame = std.heap.ArenaAllocator.init(gpa);
     try draw(&app, &vx, frame.allocator());
-    try std.testing.expectEqual(@as(usize, 3), app.last_pinned_rows);
+    try std.testing.expectEqual(@as(usize, 4), app.last_pinned_rows);
     try std.testing.expect(app.last_body_first > app.last_pinned_start + app.last_pinned_rows);
     try std.testing.expect(app.visibleLineAtRow(0) == null);
+    try std.testing.expect(app.visibleLineAtRow(app.last_pinned_rows - 1) == null);
     try std.testing.expectEqual(app.last_body_first, app.visibleLineAtRow(app.last_pinned_rows).?);
+    const pinned_mark = vx.window().readCell(1, @intCast(app.tabBarRows() + 1)).?;
+    try std.testing.expectEqualStrings("#", pinned_mark.char.grapheme);
+    try std.testing.expect(vaxis.Color.eql(pinned_mark.style.fg, Palette.pinned_prompt_mark.fg));
 
     app.scroll_up = 1;
     frame.deinit();

@@ -21,6 +21,7 @@ pub const Palette = struct {
     /// prompts are the anchors a transcript is scanned by.)
     pub const prompt_text: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } }, .bg = prompt_bg, .bold = true };
     pub const prompt_mark: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 6 }, .bold = true };
+    pub const pinned_prompt_mark: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .rgb = .{ 0xc7, 0x92, 0xea } }, .bold = true };
     pub const command_bg: vaxis.Color = .{ .rgb = .{ 0x2d, 0x30, 0x35 } };
     pub const tab_bar: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 8 } };
     pub const tab_inactive: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 7 } };
