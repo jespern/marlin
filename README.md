@@ -36,7 +36,12 @@ Every agent harness today picks one of two shapes:
    files, breadth over speed.
 
 marlin takes the unclaimed third shape: **daemon-native structured sessions,
-multiplexed by a TUI that is just another client.**
+multiplexed by a TUI that is just another client.** Some of those sessions
+run Marlin's own agent. Some host Claude Code as a *guest* when you need
+subscription Fable — Anthropic will not sell that inference as a Marlin
+model. Guest is a session regime, not a third dialect; the multiplexer
+still sees blocks, not pixels. See
+[Native vs guest](docs/ARCHITECTURE.md#native-vs-guest-agents).
 
 - Sessions live in the daemon. Detach, reboot your laptop, ssh in from another
   machine, reattach — the agent never noticed.
@@ -78,9 +83,11 @@ multiplexed by a TUI that is just another client.**
 4. **Extensibility at process boundaries.** MCP servers for tools, hook scripts
    for events, executables as custom tools. The Zig core stays small and stable;
    churn lives in scripts.
-5. **OpenRouter first, providers as a thin interface.** OpenAI-compatible wire
-   format covers 90% of the world; Anthropic Messages is the one worth
-   special-casing (prompt-cache control).
+5. **OpenRouter first for the native agent; two wire dialects, not N.**
+   OpenAI-compatible covers most models; Anthropic Messages is the one
+   extra wire. Claude Code is not a dialect — it is a guest session
+   because subscription Fable is only sanctioned through their binary.
+   Do not add a third wire, and do not add a second guest.
 6. **Agent panes only — no VTE.** Splits show marlin sessions, which are
    structured data we render ourselves. No terminal emulation tarpit. (If an
    embedded terminal is ever truly needed: libghostty-vt, not hand-rolled.)
@@ -147,10 +154,11 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
   │  later:  │      │  │  SQLite: blocks, sessions,   │    │
   │  PWA)    │      │  │  indexed logs, full outputs  │    │
   └──────────┘      │  └──────────────────────────────┘    │
-                    │   tools ─▶ bash/files/MCP/hooks       │
-                    └──────────────┬───────────────────────┘
-                                   ▼
-                            OpenRouter / OpenAI-compat / Anthropic
+                    │  native loop  ·  guest: claude -p       │
+                    └──────────────────┬──────────────────────┘
+                                       ▼
+                         OpenRouter / Anthropic API
+                         (guest sessions: their binary)
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and

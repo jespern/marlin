@@ -24,6 +24,75 @@ with the latter, it's simpler to ship):
   kill <handle>` —
   thin protocol clients for scripting.
 
+### Native vs guest agents
+
+Marlin is a **session multiplexer with a native agent**. Some sessions
+run that agent. Some sessions host someone else's.
+
+**Native** (`openrouter/`, `anthropic/`, `local/`): Marlin owns the turn.
+§4–§7 apply in full — context assembly, Marlin tools, Seatbelt, MCP,
+`task`/`task_batch`, `plan_update`, L0/L1/L2. The TUI is a client of this
+loop. This is the product.
+
+**Guest** (`claudecode/`): Anthropic's official `claude` binary owns the
+turn. Subscription Fable (and the rest of the plan-included lineup) is
+only sanctioned through that binary; treating it as a Marlin wire dialect
+is how you get the account restricted. Marlin's job on a guest session is
+the multiplexer: persist the structured event stream as blocks, attach,
+interrupt, reboot/`--resume` via a derived UUID, copy, and park *their*
+permission prompts on *our* approval bar. Marlin tools, Seatbelt, network
+screening, MCP-as-agent-tools, `task`/`task_batch`, `plan_update`, and
+L0/L1/L2 **do not reach inside the subprocess.**
+
+Guest is a session regime, not a model. Kitchen-sink is chasing parity so
+a guest tab feels like a native tab. The adapter is frozen at:
+
+1. spawn `claude -p --output-format stream-json`
+2. map stream-json → blocks
+3. interrupt / reboot / resume
+4. permission bridge onto the existing approval bar (mux UX, not harness UX)
+5. session status (running / awaiting_approval / idle)
+
+Nothing else. Semantic rendering of unknown tools is a TUI fact, not a
+Claude Code catalogue. Images stay durable in Marlin and are not smuggled
+into the binary. `/compact`, `/sandbox`, `/effort`, and Marlin tool
+dispatch are native-only; a guest session that receives them must refuse
+at the protocol, not start a turn and fail with an internal name.
+
+`/new` is native. Guest is opt-in (`/model claudecode/…` on a **new**
+session, or an explicit first-run "I have a Claude subscription" path).
+Switching `/model` across the wall on a live transcript is a regime
+change, not a model change — refuse it (open a new session) once the
+durable agent field exists. Today the regime is inferred from the model
+string, which is the leak this section exists to close; see "Making the
+wall true" at the end of this subsection.
+
+The day Anthropic ships a subscriber-legal Messages endpoint, guest
+sessions become a weekend deletion and Fable is a native model. Until
+then the wall is how Marlin stays small.
+
+**Making the wall true** (honest: not all of this is code yet):
+
+- Durable agent field (`native` | `claude_code`), not `claudecode/` as a
+  dialect on `Endpoint`. `SessionKind` stays hierarchy (`root` /
+  `task_child` / `review_child`); agent is orthogonal.
+- Protocol reject: `/compact`, `/sandbox`, `/network` (session toggle),
+  `/effort` on guest; `/model` that would cross the wall. `/mcp` stays
+  daemon-global. Guest `/compact` today starts a running turn and fails
+  as `DelegatedContext` — that is a bug against this section.
+- Picker and status name the regime. Do not lead the default favorites
+  list with `claudecode/`. Native remains the `/new` default.
+- Permission bridge (`marlin cc_approve`) is mux: fail-closed to *ask*,
+  never a shell parser, never applied to native `read_file`. Auto-allow
+  of CC `Read` (including paths outside the workspace) is CC's policy,
+  documented as such, not Marlin protected-path enforcement.
+- Do not spawn Marlin `task` children from a guest parent. Do not grow
+  `ccAutoAllow`. Do not add guest-specific product (CC plan sync, wrapping
+  Seatbelt around their bash, vision side-channel).
+- Type-system: `Dialect` is wire (`openrouter` | `openai_compatible` |
+  `anthropic`). Guest is not a dialect; `runTurn` branching on
+  `.claude_code` is the current implementation, not the target shape.
+
 ### Session identity at the human boundary
 
 SQLite and the wire protocol keep sortable `u64` session ids. User-facing
@@ -371,7 +440,11 @@ Two stream disciplines worth locking in now:
 
 ## 4. Agent loop
 
-Per running turn, in its own thread:
+This section is the **native** turn. Guest sessions do not run it; they
+delegate to the official `claude` binary (Native vs guest, §1) and only
+persist the resulting blocks.
+
+Per running native turn, in its own thread:
 
 ```
 assemble context (see §6)
@@ -429,7 +502,9 @@ loop:
 
 ## 5. Providers
 
-One internal chat representation (blocks → messages), two wire dialects:
+Native sessions: one internal chat representation (blocks → messages),
+**two wire dialects**. Guest sessions are not a third dialect — they are
+the Native vs guest rule in §1.
 
 ```
 provider/
@@ -442,30 +517,23 @@ provider/
                       // thinking (requires persisting signed thinking blocks
                       // for tool-round replay; effort is ignored on the
                       // direct dialect until then — it works via OpenRouter).
-  claude_code.zig     // claudecode/<model> (SHIPPED): turns delegated to the
-                      // OFFICIAL `claude` binary in headless stream-json mode
-                      // under the user's subscription login — the only
-                      // sanctioned way to use plan-included inference outside
-                      // claude.ai. Claude Code is the agent loop (its tools,
-                      // its permission system, its context management);
-                      // marlin persists the structured event stream as blocks
-                      // and remains the multiplexer. Marlin's sandbox,
-                      // network screening, and L0/L1/L2 do NOT reach inside
-                      // the subprocess — but its APPROVAL GATE does: default
-                      // sessions run --permission-mode default with
-                      // --permission-prompt-tool wired (over --mcp-config) to
-                      // `marlin cc_approve --sid N`, a stdio MCP bridge that
-                      // forwards each prompt to the daemon as cc_approval.
-                      // Policy (permissions.ccAutoAllow) answers workspace-
-                      // scoped calls instantly, mirroring native auto-inside;
-                      // everything else parks as a normal approval_request
-                      // answerable from any client. Auto sessions map to
-                      // --dangerously-skip-permissions as before.
-  registry.zig        // model string "openrouter/anthropic/claude-..." → dialect + base_url + key env
+  claude_code.zig     // GUEST ADAPTER, not a wire dialect. claudecode/<model>
+                      // sessions spawn the official `claude` binary; see §1.
+                      // The approval bar is mux UX: `marlin cc_approve --sid N`
+                      // (stdio MCP `--permission-prompt-tool`) forwards their
+                      // prompts as cc_approval. Workspace-scoped calls may
+                      // auto-allow (CC's read-only/auto-inside analogue);
+                      // everything else parks as a normal approval_request.
+                      // Auto/yolo guest sessions map to
+                      // --dangerously-skip-permissions.
+  registry.zig        // model string → native dialect+endpoint+key, or guest
 ```
 
-- OpenRouter is the default registry entry; `base_url` + `api_key_env` in
-  config adds any OpenAI-compatible endpoint without code.
+- OpenRouter is the default registry entry and the `/new` default.
+- `base_url` + `api_key_env` in config adding arbitrary OpenAI-compatible
+  endpoints is **design, not shipped** — the registry is `openrouter` /
+  `anthropic` / `local` plus the guest prefix `claudecode`. Do not describe
+  extra native providers as config-only until that table exists.
 - Every OpenRouter request carries the Marlin session's stable `session_id`.
   OpenRouter therefore keeps a session on the same provider/cache and groups
   its generations in Activity. `[providers.openrouter] sort` defaults to
@@ -520,7 +588,10 @@ safe by construction — deltas are ephemeral, so discard the partial buffer
 and re-request the same assembled context against the fallback.
 
 **Don't build:** Gemini-native, Bedrock (SigV4), Vertex dialects — heavy
-auth for platforms not in use. The two-dialect rule holds.
+auth for platforms not in use. The two-dialect rule holds for *native*
+sessions. Guest is not a dialect; do not add a third wire. Do not add
+further guest agents (Codex CLI, `gemini -p`, …) — one hostage is the
+budget.
 
 **Accounting footnote:** OpenRouter reports $ directly; direct providers
 report only tokens. The status-bar `$` needs a small local price table
@@ -692,23 +763,28 @@ secret IMMORTAL):
   a tool_result.
 - **Redact at capture time (L0), before appendBlock.** Blocks are
   immutable, so redaction after persistence is impossible by design. Two
-  layers: (a) known-value scrub — the daemon greps tool output for the
-  literal bytes of every secret it loaded and replaces with
+  layers: (a) known-value scrub (SHIPPED: `permissions.collectSecrets` +
+  `redactSecrets`, applied in the loop before hashing/capping/blobbing,
+  native and guest tool results alike) — the daemon greps tool output for
+  the literal bytes of every secret it loaded and replaces with
   `[REDACTED:<name>]`; exact match, zero false positives; (b) pattern
   scrub for secret-shaped strings (sk-*, AKIA*, PEM blocks, JWTs),
-  configurable since build logs hit false positives. Redaction runs
-  before persistence AND context assembly: the model never sees the
-  bytes, so injection cannot make it repeat them. (Same principle as
-  1Password-for-Claude's zero-exposure framework: the agent may USE a
-  credential, it never HOLDS it in context.)
+  configurable since build logs hit false positives **(not yet
+  implemented)**. Redaction runs before persistence AND context assembly:
+  the model never sees the bytes, so injection cannot make it repeat
+  them. (Same principle as 1Password-for-Claude's zero-exposure
+  framework: the agent may USE a credential, it never HOLDS it in
+  context.)
 - **Config holds no plaintext.** `api_key_env` (existing) or
   `api_key_cmd = "op read op://..."` — run at daemon start and /reboot,
   cached in memory. op/pass/security(1) become the vault; marlin never
   writes a key to disk.
-- **Protected paths enforced, not requested.** read_file/grep on
-  `.env*`, `*_rsa`, `*.pem`, `~/.aws/credentials` etc. returns
-  refusal-as-data ("blocked by secrets policy; /allow to override") —
-  policy in the tool layer, not a plea in the system prompt.
+- **Protected paths enforced, not requested.** (SHIPPED) read_file/grep
+  on `.env*`, `*_rsa`, `*.pem`, `~/.aws/credentials` etc. return
+  refusal-as-data, symlink-aware; grep additionally filters matches from
+  protected files inside ordinary trees — policy in the tool layer, not
+  a plea in the system prompt. The `/allow` override is the designed
+  escape hatch **(not yet implemented; M3.5 capability grants)**.
 - **(v2 door) Credential brokering:** daemon as forward proxy injecting
   auth headers for allowlisted hosts, so agent-written code calling
   external APIs never holds tokens (Agent Vault pattern). Needs TLS
@@ -864,7 +940,11 @@ A split pane identifies its session with a compact pane label.
   `/model`, `/compact`, `/new`, `/archive`, `/allow`); `!` = terse aliases for
   frequent actions (`!rb` expands to `/reboot --build`, `!c` copies the last
   output). Plain text = message to agent. `Esc` during a turn = queue steer
-  text; `Ctrl+C` = interrupt.
+  text; `Ctrl+C` = interrupt. Native-only harness verbs (`/compact`,
+  `/sandbox`, `/effort`, session `/network`) must refuse on a guest session
+  rather than no-op or fail internally (Native vs guest, §1). `/model`
+  that would cross the wall is a new session, not a live switch — once the
+  durable agent field exists.
 - Tool blocks render collapsed by default (name + one-line summary + status),
   expand on demand. Approvals render as inline prompt cards.
 

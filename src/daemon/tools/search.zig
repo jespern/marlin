@@ -6,6 +6,7 @@ const Io = std.Io;
 const regex_mod = @import("regex");
 
 const files = @import("files.zig");
+const permissions = @import("../permissions.zig");
 const process_io = @import("../process_io.zig");
 
 fn cancelled(flag: ?*const std.atomic.Value(bool)) bool {
@@ -43,6 +44,11 @@ pub fn grep(
     if (cancelled(cancel)) return error.Cancelled;
     const search_path = try files.resolvePath(gpa, args.path orelse ".", cwd);
     defer gpa.free(search_path);
+
+    // Protected-path refusal (ARCHITECTURE §7): searching credential
+    // material directly is refused as data; matches from protected files
+    // inside an ordinary tree are filtered out below (see capLines).
+    if (files.protectedReadRefusal(gpa, io, search_path, args.path orelse ".")) |refusal| return refusal;
 
     // ripgrep is the ideal path. A platform grep is still orders of magnitude
     // faster than interpreting a regex once per line, and is present on every
@@ -270,6 +276,7 @@ fn internalGrep(
             if (matches >= args.limit) break;
             if (entry.kind != .file) continue;
             if (skipPath(entry.path)) continue;
+            if (permissions.isProtectedPath(entry.path)) continue;
             if (args.glob) |g| {
                 if (!try globMatchAlloc(gpa, g, std.fs.path.basename(entry.path), cancel)) continue;
             }
@@ -425,9 +432,17 @@ fn capLines(gpa: std.mem.Allocator, text: []const u8, limit: u64) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var n: u64 = 0;
+    var hidden: u64 = 0;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
         if (line.len == 0) continue;
+        // rg/system grep have no protected-path concept; both funnel their
+        // "path:line:content" output through here, so filter matches from
+        // protected files (a .env in an ordinary tree) at the choke point.
+        if (lineFromProtectedFile(line)) {
+            hidden += 1;
+            continue;
+        }
         if (n >= limit) {
             try out.appendSlice(gpa, "[... more matches truncated; refine the pattern ...]\n");
             break;
@@ -436,11 +451,26 @@ fn capLines(gpa: std.mem.Allocator, text: []const u8, limit: u64) ![]u8 {
         try out.append(gpa, '\n');
         n += 1;
     }
+    if (hidden > 0) {
+        var note_buf: [96]u8 = undefined;
+        const note = std.fmt.bufPrint(
+            &note_buf,
+            "[{d} matches in protected files hidden; see docs/PERMISSIONS.md]\n",
+            .{hidden},
+        ) catch unreachable;
+        try out.appendSlice(gpa, note);
+    }
     if (out.items.len == 0) {
         out.deinit(gpa);
         return gpa.dupe(u8, "no matches");
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// True when a "path:line:content" result line names a protected file.
+fn lineFromProtectedFile(line: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+    return permissions.isProtectedPath(line[0..colon]);
 }
 
 // ------------------------------------------------------------------ glob --

@@ -5,6 +5,13 @@ fan-out primitives are implemented and verified. M4 is verified; M5 is
 productized and still needs a short real-server/hook dogfood pass. The workspace
 recovery/isolation track formerly called M4.5 is deliberately Later.
 
+Guest Claude Code sessions (ARCHITECTURE.md, Native vs guest) are a
+multiplexer feature, not an M6 workstream. Do not schedule guest-parity
+work (wrapping Seatbelt around `claude -p`, Marlin `task` inside their
+loop, CC plan sync, extra guest agents) as M6. The adapter is frozen;
+remaining guest work is the durable agent field plus protocol refuses
+listed in that section. Councils (`REVIEW.md`) are native-loop only.
+
 ## What exists now
 
 - The daemon already owns concurrent durable sessions, status watch/fan-out,

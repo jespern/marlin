@@ -285,6 +285,9 @@ pub const Daemon = struct {
     /// Absolute path to this marlin binary (gpa-owned), handed to delegated
     /// Claude Code sessions so their permission bridge can call back here.
     marlin_exe: ?[:0]u8 = null,
+    /// Secret values this process holds (slice gpa-owned; values reference
+    /// the daemon environ), redacted from tool output at capture time.
+    secrets: []const permissions.Secret = &.{},
     /// Model catalog cache (registry-form ids and normalized pricing,
     /// gpa-owned). Refreshed at most once per catalog_ttl_ms; fetch runs on a
     /// worker thread.
@@ -394,6 +397,9 @@ pub const Daemon = struct {
             // their permission bridge; an unresolvable path just means the
             // bridge stays unwired (headless prompts auto-deny as before).
             .marlin_exe = std.process.executablePathAlloc(io, gpa) catch null,
+            // Secret values this process holds, for capture-time redaction
+            // of tool output before it reaches the append-only store.
+            .secrets = permissions.collectSecrets(gpa, environ) catch &.{},
         };
         extension_transferred = true;
         defer {
@@ -406,6 +412,7 @@ pub const Daemon = struct {
         defer self.store.close();
         defer self.events.deinit();
         defer if (self.marlin_exe) |exe| gpa.free(exe);
+        defer if (self.secrets.len > 0) gpa.free(self.secrets);
         defer self.network.deinit();
 
         // The instance lock makes this socket provably stale.
@@ -2057,6 +2064,7 @@ pub const Daemon = struct {
             .cfg = self.cfg,
             .tool_environ = self.environ,
             .marlin_exe = self.marlin_exe,
+            .secrets = self.secrets,
             .sandbox_options = sandbox_options,
             .network_policy = if (job.network_filtering_enabled) &self.network else null,
             .extensions = self.extensions,

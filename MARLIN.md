@@ -30,9 +30,11 @@ headless CLI are thin socket clients. Docs are the contract — start with
   defaults; unknown fields are ignored on read.
 - `src/daemon/` — `daemon.zig` (threads/ownership: Store and Session structs
   are dispatcher-thread only — read the header before touching), `loop.zig`
-  (turn loop), `context.zig` (system prompt + context assembly),
+  (native turn loop; guest Claude Code turns also live here today — a
+  wall leak, see ARCHITECTURE.md Native vs guest), `context.zig`,
   `store.zig` (sqlite), `tools/`, `sandbox.zig`, `permissions.zig`,
-  `network_policy.zig`.
+  `network_policy.zig`. `provider/claude_code.zig` is a guest adapter, not
+  a third wire dialect.
 - `src/client/` — TUI and headless. DEPENDENCY RULE: `client/` imports only
   `core/`, never `daemon/`.
 - `src/testing/` — e2e runner, fake provider, scenarios.

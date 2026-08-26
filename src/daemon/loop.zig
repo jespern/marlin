@@ -55,6 +55,10 @@ pub const RunOpts = struct {
     /// back into the daemon (the Claude Code permission bridge). Null skips
     /// bridge wiring (tests; exe path unresolvable).
     marlin_exe: ?[]const u8 = null,
+    /// Secret values the daemon actually holds, redacted from tool output at
+    /// capture time (ARCHITECTURE §7) — before hashing, capping, or blobbing,
+    /// because the append-only store makes anything persisted immortal.
+    secrets: []const permissions.Secret = &.{},
     /// Kernel sandbox selected only after its runtime canary passes.
     sandbox_options: sandbox.Options = .{},
     /// Allow-by-default hostname policy for structured network tools.
@@ -647,6 +651,12 @@ pub fn runTurn(
         // Results stay in provider call order even when execution completed
         // out of order. The transcript is therefore deterministic and valid.
         for (prepared) |*call| {
+            // Capture-time redaction, BEFORE hashing/capping/blobbing: the
+            // append-only store makes anything persisted immortal.
+            if (try permissions.redactSecrets(gpa, opts.secrets, call.exec.?.output)) |clean| {
+                gpa.free(call.exec.?.output);
+                call.exec.?.output = clean;
+            }
             const exec = call.exec.?;
 
             // Blob the full output when it exceeds the inline cap.
@@ -1058,10 +1068,16 @@ fn ccInvoke(
                 },
                 .tool_result => |tr| {
                     const cap = opts.cfg.inline_tool_cap_bytes;
+                    // Same capture-time redaction as native tool results:
+                    // the delegated binary can read a file containing a key
+                    // the daemon also holds.
+                    const redacted = try permissions.redactSecrets(gpa, opts.secrets, tr.text);
+                    defer if (redacted) |r| gpa.free(r);
+                    const body = redacted orelse tr.text;
                     _ = try ap.append(.{ .tool_result = .{
                         .call_id = tr.tool_use_id,
                         .status = if (tr.is_error) .err else .ok,
-                        .inline_body = tr.text[0..@min(tr.text.len, cap)],
+                        .inline_body = body[0..@min(body.len, cap)],
                         .full_body_ref = null,
                     } });
                     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, "claude", .done);

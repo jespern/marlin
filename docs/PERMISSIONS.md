@@ -39,6 +39,16 @@ Current progress:
 - **Next:** rich once/session escalation grants; typed protected-read
   refusals for direct read tools.
 
+Guest Claude Code sessions (ARCHITECTURE.md, Native vs guest) do **not**
+run this permission matrix. Their binary has its own tools and
+permissions. The Marlin approval bar may park *their* prompts (`cc_approval`
+/ `marlin cc_approve`) as multiplexer UX — a session needs a human —
+with `permissions.ccAutoAllow` as a coarse analogue of auto-inside
+(reads auto-allow, including outside the workspace; edits and bash fail
+closed to *ask*). That heuristic is not native `read_file` policy and
+must not grow into a shell parser. Native protected-path refusals remain
+the unpaid invoice on Marlin's own tools.
+
 ## Product contract
 
 Marlin approves capabilities, not command prefixes. Every tool call continues

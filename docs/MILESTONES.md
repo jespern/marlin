@@ -35,9 +35,10 @@ marlin/
 │   │   │   ├── provider.zig   # iface: request(messages,tools) → event stream
 │   │   │   ├── openai_compat.zig
 │   │   │   ├── anthropic.zig
+│   │   │   ├── claude_code.zig # GUEST adapter: spawn official `claude` binary
 │   │   │   ├── sse.zig        # SSE parser (shared)
 │   │   │   ├── http.zig       # pooled std.http transport, streaming, cancellation
-│   │   │   └── registry.zig   # model string → dialect+endpoint+key
+│   │   │   └── registry.zig   # model string → native dialect or guest prefix
 │   │   ├── hooks.zig          # event → script runner
 │   │   └── skills.zig         # index scan, frontmatter parse, skill tool
 │   │

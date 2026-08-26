@@ -280,6 +280,45 @@ pub fn isSecretEnvironmentName(name: []const u8) bool {
     return false;
 }
 
+/// One secret value this process actually holds, for exact-value capture-time
+/// redaction of tool output (ARCHITECTURE §7).
+pub const Secret = struct { name: []const u8, value: []const u8 };
+
+/// Collect the secret values loaded into this process (provider keys and
+/// friends, by the same name policy the environment boundary uses). Values
+/// shorter than 8 bytes are skipped: redacting "1" would shred ordinary
+/// output. Returned slice references `source`'s memory; caller frees the
+/// slice only.
+pub fn collectSecrets(gpa: std.mem.Allocator, source: *const std.process.Environ.Map) ![]Secret {
+    var out: std.ArrayList(Secret) = .empty;
+    errdefer out.deinit(gpa);
+    var it = source.iterator();
+    while (it.next()) |entry| {
+        if (!isSecretEnvironmentName(entry.key_ptr.*)) continue;
+        if (entry.value_ptr.len < 8) continue;
+        try out.append(gpa, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Replace every occurrence of any collected secret value in `text` with
+/// [REDACTED:<NAME>]. Returns null when nothing matched, so the common case
+/// costs one scan and zero allocations.
+pub fn redactSecrets(gpa: std.mem.Allocator, secrets: []const Secret, text: []const u8) !?[]u8 {
+    var current: ?[]u8 = null;
+    errdefer if (current) |c| gpa.free(c);
+    for (secrets) |secret| {
+        const haystack: []const u8 = current orelse text;
+        if (std.mem.indexOf(u8, haystack, secret.value) == null) continue;
+        const marker = try std.fmt.allocPrint(gpa, "[REDACTED:{s}]", .{secret.name});
+        defer gpa.free(marker);
+        const replaced = try std.mem.replaceOwned(u8, gpa, haystack, secret.value, marker);
+        if (current) |c| gpa.free(c);
+        current = replaced;
+    }
+    return current;
+}
+
 /// Build the complete environment visible to a tool subprocess. Non-secret
 /// process context is retained (PATH/HOME/locale/etc.); matching credentials
 /// are omitted. Caller owns the returned map.
@@ -529,4 +568,29 @@ test "cc bridge policy: shell commands inside the root run, escapes ask" {
         defer gpa.free(args);
         try std.testing.expect(!ccAutoAllow(gpa, io, cwd, "Bash", args));
     }
+}
+
+test "secret collection and exact-value redaction" {
+    const gpa = std.testing.allocator;
+    var source = std.process.Environ.Map.init(gpa);
+    defer source.deinit();
+    try source.put("OPENROUTER_API_KEY", "sk-or-v1-abcdef123456");
+    try source.put("GH_TOKEN", "ghp_zyxwvut987654");
+    try source.put("SHORT_TOKEN", "x"); // too short to redact safely
+    try source.put("PATH", "/usr/bin");
+
+    const secrets = try collectSecrets(gpa, &source);
+    defer gpa.free(secrets);
+    try std.testing.expectEqual(@as(usize, 2), secrets.len);
+
+    const dirty = "key=sk-or-v1-abcdef123456 and ghp_zyxwvut987654 twice ghp_zyxwvut987654";
+    const clean = (try redactSecrets(gpa, secrets, dirty)).?;
+    defer gpa.free(clean);
+    try std.testing.expect(std.mem.indexOf(u8, clean, "sk-or-v1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, clean, "ghp_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, clean, "[REDACTED:OPENROUTER_API_KEY]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clean, "[REDACTED:GH_TOKEN]") != null);
+
+    // The common case (no secrets present) allocates nothing.
+    try std.testing.expectEqual(@as(?[]u8, null), try redactSecrets(gpa, secrets, "ordinary tool output"));
 }

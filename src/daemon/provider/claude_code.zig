@@ -1,20 +1,21 @@
-//! Claude Code delegation provider: `claudecode/<model>` sessions run their
-//! turns through the OFFICIAL `claude` binary in headless stream-json mode.
+//! Guest-session adapter: `claudecode/<model>` turns run through the OFFICIAL
+//! `claude` binary in headless stream-json mode. Not a wire dialect.
 //!
-//! Why a subprocess and not a wire dialect: subscription (Pro/Max) inference
-//! is only sanctioned through Anthropic's own binary — subscription OAuth
-//! tokens are rejected (and accounts restricted) outside Claude Code. The
-//! binary authenticates itself, runs its OWN agent loop with its OWN tools
-//! and permission system, and streams structured events; marlin remains the
-//! multiplexer and durable transcript. Consequences, stated honestly:
-//!   - marlin's approval gate, seatbelt, network screening, and secret
-//!     redaction do NOT reach inside the subprocess; Claude Code's own
-//!     permission system governs (mapped from the session approval mode).
-//!   - marlin's tools are not advertised; Claude Code uses its native set.
-//!   - context/compaction is Claude Code's; marlin's L0/L1/L2 do not apply.
+//! Why a guest and not a model: subscription (Pro/Max) inference is only
+//! sanctioned through Anthropic's own binary — subscription OAuth outside
+//! Claude Code is rejected (and accounts restricted). The binary is the
+//! agent (its tools, permissions, context). Marlin is the multiplexer:
+//! persist stream-json as blocks, attach/interrupt/reboot, park their
+//! permission prompts on our approval bar. Frozen adapter — do not chase
+//! parity with the native loop (docs/ARCHITECTURE.md, Native vs guest).
 //!
-//! This module owns the pure parts (argv, session identity, event decode);
-//! the turn driver lives in loop.zig next to the persistence machinery.
+//!   - Seatbelt, network screening, Marlin tools/MCP, task/plan, L0/L1/L2
+//!     do NOT reach inside the subprocess.
+//!   - The approval bar DOES: mux UX, not harness policy. ccAutoAllow is
+//!     fail-closed to ask; it is not native read_file enforcement.
+//!
+//! This module owns argv, session identity, and event decode; the spawn
+//! driver currently lives in loop.zig (a remaining wall leak).
 
 const std = @import("std");
 

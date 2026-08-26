@@ -1,8 +1,12 @@
 //! Provider interface (docs/ARCHITECTURE.md §5).
 //!
-//! One internal chat representation (blocks → Message list), N wire dialects.
-//! A provider takes (messages, tool specs, model params) and yields a stream
-//! of events; the agent loop is dialect-agnostic.
+//! One internal chat representation (blocks → Message list), two native wire
+//! dialects. A provider takes (messages, tool specs, model params) and yields
+//! a stream of events; the native agent loop is dialect-agnostic.
+//!
+//! `claude_code` is listed on Dialect today because registry.resolve still
+//! returns an Endpoint. That is a leak: guest sessions are not a wire
+//! dialect (docs/ARCHITECTURE.md, Native vs guest). Do not add a fifth tag.
 
 const std = @import("std");
 

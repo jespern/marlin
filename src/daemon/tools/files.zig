@@ -9,6 +9,8 @@
 const std = @import("std");
 const Io = std.Io;
 
+const permissions = @import("../permissions.zig");
+
 pub const read_spec_name = "read_file";
 pub const read_spec_description =
     "Read a text file with line numbers. Returns lines as 'N|content'. " ++
@@ -50,6 +52,12 @@ pub fn readFileCancelable(
         try std.fs.path.join(gpa, &.{ cwd, args.path });
     defer gpa.free(abs);
 
+    // Protected-path refusal (ARCHITECTURE §7): credential material is
+    // refused as tool-result data, checked on both the requested path and
+    // its symlink-resolved target. Explicit capability grants are the
+    // designed escape hatch, not silence.
+    if (protectedReadRefusal(gpa, io, abs, args.path)) |refusal| return refusal;
+
     var dir = Io.Dir.cwd();
     const contents = dir.readFileAlloc(io, abs, gpa, .limited(max_read_bytes)) catch |e| {
         return std.fmt.allocPrint(gpa, "error: cannot read '{s}': {t}", .{ args.path, e });
@@ -87,6 +95,29 @@ pub fn readFileCancelable(
     }
     if (out.items.len == 0) try out.appendSlice(gpa, "(empty file)");
     return out.toOwnedSlice(gpa);
+}
+
+/// Non-null when `abs` (or its symlink-resolved target) is protected: the
+/// refusal text to return as the tool result. Null when the read may proceed.
+pub fn protectedReadRefusal(
+    gpa: std.mem.Allocator,
+    io: Io,
+    abs: []const u8,
+    display: []const u8,
+) ?[]u8 {
+    var hit = permissions.isProtectedPath(abs);
+    if (!hit) {
+        if (Io.Dir.realPathFileAbsoluteAlloc(io, abs, gpa)) |real| {
+            defer gpa.free(real);
+            hit = permissions.isProtectedPath(real);
+        } else |_| {}
+    }
+    if (!hit) return null;
+    return std.fmt.allocPrint(
+        gpa,
+        "error: refusing to read protected path '{s}' (credential material; see docs/PERMISSIONS.md)",
+        .{display},
+    ) catch null;
 }
 
 // ------------------------------------------------------------ write_file --
@@ -616,4 +647,19 @@ test "creation diffs cap at a head preview" {
     try std.testing.expect(std.mem.indexOf(u8, w, "+line 39") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, "+line 41") == null);
     try std.testing.expect(std.mem.indexOf(u8, w, "more new lines") != null);
+}
+
+test "read_file refuses protected paths as tool-result data" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const refusal = try readFile(gpa, io, .{ .path = "/tmp/definitely/.env" }, "/tmp");
+    defer gpa.free(refusal);
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "refusing to read protected path") != null);
+
+    const rel = try readFile(gpa, io, .{ .path = ".ssh/id_ed25519" }, "/tmp");
+    defer gpa.free(rel);
+    try std.testing.expect(std.mem.indexOf(u8, rel, "refusing to read protected path") != null);
 }

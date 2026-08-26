@@ -48,7 +48,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_watch | incremental? | initial session_list_result, then structural catalog updates; incremental clients receive session_upsert/session_remove, legacy clients receive refreshed snapshots |
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
-| session_set_model | sid, model | ok, or err{busy} mid-turn |
+| session_set_model | sid, model | ok, or err{busy} mid-turn. Crossing native↔guest (`claudecode/` prefix) is a regime change; a dedicated err lands with the durable agent field (ARCHITECTURE.md, Native vs guest). Today the prefix is inferred from the model string and the switch is allowed — a known leak. |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable |
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded |
@@ -61,7 +61,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | mcp_restart | name | mcp_list_result after rediscovery; failure is reported as server health, not daemon failure |
 | mcp_reload | — | mcp_list_result after atomic registry replacement; old registry survives invalid config/build failure |
 | approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |
-| session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn |
+| session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn. Guest sessions must refuse (no Marlin-assembled context); today they fail as an internal DelegatedContext after starting a turn — a leak. |
 | interrupt | sid, report? | ok, or interrupt_result with phase/elapsed diagnostics when report=true (cooperative cancel; also denies a pending approval) |
 | reboot | force? | quiesce (wait for turns; force interrupts), retire the listening socket, then ok RIGHT BEFORE daemon exit — requester's cue to re-exec; non-force returns err{approval_pending} rather than wait on an approval with no client |
 | shutdown | — | ok, then daemon exits cleanly |
@@ -71,7 +71,14 @@ policy that failed open. Both default false when decoding an older daemon.
 
 `effort`: `"auto"` omits the provider parameter and preserves the model's
 default. Explicit values are `"none"`, `"minimal"`, `"low"`, `"medium"`,
-`"high"`, `"xhigh"`, and `"max"`; support is model-dependent.
+`"high"`, `"xhigh"`, and `"max"`; support is model-dependent. Guest
+(`claudecode/`) sessions ignore Marlin effort; the protocol should refuse
+`session_set_effort` on them once the durable agent field exists.
+
+Guest vs native is a session regime (ARCHITECTURE.md), not a `SessionKind`.
+`kind` remains hierarchy (`root`, `task_child`, `review_child`). The guest
+adapter persists Claude Code stream-json as ordinary blocks; `cc_approval`
+is multiplexer UX for their permission prompts, not Marlin tool dispatch.
 
 `sub.from_seq`: 0 = live-only. N ≥ 1 = replay stored blocks with seq ≥ N
 first, then live. Clients that reconnect pass last_seen_seq + 1.
