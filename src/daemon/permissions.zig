@@ -129,9 +129,11 @@ pub fn realPathInWorkspace(
 /// delegated `claude -p` routes to marlin. Reads and searches are always auto
 /// (native read-only policy). Edits must provably stay inside the real
 /// workspace and off protected paths. Shell commands are approved unless they
-/// mention a path outside the workspace or a protected name. The heuristics
-/// only ever need to catch, not perfectly parse: the failure mode is asking
-/// the human, never denying.
+/// mention a path outside the workspace or a protected name. Honest posture:
+/// a token the scan cannot place ASKS, but a shape it does not look for
+/// ALLOWS — this is guest-mux convenience under the wall's rules
+/// (ARCHITECTURE, Native vs guest), not a security boundary, and it must not
+/// grow toward one.
 pub fn ccAutoAllow(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -191,7 +193,11 @@ fn commandStaysInWorkspace(gpa: std.mem.Allocator, cwd: []const u8, command: []c
         if (tok.len == 0) continue;
         if (isProtectedPath(tok)) return false;
         if (tok[0] == '~') return false;
-        if (tok[0] == '/' and benignAbsolutePrefix(tok)) continue;
+        // A dotted token is never benign: /tmp/../etc/passwd must reach
+        // assessPath (found by the first council review — the shortcut used
+        // to fire before the escape check).
+        if (tok[0] == '/' and benignAbsolutePrefix(tok) and
+            std.mem.indexOf(u8, tok, "..") == null) continue;
         if (tok[0] == '/' or std.mem.indexOf(u8, tok, "..") != null) {
             var assessed = assessPath(gpa, cwd, tok) catch return false;
             defer assessed.deinit(gpa);
@@ -562,6 +568,8 @@ test "cc bridge policy: shell commands inside the root run, escapes ask" {
         "cp x.pem /work/api/", // protected basename mention
         "git -C /work/other status",
         "echo hi > ~/notes.txt",
+        "cat /tmp/../etc/passwd", // benign prefix must not mask an escape
+        "echo x > /dev/../etc/cron.d/evil",
     };
     for (asks) |cmd| {
         const args = try std.json.Stringify.valueAlloc(gpa, .{ .command = cmd }, .{});
