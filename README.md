@@ -73,11 +73,14 @@ the old rooms?
 - Delegate one focused investigation with `task`, or fan out two to eight with
   `task_batch`; every read-only child is durable, attachable, and grouped under
   its parent while results return in requested order.
-- Convene a review council as a markdown skill, no core machinery: one prompt
-  fans to several models via `task_batch` (each child a different registry
-  model) and the parent consolidates agreements, splits, and a
-  recommendation — see [skills/council.md](skills/council.md). The first live
-  council reviewed marlin's own sandbox policy and found a real bug.
+- Convene a multi-model review council in one line: `/council set core
+  openrouter/x-ai/grok-4.6 openrouter/z-ai/glm-5.3` once, then
+  `/review core <question>` fans a self-contained review prompt to the
+  roster via `task_batch` and the parent consolidates agreements, splits,
+  and a recommendation. Councils are durable config (`[[council]]` in
+  config.toml); the procedure is a markdown skill
+  ([skills/council.md](skills/council.md)), not core machinery. The first
+  live council reviewed marlin's own sandbox policy and found a real bug.
 - Substantial work gets a durable execution plan: the active step stays pinned
   above the composer, revisions survive reboot and compaction, and delegated
   child activity attaches to the step it is helping complete.
@@ -196,7 +199,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and
 | Project | What we take |
 |---|---|
 | **herdr** | The UX bar: daemon+attach ergonomics, mobile-aware layout, status sidebar |
-| **zag** (Zig) | Append-only JSONL w/ tail recovery, compaction cascade, mid-turn steering as queued interrupt, headless eval mode, seatbelt/Landlock sandboxing of bash |
+| **zag** (Zig) | Append-only JSONL w/ tail recovery, compaction cascade, lossless mid-turn steering as queued follow-up, headless eval mode, seatbelt/Landlock sandboxing of bash |
 | **pi** | Minimal-tool philosophy (~6 tools is enough), simplicity discipline |
 | **Hermes** | Skills-as-markdown, store-full/truncate-at-assembly, output caps w/ file pointers |
 | **OpenCode** | Pruning constants & algorithm (protect recent 40k tool-output tokens, stub older) |

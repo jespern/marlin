@@ -235,6 +235,10 @@ const Session = struct {
     context_used: std.atomic.Value(u64) = .init(0),
     /// Queued mid-turn steer texts (gpa-owned), drained by poll_steer.
     steer_queue: std.ArrayList([]u8) = .empty,
+    /// Guarded by steer_mutex. A turn closes this atomically with observing
+    /// an empty queue, so dispatcher input can never be acknowledged into the
+    /// final-poll/turn-done gap. Compact and handover operations leave it off.
+    steer_accepting: bool = false,
     steer_mutex: Io.Mutex = .init,
     /// Non-null only while a task child is running for a parked parent call.
     task_waiter: ?*TaskFuture = null,
@@ -809,6 +813,7 @@ pub const Daemon = struct {
                     t.join();
                     session.turn_thread = null;
                 }
+                self.settleSteeringAfterTurn(session);
                 if (session.pending_guest_model) |guest| {
                     session.pending_guest_model = null;
                     self.store.setSessionModel(td.sid, guest) catch {};
@@ -1304,6 +1309,17 @@ pub const Daemon = struct {
                         return;
                     };
                     session.steer_mutex.lockUncancelable(self.io);
+                    if (!session.steer_accepting) {
+                        session.steer_mutex.unlock(self.io);
+                        self.gpa.free(owned);
+                        self.sendInputError(
+                            client,
+                            inp.request_id,
+                            "not_steerable",
+                            "the active operation is finishing or cannot be steered; message was not sent",
+                        );
+                        return;
+                    }
                     session.steer_queue.append(self.gpa, owned) catch {
                         session.steer_mutex.unlock(self.io);
                         self.gpa.free(owned);
@@ -1450,6 +1466,9 @@ pub const Daemon = struct {
                     .cancel = &session.cancel,
                     .session = session,
                 };
+                session.steer_mutex.lockUncancelable(self.io);
+                session.steer_accepting = false;
+                session.steer_mutex.unlock(self.io);
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
                 session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
                 session.state = .running;
@@ -2033,10 +2052,16 @@ pub const Daemon = struct {
             .cancel = &session.cancel,
             .session = session,
         };
+        session.steer_mutex.lockUncancelable(self.io);
+        session.steer_accepting = true;
+        session.steer_mutex.unlock(self.io);
         session.phase_started_at_ms.store(nowMs(self.io), .release);
         session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
         session.state = .running;
         const thread = std.Thread.spawn(.{}, turnMain, .{job}) catch |err| {
+            session.steer_mutex.lockUncancelable(self.io);
+            session.steer_accepting = false;
+            session.steer_mutex.unlock(self.io);
             session.state = .idle;
             session.turn_thread = null;
             session.phase_started_at_ms.store(nowMs(self.io), .release);
@@ -2075,6 +2100,9 @@ pub const Daemon = struct {
             .cancel = &session.cancel,
             .session = session,
         };
+        session.steer_mutex.lockUncancelable(self.io);
+        session.steer_accepting = false;
+        session.steer_mutex.unlock(self.io);
         session.phase_started_at_ms.store(nowMs(self.io), .release);
         session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
         session.state = .running;
@@ -2134,6 +2162,56 @@ pub const Daemon = struct {
         };
         self.store.appendBlock(b) catch return;
         TurnHooks.onBlock(job, b);
+    }
+
+    /// The successful turn path closes steering only after an atomic empty
+    /// check, so this is normally a no-op. Errors and interrupts can end from
+    /// deeper stack frames; retain any already-acknowledged input as durable
+    /// truth instead of leaving an optimistic echo or stale queue behind.
+    fn settleSteeringAfterTurn(self: *Daemon, session: *Session) void {
+        session.steer_mutex.lockUncancelable(self.io);
+        session.steer_accepting = false;
+        var pending = session.steer_queue;
+        session.steer_queue = .empty;
+        session.steer_mutex.unlock(self.io);
+        defer pending.deinit(self.gpa);
+        if (pending.items.len == 0) return;
+
+        var seq = self.store.lastSeq(session.id) catch {
+            for (pending.items) |text| self.gpa.free(text);
+            return;
+        };
+        const turn_id = ids.next(self.io);
+        for (pending.items) |text| {
+            defer self.gpa.free(text);
+            seq += 1;
+            const b = block.Block{
+                .id = ids.next(self.io),
+                .session_id = session.id,
+                .turn_id = turn_id,
+                .seq = seq,
+                .ts = nowMs(self.io),
+                .body = .{ .steer = .{ .text = text } },
+            };
+            self.store.appendBlock(b) catch continue;
+            const line = proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = session.id, .b = b } }) catch continue;
+            defer self.gpa.free(line);
+            self.fanOutLine(session.id, line);
+        }
+
+        seq += 1;
+        const note = block.Block{
+            .id = ids.next(self.io),
+            .session_id = session.id,
+            .turn_id = turn_id,
+            .seq = seq,
+            .ts = nowMs(self.io),
+            .body = .{ .system_note = .{ .text = "turn ended before queued steering could be processed; it remains in context for the next turn" } },
+        };
+        self.store.appendBlock(note) catch return;
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = session.id, .b = note } }) catch return;
+        defer self.gpa.free(line);
+        self.fanOutLine(session.id, line);
     }
 
     fn turnMain(job: *TurnJob) void {
@@ -2224,6 +2302,7 @@ pub const Daemon = struct {
             .tool_profile = if (job.kind == .root) .full else .read_only,
             .cancel = job.cancel,
             .poll_steer = TurnHooks.pollSteer,
+            .try_close_steer = TurnHooks.tryCloseSteer,
             .max_rounds = job.max_rounds,
         }, job.text, job.attachments) catch |e| {
             // Transport errors are flattened by the http layer; the recorded
@@ -2471,6 +2550,19 @@ pub const Daemon = struct {
             // Transfer to the loop's allocator (same gpa in practice).
             _ = gpa;
             return text;
+        }
+
+        /// Close only if the queue is empty while holding the same mutex used
+        /// by dispatcher enqueue. Once true is returned, future busy-state
+        /// input gets a correlated error instead of being stranded.
+        fn tryCloseSteer(ctx: ?*anyopaque) bool {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            job.session.steer_mutex.lockUncancelable(self.io);
+            defer job.session.steer_mutex.unlock(self.io);
+            if (job.session.steer_queue.items.len > 0) return false;
+            job.session.steer_accepting = false;
+            return true;
         }
 
         fn onApprovalNeeded(ctx: ?*anyopaque, id: u64, call_id: []const u8, tool: []const u8, args_json: []const u8) bool {

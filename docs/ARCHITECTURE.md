@@ -302,7 +302,7 @@ header, which is where it must be kept current:
 - **A running turn may touch exactly the listed shared fields**, each with a
   stated discipline: atomics (`cancel`, `approval_mode_live`, `context_used`,
   `phase`, `phase_started_at_ms`), the internally-synchronized approval `gate`, the
-  `steer_queue` under `steer_mutex`, and `prune_frontier` (turn-thread
+  `steer_queue` plus `steer_accepting` under `steer_mutex`, and `prune_frontier` (turn-thread
   exclusive while running). `TurnJob.session` is a live pointer, not a copy;
   a new turn-visible field must be added to that list with its discipline.
 
@@ -320,7 +320,7 @@ const BlockKind = enum {
     tool_call,       // id, name, arguments (as sent to tool)
     tool_result,     // id, status, inline_body (capped), full_body_ref
     approval,        // request + resolution (granted/denied/timeout, by whom)
-    steer,           // mid-turn user interrupt text
+    steer,           // mid-turn user follow-up text
     plan,            // immutable execution-plan revision; newest wins
     compaction,      // summary text + range of blocks it replaces in context
     system_note,     // model switch, error, session config change
@@ -502,7 +502,8 @@ loop:
     stream POST to provider (SSE)
       → emit coalesced text/reasoning delta events as text arrives
       → collect tool_calls (may be several)
-    if no tool_calls: finalize assistant_msg block; done
+    if no tool_calls: persist assistant_msg; drain steering; only finish after
+      atomically closing an empty steer queue, otherwise request another round
     persist the complete assistant tool_call batch
     resolve approval gates (§7) — may block on client response
     execute each maximal consecutive parallel_safe group concurrently;
@@ -997,8 +998,9 @@ A split pane identifies its session with a compact pane label.
 - **Command namespace**: `/` = session & harness commands (`/sessions`,
   `/model`, `/compact`, `/new`, `/archive`, `/allow`); `!` = terse aliases for
   frequent actions (`!rb` expands to `/reboot --build`, `!c` copies the last
-  output). Plain text = message to agent. `Esc` during a turn = queue steer
-  text; `Ctrl+C` = interrupt. Native-only harness verbs (`/compact`,
+  output). Plain text + `Enter` starts a turn when idle and queues steering
+  while an agent turn is active. `Esc` enters Vim normal mode; `Ctrl+C`
+  interrupts the active turn. Native-only harness verbs (`/compact`,
   `/sandbox`, session `/network`) must refuse on a guest session rather
   than no-op or fail internally (Native vs guest, §1). `/effort` is
   forwarded as `claude -p --effort`. `/model` may cross the wall; the next

@@ -117,8 +117,13 @@ pub const RunOpts = struct {
     /// the HTTP layer. When set mid-stream the turn ends with .interrupted.
     cancel: ?*std.atomic.Value(bool) = null,
     /// Steer poll: return queued mid-turn user text (caller allocs w/ gpa;
-    /// loop frees). Checked between rounds; injected as a steer block.
+    /// loop frees). Checked between rounds and after a tool-free response;
+    /// accepted text is injected as a steer block before the turn may finish.
     poll_steer: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 = null,
+    /// Atomically close this turn to new steering only when its queue is
+    /// empty. False means a steer raced the final poll and the loop must
+    /// continue. Null is appropriate for single-threaded tests.
+    try_close_steer: ?*const fn (ctx: ?*anyopaque) bool = null,
     max_rounds: u32 = 32,
 };
 
@@ -316,12 +321,7 @@ pub fn runTurn(
             return .{ .text = try gpa.dupe(u8, ""), .rounds = round, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
         }
         // -- steer checkpoint: inject queued mid-turn user text --
-        if (opts.poll_steer) |poll| {
-            while (poll(opts.on_delta_ctx, gpa)) |steer_text| {
-                defer gpa.free(steer_text);
-                _ = try ap.append(.{ .steer = .{ .text = steer_text } });
-            }
-        }
+        _ = try drainSteers(gpa, opts, &ap);
 
         // -- assemble context from the turn-local append-only history --
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -507,10 +507,17 @@ pub fn runTurn(
 
         const response_text = try acc.textWithCitationLinks(arena);
 
-        // -- no tool calls → final answer --
+        // -- no tool calls → final answer, unless the user steered --
         if (acc.calls.items.len == 0) {
-            publishPhase(opts, .finishing);
             _ = try ap.append(.{ .assistant_msg = .{ .text = response_text } });
+            // A steer submitted while this provider request was streaming
+            // must become another model round, even though the response
+            // otherwise looked final. Closing under the daemon's queue mutex
+            // removes the last-poll/turn-done race: false means input arrived
+            // between the drain and the close, so loop around and consume it.
+            if (try drainSteers(gpa, opts, &ap) > 0) continue;
+            if (!tryCloseSteering(opts)) continue;
+            publishPhase(opts, .finishing);
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return .{
                 .text = try gpa.dupe(u8, response_text),
@@ -745,6 +752,24 @@ fn effectiveApprovalMode(opts: RunOpts) approval.Mode {
 fn cancelled(flag: ?*std.atomic.Value(bool)) bool {
     const f = flag orelse return false;
     return f.load(.acquire);
+}
+
+/// Persist every steer currently available. The callback transfers ownership
+/// of each returned allocation to this function.
+fn drainSteers(gpa: std.mem.Allocator, opts: RunOpts, ap: *Appender) !usize {
+    const poll = opts.poll_steer orelse return 0;
+    var count: usize = 0;
+    while (poll(opts.on_delta_ctx, gpa)) |steer_text| {
+        defer gpa.free(steer_text);
+        _ = try ap.append(.{ .steer = .{ .text = steer_text } });
+        count += 1;
+    }
+    return count;
+}
+
+fn tryCloseSteering(opts: RunOpts) bool {
+    const close = opts.try_close_steer orelse return true;
+    return close(opts.on_delta_ctx);
 }
 
 fn errorMessage(value: std.json.Value) ?[]const u8 {
@@ -1222,17 +1247,23 @@ fn runClaudeCodeTurn(
         try final_text.appendSlice(gpa, outcome.final_text.items);
 
         // Steers queued while the subprocess ran become follow-up rounds.
-        var steered = false;
-        if (opts.poll_steer) |poll| {
-            if (poll(opts.on_delta_ctx, gpa)) |steer_text| {
-                defer gpa.free(steer_text);
-                _ = try ap.append(.{ .steer = .{ .text = steer_text } });
-                prompt.clearRetainingCapacity();
-                try prompt.appendSlice(gpa, steer_text);
-                steered = true;
-            }
+        // `try_close_steer` closes the same last-poll race as the native
+        // provider loop; false guarantees another poll can take the winner.
+        var steer_text: ?[]u8 = if (opts.poll_steer) |poll|
+            poll(opts.on_delta_ctx, gpa)
+        else
+            null;
+        if (steer_text == null and !tryCloseSteering(opts)) {
+            steer_text = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
         }
-        if (!steered) break;
+        if (steer_text) |text| {
+            defer gpa.free(text);
+            _ = try ap.append(.{ .steer = .{ .text = text } });
+            prompt.clearRetainingCapacity();
+            try prompt.appendSlice(gpa, text);
+            continue;
+        }
+        break;
     }
 
     publishPhase(opts, .finishing);
@@ -1994,6 +2025,85 @@ test "delegated claude code turn persists the event stream as blocks" {
     try std.testing.expectEqualStrings("file.txt", loaded[3].blk.body.tool_result.inline_body);
 }
 
+test "delegated claude code turn consumes a steer racing finalization" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-cc-steer-test");
+    defer temp.deinit();
+    const script =
+        \\#!/bin/sh
+        \\echo '{"type":"system","subtype":"init","session_id":"x"}'
+        \\case "$*" in
+        \\  *"guest steer"*) result=STEERED ;;
+        \\  *) result=FIRST ;;
+        \\esac
+        \\printf '{"type":"result","subtype":"success","result":"%s","usage":{"input_tokens":1,"output_tokens":1}}\n' "$result"
+        \\
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-claude" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(claude_code.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, temp.path, "claudecode/fable-5", .auto);
+
+    const Probe = struct {
+        pending: bool = false,
+        closes: usize = 0,
+
+        fn poll(ctx: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (!self.pending) return null;
+            self.pending = false;
+            return allocator.dupe(u8, "guest steer") catch null;
+        }
+
+        fn tryClose(ctx: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.closes += 1;
+            if (self.closes == 1) {
+                self.pending = true;
+                return false;
+            }
+            return true;
+        }
+    };
+    var probe = Probe{};
+    const result = try runTurn(gpa, io, &store, .{
+        .session_id = 1,
+        .cwd = temp.path,
+        .endpoint = .{ .url = "", .bearer = null, .model = "fable-5", .dialect = .claude_code },
+        .cfg = config.defaults(),
+        .tool_environ = &env,
+        .approval_mode = .auto,
+        .on_delta_ctx = &probe,
+        .poll_steer = Probe.poll,
+        .try_close_steer = Probe.tryClose,
+    }, "start", &.{});
+    defer gpa.free(result.text);
+
+    try std.testing.expectEqualStrings("STEERED", result.text);
+    try std.testing.expectEqual(@as(usize, 2), probe.closes);
+    const loaded = try store.getBlocks(1, 1, 1000);
+    defer {
+        for (loaded) |*lb| lb.deinit();
+        gpa.free(loaded);
+    }
+    const expected = [_]block.BlockKind{ .user_msg, .assistant_msg, .steer, .assistant_msg };
+    try std.testing.expectEqual(expected.len, loaded.len);
+    for (expected, loaded) |kind, lb| try std.testing.expectEqual(kind, std.meta.activeTag(lb.blk.body));
+}
+
 test "delegated turn recovers when claude has never seen the derived session" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -2056,6 +2166,138 @@ const AnthropicWireChecks = struct {
     saw_authorization: bool = false,
     body_ok: bool = false,
 };
+
+const SteeringWireChecks = struct {
+    requests: usize = 0,
+    second_saw_first_steer: bool = false,
+    third_saw_raced_steer: bool = false,
+};
+
+fn serveSteeringCompletions(io: Io, server: *Io.net.Server, checks: *SteeringWireChecks) void {
+    const responses = [_][]const u8{ "FIRST", "SECOND", "THIRD" };
+    for (responses, 0..) |response_text, request_index| {
+        var stream = server.accept(io) catch return;
+        defer stream.close(io);
+        var read_buffer: [65536]u8 = undefined;
+        var reader = Io.net.Stream.Reader.init(stream, io, &read_buffer);
+        var content_length: usize = 0;
+        while (reader.interface.takeDelimiterInclusive('\n') catch null) |line| {
+            const trimmed = std.mem.trim(u8, line, "\r\n");
+            if (trimmed.len == 0) break;
+            if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:")) {
+                content_length = std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[15..], " "), 10) catch 0;
+            }
+        }
+        var body_buf: [65536]u8 = undefined;
+        var got: usize = 0;
+        while (got < @min(content_length, body_buf.len)) {
+            const n = reader.interface.readSliceShort(body_buf[got..@min(content_length, body_buf.len)]) catch break;
+            if (n == 0) break;
+            got += n;
+        }
+        const body = body_buf[0..got];
+        checks.requests += 1;
+        if (request_index == 1)
+            checks.second_saw_first_steer = std.mem.indexOf(u8, body, "steer after first response") != null;
+        if (request_index == 2)
+            checks.third_saw_raced_steer = std.mem.indexOf(u8, body, "steer from close race") != null;
+
+        var write_buffer: [4096]u8 = undefined;
+        var writer = Io.net.Stream.Writer.init(stream, io, &write_buffer);
+        writer.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n") catch return;
+        writer.interface.print(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{s}\"}}}}]}}\n\n" ++
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1}}}}\n\n" ++
+                "data: [DONE]\n\n",
+            .{response_text},
+        ) catch return;
+        writer.interface.flush() catch return;
+    }
+}
+
+test "tool-free responses consume steering and close the final-poll race" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const address = Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var checks = SteeringWireChecks{};
+    const server_thread = try std.Thread.spawn(.{}, serveSteeringCompletions, .{ io, &server, &checks });
+
+    const url = try std.fmt.allocPrintSentinel(gpa, "http://127.0.0.1:{d}/v1/chat/completions", .{server.socket.address.getPort()}, 0);
+    defer gpa.free(url);
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-steering-test");
+    defer temp.deinit();
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, temp.path, "test/model", .auto);
+
+    const SteerProbe = struct {
+        polls: usize = 0,
+        close_calls: usize = 0,
+        raced_pending: bool = false,
+
+        fn poll(ctx: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.polls += 1;
+            if (self.polls == 2)
+                return allocator.dupe(u8, "steer after first response") catch null;
+            if (self.raced_pending) {
+                self.raced_pending = false;
+                return allocator.dupe(u8, "steer from close race") catch null;
+            }
+            return null;
+        }
+
+        fn tryClose(ctx: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.close_calls += 1;
+            if (self.close_calls == 1) {
+                self.raced_pending = true;
+                return false;
+            }
+            return true;
+        }
+    };
+    var probe = SteerProbe{};
+    const result = try runTurn(gpa, io, &store, .{
+        .session_id = 1,
+        .cwd = temp.path,
+        .endpoint = .{ .url = url, .bearer = null, .model = "test/model", .dialect = .openai_compatible },
+        .cfg = config.defaults(),
+        .approval_mode = .auto,
+        .on_delta_ctx = &probe,
+        .poll_steer = SteerProbe.poll,
+        .try_close_steer = SteerProbe.tryClose,
+    }, "initial request", &.{});
+    defer gpa.free(result.text);
+    server_thread.join();
+
+    try std.testing.expectEqualStrings("THIRD", result.text);
+    try std.testing.expectEqual(@as(usize, 3), checks.requests);
+    try std.testing.expect(checks.second_saw_first_steer);
+    try std.testing.expect(checks.third_saw_raced_steer);
+    try std.testing.expectEqual(@as(usize, 2), probe.close_calls);
+
+    const loaded = try store.getBlocks(1, 1, 1000);
+    defer {
+        for (loaded) |*lb| lb.deinit();
+        gpa.free(loaded);
+    }
+    const expected = [_]block.BlockKind{
+        .user_msg,
+        .assistant_msg,
+        .steer,
+        .assistant_msg,
+        .steer,
+        .assistant_msg,
+    };
+    try std.testing.expectEqual(expected.len, loaded.len);
+    for (expected, loaded) |kind, lb| try std.testing.expectEqual(kind, std.meta.activeTag(lb.blk.body));
+}
 
 fn serveAnthropicMessages(io: Io, server: *Io.net.Server, checks: *AnthropicWireChecks) void {
     var stream = server.accept(io) catch return;

@@ -54,7 +54,10 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded, err{guest} on Claude Code sessions |
 | sub | sid, from_seq, tail_limit?, before_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
 | unsub | sid | ok |
-| input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer (running/awaiting approval) |
+| input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer while an agent turn is accepting them (running/awaiting approval); compact, handover, and the atomic finishing edge return `err{not_steerable}` |
+| council_list | — | council_list_result with every configured [[council]] roster |
+| council_set | name, models[] | council_list_result after atomically persisting the (new or replaced) [[council]] table to config.toml |
+| council_remove | name | council_list_result after atomically removing the table; err{council} when unknown |
 | mcp_list | — | mcp_list_result with per-server readiness, tool count, and discovery error |
 | mcp_add | name, cmd[] | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
 | mcp_remove | name | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
@@ -207,6 +210,9 @@ trade readability for a second identity or a storage migration.
 - A correlated `input` receives one `ok` or `err` with its request id. Session
   status and durable blocks may precede the `ok`; `err` means no turn/steer was
   accepted for that request.
+- An acknowledged steer is polled both between rounds and after a tool-free
+  provider response. The turn atomically closes steering only while the queue
+  is empty, so input cannot disappear into the final-poll/turn-done edge.
 - Replay (`sub` with from_seq ≥ 1 or tail_limit > 0) and its requested marker
   complete before any live message for that session reaches the client. A
   partial forward page is not subscribed at all; the final page and live

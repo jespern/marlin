@@ -195,6 +195,7 @@ fn acknowledgeInputInBlocks(blocks: []RenderBlock, request_id: u64) bool {
 
 const RejectedInput = struct {
     prior_state: ?proto.SessionState,
+    text: []u8,
 };
 
 fn rejectInputInBlocks(
@@ -204,7 +205,10 @@ fn rejectInputInBlocks(
 ) ?RejectedInput {
     for (blocks.items, 0..) |*rendered, i| {
         if (rendered.pending_request_id != request_id) continue;
-        const rejected = RejectedInput{ .prior_state = rendered.pending_prior_state };
+        const rejected = RejectedInput{
+            .prior_state = rendered.pending_prior_state,
+            .text = gpa.dupe(u8, rendered.text) catch return null,
+        };
         rendered.deinit(gpa);
         _ = blocks.orderedRemove(i);
         return rejected;
@@ -1322,6 +1326,9 @@ const App = struct {
     fn rejectInput(self: *App, request_id: u64) void {
         if (request_id == 0) return;
         if (rejectInputInBlocks(self.gpa, &self.blocks, request_id)) |rejected| {
+            defer self.gpa.free(rejected.text);
+            self.editor.pushHistory(rejected.text);
+            if (self.editor.isEmpty()) self.editor.insertSlice(rejected.text);
             if (rejected.prior_state) |state| {
                 self.state = state;
                 self.releaseStreamingBuffers();
@@ -1335,6 +1342,8 @@ const App = struct {
         var it = self.saved_views.valueIterator();
         while (it.next()) |saved| {
             if (rejectInputInBlocks(self.gpa, &saved.*.blocks, request_id)) |rejected| {
+                defer self.gpa.free(rejected.text);
+                self.editor.pushHistory(rejected.text);
                 if (rejected.prior_state) |state| saved.*.state = state;
                 return;
             }
@@ -1543,6 +1552,7 @@ const App = struct {
             .steer => |s| {
                 if (!reconcilePendingEcho(self.blocks.items, .steer, s.text, b.seq, b.turn_id))
                     self.pushDurableBlock(b, .steer, s.text, "", .ok);
+                self.editor.pushHistory(s.text);
             },
             .assistant_msg => |a| {
                 // Finalized text replaces the streaming delta.
@@ -3230,6 +3240,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "y", .description = "yank: clipboard + paste register" },
     .{ .key = "arrows", .description = "scroll the view" },
     .{ .description = "GLOBAL", .heading = true },
+    .{ .key = "Enter while working", .description = "steer the active turn" },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
     .{ .key = "Ctrl+C", .description = "interrupt the active turn" },
@@ -5720,6 +5731,7 @@ test "correlated daemon error removes only its optimistic input and restores sta
     try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
     try std.testing.expectEqualStrings("unrelated", app.blocks.items[0].text);
     try std.testing.expectEqual(@as(u64, 42), app.blocks.items[0].pending_request_id);
+    try std.testing.expectEqualStrings("rejected", app.editor.text.items);
 }
 
 test "correlated ok accepts the echo while generic errors cannot reject it" {
