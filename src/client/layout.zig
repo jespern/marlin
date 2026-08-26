@@ -1143,6 +1143,20 @@ pub fn layoutLines(
             try resolveLineLinks(tail_alloc, tail_cache.lines.items);
         }
     }
+    // Seam between independently-built ranges: the tail is laid out into its
+    // own empty list, so its first section's leading blank (a no-op at the
+    // top of any range) must be restored here. Ranges split at turn
+    // boundaries, so the seam is always a section start, never mid-group.
+    if (lines.items.len > 0 and tail_cache.lines.items.len > 0) {
+        const last = lines.items[lines.items.len - 1];
+        const first = tail_cache.lines.items[0];
+        const last_blank = last.text.len == 0 and last.text2.len == 0 and
+            last.text3.len == 0 and last.fill_style == null;
+        const first_blank = first.text.len == 0 and first.text2.len == 0 and
+            first.text3.len == 0 and first.fill_style == null;
+        if (!last_blank and !first_blank)
+            try lines.append(arena, .{ .text = "", .style = .{} });
+    }
     try lines.appendSlice(arena, tail_cache.lines.items);
 
     // Streaming region: provider reasoning summaries are verbose by nature

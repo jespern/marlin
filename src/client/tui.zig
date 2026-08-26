@@ -148,6 +148,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
     .{ .name = "/compact", .description = "compact the current context" },
+    .{ .name = "/config", .usage = " [tabbar on|off]", .description = "view or change UI settings (persisted)", .accepts_args = true },
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
     .{ .name = "/quit", .description = "leave Marlin" },
@@ -491,6 +492,9 @@ const App = struct {
     /// Successful non-diff tool runs are rolled up by default. Errors and
     /// diffs remain visible even when the rest of the transcript is hidden.
     show_tool_transcript: bool = false,
+    /// Top tab strip ([ui] tab_bar; /config tabbar toggles + persists).
+    /// Hiding the bar only removes CHROME: alt+N, gt/gT, </> keep working.
+    show_tab_bar: bool = true,
     /// Ctrl+L asks the event loop to invalidate libvaxis's previous-screen
     /// cache so the next render repaints every terminal cell.
     refresh_requested: bool = false,
@@ -731,6 +735,13 @@ const App = struct {
             if (tabActivityRank(candidate) > tabActivityRank(activity)) activity = candidate;
         }
         return activity;
+    }
+
+    /// Rows the tab strip occupies at the top of the screen; every layout
+    /// and mouse computation offsets by this so hiding the bar reflows
+    /// everything else for free.
+    fn tabBarRows(self: *const App) usize {
+        return if (self.show_tab_bar) tab_bar_height else 0;
     }
 
     fn tabAtColumn(self: *const App, col: usize) ?u64 {
@@ -1947,10 +1958,43 @@ const App = struct {
             }
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
+        } else if (std.mem.eql(u8, head, "/config")) {
+            self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
+        }
+    }
+
+    /// `/config` — the durable UI-preference surface. No args shows current
+    /// values; `tabbar [on|off]` (bare = toggle) applies live and persists to
+    /// config.toml, so the choice survives reboots and other clients.
+    fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8) void {
+        const name = setting orelse {
+            self.setNotice("config · tabbar {s} — /config tabbar [on|off]", .{onOff(self.show_tab_bar)});
+            return;
+        };
+        if (!std.mem.eql(u8, name, "tabbar")) {
+            self.setNotice("usage: /config tabbar [on|off]", .{});
+            return;
+        }
+        const enable = if (value) |v| blk: {
+            if (std.mem.eql(u8, v, "on") or std.mem.eql(u8, v, "true")) break :blk true;
+            if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false")) break :blk false;
+            self.setNotice("usage: /config tabbar [on|off]", .{});
+            return;
+        } else !self.show_tab_bar;
+        self.show_tab_bar = enable;
+        self.refresh_requested = true;
+        const environ = self.environ orelse {
+            self.setNotice("tab bar {s} (not saved: no environment)", .{onOff(enable)});
+            return;
+        };
+        if (config.setUiTabBar(self.gpa, self.io, environ, enable)) |_| {
+            self.setNotice("tab bar {s} (saved to config.toml)", .{onOff(enable)});
+        } else |err| {
+            self.setNotice("tab bar {s} (not saved: {t})", .{ onOff(enable), err });
         }
     }
 
@@ -3419,7 +3463,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const w = win.width;
     if (h < 4 or w < 20) return;
 
-    try drawTabBar(app, win, arena);
+    if (app.show_tab_bar) try drawTabBar(app, win, arena);
+    const top_rows = app.tabBarRows();
 
     // The composer is a three-row panel for a one-line prompt (padding,
     // content, padding) and grows with multiline input.
@@ -3428,7 +3473,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const content_h: u16 = @intCast(app.editor.displayHeight(panel_inner_w -| 2));
     const input_h: u16 = @intCast(inputPanelHeight(content_h));
     const input_gap: u16 = 1;
-    const fixed_h = @as(u16, @intCast(tab_bar_height)) + input_h + input_gap + 1;
+    const fixed_h = @as(u16, @intCast(top_rows)) + input_h + input_gap + 1;
     const plan_capacity = h -| (fixed_h + 2); // retain a usable transcript viewport
     const plan_range = planDisplayRange(app.plan.items, @min(@as(usize, 5), plan_capacity));
     const plan_h: u16 = @intCast(plan_range.len);
@@ -3458,7 +3503,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             const fill_width = @min(ln.fill_width orelse (w -| fill_start), w -| fill_start);
             const row_win = win.child(.{
                 .x_off = @intCast(fill_start),
-                .y_off = @intCast(tab_bar_height + row),
+                .y_off = @intCast(top_rows + row),
                 .height = 1,
                 .width = fill_width,
             });
@@ -3477,21 +3522,21 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             n += 1;
         }
         _ = win.print(segs_buf[0..n], .{
-            .row_offset = @intCast(tab_bar_height + row),
+            .row_offset = @intCast(top_rows + row),
             .wrap = .none,
         });
-        applyLineSyntax(win, @intCast(tab_bar_height + row), ln);
-        applyLineLinks(win, @intCast(tab_bar_height + row), ln);
+        applyLineSyntax(win, @intCast(top_rows + row), ln);
+        applyLineLinks(win, @intCast(top_rows + row), ln);
         // Apply selection after printing so partial-cell highlighting keeps
         // each segment's original syntax color and other style attributes.
         if (app.selection()) |sel| {
             if (sel.columns(abs_line, lineWidth(win, ln))) |cols| {
                 var col = cols.start;
                 while (col < cols.end and col < @as(usize, w)) : (col += 1) {
-                    const cell = win.readCell(@intCast(col), @intCast(tab_bar_height + row)) orelse continue;
+                    const cell = win.readCell(@intCast(col), @intCast(top_rows + row)) orelse continue;
                     var selected_cell = cell;
                     selected_cell.style.reverse = true;
-                    win.writeCell(@intCast(col), @intCast(tab_bar_height + row), selected_cell);
+                    win.writeCell(@intCast(col), @intCast(top_rows + row), selected_cell);
                 }
             }
         }
@@ -3507,10 +3552,10 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
                 } else |_| {}
                 const col = @min(cursor.col, @max(app.copy_cursor_line_width, 1) - 1);
                 if (col < @as(usize, w)) {
-                    if (win.readCell(@intCast(col), @intCast(tab_bar_height + row))) |cell| {
+                    if (win.readCell(@intCast(col), @intCast(top_rows + row))) |cell| {
                         var cursor_cell = cell;
                         cursor_cell.style.reverse = !cursor_cell.style.reverse;
-                        win.writeCell(@intCast(col), @intCast(tab_bar_height + row), cursor_cell);
+                        win.writeCell(@intCast(col), @intCast(top_rows + row), cursor_cell);
                     }
                 }
             }
@@ -4110,6 +4155,7 @@ pub fn run(
     initial_ids_transferred = true;
     defer app.deinit();
     app.setModelStr(model_at_start);
+    app.show_tab_bar = cfg.ui_tab_bar;
     app.effort = effort_at_start;
     app.setCwdStr(cwd_at_start);
     if (environ.get("HOME")) |home| app.setHomeStr(home);
@@ -4361,6 +4407,10 @@ fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     try writer.interface.flush();
 }
 
+fn onOff(enabled: bool) []const u8 {
+    return if (enabled) "on" else "off";
+}
+
 fn tabMouseAction(m: vaxis.Mouse) ?TabMouseAction {
     if (m.type != .press) return null;
     return switch (m.button) {
@@ -4380,7 +4430,7 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
     if (m.type == .release and app.sel_dragging) {
         if (app.last_view_h > 0) {
             const terminal_row: usize = if (m.row < 0) 0 else @intCast(m.row);
-            const raw_row = terminal_row -| tab_bar_height;
+            const raw_row = terminal_row -| app.tabBarRows();
             const row = @min(raw_row, app.last_view_h - 1);
             const col: usize = if (m.col < 0) 0 else @intCast(m.col);
             app.sel_head = .{ .line = app.last_first_visible + row, .col = col };
@@ -4397,7 +4447,7 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
     }
 
     const terminal_row: usize = if (m.row < 0) 0 else @intCast(m.row);
-    if (terminal_row < tab_bar_height) {
+    if (terminal_row < app.tabBarRows()) {
         const col: usize = if (m.col < 0) 0 else @intCast(m.col);
         if (app.tabAtColumn(col)) |sid| {
             if (tabMouseAction(m)) |action| switch (action) {
@@ -4424,7 +4474,7 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
         },
         .wheel_down => app.scroll_up -|= 3,
         .left => {
-            const row = terminal_row - tab_bar_height;
+            const row = terminal_row - app.tabBarRows();
             // Only rows inside the session view participate.
             if (row >= app.last_view_h) {
                 if (m.type == .press) app.sel_anchor = null; // click below view clears
@@ -7155,8 +7205,18 @@ test "transcript spacing invariant: every section breathes, nothing doubles" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    for ([_]bool{ false, true }) |show_transcript| {
+    const Pass = struct { show_transcript: bool, state: proto.SessionState };
+    for ([_]Pass{
+        .{ .show_transcript = false, .state = .idle },
+        .{ .show_transcript = true, .state = .idle },
+        // Running splits the active turn into the tail layout range: the
+        // freshly submitted prompt is the tail's first section and its air
+        // must survive the range seam (the reported flush-card bug).
+        .{ .show_transcript = false, .state = .running },
+    }) |pass| {
+        const show_transcript = pass.show_transcript;
         app.show_tool_transcript = show_transcript;
+        app.state = pass.state;
         app.layout_epoch +%= 1;
         const lines = try layoutLines(arena, &app, 100);
         try std.testing.expect(lines.items.len > 0);
@@ -7178,6 +7238,14 @@ test "transcript spacing invariant: every section breathes, nothing doubles" {
             //    is only ever followed by more card rows or a plain blank.
             if (prev != null and prev.?.fill_style != null and line.fill_style == null) {
                 try std.testing.expect(plain_blank);
+            }
+
+            // 2b. Nor above one: a card's first filled row always has air —
+            //     this is the range-seam case (a freshly submitted prompt
+            //     starts the tail range, whose leading blank is a no-op in
+            //     its own list and must be restored at concatenation).
+            if (line.fill_style != null and prev != null and prev.?.fill_style == null) {
+                try std.testing.expect(prev_plain_blank);
             }
 
             // 3. Section markers always breathe: one blank (or a card row,
