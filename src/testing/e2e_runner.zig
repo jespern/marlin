@@ -4,7 +4,7 @@
 //! in src/testing/scenarios/:
 //!   1. spawn marlin-fakeprov <scenario.json>, read "PORT <n>"
 //!   2. spawn marlin with an isolated $XDG_STATE_HOME (temp dir) and
-//!      MARLIN_BASE_URL_OPENROUTER=http://localhost:<port>/v1
+//!      internal local/OpenRouter endpoint overrides aimed at that port
 //!   3. assert marlin's exit code + stdout expectations (from the scenario's
 //!      companion "check" object)
 //!   4. assert fake provider exited 0 (all request expectations matched)
@@ -16,6 +16,7 @@
 //!     "env": {"EXTRA": "VAR"},                    // extra env for marlin
 //!     "exit_code": 0,
 //!     "stdout_contains": ["hello"],
+//!     "stdout_equals": "hello from fake\n",       // optional exact golden
 //!     "db_kinds": ["user_msg","assistant_msg"],   // expected block kinds, in order
 //!     "runs": 1,                                  // repeat marlin N times (for --continue tests)
 //!     "session_handle_flow": true                 // exercise ls/prefix/archive/unarchive
@@ -123,6 +124,8 @@ const Check = struct {
     exit_code: u8 = 0,
     stdout_contains: []const []const u8 = &.{},
     stderr_contains: []const []const u8 = &.{},
+    stdout_equals: ?[]const u8 = null,
+    stderr_equals: ?[]const u8 = null,
     db_kinds: []const []const u8 = &.{},
     /// Expected durable session hierarchy rows:
     /// kind|has_parent|has_parent_block|max_rounds.
@@ -286,6 +289,10 @@ fn runScenario(
     try env.put("XDG_STATE_HOME", state_dir);
     const sock_path = try std.fmt.allocPrint(arena, "{s}/daemon.sock", .{state_dir});
     try env.put("MARLIN_SOCKET", sock_path);
+    // Dynamic endpoint overrides are private harness plumbing. Scenarios use
+    // local/testing without requiring users to configure its loopback URL;
+    // the OpenRouter override remains for provider-specific scenarios.
+    try env.put("MARLIN_BASE_URL_LOCAL", base_url);
     try env.put("MARLIN_BASE_URL_OPENROUTER", base_url);
     // Test daemons remain in the runner's process group. That makes Ctrl+C or
     // an outer tool cancellation clean up the entire scenario tree.
@@ -401,6 +408,22 @@ fn runScenario(
                     if (std.mem.indexOf(u8, res.stderr, needle) == null) {
                         print(io, "\n  stderr missing '{s}'\n  stderr: {s}\n", .{
                             needle, res.stderr[0..@min(res.stderr.len, 2000)],
+                        });
+                        return error.StderrMismatch;
+                    }
+                }
+                if (sf.check.stdout_equals) |want| {
+                    if (!std.mem.eql(u8, want, res.stdout)) {
+                        print(io, "\n  stdout differs from exact golden\n  want: {f}\n  got:  {f}\n", .{
+                            std.json.fmt(want, .{}), std.json.fmt(res.stdout, .{}),
+                        });
+                        return error.StdoutMismatch;
+                    }
+                }
+                if (sf.check.stderr_equals) |want| {
+                    if (!std.mem.eql(u8, want, res.stderr)) {
+                        print(io, "\n  stderr differs from exact golden\n  want: {f}\n  got:  {f}\n", .{
+                            std.json.fmt(want, .{}), std.json.fmt(res.stderr, .{}),
                         });
                         return error.StderrMismatch;
                     }
@@ -772,7 +795,7 @@ fn checkApprovalReconnectFlow(
 
         try conn.send(.{ .session_create = .{
             .cwd = state_dir,
-            .model = "openrouter/test/model",
+            .model = "local/testing",
             .approvals = "default",
         } });
         const created = try recvTagBounded(conn, arena, "session_created");

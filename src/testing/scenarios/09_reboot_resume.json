@@ -18,7 +18,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "first task"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "first task"],
     "argv2": ["reboot", "--then", "run", "--quiet", "--continue", "second task"],
     "runs": 2,
     "exit_code": 0,

@@ -585,6 +585,10 @@ provider/
   endpoints is **design, not shipped** — the registry is `openrouter` /
   `anthropic` / `local` plus the guest prefix `claudecode`. Do not describe
   extra native providers as config-only until that table exists.
+- `local/testing` is the deterministic developer model. It defaults to the
+  bundled fake provider on `127.0.0.1:5757`, requires no key, and still crosses
+  the real OpenAI-compatible HTTP/SSE boundary. E2E uses a private dynamic-port
+  override; `zig build fake-model` provides the zero-config manual endpoint.
 - Every OpenRouter request carries the Marlin session's stable `session_id`.
   OpenRouter therefore keeps a session on the same provider/cache and groups
   its generations in Activity. `[providers.openrouter] sort` defaults to

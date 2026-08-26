@@ -87,7 +87,7 @@
       "run",
       "--quiet",
       "--model",
-      "openrouter/test/model",
+      "local/testing",
       "build the demo"
     ],
     "argv2": [

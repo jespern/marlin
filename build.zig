@@ -11,6 +11,7 @@ const std = @import("std");
 ///   zig build            install marlin
 ///   zig build test       unit + fixture tests
 ///   zig build e2e        end-to-end: real binary vs fake provider
+///   zig build fake-model run local/testing's deterministic fake server
 ///   zig build smoke      live tests against real OpenRouter (needs key)
 const sqlite_flags = &.{
     "-std=c99",
@@ -109,6 +110,16 @@ pub fn build(b: *std.Build) void {
     });
     // Installed too: handy for driving the TUI manually against a script.
     b.installArtifact(fakeprov);
+
+    const fake_model_cmd = b.addRunArtifact(fakeprov);
+    fake_model_cmd.addArgs(&.{ "--port", "5757", "--repeat-last" });
+    if (b.args) |args|
+        fake_model_cmd.addArgs(args)
+    else
+        fake_model_cmd.addFileArg(b.path("src/testing/fixtures/local_testing.json"));
+    fake_model_cmd.has_side_effects = true;
+    const fake_model_step = b.step("fake-model", "Run the scripted local/testing model on 127.0.0.1:5757");
+    fake_model_step.dependOn(&fake_model_cmd.step);
 
     // ---- e2e ----
     const process_io_module = b.createModule(.{

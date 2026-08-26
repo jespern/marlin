@@ -109,11 +109,11 @@ run_leg() { # $1 = leg name, $2 = "reboot" | "kill9"
 
   local -a marlin_env=(env HOME="$state" TMPDIR="$state" XDG_STATE_HOME="$state" \
       MARLIN_SOCKET="$sock" MARLIN_DAEMON_PGID=inherit MARLIN_NETWORK_BLOCKLISTS= \
-      MARLIN_BASE_URL_OPENROUTER="http://127.0.0.1:$port/v1" \
-      OPENROUTER_API_KEY=test PATH=/usr/bin:/bin:/usr/sbin:/sbin)
+      MARLIN_BASE_URL_LOCAL="http://127.0.0.1:$port/v1" \
+      PATH=/usr/bin:/bin:/usr/sbin:/sbin)
 
   run_bounded 30 "$leg first turn" "${marlin_env[@]}" \
-      "$MARLIN" run --quiet --model openrouter/test/model "first task" > /dev/null
+      "$MARLIN" run --quiet --model local/testing "first task" > /dev/null
 
   if [ "$mode" = reboot ]; then
     # Coordinated: reboot + exec into `version` (harmless follow-up).

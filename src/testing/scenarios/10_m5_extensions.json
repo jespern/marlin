@@ -26,7 +26,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "exercise configured extension"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "exercise configured extension"],
     "exit_code": 0,
     "stdout_contains": ["configured extensions completed"],
     "db_kinds": ["user_msg", "tool_call", "tool_result", "tool_call", "tool_result", "assistant_msg"],

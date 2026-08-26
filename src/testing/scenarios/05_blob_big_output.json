@@ -18,7 +18,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "produce big output"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "produce big output"],
     "exit_code": 0,
     "blob_roundtrip_min_bytes": 1200000,
     "stdout_contains": ["handled the big output"],

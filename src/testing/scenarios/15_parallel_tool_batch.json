@@ -1,7 +1,8 @@
 {
   "steps": [
     {
-      "expect_contains": ["inspect the empty workspace", "\"name\":\"grep\"", "\"name\":\"glob\"", "\"session_id\":\"marlin-", "\"sort\":\"throughput\""],
+      "expect_contains": ["inspect the empty workspace", "\"name\":\"grep\"", "\"name\":\"glob\""],
+      "expect_not_contains": ["\"session_id\":\"marlin-", "\"sort\":\"throughput\"", "openrouter:web_search"],
       "sse": [
         "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_grep\",\"function\":{\"name\":\"grep\",\"arguments\":\"{\\\"pattern\\\":\\\"needle\\\"}\"}},{\"index\":1,\"id\":\"call_glob\",\"function\":{\"name\":\"glob\",\"arguments\":\"{\\\"pattern\\\":\\\"*.zig\\\"}\"}}]}}]}"
         ,
@@ -20,7 +21,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "inspect the empty workspace"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "inspect the empty workspace"],
     "exit_code": 0,
     "stdout_contains": ["parallel inspection complete"],
     "db_kinds": ["user_msg", "tool_call", "tool_call", "tool_result", "tool_result", "assistant_msg"]

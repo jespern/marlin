@@ -3,13 +3,15 @@
 //! A tiny localhost HTTP/1.1 server that replays a scenario file: an ordered
 //! list of steps, each matching the expected request and scripting the
 //! response (SSE stream or HTTP error). The binary under test is the REAL
-//! marlin binary pointed here via MARLIN_BASE_URL_OPENROUTER. No mocks live
-//! inside marlin itself — we fake the network peer, nothing else.
+//! marlin binary pointed here through a private endpoint override. No mocks
+//! live inside marlin itself — we fake the network peer, nothing else.
 //!
 //! Contract with the runner (src/testing/e2e_runner.zig):
-//!   - args: <scenario.json>
+//!   - args: [--port N] [--repeat-last] <scenario.json>
 //!   - picks a free port (random + retry), prints "PORT <n>\n" on stdout
 //!     when listening, then serves exactly scenario.steps.len requests.
+//!     An explicit port supports the manual local/testing developer model;
+//!     --repeat-last keeps replaying the final step until interrupted.
 //!   - each request is validated against the step's `expect_contains`
 //!     substrings; mismatch → prints "FAIL ..." and exits 3.
 //!   - exits 0 after the last step; exits 2 on internal errors.
@@ -18,7 +20,7 @@
 //!   {
 //!     "steps": [
 //!       {
-//!         "expect_contains": ["\"model\":\"test/model\"", "hello"],
+//!         "expect_contains": ["\"model\":\"testing\"", "hello"],
 //!         "status": 200,                  // default 200
 //!         "sse": ["{...chunk json...}", "[DONE]"],   // for status 200
 //!         "body": "{\"error\":...}",      // for error statuses
@@ -43,20 +45,26 @@ pub const Scenario = struct {
     steps: []const Step,
 };
 
+const Args = struct {
+    scenario_path: []const u8,
+    port: ?u16 = null,
+    repeat_last: bool = false,
+};
+
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 2) {
-        std.log.err("usage: marlin-fakeprov <scenario.json>", .{});
+    const cli = parseArgs(args) orelse {
+        std.log.err("usage: marlin-fakeprov [--port N] [--repeat-last] <scenario.json>", .{});
         return 2;
-    }
+    };
 
     // Load scenario.
-    const scenario_bytes = Io.Dir.cwd().readFileAlloc(io, args[1], arena, .limited(4 * 1024 * 1024)) catch |e| {
-        std.log.err("cannot read scenario '{s}': {t}", .{ args[1], e });
+    const scenario_bytes = Io.Dir.cwd().readFileAlloc(io, cli.scenario_path, arena, .limited(4 * 1024 * 1024)) catch |e| {
+        std.log.err("cannot read scenario '{s}': {t}", .{ cli.scenario_path, e });
         return 2;
     };
     const scenario = std.json.parseFromSliceLeaky(Scenario, arena, scenario_bytes, .{
@@ -66,28 +74,46 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
 
-    // Listen on a free port: random attempts, then announce.
-    var prng = std.Random.DefaultPrng.init(seedFromTime(io));
-    const rand = prng.random();
+    if (scenario.steps.len == 0 and cli.repeat_last) {
+        std.log.err("--repeat-last requires at least one scenario step", .{});
+        return 2;
+    }
+
+    // Listen on the requested developer port or choose a free test port.
     var server: Io.net.Server = undefined;
     var port: u16 = 0;
-    var attempt: u32 = 0;
-    while (true) : (attempt += 1) {
-        if (attempt > 50) {
-            std.log.err("no free port found", .{});
+    if (cli.port) |requested| {
+        const addr = Io.net.IpAddress.parse("127.0.0.1", requested) catch unreachable;
+        server = addr.listen(io, .{ .reuse_address = true }) catch |e| {
+            std.log.err("cannot listen on 127.0.0.1:{d}: {t}", .{ requested, e });
             return 2;
+        };
+        port = requested;
+    } else {
+        var prng = std.Random.DefaultPrng.init(seedFromTime(io));
+        const rand = prng.random();
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            if (attempt > 50) {
+                std.log.err("no free port found", .{});
+                return 2;
+            }
+            port = 20000 + rand.uintLessThan(u16, 40000);
+            const addr = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+            server = addr.listen(io, .{ .reuse_address = true }) catch continue;
+            break;
         }
-        port = 20000 + rand.uintLessThan(u16, 40000);
-        const addr = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-        server = addr.listen(io, .{ .reuse_address = true }) catch continue;
-        break;
     }
     defer server.deinit(io);
 
     try stdoutPrint(io, "PORT {d}\n", .{port});
 
-    // Serve exactly one request per step, sequentially.
-    for (scenario.steps, 0..) |step, step_idx| {
+    // Serve each scripted step sequentially; manual mode can keep replaying
+    // the final response after the script is exhausted.
+    var step_idx: usize = 0;
+    while (step_idx < scenario.steps.len or cli.repeat_last) : (step_idx += 1) {
+        const script_idx = @min(step_idx, scenario.steps.len - 1);
+        const step = scenario.steps[script_idx];
         var stream = server.accept(io) catch |e| {
             std.log.err("accept failed: {t}", .{e});
             return 2;
@@ -104,7 +130,7 @@ pub fn main(init: std.process.Init) !u8 {
         for (step.expect_contains) |needle| {
             if (std.mem.indexOf(u8, req.body, needle) == null) {
                 try stdoutPrint(io, "FAIL step {d}: request body missing {f}\nBODY: {s}\n", .{
-                    step_idx, std.json.fmt(needle, .{}), req.body[0..@min(req.body.len, 4000)],
+                    script_idx, std.json.fmt(needle, .{}), req.body[0..@min(req.body.len, 4000)],
                 });
                 return 3;
             }
@@ -112,7 +138,7 @@ pub fn main(init: std.process.Init) !u8 {
         for (step.expect_not_contains) |needle| {
             if (std.mem.indexOf(u8, req.body, needle) != null) {
                 try stdoutPrint(io, "FAIL step {d}: request body unexpectedly contains {f}\nBODY: {s}\n", .{
-                    step_idx, std.json.fmt(needle, .{}), req.body[0..@min(req.body.len, 4000)],
+                    script_idx, std.json.fmt(needle, .{}), req.body[0..@min(req.body.len, 4000)],
                 });
                 return 3;
             }
@@ -149,6 +175,28 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     return 0;
+}
+
+fn parseArgs(args: []const [:0]const u8) ?Args {
+    var parsed = Args{ .scenario_path = "" };
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--port")) {
+            i += 1;
+            if (i >= args.len or parsed.port != null) return null;
+            parsed.port = std.fmt.parseInt(u16, args[i], 10) catch return null;
+            if (parsed.port.? == 0) return null;
+        } else if (std.mem.eql(u8, arg, "--repeat-last")) {
+            if (parsed.repeat_last) return null;
+            parsed.repeat_last = true;
+        } else if (parsed.scenario_path.len == 0) {
+            parsed.scenario_path = arg;
+        } else {
+            return null;
+        }
+    }
+    return if (parsed.scenario_path.len > 0) parsed else null;
 }
 
 const Request = struct { body: []u8 };

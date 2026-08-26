@@ -27,7 +27,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "delegate one focused inspection"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "delegate one focused inspection"],
     "exit_code": 0,
     "stdout_contains": ["parent received the durable child result"],
     "db_session_meta": ["root|0|0|0", "task_child|1|1|6"]

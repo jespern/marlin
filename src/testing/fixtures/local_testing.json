@@ -1,0 +1,18 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "\"model\":\"testing\"",
+        "\"stream\":true"
+      ],
+      "expect_not_contains": [
+        "openrouter:web_search"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"Response from local/testing.\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}",
+        "[DONE]"
+      ]
+    }
+  ]
+}

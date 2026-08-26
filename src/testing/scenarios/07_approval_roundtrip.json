@@ -18,7 +18,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--ask", "--model", "openrouter/test/model", "touch the marker"],
+    "argv": ["run", "--quiet", "--ask", "--model", "local/testing", "touch the marker"],
     "exit_code": 0,
     "stdout_contains": ["approved and executed"],
     "db_kinds": ["user_msg", "tool_call", "approval", "tool_result", "assistant_msg"]

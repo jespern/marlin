@@ -57,6 +57,21 @@ are covered synthetically and by the full-binary e2e batch scenario.
 zig build e2e                # all scenarios
 ```
 
+For an interactive deterministic model, start the bundled fake server in one
+terminal:
+
+```bash
+zig build fake-model
+```
+
+Then select `/model local/testing` in Marlin. No API key or endpoint variable
+is required. The default script accepts any request, returns a stable response,
+and repeats until interrupted. Pass a scenario to drive a specific sequence:
+
+```bash
+zig build fake-model -- src/testing/scenarios/02_tool_roundtrip.json
+```
+
 Each scenario is one JSON file in `src/testing/scenarios/`, consumed by two
 programs at once:
 
@@ -66,11 +81,16 @@ programs at once:
   scripted SSE events or an HTTP error.
 - **e2e-runner** (`src/testing/e2e_runner.zig`) reads `check`: spawns the fake
   provider, then the real marlin binary with an isolated `XDG_STATE_HOME` temp
-  dir and `MARLIN_BASE_URL_OPENROUTER` pointed at localhost, then asserts exit
-  code, stdout/stderr substrings, and — marlin's superpower — **the block log
-  in the SQLite store** (`db_kinds`: the exact ordered list of block kinds the
-  run must have persisted). The append-only store means every e2e test can
-  verify the full causal history, not just the final output.
+  dir and private dynamic endpoint overrides, then selects `local/testing` for
+  provider-neutral scenarios. It asserts exit code, stdout/stderr substrings or
+  exact `stdout_equals` / `stderr_equals` goldens, and — marlin's superpower —
+  **the block log in the SQLite store** (`db_kinds`: the exact ordered list of
+  block kinds the run must have persisted). The append-only store means every
+  e2e test can verify the full causal history, not just the final output.
+
+OpenRouter-only behavior keeps using `openrouter/test/model`; this prevents
+generic scenarios from accidentally inheriting provider features such as
+server-side web search.
 
 Adding a scenario: copy an existing file, keep the naming convention
 (`NN_short_name.json` — they run in sorted order), cover exactly one behavior

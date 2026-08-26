@@ -19,8 +19,8 @@
   ],
   "check": {
     "runs": 2,
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "remember the number 42"],
-    "argv2": ["run", "--quiet", "--continue", "--model", "openrouter/test/model", "what number"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "remember the number 42"],
+    "argv2": ["run", "--quiet", "--continue", "--model", "local/testing", "what number"],
     "exit_code": 0,
     "stdout_contains": ["42"],
     "db_kinds": ["user_msg", "assistant_msg", "user_msg", "assistant_msg"]

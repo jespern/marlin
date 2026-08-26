@@ -35,7 +35,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "deliver a planned change"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "deliver a planned change"],
     "exit_code": 0,
     "stdout_contains": ["planned change delivered"],
     "db_kinds": ["user_msg", "tool_call", "tool_result", "plan", "tool_call", "tool_result", "plan", "tool_call", "tool_result", "plan", "assistant_msg"]

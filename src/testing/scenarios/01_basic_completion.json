@@ -1,19 +1,20 @@
 {
   "steps": [
     {
-      "expect_contains": ["\"model\":\"test/model\"", "say hello", "\"stream\":true", "\"type\":\"openrouter:web_search\"", "\"max_results\":5", "\"max_total_results\":15"],
+      "expect_contains": ["\"model\":\"testing\"", "say hello", "\"stream\":true"],
+      "expect_not_contains": ["openrouter:web_search", "Web search is available for discovering sources"],
       "sse": [
         "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello \"}}]}",
-        "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"from fake\",\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.test/source\",\"title\":\"Fake Source\",\"content\":\"source excerpt\",\"start_index\":0,\"end_index\":4}}]}}]}",
-        "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"server_tool_use\":{\"web_search_requests\":1}}}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"from fake\"}}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}",
         "[DONE]"
       ]
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "say hello"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "say hello"],
     "exit_code": 0,
-    "stdout_contains": ["hello from fake", "Sources:", "https://example.test/source"],
+    "stdout_equals": "hello from fake\n",
     "db_kinds": ["user_msg", "assistant_msg"],
     "session_handle_flow": true
   }

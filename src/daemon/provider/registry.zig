@@ -8,17 +8,19 @@
 //!   openrouter/<model>          — needs OPENROUTER_API_KEY
 //!   local/<model>               — any OpenAI-compatible endpoint; base URL
 //!                                 from MARLIN_LOCAL_BASE_URL, key optional
-//!                                 from MARLIN_LOCAL_API_KEY. Also the e2e
-//!                                 test seam (fake provider on localhost).
+//!                                 from MARLIN_LOCAL_API_KEY. local/testing
+//!                                 defaults to the loopback fake-model port.
 //!
 //! Env override (all providers): MARLIN_BASE_URL_<PROVIDER> replaces the
-//! base URL — e2e tests use MARLIN_BASE_URL_OPENROUTER to hit the fake
-//! provider with production model strings.
+//! base URL — e2e uses it privately to route local/testing and provider-
+//! specific scenarios to a random-port fake server.
 //!
 //! M1: config-driven [providers.*] table + the anthropic dialect.
 
 const std = @import("std");
 const provider = @import("provider.zig");
+
+pub const testing_base_url = "http://127.0.0.1:5757/v1";
 
 pub const Endpoint = struct {
     url: [:0]const u8,
@@ -82,7 +84,8 @@ pub fn resolve(
     }
     if (std.mem.eql(u8, provider_name, "local")) {
         const base = overrideBaseUrl(environ, "LOCAL") orelse
-            (environ.get("MARLIN_LOCAL_BASE_URL") orelse return error.MissingBaseUrl);
+            environ.get("MARLIN_LOCAL_BASE_URL") orelse
+            if (std.mem.eql(u8, model, "testing")) testing_base_url else return error.MissingBaseUrl;
         const key: ?[]const u8 = blk: {
             const k = environ.get("MARLIN_LOCAL_API_KEY") orelse break :blk null;
             break :blk if (k.len == 0) null else k;
@@ -147,4 +150,19 @@ test "joinChatUrl normalizes trailing slash" {
     const b = try joinChatUrl(gpa, "http://127.0.0.1:9999/v1");
     defer gpa.free(b);
     try std.testing.expectEqualStrings("http://127.0.0.1:9999/v1/chat/completions", b);
+}
+
+test "local testing resolves to the keyless loopback fake model by default" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    const ep = try resolve(gpa, &env, "local/testing");
+    defer ep.deinit(gpa);
+    try std.testing.expectEqualStrings("http://127.0.0.1:5757/v1/chat/completions", ep.url);
+    try std.testing.expectEqualStrings("testing", ep.model);
+    try std.testing.expect(ep.bearer == null);
+    try std.testing.expectEqual(provider.Dialect.openai_compatible, ep.dialect);
+
+    try std.testing.expectError(error.MissingBaseUrl, resolve(gpa, &env, "local/other"));
 }

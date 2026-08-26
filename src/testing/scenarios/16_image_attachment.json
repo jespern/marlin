@@ -14,7 +14,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "--image", "tiny.gif", "inspect image"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "--image", "tiny.gif", "inspect image"],
     "image_fixture": true,
     "exit_code": 0,
     "stdout_contains": ["image received"],

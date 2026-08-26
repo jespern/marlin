@@ -45,7 +45,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "fan out three durable inspections"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "fan out three durable inspections"],
     "exit_code": 0,
     "stdout_contains": ["bounded durable fanout complete"],
     "db_session_meta": ["root|0|0|0", "task_child|1|1|6", "task_child|1|1|6", "task_child|1|1|6"]

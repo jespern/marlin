@@ -24,7 +24,7 @@
     }
   ],
   "check": {
-    "argv": ["run", "--quiet", "--model", "openrouter/test/model", "test bash network screening"],
+    "argv": ["run", "--quiet", "--model", "local/testing", "test bash network screening"],
     "env": {"MARLIN_NETWORK_DENY": "blocked.test"},
     "exit_code": 0,
     "stdout_contains": ["bash destination was blocked before execution"],
