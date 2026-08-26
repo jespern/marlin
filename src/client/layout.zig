@@ -391,8 +391,8 @@ pub fn wrapPromptCard(
 }
 
 /// Reasoning/progress updates are useful transcript landmarks, so give them
-/// a quiet full-width surface and real breathing room without competing with
-/// the stronger user-prompt cards.
+/// a quiet full-width surface without competing with the stronger user-prompt
+/// cards. Reuse an existing separator row instead of doubling the gap.
 pub fn wrapReasoningCard(
     arena: std.mem.Allocator,
     lines: *std.ArrayList(Line),
@@ -401,7 +401,12 @@ pub fn wrapReasoningCard(
 ) !void {
     const prefix = "  · ";
     const cont = "    ";
-    try lines.append(arena, .{ .text = "", .style = Palette.reasoning_panel, .fill_style = Palette.reasoning_panel });
+    const has_separator = if (lines.items.len > 0) blk: {
+        const previous = lines.items[lines.items.len - 1];
+        break :blk previous.text.len == 0 and previous.text2.len == 0 and previous.text3.len == 0;
+    } else false;
+    if (!has_separator)
+        try lines.append(arena, .{ .text = "", .style = Palette.reasoning_panel, .fill_style = Palette.reasoning_panel });
 
     // Commentary arrives with inline markdown (**bold**, `code`, links);
     // render it instead of showing the markers verbatim. Newlines flatten
@@ -1203,6 +1208,30 @@ pub fn extractJsonStringRaw(json: []const u8, key: []const u8) ?[]const u8 {
     }
     if (end > json.len) return null;
     return json[at..end];
+}
+
+test "reasoning cards leave one separator row between transcript landmarks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+
+    try wrapPromptCard(arena, &lines, "request", 80);
+    try wrapReasoningCard(arena, &lines, "first update", 80);
+    try wrapReasoningCard(arena, &lines, "second update", 80);
+    try lines.append(arena, .{
+        .text = "  • ",
+        .style = Palette.note,
+        .text2 = "Ran 6 commands",
+        .style2 = Palette.assistant,
+    });
+
+    for (lines.items[1..], 1..) |line, i| {
+        const previous = lines.items[i - 1];
+        const previous_empty = previous.text.len == 0 and previous.text2.len == 0 and previous.text3.len == 0;
+        const current_empty = line.text.len == 0 and line.text2.len == 0 and line.text3.len == 0;
+        try std.testing.expect(!(previous_empty and current_empty));
+    }
 }
 
 test "tool calls render semantic arguments instead of raw JSON" {
