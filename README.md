@@ -43,6 +43,16 @@ model. Guest is a session regime, not a third dialect; the multiplexer
 still sees blocks, not pixels. See
 [Native vs guest](docs/ARCHITECTURE.md#native-vs-guest-agents).
 
+What that consolidates: one multiplexer over your whole model fleet. The
+workflow marlin replaces is three or four vendor CLIs cycling under a
+terminal multiplexer plus a desktop app on the side — each with its own UX,
+each picked per task by preference or remaining credits, findings shuttled
+between them by hand. In marlin that is tabs in one room: Fable through its
+sanctioned binary as a guest, grok/GLM/GPT and everything else OpenRouter
+carries as native sessions, switched per task without changing tools. The
+migration test for every feature: does it delete a reason to open one of
+the old rooms?
+
 - Sessions live in the daemon. Detach, reboot your laptop, ssh in from another
   machine, reattach — the agent never noticed.
 - Unarchived root sessions are always visible as clickable tabs; child work

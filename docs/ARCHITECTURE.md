@@ -9,9 +9,15 @@ win; fix this file rather than trusting it.
 
 Product thesis, standing over every section below: Marlin is a **daily
 driver** — a session multiplexer with one native agent and one guest,
-meant to be lived in all day, and nothing else. Designed doors open when
-daily use demands them, not because the last door felt good. A section of
-this document that reads like a second product is a bug in the document.
+meant to be lived in all day, and nothing else. It consolidates a
+heterogeneous model fleet (subscription Fable as guest; grok/GLM/GPT and
+the rest as native sessions, picked per task by preference or credits)
+that previously lived in separate vendor CLIs under a terminal mux.
+Marlin is already the first tool open in the morning; the vendor CLIs it
+replaces are the benchmark, and a feature is justified when it deletes a
+reason to open one of them — not because the last door felt good. A
+section of this document that reads like a second product is a bug in
+the document.
 
 ## 1. Process model
 
