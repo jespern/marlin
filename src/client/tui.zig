@@ -540,6 +540,16 @@ const App = struct {
     /// Optional provider-published pricing keyed by model id. Model strings
     /// are separately owned so legacy model-list replies remain valid.
     catalog_pricing: std.ArrayList(proto.ModelPricing) = .empty,
+    /// Client/daemon build mismatch detected at attach: shown in the startup
+    /// notice AND kept on the welcome card, which cannot be clobbered by the
+    /// next transient notice.
+    build_mismatch: bool = false,
+    /// Handshake facts cached for the welcome card — the draw path must
+    /// never dereference conn (tests render with conn = undefined).
+    welcome_daemon_version: [64]u8 = undefined,
+    welcome_daemon_version_len: usize = 0,
+    welcome_sandbox: bool = false,
+    welcome_dnsblock_rules: u64 = 0, // 0 = filtering off
     /// Live lightweight session catalog from session_watch. Labels back the
     /// existing fuzzy picker; full view state lives in saved_views.
     sessions: std.ArrayList(SessionSummary) = .empty,
@@ -771,6 +781,16 @@ const App = struct {
         self.reasoning_delta.deinit(self.gpa);
         self.reasoning_delta = .empty;
         self.stream_layout_cache.reset(self.gpa);
+    }
+
+    fn cacheWelcomeFacts(self: *App) void {
+        self.welcome_daemon_version_len = @min(self.conn.daemon_version_len, self.welcome_daemon_version.len);
+        @memcpy(
+            self.welcome_daemon_version[0..self.welcome_daemon_version_len],
+            self.conn.daemonVersion()[0..self.welcome_daemon_version_len],
+        );
+        self.welcome_sandbox = self.conn.sandbox_available;
+        self.welcome_dnsblock_rules = if (self.conn.network_filtering) self.conn.network_rule_count else 0;
     }
 
     fn setModelStr(self: *App, m: []const u8) void {
@@ -4687,6 +4707,65 @@ fn drawShortcutHelp(win: vaxis.Window, arena: std.mem.Allocator) !void {
     }, .{ .row_offset = shown + 1, .wrap = .none });
 }
 
+/// Empty-session welcome card, centered in the transcript area: identity
+/// (version + daemon build), the session's model, and first steps. Rendered
+/// only while the session has zero transcript lines; any content reclaims
+/// the space. No box, no mode — orientation, not chrome.
+fn drawWelcome(app: *const App, win: vaxis.Window, top_rows: usize, view_h: usize, arena: std.mem.Allocator) !void {
+    if (view_h < 6 or win.width < 40) return;
+
+    const Row = struct { key: []const u8 = "", text: []const u8, style: vaxis.Style = Palette.welcome_dim };
+    var rows: std.ArrayList(Row) = .empty;
+
+    try rows.append(arena, .{ .key = "marlin", .text = "v" ++ build_options.version, .style = Palette.welcome_dim });
+    const daemon_ver = app.welcome_daemon_version[0..app.welcome_daemon_version_len];
+    if (daemon_ver.len > 0) {
+        try rows.append(arena, .{ .text = try std.fmt.allocPrint(arena, "daemon v{s} · sandbox {s} · dnsblock {s}", .{
+            daemon_ver,
+            if (app.welcome_sandbox) "✓" else "off",
+            if (app.welcome_dnsblock_rules > 0)
+                try std.fmt.allocPrint(arena, "{d} rules", .{app.welcome_dnsblock_rules})
+            else
+                "off",
+        }) });
+    }
+    if (app.build_mismatch) {
+        try rows.append(arena, .{ .text = "⚠ daemon runs a different build — /reboot to sync", .style = Palette.welcome_warn });
+    }
+    try rows.append(arena, .{ .text = "" });
+    try rows.append(arena, .{ .key = "model", .text = app.model.items });
+    try rows.append(arena, .{ .text = "" });
+    try rows.append(arena, .{ .key = "Enter", .text = "send a prompt" });
+    try rows.append(arena, .{ .key = "/", .text = "slash commands · /model switches model" });
+    try rows.append(arena, .{ .key = "Ctrl+N", .text = "new session · ⌥1–⌥9 to switch" });
+    try rows.append(arena, .{ .key = "Esc ?", .text = "all keyboard shortcuts" });
+
+    const key_column: usize = 8;
+    var block_w: usize = 0;
+    for (rows.items) |item| block_w = @max(block_w, key_column + displayWidth(item.text));
+    block_w = @min(block_w, @as(usize, win.width) -| 2);
+
+    const shown: usize = @min(rows.items.len, view_h);
+    const x_off: usize = (@as(usize, win.width) -| block_w) / 2;
+    const y_off: usize = top_rows + (view_h -| shown) / 2;
+    for (rows.items[0..shown], 0..) |item, i| {
+        if (item.text.len == 0 and item.key.len == 0) continue;
+        const padding = try spaces(arena, key_column -| displayWidth(item.key));
+        const segments = [_]vaxis.Segment{
+            .{ .text = item.key, .style = Palette.welcome_title },
+            .{ .text = padding, .style = .{} },
+            .{ .text = item.text, .style = item.style },
+        };
+        const row_win = win.child(.{
+            .x_off = @intCast(x_off),
+            .y_off = @intCast(y_off + i),
+            .height = 1,
+            .width = @intCast(block_w),
+        });
+        _ = row_win.print(&segments, .{ .wrap = .none });
+    }
+}
+
 fn tabActivityStyle(activity: TabActivity, active: bool) vaxis.Style {
     var style: vaxis.Style = switch (activity) {
         .idle => .{ .fg = .{ .index = 8 }, .dim = true },
@@ -5083,6 +5162,11 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // Keep terminal viewport geometry even when the transcript has fewer
     // rows; mouse/copy mapping separately rejects blank rows.
     app.last_view_h = view_h;
+
+    // Empty-session welcome card: only when there is genuinely nothing to
+    // show (fresh session, replay finished, no turn running).
+    if (total == 0 and !app.history_loading and app.state == .idle)
+        try drawWelcome(app, win, top_rows, view_h, arena);
 
     for (visible.items, 0..) |display, row| {
         const ln = display.line;
@@ -5697,6 +5781,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     app.conn = new_conn;
     rt.* = new_rt;
     old.deinit();
+    app.cacheWelcomeFacts();
     if (app.awaiting_new_session) {
         app.awaiting_new_session = false;
         app.pending_new_session_request_id = 0;
@@ -5914,12 +5999,15 @@ pub fn run(
     // dev build shares one version string — so also compare the daemon's
     // exe mtime at ITS startup against this client's binary. Local socket
     // only: a remote daemon is another machine's binary by design.
+    app.cacheWelcomeFacts();
     if (conn.transport == .socket) {
         const daemon_ver = conn.daemonVersion();
         if (!std.mem.eql(u8, daemon_ver, build_options.version)) {
+            app.build_mismatch = true;
             app.setNotice("daemon is {s} but this client is {s} — /reboot to sync", .{ daemon_ver, build_options.version });
         } else if (conn.daemon_exe_mtime_ms != 0) {
             if (selfExeMtimeMs(gpa, io)) |mine| if (mine != conn.daemon_exe_mtime_ms) {
+                app.build_mismatch = true;
                 app.setNotice("daemon runs a different build than this client — /reboot to sync", .{});
             };
         }
@@ -9031,6 +9119,81 @@ test "draw permanently reserves and paints the clickable tab row" {
     try std.testing.expectEqual(@as(usize, 6), app.last_view_h);
     const tab_cell = vx.window().readCell(0, 0).?;
     try std.testing.expect(vaxis.Color.eql(tab_cell.style.bg, Palette.prompt_bg));
+}
+
+test "empty session draws the welcome card; content reclaims it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var vx = try vaxis.init(threaded.io(), gpa, &environ, .{});
+    defer vx.deinit(gpa, &output.writer);
+    try vx.resize(gpa, &output.writer, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+
+    var conn: attach.Conn = undefined;
+    conn.sandbox_available = true;
+    conn.network_filtering = true;
+    conn.network_configured = true;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.setModelStr("openrouter/example/model");
+    const dv = "0.0.0-dev";
+    @memcpy(app.welcome_daemon_version[0..dv.len], dv);
+    app.welcome_daemon_version_len = dv.len;
+    app.welcome_sandbox = true;
+    app.welcome_dnsblock_rules = 173_613;
+    app.build_mismatch = true;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try draw(&app, &vx, arena_state.allocator());
+
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(gpa);
+    var row: u16 = 0;
+    while (row < 24) : (row += 1) {
+        var col: u16 = 0;
+        while (col < 80) : (col += 1) {
+            const cell = vx.window().readCell(col, row) orelse continue;
+            try screen.appendSlice(gpa, cell.char.grapheme);
+        }
+        try screen.append(gpa, '\n');
+    }
+    try std.testing.expect(std.mem.indexOf(u8, screen.items, "marlin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, screen.items, "daemon v0.0.0-dev · sandbox ✓ · dnsblock 173613 rules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, screen.items, "⚠ daemon runs a different build — /reboot to sync") != null);
+    try std.testing.expect(std.mem.indexOf(u8, screen.items, "openrouter/example/model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, screen.items, "send a prompt") != null);
+
+    // Loading history, a running turn, or any transcript content reclaims
+    // the area: the card is empty-state orientation, never chrome.
+    app.history_loading = true;
+    var frame2 = std.heap.ArenaAllocator.init(gpa);
+    defer frame2.deinit();
+    try draw(&app, &vx, frame2.allocator());
+    var found = false;
+    row = 0;
+    scan: while (row < 24) : (row += 1) {
+        var col: u16 = 0;
+        var line_buf: [512]u8 = undefined;
+        var line_len: usize = 0;
+        while (col < 80) : (col += 1) {
+            const cell = vx.window().readCell(col, row) orelse continue;
+            const g = cell.char.grapheme;
+            if (line_len + g.len <= line_buf.len) {
+                @memcpy(line_buf[line_len..][0..g.len], g);
+                line_len += g.len;
+            }
+        }
+        if (std.mem.indexOf(u8, line_buf[0..line_len], "send a prompt") != null) {
+            found = true;
+            break :scan;
+        }
+    }
+    try std.testing.expect(!found);
 }
 
 test "tool results retain full blob refs and inline !c stages clipboard text" {

@@ -124,6 +124,10 @@ pub const Palette = struct {
     pub const status_running: vaxis.Style = .{ .bg = status_bg, .fg = soft_blue, .bold = true };
     pub const status_approval: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 }, .bold = true };
     pub const status_error: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 1 }, .bold = true };
+    // Empty-session welcome card (default background, unlike the panels).
+    pub const welcome_title: vaxis.Style = .{ .fg = .{ .index = 6 }, .bold = true };
+    pub const welcome_dim: vaxis.Style = .{ .fg = .{ .index = 8 } };
+    pub const welcome_warn: vaxis.Style = .{ .fg = .{ .index = 1 }, .bold = true };
     pub const status_model: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 6 } };
     pub const status_effort: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 5 } };
     pub const status_child: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 6 }, .bold = true };
