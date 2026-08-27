@@ -46,32 +46,32 @@ run that agent. Some sessions host someone else's.
 `task`/`task_batch`, `plan_update`, L0/L1/L2. The TUI is a client of this
 loop. This is the product.
 
-**Guest** (`claudecode/`): Anthropic's official `claude` binary owns the
-turn. Subscription Fable (and the rest of the plan-included lineup) is
-only sanctioned through that binary; treating it as a Marlin wire dialect
-is how you get the account restricted. Marlin's job on a guest session is
-the multiplexer: persist the structured event stream as blocks, attach,
-interrupt, reboot/`--resume` via a derived UUID, copy, and park *their*
-permission prompts on *our* approval bar. Marlin tools, Seatbelt, network
-screening, MCP-as-agent-tools, `task`/`task_batch`, `plan_update`, and
-L0/L1/L2 **do not reach inside the subprocess.**
+**Guest** (`claudecode/`, `codex/`): an official vendor agent owns the turn.
+Claude Code runs through `claude -p`; Codex runs through the stable
+`codex app-server` JSONL protocol and uses the account already established by
+`codex login` (including ChatGPT subscription login). Marlin's job is the
+multiplexer: persist structured events as blocks, attach, interrupt, resume
+the vendor thread, copy, and park *their* permission prompts on *our* approval
+bar. Marlin tools, Seatbelt, network screening, MCP-as-agent-tools,
+`task`/`task_batch`, `plan_update`, and L0/L1/L2 **do not reach inside the
+subprocess.**
 
 Guest is a session regime, not a model. Kitchen-sink is chasing parity so
-a guest tab feels like a native tab. The adapter is frozen at:
+a guest tab feels like a native tab. The guest boundary is frozen at:
 
-1. spawn `claude -p --output-format stream-json`
-2. map stream-json → blocks
+1. spawn the official binary (`claude -p` or `codex app-server`)
+2. map its structured event stream → blocks
 3. interrupt / reboot / resume
-4. permission bridge onto the existing approval bar (mux UX, not harness UX)
+4. permission requests onto the existing approval bar (mux UX, not harness UX)
 5. session status (running / awaiting_approval / idle)
 
 Nothing else. Semantic rendering of unknown tools is a TUI fact, not a
-Claude Code catalogue. Images stay durable in Marlin and are not smuggled
+guest-tool catalogue. Images stay durable in Marlin and are not smuggled
 into the binary. `/compact`, `/sandbox`, session `/network`, and Marlin
 tool dispatch are native-only; a guest session that receives them must
 refuse at the protocol, not start a turn and fail with an internal name.
-`/effort` is the exception that still applies: Claude Code's CLI takes
-`--effort`, so Marlin forwards it.
+`/effort` is the exception that still applies: Marlin forwards it to the guest
+when that guest/model supports the selected value.
 
 `/new` is native. Guest is opt-in. `/model` **may cross the wall** on a
 live session: that is a regime change for the *next* turn, not a new
@@ -82,15 +82,17 @@ The durable agent field updates with the model string.
 The real hazard is **context continuity**, not mixing logs:
 
 - **guest→native:** Marlin's loop already derives the next request from
-  the block log. Claude Code's tool names become history; that is fine.
-- **native→guest:** `claude -p` does not read Marlin's store. `/model
-  claudecode/…` starts a **native** handover turn before the regime
+  the block log. Guest tool names become history; that is fine.
+- **native→guest:** the vendor agent does not read Marlin's store. `/model
+  claudecode/…` or `/model codex/default` starts a **native** handover turn before the regime
   flips: the current model writes a visible briefing (streamed into the
   transcript, persisted as a `[handover]` system_note). The TUI shows
   "switching to a guest model, generating handover summary…". On
   completion (or failure — the switch is not blocked) the session
-  becomes guest; the first `claude -p` prompt is that briefing plus the
+  becomes guest; the guest's first prompt is that briefing plus the
   user's next message. Empty native logs skip the LLM.
+- **guest→different guest:** refused directly. Switch through a native model
+  so the native handover turn can bridge the two private context stores.
 
 Today the regime is inferred from the model prefix. See "Making the wall true."
 
@@ -100,20 +102,20 @@ then the wall is how Marlin stays small.
 
 **Making the wall true** (honest: not all of this is code yet):
 
-- Durable agent field (`native` | `claude_code`), not `claudecode/` as a
-  dialect on `Endpoint`. `SessionKind` stays hierarchy (`root` /
+- Backend routing is explicit (`native` dialect or named guest), rather than
+  pretending a guest is a wire dialect. `SessionKind` stays hierarchy (`root` /
   `task_child` / `review_child`); agent is orthogonal.
 - Protocol reject: `/compact`, `/sandbox`, `/network` (session toggle)
-  **while the session is guest**. `/effort` is forwarded as Claude
-  `--effort` (low/medium/high/xhigh/max; Marlin `none`/`minimal` → `low`;
-  `auto` omits the flag). `/mcp` stays daemon-global.
+  **while the session is guest**. `/effort` is forwarded through the guest's
+  supported protocol (`claude --effort` or Codex turn effort); `auto` omits
+  the override. `/mcp` stays daemon-global.
   `/model` that crosses native→guest runs the visible native handover
   turn, then flips the model. Guest `/compact` refuses at the protocol
   (`err{guest}`).
 - Picker and status name the regime: guest models keep their place in
   the list, prefixed `(guest)`. Status shows `(guest) {name}` and dims
   ctx/sandbox/dnsblock as `n/a` (unavailable, not off — Marlin does not
-  see Claude Code's window). Native remains the `/new` default.
+  own the guest's context window). Native remains the `/new` default.
 - Permission bridge (`marlin cc_approve`) is mux: fail-closed to *ask*,
   never a shell parser, never applied to native `read_file`. Auto-allow
   of CC `Read` (including paths outside the workspace) is CC's policy,
@@ -269,16 +271,18 @@ Sequence:
    background bash tasks are listed for confirmation (they get orphaned).
 3. **Daemon exit.** Persist, stop accepting clients, unlink the public socket,
    then ACK and exit. Removing the socket before the ACK makes the client-side
-   exec a clean handoff rather than a race with a dying listener. No exec on
-   the daemon side — the client's autostart path brings up the new binary.
-   Connection setup also retries transient EOF/reset errors during `hello`, so
-   it remains compatible with an older daemon that ACKs before releasing its
-   socket. One restart mechanism, not two.
+   exec a clean handoff rather than a race with a dying listener. For a local
+   reboot, the re-exec'd client autostarts the daemon. For a remote source
+   rebuild, the held SSH helper starts the validated remote candidate after the
+   ACK; the re-exec'd local client then reconnects normally. Connection setup
+   also retries transient EOF/reset errors during `hello`, so it remains
+   compatible with an older daemon that ACKs before releasing its socket.
 4. **Client re-exec.** Client writes a small lossy UI snapshot (focused
-   session, split layout, input draft) to JSON, exec()s the new binary,
-   which autostarts the new daemon, reattaches with from_seq replay, and
-   restores the snapshot. Snapshot fails to parse across versions → default
-   layout, same session: annoyance, not data loss.
+   session, split layout, input draft) to JSON and exec()s the selected local
+   binary. It autostarts a local daemon when needed or reconnects to the remote
+   one, reattaches with from_seq replay, and restores the snapshot. Snapshot
+   fails to parse across versions → default layout, same session: annoyance,
+   not data loss.
 5. **Version skew.** On boot the daemon runs store migrations before
    accepting clients; the handshake rejects mismatched proto_version so
    old-client/new-daemon is a clean error, never a crash.
@@ -615,14 +619,21 @@ provider/
                       // everything else parks as a normal approval_request.
                       // Auto/yolo guest sessions map to
                       // --dangerously-skip-permissions.
+  codex.zig           // GUEST ADAPTER for codex/<model>. App-server JSONL
+                      // uses the existing ChatGPT login; its durable thread
+                      // id maps to the Marlin session. Items and approvals
+                      // project onto ordinary blocks and the shared gate.
   registry.zig        // model string → native dialect+endpoint+key, or guest
 ```
 
 - OpenRouter is the default registry entry and the `/new` default.
-- `base_url` + `api_key_env` in config adding arbitrary OpenAI-compatible
-  endpoints is **design, not shipped** — the registry is `openrouter` /
-  `anthropic` / `local` plus the guest prefix `claudecode`. Do not describe
-  extra native providers as config-only until that table exists.
+- `base_url` + `api_key_env` in `[providers.<name>]` adds arbitrary
+  OpenAI-compatible endpoints without another wire dialect. The secret stays
+  in the named environment variable; `"NONE"` explicitly selects keyless
+  auth. Credential names must match the daemon's secret-name policy so tool
+  subprocess stripping and capture-time redaction cannot drift. `vercel/` and
+  `litellm/` are built-in presets, while the same table can override their
+  defaults or the `openrouter` / `anthropic` / `local` routes.
 - `local/testing` is the deterministic developer model. It defaults to the
   bundled fake provider on `127.0.0.1:5757`, requires no key, and still crosses
   the real OpenAI-compatible HTTP/SSE boundary. E2E uses a private dynamic-port
@@ -654,7 +665,7 @@ Four distinct failure layers, four distinct answers:
    account, one proxy — every model gone at once). Mitigation: 2-3 DIRECT
    provider entries alongside it. Pure config, zero code — xAI, DeepSeek,
    Z.ai, Mistral, OpenAI, Gemini's compat endpoint are all
-   `base_url + api_key_cmd` in the openai_compat dialect. The council
+   `base_url + api_key_env` in the openai_compat dialect. The council
    models (sol / fable / grok / glm) all have direct endpoints: councils
    survive an OpenRouter outage on config alone.
 2. **Model-family outage** (Anthropic having a bad day). Mitigated by
@@ -663,9 +674,9 @@ Four distinct failure layers, four distinct answers:
 3. **Account failure** (credits, revoked key, tier limits). Only a second
    billing path fixes this — direct keys are that path, not a second
    protocol.
-4. **No internet.** `[providers.local]` (llama.cpp/vLLM/Ollama) is spec'd;
-   exercise it in the smoke suite once so it's KNOWN working, not
-   theoretically working.
+4. **No internet.** `local/` and the keyless configured-provider path cover
+   llama.cpp, vLLM, Ollama, and LiteLLM without leaving the OpenAI-compatible
+   dialect.
 
 **Failover policy** (design — no failover path exists in `provider/` yet;
 today a persistent provider failure fails the turn visibly):
@@ -686,9 +697,9 @@ and re-request the same assembled context against the fallback.
 
 **Don't build:** Gemini-native, Bedrock (SigV4), Vertex dialects — heavy
 auth for platforms not in use. The two-dialect rule holds for *native*
-sessions. Guest is not a dialect; do not add a third wire. Do not add
-further guest agents (Codex CLI, `gemini -p`, …) — one hostage is the
-budget.
+sessions. Guest is not a dialect; do not add a third wire. The two shipped
+guests are enough; do not add more (`gemini -p`, etc.) without first proving
+that daily use justifies another private runtime and context store.
 
 **Accounting footnote:** OpenRouter reports $ directly; direct providers
 report only tokens. The status-bar `$` needs a small local price table
@@ -708,7 +719,9 @@ input/output rates directly and leaves local or unpublished rates unknown.
   into SQLite turn/round/tool telemetry. `/diagnostics` is the deterministic
   local view. With `OTEL_EXPORTER_OTLP_ENDPOINT` (or its traces-specific
   variant), a separate persistent-connection worker drains completed traces
-  from a durable outbox; export failures never affect turns. Mirador or another
+  from a durable outbox; `marlin otel reload|off|status` can atomically replace
+  that process-local exporter over the existing socket/SSH transport without
+  persisting or echoing headers. Export failures never affect turns. Mirador or another
   OTLP collector provides the cross-session view. Telemetry excludes prompts,
   completions, tool arguments, and tool output.
 - HTTP uses a daemon-owned `std.http.Client` pool shared by provider requests,
@@ -1137,6 +1150,16 @@ sort = "throughput"           # throughput (default), latency, price, or null
 [providers.local]             # any OpenAI-compatible endpoint
 base_url = "http://localhost:8080/v1"
 api_key_env = "NONE"
+
+[providers.vercel]            # optional overrides for the built-in preset
+api_key_env = "AI_GATEWAY_API_KEY"
+
+[providers.litellm]           # defaults to http://127.0.0.1:4000/v1
+api_key_env = "NONE"
+
+[providers.requesty]          # any other OpenAI-compatible router
+base_url = "https://router.requesty.ai/v1"
+api_key_env = "REQUESTY_API_KEY"
 
 [context]
 output_headroom = 16000

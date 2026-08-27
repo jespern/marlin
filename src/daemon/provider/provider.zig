@@ -1,22 +1,23 @@
 //! Provider interface (docs/ARCHITECTURE.md §5).
 //!
-//! One internal chat representation (blocks → Message list), two native wire
+//! One internal chat representation (blocks → Message list), three native wire
 //! dialects. A provider takes (messages, tool specs, model params) and yields
 //! a stream of events; the native agent loop is dialect-agnostic.
-//!
-//! `claude_code` is listed on Dialect today because registry.resolve still
-//! returns an Endpoint. That is a leak: guest sessions are not a wire
-//! dialect (docs/ARCHITECTURE.md, Native vs guest). Do not add a fifth tag.
 
 const std = @import("std");
+const guest = @import("../../core/guest.zig");
 
 /// Reasoning-effort fields differ between OpenRouter and the OpenAI Chat
 /// Completions-compatible endpoints used for local models; `anthropic` is
 /// the Messages API (anthropic.zig), the one non-OpenAI wire shape shipped.
-/// `claude_code` is not a wire dialect at all: turns are delegated to the
-/// official `claude` binary (claude_code.zig) so subscription inference
-/// stays inside Anthropic's sanctioned surface.
-pub const Dialect = enum { openrouter, openai_compatible, anthropic, claude_code };
+pub const Dialect = enum { openrouter, openai_compatible, anthropic };
+
+pub const Guest = guest.Backend;
+
+pub const Backend = union(enum) {
+    native: Dialect,
+    guest: Guest,
+};
 
 pub const Role = enum { system, user, assistant, tool };
 

@@ -296,6 +296,7 @@ fn runScenario(
     // the OpenRouter override remains for provider-specific scenarios.
     try env.put("MARLIN_BASE_URL_LOCAL", base_url);
     try env.put("MARLIN_BASE_URL_OPENROUTER", base_url);
+    try env.put("MARLIN_BASE_URL_ACME", base_url);
     // Test daemons remain in the runner's process group. That makes Ctrl+C or
     // an outer tool cancellation clean up the entire scenario tree.
     try env.put("MARLIN_DAEMON_PGID", "inherit");
@@ -535,14 +536,24 @@ fn runScenario(
         defer diagnostic.deinit(gpa);
         if (diagnostic.term != .exited or diagnostic.term.exited != 0)
             return error.DiagnosticsCommandFailed;
-        const parsed = std.json.parseFromSlice(std.json.Value, arena, diagnostic.stdout, .{}) catch
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, diagnostic.stdout, .{}) catch {
+            print(io, "\n  diagnostics returned invalid JSON\n  stdout: {f}\n  stderr: {f}\n", .{
+                std.json.fmt(diagnostic.stdout, .{}), std.json.fmt(diagnostic.stderr, .{}),
+            });
             return error.DiagnosticsJsonInvalid;
+        };
         defer parsed.deinit();
         const object = if (parsed.value == .object) parsed.value.object else return error.DiagnosticsJsonInvalid;
         const provider_requests = object.get("provider_requests") orelse return error.DiagnosticsJsonInvalid;
         const tool_calls = object.get("tool_calls") orelse return error.DiagnosticsJsonInvalid;
-        if (provider_requests != .integer or provider_requests.integer != 2 or
-            tool_calls != .integer or tool_calls.integer != 2)
+        var expected_fields = std.mem.splitScalar(u8, want, '|');
+        _ = expected_fields.next(); // telemetry_turns
+        const expected_provider_requests = std.fmt.parseInt(i64, expected_fields.next() orelse return error.DiagnosticsJsonInvalid, 10) catch
+            return error.DiagnosticsJsonInvalid;
+        const expected_tool_calls = std.fmt.parseInt(i64, expected_fields.next() orelse return error.DiagnosticsJsonInvalid, 10) catch
+            return error.DiagnosticsJsonInvalid;
+        if (provider_requests != .integer or provider_requests.integer != expected_provider_requests or
+            tool_calls != .integer or tool_calls.integer != expected_tool_calls)
             return error.DiagnosticsJsonInvalid;
     }
 

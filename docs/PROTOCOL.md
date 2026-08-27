@@ -51,11 +51,11 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_watch | incremental? | initial session_list_result, then structural catalog updates; incremental clients receive session_upsert/session_remove, legacy clients receive refreshed snapshots |
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
-| session_set_model | sid, model | ok, or err{busy} mid-turn. Native→guest (`claudecode/` prefix) starts a native handover turn (visible summary, then the model becomes guest). Other switches take effect immediately. |
+| session_set_model | sid, model | ok, or err{busy} mid-turn. Native→guest (`claudecode/` or `codex/`) starts a native handover turn. Switching directly between different guest backends returns err{guest_switch}; go through a native model to create a handover. |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
 | session_set_plan_mode | sid, enabled | ok, or err{busy} mid-turn; persists collaboration mode with the session |
-| session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on Claude Code sessions |
-| session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded, err{guest} on Claude Code sessions |
+| session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on guest sessions |
+| session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded, err{guest} on guest sessions |
 | sub | sid, from_seq, tail_limit?, before_seq?, around_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
 | unsub | sid | ok |
 | input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer while an agent turn is accepting them (running/awaiting approval); compact, handover, and the atomic finishing edge return `err{not_steerable}` |
@@ -71,7 +71,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | mcp_restart | name | mcp_list_result after rediscovery; failure is reported as server health, not daemon failure |
 | mcp_reload | — | mcp_list_result after atomic registry replacement; old registry survives invalid config/build failure |
 | approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |
-| session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn, err{guest} on Claude Code sessions |
+| session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn, err{guest} on guest sessions |
 | interrupt | sid, report? | ok, or interrupt_result with phase/elapsed diagnostics when report=true (cooperative cancel; also denies a pending approval) |
 | reboot | force? | quiesce (wait for turns; force interrupts), retire the listening socket, then ok RIGHT BEFORE daemon exit — requester's cue to re-exec; non-force returns err{approval_pending} rather than wait on an approval with no client |
 | shutdown | — | ok, then daemon exits cleanly |
@@ -81,15 +81,14 @@ policy that failed open. Both default false when decoding an older daemon.
 
 `effort`: `"auto"` omits the provider parameter and preserves the model's
 default. Explicit values are `"none"`, `"minimal"`, `"low"`, `"medium"`,
-`"high"`, `"xhigh"`, and `"max"`; support is model-dependent. Guest
-(`claudecode/`) sessions pass it through as `claude -p --effort` (`low` /
-`medium` / `high` / `xhigh` / `max`; Marlin `none`/`minimal` map to `low`;
-`auto` omits the flag).
+`"high"`, `"xhigh"`, and `"max"`; support is model-dependent. Claude Code
+maps the value to `claude -p --effort` (with `none`/`minimal` becoming `low`).
+Codex sends it as the app-server turn effort. `auto` omits the guest override.
 
 Guest vs native is a session regime (ARCHITECTURE.md), not a `SessionKind`.
 `kind` remains hierarchy (`root`, `task_child`, `review_child`). The guest
-adapter persists Claude Code stream-json as ordinary blocks; `cc_approval`
-is multiplexer UX for their permission prompts, not Marlin tool dispatch.
+adapters persist Claude Code stream-json or Codex app-server items as ordinary
+blocks. Guest approvals are multiplexer UX, not Marlin tool dispatch.
 
 `sub.from_seq`: 0 = live-only. N ≥ 1 = replay stored blocks with seq ≥ N
 first, then live. Clients that reconnect pass last_seen_seq + 1.
@@ -154,6 +153,12 @@ read-only and omitted from ordinary list/watch snapshots. Send `archived:false`
 to restore the hierarchy. Parent archive/restore operations include all
 descendants.
 
+`otel_configure {endpoint,traces_endpoint,headers}` atomically replaces the
+process-local exporter. Empty endpoints disable export. Values are intentionally
+non-durable and should be sent only over the same-user Unix socket or SSH pipe;
+responses expose only the enabled bit. `otel_status` reads that bit without
+changing configuration.
+
 ## Daemon → client
 
 | message | when |
@@ -164,6 +169,7 @@ descendants.
 | input_history_result {entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
 | search_result {query,sid,hits} | reply to search; each hit carries session/block identity, kind, location, timestamp, and an FTS-highlighted snippet |
 | diagnostics_result | reply to diagnostics; aggregate provider/TTFT percentiles, outcomes, latest provider/tool waterfall, trace id, and OTLP outbox health; contains no prompt or tool content |
+| otel_status_result {enabled} | reply to `otel_status` or `otel_configure`; never includes endpoint headers |
 | session_upsert {session} | one added/restored/changed catalog row for an incremental session watcher |
 | session_remove {sid} | one archived catalog row removed from an incremental session watcher |
 | blk {sid, b} | a block was persisted (replay AND live fan-out) |

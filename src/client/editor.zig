@@ -204,6 +204,14 @@ pub fn insertImagePlaceholder(self: *Editor, index: usize) void {
 /// placeholders backed by the staged attachment count. Caller owns the
 /// returned slice. Resets the editor.
 pub fn takeExpandedWithImages(self: *Editor, image_count: usize) ![]u8 {
+    return self.takeExpandedImpl(image_count, false);
+}
+
+pub fn takeExpandedSensitive(self: *Editor) ![]u8 {
+    return self.takeExpandedImpl(0, true);
+}
+
+fn takeExpandedImpl(self: *Editor, image_count: usize, sensitive: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(self.gpa);
     const t = self.text.items;
@@ -231,7 +239,10 @@ pub fn takeExpandedWithImages(self: *Editor, image_count: usize) ![]u8 {
         try out.append(self.gpa, t[i]);
         i += 1;
     }
-    self.clear();
+    if (sensitive)
+        self.clearSensitive()
+    else
+        self.clear();
     return out.toOwnedSlice(self.gpa);
 }
 
@@ -274,19 +285,38 @@ fn parseImageLabel(s: []const u8) ?ChipRef {
 }
 
 pub fn clear(self: *Editor) void {
-    for (self.undo_stack.items) |st| self.gpa.free(st.text);
+    self.clearImpl(false);
+}
+
+pub fn clearSensitive(self: *Editor) void {
+    self.clearImpl(true);
+}
+
+fn clearImpl(self: *Editor, sensitive: bool) void {
+    for (self.undo_stack.items) |st| {
+        if (sensitive) @memset(st.text, 0);
+        self.gpa.free(st.text);
+    }
     self.undo_stack.clearRetainingCapacity();
-    for (self.redo_stack.items) |st| self.gpa.free(st.text);
+    for (self.redo_stack.items) |st| {
+        if (sensitive) @memset(st.text, 0);
+        self.gpa.free(st.text);
+    }
     self.redo_stack.clearRetainingCapacity();
+    if (sensitive) @memset(self.text.items, 0);
     self.text.clearRetainingCapacity();
     self.cursor = 0;
     self.goal_col = null;
     self.hist_idx = null;
     if (self.draft) |d| {
+        if (sensitive) @memset(d, 0);
         self.gpa.free(d);
         self.draft = null;
     }
-    for (self.pastes.items) |p| self.gpa.free(p);
+    for (self.pastes.items) |p| {
+        if (sensitive) @memset(p, 0);
+        self.gpa.free(p);
+    }
     self.pastes.clearRetainingCapacity();
 }
 
@@ -627,6 +657,27 @@ pub fn draw(
     prompt_style: vaxis.Style,
     text_style: vaxis.Style,
 ) void {
+    self.drawImpl(win, prompt, prompt_style, text_style, false);
+}
+
+pub fn drawMasked(
+    self: *const Editor,
+    win: vaxis.Window,
+    prompt: []const u8,
+    prompt_style: vaxis.Style,
+    text_style: vaxis.Style,
+) void {
+    self.drawImpl(win, prompt, prompt_style, text_style, true);
+}
+
+fn drawImpl(
+    self: *const Editor,
+    win: vaxis.Window,
+    prompt: []const u8,
+    prompt_style: vaxis.Style,
+    text_style: vaxis.Style,
+    masked: bool,
+) void {
     const w: usize = win.width;
     const prompt_width: usize = win.gwidth(prompt);
     if (w <= prompt_width + 2) return;
@@ -665,7 +716,21 @@ pub fn draw(
                 .width = @intCast(body_w),
                 .height = 1,
             });
-            _ = child.printSegment(.{ .text = seg, .style = text_style }, .{ .wrap = .none });
+            if (masked) {
+                var col: usize = 0;
+                var at: usize = 0;
+                while (at < seg.len and col < body_w) {
+                    const end = nextCpEnd(seg, at);
+                    _ = child.printSegment(.{ .text = "•", .style = text_style }, .{
+                        .col_offset = @intCast(col),
+                        .wrap = .none,
+                    });
+                    col += cpDisplayWidth(seg[at..end]);
+                    at = end;
+                }
+            } else {
+                _ = child.printSegment(.{ .text = seg, .style = text_style }, .{ .wrap = .none });
+            }
         }
         screen_row += 1;
     }

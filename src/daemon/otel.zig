@@ -17,6 +17,7 @@ pub const Exporter = struct {
     endpoint: [:0]u8,
     headers: [][]u8,
     pool: http.Pool,
+    active: std.atomic.Value(bool) = .init(false),
     stop: std.atomic.Value(bool) = .init(false),
     thread: std.Thread,
 
@@ -28,17 +29,34 @@ pub const Exporter = struct {
         store: *Store,
         environ: *const std.process.Environ.Map,
     ) !?*Exporter {
-        const traces_endpoint = environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
-        const base_endpoint = environ.get("OTEL_EXPORTER_OTLP_ENDPOINT");
-        const raw = traces_endpoint orelse base_endpoint orelse return null;
-        if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return null;
+        return startConfigured(gpa, io, store, environ, .{
+            .endpoint = environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") orelse "",
+            .traces_endpoint = environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") orelse "",
+            .headers = environ.get("OTEL_EXPORTER_OTLP_HEADERS") orelse "",
+        });
+    }
 
-        const endpoint = if (traces_endpoint != null or std.mem.endsWith(u8, raw, "/v1/traces"))
-            try std.fmt.allocPrintSentinel(gpa, "{s}", .{std.mem.trimEnd(u8, raw, " \t\r\n")}, 0)
-        else
-            try std.fmt.allocPrintSentinel(gpa, "{s}/v1/traces", .{std.mem.trimEnd(u8, raw, "/ \t\r\n")}, 0);
+    pub const Config = struct {
+        endpoint: []const u8 = "",
+        traces_endpoint: []const u8 = "",
+        headers: []const u8 = "",
+    };
+
+    pub fn startConfigured(
+        gpa: std.mem.Allocator,
+        io: Io,
+        store: *Store,
+        environ: *const std.process.Environ.Map,
+        config: Config,
+    ) !?*Exporter {
+        const traces_endpoint = std.mem.trim(u8, config.traces_endpoint, " \t\r\n");
+        const base_endpoint = std.mem.trim(u8, config.endpoint, " \t\r\n");
+        const raw = if (traces_endpoint.len > 0) traces_endpoint else base_endpoint;
+        if (raw.len == 0) return null;
+
+        const endpoint = try buildEndpoint(gpa, raw, traces_endpoint.len > 0);
         errdefer gpa.free(endpoint);
-        const headers = try parseHeaders(gpa, environ.get("OTEL_EXPORTER_OTLP_HEADERS") orelse "");
+        const headers = try parseHeaders(gpa, config.headers);
         errdefer freeHeaders(gpa, headers);
         var pool = try http.Pool.init(gpa, io, environ);
         errdefer pool.deinit();
@@ -63,6 +81,10 @@ pub const Exporter = struct {
         return self;
     }
 
+    pub fn activate(self: *Exporter) void {
+        self.active.store(true, .release);
+    }
+
     pub fn deinit(self: *Exporter) void {
         self.stop.store(true, .release);
         self.thread.join();
@@ -75,6 +97,7 @@ pub const Exporter = struct {
     }
 
     fn run(self: *Exporter) void {
+        while (!self.stop.load(.acquire) and !self.active.load(.acquire)) self.pause(10);
         while (!self.stop.load(.acquire)) {
             var arena_state = std.heap.ArenaAllocator.init(self.gpa);
             defer arena_state.deinit();
@@ -155,6 +178,18 @@ fn discard(_: void, _: []const u8) bool {
 
 fn nowMs(io: Io) i64 {
     return @intCast(@divTrunc(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+}
+
+fn buildEndpoint(gpa: std.mem.Allocator, raw: []const u8, traces_specific: bool) ![:0]u8 {
+    const uri = std.Uri.parse(raw) catch return error.InvalidOtelEndpoint;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InvalidOtelEndpoint;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    _ = uri.getHost(&host_buf) catch return error.InvalidOtelEndpoint;
+
+    if (traces_specific or std.mem.endsWith(u8, raw, "/v1/traces"))
+        return std.fmt.allocPrintSentinel(gpa, "{s}", .{raw}, 0);
+    return std.fmt.allocPrintSentinel(gpa, "{s}/v1/traces", .{std.mem.trimEnd(u8, raw, "/")}, 0);
 }
 
 fn parseHeaders(gpa: std.mem.Allocator, raw: []const u8) ![][]u8 {
@@ -349,10 +384,25 @@ test "OTLP request contains correlated root, provider, and tool spans without co
     try std.testing.expect(std.mem.indexOf(u8, json, "prompt") == null);
 }
 
+test "OTEL endpoint normalization validates schemes and appends traces path" {
+    const gpa = std.testing.allocator;
+    const base = try buildEndpoint(gpa, "https://otel.example/", false);
+    defer gpa.free(base);
+    try std.testing.expectEqualStrings("https://otel.example/v1/traces", base);
+
+    const traces = try buildEndpoint(gpa, "https://otel.example/custom/traces", true);
+    defer gpa.free(traces);
+    try std.testing.expectEqualStrings("https://otel.example/custom/traces", traces);
+
+    try std.testing.expectError(error.InvalidOtelEndpoint, buildEndpoint(gpa, "file:///tmp/traces", false));
+    try std.testing.expectError(error.InvalidOtelEndpoint, buildEndpoint(gpa, "not a URL", false));
+}
+
 test "OTEL headers decode standard percent escapes" {
     const gpa = std.testing.allocator;
     const headers = try parseHeaders(gpa, "Authorization=Bearer%20secret,x-team=marlin");
     defer freeHeaders(gpa, headers);
     try std.testing.expectEqual(@as(usize, 2), headers.len);
     try std.testing.expectEqualStrings("Authorization: Bearer secret", headers[0]);
+    try std.testing.expectError(error.InvalidOtelHeaders, parseHeaders(gpa, "Authorization"));
 }

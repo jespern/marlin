@@ -19,6 +19,7 @@ const proto = @import("../core/proto.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const media = @import("media.zig");
+const self_build = @import("self_build.zig");
 
 const ResolvedSession = struct {
     sid: u64,
@@ -738,14 +739,52 @@ pub fn compact(
     }
 }
 
-/// `marlin reboot [--build] [--force]` — coordinated re-exec onto a fresh
-/// binary (ARCHITECTURE.md §self-hosting reboot).
-///   1. --build: build the daily-driver binary in ReleaseFast; abort on failure.
-///   2. Sanity-exec the candidate binary (`--version`) — exec-into-broken
-///      must be impossible.
-///   3. Send reboot{force}; daemon quiesces, acks, exits.
-///   4. Re-exec ourselves (argv[0] path) with the given follow-up args —
-///      autostart brings up the new daemon.
+const RebuildScope = enum { none, attached, client, both };
+
+const RebootOptions = struct {
+    rebuild: RebuildScope = .none,
+    force: bool = false,
+    follow_up_at: ?usize = null,
+};
+
+fn parseRebootOptions(args: []const [:0]const u8) error{InvalidArgument}!RebootOptions {
+    var options = RebootOptions{};
+    for (args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--build")) {
+            options.rebuild = .attached;
+        } else if (std.mem.eql(u8, arg, "--build-client")) {
+            options.rebuild = .client;
+        } else if (std.mem.eql(u8, arg, "--build-both")) {
+            options.rebuild = .both;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            options.force = true;
+        } else if (std.mem.eql(u8, arg, "--then")) {
+            options.follow_up_at = i + 1;
+            break;
+        } else {
+            return error.InvalidArgument;
+        }
+    }
+    return options;
+}
+
+const RebuildActions = struct {
+    local: bool,
+    remote: bool,
+    reboot_daemon: bool,
+};
+
+fn rebuildActions(scope: RebuildScope, remote: bool) RebuildActions {
+    return .{
+        .local = scope == .client or scope == .both or (scope == .attached and !remote),
+        .remote = remote and (scope == .attached or scope == .both),
+        .reboot_daemon = scope != .client,
+    };
+}
+
+/// Coordinated local/remote reboot. Builds remain process-boundary operations:
+/// local source builds run here, remote source builds run through SSH, and the
+/// daemon protocol owns only quiescence and exit.
 pub fn reboot(
     gpa: std.mem.Allocator,
     io: Io,
@@ -753,95 +792,154 @@ pub fn reboot(
     self_exe: []const u8,
     args: []const [:0]const u8,
 ) !u8 {
-    var do_build = false;
-    var force = false;
-    var follow_up: []const [:0]const u8 = &.{};
-    for (args, 0..) |a, i| {
-        if (std.mem.eql(u8, a, "--build")) {
-            do_build = true;
-        } else if (std.mem.eql(u8, a, "--force")) {
-            force = true;
-        } else if (std.mem.eql(u8, a, "--then")) {
-            // e2e seam: exec into `marlin <follow-up args>` instead of the TUI.
-            follow_up = args[i + 1 ..];
-            break;
-        } else {
-            try eprint(io, "usage: marlin reboot [--build] [--force] [--then <args...>]\n", .{});
-            return 2;
-        }
-    }
+    const options = parseRebootOptions(args) catch {
+        try eprint(io, "usage: marlin reboot [--build|--build-client|--build-both] [--force] [--then <args...>]\n", .{});
+        return 2;
+    };
+    const follow_up = if (options.follow_up_at) |at| args[at..] else &.{};
+    const remote = environ.get(attach.remote_env);
+    const actions = rebuildActions(options.rebuild, remote != null);
 
-    // 1. Optional build. The TUI has restored the terminal by this point, so
-    // inherit stdout/stderr instead of buffering a long, apparently idle wait.
-    if (do_build) {
-        try eprint(io, "marlin: building release binary...\n", .{});
-        var child = std.process.spawn(io, .{
-            .argv = &.{ "zig", "build", "-Doptimize=ReleaseFast" },
-        }) catch |e| {
-            try eprint(io, "marlin: release build failed to spawn: {t}\n", .{e});
-            return 1;
-        };
-        const term = child.wait(io) catch |e| {
-            child.kill(io);
-            try eprint(io, "marlin: release build wait failed: {t} — reboot aborted\n", .{e});
-            return 1;
-        };
-        const ok = term == .exited and term.exited == 0;
-        if (!ok) {
-            try eprint(io, "marlin: build failed — reboot aborted\n", .{});
-            return 1;
-        }
-        try eprint(io, "marlin: build complete; restarting...\n", .{});
-    }
-
-    // 2. Sanity-exec the candidate. The one unrecoverable reboot failure is
-    // exec-into-broken-binary; make it impossible.
-    {
-        const res = std.process.run(gpa, io, .{
-            .argv = &.{ self_exe, "version" },
-            .stdout_limit = .limited(4096),
-            .stderr_limit = .limited(4096),
-        }) catch |e| {
-            try eprint(io, "marlin: candidate binary failed sanity exec: {t} — reboot aborted\n", .{e});
-            return 1;
-        };
-        defer gpa.free(res.stdout);
-        defer gpa.free(res.stderr);
-        const ok = res.term == .exited and res.term.exited == 0 and
-            std.mem.startsWith(u8, res.stdout, "marlin");
-        if (!ok) {
-            try eprint(io, "marlin: candidate binary failed sanity check — reboot aborted\n", .{});
-            return 1;
-        }
-    }
-
-    // 3. Coordinated daemon shutdown (skip silently when no daemon runs —
-    // reboot then degrades to plain exec).
-    if (attach.tryConnect(gpa, io, environ) catch null) |conn| {
-        defer conn.deinit();
-        var arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        try conn.send(.{ .hello = .{ .proto_version = proto.proto_version, .client_kind = "reboot" } });
-        _ = try conn.recvUntil(arena, .hello_ok);
-        try conn.send(.{ .reboot = .{ .force = force } });
-        _ = conn.recvUntil(arena, .ok) catch |err| {
-            if (err == error.DaemonError) {
-                try eprint(io, "marlin: reboot refused; daemon remains running\n", .{});
-                return 1;
+    var local_candidate: ?[]u8 = null;
+    defer if (local_candidate) |path| gpa.free(path);
+    if (actions.local) {
+        local_candidate = self_build.build(gpa, io, "local Marlin") catch |err| {
+            if (err == error.NotSourceBuild) {
+                try eprint(
+                    io,
+                    "marlin: !rb client requires the running executable to be <checkout>/zig-out/bin/marlin\n" ++
+                        "marlin: package installations should be updated with their installer or package manager\n",
+                    .{},
+                );
+            } else {
+                try eprint(io, "marlin: local build failed: {t}\n", .{err});
             }
-            try eprint(io, "marlin: daemon did not ack reboot (crashed?) — proceeding\n", .{});
+            return 1;
         };
     }
 
-    // 4. Re-exec. The new process autostarts the new daemon on connect.
+    const exec_path = local_candidate orelse self_exe;
+    if (!try sanityCheckCandidate(gpa, io, exec_path)) return 1;
+
+    var remote_builder: ?*attach.Conn = null;
+    defer if (remote_builder) |conn| conn.deinit();
+    if (actions.remote) {
+        const host = remote.?;
+        try eprint(io, "marlin: building attached Marlin on {s}...\n", .{host});
+        remote_builder = attach.spawnRemoteRebuild(gpa, io, host) catch |err| {
+            try eprint(io, "marlin: could not start remote build: {t}\n", .{err});
+            return 1;
+        };
+        const marker = proto.readLineAlloc(gpa, remote_builder.?.reader) catch |err| {
+            try eprint(io, "marlin: remote build failed before readiness: {t}\n", .{err});
+            return 1;
+        };
+        defer gpa.free(marker);
+        if (!std.mem.eql(u8, marker, attach.rebuild_ready_marker)) {
+            try eprint(io, "marlin: remote build failed — reboot aborted\n", .{});
+            return 1;
+        }
+    }
+
+    if (actions.reboot_daemon) {
+        const ok = if (remote != null)
+            try rebootConnectedDaemon(gpa, io, environ, self_exe, options.force)
+        else
+            try rebootLocalDaemon(gpa, io, environ, options.force);
+        if (!ok) return 1;
+    }
+
+    if (remote_builder) |conn| {
+        conn.writer.writeAll("continue\n") catch |err| {
+            try eprint(io, "marlin: could not activate remote build: {t}\n", .{err});
+            return 1;
+        };
+        conn.writer.flush() catch |err| {
+            try eprint(io, "marlin: could not activate remote build: {t}\n", .{err});
+            return 1;
+        };
+        const marker = proto.readLineAlloc(gpa, conn.reader) catch |err| {
+            try eprint(io, "marlin: remote build did not start: {t}\n", .{err});
+            return 1;
+        };
+        defer gpa.free(marker);
+        if (!std.mem.eql(u8, marker, attach.rebuild_started_marker)) {
+            try eprint(io, "marlin: remote build activation failed\n", .{});
+            return 1;
+        }
+    }
+
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.append(gpa, self_exe);
+    try argv.append(gpa, exec_path);
     for (follow_up) |a| try argv.append(gpa, a);
     const err = std.process.replace(io, .{ .argv = argv.items });
     try eprint(io, "marlin: exec failed: {t}\n", .{err});
     return 1;
+}
+
+fn sanityCheckCandidate(gpa: std.mem.Allocator, io: Io, candidate: []const u8) !bool {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ candidate, "version" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch |err| {
+        try eprint(io, "marlin: candidate binary failed sanity exec: {t} — reboot aborted\n", .{err});
+        return false;
+    };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0 or
+        !std.mem.startsWith(u8, result.stdout, "marlin "))
+    {
+        try eprint(io, "marlin: candidate binary failed sanity check — reboot aborted\n", .{});
+        return false;
+    }
+    return true;
+}
+
+fn rebootConnectedDaemon(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    force: bool,
+) !bool {
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |err| {
+        try eprint(io, "marlin: cannot reach attached daemon for reboot: {t}\n", .{err});
+        return false;
+    };
+    defer conn.deinit();
+    return requestReboot(gpa, io, conn, force);
+}
+
+fn rebootLocalDaemon(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    force: bool,
+) !bool {
+    const conn = (attach.tryConnect(gpa, io, environ) catch null) orelse return true;
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try conn.send(.{ .hello = .{ .proto_version = proto.proto_version, .client_kind = "reboot" } });
+    _ = try conn.recvUntil(arena_state.allocator(), .hello_ok);
+    return requestReboot(gpa, io, conn, force);
+}
+
+fn requestReboot(gpa: std.mem.Allocator, io: Io, conn: *attach.Conn, force: bool) !bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try conn.send(.{ .reboot = .{ .force = force } });
+    _ = conn.recvUntil(arena_state.allocator(), .ok) catch |err| {
+        if (err == error.DaemonError) {
+            try eprint(io, "marlin: reboot refused; daemon remains running\n", .{});
+            return false;
+        }
+        try eprint(io, "marlin: daemon did not ack reboot (crashed?) — proceeding\n", .{});
+    };
+    return true;
 }
 
 fn print(io: Io, comptime fmt: []const u8, args: anytype) !void {
@@ -856,6 +954,34 @@ fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     var w: Io.File.Writer = .init(.stderr(), io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
+}
+
+test "reboot scopes map to local and remote actions" {
+    try std.testing.expectEqual(
+        RebuildActions{ .local = true, .remote = false, .reboot_daemon = true },
+        rebuildActions(.attached, false),
+    );
+    try std.testing.expectEqual(
+        RebuildActions{ .local = false, .remote = true, .reboot_daemon = true },
+        rebuildActions(.attached, true),
+    );
+    try std.testing.expectEqual(
+        RebuildActions{ .local = true, .remote = false, .reboot_daemon = false },
+        rebuildActions(.client, true),
+    );
+    try std.testing.expectEqual(
+        RebuildActions{ .local = true, .remote = true, .reboot_daemon = true },
+        rebuildActions(.both, true),
+    );
+}
+
+test "reboot option parsing preserves follow-up arguments" {
+    const args = [_][:0]const u8{ "--build-both", "--force", "--then", "attach", "@7" };
+    const options = try parseRebootOptions(&args);
+    try std.testing.expectEqual(RebuildScope.both, options.rebuild);
+    try std.testing.expect(options.force);
+    try std.testing.expectEqual(@as(?usize, 3), options.follow_up_at);
+    try std.testing.expectError(error.InvalidArgument, parseRebootOptions(&.{"--bogus"}));
 }
 
 test "flag parsing" {

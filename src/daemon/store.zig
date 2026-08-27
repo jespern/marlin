@@ -56,7 +56,8 @@ const schema_sql =
     \\  parent_block_id INTEGER REFERENCES blocks(id),
     \\  max_rounds INTEGER,
     \\  archived_at INTEGER,
-    \\  plan_mode INTEGER NOT NULL DEFAULT 0
+    \\  plan_mode INTEGER NOT NULL DEFAULT 0,
+    \\  codex_thread_id TEXT
     \\);
     \\CREATE TABLE IF NOT EXISTS blocks(
     \\  id INTEGER PRIMARY KEY,
@@ -143,7 +144,7 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','9');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','10');
 ;
 
 pub const SessionRow = struct {
@@ -345,6 +346,15 @@ pub const Store = struct {
             // migration runs. Advancing the marker makes the operation
             // idempotent for existing databases without rewriting blocks.
             try self.execAll("UPDATE kv SET value='9' WHERE key='schema_version';");
+        }
+        if (ver < 10) {
+            // Codex app-server threads are durable independently of Marlin's
+            // process. Persist the mapping so a guest turn can resume after
+            // daemon or client restarts without replaying the transcript.
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN codex_thread_id TEXT;
+                \\UPDATE kv SET value='10' WHERE key='schema_version';
+            );
         }
     }
 
@@ -1022,6 +1032,26 @@ pub const Store = struct {
         bindInt(stmt, 1, if (enabled) 1 else 0);
         bindInt(stmt, 2, @bitCast(id));
         try stepDone(stmt);
+    }
+
+    pub fn setCodexThreadId(self: Store, id: u64, thread_id: ?[]const u8) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET codex_thread_id=? WHERE id=?");
+        defer finalize(stmt);
+        if (thread_id) |value| bindText(stmt, 1, value) else bindNull(stmt, 1);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
+    /// Caller owns the returned thread id.
+    pub fn getCodexThreadId(self: Store, id: u64) Error!?[]const u8 {
+        const stmt = try self.prepare("SELECT codex_thread_id FROM sessions WHERE id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return error.NotFound;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+        return try self.dupeCol(stmt, 0);
     }
 
     pub const SessionListing = struct {
@@ -2582,20 +2612,25 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v9 with plan mode, search, and telemetry" {
+test "schema is v10 with guest identity, plan mode, search, and telemetry" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 9), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 10), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 9), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 10), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
     defer store.freeSession(row);
     try std.testing.expect(row.plan_mode);
+    try std.testing.expect((try store.getCodexThreadId(42)) == null);
+    try store.setCodexThreadId(42, "thread_test");
+    const codex_thread_id = (try store.getCodexThreadId(42)).?;
+    defer gpa.free(codex_thread_id);
+    try std.testing.expectEqualStrings("thread_test", codex_thread_id);
     const stmt = try store.prepare("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='blocks_by_session'");
     defer finalize(stmt);
     try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));

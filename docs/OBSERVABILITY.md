@@ -7,9 +7,10 @@ its live [OTLP contract](https://otel.mirador.org/llms.txt).
 
 ## Local diagnostics
 
-In the TUI, `/diagnostics` shows recent provider/TTFT percentiles, failure rate,
-and the latest turn outcome. The headless form includes the latest provider and
-tool waterfall:
+In the TUI, `/diagnostics` appends a local scrollback report with recent
+provider/TTFT percentiles, failure rate, OTLP outbox health, and the latest
+provider/tool waterfall. The report is display-only and is not added to the
+durable conversation. The headless form prints the same operational detail:
 
 ```sh
 marlin diagnostics                 # newest session
@@ -30,8 +31,20 @@ is present:
 ```sh
 export OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.mirador.org
 export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20mir_srv_REDACTED'
-marlin reboot
+marlin otel reload
 ```
+
+`marlin otel reload` sends the invoking client's standard OTEL variables to the
+already-running attached daemon and atomically replaces its exporter. No daemon
+restart is required, the values are not persisted, and headers are never echoed
+back. `marlin otel status` reports whether export is active; `marlin otel off`
+disables it. With `--remote <host>`, the local values travel through the existing
+SSH pipe to that host's daemon.
+
+This live control requires a daemon build that supports it; upgrading an older
+running daemon still requires one final `!rb`. Future endpoint or key changes do
+not. A later daemon restart returns to its startup environment, so keep the OTEL
+variables in the daemon's normal launch environment if export should remain on.
 
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` may instead name the full traces URL. When
 only the base endpoint is set, Marlin appends `/v1/traces`. Header names and

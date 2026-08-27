@@ -41,6 +41,14 @@ pub const Council = struct {
     models: []const []const u8,
 };
 
+/// OpenAI Chat Completions-compatible provider. The table name is the model
+/// id prefix: `[providers.acme]` resolves `acme/<model>`.
+pub const Provider = struct {
+    name: []const u8,
+    base_url: ?[]const u8 = null,
+    api_key_env: ?[]const u8 = null,
+};
+
 pub const Document = struct {
     model_default: ?[]const u8 = null,
     model_compaction: ?[]const u8 = null,
@@ -70,6 +78,7 @@ pub const Document = struct {
     exec_tools: []const ExecTool = &.{},
     mcp_servers: []const McpServer = &.{},
     councils: []const Council = &.{},
+    providers: []const Provider = &.{},
     hooks: Hooks = .{},
 };
 
@@ -86,7 +95,7 @@ const Section = enum {
     network,
     hooks,
     skills,
-    openrouter,
+    provider,
     exec_tool,
     mcp,
     council,
@@ -115,14 +124,22 @@ const PendingCouncil = struct {
     models: ?[]const []const u8 = null,
 };
 
+const PendingProvider = struct {
+    name: []const u8,
+    base_url: ?[]const u8 = null,
+    api_key_env: ?[]const u8 = null,
+};
+
 pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
     var doc = Document{};
     var exec_tools: std.ArrayList(ExecTool) = .empty;
     var mcp_servers: std.ArrayList(McpServer) = .empty;
     var councils: std.ArrayList(Council) = .empty;
+    var providers: std.ArrayList(Provider) = .empty;
     var pending_exec: ?PendingExec = null;
     var pending_mcp: ?PendingMcp = null;
     var pending_council: ?PendingCouncil = null;
+    var pending_provider: ?PendingProvider = null;
     var section: Section = .unknown;
 
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -132,7 +149,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
         if (line.len == 0) continue;
 
         if (line[0] == '[') {
-            try finishPending(arena, &exec_tools, &pending_exec, &mcp_servers, &pending_mcp, &councils, &pending_council);
+            try finishPending(arena, &exec_tools, &pending_exec, &mcp_servers, &pending_mcp, &councils, &pending_council, &providers, &pending_provider);
             if (std.mem.startsWith(u8, line, "[[") and std.mem.endsWith(u8, line, "]]")) {
                 const name = std.mem.trim(u8, line[2 .. line.len - 2], " \t");
                 if (std.mem.eql(u8, name, "tools.exec")) {
@@ -151,7 +168,13 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             }
             if (!std.mem.endsWith(u8, line, "]")) return error.InvalidToml;
             const name = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
-            section = sectionFor(name);
+            const provider_prefix = "providers.";
+            if (std.mem.startsWith(u8, name, provider_prefix) and name.len > provider_prefix.len) {
+                section = .provider;
+                pending_provider = .{ .name = try arena.dupe(u8, name[provider_prefix.len..]) };
+            } else {
+                section = sectionFor(name);
+            }
             continue;
         }
 
@@ -205,8 +228,13 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             .skills => if (std.mem.eql(u8, key, "directories")) {
                 doc.skill_directories = try stringArray(arena, value);
             },
-            .openrouter => if (std.mem.eql(u8, key, "sort")) {
-                doc.openrouter_sort = try optionalString(arena, value);
+            .provider => {
+                const current = &(pending_provider orelse return error.InvalidToml);
+                if (std.mem.eql(u8, key, "base_url")) current.base_url = try string(arena, value);
+                if (std.mem.eql(u8, key, "api_key_env")) current.api_key_env = try string(arena, value);
+                if (std.mem.eql(u8, current.name, "openrouter") and std.mem.eql(u8, key, "sort")) {
+                    doc.openrouter_sort = try optionalString(arena, value);
+                }
             },
             .hooks => {
                 if (std.mem.eql(u8, key, "on_session_done")) doc.hooks.on_session_done = try optionalString(arena, value);
@@ -240,10 +268,11 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             .unknown => {},
         }
     }
-    try finishPending(arena, &exec_tools, &pending_exec, &mcp_servers, &pending_mcp, &councils, &pending_council);
+    try finishPending(arena, &exec_tools, &pending_exec, &mcp_servers, &pending_mcp, &councils, &pending_council, &providers, &pending_provider);
     doc.exec_tools = try exec_tools.toOwnedSlice(arena);
     doc.mcp_servers = try mcp_servers.toOwnedSlice(arena);
     doc.councils = try councils.toOwnedSlice(arena);
+    doc.providers = try providers.toOwnedSlice(arena);
     return doc;
 }
 
@@ -255,7 +284,17 @@ fn finishPending(
     pending_mcp: *?PendingMcp,
     councils: *std.ArrayList(Council),
     pending_council: *?PendingCouncil,
+    providers: *std.ArrayList(Provider),
+    pending_provider: *?PendingProvider,
 ) !void {
+    if (pending_provider.*) |pending| {
+        try providers.append(arena, .{
+            .name = pending.name,
+            .base_url = pending.base_url,
+            .api_key_env = pending.api_key_env,
+        });
+        pending_provider.* = null;
+    }
     if (pending_council.*) |pending| {
         const name = pending.name orelse return error.CouncilMissingName;
         const models = pending.models orelse return error.CouncilMissingModels;
@@ -306,7 +345,6 @@ fn sectionFor(name: []const u8) Section {
         .{ "network", Section.network },
         .{ "hooks", Section.hooks },
         .{ "skills", Section.skills },
-        .{ "providers.openrouter", Section.openrouter },
     };
     inline for (entries) |entry| if (std.mem.eql(u8, name, entry[0])) return entry[1];
     return .unknown;
@@ -449,6 +487,9 @@ test "parse Marlin config surface" {
         \\directories = ["/tmp/skills"]
         \\[providers.openrouter]
         \\sort = "latency"
+        \\[providers.acme]
+        \\base_url = "https://models.acme.test/v1/"
+        \\api_key_env = "ACME_API_KEY"
     );
     try std.testing.expectEqualStrings("local/qwen", doc.model_default.?);
     try std.testing.expectEqual(@as(usize, 2), doc.model_favorites.?.len);
@@ -461,6 +502,12 @@ test "parse Marlin config surface" {
     try std.testing.expectEqualStrings("write", doc.mcp_servers[0].mutating_tools[0]);
     try std.testing.expectEqualStrings("/tmp/notify", doc.hooks.on_turn_done.?);
     try std.testing.expectEqualStrings("latency", doc.openrouter_sort.?.?);
+    try std.testing.expectEqual(@as(usize, 2), doc.providers.len);
+    try std.testing.expectEqualStrings("openrouter", doc.providers[0].name);
+    try std.testing.expect(doc.providers[0].base_url == null);
+    try std.testing.expectEqualStrings("acme", doc.providers[1].name);
+    try std.testing.expectEqualStrings("https://models.acme.test/v1/", doc.providers[1].base_url.?);
+    try std.testing.expectEqualStrings("ACME_API_KEY", doc.providers[1].api_key_env.?);
 }
 
 test "known malformed values fail" {

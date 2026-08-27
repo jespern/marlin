@@ -41,15 +41,16 @@ Current progress:
 - **Next:** rich once/session escalation grants; typed protected-read
   refusals for direct read tools.
 
-Guest Claude Code sessions (ARCHITECTURE.md, Native vs guest) do **not**
-run this permission matrix. Their binary has its own tools and
-permissions. The Marlin approval bar may park *their* prompts (`cc_approval`
-/ `marlin cc_approve`) as multiplexer UX — a session needs a human —
-with `permissions.ccAutoAllow` as a coarse analogue of auto-inside
-(reads auto-allow, including outside the workspace; edits and bash fail
-closed to *ask*). That heuristic is not native `read_file` policy and
-must not grow into a shell parser. Native protected-path refusals remain
-the unpaid invoice on Marlin's own tools.
+Guest sessions (ARCHITECTURE.md, Native vs guest) do **not** run this
+permission matrix. Their official binary has its own tools and permissions.
+The Marlin approval bar parks guest prompts as multiplexer UX — a session
+needs a human — rather than dispatching a Marlin tool. Claude Code uses the
+`cc_approval` bridge and its deliberately coarse `ccAutoAllow` heuristic.
+Codex app-server requests flow directly through the shared gate; root threads
+use its workspace-write sandbox, while plan/child threads are started
+read-only with approvals disabled. The Codex subprocess also receives the
+scrubbed tool environment, so daemon-held provider keys cannot become agent
+shell environment. None of these are native `read_file` policy.
 
 ## Product contract
 

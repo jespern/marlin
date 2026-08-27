@@ -55,6 +55,7 @@ test {
     // not yet imported by real code paths. Prune entries as real imports land.
     std.testing.refAllDecls(@This());
     _ = @import("core/block.zig");
+    _ = @import("core/guest.zig");
     _ = @import("core/proto.zig");
     _ = @import("core/config.zig");
     _ = @import("core/jsonx.zig");
@@ -88,8 +89,11 @@ test {
     _ = @import("daemon/provider/sse.zig");
     _ = @import("daemon/provider/http.zig");
     _ = @import("daemon/provider/registry.zig");
+    _ = @import("daemon/provider/codex.zig");
     _ = @import("client/attach.zig");
     _ = @import("client/cc_approve.zig");
+    _ = @import("client/remote_rebuild.zig");
+    _ = @import("client/self_build.zig");
     _ = @import("client/voice.zig");
     _ = @import("client/web.zig");
     _ = @import("testing/fixture_tests.zig");

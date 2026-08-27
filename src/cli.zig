@@ -9,6 +9,7 @@ const cc_approve = @import("client/cc_approve.zig");
 const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
 const pipe = @import("client/pipe.zig");
+const remote_rebuild = @import("client/remote_rebuild.zig");
 const landlock = @import("daemon/landlock.zig");
 const permissions = @import("daemon/permissions.zig");
 const sandbox = @import("daemon/sandbox.zig");
@@ -38,6 +39,7 @@ pub const Command = enum {
     landlock_exec,
     sandbox_probe,
     _pipe,
+    _rebuild,
 
     pub fn parse(word: []const u8) ?Command {
         inline for (@typeInfo(Command).@"enum".fields) |f| {
@@ -84,6 +86,7 @@ pub fn dispatch(
         // Internal stdio↔daemon.sock bridge, the far end of `ssh <host>
         // marlin _pipe` remote attach; omitted from help.
         ._pipe => return pipe.run(gpa, io, environ, self_exe),
+        ._rebuild => return remote_rebuild.run(gpa, io, environ, rest),
         .help => try stdoutPrint(io, help_text, .{}),
         .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
@@ -107,7 +110,7 @@ pub fn dispatch(
             const sid_arg: ?[]const u8 = if (rest.len == 1) rest[0] else null;
             var plan = tui.RebootPlan{};
             const code = try tui.run(gpa, io, environ, self_exe, sid_arg, &plan);
-            if (plan.request != .none) {
+            if (plan.request.requested) {
                 // TUI torn down cleanly; now run the reboot sequence and
                 // exec back into `marlin attach @<sid>`.
                 var sid_buf: [25]u8 = undefined;
@@ -117,8 +120,13 @@ pub fn dispatch(
                 const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{plan.sid});
                 var argv: std.ArrayList([:0]const u8) = .empty;
                 defer argv.deinit(gpa);
-                if (plan.request.builds()) try argv.append(gpa, "--build");
-                if (plan.request.forced()) try argv.append(gpa, "--force");
+                switch (plan.request.rebuild) {
+                    .none => {},
+                    .attached => try argv.append(gpa, "--build"),
+                    .client => try argv.append(gpa, "--build-client"),
+                    .both => try argv.append(gpa, "--build-both"),
+                }
+                if (plan.request.force) try argv.append(gpa, "--force");
                 try argv.append(gpa, "--then");
                 try argv.append(gpa, "attach");
                 try argv.append(gpa, sid_str);
@@ -193,7 +201,8 @@ const help_text =
     \\  marlin mcp add <name> -- <command> [args...]
     \\  marlin mcp remove <name> | restart <name> | reload
     \\  marlin gc [--expire-days N] reclaim orphan/old full-output blobs
-    \\  marlin reboot [--build] re-exec daemon+client onto a fresh binary
+    \\  marlin reboot [--build|--build-client|--build-both] [--force]
+    \\                         rebuild scoped source binaries, then reattach
     \\  marlin shutdown        stop the daemon
     \\  marlin web [--port N]  local web UI — opt-in via [web] enabled = true
     \\                         (127.0.0.1:8377; tailnet via tailscale serve)

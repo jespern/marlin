@@ -20,6 +20,8 @@ const proto = @import("../core/proto.zig");
 /// remote daemon; the value is an ssh destination, passed to ssh verbatim.
 /// Empty/absent = local socket.
 pub const remote_env = "MARLIN_REMOTE";
+pub const rebuild_ready_marker = "MARLIN_REBUILD_READY";
+pub const rebuild_started_marker = "MARLIN_REBUILD_STARTED";
 
 pub const Transport = union(enum) {
     socket: Socket,
@@ -103,6 +105,17 @@ pub const Conn = struct {
         defer self.gpa.free(line);
         try self.writer.writeAll(line);
         try self.writer.flush();
+    }
+
+    pub fn sendSensitive(self: *Conn, msg: proto.ClientMsg) !void {
+        const line = try proto.encode(self.gpa, msg);
+        defer {
+            @memset(line, 0);
+            self.gpa.free(line);
+        }
+        try self.writer.writeAll(line);
+        try self.writer.flush();
+        @memset(self.wbuf, 0);
     }
 
     /// Read one owned wire record. Callers that need to retain the raw JSON
@@ -348,6 +361,10 @@ pub fn connectCancelable(
 /// agent, and jump hosts; marlin keeps no host registry. No BatchMode: ssh
 /// auth prompts use /dev/tty, so key-less setups still work at first
 /// connect; the remote handshake deadline is the hang backstop.
+pub fn spawnRemoteRebuild(gpa: std.mem.Allocator, io: Io, host: []const u8) !*Conn {
+    return spawnChildConn(gpa, io, &.{ "ssh", host, "sh -lc 'exec marlin _rebuild'" });
+}
+
 fn connectRemote(
     gpa: std.mem.Allocator,
     io: Io,

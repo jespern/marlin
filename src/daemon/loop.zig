@@ -23,6 +23,7 @@ const provider = @import("provider/provider.zig");
 const openai = @import("provider/openai_compat.zig");
 const anthropic = @import("provider/anthropic.zig");
 const claude_code = @import("provider/claude_code.zig");
+const codex = @import("provider/codex.zig");
 const http = @import("provider/http.zig");
 const sse = @import("provider/sse.zig");
 const tools_registry = @import("tools/registry.zig");
@@ -30,13 +31,28 @@ const task_tool = @import("tools/task.zig");
 const bash_tool = @import("tools/bash.zig");
 const files_tool = @import("tools/files.zig");
 const Effort = @import("../core/effort.zig").Effort;
+const build_options = @import("build_options");
 
 pub const Endpoint = struct {
     url: [:0]const u8, // .../chat/completions
     bearer: ?[]const u8,
     model: []const u8, // provider-native model string
-    dialect: provider.Dialect,
+    backend: provider.Backend,
 };
+
+fn nativeDialect(ep: Endpoint) provider.Dialect {
+    return switch (ep.backend) {
+        .native => |dialect| dialect,
+        .guest => unreachable,
+    };
+}
+
+fn guestBackend(ep: Endpoint) ?provider.Guest {
+    return switch (ep.backend) {
+        .native => null,
+        .guest => |guest| guest,
+    };
+}
 
 pub const ToolPhase = enum { start, done };
 pub const ToolProfile = enum { full, read_only, plan };
@@ -546,9 +562,9 @@ pub fn runTurn(
     user_text: []const u8,
     attachments: []const block.MediaRef,
 ) !TurnResult {
-    // Delegated sessions: the official `claude` binary is the agent loop;
-    // no context assembly, HTTP, or marlin tool dispatch happens here.
-    if (opts.endpoint.dialect == .claude_code) {
+    // Delegated sessions own the agent loop; no context assembly, provider
+    // HTTP, or Marlin tool dispatch happens here.
+    if (guestBackend(opts.endpoint)) |guest| {
         var ap = Appender{
             .store = store,
             .io = io,
@@ -564,11 +580,14 @@ pub fn runTurn(
         } });
         for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
         const delegated_prompt = if (attachments.len > 0)
-            try std.fmt.allocPrint(gpa, "{s}\n\n[{d} image attachment(s) are stored in Marlin but unavailable to the delegated Claude Code route]", .{ user_text, attachments.len })
+            try std.fmt.allocPrint(gpa, "{s}\n\n[{d} image attachment(s) are stored in Marlin but unavailable to this guest agent]", .{ user_text, attachments.len })
         else
             null;
         defer if (delegated_prompt) |prompt| gpa.free(prompt);
-        return runClaudeCodeTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text, fresh);
+        return switch (guest) {
+            .claude_code => runClaudeCodeTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text, fresh),
+            .codex => runCodexTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text),
+        };
     }
 
     var history_arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -607,7 +626,7 @@ pub fn runTurn(
     var total_in: u64 = 0;
     var total_out: u64 = 0;
     var round: u32 = 0;
-    var web_search_available = opts.endpoint.dialect == .openrouter;
+    var web_search_available = nativeDialect(opts.endpoint) == .openrouter;
 
     while (round < opts.max_rounds) : (round += 1) {
         publishPhase(opts, .context);
@@ -709,7 +728,7 @@ pub fn runTurn(
         const trace_id = telemetry_ids.traceId(opts.session_id, ap.turn_id);
         var request_opts = try providerRequestOptions(arena, opts, opts.endpoint);
         request_opts.openrouter_web_search = web_search_available;
-        if (opts.endpoint.dialect == .openrouter and opts.otel_correlation) {
+        if (nativeDialect(opts.endpoint) == .openrouter and opts.otel_correlation) {
             request_opts.trace_id = &trace_id;
             request_opts.parent_span_id = &provider_span;
         }
@@ -731,7 +750,7 @@ pub fn runTurn(
         var pump = Pump{
             .parser = sse.Parser.init(gpa),
             .acc = &acc,
-            .anthropic_stream = if (opts.endpoint.dialect == .anthropic) &anthropic_stream else null,
+            .anthropic_stream = if (nativeDialect(opts.endpoint) == .anthropic) &anthropic_stream else null,
             .io = io,
             .opts = &opts,
             .started_ms = nowMs(io),
@@ -801,7 +820,7 @@ pub fn runTurn(
             total_in += u.tokens_in;
             total_out += u.tokens_out;
             if (u.web_search_requests > 0) web_search_available = false;
-            if (opts.endpoint.dialect == .openrouter) {
+            if (nativeDialect(opts.endpoint) == .openrouter) {
                 std.log.debug(
                     "OpenRouter generation {s} via {s}: input={d} cached={d} cache_write={d} output={d} reasoning={d} web_search={d}",
                     .{
@@ -1101,6 +1120,50 @@ pub fn runTurn(
 fn effectiveApprovalMode(opts: RunOpts) approval.Mode {
     const live = opts.approval_mode_live orelse return opts.approval_mode;
     return @enumFromInt(live.load(.acquire));
+}
+
+/// Guest agents ask only after their own sandbox/policy requires escalation.
+/// Treat that request as mutating at Marlin's boundary and resolve it through
+/// the same durable gate and UI used by native tool calls.
+fn resolveGuestApproval(
+    gpa: std.mem.Allocator,
+    io: Io,
+    opts: RunOpts,
+    ap: *Appender,
+    call_id: []const u8,
+    tool: []const u8,
+    args_json: []const u8,
+) !approval.Verdict {
+    const decision: approval.Decision = if (opts.tool_profile != .full)
+        .deny
+    else
+        approval.policyFor(opts.cfg, effectiveApprovalMode(opts), true, false);
+    if (decision == .run) return .approved;
+    if (decision == .deny) return .denied;
+
+    publishPhase(opts, .approval);
+    const approval_id = ids.next(io);
+    const id_str = try std.fmt.allocPrint(gpa, "{d}", .{approval_id});
+    defer gpa.free(id_str);
+    const verdict: approval.Verdict = if (opts.gate) |gate| blk: {
+        if (!gate.arm(io, approval_id, opts.cancel)) break :blk .denied;
+        const published = if (opts.on_approval_needed) |callback|
+            callback(opts.on_delta_ctx, approval_id, call_id, tool, args_json)
+        else
+            false;
+        if (!published) _ = gate.resolve(io, approval_id, .denied);
+        break :blk gate.wait(io, approval_id);
+    } else .approved;
+
+    if (opts.on_approval_done) |callback| callback(opts.on_delta_ctx, approval_id, verdict);
+    publishPhase(opts, .provider);
+    _ = try ap.append(.{ .approval = .{
+        .approval_id = id_str,
+        .call_id = call_id,
+        .decision = if (verdict == .approved) .granted else .denied,
+        .decided_by = null,
+    } });
+    return verdict;
 }
 
 fn cancelled(flag: ?*std.atomic.Value(bool)) bool {
@@ -1651,6 +1714,573 @@ fn runClaudeCodeTurn(
     };
 }
 
+// ----------------------------------------------------------- codex guest --
+
+const codex_deadline_ms: i64 = 60 * 60 * 1000;
+const codex_line_bytes: usize = 4 * 1024 * 1024;
+
+fn codexWriteLine(writer: *Io.Writer, line: []const u8) !void {
+    try writer.writeAll(line);
+    try writer.writeByte('\n');
+    try writer.flush();
+}
+
+fn codexWriteValue(arena: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
+    const encoded = try std.json.Stringify.valueAlloc(arena, value, .{});
+    try codexWriteLine(writer, encoded);
+}
+
+fn codexWaitResponse(
+    arena: std.mem.Allocator,
+    reader: *Io.Reader,
+    request_id: i64,
+) !codex.Response {
+    while (true) {
+        const line = reader.takeDelimiterInclusive('\n') catch return error.CodexAppServerExited;
+        const inbound = codex.decodeLine(arena, line) catch continue;
+        switch (inbound) {
+            .response => |response| if (response.id == request_id) return response,
+            else => {},
+        }
+    }
+}
+
+fn codexRpcError(arena: std.mem.Allocator, response: codex.Response) ?[]const u8 {
+    const value = response.err orelse return null;
+    if (codex.strField(value, "message")) |message| return message;
+    return codex.stringify(arena, value) catch "app-server request failed";
+}
+
+fn codexToolName(arena: std.mem.Allocator, item: std.json.Value) !?[]const u8 {
+    const kind = codex.strField(item, "type") orelse return null;
+    if (std.mem.eql(u8, kind, "commandExecution")) return "Bash";
+    if (std.mem.eql(u8, kind, "fileChange")) return "Edit";
+    if (std.mem.eql(u8, kind, "webSearch")) return "WebSearch";
+    if (std.mem.eql(u8, kind, "imageView")) return "ImageView";
+    if (std.mem.eql(u8, kind, "imageGeneration")) return "ImageGeneration";
+    if (std.mem.eql(u8, kind, "sleep")) return "Sleep";
+    if (std.mem.eql(u8, kind, "mcpToolCall")) {
+        return try std.fmt.allocPrint(arena, "MCP {s}/{s}", .{
+            codex.strField(item, "server") orelse "server",
+            codex.strField(item, "tool") orelse "tool",
+        });
+    }
+    if (std.mem.eql(u8, kind, "dynamicToolCall") or
+        std.mem.eql(u8, kind, "collabAgentToolCall"))
+    {
+        return codex.strField(item, "tool") orelse kind;
+    }
+    return null;
+}
+
+fn codexToolBody(arena: std.mem.Allocator, item: std.json.Value) ![]const u8 {
+    const kind = codex.strField(item, "type") orelse return codex.stringify(arena, item);
+    if (std.mem.eql(u8, kind, "commandExecution"))
+        return codex.strField(item, "aggregatedOutput") orelse "";
+    if (std.mem.eql(u8, kind, "fileChange")) {
+        const changes = codex.field(item, "changes") orelse return "file change completed";
+        if (changes != .array) return "file change completed";
+        var joined: std.ArrayList(u8) = .empty;
+        for (changes.array.items) |change| {
+            const diff = codex.strField(change, "diff") orelse continue;
+            if (joined.items.len > 0) try joined.append(arena, '\n');
+            try joined.appendSlice(arena, diff);
+        }
+        return if (joined.items.len > 0) joined.items else "file change completed";
+    }
+    if (codex.field(item, "result")) |result| return codex.stringify(arena, result);
+    if (codex.field(item, "error")) |err_value| {
+        if (err_value != .null) return codex.stringify(arena, err_value);
+    }
+    return codex.stringify(arena, item);
+}
+
+fn codexStatus(item: std.json.Value) block.ToolStatus {
+    const status = codex.strField(item, "status") orelse return .ok;
+    return if (std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "declined")) .err else .ok;
+}
+
+fn appendCodexItemStarted(
+    arena: std.mem.Allocator,
+    ap: *Appender,
+    opts: RunOpts,
+    item: std.json.Value,
+) !void {
+    const name = (try codexToolName(arena, item)) orelse return;
+    const call_id = codex.strField(item, "id") orelse return;
+    const args = try codex.stringify(arena, item);
+    _ = try ap.append(.{ .tool_call = .{
+        .call_id = call_id,
+        .name = name,
+        .args_json = args,
+    } });
+    if (opts.on_tool) |callback| callback(opts.on_delta_ctx, name, .start);
+}
+
+fn appendCodexToolCompleted(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    ap: *Appender,
+    opts: RunOpts,
+    item: std.json.Value,
+) !bool {
+    const name = (try codexToolName(arena, item)) orelse return false;
+    const call_id = codex.strField(item, "id") orelse return false;
+    const raw_body = try codexToolBody(arena, item);
+    const redacted = try permissions.redactSecrets(gpa, opts.secrets, raw_body);
+    defer if (redacted) |value| gpa.free(value);
+    const body = redacted orelse raw_body;
+    _ = try ap.append(.{ .tool_result = .{
+        .call_id = call_id,
+        .status = codexStatus(item),
+        .inline_body = body[0..@min(body.len, opts.cfg.inline_tool_cap_bytes)],
+        .full_body_ref = null,
+    } });
+    if (opts.on_tool) |callback| callback(opts.on_delta_ctx, name, .done);
+    return true;
+}
+
+fn appendCodexReasoning(arena: std.mem.Allocator, ap: *Appender, item: std.json.Value) !void {
+    const summary = codex.field(item, "summary") orelse return;
+    if (summary != .array) return;
+    var joined: std.ArrayList(u8) = .empty;
+    for (summary.array.items) |part| {
+        if (part != .string) continue;
+        if (joined.items.len > 0) try joined.append(arena, '\n');
+        try joined.appendSlice(arena, part.string);
+    }
+    if (joined.items.len > 0)
+        _ = try ap.append(.{ .reasoning = .{ .text = joined.items } });
+}
+
+fn codexApprovalPolicy(opts: RunOpts) []const u8 {
+    if (opts.tool_profile != .full) return "never";
+    return if (effectiveApprovalMode(opts) == .auto) "never" else "on-request";
+}
+
+fn codexSandbox(opts: RunOpts) []const u8 {
+    return if (opts.tool_profile == .full) "workspace-write" else "read-only";
+}
+
+fn codexModel(opts: RunOpts) ?[]const u8 {
+    return if (std.mem.eql(u8, opts.endpoint.model, "default")) null else opts.endpoint.model;
+}
+
+fn codexAccountError(account_result: std.json.Value) ?[]const u8 {
+    const account = codex.field(account_result, "account");
+    const account_type = if (account) |value| codex.strField(value, "type") else null;
+    if (account_type != null and std.mem.eql(u8, account_type.?, "chatgpt")) return null;
+    if (account_type != null and std.mem.eql(u8, account_type.?, "apiKey"))
+        return "Codex guest requires a ChatGPT login, but Codex is using an API key — run `codex logout`, then `codex login` without `--with-api-key`";
+    return "Codex guest requires a ChatGPT login — run `codex login`, then retry";
+}
+
+fn codexSendTurnStart(
+    arena: std.mem.Allocator,
+    writer: *Io.Writer,
+    reader: *Io.Reader,
+    request_id: i64,
+    thread_id: []const u8,
+    opts: RunOpts,
+    text: []const u8,
+) ![]const u8 {
+    try codexWriteValue(arena, writer, .{
+        .method = "turn/start",
+        .id = request_id,
+        .params = .{
+            .threadId = thread_id,
+            .input = .{.{ .type = "text", .text = text }},
+            .cwd = opts.cwd,
+            .model = codexModel(opts),
+            .effort = opts.effort.providerValue(),
+            .approvalPolicy = codexApprovalPolicy(opts),
+            .approvalsReviewer = "user",
+        },
+    });
+    const response = try codexWaitResponse(arena, reader, request_id);
+    if (codexRpcError(arena, response)) |message| {
+        setDelegateError(message);
+        return error.DelegateFailed;
+    }
+    const result = response.result orelse return error.BadCodexResponse;
+    const turn = codex.field(result, "turn") orelse return error.BadCodexResponse;
+    return codex.strField(turn, "id") orelse error.BadCodexResponse;
+}
+
+fn sendCodexSteers(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    writer: *Io.Writer,
+    opts: RunOpts,
+    ap: *Appender,
+    thread_id: []const u8,
+    turn_id: []const u8,
+    next_request_id: *i64,
+) !usize {
+    const poll = opts.poll_steer orelse return 0;
+    var count: usize = 0;
+    while (poll(opts.on_delta_ctx, gpa)) |text| {
+        defer gpa.free(text);
+        _ = try ap.append(.{ .steer = .{ .text = text } });
+        try codexWriteValue(arena, writer, .{
+            .method = "turn/steer",
+            .id = next_request_id.*,
+            .params = .{
+                .threadId = thread_id,
+                .expectedTurnId = turn_id,
+                .input = .{.{ .type = "text", .text = text }},
+            },
+        });
+        next_request_id.* += 1;
+        count += 1;
+    }
+    return count;
+}
+
+fn runCodexTurn(
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *Store,
+    opts: RunOpts,
+    ap: *Appender,
+    first_text: []const u8,
+) !TurnResult {
+    delegate_error_len = 0;
+    publishPhase(opts, .provider);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const argv = try codex.buildArgv(arena, opts.tool_environ);
+    var guest_environ: ?std.process.Environ.Map = if (opts.tool_environ) |source|
+        try permissions.toolEnvironment(gpa, source)
+    else
+        null;
+    defer if (guest_environ) |*map| map.deinit();
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = opts.cwd },
+        .environ_map = if (guest_environ) |*map| map else null,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    }) catch |err| {
+        const note: []const u8 = if (err == error.FileNotFound)
+            "codex binary not found — install Codex (or set MARLIN_CODEX_BIN)"
+        else
+            "failed to spawn codex app-server";
+        setDelegateError(note);
+        _ = try ap.append(.{ .system_note = .{ .text = note } });
+        return error.DelegateSpawnFailed;
+    };
+
+    var watcher = CcWatcher{
+        .io = io,
+        .cancel = opts.cancel,
+        .group = child.id.?,
+        .deadline_at = nowMs(io) + codex_deadline_ms,
+    };
+    const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
+    var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
+    const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
+    defer {
+        watcher.done.store(true, .release);
+        watcher_thread.join();
+        // The app-server is per turn. Its foreground work has completed; reap
+        // the whole owned group immediately so background descendants cannot
+        // outlive the Marlin turn or add half a second of teardown latency.
+        process_io.terminateProcessGroup(io, child.id.?, 0);
+        if (drain_thread) |thread| thread.join();
+        _ = child.wait(io) catch {};
+    }
+
+    var writer_buffer: [64 * 1024]u8 = undefined;
+    var writer_file = child.stdin.?.writer(io, &writer_buffer);
+    const writer = &writer_file.interface;
+    const line_buffer = try gpa.alloc(u8, codex_line_bytes);
+    defer gpa.free(line_buffer);
+    var reader_file = child.stdout.?.reader(io, line_buffer);
+    const reader = &reader_file.interface;
+
+    try codexWriteValue(arena, writer, .{
+        .method = "initialize",
+        .id = 1,
+        .params = .{ .clientInfo = .{
+            .name = "marlin",
+            .title = "Marlin",
+            .version = build_options.version,
+        } },
+    });
+    const initialized = try codexWaitResponse(arena, reader, 1);
+    if (codexRpcError(arena, initialized)) |message| {
+        setDelegateError(message);
+        _ = try ap.append(.{ .system_note = .{ .text = message } });
+        return error.DelegateFailed;
+    }
+    try codexWriteValue(arena, writer, .{ .method = "initialized" });
+
+    // Fail early with a useful login instruction instead of letting a null
+    // account decay into an opaque failed turn.
+    try codexWriteValue(arena, writer, .{
+        .method = "account/read",
+        .id = 2,
+        .params = .{ .refreshToken = true },
+    });
+    const account_response = try codexWaitResponse(arena, reader, 2);
+    if (codexRpcError(arena, account_response)) |message| {
+        setDelegateError(message);
+        _ = try ap.append(.{ .system_note = .{ .text = message } });
+        return error.DelegateFailed;
+    }
+    const account_result = account_response.result orelse return error.BadCodexResponse;
+    if (codexAccountError(account_result)) |note| {
+        setDelegateError(note);
+        _ = try ap.append(.{ .system_note = .{ .text = note } });
+        return error.DelegateFailed;
+    }
+
+    var next_request_id: i64 = 3;
+    var thread_id: []const u8 = undefined;
+    const saved_thread_id = try store.getCodexThreadId(opts.session_id);
+    defer if (saved_thread_id) |saved| gpa.free(saved);
+    if (saved_thread_id) |saved| {
+        try codexWriteValue(arena, writer, .{
+            .method = "thread/resume",
+            .id = next_request_id,
+            .params = .{
+                .threadId = saved,
+                .cwd = opts.cwd,
+                .model = codexModel(opts),
+                .approvalPolicy = codexApprovalPolicy(opts),
+                .approvalsReviewer = "user",
+                .sandbox = codexSandbox(opts),
+            },
+        });
+        const resumed = try codexWaitResponse(arena, reader, next_request_id);
+        next_request_id += 1;
+        if (resumed.err == null) {
+            const result = resumed.result orelse return error.BadCodexResponse;
+            const thread = codex.field(result, "thread") orelse return error.BadCodexResponse;
+            thread_id = codex.strField(thread, "id") orelse return error.BadCodexResponse;
+        } else {
+            // The rollout may have been removed outside Marlin. Recreate it
+            // and atomically replace the stale mapping.
+            try store.setCodexThreadId(opts.session_id, null);
+            thread_id = "";
+        }
+    } else {
+        thread_id = "";
+    }
+    if (thread_id.len == 0) {
+        try codexWriteValue(arena, writer, .{
+            .method = "thread/start",
+            .id = next_request_id,
+            .params = .{
+                .cwd = opts.cwd,
+                .model = codexModel(opts),
+                .approvalPolicy = codexApprovalPolicy(opts),
+                .approvalsReviewer = "user",
+                .sandbox = codexSandbox(opts),
+                .ephemeral = false,
+            },
+        });
+        const started = try codexWaitResponse(arena, reader, next_request_id);
+        next_request_id += 1;
+        if (codexRpcError(arena, started)) |message| {
+            setDelegateError(message);
+            _ = try ap.append(.{ .system_note = .{ .text = message } });
+            return error.DelegateFailed;
+        }
+        const result = started.result orelse return error.BadCodexResponse;
+        const thread = codex.field(result, "thread") orelse return error.BadCodexResponse;
+        thread_id = codex.strField(thread, "id") orelse return error.BadCodexResponse;
+        try store.setCodexThreadId(opts.session_id, thread_id);
+    }
+
+    var prompt: std.ArrayList(u8) = .empty;
+    defer prompt.deinit(gpa);
+    try prompt.appendSlice(gpa, first_text);
+    {
+        var history: std.ArrayList(block.Block) = .empty;
+        var history_arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer history_arena_state.deinit();
+        store.loadContextBlocksInto(history_arena_state.allocator(), &history, opts.session_id, 1_000_000) catch {};
+        if (context.latestHandover(history.items)) |briefing| {
+            prompt.clearRetainingCapacity();
+            try prompt.print(gpa, "HANDOVER FROM MARLIN (previous agent in this session). Continue from this briefing; you will not see its block log.\n\n{s}\n\n---\n\nUSER\n{s}", .{ briefing, first_text });
+        }
+    }
+
+    var active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, prompt.items);
+    next_request_id += 1;
+    var rounds: u32 = 1;
+    var tokens_in: u64 = 0;
+    var tokens_out: u64 = 0;
+    var current_tokens_in: u64 = 0;
+    var current_tokens_out: u64 = 0;
+    var final_text: std.ArrayList(u8) = .empty;
+    defer final_text.deinit(gpa);
+    var done = false;
+    var interrupted = false;
+    var failed = false;
+    var failure_text: []const u8 = "codex turn failed";
+
+    var line_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer line_arena_state.deinit();
+    while (!done) {
+        const line = reader.takeDelimiterInclusive('\n') catch break;
+        _ = line_arena_state.reset(.retain_capacity);
+        const line_arena = line_arena_state.allocator();
+        const inbound = codex.decodeLine(line_arena, line) catch continue;
+        switch (inbound) {
+            .response => |response| {
+                if (response.err) |err_value| {
+                    if (codex.strField(err_value, "message")) |message| {
+                        setDelegateError(message);
+                        failure_text = lastDelegateErrorNote().?;
+                    }
+                }
+            },
+            .request => |request| {
+                const is_command = std.mem.eql(u8, request.method, "item/commandExecution/requestApproval");
+                const is_file = std.mem.eql(u8, request.method, "item/fileChange/requestApproval");
+                if (is_command or is_file) {
+                    const args = try codex.stringify(line_arena, request.params);
+                    const call_id = codex.strField(request.params, "itemId") orelse request.id_json;
+                    const tool = if (is_command) "Bash" else "Edit";
+                    const verdict = try resolveGuestApproval(gpa, io, opts, ap, call_id, tool, args);
+                    const response = try std.fmt.allocPrint(line_arena, "{{\"id\":{s},\"result\":{{\"decision\":\"{s}\"}}}}", .{ request.id_json, if (verdict == .approved) "accept" else "decline" });
+                    try codexWriteLine(writer, response);
+                } else {
+                    const response = try std.fmt.allocPrint(line_arena, "{{\"id\":{s},\"error\":{{\"code\":-32601,\"message\":\"unsupported app-server request\"}}}}", .{request.id_json});
+                    try codexWriteLine(writer, response);
+                }
+            },
+            .notification => |notification| {
+                const params = notification.params;
+                if (std.mem.eql(u8, notification.method, "item/agentMessage/delta")) {
+                    if (codex.strField(params, "delta")) |delta|
+                        if (opts.on_delta) |callback| callback(opts.on_delta_ctx, delta);
+                } else if (std.mem.eql(u8, notification.method, "item/reasoning/summaryTextDelta")) {
+                    if (codex.strField(params, "delta")) |delta|
+                        if (opts.on_reasoning_delta) |callback| callback(opts.on_delta_ctx, delta);
+                } else if (std.mem.eql(u8, notification.method, "item/started")) {
+                    if (codex.field(params, "item")) |item| try appendCodexItemStarted(line_arena, ap, opts, item);
+                } else if (std.mem.eql(u8, notification.method, "item/completed")) {
+                    if (codex.field(params, "item")) |item| {
+                        const kind = codex.strField(item, "type") orelse "";
+                        if (std.mem.eql(u8, kind, "agentMessage")) {
+                            const text = codex.strField(item, "text") orelse "";
+                            const phase = codex.strField(item, "phase");
+                            if (phase != null and std.mem.eql(u8, phase.?, "commentary")) {
+                                if (text.len > 0) _ = try ap.append(.{ .reasoning = .{ .text = text, .commentary = true } });
+                            } else if (text.len > 0) {
+                                _ = try ap.append(.{ .assistant_msg = .{ .text = text } });
+                                final_text.clearRetainingCapacity();
+                                try final_text.appendSlice(gpa, text);
+                            }
+                        } else if (std.mem.eql(u8, kind, "reasoning")) {
+                            try appendCodexReasoning(line_arena, ap, item);
+                        } else {
+                            _ = try appendCodexToolCompleted(gpa, line_arena, ap, opts, item);
+                        }
+                    }
+                } else if (std.mem.eql(u8, notification.method, "thread/tokenUsage/updated")) {
+                    if (codex.field(params, "tokenUsage")) |usage|
+                        if (codex.field(usage, "last")) |last| {
+                            current_tokens_in = @intCast(@max(0, codex.intField(last, "inputTokens") orelse 0));
+                            current_tokens_out = @intCast(@max(0, codex.intField(last, "outputTokens") orelse 0));
+                        };
+                } else if (std.mem.eql(u8, notification.method, "error")) {
+                    if (!(codex.boolField(params, "willRetry") orelse false)) {
+                        if (codex.field(params, "error")) |err_value| {
+                            if (codex.strField(err_value, "message")) |message| {
+                                setDelegateError(message);
+                                failure_text = lastDelegateErrorNote().?;
+                            }
+                        }
+                    }
+                } else if (std.mem.eql(u8, notification.method, "turn/completed")) {
+                    tokens_in += current_tokens_in;
+                    tokens_out += current_tokens_out;
+                    current_tokens_in = 0;
+                    current_tokens_out = 0;
+                    const turn = codex.field(params, "turn") orelse continue;
+                    const status = codex.strField(turn, "status") orelse "failed";
+                    interrupted = std.mem.eql(u8, status, "interrupted");
+                    failed = std.mem.eql(u8, status, "failed");
+                    if (codex.field(turn, "error")) |err_value| {
+                        if (err_value != .null) {
+                            if (codex.strField(err_value, "message")) |message| {
+                                setDelegateError(message);
+                                failure_text = lastDelegateErrorNote().?;
+                            }
+                        }
+                    }
+
+                    var follow_up: ?[]u8 = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
+                    if (follow_up == null and !tryCloseSteering(opts))
+                        follow_up = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
+                    if (!interrupted and !failed and follow_up != null) {
+                        const text = follow_up.?;
+                        defer gpa.free(text);
+                        _ = try ap.append(.{ .steer = .{ .text = text } });
+                        final_text.clearRetainingCapacity();
+                        active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, text);
+                        next_request_id += 1;
+                        rounds += 1;
+                    } else {
+                        if (follow_up) |text| gpa.free(text);
+                        done = true;
+                    }
+                }
+            },
+        }
+        if (!done)
+            _ = try sendCodexSteers(gpa, line_arena, writer, opts, ap, thread_id, active_turn_id, &next_request_id);
+    }
+
+    // A killed/interrupted rollout can publish usage without reaching its
+    // turn/completed notification.
+    tokens_in += current_tokens_in;
+    tokens_out += current_tokens_out;
+
+    if (watcher.cancelled.load(.acquire) or interrupted or cancelled(opts.cancel)) {
+        _ = try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
+        try store.updateSessionUsage(opts.session_id, tokens_in, tokens_out);
+        return .{
+            .text = try gpa.dupe(u8, final_text.items),
+            .rounds = rounds,
+            .tokens_in = tokens_in,
+            .tokens_out = tokens_out,
+            .interrupted = true,
+        };
+    }
+    if (watcher.timed_out.load(.acquire)) {
+        const note = "codex run exceeded the 60-minute ceiling and was terminated";
+        setDelegateError(note);
+        _ = try ap.append(.{ .system_note = .{ .text = note } });
+        return error.DelegateTimeout;
+    }
+    if (!done or failed) {
+        const note = try std.fmt.allocPrint(gpa, "codex error: {s}", .{failure_text});
+        defer gpa.free(note);
+        setDelegateError(note);
+        _ = try ap.append(.{ .system_note = .{ .text = note } });
+        return error.DelegateFailed;
+    }
+
+    publishPhase(opts, .finishing);
+    try store.updateSessionUsage(opts.session_id, tokens_in, tokens_out);
+    return .{
+        .text = try gpa.dupe(u8, final_text.items),
+        .rounds = rounds,
+        .tokens_in = tokens_in,
+        .tokens_out = tokens_out,
+    };
+}
+
 /// Summaries are bounded prose, not agent output; a fixed budget keeps the
 /// anthropic max_tokens requirement independent of the session's headroom.
 const summary_max_tokens: u64 = 8192;
@@ -1681,7 +2311,7 @@ fn summarize(
     var pump = Pump{
         .parser = sse.Parser.init(gpa),
         .acc = &acc,
-        .anthropic_stream = if (ep.dialect == .anthropic) &anthropic_stream else null,
+        .anthropic_stream = if (nativeDialect(ep) == .anthropic) &anthropic_stream else null,
         .opts = stream_opts,
     };
     defer pump.parser.deinit();
@@ -1718,9 +2348,8 @@ pub fn compactSession(
     store: *Store,
     opts: RunOpts,
 ) !bool {
-    // Delegated sessions carry no marlin-assembled context to compact;
-    // Claude Code manages its own.
-    if (opts.endpoint.dialect == .claude_code) return error.DelegatedContext;
+    // Delegated sessions carry no Marlin-assembled context to compact.
+    if (guestBackend(opts.endpoint) != null) return error.DelegatedContext;
     var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
     defer http_client.deinit();
 
@@ -1743,7 +2372,7 @@ pub fn compactSession(
 }
 
 /// Native→guest handover: the CURRENT native model writes a visible briefing
-/// for Claude Code. Empty logs skip the LLM. Summarizer failure still
+/// for the delegated agent. Empty logs skip the LLM. Summarizer failure still
 /// switches; we persist a short mechanical note rather than blocking the user.
 pub fn writeHandover(
     gpa: std.mem.Allocator,
@@ -1752,7 +2381,7 @@ pub fn writeHandover(
     opts: RunOpts,
     guest_model: []const u8,
 ) !void {
-    if (opts.endpoint.dialect == .claude_code) return error.DelegatedContext;
+    if (guestBackend(opts.endpoint) != null) return error.DelegatedContext;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1768,10 +2397,14 @@ pub fn writeHandover(
         .turn_id = ids.next(io),
     };
 
+    const guest_label: []const u8 = switch (proto.guestBackend(guest_model) orelse return error.UnknownGuest) {
+        .claude_code => "Claude Code",
+        .codex => "Codex guest",
+    };
     const announce = try std.fmt.allocPrint(
         arena,
-        "Switching to Claude Code ({s}). Generating a handover summary with the current model…",
-        .{guest_model},
+        "Switching to {s} ({s}). Generating a handover summary with the current model…",
+        .{ guest_label, guest_model },
     );
     _ = try ap.append(.{ .system_note = .{ .text = announce } });
     publishPhase(opts, .provider);
@@ -1804,8 +2437,8 @@ pub fn writeHandover(
     ) catch |e| {
         const msg = try std.fmt.allocPrint(
             arena,
-            "{s}Handover summary failed ({t}). Claude Code will start without a briefing; the Marlin transcript above is still the session log.",
-            .{ block.handover_prefix, e },
+            "{s}Handover summary failed ({t}). {s} will start without a briefing; the Marlin transcript above is still the session log.",
+            .{ block.handover_prefix, e, guest_label },
         );
         _ = try ap.append(.{ .system_note = .{ .text = msg } });
         return;
@@ -1835,7 +2468,7 @@ test "plan tool profile permits investigation and denies execution mutations" {
     const opts = RunOpts{
         .session_id = 1,
         .cwd = "/tmp",
-        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .dialect = .openai_compatible },
+        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .backend = .{ .native = .openai_compatible } },
         .cfg = config.defaults(),
         .tool_profile = .plan,
         .on_task = Probe.task,
@@ -1851,7 +2484,7 @@ test "plan tool profile permits investigation and denies execution mutations" {
 }
 
 fn providerRequestOptions(arena: std.mem.Allocator, opts: RunOpts, ep: Endpoint) !openai.RequestOptions {
-    if (ep.dialect != .openrouter) return .{};
+    if (nativeDialect(ep) != .openrouter) return .{};
     return .{
         .session_id = try std.fmt.allocPrint(arena, "marlin-{x:0>16}", .{opts.session_id}),
         .provider_sort = opts.cfg.openrouter_sort,
@@ -1890,11 +2523,12 @@ fn observabilityHeaders(dialect: provider.Dialect) []const []const u8 {
 /// The bearer the HTTP layer should send. Anthropic's Messages API has no
 /// bearer auth; its key travels in x-api-key via dialectHeaders instead.
 fn requestBearer(ep: Endpoint) ?[]const u8 {
-    return if (ep.dialect == .anthropic) null else ep.bearer;
+    return if (nativeDialect(ep) == .anthropic) null else ep.bearer;
 }
 
 fn dialectHeaders(arena: std.mem.Allocator, ep: Endpoint) ![]const []const u8 {
-    if (ep.dialect != .anthropic) return observabilityHeaders(ep.dialect);
+    const dialect = nativeDialect(ep);
+    if (dialect != .anthropic) return observabilityHeaders(dialect);
     const headers = try arena.alloc([]const u8, 2);
     headers[0] = try std.fmt.allocPrint(arena, "x-api-key: {s}", .{ep.bearer orelse ""});
     headers[1] = anthropic.version_header;
@@ -1914,11 +2548,10 @@ fn buildProviderBody(
     request_opts: openai.RequestOptions,
     max_tokens: u64,
 ) ![]u8 {
-    return switch (ep.dialect) {
+    const dialect = nativeDialect(ep);
+    return switch (dialect) {
         .anthropic => anthropic.buildRequestBody(arena, ep.model, msgs, tools, @max(1024, max_tokens)),
-        .openrouter, .openai_compatible => openai.buildRequestBody(arena, ep.model, ep.dialect, effort, msgs, tools, request_opts),
-        // Delegated turns never reach the HTTP request path.
-        .claude_code => unreachable,
+        .openrouter, .openai_compatible => openai.buildRequestBody(arena, ep.model, dialect, effort, msgs, tools, request_opts),
     };
 }
 
@@ -2392,7 +3025,7 @@ test "environment block reports cwd, git absence, and inactive regimes" {
     const opts = RunOpts{
         .session_id = 1,
         .cwd = dir,
-        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .dialect = .openai_compatible },
+        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .backend = .{ .native = .openai_compatible } },
         .cfg = config.defaults(),
     };
     const env = try environmentBlock(gpa, io, &opts);
@@ -2430,7 +3063,7 @@ test "root round budget becomes an automatic continuation checkpoint" {
     const result = try runTurn(gpa, io, &store, .{
         .session_id = 1,
         .cwd = temp.path,
-        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .dialect = .openai_compatible },
+        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .backend = .{ .native = .openai_compatible } },
         .cfg = config.defaults(),
         .max_rounds = 0,
         .auto_continue_round_budget = true,
@@ -2489,7 +3122,7 @@ test "delegated claude code turn persists the event stream as blocks" {
     const result = try runTurn(gpa, io, &store, .{
         .session_id = 1,
         .cwd = temp.path,
-        .endpoint = .{ .url = "", .bearer = null, .model = "fable-5", .dialect = .claude_code },
+        .endpoint = .{ .url = "", .bearer = null, .model = "fable-5", .backend = .{ .guest = .claude_code } },
         .cfg = .{},
         .tool_environ = &env,
         .approval_mode = .auto,
@@ -2574,7 +3207,7 @@ test "delegated claude code turn consumes a steer racing finalization" {
     const result = try runTurn(gpa, io, &store, .{
         .session_id = 1,
         .cwd = temp.path,
-        .endpoint = .{ .url = "", .bearer = null, .model = "fable-5", .dialect = .claude_code },
+        .endpoint = .{ .url = "", .bearer = null, .model = "fable-5", .backend = .{ .guest = .claude_code } },
         .cfg = config.defaults(),
         .tool_environ = &env,
         .approval_mode = .auto,
@@ -2636,7 +3269,7 @@ test "delegated turn recovers when claude has never seen the derived session" {
     const opts = RunOpts{
         .session_id = 1,
         .cwd = temp.path,
-        .endpoint = .{ .url = "", .bearer = null, .model = "claude-fable-5", .dialect = .claude_code },
+        .endpoint = .{ .url = "", .bearer = null, .model = "claude-fable-5", .backend = .{ .guest = .claude_code } },
         .cfg = .{},
         .tool_environ = &env,
         .approval_mode = .auto,
@@ -2650,6 +3283,110 @@ test "delegated turn recovers when claude has never seen the derived session" {
     const second = try runTurn(gpa, io, &store, opts, "hello fable", &.{});
     defer gpa.free(second.text);
     try std.testing.expectEqualStrings("RECOVERED-OK", second.text);
+}
+
+test "codex guest never silently falls back to API-key billing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const api_key = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(),
+        \\{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}
+    , .{});
+    try std.testing.expect(std.mem.indexOf(u8, codexAccountError(api_key).?, "using an API key") != null);
+
+    const chatgpt = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(),
+        \\{"account":{"type":"chatgpt","email":"test@example.com","planType":"plus"},"requiresOpenaiAuth":true}
+    , .{});
+    try std.testing.expect(codexAccountError(chatgpt) == null);
+}
+
+test "codex guest persists app-server items and resumes its durable thread" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-codex-turn-test");
+    defer temp.deinit();
+    const script =
+        \\#!/bin/sh
+        \\case "$*" in "app-server --listen stdio://") ;; *) exit 9 ;; esac
+        \\[ -z "$OPENAI_API_KEY" ] || exit 7
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*)
+        \\      echo '{"id":1,"result":{"userAgent":"fake"}}' ;;
+        \\    *'"method":"account/read"'*)
+        \\      echo '{"id":2,"result":{"account":{"type":"chatgpt","email":"test@example.com","planType":"plus"},"requiresOpenaiAuth":true}}' ;;
+        \\    *'"method":"thread/start"'*)
+        \\      echo '{"id":3,"result":{"thread":{"id":"thread_marlin_test"}}}' ;;
+        \\    *'"method":"thread/resume"'*)
+        \\      echo '{"id":3,"result":{"thread":{"id":"thread_marlin_test"}}}' ;;
+        \\    *'"method":"turn/start"'*)
+        \\      echo '{"id":4,"result":{"turn":{"id":"turn_test","items":[],"status":"inProgress"}}}'
+        \\      echo '{"method":"item/completed","params":{"threadId":"thread_marlin_test","turnId":"turn_test","completedAtMs":1,"item":{"id":"msg_0","type":"agentMessage","text":"checking workspace","phase":"commentary"}}}'
+        \\      echo '{"method":"item/started","params":{"threadId":"thread_marlin_test","turnId":"turn_test","startedAtMs":2,"item":{"id":"cmd_1","type":"commandExecution","command":"pwd","commandActions":[],"cwd":"/tmp","status":"inProgress"}}}'
+        \\      echo '{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"thread_marlin_test","turnId":"turn_test","itemId":"cmd_1","command":"pwd","cwd":"/tmp","startedAtMs":2}}'
+        \\      IFS= read -r approval
+        \\      case "$approval" in *'"decision":"accept"'*) ;; *) exit 8 ;; esac
+        \\      echo '{"method":"item/completed","params":{"threadId":"thread_marlin_test","turnId":"turn_test","completedAtMs":3,"item":{"id":"cmd_1","type":"commandExecution","command":"pwd","commandActions":[],"cwd":"/tmp","status":"completed","aggregatedOutput":"/tmp\\n","exitCode":0}}}'
+        \\      echo '{"method":"item/agentMessage/delta","params":{"threadId":"thread_marlin_test","turnId":"turn_test","itemId":"msg_1","delta":"CODEX-OK"}}'
+        \\      echo '{"method":"item/completed","params":{"threadId":"thread_marlin_test","turnId":"turn_test","completedAtMs":4,"item":{"id":"msg_1","type":"agentMessage","text":"CODEX-OK","phase":"final_answer"}}}'
+        \\      echo '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread_marlin_test","turnId":"turn_test","tokenUsage":{"last":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":4,"reasoningOutputTokens":1,"totalTokens":16},"total":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":4,"reasoningOutputTokens":1,"totalTokens":16},"modelContextWindow":200000}}}'
+        \\      echo '{"method":"turn/completed","params":{"threadId":"thread_marlin_test","turn":{"id":"turn_test","items":[],"status":"completed"}}}' ;;
+        \\  esac
+        \\done
+        \\
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-codex" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(codex.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+    try env.put("OPENAI_API_KEY", "must-not-reach-guest-tools");
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, temp.path, "codex/default", .auto);
+
+    const opts = RunOpts{
+        .session_id = 1,
+        .cwd = temp.path,
+        .endpoint = .{ .url = "", .bearer = null, .model = "default", .backend = .{ .guest = .codex } },
+        .cfg = config.defaults(),
+        .tool_environ = &env,
+        .approval_mode = .default,
+    };
+    const first = try runTurn(gpa, io, &store, opts, "inspect", &.{});
+    defer gpa.free(first.text);
+    try std.testing.expectEqualStrings("CODEX-OK", first.text);
+    try std.testing.expectEqual(@as(u64, 12), first.tokens_in);
+    try std.testing.expectEqual(@as(u64, 4), first.tokens_out);
+    const thread_id = (try store.getCodexThreadId(1)).?;
+    defer gpa.free(thread_id);
+    try std.testing.expectEqualStrings("thread_marlin_test", thread_id);
+
+    const second = try runTurn(gpa, io, &store, opts, "continue", &.{});
+    defer gpa.free(second.text);
+    try std.testing.expectEqualStrings("CODEX-OK", second.text);
+
+    const loaded = try store.getBlocks(1, 1, 1000);
+    defer {
+        for (loaded) |*item| item.deinit();
+        gpa.free(loaded);
+    }
+    const expected = [_]block.BlockKind{
+        .user_msg, .reasoning, .tool_call, .approval, .tool_result, .assistant_msg,
+        .user_msg, .reasoning, .tool_call, .approval, .tool_result, .assistant_msg,
+    };
+    try std.testing.expectEqual(expected.len, loaded.len);
+    for (expected, loaded) |kind, item| try std.testing.expectEqual(kind, item.blk.kind());
+    try std.testing.expect(loaded[1].blk.body.reasoning.commentary);
+    try std.testing.expectEqualStrings("Bash", loaded[2].blk.body.tool_call.name);
+    try std.testing.expectEqualStrings("/tmp\n", loaded[4].blk.body.tool_result.inline_body);
 }
 
 const AnthropicWireChecks = struct {
@@ -2758,7 +3495,7 @@ test "tool-free responses consume steering and close the final-poll race" {
     const result = try runTurn(gpa, io, &store, .{
         .session_id = 1,
         .cwd = temp.path,
-        .endpoint = .{ .url = url, .bearer = null, .model = "test/model", .dialect = .openai_compatible },
+        .endpoint = .{ .url = url, .bearer = null, .model = "test/model", .backend = .{ .native = .openai_compatible } },
         .cfg = config.defaults(),
         .approval_mode = .auto,
         .on_delta_ctx = &probe,
@@ -2855,7 +3592,7 @@ test "anthropic dialect end-to-end: headers, body shape, and SSE decode" {
         .url = url,
         .bearer = "sk-ant-test",
         .model = "claude-sonnet-4-5",
-        .dialect = .anthropic,
+        .backend = .{ .native = .anthropic },
     }, "transcript to summarize", null, .{}, context.compaction_prompt, null);
 
     try std.testing.expectEqualStrings("SUMMARY-OK", summary);
@@ -2942,7 +3679,7 @@ test "task_batch runs bounded children concurrently and preserves result order" 
     const result = runTaskBatch(gpa, io, .{
         .session_id = 1,
         .cwd = "/tmp",
-        .endpoint = .{ .url = "", .bearer = null, .model = "test", .dialect = .openai_compatible },
+        .endpoint = .{ .url = "", .bearer = null, .model = "test", .backend = .{ .native = .openai_compatible } },
         .cfg = config.defaults(),
         .on_delta_ctx = &probe,
     }, 9,

@@ -581,12 +581,12 @@ pub const compaction_prompt =
 ;
 
 /// Native→guest handover: same structure as compaction, but this text is
-/// shown to the user and given to Claude Code as its first-turn briefing.
+/// shown to the user and given to the guest as its first-turn briefing.
 /// It must not assume Marlin tool names — the guest has its own tools.
 pub const handover_prompt =
     \\Write a handover briefing for another coding agent that will continue
-    \\this work in the same repository. The next agent is Claude Code: it has
-    \\its own tools and will not see Marlin's block log. Be concrete enough
+    \\this work in the same repository. The next agent owns its own tools and
+    \\will not see Marlin's block log. Be concrete enough
     \\that it can resume without re-discovering the repo.
     \\
     \\Structure the briefing as:

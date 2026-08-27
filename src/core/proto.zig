@@ -13,7 +13,9 @@
 
 const std = @import("std");
 const block = @import("block.zig");
+const guest = @import("guest.zig");
 pub const ReasoningEffort = @import("effort.zig").Effort;
+pub const GuestBackend = guest.Backend;
 
 pub const proto_version: u32 = 3;
 /// Maximum complete NDJSON record, including its trailing newline. Large
@@ -44,11 +46,19 @@ pub const InterruptResult = struct {
 /// the same storage/protocol shape.
 pub const SessionKind = enum { root, task_child, review_child };
 
-/// Guest sessions are Claude Code (`claudecode/<model>`). Native sessions are
-/// every other registry prefix. The regime is inferred from this prefix until
-/// a durable agent field exists (ARCHITECTURE.md, Native vs guest).
+/// Guest sessions use a delegated agent namespace. Native sessions are every
+/// other registry prefix. The regime is inferred from this prefix until a
+/// durable agent field exists (ARCHITECTURE.md, Native vs guest).
 pub fn isGuestModel(model: []const u8) bool {
-    return std.mem.startsWith(u8, model, "claudecode/");
+    return guest.isGuest(model);
+}
+
+pub fn guestBackend(model: []const u8) ?GuestBackend {
+    return guest.backend(model);
+}
+
+pub fn guestModelName(model: []const u8) ?[]const u8 {
+    return guest.modelName(model);
 }
 
 /// Optional catalog pricing attached to a model id. Rates are normalized to
@@ -178,6 +188,15 @@ pub const ClientMsg = union(enum) {
     /// Operational timings/outcomes for one session. `turn_limit` bounds the
     /// percentile sample; the latest turn's waterfall is always included.
     diagnostics: struct { sid: u64, turn_limit: u32 = 50 },
+    /// Replace or disable the daemon's process-local OTLP exporter without a
+    /// restart. Credentials travel only over the local socket or SSH pipe and
+    /// are never persisted. Empty endpoint fields select disabled state.
+    otel_configure: struct {
+        endpoint: []const u8 = "",
+        traces_endpoint: []const u8 = "",
+        headers: []const u8 = "",
+    },
+    otel_status: struct {},
     /// Subscribe this client to refreshed session_list_result snapshots when
     /// any session enters an actionable state or its membership changes.
     /// The daemon replies with an immediate snapshot, then sends updates until
@@ -324,6 +343,7 @@ pub const DaemonMsg = union(enum) {
     input_history_result: struct { entries: []const InputHistoryEntry },
     search_result: struct { query: []const u8, sid: u64 = 0, hits: []const SearchHit },
     diagnostics_result: Diagnostics,
+    otel_status_result: struct { enabled: bool },
     /// Sent only to session watchers that explicitly opted in: older tagged
     /// union decoders reject message types they do not know.
     session_upsert: struct { session: SessionInfo },
@@ -568,6 +588,15 @@ test "round trip: client messages" {
     defer gpa.free(network_line);
     const network_back = try decode(ClientMsg, arena, network_line);
     try std.testing.expect(network_back.session_set_network_filtering.enabled);
+
+    const otel_line = try encode(gpa, ClientMsg{ .otel_configure = .{
+        .endpoint = "https://otel.example",
+        .headers = "Authorization=Bearer%20secret",
+    } });
+    defer gpa.free(otel_line);
+    const otel_back = try decode(ClientMsg, arena, otel_line);
+    try std.testing.expectEqualStrings("https://otel.example", otel_back.otel_configure.endpoint);
+    try std.testing.expectEqualStrings("Authorization=Bearer%20secret", otel_back.otel_configure.headers);
 
     const watch_line = try encode(gpa, ClientMsg{ .session_watch = .{ .incremental = true } });
     defer gpa.free(watch_line);
@@ -948,9 +977,12 @@ test "older session-list requests exclude archived sessions by default" {
     try std.testing.expect(!m.session_list.include_archived);
 }
 
-test "guest model prefix is the claudecode/ registry" {
+test "guest model prefixes identify their delegated backend" {
     try std.testing.expect(isGuestModel("claudecode/fable"));
     try std.testing.expect(isGuestModel("claudecode/default"));
+    try std.testing.expect(isGuestModel("codex/default"));
+    try std.testing.expectEqual(GuestBackend.codex, guestBackend("codex/default").?);
+    try std.testing.expectEqualStrings("default", guestModelName("codex/default").?);
     try std.testing.expect(!isGuestModel("openrouter/anthropic/claude-sonnet-4.5"));
     try std.testing.expect(!isGuestModel("anthropic/claude-sonnet-4-5"));
     try std.testing.expect(!isGuestModel("claudecode"));

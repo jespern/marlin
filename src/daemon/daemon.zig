@@ -55,6 +55,7 @@ const otel = @import("otel.zig");
 const extensions = @import("extensions.zig");
 const registry = @import("provider/registry.zig");
 const claude_code = @import("provider/claude_code.zig");
+const codex = @import("provider/codex.zig");
 const http = @import("provider/http.zig");
 const task_tool = @import("tools/task.zig");
 const tools_registry = @import("tools/registry.zig");
@@ -497,7 +498,10 @@ pub const Daemon = struct {
             exporter.deinit();
             self.otel_exporter = null;
         };
-        if (self.otel_exporter != null) std.log.info("OTLP trace export enabled", .{});
+        if (self.otel_exporter) |exporter| {
+            exporter.activate();
+            std.log.info("OTLP trace export enabled", .{});
+        }
 
         // Dispatcher thread: consumes events, owns all state.
         const dispatcher = try std.Thread.spawn(.{}, dispatchLoop, .{&self});
@@ -763,7 +767,11 @@ pub const Daemon = struct {
     fn handleEvent(self: *Daemon, ev: Event) !void {
         switch (ev) {
             .client_msg => |cm| {
-                defer self.gpa.free(cm.msg_line);
+                const sensitive = std.mem.indexOf(u8, cm.msg_line, "\"otel_configure\"") != null;
+                defer {
+                    if (sensitive) @memset(cm.msg_line, 0);
+                    self.gpa.free(cm.msg_line);
+                }
                 const client = self.lookupClient(cm.client_id) orelse return;
                 var arena_state = std.heap.ArenaAllocator.init(self.gpa);
                 defer arena_state.deinit();
@@ -1110,6 +1118,40 @@ pub const Daemon = struct {
                 );
                 self.sendTo(client, .{ .diagnostics_result = report });
             },
+            .otel_configure => |request| {
+                if (request.endpoint.len > 8192 or request.traces_endpoint.len > 8192 or request.headers.len > 64 * 1024) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "otel_config",
+                        .msg = "OTLP endpoint or headers exceed the configuration limit",
+                    } });
+                    return;
+                }
+                const replacement = otel.Exporter.startConfigured(
+                    self.gpa,
+                    self.io,
+                    &self.store,
+                    self.environ,
+                    .{
+                        .endpoint = request.endpoint,
+                        .traces_endpoint = request.traces_endpoint,
+                        .headers = request.headers,
+                    },
+                ) catch |err| {
+                    std.log.warn("OTLP live configuration rejected: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{
+                        .code = "otel_config",
+                        .msg = "invalid OTLP endpoint or headers; existing exporter was left unchanged",
+                    } });
+                    return;
+                };
+                const previous = self.otel_exporter;
+                self.otel_exporter = null;
+                if (previous) |exporter| exporter.deinit();
+                self.otel_exporter = replacement;
+                if (replacement) |exporter| exporter.activate();
+                self.sendOtelStatus(client);
+            },
+            .otel_status => self.sendOtelStatus(client),
             .session_watch => |sw| {
                 client.watches_sessions = true;
                 client.watches_session_deltas = sw.incremental;
@@ -1169,6 +1211,15 @@ pub const Daemon = struct {
                 if (self.rejectArchivedSession(client, session)) return;
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot switch model mid-turn" } });
+                    return;
+                }
+                const current_guest = proto.guestBackend(session.model);
+                const requested_guest = proto.guestBackend(sm.model);
+                if (current_guest != null and requested_guest != null and current_guest.? != requested_guest.?) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "guest_switch",
+                        .msg = "switch through a native model before changing guest backends so Marlin can create a handover",
+                    } });
                     return;
                 }
                 const new_model = try self.gpa.dupe(u8, sm.model);
@@ -1237,7 +1288,7 @@ pub const Daemon = struct {
                 if (proto.isGuestModel(session.model)) {
                     self.sendTo(client, .{ .err = .{
                         .code = "guest",
-                        .msg = "sandbox is Marlin's kernel profile; Claude Code has its own permissions",
+                        .msg = "sandbox is Marlin's kernel profile; guest agents use their own permissions",
                     } });
                     return;
                 }
@@ -1284,7 +1335,7 @@ pub const Daemon = struct {
                 if (proto.isGuestModel(session.model)) {
                     self.sendTo(client, .{ .err = .{
                         .code = "guest",
-                        .msg = "dnsblock is Marlin's; Claude Code's network is not filtered here",
+                        .msg = "dnsblock is Marlin's; guest-agent network access is not filtered here",
                     } });
                     return;
                 }
@@ -1645,7 +1696,7 @@ pub const Daemon = struct {
                 if (proto.isGuestModel(session.model)) {
                     self.sendTo(client, .{ .err = .{
                         .code = "guest",
-                        .msg = "Claude Code manages its own context; /compact is a native-session command",
+                        .msg = "guest agents manage their own context; /compact is a native-session command",
                     } });
                     return;
                 }
@@ -2574,7 +2625,7 @@ pub const Daemon = struct {
             nowMs(self.io),
         ) catch |err| std.log.warn("could not begin turn telemetry: {t}", .{err});
 
-        const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
+        const ep = registry.resolve(self.gpa, self.environ, self.cfg, job.model) catch |e| {
             err_text = std.fmt.allocPrint(self.gpa, "provider resolve failed for model '{s}': {t}", .{ job.model, e }) catch null;
             self.persistFailedTurn(job, err_text orelse "provider resolve failed");
             self.finishTurnTelemetry(job, "error", err_text orelse "provider resolve failed", 0, 0);
@@ -2587,7 +2638,7 @@ pub const Daemon = struct {
         // resolvable; otherwise the loop falls back to the main endpoint.
         var cep: ?registry.Endpoint = null;
         if (self.cfg.model_compaction) |cm| {
-            cep = registry.resolve(self.gpa, self.environ, cm) catch null;
+            cep = registry.resolve(self.gpa, self.environ, self.cfg, cm) catch null;
         }
         defer if (cep) |*c| c.deinit(self.gpa);
 
@@ -2621,7 +2672,7 @@ pub const Daemon = struct {
             .session_id = job.sid,
             .turn_id = job.turn_id,
             .cwd = job.cwd,
-            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .backend = ep.backend },
             .http_pool = &self.http_pool,
             .otel_correlation = self.otel_exporter != null,
             .effort = job.effort,
@@ -2632,7 +2683,7 @@ pub const Daemon = struct {
             .sandbox_options = sandbox_options,
             .network_policy = if (job.network_filtering_enabled) &self.network else null,
             .extensions = self.extensions,
-            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .dialect = c.dialect } else null,
+            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .backend = c.backend } else null,
             .prune_frontier = &job.session.prune_frontier,
             .context_used_out = &job.session.context_used,
             .approval_mode = job.approval_mode,
@@ -2663,8 +2714,8 @@ pub const Daemon = struct {
                 error.ConnectFailed, error.ReadFailed => http.lastTransportCause(),
                 else => null,
             };
-            // Delegated failures carry real prose ("claude code error: Not
-            // logged in · Please run /login"); prefer it over the error name.
+            // Delegated failures carry actionable prose (missing binary,
+            // login required, or guest-reported error); prefer that detail.
             const delegate_detail: ?[]const u8 = switch (e) {
                 error.DelegateSpawnFailed, error.DelegateFailed, error.DelegateTimeout => loop.lastDelegateErrorNote(),
                 else => null,
@@ -2731,7 +2782,7 @@ pub const Daemon = struct {
             self.gpa.destroy(job);
         }
 
-        const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
+        const ep = registry.resolve(self.gpa, self.environ, self.cfg, job.model) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "provider resolve failed: {t}", .{e}) catch null;
             self.persistTurnNote(job, t orelse "provider resolve failed");
             self.finishTurn(job.sid, false, false, t, null, 0, 0);
@@ -2740,19 +2791,19 @@ pub const Daemon = struct {
         defer ep.deinit(self.gpa);
         var cep: ?registry.Endpoint = null;
         if (self.cfg.model_compaction) |cm| {
-            cep = registry.resolve(self.gpa, self.environ, cm) catch null;
+            cep = registry.resolve(self.gpa, self.environ, self.cfg, cm) catch null;
         }
         defer if (cep) |*c| c.deinit(self.gpa);
 
         const did = loop.compactSession(self.gpa, self.io, &self.store, .{
             .session_id = job.sid,
             .cwd = job.cwd,
-            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .backend = ep.backend },
             .http_pool = &self.http_pool,
             .effort = .auto,
             .cfg = self.cfg,
             .extensions = self.extensions,
-            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .dialect = c.dialect } else null,
+            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .backend = c.backend } else null,
             .approval_mode = .auto, // compaction runs no tools
             .on_block = TurnHooks.onBlock,
             .on_phase = TurnHooks.onPhase,
@@ -2782,7 +2833,7 @@ pub const Daemon = struct {
             self.gpa.destroy(job);
         }
 
-        const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
+        const ep = registry.resolve(self.gpa, self.environ, self.cfg, job.model) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "handover provider resolve failed: {t}", .{e}) catch null;
             self.persistTurnNote(job, t orelse "handover provider resolve failed");
             self.finishTurn(job.sid, false, false, t, null, 0, 0);
@@ -2793,7 +2844,7 @@ pub const Daemon = struct {
         loop.writeHandover(self.gpa, self.io, &self.store, .{
             .session_id = job.sid,
             .cwd = job.cwd,
-            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .backend = ep.backend },
             .http_pool = &self.http_pool,
             .effort = job.effort,
             .cfg = self.cfg,
@@ -2897,7 +2948,7 @@ pub const Daemon = struct {
             // blank err-state session behind (observed with a bare model
             // name like "gpt-5.3-codex" — registry ids are provider-prefixed).
             if (args.model) |m| {
-                if (registry.resolve(self.gpa, self.environ, m)) |probe| {
+                if (registry.resolve(self.gpa, self.environ, self.cfg, m)) |probe| {
                     probe.deinit(self.gpa);
                 } else |e| {
                     const msg = std.fmt.allocPrint(
@@ -3294,9 +3345,35 @@ pub const Daemon = struct {
             }) catch return;
             self.appendNativeAnthropicIds(arena, &local_list, "claudecode/") catch return;
         }
+        if (self.codexAvailable()) {
+            // `default` delegates model selection to the user's Codex config.
+            local_list.append(arena, "codex/default") catch return;
+        }
         if (self.environ.get("ANTHROPIC_API_KEY")) |key| if (key.len > 0) {
             self.appendNativeAnthropicIds(arena, &local_list, "anthropic/") catch return;
         };
+
+        // A fetched OpenRouter catalog replaces the client's fallback list,
+        // so retain configured native favorites that the catalog cannot know
+        // about (for example `vercel/…`, `litellm/…`, or a custom provider).
+        // Guest favorites stay availability-gated by the binary checks above.
+        for (self.cfg.model_favorites) |favorite| {
+            if (proto.isGuestModel(favorite)) continue;
+            var seen = false;
+            for (local_list.items) |existing| {
+                if (std.mem.eql(u8, existing, favorite)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) for (self.catalog.items) |existing| {
+                if (std.mem.eql(u8, existing.id, favorite)) {
+                    seen = true;
+                    break;
+                }
+            };
+            if (!seen) local_list.append(arena, favorite) catch return;
+        }
         const locals = local_list.items;
 
         const total = locals.len + self.catalog.items.len;
@@ -3345,14 +3422,22 @@ pub const Daemon = struct {
     /// True when delegated sessions can actually run: an explicit binary
     /// override, or `claude` executable somewhere on the daemon's PATH.
     fn claudeCodeAvailable(self: *Daemon) bool {
-        if (self.environ.get(claude_code.binary_env)) |override| {
+        return self.guestBinaryAvailable(claude_code.binary_env, claude_code.default_binary);
+    }
+
+    fn codexAvailable(self: *Daemon) bool {
+        return self.guestBinaryAvailable(codex.binary_env, codex.default_binary);
+    }
+
+    fn guestBinaryAvailable(self: *Daemon, binary_env: []const u8, default_binary: []const u8) bool {
+        if (self.environ.get(binary_env)) |override| {
             if (override.len > 0) return true;
         }
         const path = self.environ.get("PATH") orelse return false;
         var it = std.mem.tokenizeScalar(u8, path, ':');
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         while (it.next()) |dir| {
-            const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, claude_code.default_binary }) catch continue;
+            const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, default_binary }) catch continue;
             if (std.c.access(full, 1) == 0) return true; // 1 = X_OK
         }
         return false;
@@ -3374,7 +3459,7 @@ pub const Daemon = struct {
     }
 
     fn fetchCatalog(self: *Daemon) ![]CatalogModel {
-        const url = try registry.openrouterModelsUrl(self.gpa, self.environ);
+        const url = try registry.openrouterModelsUrl(self.gpa, self.environ, self.cfg);
         defer self.gpa.free(url);
 
         const res = try http.get(
@@ -3494,6 +3579,10 @@ pub const Daemon = struct {
         loaded_transferred = true;
         previous.deinit();
         if (previous_config) |*old| old.deinit();
+    }
+
+    fn sendOtelStatus(self: *Daemon, client: *Client) void {
+        self.sendTo(client, .{ .otel_status_result = .{ .enabled = self.otel_exporter != null } });
     }
 
     fn sendMcpStatus(self: *Daemon, client: *Client) void {

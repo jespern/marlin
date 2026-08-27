@@ -112,7 +112,7 @@ pub const Body = union(BlockKind) {
 /// clipped system_note). The guest adapter prepends the latest one to the
 /// first `claude -p` prompt.
 pub const handover_prefix = "[handover]\n";
-pub const handover_announce_prefix = "Switching to Claude Code";
+pub const handover_announce_prefix = "Switching to ";
 
 pub fn isHandoverNote(text: []const u8) bool {
     return std.mem.startsWith(u8, text, handover_prefix);

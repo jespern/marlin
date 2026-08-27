@@ -12,6 +12,7 @@ const toml = @import("config_toml.zig");
 pub const ExecTool = toml.ExecTool;
 pub const McpServer = toml.McpServer;
 pub const Council = toml.Council;
+pub const Provider = toml.Provider;
 pub const Hooks = toml.Hooks;
 pub const Policy = toml.Policy;
 
@@ -28,9 +29,9 @@ pub const Config = struct {
     /// OpenRouter exposes 300+ models and a dump of that is not a picker.
     /// User-defined favorites replace these defaults when present in TOML.
     model_favorites: []const []const u8 = &.{
-        // Delegated Claude Code sessions (subscription inference; picking one
-        // errors clearly when the binary is absent). Aliases resolve to the
-        // latest model of each family, per `claude --help`.
+        // Delegated guest sessions use the official binaries and their
+        // existing subscription login. Aliases remain owned by each guest.
+        "codex/default",
         "claudecode/fable",
         "claudecode/sonnet",
         "openrouter/anthropic/claude-sonnet-4.5",
@@ -73,6 +74,9 @@ pub const Config = struct {
     exec_tools: []const ExecTool = &.{},
     mcp_servers: []const McpServer = &.{},
     councils: []const Council = &.{},
+    /// Additional OpenAI-compatible endpoints and optional overrides for
+    /// built-in providers. Secrets stay in the named environment variable.
+    providers: []const Provider = &.{},
     /// Voice dictation ([voice], written by /voice setup). Dormant until
     /// enabled; nothing else in marlin mentions its dependencies.
     voice_enabled: bool = false,
@@ -656,6 +660,7 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
     cfg.exec_tools = doc.exec_tools;
     cfg.mcp_servers = doc.mcp_servers;
     cfg.councils = doc.councils;
+    cfg.providers = doc.providers;
     if (doc.voice_enabled) |v| cfg.voice_enabled = v;
     if (doc.voice_engine) |v| cfg.voice_engine = v;
     if (doc.voice_mode) |v| cfg.voice_mode = v;
@@ -672,6 +677,25 @@ fn validate(gpa: std.mem.Allocator, cfg: Config) !void {
         if (!std.mem.eql(u8, sort, "throughput") and
             !std.mem.eql(u8, sort, "latency") and
             !std.mem.eql(u8, sort, "price")) return error.InvalidOpenRouterSort;
+    }
+    for (cfg.providers, 0..) |provider, i| {
+        try validateToolName(provider.name);
+        if (std.mem.eql(u8, provider.name, "claudecode") or std.mem.eql(u8, provider.name, "codex"))
+            return error.ReservedProviderName;
+        for (cfg.providers[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, provider.name)) return error.DuplicateProvider;
+        }
+        if (provider.base_url) |base_url| {
+            if (base_url.len == 0 or
+                !(std.mem.startsWith(u8, base_url, "http://") or std.mem.startsWith(u8, base_url, "https://")))
+                return error.InvalidProviderBaseUrl;
+        } else if (!isBuiltInProvider(provider.name)) {
+            return error.ProviderMissingBaseUrl;
+        }
+        if (provider.api_key_env) |name|
+            try validateApiKeyEnv(name)
+        else if (!isBuiltInProvider(provider.name))
+            return error.ProviderMissingApiKeyEnv;
     }
     for (cfg.exec_tools, 0..) |tool, i| {
         try validateToolName(tool.name);
@@ -692,6 +716,37 @@ fn validate(gpa: std.mem.Allocator, cfg: Config) !void {
     }
 }
 
+fn isBuiltInProvider(name: []const u8) bool {
+    return std.mem.eql(u8, name, "openrouter") or
+        std.mem.eql(u8, name, "anthropic") or
+        std.mem.eql(u8, name, "local") or
+        std.mem.eql(u8, name, "vercel") or
+        std.mem.eql(u8, name, "litellm");
+}
+
+fn validateApiKeyEnv(name: []const u8) !void {
+    if (std.mem.eql(u8, name, "NONE")) return;
+    if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_'))
+        return error.InvalidProviderApiKeyEnv;
+    for (name[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return error.InvalidProviderApiKeyEnv;
+    }
+    // Keep configured credentials inside the same name-based boundary used
+    // to strip tool subprocess environments and redact captured output.
+    if (!(startsWithIgnoreCase(name, "AWS_") or
+        endsWithIgnoreCase(name, "_API_KEY") or
+        endsWithIgnoreCase(name, "_TOKEN") or
+        endsWithIgnoreCase(name, "_SECRET"))) return error.InvalidProviderApiKeyEnv;
+}
+
+fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+}
+
+fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
+    return value.len >= suffix.len and std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
+}
+
 fn validateToolName(name: []const u8) !void {
     if (name.len == 0) return error.InvalidExtensionName;
     for (name) |byte| {
@@ -707,6 +762,42 @@ test "defaults are sane" {
     try std.testing.expect(c.prune_protect_tokens > c.prune_min_reclaim_tokens);
     try std.testing.expect(c.permissions_enabled);
     try std.testing.expect(!c.workspace_enabled);
+}
+
+test "configured providers validate without storing secret material" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const doc = try toml.parse(arena,
+        \\[providers.acme]
+        \\base_url = "https://gateway.acme.test/v1"
+        \\api_key_env = "ACME_API_KEY"
+        \\[providers.litellm]
+        \\api_key_env = "NONE"
+    );
+    var cfg = defaults();
+    applyDocument(&cfg, doc);
+    try validate(std.testing.allocator, cfg);
+    try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
+    try std.testing.expectEqualStrings("ACME_API_KEY", cfg.providers[0].api_key_env.?);
+
+    const missing = try toml.parse(arena, "[providers.acme]\napi_key_env = \"ACME_API_KEY\"\n");
+    var missing_cfg = defaults();
+    applyDocument(&missing_cfg, missing);
+    try std.testing.expectError(error.ProviderMissingBaseUrl, validate(std.testing.allocator, missing_cfg));
+
+    const ambiguous_key = try toml.parse(arena, "[providers.acme]\nbase_url = \"https://gateway.acme.test/v1\"\n");
+    var ambiguous_key_cfg = defaults();
+    applyDocument(&ambiguous_key_cfg, ambiguous_key);
+    try std.testing.expectError(error.ProviderMissingApiKeyEnv, validate(std.testing.allocator, ambiguous_key_cfg));
+
+    const unprotected_name = try toml.parse(
+        arena,
+        "[providers.acme]\nbase_url = \"https://gateway.acme.test/v1\"\napi_key_env = \"ACME_CREDENTIAL\"\n",
+    );
+    var unprotected_cfg = defaults();
+    applyDocument(&unprotected_cfg, unprotected_name);
+    try std.testing.expectError(error.InvalidProviderApiKeyEnv, validate(std.testing.allocator, unprotected_cfg));
 }
 
 test "MARLIN_PERMISSIONS opts out of capability permissions" {

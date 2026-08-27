@@ -24,7 +24,7 @@
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /search <query>, /new, /compact,
 //!             /archive, /reboot [--build], /help, /quit
-//!   shortcuts: !c (copy last full tool output), !rb (reboot with build)
+//!   shortcuts: !c (copy last full tool output), !rb [client|both] (scoped rebuild)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
 //!            chips, expanded into the message on send.
 
@@ -130,20 +130,12 @@ pub const VoiceEvent = union(enum) {
 
 const Mode = enum { insert, normal };
 
-pub const RebootRequest = enum {
-    none,
-    plain,
-    build,
-    force,
-    build_force,
+pub const RebuildScope = enum { none, attached, client, both };
 
-    pub fn builds(self: RebootRequest) bool {
-        return self == .build or self == .build_force;
-    }
-
-    pub fn forced(self: RebootRequest) bool {
-        return self == .force or self == .build_force;
-    }
+pub const RebootRequest = struct {
+    requested: bool = false,
+    rebuild: RebuildScope = .none,
+    force: bool = false,
 };
 
 const ComposerCommand = struct {
@@ -169,6 +161,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
+    .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
@@ -179,7 +172,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/help", .description = "show commands and key bindings" },
     .{ .name = "/quit", .description = "leave Marlin" },
     .{ .name = "!c", .description = "copy the last full tool output" },
-    .{ .name = "!rb", .description = "rebuild and restart Marlin" },
+    .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
 };
 
 const CommandSuggestion = struct {
@@ -191,6 +184,12 @@ const CommandSuggestion = struct {
 };
 
 const PickerKind = enum { model, effort, session, search_prompt, search, council, council_list, voice_engine, voice_mode };
+
+const OtelCommand = union(enum) {
+    status,
+    off,
+    set: []const u8,
+};
 
 const council_done_item = "Done";
 
@@ -512,6 +511,10 @@ const App = struct {
     command_selection: usize = 0,
     /// Type-to-filter query while the picker is open.
     picker_filter: std.ArrayList(u8) = .empty,
+    /// Process-local OTLP setup. The endpoint survives only until the masked
+    /// header entry is submitted or cancelled; neither value enters history.
+    otel_endpoint: std.ArrayList(u8) = .empty,
+    otel_header_prompt: bool = false,
     /// Inline readline-style reverse history search. The editor shows the
     /// current candidate while these buffers preserve the original draft and
     /// collect the query independently of the candidate text.
@@ -666,9 +669,9 @@ const App = struct {
     awaiting_new_session: bool = false,
     pending_new_session_request_id: u64 = 0,
     pending_new_cwd: std.ArrayList(u8) = .empty,
-    /// Set by /reboot: after clean TUI teardown, run() returns this to
-    /// cli.zig which execs `marlin reboot [--build] --then attach @<sid>`.
-    reboot_request: RebootRequest = .none,
+    /// Set by /reboot or !rb: after clean TUI teardown, run() returns this
+    /// to cli.zig, which coordinates scoped builds and reattachment.
+    reboot_request: RebootRequest = .{},
     next_input_request_id: u64 = 1,
 
     fn deinit(self: *App) void {
@@ -680,6 +683,7 @@ const App = struct {
         self.stream_layout_cache.reset(self.gpa);
         self.layout_cache.reset(self.gpa);
         self.picker_filter.deinit(self.gpa);
+        self.otel_endpoint.deinit(self.gpa);
         self.history_search_query.deinit(self.gpa);
         self.history_search_draft.deinit(self.gpa);
         self.clearSearchHits();
@@ -723,6 +727,7 @@ const App = struct {
         self.cwd.deinit(self.gpa);
         self.home.deinit(self.gpa);
         self.notice.deinit(self.gpa);
+        if (self.otel_header_prompt) self.editor.clearSensitive();
         self.editor.deinit();
     }
 
@@ -1764,20 +1769,17 @@ const App = struct {
             .search_result => |result| self.replaceSearchHits(result),
             .diagnostics_result => |report| {
                 if (report.sid != self.sid) return;
-                self.setNotice(
-                    "diag · {s} {d:.1}s · provider p50 {d:.1}s p95 {d:.1}s · TTFT p95 {d:.1}s · {d}/{d} failed{s}",
-                    .{
-                        report.last_outcome,
-                        @as(f64, @floatFromInt(report.last_duration_ms)) / 1000.0,
-                        @as(f64, @floatFromInt(report.provider_p50_ms)) / 1000.0,
-                        @as(f64, @floatFromInt(report.provider_p95_ms)) / 1000.0,
-                        @as(f64, @floatFromInt(report.ttft_p95_ms)) / 1000.0,
-                        report.failed_turns + report.abandoned_turns,
-                        report.sample_turns,
-                        if (report.otlp_enabled) " · OTLP on" else "",
-                    },
-                );
+                const rendered = formatDiagnostics(self.gpa, report) catch {
+                    self.setNotice("could not render diagnostics", .{});
+                    return;
+                };
+                defer self.gpa.free(rendered);
+                self.pushBlock(.system_note, rendered, "diagnostics", .ok);
             },
+            .otel_status_result => |status| self.setNotice(
+                "OTLP {s}",
+                .{if (status.enabled) @as([]const u8, "enabled") else "disabled"},
+            ),
             .session_upsert => |su| self.upsertSessionSummary(su.session),
             .session_remove => |sr| self.removeSessionSummary(sr.sid),
             .interrupt_result => |result| {
@@ -2344,37 +2346,37 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "!c")) {
             self.copyLastToolOutput();
         } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
-            var build = std.mem.eql(u8, head, "!rb");
+            var rebuild: RebuildScope = if (std.mem.eql(u8, head, "!rb")) .attached else .none;
             var force = false;
             while (it.next()) |arg| {
                 if (std.mem.eql(u8, arg, "--build")) {
-                    build = true;
+                    rebuild = .attached;
                 } else if (std.mem.eql(u8, arg, "--force")) {
                     force = true;
+                } else if (std.mem.eql(u8, head, "!rb") and std.mem.eql(u8, arg, "client")) {
+                    rebuild = .client;
+                } else if (std.mem.eql(u8, head, "!rb") and std.mem.eql(u8, arg, "both")) {
+                    rebuild = .both;
                 } else {
-                    self.setNotice("usage: /reboot [--build] [--force]", .{});
+                    if (std.mem.eql(u8, head, "!rb"))
+                        self.setNotice("usage: !rb [client|both] [--force]", .{})
+                    else
+                        self.setNotice("usage: /reboot [--build] [--force]", .{});
                     return;
                 }
             }
-            if (self.state == .awaiting_approval and !force) {
+            if (self.state == .awaiting_approval and !force and rebuild != .client) {
                 self.setNotice("approval pending — answer it, interrupt, or /reboot --force", .{});
                 return;
             }
-            if (self.state == .running) {
+            if (self.state == .running and rebuild != .client) {
                 self.setNotice("turn running — /reboot waits for it (interrupt first if you want force)", .{});
             }
-            self.reboot_request = if (build and force)
-                .build_force
-            else if (build)
-                .build
-            else if (force)
-                .force
-            else
-                .plain;
+            self.reboot_request = .{ .requested = true, .rebuild = rebuild, .force = force };
             self.should_quit = true;
         } else if (std.mem.eql(u8, head, "/compact")) {
             if (proto.isGuestModel(self.model.items)) {
-                self.setNotice("Claude Code manages its own context — /compact is native-only", .{});
+                self.setNotice("guest agents manage their own context — /compact is native-only", .{});
                 return;
             }
             if (self.state == .running or self.state == .awaiting_approval) {
@@ -2391,10 +2393,12 @@ const App = struct {
             self.conn.send(.{ .diagnostics = .{ .sid = self.sid } }) catch {
                 self.setNotice("could not request diagnostics", .{});
             };
+        } else if (std.mem.eql(u8, head, "/otel")) {
+            self.otelCommand(it.next(), it.rest());
         } else if (std.mem.eql(u8, head, "/config")) {
             self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /search [query] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !c · !rb · /quit", .{});
+            self.setNotice("/sessions · /search [query] · /diagnostics · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !rb [client|both] · !c · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -3537,6 +3541,12 @@ const App = struct {
             self.setNotice("cannot switch model mid-turn", .{});
             return;
         }
+        const current_guest = proto.guestBackend(self.model.items);
+        const requested_guest = proto.guestBackend(m);
+        if (current_guest != null and requested_guest != null and current_guest.? != requested_guest.?) {
+            self.setNotice("switch through a native model first so Marlin can hand over between guest agents", .{});
+            return;
+        }
         self.conn.send(.{ .session_set_model = .{ .sid = self.sid, .model = m } }) catch return;
         if (!proto.isGuestModel(self.model.items) and proto.isGuestModel(m)) {
             const guest_name = if (std.mem.startsWith(u8, m, "claudecode/")) m["claudecode/".len..] else m;
@@ -3624,7 +3634,7 @@ const App = struct {
 
     fn toggleSandbox(self: *App, arg: []const u8) void {
         if (proto.isGuestModel(self.model.items)) {
-            self.setNotice("sandbox is Marlin's; Claude Code has its own permissions — not available on a guest session", .{});
+            self.setNotice("sandbox is Marlin's; guest agents use their own permissions", .{});
             return;
         }
         if (self.state == .running or self.state == .awaiting_approval) {
@@ -3658,9 +3668,56 @@ const App = struct {
         return self.conn.network_filtering;
     }
 
+    fn otelCommand(self: *App, action_arg: ?[]const u8, rest_arg: []const u8) void {
+        const parsed = parseOtelCommand(action_arg, rest_arg) orelse {
+            self.setNotice("usage: /otel [status|off|set <endpoint>]", .{});
+            return;
+        };
+        switch (parsed) {
+            .status => self.conn.send(.{ .otel_status = .{} }) catch {
+                self.setNotice("could not request OTLP status", .{});
+            },
+            .off => self.conn.send(.{ .otel_configure = .{} }) catch {
+                self.setNotice("could not disable OTLP export", .{});
+            },
+            .set => |endpoint| {
+                self.otel_endpoint.clearRetainingCapacity();
+                self.otel_endpoint.appendSlice(self.gpa, endpoint) catch {
+                    self.setNotice("could not start OTLP setup", .{});
+                    return;
+                };
+                self.editor.clear();
+                self.otel_header_prompt = true;
+                self.mode = .insert;
+                self.setNotice("enter OTLP headers as name=value pairs · Enter applies · Esc cancels", .{});
+            },
+        }
+    }
+
+    fn submitOtelHeaders(self: *App, headers: []const u8) void {
+        if (!self.otel_header_prompt) return;
+        self.otel_header_prompt = false;
+        defer self.otel_endpoint.clearRetainingCapacity();
+        self.conn.sendSensitive(.{ .otel_configure = .{
+            .endpoint = self.otel_endpoint.items,
+            .headers = headers,
+        } }) catch {
+            self.setNotice("could not configure OTLP export", .{});
+            return;
+        };
+        self.setNotice("configuring OTLP export…", .{});
+    }
+
+    fn cancelOtelSetup(self: *App) void {
+        self.editor.clearSensitive();
+        self.otel_endpoint.clearRetainingCapacity();
+        self.otel_header_prompt = false;
+        self.setNotice("OTLP setup cancelled", .{});
+    }
+
     fn networkCommand(self: *App, arg: []const u8) void {
         if (proto.isGuestModel(self.model.items)) {
-            self.setNotice("dnsblock is Marlin's; Claude Code's network is its own — not available on a guest session", .{});
+            self.setNotice("dnsblock is Marlin's; guest-agent networking is not filtered here", .{});
             return;
         }
         if (arg.len == 0 or std.mem.eql(u8, arg, "status")) {
@@ -4088,6 +4145,17 @@ fn validCouncilName(name: []const u8) bool {
     return true;
 }
 
+fn parseOtelCommand(action_arg: ?[]const u8, rest_arg: []const u8) ?OtelCommand {
+    const action = action_arg orelse "status";
+    const rest = std.mem.trim(u8, rest_arg, " \t\r\n");
+    if (std.mem.eql(u8, action, "status") and rest.len == 0) return .status;
+    if (std.mem.eql(u8, action, "off") and rest.len == 0) return .off;
+    if (std.mem.eql(u8, action, "set") and rest.len > 0 and
+        std.mem.indexOfAny(u8, rest, " \t\r\n") == null)
+        return .{ .set = rest };
+    return null;
+}
+
 fn commandQuery(editor: *const Editor) ?[]const u8 {
     const text = editor.text.items;
     if (text.len == 0 or (text[0] != '/' and text[0] != '!')) return null;
@@ -4096,7 +4164,9 @@ fn commandQuery(editor: *const Editor) ?[]const u8 {
         const head = text[0..space];
         if (!std.mem.eql(u8, head, "/council") and
             !std.mem.eql(u8, head, "/review") and
-            !std.mem.eql(u8, head, "/plan")) return null;
+            !std.mem.eql(u8, head, "/plan") and
+            !std.mem.eql(u8, head, "/otel") and
+            !std.mem.eql(u8, head, "!rb")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
         if (std.mem.indexOfAny(u8, rest, " \t") != null) return null;
     }
@@ -4153,6 +4223,51 @@ fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Comman
                     .description = try std.fmt.allocPrint(arena, "review with council · {d} models", .{council.models.items.len}),
                     .replacement = replacement,
                     .submit_on_enter = false,
+                });
+            }
+        }
+        return out.items;
+    }
+    if (query.len > "/otel".len and
+        std.mem.eql(u8, query[0.."/otel".len], "/otel") and
+        (query["/otel".len] == ' ' or query["/otel".len] == '\t'))
+    {
+        const rest = std.mem.trimStart(u8, query["/otel".len..], " \t");
+        const actions = [_]struct { name: []const u8, description: []const u8, submit: bool }{
+            .{ .name = "set", .description = "set endpoint, then enter masked headers", .submit = false },
+            .{ .name = "status", .description = "show live OTLP exporter state", .submit = true },
+            .{ .name = "off", .description = "disable live OTLP export", .submit = true },
+        };
+        for (actions) |action| {
+            if (rest.len <= action.name.len and std.ascii.eqlIgnoreCase(rest, action.name[0..rest.len])) {
+                const replacement = try std.fmt.allocPrint(arena, "/otel {s}{s}", .{ action.name, if (action.submit) "" else " " });
+                try out.append(arena, .{
+                    .label = try std.fmt.allocPrint(arena, "/otel {s}", .{action.name}),
+                    .description = action.description,
+                    .replacement = replacement,
+                    .submit_on_enter = action.submit,
+                });
+            }
+        }
+        return out.items;
+    }
+    if (query.len > "!rb".len and
+        std.mem.eql(u8, query[0.."!rb".len], "!rb") and
+        (query["!rb".len] == ' ' or query["!rb".len] == '\t'))
+    {
+        const rest = std.mem.trimStart(u8, query["!rb".len..], " \t");
+        const actions = [_]struct { name: []const u8, description: []const u8 }{
+            .{ .name = "client", .description = "rebuild only the local client" },
+            .{ .name = "both", .description = "rebuild the local client and attached Marlin" },
+        };
+        for (actions) |action| {
+            if (rest.len <= action.name.len and std.ascii.eqlIgnoreCase(rest, action.name[0..rest.len])) {
+                const replacement = try std.fmt.allocPrint(arena, "!rb {s}", .{action.name});
+                try out.append(arena, .{
+                    .label = replacement,
+                    .description = action.description,
+                    .replacement = replacement,
+                    .submit_on_enter = true,
                 });
             }
         }
@@ -4237,6 +4352,68 @@ fn transcriptView(app: *App) Transcript {
 fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(Line) {
     var transcript = transcriptView(app);
     return layout_mod.layoutLines(arena, app.gpa, &transcript, width);
+}
+
+fn formatDiagnostics(gpa: std.mem.Allocator, report: proto.Diagnostics) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    try out.print(gpa, "**Session** `{x}`\n", .{report.sid});
+    try out.print(gpa, "**Sample** {d} turns · {d} ok · {d} failed · {d} interrupted · {d} abandoned · {d} checkpoints\n", .{
+        report.sample_turns,
+        report.successful_turns,
+        report.failed_turns,
+        report.interrupted_turns,
+        report.abandoned_turns,
+        report.checkpoint_turns,
+    });
+    try out.print(gpa, "**Provider** {d} requests · p50 {d:.2}s · p95 {d:.2}s · TTFT p50 {d:.2}s · p95 {d:.2}s\n", .{
+        report.provider_requests,
+        diagnosticsSeconds(report.provider_p50_ms),
+        diagnosticsSeconds(report.provider_p95_ms),
+        diagnosticsSeconds(report.ttft_p50_ms),
+        diagnosticsSeconds(report.ttft_p95_ms),
+    });
+    try out.print(gpa, "**Tools** {d} calls\n", .{report.tool_calls});
+
+    if (report.last_turn_id == 0) {
+        try out.appendSlice(gpa, "**Last** no telemetry yet (run a new turn after this build)\n");
+    } else {
+        try out.print(gpa, "**Last** {s} · {d:.2}s · trace `{s}`\n", .{
+            report.last_outcome,
+            diagnosticsSeconds(report.last_duration_ms),
+            report.last_trace_id,
+        });
+        if (report.last_error.len > 0) try out.print(gpa, "**Error** {s}\n", .{report.last_error});
+        for (report.last_rounds) |round| {
+            try out.print(gpa, "- Provider #{d}: {s} · {d:.2}s · TTFT {d:.2}s · {d} bytes · {d} in/{d} out", .{
+                round.round + 1,
+                round.status,
+                diagnosticsSeconds(round.duration_ms),
+                diagnosticsSeconds(round.ttft_ms),
+                round.bytes,
+                round.tokens_in,
+                round.tokens_out,
+            });
+            if (round.provider.len > 0) try out.print(gpa, " · {s}", .{round.provider});
+            if (round.generation_id.len > 0) try out.print(gpa, " · `{s}`", .{round.generation_id});
+            try out.append(gpa, '\n');
+        }
+        for (report.last_tools) |tool| try out.print(gpa, "- Tool `{s}`: {s} · {d:.2}s\n", .{
+            tool.name,
+            tool.status,
+            diagnosticsSeconds(tool.duration_ms),
+        });
+    }
+
+    try out.print(gpa, "**OTLP** {s}", .{if (report.otlp_enabled) "enabled" else "disabled"});
+    if (report.otlp_enabled) try out.print(gpa, " · {d} pending", .{report.otlp_pending});
+    if (report.otlp_last_error.len > 0) try out.print(gpa, " · last error: {s}", .{report.otlp_last_error});
+    return out.toOwnedSlice(gpa);
+}
+
+fn diagnosticsSeconds(ms: u64) f64 {
+    return @as(f64, @floatFromInt(ms)) / 1000.0;
 }
 
 fn validCatalogRate(rate: ?f64) ?f64 {
@@ -5064,7 +5241,9 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         const query = app.history_search_query.items;
         const query_end = hardCellBreak(query, 0, @max(@as(usize, w) / 3, 1));
         break :search_prompt try std.fmt.allocPrint(arena, "⌕ '{s}'▏: ", .{query[0..query_end]});
-    } else if (app.plan_mode)
+    } else if (app.otel_header_prompt)
+        "OTLP headers ❯ "
+    else if (app.plan_mode)
         if (app.mode == .insert) "PLAN ❯ " else "PLAN : "
     else if (app.mode == .insert)
         "❯ "
@@ -5287,7 +5466,10 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         .width = panel_inner_w,
         .height = content_h,
     });
-    app.editor.draw(input_win, prompt, if (app.plan_mode) Palette.plan_active else Palette.prompt_mark, Palette.prompt_text);
+    if (app.otel_header_prompt)
+        app.editor.drawMasked(input_win, prompt, Palette.prompt_mark, Palette.prompt_text)
+    else
+        app.editor.draw(input_win, prompt, if (app.plan_mode) Palette.plan_active else Palette.prompt_mark, Palette.prompt_text);
     if (proposal_ready) {
         _ = input_panel.printSegment(.{
             .text = " Enter implement · e revise · Esc stay · q dismiss",
@@ -5839,7 +6021,7 @@ fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
 }
 
 pub const RebootPlan = struct {
-    request: RebootRequest = .none,
+    request: RebootRequest = .{},
     sid: u64 = 0,
 };
 
@@ -6752,6 +6934,25 @@ fn mediaErrorMessage(err: anyerror) []const u8 {
 }
 
 fn handleKey(app: *App, key: vaxis.Key) !void {
+    if (app.otel_header_prompt) {
+        const ed = &app.editor;
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('g', .{ .ctrl = true })) {
+            app.cancelOtelSetup();
+        } else if (isEnterKey(key)) {
+            const headers = try ed.takeExpandedSensitive();
+            defer {
+                @memset(headers, 0);
+                app.gpa.free(headers);
+            }
+            app.submitOtelHeaders(std.mem.trim(u8, headers, " \t\r\n"));
+        } else if (editCommand(key)) |command| {
+            applyEditCommand(ed, command);
+        } else if (key.text) |text| {
+            ed.insertSlice(text);
+        }
+        return;
+    }
+
     if (key.matches('t', .{ .ctrl = true })) {
         app.show_tool_transcript = !app.show_tool_transcript;
         if (app.show_tool_transcript)
@@ -7426,6 +7627,15 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqual(@as(usize, 1), suggestions.len);
     try std.testing.expectEqualStrings("/plan clear", suggestions[0].label);
     try std.testing.expect(suggestions[0].submit_on_enter);
+
+    app.editor.clear();
+    app.editor.insertSlice("!rb c");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("!rb client", suggestions[0].label);
+    try std.testing.expect(suggestions[0].submit_on_enter);
 }
 
 test "command menu Tab completes and Enter runs the selection" {
@@ -7635,9 +7845,34 @@ test "bang rb expands to reboot with build" {
     defer app.deinit();
 
     app.submitInput("!rb");
-    try std.testing.expectEqual(RebootRequest.build, app.reboot_request);
+    try std.testing.expect(app.reboot_request.requested);
+    try std.testing.expectEqual(RebuildScope.attached, app.reboot_request.rebuild);
+    try std.testing.expect(!app.reboot_request.force);
     try std.testing.expect(app.should_quit);
     try std.testing.expectEqualStrings("!rb", app.editor.history.items[0]);
+}
+
+test "bang rb supports client and both scopes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.runCommand("!rb client");
+    try std.testing.expectEqual(RebuildScope.client, app.reboot_request.rebuild);
+
+    app.should_quit = false;
+    app.reboot_request = .{};
+    app.runCommand("!rb both --force");
+    try std.testing.expectEqual(RebuildScope.both, app.reboot_request.rebuild);
+    try std.testing.expect(app.reboot_request.force);
 }
 
 test "plain reboot refuses a focused approval unless forced" {
@@ -7655,12 +7890,14 @@ test "plain reboot refuses a focused approval unless forced" {
     defer app.deinit();
 
     app.runCommand("/reboot");
-    try std.testing.expectEqual(RebootRequest.none, app.reboot_request);
+    try std.testing.expect(!app.reboot_request.requested);
     try std.testing.expect(!app.should_quit);
     try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "approval pending") != null);
 
     app.runCommand("/reboot --build --force");
-    try std.testing.expectEqual(RebootRequest.build_force, app.reboot_request);
+    try std.testing.expect(app.reboot_request.requested);
+    try std.testing.expectEqual(RebuildScope.attached, app.reboot_request.rebuild);
+    try std.testing.expect(app.reboot_request.force);
     try std.testing.expect(app.should_quit);
 }
 
@@ -8127,6 +8364,10 @@ test "status metadata is compact without losing its identity" {
     try std.testing.expectEqualStrings(
         "(guest) fable",
         try statusModel(arena, "claudecode/fable"),
+    );
+    try std.testing.expectEqualStrings(
+        "(guest) codex/default",
+        try statusModel(arena, "codex/default"),
     );
     try std.testing.expectEqualStrings("ctx n/a", try statusContext(arena, true, 0, 200_000));
     try std.testing.expectEqualStrings("ctx 12%", try statusContext(arena, false, 24_000, 200_000));
@@ -8663,6 +8904,85 @@ test "failed replay request releases buffered page and can be retried" {
     try std.testing.expectEqual(@as(u64, 0), app.history_before_seq);
     try std.testing.expectEqual(@as(usize, 0), app.history_backfill.items.len);
     try std.testing.expect(!app.history_complete);
+}
+
+test "diagnostics render in scrollback with the full latest-turn waterfall" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 7,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    const rounds = [_]proto.DiagnosticRound{.{
+        .round = 0,
+        .duration_ms = 1250,
+        .ttft_ms = 340,
+        .bytes = 4096,
+        .status = "ok",
+        .provider = "openrouter",
+        .generation_id = "gen-test-123",
+        .tokens_in = 120,
+        .tokens_out = 45,
+    }};
+    const tools = [_]proto.DiagnosticTool{.{
+        .name = "read_file",
+        .status = "ok",
+        .duration_ms = 80,
+    }};
+    const msg: proto.DaemonMsg = .{ .diagnostics_result = .{
+        .sid = 7,
+        .sample_turns = 3,
+        .successful_turns = 2,
+        .failed_turns = 1,
+        .interrupted_turns = 0,
+        .abandoned_turns = 0,
+        .checkpoint_turns = 1,
+        .provider_requests = 4,
+        .tool_calls = 1,
+        .provider_p50_ms = 1000,
+        .provider_p95_ms = 2200,
+        .ttft_p50_ms = 250,
+        .ttft_p95_ms = 500,
+        .last_turn_id = 9,
+        .last_trace_id = "0123456789abcdef0123456789abcdef",
+        .last_outcome = "error",
+        .last_error = "collector response retained in full",
+        .last_duration_ms = 1500,
+        .last_rounds = &rounds,
+        .last_tools = &tools,
+        .otlp_enabled = true,
+        .otlp_pending = 2,
+        .otlp_last_error = "HTTP 401 authorization failed",
+    } };
+    app.handleDaemonLine(try proto.encode(gpa, msg));
+
+    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
+    try std.testing.expectEqual(block.BlockKind.system_note, app.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("diagnostics", app.blocks.items[0].label);
+    try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "Provider #1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "HTTP 401 authorization failed") != null);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const lines = try layoutLines(arena, &app, 52);
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(gpa);
+    for (lines.items) |line| {
+        try rendered.appendSlice(gpa, try lineText(arena, line));
+        try rendered.append(gpa, '\n');
+    }
+    try std.testing.expect(std.mem.indexOf(u8, rendered.items, "diagnostics") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.items, "gen-test-123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.items, "read_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.items, "HTTP 401") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.items, "authorization failed") != null);
 }
 
 test "synthetic and legacy rehydration render as notes, not prompts or history" {

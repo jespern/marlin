@@ -1263,10 +1263,15 @@ pub fn layoutBlockRange(
                 }
             },
             .system_note => {
-                if (block.isHandoverNote(rb.text)) {
+                if (std.mem.eql(u8, rb.label, "diagnostics")) {
                     try flushRanSummary(alloc, lines, &pending_ran);
                     try blankLine(alloc, lines);
-                    try wrapPrefixed(alloc, lines, "  ", "handover for Claude Code", Palette.note, w);
+                    try wrapPrefixed(alloc, lines, "  ", "diagnostics", Palette.note, w);
+                    try wrapMarkdown(alloc, lines, rb.text, w);
+                } else if (block.isHandoverNote(rb.text)) {
+                    try flushRanSummary(alloc, lines, &pending_ran);
+                    try blankLine(alloc, lines);
+                    try wrapPrefixed(alloc, lines, "  ", "handover to guest", Palette.note, w);
                     try wrapMarkdown(alloc, lines, block.handoverBody(rb.text), w);
                 } else {
                     try blankLine(alloc, lines);
@@ -2165,7 +2170,7 @@ test "handover notes render in full instead of a clipped system card" {
     try layoutBlockRange(arena, &transcript, &lines, 0, 1, 80, &label, false);
     var joined: std.ArrayList(u8) = .empty;
     for (lines.items) |line| try joined.appendSlice(arena, line.text);
-    try std.testing.expect(std.mem.indexOf(u8, joined.items, "handover for Claude Code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "handover to guest") != null);
     try std.testing.expect(std.mem.indexOf(u8, joined.items, "AAAA") != null);
 }
 

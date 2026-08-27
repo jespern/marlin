@@ -37,19 +37,19 @@ Every agent harness today picks one of two shapes:
 
 marlin takes the unclaimed third shape: **daemon-native structured sessions,
 multiplexed by a TUI that is just another client.** Some of those sessions
-run Marlin's own agent. Some host Claude Code as a *guest* when you need
-subscription Fable — Anthropic will not sell that inference as a Marlin
-model. Guest is a session regime, not a third dialect; the multiplexer
-still sees blocks, not pixels. See
+run Marlin's own agent. Some host an official vendor agent as a *guest*:
+Claude Code for subscription Fable, or Codex through `codex app-server`
+using the user's existing ChatGPT login. Guest is a session regime, not
+another wire dialect; the multiplexer still sees blocks, not pixels. See
 [Native vs guest](docs/ARCHITECTURE.md#native-vs-guest-agents).
 
 What that consolidates: one multiplexer over your whole model fleet. The
 workflow marlin replaces is three or four vendor CLIs cycling under a
 terminal multiplexer plus a desktop app on the side — each with its own UX,
 each picked per task by preference or remaining credits, findings shuttled
-between them by hand. In marlin that is tabs in one room: Fable through its
-sanctioned binary as a guest, grok/GLM/GPT and everything else OpenRouter
-carries as native sessions, switched per task without changing tools. The
+between them by hand. In marlin that is tabs in one room: Fable and Codex
+through their official binaries as guests, grok/GLM/GPT and everything else
+OpenRouter carries as native sessions, switched per task. The
 migration test for every feature: does it delete a reason to open one of
 the old rooms?
 
@@ -71,10 +71,15 @@ the old rooms?
   `marlin search <query>` search every durable session.
 - `/diagnostics` and `marlin diagnostics [handle] [--json]` separate provider
   latency, TTFT, tool time, and failures. Optional OTLP/HTTP export uses a
-  durable retry outbox and correlates OpenRouter Broadcast under the same
-  trace; see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
+  durable retry outbox, supports restart-free `marlin otel reload|off|status`,
+  and correlates OpenRouter Broadcast under the same trace; see
+  [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
 - OpenRouter sessions can search the web with the same API key and preserve
   cited source URLs; `fetch` opens known pages for deeper reading.
+- `/model codex/default` hosts the installed Codex agent through its stable
+  app-server protocol. It uses `codex login`/the existing ChatGPT session, so
+  Marlin needs no additional search or inference API key. The guest route
+  refuses an API-key Codex login instead of silently changing the biller.
 - Paste an image with Ctrl+V (Control-V, not Command-V on macOS) or attach one
   by path. Staged images appear in the prompt as `[image #1]`, `[image #2]`, and
   so on. The client uploads them through the protocol—no shared path
@@ -121,15 +126,11 @@ the old rooms?
    churn lives in scripts.
 5. **OpenRouter first for the native agent; two wire dialects, not N.**
    OpenAI-compatible covers most models; Anthropic Messages is the one
-   extra wire. Claude Code is not a dialect — it is a guest session
-   because subscription Fable is only sanctioned through their binary.
+   extra wire. Claude Code and Codex are guest sessions, not dialects: their
+   official binaries own inference, context, and tools.
    Do not add a third wire. OpenRouter is the default, not a hard
-   dependency: `anthropic/` and `local/` hit endpoints directly, and a
-   config-driven `[providers.*]` table is the designed door if direct
-   multi-endpoint becomes the daily norm. A second guest (codex, for
-   subscription-side economics) is a live question that gets decided in
-   writing — today OpenRouter carries the same models cheaper, so the
-   door stays shut, deliberately rather than by drift.
+   dependency: `anthropic/`, `vercel/`, `litellm/`, `local/`, and configured
+   `[providers.*]` entries can all route independently.
 6. **Agent panes only — no VTE.** Splits show marlin sessions, which are
    structured data we render ourselves. No terminal emulation tarpit. (If an
    embedded terminal is ever truly needed: libghostty-vt, not hand-rolled.)
@@ -159,6 +160,42 @@ The TUI equivalents are `/mcp`, `/mcp add`, `/mcp restart`, `/mcp remove`, and
 `readonly_tools` and `mutating_tools` config overrides. Image results are stored
 as transcript media and sent back to vision-capable providers. Streamable HTTP
 transport remains later work; stdio is the supported product path today.
+
+## Provider routing
+
+Model ids are `provider/model`. Marlin strips the first component before
+sending the request, so `vercel/anthropic/claude-sonnet-4` sends
+`anthropic/claude-sonnet-4` to Vercel AI Gateway.
+
+The built-in native routes are:
+
+- `openrouter/<model>` with `OPENROUTER_API_KEY`
+- `vercel/<model>` with `AI_GATEWAY_API_KEY`
+- `litellm/<model>` at `http://127.0.0.1:4000/v1`, optionally with
+  `LITELLM_API_KEY`
+- `anthropic/<model>` with `ANTHROPIC_API_KEY`
+- `local/<model>` with `MARLIN_LOCAL_BASE_URL` and the optional
+  `MARLIN_LOCAL_API_KEY`
+
+Any other OpenAI Chat Completions-compatible router or direct endpoint is a
+small config entry:
+
+```toml
+[providers.requesty]
+base_url = "https://router.requesty.ai/v1"
+api_key_env = "REQUESTY_API_KEY"
+
+[model]
+favorites = ["requesty/openai/gpt-5", "litellm/fast-code"]
+```
+
+`base_url` stops at the API root; Marlin appends `/chat/completions`. The
+credential field names an environment variable and never contains the secret.
+Use `api_key_env = "NONE"` for an intentionally keyless endpoint. Provider
+config takes effect the next time the daemon starts. Configured favorites stay
+available in the model picker alongside the fetched OpenRouter catalog. Key
+variable names must end in `_API_KEY`, `_TOKEN`, or `_SECRET` so Marlin's tool
+boundary strips and redacts them automatically.
 
 ## Context management today
 

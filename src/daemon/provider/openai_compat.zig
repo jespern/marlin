@@ -62,9 +62,8 @@ pub fn buildRequestBody(
         switch (dialect) {
             .openrouter => try ws.writeAll(",\"reasoning\":{\"effort\":"),
             .openai_compatible => try ws.writeAll(",\"reasoning_effort\":"),
-            // Anthropic requests are built by anthropic.buildRequestBody;
-            // claude_code never builds a wire request at all.
-            .anthropic, .claude_code => unreachable,
+            // Anthropic requests are built by anthropic.buildRequestBody.
+            .anthropic => unreachable,
         }
         try enc(value, .{}, ws);
         if (dialect == .openrouter) try ws.writeByte('}');

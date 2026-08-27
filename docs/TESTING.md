@@ -57,6 +57,11 @@ Wanted-but-not-yet-recorded: mid-stream disconnect, 429 with Retry-After, and
 real reasoning deltas (o-series / Claude via OpenRouter). Parallel tool calls
 are covered synthetically and by the full-binary e2e batch scenario.
 
+Guest adapters are tested at their process boundary in `loop.zig`: executable
+fixture peers validate argv and JSONL in both directions. The Codex fixture
+covers initialize/account checks, durable `thread/resume`, item-to-block
+projection, approval responses, token usage, and secret-environment scrubbing.
+
 ## Layer 3 — e2e scenarios
 
 ```bash
@@ -107,7 +112,10 @@ it's ~200 lines on purpose.
 Current coverage: basic completion, tool round-trip (fragmented args),
 --continue across invocations, provider 500 → system_note + exit 1, oversized
 tool output → blob + inline elision, and concurrent safe tool batches with
-provider-order transcript reconstruction.
+provider-order transcript reconstruction. A configured-provider scenario
+loads `[providers.acme]`, supplies its named credential, and crosses the same
+real OpenAI-compatible HTTP/SSE boundary through a dynamic test-only URL
+override.
 
 The runner is fail-bounded as well as hermetic. Each Marlin invocation has a
 30-second wall-clock deadline; timeout terminates its complete process group.

@@ -1,0 +1,22 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["\"model\":\"vendor/code-model\"", "use the configured route", "\"stream\":true"],
+      "expect_not_contains": ["\"session_id\":\"marlin-", "\"sort\":\"throughput\"", "openrouter:web_search"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"configured provider works\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "acme/vendor/code-model", "use the configured route"],
+    "env": {"ACME_API_KEY": "configured-test-secret"},
+    "config_toml": "[providers.acme]\nbase_url = \"https://unused.invalid/v1\"\napi_key_env = \"ACME_API_KEY\"\n",
+    "exit_code": 0,
+    "stdout_equals": "configured provider works\n",
+    "db_kinds": ["user_msg", "assistant_msg"],
+    "db_telemetry": "1|1|0|ok"
+  }
+}
