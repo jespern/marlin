@@ -269,7 +269,10 @@ pub fn decodeLine(
         };
         try out.append(arena, .{ .result = .{
             .text = strField(root, "result") orelse "",
-            .is_error = !std.mem.eql(u8, subtype, "success"),
+            // Trust either error signal: an auth failure (logged-out claude,
+            // observed live) reports subtype "success" WITH is_error true.
+            .is_error = !std.mem.eql(u8, subtype, "success") or
+                (boolField(root, "is_error") orelse false),
             .error_text = error_text.items,
             .tokens_in = tokens_in + cached,
             .tokens_out = tokens_out,
@@ -590,6 +593,22 @@ test "decode: init, assistant blocks, tool_result shapes, result usage" {
     try std.testing.expectEqual(@as(u64, 5), result.tokens_out);
     try std.testing.expectEqual(@as(u64, 90), result.cached_tokens);
     try std.testing.expect(!result.is_error);
+}
+
+test "decode: logged-out result is an error despite subtype success" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+
+    // Captured live from `claude -p` with no login: the auth failure ships
+    // subtype "success" WITH is_error true, so subtype alone lies.
+    try decodeLine(arena,
+        \\{"is_error":true,"session_id":"s","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0},"terminal_reason":"api_error","subtype":"success","result":"Not logged in · Please run /login","type":"result","duration_ms":58}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expect(events.items[0].result.is_error);
+    try std.testing.expectEqualStrings("Not logged in · Please run /login", events.items[0].result.text);
 }
 
 test "decode: tool_result adopts the structuredPatch diff when present" {

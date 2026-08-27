@@ -262,6 +262,10 @@ pub const DaemonMsg = union(enum) {
         network_configured: bool = false,
         network_feed_count: u64 = 0,
         network_rule_count: u64 = 0,
+        /// Modification time (ms) of the daemon's own executable, captured at
+        /// startup; 0 when unknown. Lets a client spot a stale daemon even in
+        /// dev, where every build shares one version string.
+        daemon_exe_mtime_ms: i64 = 0,
     },
     session_created: struct { sid: u64, request_id: u64 = 0 },
     session_list_result: struct { sessions: []const SessionInfo },
@@ -293,7 +297,10 @@ pub const DaemonMsg = union(enum) {
         /// Old daemons omit this and preserve the historical pinned behavior.
         plan_pinned: bool = true,
     },
-    status: struct { sid: u64, state: SessionState },
+    /// err_text carries the reason whenever state is .err — an error state
+    /// must never reach a client without its explanation (older daemons omit
+    /// it; older clients ignore it).
+    status: struct { sid: u64, state: SessionState, err_text: ?[]const u8 = null },
     approval_request: struct {
         sid: u64,
         approval_id: []const u8,
@@ -799,6 +806,27 @@ test "older hello defaults network configuration state" {
     );
     try std.testing.expect(!m.hello_ok.network_configured);
     try std.testing.expect(!m.hello_ok.network_filtering);
+    try std.testing.expectEqual(@as(i64, 0), m.hello_ok.daemon_exe_mtime_ms);
+}
+
+test "status err_text is additive: absent from old daemons, carried when set" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const old = try decode(DaemonMsg, arena,
+        \\{"status":{"sid":7,"state":"err"}}
+    );
+    try std.testing.expect(old.status.err_text == null);
+
+    const line = try encode(std.testing.allocator, DaemonMsg{ .status = .{
+        .sid = 7,
+        .state = .err,
+        .err_text = "claude code error: Not logged in",
+    } });
+    defer std.testing.allocator.free(line);
+    const carried = try decode(DaemonMsg, arena, line);
+    try std.testing.expectEqualStrings("claude code error: Not logged in", carried.status.err_text.?);
 }
 
 test "model catalog pricing round trips and remains optional" {

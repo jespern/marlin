@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const build_options = @import("build_options");
 const vaxis = @import("vaxis");
 
 const proto = @import("../core/proto.zig");
@@ -1709,6 +1710,10 @@ const App = struct {
                 if (s.state != .awaiting_approval) self.pending = null;
                 if (s.state == .idle or s.state == .err or s.state == .done)
                     self.releaseStreamingBuffers();
+                // An error state never arrives bare: show its reason in the
+                // notice slot (the transcript note holds the durable copy).
+                if (s.state == .err) if (s.err_text) |text| if (text.len > 0)
+                    self.setNotice("{s}", .{text});
             },
             .approval_request => |ar| {
                 var p = PendingApproval{};
@@ -5703,6 +5708,15 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     return true;
 }
 
+/// mtime (ms) of this client's own binary, for stale-daemon detection
+/// against hello_ok's daemon_exe_mtime_ms. null when unresolvable.
+fn selfExeMtimeMs(gpa: std.mem.Allocator, io: Io) ?i64 {
+    const path = std.process.executablePathAlloc(io, gpa) catch return null;
+    defer gpa.free(path);
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    return @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_ms));
+}
+
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     while (!app.animation_stop.load(.acquire)) {
         if (app.animation_active.load(.acquire)) {
@@ -5894,6 +5908,21 @@ pub fn run(
     // a misconfiguration (configured but failed to load) warrants a notice.
     if (!conn.network_filtering and conn.network_configured) {
         app.setNotice("dnsblock configured but unavailable — feed load failed; networking is fail-open", .{});
+    }
+    // Stale-daemon warning (ordered after the network notice so it wins the
+    // single notice slot). The handshake only checks proto_version, and every
+    // dev build shares one version string — so also compare the daemon's
+    // exe mtime at ITS startup against this client's binary. Local socket
+    // only: a remote daemon is another machine's binary by design.
+    if (conn.transport == .socket) {
+        const daemon_ver = conn.daemonVersion();
+        if (!std.mem.eql(u8, daemon_ver, build_options.version)) {
+            app.setNotice("daemon is {s} but this client is {s} — /reboot to sync", .{ daemon_ver, build_options.version });
+        } else if (conn.daemon_exe_mtime_ms != 0) {
+            if (selfExeMtimeMs(gpa, io)) |mine| if (mine != conn.daemon_exe_mtime_ms) {
+                app.setNotice("daemon runs a different build than this client — /reboot to sync", .{});
+            };
+        }
     }
 
     var daemon_disconnect_reason: ?[]const u8 = null;

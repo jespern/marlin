@@ -101,7 +101,7 @@ const Event = union(enum) {
     turn_resumed: struct { sid: u64 },
     /// Model catalog fetched by a worker thread (registry-form ids plus
     /// normalized pricing; id allocations are dispatcher-owned on receipt).
-    catalog_ready: struct { client_id: u64, models: []CatalogModel },
+    catalog_ready: struct { client_id: u64, models: []CatalogModel, err: ?anyerror = null },
     /// Turn thread → dispatcher completion. final_text and err_text are
     /// separately owned because child task results serialize both fields.
     turn_done: struct { sid: u64, interrupted: bool, round_budget_reached: bool, err_text: ?[]u8, final_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
@@ -320,6 +320,10 @@ pub const Daemon = struct {
     /// Absolute path to this marlin binary (gpa-owned), handed to delegated
     /// Claude Code sessions so their permission bridge can call back here.
     marlin_exe: ?[:0]u8 = null,
+    /// mtime (ms) of that binary CAPTURED AT STARTUP — after an on-disk
+    /// rebuild it still describes the running build, which is exactly what
+    /// lets clients detect a stale daemon. 0 when unknown.
+    exe_mtime_ms: i64 = 0,
     /// Secret values this process holds (slice gpa-owned; values reference
     /// the daemon environ), redacted from tool output at capture time.
     secrets: []const permissions.Secret = &.{},
@@ -384,6 +388,11 @@ pub const Daemon = struct {
         // Needed before the sandbox probe: the Landlock wrapper and the
         // Claude Code permission bridge both spawn this binary by path.
         const marlin_exe: ?[:0]u8 = std.process.executablePathAlloc(io, gpa) catch null;
+        const exe_mtime_ms: i64 = blk: {
+            const exe = marlin_exe orelse break :blk 0;
+            const st = Io.Dir.cwd().statFile(io, exe, .{}) catch break :blk 0;
+            break :blk @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_ms));
+        };
 
         var probe_environ: ?std.process.Environ.Map = null;
         defer if (probe_environ) |*env| env.deinit();
@@ -437,6 +446,7 @@ pub const Daemon = struct {
             // their permission bridge; an unresolvable path just means the
             // bridge stays unwired (headless prompts auto-deny as before).
             .marlin_exe = marlin_exe,
+            .exe_mtime_ms = exe_mtime_ms,
             // Secret values this process holds, for capture-time redaction
             // of tool output before it reaches the append-only store.
             .secrets = permissions.collectSecrets(gpa, environ) catch &.{},
@@ -831,7 +841,16 @@ pub const Daemon = struct {
                 self.gpa.free(cr.models);
                 self.catalog_fetched_at = nowMs(self.io);
                 self.catalog_fetching = false;
-                if (self.lookupClient(cr.client_id)) |client| self.sendCatalog(client);
+                if (self.lookupClient(cr.client_id)) |client| {
+                    if (cr.err) |e| {
+                        var msg_buf: [128]u8 = undefined;
+                        self.sendTo(client, .{ .err = .{
+                            .code = "catalog",
+                            .msg = std.fmt.bufPrint(&msg_buf, "model catalog fetch failed: {t} — picker shows favorites", .{e}) catch "model catalog fetch failed — picker shows favorites",
+                        } });
+                    }
+                    self.sendCatalog(client);
+                }
             },
             .turn_done => |td| {
                 defer if (td.err_text) |t| self.gpa.free(t);
@@ -882,18 +901,22 @@ pub const Daemon = struct {
                         self.appendSessionNote(td.sid, continuation_error orelse "automatic continuation failed to start");
                         session.state = .err;
                         self.store.setSessionStatus(td.sid, "err") catch {};
-                        self.broadcastStatus(td.sid, .err);
+                        self.broadcastStatusErr(td.sid, .err, continuation_error orelse "automatic continuation failed to start");
                     };
                     continued = !continuation_failed and session.state == .running;
                 } else {
                     self.store.setSessionStatus(td.sid, @tagName(session.state)) catch {};
                 }
+                const terminal_error: ?[]const u8 = td.err_text orelse continuation_error orelse
+                    if (continuation_failed) "automatic continuation failed to start" else null;
                 // Meta BEFORE status: clients treat idle/err as end-of-turn
                 // and stop reading, so usage must already be on the wire.
                 self.broadcastMeta(td.sid, td.tokens_in, td.tokens_out);
-                if (!auto_continue) self.broadcastStatus(td.sid, session.state);
-                const terminal_error: ?[]const u8 = td.err_text orelse continuation_error orelse
-                    if (continuation_failed) "automatic continuation failed to start" else null;
+                if (!auto_continue) self.broadcastStatusErr(
+                    td.sid,
+                    session.state,
+                    if (session.state == .err) terminal_error else null,
+                );
                 const payload = std.json.Stringify.valueAlloc(self.gpa, .{
                     .sid = td.sid,
                     .interrupted = td.interrupted,
@@ -996,6 +1019,7 @@ pub const Daemon = struct {
                     .network_configured = config.networkPolicyConfigured(self.cfg),
                     .network_feed_count = self.network.feedCount(),
                     .network_rule_count = self.network.ruleCount(),
+                    .daemon_exe_mtime_ms = self.exe_mtime_ms,
                 } });
             },
             .session_create => |sc| {
@@ -2245,7 +2269,8 @@ pub const Daemon = struct {
             session.task_waiter = null;
             session.state = .err;
             self.store.setSessionStatus(sid, "err") catch {};
-            self.broadcastStatus(sid, .err);
+            var err_buf: [128]u8 = undefined;
+            self.broadcastStatusErr(sid, .err, std.fmt.bufPrint(&err_buf, "failed to start turn: {t}", .{e}) catch "failed to start turn");
             return e;
         };
     }
@@ -2594,14 +2619,23 @@ pub const Daemon = struct {
                 error.ConnectFailed, error.ReadFailed => http.lastTransportCause(),
                 else => null,
             };
-            err_text = if (cause) |c|
+            // Delegated failures carry real prose ("claude code error: Not
+            // logged in · Please run /login"); prefer it over the error name.
+            const delegate_detail: ?[]const u8 = switch (e) {
+                error.DelegateSpawnFailed, error.DelegateFailed, error.DelegateTimeout => loop.lastDelegateErrorNote(),
+                else => null,
+            };
+            err_text = if (delegate_detail) |detail|
+                std.fmt.allocPrint(self.gpa, "{s}", .{detail}) catch null
+            else if (cause) |c|
                 std.fmt.allocPrint(self.gpa, "turn failed: {t} ({t})", .{ e, c }) catch null
             else
                 std.fmt.allocPrint(self.gpa, "turn failed: {t}", .{e}) catch null;
             // The reason must survive in the transcript: turn_done frees
             // err_text after status fan-out, so without a durable note the
-            // user sees a bare "error" state with no explanation.
-            if (e != error.ProviderError)
+            // user sees a bare "error" state with no explanation. Provider
+            // and delegate paths already persisted their own richer note.
+            if (e != error.ProviderError and delegate_detail == null)
                 self.persistTurnNote(job, err_text orelse "turn failed");
             self.finishTurn(job.sid, false, false, err_text, null, 0, 0);
             return;
@@ -2628,6 +2662,7 @@ pub const Daemon = struct {
 
         const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "provider resolve failed: {t}", .{e}) catch null;
+            self.persistTurnNote(job, t orelse "provider resolve failed");
             self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
         };
@@ -2654,6 +2689,7 @@ pub const Daemon = struct {
             .cancel = job.cancel,
         }) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "compaction failed: {t}", .{e}) catch null;
+            self.persistTurnNote(job, t orelse "compaction failed");
             self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
         };
@@ -2677,6 +2713,7 @@ pub const Daemon = struct {
 
         const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "handover provider resolve failed: {t}", .{e}) catch null;
+            self.persistTurnNote(job, t orelse "handover provider resolve failed");
             self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
         };
@@ -2699,6 +2736,7 @@ pub const Daemon = struct {
             .cancel = job.cancel,
         }, job.text) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "handover failed: {t}", .{e}) catch null;
+            self.persistTurnNote(job, t orelse "handover failed");
             self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
         };
@@ -2986,7 +3024,13 @@ pub const Daemon = struct {
     }
 
     fn broadcastStatus(self: *Daemon, sid: u64, state: proto.SessionState) void {
-        const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{ .sid = sid, .state = state } }) catch return;
+        self.broadcastStatusErr(sid, state, null);
+    }
+
+    /// Status with its reason attached: an error state must never reach a
+    /// client without the text that explains it.
+    fn broadcastStatusErr(self: *Daemon, sid: u64, state: proto.SessionState, err_text: ?[]const u8) void {
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{ .sid = sid, .state = state, .err_text = err_text } }) catch return;
         defer self.gpa.free(line);
         const ctx = FanCtx{ .self = self, .sid = sid, .line = line };
         self.forEachClient(ctx, struct {
@@ -3244,11 +3288,15 @@ pub const Daemon = struct {
     }
 
     /// Worker thread: GET /models from OpenRouter, parse ids, hand the
-    /// result to the dispatcher. Failure → empty list (client falls back).
+    /// result to the dispatcher. Failure → empty list (client falls back to
+    /// favorites) plus the error, so the requester hears WHY, not silence.
     fn catalogFetchMain(self: *Daemon, client_id: u64) void {
-        const models = self.fetchCatalog() catch
-            self.gpa.alloc(CatalogModel, 0) catch return;
-        self.events.push(self.io, .{ .catalog_ready = .{ .client_id = client_id, .models = models } }) catch {
+        var fetch_err: ?anyerror = null;
+        const models = self.fetchCatalog() catch |e| blk: {
+            fetch_err = e;
+            break :blk self.gpa.alloc(CatalogModel, 0) catch return;
+        };
+        self.events.push(self.io, .{ .catalog_ready = .{ .client_id = client_id, .models = models, .err = fetch_err } }) catch {
             for (models) |m| self.gpa.free(m.id);
             self.gpa.free(models);
         };

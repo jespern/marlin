@@ -1215,6 +1215,22 @@ fn maybeCompact(
 /// internal turn management, this only prevents an unkillable zombie run.
 const claude_code_deadline_ms: i64 = 60 * 60 * 1000;
 
+/// Failure detail for the most recent Delegate* error on THIS thread,
+/// mirroring http.lastTransportCause: Zig errors carry no payload, and a
+/// bare "DelegateFailed" reaching the user is a shrug where a diagnosis
+/// ("claude code error: Not logged in · Please run /login") exists.
+threadlocal var delegate_error_buf: [256]u8 = undefined;
+threadlocal var delegate_error_len: usize = 0;
+
+pub fn lastDelegateErrorNote() ?[]const u8 {
+    return if (delegate_error_len == 0) null else delegate_error_buf[0..delegate_error_len];
+}
+
+fn setDelegateError(text: []const u8) void {
+    delegate_error_len = @min(text.len, delegate_error_buf.len);
+    @memcpy(delegate_error_buf[0..delegate_error_len], text[0..delegate_error_len]);
+}
+
 const CcWatcher = struct {
     io: Io,
     cancel: ?*const std.atomic.Value(bool),
@@ -1342,12 +1358,12 @@ fn ccInvoke(
         .stderr = .pipe,
         .pgid = 0,
     }) catch |err| {
-        _ = try ap.append(.{ .system_note = .{
-            .text = if (err == error.FileNotFound)
-                "claude binary not found — install Claude Code (or set MARLIN_CLAUDE_CODE_BIN)"
-            else
-                "failed to spawn claude",
-        } });
+        const text: []const u8 = if (err == error.FileNotFound)
+            "claude binary not found — install Claude Code (or set MARLIN_CLAUDE_CODE_BIN)"
+        else
+            "failed to spawn claude";
+        setDelegateError(text);
+        _ = try ap.append(.{ .system_note = .{ .text = text } });
         return error.DelegateSpawnFailed;
     };
 
@@ -1457,6 +1473,7 @@ fn runClaudeCodeTurn(
     first_text: []const u8,
     fresh_first: bool,
 ) !TurnResult {
+    delegate_error_len = 0; // no stale detail from an earlier turn on this thread
     publishPhase(opts, .provider);
     var total_in: u64 = 0;
     var total_out: u64 = 0;
@@ -1512,7 +1529,9 @@ fn runClaudeCodeTurn(
             return .{ .text = try gpa.dupe(u8, ""), .rounds = rounds, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
         }
         if (outcome.timed_out) {
-            _ = try ap.append(.{ .system_note = .{ .text = "claude code run exceeded the 60-minute ceiling and was terminated" } });
+            const note = "claude code run exceeded the 60-minute ceiling and was terminated";
+            setDelegateError(note);
+            _ = try ap.append(.{ .system_note = .{ .text = note } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return error.DelegateTimeout;
         }
@@ -1527,6 +1546,7 @@ fn runClaudeCodeTurn(
                 },
             );
             defer gpa.free(note);
+            setDelegateError(note);
             _ = try ap.append(.{ .system_note = .{ .text = note } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return error.DelegateFailed;
@@ -1541,6 +1561,7 @@ fn runClaudeCodeTurn(
                 "no detail reported";
             const note = try std.fmt.allocPrint(gpa, "claude code error: {s}", .{detail});
             defer gpa.free(note);
+            setDelegateError(note);
             _ = try ap.append(.{ .system_note = .{ .text = note } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return error.DelegateFailed;

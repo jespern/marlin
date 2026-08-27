@@ -58,6 +58,12 @@ pub const Conn = struct {
     network_configured: bool = false,
     network_feed_count: u64 = 0,
     network_rule_count: u64 = 0,
+    /// Daemon build identity from hello_ok, for stale-daemon detection:
+    /// version string plus the daemon executable's mtime at ITS startup
+    /// (0 = unknown or a pre-field daemon).
+    daemon_version_buf: [64]u8 = undefined,
+    daemon_version_len: usize = 0,
+    daemon_exe_mtime_ms: i64 = 0,
 
     pub fn deinit(self: *Conn) void {
         switch (self.transport) {
@@ -86,6 +92,10 @@ pub const Conn = struct {
                 c.killed = true;
             },
         }
+    }
+
+    pub fn daemonVersion(self: *const Conn) []const u8 {
+        return self.daemon_version_buf[0..self.daemon_version_len];
     }
 
     pub fn send(self: *Conn, msg: proto.ClientMsg) !void {
@@ -265,6 +275,9 @@ fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !void 
     conn.network_configured = hello.network_configured;
     conn.network_feed_count = hello.network_feed_count;
     conn.network_rule_count = hello.network_rule_count;
+    conn.daemon_version_len = @min(hello.daemon_version.len, conn.daemon_version_buf.len);
+    @memcpy(conn.daemon_version_buf[0..conn.daemon_version_len], hello.daemon_version[0..conn.daemon_version_len]);
+    conn.daemon_exe_mtime_ms = hello.daemon_exe_mtime_ms;
 }
 
 /// Connect, autostarting the daemon if needed. Handshakes (hello/hello_ok).
