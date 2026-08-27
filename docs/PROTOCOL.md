@@ -10,7 +10,7 @@ never an accidental wire limit. Clients reject oversized outbound messages
 before optimistic UI state; the daemon drains an oversized inbound record and
 returns `err{line_too_long}` instead of silently dropping the connection.
 
-proto_version: 1
+proto_version: 2
 
 ## Connection lifecycle
 
@@ -52,6 +52,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
 | session_set_model | sid, model | ok, or err{busy} mid-turn. Native→guest (`claudecode/` prefix) starts a native handover turn (visible summary, then the model becomes guest). Other switches take effect immediately. |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
+| session_set_plan_mode | sid, enabled | ok, or err{busy} mid-turn; persists collaboration mode with the session |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on Claude Code sessions |
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded, err{guest} on Claude Code sessions |
 | sub | sid, from_seq, tail_limit?, before_seq?, around_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
@@ -60,6 +61,8 @@ policy that failed open. Both default false when decoding an older daemon.
 | council_list | — | council_list_result with every configured [[council]] roster |
 | council_set | name, models[] | council_list_result after atomically persisting the (new or replaced) [[council]] table to config.toml |
 | council_remove | name | council_list_result after atomically removing the table; err{council} when unknown |
+| plan_clear | sid, request_id? | plan_clear_result{sid,cleared,request_id}; idempotently completes the latest unfinished durable execution plan |
+| plan_accept | sid, request_id? | ok/err; leaves Plan mode and starts a synthetic implementation turn from the latest proposal |
 | mcp_list | — | mcp_list_result with per-server readiness, tool count, and discovery error |
 | mcp_add | name, cmd[] | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
 | mcp_remove | name | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |

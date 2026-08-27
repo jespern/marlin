@@ -419,8 +419,9 @@ live edge without a subscription gap, positions the viewport, and highlights
 the matching block. Normal-mode `n`/`N` advances through the retained result
 set without re-running the query.
 
-Schema v7 projects visible text into `search_docs` in the same transaction as
-the append-only block. User/assistant text, reasoning, steers, plans, bounded
+Schema v8 persists per-session Plan mode. Schema v7 projects visible text into
+`search_docs` in the same transaction as the append-only block. User/assistant
+text, reasoning, steers, plans, bounded
 tool arguments/results, compaction summaries, and notes are searchable;
 synthetic rehydration, approvals, binary data, base64, and uncapped blob bodies
 are not. Existing databases backfill once. At startup Marlin capability-checks
@@ -938,6 +939,14 @@ get these right; Hermes is the counter-example):
   things that change a decision *right now*. No session-duration counters, no
   feature-toggle indicators, no diagnostic chrome. Every candidate status item
   answers "would I act on this mid-turn?" or it stays out.
+- **Plan mode is collaboration state, not the todo list.** Shift+Tab toggles
+  persistent per-session Plan mode; `/plan [task]`, `/plan off`, and `/plan
+  clear` provide explicit entry, exit, and stale-todo recovery. Native turns
+  advertise only reads, search/fetch, and read-only child tasks—no bash,
+  writes, mutating extensions, or `plan_update`. Guest turns use Claude Code's
+  `--permission-mode plan`. A finalized proposal offers Implement, Revise,
+  Stay, and Dismiss; Implement atomically leaves Plan mode and starts a
+  synthetic implementation turn, which creates the durable execution todo.
 - **Todo/plan list pinned above the input** while work remains (**shipped**):
   `plan_update` appends immutable revisions to the block log; the daemon
   restores the latest unfinished revision independently of bounded replay and
@@ -957,7 +966,10 @@ get these right; Hermes is the counter-example):
   progress renders inline on that todo line
   (`▸ adversarial review  sol ✓ grok … glm ✓`) instead of spawning its own
   strip — the common case stays at exactly one strip. A strip must be live
-  (recently changed, potentially actionable) to hold vertical space.
+  (recently changed, potentially actionable) to hold vertical space. Durable
+  unfinished plans remain visible after a turn, but their active row shows a
+  paused mark and frozen active-time duration whenever the session is idle;
+  only a running turn may animate it.
 - **Liveness via text shimmer.** While a turn runs, the working indicator is
   an animated gradient/shimmer on the status word (the Claude/Codex rainbow
   effect), not spinner characters and not log lines. Cheap in a cell grid:

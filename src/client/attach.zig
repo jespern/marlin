@@ -446,7 +446,7 @@ const FlakyHelloServer = struct {
         var wbuf: [1024]u8 = undefined;
         var writer = Io.net.Stream.Writer.init(second, self.io, &wbuf);
         try writer.interface.writeAll(
-            "{\"hello_ok\":{\"proto_version\":1,\"daemon_version\":\"test\",\"network_filtering\":true}}\n",
+            "{\"hello_ok\":{\"proto_version\":2,\"daemon_version\":\"test\",\"network_filtering\":true}}\n",
         );
         try writer.interface.flush();
     }
@@ -523,7 +523,7 @@ test "child transport handshakes over subprocess stdio" {
     // everything until stdin EOF (which deinit provides by closing it).
     const conn = try spawnChildConn(gpa, io, &.{
         "/bin/sh",                                                                                                                             "-c",
-        "read line; printf '{\"hello_ok\":{\"proto_version\":1,\"daemon_version\":\"fake\",\"sandbox_available\":true}}\\n'; cat > /dev/null",
+        "read line; printf '{\"hello_ok\":{\"proto_version\":2,\"daemon_version\":\"fake\",\"sandbox_available\":true}}\\n'; cat > /dev/null",
     });
     handshake(conn, 5_000, null) catch |err| {
         conn.deinit();

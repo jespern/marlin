@@ -15,7 +15,7 @@ const std = @import("std");
 const block = @import("block.zig");
 pub const ReasoningEffort = @import("effort.zig").Effort;
 
-pub const proto_version: u32 = 1;
+pub const proto_version: u32 = 2;
 /// Maximum complete NDJSON record, including its trailing newline. Large
 /// blob replies can JSON-escape to several times their raw size, so this is
 /// deliberately larger than any supported tool capture while still bounding
@@ -144,6 +144,9 @@ pub const ClientMsg = union(enum) {
     session_rename: struct { sid: u64, title: []const u8 },
     session_set_model: struct { sid: u64, model: []const u8 },
     session_set_effort: struct { sid: u64, effort: ReasoningEffort },
+    /// Persist the session collaboration mode. Plan mode is daemon-enforced
+    /// read-only and survives client reconnects and daemon restarts.
+    session_set_plan_mode: struct { sid: u64, enabled: bool },
     /// Toggle the kernel shell sandbox (and its prompt-free shell execution)
     /// for one session. Enabling requires the daemon's verified backend
     /// (hello_ok.sandbox_available); the daemon rejects it otherwise.
@@ -221,6 +224,12 @@ pub const ClientMsg = union(enum) {
     council_remove: struct { name: []const u8 },
     /// List configured councils. Replies council_list_result.
     council_list: struct {},
+    /// Complete the latest unfinished durable execution plan without starting
+    /// a turn. Used by `/plan clear` as an explicit recovery path.
+    plan_clear: struct { sid: u64, request_id: u64 = 0 },
+    /// Accept the latest Plan-mode proposal: leave Plan mode, seed a durable
+    /// execution todo, and start implementation in one dispatcher operation.
+    plan_accept: struct { sid: u64, request_id: u64 = 0 },
     /// Blob-store maintenance (`marlin gc`): sweep orphan blobs, and demote
     /// full bodies older than expire_before_ms when non-zero. Runs in the
     /// daemon so the store keeps its single-connection discipline; replies
@@ -325,6 +334,9 @@ pub const DaemonMsg = union(enum) {
     /// Reply to council_set/council_remove/council_list: the full current
     /// council roster set, so clients replace their cache in one message.
     council_list_result: struct { councils: []const CouncilInfo },
+    /// Terminal reply to plan_clear. `cleared=false` means no unfinished plan
+    /// existed; either result is successful and idempotent.
+    plan_clear_result: struct { sid: u64, cleared: bool, request_id: u64 = 0 },
     interrupt_result: InterruptResult,
     /// `request_id` is non-zero only when replying to a correlated request
     /// (currently input). Defaults preserve compatibility in both directions.
@@ -362,6 +374,8 @@ pub const SessionInfo = struct {
     /// Whether Marlin-owned network tools enforce the loaded hostname policy
     /// for this session. Defaults false when decoding older daemons.
     network_filtering: bool = false,
+    /// Persistent collaboration mode. Defaults false for older daemons.
+    plan_mode: bool = false,
     /// Archived sessions appear only in explicitly inclusive list requests.
     archived: bool = false,
 };
@@ -466,6 +480,22 @@ test "round trip: client messages" {
     defer gpa.free(effort_line);
     const effort_back = try decode(ClientMsg, arena, effort_line);
     try std.testing.expectEqual(ReasoningEffort.xhigh, effort_back.session_set_effort.effort);
+
+    const plan_mode_msg: ClientMsg = .{ .session_set_plan_mode = .{ .sid = 9, .enabled = true } };
+    const plan_mode_line = try encode(gpa, plan_mode_msg);
+    defer gpa.free(plan_mode_line);
+    const plan_mode_back = try decode(ClientMsg, arena, plan_mode_line);
+    try std.testing.expect(plan_mode_back.session_set_plan_mode.enabled);
+
+    const plan_clear_line = try encode(gpa, ClientMsg{ .plan_clear = .{ .sid = 9, .request_id = 17 } });
+    defer gpa.free(plan_clear_line);
+    const plan_clear_back = try decode(ClientMsg, arena, plan_clear_line);
+    try std.testing.expectEqual(@as(u64, 17), plan_clear_back.plan_clear.request_id);
+
+    const plan_accept_line = try encode(gpa, ClientMsg{ .plan_accept = .{ .sid = 9, .request_id = 18 } });
+    defer gpa.free(plan_accept_line);
+    const plan_accept_back = try decode(ClientMsg, arena, plan_accept_line);
+    try std.testing.expectEqual(@as(u64, 18), plan_accept_back.plan_accept.request_id);
 
     const sandbox_msg: ClientMsg = .{ .session_set_sandbox = .{ .sid = 9, .enabled = false } };
     const sandbox_line = try encode(gpa, sandbox_msg);
@@ -589,6 +619,16 @@ test "round trip: client messages" {
     defer gpa.free(council_reply);
     const council_reply_back = try decode(DaemonMsg, arena, council_reply);
     try std.testing.expectEqualStrings("core", council_reply_back.council_list_result.councils[0].name);
+
+    const plan_clear_reply = try encode(gpa, DaemonMsg{ .plan_clear_result = .{
+        .sid = 9,
+        .cleared = true,
+        .request_id = 17,
+    } });
+    defer gpa.free(plan_clear_reply);
+    const plan_clear_reply_back = try decode(DaemonMsg, arena, plan_clear_reply);
+    try std.testing.expect(plan_clear_reply_back.plan_clear_result.cleared);
+    try std.testing.expectEqual(@as(u64, 17), plan_clear_reply_back.plan_clear_result.request_id);
 }
 
 test "latest plan survives the replay marker wire" {

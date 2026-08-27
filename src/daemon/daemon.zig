@@ -60,6 +60,10 @@ const tools_registry = @import("tools/registry.zig");
 
 const daemon_version = build_options.version;
 
+const plan_accept_prompt =
+    \\Implement the plan you just proposed. First create a concise durable execution plan with plan_update, then carry it through completion. Do not re-plan unless implementation evidence requires a change.
+;
+
 const round_checkpoint_prompt =
     \\Continue the current task from the durable transcript. An internal worker-round checkpoint was reached; this is not a user-requested stop. Resume the existing plan and work through completion, then give the user the final answer.
 ;
@@ -208,6 +212,7 @@ const Session = struct {
     model: []u8, // gpa-owned
     effort: proto.ReasoningEffort = .auto,
     cwd: []u8, // gpa-owned
+    plan_mode: bool = false,
     state: proto.SessionState = .idle,
     turn_thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = .init(false),
@@ -1153,6 +1158,21 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(se.sid);
             },
+            .session_set_plan_mode => |sp| {
+                const session = (try self.getOrLoadSession(sp.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (self.rejectArchivedSession(client, session)) return;
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot change plan mode mid-turn" } });
+                    return;
+                }
+                try self.store.setSessionPlanMode(sp.sid, sp.enabled);
+                session.plan_mode = sp.enabled;
+                self.sendTo(client, .{ .ok = .{} });
+                self.broadcastSessionUpsert(sp.sid);
+            },
             .session_set_sandbox => |ss| {
                 const session = (try self.getOrLoadSession(ss.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
@@ -1603,6 +1623,7 @@ pub const Daemon = struct {
                     .kind = session.kind,
                     .max_rounds = session.max_rounds,
                     .approval_mode = session.approval_mode,
+                    .plan_mode = false,
                     .cancel = &session.cancel,
                     .session = session,
                 };
@@ -1669,6 +1690,51 @@ pub const Daemon = struct {
                     return;
                 };
                 try self.sendCouncilList(client);
+            },
+            .plan_clear => |request| {
+                const session = (try self.getOrLoadSession(request.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session", .request_id = request.request_id } });
+                    return;
+                };
+                if (self.rejectArchivedSession(client, session)) return;
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot clear a plan mid-turn", .request_id = request.request_id } });
+                    return;
+                }
+                self.sendTo(client, .{ .plan_clear_result = .{
+                    .sid = request.sid,
+                    .cleared = try self.clearLatestPlan(request.sid),
+                    .request_id = request.request_id,
+                } });
+            },
+            .plan_accept => |request| {
+                const session = (try self.getOrLoadSession(request.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session", .request_id = request.request_id } });
+                    return;
+                };
+                if (self.rejectArchivedSession(client, session)) return;
+                if (!session.plan_mode) {
+                    self.sendTo(client, .{ .err = .{ .code = "not_plan_mode", .msg = "session is not in Plan mode", .request_id = request.request_id } });
+                    return;
+                }
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot accept a plan mid-turn", .request_id = request.request_id } });
+                    return;
+                }
+                try self.store.setSessionPlanMode(request.sid, false);
+                session.plan_mode = false;
+                self.broadcastSessionUpsert(request.sid);
+                self.startTurnWithOptions(session, plan_accept_prompt, &.{}, true) catch |err| {
+                    try self.store.setSessionPlanMode(request.sid, true);
+                    session.plan_mode = true;
+                    self.broadcastSessionUpsert(request.sid);
+                    if (err == error.SessionBusy) {
+                        self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "session already has an active turn", .request_id = request.request_id } });
+                        return;
+                    }
+                    return err;
+                };
+                self.sendTo(client, .{ .ok = .{ .request_id = request.request_id } });
             },
             .mcp_restart => |request| {
                 if (self.anySessionBusy()) {
@@ -1855,6 +1921,34 @@ pub const Daemon = struct {
     /// Sessions are loaded lazily after daemon restart. Settings and manual
     /// compaction must work before the first new input, not only after the
     /// input path happens to rehydrate the row.
+    fn clearLatestPlan(self: *Daemon, sid: u64) !bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const latest = try self.store.loadLatestPlan(arena, sid) orelse return false;
+        if (!latest.pinned) return false;
+
+        const items = try arena.alloc(block.PlanItem, latest.items.len);
+        for (latest.items, 0..) |item, i| {
+            items[i] = item;
+            items[i].status = .completed;
+            items[i].started_at_ms = 0;
+        }
+        const blk = block.Block{
+            .id = ids.next(self.io),
+            .session_id = sid,
+            .turn_id = ids.next(self.io),
+            .seq = try self.store.lastSeq(sid) + 1,
+            .ts = nowMs(self.io),
+            .body = .{ .plan = .{ .items = items } },
+        };
+        try self.store.appendBlock(blk);
+        const line = try proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = sid, .b = blk } });
+        defer self.gpa.free(line);
+        self.fanOutLine(sid, line);
+        return true;
+    }
+
     fn getOrLoadSession(self: *Daemon, sid: u64) !?*Session {
         if (self.sessions.get(sid)) |session| return session;
         const row = self.store.getSession(sid) catch |err| switch (err) {
@@ -1880,6 +1974,7 @@ pub const Daemon = struct {
             .model = model,
             .effort = row.effort,
             .cwd = cwd,
+            .plan_mode = row.plan_mode,
             .sandbox_enabled = self.cfg.permissions_enabled,
             .network_filtering_enabled = self.network.isActive(),
         };
@@ -2170,6 +2265,7 @@ pub const Daemon = struct {
         kind: proto.SessionKind,
         max_rounds: u32,
         approval_mode: approval.Mode,
+        plan_mode: bool,
         synthetic_input: bool = false,
         cancel: *std.atomic.Value(bool),
         /// Live turn state only; configuration must use the value fields above.
@@ -2212,6 +2308,7 @@ pub const Daemon = struct {
             .kind = session.kind,
             .max_rounds = session.max_rounds,
             .approval_mode = session.approval_mode,
+            .plan_mode = session.plan_mode,
             .synthetic_input = synthetic_input,
             .cancel = &session.cancel,
             .session = session,
@@ -2261,6 +2358,7 @@ pub const Daemon = struct {
             .kind = session.kind,
             .max_rounds = session.max_rounds,
             .approval_mode = session.approval_mode,
+            .plan_mode = session.plan_mode,
             .cancel = &session.cancel,
             .session = session,
         };
@@ -2480,7 +2578,7 @@ pub const Daemon = struct {
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
             .on_task = if (job.kind == .root) TurnHooks.onTask else null,
-            .tool_profile = if (job.kind == .root) .full else .read_only,
+            .tool_profile = if (job.kind != .root) .read_only else if (job.plan_mode) .plan else .full,
             .synthetic_input = job.synthetic_input,
             .auto_continue_round_budget = job.kind == .root,
             .cancel = job.cancel,
@@ -2954,6 +3052,7 @@ pub const Daemon = struct {
                 .sandboxed = self.sandbox_backend != .unavailable and
                     (if (live) |session| session.sandbox_enabled else self.cfg.permissions_enabled),
                 .full_access = if (live) |session| session.approval_mode == .auto else false,
+                .plan_mode = if (live) |session| session.plan_mode else row.plan_mode,
                 .network_filtering = self.network.isActive() and
                     (if (live) |session| session.network_filtering_enabled else true),
                 .archived = row.archived,

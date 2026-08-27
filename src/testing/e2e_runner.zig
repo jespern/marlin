@@ -710,7 +710,7 @@ fn connectProtocol(
 ) !*ProtocolConn {
     const conn = try ProtocolConn.connect(gpa, io, env);
     errdefer conn.deinit();
-    try conn.send(.{ .hello = .{ .proto_version = 1, .client_kind = "e2e-protocol" } });
+    try conn.send(.{ .hello = .{ .proto_version = proto.proto_version, .client_kind = "e2e-protocol" } });
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     _ = try recvTagBounded(conn, arena_state.allocator(), "hello_ok");

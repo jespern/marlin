@@ -31,7 +31,7 @@ pub fn binaryPath(environ: ?*const std.process.Environ.Map) []const u8 {
 }
 
 /// Claude Code's own permission posture for the delegated session.
-pub const Permissions = enum { accept_edits, bypass };
+pub const Permissions = enum { accept_edits, bypass, plan };
 
 /// Wiring for the marlin permission bridge: instead of headless auto-deny,
 /// Claude Code's permission prompts route over MCP to
@@ -111,6 +111,7 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
             }
         },
         .bypass => try argv.append(arena, "--dangerously-skip-permissions"),
+        .plan => try argv.appendSlice(arena, &.{ "--permission-mode", "plan" }),
     }
     try argv.appendSlice(arena, &.{
         "--max-turns",
@@ -512,6 +513,19 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     for (resumed) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--model"));
     try std.testing.expectEqualStrings("--resume", resumed[6]);
     try std.testing.expectEqualStrings("--dangerously-skip-permissions", resumed[8]);
+
+    const planned = try buildArgv(arena, .{
+        .binary = "claude",
+        .prompt = "design it",
+        .model = "default",
+        .session_uuid = "u-u-i-d",
+        .fresh = false,
+        .permissions = .plan,
+        .max_turns = 8,
+    });
+    try std.testing.expectEqualStrings("--permission-mode", planned[8]);
+    try std.testing.expectEqualStrings("plan", planned[9]);
+    for (planned) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--dangerously-skip-permissions"));
 
     const bridged = try buildArgv(arena, .{
         .binary = "claude",

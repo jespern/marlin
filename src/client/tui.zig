@@ -268,6 +268,7 @@ const SessionSummary = struct {
     network_filtering: bool,
     /// Approval mode is "auto" (/permissions full) for this session.
     full_access: bool,
+    plan_mode: bool,
 
     fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
@@ -363,6 +364,8 @@ const SavedSessionView = struct {
     tokens_out: u64,
     context_used: u64,
     context_limit: u64,
+    plan_mode: bool,
+    plan_proposal_ready: bool,
     scroll_up: usize,
     last_total_lines: usize,
     last_first_visible: usize,
@@ -441,6 +444,11 @@ const App = struct {
     tokens_out: u64 = 0,
     context_used: u64 = 0,
     context_limit: u64 = 0,
+    /// Persistent daemon-owned collaboration mode for the active session.
+    plan_mode: bool = false,
+    /// An idle final answer from a Plan-mode turn can be implemented or
+    /// revised without retyping the proposal.
+    plan_proposal_ready: bool = false,
     /// Highest durable block incorporated for the active session.
     last_seq: u64 = 0,
     /// Initial attach is a bounded tail. `history_complete=false` means a
@@ -906,6 +914,8 @@ const App = struct {
         self.tokens_out = 0;
         self.context_used = 0;
         self.context_limit = 0;
+        self.plan_mode = false;
+        self.plan_proposal_ready = false;
         self.last_seq = 0;
         self.oldest_seq = 0;
         self.history_complete = true;
@@ -951,6 +961,8 @@ const App = struct {
             .tokens_out = self.tokens_out,
             .context_used = self.context_used,
             .context_limit = self.context_limit,
+            .plan_mode = self.plan_mode,
+            .plan_proposal_ready = self.plan_proposal_ready,
             .scroll_up = self.scroll_up,
             .last_total_lines = self.last_total_lines,
             .last_first_visible = self.last_first_visible,
@@ -1016,6 +1028,8 @@ const App = struct {
         self.tokens_out = saved.tokens_out;
         self.context_used = saved.context_used;
         self.context_limit = saved.context_limit;
+        self.plan_mode = saved.plan_mode;
+        self.plan_proposal_ready = saved.plan_proposal_ready;
         self.scroll_up = saved.scroll_up;
         self.last_total_lines = saved.last_total_lines;
         self.last_first_visible = saved.last_first_visible;
@@ -1064,6 +1078,7 @@ const App = struct {
             try self.cwd.appendSlice(self.gpa, summary.cwd);
             self.effort = summary.effort;
             self.state = summary.state;
+            self.plan_mode = summary.plan_mode;
         }
         if (self.background_approvals.get(sid)) |pending| {
             self.pending = pending;
@@ -1147,6 +1162,7 @@ const App = struct {
                 try self.cwd.appendSlice(self.gpa, summary.cwd);
                 self.effort = summary.effort;
                 self.state = summary.state;
+                self.plan_mode = summary.plan_mode;
             }
             if (self.background_approvals.get(sid)) |pending| {
                 self.pending = pending;
@@ -1245,8 +1261,12 @@ const App = struct {
 
             if (info.sid == self.sid) {
                 self.state = info.state;
+                self.plan_mode = info.plan_mode;
+                if (!info.plan_mode) self.plan_proposal_ready = false;
             } else if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
+                saved.plan_mode = info.plan_mode;
+                if (!info.plan_mode) saved.plan_proposal_ready = false;
             }
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
         }
@@ -1328,6 +1348,7 @@ const App = struct {
             .sandboxed = info.sandboxed,
             .network_filtering = info.network_filtering,
             .full_access = info.full_access,
+            .plan_mode = info.plan_mode,
         };
     }
 
@@ -1344,8 +1365,14 @@ const App = struct {
                 self.state = info.state;
                 self.setModelStr(info.model);
                 self.permissions_full = info.full_access;
+                self.plan_mode = info.plan_mode;
+                if (!info.plan_mode) self.plan_proposal_ready = false;
             }
-            if (self.saved_views.get(info.sid)) |saved| saved.state = info.state;
+            if (self.saved_views.get(info.sid)) |saved| {
+                saved.state = info.state;
+                saved.plan_mode = info.plan_mode;
+                if (!info.plan_mode) saved.plan_proposal_ready = false;
+            }
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
             return;
         }
@@ -1389,7 +1416,11 @@ const App = struct {
             break;
         };
         if (!known_recent) self.recent_sessions.append(self.gpa, info.sid) catch {};
-        if (info.sid == self.sid) self.state = info.state;
+        if (info.sid == self.sid) {
+            self.state = info.state;
+            self.plan_mode = info.plan_mode;
+            if (!info.plan_mode) self.plan_proposal_ready = false;
+        }
     }
 
     fn removeSessionSummary(self: *App, sid: u64) void {
@@ -1728,6 +1759,16 @@ const App = struct {
                 self.setNotice("tab bar {s} (saved to config.toml)", .{onOff(result.tab_bar)});
             },
             .council_list_result => |result| self.applyCouncils(result.councils),
+            .plan_clear_result => |result| {
+                if (result.sid != self.sid) return;
+                if (result.cleared) {
+                    deinitPlan(self.gpa, &self.plan);
+                    self.layout_epoch +%= 1;
+                    self.setNotice("execution plan cleared", .{});
+                } else {
+                    self.setNotice("no unfinished execution plan", .{});
+                }
+            },
             .session_meta => |m| {
                 if (m.sid != self.sid) return;
                 self.tokens_in = m.tokens_in;
@@ -1758,7 +1799,10 @@ const App = struct {
     fn applyBlock(self: *App, b: block.Block) void {
         switch (b.body) {
             .user_msg => |u| {
-                if (!u.synthetic and !isLegacyRehydration(u.text)) self.clearCompletedPlan();
+                if (!u.synthetic and !isLegacyRehydration(u.text)) {
+                    self.clearCompletedPlan();
+                    self.plan_proposal_ready = false;
+                }
                 if (u.synthetic or isLegacyRehydration(u.text)) {
                     const label = rehydrationLabel(self.gpa, u.text) catch return;
                     defer self.gpa.free(label);
@@ -1794,6 +1838,7 @@ const App = struct {
                 // Finalized text replaces the streaming delta.
                 self.releaseStreamingBuffers();
                 self.pushDurableBlock(b, .assistant_msg, a.text, "", .ok);
+                if (self.plan_mode and !self.history_loading) self.plan_proposal_ready = true;
             },
             .reasoning => |r| {
                 // Reasoning and progress commentary use distinct live streams
@@ -2124,6 +2169,23 @@ const App = struct {
                 self.showCouncilDetail(action.?);
             } else {
                 self.setNotice("usage: /council [<name>|new <name>|edit <name>|remove <name>]", .{});
+            }
+        } else if (std.mem.eql(u8, head, "/plan")) {
+            const arg = std.mem.trim(u8, it.rest(), " \t");
+            if (std.mem.eql(u8, arg, "clear")) {
+                if (self.state == .running or self.state == .awaiting_approval) {
+                    self.setNotice("cannot clear a plan mid-turn", .{});
+                    return;
+                }
+                self.conn.send(.{ .plan_clear = .{ .sid = self.sid } }) catch {
+                    self.setNotice("could not clear plan", .{});
+                };
+            } else if (std.mem.eql(u8, arg, "off")) {
+                _ = self.setPlanMode(false);
+            } else if (arg.len == 0) {
+                _ = self.setPlanMode(true);
+            } else if (self.setPlanMode(true)) {
+                self.submitInput(arg);
             }
         } else if (std.mem.eql(u8, head, "/review")) {
             const name = it.next() orelse {
@@ -3016,6 +3078,38 @@ const App = struct {
         return self.conn.sandbox_available;
     }
 
+    fn setPlanMode(self: *App, enabled: bool) bool {
+        if (self.state == .running or self.state == .awaiting_approval) {
+            self.setNotice("cannot change Plan mode mid-turn", .{});
+            return false;
+        }
+        self.conn.send(.{ .session_set_plan_mode = .{ .sid = self.sid, .enabled = enabled } }) catch {
+            self.setNotice("could not change Plan mode", .{});
+            return false;
+        };
+        self.plan_mode = enabled;
+        self.plan_proposal_ready = false;
+        if (enabled)
+            self.setNotice("Plan mode on · read-only investigation · Shift+Tab exits", .{})
+        else
+            self.setNotice("Plan mode off", .{});
+        return true;
+    }
+
+    fn togglePlanMode(self: *App) void {
+        _ = self.setPlanMode(!self.plan_mode);
+    }
+
+    fn acceptPlanProposal(self: *App) void {
+        if (!self.plan_mode or !self.plan_proposal_ready or self.state != .idle) return;
+        self.conn.send(.{ .plan_accept = .{ .sid = self.sid } }) catch {
+            self.setNotice("could not start implementation", .{});
+            return;
+        };
+        self.plan_proposal_ready = false;
+        self.setNotice("plan accepted · starting implementation…", .{});
+    }
+
     /// /permissions full|default — session-wide approval switch. Full
     /// access means NOTHING asks (the --yolo mode, chosen mid-session);
     /// default restores boundary-crossing prompts. Tracked optimistically:
@@ -3511,7 +3605,9 @@ fn commandQuery(editor: *const Editor) ?[]const u8 {
     if (std.mem.indexOfAny(u8, text, "\r\n") != null) return null;
     if (std.mem.indexOfAny(u8, text, " \t")) |space| {
         const head = text[0..space];
-        if (!std.mem.eql(u8, head, "/council") and !std.mem.eql(u8, head, "/review")) return null;
+        if (!std.mem.eql(u8, head, "/council") and
+            !std.mem.eql(u8, head, "/review") and
+            !std.mem.eql(u8, head, "/plan")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
         if (std.mem.indexOfAny(u8, rest, " \t") != null) return null;
     }
@@ -3568,6 +3664,28 @@ fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Comman
                     .description = try std.fmt.allocPrint(arena, "review with council · {d} models", .{council.models.items.len}),
                     .replacement = replacement,
                     .submit_on_enter = false,
+                });
+            }
+        }
+        return out.items;
+    }
+    if (query.len > "/plan".len and
+        std.mem.eql(u8, query[0.."/plan".len], "/plan") and
+        (query["/plan".len] == ' ' or query["/plan".len] == '\t'))
+    {
+        const rest = std.mem.trimStart(u8, query["/plan".len..], " \t");
+        const actions = [_]struct { name: []const u8, description: []const u8 }{
+            .{ .name = "off", .description = "leave Plan mode" },
+            .{ .name = "clear", .description = "clear the durable execution todo" },
+        };
+        for (actions) |action| {
+            if (rest.len <= action.name.len and std.ascii.eqlIgnoreCase(rest, action.name[0..rest.len])) {
+                const replacement = try std.fmt.allocPrint(arena, "/plan {s}", .{action.name});
+                try out.append(arena, .{
+                    .label = replacement,
+                    .description = action.description,
+                    .replacement = replacement,
+                    .submit_on_enter = true,
                 });
             }
         }
@@ -4398,14 +4516,17 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         const query = app.history_search_query.items;
         const query_end = hardCellBreak(query, 0, @max(@as(usize, w) / 3, 1));
         break :search_prompt try std.fmt.allocPrint(arena, "⌕ '{s}'▏: ", .{query[0..query_end]});
-    } else if (app.mode == .insert)
+    } else if (app.plan_mode)
+        if (app.mode == .insert) "PLAN ❯ " else "PLAN : "
+    else if (app.mode == .insert)
         "❯ "
     else
         ": ";
     const panel_inner_w = w -| 2; // one cell of horizontal padding
     const editor_body_w = @max(panel_inner_w -| displayWidth(prompt), 1);
     const content_h: u16 = @intCast(app.editor.displayHeight(editor_body_w));
-    const input_h: u16 = @intCast(inputPanelHeight(content_h));
+    const proposal_ready = app.plan_mode and app.plan_proposal_ready and app.state == .idle;
+    const input_h: u16 = @intCast(inputPanelHeight(content_h) + @intFromBool(proposal_ready));
     // The plan's final framed row provides breathing room before the composer;
     // the ordinary transcript gap remains above the lowest surface.
     const surfaces = planSurfaceLayout(h, top_rows, input_h, app.plan.items);
@@ -4613,7 +4734,13 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         .width = panel_inner_w,
         .height = content_h,
     });
-    app.editor.draw(input_win, prompt, Palette.prompt_mark, Palette.prompt_text);
+    app.editor.draw(input_win, prompt, if (app.plan_mode) Palette.plan_active else Palette.prompt_mark, Palette.prompt_text);
+    if (proposal_ready) {
+        _ = input_panel.printSegment(.{
+            .text = " Enter implement · e revise · Esc stay · q dismiss",
+            .style = Palette.plan_active,
+        }, .{ .row_offset = input_h - 1, .wrap = .none });
+    }
     if (app.mode == .normal or app.history_search_active) win.hideCursor();
     try drawCommandMenu(app, win, arena, input_top, w);
 
@@ -4835,9 +4962,9 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         Palette.status_context_warn
     else
         Palette.status_sep;
-    const full_txt: []const u8 = if (app.permissions_full) "FULL ACCESS" else "";
+    const mode_txt: []const u8 = if (app.plan_mode) "PLAN" else if (app.permissions_full) "FULL ACCESS" else "";
     var right_w: u16 = sandbox_cols + 1 + @as(u16, @intCast(dns_txt.len)) + 3;
-    if (full_txt.len > 0) right_w += @intCast(full_txt.len + 3);
+    if (mode_txt.len > 0) right_w += @intCast(mode_txt.len + 3);
     if (status_win.width > right_w) {
         const right_win = status_win.child(.{
             .x_off = @intCast(status_win.width - right_w),
@@ -4845,8 +4972,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         });
         var right_segments: [6]vaxis.Segment = undefined;
         var right_n: usize = 0;
-        if (full_txt.len > 0) {
-            right_segments[right_n] = .{ .text = full_txt, .style = Palette.status_approval };
+        if (mode_txt.len > 0) {
+            right_segments[right_n] = .{ .text = mode_txt, .style = if (app.plan_mode) Palette.plan_active else Palette.status_approval };
             right_n += 1;
             right_segments[right_n] = .{ .text = " · ", .style = Palette.status_sep };
             right_n += 1;
@@ -5954,6 +6081,28 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
+    if (isPlanToggleKey(key)) {
+        app.togglePlanMode();
+        return;
+    }
+
+    if (app.plan_proposal_ready and app.plan_mode and app.state == .idle) {
+        switch (planProposalAction(key)) {
+            .implement => app.acceptPlanProposal(),
+            .revise => {
+                app.plan_proposal_ready = false;
+                app.mode = .insert;
+                app.setNotice("revise the plan in the composer", .{});
+            },
+            .dismiss => {
+                app.plan_proposal_ready = false;
+                app.setNotice("proposal dismissed · Plan mode remains on", .{});
+            },
+            .stay, .none => {},
+        }
+        return;
+    }
+
     // A mode-independent, single-chord alias for /new. Pickers retain Vim's
     // Ctrl+n navigation because their modal block above consumes it first.
     if (isNewSessionKey(key)) {
@@ -6450,6 +6599,15 @@ test "composer suggestions include commands, council actions, and council names"
     completeSuggestion(&app.editor, suggestions[0], false);
     try std.testing.expectEqualStrings("/review adversarial ", app.editor.text.items);
     try std.testing.expect(commandQuery(&app.editor) == null);
+
+    app.editor.clear();
+    app.editor.insertSlice("/plan c");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/plan clear", suggestions[0].label);
+    try std.testing.expect(suggestions[0].submit_on_enter);
 }
 
 test "command menu Tab completes and Enter runs the selection" {
@@ -8757,6 +8915,91 @@ test "J joins lines; gg tops; gt cycles sessions" {
     try std.testing.expect(app.copy_cursor == null);
     try std.testing.expect(app.copy_pending);
     try std.testing.expect(app.sel_clear_after_copy);
+}
+
+test "Plan mode keys distinguish toggle and proposal actions" {
+    try std.testing.expect(isPlanToggleKey(.{ .codepoint = vaxis.Key.tab, .mods = .{ .shift = true } }));
+    try std.testing.expect(!isPlanToggleKey(.{ .codepoint = vaxis.Key.tab }));
+    try std.testing.expectEqual(PlanProposalAction.implement, planProposalAction(.{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expectEqual(PlanProposalAction.revise, planProposalAction(.{ .codepoint = 'e' }));
+    try std.testing.expectEqual(PlanProposalAction.stay, planProposalAction(.{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expectEqual(PlanProposalAction.dismiss, planProposalAction(.{ .codepoint = 'q' }));
+    try std.testing.expectEqual(PlanProposalAction.none, planProposalAction(.{ .codepoint = 'x' }));
+}
+
+test "Plan clear result removes only the active session todo" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 7,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    try app.plan.append(gpa, .{ .step = try gpa.dupe(u8, "stale work"), .status = .in_progress });
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .plan_clear_result = .{
+        .sid = 8,
+        .cleared = true,
+    } }));
+    try std.testing.expectEqual(@as(usize, 1), app.plan.items.len);
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .plan_clear_result = .{
+        .sid = 7,
+        .cleared = true,
+    } }));
+    try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
+    try std.testing.expectEqualStrings("execution plan cleared", app.notice.items);
+}
+
+test "Plan mode proposal becomes actionable only from a live finalized answer" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .plan_mode = true,
+    };
+    defer app.deinit();
+
+    app.history_loading = true;
+    app.applyBlock(.{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 0,
+        .body = .{ .assistant_msg = .{ .text = "old proposal" } },
+    });
+    try std.testing.expect(!app.plan_proposal_ready);
+
+    app.history_loading = false;
+    app.applyBlock(.{
+        .id = 2,
+        .session_id = 1,
+        .turn_id = 2,
+        .seq = 2,
+        .ts = 0,
+        .body = .{ .assistant_msg = .{ .text = "new proposal" } },
+    });
+    try std.testing.expect(app.plan_proposal_ready);
+
+    app.applyBlock(.{
+        .id = 3,
+        .session_id = 1,
+        .turn_id = 3,
+        .seq = 3,
+        .ts = 0,
+        .body = .{ .user_msg = .{ .text = "revise it" } },
+    });
+    try std.testing.expect(!app.plan_proposal_ready);
 }
 
 test "plan table centers current work and retains completed timings" {

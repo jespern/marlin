@@ -54,7 +54,8 @@ const schema_sql =
     \\  kind TEXT NOT NULL DEFAULT 'root',
     \\  parent_block_id INTEGER REFERENCES blocks(id),
     \\  max_rounds INTEGER,
-    \\  archived_at INTEGER
+    \\  archived_at INTEGER,
+    \\  plan_mode INTEGER NOT NULL DEFAULT 0
     \\);
     \\CREATE TABLE IF NOT EXISTS blocks(
     \\  id INTEGER PRIMARY KEY,
@@ -86,7 +87,7 @@ const schema_sql =
     \\  text TEXT NOT NULL
     \\);
     \\CREATE INDEX IF NOT EXISTS search_docs_by_session ON search_docs(session_id, seq);
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','7');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','8');
 ;
 
 pub const SessionRow = struct {
@@ -103,6 +104,7 @@ pub const SessionRow = struct {
     tokens_in: u64,
     tokens_out: u64,
     archived: bool,
+    plan_mode: bool,
 };
 
 pub const GcReport = struct {
@@ -226,6 +228,14 @@ pub const Store = struct {
                 \\);
                 \\CREATE INDEX IF NOT EXISTS search_docs_by_session ON search_docs(session_id, seq);
                 \\UPDATE kv SET value='7' WHERE key='schema_version';
+            );
+        }
+        if (ver < 8) {
+            // Plan mode is collaboration state, not a client preference. It
+            // survives reconnects and daemon restarts with the session.
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0;
+                \\UPDATE kv SET value='8' WHERE key='schema_version';
             );
         }
     }
@@ -466,6 +476,14 @@ pub const Store = struct {
         try stepDone(stmt);
     }
 
+    pub fn setSessionPlanMode(self: Store, id: u64, enabled: bool) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET plan_mode=? WHERE id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, if (enabled) 1 else 0);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
     pub const SessionListing = struct {
         id: u64,
         parent_sid: ?u64,
@@ -479,6 +497,7 @@ pub const Store = struct {
         status: []const u8,
         created_at: i64,
         archived: bool,
+        plan_mode: bool,
 
         pub fn deinit(self: SessionListing, gpa: std.mem.Allocator) void {
             gpa.free(self.title);
@@ -510,6 +529,7 @@ pub const Store = struct {
             .status = status,
             .created_at = c.sqlite3_column_int64(stmt, 10),
             .archived = c.sqlite3_column_int64(stmt, 11) != 0,
+            .plan_mode = c.sqlite3_column_int64(stmt, 12) != 0,
         };
     }
 
@@ -519,7 +539,7 @@ pub const Store = struct {
         const stmt = try self.prepare(
             \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
             \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
-            \\       s.archived_at IS NOT NULL
+            \\       s.archived_at IS NOT NULL, s.plan_mode
             \\FROM sessions s
             \\WHERE (? OR s.archived_at IS NULL)
             \\ORDER BY COALESCE((SELECT p.created_at FROM sessions p WHERE p.id=s.parent_sid), s.created_at) DESC,
@@ -551,7 +571,7 @@ pub const Store = struct {
         const stmt = try self.prepare(
             \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
             \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
-            \\       s.archived_at IS NOT NULL
+            \\       s.archived_at IS NOT NULL, s.plan_mode
             \\FROM sessions s WHERE s.id=?
         );
         defer finalize(stmt);
@@ -573,7 +593,7 @@ pub const Store = struct {
             \\)
             \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
             \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
-            \\       s.archived_at IS NOT NULL
+            \\       s.archived_at IS NOT NULL, s.plan_mode
             \\FROM sessions s JOIN session_tree t ON t.id=s.id
             \\ORDER BY CASE WHEN s.parent_sid IS NULL THEN 0 ELSE 1 END,
             \\         s.created_at ASC, s.id ASC
@@ -611,7 +631,7 @@ pub const Store = struct {
     /// Fetch one session row. Strings are allocated with gpa; caller frees.
     pub fn getSession(self: Store, id: u64) Error!SessionRow {
         const stmt = try self.prepare(
-            "SELECT parent_sid, kind, parent_block_id, COALESCE(max_rounds, 0), title, cwd, model, effort, status, tokens_in, tokens_out, archived_at IS NOT NULL FROM sessions WHERE id=?",
+            "SELECT parent_sid, kind, parent_block_id, COALESCE(max_rounds, 0), title, cwd, model, effort, status, tokens_in, tokens_out, archived_at IS NOT NULL, plan_mode FROM sessions WHERE id=?",
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(id));
@@ -632,6 +652,7 @@ pub const Store = struct {
             .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 9)),
             .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 10)),
             .archived = c.sqlite3_column_int64(stmt, 11) != 0,
+            .plan_mode = c.sqlite3_column_int64(stmt, 12) != 0,
         };
     }
 
@@ -2002,15 +2023,20 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v7 with search projection and without duplicate block index" {
+test "schema is v8 with plan mode and search projection" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 7), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 8), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 7), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 8), try store.kvGetInt("schema_version"));
+    try store.createSession(42, 1, "/tmp", "m", .auto);
+    try store.setSessionPlanMode(42, true);
+    const row = try store.getSession(42);
+    defer store.freeSession(row);
+    try std.testing.expect(row.plan_mode);
     const stmt = try store.prepare("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='blocks_by_session'");
     defer finalize(stmt);
     try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));

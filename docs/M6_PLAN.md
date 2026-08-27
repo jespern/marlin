@@ -33,6 +33,9 @@ children. Marlin tools still do not enter the guest loop.
 - Named councils are shipped: daemon-owned atomic config, `/council`
   management, `/review` fan-out, durable `review_child` sessions, parent
   synthesis, and bridge-enforced read-only Claude Code seats.
+- Persistent Plan mode is shipped: Shift+Tab and `/plan` enter a daemon-enforced
+  read-only collaboration mode, accepted proposals transition directly into a
+  durable implementation plan, and `/plan clear` recovers stale todos.
 - `parallel_safe` is **enforced** (this superseded the earlier
   "metadata-only" state): `loop.zig` runs each maximal consecutive safe group
   in chunks of at most eight worker threads and joins before persisting results

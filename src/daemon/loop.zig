@@ -38,7 +38,7 @@ pub const Endpoint = struct {
 };
 
 pub const ToolPhase = enum { start, done };
-pub const ToolProfile = enum { full, read_only };
+pub const ToolProfile = enum { full, read_only, plan };
 
 pub const RunOpts = struct {
     session_id: u64,
@@ -107,8 +107,9 @@ pub const RunOpts = struct {
     /// Daemon-owned durable-child primitive. It receives the already-persisted
     /// parent tool_call block id and parks this turn until the child completes.
     on_task: ?*const fn (ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut = null,
-    /// Read-only child sessions advertise only non-mutating tools and never
-    /// advertise task, preventing recursive delegation in the first M6 cut.
+    /// Read-only children omit mutating tools and recursive task. Plan mode is
+    /// stricter: no bash, no mutations, no plan_update, but read-only tasks
+    /// remain available for investigation.
     tool_profile: ToolProfile = .full,
     /// Internal continuation prompts remain model-visible without appearing as
     /// authored user input or entering composer history.
@@ -621,12 +622,14 @@ pub fn runTurn(
 
         const frontier: u64 = if (opts.prune_frontier) |pf| pf.* else 0;
         const extension_prompt_suffix = if (opts.extensions) |ext| ext.systemPromptSuffix() else "";
-        const system_prompt_suffix = if (!web_search_available)
-            extension_prompt_suffix
-        else if (extension_prompt_suffix.len == 0)
-            openrouter_web_search_prompt
+        var prompt_parts: std.ArrayList([]const u8) = .empty;
+        if (extension_prompt_suffix.len > 0) try prompt_parts.append(arena, extension_prompt_suffix);
+        if (web_search_available) try prompt_parts.append(arena, openrouter_web_search_prompt);
+        if (opts.tool_profile == .plan) try prompt_parts.append(arena, plan_mode_prompt);
+        const system_prompt_suffix = if (prompt_parts.items.len == 0)
+            ""
         else
-            try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ extension_prompt_suffix, openrouter_web_search_prompt });
+            try std.mem.join(arena, "\n\n", prompt_parts.items);
         var asm_opts = context.AssembleOpts{
             .prune_before_seq = frontier,
             .system_prompt_suffix = system_prompt_suffix,
@@ -880,7 +883,7 @@ pub fn runTurn(
                 sandboxed = permissions.workspaceWriteAllowed(gpa, io, opts.cwd, call.args_json);
             }
             const decision: approval.Decision = if (call.spec) |s|
-                if (opts.tool_profile == .read_only and s.mutating)
+                if (!toolAllowed(opts, s))
                     .deny
                 else
                     approval.policyFor(opts.cfg, effectiveApprovalMode(opts), s.mutating, sandboxed)
@@ -1296,7 +1299,7 @@ fn ccInvoke(
         .model = opts.endpoint.model,
         .session_uuid = claude_code.sessionUuid(&uuid_buf, opts.session_id),
         .fresh = fresh,
-        .permissions = if (opts.approval_mode == .auto) .bypass else .accept_edits,
+        .permissions = if (opts.tool_profile == .plan) .plan else if (opts.approval_mode == .auto) .bypass else .accept_edits,
         .bridge = bridge,
         .max_turns = opts.max_rounds,
         .effort = opts.effort,
@@ -1742,11 +1745,39 @@ pub fn writeHandover(
 }
 
 fn toolAllowed(opts: RunOpts, spec: *const tools_registry.Spec) bool {
-    if (std.mem.eql(u8, spec.name, task_tool.spec_name) or
-        std.mem.eql(u8, spec.name, task_tool.batch_spec_name))
-        return opts.on_task != null and opts.tool_profile == .full;
+    const is_task = std.mem.eql(u8, spec.name, task_tool.spec_name) or
+        std.mem.eql(u8, spec.name, task_tool.batch_spec_name);
+    if (is_task) return opts.on_task != null and opts.tool_profile != .read_only;
+    if (opts.tool_profile == .plan) {
+        if (std.mem.eql(u8, spec.name, "bash") or std.mem.eql(u8, spec.name, "plan_update")) return false;
+        return !spec.mutating;
+    }
     if (opts.tool_profile == .read_only and spec.mutating) return false;
     return true;
+}
+
+test "plan tool profile permits investigation and denies execution mutations" {
+    const Probe = struct {
+        fn task(_: ?*anyopaque, _: u64, _: []const u8) tools_registry.ExecOut {
+            unreachable;
+        }
+    };
+    const opts = RunOpts{
+        .session_id = 1,
+        .cwd = "/tmp",
+        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .dialect = .openai_compatible },
+        .cfg = config.defaults(),
+        .tool_profile = .plan,
+        .on_task = Probe.task,
+    };
+    try std.testing.expect(toolAllowed(opts, tools_registry.find("read_file").?));
+    try std.testing.expect(toolAllowed(opts, tools_registry.find("grep").?));
+    try std.testing.expect(toolAllowed(opts, tools_registry.find("fetch").?));
+    try std.testing.expect(toolAllowed(opts, tools_registry.find("task").?));
+    try std.testing.expect(!toolAllowed(opts, tools_registry.find("bash").?));
+    try std.testing.expect(!toolAllowed(opts, tools_registry.find("write_file").?));
+    try std.testing.expect(!toolAllowed(opts, tools_registry.find("edit").?));
+    try std.testing.expect(!toolAllowed(opts, tools_registry.find("plan_update").?));
 }
 
 fn providerRequestOptions(arena: std.mem.Allocator, opts: RunOpts, ep: Endpoint) !openai.RequestOptions {
@@ -1772,6 +1803,14 @@ const openrouter_web_search_prompt =
     \\- Web search is available for discovering sources and verifying current
     \\  information. Use `fetch` when you already have a specific URL. Preserve
     \\  source URLs in the response.
+;
+
+const plan_mode_prompt =
+    \\PLAN MODE
+    \\- Investigate and design only. Do not modify files, run shell commands, or call mutating tools.
+    \\- Ask focused questions only when the answer materially changes the plan.
+    \\- End with a concrete implementation plan that is ready for the user to accept or revise.
+    \\- Do not call plan_update; that tool tracks execution after a proposal is accepted.
 ;
 
 fn observabilityHeaders(dialect: provider.Dialect) []const []const u8 {

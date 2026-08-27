@@ -87,9 +87,13 @@ the old rooms?
   config.toml); the procedure is a markdown skill
   ([skills/council.md](skills/council.md)), not core machinery. The first
   live council reviewed marlin's own sandbox policy and found a real bug.
-- Substantial work gets a durable execution plan: the active step stays pinned
-  above the composer, revisions survive reboot and compaction, and delegated
-  child activity attaches to the step it is helping complete.
+- Shift+Tab enters persistent Plan mode: the agent investigates with a
+  daemon-enforced read-only tool profile, then offers Implement, Revise, Stay,
+  or Dismiss. `/plan <task>` enters directly, `/plan off` exits, and `/plan
+  clear` closes a stale durable execution todo.
+- Substantial implementation gets a durable execution plan: the active step
+  stays pinned above the composer, revisions survive reboot and compaction,
+  and delegated child activity attaches to the step it is helping complete.
 - ssh/mosh remain the transport. We never reinvent them; we just put structure
   on the wire above them.
 
