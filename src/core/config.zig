@@ -73,6 +73,13 @@ pub const Config = struct {
     exec_tools: []const ExecTool = &.{},
     mcp_servers: []const McpServer = &.{},
     councils: []const Council = &.{},
+    /// Voice dictation ([voice], written by /voice setup). Dormant until
+    /// enabled; nothing else in marlin mentions its dependencies.
+    voice_enabled: bool = false,
+    voice_engine: []const u8 = "",
+    voice_mode: []const u8 = "ptt",
+    voice_model: []const u8 = "",
+    voice_stt_bin: []const u8 = "",
     hooks: Hooks = .{},
     skill_directories: []const []const u8 = &.{},
 
@@ -362,6 +369,75 @@ pub fn removeCouncil(
     try replaceRaw(gpa, io, environ, updated);
 }
 
+/// Persist the complete [voice] section (replace-or-append): /voice setup
+/// owns every key, so whole-section replacement keeps hand edits from
+/// half-surviving a re-setup.
+pub fn setVoice(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    enabled: bool,
+    engine: []const u8,
+    mode: []const u8,
+    model: []const u8,
+    stt_bin: []const u8,
+) !void {
+    const current = try readRawAlloc(gpa, io, environ);
+    defer gpa.free(current);
+    const without = try removeSectionText(gpa, current, "[voice]");
+    defer gpa.free(without);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, without);
+    if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(gpa, '\n');
+    if (out.items.len > 0) try out.append(gpa, '\n');
+    try out.print(gpa, "[voice]\nenabled = {}\n", .{enabled});
+    try out.appendSlice(gpa, "engine = ");
+    try appendTomlString(&out, gpa, engine);
+    try out.appendSlice(gpa, "\nmode = ");
+    try appendTomlString(&out, gpa, mode);
+    if (model.len > 0) {
+        try out.appendSlice(gpa, "\nmodel = ");
+        try appendTomlString(&out, gpa, model);
+    }
+    try out.appendSlice(gpa, "\nstt_bin = ");
+    try appendTomlString(&out, gpa, stt_bin);
+    try out.append(gpa, '\n');
+
+    var verify_arena = std.heap.ArenaAllocator.init(gpa);
+    defer verify_arena.deinit();
+    _ = try toml.parse(verify_arena.allocator(), out.items);
+    try replaceRaw(gpa, io, environ, out.items);
+}
+
+/// Remove one `[section]` (header through the line before the next header).
+/// Absent section returns the input unchanged.
+fn removeSectionText(gpa: std.mem.Allocator, current: []const u8, header: []const u8) ![]u8 {
+    var offset: usize = 0;
+    while (offset < current.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, current, offset, '\n') orelse current.len;
+        const next = if (line_end < current.len) line_end + 1 else line_end;
+        const line = std.mem.trim(u8, current[offset..line_end], " \t\r");
+        if (!std.mem.eql(u8, line, header)) {
+            offset = next;
+            continue;
+        }
+        var section_end = next;
+        while (section_end < current.len) {
+            const candidate_end = std.mem.indexOfScalarPos(u8, current, section_end, '\n') orelse current.len;
+            const candidate = std.mem.trim(u8, current[section_end..candidate_end], " \t\r");
+            if (candidate.len > 0 and candidate[0] == '[') break;
+            section_end = if (candidate_end < current.len) candidate_end + 1 else candidate_end;
+        }
+        const out = try gpa.alloc(u8, current.len - (section_end - offset));
+        @memcpy(out[0..offset], current[0..offset]);
+        @memcpy(out[offset..], current[section_end..]);
+        return out;
+    }
+    return gpa.dupe(u8, current);
+}
+
 fn setCouncilText(
     gpa: std.mem.Allocator,
     current: []const u8,
@@ -580,6 +656,11 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
     cfg.exec_tools = doc.exec_tools;
     cfg.mcp_servers = doc.mcp_servers;
     cfg.councils = doc.councils;
+    if (doc.voice_enabled) |v| cfg.voice_enabled = v;
+    if (doc.voice_engine) |v| cfg.voice_engine = v;
+    if (doc.voice_mode) |v| cfg.voice_mode = v;
+    if (doc.voice_model) |v| cfg.voice_model = v;
+    if (doc.voice_stt_bin) |v| cfg.voice_stt_bin = v;
     cfg.hooks = doc.hooks;
 }
 
@@ -822,4 +903,35 @@ test "ui scalar edits: replace in place, insert into section, append section" {
     const web_at = std.mem.indexOf(u8, inserted, "[web]").?;
     try std.testing.expect(ui_at < key_at and key_at < web_at);
     try std.testing.expect(std.mem.indexOf(u8, inserted, "# chrome prefs") != null);
+}
+
+test "voice section: parse, whole-section replace, removal helper" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const doc = try toml.parse(arena_state.allocator(),
+        \\[voice]
+        \\enabled = true
+        \\engine = "whisper-turbo"
+        \\mode = "toggle"
+        \\model = "/data/ggml-large-v3-turbo.bin"
+        \\stt_bin = "/opt/homebrew/bin/whisper-cli"
+        \\
+        \\[web]
+        \\enabled = true
+        \\
+    );
+    try std.testing.expect(doc.voice_enabled.?);
+    try std.testing.expectEqualStrings("whisper-turbo", doc.voice_engine.?);
+    try std.testing.expectEqualStrings("toggle", doc.voice_mode.?);
+
+    const base = "[voice]\nenabled = false\nengine = \"x\"\n\n[web]\nenabled = true\n";
+    const removed = try removeSectionText(gpa, base, "[voice]");
+    defer gpa.free(removed);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "[voice]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "[web]") != null);
+
+    const untouched = try removeSectionText(gpa, "[web]\nenabled = true\n", "[voice]");
+    defer gpa.free(untouched);
+    try std.testing.expectEqualStrings("[web]\nenabled = true\n", untouched);
 }

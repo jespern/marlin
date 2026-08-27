@@ -55,6 +55,11 @@ pub const Document = struct {
     permissions_enabled: ?bool = null,
     workspace_enabled: ?bool = null,
     web_enabled: ?bool = null,
+    voice_enabled: ?bool = null,
+    voice_engine: ?[]const u8 = null,
+    voice_mode: ?[]const u8 = null,
+    voice_model: ?[]const u8 = null,
+    voice_stt_bin: ?[]const u8 = null,
     web_tailscale: ?bool = null,
     ui_tab_bar: ?bool = null,
     network_blocklists: ?[]const u8 = null,
@@ -77,6 +82,7 @@ const Section = enum {
     workspace,
     web,
     ui,
+    voice,
     network,
     hooks,
     skills,
@@ -184,6 +190,13 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             .ui => if (std.mem.eql(u8, key, "tab_bar")) {
                 doc.ui_tab_bar = try boolean(value);
             },
+            .voice => {
+                if (std.mem.eql(u8, key, "enabled")) doc.voice_enabled = try boolean(value);
+                if (std.mem.eql(u8, key, "engine")) doc.voice_engine = try string(arena, value);
+                if (std.mem.eql(u8, key, "mode")) doc.voice_mode = try string(arena, value);
+                if (std.mem.eql(u8, key, "model")) doc.voice_model = try string(arena, value);
+                if (std.mem.eql(u8, key, "stt_bin")) doc.voice_stt_bin = try string(arena, value);
+            },
             .network => {
                 if (std.mem.eql(u8, key, "blocklists")) doc.network_blocklists = try string(arena, value);
                 if (std.mem.eql(u8, key, "allow")) doc.network_allow = try string(arena, value);
@@ -288,6 +301,7 @@ fn sectionFor(name: []const u8) Section {
         .{ "permissions", Section.permissions },
         .{ "workspace", Section.workspace },
         .{ "web", Section.web },
+        .{ "voice", Section.voice },
         .{ "ui", Section.ui },
         .{ "network", Section.network },
         .{ "hooks", Section.hooks },

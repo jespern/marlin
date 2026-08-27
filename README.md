@@ -175,7 +175,13 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
   token-gated, localhost-only client on the same protocol — install it to a
   phone home screen to watch sessions and answer parked approvals over your
   own tailnet. It is one embedded HTML file, and it is not a deploy surface.
-- No voice, OCR/video pipelines, themes, cron, profiles.
+- No voice *stack*: no realtime voice models, wake words, or audio in the
+  protocol — ever. What exists is deliberately smaller: `/voice setup` (TUI)
+  configures local, offline push-to-talk dictation into the composer —
+  ffmpeg records, whisper.cpp (or parakeet-mlx) transcribes at the client
+  edge, both as optional subprocesses that are never mentioned until you
+  ask. Dormant until invoked; the daemon never learns audio exists.
+- No OCR/video pipelines, themes, cron, profiles.
 - No embedded terminal emulator / editor panes.
 - No Tailscale embedding — your tailnet already reaches the daemon socket.
 

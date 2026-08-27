@@ -37,6 +37,7 @@ const block = @import("../core/block.zig");
 const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
+const voice = @import("voice.zig");
 const credentials = @import("../core/credentials.zig");
 const Editor = @import("editor.zig");
 const media = @import("media.zig");
@@ -110,6 +111,20 @@ const Event = union(enum) {
     /// Reconnect worker verdict: a fresh handshaked Conn to adopt, or null
     /// when every attempt failed and the TUI should quit like before.
     reconnected: ?*attach.Conn,
+    /// Kitty-protocol key release (report_events); only the voice
+    /// push-to-talk key acts on releases, everything else ignores them.
+    key_release: vaxis.Key,
+    /// Voice worker verdicts (transcription and model-download threads).
+    voice: VoiceEvent,
+};
+
+pub const VoiceEvent = union(enum) {
+    /// Cleaned transcript (gpa-owned; handler frees) for the composer.
+    transcript: []u8,
+    /// Static human-readable failure.
+    stt_failed: []const u8,
+    download_done,
+    download_failed: []const u8,
 };
 
 const Mode = enum { insert, normal };
@@ -147,7 +162,9 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
     .{ .name = "/mcp", .usage = " [add|remove|restart|reload]", .description = "inspect and manage MCP servers", .accepts_args = true },
     .{ .name = "/council", .usage = " [<name>|new <name>|edit <name>|remove <name>]", .description = "list, inspect, or edit review councils", .accepts_args = true },
+    .{ .name = "/voice", .usage = " [setup|mode|off]", .description = "dictate into the composer (local STT; setup on first use)", .accepts_args = true },
     .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
+    .{ .name = "/plan", .usage = " [task|off|clear]", .description = "enter Plan mode or manage its execution todo", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
@@ -171,7 +188,7 @@ const CommandSuggestion = struct {
     submit_on_enter: bool,
 };
 
-const PickerKind = enum { model, effort, session, search_prompt, search, council, council_list };
+const PickerKind = enum { model, effort, session, search_prompt, search, council, council_list, voice_engine, voice_mode };
 
 const council_done_item = "Done";
 
@@ -418,6 +435,10 @@ const App = struct {
     io: Io,
     conn: *attach.Conn,
     environ: ?*const std.process.Environ.Map = null,
+    /// Event loop handle for worker threads spawned from App methods
+    /// (voice transcription/download); set once in run().
+    loop: ?*vaxis.Loop(Event) = null,
+    voice_rt: VoiceRt = .{},
     sid: u64,
     editor: Editor,
     attachments: std.ArrayList(media.Pending) = .empty,
@@ -673,6 +694,7 @@ const App = struct {
         self.background_approvals.deinit(self.gpa);
         self.clearCouncils();
         self.councils.deinit(self.gpa);
+        self.voice_rt.deinit(self.gpa);
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.pending_new_cwd.deinit(self.gpa);
@@ -2214,6 +2236,41 @@ const App = struct {
             };
             defer self.gpa.free(expanded);
             self.submitInput(expanded);
+        } else if (std.mem.eql(u8, head, "/voice")) {
+            const action = it.next();
+            if (action == null) {
+                if (!self.voice_rt.enabled) self.startVoiceSetup() else self.voiceStatusNotice();
+            } else if (std.mem.eql(u8, action.?, "setup")) {
+                self.startVoiceSetup();
+            } else if (std.mem.eql(u8, action.?, "off")) {
+                if (self.voice_rt.setup) |st| {
+                    const environ = self.environ orelse return;
+                    config.setVoice(self.gpa, self.io, environ, false, st.engine.configName(), if (st.mode == .toggle) "toggle" else "ptt", st.model_path, st.stt_bin) catch {};
+                }
+                self.voice_rt.enabled = false;
+                self.setNotice("voice off — /voice turns it back on", .{});
+            } else if (std.mem.eql(u8, action.?, "on")) {
+                if (self.voice_rt.setup) |st| {
+                    const environ = self.environ orelse return;
+                    config.setVoice(self.gpa, self.io, environ, true, st.engine.configName(), if (st.mode == .toggle) "toggle" else "ptt", st.model_path, st.stt_bin) catch {};
+                    self.voice_rt.enabled = true;
+                    self.voiceStatusNotice();
+                } else self.startVoiceSetup();
+            } else if (std.mem.eql(u8, action.?, "mode")) {
+                const which = it.next() orelse {
+                    self.setNotice("usage: /voice mode ptt|toggle", .{});
+                    return;
+                };
+                const mode: voice.Mode = if (std.mem.eql(u8, which, "toggle")) .toggle else .ptt;
+                if (self.voice_rt.setup) |*st| {
+                    st.mode = mode;
+                    const environ = self.environ orelse return;
+                    config.setVoice(self.gpa, self.io, environ, self.voice_rt.enabled, st.engine.configName(), if (mode == .toggle) "toggle" else "ptt", st.model_path, st.stt_bin) catch {};
+                    self.voiceStatusNotice();
+                } else self.setNotice("voice is not set up — /voice setup first", .{});
+            } else {
+                self.setNotice("usage: /voice [setup|mode ptt|toggle|off|on]", .{});
+            }
         } else if (std.mem.eql(u8, head, "/sessions")) {
             self.openPicker(.session);
         } else if (std.mem.eql(u8, head, "/new")) {
@@ -2396,6 +2453,352 @@ const App = struct {
             if (std.mem.eql(u8, council.name, name)) return council;
         }
         return null;
+    }
+
+    // ------------------------------------------------------------ voice --
+
+    /// Resolve [voice] config into a runnable runtime, silently: a broken
+    /// or absent setup leaves voice dormant with zero noise — dependencies
+    /// are only ever mentioned inside /voice itself.
+    fn initVoiceFromConfig(self: *App) void {
+        const cfg = self.cfg;
+        if (!cfg.voice_enabled) return;
+        const engine = voice.Engine.parse(cfg.voice_engine) orelse return;
+        if (cfg.voice_stt_bin.len == 0) return;
+        const environ = self.environ orelse return;
+        const ffmpeg = (voice.findBinary(self.gpa, self.io, environ, &.{"ffmpeg"}) catch null) orelse return;
+        const model = self.gpa.dupe(u8, cfg.voice_model) catch {
+            self.gpa.free(ffmpeg);
+            return;
+        };
+        const bin = self.gpa.dupe(u8, cfg.voice_stt_bin) catch {
+            self.gpa.free(ffmpeg);
+            self.gpa.free(model);
+            return;
+        };
+        self.voice_rt.ffmpeg = ffmpeg;
+        self.voice_rt.setup = .{
+            .engine = engine,
+            .mode = if (std.mem.eql(u8, cfg.voice_mode, "toggle")) .toggle else .ptt,
+            .model_path = model,
+            .stt_bin = bin,
+        };
+        self.voice_rt.enabled = true;
+    }
+
+    fn voiceStatusNotice(self: *App) void {
+        const rt = &self.voice_rt;
+        if (!rt.enabled or rt.setup == null) {
+            self.setNotice("voice is not set up — /voice setup walks through it (local, offline)", .{});
+            return;
+        }
+        const st = rt.setup.?;
+        self.setNotice("voice · {s} · {s} · ctrl+space{s} · /voice [setup|mode ptt|toggle|off]", .{
+            st.engine.configName(),
+            if (st.mode == .ptt) "push-to-talk" else "toggle",
+            if (st.mode == .ptt and !rt.kitty_release) " (terminal lacks key-release: acting as toggle)" else "",
+        });
+    }
+
+    fn startVoiceSetup(self: *App) void {
+        const environ = self.environ orelse return;
+        // The only place dependencies are ever mentioned.
+        const ffmpeg = (voice.findBinary(self.gpa, self.io, environ, &.{"ffmpeg"}) catch null) orelse {
+            self.setNotice("voice needs ffmpeg for the microphone — `brew install ffmpeg`, then /voice setup again", .{});
+            return;
+        };
+        if (self.voice_rt.ffmpeg) |old| self.gpa.free(old);
+        self.voice_rt.ffmpeg = ffmpeg;
+        self.voice_rt.wiz_engine = null;
+        self.voice_rt.wiz_mode = null;
+        self.openPicker(.voice_engine);
+    }
+
+    fn voiceWizardEngineChosen(self: *App, item: []const u8) void {
+        const environ = self.environ orelse return;
+        var chosen: ?voice.Engine = null;
+        for (voice_engine_items, 0..) |label, i| {
+            if (std.mem.eql(u8, label, item)) chosen = voice_engines[i];
+        }
+        const engine = chosen orelse return;
+        const bin = (voice.findBinary(self.gpa, self.io, environ, engine.binaryCandidates()) catch null) orelse {
+            self.setNotice("voice: {s} needs `{s}` — install it, then /voice setup again", .{
+                engine.configName(), engine.installHint(),
+            });
+            return;
+        };
+        if (self.voice_rt.wiz_stt_bin) |old| self.gpa.free(old);
+        self.voice_rt.wiz_stt_bin = bin;
+        self.voice_rt.wiz_engine = engine;
+        self.openPicker(.voice_mode);
+    }
+
+    fn voiceWizardModeChosen(self: *App, item: []const u8) void {
+        const rt = &self.voice_rt;
+        const engine = rt.wiz_engine orelse return;
+        rt.wiz_mode = if (std.mem.startsWith(u8, item, "toggle")) .toggle else .ptt;
+        if (rt.wiz_mode == .ptt and !rt.kitty_release)
+            self.setNotice("this terminal doesn't report key releases — ctrl+space will act as a toggle here", .{});
+
+        if (engine.modelUrl() == null) {
+            self.finishVoiceSetup("");
+            return;
+        }
+        const environ = self.environ orelse return;
+        const dir = voice.modelsDir(self.gpa, environ) catch return;
+        defer self.gpa.free(dir);
+        const dest = std.fs.path.join(self.gpa, &.{ dir, engine.modelFileName().? }) catch return;
+        if (Io.Dir.cwd().statFile(self.io, dest, .{})) |_| {
+            defer self.gpa.free(dest);
+            self.finishVoiceSetup(dest);
+            return;
+        } else |_| {}
+
+        // Model download with live progress (rendered from voiceTick).
+        const progress = self.gpa.create(voice.DownloadProgress) catch {
+            self.gpa.free(dest);
+            return;
+        };
+        progress.* = .{};
+        const job = self.gpa.create(VoiceDownloadJob) catch {
+            self.gpa.destroy(progress);
+            self.gpa.free(dest);
+            return;
+        };
+        job.* = .{
+            .gpa = self.gpa,
+            .io = self.io,
+            .loop = self.loop orelse return,
+            .url = engine.modelUrl().?,
+            .dest = dest,
+            .progress = progress,
+        };
+        if (rt.wiz_model_dest) |old| self.gpa.free(old);
+        rt.wiz_model_dest = self.gpa.dupe(u8, dest) catch null;
+        rt.download = progress;
+        rt.rate_bytes = 0;
+        rt.rate_at_ms = 0;
+        rt.rate_bps = 0;
+        rt.download_thread = std.Thread.spawn(.{}, VoiceDownloadJob.run, .{job}) catch {
+            self.gpa.destroy(progress);
+            rt.download = null;
+            self.setNotice("voice: could not start the model download", .{});
+            return;
+        };
+        self.animation_active.store(true, .release);
+        self.setNotice("voice: downloading {s}…", .{engine.modelFileName().?});
+    }
+
+    fn finishVoiceSetup(self: *App, model_path: []const u8) void {
+        const rt = &self.voice_rt;
+        const engine = rt.wiz_engine orelse return;
+        const mode = rt.wiz_mode orelse .ptt;
+        const environ = self.environ orelse return;
+        const bin = rt.wiz_stt_bin orelse return;
+
+        config.setVoice(
+            self.gpa,
+            self.io,
+            environ,
+            true,
+            engine.configName(),
+            if (mode == .toggle) "toggle" else "ptt",
+            model_path,
+            bin,
+        ) catch {
+            self.setNotice("voice: could not persist [voice] to config.toml", .{});
+            return;
+        };
+
+        rt.freeSetup(self.gpa);
+        const model = self.gpa.dupe(u8, model_path) catch return;
+        const bin_copy = self.gpa.dupe(u8, bin) catch {
+            self.gpa.free(model);
+            return;
+        };
+        rt.setup = .{ .engine = engine, .mode = mode, .model_path = model, .stt_bin = bin_copy };
+        rt.enabled = true;
+        rt.wiz_engine = null;
+        rt.wiz_mode = null;
+        self.setNotice("voice ready · {s} ctrl+space to dictate into the composer", .{
+            if (mode == .ptt and rt.kitty_release) "hold" else "press",
+        });
+    }
+
+    /// Download progress → status notice, driven by animation ticks. A
+    /// dedicated modal would be prettier; the status line is honest and
+    /// already everywhere.
+    fn voiceTick(self: *App) void {
+        const rt = &self.voice_rt;
+        const progress = rt.download orelse return;
+        const done = progress.done.load(.acquire);
+        const total = progress.total.load(.acquire);
+        const now = nowWallMs(self.io);
+        if (rt.rate_at_ms == 0) {
+            rt.rate_at_ms = now;
+            rt.rate_bytes = done;
+        } else if (now - rt.rate_at_ms >= 1000) {
+            rt.rate_bps = (done -| rt.rate_bytes) * 1000 / @as(u64, @intCast(now - rt.rate_at_ms));
+            rt.rate_at_ms = now;
+            rt.rate_bytes = done;
+        }
+        var bar: [24]u8 = undefined;
+        const cells = bar.len;
+        const filled = if (total > 0) @min(cells, done * cells / total) else 0;
+        for (0..cells) |i| bar[i] = if (i < filled) '#' else '-';
+        if (total > 0) {
+            self.setNotice("voice model  [{s}] {d}% · {d}/{d} MB · {d:.1} MB/s · esc cancels", .{
+                bar[0..],                                                 done * 100 / total, done >> 20, total >> 20,
+                @as(f64, @floatFromInt(rt.rate_bps)) / (1024.0 * 1024.0),
+            });
+        } else {
+            self.setNotice("voice model  [{s}] {d} MB · esc cancels", .{ bar[0..], done >> 20 });
+        }
+    }
+
+    fn voiceDownloadFinished(self: *App, failure: ?[]const u8) void {
+        const rt = &self.voice_rt;
+        if (rt.download_thread) |t| t.join();
+        rt.download_thread = null;
+        if (rt.download) |pr| self.gpa.destroy(pr);
+        rt.download = null;
+        self.animation_active.store(self.state == .running, .release);
+        if (failure) |name| {
+            self.setNotice("voice: model download failed ({s}) — /voice setup resumes it", .{name});
+            return;
+        }
+        const dest = rt.wiz_model_dest orelse return;
+        self.finishVoiceSetup(dest);
+    }
+
+    fn voiceCancelDownload(self: *App) void {
+        const rt = &self.voice_rt;
+        const progress = rt.download orelse return;
+        progress.cancel.store(true, .release);
+        // The worker notices and posts download_failed(Cancelled); the .part
+        // file stays for the next /voice setup to resume.
+    }
+
+    fn startVoiceRecording(self: *App) void {
+        const rt = &self.voice_rt;
+        if (rt.phase != .idle or !rt.enabled) return;
+        const setup = rt.setup orelse return;
+        _ = setup;
+        const ffmpeg = rt.ffmpeg orelse return;
+        var nonce: [4]u8 = undefined;
+        self.io.random(&nonce);
+        const tmp = (self.environ orelse return).get("TMPDIR") orelse "/tmp";
+        const wav = std.fmt.allocPrint(self.gpa, "{s}/marlin-voice-{x}.wav", .{
+            std.mem.trimEnd(u8, tmp, "/"), std.mem.readInt(u32, &nonce, .little),
+        }) catch return;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const argv = voice.recordArgv(arena_state.allocator(), ffmpeg, wav) catch {
+            self.gpa.free(wav);
+            return;
+        };
+        const child = std.process.spawn(self.io, .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .pgid = 0,
+        }) catch {
+            self.gpa.free(wav);
+            self.setNotice("voice: could not start recording (microphone permission?)", .{});
+            return;
+        };
+        rt.recorder = child;
+        rt.wav_path = wav;
+        rt.phase = .recording;
+        self.setNotice("● recording — {s}", .{if (rt.setup.?.mode == .ptt and rt.kitty_release) "release to transcribe" else "ctrl+space to stop"});
+    }
+
+    fn stopVoiceRecording(self: *App) void {
+        const rt = &self.voice_rt;
+        if (rt.phase != .recording) return;
+        const setup = rt.setup orelse return;
+        // SIGINT lets ffmpeg finalize the wav header.
+        if (rt.recorder) |recorder| {
+            if (recorder.id) |pid| std.posix.kill(pid, std.posix.SIG.INT) catch {};
+        }
+        const job = self.gpa.create(VoiceJob) catch return;
+        job.* = .{
+            .gpa = self.gpa,
+            .io = self.io,
+            .loop = self.loop orelse return,
+            .recorder = rt.recorder,
+            .wav_path = rt.wav_path.?,
+            .setup = setup,
+        };
+        rt.recorder = null;
+        rt.wav_path = null;
+        rt.phase = .transcribing;
+        self.setNotice("… transcribing", .{});
+        const thread = std.Thread.spawn(.{}, VoiceJob.run, .{job}) catch {
+            self.gpa.destroy(job);
+            rt.phase = .idle;
+            return;
+        };
+        thread.detach();
+    }
+
+    fn abortVoiceRecording(self: *App) void {
+        const rt = &self.voice_rt;
+        if (rt.phase != .recording) return;
+        if (rt.recorder) |*recorder| {
+            recorder.kill(self.io);
+            _ = recorder.wait(self.io) catch {};
+        }
+        rt.recorder = null;
+        if (rt.wav_path) |wav| {
+            Io.Dir.cwd().deleteFile(self.io, wav) catch {};
+            self.gpa.free(wav);
+        }
+        rt.wav_path = null;
+        rt.phase = .idle;
+        self.setNotice("voice: recording discarded", .{});
+    }
+
+    fn handleVoiceEvent(self: *App, ev: VoiceEvent) void {
+        switch (ev) {
+            .transcript => |text| {
+                defer self.gpa.free(text);
+                self.voice_rt.phase = .idle;
+                if (text.len == 0) {
+                    self.setNotice("voice: heard nothing", .{});
+                    return;
+                }
+                if (!self.editor.isEmpty()) self.editor.insertSlice(" ");
+                self.editor.insertSlice(text);
+                self.mode = .insert;
+                self.setNotice("voice: {d} chars — review, then enter", .{text.len});
+            },
+            .stt_failed => |name| {
+                self.voice_rt.phase = .idle;
+                self.setNotice("voice: transcription failed ({s})", .{name});
+            },
+            .download_done => self.voiceDownloadFinished(null),
+            .download_failed => |name| self.voiceDownloadFinished(name),
+        }
+    }
+
+    /// The ctrl+space press in either mode. Returns true when consumed.
+    fn handleVoiceKey(self: *App) bool {
+        const rt = &self.voice_rt;
+        if (!rt.enabled or rt.setup == null) return false;
+        switch (rt.phase) {
+            .transcribing => return true, // swallow until the verdict lands
+            .recording => {
+                // Toggle stop; under PTT this is the repeat/no-release path.
+                if (rt.setup.?.mode == .toggle or !rt.kitty_release) self.stopVoiceRecording();
+                return true;
+            },
+            .idle => {
+                self.startVoiceRecording();
+                return true;
+            },
+        }
     }
 
     fn stageClipboard(self: *App, text: []const u8) void {
@@ -2980,6 +3383,8 @@ const App = struct {
             .search => self.search_labels.items,
             .search_prompt => &.{},
             .council_list => &.{},
+            .voice_engine => &voice_engine_items,
+            .voice_mode => &voice_mode_items,
         };
     }
 
@@ -3338,6 +3743,8 @@ const App = struct {
             .search_prompt => {},
             .council => self.toggleCouncilModel(item),
             .council_list => self.showCouncilDetail(item),
+            .voice_engine => self.voiceWizardEngineChosen(item),
+            .voice_mode => self.voiceWizardModeChosen(item),
         }
     }
 
@@ -3368,7 +3775,7 @@ const App = struct {
         return switch (self.picker_kind) {
             .model => self.model.items,
             .effort => @tagName(self.effort),
-            .session, .search_prompt, .search, .council, .council_list => "",
+            .session, .search_prompt, .search, .council, .council_list, .voice_engine, .voice_mode => "",
         };
     }
 
@@ -5005,6 +5412,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
                 app.council_edit_models.items.len,
             }),
             .council_list => "councils",
+            .voice_engine => "voice engine",
+            .voice_mode => "voice input mode",
         };
 
         const list_max: u16 = @min(@as(u16, 14), h -| 6);
@@ -5432,10 +5841,13 @@ pub fn run(
             // Doubles as the bracketed-paste allocator: Loop passes it when
             // parsing paste bodies into .paste events.
             .system_clipboard_allocator = gpa,
+            // Key releases (voice push-to-talk) on kitty-protocol terminals.
+            .kitty_keyboard_flags = .{ .report_events = true },
         });
         defer vx.deinit(gpa, tty.writer());
 
         var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
+        app.loop = &loop;
         try loop.installResizeHandler();
         try loop.start();
         defer loop.stop();
@@ -5443,6 +5855,8 @@ pub fn run(
         try vx.enterAltScreen(writer);
         try writer.flush();
         try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+        app.voice_rt.kitty_release = vx.caps.kitty_keyboard;
+        app.initVoiceFromConfig();
         try vx.setBracketedPaste(writer, true);
         // Mouse: wheel scrolls the session view; native cell-precise selection
         // copies through OSC52. Shift+drag remains the terminal's escape hatch.
@@ -5503,8 +5917,17 @@ pub fn run(
             var reconnect_verdict: ??*attach.Conn = null;
             switch (event) {
                 .key_press => |key| try handleKey(&app, key),
+                .key_release => |key| {
+                    if (isVoiceKey(key) and app.voice_rt.phase == .recording and
+                        app.voice_rt.setup != null and app.voice_rt.setup.?.mode == .ptt)
+                        app.stopVoiceRecording();
+                },
+                .voice => |vev| app.handleVoiceEvent(vev),
                 .mouse => |m| handleMouse(&app, m),
-                .tick => app.spinner_frame +%= 1,
+                .tick => {
+                    app.spinner_frame +%= 1;
+                    app.voiceTick();
+                },
                 .winsize => |ws| {
                     app.term_cols = ws.cols;
                     try vx.resize(gpa, tty.writer(), ws);
@@ -5522,8 +5945,17 @@ pub fn run(
                             .daemon_gone => |reason| conn_lost = reason,
                             .reconnected => |maybe| reconnect_verdict = maybe,
                             .key_press => |k2| try handleKey(&app, k2),
+                            .key_release => |k2| {
+                                if (isVoiceKey(k2) and app.voice_rt.phase == .recording and
+                                    app.voice_rt.setup != null and app.voice_rt.setup.?.mode == .ptt)
+                                    app.stopVoiceRecording();
+                            },
+                            .voice => |vev| app.handleVoiceEvent(vev),
                             .mouse => |m2| handleMouse(&app, m2),
-                            .tick => app.spinner_frame +%= 1,
+                            .tick => {
+                                app.spinner_frame +%= 1;
+                                app.voiceTick();
+                            },
                             .winsize => |ws2| {
                                 app.term_cols = ws2.cols;
                                 try vx.resize(gpa, tty.writer(), ws2);
@@ -5917,6 +6349,150 @@ fn applyEditCommand(ed: *Editor, command: EditCommand) void {
     }
 }
 
+fn isPlanToggleKey(key: vaxis.Key) bool {
+    return key.matchExact(vaxis.Key.tab, .{ .shift = true });
+}
+
+const PlanProposalAction = enum { none, implement, revise, stay, dismiss };
+
+const voice_engines = [_]voice.Engine{ .whisper_turbo, .whisper_base, .parakeet };
+const voice_engine_items = [_][]const u8{
+    voice.Engine.whisper_turbo.label(),
+    voice.Engine.whisper_base.label(),
+    voice.Engine.parakeet.label(),
+};
+const voice_mode_items = [_][]const u8{
+    "push-to-talk · hold ctrl+space, release to transcribe",
+    "toggle · press ctrl+space to start, press again to stop",
+};
+
+/// True for the dictation hotkey in both kitty (' '+ctrl) and legacy (NUL)
+/// encodings.
+fn isVoiceKey(key: vaxis.Key) bool {
+    return key.matches(' ', .{ .ctrl = true }) or key.codepoint == 0;
+}
+
+/// Transcription worker: waits out the recorder, runs the STT engine, and
+/// posts the cleaned transcript (or a failure) back to the event loop.
+const VoiceJob = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    loop: *vaxis.Loop(Event),
+    recorder: ?std.process.Child,
+    wav_path: []u8,
+    setup: voice.Setup,
+
+    fn run(job: *VoiceJob) void {
+        defer job.gpa.destroy(job);
+        defer job.gpa.free(job.wav_path);
+        job.transcribe() catch |err| {
+            Io.Dir.cwd().deleteFile(job.io, job.wav_path) catch {};
+            job.loop.postEvent(.{ .voice = .{ .stt_failed = @errorName(err) } }) catch {};
+        };
+    }
+
+    fn transcribe(job: *VoiceJob) !void {
+        if (job.recorder) |*recorder| _ = recorder.wait(job.io) catch {};
+        const out_dir = std.fs.path.dirname(job.wav_path) orelse ".";
+        var arena_state = std.heap.ArenaAllocator.init(job.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const argv = try voice.sttArgv(arena, job.setup, job.wav_path, out_dir);
+        const result = try std.process.run(arena, job.io, .{
+            .argv = argv,
+            .stdout_limit = .limited(1 << 20),
+            .stderr_limit = .limited(64 * 1024),
+        });
+        var text: []const u8 = result.stdout;
+        if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+            // parakeet writes a sidecar txt instead of using stdout.
+            const stem = std.fs.path.stem(job.wav_path);
+            const sidecar = try std.fs.path.join(arena, &.{ out_dir, try std.fmt.allocPrint(arena, "{s}.txt", .{stem}) });
+            text = Io.Dir.cwd().readFileAlloc(job.io, sidecar, arena, .limited(1 << 20)) catch "";
+            Io.Dir.cwd().deleteFile(job.io, sidecar) catch {};
+        }
+        Io.Dir.cwd().deleteFile(job.io, job.wav_path) catch {};
+        const exited_ok = result.term == .exited and result.term.exited == 0;
+        const cleaned = try voice.cleanTranscript(job.gpa, text);
+        if (!exited_ok and cleaned.len == 0) {
+            job.gpa.free(cleaned);
+            return error.TranscriberFailed;
+        }
+        job.loop.postEvent(.{ .voice = .{ .transcript = cleaned } }) catch job.gpa.free(cleaned);
+    }
+};
+
+/// Model download worker for /voice setup.
+const VoiceDownloadJob = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    loop: *vaxis.Loop(Event),
+    url: []const u8,
+    dest: []u8,
+    progress: *voice.DownloadProgress,
+
+    fn run(job: *VoiceDownloadJob) void {
+        defer job.gpa.destroy(job);
+        voice.download(job.gpa, job.io, job.url, job.dest, job.progress) catch |err| {
+            job.loop.postEvent(.{ .voice = .{ .download_failed = @errorName(err) } }) catch {};
+            return;
+        };
+        job.loop.postEvent(.{ .voice = .download_done }) catch {};
+    }
+};
+
+/// Everything /voice owns at runtime. Dormant (all defaults) until either
+/// config enables it at startup or /voice setup finishes.
+const VoiceRt = struct {
+    enabled: bool = false,
+    setup: ?voice.Setup = null, // strings gpa-owned
+    ffmpeg: ?[]u8 = null,
+    phase: enum { idle, recording, transcribing } = .idle,
+    recorder: ?std.process.Child = null,
+    wav_path: ?[]u8 = null,
+    /// Terminal reports key releases (kitty): push-to-talk possible.
+    kitty_release: bool = false,
+    // -- wizard state (live only during /voice setup) --
+    wiz_engine: ?voice.Engine = null,
+    wiz_mode: ?voice.Mode = null,
+    wiz_stt_bin: ?[]u8 = null,
+    wiz_model_dest: ?[]u8 = null,
+    download: ?*voice.DownloadProgress = null,
+    download_thread: ?std.Thread = null,
+    rate_bytes: u64 = 0,
+    rate_at_ms: i64 = 0,
+    rate_bps: u64 = 0,
+
+    fn freeSetup(self: *VoiceRt, gpa: std.mem.Allocator) void {
+        if (self.setup) |st| {
+            gpa.free(st.model_path);
+            gpa.free(st.stt_bin);
+        }
+        self.setup = null;
+    }
+
+    fn deinit(self: *VoiceRt, gpa: std.mem.Allocator) void {
+        self.freeSetup(gpa);
+        if (self.ffmpeg) |f| gpa.free(f);
+        if (self.wav_path) |w| gpa.free(w);
+        if (self.wiz_stt_bin) |b| gpa.free(b);
+        if (self.wiz_model_dest) |d| gpa.free(d);
+        if (self.download) |pr| {
+            pr.cancel.store(true, .release);
+            if (self.download_thread) |t| t.join();
+            gpa.destroy(pr);
+        }
+    }
+};
+
+fn planProposalAction(key: vaxis.Key) PlanProposalAction {
+    if (isEnterKey(key)) return .implement;
+    if (key.matches('e', .{})) return .revise;
+    if (key.matches(vaxis.Key.escape, .{})) return .stay;
+    if (key.matches('q', .{})) return .dismiss;
+    return .none;
+}
+
 fn tabNavigationDirection(key: vaxis.Key) ?i8 {
     if (key.matches('>', .{}) or key.matches(vaxis.Key.right, .{})) return 1;
     if (key.matches('<', .{}) or key.matches(vaxis.Key.left, .{})) return -1;
@@ -6122,6 +6698,21 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     // keeps swallowing every key.
     if (key.mods.alt and !key.mods.ctrl and key.codepoint >= '1' and key.codepoint <= '9') {
         app.jumpToTab(@intCast(key.codepoint - '0'));
+        return;
+    }
+
+    // Voice dictation: ctrl+space in either mode. Esc discards an active
+    // recording or cancels a model download. Dormant (never consumes keys)
+    // until /voice setup ran.
+    if (isVoiceKey(key)) {
+        if (app.handleVoiceKey()) return;
+    }
+    if (app.voice_rt.phase == .recording and key.matches(vaxis.Key.escape, .{})) {
+        app.abortVoiceRecording();
+        return;
+    }
+    if (app.voice_rt.download != null and key.matches(vaxis.Key.escape, .{})) {
+        app.voiceCancelDownload();
         return;
     }
 

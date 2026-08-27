@@ -88,6 +88,7 @@ test {
     _ = @import("daemon/provider/registry.zig");
     _ = @import("client/attach.zig");
     _ = @import("client/cc_approve.zig");
+    _ = @import("client/voice.zig");
     _ = @import("client/web.zig");
     _ = @import("testing/fixture_tests.zig");
     _ = @import("client/render.zig");
