@@ -122,8 +122,14 @@
   #status .state.err { color: var(--red); }
   #status .notice { color: var(--yellow); }
   #status .right { margin-left: auto; display: flex; gap: 10px; align-items: center; }
-  #interrupt { display: none; }
-  #interrupt.show { display: inline-block; }
+  #interrupt {
+    display: none; padding: 1px 6px; min-width: 26px; align-items: center;
+    justify-content: center; border-color: transparent; background: transparent;
+    color: var(--dim); opacity: .6;
+  }
+  #interrupt.show { display: inline-flex; }
+  #interrupt:hover { color: var(--red); border-color: var(--line); opacity: 1; }
+  #interrupt.armed { color: var(--red); border-color: var(--red); opacity: 1; }
   #sandbox-btn.on { color: var(--green); border-color: var(--green); }
   /* ---- mobile: sidebar becomes an off-canvas drawer behind a top bar ---- */
   @media (max-width: 700px) {
@@ -204,8 +210,8 @@
     <span class="state">idle</span><span>·</span><span class="model"></span>
     <span class="notice"></span>
     <span class="right">
-      <button id="interrupt" class="act no">⏹ interrupt</button>
       <button id="sandbox-btn" class="act">⛨ sandbox</button>
+      <button id="interrupt" class="act" title="interrupt running turn" aria-label="interrupt running turn">⏹</button>
     </span>
   </div>
 </div>
@@ -217,7 +223,7 @@ const bigints = raw => raw.replace(/"(sid|parent_sid|session_id)":(\d{12,})/g, '
 const $ = s => document.querySelector(s);
 let sid = null, cur = null, es = null, lastSeq = 0, oldestSeq = 0, historyHasOlder = false,
   historyLoading = false, historyBlocks = [], deltaEl = null, deltaText = '', reasoningEl = null,
-  reasoningText = '', approvalId = null, sessionsCache = [];
+  reasoningText = '', approvalId = null, sessionsCache = [], interruptArmTimer = null;
 // Set on each session open; replayed history stays collapsed while blocks
 // stamped after this moment count as live (block ts is ms epoch).
 let openedAt = 0;
@@ -428,11 +434,22 @@ function updateHistoryButton() {
   button.textContent = historyLoading ? 'loading…' : 'load older';
 }
 
+function disarmInterrupt() {
+  if (interruptArmTimer) clearTimeout(interruptArmTimer);
+  interruptArmTimer = null;
+  const button = $('#interrupt');
+  button.classList.remove('armed');
+  button.textContent = '⏹';
+  button.title = 'interrupt running turn';
+  button.setAttribute('aria-label', 'interrupt running turn');
+}
+
 function setState(state) {
   const st = $('#status .state');
   st.textContent = state;
   st.className = 'state ' + state;
   $('#interrupt').classList.toggle('show', state === 'running' || state === 'awaiting_approval');
+  if (state !== 'running' && state !== 'awaiting_approval') disarmInterrupt();
   if (state !== 'awaiting_approval') $('#approval').classList.remove('show');
 }
 
@@ -575,6 +592,7 @@ function drawer(show) {
 
 function open(s) {
   drawer(false);
+  disarmInterrupt();
   $('#topbar .title').textContent = s.title || '(untitled)';
   tabTitle(s);
   sid = s.sid;
@@ -622,6 +640,16 @@ $('#approval .no').onclick = () =>
   send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"denied"}}');
 $('#interrupt').onclick = async () => {
   if (!sid) return;
+  const button = $('#interrupt');
+  if (!button.classList.contains('armed')) {
+    button.classList.add('armed');
+    button.textContent = 'stop?';
+    button.title = 'click again to interrupt';
+    button.setAttribute('aria-label', 'click again to interrupt running turn');
+    interruptArmTimer = setTimeout(disarmInterrupt, 2500);
+    return;
+  }
+  disarmInterrupt();
   const r = await send('{"interrupt":{"sid":' + sid + ',"report":true}}');
   handle(r);
 };
