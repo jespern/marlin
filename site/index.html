@@ -13,13 +13,17 @@
   :root{
     --hot-pink:#ff00cc; --lime:#00ff00; --cyan:#00ffff; --yellow:#ffff00;
     --purple:#9900ff; --ocean:#000066; --panel:#000033;
+    /* Comic Sans ships on desktop Windows/macOS but not iOS. Chalkboard SE
+       is its readable Apple-mobile counterpart; never fall back to a generic
+       cursive face, which becomes an illegible script font on phones. */
+    --comic-font:"Comic Sans MS","Chalkboard SE","Comic Neue","Trebuchet MS",sans-serif;
   }
   html{ box-sizing:border-box; }
   *,*:before,*:after{ box-sizing:inherit; }
 
   body{
     margin:0;
-    font-family:"Comic Sans MS","Comic Neue",cursive;
+    font-family:var(--comic-font);
     color:#fff;
     background-color:var(--ocean);
     /* tiled diagonal water: no image needed, pure 90s energy */
@@ -285,7 +289,7 @@
     max-width:100%;
   }
   .install button{
-    font-family:"Comic Sans MS","Comic Neue",cursive;
+    font-family:var(--comic-font);
     font-weight:bold;
     font-size:0.9rem;
     color:#000;
