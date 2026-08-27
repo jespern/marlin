@@ -1177,6 +1177,17 @@ pub const Daemon = struct {
                 self.sendOtelStatus(client);
             },
             .otel_status => self.sendOtelStatus(client),
+            .otel_content => |request| {
+                const exporter = self.otel_exporter orelse {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "otel_config",
+                        .msg = "content capture needs an active exporter — run /otel set first",
+                    } });
+                    return;
+                };
+                exporter.setCaptureContent(request.enabled);
+                self.sendOtelStatus(client);
+            },
             .session_watch => |sw| {
                 client.watches_sessions = true;
                 client.watches_session_deltas = sw.incremental;
@@ -2522,6 +2533,14 @@ pub const Daemon = struct {
         approval_mode: approval.Mode,
         plan_mode: bool,
         synthetic_input: bool = false,
+        /// OTLP collector snapshot for guest telemetry pass-down. Duped on
+        /// the dispatcher thread — exporter replacement happens there too,
+        /// so the turn thread never reads exporter-owned strings.
+        otel_active: bool = false,
+        otel_base: []u8 = &.{},
+        otel_traces: []u8 = &.{},
+        otel_headers: []u8 = &.{},
+        otel_content: bool = false,
         cancel: *std.atomic.Value(bool),
         /// Live turn state only; configuration must use the value fields above.
         session: *Session,
@@ -2550,10 +2569,21 @@ pub const Daemon = struct {
         errdefer self.gpa.free(owned_text);
         const owned_attachments = try dupeMediaRefs(self.gpa, attachments);
         errdefer freeMediaRefs(self.gpa, owned_attachments);
+        const otel_base: []u8 = if (self.otel_exporter) |e| try self.gpa.dupe(u8, e.raw_base_endpoint) else try self.gpa.dupe(u8, "");
+        errdefer self.gpa.free(otel_base);
+        const otel_traces: []u8 = if (self.otel_exporter) |e| try self.gpa.dupe(u8, e.raw_traces_endpoint) else try self.gpa.dupe(u8, "");
+        errdefer self.gpa.free(otel_traces);
+        const otel_headers: []u8 = if (self.otel_exporter) |e| try self.gpa.dupe(u8, e.raw_headers) else try self.gpa.dupe(u8, "");
+        errdefer self.gpa.free(otel_headers);
         job.* = .{
             .daemon = self,
             .sid = session.id,
             .turn_id = ids.next(self.io),
+            .otel_active = self.otel_exporter != null,
+            .otel_base = otel_base,
+            .otel_traces = otel_traces,
+            .otel_headers = otel_headers,
+            .otel_content = if (self.otel_exporter) |e| e.capturesContent() else false,
             .cwd = cwd,
             .model = model,
             .effort = session.effort,
@@ -2755,6 +2785,10 @@ pub const Daemon = struct {
             self.gpa.free(job.cwd);
             self.gpa.free(job.model);
             self.gpa.free(job.text);
+            self.gpa.free(job.otel_base);
+            self.gpa.free(job.otel_traces);
+            @memset(job.otel_headers, 0);
+            self.gpa.free(job.otel_headers);
             freeMediaRefs(self.gpa, job.attachments);
             self.gpa.destroy(job);
         }
@@ -2822,6 +2856,12 @@ pub const Daemon = struct {
             .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .provider_name = ep.provider_name, .backend = ep.backend },
             .http_pool = &self.http_pool,
             .otel_correlation = self.otel_exporter != null,
+            .otel_guest = if (job.otel_active) .{
+                .base_endpoint = job.otel_base,
+                .traces_endpoint = job.otel_traces,
+                .headers = job.otel_headers,
+                .capture_content = job.otel_content,
+            } else null,
             .effort = job.effort,
             .cfg = self.cfg,
             .tool_environ = self.environ,
@@ -3785,7 +3825,10 @@ pub const Daemon = struct {
     }
 
     fn sendOtelStatus(self: *Daemon, client: *Client) void {
-        self.sendTo(client, .{ .otel_status_result = .{ .enabled = self.otel_exporter != null } });
+        self.sendTo(client, .{ .otel_status_result = .{
+            .enabled = self.otel_exporter != null,
+            .content = if (self.otel_exporter) |exporter| exporter.capturesContent() else false,
+        } });
     }
 
     fn sendMcpStatus(self: *Daemon, client: *Client) void {

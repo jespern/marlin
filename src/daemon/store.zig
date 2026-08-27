@@ -1551,6 +1551,43 @@ pub const Store = struct {
         }
     }
 
+    /// Load one turn's blocks in seq order (OTLP content capture reads the
+    /// conversation of the turn it is exporting, nothing before or after).
+    pub fn loadTurnBlocksInto(
+        self: Store,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(block.Block),
+        session_id: u64,
+        turn_id: u64,
+    ) Error!void {
+        const stmt = try self.prepare(
+            "SELECT id, seq, ts, body_json FROM blocks WHERE session_id=? AND turn_id=? ORDER BY seq ASC",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(turn_id));
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            const body_ptr = c.sqlite3_column_text(stmt, 3);
+            const body_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+            const body_json = try arena.dupe(u8, body_ptr[0..body_len]);
+            const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.SqliteStep;
+            try out.append(arena, .{
+                .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .session_id = session_id,
+                .turn_id = turn_id,
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 1)),
+                .ts = c.sqlite3_column_int64(stmt, 2),
+                .body = body,
+            });
+        }
+    }
+
     /// Load one forward replay page without first materializing `limit` large
     /// rows. Returns true when another row exists (or the body-byte budget
     /// stopped this page). One first row may exceed max_body_bytes so every

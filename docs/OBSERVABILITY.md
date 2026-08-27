@@ -62,21 +62,72 @@ Exporter DNS, TLS, HTTP, or collector failures cannot fail or delay an agent
 turn; pending count and the last export error appear in diagnostics. Shutdown
 cancels an in-flight export before closing SQLite.
 
-Marlin exports one custom INTERNAL `marlin.turn` orchestration root without
-`gen_ai.*` attributes. Each provider round is a GenAI CLIENT span named
-`chat <request-model>`; each local tool execution is an INTERNAL span named
-`execute_tool <name>`, parented to the provider round that requested it.
-Inference spans include the provider, requested and returned model identifiers,
-streaming/TTFT, available request settings, finish reason, token usage, server
-address, and low-cardinality error type. Tool spans include the name, call id,
-description, and type when available. Successful spans leave OpenTelemetry
-status unset; failed spans set ERROR and `error.type`.
+Marlin exports one INTERNAL `invoke_agent marlin` root per turn
+(`gen_ai.operation.name=invoke_agent`, `gen_ai.agent.name=marlin`) carrying
+turn-level rollups: `gen_ai.usage.input_tokens`/`output_tokens`, round and
+tool-call counts, session kind, and outcome. Rollups on the root mean guest
+turns — whose work happens inside the guest binary rather than the native
+provider loop — still report usage. Each native provider round is a GenAI
+CLIENT span named `chat <request-model>`; each local tool execution is an
+INTERNAL span named `execute_tool <name>`, parented to the provider round that
+requested it. Inference spans include the provider, requested and returned
+model identifiers, streaming/TTFT, available request settings, finish reason,
+token usage, server address, and low-cardinality error type. Tool spans
+include the name, call id, description, and type when available. Successful
+spans leave OpenTelemetry status unset; failed spans set ERROR and
+`error.type`. Root attributes include `mirador.trace.tags=marlin` and a
+promoted `mirador.trace.attribute.session_id`, so Mirador can search and
+derive metrics without a second metrics pipeline.
 
-The exporter never records `gen_ai.system_instructions`, `gen_ai.input.messages`,
-`gen_ai.output.messages`, `gen_ai.tool.definitions`, tool arguments, or tool
-results. Root attributes include `mirador.trace.tags=marlin` and a promoted
-`mirador.trace.attribute.session_id`, so Mirador can search and derive metrics
-without a second metrics pipeline.
+## Content capture (opt-in)
+
+By default the exporter records structure only: no `gen_ai.input.messages`,
+`gen_ai.output.messages`, `gen_ai.system_instructions`,
+`gen_ai.tool.definitions`, tool arguments, or tool results — and provider
+error bodies never ship regardless. Tests assert the absence.
+
+Content capture is a deliberate opt-in, using the ecosystem-standard switch:
+
+```sh
+OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=SPAN_ONLY  # daemon env
+```
+
+or at runtime, `/otel content on` (`/otel content off` reverts; `/otel status`
+reports the state). Marlin records content on spans only, so `span_only`,
+`span_and_event`, and `true` enable it; `event_only` and `no_content` do not.
+
+When enabled, the invoke_agent root carries `gen_ai.input.messages` (authored
+user input including steering; synthetic post-compaction context is excluded)
+and `gen_ai.output.messages` (assistant prose, finish reason on the final
+message) in the spec's JSON message shape. Each execute_tool span carries
+`gen_ai.tool.call.arguments` and `gen_ai.tool.call.result`. Values are capped
+at 32 KiB each with an explicit truncation marker. Content is joined from the
+durable block log at export time — telemetry tables stay content-free, and
+because tool output is secret-redacted at capture time, exported results
+inherit that redaction. Toggling applies to everything still in the outbox.
+
+## Guest telemetry pass-down
+
+When Marlin's exporter is active, guest turns hand the same collector to the
+guest binary so its telemetry lands in the same backend, nested under Marlin's
+turn via W3C `TRACEPARENT` (trace ids are deterministic, so the guest's spans
+join the same trace Marlin exports). Values already present in the daemon's
+environment always win.
+
+- **Claude Code** receives `CLAUDE_CODE_ENABLE_TELEMETRY=1`, OTLP exporter
+  variables for traces/metrics/logs (traces-only when the configured endpoint
+  is traces-specific), headers, and `TRACEPARENT`. Content flags
+  (`OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`,
+  `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`) are set only when Marlin's
+  own content capture is on. Note: Claude Code's telemetry includes
+  `user.email` and account identifiers by default once enabled.
+- **Codex** has no `OTEL_*` environment interface; Marlin passes `-c
+  otel.trace_exporter=...` config overrides with per-signal URLs composed from
+  the base endpoint. Codex's log events carry tool arguments and output
+  previews with no redaction switch of their own, so the content-bearing log
+  exporter and `otel.log_user_prompt` are enabled only under Marlin's content
+  opt-in; structural trace spans flow regardless. `TRACEPARENT` is exported to
+  the process environment as well.
 
 ## OpenRouter correlation
 

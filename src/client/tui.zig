@@ -231,6 +231,7 @@ const OtelCommand = union(enum) {
     status,
     off,
     set: []const u8,
+    content: bool,
 };
 
 const council_done_item = "Done";
@@ -1838,8 +1839,11 @@ const App = struct {
                 self.pushBlock(.system_note, rendered, "diagnostics", .ok);
             },
             .otel_status_result => |status| self.setNotice(
-                "OTLP {s}",
-                .{if (status.enabled) @as([]const u8, "enabled") else "disabled"},
+                "OTLP {s}{s}",
+                .{
+                    if (status.enabled) @as([]const u8, "enabled") else "disabled",
+                    if (status.content) @as([]const u8, " · content capture ON") else "",
+                },
             ),
             .session_upsert => |su| self.upsertSessionSummary(su.session),
             .session_remove => |sr| self.removeSessionSummary(sr.sid),
@@ -4031,7 +4035,7 @@ const App = struct {
 
     fn otelCommand(self: *App, action_arg: ?[]const u8, rest_arg: []const u8) void {
         const parsed = parseOtelCommand(action_arg, rest_arg) orelse {
-            self.setNotice("usage: /otel [status|off|set <endpoint>]", .{});
+            self.setNotice("usage: /otel [status|off|set <endpoint>|content on|content off]", .{});
             return;
         };
         switch (parsed) {
@@ -4040,6 +4044,9 @@ const App = struct {
             },
             .off => self.conn.send(.{ .otel_configure = .{} }) catch {
                 self.setNotice("could not disable OTLP export", .{});
+            },
+            .content => |enabled| self.conn.send(.{ .otel_content = .{ .enabled = enabled } }) catch {
+                self.setNotice("could not toggle OTLP content capture", .{});
             },
             .set => |endpoint| {
                 self.otel_endpoint.clearRetainingCapacity();
@@ -4520,6 +4527,10 @@ fn parseOtelCommand(action_arg: ?[]const u8, rest_arg: []const u8) ?OtelCommand 
     if (std.mem.eql(u8, action, "set") and rest.len > 0 and
         std.mem.indexOfAny(u8, rest, " \t\r\n") == null)
         return .{ .set = rest };
+    if (std.mem.eql(u8, action, "content")) {
+        if (std.mem.eql(u8, rest, "on")) return .{ .content = true };
+        if (std.mem.eql(u8, rest, "off")) return .{ .content = false };
+    }
     return null;
 }
 

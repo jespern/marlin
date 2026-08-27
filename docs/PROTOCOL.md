@@ -159,8 +159,10 @@ descendants.
 process-local exporter. Empty endpoints disable export. Values are intentionally
 non-durable and should be sent only over the same-user Unix socket or SSH pipe;
 the TUI collects headers in a masked prompt outside command history and the
-transcript. Responses expose only the enabled bit. `otel_status` reads that bit
-without changing configuration.
+transcript. Responses expose only the enabled bits. `otel_status` reads them
+without changing configuration. `otel_content {enabled}` toggles opt-in GenAI
+content capture on the active exporter (error when none is configured); the
+flag is read at export time, so it covers everything still in the outbox.
 
 ## Daemon → client
 
@@ -172,7 +174,7 @@ without changing configuration.
 | input_history_result {entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
 | search_result {query,sid,hits} | reply to search; each hit carries session/block identity, kind, location, timestamp, and an FTS-highlighted snippet |
 | diagnostics_result | reply to diagnostics; aggregate provider/TTFT percentiles, outcomes, latest provider/tool waterfall, trace id, and OTLP outbox health; contains no prompt or tool content |
-| otel_status_result {enabled} | reply to `otel_status` or `otel_configure`; never includes endpoint headers |
+| otel_status_result {enabled,content} | reply to `otel_status`, `otel_configure`, or `otel_content`; never includes endpoint headers |
 | session_upsert {session} | one added/restored/changed catalog row for an incremental session watcher |
 | session_remove {sid} | one archived catalog row removed from an incremental session watcher |
 | blk {sid, b} | a block was persisted (replay AND live fan-out) |

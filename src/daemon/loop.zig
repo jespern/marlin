@@ -58,6 +58,19 @@ fn guestBackend(ep: Endpoint) ?provider.Guest {
 pub const ToolPhase = enum { start, done };
 pub const ToolProfile = enum { full, read_only, plan };
 
+/// What a guest agent needs to ship its telemetry to Marlin's collector.
+/// Strings are turn-job-owned snapshots of the exporter configuration.
+pub const OtelGuest = struct {
+    base_endpoint: []const u8 = "",
+    traces_endpoint: []const u8 = "",
+    /// Standard comma-separated, percent-encoded `name=value` form.
+    headers: []const u8 = "",
+    /// Mirrors Marlin's opt-in content capture: when the operator has opted
+    /// into shipping conversation content, guest prompt/tool content flags
+    /// are enabled too; otherwise guests keep their redacted defaults.
+    capture_content: bool = false,
+};
+
 pub const RunOpts = struct {
     session_id: u64,
     /// Durable turn id allocated by the dispatcher. Zero keeps standalone
@@ -70,6 +83,10 @@ pub const RunOpts = struct {
     /// Add OpenRouter's trace linkage only when the matching Marlin OTLP root
     /// will be exported. Avoid orphan parent ids in Broadcast-only setups.
     otel_correlation: bool = false,
+    /// Collector snapshot handed to guest agents so their own telemetry
+    /// (claude, codex) lands in the same backend, nested under Marlin's turn
+    /// trace via TRACEPARENT. Null when Marlin itself is not exporting.
+    otel_guest: ?OtelGuest = null,
     effort: Effort = .auto,
     cfg: config.Config,
     /// Daemon-owned environment. Tool subprocesses receive a scrubbed copy;
@@ -1412,6 +1429,14 @@ const CcOutcome = struct {
     stderr_len: usize = 0,
 };
 
+/// Put a key only when the parent environment didn't set it — the operator's
+/// own value always wins over Marlin's pass-down defaults.
+fn putEnvDefault(map: *std.process.Environ.Map, key: []const u8, value: []const u8) bool {
+    if (map.get(key) != null) return true;
+    map.put(key, value) catch return false;
+    return true;
+}
+
 /// One `claude -p` invocation: spawn, decode stream-json, persist blocks.
 fn ccInvoke(
     gpa: std.mem.Allocator,
@@ -1444,10 +1469,14 @@ fn ccInvoke(
 
     // A bridged permission prompt can park on a human for a long time;
     // stretch Claude Code's MCP tool timeout so the call survives the wait
-    // instead of decaying into a deny. Existing values always win.
-    var bridge_environ: ?std.process.Environ.Map = null;
-    defer if (bridge_environ) |*map| map.deinit();
-    if (bridge != null) {
+    // instead of decaying into a deny. When Marlin exports OTLP, the same
+    // copy also switches on Claude Code's telemetry against the same
+    // collector, with TRACEPARENT nesting its spans under Marlin's turn.
+    // Existing values always win in both cases.
+    var traceparent_buf: [64]u8 = undefined;
+    var child_environ: ?std.process.Environ.Map = null;
+    defer if (child_environ) |*map| map.deinit();
+    if (bridge != null or opts.otel_guest != null) {
         if (opts.tool_environ) |source| {
             var map = std.process.Environ.Map.init(gpa);
             var ok = true;
@@ -1458,22 +1487,53 @@ fn ccInvoke(
                     break;
                 };
             }
-            if (ok and map.get("MCP_TOOL_TIMEOUT") == null)
-                map.put("MCP_TOOL_TIMEOUT", "86400000") catch {
-                    ok = false;
-                };
-            if (ok and map.get("MCP_TIMEOUT") == null)
-                map.put("MCP_TIMEOUT", "30000") catch {
-                    ok = false;
-                };
-            if (ok) bridge_environ = map else map.deinit();
+            if (bridge != null) {
+                if (ok and map.get("MCP_TOOL_TIMEOUT") == null)
+                    map.put("MCP_TOOL_TIMEOUT", "86400000") catch {
+                        ok = false;
+                    };
+                if (ok and map.get("MCP_TIMEOUT") == null)
+                    map.put("MCP_TIMEOUT", "30000") catch {
+                        ok = false;
+                    };
+            }
+            if (opts.otel_guest) |guest| {
+                const trace_id = telemetry_ids.traceId(opts.session_id, ap.turn_id);
+                const root_span = telemetry_ids.spanId(ap.turn_id);
+                const traceparent = std.fmt.bufPrint(
+                    &traceparent_buf,
+                    "00-{s}-{s}-01",
+                    .{ trace_id[0..], root_span[0..] },
+                ) catch unreachable;
+                ok = ok and putEnvDefault(&map, "TRACEPARENT", traceparent);
+                ok = ok and putEnvDefault(&map, "CLAUDE_CODE_ENABLE_TELEMETRY", "1");
+                ok = ok and putEnvDefault(&map, "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA", "1");
+                ok = ok and putEnvDefault(&map, "OTEL_TRACES_EXPORTER", "otlp");
+                ok = ok and putEnvDefault(&map, "OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf");
+                if (guest.base_endpoint.len > 0) {
+                    ok = ok and putEnvDefault(&map, "OTEL_EXPORTER_OTLP_ENDPOINT", guest.base_endpoint);
+                    ok = ok and putEnvDefault(&map, "OTEL_METRICS_EXPORTER", "otlp");
+                    ok = ok and putEnvDefault(&map, "OTEL_LOGS_EXPORTER", "otlp");
+                } else if (guest.traces_endpoint.len > 0) {
+                    ok = ok and putEnvDefault(&map, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", guest.traces_endpoint);
+                }
+                if (guest.headers.len > 0)
+                    ok = ok and putEnvDefault(&map, "OTEL_EXPORTER_OTLP_HEADERS", guest.headers);
+                if (guest.capture_content) {
+                    ok = ok and putEnvDefault(&map, "OTEL_LOG_USER_PROMPTS", "1");
+                    ok = ok and putEnvDefault(&map, "OTEL_LOG_ASSISTANT_RESPONSES", "1");
+                    ok = ok and putEnvDefault(&map, "OTEL_LOG_TOOL_DETAILS", "1");
+                    ok = ok and putEnvDefault(&map, "OTEL_LOG_TOOL_CONTENT", "1");
+                }
+            }
+            if (ok) child_environ = map else map.deinit();
         }
     }
 
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = opts.cwd },
-        .environ_map = if (bridge_environ) |*map| map else opts.tool_environ,
+        .environ_map = if (child_environ) |*map| map else opts.tool_environ,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -1960,12 +2020,33 @@ fn runCodexTurn(
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const argv = try codex.buildArgv(arena, opts.tool_environ);
+    const argv = try codex.buildArgv(arena, opts.tool_environ, if (opts.otel_guest) |guest| .{
+        .base_endpoint = guest.base_endpoint,
+        .traces_endpoint = guest.traces_endpoint,
+        .headers = guest.headers,
+        .capture_content = guest.capture_content,
+    } else null);
     var guest_environ: ?std.process.Environ.Map = if (opts.tool_environ) |source|
         try permissions.toolEnvironment(gpa, source)
     else
         null;
     defer if (guest_environ) |*map| map.deinit();
+    // Codex reads its collector from config overrides above; TRACEPARENT
+    // still travels via the environment so subprocesses it spawns (and any
+    // future inbound-context support) can nest under Marlin's turn trace.
+    var codex_traceparent_buf: [64]u8 = undefined;
+    if (opts.otel_guest != null) {
+        if (guest_environ) |*map| {
+            const trace_id = telemetry_ids.traceId(opts.session_id, ap.turn_id);
+            const root_span = telemetry_ids.spanId(ap.turn_id);
+            const traceparent = std.fmt.bufPrint(
+                &codex_traceparent_buf,
+                "00-{s}-{s}-01",
+                .{ trace_id[0..], root_span[0..] },
+            ) catch unreachable;
+            _ = putEnvDefault(map, "TRACEPARENT", traceparent);
+        }
+    }
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = opts.cwd },

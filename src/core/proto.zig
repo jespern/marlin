@@ -214,6 +214,10 @@ pub const ClientMsg = union(enum) {
         headers: []const u8 = "",
     },
     otel_status: struct {},
+    /// Toggle opt-in GenAI content capture (prompts, replies, tool
+    /// args/results on exported spans). Requires an active exporter; the
+    /// flag applies to everything still in the durable outbox.
+    otel_content: struct { enabled: bool },
     /// Subscribe this client to refreshed session_list_result snapshots when
     /// any session enters an actionable state or its membership changes.
     /// The daemon replies with an immediate snapshot, then sends updates until
@@ -380,7 +384,7 @@ pub const DaemonMsg = union(enum) {
     input_history_result: struct { entries: []const InputHistoryEntry },
     search_result: struct { query: []const u8, sid: u64 = 0, hits: []const SearchHit },
     diagnostics_result: Diagnostics,
-    otel_status_result: struct { enabled: bool },
+    otel_status_result: struct { enabled: bool, content: bool = false },
     /// Sent only to session watchers that explicitly opted in: older tagged
     /// union decoders reject message types they do not know.
     session_upsert: struct { session: SessionInfo },

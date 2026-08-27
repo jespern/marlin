@@ -6,9 +6,15 @@ const Io = std.Io;
 const build_options = @import("build_options");
 
 const telemetry_ids = @import("../core/telemetry.zig");
+const block = @import("../core/block.zig");
 const Store = @import("store.zig").Store;
 const TelemetryTrace = @import("store.zig").TelemetryTrace;
 const http = @import("provider/http.zig");
+
+/// Ceiling per exported content attribute. Generous enough for real prompts
+/// and tool output, small enough that one pathological turn cannot produce a
+/// pathological OTLP request.
+const content_attribute_cap = 32 * 1024;
 
 pub const Exporter = struct {
     gpa: std.mem.Allocator,
@@ -16,9 +22,19 @@ pub const Exporter = struct {
     store: *Store,
     endpoint: [:0]u8,
     headers: [][]u8,
+    /// Raw configuration retained verbatim for guest-agent pass-down: guests
+    /// (claude, codex) receive the same collector so their telemetry nests
+    /// under Marlin's turn trace. Empty strings mean "not provided".
+    raw_base_endpoint: []u8,
+    raw_traces_endpoint: []u8,
+    raw_headers: []u8,
     pool: http.Pool,
     active: std.atomic.Value(bool) = .init(false),
     stop: std.atomic.Value(bool) = .init(false),
+    /// Ship conversation content (prompts, replies, tool args/results) on
+    /// spans. Strictly opt-in; read at export time, so toggling covers
+    /// everything still in the outbox.
+    capture_content: std.atomic.Value(bool) = .init(false),
     thread: std.Thread,
 
     /// Standard OTEL environment variables make export opt-in without putting
@@ -33,6 +49,9 @@ pub const Exporter = struct {
             .endpoint = environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") orelse "",
             .traces_endpoint = environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") orelse "",
             .headers = environ.get("OTEL_EXPORTER_OTLP_HEADERS") orelse "",
+            .capture_content = contentCaptureRequested(
+                environ.get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT") orelse "",
+            ),
         });
     }
 
@@ -40,6 +59,7 @@ pub const Exporter = struct {
         endpoint: []const u8 = "",
         traces_endpoint: []const u8 = "",
         headers: []const u8 = "",
+        capture_content: bool = false,
     };
 
     pub fn startConfigured(
@@ -58,6 +78,12 @@ pub const Exporter = struct {
         errdefer gpa.free(endpoint);
         const headers = try parseHeaders(gpa, config.headers);
         errdefer freeHeaders(gpa, headers);
+        const raw_base = try gpa.dupe(u8, base_endpoint);
+        errdefer gpa.free(raw_base);
+        const raw_traces = try gpa.dupe(u8, traces_endpoint);
+        errdefer gpa.free(raw_traces);
+        const raw_headers = try gpa.dupe(u8, std.mem.trim(u8, config.headers, " \t\r\n"));
+        errdefer gpa.free(raw_headers);
         var pool = try http.Pool.init(gpa, io, environ);
         errdefer pool.deinit();
         const self = try gpa.create(Exporter);
@@ -68,11 +94,18 @@ pub const Exporter = struct {
             .store = store,
             .endpoint = endpoint,
             .headers = headers,
+            .raw_base_endpoint = raw_base,
+            .raw_traces_endpoint = raw_traces,
+            .raw_headers = raw_headers,
             .pool = pool,
+            .capture_content = .init(config.capture_content),
             .thread = undefined,
         };
         self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| {
             self.pool.deinit();
+            gpa.free(raw_headers);
+            gpa.free(raw_traces);
+            gpa.free(raw_base);
             freeHeaders(gpa, headers);
             gpa.free(endpoint);
             gpa.destroy(self);
@@ -80,9 +113,16 @@ pub const Exporter = struct {
         };
         return self;
     }
-
     pub fn activate(self: *Exporter) void {
         self.active.store(true, .release);
+    }
+
+    pub fn setCaptureContent(self: *Exporter, enabled: bool) void {
+        self.capture_content.store(enabled, .release);
+    }
+
+    pub fn capturesContent(self: *const Exporter) bool {
+        return self.capture_content.load(.acquire);
     }
 
     pub fn deinit(self: *Exporter) void {
@@ -90,6 +130,10 @@ pub const Exporter = struct {
         self.thread.join();
         self.pool.deinit();
         freeHeaders(self.gpa, self.headers);
+        @memset(self.raw_headers, 0);
+        self.gpa.free(self.raw_headers);
+        self.gpa.free(self.raw_traces_endpoint);
+        self.gpa.free(self.raw_base_endpoint);
         self.gpa.free(self.endpoint);
         const gpa = self.gpa;
         self.* = undefined;
@@ -111,7 +155,15 @@ pub const Exporter = struct {
                 self.pause(500);
                 continue;
             };
-            const body = buildTraceRequest(arena, trace) catch |err| {
+            // Content is joined from the durable block log at export time —
+            // telemetry tables stay content-free and the toggle covers
+            // everything still in the outbox. A failed join exports the
+            // structural trace rather than dropping it.
+            const content: ?TurnContent = if (self.capture_content.load(.acquire))
+                buildTurnContent(arena, self.store, trace) catch null
+            else
+                null;
+            const body = buildTraceRequest(arena, trace, content) catch |err| {
                 self.recordFailure(trace, now, @errorName(err));
                 self.pause(1_000);
                 continue;
@@ -286,17 +338,123 @@ const OtlpTraceRequest = struct {
     resourceSpans: []const OtlpResourceSpans,
 };
 
-fn buildTraceRequest(allocator: std.mem.Allocator, trace: TelemetryTrace) ![]u8 {
+/// True when the standard OTel GenAI capture variable requests span-carried
+/// content. Marlin records content on spans only, so the event-only mode
+/// stays off rather than silently mapping to a shape the user didn't ask for.
+pub fn contentCaptureRequested(value: []const u8) bool {
+    const v = std.mem.trim(u8, value, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(v, "span_only") or
+        std.ascii.eqlIgnoreCase(v, "span_and_event") or
+        std.ascii.eqlIgnoreCase(v, "true");
+}
+
+/// Conversation content for one turn, keyed for span attachment. All slices
+/// are arena-owned JSON/text, already capped.
+const TurnContent = struct {
+    input_messages: ?[]const u8 = null,
+    output_messages: ?[]const u8 = null,
+    tool_args: std.StringHashMapUnmanaged([]const u8) = .empty,
+    tool_results: std.StringHashMapUnmanaged([]const u8) = .empty,
+};
+
+/// Cap one content value; truncation lands on a UTF-8 boundary and says so.
+fn capContent(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (text.len <= content_attribute_cap) return text;
+    var end: usize = content_attribute_cap;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return std.fmt.allocPrint(arena, "{s}…[truncated {d} bytes]", .{ text[0..end], text.len - end });
+}
+
+const ContentPart = struct { type: []const u8 = "text", content: []const u8 };
+const InputMessage = struct { role: []const u8, parts: []const ContentPart };
+const OutputMessage = struct {
+    role: []const u8 = "assistant",
+    parts: []const ContentPart,
+    finish_reason: ?[]const u8 = null,
+};
+
+/// Join the turn's durable blocks into the GenAI content attributes: authored
+/// user input (steering included, synthetic context excluded) becomes
+/// gen_ai.input.messages, assistant prose becomes gen_ai.output.messages, and
+/// tool argument/result text is keyed by call id for the execute_tool spans.
+fn buildTurnContent(arena: std.mem.Allocator, store: *Store, trace: TelemetryTrace) !TurnContent {
+    var blocks: std.ArrayList(block.Block) = .empty;
+    try store.loadTurnBlocksInto(arena, &blocks, trace.session_id, trace.turn_id);
+
+    var content = TurnContent{};
+    var inputs: std.ArrayList(InputMessage) = .empty;
+    var outputs: std.ArrayList(OutputMessage) = .empty;
+    for (blocks.items) |b| switch (b.body) {
+        .user_msg => |msg| {
+            if (msg.synthetic) continue;
+            const parts = try arena.alloc(ContentPart, 1);
+            parts[0] = .{ .content = try capContent(arena, msg.text) };
+            try inputs.append(arena, .{ .role = "user", .parts = parts });
+        },
+        .steer => |msg| {
+            const parts = try arena.alloc(ContentPart, 1);
+            parts[0] = .{ .content = try capContent(arena, msg.text) };
+            try inputs.append(arena, .{ .role = "user", .parts = parts });
+        },
+        .assistant_msg => |msg| {
+            const parts = try arena.alloc(ContentPart, 1);
+            parts[0] = .{ .content = try capContent(arena, msg.text) };
+            try outputs.append(arena, .{ .parts = parts });
+        },
+        .tool_call => |call| {
+            if (call.call_id.len == 0) continue;
+            try content.tool_args.put(arena, call.call_id, try capContent(arena, call.args_json));
+        },
+        .tool_result => |result| {
+            if (result.call_id.len == 0) continue;
+            try content.tool_results.put(arena, result.call_id, try capContent(arena, result.inline_body));
+        },
+        else => {},
+    };
+    if (outputs.items.len > 0) {
+        const finish_reason = for (0..trace.rounds.len) |i| {
+            const reason = trace.rounds[trace.rounds.len - 1 - i].finish_reason;
+            if (reason.len > 0) break reason;
+        } else "";
+        if (finish_reason.len > 0)
+            outputs.items[outputs.items.len - 1].finish_reason = finish_reason;
+    }
+    const stringify_options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    if (inputs.items.len > 0)
+        content.input_messages = try std.json.Stringify.valueAlloc(arena, inputs.items, stringify_options);
+    if (outputs.items.len > 0)
+        content.output_messages = try std.json.Stringify.valueAlloc(arena, outputs.items, stringify_options);
+    return content;
+}
+
+fn buildTraceRequest(allocator: std.mem.Allocator, trace: TelemetryTrace, content: ?TurnContent) ![]u8 {
     const trace_id = telemetry_ids.traceId(trace.session_id, trace.turn_id);
     const root_span_id = telemetry_ids.spanId(trace.turn_id);
     const conversation_id = try std.fmt.allocPrint(allocator, "{x}", .{trace.session_id});
 
     var spans: std.ArrayList(OtlpSpan) = .empty;
     var root_attributes: std.ArrayList(OtlpKeyValue) = .empty;
+    try root_attributes.append(allocator, stringKeyValue("gen_ai.operation.name", "invoke_agent"));
+    try root_attributes.append(allocator, stringKeyValue("gen_ai.agent.name", "marlin"));
+    try root_attributes.append(allocator, stringKeyValue("gen_ai.conversation.id", conversation_id));
     try root_attributes.append(allocator, stringKeyValue("marlin.session.kind", trace.session_kind));
     try root_attributes.append(allocator, stringKeyValue("marlin.turn.outcome", trace.outcome));
     try root_attributes.append(allocator, stringKeyValue("mirador.trace.tags", "marlin"));
     try root_attributes.append(allocator, stringKeyValue("mirador.trace.attribute.session_id", conversation_id));
+    // Turn-level rollups live on the root so turns whose work happens outside
+    // the native provider loop (guest sessions) still report usage.
+    if (trace.tokens_in > 0)
+        try root_attributes.append(allocator, try intKeyValue(allocator, "gen_ai.usage.input_tokens", trace.tokens_in));
+    if (trace.tokens_out > 0)
+        try root_attributes.append(allocator, try intKeyValue(allocator, "gen_ai.usage.output_tokens", trace.tokens_out));
+    try root_attributes.append(allocator, try intKeyValue(allocator, "marlin.turn.rounds", trace.rounds_count));
+    try root_attributes.append(allocator, try intKeyValue(allocator, "marlin.turn.tool_calls", trace.tool_calls));
+    if (content) |ct| {
+        if (ct.input_messages) |messages|
+            try root_attributes.append(allocator, stringKeyValue("gen_ai.input.messages", messages));
+        if (ct.output_messages) |messages|
+            try root_attributes.append(allocator, stringKeyValue("gen_ai.output.messages", messages));
+    }
     const root_failed = std.mem.eql(u8, trace.outcome, "error") or std.mem.eql(u8, trace.outcome, "abandoned");
     if (root_failed) try root_attributes.append(allocator, stringKeyValue("error.type", trace.outcome));
     try spans.append(allocator, try makeSpan(
@@ -304,7 +462,7 @@ fn buildTraceRequest(allocator: std.mem.Allocator, trace: TelemetryTrace) ![]u8 
         &trace_id,
         &root_span_id,
         null,
-        "marlin.turn",
+        "invoke_agent marlin",
         1,
         trace.started_at_ms,
         trace.ended_at_ms,
@@ -396,6 +554,12 @@ fn buildTraceRequest(allocator: std.mem.Allocator, trace: TelemetryTrace) ![]u8 
         if (tool.description.len > 0)
             try attributes.append(allocator, stringKeyValue("gen_ai.tool.description", tool.description));
         try attributes.append(allocator, stringKeyValue("gen_ai.tool.type", "function"));
+        if (content) |ct| {
+            if (ct.tool_args.get(tool.call_id)) |args|
+                try attributes.append(allocator, stringKeyValue("gen_ai.tool.call.arguments", args));
+            if (ct.tool_results.get(tool.call_id)) |result|
+                try attributes.append(allocator, stringKeyValue("gen_ai.tool.call.result", result));
+        }
         const failed = !std.mem.eql(u8, tool.status, "ok");
         if (failed) try attributes.append(allocator, stringKeyValue("error.type", tool.status));
         try spans.append(allocator, try makeSpan(
@@ -566,15 +730,19 @@ test "OTLP request follows GenAI inference and execute-tool structure without co
             .ended_at_ms = 21,
             .status = "ok",
         }},
-    });
+    }, null);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), json, .{});
     defer parsed.deinit();
     const spans = traceSpans(parsed.value);
     try std.testing.expectEqual(@as(usize, 3), spans.len);
 
-    const root = spanNamed(spans, "marlin.turn");
+    const root = spanNamed(spans, "invoke_agent marlin");
     try std.testing.expectEqual(@as(i64, 1), root.object.get("kind").?.integer);
-    try std.testing.expect(spanAttribute(root.*, "gen_ai.operation.name") == null);
+    try expectStringAttribute(root.*, "gen_ai.operation.name", "invoke_agent");
+    try expectStringAttribute(root.*, "gen_ai.agent.name", "marlin");
+    try std.testing.expect(spanAttribute(root.*, "gen_ai.conversation.id") != null);
+    try std.testing.expect(spanAttribute(root.*, "gen_ai.usage.input_tokens") != null);
+    try std.testing.expect(spanAttribute(root.*, "gen_ai.usage.output_tokens") != null);
     try std.testing.expect(spanAttribute(root.*, "gen_ai.provider.name") == null);
 
     const inference = spanNamed(spans, "chat test/model");
@@ -663,7 +831,7 @@ test "OTLP GenAI failures set error type and error span status" {
             .ended_at_ms = 21,
             .status = "denied",
         }},
-    });
+    }, null);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), json, .{});
     defer parsed.deinit();
     const spans = traceSpans(parsed.value);
@@ -677,6 +845,100 @@ test "OTLP GenAI failures set error type and error span status" {
     try expectStringAttribute(tool.*, "error.type", "denied");
     try std.testing.expectEqual(@as(i64, 2), tool.object.get("status").?.object.get("code").?.integer);
     try std.testing.expect(std.mem.indexOf(u8, json, "secret provider message") == null);
+}
+
+test "content capture is recognized only for span-carrying opt-in values" {
+    try std.testing.expect(contentCaptureRequested("SPAN_ONLY"));
+    try std.testing.expect(contentCaptureRequested("span_and_event"));
+    try std.testing.expect(contentCaptureRequested("true"));
+    try std.testing.expect(!contentCaptureRequested(""));
+    try std.testing.expect(!contentCaptureRequested("NO_CONTENT"));
+    try std.testing.expect(!contentCaptureRequested("event_only"));
+    try std.testing.expect(!contentCaptureRequested("false"));
+}
+
+test "content capture joins turn blocks onto spans and caps oversized values" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "test/model", .auto);
+    const huge = try arena.alloc(u8, content_attribute_cap + 100);
+    @memset(huge, 'x');
+    const bodies = [_]block.Body{
+        .{ .user_msg = .{ .text = "please fix the flaky test" } },
+        .{ .user_msg = .{ .text = "machine context", .synthetic = true } },
+        .{ .tool_call = .{ .call_id = "call-1", .name = "bash", .args_json = "{\"cmd\":\"zig build test\"}" } },
+        .{ .tool_result = .{ .call_id = "call-1", .status = .ok, .inline_body = huge, .full_body_ref = null } },
+        .{ .steer = .{ .text = "prefer rg" } },
+        .{ .assistant_msg = .{ .text = "done — the test was time-dependent" } },
+    };
+    for (bodies, 1..) |body, seq| try store.appendBlock(.{
+        .id = seq,
+        .session_id = 1,
+        .turn_id = 2,
+        .seq = seq,
+        .ts = 100,
+        .body = body,
+    });
+    // Another turn's block must not leak into this turn's content.
+    try store.appendBlock(.{
+        .id = 99,
+        .session_id = 1,
+        .turn_id = 3,
+        .seq = 99,
+        .ts = 200,
+        .body = .{ .user_msg = .{ .text = "unrelated later prompt" } },
+    });
+
+    const trace = TelemetryTrace{
+        .session_id = 1,
+        .turn_id = 2,
+        .model = "test/model",
+        .session_kind = "root",
+        .started_at_ms = 10,
+        .ended_at_ms = 30,
+        .outcome = "ok",
+        .error_text = "",
+        .rounds_count = 1,
+        .tool_calls = 1,
+        .tokens_in = 12,
+        .tokens_out = 4,
+        .rounds = &.{},
+        .tools = &.{.{
+            .round = 0,
+            .call_id = "call-1",
+            .span_id = "0000000000000004",
+            .name = "bash",
+            .description = "",
+            .started_at_ms = 20,
+            .ended_at_ms = 21,
+            .status = "ok",
+        }},
+    };
+    const content = try buildTurnContent(arena, &store, trace);
+    const json = try buildTraceRequest(arena, trace, content);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, json, .{});
+    defer parsed.deinit();
+    const spans = traceSpans(parsed.value);
+
+    const root = spanNamed(spans, "invoke_agent marlin");
+    const input = spanAttribute(root.*, "gen_ai.input.messages").?.object.get("stringValue").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, input, "please fix the flaky test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input, "prefer rg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input, "machine context") == null);
+    try std.testing.expect(std.mem.indexOf(u8, input, "unrelated later prompt") == null);
+    const output = spanAttribute(root.*, "gen_ai.output.messages").?.object.get("stringValue").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, output, "time-dependent") != null);
+
+    const tool = spanNamed(spans, "execute_tool bash");
+    try expectStringAttribute(tool.*, "gen_ai.tool.call.arguments", "{\"cmd\":\"zig build test\"}");
+    const result = spanAttribute(tool.*, "gen_ai.tool.call.result").?.object.get("stringValue").?.string;
+    try std.testing.expect(result.len < huge.len);
+    try std.testing.expect(std.mem.indexOf(u8, result, "…[truncated 100 bytes]") != null);
 }
 
 test "OTEL endpoint normalization validates schemes and appends traces path" {
