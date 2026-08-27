@@ -2711,7 +2711,32 @@ const App = struct {
         rt.recorder = child;
         rt.wav_path = wav;
         rt.phase = .recording;
+        self.prewarmVoiceModel();
         self.setNotice("● recording — {s}", .{if (rt.setup.?.mode == .ptt and rt.kitty_release) "release to transcribe" else "ctrl+space to stop"});
+    }
+
+    /// While the user is talking, pull the model through the page cache so
+    /// the transcriber starts hot. Rate-limited: a cached re-read is cheap
+    /// but not free, and one warm pass a minute keeps residency fresh.
+    fn prewarmVoiceModel(self: *App) void {
+        const rt = &self.voice_rt;
+        const setup = rt.setup orelse return;
+        if (setup.model_path.len == 0) return;
+        const now = nowWallMs(self.io);
+        if (rt.prewarm_at_ms != 0 and now - rt.prewarm_at_ms < 60_000) return;
+        rt.prewarm_at_ms = now;
+        const job = self.gpa.create(VoicePrewarmJob) catch return;
+        const path = self.gpa.dupe(u8, setup.model_path) catch {
+            self.gpa.destroy(job);
+            return;
+        };
+        job.* = .{ .gpa = self.gpa, .io = self.io, .path = path };
+        const thread = std.Thread.spawn(.{}, VoicePrewarmJob.run, .{job}) catch {
+            self.gpa.free(path);
+            self.gpa.destroy(job);
+            return;
+        };
+        thread.detach();
     }
 
     fn stopVoiceRecording(self: *App) void {
@@ -6422,6 +6447,20 @@ const VoiceJob = struct {
     }
 };
 
+/// Fire-and-forget page-cache prewarm, spawned when recording starts so
+/// the model is hot by the time the user stops talking.
+const VoicePrewarmJob = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    path: []u8,
+
+    fn run(job: *VoicePrewarmJob) void {
+        voice.prewarmModel(job.gpa, job.io, job.path);
+        job.gpa.free(job.path);
+        job.gpa.destroy(job);
+    }
+};
+
 /// Model download worker for /voice setup.
 const VoiceDownloadJob = struct {
     gpa: std.mem.Allocator,
@@ -6462,6 +6501,8 @@ const VoiceRt = struct {
     rate_bytes: u64 = 0,
     rate_at_ms: i64 = 0,
     rate_bps: u64 = 0,
+    /// Last page-cache prewarm; refreshed at most once a minute.
+    prewarm_at_ms: i64 = 0,
 
     fn freeSetup(self: *VoiceRt, gpa: std.mem.Allocator) void {
         if (self.setup) |st| {

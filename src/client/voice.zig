@@ -172,6 +172,24 @@ pub fn cleanTranscript(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// Pull the model file through the page cache so the transcriber that runs
+/// a few seconds from now (when the user releases the key) finds hot pages
+/// instead of a cold SSD read. Reads into a small scratch buffer that is
+/// immediately discarded: the residency lands in the kernel's file cache,
+/// never in marlin's RSS. Errors are irrelevant — this is a hint.
+pub fn prewarmModel(gpa: std.mem.Allocator, io: Io, path: []const u8) void {
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return;
+    defer file.close(io);
+    const scratch = gpa.alloc(u8, 4 * 1024 * 1024) catch return;
+    defer gpa.free(scratch);
+    var offset: u64 = 0;
+    while (true) {
+        const n = file.readPositional(io, &.{scratch}, offset) catch return;
+        if (n == 0) return;
+        offset += n;
+    }
+}
+
 // ------------------------------------------------------------- download --
 
 pub const DownloadProgress = struct {
@@ -365,4 +383,23 @@ test "model download: real network smoke (MARLIN_VOICE_NET_TEST=1)" {
     try std.testing.expect(total == done);
     const st = try Io.Dir.cwd().statFile(io, dest, .{});
     try std.testing.expectEqual(done, st.size);
+}
+
+test "prewarm reads a file to completion and tolerates absence" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-voice-prewarm");
+    defer temp.deinit();
+    const path = try std.fs.path.join(gpa, &.{ temp.path, "model.bin" });
+    defer gpa.free(path);
+    const blob = try gpa.alloc(u8, 6 * 1024 * 1024); // spans scratch chunks
+    defer gpa.free(blob);
+    @memset(blob, 0xab);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = blob });
+
+    prewarmModel(gpa, io, path); // must complete without error signaling
+    prewarmModel(gpa, io, "/definitely/not/here.bin"); // and shrug at absence
 }
