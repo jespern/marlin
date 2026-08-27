@@ -63,6 +63,14 @@
     padding: 8px 12px; border-radius: 4px; white-space: pre-wrap;
     color: #fff; font-weight: 600;
   }
+  .user.optimistic { opacity: .72; border-left-color: var(--dim); }
+  .user.optimistic::after { content: " · sending…"; color: var(--dim); font-size: 12px; font-weight: 400; }
+  .user.optimistic.accepted { opacity: 1; }
+  .user.optimistic.accepted::after { content: ""; }
+  .user.optimistic.unconfirmed { border-left-color: var(--yellow); }
+  .user.optimistic.unconfirmed::after { content: " · delivery?"; color: var(--yellow); }
+  .user.rejected { border-left-color: var(--red); color: var(--red); opacity: .85; }
+  .user.rejected::after { content: " · not sent"; color: var(--red); font-size: 12px; }
   .reasoning { color: var(--dim); padding: 0 12px; }
   .reasoning::before { content: "· "; color: var(--accent); font-weight: bold; }
   .tool summary { color: var(--dim); cursor: pointer; }
@@ -223,7 +231,8 @@ const bigints = raw => raw.replace(/"(sid|parent_sid|session_id)":(\d{12,})/g, '
 const $ = s => document.querySelector(s);
 let sid = null, cur = null, es = null, lastSeq = 0, oldestSeq = 0, historyHasOlder = false,
   historyLoading = false, historyBlocks = [], deltaEl = null, deltaText = '', reasoningEl = null,
-  reasoningText = '', approvalId = null, sessionsCache = [], interruptArmTimer = null;
+  reasoningText = '', approvalId = null, sessionsCache = [], interruptArmTimer = null,
+  pendingInputs = [], nextInputRequestId = Date.now();
 // Set on each session open; replayed history stays collapsed while blocks
 // stamped after this moment count as live (block ts is ms epoch).
 let openedAt = 0;
@@ -338,6 +347,46 @@ function clearReasoning() {
   reasoningText = '';
 }
 
+function addOptimisticInput(targetSid, text, steer) {
+  const requestId = ++nextInputRequestId;
+  const node = el('div', 'block user optimistic', (steer ? '↪ ' : '') + text);
+  node.dataset.requestId = String(requestId);
+  $('#transcript').appendChild(node);
+  pendingInputs.push({ requestId, sid: targetSid, text, steer, node });
+  scrollBottom();
+  return pendingInputs[pendingInputs.length - 1];
+}
+
+function settleOptimisticInput(kind, text) {
+  const i = pendingInputs.findIndex(p => p.sid === sid && p.text === text);
+  if (i < 0) return false;
+  const pending = pendingInputs.splice(i, 1)[0];
+  if (!pending.node.isConnected) return false;
+  pending.node.className = 'block user';
+  pending.node.textContent = (kind === 'steer' ? '↪ ' : '') + text;
+  delete pending.node.dataset.requestId;
+  // Move the optimistic row to the durable event's actual position. This is
+  // observable for steering: the in-flight row can precede the assistant's
+  // final block locally, while the durable steer correctly follows it.
+  $('#transcript').appendChild(pending.node);
+  scrollBottom();
+  return true;
+}
+
+function rejectOptimisticInput(pending, message, uncertain) {
+  if (!pending.node.isConnected) return;
+  if (uncertain) {
+    pending.node.classList.add('unconfirmed');
+    pending.node.title = 'delivery unconfirmed: ' + message;
+  } else {
+    const i = pendingInputs.indexOf(pending);
+    if (i >= 0) pendingInputs.splice(i, 1);
+    pending.node.className = 'block user rejected';
+    pending.node.title = message;
+  }
+  notice(message);
+}
+
 function toolPreview(name, argsJson) {
   try {
     const a = JSON.parse(argsJson);
@@ -376,6 +425,8 @@ function addBlock(b, target = $('#transcript'), live = true) {
   if (kind === 'user_msg') {
     if (v.synthetic || (v.text || '').startsWith(rehydrationPrefix))
       node = el('div', 'block note', '[' + rehydrationNote(v.text) + ']');
+    else if (live && settleOptimisticInput(kind, v.text || ''))
+      return;
     else
       node = el('div', 'block user', v.text);
   }
@@ -420,7 +471,10 @@ function addBlock(b, target = $('#transcript'), live = true) {
   }
   else if (kind === 'compaction') node = el('div', 'block note', '≋ context compacted');
   else if (kind === 'approval') node = el('div', 'block note', 'approval: ' + (v.decision || 'pending'));
-  else if (kind === 'steer') node = el('div', 'block user', '↪ ' + v.text);
+  else if (kind === 'steer') {
+    if (live && settleOptimisticInput(kind, v.text || '')) return;
+    node = el('div', 'block user', '↪ ' + v.text);
+  }
   if (node) {
     t.appendChild(node);
     if (live) scrollBottom();
@@ -593,6 +647,7 @@ function drawer(show) {
 function open(s) {
   drawer(false);
   disarmInterrupt();
+  pendingInputs = [];
   $('#topbar .title').textContent = s.title || '(untitled)';
   tabTitle(s);
   sid = s.sid;
@@ -627,12 +682,24 @@ async function loadSessions() {
   }
 }
 
-$('#input').addEventListener('keydown', e => {
+$('#input').addEventListener('keydown', async e => {
   if (e.key !== 'Enter') return;
   const text = e.target.value.trim();
   if (!text || !sid) return;
+  const targetSid = sid;
+  const state = $('#status .state').textContent;
+  const pending = addOptimisticInput(targetSid, text, state === 'running' || state === 'awaiting_approval');
   e.target.value = '';
-  send('{"input":{"sid":' + sid + ',"text":' + JSON.stringify(text) + '}}');
+  try {
+    const r = await send('{"input":{"sid":' + targetSid + ',"text":' + JSON.stringify(text) +
+      ',"request_id":' + pending.requestId + '}}');
+    if (r.err) rejectOptimisticInput(pending, r.err.msg || 'message was not accepted', false);
+    else if (pending.node.isConnected && pendingInputs.includes(pending)) pending.node.classList.add('accepted');
+  } catch (err) {
+    // A lost HTTP reply is ambiguous: the daemon may already have accepted
+    // the message. Keep it reconcilable with the SSE block instead of lying.
+    rejectOptimisticInput(pending, 'delivery unconfirmed; waiting for session replay', true);
+  }
 });
 $('#approval .yes').onclick = () =>
   send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"granted"}}');
