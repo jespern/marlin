@@ -84,6 +84,9 @@ pub const Body = union(BlockKind) {
         /// Content hash into the blobs table for the FULL output; null when
         /// the output fit inline uncapped. `!c` and scrollback prefer this.
         full_body_ref: ?[]const u8,
+        /// Source payload size before any readable-text conversion or inline
+        /// cap. Present for tools such as HTTP fetch where it is known.
+        payload_bytes: ?u64 = null,
         /// Binary tool output (currently MCP images), stored in the same
         /// content-addressed blob table as user-authored attachments.
         attachments: []const MediaRef = &.{},

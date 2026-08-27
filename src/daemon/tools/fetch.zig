@@ -27,7 +27,9 @@ pub fn fetch(
     args: Args,
     policy: ?*const network_policy.Policy,
     cancel: ?*std.atomic.Value(bool),
+    payload_bytes_out: ?*u64,
 ) ![]u8 {
+    if (payload_bytes_out) |out| out.* = 0;
     if (!std.mem.startsWith(u8, args.url, "http://") and !std.mem.startsWith(u8, args.url, "https://")) {
         return std.fmt.allocPrint(gpa, "error: only http(s) URLs are supported, got '{s}'", .{args.url});
     }
@@ -85,6 +87,8 @@ pub fn fetch(
             res.status, res.body[0..@min(res.body.len, 2000)],
         });
     }
+
+    if (payload_bytes_out) |out| out.* = @intCast(res.body.len);
 
     const is_html = blk: {
         if (res.content_type) |ct| {
@@ -326,7 +330,7 @@ test "fetch rejects non-http urls" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const out = try fetch(gpa, threaded.io(), null, .{ .url = "file:///etc/passwd" }, null, null);
+    const out = try fetch(gpa, threaded.io(), null, .{ .url = "file:///etc/passwd" }, null, null, null);
     defer gpa.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "error:"));
 }
@@ -341,7 +345,7 @@ test "fetch blocks an explicit denied hostname before network I/O" {
     var policy = network_policy.Policy.init(gpa, io, &environ, .{ .deny = "blocked.test" });
     defer policy.deinit();
 
-    const out = try fetch(gpa, io, &environ, .{ .url = "https://sub.blocked.test/secret" }, &policy, null);
+    const out = try fetch(gpa, io, &environ, .{ .url = "https://sub.blocked.test/secret" }, &policy, null, null);
     defer gpa.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "error: network policy blocked"));
     try std.testing.expect(std.mem.indexOf(u8, out, "explicit deny") != null);

@@ -235,6 +235,7 @@ pub const StreamAccum = struct {
     /// Activity/generation observability surfaces; kept only for live logs.
     generation_id: std.ArrayList(u8) = .empty,
     provider_name: std.ArrayList(u8) = .empty,
+    response_model: std.ArrayList(u8) = .empty,
     finish_reason: ?FinishReason = null,
     usage: ?provider.Usage = null,
     saw_done: bool = false,
@@ -264,6 +265,10 @@ pub const StreamAccum = struct {
 
     pub const FinishReason = enum { stop, tool_calls, length, content_filter, other };
 
+    pub fn finishReason(self: *const StreamAccum) []const u8 {
+        return if (self.finish_reason) |reason| @tagName(reason) else "";
+    }
+
     pub const PartialCall = struct {
         index: u32,
         call_id: std.ArrayList(u8) = .empty,
@@ -285,6 +290,7 @@ pub const StreamAccum = struct {
         self.reasoning.deinit(self.gpa);
         self.generation_id.deinit(self.gpa);
         self.provider_name.deinit(self.gpa);
+        self.response_model.deinit(self.gpa);
         for (self.calls.items) |*pc| {
             pc.call_id.deinit(self.gpa);
             pc.name.deinit(self.gpa);
@@ -331,6 +337,11 @@ pub const StreamAccum = struct {
         try appendBounded(self.gpa, &self.generation_id, id, max_metadata_bytes);
     }
 
+    pub fn setResponseModel(self: *StreamAccum, model: []const u8) !void {
+        if (self.response_model.items.len > 0) return;
+        try appendBounded(self.gpa, &self.response_model, model, max_metadata_bytes);
+    }
+
     /// SSE sink: feed each `data:` event payload here.
     pub fn onEvent(self: *StreamAccum, ev: sse.Event) void {
         if (self.response_too_large) return;
@@ -364,6 +375,10 @@ pub const StreamAccum = struct {
         if (self.provider_name.items.len == 0) {
             if (root.get("provider")) |name| if (name == .string)
                 try appendBounded(self.gpa, &self.provider_name, name.string, max_metadata_bytes);
+        }
+        if (self.response_model.items.len == 0) {
+            if (root.get("model")) |model| if (model == .string)
+                try appendBounded(self.gpa, &self.response_model, model.string, max_metadata_bytes);
         }
 
         // usage: on the final chunk (or OpenRouter's usage-only tail chunk)
@@ -610,7 +625,7 @@ test "text deltas accumulate; usage and finish captured" {
         ,
         \\{"choices":[{"index":0,"delta":{"content":"lo"}}]}
         ,
-        \\{"id":"gen-test","provider":"OpenAI","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":3},"server_tool_use":{"web_search_requests":2}}}
+        \\{"id":"gen-test","provider":"OpenAI","model":"gpt-5.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":3},"server_tool_use":{"web_search_requests":2}}}
         ,
         "[DONE]",
     });
@@ -623,6 +638,7 @@ test "text deltas accumulate; usage and finish captured" {
     try std.testing.expectEqual(@as(u64, 2), acc.usage.?.web_search_requests);
     try std.testing.expectEqualStrings("gen-test", acc.generation_id.items);
     try std.testing.expectEqualStrings("OpenAI", acc.provider_name.items);
+    try std.testing.expectEqualStrings("gpt-5.1", acc.response_model.items);
     try std.testing.expect(acc.saw_done);
     try std.testing.expectEqual(@as(u32, 0), acc.parse_errors);
 }

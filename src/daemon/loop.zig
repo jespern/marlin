@@ -37,6 +37,7 @@ pub const Endpoint = struct {
     url: [:0]const u8, // .../chat/completions
     bearer: ?[]const u8,
     model: []const u8, // provider-native model string
+    provider_name: []const u8 = "unknown",
     backend: provider.Backend,
 };
 
@@ -238,6 +239,7 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .status = value.status,
             .inline_body = try arena.dupe(u8, value.inline_body),
             .full_body_ref = if (value.full_body_ref) |reference| try arena.dupe(u8, reference) else null,
+            .payload_bytes = value.payload_bytes,
             .attachments = try cloneMediaRefs(arena, value.attachments),
         } },
         .approval => |value| .{ .approval = .{
@@ -764,6 +766,11 @@ pub fn runTurn(
             .turn_id = ap.turn_id,
             .round = round,
             .span_id = provider_span,
+            .request_model = opts.endpoint.model,
+            .provider_name = opts.endpoint.provider_name,
+            .endpoint_url = opts.endpoint.url,
+            .reasoning_level = if (nativeDialect(opts.endpoint) == .anthropic) "" else opts.effort.providerValue() orelse "",
+            .max_tokens = if (nativeDialect(opts.endpoint) == .anthropic) @max(1024, opts.cfg.output_headroom_tokens) else 0,
             .pump = &pump,
             .acc = &acc,
         };
@@ -1052,6 +1059,7 @@ pub fn runTurn(
                 .status = exec.status,
                 .inline_body = inline_body,
                 .full_body_ref = full_ref,
+                .payload_bytes = exec.payload_bytes,
                 .attachments = media_refs,
             } };
             const blob_count = exec.media.len + @intFromBool(full_ref != null);
@@ -1089,6 +1097,7 @@ pub fn runTurn(
                 .call_id = call.call_id,
                 .span_id = &call.span_id,
                 .name = call.name,
+                .description = if (call.spec) |spec| spec.description else "",
                 .started_at_ms = call.started_at_ms,
                 .ended_at_ms = call.ended_at_ms,
                 .status = @tagName(exec.status),
@@ -2506,7 +2515,14 @@ const openrouter_web_search_prompt =
     \\- Web search is available for discovering sources and verifying current
     \\  information. Use `fetch` when you already have a specific URL. Preserve
     \\  source URLs in the response.
+    \\- Before invoking web search, emit a brief user-visible progress note
+    \\  naming the search target. Never search silently.
 ;
+
+test "OpenRouter web search requires visible progress" {
+    try std.testing.expect(std.mem.indexOf(u8, openrouter_web_search_prompt, "user-visible progress note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openrouter_web_search_prompt, "Never search silently") != null);
+}
 
 const plan_mode_prompt =
     \\PLAN MODE
@@ -2912,6 +2928,11 @@ const RoundObservation = struct {
     turn_id: u64,
     round: u32,
     span_id: telemetry_ids.SpanId,
+    request_model: []const u8,
+    provider_name: []const u8,
+    endpoint_url: []const u8,
+    reasoning_level: []const u8,
+    max_tokens: u64,
     pump: *const Pump,
     acc: *const openai.StreamAccum,
     status: []const u8 = "transport_error",
@@ -2919,6 +2940,19 @@ const RoundObservation = struct {
 
     fn persist(self: RoundObservation, store: *Store, io: Io) void {
         if (!self.enabled) return;
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        const uri = std.Uri.parse(self.endpoint_url) catch null;
+        const server_address = if (uri) |parsed| host: {
+            const host_name = parsed.getHost(&host_buf) catch break :host "";
+            break :host host_name.bytes;
+        } else "";
+        const server_port: u16 = if (uri) |parsed| parsed.port orelse
+            if (std.ascii.eqlIgnoreCase(parsed.scheme, "http"))
+                80
+            else if (std.ascii.eqlIgnoreCase(parsed.scheme, "https"))
+                443
+            else
+                0 else 0;
         store.telemetryRecordRound(self.session_id, self.turn_id, .{
             .round = self.round,
             .span_id = &self.span_id,
@@ -2930,7 +2964,16 @@ const RoundObservation = struct {
             .http_status = self.http_status,
             .response_bytes = self.pump.bytes_total,
             .provider = self.acc.provider_name.items,
+            .provider_name = self.provider_name,
+            .request_model = self.request_model,
+            .response_model = self.acc.response_model.items,
+            .server_address = server_address,
+            .server_port = server_port,
+            .finish_reason = self.acc.finishReason(),
+            .reasoning_level = self.reasoning_level,
+            .max_tokens = self.max_tokens,
             .generation_id = self.acc.generation_id.items,
+            .usage_available = self.acc.usage != null,
             .tokens_in = if (self.acc.usage) |usage| usage.tokens_in else 0,
             .tokens_out = if (self.acc.usage) |usage| usage.tokens_out else 0,
             .cached_tokens = if (self.acc.usage) |usage| usage.cached_tokens else 0,

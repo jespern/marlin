@@ -1143,6 +1143,7 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .diagnostics_result = report });
             },
             .otel_configure => |request| {
+                defer if (request.headers.len > 0) @memset(@constCast(request.headers), 0);
                 if (request.endpoint.len > 8192 or request.traces_endpoint.len > 8192 or request.headers.len > 64 * 1024) {
                     self.sendTo(client, .{ .err = .{
                         .code = "otel_config",
@@ -2818,7 +2819,7 @@ pub const Daemon = struct {
             .session_id = job.sid,
             .turn_id = job.turn_id,
             .cwd = job.cwd,
-            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .backend = ep.backend },
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .provider_name = ep.provider_name, .backend = ep.backend },
             .http_pool = &self.http_pool,
             .otel_correlation = self.otel_exporter != null,
             .effort = job.effort,
@@ -2829,7 +2830,7 @@ pub const Daemon = struct {
             .sandbox_options = sandbox_options,
             .network_policy = if (job.network_filtering_enabled) &self.network else null,
             .extensions = self.extensions,
-            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .backend = c.backend } else null,
+            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .provider_name = c.provider_name, .backend = c.backend } else null,
             .prune_frontier = &job.session.prune_frontier,
             .context_used_out = &job.session.context_used,
             .approval_mode = job.approval_mode,
@@ -2944,12 +2945,12 @@ pub const Daemon = struct {
         const did = loop.compactSession(self.gpa, self.io, &self.store, .{
             .session_id = job.sid,
             .cwd = job.cwd,
-            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .backend = ep.backend },
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .provider_name = ep.provider_name, .backend = ep.backend },
             .http_pool = &self.http_pool,
             .effort = .auto,
             .cfg = self.cfg,
             .extensions = self.extensions,
-            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .backend = c.backend } else null,
+            .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .provider_name = c.provider_name, .backend = c.backend } else null,
             .approval_mode = .auto, // compaction runs no tools
             .on_block = TurnHooks.onBlock,
             .on_phase = TurnHooks.onPhase,
@@ -2990,7 +2991,7 @@ pub const Daemon = struct {
         loop.writeHandover(self.gpa, self.io, &self.store, .{
             .session_id = job.sid,
             .cwd = job.cwd,
-            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .backend = ep.backend },
+            .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .provider_name = ep.provider_name, .backend = ep.backend },
             .http_pool = &self.http_pool,
             .effort = job.effort,
             .cfg = self.cfg,

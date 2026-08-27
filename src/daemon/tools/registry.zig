@@ -74,6 +74,7 @@ pub fn find(name: []const u8) ?*const Spec {
 pub const ExecOut = struct {
     output: []u8,
     status: block.ToolStatus,
+    payload_bytes: ?u64 = null,
     media: []MediaOutput = &.{},
     plan_items: ?[]block.PlanItem = null,
 
@@ -198,7 +199,10 @@ pub fn dispatch(
     if (std.mem.eql(u8, name, fetch_tool.spec_name)) {
         const parsed = parseArgs(fetch_tool.Args, gpa, args_json) orelse return argError(gpa, args_json);
         defer parsed.deinit();
-        return cancellableTextResult(fetch_tool.fetch(gpa, io, source_environ, parsed.value, policy, cancel), gpa);
+        var payload_bytes: u64 = 0;
+        var result = cancellableTextResult(fetch_tool.fetch(gpa, io, source_environ, parsed.value, policy, cancel, &payload_bytes), gpa);
+        if (result.status == .ok) result.payload_bytes = payload_bytes;
+        return result;
     }
     if (std.mem.eql(u8, name, plan.spec_name)) {
         const result = plan.run(gpa, args_json);

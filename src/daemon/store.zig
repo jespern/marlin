@@ -122,7 +122,16 @@ const schema_sql =
     \\  http_status INTEGER NOT NULL DEFAULT 0,
     \\  response_bytes INTEGER NOT NULL DEFAULT 0,
     \\  provider TEXT NOT NULL DEFAULT '',
+    \\  provider_name TEXT NOT NULL DEFAULT '',
+    \\  request_model TEXT NOT NULL DEFAULT '',
+    \\  response_model TEXT NOT NULL DEFAULT '',
+    \\  server_address TEXT NOT NULL DEFAULT '',
+    \\  server_port INTEGER NOT NULL DEFAULT 0,
+    \\  finish_reason TEXT NOT NULL DEFAULT '',
+    \\  reasoning_level TEXT NOT NULL DEFAULT '',
+    \\  max_tokens INTEGER NOT NULL DEFAULT 0,
     \\  generation_id TEXT NOT NULL DEFAULT '',
+    \\  usage_available INTEGER NOT NULL DEFAULT 0,
     \\  tokens_in INTEGER NOT NULL DEFAULT 0,
     \\  tokens_out INTEGER NOT NULL DEFAULT 0,
     \\  cached_tokens INTEGER NOT NULL DEFAULT 0,
@@ -138,13 +147,14 @@ const schema_sql =
     \\  call_id TEXT NOT NULL,
     \\  span_id TEXT NOT NULL,
     \\  name TEXT NOT NULL,
+    \\  description TEXT NOT NULL DEFAULT '',
     \\  started_at_ms INTEGER NOT NULL,
     \\  ended_at_ms INTEGER NOT NULL,
     \\  status TEXT NOT NULL,
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','10');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','12');
 ;
 
 pub const SessionRow = struct {
@@ -181,7 +191,16 @@ pub const TelemetryRound = struct {
     http_status: u16,
     response_bytes: u64,
     provider: []const u8,
+    provider_name: []const u8,
+    request_model: []const u8,
+    response_model: []const u8,
+    server_address: []const u8,
+    server_port: u16,
+    finish_reason: []const u8,
+    reasoning_level: []const u8,
+    max_tokens: u64,
     generation_id: []const u8,
+    usage_available: bool,
     tokens_in: u64,
     tokens_out: u64,
     cached_tokens: u64,
@@ -194,6 +213,7 @@ pub const TelemetryTool = struct {
     call_id: []const u8,
     span_id: []const u8,
     name: []const u8,
+    description: []const u8,
     started_at_ms: i64,
     ended_at_ms: i64,
     status: []const u8,
@@ -355,6 +375,29 @@ pub const Store = struct {
                 \\ALTER TABLE sessions ADD COLUMN codex_thread_id TEXT;
                 \\UPDATE kv SET value='10' WHERE key='schema_version';
             );
+        }
+        if (ver >= 9 and ver < 11) {
+            try self.execAll(
+                \\ALTER TABLE telemetry_rounds ADD COLUMN provider_name TEXT NOT NULL DEFAULT '';
+                \\ALTER TABLE telemetry_rounds ADD COLUMN request_model TEXT NOT NULL DEFAULT '';
+                \\ALTER TABLE telemetry_rounds ADD COLUMN response_model TEXT NOT NULL DEFAULT '';
+                \\ALTER TABLE telemetry_rounds ADD COLUMN server_address TEXT NOT NULL DEFAULT '';
+                \\ALTER TABLE telemetry_rounds ADD COLUMN server_port INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE telemetry_rounds ADD COLUMN finish_reason TEXT NOT NULL DEFAULT '';
+                \\ALTER TABLE telemetry_rounds ADD COLUMN reasoning_level TEXT NOT NULL DEFAULT '';
+                \\ALTER TABLE telemetry_tools ADD COLUMN description TEXT NOT NULL DEFAULT '';
+                \\UPDATE kv SET value='11' WHERE key='schema_version';
+            );
+        }
+        if (ver >= 9 and ver < 12) {
+            try self.execAll(
+                \\ALTER TABLE telemetry_rounds ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE telemetry_rounds ADD COLUMN usage_available INTEGER NOT NULL DEFAULT 0;
+                \\UPDATE kv SET value='12' WHERE key='schema_version';
+            );
+        } else if (ver < 9) {
+            // schema_sql created the telemetry tables at their current shape.
+            try self.execAll("UPDATE kv SET value='12' WHERE key='schema_version';");
         }
     }
 
@@ -645,8 +688,9 @@ pub const Store = struct {
             \\INSERT OR REPLACE INTO telemetry_rounds(
             \\ session_id,turn_id,round_index,span_id,started_at_ms,first_byte_at_ms,
             \\ first_visible_at_ms,ended_at_ms,status,http_status,response_bytes,provider,
-            \\ generation_id,tokens_in,tokens_out,cached_tokens,cache_write_tokens,reasoning_tokens
-            \\) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\ provider_name,request_model,response_model,server_address,server_port,finish_reason,
+            \\ reasoning_level,max_tokens,generation_id,usage_available,tokens_in,tokens_out,cached_tokens,cache_write_tokens,reasoning_tokens
+            \\) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
@@ -661,12 +705,21 @@ pub const Store = struct {
         bindInt(stmt, 10, row.http_status);
         bindInt(stmt, 11, @intCast(row.response_bytes));
         bindText(stmt, 12, row.provider);
-        bindText(stmt, 13, row.generation_id);
-        bindInt(stmt, 14, @intCast(row.tokens_in));
-        bindInt(stmt, 15, @intCast(row.tokens_out));
-        bindInt(stmt, 16, @intCast(row.cached_tokens));
-        bindInt(stmt, 17, @intCast(row.cache_write_tokens));
-        bindInt(stmt, 18, @intCast(row.reasoning_tokens));
+        bindText(stmt, 13, row.provider_name);
+        bindText(stmt, 14, row.request_model);
+        bindText(stmt, 15, row.response_model);
+        bindText(stmt, 16, row.server_address);
+        bindInt(stmt, 17, row.server_port);
+        bindText(stmt, 18, row.finish_reason);
+        bindText(stmt, 19, row.reasoning_level);
+        bindInt(stmt, 20, @intCast(row.max_tokens));
+        bindText(stmt, 21, row.generation_id);
+        bindInt(stmt, 22, @intFromBool(row.usage_available));
+        bindInt(stmt, 23, @intCast(row.tokens_in));
+        bindInt(stmt, 24, @intCast(row.tokens_out));
+        bindInt(stmt, 25, @intCast(row.cached_tokens));
+        bindInt(stmt, 26, @intCast(row.cache_write_tokens));
+        bindInt(stmt, 27, @intCast(row.reasoning_tokens));
         try stepDone(stmt);
     }
 
@@ -678,8 +731,8 @@ pub const Store = struct {
     ) Error!void {
         const stmt = try self.prepare(
             \\INSERT OR REPLACE INTO telemetry_tools(
-            \\ session_id,turn_id,round_index,call_id,span_id,name,started_at_ms,ended_at_ms,status
-            \\) VALUES(?,?,?,?,?,?,?,?,?)
+            \\ session_id,turn_id,round_index,call_id,span_id,name,description,started_at_ms,ended_at_ms,status
+            \\) VALUES(?,?,?,?,?,?,?,?,?,?)
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
@@ -688,9 +741,10 @@ pub const Store = struct {
         bindText(stmt, 4, row.call_id);
         bindText(stmt, 5, row.span_id);
         bindText(stmt, 6, row.name);
-        bindInt(stmt, 7, row.started_at_ms);
-        bindInt(stmt, 8, row.ended_at_ms);
-        bindText(stmt, 9, row.status);
+        bindText(stmt, 7, row.description);
+        bindInt(stmt, 8, row.started_at_ms);
+        bindInt(stmt, 9, row.ended_at_ms);
+        bindText(stmt, 10, row.status);
         try stepDone(stmt);
     }
 
@@ -915,8 +969,9 @@ pub const Store = struct {
         var rows: std.ArrayList(TelemetryRound) = .empty;
         const stmt = try self.prepare(
             \\SELECT round_index,span_id,started_at_ms,first_byte_at_ms,first_visible_at_ms,
-            \\ ended_at_ms,status,http_status,response_bytes,provider,generation_id,tokens_in,
-            \\ tokens_out,cached_tokens,cache_write_tokens,reasoning_tokens
+            \\ ended_at_ms,status,http_status,response_bytes,provider,provider_name,request_model,
+            \\ response_model,server_address,server_port,finish_reason,reasoning_level,max_tokens,generation_id,
+            \\ usage_available,tokens_in,tokens_out,cached_tokens,cache_write_tokens,reasoning_tokens
             \\FROM telemetry_rounds WHERE session_id=? AND turn_id=? ORDER BY round_index
         );
         defer finalize(stmt);
@@ -934,12 +989,21 @@ pub const Store = struct {
                 .http_status = @intCast(c.sqlite3_column_int64(stmt, 7)),
                 .response_bytes = @intCast(c.sqlite3_column_int64(stmt, 8)),
                 .provider = try dupeColumn(allocator, stmt, 9),
-                .generation_id = try dupeColumn(allocator, stmt, 10),
-                .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 11)),
-                .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 12)),
-                .cached_tokens = @intCast(c.sqlite3_column_int64(stmt, 13)),
-                .cache_write_tokens = @intCast(c.sqlite3_column_int64(stmt, 14)),
-                .reasoning_tokens = @intCast(c.sqlite3_column_int64(stmt, 15)),
+                .provider_name = try dupeColumn(allocator, stmt, 10),
+                .request_model = try dupeColumn(allocator, stmt, 11),
+                .response_model = try dupeColumn(allocator, stmt, 12),
+                .server_address = try dupeColumn(allocator, stmt, 13),
+                .server_port = @intCast(c.sqlite3_column_int64(stmt, 14)),
+                .finish_reason = try dupeColumn(allocator, stmt, 15),
+                .reasoning_level = try dupeColumn(allocator, stmt, 16),
+                .max_tokens = @intCast(c.sqlite3_column_int64(stmt, 17)),
+                .generation_id = try dupeColumn(allocator, stmt, 18),
+                .usage_available = c.sqlite3_column_int64(stmt, 19) != 0,
+                .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 20)),
+                .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 21)),
+                .cached_tokens = @intCast(c.sqlite3_column_int64(stmt, 22)),
+                .cache_write_tokens = @intCast(c.sqlite3_column_int64(stmt, 23)),
+                .reasoning_tokens = @intCast(c.sqlite3_column_int64(stmt, 24)),
             }),
             c.SQLITE_DONE => break,
             else => return error.SqliteStep,
@@ -950,7 +1014,7 @@ pub const Store = struct {
     fn loadTelemetryTools(self: Store, allocator: std.mem.Allocator, session_id: u64, turn_id: u64) Error![]const TelemetryTool {
         var rows: std.ArrayList(TelemetryTool) = .empty;
         const stmt = try self.prepare(
-            \\SELECT round_index,call_id,span_id,name,started_at_ms,ended_at_ms,status
+            \\SELECT round_index,call_id,span_id,name,description,started_at_ms,ended_at_ms,status
             \\FROM telemetry_tools WHERE session_id=? AND turn_id=? ORDER BY started_at_ms,call_id
         );
         defer finalize(stmt);
@@ -962,9 +1026,10 @@ pub const Store = struct {
                 .call_id = try dupeColumn(allocator, stmt, 1),
                 .span_id = try dupeColumn(allocator, stmt, 2),
                 .name = try dupeColumn(allocator, stmt, 3),
-                .started_at_ms = c.sqlite3_column_int64(stmt, 4),
-                .ended_at_ms = c.sqlite3_column_int64(stmt, 5),
-                .status = try dupeColumn(allocator, stmt, 6),
+                .description = try dupeColumn(allocator, stmt, 4),
+                .started_at_ms = c.sqlite3_column_int64(stmt, 5),
+                .ended_at_ms = c.sqlite3_column_int64(stmt, 6),
+                .status = try dupeColumn(allocator, stmt, 7),
             }),
             c.SQLITE_DONE => break,
             else => return error.SqliteStep,
@@ -2623,15 +2688,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v10 with guest identity, plan mode, search, and telemetry" {
+test "schema is v12 with guest identity, plan mode, search, and GenAI telemetry" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 10), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 12), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 10), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 12), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
@@ -2664,8 +2729,17 @@ test "telemetry diagnostics and export outbox are durable and content-free" {
         .status = "ok",
         .http_status = 200,
         .response_bytes = 512,
-        .provider = "test-provider",
+        .provider = "test-backend",
+        .provider_name = "openrouter",
+        .request_model = "test/model",
+        .response_model = "test/model-v2",
+        .server_address = "openrouter.ai",
+        .server_port = 443,
+        .finish_reason = "stop",
+        .reasoning_level = "high",
+        .max_tokens = 16_000,
         .generation_id = "gen-1",
+        .usage_available = true,
         .tokens_in = 20,
         .tokens_out = 5,
         .cached_tokens = 10,
@@ -2677,6 +2751,7 @@ test "telemetry diagnostics and export outbox are durable and content-free" {
         .call_id = "call-1",
         .span_id = "0000000000000066",
         .name = "read_file",
+        .description = "Read a text file",
         .started_at_ms = 1_111,
         .ended_at_ms = 1_121,
         .status = "ok",
@@ -2699,6 +2774,11 @@ test "telemetry diagnostics and export outbox are durable and content-free" {
     const trace = (try store.nextTelemetryTrace(arena, 1_300)).?;
     try std.testing.expectEqual(@as(u64, 100), trace.turn_id);
     try std.testing.expectEqualStrings("gen-1", trace.rounds[0].generation_id);
+    try std.testing.expectEqualStrings("openrouter", trace.rounds[0].provider_name);
+    try std.testing.expectEqualStrings("test/model", trace.rounds[0].request_model);
+    try std.testing.expectEqualStrings("test/model-v2", trace.rounds[0].response_model);
+    try std.testing.expectEqual(@as(u64, 16_000), trace.rounds[0].max_tokens);
+    try std.testing.expectEqualStrings("Read a text file", trace.tools[0].description);
     try store.markTelemetryExported(42, 100, 1_301);
     try std.testing.expect((try store.nextTelemetryTrace(arena, 1_302)) == null);
 }

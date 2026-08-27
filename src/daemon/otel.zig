@@ -204,9 +204,15 @@ fn parseHeaders(gpa: std.mem.Allocator, raw: []const u8) ![][]u8 {
         if (entry.len == 0) continue;
         const equal = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidOtelHeaders;
         const name_owned = try gpa.dupe(u8, std.mem.trim(u8, entry[0..equal], " \t"));
-        defer gpa.free(name_owned);
+        defer {
+            @memset(name_owned, 0);
+            gpa.free(name_owned);
+        }
         const value_owned = try gpa.dupe(u8, std.mem.trim(u8, entry[equal + 1 ..], " \t"));
-        defer gpa.free(value_owned);
+        defer {
+            @memset(value_owned, 0);
+            gpa.free(value_owned);
+        }
         const name = std.Uri.percentDecodeInPlace(name_owned);
         const value = std.Uri.percentDecodeInPlace(value_owned);
         if (name.len == 0 or std.mem.indexOfAny(u8, name, "\r\n:") != null or
@@ -217,72 +223,217 @@ fn parseHeaders(gpa: std.mem.Allocator, raw: []const u8) ![][]u8 {
 }
 
 fn freeHeaders(gpa: std.mem.Allocator, headers: [][]u8) void {
-    for (headers) |line| gpa.free(line);
+    for (headers) |line| {
+        @memset(line, 0);
+        gpa.free(line);
+    }
     gpa.free(headers);
 }
 
-fn buildTraceRequest(allocator: std.mem.Allocator, trace: TelemetryTrace) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    const w = &out.writer;
-    try w.writeAll("{\"resourceSpans\":[{\"resource\":{\"attributes\":[");
-    try stringAttribute(w, "service.name", "marlin", false);
-    try stringAttribute(w, "service.version", build_options.version, true);
-    try w.writeAll("]},\"scopeSpans\":[{\"scope\":{\"name\":\"marlin\",\"version\":");
-    try std.json.Stringify.encodeJsonString(build_options.version, .{}, w);
-    try w.writeAll("},\"spans\":[");
+const OtlpAnyValue = struct {
+    stringValue: ?[]const u8 = null,
+    intValue: ?[]const u8 = null,
+    boolValue: ?bool = null,
+    doubleValue: ?f64 = null,
+    arrayValue: ?OtlpArrayValue = null,
+};
 
+const OtlpArrayValue = struct {
+    values: []const OtlpAnyValue,
+};
+
+const OtlpKeyValue = struct {
+    key: []const u8,
+    value: OtlpAnyValue,
+};
+
+const OtlpStatus = struct {
+    code: u8,
+};
+
+const OtlpSpan = struct {
+    traceId: []const u8,
+    spanId: []const u8,
+    parentSpanId: ?[]const u8 = null,
+    name: []const u8,
+    kind: u8,
+    startTimeUnixNano: []const u8,
+    endTimeUnixNano: []const u8,
+    attributes: []const OtlpKeyValue,
+    status: ?OtlpStatus = null,
+};
+
+const OtlpScope = struct {
+    name: []const u8,
+    version: []const u8,
+};
+
+const OtlpScopeSpans = struct {
+    scope: OtlpScope,
+    spans: []const OtlpSpan,
+};
+
+const OtlpResource = struct {
+    attributes: []const OtlpKeyValue,
+};
+
+const OtlpResourceSpans = struct {
+    resource: OtlpResource,
+    scopeSpans: []const OtlpScopeSpans,
+};
+
+const OtlpTraceRequest = struct {
+    resourceSpans: []const OtlpResourceSpans,
+};
+
+fn buildTraceRequest(allocator: std.mem.Allocator, trace: TelemetryTrace) ![]u8 {
     const trace_id = telemetry_ids.traceId(trace.session_id, trace.turn_id);
     const root_span_id = telemetry_ids.spanId(trace.turn_id);
-    try spanPrefix(w, &trace_id, &root_span_id, null, "marlin.turn", 1, trace.started_at_ms, trace.ended_at_ms);
-    try stringAttribute(w, "gen_ai.operation.name", "invoke_agent", false);
-    try stringAttribute(w, "gen_ai.agent.name", "marlin", true);
-    try stringAttribute(w, "gen_ai.request.model", trace.model, true);
-    try stringAttribute(w, "marlin.session.kind", trace.session_kind, true);
-    try stringAttribute(w, "marlin.turn.outcome", trace.outcome, true);
-    try stringAttribute(w, "mirador.trace.tags", "marlin", true);
-    var sid_buf: [32]u8 = undefined;
-    const sid = try std.fmt.bufPrint(&sid_buf, "{x}", .{trace.session_id});
-    try stringAttribute(w, "mirador.trace.attribute.session_id", sid, true);
-    try intAttribute(w, "gen_ai.usage.input_tokens", trace.tokens_in, true);
-    try intAttribute(w, "gen_ai.usage.output_tokens", trace.tokens_out, true);
-    try spanSuffix(w, std.mem.eql(u8, trace.outcome, "error") or std.mem.eql(u8, trace.outcome, "abandoned"));
+    const conversation_id = try std.fmt.allocPrint(allocator, "{x}", .{trace.session_id});
+
+    var spans: std.ArrayList(OtlpSpan) = .empty;
+    var root_attributes: std.ArrayList(OtlpKeyValue) = .empty;
+    try root_attributes.append(allocator, stringKeyValue("marlin.session.kind", trace.session_kind));
+    try root_attributes.append(allocator, stringKeyValue("marlin.turn.outcome", trace.outcome));
+    try root_attributes.append(allocator, stringKeyValue("mirador.trace.tags", "marlin"));
+    try root_attributes.append(allocator, stringKeyValue("mirador.trace.attribute.session_id", conversation_id));
+    const root_failed = std.mem.eql(u8, trace.outcome, "error") or std.mem.eql(u8, trace.outcome, "abandoned");
+    if (root_failed) try root_attributes.append(allocator, stringKeyValue("error.type", trace.outcome));
+    try spans.append(allocator, try makeSpan(
+        allocator,
+        &trace_id,
+        &root_span_id,
+        null,
+        "marlin.turn",
+        1,
+        trace.started_at_ms,
+        trace.ended_at_ms,
+        root_attributes.items,
+        root_failed,
+    ));
 
     for (trace.rounds) |round| {
-        try w.writeByte(',');
-        try spanPrefix(w, &trace_id, round.span_id, &root_span_id, "chat", 3, round.started_at_ms, round.ended_at_ms);
-        try stringAttribute(w, "gen_ai.operation.name", "chat", false);
-        try stringAttribute(w, "gen_ai.request.model", trace.model, true);
-        if (round.provider.len > 0) try stringAttribute(w, "gen_ai.provider.name", round.provider, true);
-        if (round.generation_id.len > 0) try stringAttribute(w, "openrouter.generation.id", round.generation_id, true);
-        try intAttribute(w, "gen_ai.usage.input_tokens", round.tokens_in, true);
-        try intAttribute(w, "gen_ai.usage.output_tokens", round.tokens_out, true);
-        try intAttribute(w, "gen_ai.usage.cached_input_tokens", round.cached_tokens, true);
-        try intAttribute(w, "marlin.response.bytes", round.response_bytes, true);
-        if (round.first_visible_at_ms > 0 or round.first_byte_at_ms > 0) {
-            const first = if (round.first_visible_at_ms > 0) round.first_visible_at_ms else round.first_byte_at_ms;
-            try intAttribute(w, "marlin.ttft_ms", @intCast(@max(0, first - round.started_at_ms)), true);
+        const request_model = if (round.request_model.len > 0) round.request_model else trace.model;
+        const provider_name = if (round.provider_name.len > 0) round.provider_name else "unknown";
+        const span_name = try std.fmt.allocPrint(allocator, "chat {s}", .{request_model});
+        var attributes: std.ArrayList(OtlpKeyValue) = .empty;
+        try attributes.append(allocator, stringKeyValue("gen_ai.operation.name", "chat"));
+        try attributes.append(allocator, stringKeyValue("gen_ai.provider.name", provider_name));
+        try attributes.append(allocator, stringKeyValue("gen_ai.conversation.id", conversation_id));
+        try attributes.append(allocator, stringKeyValue("gen_ai.request.model", request_model));
+        try attributes.append(allocator, boolKeyValue("gen_ai.request.stream", true));
+        if (round.max_tokens > 0)
+            try attributes.append(allocator, try intKeyValue(allocator, "gen_ai.request.max_tokens", round.max_tokens));
+        if (round.reasoning_level.len > 0)
+            try attributes.append(allocator, stringKeyValue("gen_ai.request.reasoning.level", round.reasoning_level));
+        if (round.server_address.len > 0) {
+            try attributes.append(allocator, stringKeyValue("server.address", round.server_address));
+            try attributes.append(allocator, try intKeyValue(allocator, "server.port", round.server_port));
         }
-        try spanSuffix(w, !std.mem.eql(u8, round.status, "ok"));
+        if (round.generation_id.len > 0)
+            try attributes.append(allocator, stringKeyValue("gen_ai.response.id", round.generation_id));
+        if (round.response_model.len > 0)
+            try attributes.append(allocator, stringKeyValue("gen_ai.response.model", round.response_model));
+        if (round.finish_reason.len > 0)
+            try attributes.append(allocator, try stringArrayKeyValue(allocator, "gen_ai.response.finish_reasons", &.{round.finish_reason}));
+        if (round.first_byte_at_ms > 0)
+            try attributes.append(allocator, doubleKeyValue(
+                "gen_ai.response.time_to_first_chunk",
+                @as(f64, @floatFromInt(@max(0, round.first_byte_at_ms - round.started_at_ms))) / 1000.0,
+            ));
+        if (round.usage_available) {
+            try attributes.append(allocator, try intKeyValue(allocator, "gen_ai.usage.input_tokens", round.tokens_in));
+            try attributes.append(allocator, try intKeyValue(allocator, "gen_ai.usage.output_tokens", round.tokens_out));
+        }
+        if (round.provider.len > 0 and !std.mem.eql(u8, round.provider, provider_name))
+            try attributes.append(allocator, stringKeyValue("marlin.provider.backend", round.provider));
+        if (round.cached_tokens > 0)
+            try attributes.append(allocator, try intKeyValue(allocator, "gen_ai.usage.cache_read.input_tokens", round.cached_tokens));
+        if (round.cache_write_tokens > 0)
+            try attributes.append(allocator, try intKeyValue(allocator, "gen_ai.usage.cache_write.input_tokens", round.cache_write_tokens));
+        if (round.reasoning_tokens > 0)
+            try attributes.append(allocator, try intKeyValue(allocator, "gen_ai.usage.reasoning.output_tokens", round.reasoning_tokens));
+        try attributes.append(allocator, try intKeyValue(allocator, "marlin.response.bytes", round.response_bytes));
+        if (round.first_visible_at_ms > 0)
+            try attributes.append(allocator, try intKeyValue(
+                allocator,
+                "marlin.time_to_first_visible_ms",
+                @intCast(@max(0, round.first_visible_at_ms - round.started_at_ms)),
+            ));
+        const round_failed = !std.mem.eql(u8, round.status, "ok");
+        if (round_failed) {
+            const error_type = if (round.http_status >= 400)
+                try std.fmt.allocPrint(allocator, "{d}", .{round.http_status})
+            else
+                round.status;
+            try attributes.append(allocator, stringKeyValue("error.type", error_type));
+        }
+        try spans.append(allocator, try makeSpan(
+            allocator,
+            &trace_id,
+            round.span_id,
+            &root_span_id,
+            span_name,
+            3,
+            round.started_at_ms,
+            round.ended_at_ms,
+            attributes.items,
+            round_failed,
+        ));
     }
 
     for (trace.tools) |tool| {
-        try w.writeByte(',');
-        var name_buf: [160]u8 = undefined;
-        const span_name = std.fmt.bufPrint(&name_buf, "execute_tool {s}", .{tool.name}) catch "execute_tool";
-        try spanPrefix(w, &trace_id, tool.span_id, &root_span_id, span_name, 1, tool.started_at_ms, tool.ended_at_ms);
-        try stringAttribute(w, "gen_ai.operation.name", "execute_tool", false);
-        try stringAttribute(w, "gen_ai.tool.name", tool.name, true);
-        try stringAttribute(w, "marlin.tool.status", tool.status, true);
-        try spanSuffix(w, !std.mem.eql(u8, tool.status, "ok"));
+        const parent_span_id = for (trace.rounds) |round| {
+            if (round.round == tool.round) break round.span_id;
+        } else &root_span_id;
+        const span_name = try std.fmt.allocPrint(allocator, "execute_tool {s}", .{tool.name});
+        var attributes: std.ArrayList(OtlpKeyValue) = .empty;
+        try attributes.append(allocator, stringKeyValue("gen_ai.operation.name", "execute_tool"));
+        try attributes.append(allocator, stringKeyValue("gen_ai.tool.name", tool.name));
+        try attributes.append(allocator, stringKeyValue("gen_ai.agent.name", "marlin"));
+        if (tool.call_id.len > 0)
+            try attributes.append(allocator, stringKeyValue("gen_ai.tool.call.id", tool.call_id));
+        if (tool.description.len > 0)
+            try attributes.append(allocator, stringKeyValue("gen_ai.tool.description", tool.description));
+        try attributes.append(allocator, stringKeyValue("gen_ai.tool.type", "function"));
+        const failed = !std.mem.eql(u8, tool.status, "ok");
+        if (failed) try attributes.append(allocator, stringKeyValue("error.type", tool.status));
+        try spans.append(allocator, try makeSpan(
+            allocator,
+            &trace_id,
+            tool.span_id,
+            parent_span_id,
+            span_name,
+            1,
+            tool.started_at_ms,
+            tool.ended_at_ms,
+            attributes.items,
+            failed,
+        ));
     }
 
-    try w.writeAll("]}]}]}");
-    return out.toOwnedSlice();
+    const resource_attributes = [_]OtlpKeyValue{
+        stringKeyValue("service.name", "marlin"),
+        stringKeyValue("service.version", build_options.version),
+    };
+    const scope_spans = [_]OtlpScopeSpans{.{
+        .scope = .{ .name = "marlin", .version = build_options.version },
+        .spans = spans.items,
+    }};
+    const resource_spans = [_]OtlpResourceSpans{.{
+        .resource = .{ .attributes = &resource_attributes },
+        .scopeSpans = &scope_spans,
+    }};
+    return std.json.Stringify.valueAlloc(allocator, OtlpTraceRequest{
+        .resourceSpans = &resource_spans,
+    }, .{
+        .emit_null_optional_fields = false,
+        .emit_nonportable_numbers_as_strings = true,
+    });
 }
 
-fn spanPrefix(
-    w: *std.Io.Writer,
+fn makeSpan(
+    allocator: std.mem.Allocator,
     trace_id: []const u8,
     span_id: []const u8,
     parent_span_id: ?[]const u8,
@@ -290,49 +441,79 @@ fn spanPrefix(
     kind: u8,
     started_ms: i64,
     ended_ms: i64,
-) !void {
-    try w.writeAll("{\"traceId\":");
-    try std.json.Stringify.encodeJsonString(trace_id, .{}, w);
-    try w.writeAll(",\"spanId\":");
-    try std.json.Stringify.encodeJsonString(span_id, .{}, w);
-    if (parent_span_id) |parent| {
-        try w.writeAll(",\"parentSpanId\":");
-        try std.json.Stringify.encodeJsonString(parent, .{}, w);
+    attributes: []const OtlpKeyValue,
+    failed: bool,
+) !OtlpSpan {
+    return .{
+        .traceId = trace_id,
+        .spanId = span_id,
+        .parentSpanId = parent_span_id,
+        .name = name,
+        .kind = kind,
+        .startTimeUnixNano = try std.fmt.allocPrint(allocator, "{d}", .{started_ms * std.time.ns_per_ms}),
+        .endTimeUnixNano = try std.fmt.allocPrint(allocator, "{d}", .{ended_ms * std.time.ns_per_ms}),
+        .attributes = attributes,
+        .status = if (failed) .{ .code = 2 } else null,
+    };
+}
+
+fn stringKeyValue(key: []const u8, value: []const u8) OtlpKeyValue {
+    return .{ .key = key, .value = .{ .stringValue = value } };
+}
+
+fn intKeyValue(allocator: std.mem.Allocator, key: []const u8, value: u64) !OtlpKeyValue {
+    return .{ .key = key, .value = .{ .intValue = try std.fmt.allocPrint(allocator, "{d}", .{value}) } };
+}
+
+fn boolKeyValue(key: []const u8, value: bool) OtlpKeyValue {
+    return .{ .key = key, .value = .{ .boolValue = value } };
+}
+
+fn doubleKeyValue(key: []const u8, value: f64) OtlpKeyValue {
+    return .{ .key = key, .value = .{ .doubleValue = value } };
+}
+
+fn stringArrayKeyValue(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    values: []const []const u8,
+) !OtlpKeyValue {
+    const encoded = try allocator.alloc(OtlpAnyValue, values.len);
+    for (values, encoded) |value, *item| item.* = .{ .stringValue = value };
+    return .{ .key = key, .value = .{ .arrayValue = .{ .values = encoded } } };
+}
+
+fn traceSpans(value: std.json.Value) []const std.json.Value {
+    return value.object.get("resourceSpans").?.array.items[0]
+        .object.get("scopeSpans").?.array.items[0]
+        .object.get("spans").?.array.items;
+}
+
+fn spanNamed(spans: []const std.json.Value, name: []const u8) *const std.json.Value {
+    for (spans) |*span| {
+        const span_name = span.object.get("name") orelse continue;
+        if (span_name == .string and std.mem.eql(u8, span_name.string, name)) return span;
     }
-    try w.writeAll(",\"name\":");
-    try std.json.Stringify.encodeJsonString(name, .{}, w);
-    try w.print(",\"kind\":{d},\"startTimeUnixNano\":\"{d}\",\"endTimeUnixNano\":\"{d}\",\"attributes\":[", .{
-        kind,
-        started_ms * std.time.ns_per_ms,
-        ended_ms * std.time.ns_per_ms,
-    });
+    unreachable;
 }
 
-fn spanSuffix(w: *std.Io.Writer, failed: bool) !void {
-    try w.writeAll("],\"status\":{\"code\":");
-    try w.print("{d}", .{if (failed) @as(u8, 2) else 1});
-    try w.writeAll("}}");
+fn spanAttribute(span: std.json.Value, key: []const u8) ?std.json.Value {
+    const attributes = span.object.get("attributes") orelse return null;
+    for (attributes.array.items) |attribute| {
+        const attribute_key = attribute.object.get("key") orelse continue;
+        if (attribute_key == .string and std.mem.eql(u8, attribute_key.string, key))
+            return attribute.object.get("value");
+    }
+    return null;
 }
 
-fn stringAttribute(w: *std.Io.Writer, key: []const u8, value: []const u8, comma: bool) !void {
-    if (comma) try w.writeByte(',');
-    try w.writeAll("{\"key\":");
-    try std.json.Stringify.encodeJsonString(key, .{}, w);
-    try w.writeAll(",\"value\":{\"stringValue\":");
-    try std.json.Stringify.encodeJsonString(value, .{}, w);
-    try w.writeAll("}}");
+fn expectStringAttribute(span: std.json.Value, key: []const u8, expected: []const u8) !void {
+    const value = spanAttribute(span, key) orelse return error.TestExpectedEqual;
+    const string_value = value.object.get("stringValue") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(expected, string_value.string);
 }
 
-fn intAttribute(w: *std.Io.Writer, key: []const u8, value: u64, comma: bool) !void {
-    if (comma) try w.writeByte(',');
-    try w.writeAll("{\"key\":");
-    try std.json.Stringify.encodeJsonString(key, .{}, w);
-    try w.writeAll(",\"value\":{\"intValue\":\"");
-    try w.print("{d}", .{value});
-    try w.writeAll("\"}}");
-}
-
-test "OTLP request contains correlated root, provider, and tool spans without content" {
+test "OTLP request follows GenAI inference and execute-tool structure without content" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const json = try buildTraceRequest(arena_state.allocator(), .{
@@ -358,8 +539,17 @@ test "OTLP request contains correlated root, provider, and tool spans without co
             .status = "ok",
             .http_status = 200,
             .response_bytes = 50,
-            .provider = "test",
+            .provider = "OpenAI",
+            .provider_name = "openrouter",
+            .request_model = "test/model",
+            .response_model = "test/model-v2",
+            .server_address = "openrouter.ai",
+            .server_port = 443,
+            .finish_reason = "stop",
+            .reasoning_level = "high",
+            .max_tokens = 0,
             .generation_id = "gen-1",
+            .usage_available = true,
             .tokens_in = 12,
             .tokens_out = 4,
             .cached_tokens = 2,
@@ -371,6 +561,7 @@ test "OTLP request contains correlated root, provider, and tool spans without co
             .call_id = "call-1",
             .span_id = "0000000000000004",
             .name = "read_file",
+            .description = "Read a text file",
             .started_at_ms = 20,
             .ended_at_ms = 21,
             .status = "ok",
@@ -378,10 +569,114 @@ test "OTLP request contains correlated root, provider, and tool spans without co
     });
     const parsed = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), json, .{});
     defer parsed.deinit();
-    try std.testing.expect(parsed.value == .object);
-    try std.testing.expect(std.mem.indexOf(u8, json, "openrouter/test/model") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "execute_tool read_file") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "prompt") == null);
+    const spans = traceSpans(parsed.value);
+    try std.testing.expectEqual(@as(usize, 3), spans.len);
+
+    const root = spanNamed(spans, "marlin.turn");
+    try std.testing.expectEqual(@as(i64, 1), root.object.get("kind").?.integer);
+    try std.testing.expect(spanAttribute(root.*, "gen_ai.operation.name") == null);
+    try std.testing.expect(spanAttribute(root.*, "gen_ai.provider.name") == null);
+
+    const inference = spanNamed(spans, "chat test/model");
+    try std.testing.expectEqual(@as(i64, 3), inference.object.get("kind").?.integer);
+    try std.testing.expectEqualStrings(root.object.get("spanId").?.string, inference.object.get("parentSpanId").?.string);
+    try expectStringAttribute(inference.*, "gen_ai.operation.name", "chat");
+    try expectStringAttribute(inference.*, "gen_ai.provider.name", "openrouter");
+    try expectStringAttribute(inference.*, "gen_ai.request.model", "test/model");
+    try expectStringAttribute(inference.*, "gen_ai.response.id", "gen-1");
+    try expectStringAttribute(inference.*, "gen_ai.response.model", "test/model-v2");
+    try expectStringAttribute(inference.*, "server.address", "openrouter.ai");
+    try std.testing.expect(spanAttribute(inference.*, "gen_ai.response.finish_reasons") != null);
+    try std.testing.expect(spanAttribute(inference.*, "gen_ai.response.time_to_first_chunk") != null);
+    try std.testing.expect(inference.object.get("status") == null);
+
+    const tool = spanNamed(spans, "execute_tool read_file");
+    try std.testing.expectEqual(@as(i64, 1), tool.object.get("kind").?.integer);
+    try std.testing.expectEqualStrings(inference.object.get("spanId").?.string, tool.object.get("parentSpanId").?.string);
+    try expectStringAttribute(tool.*, "gen_ai.operation.name", "execute_tool");
+    try expectStringAttribute(tool.*, "gen_ai.tool.name", "read_file");
+    try expectStringAttribute(tool.*, "gen_ai.tool.call.id", "call-1");
+    try expectStringAttribute(tool.*, "gen_ai.tool.description", "Read a text file");
+    try expectStringAttribute(tool.*, "gen_ai.tool.type", "function");
+    try std.testing.expect(tool.object.get("status") == null);
+
+    for ([_][]const u8{
+        "gen_ai.system_instructions",
+        "gen_ai.input.messages",
+        "gen_ai.output.messages",
+        "gen_ai.tool.definitions",
+        "gen_ai.tool.call.arguments",
+        "gen_ai.tool.call.result",
+    }) |content_key| try std.testing.expect(std.mem.indexOf(u8, json, content_key) == null);
+}
+
+test "OTLP GenAI failures set error type and error span status" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const json = try buildTraceRequest(arena_state.allocator(), .{
+        .session_id = 1,
+        .turn_id = 2,
+        .model = "anthropic/test-model",
+        .session_kind = "root",
+        .started_at_ms = 10,
+        .ended_at_ms = 30,
+        .outcome = "error",
+        .error_text = "secret provider message",
+        .rounds_count = 1,
+        .tool_calls = 1,
+        .tokens_in = 0,
+        .tokens_out = 0,
+        .rounds = &.{.{
+            .round = 0,
+            .span_id = "0000000000000003",
+            .started_at_ms = 12,
+            .first_byte_at_ms = 0,
+            .first_visible_at_ms = 0,
+            .ended_at_ms = 20,
+            .status = "provider_error",
+            .http_status = 429,
+            .response_bytes = 0,
+            .provider = "",
+            .provider_name = "anthropic",
+            .request_model = "test-model",
+            .response_model = "",
+            .server_address = "api.anthropic.com",
+            .server_port = 443,
+            .finish_reason = "",
+            .reasoning_level = "",
+            .max_tokens = 16_000,
+            .generation_id = "",
+            .usage_available = false,
+            .tokens_in = 0,
+            .tokens_out = 0,
+            .cached_tokens = 0,
+            .cache_write_tokens = 0,
+            .reasoning_tokens = 0,
+        }},
+        .tools = &.{.{
+            .round = 0,
+            .call_id = "call-1",
+            .span_id = "0000000000000004",
+            .name = "bash",
+            .description = "",
+            .started_at_ms = 20,
+            .ended_at_ms = 21,
+            .status = "denied",
+        }},
+    });
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), json, .{});
+    defer parsed.deinit();
+    const spans = traceSpans(parsed.value);
+
+    const inference = spanNamed(spans, "chat test-model");
+    try expectStringAttribute(inference.*, "error.type", "429");
+    try std.testing.expectEqual(@as(i64, 2), inference.object.get("status").?.object.get("code").?.integer);
+    try std.testing.expect(spanAttribute(inference.*, "gen_ai.request.max_tokens") != null);
+
+    const tool = spanNamed(spans, "execute_tool bash");
+    try expectStringAttribute(tool.*, "error.type", "denied");
+    try std.testing.expectEqual(@as(i64, 2), tool.object.get("status").?.object.get("code").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, json, "secret provider message") == null);
 }
 
 test "OTEL endpoint normalization validates schemes and appends traces path" {

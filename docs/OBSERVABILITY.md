@@ -2,8 +2,10 @@
 
 Marlin records operational evidence locally for every new agent turn. SQLite is
 the durable source for `/diagnostics`; exporting it is optional and never sits
-on the turn's critical path. Mirador-specific attributes and endpoints follow
-its live [OTLP contract](https://otel.mirador.org/llms.txt).
+on the turn's critical path. GenAI spans follow the OpenTelemetry
+[generative client AI span conventions](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md).
+Mirador-specific attributes and endpoints follow its live
+[OTLP contract](https://otel.mirador.org/llms.txt).
 
 ## Local diagnostics
 
@@ -28,22 +30,26 @@ tool arguments, or tool output into telemetry.
 Export uses the standard OpenTelemetry variables and is off unless an endpoint
 is present:
 
-```sh
-export OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.mirador.org
-export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20mir_srv_REDACTED'
-marlin otel reload
+From the TUI, configure any OTLP/HTTP collector without restarting:
+
+```text
+/otel set https://otel.mirador.org
+OTLP headers ❯ Authorization=Bearer mir_srv_REDACTED
 ```
 
-`marlin otel reload` sends the invoking client's standard OTEL variables to the
-already-running attached daemon and atomically replaces its exporter. No daemon
-restart is required, the values are not persisted, and headers are never echoed
-back. `marlin otel status` reports whether export is active; `marlin otel off`
-disables it. With `--remote <host>`, the local values travel through the existing
-SSH pipe to that host's daemon.
+The second line is a masked input prompt, not a slash command. It accepts the
+standard comma-separated `name=value` header form. The endpoint may be any
+OTLP/HTTP collector; Mirador is only an example.
 
-This live control requires a daemon build that supports it; upgrading an older
-running daemon still requires one final `!rb`. Future endpoint or key changes do
-not. A later daemon restart returns to its startup environment, so keep the OTEL
+`/otel` and `/otel status` report whether export is active. `/otel off` disables
+it. Configuration applies to the attached daemon, including a daemon reached
+through `--remote`, and atomically replaces its exporter. Values are process-local,
+not persisted, not added to editor history or the transcript, and headers are
+never echoed back.
+
+This control requires a daemon build that supports it; upgrading an older running
+daemon requires one final `!rb`. Future endpoint or key changes do not. A later
+daemon restart returns to its startup environment, so keep the standard OTEL
 variables in the daemon's normal launch environment if export should remain on.
 
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` may instead name the full traces URL. When
@@ -56,9 +62,19 @@ Exporter DNS, TLS, HTTP, or collector failures cannot fail or delay an agent
 turn; pending count and the last export error appear in diagnostics. Shutdown
 cancels an in-flight export before closing SQLite.
 
-Marlin exports one `marlin.turn` root span, `chat` client spans for provider
-rounds, and `execute_tool <name>` spans. Root attributes include
-`mirador.trace.tags=marlin` and a promoted
+Marlin exports one custom INTERNAL `marlin.turn` orchestration root without
+`gen_ai.*` attributes. Each provider round is a GenAI CLIENT span named
+`chat <request-model>`; each local tool execution is an INTERNAL span named
+`execute_tool <name>`, parented to the provider round that requested it.
+Inference spans include the provider, requested and returned model identifiers,
+streaming/TTFT, available request settings, finish reason, token usage, server
+address, and low-cardinality error type. Tool spans include the name, call id,
+description, and type when available. Successful spans leave OpenTelemetry
+status unset; failed spans set ERROR and `error.type`.
+
+The exporter never records `gen_ai.system_instructions`, `gen_ai.input.messages`,
+`gen_ai.output.messages`, `gen_ai.tool.definitions`, tool arguments, or tool
+results. Root attributes include `mirador.trace.tags=marlin` and a promoted
 `mirador.trace.attribute.session_id`, so Mirador can search and derive metrics
 without a second metrics pipeline.
 

@@ -280,6 +280,7 @@ pub const Stream = struct {
         if (std.mem.eql(u8, t, "message_start")) {
             const msg = objField(root, "message") orelse return;
             if (strField(msg, "id")) |id| try self.acc.setGenerationId(id);
+            if (strField(msg, "model")) |model| try self.acc.setResponseModel(model);
             if (objField(msg, "usage")) |usage| {
                 self.tokens_in = uintField(usage, "input_tokens") orelse 0;
                 self.cached = uintField(usage, "cache_read_input_tokens") orelse 0;
@@ -439,7 +440,7 @@ test "stream decode: text, thinking, tool_use reassembly, usage, stop reason" {
     var stream = Stream{ .acc = &acc };
 
     const events = [_][]const u8{
-        \\{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":50,"output_tokens":1}}}
+        \\{"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-4-5","usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":50,"output_tokens":1}}}
         ,
         \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
         ,
@@ -468,6 +469,7 @@ test "stream decode: text, thinking, tool_use reassembly, usage, stop reason" {
 
     try std.testing.expectEqualStrings("Hello", acc.text.items);
     try std.testing.expectEqualStrings("pondering", acc.reasoning.items);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", acc.response_model.items);
     try std.testing.expectEqual(@as(usize, 1), acc.calls.items.len);
     try std.testing.expectEqualStrings("toolu_9", acc.calls.items[0].call_id.items);
     try std.testing.expectEqualStrings("bash", acc.calls.items[0].name.items);

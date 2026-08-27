@@ -33,12 +33,14 @@ pub const Endpoint = struct {
     url: [:0]const u8,
     bearer: ?[]const u8,
     model: []const u8,
+    provider_name: []const u8,
     backend: provider.Backend,
 
     pub fn deinit(self: Endpoint, gpa: std.mem.Allocator) void {
         gpa.free(self.url);
         if (self.bearer) |b| gpa.free(b);
         gpa.free(self.model);
+        gpa.free(self.provider_name);
     }
 };
 
@@ -63,6 +65,7 @@ pub fn resolve(
             .url = std.fmt.allocPrintSentinel(gpa, "", .{}, 0) catch return error.OutOfMemory,
             .bearer = null,
             .model = try gpa.dupe(u8, model),
+            .provider_name = try gpa.dupe(u8, "anthropic"),
             .backend = .{ .guest = .claude_code },
         };
     }
@@ -73,6 +76,7 @@ pub fn resolve(
             .url = std.fmt.allocPrintSentinel(gpa, "", .{}, 0) catch return error.OutOfMemory,
             .bearer = null,
             .model = try gpa.dupe(u8, model),
+            .provider_name = try gpa.dupe(u8, "openai"),
             .backend = .{ .guest = .codex },
         };
     }
@@ -119,7 +123,7 @@ pub fn resolve(
             const value = environ.get("MARLIN_LOCAL_API_KEY") orelse break :blk null;
             break :blk if (value.len == 0) null else value;
         };
-        return makeNativeEndpoint(gpa, base, key, model, .openai_compatible);
+        return makeNativeEndpoint(gpa, base, key, model, "local", .openai_compatible);
     }
     if (configured) |entry| {
         var env_key_buf: [128]u8 = undefined;
@@ -129,7 +133,7 @@ pub fn resolve(
             try readApiKey(environ, env_name, true)
         else
             null;
-        return makeNativeEndpoint(gpa, base, key, model, .openai_compatible);
+        return makeNativeEndpoint(gpa, base, key, model, provider_name, .openai_compatible);
     }
     return error.UnknownProvider;
 }
@@ -157,7 +161,7 @@ fn resolveNative(
         try readApiKey(environ, name, preset.key_required or configuredApiKeyEnv(configured) != null)
     else
         null;
-    return makeNativeEndpoint(gpa, base, key, model, preset.dialect);
+    return makeNativeEndpoint(gpa, base, key, model, preset.name, preset.dialect);
 }
 
 fn makeNativeEndpoint(
@@ -165,6 +169,7 @@ fn makeNativeEndpoint(
     base: []const u8,
     key: ?[]const u8,
     model: []const u8,
+    provider_name: []const u8,
     dialect: provider.Dialect,
 ) Error!Endpoint {
     const url = if (dialect == .anthropic) try joinMessagesUrl(gpa, base) else try joinChatUrl(gpa, base);
@@ -172,10 +177,13 @@ fn makeNativeEndpoint(
     const bearer = if (key) |value| try gpa.dupe(u8, value) else null;
     errdefer if (bearer) |value| gpa.free(value);
     const owned_model = try gpa.dupe(u8, model);
+    errdefer gpa.free(owned_model);
+    const owned_provider_name = try gpa.dupe(u8, provider_name);
     return .{
         .url = url,
         .bearer = bearer,
         .model = owned_model,
+        .provider_name = owned_provider_name,
         .backend = .{ .native = dialect },
     };
 }
@@ -263,6 +271,7 @@ test "anthropic models resolve to the Messages endpoint with x-api-key material"
     defer ep.deinit(gpa);
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep.url);
     try std.testing.expectEqualStrings("claude-sonnet-4-5", ep.model);
+    try std.testing.expectEqualStrings("anthropic", ep.provider_name);
     try std.testing.expectEqual(provider.Dialect.anthropic, ep.backend.native);
     try std.testing.expectEqualStrings("sk-ant-test", ep.bearer.?);
 
@@ -290,6 +299,7 @@ test "local testing resolves to the keyless loopback fake model by default" {
     defer ep.deinit(gpa);
     try std.testing.expectEqualStrings("http://127.0.0.1:5757/v1/chat/completions", ep.url);
     try std.testing.expectEqualStrings("testing", ep.model);
+    try std.testing.expectEqualStrings("local", ep.provider_name);
     try std.testing.expect(ep.bearer == null);
     try std.testing.expectEqual(provider.Dialect.openai_compatible, ep.backend.native);
 

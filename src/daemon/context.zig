@@ -48,6 +48,9 @@ pub const system_prompt_base =
     \\- Progress notes (the one line before a tool round) are telegraphic:
     \\  action plus target, a dozen words at most — "Checking the approval
     \\  gate in loop.zig" — never a paragraph, never a plan recital.
+    \\- Never begin network access silently. Immediately before `fetch`, web
+    \\  search, or another URL-reading tool, emit a progress note naming the
+    \\  URL or search target — for example, "Opening docs.example.com".
     \\- Final answers must stand alone and be as short as their content
     \\  allows. Use Markdown lists or tables only when they materially ease
     \\  scanning.
@@ -69,6 +72,8 @@ pub const system_prompt_base =
     \\  jq is unavailable.
     \\- Reserve bash for what it is uniquely good at: builds, tests, git, and
     \\  running programs.
+    \\- If the user asks whether you have read a specific URL, call `fetch`
+    \\  before claiming that you have read it.
     \\- Read a file before editing it; after a change, re-run a focused check.
     \\
     \\PLANNING
@@ -907,6 +912,8 @@ test "assemble: system prompt carries instructions, environment, and suffix" {
     try std.testing.expect(std.mem.indexOf(u8, sys, "rg` (ripgrep)") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "use `jq`") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "fetch\n  over curl or wget") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "Never begin network access silently") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "read a specific URL") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "PLANNING") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "call `plan_update`") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "only current and remaining work") != null);

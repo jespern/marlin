@@ -158,8 +158,9 @@ descendants.
 `otel_configure {endpoint,traces_endpoint,headers}` atomically replaces the
 process-local exporter. Empty endpoints disable export. Values are intentionally
 non-durable and should be sent only over the same-user Unix socket or SSH pipe;
-responses expose only the enabled bit. `otel_status` reads that bit without
-changing configuration.
+the TUI collects headers in a masked prompt outside command history and the
+transcript. Responses expose only the enabled bit. `otel_status` reads that bit
+without changing configuration.
 
 ## Daemon → client
 

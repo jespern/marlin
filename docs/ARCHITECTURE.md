@@ -719,11 +719,14 @@ input/output rates directly and leaves local or unpublished rates unknown.
   into SQLite turn/round/tool telemetry. `/diagnostics` is the deterministic
   local view. With `OTEL_EXPORTER_OTLP_ENDPOINT` (or its traces-specific
   variant), a separate persistent-connection worker drains completed traces
-  from a durable outbox; `marlin otel reload|off|status` can atomically replace
-  that process-local exporter over the existing socket/SSH transport without
-  persisting or echoing headers. Export failures never affect turns. Mirador or another
-  OTLP collector provides the cross-session view. Telemetry excludes prompts,
-  completions, tool arguments, and tool output.
+  from a durable outbox; `/otel set <endpoint>|off|status` can atomically replace
+  that process-local exporter over the existing socket/SSH transport. Header
+  entry is masked and neither persisted nor echoed. Export failures never affect
+  turns. Mirador or another OTLP collector provides the cross-session view.
+  The custom `marlin.turn` INTERNAL root carries no `gen_ai.*` attributes;
+  GenAI CLIENT spans represent provider rounds, and INTERNAL execute-tool spans
+  are parented to the round that requested them. Telemetry excludes prompts,
+  completions, tool definitions, tool arguments, and tool output.
 - HTTP uses a daemon-owned `std.http.Client` pool shared by provider requests,
   bounded fetches, catalogs, and network blocklists. It retains reusable
   connections across rounds while the transport remains isolated behind one

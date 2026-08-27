@@ -4050,7 +4050,7 @@ const App = struct {
                 self.editor.clear();
                 self.otel_header_prompt = true;
                 self.mode = .insert;
-                self.setNotice("enter OTLP headers as name=value pairs · Enter applies · Esc cancels", .{});
+                self.setNotice("enter OTLP headers: name=value[,name=value] · Enter applies · Esc cancels", .{});
             },
         }
     }
@@ -8009,6 +8009,17 @@ test "composer suggestions include commands, council actions, and council names"
     completeSuggestion(&app.editor, suggestions[0], false);
     try std.testing.expectEqualStrings("/review adversarial ", app.editor.text.items);
     try std.testing.expect(commandQuery(&app.editor) == null);
+
+    app.editor.clear();
+    app.editor.insertSlice("/otel s");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 2), suggestions.len);
+    try std.testing.expectEqualStrings("/otel set", suggestions[0].label);
+    try std.testing.expect(!suggestions[0].submit_on_enter);
+    try std.testing.expectEqualStrings("/otel status", suggestions[1].label);
+    try std.testing.expect(suggestions[1].submit_on_enter);
 
     app.editor.clear();
     app.editor.insertSlice("/plan c");

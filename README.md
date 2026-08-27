@@ -87,8 +87,8 @@ the old rooms?
   `marlin search <query>` search every durable session.
 - `/diagnostics` and `marlin diagnostics [handle] [--json]` separate provider
   latency, TTFT, tool time, and failures. Optional OTLP/HTTP export uses a
-  durable retry outbox, supports restart-free `marlin otel reload|off|status`,
-  and correlates OpenRouter Broadcast under the same trace; see
+  durable retry outbox, supports restart-free `/otel set|off|status`, and
+  correlates OpenRouter Broadcast under the same trace; see
   [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
 - OpenRouter sessions can search the web with the same API key and preserve
   cited source URLs; `fetch` opens known pages for deeper reading.

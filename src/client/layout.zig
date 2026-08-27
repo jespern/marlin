@@ -243,6 +243,8 @@ pub const RenderBlock = struct {
     /// Content-addressed uncapped tool output. Null means `text` is already
     /// the complete result and can be copied without another daemon query.
     full_body_ref: ?[]u8 = null,
+    /// Source payload size supplied by the tool runtime when available.
+    payload_bytes: ?u64 = null,
     /// reasoning blocks: true = deliberate mid-turn narration (visible);
     /// false = raw provider reasoning (folded; ctrl+t reveals).
     commentary: bool = false,
@@ -295,6 +297,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     var label: []const u8 = "";
     var status: block.ToolStatus = .ok;
     var full_body_ref: ?[]const u8 = null;
+    var payload_bytes: ?u64 = null;
     var generated_text: ?[]u8 = null;
     var generated_label: ?[]u8 = null;
     var plan_items: []block.PlanItem = &.{};
@@ -330,6 +333,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
             text = tr.inline_body;
             status = tr.status;
             full_body_ref = tr.full_body_ref;
+            payload_bytes = tr.payload_bytes;
             if (tr.attachments.len > 0) {
                 generated_label = try mediaLabel(gpa, tr.attachments);
                 label = generated_label.?;
@@ -368,6 +372,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .plan_items = plan_items,
         .status = status,
         .full_body_ref = owned_ref,
+        .payload_bytes = payload_bytes,
     };
 }
 
@@ -495,6 +500,16 @@ pub fn isFileEditTool(label: []const u8) bool {
     return false;
 }
 
+/// Successful network reads remain visible even when ordinary successful
+/// tools fold into "Ran N commands". Their often-large result bodies stay
+/// collapsed; the durable row records exactly which URL/query was accessed.
+pub fn isNetworkReadTool(label: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(label, "fetch") or
+        std.ascii.eqlIgnoreCase(label, "webfetch") or
+        std.ascii.eqlIgnoreCase(label, "websearch") or
+        std.ascii.eqlIgnoreCase(label, "web_search");
+}
+
 /// A failed command can emit hundreds of perfectly ordinary compiler or test
 /// lines. Reserve red for the lines that actually summarize the failure; the
 /// surrounding transcript stays at the same quiet level as successful tool
@@ -605,6 +620,36 @@ pub fn appendToolCallLine(
             .syntax = try diffCountSpans(alloc, note_text, head.len),
         });
     }
+}
+
+fn appendNetworkSuccessLine(
+    alloc: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    rb: RenderBlock,
+    result: RenderBlock,
+    cwd: []const u8,
+    w: usize,
+) !void {
+    const action: []const u8 = if (std.ascii.indexOfIgnoreCase(rb.label, "search") != null)
+        "Searched"
+    else
+        "Fetched";
+    const head = try std.fmt.allocPrint(alloc, "  ✓ {s} ", .{action});
+    const arg = toolDisplayArg(rb.label, rb.text, cwd) orelse toolDisplayName(rb.label);
+    const capped = arg[0..utf8Floor(arg, @min(arg.len, w -| (head.len + 2)))];
+    const payload_bytes: u64 = result.payload_bytes orelse @intCast(result.text.len);
+    const detail = try std.fmt.allocPrint(alloc, "{s} · {Bi:.1}", .{
+        if (capped.len < arg.len) "…" else "",
+        payload_bytes,
+    });
+    try lines.append(alloc, .{
+        .text = head,
+        .style = Palette.note,
+        .text2 = capped,
+        .style2 = Palette.tool_cmd,
+        .text3 = detail,
+        .style3 = Palette.collapse_hint,
+    });
 }
 
 /// Color the compact diffstat at the end of a tool-line note without
@@ -763,11 +808,16 @@ pub const ScannedBatch = struct {
     ok_count: usize,
 };
 
-pub const ExpandPair = struct { call: usize, result: usize };
+pub const ExpandPair = struct {
+    call: usize,
+    result: usize,
+    show_result: bool = true,
+};
 
 /// Scan the batch starting at `start`; pairs that must stay visible (failed
 /// results, or author-diffs from the edit/write tools whose truncation would
-/// mislead) are appended to `expand`.
+/// mislead) are appended to `expand`. Successful network reads retain only a
+/// compact success row: page/search result bodies remain folded.
 pub fn scanToolBatch(
     alloc: std.mem.Allocator,
     blocks: []const RenderBlock,
@@ -793,8 +843,13 @@ pub fn scanToolBatch(
                 const failed = blocks[i].status != .ok;
                 const author_diff = isDiffOutput(blocks[i].text) and
                     isFileEditTool(blocks[call_idx].label);
-                if (failed or author_diff) {
-                    try expand.append(alloc, .{ .call = call_idx, .result = i });
+                const network_read = !failed and isNetworkReadTool(blocks[call_idx].label);
+                if (failed or author_diff or network_read) {
+                    try expand.append(alloc, .{
+                        .call = call_idx,
+                        .result = i,
+                        .show_result = !network_read,
+                    });
                 } else {
                     ok_count += 1;
                 }
@@ -1120,7 +1175,7 @@ pub fn layoutBlockRange(
                 folded += batch.ok_count;
                 scan_end = batch.next;
                 scan_idx = batch.next;
-                if (expand.items.len > 0) break; // surface failures promptly
+                if (expand.items.len > 0) break; // surface retained rows promptly
             }
 
             // A trailing call/batch with no results yet is still executing:
@@ -1198,14 +1253,18 @@ pub fn layoutBlockRange(
                     });
                 }
                 for (expand.items) |pair| {
-                    // Authored diffs and failures are sections the user reads,
-                    // not machinery: give them air instead of hugging the
-                    // summary line above.
+                    // Authored diffs, failures, and network receipts are
+                    // sections the user reads, not machinery: give them air
+                    // instead of hugging the summary line above.
                     try blankLine(alloc, lines);
                     const result = blocks_all[pair.result];
-                    const note = if (result.status == .ok) try diffSummaryNote(alloc, result.text) else null;
-                    try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note);
-                    try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
+                    if (pair.show_result) {
+                        const note = if (result.status == .ok) try diffSummaryNote(alloc, result.text) else null;
+                        try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note);
+                        try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
+                    } else {
+                        try appendNetworkSuccessLine(alloc, lines, blocks_all[pair.call], result, transcript.cwd, w);
+                    }
                 }
                 // Whatever follows brings its own leading blank; nothing
                 // in the transcript appends trailing air.
@@ -1631,6 +1690,21 @@ test "tool calls render semantic arguments instead of raw JSON" {
     }, cwd, 100, null);
     try std.testing.expectEqualStrings("  ⚙ custom_tool ", lines.items[0].text);
     try std.testing.expectEqualStrings("", lines.items[0].text2);
+
+    lines.clearRetainingCapacity();
+    try appendNetworkSuccessLine(arena, &lines, .{
+        .kind = .tool_call,
+        .text = try arena.dupe(u8, "{\"url\":\"https://example.com/spec\"}"),
+        .label = try arena.dupe(u8, "fetch"),
+    }, .{
+        .kind = .tool_result,
+        .text = try arena.dupe(u8, "readable body"),
+        .label = try arena.dupe(u8, ""),
+        .payload_bytes = 43_212,
+    }, cwd, 100);
+    try std.testing.expectEqualStrings("  ✓ Fetched ", lines.items[0].text);
+    try std.testing.expectEqualStrings("https://example.com/spec", lines.items[0].text2);
+    try std.testing.expectEqualStrings(" · 42.2KiB", lines.items[0].text3);
 }
 
 test "diff intro notes distill to counts for the tool line" {
@@ -1829,6 +1903,18 @@ test "successful tools collapse but diffs and failures stop the run" {
     const guest_batch = try scanToolBatch(arena, &guest, 0, &guest_expand);
     try std.testing.expectEqual(@as(usize, 0), guest_batch.ok_count);
     try std.testing.expectEqual(@as(usize, 1), guest_expand.items.len);
+
+    // Network reads retain a compact receipt, but not the fetched page body.
+    const network = [_]RenderBlock{
+        .{ .kind = .tool_call, .text = try arena.dupe(u8, "{\"url\":\"https://example.com/spec\"}"), .label = try arena.dupe(u8, "fetch") },
+        .{ .kind = .tool_result, .text = try arena.dupe(u8, "large fetched page body"), .label = try arena.dupe(u8, ""), .payload_bytes = 98_765 },
+    };
+    var network_expand: std.ArrayList(ExpandPair) = .empty;
+    defer network_expand.deinit(arena);
+    const network_batch = try scanToolBatch(arena, &network, 0, &network_expand);
+    try std.testing.expectEqual(@as(usize, 0), network_batch.ok_count);
+    try std.testing.expectEqual(@as(usize, 1), network_expand.items.len);
+    try std.testing.expect(!network_expand.items[0].show_result);
 }
 
 test "diffs merely read via bash collapse like any other success" {
