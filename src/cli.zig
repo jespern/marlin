@@ -21,6 +21,7 @@ pub const Command = enum {
     run,
     ls,
     search,
+    diagnostics,
     archive,
     unarchive,
     kill,
@@ -88,6 +89,7 @@ pub fn dispatch(
         .run => return headless.run(gpa, io, environ, self_exe, rest),
         .ls => return headless.ls(gpa, io, environ, self_exe, rest),
         .search => return headless.search(gpa, io, environ, self_exe, rest),
+        .diagnostics => return headless.diagnostics(gpa, io, environ, self_exe, rest),
         .archive => return headless.setArchived(gpa, io, environ, self_exe, rest, true),
         .unarchive => return headless.setArchived(gpa, io, environ, self_exe, rest, false),
         .kill => return headless.kill(gpa, io, environ, self_exe, rest),
@@ -182,6 +184,7 @@ const help_text =
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls [--all]      list sessions
     \\  marlin search <query>  search durable transcripts across sessions
+    \\  marlin diagnostics [handle] [--json]  inspect recent turn timings
     \\  marlin archive <handle> hide a session tree without deleting it
     \\  marlin unarchive <handle> restore an archived session tree
     \\  marlin kill <handle>   interrupt a session's running turn
@@ -214,6 +217,7 @@ test "command parse" {
     try std.testing.expectEqual(Command.unarchive, Command.parse("unarchive").?);
     try std.testing.expectEqual(Command.shutdown, Command.parse("shutdown").?);
     try std.testing.expectEqual(Command.gc, Command.parse("gc").?);
+    try std.testing.expectEqual(Command.diagnostics, Command.parse("diagnostics").?);
     try std.testing.expectEqual(Command.resolve_host, Command.parse("resolve_host").?);
     try std.testing.expectEqual(@as(?Command, null), Command.parse("bogus"));
 }

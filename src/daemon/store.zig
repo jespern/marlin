@@ -11,6 +11,7 @@ const std = @import("std");
 const block = @import("../core/block.zig");
 const Effort = @import("../core/effort.zig").Effort;
 const proto = @import("../core/proto.zig");
+const telemetry_ids = @import("../core/telemetry.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -87,7 +88,62 @@ const schema_sql =
     \\  text TEXT NOT NULL
     \\);
     \\CREATE INDEX IF NOT EXISTS search_docs_by_session ON search_docs(session_id, seq);
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','8');
+    \\CREATE TABLE IF NOT EXISTS telemetry_turns(
+    \\  session_id INTEGER NOT NULL REFERENCES sessions(id),
+    \\  turn_id INTEGER NOT NULL,
+    \\  model TEXT NOT NULL,
+    \\  session_kind TEXT NOT NULL,
+    \\  started_at_ms INTEGER NOT NULL,
+    \\  ended_at_ms INTEGER,
+    \\  outcome TEXT NOT NULL DEFAULT 'running',
+    \\  error_text TEXT NOT NULL DEFAULT '',
+    \\  rounds INTEGER NOT NULL DEFAULT 0,
+    \\  tool_calls INTEGER NOT NULL DEFAULT 0,
+    \\  tokens_in INTEGER NOT NULL DEFAULT 0,
+    \\  tokens_out INTEGER NOT NULL DEFAULT 0,
+    \\  exported_at_ms INTEGER,
+    \\  export_attempts INTEGER NOT NULL DEFAULT 0,
+    \\  export_after_ms INTEGER NOT NULL DEFAULT 0,
+    \\  export_error TEXT NOT NULL DEFAULT '',
+    \\  PRIMARY KEY(session_id, turn_id)
+    \\) WITHOUT ROWID;
+    \\CREATE INDEX IF NOT EXISTS telemetry_turns_export ON telemetry_turns(exported_at_ms, export_after_ms, ended_at_ms);
+    \\CREATE TABLE IF NOT EXISTS telemetry_rounds(
+    \\  session_id INTEGER NOT NULL,
+    \\  turn_id INTEGER NOT NULL,
+    \\  round_index INTEGER NOT NULL,
+    \\  span_id TEXT NOT NULL,
+    \\  started_at_ms INTEGER NOT NULL,
+    \\  first_byte_at_ms INTEGER NOT NULL DEFAULT 0,
+    \\  first_visible_at_ms INTEGER NOT NULL DEFAULT 0,
+    \\  ended_at_ms INTEGER NOT NULL,
+    \\  status TEXT NOT NULL,
+    \\  http_status INTEGER NOT NULL DEFAULT 0,
+    \\  response_bytes INTEGER NOT NULL DEFAULT 0,
+    \\  provider TEXT NOT NULL DEFAULT '',
+    \\  generation_id TEXT NOT NULL DEFAULT '',
+    \\  tokens_in INTEGER NOT NULL DEFAULT 0,
+    \\  tokens_out INTEGER NOT NULL DEFAULT 0,
+    \\  cached_tokens INTEGER NOT NULL DEFAULT 0,
+    \\  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    \\  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    \\  PRIMARY KEY(session_id, turn_id, round_index),
+    \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
+    \\) WITHOUT ROWID;
+    \\CREATE TABLE IF NOT EXISTS telemetry_tools(
+    \\  session_id INTEGER NOT NULL,
+    \\  turn_id INTEGER NOT NULL,
+    \\  round_index INTEGER NOT NULL,
+    \\  call_id TEXT NOT NULL,
+    \\  span_id TEXT NOT NULL,
+    \\  name TEXT NOT NULL,
+    \\  started_at_ms INTEGER NOT NULL,
+    \\  ended_at_ms INTEGER NOT NULL,
+    \\  status TEXT NOT NULL,
+    \\  PRIMARY KEY(session_id, turn_id, call_id),
+    \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
+    \\) WITHOUT ROWID;
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','9');
 ;
 
 pub const SessionRow = struct {
@@ -111,6 +167,52 @@ pub const GcReport = struct {
     orphan_blobs: u64,
     expired_blobs: u64,
     bytes_reclaimed: u64,
+};
+
+pub const TelemetryRound = struct {
+    round: u32,
+    span_id: []const u8,
+    started_at_ms: i64,
+    first_byte_at_ms: i64,
+    first_visible_at_ms: i64,
+    ended_at_ms: i64,
+    status: []const u8,
+    http_status: u16,
+    response_bytes: u64,
+    provider: []const u8,
+    generation_id: []const u8,
+    tokens_in: u64,
+    tokens_out: u64,
+    cached_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+};
+
+pub const TelemetryTool = struct {
+    round: u32,
+    call_id: []const u8,
+    span_id: []const u8,
+    name: []const u8,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    status: []const u8,
+};
+
+pub const TelemetryTrace = struct {
+    session_id: u64,
+    turn_id: u64,
+    model: []const u8,
+    session_kind: []const u8,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    outcome: []const u8,
+    error_text: []const u8,
+    rounds_count: u32,
+    tool_calls: u32,
+    tokens_in: u64,
+    tokens_out: u64,
+    rounds: []const TelemetryRound,
+    tools: []const TelemetryTool,
 };
 
 pub const Store = struct {
@@ -237,6 +339,12 @@ pub const Store = struct {
                 \\ALTER TABLE sessions ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0;
                 \\UPDATE kv SET value='8' WHERE key='schema_version';
             );
+        }
+        if (ver < 9) {
+            // schema_sql creates the additive telemetry tables before this
+            // migration runs. Advancing the marker makes the operation
+            // idempotent for existing databases without rewriting blocks.
+            try self.execAll("UPDATE kv SET value='9' WHERE key='schema_version';");
         }
     }
 
@@ -449,6 +557,438 @@ pub const Store = struct {
         bindInt(stmt, 1, @intCast(tokens_in));
         bindInt(stmt, 2, @intCast(tokens_out));
         bindInt(stmt, 3, @bitCast(id));
+        try stepDone(stmt);
+    }
+
+    // ------------------------------------------------------- telemetry --
+
+    pub fn telemetryBeginTurn(
+        self: Store,
+        session_id: u64,
+        turn_id: u64,
+        model: []const u8,
+        session_kind: proto.SessionKind,
+        started_at_ms: i64,
+    ) Error!void {
+        const stmt = try self.prepare(
+            "INSERT OR IGNORE INTO telemetry_turns(session_id,turn_id,model,session_kind,started_at_ms) VALUES(?,?,?,?,?)",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(turn_id));
+        bindText(stmt, 3, model);
+        bindText(stmt, 4, @tagName(session_kind));
+        bindInt(stmt, 5, started_at_ms);
+        try stepDone(stmt);
+    }
+
+    pub fn telemetryFinishTurn(
+        self: Store,
+        session_id: u64,
+        turn_id: u64,
+        ended_at_ms: i64,
+        outcome: []const u8,
+        error_text: []const u8,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) Error!void {
+        const stmt = try self.prepare(
+            \\UPDATE telemetry_turns SET ended_at_ms=?, outcome=?, error_text=?,
+            \\ rounds=(SELECT count(*) FROM telemetry_rounds WHERE session_id=? AND turn_id=?),
+            \\ tokens_in=CASE WHEN EXISTS(SELECT 1 FROM telemetry_rounds WHERE session_id=? AND turn_id=?)
+            \\   THEN (SELECT COALESCE(sum(tokens_in),0) FROM telemetry_rounds WHERE session_id=? AND turn_id=?) ELSE ? END,
+            \\ tokens_out=CASE WHEN EXISTS(SELECT 1 FROM telemetry_rounds WHERE session_id=? AND turn_id=?)
+            \\   THEN (SELECT COALESCE(sum(tokens_out),0) FROM telemetry_rounds WHERE session_id=? AND turn_id=?) ELSE ? END,
+            \\ tool_calls=(SELECT count(*) FROM telemetry_tools WHERE session_id=? AND turn_id=?)
+            \\ WHERE session_id=? AND turn_id=?
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, ended_at_ms);
+        bindText(stmt, 2, outcome);
+        bindText(stmt, 3, error_text);
+        bindInt(stmt, 4, @bitCast(session_id));
+        bindInt(stmt, 5, @bitCast(turn_id));
+        bindInt(stmt, 6, @bitCast(session_id));
+        bindInt(stmt, 7, @bitCast(turn_id));
+        bindInt(stmt, 8, @bitCast(session_id));
+        bindInt(stmt, 9, @bitCast(turn_id));
+        bindInt(stmt, 10, @intCast(tokens_in));
+        bindInt(stmt, 11, @bitCast(session_id));
+        bindInt(stmt, 12, @bitCast(turn_id));
+        bindInt(stmt, 13, @bitCast(session_id));
+        bindInt(stmt, 14, @bitCast(turn_id));
+        bindInt(stmt, 15, @intCast(tokens_out));
+        bindInt(stmt, 16, @bitCast(session_id));
+        bindInt(stmt, 17, @bitCast(turn_id));
+        bindInt(stmt, 18, @bitCast(session_id));
+        bindInt(stmt, 19, @bitCast(turn_id));
+        try stepDone(stmt);
+    }
+
+    pub fn telemetryRecordRound(
+        self: Store,
+        session_id: u64,
+        turn_id: u64,
+        row: TelemetryRound,
+    ) Error!void {
+        const stmt = try self.prepare(
+            \\INSERT OR REPLACE INTO telemetry_rounds(
+            \\ session_id,turn_id,round_index,span_id,started_at_ms,first_byte_at_ms,
+            \\ first_visible_at_ms,ended_at_ms,status,http_status,response_bytes,provider,
+            \\ generation_id,tokens_in,tokens_out,cached_tokens,cache_write_tokens,reasoning_tokens
+            \\) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(turn_id));
+        bindInt(stmt, 3, row.round);
+        bindText(stmt, 4, row.span_id);
+        bindInt(stmt, 5, row.started_at_ms);
+        bindInt(stmt, 6, row.first_byte_at_ms);
+        bindInt(stmt, 7, row.first_visible_at_ms);
+        bindInt(stmt, 8, row.ended_at_ms);
+        bindText(stmt, 9, row.status);
+        bindInt(stmt, 10, row.http_status);
+        bindInt(stmt, 11, @intCast(row.response_bytes));
+        bindText(stmt, 12, row.provider);
+        bindText(stmt, 13, row.generation_id);
+        bindInt(stmt, 14, @intCast(row.tokens_in));
+        bindInt(stmt, 15, @intCast(row.tokens_out));
+        bindInt(stmt, 16, @intCast(row.cached_tokens));
+        bindInt(stmt, 17, @intCast(row.cache_write_tokens));
+        bindInt(stmt, 18, @intCast(row.reasoning_tokens));
+        try stepDone(stmt);
+    }
+
+    pub fn telemetryRecordTool(
+        self: Store,
+        session_id: u64,
+        turn_id: u64,
+        row: TelemetryTool,
+    ) Error!void {
+        const stmt = try self.prepare(
+            \\INSERT OR REPLACE INTO telemetry_tools(
+            \\ session_id,turn_id,round_index,call_id,span_id,name,started_at_ms,ended_at_ms,status
+            \\) VALUES(?,?,?,?,?,?,?,?,?)
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(turn_id));
+        bindInt(stmt, 3, row.round);
+        bindText(stmt, 4, row.call_id);
+        bindText(stmt, 5, row.span_id);
+        bindText(stmt, 6, row.name);
+        bindInt(stmt, 7, row.started_at_ms);
+        bindInt(stmt, 8, row.ended_at_ms);
+        bindText(stmt, 9, row.status);
+        try stepDone(stmt);
+    }
+
+    /// Mark unfinished telemetry honestly when daemon recovery marks the
+    /// corresponding sessions failed.
+    pub fn recoverInterruptedTelemetry(self: Store, now_ms: i64) Error!void {
+        const stmt = try self.prepare(
+            "UPDATE telemetry_turns SET ended_at_ms=?, outcome='abandoned', error_text='daemon stopped during turn' WHERE ended_at_ms IS NULL",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, now_ms);
+        try stepDone(stmt);
+    }
+
+    pub fn diagnostics(
+        self: Store,
+        allocator: std.mem.Allocator,
+        session_id: u64,
+        turn_limit: u32,
+        now_ms: i64,
+        otlp_enabled: bool,
+    ) Error!proto.Diagnostics {
+        const limit = @max(@min(turn_limit, 500), 1);
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+
+        var result = proto.Diagnostics{ .sid = session_id, .sample_turns = 0, .successful_turns = 0, .failed_turns = 0, .interrupted_turns = 0, .abandoned_turns = 0, .checkpoint_turns = 0, .provider_requests = 0, .tool_calls = 0, .provider_p50_ms = 0, .provider_p95_ms = 0, .ttft_p50_ms = 0, .ttft_p95_ms = 0, .otlp_enabled = otlp_enabled };
+
+        const counts = try self.prepare(
+            \\SELECT count(*),
+            \\ sum(CASE WHEN outcome='ok' THEN 1 ELSE 0 END),
+            \\ sum(CASE WHEN outcome='error' THEN 1 ELSE 0 END),
+            \\ sum(CASE WHEN outcome='interrupted' THEN 1 ELSE 0 END),
+            \\ sum(CASE WHEN outcome='abandoned' THEN 1 ELSE 0 END),
+            \\ sum(CASE WHEN outcome='checkpoint' THEN 1 ELSE 0 END),
+            \\ COALESCE(sum(tool_calls),0)
+            \\FROM (SELECT outcome,tool_calls FROM telemetry_turns WHERE session_id=? ORDER BY started_at_ms DESC LIMIT ?)
+        );
+        defer finalize(counts);
+        bindInt(counts, 1, @bitCast(session_id));
+        bindInt(counts, 2, limit);
+        if (c.sqlite3_step(counts) != c.SQLITE_ROW) return error.SqliteStep;
+        result.sample_turns = @intCast(c.sqlite3_column_int64(counts, 0));
+        result.successful_turns = @intCast(c.sqlite3_column_int64(counts, 1));
+        result.failed_turns = @intCast(c.sqlite3_column_int64(counts, 2));
+        result.interrupted_turns = @intCast(c.sqlite3_column_int64(counts, 3));
+        result.abandoned_turns = @intCast(c.sqlite3_column_int64(counts, 4));
+        result.checkpoint_turns = @intCast(c.sqlite3_column_int64(counts, 5));
+        result.tool_calls = @intCast(c.sqlite3_column_int64(counts, 6));
+
+        var provider_durations: std.ArrayList(u64) = .empty;
+        defer provider_durations.deinit(allocator);
+        var ttft_durations: std.ArrayList(u64) = .empty;
+        defer ttft_durations.deinit(allocator);
+        const timings = try self.prepare(
+            \\SELECT r.started_at_ms,r.ended_at_ms,r.first_visible_at_ms,r.first_byte_at_ms
+            \\FROM telemetry_rounds r JOIN (
+            \\ SELECT turn_id FROM telemetry_turns WHERE session_id=? ORDER BY started_at_ms DESC LIMIT ?
+            \\) recent ON recent.turn_id=r.turn_id
+            \\WHERE r.session_id=? ORDER BY r.started_at_ms
+        );
+        defer finalize(timings);
+        bindInt(timings, 1, @bitCast(session_id));
+        bindInt(timings, 2, limit);
+        bindInt(timings, 3, @bitCast(session_id));
+        while (true) switch (c.sqlite3_step(timings)) {
+            c.SQLITE_ROW => {
+                const started = c.sqlite3_column_int64(timings, 0);
+                const ended = c.sqlite3_column_int64(timings, 1);
+                const first_visible = c.sqlite3_column_int64(timings, 2);
+                const first_byte = c.sqlite3_column_int64(timings, 3);
+                try provider_durations.append(allocator, @intCast(@max(0, ended - started)));
+                const first = if (first_visible > 0) first_visible else first_byte;
+                if (first > 0) try ttft_durations.append(allocator, @intCast(@max(0, first - started)));
+            },
+            c.SQLITE_DONE => break,
+            else => return error.SqliteStep,
+        };
+        result.provider_requests = @intCast(provider_durations.items.len);
+        sortDurations(&provider_durations);
+        sortDurations(&ttft_durations);
+        result.provider_p50_ms = percentile(provider_durations.items, 50);
+        result.provider_p95_ms = percentile(provider_durations.items, 95);
+        result.ttft_p50_ms = percentile(ttft_durations.items, 50);
+        result.ttft_p95_ms = percentile(ttft_durations.items, 95);
+
+        const latest = try self.prepare(
+            \\SELECT turn_id,started_at_ms,COALESCE(ended_at_ms,?),outcome,error_text
+            \\FROM telemetry_turns WHERE session_id=? ORDER BY started_at_ms DESC LIMIT 1
+        );
+        defer finalize(latest);
+        bindInt(latest, 1, now_ms);
+        bindInt(latest, 2, @bitCast(session_id));
+        const latest_rc = c.sqlite3_step(latest);
+        if (latest_rc == c.SQLITE_ROW) {
+            result.last_turn_id = @bitCast(c.sqlite3_column_int64(latest, 0));
+            const started = c.sqlite3_column_int64(latest, 1);
+            const ended = c.sqlite3_column_int64(latest, 2);
+            result.last_duration_ms = @intCast(@max(0, ended - started));
+            result.last_outcome = try dupeColumn(allocator, latest, 3);
+            result.last_error = try dupeColumn(allocator, latest, 4);
+            const trace = telemetry_ids.traceId(session_id, result.last_turn_id);
+            result.last_trace_id = try allocator.dupe(u8, &trace);
+
+            result.last_rounds = try self.diagnosticRounds(allocator, session_id, result.last_turn_id);
+            result.last_tools = try self.diagnosticTools(allocator, session_id, result.last_turn_id);
+        } else if (latest_rc != c.SQLITE_DONE) return error.SqliteStep;
+
+        const export_status = try self.prepare(
+            \\SELECT count(*),COALESCE((SELECT export_error FROM telemetry_turns
+            \\ WHERE session_id=? AND export_error<>'' ORDER BY started_at_ms DESC LIMIT 1),'')
+            \\FROM telemetry_turns WHERE session_id=? AND ended_at_ms IS NOT NULL AND exported_at_ms IS NULL
+        );
+        defer finalize(export_status);
+        bindInt(export_status, 1, @bitCast(session_id));
+        bindInt(export_status, 2, @bitCast(session_id));
+        if (c.sqlite3_step(export_status) != c.SQLITE_ROW) return error.SqliteStep;
+        result.otlp_pending = @intCast(c.sqlite3_column_int64(export_status, 0));
+        result.otlp_last_error = try dupeColumn(allocator, export_status, 1);
+        return result;
+    }
+
+    fn diagnosticRounds(self: Store, allocator: std.mem.Allocator, session_id: u64, turn_id: u64) Error![]const proto.DiagnosticRound {
+        var rows: std.ArrayList(proto.DiagnosticRound) = .empty;
+        const stmt = try self.prepare(
+            \\SELECT round_index,started_at_ms,ended_at_ms,first_visible_at_ms,first_byte_at_ms,
+            \\ response_bytes,status,provider,generation_id,tokens_in,tokens_out,cached_tokens,reasoning_tokens
+            \\FROM telemetry_rounds WHERE session_id=? AND turn_id=? ORDER BY round_index
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(turn_id));
+        while (true) switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => {
+                const started = c.sqlite3_column_int64(stmt, 1);
+                const ended = c.sqlite3_column_int64(stmt, 2);
+                const visible = c.sqlite3_column_int64(stmt, 3);
+                const first_byte = c.sqlite3_column_int64(stmt, 4);
+                const first = if (visible > 0) visible else first_byte;
+                try rows.append(allocator, .{
+                    .round = @intCast(c.sqlite3_column_int64(stmt, 0)),
+                    .duration_ms = @intCast(@max(0, ended - started)),
+                    .ttft_ms = if (first > 0) @intCast(@max(0, first - started)) else 0,
+                    .bytes = @intCast(c.sqlite3_column_int64(stmt, 5)),
+                    .status = try dupeColumn(allocator, stmt, 6),
+                    .provider = try dupeColumn(allocator, stmt, 7),
+                    .generation_id = try dupeColumn(allocator, stmt, 8),
+                    .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 9)),
+                    .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 10)),
+                    .cached_tokens = @intCast(c.sqlite3_column_int64(stmt, 11)),
+                    .reasoning_tokens = @intCast(c.sqlite3_column_int64(stmt, 12)),
+                });
+            },
+            c.SQLITE_DONE => break,
+            else => return error.SqliteStep,
+        };
+        return rows.toOwnedSlice(allocator) catch error.OutOfMemory;
+    }
+
+    fn diagnosticTools(self: Store, allocator: std.mem.Allocator, session_id: u64, turn_id: u64) Error![]const proto.DiagnosticTool {
+        var rows: std.ArrayList(proto.DiagnosticTool) = .empty;
+        const stmt = try self.prepare(
+            "SELECT name,status,started_at_ms,ended_at_ms FROM telemetry_tools WHERE session_id=? AND turn_id=? ORDER BY started_at_ms,call_id",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(turn_id));
+        while (true) switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => {
+                const started = c.sqlite3_column_int64(stmt, 2);
+                const ended = c.sqlite3_column_int64(stmt, 3);
+                try rows.append(allocator, .{
+                    .name = try dupeColumn(allocator, stmt, 0),
+                    .status = try dupeColumn(allocator, stmt, 1),
+                    .duration_ms = @intCast(@max(0, ended - started)),
+                });
+            },
+            c.SQLITE_DONE => break,
+            else => return error.SqliteStep,
+        };
+        return rows.toOwnedSlice(allocator) catch error.OutOfMemory;
+    }
+
+    pub fn nextTelemetryTrace(self: Store, allocator: std.mem.Allocator, now_ms: i64) Error!?TelemetryTrace {
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.prepare(
+            \\SELECT session_id,turn_id,model,session_kind,started_at_ms,ended_at_ms,outcome,
+            \\ error_text,rounds,tool_calls,tokens_in,tokens_out
+            \\FROM telemetry_turns
+            \\WHERE ended_at_ms IS NOT NULL AND exported_at_ms IS NULL AND export_after_ms<=?
+            \\ORDER BY started_at_ms LIMIT 1
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, now_ms);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        const session_id: u64 = @bitCast(c.sqlite3_column_int64(stmt, 0));
+        const turn_id: u64 = @bitCast(c.sqlite3_column_int64(stmt, 1));
+        return .{
+            .session_id = session_id,
+            .turn_id = turn_id,
+            .model = try dupeColumn(allocator, stmt, 2),
+            .session_kind = try dupeColumn(allocator, stmt, 3),
+            .started_at_ms = c.sqlite3_column_int64(stmt, 4),
+            .ended_at_ms = c.sqlite3_column_int64(stmt, 5),
+            .outcome = try dupeColumn(allocator, stmt, 6),
+            .error_text = try dupeColumn(allocator, stmt, 7),
+            .rounds_count = @intCast(c.sqlite3_column_int64(stmt, 8)),
+            .tool_calls = @intCast(c.sqlite3_column_int64(stmt, 9)),
+            .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 10)),
+            .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 11)),
+            .rounds = try self.loadTelemetryRounds(allocator, session_id, turn_id),
+            .tools = try self.loadTelemetryTools(allocator, session_id, turn_id),
+        };
+    }
+
+    fn loadTelemetryRounds(self: Store, allocator: std.mem.Allocator, session_id: u64, turn_id: u64) Error![]const TelemetryRound {
+        var rows: std.ArrayList(TelemetryRound) = .empty;
+        const stmt = try self.prepare(
+            \\SELECT round_index,span_id,started_at_ms,first_byte_at_ms,first_visible_at_ms,
+            \\ ended_at_ms,status,http_status,response_bytes,provider,generation_id,tokens_in,
+            \\ tokens_out,cached_tokens,cache_write_tokens,reasoning_tokens
+            \\FROM telemetry_rounds WHERE session_id=? AND turn_id=? ORDER BY round_index
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(turn_id));
+        while (true) switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => try rows.append(allocator, .{
+                .round = @intCast(c.sqlite3_column_int64(stmt, 0)),
+                .span_id = try dupeColumn(allocator, stmt, 1),
+                .started_at_ms = c.sqlite3_column_int64(stmt, 2),
+                .first_byte_at_ms = c.sqlite3_column_int64(stmt, 3),
+                .first_visible_at_ms = c.sqlite3_column_int64(stmt, 4),
+                .ended_at_ms = c.sqlite3_column_int64(stmt, 5),
+                .status = try dupeColumn(allocator, stmt, 6),
+                .http_status = @intCast(c.sqlite3_column_int64(stmt, 7)),
+                .response_bytes = @intCast(c.sqlite3_column_int64(stmt, 8)),
+                .provider = try dupeColumn(allocator, stmt, 9),
+                .generation_id = try dupeColumn(allocator, stmt, 10),
+                .tokens_in = @intCast(c.sqlite3_column_int64(stmt, 11)),
+                .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 12)),
+                .cached_tokens = @intCast(c.sqlite3_column_int64(stmt, 13)),
+                .cache_write_tokens = @intCast(c.sqlite3_column_int64(stmt, 14)),
+                .reasoning_tokens = @intCast(c.sqlite3_column_int64(stmt, 15)),
+            }),
+            c.SQLITE_DONE => break,
+            else => return error.SqliteStep,
+        };
+        return rows.toOwnedSlice(allocator) catch error.OutOfMemory;
+    }
+
+    fn loadTelemetryTools(self: Store, allocator: std.mem.Allocator, session_id: u64, turn_id: u64) Error![]const TelemetryTool {
+        var rows: std.ArrayList(TelemetryTool) = .empty;
+        const stmt = try self.prepare(
+            \\SELECT round_index,call_id,span_id,name,started_at_ms,ended_at_ms,status
+            \\FROM telemetry_tools WHERE session_id=? AND turn_id=? ORDER BY started_at_ms,call_id
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(session_id));
+        bindInt(stmt, 2, @bitCast(turn_id));
+        while (true) switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => try rows.append(allocator, .{
+                .round = @intCast(c.sqlite3_column_int64(stmt, 0)),
+                .call_id = try dupeColumn(allocator, stmt, 1),
+                .span_id = try dupeColumn(allocator, stmt, 2),
+                .name = try dupeColumn(allocator, stmt, 3),
+                .started_at_ms = c.sqlite3_column_int64(stmt, 4),
+                .ended_at_ms = c.sqlite3_column_int64(stmt, 5),
+                .status = try dupeColumn(allocator, stmt, 6),
+            }),
+            c.SQLITE_DONE => break,
+            else => return error.SqliteStep,
+        };
+        return rows.toOwnedSlice(allocator) catch error.OutOfMemory;
+    }
+
+    pub fn markTelemetryExported(self: Store, session_id: u64, turn_id: u64, now_ms: i64) Error!void {
+        const stmt = try self.prepare(
+            "UPDATE telemetry_turns SET exported_at_ms=?,export_error='' WHERE session_id=? AND turn_id=?",
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, now_ms);
+        bindInt(stmt, 2, @bitCast(session_id));
+        bindInt(stmt, 3, @bitCast(turn_id));
+        try stepDone(stmt);
+    }
+
+    pub fn markTelemetryExportFailed(
+        self: Store,
+        session_id: u64,
+        turn_id: u64,
+        retry_at_ms: i64,
+        message: []const u8,
+    ) Error!void {
+        const stmt = try self.prepare(
+            \\UPDATE telemetry_turns SET export_attempts=export_attempts+1,export_after_ms=?,export_error=?
+            \\WHERE session_id=? AND turn_id=?
+        );
+        defer finalize(stmt);
+        bindInt(stmt, 1, retry_at_ms);
+        bindText(stmt, 2, message[0..@min(message.len, 512)]);
+        bindInt(stmt, 3, @bitCast(session_id));
+        bindInt(stmt, 4, @bitCast(turn_id));
         try stepDone(stmt);
     }
 
@@ -1550,6 +2090,25 @@ fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {
     return ptr[0..len];
 }
 
+fn dupeColumn(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, col: c_int) Error![]const u8 {
+    const value = columnText(stmt, col);
+    return allocator.dupe(u8, value) catch error.OutOfMemory;
+}
+
+fn sortDurations(values: *std.ArrayList(u64)) void {
+    std.mem.sort(u64, values.items, {}, struct {
+        fn lessThan(_: void, a: u64, b: u64) bool {
+            return a < b;
+        }
+    }.lessThan);
+}
+
+fn percentile(sorted: []const u64, p: u64) u64 {
+    if (sorted.len == 0) return 0;
+    const rank = @divFloor(sorted.len * p + 99, 100);
+    return sorted[@max(rank, 1) - 1];
+}
+
 fn columnOptionalU64(stmt: *c.sqlite3_stmt, col: c_int) ?u64 {
     if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return null;
     return @bitCast(c.sqlite3_column_int64(stmt, col));
@@ -2023,15 +2582,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v8 with plan mode and search projection" {
+test "schema is v9 with plan mode, search, and telemetry" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 8), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 9), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 8), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 9), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
@@ -2041,6 +2600,61 @@ test "schema is v8 with plan mode and search projection" {
     defer finalize(stmt);
     try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "telemetry diagnostics and export outbox are durable and content-free" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(42, 1, "/tmp", "openrouter/test/model", .auto);
+    try store.telemetryBeginTurn(42, 100, "openrouter/test/model", .root, 1_000);
+    try store.telemetryRecordRound(42, 100, .{
+        .round = 0,
+        .span_id = "0000000000000065",
+        .started_at_ms = 1_010,
+        .first_byte_at_ms = 1_020,
+        .first_visible_at_ms = 1_030,
+        .ended_at_ms = 1_110,
+        .status = "ok",
+        .http_status = 200,
+        .response_bytes = 512,
+        .provider = "test-provider",
+        .generation_id = "gen-1",
+        .tokens_in = 20,
+        .tokens_out = 5,
+        .cached_tokens = 10,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = 2,
+    });
+    try store.telemetryRecordTool(42, 100, .{
+        .round = 0,
+        .call_id = "call-1",
+        .span_id = "0000000000000066",
+        .name = "read_file",
+        .started_at_ms = 1_111,
+        .ended_at_ms = 1_121,
+        .status = "ok",
+    });
+    try store.telemetryFinishTurn(42, 100, 1_200, "ok", "", 20, 5);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const report = try store.diagnostics(arena, 42, 50, 1_300, true);
+    try std.testing.expectEqual(@as(u32, 1), report.sample_turns);
+    try std.testing.expectEqual(@as(u32, 1), report.successful_turns);
+    try std.testing.expectEqual(@as(u64, 100), report.provider_p50_ms);
+    try std.testing.expectEqual(@as(u64, 20), report.ttft_p50_ms);
+    try std.testing.expectEqual(@as(usize, 1), report.last_rounds.len);
+    try std.testing.expectEqual(@as(usize, 1), report.last_tools.len);
+    try std.testing.expectEqualStrings("read_file", report.last_tools[0].name);
+    try std.testing.expectEqual(@as(u32, 1), report.otlp_pending);
+
+    const trace = (try store.nextTelemetryTrace(arena, 1_300)).?;
+    try std.testing.expectEqual(@as(u64, 100), trace.turn_id);
+    try std.testing.expectEqualStrings("gen-1", trace.rounds[0].generation_id);
+    try store.markTelemetryExported(42, 100, 1_301);
+    try std.testing.expect((try store.nextTelemetryTrace(arena, 1_302)) == null);
 }
 
 test "durable search indexes visible text and recent authored inputs" {

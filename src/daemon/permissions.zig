@@ -295,6 +295,7 @@ pub fn isSecretEnvironmentName(name: []const u8) bool {
     // cannot accidentally fall out of a generic suffix rule.
     if (std.ascii.eqlIgnoreCase(name, "OPENROUTER_API_KEY")) return true;
     if (std.ascii.eqlIgnoreCase(name, "MARLIN_LOCAL_API_KEY")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "OTEL_EXPORTER_OTLP_HEADERS")) return true;
 
     if (startsWithIgnoreCase(name, "AWS_")) return true;
     if (endsWithIgnoreCase(name, "_API_KEY")) return true;
@@ -442,6 +443,7 @@ test "secret environment names cover provider keys and configured patterns" {
     try std.testing.expect(isSecretEnvironmentName("GITHUB_TOKEN"));
     try std.testing.expect(isSecretEnvironmentName("DEPLOY_SECRET"));
     try std.testing.expect(isSecretEnvironmentName("AWS_ACCESS_KEY_ID"));
+    try std.testing.expect(isSecretEnvironmentName("OTEL_EXPORTER_OTLP_HEADERS"));
 
     try std.testing.expect(!isSecretEnvironmentName("PATH"));
     try std.testing.expect(!isSecretEnvironmentName("HOME"));
@@ -457,6 +459,7 @@ test "tool environment retains process context and removes secrets" {
     try source.put("HOME", "/tmp/example-home");
     try source.put("OPENROUTER_API_KEY", "never-in-child");
     try source.put("GH_TOKEN", "also-never-in-child");
+    try source.put("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer%20mir_srv_secret");
     try source.put("AWS_REGION", "also-stripped-by-policy");
 
     var child = try toolEnvironment(gpa, &source);
@@ -466,6 +469,7 @@ test "tool environment retains process context and removes secrets" {
     try std.testing.expectEqualStrings("/tmp/example-home", child.get("HOME").?);
     try std.testing.expect(child.get("OPENROUTER_API_KEY") == null);
     try std.testing.expect(child.get("GH_TOKEN") == null);
+    try std.testing.expect(child.get("OTEL_EXPORTER_OTLP_HEADERS") == null);
     try std.testing.expect(child.get("AWS_REGION") == null);
 }
 

@@ -51,6 +51,7 @@ const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
 const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
+const otel = @import("otel.zig");
 const extensions = @import("extensions.zig");
 const registry = @import("provider/registry.zig");
 const claude_code = @import("provider/claude_code.zig");
@@ -291,6 +292,9 @@ pub const Daemon = struct {
     /// Shared std.http connection pool. Requests are turn-thread-owned while
     /// idle HTTP/TLS connections remain warm across turns.
     http_pool: http.Pool,
+    /// Optional OTLP worker. It drains durable telemetry with a separate
+    /// persistent HTTP pool and is stopped before the store closes.
+    otel_exporter: ?*otel.Exporter = null,
     sandbox_backend: sandbox.Backend = .unavailable,
     /// Non-null exactly when sandbox_backend is .seatbelt: the profile's
     /// protected-read denials are parameterized on these roots.
@@ -373,6 +377,7 @@ pub const Daemon = struct {
         // Provider streams are not resumable across daemon death. Keep their
         // durable session hierarchy and mark the abandoned lifecycle honestly.
         try opened_store.recoverInterruptedSessions();
+        try opened_store.recoverInterruptedTelemetry(nowMs(io));
 
         var loaded_config = try config.load(gpa, io, environ);
         defer loaded_config.deinit();
@@ -483,6 +488,16 @@ pub const Daemon = struct {
             w.interface.flush() catch {};
             p.close(io);
         }
+
+        self.otel_exporter = otel.Exporter.start(gpa, io, &self.store, environ) catch |err| blk: {
+            std.log.warn("OTLP exporter disabled: {t}", .{err});
+            break :blk null;
+        };
+        errdefer if (self.otel_exporter) |exporter| {
+            exporter.deinit();
+            self.otel_exporter = null;
+        };
+        if (self.otel_exporter != null) std.log.info("OTLP trace export enabled", .{});
 
         // Dispatcher thread: consumes events, owns all state.
         const dispatcher = try std.Thread.spawn(.{}, dispatchLoop, .{&self});
@@ -1078,6 +1093,22 @@ pub const Daemon = struct {
                     .sid = request.sid,
                     .hits = hits,
                 } });
+            },
+            .diagnostics => |request| {
+                _ = (try self.getOrLoadSession(request.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena_state.deinit();
+                const report = try self.store.diagnostics(
+                    arena_state.allocator(),
+                    request.sid,
+                    request.turn_limit,
+                    nowMs(self.io),
+                    self.otel_exporter != null,
+                );
+                self.sendTo(client, .{ .diagnostics_result = report });
             },
             .session_watch => |sw| {
                 client.watches_sessions = true;
@@ -2280,6 +2311,7 @@ pub const Daemon = struct {
     const TurnJob = struct {
         daemon: *Daemon,
         sid: u64,
+        turn_id: u64 = 0,
         cwd: []u8, // job-owned copies
         model: []u8,
         effort: proto.ReasoningEffort,
@@ -2323,6 +2355,7 @@ pub const Daemon = struct {
         job.* = .{
             .daemon = self,
             .sid = session.id,
+            .turn_id = ids.next(self.io),
             .cwd = cwd,
             .model = model,
             .effort = session.effort,
@@ -2411,7 +2444,7 @@ pub const Daemon = struct {
     /// Persist the submitted prompt and a failure note so the log tells the
     /// story; runs on the turn thread like the loop's own block appends.
     fn persistFailedTurn(self: *Daemon, job: *TurnJob, note: []const u8) void {
-        const turn_id = ids.next(self.io);
+        const turn_id = if (job.turn_id != 0) job.turn_id else ids.next(self.io);
         var seq = self.store.lastSeq(job.sid) catch return;
         const bodies = [_]block.Body{
             .{ .user_msg = .{ .text = job.text, .attachments = job.attachments } },
@@ -2442,7 +2475,7 @@ pub const Daemon = struct {
         const b = block.Block{
             .id = ids.next(self.io),
             .session_id = job.sid,
-            .turn_id = ids.next(self.io),
+            .turn_id = if (job.turn_id != 0) job.turn_id else ids.next(self.io),
             .seq = (self.store.lastSeq(job.sid) catch return) + 1,
             .ts = nowMs(self.io),
             .body = .{ .system_note = .{ .text = note } },
@@ -2533,9 +2566,18 @@ pub const Daemon = struct {
         var tokens_out: u64 = 0;
         var interrupted = false;
 
+        self.store.telemetryBeginTurn(
+            job.sid,
+            job.turn_id,
+            job.model,
+            job.kind,
+            nowMs(self.io),
+        ) catch |err| std.log.warn("could not begin turn telemetry: {t}", .{err});
+
         const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
             err_text = std.fmt.allocPrint(self.gpa, "provider resolve failed for model '{s}': {t}", .{ job.model, e }) catch null;
             self.persistFailedTurn(job, err_text orelse "provider resolve failed");
+            self.finishTurnTelemetry(job, "error", err_text orelse "provider resolve failed", 0, 0);
             self.finishTurn(job.sid, false, false, err_text, null, 0, 0);
             return;
         };
@@ -2577,9 +2619,11 @@ pub const Daemon = struct {
 
         const result = loop.runTurn(self.gpa, self.io, &self.store, .{
             .session_id = job.sid,
+            .turn_id = job.turn_id,
             .cwd = job.cwd,
             .endpoint = .{ .url = ep.url, .bearer = ep.bearer, .model = ep.model, .dialect = ep.dialect },
             .http_pool = &self.http_pool,
+            .otel_correlation = self.otel_exporter != null,
             .effort = job.effort,
             .cfg = self.cfg,
             .tool_environ = self.environ,
@@ -2637,13 +2681,40 @@ pub const Daemon = struct {
             // and delegate paths already persisted their own richer note.
             if (e != error.ProviderError and delegate_detail == null)
                 self.persistTurnNote(job, err_text orelse "turn failed");
+            self.finishTurnTelemetry(job, "error", err_text orelse @errorName(e), 0, 0);
             self.finishTurn(job.sid, false, false, err_text, null, 0, 0);
             return;
         };
         tokens_in = result.tokens_in;
         tokens_out = result.tokens_out;
         interrupted = result.interrupted;
+        self.finishTurnTelemetry(
+            job,
+            if (interrupted) "interrupted" else if (result.round_budget_reached) "checkpoint" else "ok",
+            "",
+            tokens_in,
+            tokens_out,
+        );
         self.finishTurn(job.sid, interrupted, result.round_budget_reached, null, result.text, tokens_in, tokens_out);
+    }
+
+    fn finishTurnTelemetry(
+        self: *Daemon,
+        job: *const TurnJob,
+        outcome: []const u8,
+        error_text: []const u8,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) void {
+        self.store.telemetryFinishTurn(
+            job.sid,
+            job.turn_id,
+            nowMs(self.io),
+            outcome,
+            error_text,
+            tokens_in,
+            tokens_out,
+        ) catch |err| std.log.warn("could not finish turn telemetry: {t}", .{err});
     }
 
     /// /compact thread body: like turnMain but runs only the compaction
@@ -3481,6 +3552,10 @@ pub const Daemon = struct {
         if (self.catalog_thread) |thread| thread.join();
         self.catalog_thread = null;
         self.catalog_fetching = false;
+        if (self.otel_exporter) |exporter| {
+            self.otel_exporter = null;
+            exporter.deinit();
+        }
 
         // The dispatcher stops at the shutdown marker, so producers that won
         // the queue lock immediately before close may still have payloads

@@ -8,6 +8,7 @@ const Io = std.Io;
 const block = @import("../core/block.zig");
 const proto = @import("../core/proto.zig");
 const ids = @import("../core/ids.zig");
+const telemetry_ids = @import("../core/telemetry.zig");
 const jsonx = @import("../core/jsonx.zig");
 const config = @import("../core/config.zig");
 const Store = @import("store.zig").Store;
@@ -42,10 +43,16 @@ pub const ToolProfile = enum { full, read_only, plan };
 
 pub const RunOpts = struct {
     session_id: u64,
+    /// Durable turn id allocated by the dispatcher. Zero keeps standalone
+    /// tests/backward callers on the loop's local id generator.
+    turn_id: u64 = 0,
     cwd: []const u8,
     endpoint: Endpoint,
     /// Daemon-owned HTTP connection pool shared across provider rounds.
     http_pool: ?*http.Pool = null,
+    /// Add OpenRouter's trace linkage only when the matching Marlin OTLP root
+    /// will be exported. Avoid orphan parent ids in Broadcast-only setups.
+    otel_correlation: bool = false,
     effort: Effort = .auto,
     cfg: config.Config,
     /// Daemon-owned environment. Tool subprocesses receive a scrubbed copy;
@@ -547,7 +554,7 @@ pub fn runTurn(
             .io = io,
             .opts = &opts,
             .seq = try store.lastSeq(opts.session_id),
-            .turn_id = ids.next(io),
+            .turn_id = resolvedTurnId(opts, io),
         };
         const fresh = ap.seq == 0;
         const user_block_id = try ap.append(.{ .user_msg = .{
@@ -575,7 +582,7 @@ pub fn runTurn(
         .io = io,
         .opts = &opts,
         .seq = try store.lastSeq(opts.session_id),
-        .turn_id = ids.next(io),
+        .turn_id = resolvedTurnId(opts, io),
         .history = &history,
         .history_arena = history_arena,
     };
@@ -698,8 +705,14 @@ pub fn runTurn(
             tool_i += 1;
         }
 
+        const provider_span = telemetry_ids.spanId(ids.next(io));
+        const trace_id = telemetry_ids.traceId(opts.session_id, ap.turn_id);
         var request_opts = try providerRequestOptions(arena, opts, opts.endpoint);
         request_opts.openrouter_web_search = web_search_available;
+        if (opts.endpoint.dialect == .openrouter and opts.otel_correlation) {
+            request_opts.trace_id = &trace_id;
+            request_opts.parent_span_id = &provider_span;
+        }
         const body = try buildProviderBody(
             arena,
             opts.endpoint,
@@ -726,6 +739,16 @@ pub fn runTurn(
         pump.last_visible_ms = pump.started_ms;
         pump.last_emit_ms = pump.started_ms;
         defer pump.parser.deinit();
+        var round_observation = RoundObservation{
+            .enabled = opts.turn_id != 0,
+            .session_id = opts.session_id,
+            .turn_id = ap.turn_id,
+            .round = round,
+            .span_id = provider_span,
+            .pump = &pump,
+            .acc = &acc,
+        };
+        defer round_observation.persist(store, io);
         // Visible deltas route through the pump so it can stamp liveness
         // before chaining to the caller's callbacks.
         acc.on_delta = Pump.onVisibleText;
@@ -743,18 +766,27 @@ pub fn runTurn(
             .on_wait_ctx = &pump,
         }, &pump, Pump.onChunk) catch |e| switch (e) {
             error.Cancelled => {
+                round_observation.status = "interrupted";
                 _ = try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
                 try store.updateSessionUsage(opts.session_id, total_in, total_out);
                 return .{ .text = try gpa.dupe(u8, ""), .rounds = round, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
             },
-            error.ConsumerAborted => if (acc.response_too_large)
-                return error.ProviderResponseTooLarge
-            else
-                return e,
-            else => return e,
+            error.ConsumerAborted => if (acc.response_too_large) {
+                round_observation.status = "response_too_large";
+                return error.ProviderResponseTooLarge;
+            } else {
+                round_observation.status = "consumer_aborted";
+                return e;
+            },
+            else => {
+                round_observation.status = @errorName(e);
+                return e;
+            },
         };
+        round_observation.http_status = @intCast(@max(resp.status, 0));
 
         if (resp.status >= 400) {
+            round_observation.status = "provider_error";
             const eb = resp.error_body orelse try gpa.dupe(u8, "");
             defer gpa.free(eb);
             const msg = try providerErrorNote(gpa, resp.status, eb);
@@ -762,6 +794,7 @@ pub fn runTurn(
             _ = try ap.append(.{ .system_note = .{ .text = msg } });
             return error.ProviderError;
         }
+        round_observation.status = "ok";
         acc.flushDeltas();
 
         if (acc.usage) |u| {
@@ -858,6 +891,7 @@ pub fn runTurn(
                 .args_json = args_owned,
                 .tool_call_block_id = tool_call_block_id,
                 .spec = spec,
+                .span_id = telemetry_ids.spanId(ids.next(io)),
             };
             prepared_count += 1;
         }
@@ -945,6 +979,12 @@ pub fn runTurn(
         }
 
         publishPhase(opts, .tool);
+        for (prepared) |*call| {
+            if (call.exec != null and call.started_at_ms == 0) {
+                call.started_at_ms = nowMs(io);
+                call.ended_at_ms = call.started_at_ms;
+            }
+        }
         try executePrepared(gpa, io, opts, prepared);
 
         // Results stay in provider call order even when execution completed
@@ -1025,6 +1065,15 @@ pub fn runTurn(
                     _ = try ap.append(.{ .plan = .{ .items = items } });
                 }
             }
+            if (opts.turn_id != 0) store.telemetryRecordTool(opts.session_id, ap.turn_id, .{
+                .round = round,
+                .call_id = call.call_id,
+                .span_id = &call.span_id,
+                .name = call.name,
+                .started_at_ms = call.started_at_ms,
+                .ended_at_ms = call.ended_at_ms,
+                .status = @tagName(exec.status),
+            }) catch |err| std.log.warn("could not persist tool telemetry: {t}", .{err});
         }
         // Loop: next round re-assembles including the new tool results.
     }
@@ -2018,6 +2067,9 @@ const PreparedCall = struct {
     args_json: []u8,
     tool_call_block_id: u64,
     spec: ?*const tools_registry.Spec,
+    span_id: telemetry_ids.SpanId,
+    started_at_ms: i64 = 0,
+    ended_at_ms: i64 = 0,
     exec: ?tools_registry.ExecOut = null,
 
     fn deinit(self: *PreparedCall, gpa: std.mem.Allocator) void {
@@ -2033,7 +2085,9 @@ const PreparedCall = struct {
 
 const ToolWorker = struct {
     fn run(gpa: std.mem.Allocator, io: Io, opts: RunOpts, call: *PreparedCall) void {
+        call.started_at_ms = nowMs(io);
         call.exec = runTool(gpa, io, opts, call.tool_call_block_id, call.name, call.args_json);
+        call.ended_at_ms = nowMs(io);
     }
 };
 
@@ -2096,6 +2150,10 @@ fn executePrepared(gpa: std.mem.Allocator, io: Io, opts: RunOpts, calls: []Prepa
 fn nowMs(io: Io) i64 {
     const ts = Io.Timestamp.now(io, .real);
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+fn resolvedTurnId(opts: RunOpts, io: Io) u64 {
+    return if (opts.turn_id != 0) opts.turn_id else ids.next(io);
 }
 
 /// Repo-local agent instructions: MARLIN.md, falling back to AGENTS.md, at
@@ -2215,7 +2273,41 @@ fn environmentBlock(gpa: std.mem.Allocator, io: Io, opts: *const RunOpts) ![]u8 
     });
 }
 
-/// Glue: curl chunk → SSE parser → StreamAccum.
+const RoundObservation = struct {
+    enabled: bool,
+    session_id: u64,
+    turn_id: u64,
+    round: u32,
+    span_id: telemetry_ids.SpanId,
+    pump: *const Pump,
+    acc: *const openai.StreamAccum,
+    status: []const u8 = "transport_error",
+    http_status: u16 = 0,
+
+    fn persist(self: RoundObservation, store: *Store, io: Io) void {
+        if (!self.enabled) return;
+        store.telemetryRecordRound(self.session_id, self.turn_id, .{
+            .round = self.round,
+            .span_id = &self.span_id,
+            .started_at_ms = self.pump.started_ms,
+            .first_byte_at_ms = self.pump.first_byte_ms,
+            .first_visible_at_ms = self.pump.first_visible_ms,
+            .ended_at_ms = nowMs(io),
+            .status = self.status,
+            .http_status = self.http_status,
+            .response_bytes = self.pump.bytes_total,
+            .provider = self.acc.provider_name.items,
+            .generation_id = self.acc.generation_id.items,
+            .tokens_in = if (self.acc.usage) |usage| usage.tokens_in else 0,
+            .tokens_out = if (self.acc.usage) |usage| usage.tokens_out else 0,
+            .cached_tokens = if (self.acc.usage) |usage| usage.cached_tokens else 0,
+            .cache_write_tokens = if (self.acc.usage) |usage| usage.cache_write_tokens else 0,
+            .reasoning_tokens = if (self.acc.usage) |usage| usage.reasoning_tokens else 0,
+        }) catch |err| std.log.warn("could not persist provider telemetry: {t}", .{err});
+    }
+};
+
+/// Glue: HTTP response bytes → SSE parser → StreamAccum.
 const Pump = struct {
     parser: sse.Parser,
     acc: *openai.StreamAccum,
@@ -2225,11 +2317,16 @@ const Pump = struct {
     io: ?Io = null,
     opts: ?*const RunOpts = null,
     started_ms: i64 = 0,
+    first_byte_ms: i64 = 0,
+    first_visible_ms: i64 = 0,
     bytes_total: u64 = 0,
     last_visible_ms: i64 = 0,
     last_emit_ms: i64 = 0,
 
     fn onChunk(self: *Pump, bytes: []const u8) bool {
+        if (self.first_byte_ms == 0) {
+            if (self.io) |io| self.first_byte_ms = nowMs(io);
+        }
         self.bytes_total += bytes.len;
         self.parser.feed(bytes, self, onEvent) catch {
             self.acc.response_too_large = true;
@@ -2266,6 +2363,7 @@ const Pump = struct {
     fn markVisible(self: *Pump) void {
         const io = self.io orelse return;
         self.last_visible_ms = nowMs(io);
+        if (self.first_visible_ms == 0) self.first_visible_ms = self.last_visible_ms;
     }
 
     /// At most one status per second, and only while bytes actually flow —

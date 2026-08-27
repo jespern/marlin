@@ -10,7 +10,7 @@ never an accidental wire limit. Clients reject oversized outbound messages
 before optimistic UI state; the daemon drains an oversized inbound record and
 returns `err{line_too_long}` instead of silently dropping the connection.
 
-proto_version: 2
+proto_version: 3
 
 ## Connection lifecycle
 
@@ -47,6 +47,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_list | include_archived? | session_list_result{sessions}; archived omitted by default |
 | input_history | sid?, limit? | input_history_result{entries}; authored user/steer text across sessions, current sid first then newest, capped at 1024 |
 | search | query, sid?, limit? | search_result{query,sid,hits}; sid=0 searches all sessions, capped at 200 results |
+| diagnostics | sid, turn_limit? | diagnostics_result; bounded local timing/outcome summary plus the latest turn waterfall |
 | session_watch | incremental? | initial session_list_result, then structural catalog updates; incremental clients receive session_upsert/session_remove, legacy clients receive refreshed snapshots |
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
@@ -162,6 +163,7 @@ descendants.
 | session_list_result | reply to session_list |
 | input_history_result {entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
 | search_result {query,sid,hits} | reply to search; each hit carries session/block identity, kind, location, timestamp, and an FTS-highlighted snippet |
+| diagnostics_result | reply to diagnostics; aggregate provider/TTFT percentiles, outcomes, latest provider/tool waterfall, trace id, and OTLP outbox health; contains no prompt or tool content |
 | session_upsert {session} | one added/restored/changed catalog row for an incremental session watcher |
 | session_remove {sid} | one archived catalog row removed from an incremental session watcher |
 | blk {sid, b} | a block was persisted (replay AND live fan-out) |

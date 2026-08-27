@@ -12,7 +12,8 @@ marlin/
 │   │   ├── proto.zig          # wire message types, encode/decode, versioning
 │   │   ├── config.zig         # TOML load, defaults, validation
 │   │   ├── jsonx.zig          # lenient JSON repair (tool args), helpers
-│   │   └── ids.zig            # session/block/turn id generation
+│   │   ├── ids.zig            # session/block/turn id generation
+│   │   └── telemetry.zig      # stable OTLP trace/span id formatting
 │   │
 │   ├── daemon/
 │   │   ├── daemon.zig         # listener, client registry, event fan-out, main loop;
@@ -23,6 +24,7 @@ marlin/
 │   │   ├── approval.zig       # policies, capability grants, pending approvals
 │   │   ├── permissions.zig    # capability/path policy + child secret boundary
 │   │   ├── sandbox.zig        # runtime-verified Seatbelt/Landlock adapters
+│   │   ├── otel.zig           # asynchronous OTLP/HTTP outbox drain
 │   │   ├── tools/
 │   │   │   ├── registry.zig   # spec: name, schema, parallel_safe, policy; dispatch
 │   │   │   ├── bash.zig       # subprocess, cancellation, (later: sandbox.zig)
@@ -101,11 +103,12 @@ prompts inline. *Exit: marlin replaces your daily driver for some real tasks.*
 ## M3 — context engine + self-hosting
 L0 caps + L1 pruning + L2 compaction w/ headroom trigger + rehydration +
 usage accounting in status bar. Fixture tests for the cascade.
-`/reboot` + `/reboot --build` (ARCHITECTURE.md §self-hosting reboot):
-coordinated re-exec onto fresh binaries with full state restore — from here
-marlin is developed from inside marlin. e2e: reboot vs kill-9 converge.
-*Exit: a 3-hour session never hits a context error, costs behave, and you
-ship a marlin change from a marlin session and `/reboot --build` into it.*
+`/reboot` + scoped `!rb` source rebuilds (attached/client/both;
+ARCHITECTURE.md §self-hosting reboot): coordinated re-exec onto fresh binaries
+with full state restore — from here marlin is developed from inside marlin.
+e2e: reboot vs kill-9 converge. *Exit: a 3-hour session never hits a context
+error, costs behave, and you ship a marlin change from a marlin session and
+`!rb` into it.*
 
 ## M3.5 — permissions and secret boundary
 Capability-scoped approvals (once or session), scrubbed tool-process

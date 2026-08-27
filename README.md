@@ -69,6 +69,10 @@ the old rooms?
   inline in the composer, repeated `Ctrl+R` walks older matches, and Esc
   restores the draft. Normal-mode `/` searches the current transcript; `/search <query>` and
   `marlin search <query>` search every durable session.
+- `/diagnostics` and `marlin diagnostics [handle] [--json]` separate provider
+  latency, TTFT, tool time, and failures. Optional OTLP/HTTP export uses a
+  durable retry outbox and correlates OpenRouter Broadcast under the same
+  trace; see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
 - OpenRouter sessions can search the web with the same API key and preserve
   cited source URLs; `fetch` opens known pages for deeper reading.
 - Paste an image with Ctrl+V (Control-V, not Command-V on macOS) or attach one
@@ -94,6 +98,10 @@ the old rooms?
 - Substantial implementation gets a durable execution plan: the active step
   stays pinned above the composer, revisions survive reboot and compaction,
   and delegated child activity attaches to the step it is helping complete.
+- Source-built self-hosting works across remote attachments: `!rb` rebuilds the
+  attached daemon side, `!rb client` rebuilds only the local client, and `!rb
+  both` builds both before restarting. Package-installed binaries refuse these
+  builds and remain owned by install.sh or Homebrew.
 - ssh/mosh remain the transport. We never reinvent them; we just put structure
   on the wire above them.
 

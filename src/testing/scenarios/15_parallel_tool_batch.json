@@ -24,6 +24,7 @@
     "argv": ["run", "--quiet", "--model", "local/testing", "inspect the empty workspace"],
     "exit_code": 0,
     "stdout_contains": ["parallel inspection complete"],
-    "db_kinds": ["user_msg", "tool_call", "tool_call", "tool_result", "tool_result", "assistant_msg"]
+    "db_kinds": ["user_msg", "tool_call", "tool_call", "tool_result", "tool_result", "assistant_msg"],
+    "db_telemetry": "1|2|2|ok"
   }
 }

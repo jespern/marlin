@@ -15,7 +15,7 @@ const std = @import("std");
 const block = @import("block.zig");
 pub const ReasoningEffort = @import("effort.zig").Effort;
 
-pub const proto_version: u32 = 2;
+pub const proto_version: u32 = 3;
 /// Maximum complete NDJSON record, including its trailing newline. Large
 /// blob replies can JSON-escape to several times their raw size, so this is
 /// deliberately larger than any supported tool capture while still bounding
@@ -96,6 +96,55 @@ pub const McpServerInfo = struct {
     error_message: ?[]const u8 = null,
 };
 
+pub const DiagnosticRound = struct {
+    round: u32,
+    duration_ms: u64,
+    ttft_ms: u64,
+    bytes: u64,
+    status: []const u8,
+    provider: []const u8 = "",
+    generation_id: []const u8 = "",
+    tokens_in: u64 = 0,
+    tokens_out: u64 = 0,
+    cached_tokens: u64 = 0,
+    reasoning_tokens: u64 = 0,
+};
+
+pub const DiagnosticTool = struct {
+    name: []const u8,
+    status: []const u8,
+    duration_ms: u64,
+};
+
+/// Bounded, deterministic local evidence for one session. Prompt and tool
+/// contents are deliberately absent: this is operational telemetry, not a
+/// second transcript.
+pub const Diagnostics = struct {
+    sid: u64,
+    sample_turns: u32,
+    successful_turns: u32,
+    failed_turns: u32,
+    interrupted_turns: u32,
+    abandoned_turns: u32,
+    checkpoint_turns: u32,
+    provider_requests: u32,
+    tool_calls: u32,
+    provider_p50_ms: u64,
+    provider_p95_ms: u64,
+    ttft_p50_ms: u64,
+    ttft_p95_ms: u64,
+    last_turn_id: u64 = 0,
+    last_trace_id: []const u8 = "",
+    last_outcome: []const u8 = "none",
+    last_error: []const u8 = "",
+    last_duration_ms: u64 = 0,
+    last_rounds: []const DiagnosticRound = &.{},
+    last_tools: []const DiagnosticTool = &.{},
+    otlp_enabled: bool = false,
+    otlp_pending: u32 = 0,
+    otlp_last_error: []const u8 = "",
+};
+
 /// Client-owned media submitted with one user message. Base64 keeps NDJSON
 /// valid for arbitrary binary data and lets a local client upload directly
 /// to a remote daemon without sharing a filesystem.
@@ -126,6 +175,9 @@ pub const ClientMsg = union(enum) {
     input_history: struct { sid: u64 = 0, limit: u32 = 256 },
     /// Durable transcript search. sid=0 searches every session.
     search: struct { query: []const u8, sid: u64 = 0, limit: u32 = 100 },
+    /// Operational timings/outcomes for one session. `turn_limit` bounds the
+    /// percentile sample; the latest turn's waterfall is always included.
+    diagnostics: struct { sid: u64, turn_limit: u32 = 50 },
     /// Subscribe this client to refreshed session_list_result snapshots when
     /// any session enters an actionable state or its membership changes.
     /// The daemon replies with an immediate snapshot, then sends updates until
@@ -271,6 +323,7 @@ pub const DaemonMsg = union(enum) {
     session_list_result: struct { sessions: []const SessionInfo },
     input_history_result: struct { entries: []const InputHistoryEntry },
     search_result: struct { query: []const u8, sid: u64 = 0, hits: []const SearchHit },
+    diagnostics_result: Diagnostics,
     /// Sent only to session watchers that explicitly opted in: older tagged
     /// union decoders reject message types they do not know.
     session_upsert: struct { session: SessionInfo },

@@ -60,6 +60,7 @@ test {
     _ = @import("core/jsonx.zig");
     _ = @import("core/ids.zig");
     _ = @import("core/session_handle.zig");
+    _ = @import("core/telemetry.zig");
     _ = @import("core/queue.zig");
     _ = @import("daemon/store.zig");
     _ = @import("daemon/loop.zig");
@@ -69,6 +70,7 @@ test {
     _ = @import("daemon/sandbox.zig");
     _ = @import("daemon/landlock.zig");
     _ = @import("daemon/network_policy.zig");
+    _ = @import("daemon/otel.zig");
     _ = @import("daemon/extensions.zig");
     _ = @import("daemon/hooks.zig");
     _ = @import("daemon/skills.zig");

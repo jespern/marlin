@@ -78,6 +78,118 @@ pub fn search(
     return 0;
 }
 
+/// `marlin diagnostics [handle] [--json]` — durable local timing evidence.
+/// Without a handle, inspect the newest non-archived session.
+pub fn diagnostics(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    var json = false;
+    var handle: ?[]const u8 = null;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else if (handle == null) {
+            handle = arg;
+        } else {
+            try eprint(io, "usage: marlin diagnostics [session-handle] [--json]\n", .{});
+            return 2;
+        }
+    }
+
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |err| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{err});
+        return 1;
+    };
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var sid: u64 = 0;
+    if (handle) |query| {
+        sid = ((try resolveSessionArg(io, conn, arena, query)) orelse return 2).sid;
+    } else {
+        try conn.send(.{ .session_list = .{ .include_archived = false } });
+        const list = try conn.recvUntil(arena, .session_list_result);
+        if (list.sessions.len == 0) {
+            try eprint(io, "marlin diagnostics: no sessions\n", .{});
+            return 1;
+        }
+        sid = list.sessions[0].sid;
+    }
+
+    try conn.send(.{ .diagnostics = .{ .sid = sid } });
+    const report = conn.recvUntil(arena, .diagnostics_result) catch {
+        try eprint(io, "marlin diagnostics: daemon could not produce a report\n", .{});
+        return 1;
+    };
+    if (json) {
+        const encoded = try std.json.Stringify.valueAlloc(arena, report, .{});
+        try print(io, "{s}\n", .{encoded});
+        return 0;
+    }
+
+    try print(io, "session {x}\n", .{report.sid});
+    try print(io, "sample  {d} turns · {d} ok · {d} failed · {d} interrupted · {d} abandoned · {d} checkpoints\n", .{
+        report.sample_turns,
+        report.successful_turns,
+        report.failed_turns,
+        report.interrupted_turns,
+        report.abandoned_turns,
+        report.checkpoint_turns,
+    });
+    try print(io, "provider  {d} requests · p50 {d:.2}s · p95 {d:.2}s · TTFT p50 {d:.2}s · p95 {d:.2}s\n", .{
+        report.provider_requests,
+        seconds(report.provider_p50_ms),
+        seconds(report.provider_p95_ms),
+        seconds(report.ttft_p50_ms),
+        seconds(report.ttft_p95_ms),
+    });
+    try print(io, "tools  {d} calls\n", .{report.tool_calls});
+    if (report.last_turn_id != 0) {
+        try print(io, "last  {s} · {d:.2}s · trace {s}\n", .{
+            report.last_outcome,
+            seconds(report.last_duration_ms),
+            report.last_trace_id,
+        });
+        if (report.last_error.len > 0) try print(io, "error  {s}\n", .{report.last_error});
+        for (report.last_rounds) |round| {
+            try print(io, "  provider #{d}  {s} · {d:.2}s · TTFT {d:.2}s · {d} bytes · {d} in/{d} out", .{
+                round.round + 1,
+                round.status,
+                seconds(round.duration_ms),
+                seconds(round.ttft_ms),
+                round.bytes,
+                round.tokens_in,
+                round.tokens_out,
+            });
+            if (round.provider.len > 0) try print(io, " · {s}", .{round.provider});
+            if (round.generation_id.len > 0) try print(io, " · {s}", .{round.generation_id});
+            try print(io, "\n", .{});
+        }
+        for (report.last_tools) |tool| try print(io, "  tool {s}  {s} · {d:.2}s\n", .{
+            tool.name,
+            tool.status,
+            seconds(tool.duration_ms),
+        });
+    } else {
+        try print(io, "last  no telemetry yet (run a new turn after this build)\n", .{});
+    }
+    try print(io, "OTLP  {s}", .{if (report.otlp_enabled) "enabled" else "disabled"});
+    if (report.otlp_enabled) try print(io, " · {d} pending", .{report.otlp_pending});
+    if (report.otlp_last_error.len > 0) try print(io, " · last error: {s}", .{report.otlp_last_error});
+    try print(io, "\n", .{});
+    return 0;
+}
+
+fn seconds(ms: u64) f64 {
+    return @as(f64, @floatFromInt(ms)) / 1000.0;
+}
+
 pub fn mcp(
     gpa: std.mem.Allocator,
     io: Io,

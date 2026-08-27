@@ -35,6 +35,10 @@ pub const RequestOptions = struct {
     /// OpenRouter executes this server tool inside the provider request. It is
     /// never emitted for generic OpenAI-compatible endpoints.
     openrouter_web_search: bool = false,
+    /// OpenRouter Broadcast correlation. The Marlin provider span is the
+    /// parent; OpenRouter emits its generation span beneath it.
+    trace_id: ?[]const u8 = null,
+    parent_span_id: ?[]const u8 = null,
 };
 
 /// Build the request body JSON. Caller frees.
@@ -74,6 +78,15 @@ pub fn buildRequestBody(
             try ws.writeAll(",\"provider\":{\"sort\":");
             try enc(sort, .{}, ws);
             try ws.writeByte('}');
+        }
+        if (opts.trace_id) |trace_id| {
+            try ws.writeAll(",\"trace\":{\"trace_id\":");
+            try enc(trace_id, .{}, ws);
+            if (opts.parent_span_id) |parent_span_id| {
+                try ws.writeAll(",\"parent_span_id\":");
+                try enc(parent_span_id, .{}, ws);
+            }
+            try ws.writeAll(",\"trace_name\":\"marlin.turn\",\"generation_name\":\"openrouter.chat\"}");
         }
     }
     try ws.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
@@ -748,6 +761,8 @@ test "request body builds valid json" {
         .session_id = "marlin-abc",
         .provider_sort = "throughput",
         .openrouter_web_search = true,
+        .trace_id = "00000000000000000000000000000001",
+        .parent_span_id = "0000000000000002",
     });
     defer gpa.free(body);
     // Must be valid JSON with the right top-level fields.
@@ -762,17 +777,22 @@ test "request body builds valid json" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"high\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"session_id\":\"marlin-abc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"provider\":{\"sort\":\"throughput\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"trace_id\":\"00000000000000000000000000000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parent_span_id\":\"0000000000000002\"") != null);
 
     const auto_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .auto, &msgs, &.{}, .{
         .session_id = "must-not-leak",
         .provider_sort = "throughput",
         .openrouter_web_search = true,
+        .trace_id = "must-not-leak",
+        .parent_span_id = "must-not-leak",
     });
     defer gpa.free(auto_body);
     try std.testing.expect(std.mem.indexOf(u8, auto_body, "reasoning_effort") == null);
     try std.testing.expect(std.mem.indexOf(u8, auto_body, "session_id") == null);
     try std.testing.expect(std.mem.indexOf(u8, auto_body, "provider\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, auto_body, "openrouter:web_search") == null);
+    try std.testing.expect(std.mem.indexOf(u8, auto_body, "trace_id") == null);
 
     const local_body = try buildRequestBody(gpa, "local/model", .openai_compatible, .low, &msgs, &.{}, .{});
     defer gpa.free(local_body);

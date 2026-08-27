@@ -168,6 +168,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/plan", .usage = " [task|off|clear]", .description = "enter Plan mode or manage its execution todo", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
+    .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
@@ -1761,6 +1762,22 @@ const App = struct {
                 if (self.history_search_active) self.refreshHistorySearch(true);
             },
             .search_result => |result| self.replaceSearchHits(result),
+            .diagnostics_result => |report| {
+                if (report.sid != self.sid) return;
+                self.setNotice(
+                    "diag · {s} {d:.1}s · provider p50 {d:.1}s p95 {d:.1}s · TTFT p95 {d:.1}s · {d}/{d} failed{s}",
+                    .{
+                        report.last_outcome,
+                        @as(f64, @floatFromInt(report.last_duration_ms)) / 1000.0,
+                        @as(f64, @floatFromInt(report.provider_p50_ms)) / 1000.0,
+                        @as(f64, @floatFromInt(report.provider_p95_ms)) / 1000.0,
+                        @as(f64, @floatFromInt(report.ttft_p95_ms)) / 1000.0,
+                        report.failed_turns + report.abandoned_turns,
+                        report.sample_turns,
+                        if (report.otlp_enabled) " · OTLP on" else "",
+                    },
+                );
+            },
             .session_upsert => |su| self.upsertSessionSummary(su.session),
             .session_remove => |sr| self.removeSessionSummary(sr.sid),
             .interrupt_result => |result| {
@@ -2366,6 +2383,14 @@ const App = struct {
             }
             self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
             self.setNotice("compacting…", .{});
+        } else if (std.mem.eql(u8, head, "/diagnostics")) {
+            if (it.next() != null) {
+                self.setNotice("usage: /diagnostics", .{});
+                return;
+            }
+            self.conn.send(.{ .diagnostics = .{ .sid = self.sid } }) catch {
+                self.setNotice("could not request diagnostics", .{});
+            };
         } else if (std.mem.eql(u8, head, "/config")) {
             self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {

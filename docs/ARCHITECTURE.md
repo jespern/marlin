@@ -190,12 +190,15 @@ verbatim, and ssh config owns naming, keys, agent, and jump hosts. A shell
 alias covers the daily case (`alias mw='marlin --remote work'`). mosh
 remains a Mode A transport only — it carries terminal frames, not stdio.
 
-Known gaps: `marlin` must be installed on the remote and findable by a
-login shell (the connect error says how to test), and `/reboot --build`
-under a remote rebuilds the LOCAL binary; refreshing the remote daemon
-still means a shell there. A remote client needs no local provider key —
-providers live with the daemon — so first-run onboarding is skipped when
-MARLIN_REMOTE is set.
+`marlin` must be installed on the remote and findable by a login shell (the
+connect error says how to test). Source-built installations get scoped
+self-hosting rebuilds: bare `!rb` rebuilds the side hosting the attached daemon,
+`!rb client` rebuilds only the local client, and `!rb both` builds both before
+restarting anything. Each build is gated on the running executable resolving to
+`<checkout>/zig-out/bin/marlin` with Marlin checkout markers; install.sh and
+Homebrew binaries refuse with package-manager guidance rather than guessing an
+update mechanism. A remote client needs no local provider key — providers live
+with the daemon — so first-run onboarding is skipped when MARLIN_REMOTE is set.
 
 Why primary: from_seq replay resynchronizes STATE, not a screen — a
 dropped connection reconnects with zero lost blocks (better than mosh for
@@ -247,13 +250,16 @@ the reboot is lying about the crash story; e2e test both and diff.
 
 Sequence:
 
-1. **Binary selection.** `/reboot` re-execs the path argv[0] resolved to at
-   daemon start (you `zig build` beforehand; binary lives at a stable path).
-   `/reboot --build` restores the terminal, runs
-   `zig build -Doptimize=ReleaseFast` with live output there, and proceeds only
-   on success. Either way the candidate is sanity-exec'd (`--version`) before committing —
-   exec-into-broken-binary is the one unrecoverable failure (daemon gone,
-   nothing to reattach), so it must be impossible.
+1. **Binary selection.** `/reboot` restarts the attached daemon and re-execs
+   the current client without building. `!rb` (the `/reboot --build` alias)
+   rebuilds the side hosting the attached daemon; under Mode B the build runs
+   through SSH on the remote. `!rb client` rebuilds/re-execs only the local
+   client and leaves a remote daemon running. `!rb both` builds both candidates
+   before rebooting the attached daemon, which is the protocol-change path.
+   Source builds require the running executable to resolve to
+   `<checkout>/zig-out/bin/marlin` and the checkout markers `.git`, `build.zig`,
+   `build.zig.zon`, and `src/main.zig`; package installations refuse. Every
+   candidate is sanity-exec'd (`version`) before any daemon exits.
 2. **Quiesce.** Default: wait for running turns to reach a block boundary. A
    parked approval refuses a plain reboot visibly: once the requesting TUI
    exits there would be nobody left to answer it. `/reboot --force` interrupts
@@ -625,6 +631,10 @@ provider/
   OpenRouter therefore keeps a session on the same provider/cache and groups
   its generations in Activity. `[providers.openrouter] sort` defaults to
   `"throughput"` (`"latency"`, `"price"`, or `null` are supported).
+- Native agent turns also have stable trace ids. When OTLP export is enabled,
+  OpenRouter receives that trace id plus the Marlin provider span as
+  `parent_span_id`, so Broadcast can join its generation beneath the local
+  trace instead of creating an unrelated one.
 - Ordinary OpenRouter turns also advertise the `openrouter:web_search` server
   tool using the existing OpenRouter credential and briefly describes its use
   in the system prompt. OpenRouter executes searches inside the provider
@@ -695,7 +705,12 @@ input/output rates directly and leaves local or unpublished rates unknown.
   completed tool batch for Claude/Gemini/Qwen families. Models with automatic
   caching use the same append-only prefix without extra parameters. Returned
   cached/write/reasoning token counts and generation/provider ids are decoded
-  for diagnostics; OpenRouter remains the observability system of record.
+  into SQLite turn/round/tool telemetry. `/diagnostics` is the deterministic
+  local view. With `OTEL_EXPORTER_OTLP_ENDPOINT` (or its traces-specific
+  variant), a separate persistent-connection worker drains completed traces
+  from a durable outbox; export failures never affect turns. Mirador or another
+  OTLP collector provides the cross-session view. Telemetry excludes prompts,
+  completions, tool arguments, and tool output.
 - HTTP uses a daemon-owned `std.http.Client` pool shared by provider requests,
   bounded fetches, catalogs, and network blocklists. It retains reusable
   connections across rounds while the transport remains isolated behind one
@@ -1058,9 +1073,10 @@ A split pane identifies its session with a compact pane label.
   it). The `!c msg`/`!c code`/`!c all` variants and the `!y`/`!p` daemon-side
   register are future work.
 - **Command namespace**: `/` = session & harness commands (`/sessions`,
-  `/model`, `/compact`, `/new`, `/archive`, `/allow`); `!` = terse aliases for
-  frequent actions (`!rb` expands to `/reboot --build`, `!c` copies the last
-  output). Plain text + `Enter` starts a turn when idle and queues steering
+  `/model`, `/compact`, `/new`, `/archive`, `/allow`); `!` = terse frequent
+  actions. `!rb` rebuilds the attached daemon side, `!rb client` rebuilds only
+  the local client, `!rb both` rebuilds both, and `!c` copies the last output.
+  Plain text + `Enter` starts a turn when idle and queues steering
   while an agent turn is active. `Esc` enters Vim normal mode; `Ctrl+C`
   interrupts the active turn. Native-only harness verbs (`/compact`,
   `/sandbox`, session `/network`) must refuse on a guest session rather

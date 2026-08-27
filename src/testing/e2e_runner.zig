@@ -127,6 +127,8 @@ const Check = struct {
     stdout_equals: ?[]const u8 = null,
     stderr_equals: ?[]const u8 = null,
     db_kinds: []const []const u8 = &.{},
+    /// Exact `turns|rounds|tools|outcome` telemetry aggregate.
+    db_telemetry: ?[]const u8 = null,
     /// Expected durable session hierarchy rows:
     /// kind|has_parent|has_parent_block|max_rounds|archived.
     db_session_meta: []const []const u8 = &.{},
@@ -306,6 +308,9 @@ fn runScenario(
     // Production's generated starter config subscribes to a remote feed.
     // Fake-provider scenarios stay hermetic unless their own env opts in.
     try env.put("MARLIN_NETWORK_BLOCKLISTS", "");
+    try env.put("OTEL_EXPORTER_OTLP_ENDPOINT", "");
+    try env.put("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "");
+    try env.put("OTEL_EXPORTER_OTLP_HEADERS", "");
     var env_it = sf.check.env.map.iterator();
     while (env_it.next()) |kv| {
         try env.put(kv.key_ptr.*, kv.value_ptr.*);
@@ -498,6 +503,47 @@ fn runScenario(
                 return error.DbKindsMismatch;
             }
         }
+    }
+
+    if (sf.check.db_telemetry) |want| {
+        const db_path = try std.fmt.allocPrint(arena, "{s}/marlin/marlin.db", .{state_dir});
+        const query =
+            "SELECT (SELECT count(*) FROM telemetry_turns) || '|' || " ++
+            "(SELECT count(*) FROM telemetry_rounds) || '|' || " ++
+            "(SELECT count(*) FROM telemetry_tools) || '|' || " ++
+            "COALESCE((SELECT outcome FROM telemetry_turns ORDER BY started_at_ms DESC LIMIT 1),'');";
+        const res = try process_io.run(gpa, io, .{
+            .argv = &.{ "sqlite3", db_path, query },
+            .stdout_limit = 64 * 1024,
+            .stderr_limit = 64 * 1024,
+            .timeout_ms = helper_timeout_ms,
+        });
+        defer res.deinit(gpa);
+        const got = std.mem.trim(u8, res.stdout, " \t\r\n");
+        if (!std.mem.eql(u8, want, got)) {
+            print(io, "\n  db telemetry mismatch: want {s}, got {s}\n", .{ want, got });
+            return error.DbTelemetryMismatch;
+        }
+        const diagnostic = try process_io.run(gpa, io, .{
+            .argv = &.{ marlin_bin, "diagnostics", "--json" },
+            .environ_map = &env,
+            .cwd = .{ .path = state_dir },
+            .stdout_limit = 256 * 1024,
+            .stderr_limit = 64 * 1024,
+            .timeout_ms = helper_timeout_ms,
+        });
+        defer diagnostic.deinit(gpa);
+        if (diagnostic.term != .exited or diagnostic.term.exited != 0)
+            return error.DiagnosticsCommandFailed;
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, diagnostic.stdout, .{}) catch
+            return error.DiagnosticsJsonInvalid;
+        defer parsed.deinit();
+        const object = if (parsed.value == .object) parsed.value.object else return error.DiagnosticsJsonInvalid;
+        const provider_requests = object.get("provider_requests") orelse return error.DiagnosticsJsonInvalid;
+        const tool_calls = object.get("tool_calls") orelse return error.DiagnosticsJsonInvalid;
+        if (provider_requests != .integer or provider_requests.integer != 2 or
+            tool_calls != .integer or tool_calls.integer != 2)
+            return error.DiagnosticsJsonInvalid;
     }
 
     if (sf.check.db_session_meta.len > 0) {
