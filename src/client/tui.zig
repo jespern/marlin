@@ -2711,6 +2711,9 @@ const App = struct {
         rt.recorder = child;
         rt.wav_path = wav;
         rt.phase = .recording;
+        rt.record_started_ms = nowWallMs(self.io);
+        // Keep ticks flowing so the status bar's elapsed counter is live.
+        self.animation_active.store(true, .release);
         self.prewarmVoiceModel();
         self.setNotice("● recording — {s}", .{if (rt.setup.?.mode == .ptt and rt.kitty_release) "release to transcribe" else "ctrl+space to stop"});
     }
@@ -2763,6 +2766,7 @@ const App = struct {
         const thread = std.Thread.spawn(.{}, VoiceJob.run, .{job}) catch {
             self.gpa.destroy(job);
             rt.phase = .idle;
+            self.animation_active.store(self.state == .running, .release);
             return;
         };
         thread.detach();
@@ -2782,6 +2786,7 @@ const App = struct {
         }
         rt.wav_path = null;
         rt.phase = .idle;
+        self.animation_active.store(self.state == .running, .release);
         self.setNotice("voice: recording discarded", .{});
     }
 
@@ -2790,6 +2795,7 @@ const App = struct {
             .transcript => |text| {
                 defer self.gpa.free(text);
                 self.voice_rt.phase = .idle;
+                self.animation_active.store(self.state == .running, .release);
                 if (text.len == 0) {
                     self.setNotice("voice: heard nothing", .{});
                     return;
@@ -2801,6 +2807,7 @@ const App = struct {
             },
             .stt_failed => |name| {
                 self.voice_rt.phase = .idle;
+                self.animation_active.store(self.state == .running, .release);
                 self.setNotice("voice: transcription failed ({s})", .{name});
             },
             .download_done => self.voiceDownloadFinished(null),
@@ -5395,15 +5402,50 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     else
         Palette.status_sep;
     const mode_txt: []const u8 = if (app.plan_mode) "PLAN" else if (app.permissions_full) "FULL ACCESS" else "";
+    // Voice dictation state. Invisible until /voice setup enables it —
+    // dormant means dormant — then a quiet armed hint that turns loud
+    // while a capture or transcription is in flight.
+    var voice_buf: [24]u8 = undefined;
+    var voice_txt: []const u8 = "";
+    var voice_cols: u16 = 0;
+    var voice_style: vaxis.Style = Palette.status_sep;
+    if (app.voice_rt.enabled) switch (app.voice_rt.phase) {
+        .idle => {
+            const ptt = if (app.voice_rt.setup) |st|
+                st.mode == .ptt and app.voice_rt.kitty_release
+            else
+                false;
+            voice_txt = if (ptt) "mic·ptt" else "mic·tap";
+            voice_cols = 7; // "·" renders one cell
+        },
+        .recording => {
+            const secs = @divTrunc(@max(0, nowWallMs(app.io) - app.voice_rt.record_started_ms), 1000);
+            voice_txt = std.fmt.bufPrint(&voice_buf, "● rec {d}s", .{secs}) catch "● rec";
+            voice_cols = @intCast(voice_txt.len - "●".len + 1);
+            voice_style = Palette.status_approval;
+        },
+        .transcribing => {
+            voice_txt = "… stt";
+            voice_cols = 5;
+            voice_style = Palette.status_running;
+        },
+    };
     var right_w: u16 = sandbox_cols + 1 + @as(u16, @intCast(dns_txt.len)) + 3;
     if (mode_txt.len > 0) right_w += @intCast(mode_txt.len + 3);
+    if (voice_txt.len > 0) right_w += voice_cols + 3;
     if (status_win.width > right_w) {
         const right_win = status_win.child(.{
             .x_off = @intCast(status_win.width - right_w),
             .width = right_w,
         });
-        var right_segments: [6]vaxis.Segment = undefined;
+        var right_segments: [8]vaxis.Segment = undefined;
         var right_n: usize = 0;
+        if (voice_txt.len > 0) {
+            right_segments[right_n] = .{ .text = voice_txt, .style = voice_style };
+            right_n += 1;
+            right_segments[right_n] = .{ .text = " · ", .style = Palette.status_sep };
+            right_n += 1;
+        }
         if (mode_txt.len > 0) {
             right_segments[right_n] = .{ .text = mode_txt, .style = if (app.plan_mode) Palette.plan_active else Palette.status_approval };
             right_n += 1;
@@ -6503,6 +6545,8 @@ const VoiceRt = struct {
     rate_bps: u64 = 0,
     /// Last page-cache prewarm; refreshed at most once a minute.
     prewarm_at_ms: i64 = 0,
+    /// When the live capture began — drives the status bar's elapsed counter.
+    record_started_ms: i64 = 0,
 
     fn freeSetup(self: *VoiceRt, gpa: std.mem.Allocator) void {
         if (self.setup) |st| {
