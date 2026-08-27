@@ -364,6 +364,11 @@ Key decisions:
   false so logs and clients from before the marker remain compatible.
 - **Turn grouping**: blocks carry `turn_id` so the UI can collapse/expand a
   whole turn (user msg → reasoning → N tool roundtrips → assistant msg).
+- **Long root turns checkpoint; they do not give up.** `max_rounds` bounds one
+  worker-thread segment. When a root reaches it, the daemon immediately starts
+  a synthetic continuation against the durable transcript and keeps the
+  session running. Task children retain a hard round budget so fan-out remains
+  bounded and returns partial work to its parent.
 
 ### Storage: SQLite, one DB
 
@@ -693,9 +698,12 @@ input/output rates directly and leaves local or unpublished rates unknown.
 - HTTP uses a daemon-owned `std.http.Client` pool shared by provider requests,
   bounded fetches, catalogs, and network blocklists. It retains reusable
   connections across rounds while the transport remains isolated behind one
-  interface. One absolute connect/idle deadline owns each request and can
-  shut down its live socket; it does not consume a second threaded-I/O slot or
-  wait for a discarded request to return. On Darwin, uncached DNS resolution
+  interface. DNS/connection establishment, response-header latency, stream
+  idleness, and absolute wall time have separate deadlines; a connected model
+  may take up to two minutes to return headers without being mistaken for a
+  ten-second connection failure. The watchdog can shut down its live socket;
+  it does not consume a second threaded-I/O slot or wait for a discarded
+  request to return. On Darwin, uncached DNS resolution
   is preflighted in a deadline-bound helper process because libc
   `getaddrinfo` itself is not cancellable; the resolved numeric address is
   handed to the actual connection while the original hostname remains the TLS

@@ -60,6 +60,10 @@ const tools_registry = @import("tools/registry.zig");
 
 const daemon_version = build_options.version;
 
+const round_checkpoint_prompt =
+    \\Continue the current task from the durable transcript. An internal worker-round checkpoint was reached; this is not a user-requested stop. Resume the existing plan and work through completion, then give the user the final answer.
+;
+
 // ---------------------------------------------------------------- events --
 
 const ChildStart = struct {
@@ -96,7 +100,7 @@ const Event = union(enum) {
     catalog_ready: struct { client_id: u64, models: []CatalogModel },
     /// Turn thread → dispatcher completion. final_text and err_text are
     /// separately owned because child task results serialize both fields.
-    turn_done: struct { sid: u64, interrupted: bool, err_text: ?[]u8, final_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
+    turn_done: struct { sid: u64, interrupted: bool, round_budget_reached: bool, err_text: ?[]u8, final_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
     /// Parent turn thread → dispatcher. All strings are gpa-owned; `future`
     /// points into the parked parent turn's stack until resolve().
     child_start: ChildStart,
@@ -179,6 +183,16 @@ const CcPending = struct { approval_id: u64, client_id: u64 };
 
 fn shouldAutoArchiveChild(kind: proto.SessionKind, interrupted: bool, err_text: ?[]const u8) bool {
     return kind != .root and !interrupted and err_text == null;
+}
+
+fn shouldAutoContinueRoundBudget(
+    kind: proto.SessionKind,
+    round_budget_reached: bool,
+    interrupted: bool,
+    err_text: ?[]const u8,
+    reboot_pending: bool,
+) bool {
+    return kind == .root and round_budget_reached and !interrupted and err_text == null and !reboot_pending;
 }
 
 const Session = struct {
@@ -822,6 +836,13 @@ pub const Daemon = struct {
                     t.join();
                     session.turn_thread = null;
                 }
+                const auto_continue = shouldAutoContinueRoundBudget(
+                    session.kind,
+                    td.round_budget_reached,
+                    td.interrupted,
+                    td.err_text,
+                    self.pending_reboot != null,
+                );
                 self.settleSteeringAfterTurn(session);
                 if (session.pending_guest_model) |guest| {
                     session.pending_guest_model = null;
@@ -841,24 +862,47 @@ pub const Daemon = struct {
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
                 session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
                 session.state = if (td.err_text != null) .err else .idle;
-                self.store.setSessionStatus(td.sid, @tagName(session.state)) catch {};
+                var continuation_error: ?[]u8 = null;
+                defer if (continuation_error) |text| self.gpa.free(text);
+                var continuation_failed = false;
+                var continued = false;
+                if (auto_continue) {
+                    self.startTurnWithOptions(session, round_checkpoint_prompt, &.{}, true) catch |err| {
+                        continuation_failed = true;
+                        continuation_error = std.fmt.allocPrint(
+                            self.gpa,
+                            "automatic continuation failed to start: {t}",
+                            .{err},
+                        ) catch null;
+                        self.appendSessionNote(td.sid, continuation_error orelse "automatic continuation failed to start");
+                        session.state = .err;
+                        self.store.setSessionStatus(td.sid, "err") catch {};
+                        self.broadcastStatus(td.sid, .err);
+                    };
+                    continued = !continuation_failed and session.state == .running;
+                } else {
+                    self.store.setSessionStatus(td.sid, @tagName(session.state)) catch {};
+                }
                 // Meta BEFORE status: clients treat idle/err as end-of-turn
                 // and stop reading, so usage must already be on the wire.
                 self.broadcastMeta(td.sid, td.tokens_in, td.tokens_out);
-                self.broadcastStatus(td.sid, session.state);
+                if (!auto_continue) self.broadcastStatus(td.sid, session.state);
+                const terminal_error: ?[]const u8 = td.err_text orelse continuation_error orelse
+                    if (continuation_failed) "automatic continuation failed to start" else null;
                 const payload = std.json.Stringify.valueAlloc(self.gpa, .{
                     .sid = td.sid,
                     .interrupted = td.interrupted,
-                    .ok = td.err_text == null,
-                    .error_message = td.err_text,
+                    .continued = continued,
+                    .ok = terminal_error == null,
+                    .error_message = terminal_error,
                     .tokens_in = td.tokens_in,
                     .tokens_out = td.tokens_out,
                 }, .{}) catch null;
                 if (payload) |json| {
                     defer self.gpa.free(json);
                     self.extensions.fireHook(.on_turn_done, json);
-                    self.extensions.fireHook(.on_session_done, json);
-                    if (td.err_text != null) self.extensions.fireHook(.on_error, json);
+                    if (!continued) self.extensions.fireHook(.on_session_done, json);
+                    if (terminal_error != null) self.extensions.fireHook(.on_error, json);
                 }
                 // A child is an ordinary durable session plus this one-shot
                 // rendezvous back to the parent tool call.
@@ -892,6 +936,7 @@ pub const Daemon = struct {
                         }
                     }
                 }
+                if (continued) return;
                 // A pending /reboot proceeds once the last turn drains.
                 self.maybeFinishReboot();
                 // Task children are one-shot workers. Their durable transcript
@@ -2125,12 +2170,23 @@ pub const Daemon = struct {
         kind: proto.SessionKind,
         max_rounds: u32,
         approval_mode: approval.Mode,
+        synthetic_input: bool = false,
         cancel: *std.atomic.Value(bool),
         /// Live turn state only; configuration must use the value fields above.
         session: *Session,
     };
 
     fn startTurn(self: *Daemon, session: *Session, text: []const u8, attachments: []const block.MediaRef) !void {
+        return self.startTurnWithOptions(session, text, attachments, false);
+    }
+
+    fn startTurnWithOptions(
+        self: *Daemon,
+        session: *Session,
+        text: []const u8,
+        attachments: []const block.MediaRef,
+        synthetic_input: bool,
+    ) !void {
         if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
             return error.SessionBusy;
         const job = try self.gpa.create(TurnJob);
@@ -2156,6 +2212,7 @@ pub const Daemon = struct {
             .kind = session.kind,
             .max_rounds = session.max_rounds,
             .approval_mode = session.approval_mode,
+            .synthetic_input = synthetic_input,
             .cancel = &session.cancel,
             .session = session,
         };
@@ -2271,6 +2328,23 @@ pub const Daemon = struct {
         TurnHooks.onBlock(job, b);
     }
 
+    /// Append and publish a daemon-side lifecycle note when no TurnJob exists
+    /// (for example if an automatic continuation thread cannot be spawned).
+    fn appendSessionNote(self: *Daemon, sid: u64, text: []const u8) void {
+        const b = block.Block{
+            .id = ids.next(self.io),
+            .session_id = sid,
+            .turn_id = ids.next(self.io),
+            .seq = (self.store.lastSeq(sid) catch return) + 1,
+            .ts = nowMs(self.io),
+            .body = .{ .system_note = .{ .text = text } },
+        };
+        self.store.appendBlock(b) catch return;
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = sid, .b = b } }) catch return;
+        defer self.gpa.free(line);
+        self.fanOutLine(sid, line);
+    }
+
     /// The successful turn path closes steering only after an atomic empty
     /// check, so this is normally a no-op. Errors and interrupts can end from
     /// deeper stack frames; retain any already-acknowledged input as durable
@@ -2339,7 +2413,7 @@ pub const Daemon = struct {
         const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
             err_text = std.fmt.allocPrint(self.gpa, "provider resolve failed for model '{s}': {t}", .{ job.model, e }) catch null;
             self.persistFailedTurn(job, err_text orelse "provider resolve failed");
-            self.finishTurn(job.sid, false, err_text, null, 0, 0);
+            self.finishTurn(job.sid, false, false, err_text, null, 0, 0);
             return;
         };
         defer ep.deinit(self.gpa);
@@ -2407,6 +2481,8 @@ pub const Daemon = struct {
             .on_block = TurnHooks.onBlock,
             .on_task = if (job.kind == .root) TurnHooks.onTask else null,
             .tool_profile = if (job.kind == .root) .full else .read_only,
+            .synthetic_input = job.synthetic_input,
+            .auto_continue_round_budget = job.kind == .root,
             .cancel = job.cancel,
             .poll_steer = TurnHooks.pollSteer,
             .try_close_steer = TurnHooks.tryCloseSteer,
@@ -2429,13 +2505,13 @@ pub const Daemon = struct {
             // user sees a bare "error" state with no explanation.
             if (e != error.ProviderError)
                 self.persistTurnNote(job, err_text orelse "turn failed");
-            self.finishTurn(job.sid, false, err_text, null, 0, 0);
+            self.finishTurn(job.sid, false, false, err_text, null, 0, 0);
             return;
         };
         tokens_in = result.tokens_in;
         tokens_out = result.tokens_out;
         interrupted = result.interrupted;
-        self.finishTurn(job.sid, interrupted, null, result.text, tokens_in, tokens_out);
+        self.finishTurn(job.sid, interrupted, result.round_budget_reached, null, result.text, tokens_in, tokens_out);
     }
 
     /// /compact thread body: like turnMain but runs only the compaction
@@ -2454,7 +2530,7 @@ pub const Daemon = struct {
 
         const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "provider resolve failed: {t}", .{e}) catch null;
-            self.finishTurn(job.sid, false, t, null, 0, 0);
+            self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
         };
         defer ep.deinit(self.gpa);
@@ -2480,12 +2556,12 @@ pub const Daemon = struct {
             .cancel = job.cancel,
         }) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "compaction failed: {t}", .{e}) catch null;
-            self.finishTurn(job.sid, false, t, null, 0, 0);
+            self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
         };
         _ = did; // "nothing to compact" already logged as a system_note
         TurnHooks.onPhase(job, .finishing);
-        self.finishTurn(job.sid, false, null, null, 0, 0);
+        self.finishTurn(job.sid, false, false, null, null, 0, 0);
     }
 
     /// Native model writes a visible handover, then turn_done applies
@@ -2503,7 +2579,7 @@ pub const Daemon = struct {
 
         const ep = registry.resolve(self.gpa, self.environ, job.model) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "handover provider resolve failed: {t}", .{e}) catch null;
-            self.finishTurn(job.sid, false, t, null, 0, 0);
+            self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
         };
         defer ep.deinit(self.gpa);
@@ -2525,17 +2601,27 @@ pub const Daemon = struct {
             .cancel = job.cancel,
         }, job.text) catch |e| {
             const t = std.fmt.allocPrint(self.gpa, "handover failed: {t}", .{e}) catch null;
-            self.finishTurn(job.sid, false, t, null, 0, 0);
+            self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
         };
         TurnHooks.onPhase(job, .finishing);
-        self.finishTurn(job.sid, false, null, null, 0, 0);
+        self.finishTurn(job.sid, false, false, null, null, 0, 0);
     }
 
-    fn finishTurn(self: *Daemon, sid: u64, interrupted: bool, err_text: ?[]u8, final_text: ?[]u8, tin: u64, tout: u64) void {
+    fn finishTurn(
+        self: *Daemon,
+        sid: u64,
+        interrupted: bool,
+        round_budget_reached: bool,
+        err_text: ?[]u8,
+        final_text: ?[]u8,
+        tin: u64,
+        tout: u64,
+    ) void {
         self.events.push(self.io, .{ .turn_done = .{
             .sid = sid,
             .interrupted = interrupted,
+            .round_budget_reached = round_budget_reached,
             .err_text = err_text,
             .final_text = final_text,
             .tokens_in = tin,
@@ -3559,6 +3645,15 @@ test "only successful child turns auto-archive" {
     try std.testing.expect(!shouldAutoArchiveChild(.root, false, null));
     try std.testing.expect(!shouldAutoArchiveChild(.task_child, true, null));
     try std.testing.expect(!shouldAutoArchiveChild(.task_child, false, "provider failed"));
+}
+
+test "only healthy root round checkpoints auto-continue" {
+    try std.testing.expect(shouldAutoContinueRoundBudget(.root, true, false, null, false));
+    try std.testing.expect(!shouldAutoContinueRoundBudget(.task_child, true, false, null, false));
+    try std.testing.expect(!shouldAutoContinueRoundBudget(.root, false, false, null, false));
+    try std.testing.expect(!shouldAutoContinueRoundBudget(.root, true, true, null, false));
+    try std.testing.expect(!shouldAutoContinueRoundBudget(.root, true, false, "failed", false));
+    try std.testing.expect(!shouldAutoContinueRoundBudget(.root, true, false, null, true));
 }
 
 fn nowMs(io: Io) i64 {

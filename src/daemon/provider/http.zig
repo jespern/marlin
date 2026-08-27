@@ -17,8 +17,8 @@ pub const Error = error{
     /// The caller's cancel flag was observed, or the Io runtime cancelled us
     /// (daemon shutdown).
     Cancelled,
-    /// The watchdog fired: no response head within connect_timeout_ms, or no
-    /// body bytes within idle_timeout_ms.
+    /// The watchdog fired: no response head within response_head_timeout_ms,
+    /// no body bytes within idle_timeout_ms, or the absolute deadline elapsed.
     HttpTimeout,
     /// The request could not even be formed: unparseable URL or malformed
     /// extra-header line.
@@ -116,7 +116,14 @@ pub const StreamRequest = struct {
     body_json: []const u8,
     /// Extra headers as complete `Name: value` lines.
     extra_headers: []const []const u8 = &.{},
+    /// Bound DNS lookup and initial connection establishment. This is not a
+    /// model-latency deadline: a connected provider may legitimately take
+    /// much longer before returning response headers.
     connect_timeout_ms: i64 = 10_000,
+    /// Abort if a connected provider does not return response headers within
+    /// this long. Kept separate from connect_timeout_ms so cold/queued model
+    /// starts are not mistaken for network connection failures.
+    response_head_timeout_ms: i64 = 120_000,
     /// Abort if no response bytes arrive for this long.
     idle_timeout_ms: i64 = 120_000,
     /// Absolute wall-clock bound for one streaming request. Unlike the idle
@@ -245,7 +252,7 @@ const StreamDeadline = struct {
     io: Io,
     cancel: ?*std.atomic.Value(bool),
     progress: *StreamProgress,
-    connect_timeout_ms: i64,
+    response_head_timeout_ms: i64,
     idle_timeout_ms: i64,
     total_timeout_ms: i64,
     on_wait: ?*const fn (ctx: ?*anyopaque, elapsed_ms: u64) void = null,
@@ -279,7 +286,7 @@ const StreamDeadline = struct {
                 activity_generation = current_generation;
                 elapsed_ms = 0;
             }
-            const timeout_ms = @max(if (response_started) self.idle_timeout_ms else self.connect_timeout_ms, 1);
+            const timeout_ms = @max(if (response_started) self.idle_timeout_ms else self.response_head_timeout_ms, 1);
             const total_timeout_ms = @max(self.total_timeout_ms, 1);
             if (elapsed_ms >= timeout_ms or total_elapsed_ms >= total_timeout_ms)
                 return self.fire(.timed_out);
@@ -322,7 +329,7 @@ fn streamPostTimed(
         .io = client.io,
         .cancel = stream_req.cancel,
         .progress = &progress,
-        .connect_timeout_ms = stream_req.connect_timeout_ms,
+        .response_head_timeout_ms = stream_req.response_head_timeout_ms,
         .idle_timeout_ms = stream_req.idle_timeout_ms,
         .total_timeout_ms = stream_req.total_timeout_ms,
         .on_wait = stream_req.on_wait,
@@ -520,7 +527,7 @@ fn getImpl(
         .io = client.io,
         .cancel = cancel,
         .progress = &progress,
-        .connect_timeout_ms = timeout_ms,
+        .response_head_timeout_ms = timeout_ms,
         .idle_timeout_ms = timeout_ms,
         .total_timeout_ms = timeout_ms,
     };
@@ -844,7 +851,9 @@ fn requestCompletes(
     io: Io,
     server: *Io.net.Server,
     cancel: *std.atomic.Value(bool),
-    timeout_ms: i64,
+    server_delay_ms: i64,
+    connect_timeout_ms: i64,
+    response_head_timeout_ms: i64,
 ) !void {
     const gpa = std.testing.allocator;
     const url = try testUrl(gpa, server);
@@ -854,13 +863,14 @@ fn requestCompletes(
     var results: [2]Select.Union = undefined;
     var select = Select.init(io, &results);
     defer select.cancelDiscard();
-    select.async(.serve, serveDelayedResponse, .{ io, server, 5_000, "ok" });
+    select.async(.serve, serveDelayedResponse, .{ io, server, server_delay_ms, "ok" });
     select.async(.request, streamPostTask(void, discardChunk), .{ gpa, io, StreamRequest{
         .url = url,
         .bearer = null,
         .body_json = "{}",
-        .connect_timeout_ms = timeout_ms,
-        .idle_timeout_ms = timeout_ms,
+        .connect_timeout_ms = connect_timeout_ms,
+        .response_head_timeout_ms = response_head_timeout_ms,
+        .idle_timeout_ms = response_head_timeout_ms,
         .cancel = cancel,
     }, {} });
 
@@ -915,7 +925,7 @@ test "stream cancellation interrupts a blocked response" {
     };
 }
 
-test "stream connect timeout aborts before response headers" {
+test "stream response-head timeout aborts a silent provider" {
     const gpa = std.testing.allocator;
     var threaded: Io.Threaded = .init(gpa, .{ .async_limit = .limited(2) });
     defer threaded.deinit();
@@ -923,7 +933,21 @@ test "stream connect timeout aborts before response headers" {
     var server = try testServer(io);
     defer server.deinit(io);
     var cancel: std.atomic.Value(bool) = .init(false);
-    try std.testing.expectError(error.HttpTimeout, requestCompletes(io, &server, &cancel, 100));
+    try std.testing.expectError(error.HttpTimeout, requestCompletes(io, &server, &cancel, 5_000, 2_000, 100));
+}
+
+test "connected provider may take longer than connect timeout to return headers" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{ .async_limit = .limited(2) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testServer(io);
+    defer server.deinit(io);
+    var cancel: std.atomic.Value(bool) = .init(false);
+
+    // The TCP connection is immediate, then the mock model thinks for 250ms.
+    // A 25ms connection budget must not become a 25ms response-head budget.
+    try requestCompletes(io, &server, &cancel, 250, 25, 2_000);
 }
 
 fn streamPostTask(

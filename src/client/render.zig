@@ -38,6 +38,7 @@ pub const Palette = struct {
     pub const plan_header: vaxis.Style = .{ .bg = plan_bg, .fg = .{ .index = 8 }, .bold = true };
     pub const plan_pending: vaxis.Style = .{ .bg = plan_bg, .fg = .{ .index = 7 } };
     pub const plan_active: vaxis.Style = .{ .bg = plan_bg, .fg = soft_blue, .bold = true };
+    pub const plan_error: vaxis.Style = .{ .bg = plan_bg, .fg = .{ .index = 1 }, .bold = true };
     pub const plan_done_mark: vaxis.Style = .{ .bg = plan_bg, .fg = .{ .index = 2 }, .bold = true };
     pub const shortcut_panel: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 7 } };
     pub const shortcut_key: vaxis.Style = .{ .bg = command_bg, .fg = .{ .index = 6 }, .bold = true };

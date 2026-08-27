@@ -110,6 +110,13 @@ pub const RunOpts = struct {
     /// Read-only child sessions advertise only non-mutating tools and never
     /// advertise task, preventing recursive delegation in the first M6 cut.
     tool_profile: ToolProfile = .full,
+    /// Internal continuation prompts remain model-visible without appearing as
+    /// authored user input or entering composer history.
+    synthetic_input: bool = false,
+    /// Root sessions checkpoint a very long agent loop at max_rounds and let
+    /// the daemon immediately resume it as a fresh internal turn. Children
+    /// keep max_rounds as a hard parent-facing completion boundary.
+    auto_continue_round_budget: bool = false,
     /// Called after EVERY block is persisted (daemon fan-out). The block's
     /// memory is only valid during the callback.
     on_block: ?*const fn (ctx: ?*anyopaque, b: block.Block) void = null,
@@ -134,6 +141,9 @@ pub const TurnResult = struct {
     tokens_in: u64,
     tokens_out: u64,
     interrupted: bool = false,
+    /// The bounded loop ended at an internal checkpoint rather than a model
+    /// final answer. The daemon may resume root sessions transparently.
+    round_budget_reached: bool = false,
 };
 
 fn publishPhase(opts: RunOpts, phase: proto.TurnPhase) void {
@@ -539,7 +549,11 @@ pub fn runTurn(
             .turn_id = ids.next(io),
         };
         const fresh = ap.seq == 0;
-        const user_block_id = try ap.append(.{ .user_msg = .{ .text = user_text, .attachments = attachments } });
+        const user_block_id = try ap.append(.{ .user_msg = .{
+            .text = user_text,
+            .attachments = attachments,
+            .synthetic = opts.synthetic_input,
+        } });
         for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
         const delegated_prompt = if (attachments.len > 0)
             try std.fmt.allocPrint(gpa, "{s}\n\n[{d} image attachment(s) are stored in Marlin but unavailable to the delegated Claude Code route]", .{ user_text, attachments.len })
@@ -568,7 +582,11 @@ pub fn runTurn(
     var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
     defer http_client.deinit();
 
-    const user_block_id = try ap.append(.{ .user_msg = .{ .text = user_text, .attachments = attachments } });
+    const user_block_id = try ap.append(.{ .user_msg = .{
+        .text = user_text,
+        .attachments = attachments,
+        .synthetic = opts.synthetic_input,
+    } });
     for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
 
     // System-prompt context built once per turn: repo-local instructions and
@@ -1008,17 +1026,20 @@ pub fn runTurn(
         // Loop: next round re-assembles including the new tool results.
     }
 
-    // Running out of round budget on a long task is an end-of-turn, not an
-    // error: the session stays usable and a plain "continue" resumes with
-    // full context. The note is durable; the returned text feeds task
-    // children their partial-result contract.
-    _ = try ap.append(.{ .system_note = .{ .text = "round budget reached — say 'continue' to keep going" } });
+    // max_rounds bounds one worker-thread lifetime, not the user's task. Root
+    // sessions resume from this durable checkpoint automatically; task
+    // children deliberately return their bounded partial-result contract.
+    _ = try ap.append(.{ .system_note = .{ .text = if (opts.auto_continue_round_budget)
+        "internal round checkpoint reached"
+    else
+        "child round budget reached; partial work returned to parent" } });
     try store.updateSessionUsage(opts.session_id, total_in, total_out);
     return .{
         .text = try gpa.dupe(u8, "[round budget reached before a final answer; partial work is in the transcript]"),
         .rounds = round,
         .tokens_in = total_in,
         .tokens_out = total_out,
+        .round_budget_reached = true,
     };
 }
 
@@ -2235,6 +2256,38 @@ test "environment block reports cwd, git absence, and inactive regimes" {
     const instructions = projectInstructions(gpa, io, dir);
     defer if (instructions) |text| gpa.free(text);
     try std.testing.expectEqualStrings("Use spaces, not tabs.", instructions.?);
+}
+
+test "root round budget becomes an automatic continuation checkpoint" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-round-checkpoint-test");
+    defer temp.deinit();
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, temp.path, "m", .auto);
+
+    const result = try runTurn(gpa, io, &store, .{
+        .session_id = 1,
+        .cwd = temp.path,
+        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .dialect = .openai_compatible },
+        .cfg = config.defaults(),
+        .max_rounds = 0,
+        .auto_continue_round_budget = true,
+    }, "work", &.{});
+    defer gpa.free(result.text);
+
+    try std.testing.expect(result.round_budget_reached);
+    try std.testing.expect(!result.interrupted);
+    const loaded = try store.getBlocks(1, 1, 10);
+    defer {
+        for (loaded) |*item| item.deinit();
+        gpa.free(loaded);
+    }
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqualStrings("internal round checkpoint reached", loaded[1].blk.body.system_note.text);
 }
 
 test "delegated claude code turn persists the event stream as blocks" {

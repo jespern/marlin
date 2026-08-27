@@ -4231,17 +4231,29 @@ const PlanMarker = struct {
     text_style: vaxis.Style,
 };
 
-fn planMarker(status: block.PlanStatus, spinner_frame: usize) PlanMarker {
+fn planMarker(status: block.PlanStatus, session_state: proto.SessionState, spinner_frame: usize) PlanMarker {
     return switch (status) {
         .pending => .{
             .glyph = "·",
             .glyph_style = Palette.plan_pending,
             .text_style = Palette.plan_pending,
         },
-        .in_progress => .{
-            .glyph = spinner_frames[spinner_frame % spinner_frames.len],
-            .glyph_style = Palette.plan_active,
-            .text_style = Palette.plan_active,
+        .in_progress => switch (session_state) {
+            .running => .{
+                .glyph = spinner_frames[spinner_frame % spinner_frames.len],
+                .glyph_style = Palette.plan_active,
+                .text_style = Palette.plan_active,
+            },
+            .err => .{
+                .glyph = "×",
+                .glyph_style = Palette.plan_error,
+                .text_style = Palette.plan_pending,
+            },
+            .idle, .awaiting_approval, .done => .{
+                .glyph = "⏸",
+                .glyph_style = Palette.plan_pending,
+                .text_style = Palette.plan_pending,
+            },
         },
         .completed => .{
             .glyph = "✔",
@@ -4318,7 +4330,7 @@ fn drawPlan(
 
     const now_ms = nowWallMs(app.io);
     for (app.plan.items[range.start .. range.start + range.len], 0..) |item, row| {
-        const marker = planMarker(item.status, app.spinner_frame);
+        const marker = planMarker(item.status, app.state, app.spinner_frame);
         const available = widths.task -| 3;
         const end = hardCellBreak(item.step, 0, available);
         const left = [_]vaxis.Segment{
@@ -8839,12 +8851,21 @@ test "completed plan leaves the live panel and remains durable in transcript" {
 }
 
 test "plan table uses semantic markers, stable columns, and concise timing" {
-    const pending = planMarker(.pending, 0);
-    const active = planMarker(.in_progress, 3);
-    const completed = planMarker(.completed, 0);
+    const pending = planMarker(.pending, .idle, 0);
+    const active = planMarker(.in_progress, .running, 3);
+    const paused = planMarker(.in_progress, .idle, 3);
+    const failed = planMarker(.in_progress, .err, 3);
+    const completed = planMarker(.completed, .idle, 0);
 
     try std.testing.expectEqualStrings("·", pending.glyph);
     try std.testing.expectEqualStrings(spinner_frames[3], active.glyph);
+    try std.testing.expectEqualStrings("⏸", paused.glyph);
+    try std.testing.expectEqual(@as(usize, 1), displayWidth(paused.glyph));
+    try std.testing.expect(vaxis.Color.eql(Palette.plan_pending.fg, paused.glyph_style.fg));
+    try std.testing.expect(!paused.text_style.bold);
+    try std.testing.expectEqualStrings("×", failed.glyph);
+    try std.testing.expectEqual(@as(usize, 1), displayWidth(failed.glyph));
+    try std.testing.expect(vaxis.Color.eql(Palette.plan_error.fg, failed.glyph_style.fg));
     try std.testing.expectEqualStrings("✔", completed.glyph);
     try std.testing.expectEqual(@as(usize, 1), displayWidth(completed.glyph));
     try std.testing.expect(vaxis.Color.eql(Palette.plan_done_mark.fg, completed.glyph_style.fg));
