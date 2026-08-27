@@ -27,7 +27,7 @@ jobs:
       # macOS ships sqlite3 in the SDK; nothing to install.
 
       - name: Format check
-        run: zig fmt --check src build.zig
+        run: zig build fmt-check
 
       - name: Installer tests
         run: sh scripts/test-install.sh

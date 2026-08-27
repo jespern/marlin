@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+echo "Checking staged Zig formatting..."
+
+# Check blobs from the index, not the working tree. Otherwise a formatted but
+# unstaged edit can hide an unformatted version in the commit being created.
+if ! git ls-files --cached -- '*.zig' build.zig |
+    while IFS= read -r path; do
+        if ! git show ":$path" | zig fmt --stdin --check >/dev/null; then
+            echo "$path is not formatted in the staged snapshot" >&2
+            exit 1
+        fi
+    done
+then
+    echo "Run 'zig build fmt', then stage the formatted files." >&2
+    exit 1
+fi

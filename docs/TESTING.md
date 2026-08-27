@@ -5,10 +5,16 @@ marlin's bar: **`zig build test && zig build e2e` green is the definition of
 with their tests in the same commit. Expect more test code than core code;
 that is intended, not accidental.
 
+Run `scripts/install-git-hooks.sh` once after cloning. The repo-owned
+pre-commit hook checks the complete staged snapshot with Zig's canonical
+formatter, the same formatting gate as CI. Use `zig build fmt` during
+implementation to format all Zig source and `build.zig`.
+
 ## The pyramid
 
 | Layer | Command | What it proves | Network | When it runs |
 |---|---|---|---|---|
+| 0. Format | `zig build fmt-check` | Zig source matches the canonical formatter | none | every commit |
 | 1. Unit | `zig build test` | each module's logic, inline `test` blocks | none | every save |
 | 2. Fixture | `zig build test` (same step) | real recorded provider streams still parse | none | every save |
 | 3. e2e | `zig build e2e` | the REAL binary against a scripted fake provider | localhost only | every commit |
@@ -130,7 +136,7 @@ CI runs it nightly and on manual dispatch, never on PRs.
 
 ## CI
 
-`.github/workflows/ci.yml`: fmt check + unit/fixture + e2e on macOS and Linux
+`.github/workflows/ci.yml`: `zig build fmt-check` + unit/fixture + e2e on macOS and Linux
 for every push/PR. Smoke is a separate job gated on schedule/dispatch with
 `OPENROUTER_API_KEY` from repo secrets.
 

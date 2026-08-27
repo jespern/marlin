@@ -54,6 +54,18 @@ pub fn build(b: *std.Build) void {
         "Compile vendored SQLite into Marlin (official releases enable this)",
     ) orelse false;
 
+    // ---- source formatting ----
+    const format = b.addFmt(.{ .paths = &.{ "src", "build.zig" } });
+    const format_step = b.step("fmt", "Format Zig source");
+    format_step.dependOn(&format.step);
+
+    const format_check = b.addFmt(.{
+        .paths = &.{ "src", "build.zig" },
+        .check = true,
+    });
+    const format_check_step = b.step("fmt-check", "Check Zig source formatting");
+    format_check_step.dependOn(&format_check.step);
+
     // ---- marlin ----
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const regex = b.dependency("regex", .{ .target = target, .optimize = optimize });

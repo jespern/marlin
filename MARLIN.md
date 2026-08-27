@@ -17,6 +17,11 @@ answer is no. Standing walls: README Principles, and ARCHITECTURE
 
 ## Build and test
 
+- `zig build fmt` — format all Zig source and `build.zig`. Run this while
+  editing, before tests and handoff; do not leave formatting for CI.
+- `zig build fmt-check` — verify formatting without changing files. The
+  repo-owned pre-commit hook checks the equivalent staged snapshot, and CI
+  runs this step against the checked-out commit.
 - `zig build` — build AND install `zig-out/bin/marlin`, defaulting to
   ReleaseFast (the installed binary is the daily driver; a Debug install is
   5-10x slower). Pass `-Doptimize=Debug` only for debugging the binary.
@@ -76,4 +81,6 @@ answer is no. Standing walls: README Principles, and ARCHITECTURE
 
 ## Git
 
+- Run `scripts/install-git-hooks.sh` once per clone. The pre-commit hook
+  rejects unformatted Zig changes before they enter history.
 - Do not commit, push, or branch unless explicitly asked.

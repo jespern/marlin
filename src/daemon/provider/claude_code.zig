@@ -267,17 +267,19 @@ pub fn decodeLine(
                 try error_text.appendSlice(arena, item.string);
             }
         };
-        try out.append(arena, .{ .result = .{
-            .text = strField(root, "result") orelse "",
-            // Trust either error signal: an auth failure (logged-out claude,
-            // observed live) reports subtype "success" WITH is_error true.
-            .is_error = !std.mem.eql(u8, subtype, "success") or
-                (boolField(root, "is_error") orelse false),
-            .error_text = error_text.items,
-            .tokens_in = tokens_in + cached,
-            .tokens_out = tokens_out,
-            .cached_tokens = cached,
-        } });
+        try out.append(arena, .{
+            .result = .{
+                .text = strField(root, "result") orelse "",
+                // Trust either error signal: an auth failure (logged-out claude,
+                // observed live) reports subtype "success" WITH is_error true.
+                .is_error = !std.mem.eql(u8, subtype, "success") or
+                    (boolField(root, "is_error") orelse false),
+                .error_text = error_text.items,
+                .tokens_in = tokens_in + cached,
+                .tokens_out = tokens_out,
+                .cached_tokens = cached,
+            },
+        });
         return;
     }
     // stream_event (partial deltas, not requested), unknown types: ignore.
