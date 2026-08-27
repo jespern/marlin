@@ -43,6 +43,7 @@ const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const ids = @import("../core/ids.zig");
 const config = @import("../core/config.zig");
+const credentials = @import("../core/credentials.zig");
 const queue = @import("../core/queue.zig");
 const store_mod = @import("store.zig");
 const loop = @import("loop.zig");
@@ -57,6 +58,7 @@ const registry = @import("provider/registry.zig");
 const claude_code = @import("provider/claude_code.zig");
 const codex = @import("provider/codex.zig");
 const http = @import("provider/http.zig");
+const process_io = @import("process_io.zig");
 const task_tool = @import("tools/task.zig");
 const tools_registry = @import("tools/registry.zig");
 
@@ -69,6 +71,27 @@ const plan_accept_prompt =
 const round_checkpoint_prompt =
     \\Continue the current task from the durable transcript. An internal worker-round checkpoint was reached; this is not a user-requested stop. Resume the existing plan and work through completion, then give the user the final answer.
 ;
+
+fn envReady(environ: *const std.process.Environ.Map, name: []const u8) bool {
+    const value = environ.get(name) orelse return false;
+    return value.len > 0;
+}
+
+fn configuredProvider(cfg: config.Config, name: []const u8) bool {
+    for (cfg.providers) |provider| {
+        if (std.mem.eql(u8, provider.name, name)) return true;
+    }
+    return false;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    for (0..haystack.len - needle.len + 1) |index| {
+        if (std.ascii.eqlIgnoreCase(haystack[index..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------- events --
 
@@ -281,7 +304,7 @@ const Session = struct {
 pub const Daemon = struct {
     gpa: std.mem.Allocator,
     io: Io,
-    environ: *const std.process.Environ.Map,
+    environ: *std.process.Environ.Map,
     store: store_mod.Store,
     cfg: config.Config,
     extensions: *extensions.Runtime,
@@ -348,7 +371,7 @@ pub const Daemon = struct {
     pub fn serve(
         gpa: std.mem.Allocator,
         io: Io,
-        environ: *const std.process.Environ.Map,
+        environ: *std.process.Environ.Map,
         ready_pipe: ?Io.File,
     ) !void {
         // The daemon must survive its spawning terminal: autostart puts us in
@@ -767,7 +790,8 @@ pub const Daemon = struct {
     fn handleEvent(self: *Daemon, ev: Event) !void {
         switch (ev) {
             .client_msg => |cm| {
-                const sensitive = std.mem.indexOf(u8, cm.msg_line, "\"otel_configure\"") != null;
+                const sensitive = std.mem.indexOf(u8, cm.msg_line, "\"otel_configure\"") != null or
+                    std.mem.indexOf(u8, cm.msg_line, "\"setup_apply\"") != null;
                 defer {
                     if (sensitive) @memset(cm.msg_line, 0);
                     self.gpa.free(cm.msg_line);
@@ -1772,6 +1796,128 @@ pub const Daemon = struct {
                     self.sendCatalog(client);
                     return;
                 };
+            },
+            .setup_status => |request| self.sendSetupStatus(client, request.probe_guests),
+            .setup_apply => |request| {
+                if (self.anySessionBusy()) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "busy",
+                        .msg = "wait for running turns before changing provider setup",
+                    } });
+                    return;
+                }
+                if (request.model.len == 0 or request.model.len > 512 or
+                    request.provider_name.len > 64 or request.base_url.len > 2048 or
+                    request.api_key_env.len > 128 or request.credential.len > 64 * 1024)
+                {
+                    self.sendTo(client, .{ .err = .{ .code = "setup", .msg = "provider setup contains an invalid field" } });
+                    return;
+                }
+                const session = (try self.getOrLoadSession(request.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (self.rejectArchivedSession(client, session)) return;
+
+                if (proto.guestBackend(request.model)) |backend| {
+                    const available = switch (backend) {
+                        .claude_code => self.claudeCodeAuthenticated(),
+                        .codex => self.codexAuthenticated(),
+                    };
+                    if (!available) {
+                        self.sendTo(client, .{ .err = .{
+                            .code = "guest_unavailable",
+                            .msg = "that guest agent is not installed or authenticated on the daemon host",
+                        } });
+                        return;
+                    }
+                }
+                if (request.credential.len > 0) {
+                    if (!credentials.allowedKey(request.api_key_env) or request.api_key_env.len == 0) {
+                        self.sendTo(client, .{ .err = .{
+                            .code = "credential_name",
+                            .msg = "credential name is outside Marlin's protected secret policy",
+                        } });
+                        return;
+                    }
+                    credentials.store(
+                        self.gpa,
+                        self.io,
+                        self.environ,
+                        request.api_key_env,
+                        request.credential,
+                    ) catch {
+                        self.sendTo(client, .{ .err = .{ .code = "credentials", .msg = "could not save credentials on the daemon host" } });
+                        return;
+                    };
+                    // A real process environment value retains precedence.
+                    if (self.environ.get(request.api_key_env) == null or self.environ.get(request.api_key_env).?.len == 0) {
+                        try self.environ.put(
+                            try self.environ.allocator.dupe(u8, request.api_key_env),
+                            try self.environ.allocator.dupe(u8, request.credential),
+                        );
+                    }
+                }
+
+                const previous = config.readRawAlloc(self.gpa, self.io, self.environ) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "config", .msg = "could not read config.toml" } });
+                    return;
+                };
+                defer self.gpa.free(previous);
+                config.setProviderSetup(
+                    self.gpa,
+                    self.io,
+                    self.environ,
+                    request.model,
+                    request.provider_name,
+                    request.base_url,
+                    request.api_key_env,
+                ) catch |err| {
+                    std.log.warn("could not persist provider setup: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{ .code = "config", .msg = "provider setup is invalid or could not be saved" } });
+                    return;
+                };
+                self.reloadExtensions() catch |err| {
+                    std.log.warn("config reload after provider setup failed: {t}", .{err});
+                    config.replaceRaw(self.gpa, self.io, self.environ, previous) catch |restore_err| {
+                        std.log.err("provider setup config rollback failed: {t}", .{restore_err});
+                    };
+                    self.sendTo(client, .{ .err = .{ .code = "config", .msg = "provider setup could not be activated; config change was rolled back" } });
+                    return;
+                };
+
+                // Resolve structurally against the newly loaded config and
+                // credential map. Guest binaries and login state were checked
+                // above; native network credentials are exercised on first use.
+                const probe = registry.resolve(self.gpa, self.environ, self.cfg, request.model) catch |err| {
+                    std.log.warn("provider setup resolve failed: {t}", .{err});
+                    config.replaceRaw(self.gpa, self.io, self.environ, previous) catch |restore_err| {
+                        std.log.err("provider setup rollback after resolve failure failed: {t}", .{restore_err});
+                    };
+                    self.reloadExtensions() catch |reload_err| {
+                        std.log.err("provider setup runtime rollback failed: {t}", .{reload_err});
+                    };
+                    self.sendTo(client, .{ .err = .{ .code = "provider", .msg = "the selected model is not usable with this setup" } });
+                    return;
+                };
+                probe.deinit(self.gpa);
+
+                var session_updated = false;
+                if (request.replace_empty_session and session.state == .idle and
+                    !(self.store.sessionHasBlocks(session.id) catch true))
+                {
+                    try self.store.setSessionModel(session.id, request.model);
+                    const owned = try self.gpa.dupe(u8, request.model);
+                    self.gpa.free(session.model);
+                    session.model = owned;
+                    session_updated = true;
+                    self.broadcastSessionUpsert(session.id);
+                }
+                self.refreshSecrets();
+                self.sendTo(client, .{ .setup_result = .{
+                    .model = request.model,
+                    .session_updated = session_updated,
+                } });
             },
             .mcp_list => self.sendMcpStatus(client),
             .council_list => try self.sendCouncilList(client),
@@ -3576,9 +3722,65 @@ pub const Daemon = struct {
         var previous_config = self.extension_config;
         self.extensions = replacement;
         self.extension_config = loaded;
+        self.cfg = loaded.value;
         loaded_transferred = true;
         previous.deinit();
         if (previous_config) |*old| old.deinit();
+    }
+
+    fn sendSetupStatus(self: *Daemon, client: *Client, probe_guests: bool) void {
+        self.sendTo(client, .{ .setup_status_result = .{
+            .completed = self.cfg.setup_completed,
+            .default_model = self.cfg.model_default,
+            .default_effort = self.cfg.effort_default,
+            .codex_available = self.codexAvailable(),
+            .codex_authenticated = probe_guests and self.codexAuthenticated(),
+            .claude_code_available = self.claudeCodeAvailable(),
+            .claude_code_authenticated = probe_guests and self.claudeCodeAuthenticated(),
+            .openrouter_ready = envReady(self.environ, "OPENROUTER_API_KEY"),
+            .vercel_ready = envReady(self.environ, "AI_GATEWAY_API_KEY"),
+            .anthropic_ready = envReady(self.environ, "ANTHROPIC_API_KEY"),
+            .litellm_ready = envReady(self.environ, "LITELLM_API_KEY") or configuredProvider(self.cfg, "litellm"),
+            .local_ready = envReady(self.environ, "MARLIN_LOCAL_BASE_URL") or configuredProvider(self.cfg, "local"),
+        } });
+    }
+
+    fn refreshSecrets(self: *Daemon) void {
+        const replacement = permissions.collectSecrets(self.gpa, self.environ) catch return;
+        if (self.secrets.len > 0) self.gpa.free(self.secrets);
+        self.secrets = replacement;
+    }
+
+    fn codexAuthenticated(self: *Daemon) bool {
+        if (!self.codexAvailable()) return false;
+        var child_environ = permissions.toolEnvironment(self.gpa, self.environ) catch return false;
+        defer child_environ.deinit();
+        const result = process_io.run(self.gpa, self.io, .{
+            .argv = &.{ codex.binaryPath(self.environ), "login", "status" },
+            .environ_map = &child_environ,
+            .stdout_limit = 16 * 1024,
+            .stderr_limit = 16 * 1024,
+            .timeout_ms = 3_000,
+        }) catch return false;
+        defer result.deinit(self.gpa);
+        return !result.timed_out and result.term == .exited and result.term.exited == 0 and
+            containsIgnoreCase(result.stdout, "chatgpt");
+    }
+
+    fn claudeCodeAuthenticated(self: *Daemon) bool {
+        if (!self.claudeCodeAvailable()) return false;
+        var child_environ = permissions.toolEnvironment(self.gpa, self.environ) catch return false;
+        defer child_environ.deinit();
+        const result = process_io.run(self.gpa, self.io, .{
+            .argv = &.{ claude_code.binaryPath(self.environ), "auth", "status" },
+            .environ_map = &child_environ,
+            .stdout_limit = 32 * 1024,
+            .stderr_limit = 16 * 1024,
+            .timeout_ms = 3_000,
+        }) catch return false;
+        defer result.deinit(self.gpa);
+        return !result.timed_out and result.term == .exited and result.term.exited == 0 and
+            std.mem.indexOf(u8, result.stdout, "\"loggedIn\": true") != null;
     }
 
     fn sendOtelStatus(self: *Daemon, client: *Client) void {

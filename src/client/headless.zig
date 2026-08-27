@@ -14,7 +14,6 @@
 const std = @import("std");
 const Io = std.Io;
 
-const config = @import("../core/config.zig");
 const proto = @import("../core/proto.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
@@ -339,11 +338,6 @@ pub fn run(
         return 2;
     };
 
-    var loaded_config = try config.load(gpa, io, environ);
-    defer loaded_config.deinit();
-    const cfg = loaded_config.value;
-    const model_str = flags.model orelse cfg.model_default;
-
     var pending_image: ?media.Pending = null;
     defer if (pending_image) |*image| image.deinit(gpa);
     if (flags.image) |path| {
@@ -364,6 +358,22 @@ pub fn run(
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var model_str: []const u8 = flags.model orelse "";
+    var effort: proto.ReasoningEffort = .auto;
+
+    // Headless mode never prompts. Ask the daemon host for its durable
+    // default (important over SSH), and fail before creating a doomed session
+    // when a fresh installation has not completed interactive setup.
+    if (!flags.continue_last) {
+        try conn.send(.{ .setup_status = .{ .probe_guests = false } });
+        const setup = try conn.recvUntil(arena, .setup_status_result);
+        if (flags.model == null and !setup.completed) {
+            try eprint(io, "marlin run: provider setup is incomplete; start Marlin interactively and choose /setup, or pass --model with credentials configured on the daemon host\n", .{});
+            return 2;
+        }
+        if (flags.model == null) model_str = setup.default_model;
+        effort = setup.default_effort;
+    }
 
     // Resolve the session id.
     var sid: u64 = 0;
@@ -383,7 +393,7 @@ pub fn run(
         try conn.send(.{ .session_create = .{
             .cwd = cwd_buf[0..cwd_len],
             .model = model_str,
-            .effort = cfg.effort_default,
+            .effort = effort,
             .approvals = approvals,
         } });
         const created = try conn.recvUntil(arena, .session_created);

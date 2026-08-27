@@ -23,6 +23,22 @@ Or use [Homebrew](https://brew.sh/) on macOS or Linux:
 brew install jespern/tap/marlin
 ```
 
+## First run
+
+Run `marlin` and the first screen asks where inference should run. Choose a
+native provider such as OpenRouter, Vercel AI Gateway, Anthropic, LiteLLM, or
+another OpenAI-compatible endpoint, or host an installed Codex or Claude Code
+agent as a guest. Native API keys are entered in a masked prompt and saved by
+the daemon in `~/.config/marlin/credentials` with mode 0600. Guest choices use
+the vendor CLI's existing login and tell you the exact login command when the
+daemon host is not authenticated.
+
+The setup is daemon-owned, so it works the same over `marlin --remote`: keys,
+config, guest binaries, and login state are checked on the machine that will
+run the turn. `/setup` reopens the flow later. `marlin run` never prompts; on a
+fresh unconfigured daemon it exits with an instruction to complete interactive
+setup or pass an explicit model whose credentials already exist on that host.
+
 ## The pitch
 
 Every agent harness today picks one of two shapes:

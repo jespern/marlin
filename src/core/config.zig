@@ -17,6 +17,10 @@ pub const Hooks = toml.Hooks;
 pub const Policy = toml.Policy;
 
 pub const Config = struct {
+    /// The daemon completed the first-run backend/authentication flow. An
+    /// absent value deliberately stays false so a genuinely fresh install
+    /// enters setup, while clients with existing sessions are grandfathered.
+    setup_completed: bool = false,
     model_default: []const u8 = "openrouter/anthropic/claude-sonnet-4.5",
     model_compaction: ?[]const u8 = null, // null → use model_default
     /// `.auto` omits the request parameter and preserves the model default.
@@ -278,6 +282,73 @@ pub fn setUiTabBar(
     const updated = try setScalarText(gpa, current, "ui", "tab_bar", if (enabled) "true" else "false");
     defer gpa.free(updated);
     try replaceRaw(gpa, io, environ, updated);
+}
+
+/// Persist the result of the provider onboarding flow in one atomic config
+/// replacement. Secrets are intentionally absent; the daemon writes those to
+/// the separate 0600 credentials file before calling this helper.
+pub fn setProviderSetup(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    model: []const u8,
+    provider_name: []const u8,
+    base_url: []const u8,
+    api_key_env: []const u8,
+) !void {
+    if (model.len == 0 or std.mem.indexOfScalar(u8, model, '/') == null)
+        return error.InvalidSetupModel;
+    if (provider_name.len > 0) {
+        try validateToolName(provider_name);
+        if (std.mem.eql(u8, provider_name, "claudecode") or std.mem.eql(u8, provider_name, "codex"))
+            return error.ReservedProviderName;
+        if (base_url.len > 0 and
+            !(std.mem.startsWith(u8, base_url, "http://") or std.mem.startsWith(u8, base_url, "https://")))
+            return error.InvalidProviderBaseUrl;
+        try validateApiKeyEnv(api_key_env);
+    }
+
+    const current = try readRawAlloc(gpa, io, environ);
+    defer gpa.free(current);
+
+    var model_literal: std.ArrayList(u8) = .empty;
+    defer model_literal.deinit(gpa);
+    try appendTomlString(&model_literal, gpa, model);
+    const with_model = try setScalarText(gpa, current, "model", "default", model_literal.items);
+    defer gpa.free(with_model);
+    const with_setup = try setScalarText(gpa, with_model, "setup", "completed", "true");
+    defer gpa.free(with_setup);
+
+    var updated: ?[]u8 = try gpa.dupe(u8, with_setup);
+    defer if (updated) |bytes| gpa.free(bytes);
+    if (provider_name.len > 0) {
+        const section = try std.fmt.allocPrint(gpa, "providers.{s}", .{provider_name});
+        defer gpa.free(section);
+        if (base_url.len > 0) {
+            var literal: std.ArrayList(u8) = .empty;
+            defer literal.deinit(gpa);
+            try appendTomlString(&literal, gpa, base_url);
+            const next = try setScalarText(gpa, updated.?, section, "base_url", literal.items);
+            gpa.free(updated.?);
+            updated = next;
+        }
+        var key_literal: std.ArrayList(u8) = .empty;
+        defer key_literal.deinit(gpa);
+        try appendTomlString(&key_literal, gpa, api_key_env);
+        const next = try setScalarText(gpa, updated.?, section, "api_key_env", key_literal.items);
+        gpa.free(updated.?);
+        updated = next;
+    }
+
+    // Parsing catches malformed generated TOML; full config validation also
+    // catches a custom provider missing its URL or credential declaration.
+    var verify_arena = std.heap.ArenaAllocator.init(gpa);
+    defer verify_arena.deinit();
+    const doc = try toml.parse(verify_arena.allocator(), updated.?);
+    var cfg = defaults();
+    applyDocument(&cfg, doc);
+    try validate(gpa, cfg);
+    try replaceRaw(gpa, io, environ, updated.?);
 }
 
 /// Set `key = value` inside `[section]` of a TOML document, preserving all
@@ -637,6 +708,7 @@ fn hasCsvEntry(value: ?[]const u8) bool {
 }
 
 fn applyDocument(cfg: *Config, doc: toml.Document) void {
+    if (doc.setup_completed) |value| cfg.setup_completed = value;
     if (doc.model_default) |value| cfg.model_default = value;
     if (doc.model_compaction) |value| cfg.model_compaction = value;
     if (doc.model_favorites) |value| cfg.model_favorites = value;
@@ -994,6 +1066,40 @@ test "ui scalar edits: replace in place, insert into section, append section" {
     const web_at = std.mem.indexOf(u8, inserted, "[web]").?;
     try std.testing.expect(ui_at < key_at and key_at < web_at);
     try std.testing.expect(std.mem.indexOf(u8, inserted, "# chrome prefs") != null);
+}
+
+test "provider setup persists completion, default model, and custom endpoint atomically" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-provider-setup");
+    defer temp.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("XDG_CONFIG_HOME", temp.path);
+
+    var initial = try load(gpa, io, &environ);
+    try std.testing.expect(!initial.value.setup_completed);
+    initial.deinit();
+
+    try setProviderSetup(
+        gpa,
+        io,
+        &environ,
+        "acme/code-model",
+        "acme",
+        "https://gateway.acme.test/v1",
+        "ACME_API_KEY",
+    );
+    var loaded = try load(gpa, io, &environ);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.value.setup_completed);
+    try std.testing.expectEqualStrings("acme/code-model", loaded.value.model_default);
+    try std.testing.expectEqual(@as(usize, 1), loaded.value.providers.len);
+    try std.testing.expectEqualStrings("https://gateway.acme.test/v1", loaded.value.providers[0].base_url.?);
+    try std.testing.expectEqualStrings("ACME_API_KEY", loaded.value.providers[0].api_key_env.?);
 }
 
 test "voice section: parse, whole-section replace, removal helper" {

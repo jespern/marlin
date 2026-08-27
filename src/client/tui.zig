@@ -39,7 +39,6 @@ const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const voice = @import("voice.zig");
-const credentials = @import("../core/credentials.zig");
 const Editor = @import("editor.zig");
 const media = @import("media.zig");
 const render = @import("render.zig");
@@ -149,6 +148,7 @@ const ComposerCommand = struct {
 /// the dispatcher, while prefix matching completes it to `/quit`.
 const composer_commands = [_]ComposerCommand{
     .{ .name = "/model", .usage = " [model]", .description = "switch model or open the picker", .accepts_args = true },
+    .{ .name = "/setup", .description = "choose and authenticate a provider or guest agent" },
     .{ .name = "/effort", .usage = " [level]", .description = "set reasoning effort or open the picker", .accepts_args = true },
     .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
     .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
@@ -183,7 +183,49 @@ const CommandSuggestion = struct {
     submit_on_enter: bool,
 };
 
-const PickerKind = enum { model, effort, session, search_prompt, search, council, council_list, voice_engine, voice_mode };
+const PickerKind = enum { model, effort, session, search_prompt, search, council, council_list, voice_engine, voice_mode, setup_provider };
+
+const SetupProvider = enum { openrouter, codex, claude_code, vercel, anthropic, litellm, local, custom };
+const SetupPrompt = enum { none, credential, base_url, model, provider_name };
+
+const setup_provider_items = [_][]const u8{
+    "OpenRouter · native · one key, many models",
+    "Codex · guest · ChatGPT login",
+    "Claude Code · guest · Claude login",
+    "Vercel AI Gateway · native",
+    "Anthropic API · native",
+    "LiteLLM · local gateway",
+    "Local · OpenAI-compatible server",
+    "Custom · OpenAI-compatible endpoint",
+};
+
+const SetupReadiness = struct {
+    completed: bool = false,
+    codex_available: bool = false,
+    codex_authenticated: bool = false,
+    claude_code_available: bool = false,
+    claude_code_authenticated: bool = false,
+    openrouter_ready: bool = false,
+    vercel_ready: bool = false,
+    anthropic_ready: bool = false,
+    litellm_ready: bool = false,
+    local_ready: bool = false,
+
+    fn fromWire(status: proto.SetupStatus) SetupReadiness {
+        return .{
+            .completed = status.completed,
+            .codex_available = status.codex_available,
+            .codex_authenticated = status.codex_authenticated,
+            .claude_code_available = status.claude_code_available,
+            .claude_code_authenticated = status.claude_code_authenticated,
+            .openrouter_ready = status.openrouter_ready,
+            .vercel_ready = status.vercel_ready,
+            .anthropic_ready = status.anthropic_ready,
+            .litellm_ready = status.litellm_ready,
+            .local_ready = status.local_ready,
+        };
+    }
+};
 
 const OtelCommand = union(enum) {
     status,
@@ -511,6 +553,20 @@ const App = struct {
     command_selection: usize = 0,
     /// Type-to-filter query while the picker is open.
     picker_filter: std.ArrayList(u8) = .empty,
+    /// Provider onboarding is a client-side draft backed by daemon-owned
+    /// persistence. Only the credential field is masked, and it is scrubbed
+    /// immediately after setup_apply is encoded.
+    setup_readiness: SetupReadiness = .{},
+    setup_provider: ?SetupProvider = null,
+    setup_prompt: SetupPrompt = .none,
+    setup_required: bool = false,
+    setup_replace_empty_session: bool = false,
+    setup_status_pending: bool = false,
+    setup_apply_pending: bool = false,
+    setup_provider_name: std.ArrayList(u8) = .empty,
+    setup_base_url: std.ArrayList(u8) = .empty,
+    setup_api_key_env: std.ArrayList(u8) = .empty,
+    setup_credential: std.ArrayList(u8) = .empty,
     /// Process-local OTLP setup. The endpoint survives only until the masked
     /// header entry is submitted or cancelled; neither value enters history.
     otel_endpoint: std.ArrayList(u8) = .empty,
@@ -683,6 +739,11 @@ const App = struct {
         self.stream_layout_cache.reset(self.gpa);
         self.layout_cache.reset(self.gpa);
         self.picker_filter.deinit(self.gpa);
+        self.clearSetupDraft();
+        self.setup_provider_name.deinit(self.gpa);
+        self.setup_base_url.deinit(self.gpa);
+        self.setup_api_key_env.deinit(self.gpa);
+        self.setup_credential.deinit(self.gpa);
         self.otel_endpoint.deinit(self.gpa);
         self.history_search_query.deinit(self.gpa);
         self.history_search_draft.deinit(self.gpa);
@@ -1818,6 +1879,8 @@ const App = struct {
                     }) catch self.gpa.free(model);
                 }
             },
+            .setup_status_result => |status| self.applySetupStatus(status),
+            .setup_result => |result| self.applySetupResult(result),
             .mcp_list_result => |result| self.showMcpStatus(result.servers),
             .ui_config_result => |result| {
                 self.show_tab_bar = result.tab_bar;
@@ -1844,6 +1907,11 @@ const App = struct {
             },
             .err => |e| {
                 self.rejectInput(e.request_id);
+                self.setup_status_pending = false;
+                if (self.setup_apply_pending) {
+                    self.setup_apply_pending = false;
+                    self.beginSetup(self.setup_required);
+                }
                 if (self.awaiting_new_session and e.request_id != 0 and e.request_id == self.pending_new_session_request_id) {
                     self.awaiting_new_session = false;
                     self.pending_new_session_request_id = 0;
@@ -2026,6 +2094,12 @@ const App = struct {
     fn submitInput(self: *App, text: []const u8) void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.attachments.items.len == 0) return;
+        const may_quit_setup = std.mem.eql(u8, trimmed, "/quit") or std.mem.eql(u8, trimmed, "/q");
+        if (self.setup_required and !may_quit_setup) {
+            self.beginSetup(true);
+            self.setNotice("choose a backend before sending the first prompt", .{});
+            return;
+        }
         if (trimmed.len > 0 and (trimmed[0] == '/' or trimmed[0] == '!')) {
             // Commands are client actions rather than durable user_msg
             // blocks, but they still belong in the local editor history so
@@ -2086,6 +2160,8 @@ const App = struct {
 
         if (std.mem.eql(u8, head, "/quit") or std.mem.eql(u8, head, "/q")) {
             self.should_quit = true;
+        } else if (std.mem.eql(u8, head, "/setup")) {
+            self.requestSetup(false);
         } else if (std.mem.eql(u8, head, "/model")) {
             const m = it.rest();
             if (m.len == 0) {
@@ -2398,7 +2474,7 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/config")) {
             self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/sessions · /search [query] · /diagnostics · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !rb [client|both] · !c · /quit", .{});
+            self.setNotice("/setup · /sessions · /search [query] · /diagnostics · /otel [set <endpoint>|status|off] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !rb [client|both] · !c · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -3303,6 +3379,290 @@ const App = struct {
         }
     }
 
+    fn clearSetupDraft(self: *App) void {
+        if (self.setup_prompt != .none) self.editor.clearSensitive();
+        self.setup_prompt = .none;
+        self.setup_provider = null;
+        self.setup_provider_name.clearRetainingCapacity();
+        self.setup_base_url.clearRetainingCapacity();
+        self.setup_api_key_env.clearRetainingCapacity();
+        if (self.setup_credential.items.len > 0) @memset(self.setup_credential.items, 0);
+        self.setup_credential.clearRetainingCapacity();
+    }
+
+    fn requestSetup(self: *App, required: bool) void {
+        if (self.setup_status_pending or self.setup_apply_pending) return;
+        self.setup_required = self.setup_required or required;
+        if (required) self.setup_replace_empty_session = true;
+        self.setup_status_pending = true;
+        self.conn.send(.{ .setup_status = .{} }) catch {
+            self.setup_status_pending = false;
+            self.setNotice("could not query provider setup", .{});
+        };
+    }
+
+    fn beginSetup(self: *App, required: bool) void {
+        self.clearSetupDraft();
+        self.setup_required = self.setup_required or required;
+        if (required) self.setup_replace_empty_session = true;
+        self.openPicker(.setup_provider);
+        self.setNotice("choose how Marlin should run models · keys are saved by the daemon host", .{});
+    }
+
+    fn applySetupStatus(self: *App, status: proto.SetupStatus) void {
+        self.setup_readiness = .fromWire(status);
+        if (!self.setup_status_pending) return;
+        self.setup_status_pending = false;
+        self.beginSetup(self.setup_required);
+    }
+
+    fn setupProviderFromItem(item: []const u8) ?SetupProvider {
+        for (setup_provider_items, 0..) |candidate, index| {
+            if (std.mem.eql(u8, item, candidate)) return @enumFromInt(index);
+        }
+        return null;
+    }
+
+    fn setupProviderReady(self: *const App, provider: SetupProvider) bool {
+        return switch (provider) {
+            .openrouter => self.setup_readiness.openrouter_ready,
+            .codex => self.setup_readiness.codex_authenticated,
+            .claude_code => self.setup_readiness.claude_code_authenticated,
+            .vercel => self.setup_readiness.vercel_ready,
+            .anthropic => self.setup_readiness.anthropic_ready,
+            .litellm => self.setup_readiness.litellm_ready,
+            .local => self.setup_readiness.local_ready,
+            .custom => false,
+        };
+    }
+
+    fn setupProviderNote(self: *const App, item: []const u8) []const u8 {
+        const provider = setupProviderFromItem(item) orelse return "";
+        if (self.setupProviderReady(provider)) return switch (provider) {
+            .codex, .claude_code => "  ✓ signed in",
+            .local => "  ✓ configured",
+            else => "  ✓ key found",
+        };
+        return switch (provider) {
+            .codex => if (self.setup_readiness.codex_available) "  · login needed" else "  · not installed",
+            .claude_code => if (self.setup_readiness.claude_code_available) "  · login needed" else "  · not installed",
+            .custom => "",
+            else => "  · setup needed",
+        };
+    }
+
+    fn setSetupBuffer(self: *App, buffer: *std.ArrayList(u8), value: []const u8) bool {
+        buffer.clearRetainingCapacity();
+        buffer.appendSlice(self.gpa, value) catch {
+            self.setNotice("could not continue provider setup", .{});
+            return false;
+        };
+        return true;
+    }
+
+    fn startSetupPrompt(self: *App, prompt: SetupPrompt, initial: []const u8, notice: []const u8) void {
+        self.picker = null;
+        self.picker_filter.clearRetainingCapacity();
+        self.setup_prompt = prompt;
+        self.mode = .insert;
+        self.editor.replaceText(initial);
+        self.setNotice("{s}", .{notice});
+    }
+
+    fn setupProviderChosen(self: *App, item: []const u8) void {
+        const provider = setupProviderFromItem(item) orelse return;
+        self.clearSetupDraft();
+        self.setup_provider = provider;
+        switch (provider) {
+            .codex => {
+                if (!self.setup_readiness.codex_available) {
+                    self.openPicker(.setup_provider);
+                    self.setNotice("Codex is not installed on the daemon host · install it, then retry /setup", .{});
+                    return;
+                }
+                if (!self.setup_readiness.codex_authenticated) {
+                    self.openPicker(.setup_provider);
+                    self.setNotice("Codex guest needs a ChatGPT session · run `codex login` on the daemon host, then /setup", .{});
+                    return;
+                }
+                self.finishSetup("codex/default");
+            },
+            .claude_code => {
+                if (!self.setup_readiness.claude_code_available) {
+                    self.openPicker(.setup_provider);
+                    self.setNotice("Claude Code is not installed on the daemon host · install it, then retry /setup", .{});
+                    return;
+                }
+                if (!self.setup_readiness.claude_code_authenticated) {
+                    self.openPicker(.setup_provider);
+                    self.setNotice("Claude Code needs a login · run `claude auth login` on the daemon host, then /setup", .{});
+                    return;
+                }
+                self.finishSetup("claudecode/default");
+            },
+            .openrouter => {
+                if (!self.setSetupBuffer(&self.setup_provider_name, "openrouter")) return;
+                if (!self.setSetupBuffer(&self.setup_base_url, "https://openrouter.ai/api/v1")) return;
+                if (!self.setSetupBuffer(&self.setup_api_key_env, "OPENROUTER_API_KEY")) return;
+                if (self.setup_readiness.openrouter_ready)
+                    self.startSetupPrompt(.model, "openrouter/anthropic/claude-sonnet-4.5", "choose a registry model id · Enter accepts the suggested model")
+                else
+                    self.startSetupPrompt(.credential, "", "paste an OpenRouter API key · input is masked · Esc goes back");
+            },
+            .vercel => {
+                if (!self.setSetupBuffer(&self.setup_provider_name, "vercel")) return;
+                if (!self.setSetupBuffer(&self.setup_base_url, "https://ai-gateway.vercel.sh/v1")) return;
+                if (!self.setSetupBuffer(&self.setup_api_key_env, "AI_GATEWAY_API_KEY")) return;
+                if (self.setup_readiness.vercel_ready)
+                    self.startSetupPrompt(.model, "vercel/anthropic/claude-sonnet-4.5", "choose a Vercel gateway model id · Enter accepts the suggestion")
+                else
+                    self.startSetupPrompt(.credential, "", "paste a Vercel AI Gateway API key · input is masked · Esc goes back");
+            },
+            .anthropic => {
+                if (!self.setSetupBuffer(&self.setup_provider_name, "anthropic")) return;
+                if (!self.setSetupBuffer(&self.setup_base_url, "https://api.anthropic.com/v1")) return;
+                if (!self.setSetupBuffer(&self.setup_api_key_env, "ANTHROPIC_API_KEY")) return;
+                if (self.setup_readiness.anthropic_ready)
+                    self.startSetupPrompt(.model, "anthropic/claude-sonnet-4-5", "choose an Anthropic model id · Enter accepts the suggestion")
+                else
+                    self.startSetupPrompt(.credential, "", "paste an Anthropic API key · input is masked · Esc goes back");
+            },
+            .litellm => {
+                if (!self.setSetupBuffer(&self.setup_provider_name, "litellm")) return;
+                if (!self.setSetupBuffer(&self.setup_api_key_env, "LITELLM_API_KEY")) return;
+                self.startSetupPrompt(.base_url, "http://127.0.0.1:4000/v1", "LiteLLM base URL · Enter accepts the local default");
+            },
+            .local => {
+                if (!self.setSetupBuffer(&self.setup_provider_name, "local")) return;
+                if (!self.setSetupBuffer(&self.setup_api_key_env, "MARLIN_LOCAL_API_KEY")) return;
+                self.startSetupPrompt(.base_url, "http://127.0.0.1:11434/v1", "OpenAI-compatible base URL · edit the suggested local address if needed");
+            },
+            .custom => self.startSetupPrompt(.provider_name, "", "short provider name, for example acme · model ids will use acme/…"),
+        }
+    }
+
+    fn setupCredentialRequired(self: *const App) bool {
+        return switch (self.setup_provider orelse return false) {
+            .openrouter, .vercel, .anthropic => true,
+            else => false,
+        };
+    }
+
+    fn setupModelSuggestion(self: *const App) []const u8 {
+        return switch (self.setup_provider orelse return "") {
+            .openrouter => "openrouter/anthropic/claude-sonnet-4.5",
+            .vercel => "vercel/anthropic/claude-sonnet-4.5",
+            .anthropic => "anthropic/claude-sonnet-4-5",
+            .litellm => "litellm/",
+            .local => "local/",
+            .custom => "",
+            .codex, .claude_code => "",
+        };
+    }
+
+    fn submitSetupPrompt(self: *App, raw: []const u8) void {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        switch (self.setup_prompt) {
+            .none => {},
+            .provider_name => {
+                if (!validSetupProviderName(value)) {
+                    self.setNotice("provider name must use letters, digits, - or _", .{});
+                    return;
+                }
+                if (!self.setSetupBuffer(&self.setup_provider_name, value)) return;
+                var env_name: [96]u8 = undefined;
+                if (value.len + "_API_KEY".len > env_name.len) {
+                    self.setNotice("provider name is too long", .{});
+                    return;
+                }
+                for (value, 0..) |byte, i| env_name[i] = if (byte == '-') '_' else std.ascii.toUpper(byte);
+                @memcpy(env_name[value.len..][0.."_API_KEY".len], "_API_KEY");
+                if (!self.setSetupBuffer(&self.setup_api_key_env, env_name[0 .. value.len + "_API_KEY".len])) return;
+                self.startSetupPrompt(.base_url, "https://", "OpenAI-compatible base URL, including /v1 when your provider requires it");
+            },
+            .base_url => {
+                if (!(std.mem.startsWith(u8, value, "http://") or std.mem.startsWith(u8, value, "https://"))) {
+                    self.setNotice("base URL must start with http:// or https://", .{});
+                    return;
+                }
+                if (!self.setSetupBuffer(&self.setup_base_url, value)) return;
+                self.startSetupPrompt(.credential, "", "API key (optional for local gateways) · Enter skips · input is masked");
+            },
+            .credential => {
+                if (self.setupCredentialRequired() and value.len < 8) {
+                    self.setNotice("that does not look like an API key · Esc goes back", .{});
+                    return;
+                }
+                if (!self.setSetupBuffer(&self.setup_credential, value)) return;
+                if (value.len == 0 and self.setup_provider != .openrouter and self.setup_provider != .vercel and self.setup_provider != .anthropic) {
+                    if (!self.setSetupBuffer(&self.setup_api_key_env, "NONE")) return;
+                }
+                const suggestion = if (self.setup_provider == .custom)
+                    std.fmt.allocPrint(self.gpa, "{s}/", .{self.setup_provider_name.items}) catch return
+                else
+                    self.gpa.dupe(u8, self.setupModelSuggestion()) catch return;
+                defer self.gpa.free(suggestion);
+                self.startSetupPrompt(.model, suggestion, "finish the model id in provider/model form");
+            },
+            .model => {
+                const slash = std.mem.indexOfScalar(u8, value, '/') orelse {
+                    self.setNotice("model must use provider/model form", .{});
+                    return;
+                };
+                if (slash == 0 or slash + 1 == value.len) {
+                    self.setNotice("model id needs a name after provider/", .{});
+                    return;
+                }
+                const expected = self.setup_provider_name.items;
+                if (expected.len > 0 and !std.mem.eql(u8, value[0..slash], expected)) {
+                    self.setNotice("model id must start with {s}/", .{expected});
+                    return;
+                }
+                self.finishSetup(value);
+            },
+        }
+    }
+
+    fn finishSetup(self: *App, model: []const u8) void {
+        if (self.setup_apply_pending) return;
+        const configured_provider = self.setup_provider_name.items;
+        self.conn.sendSensitive(.{ .setup_apply = .{
+            .sid = self.sid,
+            .model = model,
+            .provider_name = configured_provider,
+            .base_url = self.setup_base_url.items,
+            .api_key_env = self.setup_api_key_env.items,
+            .credential = self.setup_credential.items,
+            .replace_empty_session = self.setup_replace_empty_session,
+        } }) catch {
+            self.setNotice("could not send provider setup to the daemon", .{});
+            return;
+        };
+        if (self.setup_credential.items.len > 0) @memset(self.setup_credential.items, 0);
+        self.setup_credential.clearRetainingCapacity();
+        self.editor.clearSensitive();
+        self.setup_prompt = .none;
+        self.picker = null;
+        self.setup_apply_pending = true;
+        self.setNotice("activating provider setup on the daemon host…", .{});
+    }
+
+    fn applySetupResult(self: *App, result: @FieldType(proto.DaemonMsg, "setup_result")) void {
+        self.setup_apply_pending = false;
+        self.setup_readiness.completed = true;
+        self.setup_required = false;
+        self.setup_replace_empty_session = false;
+        if (result.session_updated) {
+            self.setModelStr(result.model);
+            self.setNotice("ready · {s} · /setup changes provider later", .{result.model});
+        } else if (!std.mem.eql(u8, self.model.items, result.model)) {
+            self.applyModel(result.model);
+        } else {
+            self.setNotice("provider setup saved · {s}", .{result.model});
+        }
+        self.clearSetupDraft();
+    }
+
     fn beginHistorySearch(self: *App) void {
         if (self.history_search_active) {
             self.cycleHistorySearch();
@@ -3471,6 +3831,7 @@ const App = struct {
             .council_list => &.{},
             .voice_engine => &voice_engine_items,
             .voice_mode => &voice_mode_items,
+            .setup_provider => &setup_provider_items,
         };
     }
 
@@ -3884,6 +4245,7 @@ const App = struct {
             .council_list => self.showCouncilDetail(item),
             .voice_engine => self.voiceWizardEngineChosen(item),
             .voice_mode => self.voiceWizardModeChosen(item),
+            .setup_provider => self.setupProviderChosen(item),
         }
     }
 
@@ -3914,11 +4276,16 @@ const App = struct {
         return switch (self.picker_kind) {
             .model => self.model.items,
             .effort => @tagName(self.effort),
-            .session, .search_prompt, .search, .council, .council_list, .voice_engine, .voice_mode => "",
+            .session, .search_prompt, .search, .council, .council_list, .voice_engine, .voice_mode, .setup_provider => "",
         };
     }
 
     fn newSession(self: *App) !void {
+        if (self.setup_required) {
+            self.beginSetup(true);
+            self.setNotice("finish provider setup before creating another session", .{});
+            return;
+        }
         if (self.awaiting_new_session) {
             self.setNotice("new session already being created", .{});
             return;
@@ -4935,6 +5302,12 @@ fn drawWelcome(app: *const App, win: vaxis.Window, top_rows: usize, view_h: usiz
         try rows.append(arena, .{ .text = "⚠ daemon runs a different build — /reboot to sync", .style = Palette.welcome_warn });
     }
     try rows.append(arena, .{ .text = "" });
+    if (app.setup_required) {
+        try rows.append(arena, .{ .key = "setup", .text = "choose a provider or guest agent", .style = Palette.welcome_title });
+        try rows.append(arena, .{ .key = "Enter", .text = "reopen backend selection" });
+        try rows.append(arena, .{ .key = "/quit", .text = "leave without configuring" });
+        return drawWelcomeRows(win, top_rows, view_h, arena, rows.items);
+    }
     try rows.append(arena, .{ .key = "model", .text = app.model.items });
     try rows.append(arena, .{ .text = "" });
     try rows.append(arena, .{ .key = "Enter", .text = "send a prompt" });
@@ -4942,15 +5315,19 @@ fn drawWelcome(app: *const App, win: vaxis.Window, top_rows: usize, view_h: usiz
     try rows.append(arena, .{ .key = "Ctrl+N", .text = "new session · ⌥1–⌥9 to switch" });
     try rows.append(arena, .{ .key = "Esc ?", .text = "all keyboard shortcuts" });
 
+    return drawWelcomeRows(win, top_rows, view_h, arena, rows.items);
+}
+
+fn drawWelcomeRows(win: vaxis.Window, top_rows: usize, view_h: usize, arena: std.mem.Allocator, rows: anytype) !void {
     const key_column: usize = 8;
     var block_w: usize = 0;
-    for (rows.items) |item| block_w = @max(block_w, key_column + displayWidth(item.text));
+    for (rows) |item| block_w = @max(block_w, key_column + displayWidth(item.text));
     block_w = @min(block_w, @as(usize, win.width) -| 2);
 
-    const shown: usize = @min(rows.items.len, view_h);
+    const shown: usize = @min(rows.len, view_h);
     const x_off: usize = (@as(usize, win.width) -| block_w) / 2;
     const y_off: usize = top_rows + (view_h -| shown) / 2;
-    for (rows.items[0..shown], 0..) |item, i| {
+    for (rows[0..shown], 0..) |item, i| {
         if (item.text.len == 0 and item.key.len == 0) continue;
         const padding = try spaces(arena, key_column -| displayWidth(item.key));
         const segments = [_]vaxis.Segment{
@@ -5241,7 +5618,15 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         const query = app.history_search_query.items;
         const query_end = hardCellBreak(query, 0, @max(@as(usize, w) / 3, 1));
         break :search_prompt try std.fmt.allocPrint(arena, "⌕ '{s}'▏: ", .{query[0..query_end]});
-    } else if (app.otel_header_prompt)
+    } else if (app.setup_prompt != .none)
+        switch (app.setup_prompt) {
+            .none => unreachable,
+            .credential => "API key ❯ ",
+            .base_url => "base URL ❯ ",
+            .model => "model ❯ ",
+            .provider_name => "provider ❯ ",
+        }
+    else if (app.otel_header_prompt)
         "OTLP headers ❯ "
     else if (app.plan_mode)
         if (app.mode == .insert) "PLAN ❯ " else "PLAN : "
@@ -5466,7 +5851,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         .width = panel_inner_w,
         .height = content_h,
     });
-    if (app.otel_header_prompt)
+    if (app.otel_header_prompt or app.setup_prompt == .credential)
         app.editor.drawMasked(input_win, prompt, Palette.prompt_mark, Palette.prompt_text)
     else
         app.editor.draw(input_win, prompt, if (app.plan_mode) Palette.plan_active else Palette.prompt_mark, Palette.prompt_text);
@@ -5477,7 +5862,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         }, .{ .row_offset = input_h - 1, .wrap = .none });
     }
     if (app.mode == .normal or app.history_search_active) win.hideCursor();
-    try drawCommandMenu(app, win, arena, input_top, w);
+    if (app.setup_prompt == .none and !app.otel_header_prompt)
+        try drawCommandMenu(app, win, arena, input_top, w);
 
     // ---- status bar ----
     const status_win = win.child(.{ .y_off = h - 1, .height = 1, .width = w });
@@ -5777,6 +6163,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             .council_list => "councils",
             .voice_engine => "voice engine",
             .voice_mode => "voice input mode",
+            .setup_provider => "setup · choose a backend",
         };
 
         const list_max: u16 = @min(@as(u16, 14), h -| 6);
@@ -5789,6 +6176,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             else
                 f;
             var row_width = displayWidth(displayed);
+            if (app.picker_kind == .setup_provider) row_width += displayWidth(app.setupProviderNote(f));
             if (app.picker_kind == .council and !std.mem.eql(u8, f, council_done_item)) row_width += 2;
             if (app.picker_kind == .model or app.picker_kind == .council) {
                 if (proto.isGuestModel(f)) row_width += displayWidth("(guest) ");
@@ -5850,6 +6238,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
                     f
             else if (app.picker_kind == .search)
                 try std.fmt.allocPrint(arena, " {s}", .{try pickerTextPreview(arena, f)})
+            else if (app.picker_kind == .setup_provider)
+                try std.fmt.allocPrint(arena, " {s}{s}", .{ f, app.setupProviderNote(f) })
             else
                 try std.fmt.allocPrint(arena, " {s}{s}", .{ f[0..@min(f.len, box_w -| 4)], if (cur) " ●" else "" });
             const style: vaxis.Style = if (i == sel)
@@ -5867,6 +6257,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             .search => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter jump · Esc", .{ items.len, total_src }),
             .council => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter toggle/Done · Esc cancel", .{ items.len -| 1, total_src }),
             .council_list => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter inspect · Esc", .{ items.len, total_src }),
+            .setup_provider => " type=filter · ↑↓ · Enter choose · Esc close",
             else => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Esc", .{ items.len, total_src }),
         };
         _ = box.printSegment(.{ .text = hint, .style = Palette.tool_out }, .{ .row_offset = shown + 1, .wrap = .none });
@@ -6025,47 +6416,6 @@ pub const RebootPlan = struct {
     sid: u64 = 0,
 };
 
-/// First-run bootstrap: prompt for an OpenRouter key on plain stdio (before
-/// any TUI), store it in ~/.config/marlin/credentials (0600), and inject it
-/// into this process's environ so the autostarted daemon inherits it.
-/// Returns false when the user gave nothing usable.
-fn bootstrapKey(gpa: std.mem.Allocator, io: Io, environ: *std.process.Environ.Map) !bool {
-    var obuf: [1024]u8 = undefined;
-    var ow: Io.File.Writer = .init(.stderr(), io, &obuf);
-    try ow.interface.print(
-        \\marlin needs a provider to talk to.
-        \\
-        \\  OpenRouter (one key, every model): https://openrouter.ai/keys
-        \\  (or set MARLIN_LOCAL_BASE_URL for any OpenAI-compatible endpoint)
-        \\
-        \\Paste your OpenRouter API key (stored in ~/.config/marlin/credentials,
-        \\chmod 600; the env var OPENROUTER_API_KEY always overrides): 
-    , .{});
-    try ow.interface.flush();
-
-    var ibuf: [512]u8 = undefined;
-    var reader: Io.File.Reader = .init(.stdin(), io, &ibuf);
-    const line = reader.interface.takeDelimiterExclusive('\n') catch {
-        try ow.interface.print("\nno input — aborting.\n", .{});
-        try ow.interface.flush();
-        return false;
-    };
-    const key = std.mem.trim(u8, line, " \t\r\n");
-    if (key.len < 8) {
-        try ow.interface.print("that doesn't look like a key — aborting.\n", .{});
-        try ow.interface.flush();
-        return false;
-    }
-    try credentials.store(gpa, io, environ, "OPENROUTER_API_KEY", key);
-    try environ.put(
-        try environ.allocator.dupe(u8, "OPENROUTER_API_KEY"),
-        try environ.allocator.dupe(u8, key),
-    );
-    try ow.interface.print("saved. starting marlin…\n", .{});
-    try ow.interface.flush();
-    return true;
-}
-
 pub fn run(
     gpa: std.mem.Allocator,
     io: Io,
@@ -6074,17 +6424,6 @@ pub fn run(
     sid_arg: ?[]const u8,
     reboot_out: ?*RebootPlan,
 ) !u8 {
-    // -- first-run bootstrap: no provider key → prompt before the TUI --
-    // Not for remote attach: provider keys live with the DAEMON, and a
-    // remote client never talks to a provider itself. Demanding a local key
-    // before dialing another machine was pure friction.
-    if (environ.get(attach.remote_env) == null and
-        environ.get("OPENROUTER_API_KEY") == null and
-        environ.get("MARLIN_LOCAL_BASE_URL") == null)
-    {
-        if (!try bootstrapKey(gpa, io, environ)) return 1;
-    }
-
     // -- connect + pick session BEFORE entering the TUI --
     const conn = attach.connect(gpa, io, environ, self_exe) catch |e| {
         std.log.err("cannot reach daemon: {t}", .{e});
@@ -6102,6 +6441,8 @@ pub fn run(
     var cwd_at_start: []const u8 = "";
     var cwd_buf: [4096]u8 = undefined;
     var initial_known_ids: std.ArrayList(u64) = .empty;
+    var setup_at_start: ?SetupReadiness = null;
+    var start_setup = false;
     var initial_ids_transferred = false;
     defer if (!initial_ids_transferred) initial_known_ids.deinit(gpa);
 
@@ -6157,12 +6498,23 @@ pub fn run(
             @memcpy(cwd_buf[0..cwd_len], session_cwd[0..cwd_len]);
             cwd_at_start = cwd_buf[0..cwd_len];
         } else if (sid_arg == null) {
+            // Backend facts come from the daemon host. This matters over SSH:
+            // the client machine's config, keys, and installed guest binaries
+            // say nothing about what will execute the turn.
+            try conn.send(.{ .setup_status = .{ .probe_guests = false } });
+            const setup = try conn.recvUntil(arena, .setup_status_result);
+            setup_at_start = .fromWire(setup);
+            start_setup = !setup.completed and list.sessions.len == 0;
+            effort_at_start = setup.default_effort;
+            const configured_model_len = @min(setup.default_model.len, model_buf.len);
+            @memcpy(model_buf[0..configured_model_len], setup.default_model[0..configured_model_len]);
+            model_at_start = model_buf[0..configured_model_len];
             const cwd_len = try std.process.currentPath(io, &cwd_buf);
             cwd_at_start = cwd_buf[0..cwd_len];
             try conn.send(.{ .session_create = .{
                 .cwd = cwd_at_start,
-                .model = cfg.model_default,
-                .effort = cfg.effort_default,
+                .model = model_at_start,
+                .effort = effort_at_start,
             } });
             const created = try conn.recvUntil(arena, .session_created);
             sid = created.sid;
@@ -6191,6 +6543,7 @@ pub fn run(
     initial_ids_transferred = true;
     defer app.deinit();
     app.setModelStr(model_at_start);
+    if (setup_at_start) |readiness| app.setup_readiness = readiness;
     app.show_tab_bar = cfg.ui_tab_bar;
     app.effort = effort_at_start;
     app.setCwdStr(cwd_at_start);
@@ -6219,6 +6572,7 @@ pub fn run(
             };
         }
     }
+    if (start_setup) app.requestSetup(true);
 
     var daemon_disconnect_reason: ?[]const u8 = null;
     {
@@ -6325,6 +6679,7 @@ pub fn run(
                 },
                 .paste => |text| {
                     app.editor.paste(text);
+                    if (app.otel_header_prompt or app.setup_prompt == .credential) @memset(@constCast(text), 0);
                     gpa.free(@constCast(text));
                 },
                 .daemon_line => |line| {
@@ -6353,6 +6708,7 @@ pub fn run(
                             },
                             .paste => |t2| {
                                 app.editor.paste(t2);
+                                if (app.otel_header_prompt or app.setup_prompt == .credential) @memset(@constCast(t2), 0);
                                 gpa.free(@constCast(t2));
                             },
                         }
@@ -6933,7 +7289,37 @@ fn mediaErrorMessage(err: anyerror) []const u8 {
     };
 }
 
+fn validSetupProviderName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_')) return false;
+    }
+    return !std.mem.eql(u8, name, "codex") and !std.mem.eql(u8, name, "claudecode");
+}
+
 fn handleKey(app: *App, key: vaxis.Key) !void {
+    if (app.setup_prompt != .none) {
+        const ed = &app.editor;
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('g', .{ .ctrl = true })) {
+            app.editor.clearSensitive();
+            app.setup_prompt = .none;
+            app.openPicker(.setup_provider);
+            app.setNotice("provider setup · choose a backend", .{});
+        } else if (isEnterKey(key)) {
+            const value = try ed.takeExpandedSensitive();
+            defer {
+                @memset(value, 0);
+                app.gpa.free(value);
+            }
+            app.submitSetupPrompt(value);
+        } else if (editCommand(key)) |command| {
+            applyEditCommand(ed, command);
+        } else if (key.text) |text| {
+            ed.insertSlice(text);
+        }
+        return;
+    }
+
     if (app.otel_header_prompt) {
         const ed = &app.editor;
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('g', .{ .ctrl = true })) {
@@ -7082,6 +7468,11 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.picker = 0;
             }
         }
+        return;
+    }
+
+    if (app.setup_required and app.editor.isEmpty() and isEnterKey(key)) {
+        app.beginSetup(true);
         return;
     }
 
@@ -7829,6 +8220,70 @@ test "/effort opens the shared selector vocabulary" {
     try std.testing.expectEqualStrings("auto", app.pickerSource()[0]);
     try std.testing.expectEqualStrings("max", app.pickerSource()[proto.ReasoningEffort.choices.len - 1]);
     try std.testing.expectEqualStrings("high", app.pickerCurrent());
+}
+
+test "OTEL command parsing is vendor-neutral and strict" {
+    try std.testing.expect(parseOtelCommand(null, "").? == .status);
+    try std.testing.expect(parseOtelCommand("status", "").? == .status);
+    try std.testing.expect(parseOtelCommand("off", "").? == .off);
+    const set = parseOtelCommand("set", " https://otel.example ").?;
+    try std.testing.expectEqualStrings("https://otel.example", set.set);
+    try std.testing.expect(parseOtelCommand("set", "") == null);
+    try std.testing.expect(parseOtelCommand("set", "https://otel.example extra") == null);
+    try std.testing.expect(parseOtelCommand("mirador", "") == null);
+}
+
+test "provider setup distinguishes installed guests and advances custom fields without history" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.setup_readiness.codex_available = true;
+    try std.testing.expectEqualStrings("  · login needed", app.setupProviderNote(setup_provider_items[1]));
+    app.setup_readiness.codex_authenticated = true;
+    try std.testing.expectEqualStrings("  ✓ signed in", app.setupProviderNote(setup_provider_items[1]));
+
+    app.setupProviderChosen(setup_provider_items[7]);
+    try std.testing.expectEqual(SetupPrompt.provider_name, app.setup_prompt);
+    app.submitSetupPrompt("acme");
+    try std.testing.expectEqual(SetupPrompt.base_url, app.setup_prompt);
+    try std.testing.expectEqualStrings("ACME_API_KEY", app.setup_api_key_env.items);
+    app.submitSetupPrompt("https://gateway.acme.test/v1");
+    try std.testing.expectEqual(SetupPrompt.credential, app.setup_prompt);
+    app.submitSetupPrompt("");
+    try std.testing.expectEqual(SetupPrompt.model, app.setup_prompt);
+    try std.testing.expectEqualStrings("NONE", app.setup_api_key_env.items);
+    try std.testing.expectEqualStrings("acme/", app.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 0), app.editor.history.items.len);
+    app.submitSetupPrompt("acme/");
+    try std.testing.expectEqual(SetupPrompt.model, app.setup_prompt);
+    try std.testing.expectEqualStrings("model id needs a name after provider/", app.notice.items);
+}
+
+test "required provider setup still permits an explicit quit" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .setup_required = true,
+    };
+    defer app.deinit();
+
+    app.submitInput("/quit");
+    try std.testing.expect(app.should_quit);
 }
 
 test "bang rb expands to reboot with build" {

@@ -303,8 +303,12 @@ fn clearImpl(self: *Editor, sensitive: bool) void {
         self.gpa.free(st.text);
     }
     self.redo_stack.clearRetainingCapacity();
-    if (sensitive) @memset(self.text.items, 0);
-    self.text.clearRetainingCapacity();
+    if (sensitive) {
+        @memset(self.text.allocatedSlice(), 0);
+        self.text.clearAndFree(self.gpa);
+    } else {
+        self.text.clearRetainingCapacity();
+    }
     self.cursor = 0;
     self.goal_col = null;
     self.hist_idx = null;
@@ -766,6 +770,26 @@ test "big paste becomes chip and expands on submit" {
     defer testing.allocator.free(out);
     try testing.expect(out.len == "see: ".len + 600);
     try testing.expect(std.mem.startsWith(u8, out, "see: xxxx"));
+}
+
+test "sensitive submit clears editor and paste storage" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    var secret: [600]u8 = undefined;
+    @memset(&secret, 's');
+    ed.paste(&secret);
+    try testing.expectEqual(@as(usize, 1), ed.pastes.items.len);
+    const out = try ed.takeExpandedSensitive();
+    defer {
+        @memset(out, 0);
+        testing.allocator.free(out);
+    }
+    try testing.expectEqualSlices(u8, &secret, out);
+    try testing.expect(ed.isEmpty());
+    try testing.expectEqual(@as(usize, 0), ed.text.capacity);
+    try testing.expectEqual(@as(usize, 0), ed.pastes.items.len);
+    try testing.expectEqual(@as(usize, 0), ed.undo_stack.items.len);
+    try testing.expectEqual(@as(usize, 0), ed.redo_stack.items.len);
 }
 
 test "small paste inserts inline" {

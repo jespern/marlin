@@ -17,7 +17,7 @@ const guest = @import("guest.zig");
 pub const ReasoningEffort = @import("effort.zig").Effort;
 pub const GuestBackend = guest.Backend;
 
-pub const proto_version: u32 = 3;
+pub const proto_version: u32 = 4;
 /// Maximum complete NDJSON record, including its trailing newline. Large
 /// blob replies can JSON-escape to several times their raw size, so this is
 /// deliberately larger than any supported tool capture while still bounding
@@ -104,6 +104,23 @@ pub const McpServerInfo = struct {
     ready: bool,
     tool_count: u32,
     error_message: ?[]const u8 = null,
+};
+
+/// Daemon-host readiness for first-run setup. A remote client must never
+/// infer these facts from its own environment or installed binaries.
+pub const SetupStatus = struct {
+    completed: bool = false,
+    default_model: []const u8,
+    default_effort: ReasoningEffort = .auto,
+    codex_available: bool = false,
+    codex_authenticated: bool = false,
+    claude_code_available: bool = false,
+    claude_code_authenticated: bool = false,
+    openrouter_ready: bool = false,
+    vercel_ready: bool = false,
+    anthropic_ready: bool = false,
+    litellm_ready: bool = false,
+    local_ready: bool = false,
 };
 
 pub const DiagnosticRound = struct {
@@ -272,6 +289,26 @@ pub const ClientMsg = union(enum) {
     /// Full model catalog for the /model picker: daemon fetches the
     /// provider's model list (cached ~1h) and replies model_list_result.
     model_list: struct {},
+    /// Query and apply provider onboarding on the daemon host. Credential
+    /// material is never echoed and clients send setup_apply with the
+    /// transport's sensitive-buffer path.
+    setup_status: struct {
+        /// Guest login probes spawn vendor CLIs and are intentionally opt-in.
+        /// Callers that only need durable defaults keep this false and return
+        /// immediately; the interactive picker asks for the full result.
+        probe_guests: bool = true,
+    },
+    setup_apply: struct {
+        sid: u64,
+        model: []const u8,
+        provider_name: []const u8 = "",
+        base_url: []const u8 = "",
+        api_key_env: []const u8 = "",
+        credential: []const u8 = "",
+        /// Fresh setup creates a placeholder session before entering the TUI.
+        /// It may be rewritten directly only while its transcript is empty.
+        replace_empty_session: bool = false,
+    },
     /// MCP is daemon-owned. Listing and lifecycle actions therefore work from
     /// any thin client without assuming a shared process or filesystem.
     mcp_list: struct {},
@@ -399,6 +436,8 @@ pub const DaemonMsg = union(enum) {
         models: []const []const u8,
         pricing: []const ModelPricing = &.{},
     },
+    setup_status_result: SetupStatus,
+    setup_result: struct { model: []const u8, session_updated: bool = false },
     mcp_list_result: struct { servers: []const McpServerInfo },
     /// Terminal reply to ui_set_tab_bar after config.toml is durable.
     ui_config_result: struct { tab_bar: bool },
@@ -937,6 +976,50 @@ test "model catalog pricing round trips and remains optional" {
         \\{"model_list_result":{"models":["openrouter/legacy/model"]}}
     );
     try std.testing.expectEqual(@as(usize, 0), legacy.model_list_result.pricing.len);
+}
+
+test "provider setup keeps credentials client to daemon and never echoes them" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const line = try encode(gpa, ClientMsg{ .setup_apply = .{
+        .sid = 7,
+        .model = "acme/code-model",
+        .provider_name = "acme",
+        .base_url = "https://gateway.acme.test/v1",
+        .api_key_env = "ACME_API_KEY",
+        .credential = "secret-value",
+        .replace_empty_session = true,
+    } });
+    defer gpa.free(line);
+    const request = try decode(ClientMsg, arena_state.allocator(), line);
+    try std.testing.expectEqualStrings("secret-value", request.setup_apply.credential);
+    try std.testing.expect(request.setup_apply.replace_empty_session);
+
+    const quick_status_line = try encode(gpa, ClientMsg{ .setup_status = .{ .probe_guests = false } });
+    defer gpa.free(quick_status_line);
+    const quick_status = try decode(ClientMsg, arena_state.allocator(), quick_status_line);
+    try std.testing.expect(!quick_status.setup_status.probe_guests);
+
+    const status_line = try encode(gpa, DaemonMsg{ .setup_status_result = .{
+        .completed = false,
+        .default_model = "openrouter/example/model",
+        .codex_available = true,
+        .codex_authenticated = false,
+    } });
+    defer gpa.free(status_line);
+    const status = try decode(DaemonMsg, arena_state.allocator(), status_line);
+    try std.testing.expect(status.setup_status_result.codex_available);
+    try std.testing.expect(!status.setup_status_result.codex_authenticated);
+    try std.testing.expectEqualStrings("openrouter/example/model", status.setup_status_result.default_model);
+
+    const result_line = try encode(gpa, DaemonMsg{ .setup_result = .{
+        .model = "acme/code-model",
+        .session_updated = true,
+    } });
+    defer gpa.free(result_line);
+    try std.testing.expect(std.mem.indexOf(u8, result_line, "secret-value") == null);
 }
 
 test "round trip: blob result preserves arbitrary bytes" {

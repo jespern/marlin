@@ -1010,6 +1010,17 @@ pub const Store = struct {
         try stepDone(stmt);
     }
 
+    pub fn sessionHasBlocks(self: Store, id: u64) Error!bool {
+        const stmt = try self.prepare("SELECT 1 FROM blocks WHERE session_id=? LIMIT 1");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        return switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => true,
+            c.SQLITE_DONE => false,
+            else => error.SqliteStep,
+        };
+    }
+
     pub fn setSessionTitle(self: Store, id: u64, title: []const u8) Error!void {
         const stmt = try self.prepare("UPDATE sessions SET title=? WHERE id=?");
         defer finalize(stmt);

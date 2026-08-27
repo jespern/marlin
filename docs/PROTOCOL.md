@@ -10,7 +10,7 @@ never an accidental wire limit. Clients reject oversized outbound messages
 before optimistic UI state; the daemon drains an oversized inbound record and
 returns `err{line_too_long}` instead of silently dropping the connection.
 
-proto_version: 3
+proto_version: 4
 
 ## Connection lifecycle
 
@@ -48,6 +48,8 @@ policy that failed open. Both default false when decoding an older daemon.
 | input_history | sid?, limit? | input_history_result{entries}; authored user/steer text across sessions, current sid first then newest, capped at 1024 |
 | search | query, sid?, limit? | search_result{query,sid,hits}; sid=0 searches all sessions, capped at 200 results |
 | diagnostics | sid, turn_limit? | diagnostics_result; bounded local timing/outcome summary plus the latest turn waterfall |
+| setup_status | probe_guests? | setup_status_result with the daemon host's durable default and credential readiness; probe_guests opts into guest login checks that spawn vendor CLIs |
+| setup_apply | sid, model, provider_name?, base_url?, api_key_env?, credential?, replace_empty_session? | setup_result after daemon-host credential/config persistence and provider resolution; credential is never echoed |
 | session_watch | incremental? | initial session_list_result, then structural catalog updates; incremental clients receive session_upsert/session_remove, legacy clients receive refreshed snapshots |
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
@@ -181,6 +183,8 @@ changing configuration.
 | approval_request {sid, approval_id, call_id, tool, args_json} | a mutating tool call parked on the gate; answer with `approve` |
 | session_meta {sid, tokens_in, tokens_out, context_used, context_limit} | after each turn; ALWAYS sent before the closing status. context_* feed the status-bar gauge (0 = unmeasured) |
 | model_list_result {models, pricing} | reply to `model_list`; `pricing` optionally supplies input/output USD per million tokens and a tiered-rate flag keyed by model id |
+| setup_status_result | reply to `setup_status`; reports setup completion, default model/effort, native credential presence, and guest install/login state on the daemon host |
+| setup_result {model,session_updated} | reply to `setup_apply`; confirms the durable default and whether a fresh empty placeholder session was updated directly |
 | interrupt_result {sid, active, already_requested, request_count, pending_ms, phase_ms, phase} | opt-in cancellation acknowledgement; reports the current starting/context/provider/approval/tool/child/compaction/finishing phase and its age; repeated interrupts also report elapsed cancellation time |
 | ok {request_id?} | generic ack; non-zero for a correlated input reply |
 | err {code, msg, request_id?} | bad_msg, no_hello, version, no_session, busy, archived, bad_approval, approval_pending, reboot_pending, line_too_long, response_too_large; non-zero for a correlated input rejection |

@@ -10,9 +10,25 @@ const Io = std.Io;
 
 pub const cred_keys = [_][]const u8{
     "OPENROUTER_API_KEY",
+    "AI_GATEWAY_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "LITELLM_API_KEY",
     "MARLIN_LOCAL_BASE_URL",
     "MARLIN_LOCAL_API_KEY",
 };
+
+/// Credentials may name custom-provider secrets, but the file must never
+/// become a general-purpose environment injection mechanism. This mirrors
+/// the daemon's secret boundary and config provider validation.
+pub fn allowedKey(name: []const u8) bool {
+    for (cred_keys) |known| if (std.mem.eql(u8, known, name)) return true;
+    if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |byte| if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+    return startsWithIgnoreCase(name, "AWS_") or
+        endsWithIgnoreCase(name, "_API_KEY") or
+        endsWithIgnoreCase(name, "_TOKEN") or
+        endsWithIgnoreCase(name, "_SECRET");
+}
 
 /// Resolve ~/.config/marlin (respecting XDG_CONFIG_HOME). Caller frees.
 pub fn configDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
@@ -51,11 +67,7 @@ pub fn loadInto(
         if (key.len == 0 or val.len == 0) continue;
         // Only known keys (this file is not a general env mechanism), and
         // the real environment always wins.
-        var known = false;
-        for (cred_keys) |k| {
-            if (std.mem.eql(u8, k, key)) known = true;
-        }
-        if (!known) continue;
+        if (!allowedKey(key)) continue;
         if (environ.get(key)) |existing| {
             if (existing.len > 0) continue;
         }
@@ -74,6 +86,9 @@ pub fn store(
     key: []const u8,
     value: []const u8,
 ) !void {
+    if (!allowedKey(key)) return error.UnsupportedCredentialName;
+    if (value.len == 0 or std.mem.indexOfAny(u8, value, "\r\n\x00") != null)
+        return error.InvalidCredentialValue;
     const dir_path = try configDir(gpa, environ);
     defer gpa.free(dir_path);
     Io.Dir.cwd().createDirPath(io, dir_path) catch {};
@@ -106,6 +121,14 @@ pub fn store(
 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
     chmod600(path);
+}
+
+fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+}
+
+fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
+    return value.len >= suffix.len and std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
 }
 
 fn chmod600(path: []const u8) void {
@@ -146,4 +169,12 @@ test "store then load round trip, env wins" {
     try env2.put("OPENROUTER_API_KEY", "from-env");
     try loadInto(arena, io, &env2);
     try std.testing.expectEqualStrings("from-env", env2.get("OPENROUTER_API_KEY").?);
+
+    var env3 = std.process.Environ.Map.init(arena);
+    try env3.put("XDG_CONFIG_HOME", tmp);
+    try store(arena, io, &env3, "ACME_API_KEY", "custom-secret");
+    try loadInto(arena, io, &env3);
+    try std.testing.expectEqualStrings("custom-secret", env3.get("ACME_API_KEY").?);
+    try std.testing.expectError(error.UnsupportedCredentialName, store(arena, io, &env3, "PATH", "/malicious"));
+    try std.testing.expectError(error.InvalidCredentialValue, store(arena, io, &env3, "ACME_API_KEY", "one\nOTHER_API_KEY=two"));
 }

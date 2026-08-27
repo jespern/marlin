@@ -50,6 +50,7 @@ pub const Provider = struct {
 };
 
 pub const Document = struct {
+    setup_completed: ?bool = null,
     model_default: ?[]const u8 = null,
     model_compaction: ?[]const u8 = null,
     model_favorites: ?[]const []const u8 = null,
@@ -84,6 +85,7 @@ pub const Document = struct {
 
 const Section = enum {
     unknown,
+    setup,
     model,
     context,
     approval,
@@ -184,6 +186,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
         if (key.len == 0 or value.len == 0) return error.InvalidToml;
 
         switch (section) {
+            .setup => if (std.mem.eql(u8, key, "completed")) {
+                doc.setup_completed = try boolean(value);
+            },
             .model => {
                 if (std.mem.eql(u8, key, "default")) doc.model_default = try string(arena, value);
                 if (std.mem.eql(u8, key, "compaction")) doc.model_compaction = try optionalString(arena, value);
@@ -333,6 +338,7 @@ fn finishPending(
 }
 
 fn sectionFor(name: []const u8) Section {
+    if (std.mem.eql(u8, name, "setup")) return .setup;
     const entries = .{
         .{ "model", Section.model },
         .{ "context", Section.context },
