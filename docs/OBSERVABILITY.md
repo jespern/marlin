@@ -22,8 +22,12 @@ marlin diagnostics 63df --json     # automation / deeper analysis
 
 The sample is bounded to 50 turns by default. Marlin stores timestamps,
 outcomes, model/provider/generation identifiers, token counts, response byte
-counts, and tool names/statuses. It does not duplicate prompts, completions,
-tool arguments, or tool output into telemetry.
+counts, tool names/statuses, and a content-free local preparation breakdown:
+setup, context-load and SQLite-wait time, context rows/bytes/VM steps, context
+assembly, and provider-body serialization. Diagnostics also reconstruct the
+legacy turn-start-to-first-provider gap for older rows and report its
+p50/p95/max plus the count at or above one second. It does not duplicate
+prompts, completions, tool arguments, or tool output into telemetry.
 
 ## OTLP/HTTP export (Mirador included)
 

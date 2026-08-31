@@ -1027,6 +1027,8 @@ pub const Transcript = struct {
     reasoning_delta: []const u8,
     spinner_frame: usize,
     turn_started_ms: i64,
+    turn_phase: proto.TurnPhase = .idle,
+    phase_started_ms: i64 = 0,
     call_started_ms: i64,
     stream_bytes: u64,
     stream_quiet_ms: u64,
@@ -1068,22 +1070,50 @@ pub fn currentInflightCall(blocks: []const RenderBlock) ?InflightCall {
     return null;
 }
 
+fn streamStatusFresh(transcript: *const Transcript, now_ms: i64) bool {
+    return transcript.stream_status_at_ms > 0 and
+        now_ms - transcript.stream_status_at_ms <
+            (if (transcript.stream_bytes == 0) @as(i64, 15_000) else 3000);
+}
+
+fn workingLabel(transcript: *const Transcript, now_ms: i64) []const u8 {
+    if (handoverInProgress(transcript.blocks)) return "Generating handover…";
+    if (currentInflightCall(transcript.blocks) != null) return "Running tool…";
+    return switch (transcript.turn_phase) {
+        .idle => "Working…",
+        .starting => "Starting turn thread…",
+        .context => "Preparing request context…",
+        .provider => if (streamStatusFresh(transcript, now_ms) and transcript.stream_bytes > 0)
+            "Receiving model response…"
+        else
+            "Waiting for model…",
+        .approval => "Waiting for approval…",
+        .tool => "Running tool…",
+        .child => "Waiting for child agent…",
+        .compaction => "Compacting context…",
+        .finishing => "Finalizing response…",
+    };
+}
+
 /// Compact live telemetry for the transcript ticker. The returned text begins
-/// with a separator so it can be appended directly to the Working label.
+/// with a separator so it can be appended directly to the activity label.
 fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) ![]const u8 {
+    const now_ms = nowWallMs(transcript.io);
     const elapsed_s: i64 = if (transcript.turn_started_ms > 0)
-        @max(0, @divTrunc(nowWallMs(transcript.io) - transcript.turn_started_ms, 1000))
+        @max(0, @divTrunc(now_ms - transcript.turn_started_ms, 1000))
+    else
+        0;
+    const phase_s: i64 = if (transcript.phase_started_ms > 0)
+        @max(0, @divTrunc(now_ms - transcript.phase_started_ms, 1000))
     else
         0;
     const elapsed = if (elapsed_s >= 60)
-        try std.fmt.allocPrint(arena, " · {d}m {d}s", .{ @divTrunc(elapsed_s, 60), @mod(elapsed_s, 60) })
+        try std.fmt.allocPrint(arena, " · {d}m {d}s total · {d}s here", .{ @divTrunc(elapsed_s, 60), @mod(elapsed_s, 60), phase_s })
     else
-        try std.fmt.allocPrint(arena, " · {d}s", .{elapsed_s});
+        try std.fmt.allocPrint(arena, " · {d}s total · {d}s here", .{ elapsed_s, phase_s });
 
     var detail = elapsed;
-    const stream_fresh = transcript.stream_status_at_ms > 0 and
-        nowWallMs(transcript.io) - transcript.stream_status_at_ms <
-            (if (transcript.stream_bytes == 0) @as(i64, 15_000) else 3000);
+    const stream_fresh = streamStatusFresh(transcript, now_ms);
     if (stream_fresh and currentInflightCall(transcript.blocks) == null) {
         const quiet_s = transcript.stream_quiet_ms / 1000;
         if (transcript.stream_bytes == 0) {
@@ -1489,10 +1519,7 @@ pub fn layoutLines(
         const head = try std.fmt.allocPrint(arena, "{s} ", .{
             spinner_frames[transcript.spinner_frame % spinner_frames.len],
         });
-        const word: []const u8 = if (handoverInProgress(transcript.blocks))
-            "Generating handover…"
-        else
-            "Working…";
+        const word = workingLabel(transcript, nowWallMs(transcript.io));
         const detail = try workingDetail(arena, transcript);
         try lines.append(arena, .{
             .text = head,
@@ -2184,6 +2211,67 @@ test "completed plan moves immediately into transcript with timing summary" {
     try std.testing.expect(saw_summary);
     try std.testing.expect(saw_recap);
     try std.testing.expect(summary_line.? < recap_line.?);
+}
+
+test "working activity names each operational phase" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &.{},
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    const now_ms = nowWallMs(transcript.io);
+
+    const cases = [_]struct { phase: proto.TurnPhase, label: []const u8 }{
+        .{ .phase = .starting, .label = "Starting turn thread…" },
+        .{ .phase = .context, .label = "Preparing request context…" },
+        .{ .phase = .provider, .label = "Waiting for model…" },
+        .{ .phase = .approval, .label = "Waiting for approval…" },
+        .{ .phase = .tool, .label = "Running tool…" },
+        .{ .phase = .child, .label = "Waiting for child agent…" },
+        .{ .phase = .compaction, .label = "Compacting context…" },
+        .{ .phase = .finishing, .label = "Finalizing response…" },
+    };
+    for (cases) |case| {
+        transcript.turn_phase = case.phase;
+        try std.testing.expectEqualStrings(case.label, workingLabel(&transcript, now_ms));
+    }
+
+    transcript.turn_phase = .provider;
+    transcript.stream_bytes = 4096;
+    transcript.stream_status_at_ms = now_ms;
+    try std.testing.expectEqualStrings("Receiving model response…", workingLabel(&transcript, now_ms));
+
+    transcript.turn_started_ms = now_ms - 12_000;
+    transcript.phase_started_ms = now_ms - 3_000;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const detail = try workingDetail(arena_state.allocator(), &transcript);
+    try std.testing.expect(std.mem.indexOf(u8, detail, " total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, " here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "streaming 4.0KiB") != null);
 }
 
 test "current in-flight call follows calls-first result order" {

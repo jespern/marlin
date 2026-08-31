@@ -15,7 +15,7 @@ curl -fsSL https://marlin.wtf/install.sh | sh
 ```
 
 The installer selects the release for your architecture and verifies its
-SHA-256 checksum. To pin this release, pipe into `MARLIN_VERSION=0.1.1 sh`.
+SHA-256 checksum. To pin this release, pipe into `MARLIN_VERSION=0.1.2 sh`.
 
 Or use [Homebrew](https://brew.sh/) on macOS or Linux:
 
@@ -85,6 +85,11 @@ the old rooms?
   inline in the composer, repeated `Ctrl+R` walks older matches, and Esc
   restores the draft. Normal-mode `/` searches the current transcript; `/search <query>` and
   `marlin search <query>` search every durable session.
+- `/animate matrix` sends a fast, fluid wave of falling Unicode glyphs from the
+  top through gaps around the current UI, then fades away after its tail passes.
+- During a turn, the live activity row distinguishes request preparation, model
+  wait/streaming, tool execution, child-agent work, compaction, and finalization,
+  with total and current-phase timers.
 - `/diagnostics` and `marlin diagnostics [handle] [--json]` separate provider
   latency, TTFT, tool time, and failures. Optional OTLP/HTTP export uses a
   durable retry outbox, supports restart-free `/otel set|off|status`, and

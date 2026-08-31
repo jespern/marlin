@@ -22,8 +22,8 @@
 //!            Ctrl+T toggles the expanded tool transcript;
 //!            Alt/Option+1..9 jumps to that tab
 //!   approval pending: y approve, n deny (both modes, input empty)
-//!   commands: /model <m>, /effort <level>, /search <query>, /new, /compact,
-//!             /archive, /reboot [--build], /help, /quit
+//!   commands: /model <m>, /effort <level>, /search <query>, /animate matrix,
+//!             /new, /compact, /archive, /reboot [--build], /help, /quit
 //!   shortcuts: !c (copy last full tool output), !rb [client|both] (scoped rebuild)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
 //!            chips, expanded into the message on send.
@@ -129,6 +129,16 @@ pub const VoiceEvent = union(enum) {
 
 const Mode = enum { insert, normal };
 
+const UiAnimation = enum { none, matrix };
+
+fn matrixTrailLength(height: u16) usize {
+    return @max(@as(usize, height) * 5 / 8, 8);
+}
+
+fn matrixAnimationFrames(height: u16) usize {
+    return (@as(usize, height) + matrixTrailLength(height)) * 2;
+}
+
 pub const RebuildScope = enum { none, attached, client, both };
 
 pub const RebootRequest = struct {
@@ -161,6 +171,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/sessions", .description = "switch sessions" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
+    .{ .name = "/animate", .usage = " matrix", .description = "play a transient screen animation", .accepts_args = true },
     .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
@@ -439,7 +450,12 @@ const SavedSessionView = struct {
     show_tool_transcript: bool,
     spinner_frame: usize,
     turn_started_ms: i64,
+    turn_phase: proto.TurnPhase,
+    phase_started_ms: i64,
     call_started_ms: i64,
+    stream_bytes: u64,
+    stream_quiet_ms: u64,
+    stream_status_at_ms: i64,
     last_seq: u64,
     oldest_seq: u64,
     history_complete: bool,
@@ -488,9 +504,10 @@ const App = struct {
     attachments: std.ArrayList(media.Pending) = .empty,
 
     mode: Mode = .insert,
-    /// Terminal columns (updated on every winsize event); used by handleKey
-    /// for the editor's vertical-move edge detection so it matches draw().
+    /// Terminal size (updated on every winsize event); columns drive editor
+    /// movement and rows size viewport-relative client animations.
     term_cols: usize = 80,
+    term_rows: u16 = 24,
     blocks: std.ArrayList(RenderBlock) = .empty,
     delta: std.ArrayList(u8) = .empty,
     reasoning_delta: std.ArrayList(u8) = .empty,
@@ -665,6 +682,8 @@ const App = struct {
     /// Wall-clock ms when the active session's current turn entered
     /// .running; drives the elapsed counter on the Working line.
     turn_started_ms: i64 = 0,
+    turn_phase: proto.TurnPhase = .idle,
+    phase_started_ms: i64 = 0,
     /// Wall ms when the tool call now executing began (0 = none). Stamped
     /// as call/result blocks stream in; drives the per-call timer on the
     /// Working line.
@@ -675,6 +694,11 @@ const App = struct {
     stream_bytes: u64 = 0,
     stream_quiet_ms: u64 = 0,
     stream_status_at_ms: i64 = 0,
+    ui_animation: UiAnimation = .none,
+    ui_animation_frame: usize = 0,
+    ui_animation_frames: usize = matrixAnimationFrames(24),
+    ui_animation_seed: u64 = 0,
+    ui_animation_active: std.atomic.Value(bool) = .init(false),
     animation_active: std.atomic.Value(bool) = .init(false),
     animation_stop: std.atomic.Value(bool) = .init(false),
     cfg: config.Config = .{},
@@ -1051,7 +1075,12 @@ const App = struct {
         self.show_tool_transcript = false;
         self.spinner_frame = 0;
         self.turn_started_ms = 0;
+        self.turn_phase = .idle;
+        self.phase_started_ms = 0;
         self.call_started_ms = 0;
+        self.stream_bytes = 0;
+        self.stream_quiet_ms = 0;
+        self.stream_status_at_ms = 0;
     }
 
     fn saveActiveView(self: *App) !void {
@@ -1086,7 +1115,12 @@ const App = struct {
             .show_tool_transcript = self.show_tool_transcript,
             .spinner_frame = self.spinner_frame,
             .turn_started_ms = self.turn_started_ms,
+            .turn_phase = self.turn_phase,
+            .phase_started_ms = self.phase_started_ms,
             .call_started_ms = self.call_started_ms,
+            .stream_bytes = self.stream_bytes,
+            .stream_quiet_ms = self.stream_quiet_ms,
+            .stream_status_at_ms = self.stream_status_at_ms,
             .last_seq = self.last_seq,
             .oldest_seq = self.oldest_seq,
             .history_complete = self.history_complete,
@@ -1153,7 +1187,12 @@ const App = struct {
         self.show_tool_transcript = saved.show_tool_transcript;
         self.spinner_frame = saved.spinner_frame;
         self.turn_started_ms = saved.turn_started_ms;
+        self.turn_phase = saved.turn_phase;
+        self.phase_started_ms = saved.phase_started_ms;
         self.call_started_ms = saved.call_started_ms;
+        self.stream_bytes = saved.stream_bytes;
+        self.stream_quiet_ms = saved.stream_quiet_ms;
+        self.stream_status_at_ms = saved.stream_status_at_ms;
         self.last_seq = saved.last_seq;
         self.oldest_seq = saved.oldest_seq;
         self.history_complete = saved.history_complete;
@@ -1201,7 +1240,7 @@ const App = struct {
         self.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
 
         if (touch_recent) self.touchRecentSession(sid);
-        self.animation_active.store(self.state == .running, .release);
+        self.syncAnimationTicker();
         if (self.last_seq == 0) {
             self.history_complete = false;
             self.history_loading = true;
@@ -1281,7 +1320,7 @@ const App = struct {
             }
             self.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
             self.touchRecentSession(sid);
-            self.animation_active.store(self.state == .running, .release);
+            self.syncAnimationTicker();
         } else {
             self.conn.send(.{ .unsub = .{ .sid = sid } }) catch {};
         }
@@ -1670,7 +1709,9 @@ const App = struct {
                 self.releaseStreamingBuffers();
                 self.stream_status_at_ms = 0;
                 self.turn_started_ms = 0;
-                self.animation_active.store(state == .running, .release);
+                self.turn_phase = .idle;
+                self.phase_started_ms = 0;
+                self.syncAnimationTicker();
             }
             self.restoreLatestUnfinishedPlan();
             self.layout_epoch +%= 1;
@@ -1776,8 +1817,25 @@ const App = struct {
                 if (s.sid != self.sid) {
                     if (self.saved_views.get(s.sid)) |saved| {
                         saved.state = s.state;
-                        if (s.state == .idle or s.state == .err or s.state == .done)
+                        if (s.phase) |phase| {
+                            if (saved.turn_phase != phase) {
+                                saved.phase_started_ms = nowWallMs(self.io);
+                                if (phase == .provider) {
+                                    saved.stream_bytes = 0;
+                                    saved.stream_quiet_ms = 0;
+                                    saved.stream_status_at_ms = 0;
+                                }
+                            }
+                            saved.turn_phase = phase;
+                        }
+                        if (s.state == .idle or s.state == .err or s.state == .done) {
+                            saved.turn_phase = .idle;
+                            saved.phase_started_ms = 0;
+                            saved.stream_bytes = 0;
+                            saved.stream_quiet_ms = 0;
+                            saved.stream_status_at_ms = 0;
                             saved.releaseStreamingBuffers(self.gpa);
+                        }
                     }
                     return;
                 }
@@ -1791,10 +1849,27 @@ const App = struct {
                     self.clearCompletedPlan();
                     self.spinner_frame = 0;
                     self.turn_started_ms = nowWallMs(self.io);
+                    self.turn_phase = .starting;
+                    self.phase_started_ms = self.turn_started_ms;
                 }
-                if (s.state != .running) self.stream_status_at_ms = 0;
+                if (s.phase) |phase| {
+                    if (self.turn_phase != phase) {
+                        self.phase_started_ms = nowWallMs(self.io);
+                        if (phase == .provider) {
+                            self.stream_bytes = 0;
+                            self.stream_quiet_ms = 0;
+                            self.stream_status_at_ms = 0;
+                        }
+                    }
+                    self.turn_phase = phase;
+                }
+                if (s.state != .running) {
+                    self.stream_status_at_ms = 0;
+                    self.turn_phase = .idle;
+                    self.phase_started_ms = 0;
+                }
                 self.state = s.state;
-                self.animation_active.store(s.state == .running, .release);
+                self.syncAnimationTicker();
                 if (s.state != .awaiting_approval) self.pending = null;
                 if (s.state == .idle or s.state == .err or s.state == .done)
                     self.releaseStreamingBuffers();
@@ -2153,9 +2228,45 @@ const App = struct {
             self.state = .running;
             self.spinner_frame = 0;
             self.turn_started_ms = nowWallMs(self.io);
-            self.animation_active.store(true, .release);
+            self.turn_phase = .starting;
+            self.phase_started_ms = self.turn_started_ms;
+            self.syncAnimationTicker();
         }
         self.scroll_up = 0;
+    }
+
+    fn needsAnimationTick(self: *const App) bool {
+        return self.state == .running or
+            self.voice_rt.download != null or
+            self.voice_rt.phase != .idle or
+            self.ui_animation_active.load(.acquire);
+    }
+
+    fn syncAnimationTicker(self: *App) void {
+        self.animation_active.store(self.needsAnimationTick(), .release);
+    }
+
+    fn startUiAnimation(self: *App, animation: UiAnimation) void {
+        var seed_bytes: [8]u8 = undefined;
+        self.io.random(&seed_bytes);
+        self.ui_animation = animation;
+        self.ui_animation_frame = 0;
+        self.ui_animation_frames = matrixAnimationFrames(self.term_rows);
+        self.ui_animation_seed = std.mem.readInt(u64, &seed_bytes, .little);
+        self.ui_animation_active.store(true, .release);
+        self.syncAnimationTicker();
+    }
+
+    fn tickUiAnimation(self: *App) void {
+        if (self.ui_animation == .none) return;
+        self.ui_animation_frame += 1;
+        if (self.ui_animation_frame >= self.ui_animation_frames) {
+            self.ui_animation = .none;
+            self.ui_animation_frame = 0;
+            self.ui_animation_active.store(false, .release);
+            self.refresh_requested = true;
+            self.syncAnimationTicker();
+        }
     }
 
     fn runCommand(self: *App, cmd: []const u8) void {
@@ -2473,12 +2584,22 @@ const App = struct {
             self.conn.send(.{ .diagnostics = .{ .sid = self.sid } }) catch {
                 self.setNotice("could not request diagnostics", .{});
             };
+        } else if (std.mem.eql(u8, head, "/animate")) {
+            const name = it.next() orelse {
+                self.setNotice("usage: /animate matrix", .{});
+                return;
+            };
+            if (it.next() != null or !std.mem.eql(u8, name, "matrix")) {
+                self.setNotice("usage: /animate matrix", .{});
+                return;
+            }
+            self.startUiAnimation(.matrix);
         } else if (std.mem.eql(u8, head, "/otel")) {
             self.otelCommand(it.next(), it.rest());
         } else if (std.mem.eql(u8, head, "/config")) {
             self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/setup · /sessions · /search [query] · /diagnostics · /otel [set <endpoint>|status|off] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !rb [client|both] · !c · /quit", .{});
+            self.setNotice("/setup · /sessions · /search [query] · /diagnostics · /animate matrix · /otel [set <endpoint>|status|off] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !rb [client|both] · !c · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -2719,7 +2840,7 @@ const App = struct {
             self.setNotice("voice: could not start the model download", .{});
             return;
         };
-        self.animation_active.store(true, .release);
+        self.syncAnimationTicker();
         self.setNotice("voice: downloading {s}…", .{engine.modelFileName().?});
     }
 
@@ -2796,7 +2917,7 @@ const App = struct {
         rt.download_thread = null;
         if (rt.download) |pr| self.gpa.destroy(pr);
         rt.download = null;
-        self.animation_active.store(self.state == .running, .release);
+        self.syncAnimationTicker();
         if (failure) |name| {
             self.setNotice("voice: model download failed ({s}) — /voice setup resumes it", .{name});
             return;
@@ -2847,7 +2968,7 @@ const App = struct {
         rt.phase = .recording;
         rt.record_started_ms = nowWallMs(self.io);
         // Keep ticks flowing so the status bar's elapsed counter is live.
-        self.animation_active.store(true, .release);
+        self.syncAnimationTicker();
         self.prewarmVoiceModel();
         self.setNotice("● recording — {s}", .{if (rt.setup.?.mode == .ptt and rt.kitty_release) "release to transcribe" else "ctrl+space to stop"});
     }
@@ -2900,7 +3021,7 @@ const App = struct {
         const thread = std.Thread.spawn(.{}, VoiceJob.run, .{job}) catch {
             self.gpa.destroy(job);
             rt.phase = .idle;
-            self.animation_active.store(self.state == .running, .release);
+            self.syncAnimationTicker();
             return;
         };
         thread.detach();
@@ -2920,7 +3041,7 @@ const App = struct {
         }
         rt.wav_path = null;
         rt.phase = .idle;
-        self.animation_active.store(self.state == .running, .release);
+        self.syncAnimationTicker();
         self.setNotice("voice: recording discarded", .{});
     }
 
@@ -2929,7 +3050,7 @@ const App = struct {
             .transcript => |text| {
                 defer self.gpa.free(text);
                 self.voice_rt.phase = .idle;
-                self.animation_active.store(self.state == .running, .release);
+                self.syncAnimationTicker();
                 if (text.len == 0) {
                     self.setNotice("voice: heard nothing", .{});
                     return;
@@ -2941,7 +3062,7 @@ const App = struct {
             },
             .stt_failed => |name| {
                 self.voice_rt.phase = .idle;
-                self.animation_active.store(self.state == .running, .release);
+                self.syncAnimationTicker();
                 self.setNotice("voice: transcription failed ({s})", .{name});
             },
             .download_done => self.voiceDownloadFinished(null),
@@ -4543,6 +4664,7 @@ fn commandQuery(editor: *const Editor) ?[]const u8 {
         if (!std.mem.eql(u8, head, "/council") and
             !std.mem.eql(u8, head, "/review") and
             !std.mem.eql(u8, head, "/plan") and
+            !std.mem.eql(u8, head, "/animate") and
             !std.mem.eql(u8, head, "/otel") and
             !std.mem.eql(u8, head, "!rb")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
@@ -4651,6 +4773,21 @@ fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Comman
         }
         return out.items;
     }
+    if (query.len > "/animate".len and
+        std.mem.eql(u8, query[0.."/animate".len], "/animate") and
+        (query["/animate".len] == ' ' or query["/animate".len] == '\t'))
+    {
+        const rest = std.mem.trimStart(u8, query["/animate".len..], " \t");
+        if (rest.len <= "matrix".len and std.ascii.eqlIgnoreCase(rest, "matrix"[0..rest.len])) {
+            try out.append(arena, .{
+                .label = "/animate matrix",
+                .description = "play falling green symbols over the current screen",
+                .replacement = "/animate matrix",
+                .submit_on_enter = true,
+            });
+        }
+        return out.items;
+    }
     if (query.len > "/plan".len and
         std.mem.eql(u8, query[0.."/plan".len], "/plan") and
         (query["/plan".len] == ' ' or query["/plan".len] == '\t'))
@@ -4711,6 +4848,8 @@ fn transcriptView(app: *App) Transcript {
         .reasoning_delta = app.reasoning_delta.items,
         .spinner_frame = app.spinner_frame,
         .turn_started_ms = app.turn_started_ms,
+        .turn_phase = app.turn_phase,
+        .phase_started_ms = app.phase_started_ms,
         .call_started_ms = app.call_started_ms,
         .stream_bytes = app.stream_bytes,
         .stream_quiet_ms = app.stream_quiet_ms,
@@ -4752,6 +4891,16 @@ fn formatDiagnostics(gpa: std.mem.Allocator, report: proto.Diagnostics) ![]u8 {
         diagnosticsSeconds(report.ttft_p50_ms),
         diagnosticsSeconds(report.ttft_p95_ms),
     });
+    try out.print(gpa, "**Local prep** measured p50 {d:.2}s · p95 {d:.2}s\n", .{
+        diagnosticsSeconds(report.local_prep_p50_ms),
+        diagnosticsSeconds(report.local_prep_p95_ms),
+    });
+    try out.print(gpa, "**Legacy pre-provider** p50 {d:.2}s · p95 {d:.2}s · max {d:.2}s · {d} at least 1s\n", .{
+        diagnosticsSeconds(report.pre_provider_p50_ms),
+        diagnosticsSeconds(report.pre_provider_p95_ms),
+        diagnosticsSeconds(report.pre_provider_max_ms),
+        report.pre_provider_slow_turns,
+    });
     try out.print(gpa, "**Tools** {d} calls\n", .{report.tool_calls});
 
     if (report.last_turn_id == 0) {
@@ -4772,6 +4921,19 @@ fn formatDiagnostics(gpa: std.mem.Allocator, report: proto.Diagnostics) ![]u8 {
                 round.bytes,
                 round.tokens_in,
                 round.tokens_out,
+            });
+            if (round.round == 0) try out.print(gpa, " · pre-provider {d:.2}s", .{diagnosticsSeconds(round.pre_provider_ms)});
+            const local_ms = round.context_load_ms +| round.setup_ms +| round.assemble_ms +| round.body_ms;
+            if (local_ms > 0) try out.print(gpa, " · local {d:.2}s [setup {d:.2}s, db {d:.2}s ({d}ms wait, {d} rows/{d} bytes/{d} steps), assemble {d:.2}s, body {d:.2}s]", .{
+                diagnosticsSeconds(local_ms),
+                diagnosticsSeconds(round.setup_ms),
+                diagnosticsSeconds(round.context_load_ms),
+                round.store_wait_ms,
+                round.context_rows,
+                round.context_bytes,
+                round.context_vm_steps,
+                diagnosticsSeconds(round.assemble_ms),
+                diagnosticsSeconds(round.body_ms),
             });
             if (round.provider.len > 0) try out.print(gpa, " · {s}", .{round.provider});
             if (round.generation_id.len > 0) try out.print(gpa, " · `{s}`", .{round.generation_id});
@@ -6278,6 +6440,187 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         try drawCouncilDetail(app, win, arena)
     else if (app.shortcut_help and app.picker == null)
         try drawShortcutHelp(win, arena);
+
+    drawUiAnimation(app, win);
+}
+
+fn matrixHash(value: u64) u64 {
+    var x = value;
+    x ^= x >> 30;
+    x *%= 0xbf58476d1ce4e5b9;
+    x ^= x >> 27;
+    x *%= 0x94d049bb133111eb;
+    return x ^ (x >> 31);
+}
+
+fn drawUiAnimation(app: *const App, win: vaxis.Window) void {
+    switch (app.ui_animation) {
+        .none => {},
+        .matrix => drawMatrixAnimation(app, win),
+    }
+}
+
+fn matrixWaveOpacity(frame: usize, total_frames: usize) u8 {
+    const fade_in_frames: usize = 10;
+    const fade_out_frames: usize = 22;
+    if (frame < fade_in_frames)
+        return @intCast(frame * 255 / fade_in_frames);
+
+    const remaining = (total_frames - 1) -| frame;
+    if (remaining < fade_out_frames)
+        return @intCast(remaining * 255 / fade_out_frames);
+    return 255;
+}
+
+fn matrixWaveFront(frame: usize, total_frames: usize, height: u16, max_trail: usize) i64 {
+    const start: i64 = 2;
+    const end = @as(i64, height) + @as(i64, @intCast(max_trail));
+    const clamped_frame = @min(frame, total_frames - 1);
+    return start + @divTrunc(
+        @as(i64, @intCast(clamped_frame)) * (end - start),
+        @as(i64, @intCast(total_frames - 1)),
+    );
+}
+
+fn matrixWaveColor(base: [3]u8, opacity: u8) vaxis.Color {
+    return .{ .rgb = .{
+        @intCast(@as(u16, base[0]) * opacity / 255),
+        @intCast(@as(u16, base[1]) * opacity / 255),
+        @intCast(@as(u16, base[2]) * opacity / 255),
+    } };
+}
+
+fn matrixCellIsOpen(win: vaxis.Window, col: u16, row: u16) bool {
+    const cell = win.readCell(col, row) orelse return false;
+    if (!std.mem.eql(u8, cell.char.grapheme, " ")) return false;
+    if (col == 0) return true;
+
+    const previous = win.readCell(col - 1, row) orelse return true;
+    const previous_width = if (previous.char.width > 0)
+        previous.char.width
+    else
+        win.gwidth(previous.char.grapheme);
+    return previous_width <= 1;
+}
+
+fn drawMatrixAnimation(app: *const App, win: vaxis.Window) void {
+    if (win.width == 0 or win.height == 0) return;
+    const glyphs = [_][]const u8{
+        "ｱ",
+        "ｲ",
+        "ｳ",
+        "ｴ",
+        "ｵ",
+        "ｶ",
+        "ｷ",
+        "ｸ",
+        "ｹ",
+        "ｺ",
+        "ｻ",
+        "ｼ",
+        "ｽ",
+        "ｾ",
+        "ｿ",
+        "ﾀ",
+        "ﾁ",
+        "ﾂ",
+        "ﾃ",
+        "ﾄ",
+        "ﾅ",
+        "ﾆ",
+        "ﾇ",
+        "ﾈ",
+        "ﾉ",
+        "ﾊ",
+        "ﾋ",
+        "ﾌ",
+        "ﾍ",
+        "ﾎ",
+        "ﾏ",
+        "ﾐ",
+        "ﾑ",
+        "ﾒ",
+        "ﾓ",
+        "ﾔ",
+        "ﾕ",
+        "ﾖ",
+        "ﾗ",
+        "ﾘ",
+        "ﾙ",
+        "ﾚ",
+        "ﾛ",
+        "ﾜ",
+        "ｦ",
+        "ﾝ",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "◦",
+        "·",
+        "¦",
+        "┊",
+        "╎",
+        "╌",
+        "⌁",
+        "⟡",
+    };
+    const max_trail = matrixTrailLength(win.height);
+    const min_trail = @min(max_trail, @max(@as(usize, win.height) / 2, 6));
+    const streams_per_column = 3;
+    const opacity = matrixWaveOpacity(app.ui_animation_frame, app.ui_animation_frames);
+    const wave_front = matrixWaveFront(app.ui_animation_frame, app.ui_animation_frames, win.height, max_trail);
+
+    var col: u16 = 0;
+    while (col < win.width) : (col += 1) {
+        for (0..streams_per_column) |lane| {
+            const stream = matrixHash(app.ui_animation_seed +%
+                @as(u64, col) *% 0x9e3779b97f4a7c15 +%
+                @as(u64, lane) *% 0xd1b54a32d192ed03);
+            if (lane > 0 and stream % 7 == 0) continue;
+
+            const trail_len = min_trail + @as(usize, @intCast((stream >> 24) % (max_trail - min_trail + 1)));
+            const stagger: i64 = @intCast((stream >> 40) % 9);
+            const lane_offset: i64 = @intCast(lane * 4);
+            const head = wave_front - stagger - lane_offset;
+
+            var trail: usize = 0;
+            while (trail < trail_len) : (trail += 1) {
+                const row = head - @as(i64, @intCast(trail));
+                if (row < 0 or row >= win.height) continue;
+                if (!matrixCellIsOpen(win, col, @intCast(row))) continue;
+
+                const visibility = matrixHash(stream +%
+                    @as(u64, @intCast(row)) *% 0x94d049bb133111eb +%
+                    @as(u64, trail) *% 0xbf58476d1ce4e5b9);
+                if (visibility & 0xff >= opacity) continue;
+
+                var cell = win.readCell(col, @intCast(row)) orelse continue;
+                const glyph_hash = matrixHash(stream +%
+                    @as(u64, app.ui_animation_frame / 2) *% 17 +%
+                    @as(u64, trail));
+                cell.char = .{ .grapheme = glyphs[glyph_hash % glyphs.len], .width = 1 };
+                cell.style.fg = if (trail == 0)
+                    matrixWaveColor(.{ 0xd8, 0xff, 0xdc }, opacity)
+                else if (trail < 4)
+                    matrixWaveColor(.{ 0x68, 0xf5, 0x82 }, opacity)
+                else
+                    matrixWaveColor(.{ 0x18, 0xa8, 0x45 }, opacity);
+                cell.style.bold = trail <= 1;
+                cell.style.dim = trail > trail_len / 2;
+                cell.link = .{};
+                cell.image = null;
+                cell.default = false;
+                win.writeCell(col, @intCast(row), cell);
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------ entry point --
@@ -6415,7 +6758,8 @@ fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     while (!app.animation_stop.load(.acquire)) {
         if (app.animation_active.load(.acquire)) {
             loop.postEvent(.tick) catch return;
-            app.io.sleep(.fromMilliseconds(90), .awake) catch {};
+            const delay_ms: i64 = if (app.ui_animation_active.load(.acquire)) 33 else 90;
+            app.io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
         } else {
             app.io.sleep(.fromMilliseconds(200), .awake) catch {};
         }
@@ -6625,6 +6969,7 @@ pub fn run(
             var ws = tty.getWinsize() catch vaxis.Winsize{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 };
             if (ws.rows == 0 or ws.cols == 0) ws = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 };
             app.term_cols = ws.cols;
+            app.term_rows = ws.rows;
             try vx.resize(gpa, tty.writer(), ws);
         }
 
@@ -6683,9 +7028,11 @@ pub fn run(
                 .tick => {
                     app.spinner_frame +%= 1;
                     app.voiceTick();
+                    app.tickUiAnimation();
                 },
                 .winsize => |ws| {
                     app.term_cols = ws.cols;
+                    app.term_rows = ws.rows;
                     try vx.resize(gpa, tty.writer(), ws);
                 },
                 .paste => |text| {
@@ -6712,9 +7059,11 @@ pub fn run(
                             .tick => {
                                 app.spinner_frame +%= 1;
                                 app.voiceTick();
+                                app.tickUiAnimation();
                             },
                             .winsize => |ws2| {
                                 app.term_cols = ws2.cols;
+                                app.term_rows = ws2.rows;
                                 try vx.resize(gpa, tty.writer(), ws2);
                             },
                             .paste => |t2| {
@@ -8042,6 +8391,15 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expect(suggestions[0].submit_on_enter);
 
     app.editor.clear();
+    app.editor.insertSlice("/animate m");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/animate matrix", suggestions[0].label);
+    try std.testing.expect(suggestions[0].submit_on_enter);
+
+    app.editor.clear();
     app.editor.insertSlice("!rb c");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -8049,6 +8407,269 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqual(@as(usize, 1), suggestions.len);
     try std.testing.expectEqualStrings("!rb client", suggestions[0].label);
     try std.testing.expect(suggestions[0].submit_on_enter);
+}
+
+test "/animate matrix starts and expires a client-only animation" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.runCommand("/animate matrix");
+    try std.testing.expectEqual(UiAnimation.matrix, app.ui_animation);
+    try std.testing.expect(app.ui_animation_active.load(.acquire));
+    try std.testing.expect(app.animation_active.load(.acquire));
+
+    const animation_frames = matrixAnimationFrames(app.term_rows);
+    try std.testing.expectEqual(animation_frames, app.ui_animation_frames);
+    for (0..animation_frames) |_| app.tickUiAnimation();
+    try std.testing.expectEqual(UiAnimation.none, app.ui_animation);
+    try std.testing.expect(!app.ui_animation_active.load(.acquire));
+    try std.testing.expect(!app.animation_active.load(.acquire));
+    try std.testing.expect(app.refresh_requested);
+
+    app.runCommand("/animate unknown");
+    try std.testing.expectEqualStrings("usage: /animate matrix", app.notice.items);
+}
+
+test "matrix rain is about half a viewport height long" {
+    for ([_]u16{ 12, 24, 60 }) |height| {
+        const trail = matrixTrailLength(height);
+        try std.testing.expect(trail >= @as(usize, height) / 2);
+        try std.testing.expect(trail <= @max(@as(usize, height) * 3 / 4, 8));
+        try std.testing.expect(matrixAnimationFrames(height) > trail);
+    }
+}
+
+test "matrix wave enters at the top, crosses the viewport, and fades out" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .ui_animation = .matrix,
+        .ui_animation_frames = matrixAnimationFrames(18),
+        .ui_animation_seed = 0x12345678,
+    };
+    defer app.deinit();
+
+    var screen = try vaxis.Screen.init(gpa, .{
+        .rows = 18,
+        .cols = 48,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 48,
+        .height = 18,
+        .screen = &screen,
+    };
+
+    const countRows = struct {
+        const Counts = struct { top: usize, bottom: usize };
+
+        fn run(window: vaxis.Window, split: u16) Counts {
+            var counts: Counts = .{ .top = 0, .bottom = 0 };
+            for (0..window.height) |row| for (0..window.width) |col| {
+                const cell = window.readCell(@intCast(col), @intCast(row)).?;
+                if (cell.default) continue;
+                if (row < split) counts.top += 1 else counts.bottom += 1;
+            };
+            return counts;
+        }
+    }.run;
+
+    app.ui_animation_frame = 6;
+    win.clear();
+    drawUiAnimation(&app, win);
+    const early = countRows(win, win.height / 2);
+    try std.testing.expect(early.top > 0);
+    try std.testing.expectEqual(@as(usize, 0), early.bottom);
+
+    app.ui_animation_frame = app.ui_animation_frames / 2;
+    win.clear();
+    drawUiAnimation(&app, win);
+    const middle = countRows(win, win.height / 2);
+    try std.testing.expect(middle.top > 0 and middle.bottom > 0);
+
+    app.ui_animation_frame = app.ui_animation_frames - 2;
+    win.clear();
+    drawUiAnimation(&app, win);
+    const late = countRows(win, win.height / 2);
+    try std.testing.expect(late.bottom > 0);
+    try std.testing.expect(late.top < late.bottom);
+    try std.testing.expect(late.top + late.bottom < middle.top + middle.bottom);
+
+    try std.testing.expectEqual(@as(u8, 0), matrixWaveOpacity(0, app.ui_animation_frames));
+    try std.testing.expectEqual(@as(u8, 0), matrixWaveOpacity(app.ui_animation_frames - 1, app.ui_animation_frames));
+}
+
+test "matrix animation paints default blank cells across the screen" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .ui_animation = .matrix,
+        .ui_animation_frame = matrixAnimationFrames(12) / 2,
+        .ui_animation_frames = matrixAnimationFrames(12),
+        .ui_animation_seed = 0x12345678,
+    };
+    defer app.deinit();
+
+    var screen = try vaxis.Screen.init(gpa, .{
+        .rows = 12,
+        .cols = 32,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 32,
+        .height = 12,
+        .screen = &screen,
+    };
+    win.clear();
+
+    drawUiAnimation(&app, win);
+
+    var matrix_cells: usize = 0;
+    var top_cells: usize = 0;
+    var bottom_cells: usize = 0;
+    var left_cells: usize = 0;
+    var right_cells: usize = 0;
+    for (0..win.height) |row| for (0..win.width) |col| {
+        const cell = win.readCell(@intCast(col), @intCast(row)).?;
+        if (!cell.default) {
+            matrix_cells += 1;
+            top_cells += @intFromBool(row < win.height / 2);
+            bottom_cells += @intFromBool(row >= win.height / 2);
+            left_cells += @intFromBool(col < win.width / 2);
+            right_cells += @intFromBool(col >= win.width / 2);
+            try std.testing.expect(!std.mem.eql(u8, cell.char.grapheme, " "));
+            try std.testing.expectEqual(@as(u16, 1), win.gwidth(cell.char.grapheme));
+        }
+    };
+    try std.testing.expect(matrix_cells > 0);
+    try std.testing.expect(top_cells > 0 and bottom_cells > 0);
+    try std.testing.expect(left_cells > 0 and right_cells > 0);
+}
+
+test "matrix animation interleaves around existing text at high density" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .ui_animation = .matrix,
+        .ui_animation_frame = matrixAnimationFrames(18) / 2,
+        .ui_animation_frames = matrixAnimationFrames(18),
+        .ui_animation_seed = 0x12345678,
+    };
+    defer app.deinit();
+
+    var screen = try vaxis.Screen.init(gpa, .{
+        .rows = 18,
+        .cols = 48,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 48,
+        .height = 18,
+        .screen = &screen,
+    };
+    const baseline_style: vaxis.Style = .{ .fg = .{ .index = 4 }, .bg = .{ .index = 5 } };
+    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = baseline_style });
+    for (0..win.height) |row| {
+        if (row % 3 != 1) continue;
+        var col: u16 = 4;
+        while (col < win.width - 4) : (col += 7)
+            win.writeCell(col, @intCast(row), .{ .char = .{ .grapheme = "x", .width = 1 }, .style = baseline_style });
+    }
+
+    drawUiAnimation(&app, win);
+
+    var matrix_cells: usize = 0;
+    var unicode_cells: usize = 0;
+    var text_cells: usize = 0;
+    var blank_cells: usize = 0;
+    for (0..win.height) |row| for (0..win.width) |col| {
+        const cell = win.readCell(@intCast(col), @intCast(row)).?;
+        if (std.mem.eql(u8, cell.char.grapheme, "x")) {
+            text_cells += 1;
+            try std.testing.expect(vaxis.Style.eql(cell.style, baseline_style));
+        } else if (std.mem.eql(u8, cell.char.grapheme, " ")) {
+            blank_cells += 1;
+        } else {
+            matrix_cells += 1;
+            unicode_cells += @intFromBool(cell.char.grapheme.len > 1);
+            try std.testing.expect(!cell.default);
+            try std.testing.expect(vaxis.Color.eql(cell.style.bg, baseline_style.bg));
+        }
+    };
+    try std.testing.expect(text_cells > 0);
+    try std.testing.expect(matrix_cells > blank_cells);
+    try std.testing.expect(unicode_cells > 0);
+}
+
+test "matrix animation does not paint wide-character continuation cells" {
+    const gpa = std.testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{
+        .rows = 2,
+        .cols = 4,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 4,
+        .height = 2,
+        .screen = &screen,
+    };
+    win.clear();
+    win.writeCell(1, 0, .{ .char = .{ .grapheme = "界", .width = 2 } });
+
+    try std.testing.expect(!matrixCellIsOpen(win, 1, 0));
+    try std.testing.expect(!matrixCellIsOpen(win, 2, 0));
+    try std.testing.expect(matrixCellIsOpen(win, 3, 0));
 }
 
 test "command menu Tab completes and Enter runs the selection" {
@@ -9400,6 +10021,15 @@ test "diagnostics render in scrollback with the full latest-turn waterfall" {
         .round = 0,
         .duration_ms = 1250,
         .ttft_ms = 340,
+        .pre_provider_ms = 90,
+        .context_load_ms = 12,
+        .store_wait_ms = 2,
+        .context_rows = 40,
+        .context_bytes = 8192,
+        .context_vm_steps = 500,
+        .setup_ms = 8,
+        .assemble_ms = 4,
+        .body_ms = 3,
         .bytes = 4096,
         .status = "ok",
         .provider = "openrouter",
@@ -9426,6 +10056,12 @@ test "diagnostics render in scrollback with the full latest-turn waterfall" {
         .provider_p95_ms = 2200,
         .ttft_p50_ms = 250,
         .ttft_p95_ms = 500,
+        .local_prep_p50_ms = 20,
+        .local_prep_p95_ms = 35,
+        .pre_provider_p50_ms = 40,
+        .pre_provider_p95_ms = 90,
+        .pre_provider_max_ms = 1200,
+        .pre_provider_slow_turns = 1,
         .last_turn_id = 9,
         .last_trace_id = "0123456789abcdef0123456789abcdef",
         .last_outcome = "error",
@@ -9443,6 +10079,8 @@ test "diagnostics render in scrollback with the full latest-turn waterfall" {
     try std.testing.expectEqual(block.BlockKind.system_note, app.blocks.items[0].kind);
     try std.testing.expectEqualStrings("diagnostics", app.blocks.items[0].label);
     try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "Provider #1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "Legacy pre-provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "500 steps") != null);
     try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "HTTP 401 authorization failed") != null);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);

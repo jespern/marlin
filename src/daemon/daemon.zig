@@ -1552,11 +1552,19 @@ pub const Daemon = struct {
                     return;
                 }
                 if (!client.subscribed(s.sid)) try client.subs.append(self.gpa, s.sid);
-                const state: proto.SessionState = if (self.sessions.get(s.sid)) |ses| blk: {
+                const session = self.sessions.get(s.sid);
+                const state: proto.SessionState = if (session) |ses| blk: {
                     if (ses.pending_approval_line) |line| self.sendLine(client, line);
                     break :blk ses.state;
                 } else .idle;
-                self.sendTo(client, .{ .status = .{ .sid = s.sid, .state = state } });
+                self.sendTo(client, .{ .status = .{
+                    .sid = s.sid,
+                    .state = state,
+                    .phase = if (session) |ses| if (state == .running)
+                        @enumFromInt(ses.phase.load(.acquire))
+                    else
+                        null else null,
+                } });
             },
             .unsub => |u| {
                 for (client.subs.items, 0..) |sid, i| {
@@ -2521,6 +2529,7 @@ pub const Daemon = struct {
         daemon: *Daemon,
         sid: u64,
         turn_id: u64 = 0,
+        started_at_ms: i64 = 0,
         cwd: []u8, // job-owned copies
         model: []u8,
         effort: proto.ReasoningEffort,
@@ -2579,6 +2588,7 @@ pub const Daemon = struct {
             .daemon = self,
             .sid = session.id,
             .turn_id = ids.next(self.io),
+            .started_at_ms = nowMs(self.io),
             .otel_active = self.otel_exporter != null,
             .otel_base = otel_base,
             .otel_traces = otel_traces,
@@ -2798,12 +2808,15 @@ pub const Daemon = struct {
         var tokens_out: u64 = 0;
         var interrupted = false;
 
+        // Thread dispatch is complete. Everything below prepares the first
+        // provider request: runtime resolution, history loading, and assembly.
+        TurnHooks.onPhase(job, .context);
         self.store.telemetryBeginTurn(
             job.sid,
             job.turn_id,
             job.model,
             job.kind,
-            nowMs(self.io),
+            job.started_at_ms,
         ) catch |err| std.log.warn("could not begin turn telemetry: {t}", .{err});
 
         const ep = registry.resolve(self.gpa, self.environ, self.cfg, job.model) catch |e| {
@@ -2873,6 +2886,7 @@ pub const Daemon = struct {
             .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .provider_name = c.provider_name, .backend = c.backend } else null,
             .prune_frontier = &job.session.prune_frontier,
             .context_used_out = &job.session.context_used,
+            .initial_setup_ms = @intCast(@max(0, nowMs(self.io) - job.started_at_ms)),
             .approval_mode = job.approval_mode,
             .approval_mode_live = &job.session.approval_mode_live,
             .gate = &job.session.gate,
@@ -3111,8 +3125,11 @@ pub const Daemon = struct {
 
         fn onPhase(ctx: ?*anyopaque, phase: proto.TurnPhase) void {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
-            job.session.phase_started_at_ms.store(nowMs(job.daemon.io), .release);
+            const self = job.daemon;
+            job.session.phase_started_at_ms.store(nowMs(self.io), .release);
             job.session.phase.store(@intFromEnum(phase), .release);
+            const line = encodeTurnPhaseStatus(self.gpa, job.sid, phase) catch return;
+            self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
         }
 
         fn onTask(ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut {
@@ -3339,7 +3356,16 @@ pub const Daemon = struct {
     /// Status with its reason attached: an error state must never reach a
     /// client without the text that explains it.
     fn broadcastStatusErr(self: *Daemon, sid: u64, state: proto.SessionState, err_text: ?[]const u8) void {
-        const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{ .sid = sid, .state = state, .err_text = err_text } }) catch return;
+        const phase: ?proto.TurnPhase = if (state == .running)
+            if (self.sessions.get(sid)) |session| @enumFromInt(session.phase.load(.acquire)) else null
+        else
+            null;
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{
+            .sid = sid,
+            .state = state,
+            .err_text = err_text,
+            .phase = phase,
+        } }) catch return;
         defer self.gpa.free(line);
         const ctx = FanCtx{ .self = self, .sid = sid, .line = line };
         self.forEachClient(ctx, struct {
@@ -4211,6 +4237,27 @@ test "only healthy root round checkpoints auto-continue" {
     try std.testing.expect(!shouldAutoContinueRoundBudget(.root, true, true, null, false));
     try std.testing.expect(!shouldAutoContinueRoundBudget(.root, true, false, "failed", false));
     try std.testing.expect(!shouldAutoContinueRoundBudget(.root, true, false, null, true));
+}
+
+fn encodeTurnPhaseStatus(gpa: std.mem.Allocator, sid: u64, phase: proto.TurnPhase) ![]u8 {
+    return proto.encode(gpa, proto.DaemonMsg{ .status = .{
+        .sid = sid,
+        .state = .running,
+        .phase = phase,
+    } });
+}
+
+test "turn phase status carries running phase metadata" {
+    const gpa = std.testing.allocator;
+    const line = try encodeTurnPhaseStatus(gpa, 42, .tool);
+    defer gpa.free(line);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const msg = try proto.decode(proto.DaemonMsg, arena_state.allocator(), line);
+    try std.testing.expectEqual(@as(u64, 42), msg.status.sid);
+    try std.testing.expectEqual(proto.SessionState.running, msg.status.state);
+    try std.testing.expectEqual(proto.TurnPhase.tool, msg.status.phase.?);
 }
 
 fn nowMs(io: Io) i64 {

@@ -388,7 +388,7 @@ Key decisions:
 sessions(id, title, created_at, cwd, model, effort, provider, status,
          pinned_context, config_json, parent_sid, kind, parent_block_id,
          max_rounds)
-blocks(id, session_id, turn_id, seq, kind, ts, body_json)
+blocks(id, session_id, turn_id, seq, kind, ts, body_json, covers_to_seq)
 blobs(hash, bytes, created_at, tombstone)  -- full tool outputs, content-addressed
 blob_refs(hash, block_id)                  -- refcounting for GC
 kv(key, value)                          -- daemon metadata, schema version
@@ -407,9 +407,18 @@ blob, durable block, and blob reference in one `BEGIN IMMEDIATE` transaction,
 so it is both one WAL commit and crash-atomic. The `(session_id, seq)` unique
 constraint supplies the block-range index; migrations remove the historical
 duplicate index rather than paying twice on every append.
-The append/status/usage statements are retained and reset under the same
-connection mutex, avoiding hot-path prepare/finalize churn without allowing
-two turn threads to interleave bindings on one statement.
+The append/status/usage, context-load, and telemetry-write statements are
+retained and reset under the same connection mutex, avoiding hot-path
+prepare/finalize churn without allowing two turn threads to interleave bindings
+on one statement. Context loading materializes its one-row compaction-frontier
+and latest-plan CTEs before the indexed block scan; the frontier is also stored
+as an ordinary column rather than extracted from JSON on every turn. Leaving
+the frontier as a co-routine caused SQLite to recompute it per candidate row
+and turned large compacted sessions into a roughly 50-second pre-provider
+stall. Dedicated indexes cover block kind, turn-specific reads, session
+hierarchy, recent authored input, and recent telemetry. Ctrl+R uses separate
+bounded current-session and global-newest scans rather than a database-wide
+expression sort.
 
 Local and test builds link the platform SQLite library to keep rebuilds fast.
 Official release builds pass `-Dembedded-sqlite=true` and compile the vendored
@@ -429,8 +438,12 @@ live edge without a subscription gap, positions the viewport, and highlights
 the matching block. Normal-mode `n`/`N` advances through the retained result
 set without re-running the query.
 
-Schema v8 persists per-session Plan mode. Schema v7 projects visible text into
-`search_docs` in the same transaction as the append-only block. User/assistant
+Schema v13 adds content-free local preparation telemetry, a materialized
+compaction frontier column, and the indexes that keep recent-input, hierarchy,
+turn-specific, context-metadata, and diagnostics reads bounded as durable
+history grows. Schema v8 persists per-session Plan mode. Schema v7 projects
+visible text into `search_docs` in the same transaction as the append-only
+block. User/assistant
 text, reasoning, steers, plans, bounded
 tool arguments/results, compaction summaries, and notes are searchable;
 synthetic rehydration, approvals, binary data, base64, and uncapped blob bodies
@@ -1078,9 +1091,15 @@ A split pane identifies its session with a compact pane label.
   logical text within/across blocks; double-click = word, triple = block.
   Copy → OSC 52 (works through ssh/mosh); shift+drag falls through to the
   terminal for native selection as escape hatch. The active turn's durable
-  layout is cached until blocks/state/width change,
-  while provisional assistant text wraps append-only and receives full
-  Markdown treatment when its block finalizes. Spinner/token frames therefore
+  layout is cached until blocks/state/width change. During a running turn the
+  daemon publishes its coarse operational phase (`starting`, `context`,
+  `provider`, `tool`, `child`, `compaction`, `finishing`) as ephemeral additive
+  status metadata;
+  the live activity row names that work and shows total plus current-phase
+  elapsed time. Provider byte/quiet telemetry and exact persisted tool calls
+  refine the phase without adding durable transcript chatter. Provisional
+  assistant text wraps append-only and receives full Markdown treatment when
+  its block finalizes. Spinner/token frames therefore
   do not re-layout the accumulated turn. Inactive full
   session views are an eight-entry MRU cache; evicted views reopen from a
   bounded durable tail instead of accumulating for the lifetime of the TUI.
@@ -1089,9 +1108,15 @@ A split pane identifies its session with a compact pane label.
   it). The `!c msg`/`!c code`/`!c all` variants and the `!y`/`!p` daemon-side
   register are future work.
 - **Command namespace**: `/` = session & harness commands (`/sessions`,
-  `/model`, `/compact`, `/new`, `/archive`, `/allow`); `!` = terse frequent
-  actions. `!rb` rebuilds the attached daemon side, `!rb client` rebuilds only
-  the local client, `!rb both` rebuilds both, and `!c` copies the last output.
+  `/model`, `/compact`, `/new`, `/archive`, `/animate`); `!` = terse frequent
+  actions. `/animate matrix` sends one dense, staggered wave of falling green
+  Unicode glyphs from the top through blank cells. Its rain band spans roughly
+  half a viewport, renders at 30 FPS, and fades after the tail passes while
+  preserving every existing UI glyph; the animation enum is the future
+  selection surface for randomized startup
+  effects. `!rb` rebuilds the attached
+  daemon side, `!rb client` rebuilds only the local client, `!rb both` rebuilds
+  both, and `!c` copies the last output.
   Plain text + `Enter` starts a turn when idle and queues steering
   while an agent turn is active. `Esc` enters Vim normal mode; `Ctrl+C`
   interrupts the active turn. Native-only harness verbs (`/compact`,

@@ -127,6 +127,17 @@ pub const DiagnosticRound = struct {
     round: u32,
     duration_ms: u64,
     ttft_ms: u64,
+    /// Turn start to first provider request. Populated for round zero only;
+    /// older telemetry can still reconstruct this coarse local gap.
+    pre_provider_ms: u64 = 0,
+    context_load_ms: u64 = 0,
+    store_wait_ms: u64 = 0,
+    context_rows: u64 = 0,
+    context_bytes: u64 = 0,
+    context_vm_steps: u64 = 0,
+    setup_ms: u64 = 0,
+    assemble_ms: u64 = 0,
+    body_ms: u64 = 0,
     bytes: u64,
     status: []const u8,
     provider: []const u8 = "",
@@ -160,6 +171,14 @@ pub const Diagnostics = struct {
     provider_p95_ms: u64,
     ttft_p50_ms: u64,
     ttft_p95_ms: u64,
+    /// Exact measured local preparation for telemetry written by schema v13+.
+    local_prep_p50_ms: u64 = 0,
+    local_prep_p95_ms: u64 = 0,
+    /// Coarse turn-start → first-provider gap, available for legacy rows too.
+    pre_provider_p50_ms: u64 = 0,
+    pre_provider_p95_ms: u64 = 0,
+    pre_provider_max_ms: u64 = 0,
+    pre_provider_slow_turns: u32 = 0,
     last_turn_id: u64 = 0,
     last_trace_id: []const u8 = "",
     last_outcome: []const u8 = "none",
@@ -414,7 +433,14 @@ pub const DaemonMsg = union(enum) {
     /// err_text carries the reason whenever state is .err — an error state
     /// must never reach a client without its explanation (older daemons omit
     /// it; older clients ignore it).
-    status: struct { sid: u64, state: SessionState, err_text: ?[]const u8 = null },
+    status: struct {
+        sid: u64,
+        state: SessionState,
+        err_text: ?[]const u8 = null,
+        /// Ephemeral operational detail for running turns. Optional so old
+        /// daemons decode as unknown phase and old clients ignore the field.
+        phase: ?TurnPhase = null,
+    },
     approval_request: struct {
         sid: u64,
         approval_id: []const u8,
@@ -932,6 +958,26 @@ test "older hello defaults network configuration state" {
     try std.testing.expect(!m.hello_ok.network_configured);
     try std.testing.expect(!m.hello_ok.network_filtering);
     try std.testing.expectEqual(@as(i64, 0), m.hello_ok.daemon_exe_mtime_ms);
+}
+
+test "status phase is additive and decode-compatible" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const old = try decode(DaemonMsg, arena,
+        \\{"status":{"sid":7,"state":"running"}}
+    );
+    try std.testing.expect(old.status.phase == null);
+
+    const line = try encode(std.testing.allocator, DaemonMsg{ .status = .{
+        .sid = 7,
+        .state = .running,
+        .phase = .provider,
+    } });
+    defer std.testing.allocator.free(line);
+    const carried = try decode(DaemonMsg, arena, line);
+    try std.testing.expectEqual(TurnPhase.provider, carried.status.phase.?);
 }
 
 test "status err_text is additive: absent from old daemons, carried when set" {

@@ -149,6 +149,16 @@ pub fn diagnostics(
         seconds(report.ttft_p50_ms),
         seconds(report.ttft_p95_ms),
     });
+    try print(io, "local  measured prep p50 {d:.2}s · p95 {d:.2}s\n", .{
+        seconds(report.local_prep_p50_ms),
+        seconds(report.local_prep_p95_ms),
+    });
+    try print(io, "legacy pre-provider  p50 {d:.2}s · p95 {d:.2}s · max {d:.2}s · {d} ≥1s\n", .{
+        seconds(report.pre_provider_p50_ms),
+        seconds(report.pre_provider_p95_ms),
+        seconds(report.pre_provider_max_ms),
+        report.pre_provider_slow_turns,
+    });
     try print(io, "tools  {d} calls\n", .{report.tool_calls});
     if (report.last_turn_id != 0) {
         try print(io, "last  {s} · {d:.2}s · trace {s}\n", .{
@@ -166,6 +176,19 @@ pub fn diagnostics(
                 round.bytes,
                 round.tokens_in,
                 round.tokens_out,
+            });
+            if (round.round == 0) try print(io, " · pre-provider {d:.2}s", .{seconds(round.pre_provider_ms)});
+            const local_ms = round.context_load_ms +| round.setup_ms +| round.assemble_ms +| round.body_ms;
+            if (local_ms > 0) try print(io, " · local {d:.2}s [setup {d:.2}s, db {d:.2}s ({d}ms wait, {d} rows/{d} bytes/{d} steps), assemble {d:.2}s, body {d:.2}s]", .{
+                seconds(local_ms),
+                seconds(round.setup_ms),
+                seconds(round.context_load_ms),
+                round.store_wait_ms,
+                round.context_rows,
+                round.context_bytes,
+                round.context_vm_steps,
+                seconds(round.assemble_ms),
+                seconds(round.body_ms),
             });
             if (round.provider.len > 0) try print(io, " · {s}", .{round.provider});
             if (round.generation_id.len > 0) try print(io, " · {s}", .{round.generation_id});

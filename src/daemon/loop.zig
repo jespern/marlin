@@ -116,6 +116,8 @@ pub const RunOpts = struct {
     /// Written with the estimated assembled context tokens each round
     /// (status-bar accounting; provider-reported usage resyncs it per turn).
     context_used_out: ?*std.atomic.Value(u64) = null,
+    /// Dispatcher/daemon preparation before entering runTurn.
+    initial_setup_ms: u64 = 0,
     /// Session approval mode (default: mutating tools ask). Snapshot used
     /// when no live pointer is wired (tests, compaction).
     approval_mode: approval.Mode = .auto,
@@ -613,13 +615,14 @@ pub fn runTurn(
     defer history_arena_state.deinit();
     const history_arena = history_arena_state.allocator();
     var history: std.ArrayList(block.Block) = .empty;
-    try store.loadContextBlocksInto(history_arena, &history, opts.session_id, 1_000_000);
+    const context_load = try store.loadContextBlocksIntoMeasured(io, history_arena, &history, opts.session_id, 1_000_000);
+    const after_context_load_ms = nowAwakeMs(io);
 
     var ap = Appender{
         .store = store,
         .io = io,
         .opts = &opts,
-        .seq = try store.lastSeq(opts.session_id),
+        .seq = context_load.last_seq,
         .turn_id = resolvedTurnId(opts, io),
         .history = &history,
         .history_arena = history_arena,
@@ -646,9 +649,11 @@ pub fn runTurn(
     var total_out: u64 = 0;
     var round: u32 = 0;
     var web_search_available = nativeDialect(opts.endpoint) == .openrouter;
+    const setup_after_load_ms = @max(0, nowAwakeMs(io) - after_context_load_ms);
 
     while (round < opts.max_rounds) : (round += 1) {
         publishPhase(opts, .context);
+        const assemble_started_ms = nowAwakeMs(io);
         // -- cancellation checkpoint --
         if (cancelled(opts.cancel)) {
             _ = try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });
@@ -721,6 +726,7 @@ pub fn runTurn(
         // Publish the (possibly reduced) estimate for status displays.
         est_used = context.estimateAssembled(msgs);
         if (opts.context_used_out) |cu| cu.store(est_used, .release);
+        const assemble_ms: u64 = @intCast(@max(0, nowAwakeMs(io) - assemble_started_ms));
 
         const extension_specs = if (opts.extensions) |ext| ext.specs() else &.{};
         var tool_count: usize = 0;
@@ -751,6 +757,7 @@ pub fn runTurn(
             request_opts.trace_id = &trace_id;
             request_opts.parent_span_id = &provider_span;
         }
+        const body_started_ms = nowAwakeMs(io);
         const body = try buildProviderBody(
             arena,
             opts.endpoint,
@@ -760,6 +767,7 @@ pub fn runTurn(
             request_opts,
             opts.cfg.output_headroom_tokens,
         );
+        const body_ms: u64 = @intCast(@max(0, nowAwakeMs(io) - body_started_ms));
 
         // -- stream the response --
         var acc = openai.StreamAccum.init(gpa);
@@ -788,6 +796,14 @@ pub fn runTurn(
             .endpoint_url = opts.endpoint.url,
             .reasoning_level = if (nativeDialect(opts.endpoint) == .anthropic) "" else opts.effort.providerValue() orelse "",
             .max_tokens = if (nativeDialect(opts.endpoint) == .anthropic) @max(1024, opts.cfg.output_headroom_tokens) else 0,
+            .context_load_ms = if (round == 0) context_load.total_ms else 0,
+            .store_wait_ms = if (round == 0) context_load.wait_ms else 0,
+            .context_rows = if (round == 0) context_load.rows else 0,
+            .context_bytes = if (round == 0) context_load.body_bytes else 0,
+            .context_vm_steps = if (round == 0) context_load.vm_steps else 0,
+            .setup_ms = if (round == 0) opts.initial_setup_ms +| setup_after_load_ms else 0,
+            .assemble_ms = assemble_ms,
+            .body_ms = body_ms,
             .pump = &pump,
             .acc = &acc,
         };
@@ -2882,6 +2898,11 @@ fn nowMs(io: Io) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
 }
 
+fn nowAwakeMs(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
 fn resolvedTurnId(opts: RunOpts, io: Io) u64 {
     return if (opts.turn_id != 0) opts.turn_id else ids.next(io);
 }
@@ -3014,6 +3035,14 @@ const RoundObservation = struct {
     endpoint_url: []const u8,
     reasoning_level: []const u8,
     max_tokens: u64,
+    context_load_ms: u64 = 0,
+    store_wait_ms: u64 = 0,
+    context_rows: u64 = 0,
+    context_bytes: u64 = 0,
+    context_vm_steps: u64 = 0,
+    setup_ms: u64 = 0,
+    assemble_ms: u64 = 0,
+    body_ms: u64 = 0,
     pump: *const Pump,
     acc: *const openai.StreamAccum,
     status: []const u8 = "transport_error",
@@ -3060,6 +3089,14 @@ const RoundObservation = struct {
             .cached_tokens = if (self.acc.usage) |usage| usage.cached_tokens else 0,
             .cache_write_tokens = if (self.acc.usage) |usage| usage.cache_write_tokens else 0,
             .reasoning_tokens = if (self.acc.usage) |usage| usage.reasoning_tokens else 0,
+            .context_load_ms = self.context_load_ms,
+            .store_wait_ms = self.store_wait_ms,
+            .context_rows = self.context_rows,
+            .context_bytes = self.context_bytes,
+            .context_vm_steps = self.context_vm_steps,
+            .setup_ms = self.setup_ms,
+            .assemble_ms = self.assemble_ms,
+            .body_ms = self.body_ms,
         }) catch |err| std.log.warn("could not persist provider telemetry: {t}", .{err});
     }
 };

@@ -67,6 +67,7 @@ const schema_sql =
     \\  kind TEXT NOT NULL,
     \\  ts INTEGER NOT NULL,
     \\  body_json TEXT NOT NULL,
+    \\  covers_to_seq INTEGER,
     \\  UNIQUE(session_id, seq)
     \\);
     \\CREATE TABLE IF NOT EXISTS blobs(
@@ -89,6 +90,11 @@ const schema_sql =
     \\  text TEXT NOT NULL
     \\);
     \\CREATE INDEX IF NOT EXISTS search_docs_by_session ON search_docs(session_id, seq);
+    \\CREATE INDEX IF NOT EXISTS search_docs_recent_inputs_session ON search_docs(session_id, ts DESC, block_id DESC) WHERE kind IN ('user_msg','steer');
+    \\CREATE INDEX IF NOT EXISTS search_docs_recent_inputs_global ON search_docs(ts DESC, block_id DESC) WHERE kind IN ('user_msg','steer');
+    \\CREATE INDEX IF NOT EXISTS blocks_by_kind ON blocks(session_id, kind, seq);
+    \\CREATE INDEX IF NOT EXISTS blocks_by_turn ON blocks(session_id, turn_id, seq);
+    \\CREATE INDEX IF NOT EXISTS sessions_by_parent ON sessions(parent_sid);
     \\CREATE TABLE IF NOT EXISTS telemetry_turns(
     \\  session_id INTEGER NOT NULL REFERENCES sessions(id),
     \\  turn_id INTEGER NOT NULL,
@@ -109,6 +115,7 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id)
     \\) WITHOUT ROWID;
     \\CREATE INDEX IF NOT EXISTS telemetry_turns_export ON telemetry_turns(exported_at_ms, export_after_ms, ended_at_ms);
+    \\CREATE INDEX IF NOT EXISTS telemetry_turns_by_session_started ON telemetry_turns(session_id, started_at_ms DESC);
     \\CREATE TABLE IF NOT EXISTS telemetry_rounds(
     \\  session_id INTEGER NOT NULL,
     \\  turn_id INTEGER NOT NULL,
@@ -137,6 +144,14 @@ const schema_sql =
     \\  cached_tokens INTEGER NOT NULL DEFAULT 0,
     \\  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     \\  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    \\  context_load_ms INTEGER NOT NULL DEFAULT 0,
+    \\  store_wait_ms INTEGER NOT NULL DEFAULT 0,
+    \\  context_rows INTEGER NOT NULL DEFAULT 0,
+    \\  context_bytes INTEGER NOT NULL DEFAULT 0,
+    \\  context_vm_steps INTEGER NOT NULL DEFAULT 0,
+    \\  setup_ms INTEGER NOT NULL DEFAULT 0,
+    \\  assemble_ms INTEGER NOT NULL DEFAULT 0,
+    \\  body_ms INTEGER NOT NULL DEFAULT 0,
     \\  PRIMARY KEY(session_id, turn_id, round_index),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
@@ -154,7 +169,7 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','12');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','13');
 ;
 
 pub const SessionRow = struct {
@@ -206,6 +221,23 @@ pub const TelemetryRound = struct {
     cached_tokens: u64,
     cache_write_tokens: u64,
     reasoning_tokens: u64,
+    context_load_ms: u64 = 0,
+    store_wait_ms: u64 = 0,
+    context_rows: u64 = 0,
+    context_bytes: u64 = 0,
+    context_vm_steps: u64 = 0,
+    setup_ms: u64 = 0,
+    assemble_ms: u64 = 0,
+    body_ms: u64 = 0,
+};
+
+pub const ContextLoadStats = struct {
+    wait_ms: u64,
+    total_ms: u64,
+    rows: u64,
+    body_bytes: u64,
+    vm_steps: u64,
+    last_seq: u64,
 };
 
 pub const TelemetryTool = struct {
@@ -398,6 +430,34 @@ pub const Store = struct {
         } else if (ver < 9) {
             // schema_sql created the telemetry tables at their current shape.
             try self.execAll("UPDATE kv SET value='12' WHERE key='schema_version';");
+        }
+        if (ver < 13) {
+            try self.execAll(
+                \\ALTER TABLE blocks ADD COLUMN covers_to_seq INTEGER;
+                \\UPDATE blocks SET covers_to_seq=CAST(json_extract(body_json, '$.compaction.covers_to_seq') AS INTEGER)
+                \\ WHERE kind='compaction';
+            );
+            // v1-v8 databases did not have telemetry tables before schema_sql
+            // created them at the current shape during this open.
+            if (ver >= 9) try self.execAll(
+                \\ALTER TABLE telemetry_rounds ADD COLUMN context_load_ms INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE telemetry_rounds ADD COLUMN store_wait_ms INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE telemetry_rounds ADD COLUMN context_rows INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE telemetry_rounds ADD COLUMN context_bytes INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE telemetry_rounds ADD COLUMN context_vm_steps INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE telemetry_rounds ADD COLUMN setup_ms INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE telemetry_rounds ADD COLUMN assemble_ms INTEGER NOT NULL DEFAULT 0;
+                \\ALTER TABLE telemetry_rounds ADD COLUMN body_ms INTEGER NOT NULL DEFAULT 0;
+            );
+            try self.execAll(
+                \\CREATE INDEX IF NOT EXISTS blocks_by_kind ON blocks(session_id, kind, seq);
+                \\CREATE INDEX IF NOT EXISTS blocks_by_turn ON blocks(session_id, turn_id, seq);
+                \\CREATE INDEX IF NOT EXISTS sessions_by_parent ON sessions(parent_sid);
+                \\CREATE INDEX IF NOT EXISTS telemetry_turns_by_session_started ON telemetry_turns(session_id, started_at_ms DESC);
+                \\CREATE INDEX IF NOT EXISTS search_docs_recent_inputs_session ON search_docs(session_id, ts DESC, block_id DESC) WHERE kind IN ('user_msg','steer');
+                \\CREATE INDEX IF NOT EXISTS search_docs_recent_inputs_global ON search_docs(ts DESC, block_id DESC) WHERE kind IN ('user_msg','steer');
+                \\UPDATE kv SET value='13' WHERE key='schema_version';
+            );
         }
     }
 
@@ -623,10 +683,14 @@ pub const Store = struct {
         session_kind: proto.SessionKind,
         started_at_ms: i64,
     ) Error!void {
-        const stmt = try self.prepare(
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(
+            &self.statements.telemetry_begin_turn,
             "INSERT OR IGNORE INTO telemetry_turns(session_id,turn_id,model,session_kind,started_at_ms) VALUES(?,?,?,?,?)",
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
         bindInt(stmt, 2, @bitCast(turn_id));
         bindText(stmt, 3, model);
@@ -645,7 +709,10 @@ pub const Store = struct {
         tokens_in: u64,
         tokens_out: u64,
     ) Error!void {
-        const stmt = try self.prepare(
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(&self.statements.telemetry_finish_turn,
             \\UPDATE telemetry_turns SET ended_at_ms=?, outcome=?, error_text=?,
             \\ rounds=(SELECT count(*) FROM telemetry_rounds WHERE session_id=? AND turn_id=?),
             \\ tokens_in=CASE WHEN EXISTS(SELECT 1 FROM telemetry_rounds WHERE session_id=? AND turn_id=?)
@@ -655,7 +722,7 @@ pub const Store = struct {
             \\ tool_calls=(SELECT count(*) FROM telemetry_tools WHERE session_id=? AND turn_id=?)
             \\ WHERE session_id=? AND turn_id=?
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, ended_at_ms);
         bindText(stmt, 2, outcome);
         bindText(stmt, 3, error_text);
@@ -684,15 +751,19 @@ pub const Store = struct {
         turn_id: u64,
         row: TelemetryRound,
     ) Error!void {
-        const stmt = try self.prepare(
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(&self.statements.telemetry_record_round,
             \\INSERT OR REPLACE INTO telemetry_rounds(
             \\ session_id,turn_id,round_index,span_id,started_at_ms,first_byte_at_ms,
             \\ first_visible_at_ms,ended_at_ms,status,http_status,response_bytes,provider,
             \\ provider_name,request_model,response_model,server_address,server_port,finish_reason,
-            \\ reasoning_level,max_tokens,generation_id,usage_available,tokens_in,tokens_out,cached_tokens,cache_write_tokens,reasoning_tokens
-            \\) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\ reasoning_level,max_tokens,generation_id,usage_available,tokens_in,tokens_out,cached_tokens,cache_write_tokens,reasoning_tokens,
+            \\ context_load_ms,store_wait_ms,context_rows,context_bytes,context_vm_steps,setup_ms,assemble_ms,body_ms
+            \\) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
         bindInt(stmt, 2, @bitCast(turn_id));
         bindInt(stmt, 3, row.round);
@@ -720,6 +791,14 @@ pub const Store = struct {
         bindInt(stmt, 25, @intCast(row.cached_tokens));
         bindInt(stmt, 26, @intCast(row.cache_write_tokens));
         bindInt(stmt, 27, @intCast(row.reasoning_tokens));
+        bindInt(stmt, 28, @intCast(row.context_load_ms));
+        bindInt(stmt, 29, @intCast(row.store_wait_ms));
+        bindInt(stmt, 30, @intCast(row.context_rows));
+        bindInt(stmt, 31, @intCast(row.context_bytes));
+        bindInt(stmt, 32, @intCast(row.context_vm_steps));
+        bindInt(stmt, 33, @intCast(row.setup_ms));
+        bindInt(stmt, 34, @intCast(row.assemble_ms));
+        bindInt(stmt, 35, @intCast(row.body_ms));
         try stepDone(stmt);
     }
 
@@ -729,12 +808,15 @@ pub const Store = struct {
         turn_id: u64,
         row: TelemetryTool,
     ) Error!void {
-        const stmt = try self.prepare(
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(&self.statements.telemetry_record_tool,
             \\INSERT OR REPLACE INTO telemetry_tools(
             \\ session_id,turn_id,round_index,call_id,span_id,name,description,started_at_ms,ended_at_ms,status
             \\) VALUES(?,?,?,?,?,?,?,?,?,?)
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
         bindInt(stmt, 2, @bitCast(turn_id));
         bindInt(stmt, 3, row.round);
@@ -800,11 +882,16 @@ pub const Store = struct {
         defer provider_durations.deinit(allocator);
         var ttft_durations: std.ArrayList(u64) = .empty;
         defer ttft_durations.deinit(allocator);
+        var local_prep_durations: std.ArrayList(u64) = .empty;
+        defer local_prep_durations.deinit(allocator);
+        var pre_provider_durations: std.ArrayList(u64) = .empty;
+        defer pre_provider_durations.deinit(allocator);
         const timings = try self.prepare(
-            \\SELECT r.started_at_ms,r.ended_at_ms,r.first_visible_at_ms,r.first_byte_at_ms
+            \\SELECT r.started_at_ms,r.ended_at_ms,r.first_visible_at_ms,r.first_byte_at_ms,
+            \\ t.started_at_ms,r.round_index,r.context_load_ms,r.setup_ms,r.assemble_ms,r.body_ms
             \\FROM telemetry_rounds r JOIN (
-            \\ SELECT turn_id FROM telemetry_turns WHERE session_id=? ORDER BY started_at_ms DESC LIMIT ?
-            \\) recent ON recent.turn_id=r.turn_id
+            \\ SELECT turn_id,started_at_ms FROM telemetry_turns WHERE session_id=? ORDER BY started_at_ms DESC LIMIT ?
+            \\) t ON t.turn_id=r.turn_id
             \\WHERE r.session_id=? ORDER BY r.started_at_ms
         );
         defer finalize(timings);
@@ -820,6 +907,15 @@ pub const Store = struct {
                 try provider_durations.append(allocator, @intCast(@max(0, ended - started)));
                 const first = if (first_visible > 0) first_visible else first_byte;
                 if (first > 0) try ttft_durations.append(allocator, @intCast(@max(0, first - started)));
+                if (c.sqlite3_column_int64(timings, 5) == 0) {
+                    const turn_started = c.sqlite3_column_int64(timings, 4);
+                    try pre_provider_durations.append(allocator, @intCast(@max(0, started - turn_started)));
+                }
+                const local_prep = c.sqlite3_column_int64(timings, 6) +
+                    c.sqlite3_column_int64(timings, 7) +
+                    c.sqlite3_column_int64(timings, 8) +
+                    c.sqlite3_column_int64(timings, 9);
+                if (local_prep > 0) try local_prep_durations.append(allocator, @intCast(local_prep));
             },
             c.SQLITE_DONE => break,
             else => return error.SqliteStep,
@@ -827,10 +923,20 @@ pub const Store = struct {
         result.provider_requests = @intCast(provider_durations.items.len);
         sortDurations(&provider_durations);
         sortDurations(&ttft_durations);
+        sortDurations(&local_prep_durations);
+        sortDurations(&pre_provider_durations);
         result.provider_p50_ms = percentile(provider_durations.items, 50);
         result.provider_p95_ms = percentile(provider_durations.items, 95);
         result.ttft_p50_ms = percentile(ttft_durations.items, 50);
         result.ttft_p95_ms = percentile(ttft_durations.items, 95);
+        result.local_prep_p50_ms = percentile(local_prep_durations.items, 50);
+        result.local_prep_p95_ms = percentile(local_prep_durations.items, 95);
+        result.pre_provider_p50_ms = percentile(pre_provider_durations.items, 50);
+        result.pre_provider_p95_ms = percentile(pre_provider_durations.items, 95);
+        result.pre_provider_max_ms = if (pre_provider_durations.items.len > 0) pre_provider_durations.items[pre_provider_durations.items.len - 1] else 0;
+        for (pre_provider_durations.items) |duration| if (duration >= 1000) {
+            result.pre_provider_slow_turns += 1;
+        };
 
         const latest = try self.prepare(
             \\SELECT turn_id,started_at_ms,COALESCE(ended_at_ms,?),outcome,error_text
@@ -871,9 +977,12 @@ pub const Store = struct {
     fn diagnosticRounds(self: Store, allocator: std.mem.Allocator, session_id: u64, turn_id: u64) Error![]const proto.DiagnosticRound {
         var rows: std.ArrayList(proto.DiagnosticRound) = .empty;
         const stmt = try self.prepare(
-            \\SELECT round_index,started_at_ms,ended_at_ms,first_visible_at_ms,first_byte_at_ms,
-            \\ response_bytes,status,provider,generation_id,tokens_in,tokens_out,cached_tokens,reasoning_tokens
-            \\FROM telemetry_rounds WHERE session_id=? AND turn_id=? ORDER BY round_index
+            \\SELECT r.round_index,r.started_at_ms,r.ended_at_ms,r.first_visible_at_ms,r.first_byte_at_ms,
+            \\ r.response_bytes,r.status,r.provider,r.generation_id,r.tokens_in,r.tokens_out,r.cached_tokens,r.reasoning_tokens,
+            \\ r.context_load_ms,r.store_wait_ms,r.context_rows,r.context_bytes,r.context_vm_steps,r.setup_ms,r.assemble_ms,r.body_ms,
+            \\ t.started_at_ms
+            \\FROM telemetry_rounds r JOIN telemetry_turns t ON t.session_id=r.session_id AND t.turn_id=r.turn_id
+            \\WHERE r.session_id=? AND r.turn_id=? ORDER BY r.round_index
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
@@ -889,6 +998,18 @@ pub const Store = struct {
                     .round = @intCast(c.sqlite3_column_int64(stmt, 0)),
                     .duration_ms = @intCast(@max(0, ended - started)),
                     .ttft_ms = if (first > 0) @intCast(@max(0, first - started)) else 0,
+                    .pre_provider_ms = if (c.sqlite3_column_int64(stmt, 0) == 0)
+                        @intCast(@max(0, started - c.sqlite3_column_int64(stmt, 21)))
+                    else
+                        0,
+                    .context_load_ms = @intCast(c.sqlite3_column_int64(stmt, 13)),
+                    .store_wait_ms = @intCast(c.sqlite3_column_int64(stmt, 14)),
+                    .context_rows = @intCast(c.sqlite3_column_int64(stmt, 15)),
+                    .context_bytes = @intCast(c.sqlite3_column_int64(stmt, 16)),
+                    .context_vm_steps = @intCast(c.sqlite3_column_int64(stmt, 17)),
+                    .setup_ms = @intCast(c.sqlite3_column_int64(stmt, 18)),
+                    .assemble_ms = @intCast(c.sqlite3_column_int64(stmt, 19)),
+                    .body_ms = @intCast(c.sqlite3_column_int64(stmt, 20)),
                     .bytes = @intCast(c.sqlite3_column_int64(stmt, 5)),
                     .status = try dupeColumn(allocator, stmt, 6),
                     .provider = try dupeColumn(allocator, stmt, 7),
@@ -1355,7 +1476,7 @@ pub const Store = struct {
         defer if (!committed) self.execAll("ROLLBACK;") catch {};
         const stmt = try self.cachedStatement(
             &self.statements.append_block,
-            "INSERT INTO blocks(id, session_id, turn_id, seq, kind, ts, body_json) VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO blocks(id, session_id, turn_id, seq, kind, ts, body_json, covers_to_seq) VALUES(?,?,?,?,?,?,?,?)",
         );
         defer resetStatement(stmt);
         bindInt(stmt, 1, @bitCast(blk.id));
@@ -1365,6 +1486,7 @@ pub const Store = struct {
         bindText(stmt, 5, @tagName(blk.kind()));
         bindInt(stmt, 6, blk.ts);
         bindText(stmt, 7, body_json);
+        bindOptionalInt(stmt, 8, compactionCoversToSeq(blk.body));
         try stepDone(stmt);
         try self.insertSearchDocLocked(blk, search_text);
         try self.execAll("COMMIT;");
@@ -1427,7 +1549,7 @@ pub const Store = struct {
         {
             const stmt = try self.cachedStatement(
                 &self.statements.append_block,
-                "INSERT INTO blocks(id, session_id, turn_id, seq, kind, ts, body_json) VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO blocks(id, session_id, turn_id, seq, kind, ts, body_json, covers_to_seq) VALUES(?,?,?,?,?,?,?,?)",
             );
             defer resetStatement(stmt);
             bindInt(stmt, 1, @bitCast(blk.id));
@@ -1437,6 +1559,7 @@ pub const Store = struct {
             bindText(stmt, 5, @tagName(blk.kind()));
             bindInt(stmt, 6, blk.ts);
             bindText(stmt, 7, body_json);
+            bindOptionalInt(stmt, 8, compactionCoversToSeq(blk.body));
             try stepDone(stmt);
         }
         try self.insertSearchDocLocked(blk, search_text);
@@ -1560,10 +1683,14 @@ pub const Store = struct {
         session_id: u64,
         turn_id: u64,
     ) Error!void {
-        const stmt = try self.prepare(
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(
+            &self.statements.load_turn_blocks,
             "SELECT id, seq, ts, body_json FROM blocks WHERE session_id=? AND turn_id=? ORDER BY seq ASC",
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
         bindInt(stmt, 2, @bitCast(turn_id));
 
@@ -1647,11 +1774,27 @@ pub const Store = struct {
         session_id: u64,
         limit: u32,
     ) Error!void {
-        const stmt = try self.prepare(
-            \\WITH frontier(value) AS (
-            \\  SELECT COALESCE(MAX(CAST(json_extract(body_json, '$.compaction.covers_to_seq') AS INTEGER)), 0)
+        _ = try self.loadContextBlocksIntoMeasured(null, arena, out, session_id, limit);
+    }
+
+    pub fn loadContextBlocksIntoMeasured(
+        self: Store,
+        io: ?std.Io,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(block.Block),
+        session_id: u64,
+        limit: u32,
+    ) Error!ContextLoadStats {
+        const begin_ns = if (io) |clock_io| std.Io.Timestamp.now(clock_io, .awake).nanoseconds else 0;
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const locked_ns = if (io) |clock_io| std.Io.Timestamp.now(clock_io, .awake).nanoseconds else begin_ns;
+        const stmt = try self.cachedStatement(&self.statements.load_context,
+            \\WITH frontier(value) AS MATERIALIZED (
+            \\  SELECT COALESCE(MAX(covers_to_seq), 0)
             \\  FROM blocks WHERE session_id=? AND kind='compaction'
-            \\), latest_plan(value) AS (
+            \\), latest_plan(value) AS MATERIALIZED (
             \\  SELECT COALESCE(MAX(seq), 0) FROM blocks WHERE session_id=? AND kind='plan'
             \\)
             \\SELECT id, turn_id, seq, ts, body_json
@@ -1659,12 +1802,15 @@ pub const Store = struct {
             \\WHERE session_id=? AND (kind='compaction' OR seq>frontier.value OR seq=latest_plan.value)
             \\ORDER BY seq ASC LIMIT ?
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
         bindInt(stmt, 2, @bitCast(session_id));
         bindInt(stmt, 3, @bitCast(session_id));
         bindInt(stmt, 4, @intCast(limit));
 
+        var rows: u64 = 0;
+        var body_bytes: u64 = 0;
+        var last_seq: u64 = 0;
         while (true) {
             const rc = c.sqlite3_step(stmt);
             if (rc == c.SQLITE_DONE) break;
@@ -1675,15 +1821,27 @@ pub const Store = struct {
             const body = std.json.parseFromSliceLeaky(block.Body, arena, body_json, .{
                 .ignore_unknown_fields = true,
             }) catch return error.SqliteStep;
+            last_seq = @bitCast(c.sqlite3_column_int64(stmt, 2));
             try out.append(arena, .{
                 .id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
                 .session_id = session_id,
                 .turn_id = @bitCast(c.sqlite3_column_int64(stmt, 1)),
-                .seq = @bitCast(c.sqlite3_column_int64(stmt, 2)),
+                .seq = last_seq,
                 .ts = c.sqlite3_column_int64(stmt, 3),
                 .body = body,
             });
+            rows += 1;
+            body_bytes +|= body_len;
         }
+        const end_ns = if (io) |clock_io| std.Io.Timestamp.now(clock_io, .awake).nanoseconds else locked_ns;
+        return .{
+            .wait_ms = nsToMs(locked_ns - begin_ns),
+            .total_ms = nsToMs(end_ns - begin_ns),
+            .rows = rows,
+            .body_bytes = body_bytes,
+            .vm_steps = @intCast(c.sqlite3_stmt_status(stmt, c.SQLITE_STMTSTATUS_VM_STEP, 1)),
+            .last_seq = last_seq,
+        };
     }
 
     pub const LatestPlan = struct {
@@ -1733,10 +1891,14 @@ pub const Store = struct {
     /// Durable active-time boundaries for one turn. Plan timers use these to
     /// exclude the wall-clock gap while a session waits for the next prompt.
     pub fn turnTimeBounds(self: Store, session_id: u64, turn_id: u64) Error!?TurnTimeBounds {
-        const stmt = try self.prepare(
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(
+            &self.statements.turn_time_bounds,
             "SELECT MIN(ts), MAX(ts) FROM blocks WHERE session_id=? AND turn_id=?",
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
         bindInt(stmt, 2, @bitCast(turn_id));
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SqliteStep;
@@ -1836,13 +1998,27 @@ pub const Store = struct {
         limit: u32,
     ) Error![]const proto.InputHistoryEntry {
         const stmt = try self.prepare(
-            \\SELECT session_id, seq, ts, text FROM search_docs
-            \\WHERE kind IN ('user_msg','steer')
-            \\ORDER BY (session_id=?) DESC, ts DESC, block_id DESC LIMIT ?
+            \\SELECT session_id, seq, ts, text FROM (
+            \\  SELECT session_id, seq, ts, text, block_id, 0 AS bucket FROM (
+            \\    SELECT session_id, seq, ts, text, block_id FROM search_docs
+            \\    WHERE session_id=? AND kind IN ('user_msg','steer')
+            \\    ORDER BY ts DESC, block_id DESC LIMIT ?
+            \\  )
+            \\  UNION ALL
+            \\  SELECT session_id, seq, ts, text, block_id, 1 AS bucket FROM (
+            \\    SELECT session_id, seq, ts, text, block_id FROM search_docs
+            \\    WHERE session_id<>? AND kind IN ('user_msg','steer')
+            \\    ORDER BY ts DESC, block_id DESC LIMIT ?
+            \\  )
+            \\) ORDER BY bucket, ts DESC, block_id DESC LIMIT ?
         );
         defer finalize(stmt);
+        const capped_limit = @min(limit, 1024);
         bindInt(stmt, 1, @bitCast(current_session_id));
-        bindInt(stmt, 2, @intCast(@min(limit, 1024)));
+        bindInt(stmt, 2, @intCast(capped_limit));
+        bindInt(stmt, 3, @bitCast(current_session_id));
+        bindInt(stmt, 4, @intCast(capped_limit));
+        bindInt(stmt, 5, @intCast(capped_limit));
         var entries: std.ArrayList(proto.InputHistoryEntry) = .empty;
         while (true) {
             const rc = c.sqlite3_step(stmt);
@@ -1987,10 +2163,14 @@ pub const Store = struct {
 
     /// Highest seq in a session (0 when empty).
     pub fn lastSeq(self: Store, session_id: u64) Error!u64 {
-        const stmt = try self.prepare(
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        const stmt = try self.cachedStatement(
+            &self.statements.last_seq,
             "SELECT COALESCE(MAX(seq),0) FROM blocks WHERE session_id=?",
         );
-        defer finalize(stmt);
+        defer resetStatement(stmt);
         bindInt(stmt, 1, @bitCast(session_id));
         const rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_ROW) return error.SqliteStep;
@@ -2162,6 +2342,13 @@ fn ftsQueryAlloc(allocator: std.mem.Allocator, query: []const u8) !?[]const u8 {
     return if (out.items.len > 0) out.items else null;
 }
 
+fn compactionCoversToSeq(body: block.Body) ?u64 {
+    return switch (body) {
+        .compaction => |value| value.covers_to_seq,
+        else => null,
+    };
+}
+
 fn appendSearchPart(out: *std.ArrayList(u8), allocator: std.mem.Allocator, part: []const u8) !void {
     if (part.len == 0 or out.items.len >= max_search_text_bytes) return;
     if (out.items.len > 0) try out.append(allocator, '\n');
@@ -2204,6 +2391,14 @@ const StatementCache = struct {
     append_search_fts: ?*c.sqlite3_stmt = null,
     set_session_status: ?*c.sqlite3_stmt = null,
     update_session_usage: ?*c.sqlite3_stmt = null,
+    load_context: ?*c.sqlite3_stmt = null,
+    telemetry_begin_turn: ?*c.sqlite3_stmt = null,
+    telemetry_finish_turn: ?*c.sqlite3_stmt = null,
+    telemetry_record_round: ?*c.sqlite3_stmt = null,
+    telemetry_record_tool: ?*c.sqlite3_stmt = null,
+    load_turn_blocks: ?*c.sqlite3_stmt = null,
+    turn_time_bounds: ?*c.sqlite3_stmt = null,
+    last_seq: ?*c.sqlite3_stmt = null,
 
     fn deinit(self: *StatementCache) void {
         inline for (.{
@@ -2212,6 +2407,14 @@ const StatementCache = struct {
             self.append_search_fts,
             self.set_session_status,
             self.update_session_usage,
+            self.load_context,
+            self.telemetry_begin_turn,
+            self.telemetry_finish_turn,
+            self.telemetry_record_round,
+            self.telemetry_record_tool,
+            self.load_turn_blocks,
+            self.turn_time_bounds,
+            self.last_seq,
         }) |stmt|
             if (stmt) |value| finalize(value);
         self.* = undefined;
@@ -2238,6 +2441,11 @@ fn dupeColumn(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, col: c_int) E
     return allocator.dupe(u8, value) catch error.OutOfMemory;
 }
 
+fn nsToMs(ns: i96) u64 {
+    if (ns <= 0) return 0;
+    return @intCast(@divTrunc(ns, std.time.ns_per_ms));
+}
+
 fn sortDurations(values: *std.ArrayList(u64)) void {
     std.mem.sort(u64, values.items, {}, struct {
         fn lessThan(_: void, a: u64, b: u64) bool {
@@ -2257,6 +2465,14 @@ fn columnOptionalU64(stmt: *c.sqlite3_stmt, col: c_int) ?u64 {
     return @bitCast(c.sqlite3_column_int64(stmt, col));
 }
 
+fn bindOptionalInt(stmt: *c.sqlite3_stmt, idx: c_int, value: ?u64) void {
+    if (value) |number| {
+        bindInt(stmt, idx, @bitCast(number));
+    } else {
+        bindNull(stmt, idx);
+    }
+}
+
 fn bindInt(stmt: *c.sqlite3_stmt, idx: c_int, v: i64) void {
     _ = c.sqlite3_bind_int64(stmt, idx, v);
 }
@@ -2271,6 +2487,21 @@ fn bindText(stmt: *c.sqlite3_stmt, idx: c_int, s: []const u8) void {
 
 fn stepDone(stmt: *c.sqlite3_stmt) Error!void {
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStep;
+}
+
+fn expectQueryPlanUses(store: Store, comptime sql: [:0]const u8, bindings: []const i64, needle: []const u8) !void {
+    const stmt = try store.prepare(sql);
+    defer finalize(stmt);
+    for (bindings, 1..) |value, idx| bindInt(stmt, @intCast(idx), value);
+    var found = false;
+    while (true) switch (c.sqlite3_step(stmt)) {
+        c.SQLITE_ROW => if (std.mem.indexOf(u8, columnText(stmt, 3), needle) != null) {
+            found = true;
+        },
+        c.SQLITE_DONE => break,
+        else => return error.SqliteStep,
+    };
+    try std.testing.expect(found);
 }
 
 /// Resolve the default DB path: $XDG_STATE_HOME/marlin/marlin.db or
@@ -2352,6 +2583,9 @@ test "session + block round trip (in-memory)" {
     try std.testing.expectEqual(usage_stmt, store.statements.update_session_usage.?);
 
     try std.testing.expectEqual(@as(u64, 2), try store.lastSeq(42));
+    const last_seq_stmt = store.statements.last_seq.?;
+    try std.testing.expectEqual(@as(u64, 2), try store.lastSeq(42));
+    try std.testing.expectEqual(last_seq_stmt, store.statements.last_seq.?);
 
     const loaded = try store.getBlocks(42, 1, 100);
     defer {
@@ -2488,6 +2722,67 @@ test "context load skips durable rows superseded by nested compactions" {
     try std.testing.expectEqual(@as(u64, 5), relevant.items[0].seq);
     try std.testing.expectEqual(@as(u64, 9), relevant.items[1].seq);
     try std.testing.expectEqual(@as(u64, 10), relevant.items[2].seq);
+}
+
+test "context load materializes frontier before scanning large compacted history" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+
+    for (1..2001) |seq| try store.appendBlock(.{
+        .id = seq,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = seq,
+        .ts = 0,
+        .body = .{ .tool_result = .{
+            .call_id = "c",
+            .status = .ok,
+            .inline_body = "covered history",
+            .full_body_ref = null,
+        } },
+    });
+    try store.appendBlock(.{
+        .id = 2001,
+        .session_id = 1,
+        .turn_id = 2,
+        .seq = 2001,
+        .ts = 0,
+        .body = .{ .compaction = .{
+            .summary = "history summarized",
+            .covers_from_seq = 1,
+            .covers_to_seq = 2000,
+        } },
+    });
+    try store.appendBlock(.{
+        .id = 2002,
+        .session_id = 1,
+        .turn_id = 3,
+        .seq = 2002,
+        .ts = 0,
+        .body = .{ .user_msg = .{ .text = "live tail" } },
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var relevant: std.ArrayList(block.Block) = .empty;
+    const stats = try store.loadContextBlocksIntoMeasured(
+        null,
+        arena_state.allocator(),
+        &relevant,
+        1,
+        1_000_000,
+    );
+    try std.testing.expectEqual(@as(usize, 2), relevant.items.len);
+    try std.testing.expectEqual(@as(u64, 2001), relevant.items[0].seq);
+    try std.testing.expectEqual(@as(u64, 2002), relevant.items[1].seq);
+    try std.testing.expect(stats.vm_steps < 100_000);
+    try std.testing.expectEqual(@as(u64, 2002), stats.last_seq);
+    const context_stmt = store.statements.load_context.?;
+    relevant.clearRetainingCapacity();
+    _ = try store.loadContextBlocksIntoMeasured(null, arena_state.allocator(), &relevant, 1, 1_000_000);
+    try std.testing.expectEqual(context_stmt, store.statements.load_context.?);
 }
 
 test "latest plan remains context-relevant after compaction" {
@@ -2725,15 +3020,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v12 with guest identity, plan mode, search, and GenAI telemetry" {
+test "schema is v13 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 12), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 13), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 12), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 13), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
@@ -2748,6 +3043,24 @@ test "schema is v12 with guest identity, plan mode, search, and GenAI telemetry"
     defer finalize(stmt);
     try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+    try expectQueryPlanUses(
+        store,
+        "EXPLAIN QUERY PLAN SELECT id FROM blocks WHERE session_id=? AND turn_id=? ORDER BY seq",
+        &.{ 42, 1 },
+        "blocks_by_turn",
+    );
+    try expectQueryPlanUses(
+        store,
+        "EXPLAIN QUERY PLAN SELECT id FROM sessions WHERE parent_sid=?",
+        &.{42},
+        "sessions_by_parent",
+    );
+    try expectQueryPlanUses(
+        store,
+        "EXPLAIN QUERY PLAN SELECT turn_id FROM telemetry_turns WHERE session_id=? ORDER BY started_at_ms DESC LIMIT ?",
+        &.{ 42, 50 },
+        "telemetry_turns_by_session_started",
+    );
 }
 
 test "telemetry diagnostics and export outbox are durable and content-free" {
@@ -2782,6 +3095,14 @@ test "telemetry diagnostics and export outbox are durable and content-free" {
         .cached_tokens = 10,
         .cache_write_tokens = 0,
         .reasoning_tokens = 2,
+        .context_load_ms = 4,
+        .store_wait_ms = 1,
+        .context_rows = 8,
+        .context_bytes = 4096,
+        .context_vm_steps = 120,
+        .setup_ms = 3,
+        .assemble_ms = 2,
+        .body_ms = 1,
     });
     try store.telemetryRecordTool(42, 100, .{
         .round = 0,
@@ -2803,7 +3124,14 @@ test "telemetry diagnostics and export outbox are durable and content-free" {
     try std.testing.expectEqual(@as(u32, 1), report.successful_turns);
     try std.testing.expectEqual(@as(u64, 100), report.provider_p50_ms);
     try std.testing.expectEqual(@as(u64, 20), report.ttft_p50_ms);
+    try std.testing.expectEqual(@as(u64, 10), report.pre_provider_p50_ms);
+    try std.testing.expectEqual(@as(u64, 10), report.pre_provider_max_ms);
+    try std.testing.expectEqual(@as(u64, 10), report.local_prep_p50_ms);
     try std.testing.expectEqual(@as(usize, 1), report.last_rounds.len);
+    try std.testing.expectEqual(@as(u64, 4), report.last_rounds[0].context_load_ms);
+    try std.testing.expectEqual(@as(u64, 1), report.last_rounds[0].store_wait_ms);
+    try std.testing.expectEqual(@as(u64, 8), report.last_rounds[0].context_rows);
+    try std.testing.expectEqual(@as(u64, 120), report.last_rounds[0].context_vm_steps);
     try std.testing.expectEqual(@as(usize, 1), report.last_tools.len);
     try std.testing.expectEqualStrings("read_file", report.last_tools[0].name);
     try std.testing.expectEqual(@as(u32, 1), report.otlp_pending);
@@ -2874,6 +3202,23 @@ test "durable search indexes visible text and recent authored inputs" {
     try std.testing.expectEqual(@as(usize, 2), history.len);
     try std.testing.expectEqualStrings("add citrus support", history[0].text);
     try std.testing.expectEqualStrings("build the banana launcher", history[1].text);
+    const recent_plan =
+        \\EXPLAIN QUERY PLAN SELECT session_id,seq,ts,text FROM (
+        \\  SELECT session_id,seq,ts,text,block_id,0 AS bucket FROM (
+        \\    SELECT session_id,seq,ts,text,block_id FROM search_docs
+        \\    WHERE session_id=? AND kind IN ('user_msg','steer')
+        \\    ORDER BY ts DESC,block_id DESC LIMIT ?
+        \\  )
+        \\  UNION ALL
+        \\  SELECT session_id,seq,ts,text,block_id,1 AS bucket FROM (
+        \\    SELECT session_id,seq,ts,text,block_id FROM search_docs
+        \\    WHERE session_id<>? AND kind IN ('user_msg','steer')
+        \\    ORDER BY ts DESC,block_id DESC LIMIT ?
+        \\  )
+        \\) ORDER BY bucket,ts DESC,block_id DESC LIMIT ?
+    ;
+    try expectQueryPlanUses(store, recent_plan, &.{ 2, 20, 2, 20, 20 }, "search_docs_recent_inputs_session");
+    try expectQueryPlanUses(store, recent_plan, &.{ 2, 20, 2, 20, 20 }, "search_docs_recent_inputs_global");
 
     // Exercise the capability fallback against the same maintained corpus.
     store.fts5 = false;
