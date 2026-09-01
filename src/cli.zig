@@ -136,25 +136,89 @@ fn runTui(
     self_exe: []const u8,
     sid_arg: ?[]const u8,
 ) !u8 {
-    var plan = tui.RebootPlan{};
-    const code = try tui.run(gpa, io, environ, self_exe, sid_arg, &plan);
-    if (!plan.request.requested) return code;
+    var reattach_sid_buf: [25]u8 = undefined;
+    var next_sid = sid_arg;
+    while (true) {
+        var plan = tui.RebootPlan{};
+        const code = try tui.run(gpa, io, environ, self_exe, next_sid, &plan);
+        if (plan.shell) |request| {
+            const shell_result = runShellRequest(io, environ, request, true);
+            request.deinit(gpa);
+            _ = shell_result catch |err| {
+                try stderrPrint(io, "marlin: shell escape failed: {t}\n", .{err});
+            };
+            next_sid = try std.fmt.bufPrintZ(&reattach_sid_buf, "@{d}", .{plan.sid});
+            continue;
+        }
+        if (!plan.request.requested) return code;
 
-    var sid_buf: [25]u8 = undefined;
-    const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{plan.sid});
-    var argv: std.ArrayList([:0]const u8) = .empty;
-    defer argv.deinit(gpa);
-    switch (plan.request.rebuild) {
-        .none => {},
-        .attached => try argv.append(gpa, "--build"),
-        .client => try argv.append(gpa, "--build-client"),
-        .both => try argv.append(gpa, "--build-both"),
+        var sid_buf: [25]u8 = undefined;
+        const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{plan.sid});
+        var argv: std.ArrayList([:0]const u8) = .empty;
+        defer argv.deinit(gpa);
+        switch (plan.request.rebuild) {
+            .none => {},
+            .attached => try argv.append(gpa, "--build"),
+            .client => try argv.append(gpa, "--build-client"),
+            .both => try argv.append(gpa, "--build-both"),
+        }
+        if (plan.request.force) try argv.append(gpa, "--force");
+        try argv.append(gpa, "--then");
+        try argv.append(gpa, "attach");
+        try argv.append(gpa, sid_str);
+        return headless.reboot(gpa, io, environ, self_exe, argv.items);
     }
-    if (plan.request.force) try argv.append(gpa, "--force");
-    try argv.append(gpa, "--then");
-    try argv.append(gpa, "attach");
-    try argv.append(gpa, sid_str);
-    return headless.reboot(gpa, io, environ, self_exe, argv.items);
+}
+
+fn runShellRequest(
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    request: tui.ShellRequest,
+    pause_after_command: bool,
+) !u8 {
+    const shell = environ.get("SHELL") orelse "/bin/sh";
+    const interactive = request.command.len == 0;
+    var child = try std.process.spawn(io, .{
+        .argv = if (interactive)
+            &.{shell}
+        else
+            &.{ shell, "-c", request.command },
+        .cwd = .{ .path = request.cwd },
+        .environ_map = environ,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
+    const code: u8 = switch (term) {
+        .exited => |exit_code| exit_code,
+        .signal, .stopped, .unknown => 1,
+    };
+    if (!interactive and pause_after_command) try waitForShellReturn(io);
+    return code;
+}
+
+fn waitForShellReturn(io: Io) !void {
+    var out_buf: [256]u8 = undefined;
+    var writer = Io.File.stderr().writer(io, &out_buf);
+    try writer.interface.writeAll("\n[press Enter to return to Marlin]");
+    try writer.interface.flush();
+
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = Io.File.stdin().readStreaming(io, &.{&byte}) catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
+        if (n == 0 or byte[0] == '\n' or byte[0] == '\r') return;
+    }
+}
+
+fn stderrPrint(io: Io, comptime fmt: []const u8, fmt_args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    var writer = Io.File.stderr().writer(io, &buf);
+    try writer.interface.print(fmt, fmt_args);
+    try writer.interface.flush();
 }
 
 /// Internal resolver worker. The daemon invokes this in a killable subprocess
@@ -238,6 +302,54 @@ pub fn stdoutPrint(io: Io, comptime fmt: []const u8, fmt_args: anytype) !void {
     var w: Io.File.Writer = .init(.stdout(), io, &buf);
     try w.interface.print(fmt, fmt_args);
     try w.interface.flush();
+}
+
+test "shell request runs through configured shell in requested cwd" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const cwd = try temp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(cwd);
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("SHELL", "/bin/sh");
+    const command = "printf '%s' \"$PWD\" > cwd.txt";
+    const request = tui.ShellRequest{
+        .command = try gpa.dupe(u8, command),
+        .cwd = try gpa.dupe(u8, cwd),
+    };
+    defer request.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u8, 0), try runShellRequest(io, &environ, request, false));
+    const actual = try temp.dir.readFileAlloc(io, "cwd.txt", gpa, .limited(4096));
+    defer gpa.free(actual);
+    try std.testing.expectEqualStrings(cwd, actual);
+}
+
+test "shell request returns command exit status" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const cwd = try temp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(cwd);
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("SHELL", "/bin/sh");
+    const request = tui.ShellRequest{
+        .command = try gpa.dupe(u8, "exit 7"),
+        .cwd = try gpa.dupe(u8, cwd),
+    };
+    defer request.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u8, 7), try runShellRequest(io, &environ, request, false));
 }
 
 test "command parse" {

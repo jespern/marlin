@@ -17,14 +17,15 @@
 //!            Esc → normal (draft survives); Ctrl+C interrupts active work
 //!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom;
 //!            / searches this transcript; </> or Left/Right switch tabs; q quit
-//!   global:  Ctrl+N creates a session; Ctrl+D archives when input is empty;
+//!   global:  Ctrl+N creates a session; Ctrl+D/Ctrl+W archive when input is empty;
 //!            Ctrl+L clears/redraws and returns to bottom;
 //!            Ctrl+T toggles the expanded tool transcript;
 //!            Alt/Option+1..9 jumps to that tab
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /search <query>, /animate matrix,
 //!             /new, /compact, /archive, /reboot [--build], /help, /quit
-//!   shortcuts: !c (copy last full tool output), !rb [client|both] (scoped rebuild)
+//!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
+//!              !c (copy last full tool output), !rb [client|both] (scoped rebuild)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
 //!            chips, expanded into the message on send.
 
@@ -191,6 +192,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
     .{ .name = "/quit", .description = "leave Marlin" },
+    .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
 };
@@ -764,6 +766,11 @@ const App = struct {
     /// Set by /reboot or !rb: after clean TUI teardown, run() returns this
     /// to cli.zig, which coordinates scoped builds and reattachment.
     reboot_request: RebootRequest = .{},
+    /// Client-side shell escapes leave the alternate screen completely before
+    /// cli.zig runs the user's shell, then reattach to this durable session.
+    shell_command: std.ArrayList(u8) = .empty,
+    shell_requested: bool = false,
+    remote_transport: bool = false,
     next_input_request_id: u64 = 1,
 
     fn deinit(self: *App) void {
@@ -811,6 +818,7 @@ const App = struct {
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.pending_new_cwd.deinit(self.gpa);
+        self.shell_command.deinit(self.gpa);
         self.clipboard_pending.deinit(self.gpa);
         self.clipboard_desc.deinit(self.gpa);
         self.clearHistoryBackfill();
@@ -2191,8 +2199,12 @@ const App = struct {
     fn submitInput(self: *App, text: []const u8) void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.attachments.items.len == 0) return;
-        const may_quit_setup = std.mem.eql(u8, trimmed, "/quit") or std.mem.eql(u8, trimmed, "/q");
-        if (self.setup_required and !may_quit_setup) {
+        const allowed_during_setup = std.mem.eql(u8, trimmed, "/quit") or
+            std.mem.eql(u8, trimmed, "/q") or
+            std.mem.eql(u8, trimmed, "!") or
+            std.mem.startsWith(u8, trimmed, "! ") or
+            std.mem.startsWith(u8, trimmed, "!\t");
+        if (self.setup_required and !allowed_during_setup) {
             self.beginSetup(true);
             self.setNotice("choose a backend before sending the first prompt", .{});
             return;
@@ -2555,6 +2567,18 @@ const App = struct {
             }
         } else if (std.mem.eql(u8, head, "/attach")) {
             self.attachPath(it.rest());
+        } else if (std.mem.eql(u8, head, "!")) {
+            if (self.remote_transport) {
+                self.setNotice("shell escape unavailable over --remote — run Marlin inside ssh/mosh", .{});
+                return;
+            }
+            self.shell_command.clearRetainingCapacity();
+            self.shell_command.appendSlice(self.gpa, std.mem.trim(u8, it.rest(), " \t")) catch {
+                self.setNotice("could not prepare shell command", .{});
+                return;
+            };
+            self.shell_requested = true;
+            self.should_quit = true;
         } else if (std.mem.eql(u8, head, "!c")) {
             self.copyLastToolOutput();
         } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
@@ -2620,7 +2644,7 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/config")) {
             self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/setup · /sessions · /top · /search [query] · /diagnostics · /animate matrix · /otel [set <endpoint>|status|off] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !rb [client|both] · !c · /quit", .{});
+            self.setNotice("/setup · /sessions · /top · /search [query] · /diagnostics · /animate matrix · /otel [set <endpoint>|status|off] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · ! [command] · !rb [client|both] · !c · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -5521,7 +5545,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Enter while working", .description = "steer the active turn" },
     .{ .key = "Ctrl+N", .description = "create a new session" },
     .{ .key = "Ctrl+S", .description = "open the live session overview" },
-    .{ .key = "Ctrl+D (empty)", .description = "archive the current session" },
+    .{ .key = "Ctrl+D/W (empty)", .description = "archive the current session" },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
     .{ .key = "Ctrl+C", .description = "interrupt the active turn" },
@@ -6953,8 +6977,19 @@ fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     }
 }
 
+pub const ShellRequest = struct {
+    command: []u8,
+    cwd: []u8,
+
+    pub fn deinit(self: ShellRequest, gpa: std.mem.Allocator) void {
+        gpa.free(self.command);
+        gpa.free(self.cwd);
+    }
+};
+
 pub const RebootPlan = struct {
     request: RebootRequest = .{},
+    shell: ?ShellRequest = null,
     sid: u64 = 0,
 };
 
@@ -7076,6 +7111,7 @@ pub fn run(
         .conn = conn,
         .environ = environ,
         .sid = sid,
+        .remote_transport = conn.transport == .child,
         .editor = Editor.init(gpa),
         .known_session_ids = initial_known_ids,
         .cfg = cfg,
@@ -7374,7 +7410,18 @@ pub fn run(
             else => {},
         };
     }
-    if (reboot_out) |ro| ro.* = .{ .request = app.reboot_request, .sid = app.sid };
+    if (reboot_out) |ro| {
+        var shell: ?ShellRequest = null;
+        if (app.shell_requested) {
+            const command = try gpa.dupe(u8, app.shell_command.items);
+            errdefer gpa.free(command);
+            shell = .{
+                .command = command,
+                .cwd = try gpa.dupe(u8, app.cwd.items),
+            };
+        }
+        ro.* = .{ .request = app.reboot_request, .shell = shell, .sid = app.sid };
+    }
     if (daemon_disconnect_reason) |reason| {
         try eprint(
             io,
@@ -7616,7 +7663,7 @@ fn isNewSessionKey(key: vaxis.Key) bool {
 }
 
 fn isArchiveCurrentKey(app: *const App, key: vaxis.Key) bool {
-    return key.matches('d', .{ .ctrl = true }) and
+    return (key.matches('d', .{ .ctrl = true }) or key.matches('w', .{ .ctrl = true })) and
         app.editor.isEmpty() and app.attachments.items.len == 0 and
         app.copy_cursor == null;
 }
@@ -8092,8 +8139,8 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    // Match shell EOF muscle memory without risking a draft or attachment.
-    // Pickers consume Ctrl+D above; copy mode keeps its page-down binding.
+    // Match shell EOF/close-pane muscle memory without risking a draft or
+    // attachment. Pickers consume Ctrl+D above; copy mode keeps page-down.
     if (isArchiveCurrentKey(app, key)) {
         app.archiveCurrentSession();
         return;
@@ -9156,6 +9203,53 @@ test "required provider setup still permits an explicit quit" {
     try std.testing.expect(app.should_quit);
 }
 
+test "bang shell escape captures commands and bare interactive requests" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    app.submitInput("! printf 'hello world'");
+    try std.testing.expect(app.shell_requested);
+    try std.testing.expect(app.should_quit);
+    try std.testing.expectEqualStrings("printf 'hello world'", app.shell_command.items);
+    try std.testing.expectEqualStrings("! printf 'hello world'", app.editor.history.items[0]);
+
+    app.should_quit = false;
+    app.shell_requested = false;
+    app.runCommand("!");
+    try std.testing.expect(app.shell_requested);
+    try std.testing.expect(app.should_quit);
+    try std.testing.expectEqualStrings("", app.shell_command.items);
+}
+
+test "bang shell escape refuses remote transport" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .remote_transport = true,
+    };
+    defer app.deinit();
+
+    app.runCommand("! pwd");
+    try std.testing.expect(!app.shell_requested);
+    try std.testing.expect(!app.should_quit);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "--remote") != null);
+}
+
 test "bang rb expands to reboot with build" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -9434,7 +9528,7 @@ test "staging images inserts numbered prompt placeholders" {
     try std.testing.expectEqual(@as(usize, 2), app.attachments.items.len);
 }
 
-test "Ctrl+D archives only a truly empty composer outside copy mode" {
+test "Ctrl+D and Ctrl+W archive only a truly empty composer outside copy mode" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -9447,12 +9541,16 @@ test "Ctrl+D archives only a truly empty composer outside copy mode" {
     };
     defer app.deinit();
     const ctrl_d = vaxis.Key{ .codepoint = 'd', .mods = .{ .ctrl = true } };
+    const ctrl_w = vaxis.Key{ .codepoint = 'w', .mods = .{ .ctrl = true } };
 
     try std.testing.expect(isArchiveCurrentKey(&app, ctrl_d));
+    try std.testing.expect(isArchiveCurrentKey(&app, ctrl_w));
     try std.testing.expect(!isArchiveCurrentKey(&app, .{ .codepoint = 'd' }));
+    try std.testing.expect(!isArchiveCurrentKey(&app, .{ .codepoint = 'w' }));
 
     app.editor.insertSlice("draft survives");
     try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d));
+    try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_w));
     app.editor.clear();
 
     try app.attachments.append(gpa, .{
@@ -9461,10 +9559,12 @@ test "Ctrl+D archives only a truly empty composer outside copy mode" {
         .data_base64 = try gpa.dupe(u8, "AA=="),
     });
     try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d));
+    try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_w));
     app.clearAttachments();
 
     app.copy_cursor = .{ .line = 0, .col = 0 };
     try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d));
+    try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_w));
     app.copy_cursor = null;
 
     // The shared /archive path retains its running-session guard.

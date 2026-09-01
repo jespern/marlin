@@ -1091,10 +1091,10 @@ fn workingLabel(transcript: *const Transcript, now_ms: i64) []const u8 {
         .idle => "Working…",
         .starting => "Starting turn thread…",
         .context => "Preparing request context…",
-        .provider => switch (streamTraffic(transcript, now_ms) orelse return "Waiting for model…") {
-            .up => "Receiving model response… ↑",
-            .down => "Receiving model response… ↓",
-        },
+        .provider => if (streamTraffic(transcript, now_ms) != null)
+            "Receiving model response…"
+        else
+            "Waiting for model…",
         .approval => "Waiting for approval…",
         .tool => "Running tool…",
         .child => "Waiting for child agent…",
@@ -1135,11 +1135,11 @@ fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) !Worki
                 elapsed, quiet_s,
             });
         } else if (quiet_s >= 3) {
-            detail.text = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1} · last token {d}s ago", .{
+            detail.text = try std.fmt.allocPrint(arena, "{s} · streaming ↓ {Bi:.1} · last token {d}s ago", .{
                 elapsed, transcript.stream_bytes, quiet_s,
             });
         } else {
-            detail.text = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1}", .{
+            detail.text = try std.fmt.allocPrint(arena, "{s} · streaming ↑ {Bi:.1}", .{
                 elapsed, transcript.stream_bytes,
             });
         }
@@ -1543,12 +1543,14 @@ pub fn layoutLines(
         const detail = try workingDetail(arena, transcript);
         var syntax: std.ArrayList(SyntaxSpan) = .empty;
         if (streamTraffic(transcript, now_ms)) |traffic| {
-            const arrow_len = "↑".len;
-            try syntax.append(arena, .{
-                .start = head.len + word.len - arrow_len,
-                .end = head.len + word.len,
-                .style = if (traffic == .up) Palette.stream_up else Palette.stream_down,
-            });
+            const arrow = if (traffic == .up) "↑" else "↓";
+            if (std.mem.indexOf(u8, detail.text, arrow)) |arrow_at| {
+                try syntax.append(arena, .{
+                    .start = head.len + word.len + arrow_at,
+                    .end = head.len + word.len + arrow_at + arrow.len,
+                    .style = if (traffic == .up) Palette.stream_up else Palette.stream_down,
+                });
+            }
         }
         try syntax.appendSlice(arena, try shimmerSpans(arena, word, head.len, transcript.spinner_frame));
         if (detail.shell_command) |command| {
@@ -2303,11 +2305,12 @@ test "working activity names each operational phase" {
     transcript.turn_phase = .provider;
     transcript.stream_bytes = 4096;
     transcript.stream_status_at_ms = now_ms;
-    try std.testing.expectEqualStrings("Receiving model response… ↑", workingLabel(&transcript, now_ms));
+    try std.testing.expectEqualStrings("Receiving model response…", workingLabel(&transcript, now_ms));
     try std.testing.expectEqual(StreamTraffic.up, streamTraffic(&transcript, now_ms).?);
     const active_lines = try layoutLines(arena, gpa, &transcript, 80);
     const active = active_lines.items[active_lines.items.len - 1];
     const active_text = try lineText(arena, active);
+    try std.testing.expect(std.mem.indexOf(u8, active_text, "streaming ↑ 4.0KiB") != null);
     const active_arrow = std.mem.indexOf(u8, active_text, "↑").?;
     try std.testing.expect(vaxis.Color.eql(
         render.syntaxForBytes(active.syntax, active_arrow, active_arrow + "↑".len).?.fg,
@@ -2315,11 +2318,12 @@ test "working activity names each operational phase" {
     ));
 
     transcript.stream_quiet_ms = 4000;
-    try std.testing.expectEqualStrings("Receiving model response… ↓", workingLabel(&transcript, now_ms));
+    try std.testing.expectEqualStrings("Receiving model response…", workingLabel(&transcript, now_ms));
     try std.testing.expectEqual(StreamTraffic.down, streamTraffic(&transcript, now_ms).?);
     const stalled_lines = try layoutLines(arena, gpa, &transcript, 80);
     const stalled = stalled_lines.items[stalled_lines.items.len - 1];
     const stalled_text = try lineText(arena, stalled);
+    try std.testing.expect(std.mem.indexOf(u8, stalled_text, "streaming ↓ 4.0KiB") != null);
     const stalled_arrow = std.mem.indexOf(u8, stalled_text, "↓").?;
     try std.testing.expect(vaxis.Color.eql(
         render.syntaxForBytes(stalled.syntax, stalled_arrow, stalled_arrow + "↓".len).?.fg,
@@ -2332,7 +2336,7 @@ test "working activity names each operational phase" {
     const detail = try workingDetail(arena, &transcript);
     try std.testing.expect(std.mem.indexOf(u8, detail.text, " total") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail.text, " here") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail.text, "streaming 4.0KiB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.text, "streaming ↑ 4.0KiB") != null);
 }
 
 test "running Bash activity syntax-highlights the displayed command" {

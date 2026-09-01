@@ -80,6 +80,11 @@ the old rooms?
 - The multiplexer knows "session 3 is awaiting approval for `rm -rf`" as a
   *typed event*, not a guess from terminal output. Tap-to-approve from a phone
   becomes a protocol message, not a screen-scrape.
+- Run `! <command>` in the focused session's workspace, or enter bare `!` for
+  an interactive local shell. Marlin leaves the alternate screen completely,
+  then reattaches to the durable session when the shell exits. Direct
+  `--remote` attachments refuse shell escapes; run Marlin inside SSH or mosh
+  when the terminal and workspace live on another host.
 - Copy the last tool output with `!c` — a query over structured blocks, not a
   rectangle of screen cells. Paste it into another session without touching the
   OS clipboard.
