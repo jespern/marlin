@@ -91,7 +91,10 @@ the old rooms?
   top through gaps around the current UI, then fades away after its tail passes.
 - During a turn, the live activity row distinguishes request preparation, model
   wait/streaming, tool execution, child-agent work, compaction, and finalization,
-  with total and current-phase timers.
+  with total and current-phase timers. Streaming shows a green up arrow while
+  tokens are arriving and a red down arrow after three quiet seconds. A running
+  Bash command keeps the same shell syntax highlighting used by completed tool
+  rows.
 - `/diagnostics` and `marlin diagnostics [handle] [--json]` separate provider
   latency, TTFT, tool time, and failures. Optional OTLP/HTTP export uses a
   durable retry outbox, supports restart-free `/otel set|off|status`, and
@@ -306,6 +309,35 @@ the binary. To reproduce that configuration locally:
 ```sh
 zig build -Doptimize=ReleaseSafe -Dembedded-sqlite=true
 ```
+
+To temporarily replace the Marlin selected by your current `PATH` with this
+checkout's ReleaseFast build:
+
+```sh
+make install
+marlin reboot       # activate it in an already-running daemon
+```
+
+The install is sanity-checked and atomically replaces the resolved executable.
+That means an install.sh binary in `~/.local/bin` is replaced directly; a
+Homebrew entry keeps its public symlink and replaces the currently linked keg
+binary. Homebrew may overwrite that development build during a later upgrade or
+reinstall. For a development build that survives Homebrew upgrades, use an
+explicit `~/.local/bin` target and keep that directory before Homebrew in
+`PATH`. To choose an explicit destination instead of the active `PATH` entry:
+
+```sh
+make install MARLIN_INSTALL_TARGET="$HOME/.local/bin/marlin"
+```
+
+The script refuses to overwrite an existing executable that does not identify
+itself as Marlin. `make install` only activates the new client executable; a
+running daemon keeps its old executable until `marlin reboot` succeeds. If a
+turn or approval prevents a normal reboot, resolve it first rather than forcing
+an install-time shutdown.
+
+Run `make test-install` to exercise the developer installer without touching
+your real installation.
 
 ## License
 

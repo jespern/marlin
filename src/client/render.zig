@@ -91,6 +91,8 @@ pub const Palette = struct {
     /// lines are the only live signal while a turn runs.
     pub const collapse_hint: vaxis.Style = .{ .fg = .{ .index = 7 } };
     pub const working: vaxis.Style = .{ .fg = .{ .index = 7 }, .bold = true };
+    pub const stream_up: vaxis.Style = .{ .fg = .{ .index = 2 }, .bold = true };
+    pub const stream_down: vaxis.Style = .{ .fg = .{ .index = 1 }, .bold = true };
     pub const tool_err: vaxis.Style = .{ .fg = .{ .index = 1 } }; // red
     pub const git_subject: vaxis.Style = .{ .fg = .{ .index = 7 } };
     pub const git_hash: vaxis.Style = .{ .fg = soft_blue };

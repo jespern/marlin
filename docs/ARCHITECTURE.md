@@ -1097,7 +1097,10 @@ A split pane identifies its session with a compact pane label.
   status metadata;
   the live activity row names that work and shows total plus current-phase
   elapsed time. Provider byte/quiet telemetry and exact persisted tool calls
-  refine the phase without adding durable transcript chatter. Provisional
+  refine the phase without adding durable transcript chatter. Active provider
+  traffic shows a green up arrow; three quiet seconds change it to a red down
+  arrow. When the active call is Bash, its command preview uses the same
+  semantic shell highlighting as the durable tool row. Provisional
   assistant text wraps append-only and receives full Markdown treatment when
   its block finalizes. Spinner/token frames therefore
   do not re-layout the accumulated turn. Inactive full

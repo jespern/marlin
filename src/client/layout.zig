@@ -1076,6 +1076,14 @@ fn streamStatusFresh(transcript: *const Transcript, now_ms: i64) bool {
             (if (transcript.stream_bytes == 0) @as(i64, 15_000) else 3000);
 }
 
+const StreamTraffic = enum { up, down };
+
+fn streamTraffic(transcript: *const Transcript, now_ms: i64) ?StreamTraffic {
+    if (transcript.turn_phase != .provider or transcript.stream_bytes == 0 or
+        !streamStatusFresh(transcript, now_ms)) return null;
+    return if (transcript.stream_quiet_ms < 3000) .up else .down;
+}
+
 fn workingLabel(transcript: *const Transcript, now_ms: i64) []const u8 {
     if (handoverInProgress(transcript.blocks)) return "Generating handover…";
     if (currentInflightCall(transcript.blocks) != null) return "Running tool…";
@@ -1083,10 +1091,10 @@ fn workingLabel(transcript: *const Transcript, now_ms: i64) []const u8 {
         .idle => "Working…",
         .starting => "Starting turn thread…",
         .context => "Preparing request context…",
-        .provider => if (streamStatusFresh(transcript, now_ms) and transcript.stream_bytes > 0)
-            "Receiving model response…"
-        else
-            "Waiting for model…",
+        .provider => switch (streamTraffic(transcript, now_ms) orelse return "Waiting for model…") {
+            .up => "Receiving model response… ↑",
+            .down => "Receiving model response… ↓",
+        },
         .approval => "Waiting for approval…",
         .tool => "Running tool…",
         .child => "Waiting for child agent…",
@@ -1095,9 +1103,15 @@ fn workingLabel(transcript: *const Transcript, now_ms: i64) []const u8 {
     };
 }
 
+const WorkingDetail = struct {
+    text: []const u8,
+    shell_command: ?[]const u8 = null,
+    shell_offset: usize = 0,
+};
+
 /// Compact live telemetry for the transcript ticker. The returned text begins
 /// with a separator so it can be appended directly to the activity label.
-fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) ![]const u8 {
+fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) !WorkingDetail {
     const now_ms = nowWallMs(transcript.io);
     const elapsed_s: i64 = if (transcript.turn_started_ms > 0)
         @max(0, @divTrunc(now_ms - transcript.turn_started_ms, 1000))
@@ -1112,20 +1126,20 @@ fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) ![]con
     else
         try std.fmt.allocPrint(arena, " · {d}s total · {d}s here", .{ elapsed_s, phase_s });
 
-    var detail = elapsed;
+    var detail = WorkingDetail{ .text = elapsed };
     const stream_fresh = streamStatusFresh(transcript, now_ms);
     if (stream_fresh and currentInflightCall(transcript.blocks) == null) {
         const quiet_s = transcript.stream_quiet_ms / 1000;
         if (transcript.stream_bytes == 0) {
-            detail = try std.fmt.allocPrint(arena, "{s} · waiting for provider · {d}s", .{
+            detail.text = try std.fmt.allocPrint(arena, "{s} · waiting for provider · {d}s", .{
                 elapsed, quiet_s,
             });
         } else if (quiet_s >= 3) {
-            detail = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1} · last token {d}s ago", .{
+            detail.text = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1} · last token {d}s ago", .{
                 elapsed, transcript.stream_bytes, quiet_s,
             });
         } else {
-            detail = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1}", .{
+            detail.text = try std.fmt.allocPrint(arena, "{s} · streaming {Bi:.1}", .{
                 elapsed, transcript.stream_bytes,
             });
         }
@@ -1142,9 +1156,14 @@ fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) ![]con
             try std.fmt.allocPrint(arena, " (+{d} queued)", .{cur.queued})
         else
             "";
-        detail = try std.fmt.allocPrint(arena, "{s} · {s}{s}{s} · {d}s{s}", .{
-            elapsed, toolDisplayName(cur.rb.label), sep, arg, call_s, queued,
+        const tool_prefix = try std.fmt.allocPrint(arena, "{s} · {s}{s}", .{
+            elapsed, toolDisplayName(cur.rb.label), sep,
         });
+        detail = .{
+            .text = try std.fmt.allocPrint(arena, "{s}{s} · {d}s{s}", .{ tool_prefix, arg, call_s, queued }),
+            .shell_command = if (std.ascii.eqlIgnoreCase(cur.rb.label, "bash") and arg.len > 0) arg else null,
+            .shell_offset = tool_prefix.len,
+        };
     }
     return detail;
 }
@@ -1519,16 +1538,34 @@ pub fn layoutLines(
         const head = try std.fmt.allocPrint(arena, "{s} ", .{
             spinner_frames[transcript.spinner_frame % spinner_frames.len],
         });
-        const word = workingLabel(transcript, nowWallMs(transcript.io));
+        const now_ms = nowWallMs(transcript.io);
+        const word = workingLabel(transcript, now_ms);
         const detail = try workingDetail(arena, transcript);
+        var syntax: std.ArrayList(SyntaxSpan) = .empty;
+        if (streamTraffic(transcript, now_ms)) |traffic| {
+            const arrow_len = "↑".len;
+            try syntax.append(arena, .{
+                .start = head.len + word.len - arrow_len,
+                .end = head.len + word.len,
+                .style = if (traffic == .up) Palette.stream_up else Palette.stream_down,
+            });
+        }
+        try syntax.appendSlice(arena, try shimmerSpans(arena, word, head.len, transcript.spinner_frame));
+        if (detail.shell_command) |command| {
+            try syntax.appendSlice(arena, try shellCommandSpans(
+                arena,
+                command,
+                head.len + word.len + detail.shell_offset,
+            ));
+        }
         try lines.append(arena, .{
             .text = head,
             .style = Palette.working,
             .text2 = word,
             .style2 = Palette.working,
-            .text3 = detail,
+            .text3 = detail.text,
             .style3 = Palette.collapse_hint,
-            .syntax = try shimmerSpans(arena, word, head.len, transcript.spinner_frame),
+            .syntax = syntax.items,
         });
     }
 
@@ -2259,19 +2296,108 @@ test "working activity names each operational phase" {
         try std.testing.expectEqualStrings(case.label, workingLabel(&transcript, now_ms));
     }
 
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     transcript.turn_phase = .provider;
     transcript.stream_bytes = 4096;
     transcript.stream_status_at_ms = now_ms;
-    try std.testing.expectEqualStrings("Receiving model response…", workingLabel(&transcript, now_ms));
+    try std.testing.expectEqualStrings("Receiving model response… ↑", workingLabel(&transcript, now_ms));
+    try std.testing.expectEqual(StreamTraffic.up, streamTraffic(&transcript, now_ms).?);
+    const active_lines = try layoutLines(arena, gpa, &transcript, 80);
+    const active = active_lines.items[active_lines.items.len - 1];
+    const active_text = try lineText(arena, active);
+    const active_arrow = std.mem.indexOf(u8, active_text, "↑").?;
+    try std.testing.expect(vaxis.Color.eql(
+        render.syntaxForBytes(active.syntax, active_arrow, active_arrow + "↑".len).?.fg,
+        Palette.stream_up.fg,
+    ));
+
+    transcript.stream_quiet_ms = 4000;
+    try std.testing.expectEqualStrings("Receiving model response… ↓", workingLabel(&transcript, now_ms));
+    try std.testing.expectEqual(StreamTraffic.down, streamTraffic(&transcript, now_ms).?);
+    const stalled_lines = try layoutLines(arena, gpa, &transcript, 80);
+    const stalled = stalled_lines.items[stalled_lines.items.len - 1];
+    const stalled_text = try lineText(arena, stalled);
+    const stalled_arrow = std.mem.indexOf(u8, stalled_text, "↓").?;
+    try std.testing.expect(vaxis.Color.eql(
+        render.syntaxForBytes(stalled.syntax, stalled_arrow, stalled_arrow + "↓".len).?.fg,
+        Palette.stream_down.fg,
+    ));
+    transcript.stream_quiet_ms = 0;
 
     transcript.turn_started_ms = now_ms - 12_000;
     transcript.phase_started_ms = now_ms - 3_000;
+    const detail = try workingDetail(arena, &transcript);
+    try std.testing.expect(std.mem.indexOf(u8, detail.text, " total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.text, " here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.text, "streaming 4.0KiB") != null);
+}
+
+test "running Bash activity syntax-highlights the displayed command" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{
+        .{
+            .kind = .user_msg,
+            .text = try gpa.dupe(u8, "verify it"),
+            .label = try gpa.dupe(u8, ""),
+        },
+        .{
+            .kind = .tool_call,
+            .text = try gpa.dupe(u8, "{\"command\":\"zig build --summary all && printf 'done'\"}"),
+            .label = try gpa.dupe(u8, "bash"),
+        },
+    };
+    defer {
+        for (@constCast(&blocks)) |*rb| rb.deinit(gpa);
+    }
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const detail = try workingDetail(arena_state.allocator(), &transcript);
-    try std.testing.expect(std.mem.indexOf(u8, detail, " total") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, " here") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "streaming 4.0KiB") != null);
+    const arena = arena_state.allocator();
+    const lines = try layoutLines(arena, gpa, &transcript, 120);
+
+    for (lines.items) |line| {
+        const text = try lineText(arena, line);
+        if (std.mem.indexOf(u8, text, "Running tool…") == null) continue;
+        const command_at = std.mem.indexOf(u8, text, "zig build").?;
+        const flag_at = std.mem.indexOf(u8, text, "--summary").?;
+        const operator_at = std.mem.indexOf(u8, text, "&&").?;
+        const string_at = std.mem.indexOf(u8, text, "'done'").?;
+        try std.testing.expect(vaxis.Color.eql(render.syntaxForBytes(line.syntax, command_at, command_at + 1).?.fg, Palette.shell_executable.fg));
+        try std.testing.expect(vaxis.Color.eql(render.syntaxForBytes(line.syntax, flag_at, flag_at + 1).?.fg, Palette.shell_flag.fg));
+        try std.testing.expect(vaxis.Color.eql(render.syntaxForBytes(line.syntax, operator_at, operator_at + 1).?.fg, Palette.shell_operator.fg));
+        try std.testing.expect(vaxis.Color.eql(render.syntaxForBytes(line.syntax, string_at, string_at + 1).?.fg, Palette.shell_string.fg));
+        return;
+    }
+    return error.TestExpectedEqual;
 }
 
 test "current in-flight call follows calls-first result order" {
