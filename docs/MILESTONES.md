@@ -124,9 +124,11 @@ and scope being granted.*
 ## M4 — multiplexer
 **Status: implemented and verified (2026-08-24).**
 No persistent sidebar. Unarchived root sessions live in a permanent clickable
-top tab strip; `/sessions` remains the complete hierarchy picker and `gt`/`gT`
-switch recent sessions. Child activity rolls up to its root tab and the status
-bar shows only actionable background totals. Session switching preserves each
+top tab strip; `/sessions` remains the fuzzy hierarchy picker, while `/top` or
+`Ctrl+S` opens a live full-screen hierarchy with switching and lifecycle actions.
+The standalone `marlin top` provides the same operational overview outside an
+attached session. `gt`/`gT` switch recent sessions. Child activity rolls up to
+its root tab and the status bar shows only actionable background totals. Session switching preserves each
 session's view and draft. Mouse selection + OSC52 and the `!c` family finish
 the focused terminal workflow. Two-pane
 splits, cross-session registers, and remote attach are candidate

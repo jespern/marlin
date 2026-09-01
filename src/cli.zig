@@ -10,6 +10,7 @@ const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
 const pipe = @import("client/pipe.zig");
 const remote_rebuild = @import("client/remote_rebuild.zig");
+const top = @import("client/top.zig");
 const landlock = @import("daemon/landlock.zig");
 const permissions = @import("daemon/permissions.zig");
 const sandbox = @import("daemon/sandbox.zig");
@@ -21,6 +22,7 @@ pub const Command = enum {
     daemon,
     run,
     ls,
+    top,
     search,
     diagnostics,
     archive,
@@ -91,6 +93,20 @@ pub fn dispatch(
         .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
         .ls => return headless.ls(gpa, io, environ, self_exe, rest),
+        .top => {
+            if (rest.len != 0) {
+                try stdoutPrint(io, "usage: marlin top\n", .{});
+                return 2;
+            }
+            var pick = top.AttachPick{};
+            const code = try top.run(gpa, io, environ, self_exe, &pick);
+            if (pick.sid) |sid| {
+                var sid_buf: [25]u8 = undefined;
+                const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{sid});
+                return runTui(gpa, io, environ, self_exe, sid_str);
+            }
+            return code;
+        },
         .search => return headless.search(gpa, io, environ, self_exe, rest),
         .diagnostics => return headless.diagnostics(gpa, io, environ, self_exe, rest),
         .archive => return headless.setArchived(gpa, io, environ, self_exe, rest, true),
@@ -107,35 +123,38 @@ pub fn dispatch(
                 try stdoutPrint(io, "usage: marlin attach [session-handle]\n", .{});
                 return 2;
             }
-            const sid_arg: ?[]const u8 = if (rest.len == 1) rest[0] else null;
-            var plan = tui.RebootPlan{};
-            const code = try tui.run(gpa, io, environ, self_exe, sid_arg, &plan);
-            if (plan.request.requested) {
-                // TUI torn down cleanly; now run the reboot sequence and
-                // exec back into `marlin attach @<sid>`.
-                var sid_buf: [25]u8 = undefined;
-                // Internal exact-id syntax keeps reboot continuity immune to
-                // any public-prefix collision while old decimal input remains
-                // accepted for compatibility.
-                const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{plan.sid});
-                var argv: std.ArrayList([:0]const u8) = .empty;
-                defer argv.deinit(gpa);
-                switch (plan.request.rebuild) {
-                    .none => {},
-                    .attached => try argv.append(gpa, "--build"),
-                    .client => try argv.append(gpa, "--build-client"),
-                    .both => try argv.append(gpa, "--build-both"),
-                }
-                if (plan.request.force) try argv.append(gpa, "--force");
-                try argv.append(gpa, "--then");
-                try argv.append(gpa, "attach");
-                try argv.append(gpa, sid_str);
-                return headless.reboot(gpa, io, environ, self_exe, argv.items);
-            }
-            return code;
+            return runTui(gpa, io, environ, self_exe, if (rest.len == 1) rest[0] else null);
         },
     }
     return 0;
+}
+
+fn runTui(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *std.process.Environ.Map,
+    self_exe: []const u8,
+    sid_arg: ?[]const u8,
+) !u8 {
+    var plan = tui.RebootPlan{};
+    const code = try tui.run(gpa, io, environ, self_exe, sid_arg, &plan);
+    if (!plan.request.requested) return code;
+
+    var sid_buf: [25]u8 = undefined;
+    const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{plan.sid});
+    var argv: std.ArrayList([:0]const u8) = .empty;
+    defer argv.deinit(gpa);
+    switch (plan.request.rebuild) {
+        .none => {},
+        .attached => try argv.append(gpa, "--build"),
+        .client => try argv.append(gpa, "--build-client"),
+        .both => try argv.append(gpa, "--build-both"),
+    }
+    if (plan.request.force) try argv.append(gpa, "--force");
+    try argv.append(gpa, "--then");
+    try argv.append(gpa, "attach");
+    try argv.append(gpa, sid_str);
+    return headless.reboot(gpa, io, environ, self_exe, argv.items);
 }
 
 /// Internal resolver worker. The daemon invokes this in a killable subprocess
@@ -191,6 +210,7 @@ const help_text =
     \\  marlin run [--continue] [--model <m>] [--image <path>] [--quiet] [--ask] "task"
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls [--all]      list sessions
+    \\  marlin top             live session overview and switcher
     \\  marlin search <query>  search durable transcripts across sessions
     \\  marlin diagnostics [handle] [--json]  inspect recent turn timings
     \\  marlin archive <handle> hide a session tree without deleting it
@@ -222,6 +242,7 @@ pub fn stdoutPrint(io: Io, comptime fmt: []const u8, fmt_args: anytype) !void {
 
 test "command parse" {
     try std.testing.expectEqual(Command.run, Command.parse("run").?);
+    try std.testing.expectEqual(Command.top, Command.parse("top").?);
     try std.testing.expectEqual(Command.archive, Command.parse("archive").?);
     try std.testing.expectEqual(Command.unarchive, Command.parse("unarchive").?);
     try std.testing.expectEqual(Command.shutdown, Command.parse("shutdown").?);

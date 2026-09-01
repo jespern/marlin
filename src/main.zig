@@ -102,4 +102,5 @@ test {
     _ = @import("client/layout.zig");
     _ = @import("client/media.zig");
     _ = @import("client/tui.zig");
+    _ = @import("client/top.zig");
 }

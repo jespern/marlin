@@ -42,6 +42,7 @@ const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const media = @import("media.zig");
 const render = @import("render.zig");
+const top_view = @import("top.zig");
 const markdown = @import("markdown.zig");
 const layout_mod = @import("layout.zig");
 const LayoutCache = layout_mod.LayoutCache;
@@ -131,6 +132,13 @@ const Mode = enum { insert, normal };
 
 const UiAnimation = enum { none, matrix };
 
+const TopView = struct {
+    selected_sid: ?u64 = null,
+    selected_fallback: usize = 0,
+    scroll_top: usize = 0,
+    confirm_kill: ?u64 = null,
+};
+
 fn matrixTrailLength(height: u16) usize {
     return @max(@as(usize, height) * 5 / 8, 8);
 }
@@ -169,6 +177,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
     .{ .name = "/plan", .usage = " [task|off|clear]", .description = "enter Plan mode or manage its execution todo", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
+    .{ .name = "/top", .description = "live session overview and switcher" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
     .{ .name = "/animate", .usage = " matrix", .description = "play a transient screen animation", .accepts_args = true },
@@ -561,6 +570,8 @@ const App = struct {
     /// filtered model or effort list (see pickerItems).
     picker: ?usize = null,
     picker_kind: PickerKind = .model,
+    /// Full-screen live session overview and switcher.
+    top_view: ?TopView = null,
     /// Compact normal-mode shortcut reference opened with `?`.
     shortcut_help: bool = false,
     /// Council detail overlay. The name is owned so daemon cache refreshes do
@@ -1456,6 +1467,7 @@ const App = struct {
             self.gpa.destroy(saved);
             _ = self.background_approvals.remove(sid);
         }
+        self.normalizeTopSelection();
     }
 
     fn allocSessionSummary(self: *App, info: proto.SessionInfo) ?SessionSummary {
@@ -1571,6 +1583,7 @@ const App = struct {
             self.plan_mode = info.plan_mode;
             if (!info.plan_mode) self.plan_proposal_ready = false;
         }
+        self.normalizeTopSelection();
     }
 
     fn removeSessionSummary(self: *App, sid: u64) void {
@@ -1579,8 +1592,13 @@ const App = struct {
             summary.deinit(self.gpa);
             _ = self.sessions.orderedRemove(i);
             _ = self.session_labels.orderedRemove(i);
+            if (self.top_view) |*view| {
+                if (view.selected_sid == sid) view.selected_sid = null;
+                view.selected_fallback = @min(i, self.sessions.items.len -| 1);
+            }
             break;
         }
+        self.normalizeTopSelection();
         var recent_i: usize = 0;
         while (recent_i < self.recent_sessions.items.len) {
             if (self.recent_sessions.items[recent_i] == sid)
@@ -2237,6 +2255,7 @@ const App = struct {
 
     fn needsAnimationTick(self: *const App) bool {
         return self.state == .running or
+            self.top_view != null or
             self.voice_rt.download != null or
             self.voice_rt.phase != .idle or
             self.ui_animation_active.load(.acquire);
@@ -2508,6 +2527,8 @@ const App = struct {
             }
         } else if (std.mem.eql(u8, head, "/sessions")) {
             self.openPicker(.session);
+        } else if (std.mem.eql(u8, head, "/top")) {
+            self.openTop();
         } else if (std.mem.eql(u8, head, "/new")) {
             self.newSession() catch {
                 self.setNotice("could not create session", .{});
@@ -2599,7 +2620,7 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/config")) {
             self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/setup · /sessions · /search [query] · /diagnostics · /animate matrix · /otel [set <endpoint>|status|off] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !rb [client|both] · !c · /quit", .{});
+            self.setNotice("/setup · /sessions · /top · /search [query] · /diagnostics · /animate matrix · /otel [set <endpoint>|status|off] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · !rb [client|both] · !c · /quit", .{});
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -3501,6 +3522,151 @@ const App = struct {
                 self.picker = i;
                 break;
             }
+        }
+    }
+
+    fn openTop(self: *App) void {
+        self.notice.clearRetainingCapacity();
+        self.top_view = .{ .selected_sid = self.sid };
+        self.syncAnimationTicker();
+    }
+
+    fn closeTop(self: *App) void {
+        self.top_view = null;
+        self.syncAnimationTicker();
+    }
+
+    fn topRows(self: *const App, arena: std.mem.Allocator) ![]const top_view.RowView {
+        const rows = try arena.alloc(top_view.RowView, self.sessions.items.len);
+        for (self.sessions.items, 0..) |session, i| rows[i] = .{
+            .sid = session.sid,
+            .parent_sid = session.parent_sid,
+            .kind = session.kind,
+            .state = session.state,
+            .created_at = session.created_at,
+            .title = session.title,
+            .cwd = session.cwd,
+            .model = session.model,
+        };
+        return rows;
+    }
+
+    fn topSelectedIndex(self: *const App) ?usize {
+        const view = self.top_view orelse return null;
+        if (self.sessions.items.len == 0) return null;
+        if (view.selected_sid) |sid| for (self.sessions.items, 0..) |session, i| {
+            if (session.sid == sid) return i;
+        };
+        return @min(view.selected_fallback, self.sessions.items.len - 1);
+    }
+
+    fn normalizeTopSelection(self: *App) void {
+        if (self.top_view == null) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const rows = self.topRows(arena_state.allocator()) catch return;
+        const ordered = top_view.orderedRows(arena_state.allocator(), rows) catch return;
+        if (ordered.len == 0) {
+            self.top_view.?.selected_sid = null;
+            return;
+        }
+        if (self.top_view.?.selected_sid) |sid| for (ordered, 0..) |row, i| {
+            if (row.sid == sid) {
+                self.top_view.?.selected_fallback = i;
+                return;
+            }
+        };
+        const i = @min(self.top_view.?.selected_fallback, ordered.len - 1);
+        self.top_view.?.selected_sid = ordered[i].sid;
+    }
+
+    fn moveTopSelection(self: *App, delta: isize) void {
+        if (self.top_view == null) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const rows = self.topRows(arena_state.allocator()) catch return;
+        const ordered = top_view.orderedRows(arena_state.allocator(), rows) catch return;
+        if (ordered.len == 0) return;
+        var current = @min(self.top_view.?.selected_fallback, ordered.len - 1);
+        if (self.top_view.?.selected_sid) |sid| for (ordered, 0..) |row, i| {
+            if (row.sid == sid) {
+                current = i;
+                break;
+            }
+        };
+        const next: usize = if (delta < 0)
+            current -| @as(usize, @intCast(-delta))
+        else
+            @min(current + @as(usize, @intCast(delta)), ordered.len - 1);
+        self.top_view.?.selected_fallback = next;
+        self.top_view.?.selected_sid = ordered[next].sid;
+        self.top_view.?.confirm_kill = null;
+    }
+
+    fn setTopEdgeSelection(self: *App, last: bool) void {
+        if (self.top_view == null) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const rows = self.topRows(arena_state.allocator()) catch return;
+        const ordered = top_view.orderedRows(arena_state.allocator(), rows) catch return;
+        if (ordered.len == 0) return;
+        const i = if (last) ordered.len - 1 else 0;
+        self.top_view.?.selected_fallback = i;
+        self.top_view.?.selected_sid = ordered[i].sid;
+    }
+
+    fn archiveTopSession(self: *App, sid: u64) void {
+        for (self.sessions.items) |session| {
+            if (!self.sessionBelongsToTree(session.sid, sid)) continue;
+            if (session.state == .running or session.state == .awaiting_approval) {
+                self.setNotice("cannot archive a running session tree", .{});
+                return;
+            }
+        }
+        if (sid == self.sid) {
+            self.closeTop();
+            self.archiveCurrentSession();
+            return;
+        }
+        self.conn.send(.{ .session_archive = .{ .sid = sid } }) catch {
+            self.setNotice("could not archive session", .{});
+            return;
+        };
+        var handle_buf: session_handle.Full = undefined;
+        self.setNotice("archiving session {s}", .{self.displaySessionHandle(&handle_buf, sid)});
+    }
+
+    fn killTopSession(self: *App, sid: u64) void {
+        var fallback: ?u64 = null;
+        if (sid == self.sid) {
+            if (self.sessionSummary(sid)) |current| {
+                if (current.parent_sid) |parent_sid| {
+                    if (self.sessionSummary(parent_sid) != null) fallback = parent_sid;
+                }
+            }
+            if (fallback == null) {
+                for (self.recent_sessions.items) |candidate_sid| {
+                    if (!self.sessionBelongsToTree(candidate_sid, sid) and self.sessionSummary(candidate_sid) != null) {
+                        fallback = candidate_sid;
+                        break;
+                    }
+                }
+            }
+        }
+        self.conn.send(.{ .session_kill = .{ .sid = sid } }) catch {
+            self.setNotice("could not kill session", .{});
+            return;
+        };
+        if (sid == self.sid) {
+            self.closeTop();
+            if (fallback) |fallback_sid| {
+                self.switchSession(fallback_sid, true) catch self.setNotice("session killed, but could not switch sessions", .{});
+            } else {
+                self.newSession() catch self.setNotice("session killed; use /new to continue", .{});
+            }
+        } else {
+            var handle_buf: session_handle.Full = undefined;
+            self.setNotice("killing session {s}", .{self.displaySessionHandle(&handle_buf, sid)});
         }
     }
 
@@ -5354,6 +5520,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Ctrl+R (insert)", .description = "fuzzy-search authored input history" },
     .{ .key = "Enter while working", .description = "steer the active turn" },
     .{ .key = "Ctrl+N", .description = "create a new session" },
+    .{ .key = "Ctrl+S", .description = "open the live session overview" },
     .{ .key = "Ctrl+D (empty)", .description = "archive the current session" },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
@@ -5774,6 +5941,25 @@ fn drawPlan(
     });
 }
 
+fn drawTop(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
+    const rows = try top_view.orderedRows(arena, try app.topRows(arena));
+    var scroll_top: usize = if (app.top_view) |view| view.scroll_top else 0;
+    try top_view.drawCatalog(
+        win,
+        arena,
+        rows,
+        app.known_session_ids.items,
+        if (app.top_view) |view| view.selected_sid else null,
+        &scroll_top,
+        nowWallMs(app.io),
+        false,
+        app.notice.items,
+        if (app.top_view) |view| view.confirm_kill != null else false,
+        true,
+    );
+    if (app.top_view) |*view| view.scroll_top = scroll_top;
+}
+
 fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const win = vx.window();
     win.clear();
@@ -5781,6 +5967,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const h = win.height;
     const w = win.width;
     if (h < 4 or w < 20) return;
+    if (app.top_view != null) return drawTop(app, win, arena);
 
     if (app.show_tab_bar) try drawTabBar(app, win, arena);
     const top_rows = app.tabBarRows();
@@ -7224,6 +7411,7 @@ fn tabMouseAction(m: vaxis.Mouse) ?TabMouseAction {
 /// Left press/drag/release below it selects terminal-cell ranges; release
 /// copies the precise range via OSC52.
 fn handleMouse(app: *App, m: vaxis.Mouse) void {
+    if (app.top_view != null) return;
     // Some terminals report the release button as `none`, so complete an
     // active left-button drag based on event type before switching on button.
     if (m.type == .release and app.sel_dragging) {
@@ -7658,6 +7846,11 @@ fn validSetupProviderName(name: []const u8) bool {
 }
 
 fn handleKey(app: *App, key: vaxis.Key) !void {
+    if (key.matches('s', .{ .ctrl = true })) {
+        if (app.top_view != null) app.closeTop() else app.openTop();
+        return;
+    }
+
     if (app.setup_prompt != .none) {
         const ed = &app.editor;
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('g', .{ .ctrl = true })) {
@@ -7747,6 +7940,40 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     if (app.shortcut_help) {
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('?', .{}) or key.matches('q', .{})) {
             app.shortcut_help = false;
+        }
+        return;
+    }
+
+    if (app.top_view != null) {
+        if (app.top_view.?.confirm_kill) |sid| {
+            if (key.matches('y', .{})) app.killTopSession(sid);
+            if (app.top_view) |*view| view.confirm_kill = null;
+            return;
+        }
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+            app.closeTop();
+        } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+            app.moveTopSelection(1);
+        } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+            app.moveTopSelection(-1);
+        } else if (key.matches('g', .{})) {
+            app.setTopEdgeSelection(false);
+        } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+            app.setTopEdgeSelection(true);
+        } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
+            app.moveTopSelection(10);
+        } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
+            app.moveTopSelection(-10);
+        } else if (key.matches('a', .{})) {
+            if (app.topSelectedIndex()) |i| app.archiveTopSession(app.sessions.items[i].sid);
+        } else if (key.matches('x', .{}) or key.matches('K', .{ .shift = true })) {
+            if (app.topSelectedIndex()) |i| app.top_view.?.confirm_kill = app.sessions.items[i].sid;
+        } else if (isEnterKey(key)) {
+            if (app.topSelectedIndex()) |i| {
+                const sid = app.sessions.items[i].sid;
+                app.closeTop();
+                app.switchSession(sid, true) catch app.setNotice("could not switch session", .{});
+            }
         }
         return;
     }
@@ -10340,6 +10567,59 @@ test "incremental session catalog upserts preserve hierarchy and remove owned st
     app.removeSessionSummary(21);
     try std.testing.expectEqual(@as(usize, 3), app.sessions.items.len);
     try std.testing.expect(app.sessionSummary(21) == null);
+}
+
+test "top overlay opens from command and Ctrl+S, tracks selection, and closes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 20,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 20, .title = "root", .model = "m", .status = "idle", .created_at = 20, .running = false },
+        .{ .sid = 21, .parent_sid = 20, .kind = .task_child, .title = "child", .model = "m", .status = "running", .state = .running, .created_at = 21, .running = true },
+        .{ .sid = 10, .title = "older", .model = "m", .status = "idle", .created_at = 10, .running = false },
+    });
+
+    app.runCommand("/top");
+    try std.testing.expectEqual(@as(?u64, 20), app.top_view.?.selected_sid);
+    try handleKey(&app, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(?u64, 21), app.top_view.?.selected_sid);
+    app.removeSessionSummary(21);
+    try std.testing.expectEqual(@as(?u64, 20), app.top_view.?.selected_sid);
+    try handleKey(&app, .{ .codepoint = 's', .mods = .{ .ctrl = true } });
+    try std.testing.expect(app.top_view == null);
+    try handleKey(&app, .{ .codepoint = 's', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqual(@as(?u64, 20), app.top_view.?.selected_sid);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(app.top_view == null);
+}
+
+test "top overlay kill requires confirmation before sending" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 20,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+    app.replaceSessionSummaries(&.{.{ .sid = 20, .title = "root", .model = "m", .status = "idle", .created_at = 20, .running = false }});
+    app.openTop();
+
+    try handleKey(&app, .{ .codepoint = 'x' });
+    try std.testing.expectEqual(@as(?u64, 20), app.top_view.?.confirm_kill);
+    try handleKey(&app, .{ .codepoint = 'n' });
+    try std.testing.expect(app.top_view.?.confirm_kill == null);
 }
 
 test "inactive session view cache evicts least recently used transcripts" {
