@@ -155,24 +155,46 @@ pub const Runtime = struct {
         for (cfg.mcp_servers) |server_cfg| {
             const argv = try expandPaths(arena, server_cfg.cmd, environ.get("HOME"));
             const server = try mcp.Server.init(gpa, io, server_cfg.name, argv, child_environ);
-            var entry = Mcp{
+            const entry = Mcp{
                 .server = server,
                 .default_mutating = server_cfg.mutating,
                 .readonly_tools = server_cfg.readonly_tools,
                 .mutating_tools = server_cfg.mutating_tools,
             };
-            server.discover() catch |err| {
-                std.log.warn("MCP server '{s}' unavailable: {t}", .{ server_cfg.name, err });
-                entry.setError(gpa, err);
-            };
             self.mcp_servers.append(gpa, entry) catch |err| {
-                entry.deinit(gpa);
+                var owned = entry;
+                owned.deinit(gpa);
                 return err;
             };
         }
+        // Discover in parallel: startup latency becomes the SLOWEST server,
+        // not the sum, and discovery still finishes before the socket opens
+        // so the first turn sees the complete tool list. Each server has its
+        // own process and mutex; entries are only written by their own
+        // thread until every join.
+        try self.discoverAll();
 
         try self.rebuildSpecs();
         return self;
+    }
+
+    fn discoverAll(self: *Runtime) !void {
+        const entries = self.mcp_servers.items;
+        if (entries.len == 0) return;
+        const threads = try self.gpa.alloc(?std.Thread, entries.len);
+        defer self.gpa.free(threads);
+        for (entries, threads) |*entry, *slot| {
+            slot.* = std.Thread.spawn(.{}, discoverOne, .{ entry, self.gpa }) catch null;
+            if (slot.* == null) discoverOne(entry, self.gpa);
+        }
+        for (threads) |slot| if (slot) |thread| thread.join();
+    }
+
+    fn discoverOne(entry: *Mcp, gpa: std.mem.Allocator) void {
+        entry.server.discover() catch |err| {
+            std.log.warn("MCP server '{s}' unavailable: {t}", .{ entry.server.name, err });
+            entry.setError(gpa, err);
+        };
     }
 
     pub fn deinit(self: *Runtime) void {

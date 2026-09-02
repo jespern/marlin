@@ -122,6 +122,9 @@ const Check = struct {
     argv2: []const []const u8 = &.{},
     env: std.json.ArrayHashMap([]const u8) = .{},
     exit_code: u8 = 0,
+    /// Wall-clock budget for the final marlin invocation, including daemon
+    /// autostart. 0 = no budget. The cheapest startup regression gate we have.
+    max_wall_ms: u64 = 0,
     stdout_contains: []const []const u8 = &.{},
     stderr_contains: []const []const u8 = &.{},
     stdout_equals: ?[]const u8 = null,
@@ -372,6 +375,7 @@ fn runScenario(
             try argv.append(arena, marlin_bin);
             for (argv_cfg) |a| try argv.append(arena, a);
 
+            const run_began_ns = Io.Timestamp.now(io, .awake).nanoseconds;
             const res = process_io.run(gpa, io, .{
                 .argv = argv.items,
                 .environ_map = &env,
@@ -391,6 +395,11 @@ fn runScenario(
 
             const is_last = runs == sf.check.runs - 1;
             if (is_last) {
+                const wall_ms: u64 = @intCast(@divTrunc(Io.Timestamp.now(io, .awake).nanoseconds - run_began_ns, std.time.ns_per_ms));
+                if (sf.check.max_wall_ms > 0 and wall_ms > sf.check.max_wall_ms) {
+                    print(io, "\n  marlin took {d}ms, budget {d}ms\n", .{ wall_ms, sf.check.max_wall_ms });
+                    return error.ScenarioTooSlow;
+                }
                 const code: u8 = switch (res.term) {
                     .exited => |c| c,
                     else => 255,

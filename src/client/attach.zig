@@ -318,8 +318,19 @@ pub fn connectCancelable(
         if (host.len > 0) return connectRemote(gpa, io, host, cancel);
     }
     var spawned = false;
+    var ready_pipe: ?Io.File = null;
+    defer if (ready_pipe) |p| p.close(io);
+    var daemon_ready = false;
+    var daemon_gone = false;
     var attempt: u32 = 0;
-    while (attempt < 100) : (attempt += 1) {
+    while (true) : (attempt += 1) {
+        // Two budgets. Once a daemon is (or should be) listening, five
+        // seconds of connect+hello polling is plenty. While OUR autostarted
+        // child is still coming up — MCP discovery, sandbox canary, a cold
+        // npm cache — it gets sixty, watched through its readiness pipe so a
+        // crashed daemon fails fast instead of burning the whole budget.
+        const budget: u32 = if (spawned and !daemon_ready and !daemon_gone) 1200 else 100;
+        if (attempt >= budget) break;
         if (connectCancelled(cancel)) return error.ConnectCanceled;
         const conn = try tryConnect(gpa, io, environ);
         if (conn) |candidate| {
@@ -337,9 +348,9 @@ pub fn connectCancelable(
             // During reboot the old socket may accept one last connection
             // and close it before hello_ok; that is not daemon readiness.
             var child = try std.process.spawn(io, .{
-                .argv = &.{ self_exe, "daemon" },
+                .argv = &.{ self_exe, "daemon", "--ready-stdout" },
                 .stdin = .ignore,
-                .stdout = .ignore,
+                .stdout = .pipe,
                 .stderr = .ignore,
                 // Production daemons detach into their own group. The E2E
                 // runner opts into inheritance so one outer cancellation can
@@ -349,12 +360,47 @@ pub fn connectCancelable(
                 else
                     0,
             });
+            ready_pipe = child.stdout;
+            child.stdout = null;
             _ = &child; // deliberately not waited/killed
             spawned = true;
         }
+        if (ready_pipe) |pipe| switch (pollReadiness(pipe)) {
+            .pending => {},
+            .ready => {
+                daemon_ready = true;
+                attempt = 0; // fresh connect budget from the moment it listens
+                pipe.close(io);
+                ready_pipe = null;
+            },
+            .gone => {
+                daemon_gone = true;
+                pipe.close(io);
+                ready_pipe = null;
+                if (!daemon_ready) return error.DaemonStartFailed;
+            },
+        };
         io.sleep(.fromMilliseconds(50), .awake) catch {};
     }
     return error.DaemonStartFailed;
+}
+
+const Readiness = enum { pending, ready, gone };
+
+/// Non-blocking read of the autostarted daemon's readiness byte ('R',
+/// written right after listen()). HUP/EOF means the process died before
+/// listening. Plain poll(2): no watchdog thread, no fd closed under a read.
+fn pollReadiness(pipe: Io.File) Readiness {
+    var fds = [_]std.posix.pollfd{.{ .fd = pipe.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const n = std.posix.poll(&fds, 0) catch return .gone;
+    if (n == 0) return .pending;
+    if (fds[0].revents & std.posix.POLL.IN != 0) {
+        var byte: [1]u8 = undefined;
+        const got = std.posix.read(pipe.handle, &byte) catch return .gone;
+        if (got == 0) return .gone;
+        return if (byte[0] == 'R') .ready else .gone;
+    }
+    return .gone;
 }
 
 /// `host` is an ssh destination, verbatim — ssh config owns naming, keys,

@@ -90,7 +90,15 @@ pub fn dispatch(
         ._pipe => return pipe.run(gpa, io, environ, self_exe),
         ._rebuild => return remote_rebuild.run(gpa, io, environ, rest),
         .help => try stdoutPrint(io, help_text, .{}),
-        .daemon => try daemon.Daemon.serve(gpa, io, environ, null),
+        // `--ready-stdout` is the autostart handshake: the daemon writes one
+        // 'R' to stdout right after listen(), so the spawning client waits on
+        // readiness instead of a blind timer (docs/ARCHITECTURE.md §1).
+        .daemon => try daemon.Daemon.serve(
+            gpa,
+            io,
+            environ,
+            if (rest.len == 1 and std.mem.eql(u8, rest[0], "--ready-stdout")) Io.File.stdout() else null,
+        ),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
         .ls => return headless.ls(gpa, io, environ, self_exe, rest),
         .top => {

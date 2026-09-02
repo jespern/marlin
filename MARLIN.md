@@ -23,8 +23,10 @@ answer is no. Standing walls: README Principles, and ARCHITECTURE
   repo-owned pre-commit hook checks the equivalent staged snapshot, and CI
   runs this step against the checked-out commit.
 - `zig build` — build AND install `zig-out/bin/marlin`, defaulting to
-  ReleaseFast (the installed binary is the daily driver; a Debug install is
-  5-10x slower). Pass `-Doptimize=Debug` only for debugging the binary.
+  ReleaseFast for source installs. Official release artifacts are built
+  ReleaseSafe (safety checks stay on in a long-running daemon); the
+  ReleaseFast/ReleaseSafe delta is unmeasured, and a Debug install is
+  noticeably slower. Pass `-Doptimize=Debug` only for debugging the binary.
   Unit tests always compile Debug regardless. `zig build test` and
   `zig build e2e` do NOT install; a running daemon only picks up changes
   after an install + reboot (`!rb` in the TUI).

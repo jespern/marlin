@@ -378,6 +378,7 @@ pub const Daemon = struct {
         // our own process group, and we ignore SIGHUP for the case where the
         // user runs `marlin daemon` in a terminal that later goes away.
         ignoreSighup();
+        const startup_began_ms = nowMs(io);
 
         // Serialize startup before touching the database or stale socket.
         // The lock file may remain on disk; ownership is the kernel lock, so
@@ -406,7 +407,9 @@ pub const Daemon = struct {
         var loaded_config = try config.load(gpa, io, environ);
         defer loaded_config.deinit();
         const cfg = loaded_config.value;
+        const extensions_began_ms = nowMs(io);
         const extension_runtime = try extensions.Runtime.init(gpa, io, cfg, environ);
+        const extensions_ms = nowMs(io) - extensions_began_ms;
         var extension_transferred = false;
         defer if (!extension_transferred) extension_runtime.deinit();
         const network = network_policy.Policy.init(gpa, io, environ, .{
@@ -503,14 +506,22 @@ pub const Daemon = struct {
         // Belt-and-braces: unix sockets are also protected by the parent dir.
         posixChmod600(sock_path);
 
-        std.log.info("marlind listening on {s}", .{sock_path});
-        // Signal readiness (autostart handshake): write one byte and close.
+        // Startup is measured, not asserted: extensions (skills + MCP
+        // discovery) are the dominant term and the one that grows with config.
+        std.log.info("marlind listening on {s} (startup {d} ms, extensions {d} ms)", .{
+            sock_path,
+            nowMs(io) - startup_began_ms,
+            extensions_ms,
+        });
+        // Signal readiness (autostart handshake): write one byte. When the
+        // pipe is our own stdout (`--ready-stdout`) it stays open — closing
+        // fd 1 would let a later open() reuse it for something stdout-ish.
         if (ready_pipe) |p| {
             var wb: [1]u8 = .{'R'};
             var w = p.writer(io, &.{});
             _ = w.interface.writeAll(&wb) catch {};
             w.interface.flush() catch {};
-            p.close(io);
+            if (p.handle != Io.File.stdout().handle) p.close(io);
         }
 
         self.otel_exporter = otel.Exporter.start(gpa, io, &self.store, environ) catch |err| blk: {

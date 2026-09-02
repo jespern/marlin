@@ -3,6 +3,7 @@
   "check": {
     "argv": ["mcp"],
     "exit_code": 1,
+    "max_wall_ms": 20000,
     "stdout_contains": ["fixture\tready\t1 tools", "broken\tunavailable"],
     "config_toml": "[[mcp]]\nname = \"fixture\"\ncmd = [\"~/mcp.sh\"]\nmutating = true\nreadonly_tools = [\"answer\"]\n\n[[mcp]]\nname = \"broken\"\ncmd = [\"sh\", \"-c\", \"exit 7\"]\nmutating = true\n",
     "mcp_script": "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"tools/list\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"answer\",\"inputSchema\":{\"type\":\"object\"}}]}}' ;;\n  esac\ndone\n"
