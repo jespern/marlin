@@ -341,6 +341,8 @@ pub const ClientMsg = union(enum) {
     mcp_remove: struct { name: []const u8 },
     /// Persist one client UI preference through the daemon-owned config path.
     ui_set_tab_bar: struct { enabled: bool },
+    /// Persist `[ui] bell` (terminal BEL on a background approval).
+    ui_set_bell: struct { enabled: bool },
     /// Re-read config and atomically replace extensions while no turn is live.
     mcp_reload: struct {},
     interrupt: struct {
@@ -470,7 +472,7 @@ pub const DaemonMsg = union(enum) {
     setup_result: struct { model: []const u8, session_updated: bool = false },
     mcp_list_result: struct { servers: []const McpServerInfo },
     /// Terminal reply to ui_set_tab_bar after config.toml is durable.
-    ui_config_result: struct { tab_bar: bool },
+    ui_config_result: struct { tab_bar: bool, bell: bool = true },
     /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
     /// contain arbitrary command output (including NULs).
     blob_result: struct { hash: []const u8, bytes: []const u8 },

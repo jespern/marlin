@@ -188,7 +188,7 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
     .{ .name = "/compact", .description = "compact the current context" },
-    .{ .name = "/config", .usage = " [tabbar on|off]", .description = "view or change UI settings (persisted)", .accepts_args = true },
+    .{ .name = "/config", .usage = " [tabbar|bell on|off]", .description = "view or change UI settings (persisted)", .accepts_args = true },
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
     .{ .name = "/quit", .description = "leave Marlin" },
@@ -688,6 +688,16 @@ const App = struct {
     /// Top tab strip ([ui] tab_bar; /config tabbar toggles + persists).
     /// Hiding the bar only removes CHROME: alt+N, gt/gT, </> keep working.
     show_tab_bar: bool = true,
+    /// [ui] bell: ring the terminal when a NON-focused session parks on an
+    /// approval. The one out-of-band signal; everything else stays quiet.
+    bell_enabled: bool = true,
+    bell_pending: bool = false,
+    /// Scroll offset of the `?` help panel (rows are static + generated).
+    help_scroll: usize = 0,
+    /// Wall-clock ms after which the status notice clears itself. Read by
+    /// the animation thread so an idle TUI still gets the tick that clears
+    /// it; 0 = nothing pending.
+    notice_deadline_ms: std.atomic.Value(i64) = .init(0),
     /// Ctrl+L asks the event loop to invalidate libvaxis's previous-screen
     /// cache so the next render repaints every terminal cell.
     refresh_requested: bool = false,
@@ -878,9 +888,27 @@ const App = struct {
         self.addAttachment(pending);
     }
 
+    /// Notices are transient by construction: they self-clear after a few
+    /// seconds instead of squatting on the status bar until something else
+    /// overwrites them ("session → 3f2a" used to live there for hours).
+    const notice_ttl_ms: i64 = 8_000;
+
     fn setNotice(self: *App, comptime fmt: []const u8, args: anytype) void {
         self.notice.clearRetainingCapacity();
         self.notice.print(self.gpa, fmt, args) catch {};
+        self.armNoticeExpiry(notice_ttl_ms);
+    }
+
+    fn armNoticeExpiry(self: *App, ttl_ms: i64) void {
+        self.notice_deadline_ms.store(nowWallMs(self.io) + ttl_ms, .release);
+    }
+
+    /// Called on every tick; clears an expired notice.
+    fn expireNotice(self: *App) void {
+        const deadline = self.notice_deadline_ms.load(.acquire);
+        if (deadline == 0 or nowWallMs(self.io) < deadline) return;
+        self.notice_deadline_ms.store(0, .release);
+        self.notice.clearRetainingCapacity();
     }
 
     fn clearHistoryBackfill(self: *App) void {
@@ -1914,10 +1942,14 @@ const App = struct {
                 @memcpy(p.tool_buf[0..p.tool_len], ar.tool[0..p.tool_len]);
                 p.args_len = @min(ar.args_json.len, p.args_buf.len);
                 @memcpy(p.args_buf[0..p.args_len], ar.args_json[0..p.args_len]);
-                if (ar.sid == self.sid)
-                    self.pending = p
-                else
+                if (ar.sid == self.sid) {
+                    self.pending = p;
+                } else {
                     self.background_approvals.put(self.gpa, ar.sid, p) catch {};
+                    // The one out-of-band signal: you are looking elsewhere
+                    // and a session needs a human. Everything else stays quiet.
+                    if (self.bell_enabled) self.bell_pending = true;
+                }
             },
             .session_created => |sc| self.handleSessionCreated(sc.sid, sc.request_id),
             .session_list_result => |sl| self.replaceSessionSummaries(sl.sessions),
@@ -1991,8 +2023,9 @@ const App = struct {
             .mcp_list_result => |result| self.showMcpStatus(result.servers),
             .ui_config_result => |result| {
                 self.show_tab_bar = result.tab_bar;
+                self.bell_enabled = result.bell;
                 self.refresh_requested = true;
-                self.setNotice("tab bar {s} (saved to config.toml)", .{onOff(result.tab_bar)});
+                self.setNotice("saved · tabbar {s} · bell {s}", .{ onOff(result.tab_bar), onOff(result.bell) });
             },
             .council_list_result => |result| self.applyCouncils(result.councils),
             .plan_clear_result => |result| {
@@ -2635,7 +2668,10 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/config")) {
             self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {
-            self.setNotice("/setup · /sessions · /top · /search [query] · /diagnostics · /animate matrix · /otel [set <endpoint>|status|off] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · ! [command] · !rb [client|both] · !c · /quit", .{});
+            // The status bar is one row; the catalog is not. Open the help
+            // panel scrolled to its generated COMMANDS section instead.
+            self.shortcut_help = true;
+            self.help_scroll = shortcut_help_rows.len;
         } else if (head.len > 1 and head[0] == '!') {
             // `!ls -la` — every shell and vim accept the bang glued to the
             // command. The exact `!c`/`!rb` shortcuts matched above.
@@ -2650,30 +2686,45 @@ const App = struct {
     /// config.toml, so the choice survives reboots and other clients.
     fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8) void {
         const name = setting orelse {
-            self.setNotice("config · tabbar {s} — /config tabbar [on|off]", .{onOff(self.show_tab_bar)});
+            self.setNotice("config · tabbar {s} · bell {s} — /config <tabbar|bell> [on|off]", .{
+                onOff(self.show_tab_bar),
+                onOff(self.bell_enabled),
+            });
             return;
         };
-        if (!std.mem.eql(u8, name, "tabbar")) {
-            self.setNotice("usage: /config tabbar [on|off]", .{});
+        const is_tabbar = std.mem.eql(u8, name, "tabbar");
+        const is_bell = std.mem.eql(u8, name, "bell");
+        if (!is_tabbar and !is_bell) {
+            self.setNotice("usage: /config <tabbar|bell> [on|off]", .{});
             return;
         }
+        const current = if (is_tabbar) self.show_tab_bar else self.bell_enabled;
         const enable = if (value) |v| blk: {
             if (std.mem.eql(u8, v, "on") or std.mem.eql(u8, v, "true")) break :blk true;
             if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false")) break :blk false;
-            self.setNotice("usage: /config tabbar [on|off]", .{});
+            self.setNotice("usage: /config <tabbar|bell> [on|off]", .{});
             return;
-        } else !self.show_tab_bar;
-        self.show_tab_bar = enable;
-        self.refresh_requested = true;
-        self.conn.send(.{ .ui_set_tab_bar = .{ .enabled = enable } }) catch |err| {
-            self.setNotice("tab bar {s} (not saved: {t})", .{ onOff(enable), err });
+        } else !current;
+        if (is_tabbar) {
+            self.show_tab_bar = enable;
+            self.refresh_requested = true;
+        } else {
+            self.bell_enabled = enable;
+        }
+        const msg: proto.ClientMsg = if (is_tabbar)
+            .{ .ui_set_tab_bar = .{ .enabled = enable } }
+        else
+            .{ .ui_set_bell = .{ .enabled = enable } };
+        self.conn.send(msg) catch |err| {
+            self.setNotice("{s} {s} (not saved: {t})", .{ name, onOff(enable), err });
             return;
         };
-        self.setNotice("tab bar {s} (saving…)", .{onOff(enable)});
+        self.setNotice("{s} {s} (saving…)", .{ name, onOff(enable) });
     }
 
     fn showMcpStatus(self: *App, servers: []const proto.McpServerInfo) void {
         self.notice.clearRetainingCapacity();
+        self.armNoticeExpiry(2 * notice_ttl_ms); // a list the user asked to read
         if (servers.len == 0) {
             self.notice.appendSlice(self.gpa, "MCP · no servers configured") catch {};
             return;
@@ -5629,14 +5680,34 @@ fn drawCouncilDetail(app: *const App, win: vaxis.Window, arena: std.mem.Allocato
     }, .{ .row_offset = box_h -| 2, .wrap = .none });
 }
 
-fn drawShortcutHelp(win: vaxis.Window, arena: std.mem.Allocator) !void {
+/// Static key rows plus a COMMANDS section generated from the composer
+/// catalog, in one scrollable panel: on a 24-row terminal only half the rows
+/// fit, and silently truncating the help was the one place a user could not
+/// discover the surface.
+fn drawShortcutHelp(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
     const h = win.height;
     const w = win.width;
     if (h < 8 or w < 32) return;
 
-    const shown: u16 = @intCast(@min(shortcut_help_rows.len, h -| 6));
+    var rows: std.ArrayList(ShortcutHelpRow) = .empty;
+    try rows.appendSlice(arena, &shortcut_help_rows);
+    try rows.append(arena, .{ .description = "COMMANDS", .heading = true });
+    for (composer_commands) |cmd| {
+        try rows.append(arena, .{
+            .key = try std.fmt.allocPrint(arena, "{s}{s}", .{ cmd.name, cmd.usage }),
+            .description = cmd.description,
+        });
+    }
+    const total = rows.items.len;
+    const capacity: usize = @min(total, h -| 6);
+    const max_scroll = total - capacity;
+    if (app.help_scroll > max_scroll) app.help_scroll = max_scroll;
+    const first = app.help_scroll;
+    const remaining = total - (first + capacity);
+
+    const shown: u16 = @intCast(capacity);
     const box_h = shown + 3; // title + rows + close hint
-    const box_w: u16 = @min(@as(u16, 58), w -| 4);
+    const box_w: u16 = @min(@as(u16, 76), w -| 4);
     const box = win.child(.{
         .x_off = @intCast((w -| box_w) / 2),
         .y_off = @intCast((h -| box_h) / 2),
@@ -5650,10 +5721,10 @@ fn drawShortcutHelp(win: vaxis.Window, arena: std.mem.Allocator) !void {
         .style = Palette.shortcut_key,
     }, .{ .wrap = .none });
 
-    const key_column: usize = 19;
+    const key_column: usize = 26;
     var row: u16 = 0;
     while (row < shown) : (row += 1) {
-        const item = shortcut_help_rows[row];
+        const item = rows.items[first + row];
         const row_win = box.child(.{ .y_off = @intCast(row + 1), .height = 1, .width = box.width });
         if (item.heading) {
             const heading = try std.fmt.allocPrint(arena, " {s}", .{item.description});
@@ -5670,8 +5741,14 @@ fn drawShortcutHelp(win: vaxis.Window, arena: std.mem.Allocator) !void {
         _ = row_win.print(&segments, .{ .wrap = .none });
     }
 
+    const footer = if (remaining > 0)
+        try std.fmt.allocPrint(arena, " Esc · ? · q close · j/k scroll · {d} more", .{remaining})
+    else if (first > 0)
+        " Esc · ? · q close · j/k scroll"
+    else
+        " Esc · ? · q close";
     _ = box.printSegment(.{
-        .text = " Esc · ? · q close",
+        .text = footer,
         .style = Palette.shortcut_text,
     }, .{ .row_offset = shown + 1, .wrap = .none });
 }
@@ -6277,7 +6354,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         app.editor.draw(input_win, prompt, if (app.plan_mode) Palette.plan_active else Palette.prompt_mark, Palette.prompt_text);
     if (proposal_ready) {
         _ = input_panel.printSegment(.{
-            .text = " Enter implement · e revise · Esc stay · q dismiss",
+            .text = " Enter implement · e revise · Esc/q dismiss",
             .style = Palette.plan_active,
         }, .{ .row_offset = input_h - 1, .wrap = .none });
     }
@@ -6686,7 +6763,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     if (app.council_detail_name.items.len > 0 and app.picker == null)
         try drawCouncilDetail(app, win, arena)
     else if (app.shortcut_help and app.picker == null)
-        try drawShortcutHelp(win, arena);
+        try drawShortcutHelp(app, win, arena);
 
     drawUiAnimation(app, win);
 }
@@ -7009,6 +7086,9 @@ fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
             app.io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
         } else {
             app.io.sleep(.fromMilliseconds(200), .awake) catch {};
+            // An idle TUI posts no ticks; a pending notice expiry needs one.
+            const deadline = app.notice_deadline_ms.load(.acquire);
+            if (deadline != 0 and nowWallMs(app.io) >= deadline) loop.postEvent(.tick) catch return;
         }
     }
 }
@@ -7159,6 +7239,7 @@ pub fn run(
     app.setModelStr(model_at_start);
     if (setup_at_start) |readiness| app.setup_readiness = readiness;
     app.show_tab_bar = cfg.ui_tab_bar;
+    app.bell_enabled = cfg.ui_bell;
     app.effort = effort_at_start;
     app.setCwdStr(cwd_at_start);
     if (environ.get("HOME")) |home| app.setHomeStr(home);
@@ -7264,6 +7345,10 @@ pub fn run(
             defer frame_arena.deinit();
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
+            if (app.bell_pending) {
+                app.bell_pending = false;
+                try writer.writeAll("\x07");
+            }
             try writer.flush();
         }
 
@@ -7288,6 +7373,7 @@ pub fn run(
                     app.spinner_frame +%= 1;
                     app.voiceTick();
                     app.tickUiAnimation();
+                    app.expireNotice();
                 },
                 .winsize => |ws| {
                     app.term_cols = ws.cols;
@@ -7319,6 +7405,7 @@ pub fn run(
                                 app.spinner_frame +%= 1;
                                 app.voiceTick();
                                 app.tickUiAnimation();
+                                app.expireNotice();
                             },
                             .winsize => |ws2| {
                                 app.term_cols = ws2.cols;
@@ -7428,6 +7515,10 @@ pub fn run(
 
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
+            if (app.bell_pending) {
+                app.bell_pending = false;
+                try writer.writeAll("\x07");
+            }
             try writer.flush();
         }
 
@@ -7757,7 +7848,7 @@ fn isPlanToggleKey(key: vaxis.Key) bool {
     return key.matchExact(vaxis.Key.tab, .{ .shift = true });
 }
 
-const PlanProposalAction = enum { none, implement, revise, stay, dismiss };
+const PlanProposalAction = enum { none, implement, revise, dismiss };
 
 const voice_engines = [_]voice.Engine{ .whisper_turbo, .whisper_base, .parakeet };
 const voice_engine_items = [_][]const u8{
@@ -7910,8 +8001,7 @@ const VoiceRt = struct {
 fn planProposalAction(key: vaxis.Key) PlanProposalAction {
     if (isEnterKey(key)) return .implement;
     if (key.matches('e', .{})) return .revise;
-    if (key.matches(vaxis.Key.escape, .{})) return .stay;
-    if (key.matches('q', .{})) return .dismiss;
+    if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) return .dismiss;
     return .none;
 }
 
@@ -8049,6 +8139,15 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     if (app.shortcut_help) {
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('?', .{}) or key.matches('q', .{})) {
             app.shortcut_help = false;
+            app.help_scroll = 0;
+        } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            app.help_scroll +|= 1; // clamped when drawn
+        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            app.help_scroll -|= 1;
+        } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
+            app.help_scroll +|= 10;
+        } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
+            app.help_scroll -|= 10;
         }
         return;
     }
@@ -8177,21 +8276,28 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
+    // A finished proposal is an OFFER, not a modal: its four keys act, and
+    // every other key — tab switches, Ctrl+N, alt+N, pickers — passes
+    // through untouched. Esc dismisses (the proposal stays in the
+    // transcript; Plan mode remains on).
     if (app.plan_proposal_ready and app.plan_mode and app.state == .idle) {
-        switch (planProposalAction(key)) {
-            .implement => app.acceptPlanProposal(),
-            .revise => {
-                app.plan_proposal_ready = false;
-                app.mode = .insert;
-                app.setNotice("revise the plan in the composer", .{});
-            },
-            .dismiss => {
-                app.plan_proposal_ready = false;
-                app.setNotice("proposal dismissed · Plan mode remains on", .{});
-            },
-            .stay, .none => {},
+        const action = planProposalAction(key);
+        if (action != .none) {
+            switch (action) {
+                .implement => app.acceptPlanProposal(),
+                .revise => {
+                    app.plan_proposal_ready = false;
+                    app.mode = .insert;
+                    app.setNotice("revise the plan in the composer", .{});
+                },
+                .dismiss => {
+                    app.plan_proposal_ready = false;
+                    app.setNotice("proposal dismissed · Plan mode remains on", .{});
+                },
+                .none => unreachable,
+            }
+            return;
         }
-        return;
     }
 
     // A mode-independent, single-chord alias for /new. Pickers retain Vim's
@@ -8627,6 +8733,65 @@ test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do n
     try handleKey(&app, .{ .codepoint = 'q' });
     try handleKey(&app, .{ .codepoint = 'q' });
     try std.testing.expect(app.should_quit);
+}
+
+test "manners: notices expire, the plan offer is not a modal, a background approval rings once" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+
+    // Notice TTL: a fresh notice stays; a past deadline clears it on tick.
+    app.setNotice("session → 3f2a", .{});
+    app.expireNotice();
+    try std.testing.expectEqualStrings("session → 3f2a", app.notice.items);
+    app.notice_deadline_ms.store(1, .release);
+    app.expireNotice();
+    try std.testing.expectEqual(@as(usize, 0), app.notice.items.len);
+    try std.testing.expectEqual(@as(i64, 0), app.notice_deadline_ms.load(.acquire));
+
+    // A ready plan proposal lets unrelated keys through (j still scrolls)…
+    app.mode = .normal;
+    app.plan_mode = true;
+    app.plan_proposal_ready = true;
+    app.state = .idle;
+    app.scroll_up = 5;
+    try handleKey(&app, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(usize, 4), app.scroll_up);
+    try std.testing.expect(app.plan_proposal_ready);
+    // …and Esc dismisses the offer instead of being a no-op trap.
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(!app.plan_proposal_ready);
+    try std.testing.expect(app.plan_mode);
+
+    // An approval parked on a NON-focused session arms the bell; the
+    // focused session's own approval does not.
+    app.bell_pending = false;
+    app.handleDaemonLine(try gpa.dupe(u8,
+        \\{"approval_request":{"sid":2,"approval_id":"7","call_id":"c","tool":"bash","args_json":"{}"}}
+    ));
+    try std.testing.expect(app.bell_pending);
+    app.bell_pending = false;
+    app.handleDaemonLine(try gpa.dupe(u8,
+        \\{"approval_request":{"sid":1,"approval_id":"8","call_id":"c","tool":"bash","args_json":"{}"}}
+    ));
+    try std.testing.expect(!app.bell_pending);
+    app.bell_enabled = false;
+    app.handleDaemonLine(try gpa.dupe(u8,
+        \\{"approval_request":{"sid":3,"approval_id":"9","call_id":"c","tool":"bash","args_json":"{}"}}
+    ));
+    try std.testing.expect(!app.bell_pending);
+
+    // /help opens the panel at the COMMANDS section; keys scroll and close it.
+    app.runCommand("/help");
+    try std.testing.expect(app.shortcut_help);
+    try std.testing.expectEqual(shortcut_help_rows.len, app.help_scroll);
+    try handleKey(&app, .{ .codepoint = 'k' });
+    try std.testing.expectEqual(shortcut_help_rows.len - 1, app.help_scroll);
+    try handleKey(&app, .{ .codepoint = 'q' });
+    try std.testing.expect(!app.shortcut_help);
+    try std.testing.expectEqual(@as(usize, 0), app.help_scroll);
 }
 
 test {
@@ -9121,7 +9286,7 @@ test "command menu Tab completes and Enter runs the selection" {
     try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
     try std.testing.expect(app.editor.isEmpty());
     try std.testing.expectEqualStrings("/help", app.editor.history.items[0]);
-    try std.testing.expect(app.notice.items.len > 0);
+    try std.testing.expect(app.shortcut_help); // /help opens the panel at COMMANDS
 }
 
 test "history walks past recalled local commands without autocomplete capture" {
@@ -11787,7 +11952,7 @@ test "Plan mode keys distinguish toggle and proposal actions" {
     try std.testing.expect(!isPlanToggleKey(.{ .codepoint = vaxis.Key.tab }));
     try std.testing.expectEqual(PlanProposalAction.implement, planProposalAction(.{ .codepoint = vaxis.Key.enter }));
     try std.testing.expectEqual(PlanProposalAction.revise, planProposalAction(.{ .codepoint = 'e' }));
-    try std.testing.expectEqual(PlanProposalAction.stay, planProposalAction(.{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expectEqual(PlanProposalAction.dismiss, planProposalAction(.{ .codepoint = vaxis.Key.escape }));
     try std.testing.expectEqual(PlanProposalAction.dismiss, planProposalAction(.{ .codepoint = 'q' }));
     try std.testing.expectEqual(PlanProposalAction.none, planProposalAction(.{ .codepoint = 'x' }));
 }

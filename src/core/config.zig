@@ -110,6 +110,10 @@ pub const Config = struct {
     /// TUI chrome (`[ui]`): the top tab strip. Toggleable live via /config;
     /// the daemon serializes persistence through setUiTabBar.
     ui_tab_bar: bool = true,
+    /// Terminal bell (BEL) when a NON-focused session parks on an approval —
+    /// the one out-of-band signal a multiplexer owes you while you look
+    /// elsewhere. `[ui] bell = false` / `/config bell off` silences it.
+    ui_bell: bool = true,
 };
 
 pub fn defaults() Config {
@@ -267,19 +271,20 @@ pub fn removeMcpServer(
     try replaceRaw(gpa, io, environ, updated);
 }
 
-/// Persist the TUI tab-bar preference (`[ui] tab_bar`), editing the user's
+/// Persist one `[ui]` boolean (`tab_bar`, `bell`), editing the user's
 /// config.toml surgically: replace the existing key line, insert it into an
 /// existing [ui] table, or append a fresh table — everything else stays
 /// byte-for-byte, and the result must reparse before it may replace the file.
-pub fn setUiTabBar(
+pub fn setUiFlag(
     gpa: std.mem.Allocator,
     io: Io,
     environ: *const std.process.Environ.Map,
+    key: []const u8,
     enabled: bool,
 ) !void {
     const current = try readRawAlloc(gpa, io, environ);
     defer gpa.free(current);
-    const updated = try setScalarText(gpa, current, "ui", "tab_bar", if (enabled) "true" else "false");
+    const updated = try setScalarText(gpa, current, "ui", key, if (enabled) "true" else "false");
     defer gpa.free(updated);
     try replaceRaw(gpa, io, environ, updated);
 }
@@ -724,6 +729,7 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.web_enabled) |value| cfg.web_enabled = value;
     if (doc.web_tailscale) |value| cfg.web_tailscale = value;
     if (doc.ui_tab_bar) |value| cfg.ui_tab_bar = value;
+    if (doc.ui_bell) |value| cfg.ui_bell = value;
     if (doc.network_blocklists) |value| cfg.network_blocklists = value;
     if (doc.network_allow) |value| cfg.network_allow = value;
     if (doc.network_deny) |value| cfg.network_deny = value;

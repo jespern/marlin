@@ -71,6 +71,7 @@ pub const Document = struct {
     voice_stt_bin: ?[]const u8 = null,
     web_tailscale: ?bool = null,
     ui_tab_bar: ?bool = null,
+    ui_bell: ?bool = null,
     network_blocklists: ?[]const u8 = null,
     network_allow: ?[]const u8 = null,
     network_deny: ?[]const u8 = null,
@@ -215,8 +216,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
                 if (std.mem.eql(u8, key, "enabled")) doc.web_enabled = try boolean(value);
                 if (std.mem.eql(u8, key, "tailscale")) doc.web_tailscale = try boolean(value);
             },
-            .ui => if (std.mem.eql(u8, key, "tab_bar")) {
-                doc.ui_tab_bar = try boolean(value);
+            .ui => {
+                if (std.mem.eql(u8, key, "tab_bar")) doc.ui_tab_bar = try boolean(value);
+                if (std.mem.eql(u8, key, "bell")) doc.ui_bell = try boolean(value);
             },
             .voice => {
                 if (std.mem.eql(u8, key, "enabled")) doc.voice_enabled = try boolean(value);
@@ -538,12 +540,14 @@ test "web tailscale and ui tab_bar flags parse" {
         \\tailscale = false
         \\[ui]
         \\tab_bar = false
+        \\bell = false
         \\[model]
         \\default = "local/qwen"
     );
     try std.testing.expect(doc.web_enabled.?);
     try std.testing.expect(!doc.web_tailscale.?);
     try std.testing.expect(!doc.ui_tab_bar.?);
+    try std.testing.expect(!doc.ui_bell.?);
     try std.testing.expectEqualStrings("local/qwen", doc.model_default.?);
 }
 

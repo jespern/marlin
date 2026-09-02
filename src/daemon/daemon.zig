@@ -2061,7 +2061,7 @@ pub const Daemon = struct {
                 self.sendMcpStatus(client);
             },
             .ui_set_tab_bar => |request| {
-                config.setUiTabBar(self.gpa, self.io, self.environ, request.enabled) catch |err| {
+                config.setUiFlag(self.gpa, self.io, self.environ, "tab_bar", request.enabled) catch |err| {
                     std.log.warn("could not persist tab-bar preference: {t}", .{err});
                     self.sendTo(client, .{ .err = .{
                         .code = "config",
@@ -2070,7 +2070,19 @@ pub const Daemon = struct {
                     return;
                 };
                 self.cfg.ui_tab_bar = request.enabled;
-                self.sendTo(client, .{ .ui_config_result = .{ .tab_bar = request.enabled } });
+                self.sendTo(client, .{ .ui_config_result = .{ .tab_bar = self.cfg.ui_tab_bar, .bell = self.cfg.ui_bell } });
+            },
+            .ui_set_bell => |request| {
+                config.setUiFlag(self.gpa, self.io, self.environ, "bell", request.enabled) catch |err| {
+                    std.log.warn("could not persist bell preference: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{
+                        .code = "config",
+                        .msg = "could not save bell preference to config.toml",
+                    } });
+                    return;
+                };
+                self.cfg.ui_bell = request.enabled;
+                self.sendTo(client, .{ .ui_config_result = .{ .tab_bar = self.cfg.ui_tab_bar, .bell = self.cfg.ui_bell } });
             },
             .mcp_remove => |request| {
                 if (self.anySessionBusy()) {
