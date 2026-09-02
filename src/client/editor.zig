@@ -444,6 +444,20 @@ pub fn moveLineStart(self: *Editor) void {
     self.goal_col = null;
 }
 
+/// First non-blank byte of the logical line containing offset i (vim `^`);
+/// the line end when the line is all blanks.
+fn firstNonBlank(t: []const u8, i: usize) usize {
+    var p = lineStart(t, i);
+    const end = lineEnd(t, i);
+    while (p < end and (t[p] == ' ' or t[p] == '\t')) p += 1;
+    return p;
+}
+
+pub fn moveFirstNonBlank(self: *Editor) void {
+    self.cursor = firstNonBlank(self.text.items, self.cursor);
+    self.goal_col = null;
+}
+
 pub fn moveLineEnd(self: *Editor) void {
     self.cursor = lineEnd(self.text.items, self.cursor);
     self.goal_col = null;
@@ -1031,6 +1045,14 @@ pub fn toLineEndRange(self: *const Editor) Range {
 
 pub fn toLineStartRange(self: *const Editor) Range {
     return .{ .start = lineStart(self.text.items, self.cursor), .end = self.cursor };
+}
+
+/// `d^` / `c^`: between the cursor and the first non-blank, in either
+/// direction (vim's `^` is exclusive, so from inside the indentation it
+/// reaches forward).
+pub fn toFirstNonBlankRange(self: *const Editor) Range {
+    const target = firstNonBlank(self.text.items, self.cursor);
+    return .{ .start = @min(target, self.cursor), .end = @max(target, self.cursor) };
 }
 
 /// iw / aw: the word under the cursor; `around` extends over trailing

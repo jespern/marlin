@@ -3585,6 +3585,8 @@ const App = struct {
             ed.toLineEndRange()
         else if (key.matches('0', .{}))
             ed.toLineStartRange()
+        else if (key.matches('^', .{}))
+            ed.toFirstNonBlankRange()
         else
             null;
         if (range) |r| self.applyOperator(op, r);
@@ -3717,6 +3719,11 @@ const App = struct {
             cursor.line -|= 1;
         } else if (key.matches('0', .{})) {
             cursor.col = 0;
+        } else if (key.matches('^', .{})) {
+            const line = self.copy_cursor_line_text.items;
+            var col: usize = 0;
+            while (col < line.len and (line[col] == ' ' or line[col] == '\t')) col += 1;
+            cursor.col = col;
         } else if (key.matches('$', .{})) {
             cursor.col = self.copy_cursor_line_width -| 1;
         } else if (key.matches('w', .{})) {
@@ -5774,7 +5781,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "?", .description = "toggle shortcut help" },
     .{ .key = "q", .description = "detach (sessions keep running; warns once)" },
     .{ .description = "COMPOSER (vim)", .heading = true },
-    .{ .key = "h l w b 0 $", .description = "move in the input line" },
+    .{ .key = "h l w b 0 ^ $", .description = "move in the input line" },
     .{ .key = "x / D", .description = "delete char / to line end" },
     .{ .key = "d c y + motion", .description = "operators: w b e 0 $ f t, dd/cc/yy, iw i\" i( …" },
     .{ .key = "counts f t ; ,", .description = "3w d2w 2dd · find char, repeat" },
@@ -8603,6 +8610,8 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 while (n > 0) : (n -= 1) app.editor.moveWordLeft();
             } else if (key.matches('0', .{})) {
                 app.editor.moveLineStart();
+            } else if (key.matches('^', .{})) {
+                app.editor.moveFirstNonBlank();
             } else if (key.matches('$', .{})) {
                 app.editor.moveLineEnd();
             } else if (key.matches('f', .{}) or key.matches('t', .{}) or
@@ -11738,6 +11747,20 @@ test "normal mode: p pastes the yank register into the composer" {
     try handleKey(&app, .{ .codepoint = 'D' });
     // True-vim w: next word START, so D leaves the separator behind.
     try std.testing.expectEqualStrings("zig ", app.editor.text.items);
+
+    // ^ is first non-blank, both as a motion and as an operator target.
+    app.editor.clear();
+    app.editor.insertSlice("   zig build test");
+    app.editor.moveLineEnd();
+    try handleKey(&app, .{ .codepoint = '^' });
+    try std.testing.expectEqual(@as(usize, 3), app.editor.cursor);
+    try handleKey(&app, .{ .codepoint = '0' });
+    try handleKey(&app, .{ .codepoint = '^' });
+    try std.testing.expectEqual(@as(usize, 3), app.editor.cursor); // forward from the indentation too
+    app.editor.moveLineEnd();
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = '^' });
+    try std.testing.expectEqualStrings("   ", app.editor.text.items);
 }
 
 test "composer operators: dw ci\" yy dd" {
