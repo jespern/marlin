@@ -749,6 +749,8 @@ const App = struct {
     pending_replace: bool = false,
     /// g pressed, awaiting g/t/T (gg top, gt/gT session cycling).
     pending_g: bool = false,
+    /// `q` warned once about live sessions; the next `q` detaches.
+    quit_armed: bool = false,
     /// Last f/t/F/T for ; and , repeats.
     last_find_kind: u8 = 0,
     last_find_ch: u8 = 0,
@@ -2199,17 +2201,16 @@ const App = struct {
     fn submitInput(self: *App, text: []const u8) void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.attachments.items.len == 0) return;
+        const is_command = isCommandInput(text);
         const allowed_during_setup = std.mem.eql(u8, trimmed, "/quit") or
             std.mem.eql(u8, trimmed, "/q") or
-            std.mem.eql(u8, trimmed, "!") or
-            std.mem.startsWith(u8, trimmed, "! ") or
-            std.mem.startsWith(u8, trimmed, "!\t");
+            (is_command and trimmed[0] == '!');
         if (self.setup_required and !allowed_during_setup) {
             self.beginSetup(true);
             self.setNotice("choose a backend before sending the first prompt", .{});
             return;
         }
-        if (trimmed.len > 0 and (trimmed[0] == '/' or trimmed[0] == '!')) {
+        if (is_command) {
             // Commands are client actions rather than durable user_msg
             // blocks, but they still belong in the local editor history so
             // Up then Enter can repeat them during this client lifetime.
@@ -2568,17 +2569,7 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/attach")) {
             self.attachPath(it.rest());
         } else if (std.mem.eql(u8, head, "!")) {
-            if (self.remote_transport) {
-                self.setNotice("shell escape unavailable over --remote — run Marlin inside ssh/mosh", .{});
-                return;
-            }
-            self.shell_command.clearRetainingCapacity();
-            self.shell_command.appendSlice(self.gpa, std.mem.trim(u8, it.rest(), " \t")) catch {
-                self.setNotice("could not prepare shell command", .{});
-                return;
-            };
-            self.shell_requested = true;
-            self.should_quit = true;
+            self.shellEscape(it.rest());
         } else if (std.mem.eql(u8, head, "!c")) {
             self.copyLastToolOutput();
         } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
@@ -2645,6 +2636,10 @@ const App = struct {
             self.configCommand(it.next(), it.next());
         } else if (std.mem.eql(u8, head, "/help")) {
             self.setNotice("/setup · /sessions · /top · /search [query] · /diagnostics · /animate matrix · /otel [set <endpoint>|status|off] · /new · /rename <title> · /archive [children] · /attach <image> · /model <m> · /effort <level> · /sandbox [on|off] · /permissions [full|default] · /network [on|off|status] · /mcp [add|remove|restart|reload] · /council · /review <name> <q> · /config [tabbar on|off] · /compact · /reboot [--build] [--force] · ! [command] · !rb [client|both] · !c · /quit", .{});
+        } else if (head.len > 1 and head[0] == '!') {
+            // `!ls -la` — every shell and vim accept the bang glued to the
+            // command. The exact `!c`/`!rb` shortcuts matched above.
+            self.shellEscape(cmd[1..]);
         } else {
             self.setNotice("unknown command {s} (try /help)", .{head});
         }
@@ -3210,6 +3205,44 @@ const App = struct {
         const n = if (self.pending_count == 0) 1 else self.pending_count;
         self.pending_count = 0;
         return n;
+    }
+
+    /// vim's Esc-in-normal contract: cancel whatever is half-typed — count,
+    /// operator, find, `g` prefix, `r` — and change nothing else. Also run on
+    /// every insert-mode entry so a stale count never survives a round trip.
+    fn clearPending(self: *App) void {
+        self.pending_count = 0;
+        self.pending_op = 0;
+        self.pending_find = 0;
+        self.pending_g = false;
+        self.pending_replace = false;
+    }
+
+    /// Sessions with a live turn or parked approval — what `q` mentions once
+    /// before detaching, since a quit here is a detach, not a kill.
+    fn busySessionCount(self: *const App) usize {
+        var n: usize = 0;
+        for (self.sessions.items) |session| {
+            if (session.state == .running or session.state == .awaiting_approval) n += 1;
+        }
+        return n;
+    }
+
+    /// `! <cmd>` / `!cmd`: run through $SHELL in the focused session cwd
+    /// (bare `!` = interactive shell). The TUI tears down first; the
+    /// entry point reattaches when the shell exits.
+    fn shellEscape(self: *App, command: []const u8) void {
+        if (self.remote_transport) {
+            self.setNotice("shell escape unavailable over --remote — run Marlin inside ssh/mosh", .{});
+            return;
+        }
+        self.shell_command.clearRetainingCapacity();
+        self.shell_command.appendSlice(self.gpa, std.mem.trim(u8, command, " \t")) catch {
+            self.setNotice("could not prepare shell command", .{});
+            return;
+        };
+        self.shell_requested = true;
+        self.should_quit = true;
     }
 
     /// Repeat a forward range motion `n` times from the cursor by walking a
@@ -5513,7 +5546,9 @@ const ShortcutHelpRow = struct {
 };
 
 const shortcut_help_rows = [_]ShortcutHelpRow{
-    .{ .key = "Esc / i", .description = "return to insert mode" },
+    .{ .key = "i", .description = "return to insert mode" },
+    .{ .key = "Esc", .description = "cancel a pending count / operator" },
+    .{ .key = ":", .description = "open the command menu" },
     .{ .key = "</> or ←/→", .description = "previous / next tab" },
     .{ .key = "⌥1–⌥9", .description = "jump to Nth tab (works in insert mode too)" },
     .{ .key = "Ctrl+V", .description = "attach clipboard image (Control, not Command)" },
@@ -5525,7 +5560,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "gg / G", .description = "jump to top / bottom" },
     .{ .key = "/ · n/N", .description = "search transcript · next/previous match" },
     .{ .key = "?", .description = "toggle shortcut help" },
-    .{ .key = "q", .description = "quit Marlin" },
+    .{ .key = "q", .description = "detach (sessions keep running; warns once)" },
     .{ .description = "COMPOSER (vim)", .heading = true },
     .{ .key = "h l w b 0 $", .description = "move in the input line" },
     .{ .key = "x / D", .description = "delete char / to line end" },
@@ -5545,7 +5580,8 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Enter while working", .description = "steer the active turn" },
     .{ .key = "Ctrl+N", .description = "create a new session" },
     .{ .key = "Ctrl+S", .description = "open the live session overview" },
-    .{ .key = "Ctrl+D/W (empty)", .description = "archive the current session" },
+    .{ .key = "Ctrl+W (empty)", .description = "archive the current session" },
+    .{ .key = "␣text", .description = "leading space sends a /… or !… message verbatim" },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
     .{ .key = "Ctrl+C", .description = "interrupt the active turn" },
@@ -7650,6 +7686,16 @@ fn editCommand(key: vaxis.Key) ?EditCommand {
     return null;
 }
 
+/// Composer text is a command when it starts with `/` or `!` — unless the
+/// user typed a leading space, which means "send this verbatim" (the shell's
+/// own history convention). That is the escape hatch for messages such as
+/// `/usr/local/lib/foo.so is missing` or `!important`.
+fn isCommandInput(text: []const u8) bool {
+    if (text.len > 0 and (text[0] == ' ' or text[0] == '\t')) return false;
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return trimmed.len > 0 and (trimmed[0] == '/' or trimmed[0] == '!');
+}
+
 fn isPreviousInputRowKey(key: vaxis.Key) bool {
     return key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true });
 }
@@ -7662,8 +7708,12 @@ fn isNewSessionKey(key: vaxis.Key) bool {
     return key.matches('n', .{ .ctrl = true });
 }
 
+/// Ctrl+W on an empty composer archives (close-pane muscle memory). Ctrl+D
+/// deliberately does NOT: an empty composer is the normal state while
+/// reading a transcript, and Ctrl+D there is vim/less page-down — archiving
+/// the session you were reading is the wrong surprise.
 fn isArchiveCurrentKey(app: *const App, key: vaxis.Key) bool {
-    return (key.matches('d', .{ .ctrl = true }) or key.matches('w', .{ .ctrl = true })) and
+    return key.matches('w', .{ .ctrl = true }) and
         app.editor.isEmpty() and app.attachments.items.len == 0 and
         app.copy_cursor == null;
 }
@@ -7674,6 +7724,18 @@ fn isArchivePickerKey(kind: PickerKind, key: vaxis.Key) bool {
 }
 
 fn applyEditCommand(ed: *Editor, command: EditCommand) void {
+    // Destructive readline chords get their own undo unit: `Ctrl+U` on a
+    // long draft followed by `Esc u` must bring the draft back, not report
+    // "already at oldest change" because the insert session was one unit.
+    switch (command) {
+        .delete_word_before,
+        .delete_word_before_whitespace,
+        .delete_word_after,
+        .delete_to_line_start,
+        .delete_to_line_end,
+        => ed.pushUndo(),
+        else => {},
+    }
     switch (command) {
         .move_left => ed.moveLeft(),
         .move_right => ed.moveRight(),
@@ -8139,8 +8201,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    // Match shell EOF/close-pane muscle memory without risking a draft or
-    // attachment. Pickers consume Ctrl+D above; copy mode keeps page-down.
+    // Close-pane muscle memory without risking a draft or attachment.
     if (isArchiveCurrentKey(app, key)) {
         app.archiveCurrentSession();
         return;
@@ -8266,6 +8327,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.copyModeKey(key);
                 return;
             }
+            if (!key.matches('q', .{})) app.quit_armed = false;
             if (app.pending_g) {
                 app.pending_g = false;
                 const count = app.pending_count;
@@ -8322,25 +8384,54 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.nextSearchHit(-1);
             } else if (key.matches('?', .{})) {
                 app.shortcut_help = true;
-            } else if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{})) {
+            } else if (key.matches(vaxis.Key.escape, .{})) {
+                // vim: Esc in normal mode cancels pending input and changes
+                // nothing else. Double-Esc must never land in insert with the
+                // cursor live — that turns the next `dd` into typed text.
+                app.clearPending();
+            } else if (key.matches('i', .{})) {
+                app.clearPending();
                 app.editor.pushUndo();
                 app.mode = .insert;
+            } else if (key.matches(':', .{})) {
+                // The normal-mode prompt shows ':'; honor it. Commands live
+                // behind `/` in insert, so `:` opens that menu on an empty
+                // composer and otherwise just enters insert.
+                app.clearPending();
+                app.editor.pushUndo();
+                app.mode = .insert;
+                if (app.editor.isEmpty()) app.editor.insertSlice("/");
             } else if (key.matches('a', .{})) {
                 // Vim append: archive moved to /archive — a destructive-ish
                 // action must not sit on the muscle-memory insert key.
+                app.clearPending();
                 app.editor.pushUndo();
                 app.editor.moveRight();
                 app.mode = .insert;
             } else if (key.matches('A', .{ .shift = true }) or key.matches('A', .{})) {
+                app.clearPending();
                 app.editor.pushUndo();
                 app.editor.moveLineEnd();
                 app.mode = .insert;
             } else if (key.matches('I', .{ .shift = true }) or key.matches('I', .{})) {
+                app.clearPending();
                 app.editor.pushUndo();
                 app.editor.moveLineStart();
                 app.mode = .insert;
             } else if (key.matches('q', .{})) {
-                app.should_quit = true;
+                // Sessions are durable, so quitting is a detach — but say so
+                // once when work is live rather than vanishing silently.
+                _ = app.takeCount();
+                const busy = app.busySessionCount();
+                if (busy > 0 and !app.quit_armed) {
+                    app.quit_armed = true;
+                    app.setNotice("{d} session{s} still running — they keep going; q again to detach", .{
+                        busy,
+                        if (busy == 1) "" else "s",
+                    });
+                } else {
+                    app.should_quit = true;
+                }
             } else if (key.matches('J', .{ .shift = true }) or key.matches('J', .{})) {
                 // vim J: join lines. Sessions cycle on gt/gT (tab-style).
                 app.editor.pushUndo();
@@ -8350,16 +8441,17 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                     if (!app.editor.joinLines()) break;
                 }
             } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                app.scroll_up -|= 1;
+                app.scroll_up -|= app.takeCount();
             } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                app.scroll_up +|= 1;
+                app.scroll_up +|= app.takeCount();
                 app.maybeRequestHistoryAtTop();
             } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
-                app.scroll_up -|= 20;
+                app.scroll_up -|= 20 * app.takeCount();
             } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
-                app.scroll_up +|= 20;
+                app.scroll_up +|= 20 * app.takeCount();
                 app.maybeRequestHistoryAtTop();
             } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+                _ = app.takeCount(); // no line addressing in a transcript; consume, don't leak
                 app.scroll_up = 0;
             } else if (key.matches('g', .{})) {
                 app.pending_g = true;
@@ -8474,6 +8566,67 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             }
         },
     }
+}
+
+test "command input: / and ! lead, a leading space sends verbatim" {
+    try std.testing.expect(isCommandInput("/model x"));
+    try std.testing.expect(isCommandInput("!ls -la"));
+    try std.testing.expect(isCommandInput("!"));
+    try std.testing.expect(!isCommandInput(" /usr/local/lib/foo.so is missing"));
+    try std.testing.expect(!isCommandInput("\t!important"));
+    try std.testing.expect(!isCommandInput("plain prose"));
+    try std.testing.expect(!isCommandInput(""));
+}
+
+test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do not leak, q warns once" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.mode = .normal;
+
+    // Esc in normal mode: stays normal, clears a half-typed count/operator.
+    app.pending_count = 5;
+    app.pending_op = 'd';
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_count);
+    try std.testing.expectEqual(@as(u8, 0), app.pending_op);
+
+    // `5G` consumes its count instead of arming the next `x`.
+    try handleKey(&app, .{ .codepoint = '5' });
+    try std.testing.expectEqual(@as(usize, 5), app.pending_count);
+    try handleKey(&app, .{ .codepoint = 'G' });
+    try std.testing.expectEqual(@as(usize, 0), app.pending_count);
+
+    // `:` on an empty composer opens the command menu.
+    try handleKey(&app, .{ .codepoint = ':' });
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expectEqualStrings("/", app.editor.text.items);
+    app.editor.clear();
+    app.mode = .normal;
+
+    // `!ls -la` is a shell escape, not an unknown command.
+    app.runCommand("!ls -la");
+    try std.testing.expect(app.shell_requested);
+    try std.testing.expectEqualStrings("ls -la", app.shell_command.items);
+    app.shell_requested = false;
+    app.should_quit = false;
+
+    // q with live sessions warns once; the second q detaches.
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 1, .title = "busy", .model = "m", .status = "running", .state = .running, .created_at = 1, .running = true },
+    });
+    try handleKey(&app, .{ .codepoint = 'q' });
+    try std.testing.expect(!app.should_quit);
+    try std.testing.expect(app.quit_armed);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "still running") != null);
+    try handleKey(&app, .{ .codepoint = 'j' }); // any other key disarms
+    try std.testing.expect(!app.quit_armed);
+    try handleKey(&app, .{ .codepoint = 'q' });
+    try handleKey(&app, .{ .codepoint = 'q' });
+    try std.testing.expect(app.should_quit);
 }
 
 test {
@@ -9528,7 +9681,7 @@ test "staging images inserts numbered prompt placeholders" {
     try std.testing.expectEqual(@as(usize, 2), app.attachments.items.len);
 }
 
-test "Ctrl+D and Ctrl+W archive only a truly empty composer outside copy mode" {
+test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D never does" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -9543,7 +9696,7 @@ test "Ctrl+D and Ctrl+W archive only a truly empty composer outside copy mode" {
     const ctrl_d = vaxis.Key{ .codepoint = 'd', .mods = .{ .ctrl = true } };
     const ctrl_w = vaxis.Key{ .codepoint = 'w', .mods = .{ .ctrl = true } };
 
-    try std.testing.expect(isArchiveCurrentKey(&app, ctrl_d));
+    try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d)); // page-down while reading, never archive
     try std.testing.expect(isArchiveCurrentKey(&app, ctrl_w));
     try std.testing.expect(!isArchiveCurrentKey(&app, .{ .codepoint = 'd' }));
     try std.testing.expect(!isArchiveCurrentKey(&app, .{ .codepoint = 'w' }));
@@ -9569,11 +9722,11 @@ test "Ctrl+D and Ctrl+W archive only a truly empty composer outside copy mode" {
 
     // The shared /archive path retains its running-session guard.
     app.state = .running;
-    try handleKey(&app, ctrl_d);
+    try handleKey(&app, ctrl_w);
     try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "interrupt it first") != null);
 }
 
-test "Escape leaves normal mode after closing any active picker" {
+test "Escape closes an active picker and then stays in normal mode; i returns to insert" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -9593,7 +9746,11 @@ test "Escape leaves normal mode after closing any active picker" {
     try std.testing.expectEqual(Mode.normal, app.mode);
     try std.testing.expect(app.picker == null);
 
+    // vim contract: a second Esc is a no-op in normal mode — it must not
+    // land in insert with the cursor live. `i` is the way back.
     try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try handleKey(&app, .{ .codepoint = 'i' });
     try std.testing.expectEqual(Mode.insert, app.mode);
     try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
 }

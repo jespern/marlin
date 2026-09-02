@@ -1076,8 +1076,11 @@ A split pane identifies its session with a compact pane label.
 
 - **Modes**: insert (typing → input box), normal (vim motions: j/k scroll,
   gg top, `gt`/`gT` with count for recent-session cycling, J join lines and
-  a/A/I enter insert mode in the composer, Ctrl+D on an empty composer or
-  `/archive [children]` for explicit lifecycle changes, `/sessions` for
+  a/A/I enter insert mode in the composer, Esc cancels a pending
+  count/operator and never changes mode, `:` opens the command menu,
+  Ctrl+W on an empty composer or
+  `/archive [children]` for explicit lifecycle changes (Ctrl+D stays
+  page-down: an empty composer is the normal state while reading), `/sessions` for
   arbitrary attach, v visual-select,
   y yank).
 - **Splits (not yet implemented)**: binary-tree layout, each pane = a
@@ -1127,7 +1130,8 @@ A split pane identifies its session with a compact pane label.
   rebuilds only the local client, `!rb both` rebuilds both, and `!c` copies the
   last output.
   Plain text + `Enter` starts a turn when idle and queues steering
-  while an agent turn is active. `Esc` enters Vim normal mode; `Ctrl+C`
+  while an agent turn is active; a leading space sends text that begins
+  with `/` or `!` verbatim (`!cmd` and `! cmd` are both shell escapes). `Esc` enters Vim normal mode; `Ctrl+C`
   interrupts the active turn. Native-only harness verbs (`/compact`,
   `/sandbox`, session `/network`) must refuse on a guest session rather
   than no-op or fail internally (Native vs guest, §1). `/effort` is
