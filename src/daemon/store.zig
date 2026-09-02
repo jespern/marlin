@@ -2238,6 +2238,16 @@ pub const Store = struct {
     /// full bodies whose every durable session is idle. The block/ref rows
     /// remain untouched, so scrollback and causal structure stay complete.
     pub fn gc(self: Store, expire_before_ms: ?i64) Error!GcReport {
+        // Same discipline as appendBlock: one connection is shared by every
+        // daemon thread, so the (recursive) db mutex is held across
+        // BEGIN..COMMIT. Without it a turn's appendBlock lands inside this
+        // transaction ("cannot start a transaction within a transaction") and
+        // its block is lost, and non-transactional status/usage writes join
+        // the transaction and die with our ROLLBACK.
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        var mutex_held = true;
+        defer if (mutex_held) c.sqlite3_mutex_leave(db_mutex);
         try self.execAll("BEGIN IMMEDIATE;");
         errdefer self.execAll("ROLLBACK;") catch {};
 
@@ -2274,6 +2284,8 @@ pub const Store = struct {
         }
 
         try self.execAll("COMMIT;");
+        c.sqlite3_mutex_leave(db_mutex);
+        mutex_held = false;
         // These maintenance operations are deliberately outside the write
         // transaction so normal daemon work is not held behind them.
         try self.execAll("PRAGMA incremental_vacuum;");

@@ -3728,6 +3728,11 @@ pub const Daemon = struct {
             if (state == .running or state == .awaiting_approval) return; // not yet
         }
         self.pending_reboot = null;
+        // Freeze the producer boundary FIRST, exactly like Event.shutdown and
+        // protocol .shutdown: cleanup drains the queue and joins threads, and
+        // a payload pushed after that drain into a still-open queue is never
+        // freed. Every exit path must close before flipping `running`.
+        self.events.close(self.io);
         // Wake OUR still-linked listener before releasing the instance lock.
         // Once the ACK reaches the client a replacement daemon may bind the
         // public path; nudging after that can connect to the replacement and

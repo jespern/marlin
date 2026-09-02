@@ -936,10 +936,16 @@ pub fn runTurn(
                 try gpa.dupe(u8, args_repaired);
             errdefer gpa.free(args_owned);
 
+            // Persist a REDACTED copy. The block log, the search index, and
+            // the OTLP export are all immortal, so a model that writes a key
+            // into a command line must not get it stored; the tool itself
+            // still receives the literal arguments and executes unchanged.
+            const persisted_args = (try permissions.redactSecrets(gpa, opts.secrets, args_owned)) orelse args_owned;
+            defer if (persisted_args.ptr != args_owned.ptr) gpa.free(persisted_args);
             const tool_call_block_id = try ap.append(.{ .tool_call = .{
                 .call_id = pc.call_id.items,
                 .name = pc.name.items,
-                .args_json = args_owned,
+                .args_json = persisted_args,
             } });
 
             const spec = tools_registry.find(pc.name.items) orelse
@@ -1467,7 +1473,14 @@ fn ccInvoke(
     const arena = arena_state.allocator();
 
     var uuid_buf: [36]u8 = undefined;
-    const bridge: ?claude_code.Bridge = if (opts.approval_mode != .auto and opts.marlin_exe != null)
+    // A read-only guest child is read-only ONLY through the bridge's deny
+    // mode (daemon ccReadOnlyAllow). Without a resolvable marlin executable
+    // the bridge cannot attach and the fallback would be an unenforced
+    // acceptEdits/bypass child — so refuse to start rather than degrade, and
+    // never let a yolo parent's approval mode strip the bridge from a child.
+    const read_only_child = opts.tool_profile == .read_only;
+    if (read_only_child and opts.marlin_exe == null) return error.GuestBridgeUnavailable;
+    const bridge: ?claude_code.Bridge = if (opts.marlin_exe != null and (opts.approval_mode != .auto or read_only_child))
         .{ .marlin_exe = opts.marlin_exe.?, .sid = opts.session_id }
     else
         null;
@@ -1477,7 +1490,12 @@ fn ccInvoke(
         .model = opts.endpoint.model,
         .session_uuid = claude_code.sessionUuid(&uuid_buf, opts.session_id),
         .fresh = fresh,
-        .permissions = if (opts.tool_profile == .plan) .plan else if (opts.approval_mode == .auto) .bypass else .accept_edits,
+        .permissions = if (opts.tool_profile == .plan)
+            .plan
+        else if (opts.approval_mode == .auto and !read_only_child)
+            .bypass
+        else
+            .accept_edits,
         .bridge = bridge,
         .max_turns = opts.max_rounds,
         .effort = opts.effort,
@@ -1769,6 +1787,12 @@ fn runClaudeCodeTurn(
         final_text.clearRetainingCapacity();
         try final_text.appendSlice(gpa, outcome.final_text.items);
 
+        // Round budget. `--max-turns` bounds the subprocess, not this loop;
+        // without a ceiling here a steady stream of steers runs forever. The
+        // check sits BEFORE the steer poll so an unconsumed steer stays queued
+        // for the next turn instead of vanishing into a round that never runs.
+        if (rounds >= opts.max_rounds) break;
+
         // Steers queued while the subprocess ran become follow-up rounds.
         // `try_close_steer` closes the same last-poll race as the native
         // provider loop; false guarantees another poll can take the winner.
@@ -1894,10 +1918,12 @@ fn appendCodexItemStarted(
     const name = (try codexToolName(arena, item)) orelse return;
     const call_id = codex.strField(item, "id") orelse return;
     const args = try codex.stringify(arena, item);
+    // Same redaction discipline as the native tool_call append.
+    const persisted_args = (try permissions.redactSecrets(arena, opts.secrets, args)) orelse args;
     _ = try ap.append(.{ .tool_call = .{
         .call_id = call_id,
         .name = name,
-        .args_json = args,
+        .args_json = persisted_args,
     } });
     if (opts.on_tool) |callback| callback(opts.on_delta_ctx, name, .start);
 }
