@@ -9,7 +9,28 @@ permissions:
   contents: read
 
 jobs:
+  # A tag on a red commit must not ship. Same gates as ci.yml, on both OSes.
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev sqlite3
+      - run: zig build fmt-check
+      - run: zig build test
+      - run: zig build e2e
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:

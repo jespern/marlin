@@ -22,6 +22,7 @@
   ],
   "check": {
     "argv": ["run", "--quiet", "--model", "local/testing", "what is in /tmp/marlin-e2e-test-dir"],
+    "env": {"MARLIN_PERMISSIONS": "1"},
     "exit_code": 0,
     "stdout_contains": ["the tool ran fine"],
     "db_kinds": ["user_msg", "reasoning", "tool_call", "tool_result", "assistant_msg"]

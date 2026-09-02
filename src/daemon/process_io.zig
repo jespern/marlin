@@ -360,6 +360,40 @@ test "run uses one absolute deadline and salvages partial output" {
     try std.testing.expectEqualStrings("before-hang", result.stdout);
 }
 
+/// TMPDIR-derived scratch dir for the process tests below (the house rule in
+/// src/testing/temp_dir.zig: marlin's Seatbelt profile grants writes under
+/// the session's TMPDIR, not under a cwd-relative .zig-cache/tmp). Mirrors
+/// temp_dir.Dir locally because the e2e runner compiles this file as its
+/// own module, and a file may belong to only one module.
+const TestScratch = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    path: []u8,
+
+    fn init(gpa: std.mem.Allocator, io: Io, prefix: []const u8) !TestScratch {
+        const env: ?[]const u8 = if (std.c.getenv("TMPDIR")) |raw| std.mem.span(raw) else null;
+        const root: []const u8 = if (env != null and env.?.len > 0)
+            env.?
+        else if (builtin.os.tag == .macos)
+            "/private/tmp"
+        else
+            "/tmp";
+        var random: [8]u8 = undefined;
+        io.random(&random);
+        const leaf = try std.fmt.allocPrint(gpa, "{s}-{x}", .{ prefix, std.mem.readInt(u64, &random, .little) });
+        defer gpa.free(leaf);
+        const path = try std.fs.path.join(gpa, &.{ root, leaf });
+        errdefer gpa.free(path);
+        try Io.Dir.cwd().createDirPath(io, path);
+        return .{ .gpa = gpa, .io = io, .path = path };
+    }
+
+    fn deinit(self: *TestScratch) void {
+        Io.Dir.cwd().deleteTree(self.io, self.path) catch {};
+        self.gpa.free(self.path);
+    }
+};
+
 test "forced kill sweeps descendants that escaped the process group" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -367,9 +401,9 @@ test "forced kill sweeps descendants that escaped the process group" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var temp = std.testing.tmpDir(.{});
-    defer temp.cleanup();
-    const pid_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &temp.sub_path, "escapee.pid" });
+    var temp = try TestScratch.init(gpa, io, "marlin-process-io-escapee");
+    defer temp.deinit();
+    const pid_path = try std.fs.path.join(gpa, &.{ temp.path, "escapee.pid" });
     defer gpa.free(pid_path);
 
     // set -m gives the background job its own process group (what timeout(1)
@@ -409,9 +443,9 @@ test "cancellation terminates and reaps the complete process tree" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var temp = std.testing.tmpDir(.{});
-    defer temp.cleanup();
-    const pid_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &temp.sub_path, "descendant.pid" });
+    var temp = try TestScratch.init(gpa, io, "marlin-process-io-descendant");
+    defer temp.deinit();
+    const pid_path = try std.fs.path.join(gpa, &.{ temp.path, "descendant.pid" });
     defer gpa.free(pid_path);
 
     var cancel = std.atomic.Value(bool).init(false);
@@ -465,9 +499,9 @@ test "returned process group sweeps a daemonized descendant after parent exit" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var temp = std.testing.tmpDir(.{});
-    defer temp.cleanup();
-    const pid_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &temp.sub_path, "daemon.pid" });
+    var temp = try TestScratch.init(gpa, io, "marlin-process-io-daemon");
+    defer temp.deinit();
+    const pid_path = try std.fs.path.join(gpa, &.{ temp.path, "daemon.pid" });
     defer gpa.free(pid_path);
 
     const script =

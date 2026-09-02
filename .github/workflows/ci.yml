@@ -4,9 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *" # nightly live smoke (needs OPENROUTER_API_KEY)
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -22,7 +31,7 @@ jobs:
 
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev sqlite3
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev sqlite3 lsof procps
 
       # macOS ships sqlite3 in the SDK; nothing to install.
 
@@ -42,9 +51,17 @@ jobs:
       - name: End-to-end scenarios
         run: zig build e2e
 
+      # Reboot vs kill-9 must restore identical durable state — the
+      # load-bearing recovery test (docs/TESTING.md). Linux leg only: it
+      # needs lsof/pgrep/sqlite3 and isolated HOME/TMPDIR roots.
+      - name: Reboot convergence
+        if: runner.os == 'Linux'
+        run: zig build converge
+
   smoke:
     # Live provider smoke — nightly + manual only, never blocks PRs.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +74,3 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: zig build smoke
 
-# Nightly smoke schedule (also runnable manually from the Actions tab).
-# Kept in a separate workflow trigger block for clarity:
-#   schedule: [{cron: "17 4 * * *"}]
-# Enable by uncommenting under `on:` once the repo has the secret set.

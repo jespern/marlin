@@ -229,9 +229,9 @@ fn runScenario(
 
     const scenario_path = try std.fs.path.join(arena, &.{ scenarios_dir, name });
     const scenario_bytes = try Io.Dir.cwd().readFileAlloc(io, scenario_path, arena, .limited(4 * 1024 * 1024));
-    const sf = try std.json.parseFromSliceLeaky(ScenarioFile, arena, scenario_bytes, .{
-        .ignore_unknown_fields = true,
-    });
+    // Strict: an unknown key under "check" (a typo'd `stdout_contain`) must
+    // fail the scenario, not silently assert nothing. `steps` stays opaque.
+    const sf = try std.json.parseFromSliceLeaky(ScenarioFile, arena, scenario_bytes, .{});
 
     // Temp state and working directory for this scenario (unique per run).
     // Keeping both beneath TMPDIR makes the runner safe inside Marlin's own

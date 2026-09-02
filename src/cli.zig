@@ -309,9 +309,9 @@ test "shell request runs through configured shell in requested cwd" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var temp = std.testing.tmpDir(.{});
-    defer temp.cleanup();
-    const cwd = try temp.dir.realPathFileAlloc(io, ".", gpa);
+    var temp = try @import("testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-cli-shell");
+    defer temp.deinit();
+    const cwd = try Io.Dir.cwd().realPathFileAlloc(io, temp.path, gpa);
     defer gpa.free(cwd);
 
     var environ = std.process.Environ.Map.init(gpa);
@@ -325,7 +325,9 @@ test "shell request runs through configured shell in requested cwd" {
     defer request.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), try runShellRequest(io, &environ, request, false));
-    const actual = try temp.dir.readFileAlloc(io, "cwd.txt", gpa, .limited(4096));
+    const cwd_txt = try std.fs.path.join(gpa, &.{ cwd, "cwd.txt" });
+    defer gpa.free(cwd_txt);
+    const actual = try Io.Dir.cwd().readFileAlloc(io, cwd_txt, gpa, .limited(4096));
     defer gpa.free(actual);
     try std.testing.expectEqualStrings(cwd, actual);
 }
@@ -335,9 +337,9 @@ test "shell request returns command exit status" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var temp = std.testing.tmpDir(.{});
-    defer temp.cleanup();
-    const cwd = try temp.dir.realPathFileAlloc(io, ".", gpa);
+    var temp = try @import("testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-cli-shell");
+    defer temp.deinit();
+    const cwd = try Io.Dir.cwd().realPathFileAlloc(io, temp.path, gpa);
     defer gpa.free(cwd);
 
     var environ = std.process.Environ.Map.init(gpa);

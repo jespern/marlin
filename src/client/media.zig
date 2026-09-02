@@ -137,11 +137,13 @@ test "path attachment detects and encodes PNG" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var temp = std.testing.tmpDir(.{});
-    defer temp.cleanup();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, threaded.io(), "marlin-media");
+    defer temp.deinit();
     const bytes = "\x89PNG\r\n\x1a\nbody";
-    try temp.dir.writeFile(threaded.io(), .{ .sub_path = "shot.png", .data = bytes });
-    const path = try temp.dir.realPathFileAlloc(threaded.io(), "shot.png", gpa);
+    const shot = try std.fs.path.join(gpa, &.{ temp.path, "shot.png" });
+    defer gpa.free(shot);
+    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = shot, .data = bytes });
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), shot, gpa);
     defer gpa.free(path);
     var pending = try fromPath(gpa, threaded.io(), ".", path);
     defer pending.deinit(gpa);
