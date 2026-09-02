@@ -882,14 +882,14 @@ pub fn flushRanSummary(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), pe
     pending.* = 0;
 }
 
-const PlanTableWidths = struct { task: usize, time: usize };
+pub const PlanTableWidths = struct { task: usize, time: usize };
 
-fn planTableWidths(total: usize) PlanTableWidths {
+pub fn planTableWidths(total: usize) PlanTableWidths {
     const time = @min(@as(usize, 10), @max(@as(usize, 7), total / 6));
     return .{ .task = total -| (time + 3), .time = time };
 }
 
-fn formatPlanDuration(alloc: std.mem.Allocator, duration_ms: u64) ![]const u8 {
+pub fn formatPlanDuration(alloc: std.mem.Allocator, duration_ms: u64) ![]const u8 {
     if (duration_ms == 0) return "";
     if (duration_ms < 1_000) return "<1s";
     const seconds = (duration_ms +| 500) / 1_000;

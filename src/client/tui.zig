@@ -5962,22 +5962,12 @@ fn planMarker(status: block.PlanStatus, session_state: proto.SessionState, spinn
     };
 }
 
-fn formatPlanDuration(arena: std.mem.Allocator, duration_ms: u64) ![]const u8 {
-    if (duration_ms < 1_000) return "<1s";
-    const seconds = (duration_ms +| 500) / 1_000;
-    if (seconds < 60) return std.fmt.allocPrint(arena, "{d}s", .{seconds});
-    const minutes = seconds / 60;
-    if (minutes < 60)
-        return std.fmt.allocPrint(arena, "{d}m {d}s", .{ minutes, seconds % 60 });
-    return std.fmt.allocPrint(arena, "{d}h {d}m", .{ minutes / 60, minutes % 60 });
-}
-
-const PlanTableWidths = struct { task: usize, time: usize };
-
-fn planTableWidths(total: usize) PlanTableWidths {
-    const time = @min(@as(usize, 10), @max(@as(usize, 7), total / 6));
-    return .{ .task = total -| (time + 3), .time = time };
-}
+// The pinned panel and the transcript's closed plan table must agree on
+// geometry and duration text; layout.zig owns both (the two copies once
+// diverged on how a zero duration rendered).
+const formatPlanDuration = layout_mod.formatPlanDuration;
+const PlanTableWidths = layout_mod.PlanTableWidths;
+const planTableWidths = layout_mod.planTableWidths;
 
 fn planRule(arena: std.mem.Allocator, width: usize) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -7078,6 +7068,56 @@ fn selfExeMtimeMs(gpa: std.mem.Allocator, io: Io) ?i64 {
     return @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_ms));
 }
 
+/// Transport verdicts are collected per frame and acted on once, below the
+/// event switch: daemon_gone can surface in the drain loop too, and
+/// starting/adopting a reconnect must happen exactly once per frame.
+const TransportVerdicts = struct {
+    conn_lost: ?[]const u8 = null,
+    reconnect: ??*attach.Conn = null,
+};
+
+/// The one place every Event variant is handled. The main loop calls it for
+/// the event it woke on and for each event drained behind a daemon line, so
+/// a new variant is added here once and the compiler enforces coverage.
+fn dispatchEvent(
+    app: *App,
+    vx: *vaxis.Vaxis,
+    tty: *vaxis.Tty,
+    gpa: std.mem.Allocator,
+    event: Event,
+    verdicts: *TransportVerdicts,
+) !void {
+    switch (event) {
+        .key_press => |key| try handleKey(app, key),
+        .key_release => |key| {
+            if (isVoiceKey(key) and app.voice_rt.phase == .recording and
+                app.voice_rt.setup != null and app.voice_rt.setup.?.mode == .ptt)
+                app.stopVoiceRecording();
+        },
+        .voice => |vev| app.handleVoiceEvent(vev),
+        .mouse => |m| handleMouse(app, m),
+        .tick => {
+            app.spinner_frame +%= 1;
+            app.voiceTick();
+            app.tickUiAnimation();
+            app.expireNotice();
+        },
+        .winsize => |ws| {
+            app.term_cols = ws.cols;
+            app.term_rows = ws.rows;
+            try vx.resize(gpa, tty.writer(), ws);
+        },
+        .paste => |text| {
+            app.editor.paste(text);
+            if (app.otel_header_prompt or app.setup_prompt == .credential) @memset(@constCast(text), 0);
+            gpa.free(@constCast(text));
+        },
+        .daemon_line => |line| app.handleDaemonLine(line),
+        .daemon_gone => |reason| verdicts.conn_lost = reason,
+        .reconnected => |maybe| verdicts.reconnect = maybe,
+    }
+}
+
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     while (!app.animation_stop.load(.acquire)) {
         if (app.animation_active.load(.acquire)) {
@@ -7358,71 +7398,20 @@ pub fn run(
             // Transport verdicts are collected here and handled once below
             // the switch: daemon_gone can surface in the drain loop too, and
             // starting/adopting a reconnect must happen exactly once a frame.
-            var conn_lost: ?[]const u8 = null;
-            var reconnect_verdict: ??*attach.Conn = null;
+            var verdicts = TransportVerdicts{};
             switch (event) {
-                .key_press => |key| try handleKey(&app, key),
-                .key_release => |key| {
-                    if (isVoiceKey(key) and app.voice_rt.phase == .recording and
-                        app.voice_rt.setup != null and app.voice_rt.setup.?.mode == .ptt)
-                        app.stopVoiceRecording();
-                },
-                .voice => |vev| app.handleVoiceEvent(vev),
-                .mouse => |m| handleMouse(&app, m),
-                .tick => {
-                    app.spinner_frame +%= 1;
-                    app.voiceTick();
-                    app.tickUiAnimation();
-                    app.expireNotice();
-                },
-                .winsize => |ws| {
-                    app.term_cols = ws.cols;
-                    app.term_rows = ws.rows;
-                    try vx.resize(gpa, tty.writer(), ws);
-                },
-                .paste => |text| {
-                    app.editor.paste(text);
-                    if (app.otel_header_prompt or app.setup_prompt == .credential) @memset(@constCast(text), 0);
-                    gpa.free(@constCast(text));
-                },
                 .daemon_line => |line| {
                     app.handleDaemonLine(line);
-                    // Drain any additional queued lines before redrawing.
-                    while (try loop.tryEvent()) |ev2| {
-                        switch (ev2) {
-                            .daemon_line => |l2| app.handleDaemonLine(l2),
-                            .daemon_gone => |reason| conn_lost = reason,
-                            .reconnected => |maybe| reconnect_verdict = maybe,
-                            .key_press => |k2| try handleKey(&app, k2),
-                            .key_release => |k2| {
-                                if (isVoiceKey(k2) and app.voice_rt.phase == .recording and
-                                    app.voice_rt.setup != null and app.voice_rt.setup.?.mode == .ptt)
-                                    app.stopVoiceRecording();
-                            },
-                            .voice => |vev| app.handleVoiceEvent(vev),
-                            .mouse => |m2| handleMouse(&app, m2),
-                            .tick => {
-                                app.spinner_frame +%= 1;
-                                app.voiceTick();
-                                app.tickUiAnimation();
-                                app.expireNotice();
-                            },
-                            .winsize => |ws2| {
-                                app.term_cols = ws2.cols;
-                                app.term_rows = ws2.rows;
-                                try vx.resize(gpa, tty.writer(), ws2);
-                            },
-                            .paste => |t2| {
-                                app.editor.paste(t2);
-                                if (app.otel_header_prompt or app.setup_prompt == .credential) @memset(@constCast(t2), 0);
-                                gpa.free(@constCast(t2));
-                            },
-                        }
+                    // Drain any additional queued events before redrawing so a
+                    // burst of deltas costs one frame, not one frame each.
+                    while (try loop.tryEvent()) |queued| {
+                        try dispatchEvent(&app, &vx, &tty, gpa, queued, &verdicts);
                     }
                 },
-                .daemon_gone => |reason| conn_lost = reason,
-                .reconnected => |maybe| reconnect_verdict = maybe,
+                else => try dispatchEvent(&app, &vx, &tty, gpa, event, &verdicts),
             }
+            const conn_lost = verdicts.conn_lost;
+            const reconnect_verdict = verdicts.reconnect;
 
             if (conn_lost) |reason| {
                 // A deliberate quit/reboot expects its transport to die; only
