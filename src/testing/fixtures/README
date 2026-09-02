@@ -1,10 +1,17 @@
 Recorded fixtures for tests (no network in unit tests):
 
-  sse/        recorded provider SSE streams — happy path, mid-stream drop,
-              malformed tool-call JSON, 429 + Retry-After, usage-only tail.
-              Torture cases: events split across chunk boundaries mid-escape
-              and mid-UTF-8.
-  ndjson/     recorded client⇄daemon protocol transcripts (golden tests).
+  sse/                 recorded provider SSE streams, replayed at several
+                       chunk sizes by src/testing/fixture_tests.zig:
+                         completion_text.sse   plain streamed completion
+                         tool_call.sse         streamed tool call + arguments
+  local_testing.json   the deterministic `local/testing` model used by
+                       `zig build fake-model` and the e2e fake provider
+
+Wanted but not yet recorded (docs/TESTING.md lists the same set): mid-stream
+disconnect, malformed tool-call JSON, 429 + Retry-After, usage-only tail, and
+events split across chunk boundaries mid-escape / mid-UTF-8. There is no
+ndjson/ golden-transcript tree; protocol behavior is covered by proto.zig
+round-trip tests and the e2e scenarios.
 
 Record real OpenRouter streams with:
   curl -N https://openrouter.ai/api/v1/chat/completions ... | tee fixture.sse

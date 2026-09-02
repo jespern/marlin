@@ -249,7 +249,8 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
 
 - No messaging gateway (Telegram/Discord/...) — hook scripts cover notification.
 - No hosted or multi-user web product. `marlin web` is an opt-in,
-  token-gated, localhost-only client on the same protocol — install it to a
+  localhost-only client on the same protocol, fronted by `tailscale serve`
+  and Host/Origin-checked (no token; the tailnet is the gate) — install it to a
   phone home screen to watch sessions and answer parked approvals over your
   own tailnet. It is one embedded HTML file, and it is not a deploy surface.
 - No voice *stack*: no realtime voice models, wake words, or audio in the
@@ -274,13 +275,13 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
   ┌──────────┐ sock │  └────┬────┘ └────┬────┘ └────┬────┘ │
   │marlin web├──────┤       ▼           ▼           ▼      │
   │ (phone,  │      │  ┌──────────────────────────────┐    │
-  │  token-  │      │  │  SQLite: blocks, sessions,   │    │
-  │  gated)  │      │  │  indexed logs, full outputs  │    │
+  │  tail-   │      │  │  SQLite: blocks, sessions,   │    │
+  │  net)    │      │  │  indexed logs, full outputs  │    │
   └──────────┘      │  └──────────────────────────────┘    │
-                    │  native loop  ·  guest: claude -p       │
+                    │  native loop  ·  guests: claude · codex │
                     └──────────────────┬──────────────────────┘
                                        ▼
-                         OpenRouter / Anthropic API
+                    OpenRouter / Anthropic / configured providers
                          (guest sessions: their binary)
 ```
 

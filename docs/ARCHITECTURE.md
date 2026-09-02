@@ -27,6 +27,11 @@ with the latter, it's simpler to ship):
 - `marlin daemon` — **marlind**. Owns all state: sessions, agent loops, SQLite,
   provider connections, tool execution, MCP clients, hooks. Runs until killed.
   Autostarted on first `marlin` invocation if not running (flock + pidfile).
+  Autostart is a handshake, not a timer: the client spawns
+  `marlin daemon --ready-stdout` and waits on the one byte the daemon writes
+  right after `listen()` — patient while its child is visibly still starting
+  (MCP discovery runs in parallel but still completes before the socket
+  opens), failing fast if the child dies.
 - `marlin` (default: attach) — the TUI client. Connects to the daemon socket,
   speaks the wire protocol, renders. Zero agent logic. Multiple clients can
   attach simultaneously, to the same or different sessions.
@@ -132,8 +137,11 @@ then the wall is how Marlin stays small.
   policy message so the model reads it as policy, not a human's no. This
   is a deny mode on the bridge, not growth of `ccAutoAllow`.
 - Type-system: `Dialect` is wire (`openrouter` | `openai_compatible` |
-  `anthropic`). Guest is not a dialect; `runTurn` branching on
-  `.claude_code` is the current implementation, not the target shape.
+  `anthropic`); `provider.Backend` is `native(Dialect) | guest(Guest)`.
+  The guest runtimes live in `src/daemon/guest/{claude_code_turn,
+  codex_turn,shared}.zig` and borrow only the block appender, turn options,
+  phase/steer helpers, and approval resolution from `loop.zig` — the wall
+  is a file boundary the compiler enforces, not a paragraph.
 
 ### Session identity at the human boundary
 
@@ -294,11 +302,16 @@ turns (resumable), MCP server processes (spawn-on-use), UI state
 
 ### Concurrency model
 
-One OS thread per running agent turn (they're 99% blocked on network/subprocess),
-one dispatcher thread owning session lifecycle, one client thread per
-connection, plus the accept loop. Turn threads produce events into a
-mutex-protected MPSC queue; the dispatcher applies them, persists, and fans
-out to clients. Zig's std.Thread + a small MPSC queue; no async runtime.
+One dispatcher thread owns session lifecycle; every other thread produces
+events into a mutex-protected MPSC queue that the dispatcher applies,
+persists, and fans out. Producers: one thread per running agent turn (99%
+blocked on network/subprocess), TWO per client connection (reader and
+writer — `stopClientIo` depends on exactly that pair), the accept loop, a
+shutdown watcher, and per-activity workers (compaction, handover, catalog
+fetch, OTLP export, hooks, MCP watchdogs, guest subprocess watcher/drain,
+tool and task-batch workers). The normative, kept-current inventory is the
+header comment of `src/daemon/daemon.zig`; this paragraph is the summary.
+Zig's std.Thread + a small MPSC queue; no async runtime.
 
 The original "no shared mutable session state across threads" rule was
 deliberately relaxed to ship mid-turn features (steering, live /permissions,

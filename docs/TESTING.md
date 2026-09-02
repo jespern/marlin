@@ -168,7 +168,8 @@ a state-snapshot oracle + a mechanically generated matrix.
    store (fresh / needs-migration fixture) × UI snapshot (valid / corrupt /
    missing). The runner iterates the product; `delay_ms_between_events`
    freezes mid-stream/mid-tool states deterministically.
-3. **Convergence family (the load-bearing test).** Identical scripted
+3. **Convergence family (the load-bearing test; `zig build converge`, run
+   in CI's Linux leg).** Identical scripted
    setup; branch A `/reboot`, branch B `kill -9` at the equivalent moment;
    both restart, both dump. Dumps must be identical modulo the specified
    quiesce delta (`/reboot` may contain one more finalized block — that

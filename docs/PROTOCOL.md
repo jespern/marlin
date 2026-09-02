@@ -48,6 +48,10 @@ policy that failed open. Both default false when decoding an older daemon.
 | input_history | sid?, limit? | input_history_result{entries}; authored user/steer text across sessions, current sid first then newest, capped at 1024 |
 | search | query, sid?, limit? | search_result{query,sid,hits}; sid=0 searches all sessions, capped at 200 results |
 | diagnostics | sid, turn_limit? | diagnostics_result; bounded provider/TTFT and local-preparation summary plus the latest turn waterfall |
+| model_list | — | model_list_result{models, pricing?}; the provider catalog (cached ~1h), empty on fetch failure so clients fall back to favorites |
+| otel_configure | endpoint?, traces_endpoint?, headers… | reconfigures OTLP export without a restart and persists it; err on failure |
+| otel_status | — | the exporter's current status (endpoint, pending outbox, last error) |
+| otel_content | enabled | ok/err; toggles opt-in GenAI content capture on exported spans (requires an active exporter) |
 | setup_status | probe_guests? | setup_status_result with the daemon host's durable default and credential readiness; probe_guests opts into guest login checks that spawn vendor CLIs |
 | setup_apply | sid, model, provider_name?, base_url?, api_key_env?, credential?, replace_empty_session? | setup_result after daemon-host credential/config persistence and provider resolution; credential is never echoed |
 | session_watch | incremental? | initial session_list_result, then structural catalog updates; incremental clients receive session_upsert/session_remove, legacy clients receive refreshed snapshots |
@@ -55,11 +59,14 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
 | session_set_model | sid, model | ok, or err{busy} mid-turn. Native→guest (`claudecode/` or `codex/`) starts a native handover turn. Switching directly between different guest backends returns err{guest_switch}; go through a native model to create a handover. |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
+| session_rename | sid, title | ok; title normalized like auto-titles (first line, trimmed, capped) and broadcast as session_upsert |
+| session_set_approvals | sid, approvals ("default" \| "auto") | ok; applies to the RUNNING turn too — granting full access resolves a parked prompt immediately |
 | session_set_plan_mode | sid, enabled | ok, or err{busy} mid-turn; persists collaboration mode with the session |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on guest sessions |
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded, err{guest} on guest sessions |
 | sub | sid, from_seq, tail_limit?, before_seq?, around_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
 | unsub | sid | ok |
+| blob_get | hash | blob_result{hash, bytes}; the uncapped tool output behind a truncated inline body (`!c`) |
 | input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer while an agent turn is accepting them (running/awaiting approval); compact, handover, and the atomic finishing edge return `err{not_steerable}` |
 | council_list | — | council_list_result with every configured [[council]] roster |
 | council_set | name, models[] | council_list_result after atomically persisting the (new or replaced) [[council]] table to config.toml |
@@ -69,14 +76,17 @@ policy that failed open. Both default false when decoding an older daemon.
 | mcp_list | — | mcp_list_result with per-server readiness, tool count, and discovery error |
 | mcp_add | name, cmd[] | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
 | mcp_remove | name | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
-| ui_set_tab_bar | enabled | ui_config_result after daemon-serialized atomic persistence to config.toml |
+| ui_set_tab_bar | enabled | ui_config_result{tab_bar, bell} after daemon-serialized atomic persistence to config.toml |
+| ui_set_bell | enabled | ui_config_result{tab_bar, bell}; `[ui] bell` — BEL on a non-focused approval |
 | mcp_restart | name | mcp_list_result after rediscovery; failure is reported as server health, not daemon failure |
 | mcp_reload | — | mcp_list_result after atomic registry replacement; old registry survives invalid config/build failure |
 | approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |
+| cc_approval | sid, tool, args_json | cc_approval_result — immediately when policy auto-allows/denies (read-only guest children deny writes outright), otherwise after a human answers the parked approval_request; sent by the `marlin cc_approve` bridge |
 | session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn, err{guest} on guest sessions |
 | interrupt | sid, report? | ok, or interrupt_result with phase/elapsed diagnostics when report=true (cooperative cancel; also denies a pending approval) |
 | reboot | force? | quiesce (wait for turns; force interrupts), retire the listening socket, then ok RIGHT BEFORE daemon exit — requester's cue to re-exec; non-force returns err{approval_pending} rather than wait on an approval with no client |
 | shutdown | — | ok, then daemon exits cleanly |
+| gc | expire_before_ms? | gc report (orphan blobs, expired blobs, bytes reclaimed); holds the store's connection mutex across its transaction |
 
 `session_create.approvals`: `"default"` (mutating tools ask) or `"auto"`
 (everything auto-approved — what `marlin run` uses; `--ask` opts back in).

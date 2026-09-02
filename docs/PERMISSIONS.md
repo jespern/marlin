@@ -38,8 +38,9 @@ Current progress:
   ancestor realpath; nonexistent trailing components cannot be symlinks).
   Outside-workspace or unprovable targets keep the legacy prompt. Gated on
   the same per-session sandbox regime as shell auto-inside.
-- **Next:** rich once/session escalation grants; typed protected-read
-  refusals for direct read tools.
+- **Next:** rich once/session escalation grants (the `/allow` escape
+  hatch). Typed protected-read refusals for direct read tools have landed
+  (files.zig / search.zig refuse as tool-result data).
 
 Guest sessions (ARCHITECTURE.md, Native vs guest) do **not** run this
 permission matrix. Their official binary has its own tools and permissions.

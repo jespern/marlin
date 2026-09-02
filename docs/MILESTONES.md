@@ -5,63 +5,95 @@ marlin/
 ├── build.zig
 ├── build.zig.zon              # deps: libvaxis, regex; vendored SQLite for releases
 ├── src/
-│   ├── main.zig               # arg parse → daemon | attach | run | ls | ...
+│   ├── main.zig               # entry; test import block (every file must be reachable)
+│   ├── cli.zig                # arg parse → daemon | attach | run | ls | top | ... | --remote
 │   │
 │   ├── core/                  # shared by daemon & client; no I/O policy here
 │   │   ├── block.zig          # BlockKind, Block, serialization (json)
 │   │   ├── proto.zig          # wire message types, encode/decode, versioning
-│   │   ├── config.zig         # TOML load, defaults, validation
+│   │   ├── guest.zig          # guest namespace (claudecode/, codex/) parsing
+│   │   ├── config.zig         # TOML load, defaults, validation, surgical edits
+│   │   ├── config_toml.zig    # the focused TOML decoder
+│   │   ├── credentials.zig    # 0600 credential file, config dir resolution
+│   │   ├── effort.zig         # reasoning effort enum
 │   │   ├── jsonx.zig          # lenient JSON repair (tool args), helpers
 │   │   ├── ids.zig            # session/block/turn id generation
+│   │   ├── session_handle.zig # short stable session handles
+│   │   ├── queue.zig          # MPSC event queue
 │   │   └── telemetry.zig      # stable OTLP trace/span id formatting
 │   │
 │   ├── daemon/
-│   │   ├── daemon.zig         # listener, client registry, event fan-out, main loop;
-│   │   │                      #   owns the live Session structs (state machine incl.)
-│   │   ├── store.zig          # SQLite: blocks, sessions, blobs; the ONLY sqlite user
-│   │   ├── loop.zig           # agent turn: assemble→stream→tools→repeat; steer queue
+│   │   ├── daemon.zig         # listener, client registry, event fan-out, dispatcher;
+│   │   │                      #   owns the live Session structs; NORMATIVE thread inventory
+│   │   ├── store.zig          # SQLite: blocks, sessions, blobs, telemetry; the ONLY sqlite user
+│   │   ├── loop.zig           # NATIVE agent turn: assemble→stream→tools→repeat; steer queue
+│   │   ├── guest/             # guest turns behind a compiler-enforced wall
+│   │   │   ├── claude_code_turn.zig  # `claude -p` stream-json host
+│   │   │   ├── codex_turn.zig        # `codex app-server` JSON-RPC host
+│   │   │   └── shared.zig            # delegate error detail, watcher, stderr drain
 │   │   ├── context.zig        # assembly + L0 caps + L1 prune + L2 compaction + rehydrate
-│   │   ├── approval.zig       # policies, capability grants, pending approvals
-│   │   ├── permissions.zig    # capability/path policy + child secret boundary
-│   │   ├── sandbox.zig        # runtime-verified Seatbelt/Landlock adapters
+│   │   ├── approval.zig       # approval policy + gate (once/session grants: TODO M3.5)
+│   │   ├── permissions.zig    # protected paths, secret redaction, tool environment
+│   │   ├── sandbox.zig        # runtime-verified Seatbelt/Landlock selection + canary
+│   │   ├── landlock.zig       # Linux ruleset planner + `marlin landlock_exec`
+│   │   ├── process_io.zig     # subprocess run/cancel/kill with process-tree sweeps
+│   │   ├── shell_network.zig  # bash destination screening
+│   │   ├── network_policy.zig # DNS blocklists / allow / deny for marlin-owned tools
+│   │   ├── extensions.zig     # exec tools, MCP servers (parallel discovery), hooks, skills
 │   │   ├── otel.zig           # asynchronous OTLP/HTTP outbox drain
+│   │   ├── hooks.zig          # event → script runner
+│   │   ├── skills.zig         # index scan, frontmatter parse, skill tool
 │   │   ├── tools/
 │   │   │   ├── registry.zig   # spec: name, schema, parallel_safe, policy; dispatch
-│   │   │   ├── bash.zig       # subprocess, cancellation, (later: sandbox.zig)
-│   │   │   ├── files.zig      # read/write/edit (fuzzy string-replace)
+│   │   │   ├── bash.zig       # subprocess, cancellation, sandbox wrapper
+│   │   │   ├── files.zig      # read/write/edit (fuzzy string-replace), protected-path refusals
 │   │   │   ├── search.zig     # grep (rg → system grep → native), glob
 │   │   │   ├── fetch.zig      # bounded std.http GET → readable text
 │   │   │   ├── exec_tool.zig  # config-declared executable tools
+│   │   │   ├── task.zig       # task / task_batch child sessions
+│   │   │   ├── plan.zig       # plan_update durable execution plans
 │   │   │   └── mcp.zig        # MCP client, stdio transport, tool bridging
-│   │   ├── provider/
-│   │   │   ├── provider.zig   # iface: request(messages,tools) → event stream
-│   │   │   ├── openai_compat.zig
-│   │   │   ├── anthropic.zig
-│   │   │   ├── claude_code.zig # GUEST adapter: spawn official `claude` binary
-│   │   │   ├── sse.zig        # SSE parser (shared)
-│   │   │   ├── http.zig       # pooled std.http transport, streaming, cancellation
-│   │   │   └── registry.zig   # model string → native dialect or guest prefix
-│   │   ├── hooks.zig          # event → script runner
-│   │   └── skills.zig         # index scan, frontmatter parse, skill tool
+│   │   └── provider/
+│   │       ├── provider.zig   # Backend = native(Dialect) | guest(Guest); iface
+│   │       ├── registry.zig   # model string → backend, base URL, credential env
+│   │       ├── openai_compat.zig
+│   │       ├── anthropic.zig
+│   │       ├── claude_code.zig # guest adapter: argv, session uuid, stream-json decode
+│   │       ├── codex.zig       # guest adapter: app-server JSON-RPC decode
+│   │       ├── sse.zig        # SSE parser (shared)
+│   │       └── http.zig       # pooled std.http transport, streaming, cancellation
 │   │
 │   ├── client/
-│   │   ├── attach.zig         # socket client, reconnect w/ from_seq, delta buffer
+│   │   ├── attach.zig         # socket/ssh transports, autostart handshake, hello
+│   │   ├── pipe.zig           # `marlin _pipe`: stdio↔daemon.sock bridge (remote far end)
 │   │   ├── tui.zig            # App, draw orchestration, protocol, tabs, keys
 │   │   ├── render.zig         # terminal lines, palette, syntax, wrapping
 │   │   ├── markdown.zig       # inline/block Markdown, tables, panels, callouts
-│   │   ├── layout.zig         # transcript view, caches, tool folding, diffs
+│   │   ├── layout.zig         # transcript view, caches, tool folding, diffs, plan table
 │   │   ├── editor.zig         # composer editing + vim ops
-│   │   ├── web.zig            # `marlin web`: localhost HTTP/SSE bridge (POC)
-│   │   └── headless.zig       # `marlin run`: same protocol, no UI
+│   │   ├── top.zig            # `marlin top` live hierarchy view
+│   │   ├── media.zig          # image paste/path attachments
+│   │   ├── voice.zig          # optional local push-to-talk dictation
+│   │   ├── self_build.zig / remote_rebuild.zig  # `!rb` source rebuilds
+│   │   ├── cc_approve.zig     # Claude Code permission bridge (MCP stdio)
+│   │   ├── web.zig            # `marlin web`: localhost HTTP/SSE bridge, tailnet-fronted
+│   │   └── headless.zig       # `marlin run` and the scripting subcommands
 │   │
 │   └── testing/
-│       ├── fake_provider.zig  # scripted OpenAI-compat server for e2e
-│       └── fixtures/          # recorded SSE streams, NDJSON transcripts
+│       ├── e2e_runner.zig     # scenario runner (fake provider, MCP/hook fixtures)
+│       ├── fake_provider_main.zig  # scripted OpenAI-compat server for e2e
+│       ├── fixture_tests.zig  # recorded SSE replay at several chunk sizes
+│       ├── reboot_convergence.sh   # reboot vs kill-9 restore identical state
+│       ├── scenarios/         # 23 e2e scenario files
+│       └── fixtures/          # recorded SSE streams, local_testing model
 └── docs/
     ├── ARCHITECTURE.md
     ├── MILESTONES.md
     ├── PROTOCOL.md            # wire protocol reference (grows with proto.zig)
-    └── REVIEW.md              # multi-model review councils (post-M4 design)
+    ├── PERMISSIONS.md         # the M3.5 permissions/secret-boundary contract
+    ├── TESTING.md, OBSERVABILITY.md, WORKSPACE.md
+    ├── REVIEW.md              # multi-model review councils (shipped)
+    └── SOFTWARE_REVIEW_*.md   # dated point-in-time reviews
 ```
 
 Dependency rules (enforce by convention, they keep the build fast and the
@@ -131,9 +163,9 @@ attached session. `gt`/`gT` switch recent sessions. Child activity rolls up to
 its root tab and the status bar shows only actionable background totals. Session switching preserves each
 session's view and draft. Mouse selection + OSC52 and the `!c` family finish
 the focused terminal workflow. Two-pane
-splits, cross-session registers, and remote attach are candidate
-slices, not exit requirements; decide them in `docs/M4_PLAN.md` before work
-starts. The post-M4 rich-input slice now supplies remote-safe clipboard/path
+splits and cross-session registers are candidate slices, not exit
+requirements; decide them in `docs/M4_PLAN.md` before work starts. Remote
+attach shipped as `marlin --remote <host>` (ARCHITECTURE.md, Mode B). The post-M4 rich-input slice now supplies remote-safe clipboard/path
 image attachments and provider vision mapping.
 *Exit: several local sessions can run and be revisited from one full-width
 Marlin UI without losing their place or hiding actionable background state.*
@@ -153,10 +185,12 @@ use; the fake-provider/stdio E2E gates prove mechanics, not operational value.*
 read-only `task` and `task_batch` children now have parent/child hierarchy,
 dispatcher-owned creation, cancellation cascade, round budgets, ordered
 structured results, an eight-child concurrency ceiling, and session-picker
-visibility. Next: multi-model review councils (docs/REVIEW.md) as specialized
-read-only task fan-out. TCP listener/token auth is a retained v2 door to
-schedule only for a concrete
-remote-client need. Then decide: PWA client. Execution plan: `docs/M6_PLAN.md`.
+visibility. Multi-model review councils (docs/REVIEW.md) shipped as
+specialized read-only task fan-out (`/council`, `/review`, durable
+`[[council]]`). The remote door is decided and shipped (docs/M6_PLAN.md
+M6c): ssh for terminals, the tailnet for the phone PWA, no marlin-owned
+TCP listener or bearer tokens. Remaining M6 hardening is measurement and
+shape, per the dated software reviews.
 
 ## Later — workspace recovery & isolation (formerly M4.5)
 Copy-on-write snapshots with portable fallback, `/undo` preview, external
