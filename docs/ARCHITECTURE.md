@@ -1089,8 +1089,9 @@ A split pane identifies its session with a compact pane label.
 
 - **Modes**: insert (typing → input box), normal (vim motions: j/k scroll,
   gg top, `gt`/`gT` with count for recent-session cycling, J join lines and
-  a/A/I enter insert mode in the composer, Esc cancels a pending
-  count/operator and never changes mode, `:` opens the command menu,
+  a/A/I enter insert mode in the composer, a bare Esc returns to insert
+  (with a count/operator pending it cancels that instead and stays),
+  `:` opens the command menu,
   Ctrl+W on an empty composer or
   `/archive [children]` for explicit lifecycle changes (Ctrl+D stays
   page-down: an empty composer is the normal state while reading), `/sessions` for

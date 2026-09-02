@@ -3258,9 +3258,14 @@ const App = struct {
         return n;
     }
 
-    /// vim's Esc-in-normal contract: cancel whatever is half-typed — count,
-    /// operator, find, `g` prefix, `r` — and change nothing else. Also run on
-    /// every insert-mode entry so a stale count never survives a round trip.
+    fn hasPending(self: *const App) bool {
+        return self.pending_count != 0 or self.pending_op != 0 or self.pending_find != 0 or
+            self.pending_g or self.pending_replace;
+    }
+
+    /// Cancel whatever is half-typed — count, operator, find, `g` prefix,
+    /// `r`. Also run on every insert-mode entry so a stale count never
+    /// survives a round trip.
     fn clearPending(self: *App) void {
         self.pending_count = 0;
         self.pending_op = 0;
@@ -5597,8 +5602,7 @@ const ShortcutHelpRow = struct {
 };
 
 const shortcut_help_rows = [_]ShortcutHelpRow{
-    .{ .key = "i", .description = "return to insert mode" },
-    .{ .key = "Esc", .description = "cancel a pending count / operator" },
+    .{ .key = "Esc / i", .description = "return to insert mode (Esc first cancels a pending count/operator)" },
     .{ .key = ":", .description = "open the command menu" },
     .{ .key = "</> or ←/→", .description = "previous / next tab" },
     .{ .key = "⌥1–⌥9", .description = "jump to Nth tab (works in insert mode too)" },
@@ -8480,10 +8484,16 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (key.matches('?', .{})) {
                 app.shortcut_help = true;
             } else if (key.matches(vaxis.Key.escape, .{})) {
-                // vim: Esc in normal mode cancels pending input and changes
-                // nothing else. Double-Esc must never land in insert with the
-                // cursor live — that turns the next `dd` into typed text.
-                app.clearPending();
+                // Normal mode is an excursion from a prompt, not a resting
+                // state, so a BARE Esc goes back to typing. But a half-typed
+                // count/operator/find is cancelled first and stays in normal:
+                // `d` Esc must never land in insert with the cursor live.
+                if (app.hasPending()) {
+                    app.clearPending();
+                } else {
+                    app.editor.pushUndo();
+                    app.mode = .insert;
+                }
             } else if (key.matches('i', .{})) {
                 app.clearPending();
                 app.editor.pushUndo();
@@ -8681,13 +8691,18 @@ test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do n
     defer app.deinit();
     app.mode = .normal;
 
-    // Esc in normal mode: stays normal, clears a half-typed count/operator.
+    // Esc with a half-typed count/operator: cancel it, stay in normal —
+    // never drop into insert with the cursor live. A bare Esc goes back to
+    // typing, which is what normal mode is an excursion from.
     app.pending_count = 5;
     app.pending_op = 'd';
     try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
     try std.testing.expectEqual(Mode.normal, app.mode);
     try std.testing.expectEqual(@as(usize, 0), app.pending_count);
     try std.testing.expectEqual(@as(u8, 0), app.pending_op);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    app.mode = .normal;
 
     // `5G` consumes its count instead of arming the next `x`.
     try handleKey(&app, .{ .codepoint = '5' });
@@ -9880,7 +9895,7 @@ test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D neve
     try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "interrupt it first") != null);
 }
 
-test "Escape closes an active picker and then stays in normal mode; i returns to insert" {
+test "Escape closes an active picker, then a bare Escape returns to insert" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -9900,11 +9915,8 @@ test "Escape closes an active picker and then stays in normal mode; i returns to
     try std.testing.expectEqual(Mode.normal, app.mode);
     try std.testing.expect(app.picker == null);
 
-    // vim contract: a second Esc is a no-op in normal mode — it must not
-    // land in insert with the cursor live. `i` is the way back.
+    // Nothing pending: Esc is the way back to typing; the draft survives.
     try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
-    try std.testing.expectEqual(Mode.normal, app.mode);
-    try handleKey(&app, .{ .codepoint = 'i' });
     try std.testing.expectEqual(Mode.insert, app.mode);
     try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
 }
