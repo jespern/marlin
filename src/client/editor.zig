@@ -458,6 +458,119 @@ pub fn moveFirstNonBlank(self: *Editor) void {
     self.goal_col = null;
 }
 
+// ---- WORD motions (vim W/B/E): whitespace-delimited, unlike word/non-word
+// runs for w/b/e. Byte-level blanks are enough; every UTF-8 continuation byte
+// is non-blank.
+
+fn isBlank(b: u8) bool {
+    return b == ' ' or b == '\t' or b == '\n';
+}
+
+/// vim `W`: start of the next WORD.
+fn wordStartAfterBig(t: []const u8, i: usize) usize {
+    var p = i;
+    while (p < t.len and !isBlank(t[p])) p += 1;
+    while (p < t.len and isBlank(t[p])) p += 1;
+    return p;
+}
+
+/// vim `B`: start of the current/previous WORD.
+fn wordStartBeforeBig(t: []const u8, i: usize) usize {
+    var p = i;
+    while (p > 0 and isBlank(t[p - 1])) p -= 1;
+    while (p > 0 and !isBlank(t[p - 1])) p -= 1;
+    return p;
+}
+
+/// vim `E` in the between-characters cursor model: just past the end of the
+/// current WORD, or of the next one when already at a WORD's end.
+fn wordEndAfterBig(t: []const u8, i: usize) usize {
+    var p = i;
+    while (p < t.len and isBlank(t[p])) p += 1;
+    while (p < t.len and !isBlank(t[p])) p += 1;
+    return p;
+}
+
+pub fn moveWORDStart(self: *Editor) void {
+    self.cursor = wordStartAfterBig(self.text.items, self.cursor);
+    self.goal_col = null;
+}
+
+pub fn moveWORDLeft(self: *Editor) void {
+    self.cursor = wordStartBeforeBig(self.text.items, self.cursor);
+    self.goal_col = null;
+}
+
+pub fn moveWORDEnd(self: *Editor) void {
+    self.cursor = wordEndAfterBig(self.text.items, self.cursor);
+    self.goal_col = null;
+}
+
+/// True when the cursor sits on whitespace or past the end — vim's `cw`
+/// special case (cw == ce) applies only on a non-blank.
+pub fn cursorOnBlank(self: *const Editor) bool {
+    const t = self.text.items;
+    return self.cursor >= t.len or isBlank(t[self.cursor]);
+}
+
+fn bracketPartner(b: u8) ?u8 {
+    return switch (b) {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '{' => '}',
+        '}' => '{',
+        else => null,
+    };
+}
+
+/// vim `%`: the bracket matching the one under the cursor — or under the
+/// first bracket at/after the cursor on this line. Null when nothing matches.
+pub fn matchingBracket(self: *const Editor) ?usize {
+    const t = self.text.items;
+    const end = lineEnd(t, self.cursor);
+    var i = self.cursor;
+    while (i < end and bracketPartner(t[i]) == null) i += 1;
+    if (i >= end) return null;
+    const here = t[i];
+    const partner = bracketPartner(here).?;
+    const forward = here == '(' or here == '[' or here == '{';
+    var depth: usize = 0;
+    if (forward) {
+        var j = i;
+        while (j < t.len) : (j += 1) {
+            if (t[j] == here) depth += 1 else if (t[j] == partner) {
+                depth -= 1;
+                if (depth == 0) return j;
+            }
+        }
+    } else {
+        var j = i + 1;
+        while (j > 0) {
+            j -= 1;
+            if (t[j] == here) depth += 1 else if (t[j] == partner) {
+                depth -= 1;
+                if (depth == 0) return j;
+            }
+        }
+    }
+    return null;
+}
+
+pub fn moveMatchingBracket(self: *Editor) void {
+    if (self.matchingBracket()) |p| {
+        self.cursor = p;
+        self.goal_col = null;
+    }
+}
+
+/// `d%`/`c%`/`y%`: inclusive, cursor through the matching bracket.
+pub fn matchingBracketRange(self: *const Editor) ?Range {
+    const p = self.matchingBracket() orelse return null;
+    return .{ .start = @min(self.cursor, p), .end = @max(self.cursor, p) + 1 };
+}
+
 pub fn moveLineEnd(self: *Editor) void {
     self.cursor = lineEnd(self.text.items, self.cursor);
     self.goal_col = null;
@@ -1270,6 +1383,44 @@ pub fn moveWordStart(self: *Editor) void {
 /// vim `e` as an operator target: cursor through the end of the word.
 pub fn wordEndRange(self: *const Editor) Range {
     return .{ .start = self.cursor, .end = wordEndAfter(self.text.items, self.cursor) };
+}
+
+pub fn wordForwardRangeBig(self: *const Editor) Range {
+    return .{ .start = self.cursor, .end = wordStartAfterBig(self.text.items, self.cursor) };
+}
+
+pub fn wordBackRangeBig(self: *const Editor) Range {
+    return .{ .start = wordStartBeforeBig(self.text.items, self.cursor), .end = self.cursor };
+}
+
+pub fn wordEndRangeBig(self: *const Editor) Range {
+    return .{ .start = self.cursor, .end = wordEndAfterBig(self.text.items, self.cursor) };
+}
+
+/// iW / aW: the whitespace-delimited WORD under the cursor (or the blank run
+/// when on one); `around` takes trailing blanks, or leading when none trail.
+pub fn innerWORDRange(self: *const Editor, around: bool) ?Range {
+    const t = self.text.items;
+    if (t.len == 0) return null;
+    var lo = @min(self.cursor, t.len - 1);
+    var hi = lo;
+    if (isBlank(t[lo])) {
+        while (hi < t.len and isBlank(t[hi]) and t[hi] != '\n') hi += 1;
+        while (lo > 0 and isBlank(t[lo - 1]) and t[lo - 1] != '\n') lo -= 1;
+        return .{ .start = lo, .end = hi };
+    }
+    while (lo > 0 and !isBlank(t[lo - 1])) lo -= 1;
+    while (hi < t.len and !isBlank(t[hi])) hi += 1;
+    if (around) {
+        var padded = hi;
+        while (padded < t.len and t[padded] == ' ') padded += 1;
+        if (padded > hi) {
+            hi = padded;
+        } else {
+            while (lo > 0 and t[lo - 1] == ' ') lo -= 1;
+        }
+    }
+    return .{ .start = lo, .end = hi };
 }
 
 /// `count` logical lines starting at the cursor's line (for 2dd/3yy).

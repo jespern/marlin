@@ -3531,6 +3531,10 @@ const App = struct {
             self.pending_obj = 0;
             const range: ?Editor.Range = if (key.matches('w', .{}))
                 ed.innerWordRange(around)
+            else if (key.matches('W', .{ .shift = true }) or key.matches('W', .{}))
+                ed.innerWORDRange(around)
+            else if (key.matches('<', .{}) or key.matches('>', .{}))
+                ed.delimRange('<', '>', around)
             else if (key.matches('"', .{}))
                 ed.quoteRange('"', around)
             else if (key.matches('\'', .{}))
@@ -3576,16 +3580,32 @@ const App = struct {
             // dd deletes the line including its newline; cc keeps the shell.
             ed.linesRange(count, op != 'c')
         else if (key.matches('w', .{}))
-            self.repeatForwardRange(Editor.wordForwardRange, count)
+            // vim's famous special case: `cw` on a non-blank changes to the
+            // END of the word (like `ce`) and keeps the following space.
+            (if (op == 'c' and !ed.cursorOnBlank())
+                self.repeatForwardRange(Editor.wordEndRange, count)
+            else
+                self.repeatForwardRange(Editor.wordForwardRange, count))
         else if (key.matches('e', .{}))
             self.repeatForwardRange(Editor.wordEndRange, count)
         else if (key.matches('b', .{}))
             self.repeatBackwardRange(Editor.wordBackRange, count)
+        else if (key.matches('W', .{ .shift = true }) or key.matches('W', .{}))
+            (if (op == 'c' and !ed.cursorOnBlank())
+                self.repeatForwardRange(Editor.wordEndRangeBig, count)
+            else
+                self.repeatForwardRange(Editor.wordForwardRangeBig, count))
+        else if (key.matches('E', .{ .shift = true }) or key.matches('E', .{}))
+            self.repeatForwardRange(Editor.wordEndRangeBig, count)
+        else if (key.matches('B', .{ .shift = true }) or key.matches('B', .{}))
+            self.repeatBackwardRange(Editor.wordBackRangeBig, count)
+        else if (key.matches('%', .{}))
+            ed.matchingBracketRange()
         else if (key.matches('$', .{}))
             ed.toLineEndRange()
         else if (key.matches('0', .{}))
             ed.toLineStartRange()
-        else if (key.matches('^', .{}))
+        else if (key.matches('^', .{}) or key.matches('_', .{}))
             ed.toFirstNonBlankRange()
         else
             null;
@@ -5781,9 +5801,9 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "?", .description = "toggle shortcut help" },
     .{ .key = "q", .description = "detach (sessions keep running; warns once)" },
     .{ .description = "COMPOSER (vim)", .heading = true },
-    .{ .key = "h l w b 0 ^ $", .description = "move in the input line" },
+    .{ .key = "h l w b e W B E 0 ^ $ %", .description = "move in the input line" },
     .{ .key = "x / D", .description = "delete char / to line end" },
-    .{ .key = "d c y + motion", .description = "operators: w b e 0 $ f t, dd/cc/yy, iw i\" i( …" },
+    .{ .key = "d c y + motion", .description = "operators: w b e W B E 0 ^ $ % f t, dd/cc/yy, iw aW i\" i( i< …" },
     .{ .key = "counts f t ; ,", .description = "3w d2w 2dd · find char, repeat" },
     .{ .key = "u / Ctrl+R", .description = "undo / redo (normal mode)" },
     .{ .key = "s S C Y o O r ~", .description = "vim synonyms, open line, replace, case" },
@@ -8608,9 +8628,22 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (key.matches('b', .{})) {
                 var n = app.takeCount();
                 while (n > 0) : (n -= 1) app.editor.moveWordLeft();
+            } else if (key.matches('W', .{ .shift = true }) or key.matches('W', .{})) {
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.moveWORDStart();
+            } else if (key.matches('E', .{ .shift = true }) or key.matches('E', .{})) {
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.moveWORDEnd();
+            } else if (key.matches('B', .{ .shift = true }) or key.matches('B', .{})) {
+                var n = app.takeCount();
+                while (n > 0) : (n -= 1) app.editor.moveWORDLeft();
+            } else if (key.matches('%', .{})) {
+                _ = app.takeCount();
+                app.editor.moveMatchingBracket();
             } else if (key.matches('0', .{})) {
                 app.editor.moveLineStart();
-            } else if (key.matches('^', .{})) {
+            } else if (key.matches('^', .{}) or key.matches('_', .{})) {
+                _ = app.takeCount();
                 app.editor.moveFirstNonBlank();
             } else if (key.matches('$', .{})) {
                 app.editor.moveLineEnd();
@@ -8829,6 +8862,64 @@ test "manners: notices expire, the plan offer is not a modal, a background appro
     try handleKey(&app, .{ .codepoint = 'q' });
     try std.testing.expect(!app.shortcut_help);
     try std.testing.expectEqual(@as(usize, 0), app.help_scroll);
+}
+
+test "composer WORD motions, %, i<, and vim's cw special case" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    defer app.deinit();
+    app.mode = .normal;
+
+    // W/E/B are whitespace-delimited where w/e/b split on punctuation.
+    app.editor.insertSlice("foo-bar baz(qux) end");
+    app.editor.moveLineStart();
+    try handleKey(&app, .{ .codepoint = 'W' });
+    try std.testing.expectEqual(@as(usize, 8), app.editor.cursor); // "baz(qux)"
+    try handleKey(&app, .{ .codepoint = 'E' });
+    try std.testing.expectEqual(@as(usize, 16), app.editor.cursor); // past ")"
+    try handleKey(&app, .{ .codepoint = 'B' });
+    try std.testing.expectEqual(@as(usize, 8), app.editor.cursor);
+
+    // % jumps between matching brackets, searching forward on the line first.
+    try handleKey(&app, .{ .codepoint = '%' }); // from "b" of baz: first bracket is "(" at 11 → ")" at 15
+    try std.testing.expectEqual(@as(usize, 15), app.editor.cursor);
+    try handleKey(&app, .{ .codepoint = '%' });
+    try std.testing.expectEqual(@as(usize, 11), app.editor.cursor);
+
+    // dW from the start removes the whole punctuated WORD and its space.
+    app.editor.moveLineStart();
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = 'W' });
+    try std.testing.expectEqualStrings("baz(qux) end", app.editor.text.items);
+
+    // i< is a text object like i( and i[.
+    app.editor.clear();
+    app.editor.insertSlice("see <the tag> here");
+    app.editor.cursor = 7;
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = 'i' });
+    try handleKey(&app, .{ .codepoint = '<' });
+    try std.testing.expectEqualStrings("see <> here", app.editor.text.items);
+
+    // vim's cw: on a non-blank it changes to the END of the word, keeping the
+    // separator — the one place cw and dw legitimately differ.
+    app.editor.clear();
+    app.mode = .normal;
+    app.editor.insertSlice("foo bar");
+    app.editor.moveLineStart();
+    try handleKey(&app, .{ .codepoint = 'c' });
+    try handleKey(&app, .{ .codepoint = 'w' });
+    try std.testing.expectEqualStrings(" bar", app.editor.text.items);
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    app.mode = .normal;
+    app.editor.clear();
+    app.editor.insertSlice("foo bar");
+    app.editor.moveLineStart();
+    try handleKey(&app, .{ .codepoint = 'd' });
+    try handleKey(&app, .{ .codepoint = 'w' });
+    try std.testing.expectEqualStrings("bar", app.editor.text.items);
 }
 
 test {
