@@ -2115,14 +2115,14 @@ const App = struct {
                 if (self.plan_mode and !self.history_loading) self.plan_proposal_ready = true;
             },
             .reasoning => |r| {
-                // Reasoning and progress commentary use distinct live streams
-                // but the same durable card type. Clear whichever buffer this
-                // finalized block exactly replaces.
-                if (std.mem.eql(u8, self.reasoning_delta.items, r.text)) {
-                    self.reasoning_delta.clearRetainingCapacity();
-                } else if (std.mem.eql(u8, self.delta.items, r.text)) {
+                // Raw reasoning streams on reasoning_delta; tool-round
+                // commentary streams on delta. Finalization ends that channel's
+                // current provider round regardless of prior-round residue.
+                if (r.commentary) {
                     self.delta.clearRetainingCapacity();
                     self.stream_layout_cache.reset(self.gpa);
+                } else {
+                    self.reasoning_delta.clearRetainingCapacity();
                 }
                 const before = self.blocks.items.len;
                 self.pushDurableBlock(b, .reasoning, r.text, "", .ok);
@@ -11984,6 +11984,53 @@ test "Plan clear result removes only the active session todo" {
     } }));
     try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
     try std.testing.expectEqualStrings("execution plan cleared", app.notice.items);
+}
+
+test "finalized reasoning clears only its live stream channel across rounds" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 7,
+        .editor = Editor.init(gpa),
+    };
+    defer app.deinit();
+
+    try app.reasoning_delta.appendSlice(gpa, "stale raw current raw");
+    try app.delta.appendSlice(gpa, "stale commentary current commentary");
+    try app.stream_layout_cache.update(gpa, app.delta.items, 80);
+
+    app.applyBlock(.{
+        .id = 1,
+        .session_id = 7,
+        .turn_id = 9,
+        .seq = 1,
+        .ts = 0,
+        .body = .{ .reasoning = .{ .text = "current raw" } },
+    });
+    try std.testing.expectEqual(@as(usize, 0), app.reasoning_delta.items.len);
+    try std.testing.expectEqualStrings("stale commentary current commentary", app.delta.items);
+
+    try app.reasoning_delta.appendSlice(gpa, "next raw");
+    app.applyBlock(.{
+        .id = 2,
+        .session_id = 7,
+        .turn_id = 9,
+        .seq = 2,
+        .ts = 0,
+        .body = .{ .reasoning = .{ .text = "current commentary", .commentary = true } },
+    });
+    try std.testing.expectEqual(@as(usize, 0), app.delta.items.len);
+    try std.testing.expectEqualStrings("next raw", app.reasoning_delta.items);
+    try std.testing.expectEqual(@as(usize, 0), app.stream_layout_cache.lines.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.stream_layout_cache.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.stream_layout_cache.source_len);
+
+    try app.delta.appendSlice(gpa, "next commentary");
+    try std.testing.expectEqualStrings("next commentary", app.delta.items);
 }
 
 test "Plan mode proposal becomes actionable only from a live finalized answer" {

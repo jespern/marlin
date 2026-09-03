@@ -1,0 +1,27 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["do not hide a blank response"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"reasoning\":\"First internal-only response.\"}}]}",
+        "{\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4,\"completion_tokens_details\":{\"reasoning_tokens\":4}}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["Your previous response contained no user-visible answer or tool call"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"reasoning\":\"Second internal-only response.\"}}]}",
+        "{\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":24,\"completion_tokens\":4,\"completion_tokens_details\":{\"reasoning_tokens\":4}}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "local/testing", "do not hide a blank response"],
+    "exit_code": 1,
+    "stderr_contains": ["provider returned no user-visible answer or tool call after one recovery attempt"],
+    "db_kinds": ["user_msg", "reasoning", "reasoning", "system_note"],
+    "db_telemetry": "1|2|0|error"
+  }
+}

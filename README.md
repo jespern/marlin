@@ -74,8 +74,12 @@ the old rooms?
 - Unarchived root sessions are always visible as clickable tabs; child work
   rolls up into the root's running, approval, or error indicator.
 - Sessions have short stable handles: `marlin ls` prints eight characters and
-  `marlin attach 63df` accepts any unique prefix of four or more. `marlin top`
-  opens a live chronological tree with archive/kill shortcuts; inside the TUI,
+  `marlin attach 63df` accepts any unique prefix of four or more.
+  `marlin inspect 63df --json` is the supported read-only view for metadata,
+  live state, bounded blocks, the latest plan, and diagnostics—no SQLite schema
+  knowledge required.
+  `marlin top` opens a live chronological tree with archive/kill shortcuts;
+  inside the TUI,
   `/top` or `Ctrl+S` opens the same overview as a session switcher.
 - The multiplexer knows "session 3 is awaiting approval for `rm -rf`" as a
   *typed event*, not a guess from terminal output. Tap-to-approve from a phone

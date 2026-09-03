@@ -24,6 +24,7 @@ pub const Command = enum {
     ls,
     top,
     search,
+    inspect,
     diagnostics,
     archive,
     unarchive,
@@ -116,6 +117,7 @@ pub fn dispatch(
             return code;
         },
         .search => return headless.search(gpa, io, environ, self_exe, rest),
+        .inspect => return headless.inspect(gpa, io, environ, self_exe, rest),
         .diagnostics => return headless.diagnostics(gpa, io, environ, self_exe, rest),
         .archive => return headless.setArchived(gpa, io, environ, self_exe, rest, true),
         .unarchive => return headless.setArchived(gpa, io, environ, self_exe, rest, false),
@@ -284,6 +286,8 @@ const help_text =
     \\  marlin ls [--all]      list sessions
     \\  marlin top             live session overview and switcher
     \\  marlin search <query>  search durable transcripts across sessions
+    \\  marlin inspect <handle> [options]  inspect session state, plan, blocks, and diagnostics
+    \\      --json | --plan | --kind <kind> | --limit N | --around SEQ | --turn latest
     \\  marlin diagnostics [handle] [--json]  inspect recent turn timings
     \\  marlin archive <handle> hide a session tree without deleting it
     \\  marlin unarchive <handle> restore an archived session tree

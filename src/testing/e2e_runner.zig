@@ -1119,6 +1119,37 @@ fn checkSessionHandleFlow(
     for (handle) |c| if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) return error.SessionHandleBadSyntax;
     const prefix = handle[0..4];
 
+    const inspected = try process_io.run(gpa, io, .{
+        .argv = &.{ marlin_bin, "inspect", prefix, "--json" },
+        .environ_map = env,
+        .cwd = .{ .path = state_dir },
+        .stdout_limit = 1024 * 1024,
+        .stderr_limit = 256 * 1024,
+        .timeout_ms = helper_timeout_ms,
+    });
+    defer inspected.deinit(gpa);
+    if (inspected.term != .exited or inspected.term.exited != 0) return error.SessionInspectFailed;
+    var inspect_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer inspect_arena_state.deinit();
+    const inspect_value = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        inspect_arena_state.allocator(),
+        inspected.stdout,
+        .{},
+    ) catch return error.SessionInspectJsonInvalid;
+    if (inspect_value != .object) return error.SessionInspectJsonInvalid;
+    const inspect_object = inspect_value.object;
+    const inspect_handle = inspect_object.get("handle") orelse return error.SessionInspectJsonInvalid;
+    const inspect_session = inspect_object.get("session") orelse return error.SessionInspectJsonInvalid;
+    const inspect_blocks = inspect_object.get("blocks") orelse return error.SessionInspectJsonInvalid;
+    const inspect_diagnostics = inspect_object.get("diagnostics") orelse return error.SessionInspectJsonInvalid;
+    if (inspect_handle != .string or !std.mem.eql(u8, inspect_handle.string, handle) or
+        inspect_session != .object or inspect_blocks != .array or inspect_blocks.array.items.len != 2 or
+        inspect_diagnostics != .object)
+    {
+        return error.SessionInspectJsonInvalid;
+    }
+
     const archived = try process_io.run(gpa, io, .{
         .argv = &.{ marlin_bin, "archive", prefix },
         .environ_map = env,

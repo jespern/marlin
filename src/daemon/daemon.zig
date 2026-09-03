@@ -2946,6 +2946,10 @@ pub const Daemon = struct {
             };
             err_text = if (delegate_detail) |detail|
                 std.fmt.allocPrint(self.gpa, "{s}", .{detail}) catch null
+            else if (e == error.ProviderEmptyResponse)
+                self.gpa.dupe(u8, "provider returned no user-visible answer or tool call after one recovery attempt") catch null
+            else if (e == error.ProviderContentFiltered)
+                self.gpa.dupe(u8, "provider blocked the response before producing a user-visible answer") catch null
             else if (cause) |c|
                 std.fmt.allocPrint(self.gpa, "turn failed: {t} ({t})", .{ e, c }) catch null
             else

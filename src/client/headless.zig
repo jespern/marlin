@@ -1,6 +1,6 @@
-//! Headless protocol clients: `marlin run`, `marlin ls`, `marlin archive`,
-//! `marlin unarchive`, `marlin kill`, and `marlin shutdown`. All drive the
-//! daemon over the socket — the in-process M0 path is gone; the daemon
+//! Headless protocol clients: `marlin run`, `marlin ls`, `marlin inspect`,
+//! `marlin archive`, `marlin unarchive`, `marlin kill`, and `marlin shutdown`.
+//! All drive the daemon over the socket — the in-process M0 path is gone; the daemon
 //! autostarts on demand (attach.connect).
 //!
 //! run flags:
@@ -14,6 +14,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+const block = @import("../core/block.zig");
 const proto = @import("../core/proto.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
@@ -439,6 +440,8 @@ pub fn run(
     var tokens_out: u64 = 0;
     var saw_running = false;
     var failed = false;
+    var failure_text: ?[]u8 = null;
+    defer if (failure_text) |text| gpa.free(text);
 
     while (true) {
         var msg_arena = std.heap.ArenaAllocator.init(gpa);
@@ -471,6 +474,10 @@ pub fn run(
                     .idle => if (saw_running) break,
                     .err => {
                         failed = true;
+                        if (s.err_text) |text| {
+                            if (failure_text) |old| gpa.free(old);
+                            failure_text = try gpa.dupe(u8, text);
+                        }
                         if (saw_running) break;
                         saw_running = true; // err before running=already done
                     },
@@ -500,7 +507,10 @@ pub fn run(
     }
 
     if (failed) {
-        try eprint(io, "\nmarlin: turn failed (see session log)\n", .{});
+        if (failure_text) |text|
+            try eprint(io, "\nmarlin: {s}\n", .{text})
+        else
+            try eprint(io, "\nmarlin: turn failed (see session log)\n", .{});
         return 1;
     }
     if (flags.quiet) {
@@ -518,6 +528,259 @@ pub fn run(
         try print(io, "\n\n[{d} in / {d} out tokens, session {s}]\n", .{ tokens_in, tokens_out, resolved.text() });
     }
     return 0;
+}
+
+const InspectOptions = struct {
+    handle: ?[]const u8 = null,
+    json: bool = false,
+    limit: u32 = 20,
+    around_seq: u64 = 0,
+    kind: ?block.BlockKind = null,
+    latest_turn: bool = false,
+    plan_only: bool = false,
+};
+
+fn parseInspectOptions(args: []const [:0]const u8) !InspectOptions {
+    var options = InspectOptions{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--json")) {
+            options.json = true;
+        } else if (std.mem.eql(u8, arg, "--blocks")) {
+            options.plan_only = false;
+        } else if (std.mem.eql(u8, arg, "--plan")) {
+            options.plan_only = true;
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            i += 1;
+            if (i >= args.len) return error.MissingLimit;
+            options.limit = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidLimit;
+            if (options.limit == 0 or options.limit > 512) return error.InvalidLimit;
+        } else if (std.mem.eql(u8, arg, "--around")) {
+            i += 1;
+            if (i >= args.len) return error.MissingSequence;
+            options.around_seq = std.fmt.parseInt(u64, args[i], 10) catch return error.InvalidSequence;
+            if (options.around_seq == 0) return error.InvalidSequence;
+        } else if (std.mem.eql(u8, arg, "--kind")) {
+            i += 1;
+            if (i >= args.len) return error.MissingKind;
+            options.kind = std.meta.stringToEnum(block.BlockKind, args[i]) orelse return error.InvalidKind;
+        } else if (std.mem.eql(u8, arg, "--turn")) {
+            i += 1;
+            if (i >= args.len) return error.MissingTurn;
+            if (!std.mem.eql(u8, args[i], "latest")) return error.InvalidTurn;
+            options.latest_turn = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownOption;
+        } else if (options.handle == null) {
+            options.handle = arg;
+        } else {
+            return error.UnexpectedArg;
+        }
+    }
+    if (options.handle == null) return error.MissingHandle;
+    if (options.plan_only and (options.kind != null or options.latest_turn or options.around_seq != 0)) return error.ConflictingOptions;
+    return options;
+}
+
+const InspectResult = struct {
+    handle: []const u8,
+    session: proto.SessionInfo,
+    status: proto.SessionState,
+    phase: ?proto.TurnPhase,
+    error_text: ?[]const u8,
+    oldest_seq: u64,
+    newest_seq: u64,
+    has_older: bool,
+    has_newer: bool,
+    blocks: []const block.Block,
+    plan_items: []const block.PlanItem,
+    plan_pinned: bool,
+    diagnostics: proto.Diagnostics,
+};
+
+/// `marlin inspect <handle>` — bounded, structured session investigation.
+pub fn inspect(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    const options = parseInspectOptions(args) catch {
+        try eprint(io, "usage: marlin inspect <session-handle> [--json] [--blocks] [--kind <kind>] [--limit N] [--around SEQ] [--plan] [--turn latest]\n", .{});
+        return 2;
+    };
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |err| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{err});
+        return 1;
+    };
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try conn.send(.{ .session_list = .{ .include_archived = true } });
+    const list = try conn.recvUntil(arena, .session_list_result);
+    const ids = try sessionIds(arena, list.sessions);
+    const sid = session_handle.resolve(options.handle.?, ids) catch |err| {
+        switch (err) {
+            error.PrefixTooShort => try eprint(io, "marlin: session handle '{s}' is too short (use at least {d} characters)\n", .{ options.handle.?, session_handle.min_prefix_len }),
+            error.Ambiguous => try eprint(io, "marlin: session handle '{s}' is ambiguous\n", .{options.handle.?}),
+            error.NotFound => try eprint(io, "marlin: no session matches '{s}'\n", .{options.handle.?}),
+            error.InvalidHandle => try eprint(io, "marlin: invalid session handle '{s}'\n", .{options.handle.?}),
+        }
+        return 2;
+    };
+    const session = for (list.sessions) |candidate| {
+        if (candidate.sid == sid) break candidate;
+    } else unreachable;
+    var handle_buf: session_handle.Full = undefined;
+    const handle = session_handle.display(&handle_buf, sid, ids);
+
+    var blocks: std.ArrayList(block.Block) = .empty;
+    try conn.send(.{ .sub = .{
+        .sid = sid,
+        .tail_limit = if (options.plan_only) 1 else options.limit,
+        .around_seq = if (options.plan_only) 0 else options.around_seq,
+        .replay_done = true,
+    } });
+    var replay: ?@FieldType(proto.DaemonMsg, "replay_done") = null;
+    while (replay == null) {
+        const msg = try conn.recv(arena);
+        switch (msg) {
+            .blk => |item| {
+                if (item.sid == sid) try blocks.append(arena, item.b);
+            },
+            .replay_done => |done| {
+                if (done.sid == sid) replay = done;
+            },
+            .err => |err| {
+                try eprint(io, "marlin inspect: {s}: {s}\n", .{ err.code, err.msg });
+                return 1;
+            },
+            else => {},
+        }
+    }
+    const replay_done = replay orelse return error.MissingReplayMarker;
+
+    // A centered replay may deliberately stop before the live edge and omit
+    // status. A live-only subscription always yields current state without
+    // forcing inspect to page through the intervening transcript.
+    try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+    var state = session.state;
+    var phase: ?proto.TurnPhase = null;
+    var error_text: ?[]const u8 = null;
+    while (true) {
+        const msg = try conn.recv(arena);
+        switch (msg) {
+            .status => |status| {
+                if (status.sid != sid) continue;
+                state = status.state;
+                phase = status.phase;
+                error_text = status.err_text;
+                break;
+            },
+            .err => |err| {
+                try eprint(io, "marlin inspect: {s}: {s}\n", .{ err.code, err.msg });
+                return 1;
+            },
+            else => {},
+        }
+    }
+    try conn.send(.{ .unsub = .{ .sid = sid } });
+    try conn.send(.{ .diagnostics = .{ .sid = sid } });
+    const report = conn.recvUntil(arena, .diagnostics_result) catch {
+        try eprint(io, "marlin inspect: daemon could not produce diagnostics\n", .{});
+        return 1;
+    };
+
+    var selected: std.ArrayList(block.Block) = .empty;
+    var selected_turn: ?u64 = null;
+    if (options.latest_turn) {
+        for (blocks.items) |item| selected_turn = @max(selected_turn orelse 0, item.turn_id);
+    }
+    if (!options.plan_only) for (blocks.items) |item| {
+        if (options.kind) |kind| if (item.kind() != kind) continue;
+        if (selected_turn) |turn_id| if (item.turn_id != turn_id) continue;
+        try selected.append(arena, item);
+    };
+
+    const result = InspectResult{
+        .handle = handle,
+        .session = session,
+        .status = state,
+        .phase = phase,
+        .error_text = error_text,
+        .oldest_seq = replay_done.oldest_seq,
+        .newest_seq = replay_done.newest_seq,
+        .has_older = replay_done.has_older,
+        .has_newer = replay_done.has_newer,
+        .blocks = selected.items,
+        .plan_items = replay_done.plan_items,
+        .plan_pinned = replay_done.plan_pinned,
+        .diagnostics = report,
+    };
+    if (options.json) {
+        const encoded = try std.json.Stringify.valueAlloc(arena, result, .{});
+        try print(io, "{s}\n", .{encoded});
+        return 0;
+    }
+    try printInspect(io, result, options.plan_only);
+    return 0;
+}
+
+fn printInspect(io: Io, result: InspectResult, plan_only: bool) !void {
+    if (!plan_only) {
+        const title = if (result.session.title.len > 0) result.session.title else "(untitled)";
+        try print(io, "session {s}  {s}\n", .{ result.handle, title });
+        try print(io, "state   {s}", .{@tagName(result.status)});
+        if (result.phase) |phase| try print(io, " ({s})", .{@tagName(phase)});
+        try print(io, "\nmodel   {s} · effort {s}\n", .{ result.session.model, @tagName(result.session.effort) });
+        try print(io, "cwd     {s}\n", .{result.session.cwd});
+        try print(io, "kind    {s} · created {d} · archived {s} · plan mode {s}\n", .{
+            @tagName(result.session.kind),
+            result.session.created_at,
+            if (result.session.archived) "yes" else "no",
+            if (result.session.plan_mode) "on" else "off",
+        });
+        if (result.session.parent_sid) |parent| try print(io, "parent  {x}", .{parent});
+        if (result.session.parent_block_id) |block_id| try print(io, " · block {d}", .{block_id});
+        if (result.session.parent_sid != null) try print(io, "\n", .{});
+        if (result.error_text) |text| try print(io, "error   {s}\n", .{text});
+        try print(io, "range   {d}..{d} · older {s} · newer {s}\n", .{
+            result.oldest_seq,
+            result.newest_seq,
+            if (result.has_older) "yes" else "no",
+            if (result.has_newer) "yes" else "no",
+        });
+        try print(io, "last    {s} · {d:.2}s · {d} sampled turns · {d} provider requests · {d} tool calls\n", .{
+            result.diagnostics.last_outcome,
+            seconds(result.diagnostics.last_duration_ms),
+            result.diagnostics.sample_turns,
+            result.diagnostics.provider_requests,
+            result.diagnostics.tool_calls,
+        });
+        if (result.diagnostics.last_error.len > 0) try print(io, "failure {s}\n", .{result.diagnostics.last_error});
+    }
+
+    try print(io, "plan    {s}\n", .{if (result.plan_pinned) "active" else "complete or absent"});
+    if (result.plan_items.len == 0) {
+        try print(io, "  (none)\n", .{});
+    } else for (result.plan_items) |item| {
+        try print(io, "  [{s}] {s}", .{ @tagName(item.status), item.step });
+        if (item.duration_ms > 0) try print(io, " ({d:.2}s)", .{seconds(item.duration_ms)});
+        try print(io, "\n", .{});
+    }
+    if (plan_only) return;
+
+    try print(io, "blocks  {d}\n", .{result.blocks.len});
+    for (result.blocks) |item| {
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        const body = try std.json.Stringify.valueAlloc(arena_state.allocator(), item.body, .{});
+        try print(io, "  #{d} turn {d} {s} @{d}  {s}\n", .{ item.seq, item.turn_id, @tagName(item.kind()), item.ts, body });
+    }
 }
 
 pub fn ls(
@@ -1023,4 +1286,22 @@ test "flag parsing" {
     try std.testing.expect(f.continue_last);
     try std.testing.expectEqualStrings("openrouter/x", f.model.?);
     try std.testing.expectEqualStrings("do stuff", f.task.?);
+}
+
+test "inspect option parsing" {
+    const args = [_][:0]const u8{ "63df", "--json", "--kind", "tool_result", "--limit", "40", "--around", "12", "--turn", "latest" };
+    const options = try parseInspectOptions(&args);
+    try std.testing.expectEqualStrings("63df", options.handle.?);
+    try std.testing.expect(options.json);
+    try std.testing.expectEqual(block.BlockKind.tool_result, options.kind.?);
+    try std.testing.expectEqual(@as(u32, 40), options.limit);
+    try std.testing.expectEqual(@as(u64, 12), options.around_seq);
+    try std.testing.expect(options.latest_turn);
+}
+
+test "inspect option parsing rejects unsafe or contradictory bounds" {
+    try std.testing.expectError(error.InvalidLimit, parseInspectOptions(&.{ "63df", "--limit", "0" }));
+    try std.testing.expectError(error.InvalidKind, parseInspectOptions(&.{ "63df", "--kind", "bogus" }));
+    try std.testing.expectError(error.ConflictingOptions, parseInspectOptions(&.{ "63df", "--plan", "--turn", "latest" }));
+    try std.testing.expectError(error.MissingHandle, parseInspectOptions(&.{"--json"}));
 }

@@ -1,0 +1,27 @@
+{
+  "steps": [
+    {
+      "expect_contains": ["finish the task"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"reasoning\":\"I reached a conclusion but forgot to expose it.\"}}]}",
+        "{\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":8,\"completion_tokens_details\":{\"reasoning_tokens\":8}}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["Your previous response contained no user-visible answer or tool call", "finish the task"],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"recovered final answer\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":3}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": ["run", "--quiet", "--model", "local/testing", "finish the task"],
+    "exit_code": 0,
+    "stdout_equals": "recovered final answer\n",
+    "db_kinds": ["user_msg", "reasoning", "assistant_msg"],
+    "db_telemetry": "1|2|0|ok"
+  }
+}

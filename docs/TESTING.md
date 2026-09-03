@@ -111,11 +111,12 @@ it's ~200 lines on purpose.
 
 Current coverage: basic completion, tool round-trip (fragmented args),
 --continue across invocations, provider 500 → system_note + exit 1, oversized
-tool output → blob + inline elision, and concurrent safe tool batches with
-provider-order transcript reconstruction. A configured-provider scenario
-loads `[providers.acme]`, supplies its named credential, and crosses the same
-real OpenAI-compatible HTTP/SSE boundary through a dynamic test-only URL
-override.
+tool output → blob + inline elision, concurrent safe tool batches with
+provider-order transcript reconstruction, and reasoning-only terminal responses
+that either recover on the bounded retry or become a visible error without an
+empty `assistant_msg`. A configured-provider scenario loads `[providers.acme]`,
+supplies its named credential, and crosses the same real OpenAI-compatible
+HTTP/SSE boundary through a dynamic test-only URL override.
 
 The runner is fail-bounded as well as hermetic. Each Marlin invocation has a
 30-second wall-clock deadline; timeout terminates its complete process group.

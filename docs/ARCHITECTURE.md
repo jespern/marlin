@@ -37,9 +37,11 @@ with the latter, it's simpler to ship):
   attach simultaneously, to the same or different sessions.
 - `marlin run "task"` — headless one-shot: create session, run to completion,
   print result, exit nonzero on failure. Doubles as the eval harness.
-- `marlin ls / attach <handle> / archive <handle> / unarchive <handle> /
-  kill <handle>` —
-  thin protocol clients for scripting.
+- `marlin ls / inspect <handle> / attach <handle> / archive <handle> /
+  unarchive <handle> / kill <handle>` — thin protocol clients for scripting.
+  `inspect` is the supported read-only investigation surface: it combines the
+  session catalog, bounded block replay, latest plan, live status, and local
+  diagnostics without exposing SQLite schema details.
 
 ### Native vs guest agents
 
@@ -392,6 +394,11 @@ Key decisions:
   a synthetic continuation against the durable transcript and keeps the
   session running. Task children retain a hard round budget so fan-out remains
   bounded and returns partial work to its parent.
+- **A blank provider response is not a final answer.** When a native provider
+  returns neither visible text nor tool calls, the loop retries once with an
+  ephemeral continuation instruction. A second blank response becomes a
+  durable, visible turn error; Marlin never appends an empty `assistant_msg`.
+  Content-filtered blanks fail immediately.
 
 ### Storage: SQLite, one DB
 
@@ -542,8 +549,11 @@ session state.
 Two stream disciplines worth locking in now:
 
 - **Deltas are ephemeral; blocks are truth.** Clients render deltas for
-  liveness, then replace the streaming region with the finalized block. A
-  client that attaches mid-turn gets replayed blocks + current partial delta
+  liveness, then replace the streaming region with the finalized block. Raw
+  reasoning finalizes `reasoning_delta`; tool-round commentary finalizes
+  `delta`. Clients clear that channel at every finalized block rather than
+  comparing accumulated text, so residue cannot join adjacent provider rounds.
+  A client that attaches mid-turn gets replayed blocks + current partial delta
   buffer. This makes reconnect/multi-client trivial.
 - **Bounded attach + paged `from_seq` resume.** Clients remember the last block seq
   they've seen per session and replay only the gap when revisiting a cached

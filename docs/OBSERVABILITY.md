@@ -20,6 +20,12 @@ marlin diagnostics 63df            # unique session prefix
 marlin diagnostics 63df --json     # automation / deeper analysis
 ```
 
+For broader session investigation, `marlin inspect <handle>` combines this
+report with session metadata, live status, the latest durable plan, and a bounded
+block window. `--json` is the stable automation form; `--limit`, `--around`,
+`--kind`, `--turn latest`, and `--plan` narrow the result. It uses daemon
+protocol reads rather than opening the SQLite database directly.
+
 The sample is bounded to 50 turns by default. Marlin stores timestamps,
 outcomes, model/provider/generation identifiers, token counts, response byte
 counts, tool names/statuses, and a content-free local preparation breakdown:

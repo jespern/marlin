@@ -33,6 +33,9 @@ const files_tool = @import("tools/files.zig");
 const Effort = @import("../core/effort.zig").Effort;
 const build_options = @import("build_options");
 
+const empty_final_recovery_prompt =
+    "Your previous response contained no user-visible answer or tool call. Continue the task now: use tools if work remains, otherwise provide the final answer.";
+
 pub const Endpoint = struct {
     url: [:0]const u8, // .../chat/completions
     bearer: ?[]const u8,
@@ -572,6 +575,17 @@ fn loadMedia(ctx: *const anyopaque, allocator: std.mem.Allocator, hash: []const 
     return store.getBlobAlloc(allocator, hash);
 }
 
+fn appendEphemeralUserMessage(
+    arena: std.mem.Allocator,
+    msgs: []const provider.Message,
+    text: []const u8,
+) ![]provider.Message {
+    const out = try arena.alloc(provider.Message, msgs.len + 1);
+    @memcpy(out[0..msgs.len], msgs);
+    out[msgs.len] = .{ .role = .user, .payload = .{ .text = text } };
+    return out;
+}
+
 /// Run one full agent turn: user text in → tool roundtrips → final text out.
 /// All blocks are persisted as they happen; a crash mid-turn leaves a
 /// consistent log.
@@ -648,6 +662,8 @@ pub fn runTurn(
     var total_in: u64 = 0;
     var total_out: u64 = 0;
     var round: u32 = 0;
+    var empty_final_retries: u8 = 0;
+    var recover_empty_final = false;
     var web_search_available = nativeDialect(opts.endpoint) == .openrouter;
     const setup_after_load_ms = @max(0, nowAwakeMs(io) - after_context_load_ms);
 
@@ -721,6 +737,10 @@ pub fn runTurn(
                     msgs = try context.assemble(arena, blocks, asm_opts);
                 }
             }
+        }
+        if (recover_empty_final) {
+            msgs = try appendEphemeralUserMessage(arena, msgs, empty_final_recovery_prompt);
+            recover_empty_final = false;
         }
 
         // Publish the (possibly reduced) estimate for status displays.
@@ -893,6 +913,16 @@ pub fn runTurn(
 
         // -- no tool calls → final answer, unless the user steered --
         if (acc.calls.items.len == 0) {
+            if (response_text.len == 0) {
+                if (try drainSteers(gpa, opts, &ap) > 0) continue;
+                if (acc.finish_reason == .content_filter) return error.ProviderContentFiltered;
+                if (empty_final_retries == 0 and round + 1 < opts.max_rounds) {
+                    empty_final_retries += 1;
+                    recover_empty_final = true;
+                    continue;
+                }
+                return error.ProviderEmptyResponse;
+            }
             _ = try ap.append(.{ .assistant_msg = .{ .text = response_text } });
             // A steer submitted while this provider request was streaming
             // must become another model round, even though the response

@@ -5,6 +5,7 @@
 //!   marlin daemon         → run the daemon in the foreground         [M1]
 //!   marlin run "task"     → headless one-shot session                [M0]
 //!   marlin ls [--all]     → list sessions                            [M1]
+//!   marlin inspect <handle> → inspect session state and history
 //!   marlin attach <handle>    → attach TUI to a session               [M2]
 //!   marlin archive <handle>   → hide a durable session hierarchy      [M6]
 //!   marlin unarchive <handle> → restore an archived hierarchy         [M6]
