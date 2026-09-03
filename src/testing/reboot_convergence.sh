@@ -9,7 +9,13 @@
 set -euo pipefail
 
 MARLIN="$1"; FAKEPROV="$2"; SCENARIO="$3"
-TEST_TMP_ROOT="${TMPDIR:-/private/tmp}"
+if [ -n "${TMPDIR:-}" ]; then
+  TEST_TMP_ROOT="$TMPDIR"
+elif [ "$(uname -s)" = Darwin ]; then
+  TEST_TMP_ROOT=/private/tmp
+else
+  TEST_TMP_ROOT=/tmp
+fi
 SUITE_TMP="$(mktemp -d "$TEST_TMP_ROOT/marlin-conv-suite-XXXXXX")"
 ACTIVE_STATE=""
 PROVIDER_PID=""
