@@ -27,12 +27,3 @@ pub fn modelName(model: []const u8) ?[]const u8 {
     if (backend(model) == null or slash + 1 == model.len) return null;
     return model[slash + 1 ..];
 }
-
-test "guest backends are explicit model namespaces" {
-    try std.testing.expectEqual(Backend.claude_code, backend("claudecode/sonnet").?);
-    try std.testing.expectEqual(Backend.codex, backend("codex/default").?);
-    try std.testing.expectEqualStrings("default", modelName("codex/default").?);
-    try std.testing.expect(backend("openrouter/openai/gpt-5") == null);
-    try std.testing.expect(backend("codex") == null);
-    try std.testing.expect(modelName("codex/") == null);
-}

@@ -55,18 +55,21 @@ test {
     // Force the whole skeleton into the compile+test graph, including files
     // not yet imported by real code paths. Prune entries as real imports land.
     std.testing.refAllDecls(@This());
+    _ = @import("core/effort_test.zig");
+    _ = @import("core/credentials_test.zig");
+    _ = @import("core/config_toml_test.zig");
     _ = @import("client/pipe_test.zig");
     _ = @import("client/headless_test.zig");
     _ = @import("client/editor_test.zig");
-    _ = @import("core/block.zig");
-    _ = @import("core/guest.zig");
-    _ = @import("core/proto.zig");
-    _ = @import("core/config.zig");
-    _ = @import("core/jsonx.zig");
-    _ = @import("core/ids.zig");
-    _ = @import("core/session_handle.zig");
-    _ = @import("core/telemetry.zig");
-    _ = @import("core/queue.zig");
+    _ = @import("core/block_test.zig");
+    _ = @import("core/guest_test.zig");
+    _ = @import("core/proto_test.zig");
+    _ = @import("core/config_test.zig");
+    _ = @import("core/jsonx_test.zig");
+    _ = @import("core/ids_test.zig");
+    _ = @import("core/session_handle_test.zig");
+    _ = @import("core/telemetry_test.zig");
+    _ = @import("core/queue_test.zig");
     _ = @import("daemon/store.zig");
     _ = @import("daemon/loop.zig");
     _ = @import("daemon/context.zig");

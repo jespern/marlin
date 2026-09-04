@@ -17,10 +17,3 @@ pub fn next(io: Io) u64 {
     const rand20: u64 = std.mem.readInt(u32, &buf, .little) & 0xFFFFF;
     return (millis << 20) | rand20;
 }
-
-test "id layout leaves 20 random bits" {
-    const millis: u64 = 1_700_000_000_000;
-    const id = (millis << 20) | 0xABCDE;
-    try std.testing.expectEqual(millis, id >> 20);
-    try std.testing.expectEqual(@as(u64, 0xABCDE), id & 0xFFFFF);
-}

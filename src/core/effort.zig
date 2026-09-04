@@ -36,10 +36,3 @@ pub const Effort = enum {
         return if (self == .auto) null else @tagName(self);
     }
 };
-
-test "reasoning effort parses case-insensitively and auto omits provider value" {
-    try std.testing.expectEqual(Effort.high, Effort.parse("HIGH").?);
-    try std.testing.expect(Effort.parse("turbo") == null);
-    try std.testing.expect(Effort.auto.providerValue() == null);
-    try std.testing.expectEqualStrings("xhigh", Effort.xhigh.providerValue().?);
-}

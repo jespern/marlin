@@ -16,10 +16,3 @@ pub fn spanId(id: u64) SpanId {
     _ = std.fmt.bufPrint(&out, "{x:0>16}", .{id}) catch unreachable;
     return out;
 }
-
-test "telemetry ids have OTLP widths" {
-    const trace = traceId(0x12, 0x34);
-    const span = spanId(0x56);
-    try std.testing.expectEqualStrings("00000000000000120000000000000034", &trace);
-    try std.testing.expectEqualStrings("0000000000000056", &span);
-}
