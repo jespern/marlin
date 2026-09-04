@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>~*~ marlin ~*~ durable terminal agents</title>
-<meta name="description" content="marlin is a fast, durable terminal AI agent harness in Zig: structured sessions, a developer-first TUI, execution plans, review councils, remote clients, extensions, and enforced permissions.">
+<meta name="description" content="marlin is a fast, durable terminal AI agent harness in Zig: structured sessions, native models, Claude Code and Codex guests, a scriptable CLI, remote clients, extensions, and enforced permissions.">
 <link rel="icon" href="assets/marlin-tiny.gif">
 <style>
   /* ============================================================
@@ -331,23 +331,23 @@
   </div>
 
   <marquee scrollamount="6">
-    ★★★ WELCOME to marlin.wtf ★★★ one native binary ★ daemon-owned sessions ★ durable plans ★ review councils ★ SSH remote ★ tailnet web ★ MCP + hooks + skills ★ written in ZIG ★★★
+    ★★★ WELCOME to marlin.wtf ★★★ native agent ★ Claude Code + Codex guests ★ daemon-owned sessions ★ scriptable CLI ★ durable plans ★ SSH remote ★ MCP + hooks + skills ★ written in ZIG ★★★
   </marquee>
 
   <div class="panel">
     <h2>&gt;&gt; what IS marlin??</h2>
     <p class="lede">
-      marlin is a <b>daemon-native terminal AI agent harness</b>. The daemon
-      owns structured sessions; the TUI and headless CLI are thin clients.
-      Close a terminal and the turn keeps running. Reattach later, or reach it
-      through SSH, mosh, or your tailnet. The transcript, plans, status,
-      approvals, and full tool results are still there.
+      marlin is a <b>daemon-native terminal AI agent harness and session
+      multiplexer</b>. Its own agent runs native models; installed Claude Code
+      and Codex agents can run beside it as guests using their existing vendor
+      logins. The daemon owns the structured sessions while the TUI, web UI,
+      and headless CLI remain thin clients.
     </p>
     <p class="lede">
-      Think <b>Claude Code and OpenAI Codex had a fast, stubborn terminal-native
-      baby</b>, then raised it on the best ideas from a handful of other agent
-      harnesses. Marlin borrows freely, keeps the parts that survive daily use,
-      and rebuilds them around one durable daemon instead of a pile of terminals.
+      Close a terminal and the turn keeps running. Reattach later, reach it
+      through SSH, mosh, or your tailnet, or compose it with ordinary shell
+      commands. The transcript, plans, status, approvals, diagnostics, and full
+      tool results are still there—and inspectable without opening SQLite.
     </p>
     <p class="car-analogy">
       <span class="badge">GARAGE PICK</span>
@@ -359,7 +359,8 @@
     </p>
     <ul class="starlist">
       <li><b>one native core binary</b>: no Node runtime, no Python environment, no terminal scraping</li>
-      <li><b>structured multiplexer</b>: switch sessions without losing drafts, scroll position, or actionable state</li>
+      <li><b>one room for the fleet</b>: Marlin's native agent, Claude Code, and Codex share durable multiplexed sessions without pretending they share an implementation</li>
+      <li><b>UNIX-shaped clients</b>: run headlessly, list, search, inspect as JSON, archive, kill, and pipe results from ordinary shell scripts</li>
       <li><b>append-only truth</b>: context may compact; durable history and full tool output do not pretend they never happened</li>
       <li><b>process-boundary extensions</b>: managed MCP stdio servers, executable tools, hooks, and Markdown skills</li>
       <li><b>visible execution</b>: durable plans pin the active step and its timing while child work stays inspectable</li>
@@ -372,11 +373,11 @@
   <div class="status-note">
     <span class="badge">DEVELOPMENT PREVIEW</span>
     Marlin is already self-hosting and useful for real work, but it is not a
-    stable 1.0 product. The multiplexer, extension platform, child delegation,
-    named review councils, durable plans, SSH remote client, and tailnet web UI
-    are built. Current work is concentrated on hardening cancellation,
-    reconnect edges, diagnostics, and performance. Config and protocol details
-    may still move.
+    stable 1.0 product. The native agent, Claude Code and Codex guest sessions,
+    structured multiplexer, scriptable inspection CLI, extension platform,
+    durable plans, child delegation, review councils, SSH remote client, and
+    tailnet web UI are built. Current work is concentrated on hardening edges,
+    diagnostics, and performance. Config and protocol details may still move.
   </div>
 
   <div class="panel">
@@ -391,11 +392,13 @@
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">↻</span>Self-hosting loop</b>Headless runs, steering, approvals, interruption, automatic client reconnect, and coordinated <code class="inline">/reboot --build</code> while developing Marlin inside Marlin.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">⚙</span>MCP as a product</b>Isolated health, daemon-owned add/remove/restart/reload, per-tool policy, durable image results, and one schema + approval path.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">⛨</span>Permissions that enforce</b>Scrubbed tool environments, protected-path read refusals, capture-time secret redaction, managed network filtering, and canary-verified kernel shell sandboxing on macOS (Seatbelt) and Linux (Landlock) with safe fallback.</div>
-      <div class="feature"><b><span class="feature-icon" aria-hidden="true">◇</span>Claude Code as a guest</b>Subscription models run through the official <code class="inline">claude</code> binary as first-class multiplexed sessions; their permission prompts park on marlin's approval bar, answerable from any client, including your phone.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">◇</span>Claude Code + Codex guests</b>Run the official <code class="inline">claude</code> binary or stable <code class="inline">codex app-server</code> protocol as first-class multiplexed sessions using existing subscription logins. Guest permission prompts share marlin's approval bar.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">$</span>Scriptable by design</b><code class="inline">marlin run</code> works headlessly; <code class="inline">ls</code>, <code class="inline">search</code>, and <code class="inline">inspect --json</code> expose daemon-owned state for shell scripts without screen scraping or SQLite queries.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">⋈</span>Children + review councils</b><code class="inline">task</code> and <code class="inline">task_batch</code> create up to eight durable, attachable, read-only children. Named councils fan questions across models for parent synthesis.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">▧</span>Image-aware sessions</b>Ctrl+V or <code class="inline">/attach</code> uploads signed image data through the client boundary, stores it by content hash, and maps it to native provider vision blocks.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">⚡</span>Fast parallel tools</b>Consecutive tools marked <code class="inline">parallel_safe</code> really run concurrently, with at most eight workers. Durable results stay in provider-call order.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">◎</span>Provider choice</b>OpenRouter-first model catalog, built-in web search/fetch, and OpenAI-compatible and Anthropic paths, with per-session model and reasoning effort.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">◉</span>Local voice dictation</b><code class="inline">/voice setup</code> adds optional push-to-talk or toggle dictation with whisper.cpp or parakeet-mlx. Audio stays at the client edge, and transcripts land in the composer for review before submission.</div>
     </div>
   </div>
 
@@ -408,7 +411,12 @@ $ marlin run "why is my build broken"
 $ marlin             <span class="c"># attach the TUI</span>
 $ marlin --remote devbox <span class="c"># same TUI, carried over SSH</span>
 $ marlin ls          <span class="c"># short stable handles, including children</span>
+$ marlin inspect 63df --json <span class="c"># metadata, state, plan, blocks, diagnostics</span>
+$ marlin search "permission denied" <span class="c"># search durable transcripts</span>
 $ marlin attach 63df <span class="c"># any unique prefix (minimum four)</span>
+
+<span class="c"># installed vendor agents can join the same multiplexer:</span>
+$ marlin run --model codex/default "review this patch"
 
 <span class="c"># inside the TUI:</span>
 /council new core   <span class="c"># pick models, then choose Done</span>
@@ -454,7 +462,7 @@ $ marlin attach 63df <span class="c"># any unique prefix (minimum four)</span>
       <li><b>MCP streamable HTTP</b>: stdio is managed and supported today; remote HTTP transport remains later</li>
       <li><b>hosted or multi-user web</b>: <code class="inline">marlin web</code> is an opt-in, tokenless loopback client exposed through Tailscale Serve; your tailnet is the trust boundary, and it is not a public deploy surface</li>
       <li><b>workspace undo/isolation</b>: snapshots, leases, worktrees, <code class="inline">/land</code>, and <code class="inline">/discard</code> remain one deliberately later track</li>
-      <li><b>kitchen sink surfaces</b>: no messaging gateway, voice stack, embedded terminal emulator, or dashboard empire</li>
+      <li><b>kitchen sink surfaces</b>: no messaging gateway, realtime voice models, wake words, audio protocol, embedded terminal emulator, or dashboard empire; optional local push-to-talk dictation stays entirely at the client edge</li>
     </ul>
   </div>
 
