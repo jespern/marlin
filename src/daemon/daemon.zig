@@ -333,6 +333,13 @@ pub const Daemon = struct {
     /// registering after shutdown has begun draining the registry.
     accepting_clients: bool = true,
     sessions: std.AutoHashMapUnmanaged(u64, *Session) = .empty,
+    /// /permissions grants by sid. Loaded sessions are a working set that is
+    /// unloaded and rehydrated from SQLite behind the user's back, and the
+    /// durable row records no approval mode — without this the grant would
+    /// silently expire at the next unload (turn_done eviction, tab switch).
+    /// Daemon-lifetime on purpose: a restart still returns every session to
+    /// default approvals.
+    retained_approvals: std.AutoHashMapUnmanaged(u64, approval.Mode) = .empty,
     next_client_id: u64 = 1,
     running: bool = true,
     /// /reboot in flight: client id awaiting the coordinated shutdown.
@@ -1098,6 +1105,8 @@ pub const Daemon = struct {
                     .network_filtering_enabled = self.network.isActive(),
                 };
                 session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
+                if (session.approval_mode != .default)
+                    try self.retained_approvals.put(self.gpa, sid, session.approval_mode);
                 // Reserve every fallible in-memory resource before committing
                 // the durable row. After createSession succeeds, publishing to
                 // the map cannot fail and no ghost session can be left behind.
@@ -1366,6 +1375,11 @@ pub const Daemon = struct {
                 const mode = approval.Mode.parse(sa.approvals);
                 session.approval_mode = mode;
                 session.approval_mode_live.store(@intFromEnum(mode), .release);
+                if (mode == .default) {
+                    _ = self.retained_approvals.remove(sa.sid);
+                } else {
+                    try self.retained_approvals.put(self.gpa, sa.sid, mode);
+                }
                 if (mode == .auto) {
                     if (session.gate.isPending(self.io)) |pending| {
                         _ = session.gate.resolve(self.io, pending, .approved);
@@ -1565,6 +1579,11 @@ pub const Daemon = struct {
                 if (!client.subscribed(s.sid)) try client.subs.append(self.gpa, s.sid);
                 const session = self.sessions.get(s.sid);
                 const state: proto.SessionState = if (session) |ses| blk: {
+                    // A subscriber returned: the release-when-unwatched
+                    // eviction reason is gone; do not tear this session down
+                    // at turn_done under a watching client. Kill/archive
+                    // eviction stays (those sessions are archived).
+                    if (!ses.archived) ses.evict_when_idle = false;
                     if (ses.pending_approval_line) |line| self.sendLine(client, line);
                     break :blk ses.state;
                 } else .idle;
@@ -2309,6 +2328,10 @@ pub const Daemon = struct {
             .sandbox_enabled = self.cfg.permissions_enabled,
             .network_filtering_enabled = self.network.isActive(),
         };
+        if (self.retained_approvals.get(sid)) |mode| {
+            session.approval_mode = mode;
+            session.approval_mode_live.store(@intFromEnum(mode), .release);
+        }
         try self.sessions.put(self.gpa, sid, session);
         return session;
     }
@@ -4013,6 +4036,7 @@ pub const Daemon = struct {
         var sit = self.sessions.valueIterator();
         while (sit.next()) |sp| self.destroySession(sp.*);
         self.sessions.deinit(self.gpa);
+        self.retained_approvals.deinit(self.gpa);
         self.http_pool.deinit();
 
         // Close all client outboxes; writer threads exit, readers hit EOF.
@@ -4532,4 +4556,53 @@ test "a dying bridge client unparks its session's parked cc approval" {
     try std.testing.expect(session.cc_pending == null);
     try std.testing.expect(session.pending_approval_line == null);
     try std.testing.expectEqual(proto.SessionState.running, session.state);
+}
+
+test "a /permissions grant survives the unload/rehydrate cycle" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var daemon: Daemon = undefined;
+    daemon.gpa = gpa;
+    daemon.io = io;
+    daemon.store = try store_mod.Store.open(gpa, null);
+    defer daemon.store.close();
+    daemon.cfg = .{};
+    daemon.network = .{ .gpa = gpa };
+    daemon.clients = .empty;
+    daemon.clients_mutex = .init;
+    defer daemon.clients.deinit(gpa);
+    daemon.sessions = .empty;
+    defer daemon.sessions.deinit(gpa);
+    daemon.retained_approvals = .empty;
+    defer daemon.retained_approvals.deinit(gpa);
+
+    try daemon.store.createSession(11, 0, "/tmp", "m", .auto);
+
+    // Grant full access the way session_set_approvals does.
+    const session = (try daemon.getOrLoadSession(11)).?;
+    try std.testing.expectEqual(approval.Mode.default, session.approval_mode);
+    session.approval_mode = .auto;
+    session.approval_mode_live.store(@intFromEnum(approval.Mode.auto), .release);
+    try daemon.retained_approvals.put(gpa, 11, .auto);
+
+    // The working set unloads the idle session (turn_done eviction, tab
+    // switch); rehydration must not silently revoke the grant.
+    daemon.unloadSession(11);
+    try std.testing.expect(daemon.sessions.get(11) == null);
+    const rehydrated = (try daemon.getOrLoadSession(11)).?;
+    defer daemon.unloadSession(11);
+    try std.testing.expectEqual(approval.Mode.auto, rehydrated.approval_mode);
+    try std.testing.expectEqual(
+        @intFromEnum(approval.Mode.auto),
+        rehydrated.approval_mode_live.load(.acquire),
+    );
+
+    // Revocation clears the retained grant the same way.
+    _ = daemon.retained_approvals.remove(11);
+    daemon.unloadSession(11);
+    const reloaded = (try daemon.getOrLoadSession(11)).?;
+    try std.testing.expectEqual(approval.Mode.default, reloaded.approval_mode);
 }
