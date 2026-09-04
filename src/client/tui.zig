@@ -499,24 +499,14 @@ const SearchHitOwned = struct {
     }
 };
 
-const App = struct {
-    gpa: std.mem.Allocator,
-    io: Io,
-    conn: *attach.Conn,
-    environ: ?*const std.process.Environ.Map = null,
-    /// Event loop handle for worker threads spawned from App methods
-    /// (voice transcription/download); set once in run().
-    loop: ?*vaxis.Loop(Event) = null,
-    voice_rt: VoiceRt = .{},
+/// Everything the client knows about one session: its transcript, composer
+/// draft, viewport, selection, approval, turn timers, and layout caches. The
+/// App owns exactly one focused view today; a pane layout would own several.
+/// Anything that is per-session belongs here, never on App, so that a switch
+/// moves one value and a new field cannot leak across sessions by omission.
+const SessionView = struct {
     sid: u64,
     editor: Editor,
-    attachments: std.ArrayList(media.Pending) = .empty,
-
-    mode: Mode = .insert,
-    /// Terminal size (updated on every winsize event); columns drive editor
-    /// movement and rows size viewport-relative client animations.
-    term_cols: usize = 80,
-    term_rows: u16 = 24,
     blocks: std.ArrayList(RenderBlock) = .empty,
     delta: std.ArrayList(u8) = .empty,
     reasoning_delta: std.ArrayList(u8) = .empty,
@@ -529,18 +519,19 @@ const App = struct {
     /// Session root from daemon metadata, not necessarily the attach
     /// process's current directory.
     cwd: std.ArrayList(u8) = .empty,
-    /// Used only to render cwd with a compact ~/ prefix.
-    home: std.ArrayList(u8) = .empty,
     tokens_in: u64 = 0,
     tokens_out: u64 = 0,
     context_used: u64 = 0,
     context_limit: u64 = 0,
-    /// Persistent daemon-owned collaboration mode for the active session.
+    /// Persistent daemon-owned collaboration mode for the session.
     plan_mode: bool = false,
     /// An idle final answer from a Plan-mode turn can be implemented or
     /// revised without retyping the proposal.
     plan_proposal_ready: bool = false,
-    /// Highest durable block incorporated for the active session.
+    /// /permissions full is active for this session (client-side mirror of
+    /// the daemon's approval mode; a daemon restart resets both to default).
+    permissions_full: bool = false,
+    /// Highest durable block incorporated for the session.
     last_seq: u64 = 0,
     /// Initial attach is a bounded tail. `history_complete=false` means a
     /// trip to the loaded top should request another bounded older page.
@@ -566,6 +557,70 @@ const App = struct {
     last_body_first: usize = 0,
     last_body_rows: usize = 0,
     pending: ?PendingApproval = null,
+    /// Character-precise mouse selection over the session view. Lines are
+    /// absolute layout indices; columns are terminal cells within the line.
+    sel_anchor: ?SelectionPoint = null,
+    sel_head: SelectionPoint = .{ .line = 0, .col = 0 },
+    sel_dragging: bool = false,
+    /// Set when a selection was completed (mouse released): next frame
+    /// copies the selected cells via OSC52 and clears the flag.
+    copy_pending: bool = false,
+    /// Keyboard yanks clear the selection highlight once copied (vim visual-
+    /// mode y); mouse selections keep theirs.
+    sel_clear_after_copy: bool = false,
+    /// Successful non-diff tool runs are rolled up by default. Errors and
+    /// diffs remain visible even when the rest of the transcript is hidden.
+    show_tool_transcript: bool = false,
+    spinner_frame: usize = 0,
+    /// Wall-clock ms when the session's current turn entered .running;
+    /// drives the elapsed counter on the Working line.
+    turn_started_ms: i64 = 0,
+    turn_phase: proto.TurnPhase = .idle,
+    phase_started_ms: i64 = 0,
+    /// Wall ms when the tool call now executing began (0 = none). Stamped
+    /// as call/result blocks stream in; drives the per-call timer on the
+    /// Working line.
+    call_started_ms: i64 = 0,
+    /// Provider stream telemetry (ephemeral, ~1/s while receiving):
+    /// cumulative bytes this round, ms since the last visible delta, and
+    /// when the last report arrived (0 = none; stale reports are hidden).
+    stream_bytes: u64 = 0,
+    stream_quiet_ms: u64 = 0,
+    stream_status_at_ms: i64 = 0,
+    /// Baked layout of completed turns; see LayoutCache.
+    layout_cache: LayoutCache = .{},
+    /// Baked durable portion of the active turn; see TailLayoutCache.
+    tail_layout_cache: TailLayoutCache = .{},
+    /// Incremental provisional assistant text; finalized blocks use the full
+    /// Markdown layout caches above.
+    stream_layout_cache: StreamLayoutCache = .{},
+    /// Bumped whenever existing blocks mutate in place or the block list is
+    /// replaced (session switch) — invalidates layout_cache.
+    layout_epoch: u64 = 0,
+};
+
+const App = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    conn: *attach.Conn,
+    environ: ?*const std.process.Environ.Map = null,
+    /// Event loop handle for worker threads spawned from App methods
+    /// (voice transcription/download); set once in run().
+    loop: ?*vaxis.Loop(Event) = null,
+    voice_rt: VoiceRt = .{},
+    /// The focused session's complete client-side view. Everything that is
+    /// per-session lives there so a switch (or, later, a second pane) moves
+    /// one value instead of a field list.
+    view: SessionView,
+    attachments: std.ArrayList(media.Pending) = .empty,
+
+    mode: Mode = .insert,
+    /// Terminal size (updated on every winsize event); columns drive editor
+    /// movement and rows size viewport-relative client animations.
+    term_cols: usize = 80,
+    term_rows: u16 = 24,
+    /// Used only to render cwd with a compact ~/ prefix.
+    home: std.ArrayList(u8) = .empty,
     /// Selector overlay: null = closed; value = highlighted index into the
     /// filtered model or effort list (see pickerItems).
     picker: ?usize = null,
@@ -662,17 +717,6 @@ const App = struct {
     /// Click targets from the most recently rendered tab strip. The entries
     /// contain no behavior, leaving room for button-specific actions later.
     tab_hits: std.ArrayList(TabHit) = .empty,
-    /// Character-precise mouse selection over the session view. Lines are
-    /// absolute layout indices; columns are terminal cells within the line.
-    sel_anchor: ?SelectionPoint = null,
-    sel_head: SelectionPoint = .{ .line = 0, .col = 0 },
-    sel_dragging: bool = false,
-    /// Set when a selection was completed (mouse released): next frame
-    /// copies the selected cells via OSC52 and clears the flag.
-    copy_pending: bool = false,
-    /// Keyboard yanks clear the selection highlight once copied (vim visual-
-    /// mode y); mouse selections keep theirs.
-    sel_clear_after_copy: bool = false,
     /// Text ready for the event loop to send through OSC52. Blob responses
     /// arrive in the daemon reader path, where the terminal writer is not
     /// available, so `!c` stages the bytes here for the next frame.
@@ -680,9 +724,6 @@ const App = struct {
     /// What `!c` is copying ("read_file docs/FOO.md"); folded transcripts
     /// hide the source block, so the notice must identify it.
     clipboard_desc: std.ArrayList(u8) = .empty,
-    /// Successful non-diff tool runs are rolled up by default. Errors and
-    /// diffs remain visible even when the rest of the transcript is hidden.
-    show_tool_transcript: bool = false,
     /// Top tab strip ([ui] tab_bar; /config tabbar toggles + persists).
     /// Hiding the bar only removes CHROME: alt+N, gt/gT, </> keep working.
     show_tab_bar: bool = true,
@@ -699,22 +740,6 @@ const App = struct {
     /// Ctrl+L asks the event loop to invalidate libvaxis's previous-screen
     /// cache so the next render repaints every terminal cell.
     refresh_requested: bool = false,
-    spinner_frame: usize = 0,
-    /// Wall-clock ms when the active session's current turn entered
-    /// .running; drives the elapsed counter on the Working line.
-    turn_started_ms: i64 = 0,
-    turn_phase: proto.TurnPhase = .idle,
-    phase_started_ms: i64 = 0,
-    /// Wall ms when the tool call now executing began (0 = none). Stamped
-    /// as call/result blocks stream in; drives the per-call timer on the
-    /// Working line.
-    call_started_ms: i64 = 0,
-    /// Provider stream telemetry (ephemeral, ~1/s while receiving):
-    /// cumulative bytes this round, ms since the last visible delta, and
-    /// when the last report arrived (0 = none; stale reports are hidden).
-    stream_bytes: u64 = 0,
-    stream_quiet_ms: u64 = 0,
-    stream_status_at_ms: i64 = 0,
     ui_animation: ?effects.Kind = null,
     ui_animation_frame: usize = 0,
     effect_engine: ?effects.Engine = null,
@@ -732,16 +757,6 @@ const App = struct {
     animation_active: std.atomic.Value(bool) = .init(false),
     animation_stop: std.atomic.Value(bool) = .init(false),
     cfg: config.Config = .{},
-    /// Baked layout of completed turns; see LayoutCache.
-    layout_cache: LayoutCache = .{},
-    /// Baked durable portion of the active turn; see TailLayoutCache.
-    tail_layout_cache: TailLayoutCache = .{},
-    /// Incremental provisional assistant text; finalized blocks use the full
-    /// Markdown layout caches above.
-    stream_layout_cache: StreamLayoutCache = .{},
-    /// Bumped whenever existing blocks mutate in place or the block list is
-    /// replaced (session switch) — invalidates layout_cache.
-    layout_epoch: u64 = 0,
     /// Copy-mode (vim-style keyboard selection over the transcript):
     /// non-null = active. Coordinates are absolute layout lines, like the
     /// mouse selection.
@@ -771,9 +786,6 @@ const App = struct {
     last_find_ch: u8 = 0,
     /// The yank register holds whole lines (dd/yy/cc/V); p pastes below.
     yank_linewise: bool = false,
-    /// /permissions full is active for this session (client-side mirror of
-    /// the daemon's approval mode; a daemon restart resets both to default).
-    permissions_full: bool = false,
     /// Transient one-line notice shown in the status bar.
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
@@ -795,9 +807,9 @@ const App = struct {
         self.attachments.deinit(self.gpa);
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
-        self.tail_layout_cache.reset(self.gpa);
-        self.stream_layout_cache.reset(self.gpa);
-        self.layout_cache.reset(self.gpa);
+        self.view.tail_layout_cache.reset(self.gpa);
+        self.view.stream_layout_cache.reset(self.gpa);
+        self.view.layout_cache.reset(self.gpa);
         self.picker_filter.deinit(self.gpa);
         self.clearSetupDraft();
         self.setup_provider_name.deinit(self.gpa);
@@ -840,18 +852,18 @@ const App = struct {
         self.clipboard_pending.deinit(self.gpa);
         self.clipboard_desc.deinit(self.gpa);
         self.clearHistoryBackfill();
-        self.history_backfill.deinit(self.gpa);
-        for (self.blocks.items) |*rb| rb.deinit(self.gpa);
-        self.blocks.deinit(self.gpa);
-        self.delta.deinit(self.gpa);
-        self.reasoning_delta.deinit(self.gpa);
-        deinitPlan(self.gpa, &self.plan);
-        self.model.deinit(self.gpa);
-        self.cwd.deinit(self.gpa);
+        self.view.history_backfill.deinit(self.gpa);
+        for (self.view.blocks.items) |*rb| rb.deinit(self.gpa);
+        self.view.blocks.deinit(self.gpa);
+        self.view.delta.deinit(self.gpa);
+        self.view.reasoning_delta.deinit(self.gpa);
+        deinitPlan(self.gpa, &self.view.plan);
+        self.view.model.deinit(self.gpa);
+        self.view.cwd.deinit(self.gpa);
         self.home.deinit(self.gpa);
         self.notice.deinit(self.gpa);
-        if (self.otel_header_prompt) self.editor.clearSensitive();
-        self.editor.deinit();
+        if (self.otel_header_prompt) self.view.editor.clearSensitive();
+        self.view.editor.deinit();
     }
 
     fn clearAttachments(self: *App) void {
@@ -871,7 +883,7 @@ const App = struct {
             self.setNotice("could not stage image", .{});
             return;
         };
-        self.editor.insertImagePlaceholder(self.attachments.items.len);
+        self.view.editor.insertImagePlaceholder(self.attachments.items.len);
         self.setNotice("attached {s} · {d}/4 · Ctrl+V or /attach adds another", .{
             self.attachments.items[self.attachments.items.len - 1].name,
             self.attachments.items.len,
@@ -879,7 +891,7 @@ const App = struct {
     }
 
     fn attachPath(self: *App, path: []const u8) void {
-        const pending = media.fromPath(self.gpa, self.io, self.cwd.items, path) catch |err| {
+        const pending = media.fromPath(self.gpa, self.io, self.view.cwd.items, path) catch |err| {
             self.setNotice("could not attach image: {s}", .{mediaErrorMessage(err)});
             return;
         };
@@ -918,16 +930,16 @@ const App = struct {
     }
 
     fn clearHistoryBackfill(self: *App) void {
-        for (self.history_backfill.items) |*rendered| rendered.deinit(self.gpa);
-        self.history_backfill.clearRetainingCapacity();
+        for (self.view.history_backfill.items) |*rendered| rendered.deinit(self.gpa);
+        self.view.history_backfill.clearRetainingCapacity();
     }
 
     fn releaseStreamingBuffers(self: *App) void {
-        self.delta.deinit(self.gpa);
-        self.delta = .empty;
-        self.reasoning_delta.deinit(self.gpa);
-        self.reasoning_delta = .empty;
-        self.stream_layout_cache.reset(self.gpa);
+        self.view.delta.deinit(self.gpa);
+        self.view.delta = .empty;
+        self.view.reasoning_delta.deinit(self.gpa);
+        self.view.reasoning_delta = .empty;
+        self.view.stream_layout_cache.reset(self.gpa);
     }
 
     fn cacheWelcomeFacts(self: *App) void {
@@ -941,13 +953,13 @@ const App = struct {
     }
 
     fn setModelStr(self: *App, m: []const u8) void {
-        self.model.clearRetainingCapacity();
-        self.model.appendSlice(self.gpa, m) catch {};
+        self.view.model.clearRetainingCapacity();
+        self.view.model.appendSlice(self.gpa, m) catch {};
     }
 
     fn setCwdStr(self: *App, cwd: []const u8) void {
-        self.cwd.clearRetainingCapacity();
-        self.cwd.appendSlice(self.gpa, cwd) catch {};
+        self.view.cwd.clearRetainingCapacity();
+        self.view.cwd.appendSlice(self.gpa, cwd) catch {};
     }
 
     fn setPlan(self: *App, source: []const block.PlanItem) void {
@@ -968,23 +980,23 @@ const App = struct {
                 return;
             };
         }
-        deinitPlan(self.gpa, &self.plan);
-        self.plan = replacement;
+        deinitPlan(self.gpa, &self.view.plan);
+        self.view.plan = replacement;
     }
 
     fn clearCompletedPlan(self: *App) void {
-        if (self.plan.items.len > 0 and !hasUnfinishedPlan(self.plan.items)) {
-            deinitPlan(self.gpa, &self.plan);
-            self.layout_epoch +%= 1;
+        if (self.view.plan.items.len > 0 and !hasUnfinishedPlan(self.view.plan.items)) {
+            deinitPlan(self.gpa, &self.view.plan);
+            self.view.layout_epoch +%= 1;
         }
     }
 
     fn restoreLatestUnfinishedPlan(self: *App) void {
-        if (self.plan.items.len > 0) return;
-        var i = self.blocks.items.len;
+        if (self.view.plan.items.len > 0) return;
+        var i = self.view.blocks.items.len;
         while (i > 0) {
             i -= 1;
-            const rendered = self.blocks.items[i];
+            const rendered = self.view.blocks.items[i];
             if (rendered.kind != .plan) continue;
             if (hasUnfinishedPlan(rendered.plan_items)) self.setPlan(rendered.plan_items);
             return;
@@ -1060,7 +1072,7 @@ const App = struct {
     /// First non-focused session parked on an approval, anywhere.
     fn firstAwaitingSid(self: *const App) ?u64 {
         for (self.sessions.items) |session| {
-            if (session.sid == self.sid) continue;
+            if (session.sid == self.view.sid) continue;
             if (session.state == .awaiting_approval) return session.sid;
         }
         return null;
@@ -1089,53 +1101,53 @@ const App = struct {
         self.history_search_draft.clearRetainingCapacity();
         self.history_search_match = null;
         self.copy_cursor = null;
-        self.stream_layout_cache.reset(self.gpa);
-        self.layout_epoch +%= 1;
-        self.editor = Editor.init(self.gpa);
-        self.blocks = .empty;
-        self.delta = .empty;
-        self.reasoning_delta = .empty;
-        self.plan = .empty;
-        self.state = .idle;
-        self.model = .empty;
-        self.effort = .auto;
-        self.cwd = .empty;
-        self.tokens_in = 0;
-        self.tokens_out = 0;
-        self.context_used = 0;
-        self.context_limit = 0;
-        self.plan_mode = false;
-        self.plan_proposal_ready = false;
-        self.last_seq = 0;
-        self.oldest_seq = 0;
-        self.history_complete = true;
-        self.history_loading = false;
-        self.history_before_seq = 0;
-        self.history_page_failed = false;
-        self.scroll_up = 0;
-        self.last_total_lines = 0;
-        self.last_first_visible = 0;
+        self.view.stream_layout_cache.reset(self.gpa);
+        self.view.layout_epoch +%= 1;
+        self.view.editor = Editor.init(self.gpa);
+        self.view.blocks = .empty;
+        self.view.delta = .empty;
+        self.view.reasoning_delta = .empty;
+        self.view.plan = .empty;
+        self.view.state = .idle;
+        self.view.model = .empty;
+        self.view.effort = .auto;
+        self.view.cwd = .empty;
+        self.view.tokens_in = 0;
+        self.view.tokens_out = 0;
+        self.view.context_used = 0;
+        self.view.context_limit = 0;
+        self.view.plan_mode = false;
+        self.view.plan_proposal_ready = false;
+        self.view.last_seq = 0;
+        self.view.oldest_seq = 0;
+        self.view.history_complete = true;
+        self.view.history_loading = false;
+        self.view.history_before_seq = 0;
+        self.view.history_page_failed = false;
+        self.view.scroll_up = 0;
+        self.view.last_total_lines = 0;
+        self.view.last_first_visible = 0;
         self.search_highlight_line = null;
-        self.last_view_h = 0;
-        self.last_pinned_start = 0;
-        self.last_pinned_rows = 0;
-        self.last_body_first = 0;
-        self.last_body_rows = 0;
-        self.pending = null;
-        self.sel_anchor = null;
-        self.sel_head = .{ .line = 0, .col = 0 };
-        self.sel_dragging = false;
-        self.copy_pending = false;
-        self.sel_clear_after_copy = false;
-        self.show_tool_transcript = false;
-        self.spinner_frame = 0;
-        self.turn_started_ms = 0;
-        self.turn_phase = .idle;
-        self.phase_started_ms = 0;
-        self.call_started_ms = 0;
-        self.stream_bytes = 0;
-        self.stream_quiet_ms = 0;
-        self.stream_status_at_ms = 0;
+        self.view.last_view_h = 0;
+        self.view.last_pinned_start = 0;
+        self.view.last_pinned_rows = 0;
+        self.view.last_body_first = 0;
+        self.view.last_body_rows = 0;
+        self.view.pending = null;
+        self.view.sel_anchor = null;
+        self.view.sel_head = .{ .line = 0, .col = 0 };
+        self.view.sel_dragging = false;
+        self.view.copy_pending = false;
+        self.view.sel_clear_after_copy = false;
+        self.view.show_tool_transcript = false;
+        self.view.spinner_frame = 0;
+        self.view.turn_started_ms = 0;
+        self.view.turn_phase = .idle;
+        self.view.phase_started_ms = 0;
+        self.view.call_started_ms = 0;
+        self.view.stream_bytes = 0;
+        self.view.stream_quiet_ms = 0;
+        self.view.stream_status_at_ms = 0;
     }
 
     fn saveActiveView(self: *App) !void {
@@ -1143,45 +1155,45 @@ const App = struct {
         errdefer self.gpa.destroy(saved);
         self.saved_view_clock +%= 1;
         saved.* = .{
-            .editor = self.editor,
-            .blocks = self.blocks,
-            .delta = self.delta,
-            .reasoning_delta = self.reasoning_delta,
-            .plan = self.plan,
-            .state = self.state,
-            .model = self.model,
-            .effort = self.effort,
-            .cwd = self.cwd,
-            .tokens_in = self.tokens_in,
-            .tokens_out = self.tokens_out,
-            .context_used = self.context_used,
-            .context_limit = self.context_limit,
-            .plan_mode = self.plan_mode,
-            .plan_proposal_ready = self.plan_proposal_ready,
-            .scroll_up = self.scroll_up,
-            .last_total_lines = self.last_total_lines,
-            .last_first_visible = self.last_first_visible,
-            .last_view_h = self.last_view_h,
-            .pending = self.pending,
-            .sel_anchor = self.sel_anchor,
-            .sel_head = self.sel_head,
-            .sel_dragging = self.sel_dragging,
-            .copy_pending = self.copy_pending,
-            .show_tool_transcript = self.show_tool_transcript,
-            .spinner_frame = self.spinner_frame,
-            .turn_started_ms = self.turn_started_ms,
-            .turn_phase = self.turn_phase,
-            .phase_started_ms = self.phase_started_ms,
-            .call_started_ms = self.call_started_ms,
-            .stream_bytes = self.stream_bytes,
-            .stream_quiet_ms = self.stream_quiet_ms,
-            .stream_status_at_ms = self.stream_status_at_ms,
-            .last_seq = self.last_seq,
-            .oldest_seq = self.oldest_seq,
-            .history_complete = self.history_complete,
+            .editor = self.view.editor,
+            .blocks = self.view.blocks,
+            .delta = self.view.delta,
+            .reasoning_delta = self.view.reasoning_delta,
+            .plan = self.view.plan,
+            .state = self.view.state,
+            .model = self.view.model,
+            .effort = self.view.effort,
+            .cwd = self.view.cwd,
+            .tokens_in = self.view.tokens_in,
+            .tokens_out = self.view.tokens_out,
+            .context_used = self.view.context_used,
+            .context_limit = self.view.context_limit,
+            .plan_mode = self.view.plan_mode,
+            .plan_proposal_ready = self.view.plan_proposal_ready,
+            .scroll_up = self.view.scroll_up,
+            .last_total_lines = self.view.last_total_lines,
+            .last_first_visible = self.view.last_first_visible,
+            .last_view_h = self.view.last_view_h,
+            .pending = self.view.pending,
+            .sel_anchor = self.view.sel_anchor,
+            .sel_head = self.view.sel_head,
+            .sel_dragging = self.view.sel_dragging,
+            .copy_pending = self.view.copy_pending,
+            .show_tool_transcript = self.view.show_tool_transcript,
+            .spinner_frame = self.view.spinner_frame,
+            .turn_started_ms = self.view.turn_started_ms,
+            .turn_phase = self.view.turn_phase,
+            .phase_started_ms = self.view.phase_started_ms,
+            .call_started_ms = self.view.call_started_ms,
+            .stream_bytes = self.view.stream_bytes,
+            .stream_quiet_ms = self.view.stream_quiet_ms,
+            .stream_status_at_ms = self.view.stream_status_at_ms,
+            .last_seq = self.view.last_seq,
+            .oldest_seq = self.view.oldest_seq,
+            .history_complete = self.view.history_complete,
             .last_used = self.saved_view_clock,
         };
-        try self.saved_views.put(self.gpa, self.sid, saved);
+        try self.saved_views.put(self.gpa, self.view.sid, saved);
         self.trimSavedViews();
         self.resetActiveAfterMove();
     }
@@ -1214,46 +1226,46 @@ const App = struct {
 
     fn restoreSavedView(self: *App, saved: *SavedSessionView) void {
         self.copy_cursor = null;
-        self.layout_epoch +%= 1;
-        self.editor = saved.editor;
-        self.blocks = saved.blocks;
-        self.delta = saved.delta;
-        self.reasoning_delta = saved.reasoning_delta;
-        self.plan = saved.plan;
-        self.state = saved.state;
-        self.model = saved.model;
-        self.effort = saved.effort;
-        self.cwd = saved.cwd;
-        self.tokens_in = saved.tokens_in;
-        self.tokens_out = saved.tokens_out;
-        self.context_used = saved.context_used;
-        self.context_limit = saved.context_limit;
-        self.plan_mode = saved.plan_mode;
-        self.plan_proposal_ready = saved.plan_proposal_ready;
-        self.scroll_up = saved.scroll_up;
-        self.last_total_lines = saved.last_total_lines;
-        self.last_first_visible = saved.last_first_visible;
-        self.last_view_h = saved.last_view_h;
-        self.pending = saved.pending;
-        self.sel_anchor = saved.sel_anchor;
-        self.sel_head = saved.sel_head;
-        self.sel_dragging = saved.sel_dragging;
-        self.copy_pending = saved.copy_pending;
-        self.show_tool_transcript = saved.show_tool_transcript;
-        self.spinner_frame = saved.spinner_frame;
-        self.turn_started_ms = saved.turn_started_ms;
-        self.turn_phase = saved.turn_phase;
-        self.phase_started_ms = saved.phase_started_ms;
-        self.call_started_ms = saved.call_started_ms;
-        self.stream_bytes = saved.stream_bytes;
-        self.stream_quiet_ms = saved.stream_quiet_ms;
-        self.stream_status_at_ms = saved.stream_status_at_ms;
-        self.last_seq = saved.last_seq;
-        self.oldest_seq = saved.oldest_seq;
-        self.history_complete = saved.history_complete;
-        self.history_loading = false;
-        self.history_before_seq = 0;
-        self.history_page_failed = false;
+        self.view.layout_epoch +%= 1;
+        self.view.editor = saved.editor;
+        self.view.blocks = saved.blocks;
+        self.view.delta = saved.delta;
+        self.view.reasoning_delta = saved.reasoning_delta;
+        self.view.plan = saved.plan;
+        self.view.state = saved.state;
+        self.view.model = saved.model;
+        self.view.effort = saved.effort;
+        self.view.cwd = saved.cwd;
+        self.view.tokens_in = saved.tokens_in;
+        self.view.tokens_out = saved.tokens_out;
+        self.view.context_used = saved.context_used;
+        self.view.context_limit = saved.context_limit;
+        self.view.plan_mode = saved.plan_mode;
+        self.view.plan_proposal_ready = saved.plan_proposal_ready;
+        self.view.scroll_up = saved.scroll_up;
+        self.view.last_total_lines = saved.last_total_lines;
+        self.view.last_first_visible = saved.last_first_visible;
+        self.view.last_view_h = saved.last_view_h;
+        self.view.pending = saved.pending;
+        self.view.sel_anchor = saved.sel_anchor;
+        self.view.sel_head = saved.sel_head;
+        self.view.sel_dragging = saved.sel_dragging;
+        self.view.copy_pending = saved.copy_pending;
+        self.view.show_tool_transcript = saved.show_tool_transcript;
+        self.view.spinner_frame = saved.spinner_frame;
+        self.view.turn_started_ms = saved.turn_started_ms;
+        self.view.turn_phase = saved.turn_phase;
+        self.view.phase_started_ms = saved.phase_started_ms;
+        self.view.call_started_ms = saved.call_started_ms;
+        self.view.stream_bytes = saved.stream_bytes;
+        self.view.stream_quiet_ms = saved.stream_quiet_ms;
+        self.view.stream_status_at_ms = saved.stream_status_at_ms;
+        self.view.last_seq = saved.last_seq;
+        self.view.oldest_seq = saved.oldest_seq;
+        self.view.history_complete = saved.history_complete;
+        self.view.history_loading = false;
+        self.view.history_before_seq = 0;
+        self.view.history_page_failed = false;
     }
 
     fn touchRecentSession(self: *App, sid: u64) void {
@@ -1268,38 +1280,38 @@ const App = struct {
     }
 
     fn switchSession(self: *App, sid: u64, touch_recent: bool) !void {
-        if (sid == self.sid) return;
-        const old_sid = self.sid;
+        if (sid == self.view.sid) return;
+        const old_sid = self.view.sid;
         try self.saveActiveView();
         self.conn.send(.{ .unsub = .{ .sid = old_sid } }) catch {};
-        self.sid = sid;
+        self.view.sid = sid;
 
         if (self.saved_views.get(sid)) |saved| {
             _ = self.saved_views.remove(sid);
             self.restoreSavedView(saved);
             self.gpa.destroy(saved);
         } else if (self.sessionSummary(sid)) |summary| {
-            try self.model.appendSlice(self.gpa, summary.model);
-            try self.cwd.appendSlice(self.gpa, summary.cwd);
-            self.effort = summary.effort;
-            self.state = summary.state;
-            self.plan_mode = summary.plan_mode;
+            try self.view.model.appendSlice(self.gpa, summary.model);
+            try self.view.cwd.appendSlice(self.gpa, summary.cwd);
+            self.view.effort = summary.effort;
+            self.view.state = summary.state;
+            self.view.plan_mode = summary.plan_mode;
         }
         if (self.background_approvals.get(sid)) |pending| {
-            self.pending = pending;
+            self.view.pending = pending;
             _ = self.background_approvals.remove(sid);
         }
         // Server truth, per session — the FULL ACCESS badge must never
         // follow the App across tabs (a full A, default B switch used to
         // keep the badge lit).
-        self.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
+        self.view.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
 
         if (touch_recent) self.touchRecentSession(sid);
         self.syncAnimationTicker();
-        if (self.last_seq == 0) {
-            self.history_complete = false;
-            self.history_loading = true;
-            self.history_before_seq = 0;
+        if (self.view.last_seq == 0) {
+            self.view.history_complete = false;
+            self.view.history_loading = true;
+            self.view.history_before_seq = 0;
             self.conn.send(.{ .sub = .{
                 .sid = sid,
                 .from_seq = 1,
@@ -1308,7 +1320,7 @@ const App = struct {
         } else {
             self.conn.send(.{ .sub = .{
                 .sid = sid,
-                .from_seq = self.last_seq +| 1,
+                .from_seq = self.view.last_seq +| 1,
                 .replay_limit = initial_replay_blocks,
             } }) catch {};
         }
@@ -1319,32 +1331,32 @@ const App = struct {
 
     fn clearTranscriptForSearch(self: *App) void {
         self.clearHistoryBackfill();
-        for (self.blocks.items) |*rendered| rendered.deinit(self.gpa);
-        self.blocks.clearRetainingCapacity();
-        self.delta.clearRetainingCapacity();
-        self.reasoning_delta.clearRetainingCapacity();
-        deinitPlan(self.gpa, &self.plan);
-        self.layout_cache.reset(self.gpa);
-        self.tail_layout_cache.reset(self.gpa);
-        self.stream_layout_cache.reset(self.gpa);
-        self.layout_epoch +%= 1;
-        self.last_seq = 0;
-        self.oldest_seq = 0;
-        self.history_complete = false;
-        self.history_loading = true;
-        self.history_before_seq = 0;
-        self.history_page_failed = false;
-        self.scroll_up = 0;
-        self.last_total_lines = 0;
-        self.last_first_visible = 0;
+        for (self.view.blocks.items) |*rendered| rendered.deinit(self.gpa);
+        self.view.blocks.clearRetainingCapacity();
+        self.view.delta.clearRetainingCapacity();
+        self.view.reasoning_delta.clearRetainingCapacity();
+        deinitPlan(self.gpa, &self.view.plan);
+        self.view.layout_cache.reset(self.gpa);
+        self.view.tail_layout_cache.reset(self.gpa);
+        self.view.stream_layout_cache.reset(self.gpa);
+        self.view.layout_epoch +%= 1;
+        self.view.last_seq = 0;
+        self.view.oldest_seq = 0;
+        self.view.history_complete = false;
+        self.view.history_loading = true;
+        self.view.history_before_seq = 0;
+        self.view.history_page_failed = false;
+        self.view.scroll_up = 0;
+        self.view.last_total_lines = 0;
+        self.view.last_first_visible = 0;
         self.search_highlight_line = null;
         self.copy_cursor = null;
-        self.sel_anchor = null;
+        self.view.sel_anchor = null;
     }
 
     fn jumpToSearchHit(self: *App, sid: u64, seq: u64) !void {
-        if (sid == self.sid) {
-            for (self.blocks.items) |rendered| {
+        if (sid == self.view.sid) {
+            for (self.view.blocks.items) |rendered| {
                 if (rendered.seq != seq) continue;
                 self.search_target_seq = seq;
                 self.search_highlight_line = null;
@@ -1353,27 +1365,27 @@ const App = struct {
                 return;
             }
         }
-        if (sid != self.sid) {
-            const old_sid = self.sid;
+        if (sid != self.view.sid) {
+            const old_sid = self.view.sid;
             try self.saveActiveView();
             self.conn.send(.{ .unsub = .{ .sid = old_sid } }) catch {};
-            self.sid = sid;
+            self.view.sid = sid;
             if (self.saved_views.get(sid)) |saved| {
                 _ = self.saved_views.remove(sid);
                 self.restoreSavedView(saved);
                 self.gpa.destroy(saved);
             } else if (self.sessionSummary(sid)) |summary| {
-                try self.model.appendSlice(self.gpa, summary.model);
-                try self.cwd.appendSlice(self.gpa, summary.cwd);
-                self.effort = summary.effort;
-                self.state = summary.state;
-                self.plan_mode = summary.plan_mode;
+                try self.view.model.appendSlice(self.gpa, summary.model);
+                try self.view.cwd.appendSlice(self.gpa, summary.cwd);
+                self.view.effort = summary.effort;
+                self.view.state = summary.state;
+                self.view.plan_mode = summary.plan_mode;
             }
             if (self.background_approvals.get(sid)) |pending| {
-                self.pending = pending;
+                self.view.pending = pending;
                 _ = self.background_approvals.remove(sid);
             }
-            self.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
+            self.view.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
             self.touchRecentSession(sid);
             self.syncAnimationTicker();
         } else {
@@ -1408,9 +1420,9 @@ const App = struct {
     /// strip. This is deliberately separate from gt/gT, whose useful Vim-like
     /// contract is MRU navigation across every session (including children).
     fn cycleTab(self: *App, direction: i8) void {
-        const active_root = self.rootSessionId(self.sid);
+        const active_root = self.rootSessionId(self.view.sid);
         const sid = nextRootTabSid(self.sessions.items, active_root, direction) orelse return;
-        if (sid == self.sid) return;
+        if (sid == self.view.sid) return;
         self.switchSession(sid, true) catch self.setNotice("could not switch tab", .{});
     }
 
@@ -1422,7 +1434,7 @@ const App = struct {
             self.setNotice("no tab {d}", .{index});
             return;
         };
-        if (sid == self.sid) return;
+        if (sid == self.view.sid) return;
         self.switchSession(sid, true) catch self.setNotice("could not switch tab", .{});
     }
 
@@ -1464,10 +1476,10 @@ const App = struct {
             }
             if (!known_recent) self.recent_sessions.append(self.gpa, info.sid) catch {};
 
-            if (info.sid == self.sid) {
-                self.state = info.state;
-                self.plan_mode = info.plan_mode;
-                if (!info.plan_mode) self.plan_proposal_ready = false;
+            if (info.sid == self.view.sid) {
+                self.view.state = info.state;
+                self.view.plan_mode = info.plan_mode;
+                if (!info.plan_mode) self.view.plan_proposal_ready = false;
             } else if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
                 saved.plan_mode = info.plan_mode;
@@ -1567,12 +1579,12 @@ const App = struct {
             existing.deinit(self.gpa);
             existing.* = summary;
             self.session_labels.items[i] = summary.label;
-            if (info.sid == self.sid) {
-                self.state = info.state;
+            if (info.sid == self.view.sid) {
+                self.view.state = info.state;
                 self.setModelStr(info.model);
-                self.permissions_full = info.full_access;
-                self.plan_mode = info.plan_mode;
-                if (!info.plan_mode) self.plan_proposal_ready = false;
+                self.view.permissions_full = info.full_access;
+                self.view.plan_mode = info.plan_mode;
+                if (!info.plan_mode) self.view.plan_proposal_ready = false;
             }
             if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
@@ -1622,10 +1634,10 @@ const App = struct {
             break;
         };
         if (!known_recent) self.recent_sessions.append(self.gpa, info.sid) catch {};
-        if (info.sid == self.sid) {
-            self.state = info.state;
-            self.plan_mode = info.plan_mode;
-            if (!info.plan_mode) self.plan_proposal_ready = false;
+        if (info.sid == self.view.sid) {
+            self.view.state = info.state;
+            self.view.plan_mode = info.plan_mode;
+            if (!info.plan_mode) self.view.plan_proposal_ready = false;
         }
         self.normalizeTopSelection();
     }
@@ -1660,7 +1672,7 @@ const App = struct {
     }
 
     fn currentInflightCall(self: *const App) ?InflightCall {
-        return layout_mod.currentInflightCall(self.blocks.items);
+        return layout_mod.currentInflightCall(self.view.blocks.items);
     }
 
     fn pushBlock(self: *App, kind: block.BlockKind, text: []const u8, label: []const u8, status: block.ToolStatus) void {
@@ -1675,10 +1687,10 @@ const App = struct {
         label: []const u8,
         status: block.ToolStatus,
     ) void {
-        const before = self.blocks.items.len;
+        const before = self.view.blocks.items.len;
         self.pushBlock(kind, text, label, status);
-        if (self.blocks.items.len > before) {
-            const rendered = &self.blocks.items[self.blocks.items.len - 1];
+        if (self.view.blocks.items.len > before) {
+            const rendered = &self.view.blocks.items[self.view.blocks.items.len - 1];
             rendered.seq = b.seq;
             rendered.turn_id = b.turn_id;
         }
@@ -1692,11 +1704,11 @@ const App = struct {
         full_body_ref: ?[]const u8,
         label: []const u8,
     ) void {
-        const before = self.blocks.items.len;
+        const before = self.view.blocks.items.len;
         self.pushDurableBlock(b, .tool_result, text, label, status);
-        if (self.blocks.items.len == before) return;
+        if (self.view.blocks.items.len == before) return;
         if (full_body_ref) |ref| {
-            self.blocks.items[self.blocks.items.len - 1].full_body_ref = self.gpa.dupe(u8, ref) catch null;
+            self.view.blocks.items[self.view.blocks.items.len - 1].full_body_ref = self.gpa.dupe(u8, ref) catch null;
         }
     }
 
@@ -1713,7 +1725,7 @@ const App = struct {
             self.gpa.free(t);
             return;
         };
-        self.blocks.append(self.gpa, .{
+        self.view.blocks.append(self.gpa, .{
             .kind = kind,
             .text = t,
             .label = l,
@@ -1743,17 +1755,17 @@ const App = struct {
         request_id: u64,
         prior_state: ?proto.SessionState,
     ) void {
-        const before = self.blocks.items.len;
+        const before = self.view.blocks.items.len;
         self.pushBlockPending(kind, text, label, .ok, true);
-        if (self.blocks.items.len == before) return;
-        const rendered = &self.blocks.items[self.blocks.items.len - 1];
+        if (self.view.blocks.items.len == before) return;
+        const rendered = &self.view.blocks.items[self.view.blocks.items.len - 1];
         rendered.pending_request_id = request_id;
         rendered.pending_prior_state = prior_state;
     }
 
     fn acknowledgeInput(self: *App, request_id: u64) void {
         if (request_id == 0) return;
-        if (acknowledgeInputInBlocks(self.blocks.items, request_id)) return;
+        if (acknowledgeInputInBlocks(self.view.blocks.items, request_id)) return;
         var it = self.saved_views.valueIterator();
         while (it.next()) |saved| {
             if (acknowledgeInputInBlocks(saved.*.blocks.items, request_id)) return;
@@ -1762,28 +1774,28 @@ const App = struct {
 
     fn rejectInput(self: *App, request_id: u64) void {
         if (request_id == 0) return;
-        if (rejectInputInBlocks(self.gpa, &self.blocks, request_id)) |rejected| {
+        if (rejectInputInBlocks(self.gpa, &self.view.blocks, request_id)) |rejected| {
             defer self.gpa.free(rejected.text);
-            self.editor.pushHistory(rejected.text);
-            if (self.editor.isEmpty()) self.editor.insertSlice(rejected.text);
+            self.view.editor.pushHistory(rejected.text);
+            if (self.view.editor.isEmpty()) self.view.editor.insertSlice(rejected.text);
             if (rejected.prior_state) |state| {
-                self.state = state;
+                self.view.state = state;
                 self.releaseStreamingBuffers();
-                self.stream_status_at_ms = 0;
-                self.turn_started_ms = 0;
-                self.turn_phase = .idle;
-                self.phase_started_ms = 0;
+                self.view.stream_status_at_ms = 0;
+                self.view.turn_started_ms = 0;
+                self.view.turn_phase = .idle;
+                self.view.phase_started_ms = 0;
                 self.syncAnimationTicker();
             }
             self.restoreLatestUnfinishedPlan();
-            self.layout_epoch +%= 1;
+            self.view.layout_epoch +%= 1;
             return;
         }
         var it = self.saved_views.valueIterator();
         while (it.next()) |saved| {
             if (rejectInputInBlocks(self.gpa, &saved.*.blocks, request_id)) |rejected| {
                 defer self.gpa.free(rejected.text);
-                self.editor.pushHistory(rejected.text);
+                self.view.editor.pushHistory(rejected.text);
                 if (rejected.prior_state) |state| saved.*.state = state;
                 return;
             }
@@ -1800,39 +1812,39 @@ const App = struct {
 
         switch (msg) {
             .blk => |b| {
-                if (b.sid != self.sid) return;
-                if (self.history_loading and self.history_before_seq > 0 and b.b.seq < self.history_before_seq) {
+                if (b.sid != self.view.sid) return;
+                if (self.view.history_loading and self.view.history_before_seq > 0 and b.b.seq < self.view.history_before_seq) {
                     self.bufferOlderBlock(b.b);
                     return;
                 }
-                if (b.b.seq <= self.last_seq) return;
-                if (self.oldest_seq == 0) {
-                    self.oldest_seq = b.b.seq;
+                if (b.b.seq <= self.view.last_seq) return;
+                if (self.view.oldest_seq == 0) {
+                    self.view.oldest_seq = b.b.seq;
                     // Compatibility with an older daemon that ignores the
                     // tail request and performs a full replay without a
                     // replay_done marker.
                     if (b.b.seq == 1) {
-                        self.history_complete = true;
-                        if (self.history_before_seq == 0) self.history_loading = false;
+                        self.view.history_complete = true;
+                        if (self.view.history_before_seq == 0) self.view.history_loading = false;
                     }
                 }
-                self.last_seq = b.b.seq;
+                self.view.last_seq = b.b.seq;
                 self.applyBlock(b.b);
             },
             .replay_done => |replay| {
-                if (replay.sid != self.sid) return;
+                if (replay.sid != self.view.sid) return;
                 if (!replay.has_newer) {
                     if (replay.plan_pinned and hasUnfinishedPlan(replay.plan_items)) {
                         self.setPlan(replay.plan_items);
                     } else {
-                        deinitPlan(self.gpa, &self.plan);
+                        deinitPlan(self.gpa, &self.view.plan);
                     }
                 }
                 if (!replay.forward and replay.has_newer and replay.newest_seq > 0) {
-                    if (replay.oldest_seq > 0) self.oldest_seq = replay.oldest_seq;
-                    self.history_complete = !replay.has_older;
+                    if (replay.oldest_seq > 0) self.view.oldest_seq = replay.oldest_seq;
+                    self.view.history_complete = !replay.has_older;
                     self.conn.send(.{ .sub = .{
-                        .sid = self.sid,
+                        .sid = self.view.sid,
                         .from_seq = replay.newest_seq +| 1,
                         .replay_limit = initial_replay_blocks,
                     } }) catch self.setNotice("could not continue session replay", .{});
@@ -1841,42 +1853,42 @@ const App = struct {
                 if (replay.forward) {
                     if (replay.has_newer and replay.newest_seq > 0) {
                         self.conn.send(.{ .sub = .{
-                            .sid = self.sid,
+                            .sid = self.view.sid,
                             .from_seq = replay.newest_seq +| 1,
                             .replay_limit = initial_replay_blocks,
                         } }) catch self.setNotice("could not continue session replay", .{});
                     } else {
-                        self.history_loading = false;
+                        self.view.history_loading = false;
                     }
                     return;
                 }
-                if (self.history_before_seq > 0) {
+                if (self.view.history_before_seq > 0) {
                     self.finishOlderHistoryPage(replay.oldest_seq, replay.has_older);
                     return;
                 }
-                if (replay.oldest_seq > 0) self.oldest_seq = replay.oldest_seq;
-                self.history_complete = !replay.has_older;
-                self.history_loading = false;
-                self.history_before_seq = 0;
-                if (self.scroll_up > 0) self.scroll_up = std.math.maxInt(usize);
+                if (replay.oldest_seq > 0) self.view.oldest_seq = replay.oldest_seq;
+                self.view.history_complete = !replay.has_older;
+                self.view.history_loading = false;
+                self.view.history_before_seq = 0;
+                if (self.view.scroll_up > 0) self.view.scroll_up = std.math.maxInt(usize);
             },
             .delta => |d| {
-                if (d.sid != self.sid) return;
-                self.delta.appendSlice(self.gpa, d.text) catch {};
+                if (d.sid != self.view.sid) return;
+                self.view.delta.appendSlice(self.gpa, d.text) catch {};
             },
             .reasoning_delta => |d| {
-                if (d.sid != self.sid) return;
-                self.reasoning_delta.appendSlice(self.gpa, d.text) catch {};
+                if (d.sid != self.view.sid) return;
+                self.view.reasoning_delta.appendSlice(self.gpa, d.text) catch {};
             },
             .stream_status => |ss| {
-                if (ss.sid != self.sid) return;
-                self.stream_bytes = ss.bytes;
-                self.stream_quiet_ms = ss.quiet_ms;
-                self.stream_status_at_ms = nowWallMs(self.io);
+                if (ss.sid != self.view.sid) return;
+                self.view.stream_bytes = ss.bytes;
+                self.view.stream_quiet_ms = ss.quiet_ms;
+                self.view.stream_status_at_ms = nowWallMs(self.io);
             },
             .status => |s| {
                 self.updateSessionSummaryState(s.sid, s.state);
-                if (s.sid != self.sid) {
+                if (s.sid != self.view.sid) {
                     if (self.saved_views.get(s.sid)) |saved| {
                         saved.state = s.state;
                         if (s.phase) |phase| {
@@ -1903,36 +1915,36 @@ const App = struct {
                 }
                 // Old daemons ignore tail_limit/replay_done and finish their
                 // full replay with status. Recognize that safe fallback.
-                if (self.history_loading and self.history_before_seq == 0 and self.oldest_seq <= 1) {
-                    self.history_complete = true;
-                    self.history_loading = false;
+                if (self.view.history_loading and self.view.history_before_seq == 0 and self.view.oldest_seq <= 1) {
+                    self.view.history_complete = true;
+                    self.view.history_loading = false;
                 }
-                if (s.state == .running and self.state != .running) {
+                if (s.state == .running and self.view.state != .running) {
                     self.clearCompletedPlan();
-                    self.spinner_frame = 0;
-                    self.turn_started_ms = nowWallMs(self.io);
-                    self.turn_phase = .starting;
-                    self.phase_started_ms = self.turn_started_ms;
+                    self.view.spinner_frame = 0;
+                    self.view.turn_started_ms = nowWallMs(self.io);
+                    self.view.turn_phase = .starting;
+                    self.view.phase_started_ms = self.view.turn_started_ms;
                 }
                 if (s.phase) |phase| {
-                    if (self.turn_phase != phase) {
-                        self.phase_started_ms = nowWallMs(self.io);
+                    if (self.view.turn_phase != phase) {
+                        self.view.phase_started_ms = nowWallMs(self.io);
                         if (phase == .provider) {
-                            self.stream_bytes = 0;
-                            self.stream_quiet_ms = 0;
-                            self.stream_status_at_ms = 0;
+                            self.view.stream_bytes = 0;
+                            self.view.stream_quiet_ms = 0;
+                            self.view.stream_status_at_ms = 0;
                         }
                     }
-                    self.turn_phase = phase;
+                    self.view.turn_phase = phase;
                 }
                 if (s.state != .running) {
-                    self.stream_status_at_ms = 0;
-                    self.turn_phase = .idle;
-                    self.phase_started_ms = 0;
+                    self.view.stream_status_at_ms = 0;
+                    self.view.turn_phase = .idle;
+                    self.view.phase_started_ms = 0;
                 }
-                self.state = s.state;
+                self.view.state = s.state;
                 self.syncAnimationTicker();
-                if (s.state != .awaiting_approval) self.pending = null;
+                if (s.state != .awaiting_approval) self.view.pending = null;
                 if (s.state == .idle or s.state == .err or s.state == .done)
                     self.releaseStreamingBuffers();
                 // An error state never arrives bare: show its reason in the
@@ -1948,8 +1960,8 @@ const App = struct {
                 @memcpy(p.tool_buf[0..p.tool_len], ar.tool[0..p.tool_len]);
                 p.args_len = @min(ar.args_json.len, p.args_buf.len);
                 @memcpy(p.args_buf[0..p.args_len], ar.args_json[0..p.args_len]);
-                if (ar.sid == self.sid) {
-                    self.pending = p;
+                if (ar.sid == self.view.sid) {
+                    self.view.pending = p;
                 } else {
                     self.background_approvals.put(self.gpa, ar.sid, p) catch {};
                     // The one out-of-band signal: you are looking elsewhere
@@ -1965,13 +1977,13 @@ const App = struct {
                 var i = history.entries.len;
                 while (i > 0) {
                     i -= 1;
-                    self.editor.pushHistory(history.entries[i].text);
+                    self.view.editor.pushHistory(history.entries[i].text);
                 }
                 if (self.history_search_active) self.refreshHistorySearch(true);
             },
             .search_result => |result| self.replaceSearchHits(result),
             .diagnostics_result => |report| {
-                if (report.sid != self.sid) return;
+                if (report.sid != self.view.sid) return;
                 const rendered = formatDiagnostics(self.gpa, report) catch {
                     self.setNotice("could not render diagnostics", .{});
                     return;
@@ -1989,7 +2001,7 @@ const App = struct {
             .session_upsert => |su| self.upsertSessionSummary(su.session),
             .session_remove => |sr| self.removeSessionSummary(sr.sid),
             .interrupt_result => |result| {
-                if (result.sid != self.sid) return;
+                if (result.sid != self.view.sid) return;
                 if (!result.active) {
                     self.setNotice("nothing to interrupt", .{});
                 } else if (result.already_requested) {
@@ -2043,21 +2055,21 @@ const App = struct {
             },
             .council_list_result => |result| self.applyCouncils(result.councils),
             .plan_clear_result => |result| {
-                if (result.sid != self.sid) return;
+                if (result.sid != self.view.sid) return;
                 if (result.cleared) {
-                    deinitPlan(self.gpa, &self.plan);
-                    self.layout_epoch +%= 1;
+                    deinitPlan(self.gpa, &self.view.plan);
+                    self.view.layout_epoch +%= 1;
                     self.setNotice("execution plan cleared", .{});
                 } else {
                     self.setNotice("no unfinished execution plan", .{});
                 }
             },
             .session_meta => |m| {
-                if (m.sid != self.sid) return;
-                self.tokens_in = m.tokens_in;
-                self.tokens_out = m.tokens_out;
-                if (m.context_used > 0) self.context_used = m.context_used;
-                if (m.context_limit > 0) self.context_limit = m.context_limit;
+                if (m.sid != self.view.sid) return;
+                self.view.tokens_in = m.tokens_in;
+                self.view.tokens_out = m.tokens_out;
+                if (m.context_used > 0) self.view.context_used = m.context_used;
+                if (m.context_limit > 0) self.view.context_limit = m.context_limit;
             },
             .err => |e| {
                 self.rejectInput(e.request_id);
@@ -2071,11 +2083,11 @@ const App = struct {
                     self.pending_new_session_request_id = 0;
                     self.pending_new_cwd.clearRetainingCapacity();
                 }
-                if (self.history_loading and std.mem.eql(u8, e.code, "request_failed")) {
+                if (self.view.history_loading and std.mem.eql(u8, e.code, "request_failed")) {
                     self.clearHistoryBackfill();
-                    self.history_loading = false;
-                    self.history_before_seq = 0;
-                    self.history_page_failed = false;
+                    self.view.history_loading = false;
+                    self.view.history_before_seq = 0;
+                    self.view.history_page_failed = false;
                 }
                 self.setNotice("daemon error {s}: {s}", .{ e.code, e.msg });
             },
@@ -2089,7 +2101,7 @@ const App = struct {
             .user_msg => |u| {
                 if (!u.synthetic and !isLegacyRehydration(u.text)) {
                     self.clearCompletedPlan();
-                    self.plan_proposal_ready = false;
+                    self.view.plan_proposal_ready = false;
                 }
                 if (u.synthetic or isLegacyRehydration(u.text)) {
                     const label = rehydrationLabel(self.gpa, u.text) catch return;
@@ -2101,10 +2113,10 @@ const App = struct {
                     else
                         null;
                     defer if (label) |owned| self.gpa.free(owned);
-                    if (!reconcilePendingEcho(self.blocks.items, .user_msg, u.text, b.seq, b.turn_id)) {
+                    if (!reconcilePendingEcho(self.view.blocks.items, .user_msg, u.text, b.seq, b.turn_id)) {
                         self.pushDurableBlock(b, .user_msg, u.text, label orelse "", .ok);
                     } else if (label) |owned| {
-                        for (self.blocks.items) |*rendered| {
+                        for (self.view.blocks.items) |*rendered| {
                             if (rendered.seq != b.seq) continue;
                             const replacement = self.gpa.dupe(u8, owned) catch return;
                             self.gpa.free(rendered.label);
@@ -2114,40 +2126,40 @@ const App = struct {
                     }
                     // Seed input history from the log (replay covers pre-reboot
                     // messages; live blocks cover this session's submits).
-                    self.editor.pushHistory(u.text);
+                    self.view.editor.pushHistory(u.text);
                 }
             },
             .steer => |s| {
-                if (!reconcilePendingEcho(self.blocks.items, .steer, s.text, b.seq, b.turn_id))
+                if (!reconcilePendingEcho(self.view.blocks.items, .steer, s.text, b.seq, b.turn_id))
                     self.pushDurableBlock(b, .steer, s.text, "", .ok);
-                self.editor.pushHistory(s.text);
+                self.view.editor.pushHistory(s.text);
             },
             .assistant_msg => |a| {
                 // Finalized text replaces the streaming delta.
                 self.releaseStreamingBuffers();
                 self.pushDurableBlock(b, .assistant_msg, a.text, "", .ok);
-                if (self.plan_mode and !self.history_loading) self.plan_proposal_ready = true;
+                if (self.view.plan_mode and !self.view.history_loading) self.view.plan_proposal_ready = true;
             },
             .reasoning => |r| {
                 // Raw reasoning streams on reasoning_delta; tool-round
                 // commentary streams on delta. Finalization ends that channel's
                 // current provider round regardless of prior-round residue.
                 if (r.commentary) {
-                    self.delta.clearRetainingCapacity();
-                    self.stream_layout_cache.reset(self.gpa);
+                    self.view.delta.clearRetainingCapacity();
+                    self.view.stream_layout_cache.reset(self.gpa);
                 } else {
-                    self.reasoning_delta.clearRetainingCapacity();
+                    self.view.reasoning_delta.clearRetainingCapacity();
                 }
-                const before = self.blocks.items.len;
+                const before = self.view.blocks.items.len;
                 self.pushDurableBlock(b, .reasoning, r.text, "", .ok);
-                if (self.blocks.items.len > before)
-                    self.blocks.items[self.blocks.items.len - 1].commentary = r.commentary;
+                if (self.view.blocks.items.len > before)
+                    self.view.blocks.items[self.view.blocks.items.len - 1].commentary = r.commentary;
             },
             .tool_call => |tc| {
                 self.pushDurableBlock(b, .tool_call, tc.args_json, tc.name, .ok);
                 // A call with nothing queued ahead of it starts immediately.
                 if (self.currentInflightCall()) |cur| {
-                    if (cur.queued == 0) self.call_started_ms = nowWallMs(self.io);
+                    if (cur.queued == 0) self.view.call_started_ms = nowWallMs(self.io);
                 }
             },
             .tool_result => |tr| {
@@ -2157,7 +2169,7 @@ const App = struct {
                     null;
                 defer if (label) |owned| self.gpa.free(owned);
                 self.pushDurableToolResult(b, tr.inline_body, tr.status, tr.full_body_ref, label orelse "");
-                self.call_started_ms = if (self.currentInflightCall() != null)
+                self.view.call_started_ms = if (self.currentInflightCall() != null)
                     nowWallMs(self.io)
                 else
                     0;
@@ -2170,7 +2182,7 @@ const App = struct {
                 self.setPlan(plan.items);
                 const rendered = allocDurableRenderBlock(self.gpa, b) catch return;
                 if (rendered) |owned| {
-                    self.blocks.append(self.gpa, owned) catch {
+                    self.view.blocks.append(self.gpa, owned) catch {
                         var orphan = owned;
                         orphan.deinit(self.gpa);
                     };
@@ -2184,62 +2196,62 @@ const App = struct {
             .compaction => self.pushDurableBlock(b, .compaction, "context compacted", "", .ok),
         }
         // New content: keep pinned to bottom unless the user scrolled up.
-        if (self.scroll_up > 0) self.scroll_up +|= 0; // stay where they are
+        if (self.view.scroll_up > 0) self.view.scroll_up +|= 0; // stay where they are
     }
 
     fn bufferOlderBlock(self: *App, b: block.Block) void {
-        if (self.history_page_failed) return;
-        if (self.history_backfill.items.len > 0 and
-            self.history_backfill.items[self.history_backfill.items.len - 1].seq >= b.seq) return;
+        if (self.view.history_page_failed) return;
+        if (self.view.history_backfill.items.len > 0 and
+            self.view.history_backfill.items[self.view.history_backfill.items.len - 1].seq >= b.seq) return;
         const rendered = allocDurableRenderBlock(self.gpa, b) catch {
-            self.history_page_failed = true;
+            self.view.history_page_failed = true;
             self.clearHistoryBackfill();
             return;
         } orelse return;
-        self.history_backfill.append(self.gpa, rendered) catch {
+        self.view.history_backfill.append(self.gpa, rendered) catch {
             var owned = rendered;
             owned.deinit(self.gpa);
-            self.history_page_failed = true;
+            self.view.history_page_failed = true;
             self.clearHistoryBackfill();
         };
     }
 
     fn finishOlderHistoryPage(self: *App, oldest_seq: u64, has_older: bool) void {
         defer {
-            self.history_loading = false;
-            self.history_before_seq = 0;
-            self.history_page_failed = false;
+            self.view.history_loading = false;
+            self.view.history_before_seq = 0;
+            self.view.history_page_failed = false;
         }
-        if (self.history_page_failed) {
+        if (self.view.history_page_failed) {
             self.clearHistoryBackfill();
             self.setNotice("could not load older history", .{});
             return;
         }
 
-        const loaded = self.history_backfill.items.len;
-        self.blocks.insertSlice(self.gpa, 0, self.history_backfill.items) catch {
+        const loaded = self.view.history_backfill.items.len;
+        self.view.blocks.insertSlice(self.gpa, 0, self.view.history_backfill.items) catch {
             self.clearHistoryBackfill();
             self.setNotice("could not load older history", .{});
             return;
         };
         // Ownership moved into blocks; retain only the scratch allocation.
-        self.history_backfill.items.len = 0;
-        if (oldest_seq > 0) self.oldest_seq = oldest_seq;
-        self.history_complete = !has_older;
+        self.view.history_backfill.items.len = 0;
+        if (oldest_seq > 0) self.view.oldest_seq = oldest_seq;
+        self.view.history_complete = !has_older;
 
         // History is bounded by Editor; rebuilding restores chronological
         // order now that older user messages were prepended.
-        self.editor.clearHistory();
-        for (self.blocks.items) |rendered| {
-            if (rendered.kind == .user_msg) self.editor.pushHistory(rendered.text);
+        self.view.editor.clearHistory();
+        for (self.view.blocks.items) |rendered| {
+            if (rendered.kind == .user_msg) self.view.editor.pushHistory(rendered.text);
         }
         self.copy_cursor = null;
-        self.sel_anchor = null;
-        self.sel_dragging = false;
-        self.layout_epoch +%= 1;
-        self.layout_cache.reset(self.gpa);
-        self.tail_layout_cache.reset(self.gpa);
-        if (self.scroll_up > 0) self.scroll_up = std.math.maxInt(usize);
+        self.view.sel_anchor = null;
+        self.view.sel_dragging = false;
+        self.view.layout_epoch +%= 1;
+        self.view.layout_cache.reset(self.gpa);
+        self.view.tail_layout_cache.reset(self.gpa);
+        if (self.view.scroll_up > 0) self.view.scroll_up = std.math.maxInt(usize);
         self.setNotice("loaded {d} older blocks", .{loaded});
     }
 
@@ -2262,11 +2274,11 @@ const App = struct {
             // Commands are client actions rather than durable user_msg
             // blocks, but they still belong in the local editor history so
             // Up then Enter can repeat them during this client lifetime.
-            self.editor.pushHistory(trimmed);
+            self.view.editor.pushHistory(trimmed);
             self.runCommand(trimmed);
             return;
         }
-        const was_busy = self.state == .running or self.state == .awaiting_approval;
+        const was_busy = self.view.state == .running or self.view.state == .awaiting_approval;
         if (was_busy and self.attachments.items.len > 0) {
             self.setNotice("images attach to a new turn; interrupt or wait before sending", .{});
             return;
@@ -2284,7 +2296,7 @@ const App = struct {
         self.next_input_request_id +%= 1;
         if (self.next_input_request_id == 0) self.next_input_request_id = 1;
         self.conn.send(.{ .input = .{
-            .sid = self.sid,
+            .sid = self.view.sid,
             .text = trimmed,
             .request_id = request_id,
             .attachments = uploads,
@@ -2303,19 +2315,19 @@ const App = struct {
             // The composer becomes a scrollback card immediately. The turn
             // thread's persisted user_msg will reconcile this local echo.
             self.clearCompletedPlan();
-            self.pushInputEchoLabel(.user_msg, trimmed, attachment_label orelse "", request_id, self.state);
-            self.state = .running;
-            self.spinner_frame = 0;
-            self.turn_started_ms = nowWallMs(self.io);
-            self.turn_phase = .starting;
-            self.phase_started_ms = self.turn_started_ms;
+            self.pushInputEchoLabel(.user_msg, trimmed, attachment_label orelse "", request_id, self.view.state);
+            self.view.state = .running;
+            self.view.spinner_frame = 0;
+            self.view.turn_started_ms = nowWallMs(self.io);
+            self.view.turn_phase = .starting;
+            self.view.phase_started_ms = self.view.turn_started_ms;
             self.syncAnimationTicker();
         }
-        self.scroll_up = 0;
+        self.view.scroll_up = 0;
     }
 
     fn needsAnimationTick(self: *const App) bool {
-        return self.state == .running or
+        return self.view.state == .running or
             self.top_view != null or
             self.voice_rt.download != null or
             self.voice_rt.phase != .idle or
@@ -2611,11 +2623,11 @@ const App = struct {
         } else if (std.mem.eql(u8, head, "/plan")) {
             const arg = std.mem.trim(u8, it.rest(), " \t");
             if (std.mem.eql(u8, arg, "clear")) {
-                if (self.state == .running or self.state == .awaiting_approval) {
+                if (self.view.state == .running or self.view.state == .awaiting_approval) {
                     self.setNotice("cannot clear a plan mid-turn", .{});
                     return;
                 }
-                self.conn.send(.{ .plan_clear = .{ .sid = self.sid } }) catch {
+                self.conn.send(.{ .plan_clear = .{ .sid = self.view.sid } }) catch {
                     self.setNotice("could not clear plan", .{});
                 };
             } else if (std.mem.eql(u8, arg, "off")) {
@@ -2642,7 +2654,7 @@ const App = struct {
                     self.setNotice("unknown council '{s}' — /council lists them", .{name});
                 return;
             };
-            if (proto.isGuestModel(self.model.items)) {
+            if (proto.isGuestModel(self.view.model.items)) {
                 self.setNotice("councils need a native session (guest sessions have no marlin tools)", .{});
                 return;
             }
@@ -2701,7 +2713,7 @@ const App = struct {
                 self.setNotice("usage: /rename <title>", .{});
                 return;
             }
-            self.conn.send(.{ .session_rename = .{ .sid = self.sid, .title = title } }) catch {
+            self.conn.send(.{ .session_rename = .{ .sid = self.view.sid, .title = title } }) catch {
                 self.setNotice("could not rename session", .{});
                 return;
             };
@@ -2741,32 +2753,32 @@ const App = struct {
                     return;
                 }
             }
-            if (self.state == .awaiting_approval and !force and rebuild != .client) {
+            if (self.view.state == .awaiting_approval and !force and rebuild != .client) {
                 self.setNotice("approval pending — answer it, interrupt, or /reboot --force", .{});
                 return;
             }
-            if (self.state == .running and rebuild != .client) {
+            if (self.view.state == .running and rebuild != .client) {
                 self.setNotice("turn running — /reboot waits for it (interrupt first if you want force)", .{});
             }
             self.reboot_request = .{ .requested = true, .rebuild = rebuild, .force = force };
             self.should_quit = true;
         } else if (std.mem.eql(u8, head, "/compact")) {
-            if (proto.isGuestModel(self.model.items)) {
+            if (proto.isGuestModel(self.view.model.items)) {
                 self.setNotice("guest agents manage their own context — /compact is native-only", .{});
                 return;
             }
-            if (self.state == .running or self.state == .awaiting_approval) {
+            if (self.view.state == .running or self.view.state == .awaiting_approval) {
                 self.setNotice("cannot compact mid-turn", .{});
                 return;
             }
-            self.conn.send(.{ .session_compact = .{ .sid = self.sid } }) catch return;
+            self.conn.send(.{ .session_compact = .{ .sid = self.view.sid } }) catch return;
             self.setNotice("compacting…", .{});
         } else if (std.mem.eql(u8, head, "/diagnostics")) {
             if (it.next() != null) {
                 self.setNotice("usage: /diagnostics", .{});
                 return;
             }
-            self.conn.send(.{ .diagnostics = .{ .sid = self.sid } }) catch {
+            self.conn.send(.{ .diagnostics = .{ .sid = self.view.sid } }) catch {
                 self.setNotice("could not request diagnostics", .{});
             };
         } else if (std.mem.eql(u8, head, "/animate")) {
@@ -3334,8 +3346,8 @@ const App = struct {
                     self.setNotice("voice: heard nothing", .{});
                     return;
                 }
-                if (!self.editor.isEmpty()) self.editor.insertSlice(" ");
-                self.editor.insertSlice(text);
+                if (!self.view.editor.isEmpty()) self.view.editor.insertSlice(" ");
+                self.view.editor.insertSlice(text);
                 self.mode = .insert;
                 self.setNotice("voice: {d} chars — review, then enter", .{text.len});
             },
@@ -3384,19 +3396,19 @@ const App = struct {
     /// call order within a turn, so the k-th result pairs with the turn's
     /// k-th call (the same positional invariant scanToolBatch folds by).
     fn toolResultSource(self: *const App, idx: usize) ToolResultSource {
-        const turn_id = self.blocks.items[idx].turn_id;
+        const turn_id = self.view.blocks.items[idx].turn_id;
         var start = idx;
-        while (start > 0 and self.blocks.items[start - 1].turn_id == turn_id) start -= 1;
+        while (start > 0 and self.view.blocks.items[start - 1].turn_id == turn_id) start -= 1;
         var result_ord: usize = 0;
-        for (self.blocks.items[start..idx]) |rb| {
+        for (self.view.blocks.items[start..idx]) |rb| {
             if (rb.kind == .tool_result) result_ord += 1;
         }
         var seen: usize = 0;
-        for (self.blocks.items[start..]) |rb| {
+        for (self.view.blocks.items[start..]) |rb| {
             if (rb.kind != .tool_call) continue;
             if (seen == result_ord) return .{
                 .name = toolDisplayName(rb.label),
-                .arg = toolDisplayArg(rb.label, rb.text, self.cwd.items),
+                .arg = toolDisplayArg(rb.label, rb.text, self.view.cwd.items),
             };
             seen += 1;
         }
@@ -3416,10 +3428,10 @@ const App = struct {
     }
 
     fn copyLastToolOutput(self: *App) void {
-        var i = self.blocks.items.len;
+        var i = self.view.blocks.items.len;
         while (i > 0) {
             i -= 1;
-            const rendered = self.blocks.items[i];
+            const rendered = self.view.blocks.items[i];
             if (rendered.kind != .tool_result) continue;
             // The result may be folded out of view ("Ran N commands"), so
             // name its source; a silent copy of invisible bytes reads as
@@ -3482,7 +3494,7 @@ const App = struct {
     /// Repeat a forward range motion `n` times from the cursor by walking a
     /// scratch cursor; the editor is restored before returning.
     fn repeatForwardRange(self: *App, comptime range_fn: fn (*const Editor) Editor.Range, n: usize) Editor.Range {
-        const ed = &self.editor;
+        const ed = &self.view.editor;
         const saved = ed.cursor;
         var end = saved;
         var i: usize = 0;
@@ -3497,7 +3509,7 @@ const App = struct {
     }
 
     fn repeatBackwardRange(self: *App, comptime range_fn: fn (*const Editor) Editor.Range, n: usize) Editor.Range {
-        const ed = &self.editor;
+        const ed = &self.view.editor;
         const saved = ed.cursor;
         var start = saved;
         var i: usize = 0;
@@ -3514,7 +3526,7 @@ const App = struct {
     /// Resolve a completed f/t/F/T: either move the cursor or feed the
     /// pending operator (df" / ct)). Inclusive for f, exclusive for t.
     fn resolveFind(self: *App, kind: u8, ch: u8, count: usize) void {
-        const ed = &self.editor;
+        const ed = &self.view.editor;
         const forward = kind == 'f' or kind == 't';
         const target = ed.findOnLine(ch, forward, count) orelse {
             self.pending_op = 0;
@@ -3546,19 +3558,19 @@ const App = struct {
 
     fn applyOperator(self: *App, op: u8, range: Editor.Range) void {
         if (range.end <= range.start) return;
-        const slice = self.editor.text.items[range.start..range.end];
+        const slice = self.view.editor.text.items[range.start..range.end];
         self.yank_register.clearRetainingCapacity();
         self.yank_register.appendSlice(self.gpa, slice) catch {};
         self.yank_linewise = slice.len > 0 and slice[slice.len - 1] == '\n';
         switch (op) {
-            'y' => self.editor.cursor = range.start,
+            'y' => self.view.editor.cursor = range.start,
             'd' => {
-                self.editor.pushUndo();
-                self.editor.deleteRange(range.start, range.end);
+                self.view.editor.pushUndo();
+                self.view.editor.deleteRange(range.start, range.end);
             },
             'c' => {
-                self.editor.pushUndo();
-                self.editor.deleteRange(range.start, range.end);
+                self.view.editor.pushUndo();
+                self.view.editor.deleteRange(range.start, range.end);
                 self.mode = .insert;
             },
             else => {},
@@ -3570,7 +3582,7 @@ const App = struct {
     /// cancels, vim-style.
     fn operatorKey(self: *App, key: vaxis.Key) void {
         const op = self.pending_op;
-        const ed = &self.editor;
+        const ed = &self.view.editor;
         if (self.pending_obj != 0) {
             const around = self.pending_obj == 'a';
             self.pending_op = 0;
@@ -3663,29 +3675,29 @@ const App = struct {
     /// contiguous body below them; the original prompt remains selectable
     /// through ordinary scrollback.
     fn visibleLineAtRow(self: *const App, row: usize) ?usize {
-        if (row >= self.last_view_h) return null;
-        if (self.last_pinned_rows == 0 and self.last_body_rows == 0) {
-            const line = self.last_first_visible + row;
-            return if (line < self.last_total_lines) line else null;
+        if (row >= self.view.last_view_h) return null;
+        if (self.view.last_pinned_rows == 0 and self.view.last_body_rows == 0) {
+            const line = self.view.last_first_visible + row;
+            return if (line < self.view.last_total_lines) line else null;
         }
-        if (row < self.last_pinned_rows) return null;
-        const body_row = row - self.last_pinned_rows;
-        if (body_row < self.last_body_rows)
-            return self.last_body_first + body_row;
+        if (row < self.view.last_pinned_rows) return null;
+        const body_row = row - self.view.last_pinned_rows;
+        if (body_row < self.view.last_body_rows)
+            return self.view.last_body_first + body_row;
         return null;
     }
 
     fn lineVisible(self: *const App, line: usize) bool {
-        if (self.last_pinned_rows == 0 and self.last_body_rows == 0)
-            return line < self.last_total_lines and
-                line >= self.last_first_visible and line < self.last_first_visible + self.last_view_h;
-        return line >= self.last_body_first and line < self.last_body_first + self.last_body_rows;
+        if (self.view.last_pinned_rows == 0 and self.view.last_body_rows == 0)
+            return line < self.view.last_total_lines and
+                line >= self.view.last_first_visible and line < self.view.last_first_visible + self.view.last_view_h;
+        return line >= self.view.last_body_first and line < self.view.last_body_first + self.view.last_body_rows;
     }
 
     /// Enter transcript copy mode with the cursor on the bottom visible line.
     fn enterCopyMode(self: *App) void {
-        if (self.last_total_lines == 0) return;
-        var row = self.last_view_h;
+        if (self.view.last_total_lines == 0) return;
+        var row = self.view.last_view_h;
         while (row > 0) {
             row -= 1;
             if (self.visibleLineAtRow(row)) |line| {
@@ -3702,62 +3714,62 @@ const App = struct {
     fn followCopyCursor(self: *App) void {
         const cursor = self.copy_cursor orelse return;
         if (self.lineVisible(cursor.line)) return;
-        const total = self.last_total_lines;
-        const view = @max(self.last_view_h, 1);
+        const total = self.view.last_total_lines;
+        const view = @max(self.view.last_view_h, 1);
         if (total <= view) {
-            self.scroll_up = 0;
+            self.view.scroll_up = 0;
             return;
         }
         const max_scroll = total - view;
-        var first = total - view - @min(self.scroll_up, max_scroll);
+        var first = total - view - @min(self.view.scroll_up, max_scroll);
         if (cursor.line < first) first = cursor.line;
         if (cursor.line >= first + view) first = cursor.line + 1 - view;
-        self.scroll_up = max_scroll - @min(first, max_scroll);
+        self.view.scroll_up = max_scroll - @min(first, max_scroll);
     }
 
     /// Clamp the cursor into the (possibly non-contiguous) visible view.
     fn clampCopyCursorToView(self: *App) void {
         var cursor = self.copy_cursor orelse return;
         if (self.lineVisible(cursor.line)) return;
-        if (self.last_view_h == 0) return;
+        if (self.view.last_view_h == 0) return;
         const first = self.visibleLineAtRow(0) orelse return;
-        const last = self.visibleLineAtRow(self.last_view_h - 1) orelse first;
+        const last = self.visibleLineAtRow(self.view.last_view_h - 1) orelse first;
         cursor.line = if (cursor.line < first) first else last;
         self.copy_cursor = cursor;
-        if (self.sel_anchor != null) self.updateCopySelection(cursor);
+        if (self.view.sel_anchor != null) self.updateCopySelection(cursor);
     }
 
     fn updateCopySelection(self: *App, cursor: SelectionPoint) void {
-        const a = self.sel_anchor orelse return;
+        const a = self.view.sel_anchor orelse return;
         if (self.copy_linewise) {
             const lo = @min(a.line, cursor.line);
             const hi = @max(a.line, cursor.line);
-            self.sel_anchor = .{ .line = lo, .col = 0 };
-            self.sel_head = .{ .line = hi, .col = std.math.maxInt(usize) };
+            self.view.sel_anchor = .{ .line = lo, .col = 0 };
+            self.view.sel_head = .{ .line = hi, .col = std.math.maxInt(usize) };
         } else {
-            self.sel_head = cursor;
+            self.view.sel_head = cursor;
         }
     }
 
     fn yankSelection(self: *App, cursor: SelectionPoint) void {
-        if (self.sel_anchor == null) {
+        if (self.view.sel_anchor == null) {
             // Bare y yanks the whole cursor line, vim's yy in spirit.
             self.copy_linewise = true;
-            self.sel_anchor = cursor;
+            self.view.sel_anchor = cursor;
         }
         self.updateCopySelection(cursor);
-        if (!self.copy_linewise) self.sel_head = cursor;
-        self.copy_pending = true;
-        self.sel_clear_after_copy = true;
+        if (!self.copy_linewise) self.view.sel_head = cursor;
+        self.view.copy_pending = true;
+        self.view.sel_clear_after_copy = true;
         self.copy_cursor = null; // yank ends copy mode
     }
 
     fn copyModeKey(self: *App, key: vaxis.Key) void {
         var cursor = self.copy_cursor orelse return;
-        const total = if (self.last_total_lines > 0) self.last_total_lines else 1;
+        const total = if (self.view.last_total_lines > 0) self.view.last_total_lines else 1;
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
-            if (self.sel_anchor != null) {
-                self.sel_anchor = null;
+            if (self.view.sel_anchor != null) {
+                self.view.sel_anchor = null;
             } else {
                 self.copy_cursor = null;
             }
@@ -3767,12 +3779,12 @@ const App = struct {
             return;
         } else if (key.matches('v', .{})) {
             self.copy_linewise = false;
-            self.sel_anchor = cursor;
-            self.sel_head = cursor;
+            self.view.sel_anchor = cursor;
+            self.view.sel_head = cursor;
             return;
         } else if (key.matches('V', .{ .shift = true }) or key.matches('V', .{})) {
             self.copy_linewise = true;
-            self.sel_anchor = cursor;
+            self.view.sel_anchor = cursor;
             self.updateCopySelection(cursor);
             return;
         } else if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
@@ -3805,24 +3817,24 @@ const App = struct {
         } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
             cursor.line -|= 20;
         } else if (key.matches(vaxis.Key.down, .{})) {
-            self.scroll_up -|= 1;
+            self.view.scroll_up -|= 1;
             self.clampCopyCursorToView();
             return;
         } else if (key.matches(vaxis.Key.up, .{})) {
-            self.scroll_up +|= 1;
+            self.view.scroll_up +|= 1;
             self.clampCopyCursorToView();
             self.maybeRequestHistoryAtTop();
             return;
         } else return;
         self.copy_cursor = cursor;
-        if (self.sel_anchor != null) self.updateCopySelection(cursor);
+        if (self.view.sel_anchor != null) self.updateCopySelection(cursor);
         self.followCopyCursor();
         self.maybeRequestHistoryAtTop();
     }
 
     fn selection(self: *const App) ?Selection {
-        const a = self.sel_anchor orelse return null;
-        return Selection.init(a, self.sel_head);
+        const a = self.view.sel_anchor orelse return null;
+        return Selection.init(a, self.view.sel_head);
     }
 
     fn openPicker(self: *App, kind: PickerKind) void {
@@ -3833,7 +3845,7 @@ const App = struct {
         const current = self.pickerCurrent();
         for (self.pickerSource(), 0..) |item, i| {
             const selected = if (kind == .session)
-                (self.sessionIdForLabel(item) orelse 0) == self.sid
+                (self.sessionIdForLabel(item) orelse 0) == self.view.sid
             else
                 std.mem.eql(u8, item, current);
             if (selected) {
@@ -3845,7 +3857,7 @@ const App = struct {
 
     fn openTop(self: *App) void {
         self.notice.clearRetainingCapacity();
-        self.top_view = .{ .selected_sid = self.sid };
+        self.top_view = .{ .selected_sid = self.view.sid };
         self.syncAnimationTicker();
     }
 
@@ -3941,7 +3953,7 @@ const App = struct {
                 return;
             }
         }
-        if (sid == self.sid) {
+        if (sid == self.view.sid) {
             self.closeTop();
             self.archiveCurrentSession();
             return;
@@ -3956,7 +3968,7 @@ const App = struct {
 
     fn killTopSession(self: *App, sid: u64) void {
         var fallback: ?u64 = null;
-        if (sid == self.sid) {
+        if (sid == self.view.sid) {
             if (self.sessionSummary(sid)) |current| {
                 if (current.parent_sid) |parent_sid| {
                     if (self.sessionSummary(parent_sid) != null) fallback = parent_sid;
@@ -3975,7 +3987,7 @@ const App = struct {
             self.setNotice("could not kill session", .{});
             return;
         };
-        if (sid == self.sid) {
+        if (sid == self.view.sid) {
             self.closeTop();
             if (fallback) |fallback_sid| {
                 self.switchSession(fallback_sid, true) catch self.setNotice("session killed, but could not switch sessions", .{});
@@ -3989,7 +4001,7 @@ const App = struct {
     }
 
     fn clearSetupDraft(self: *App) void {
-        if (self.setup_prompt != .none) self.editor.clearSensitive();
+        if (self.setup_prompt != .none) self.view.editor.clearSensitive();
         self.setup_prompt = .none;
         self.setup_provider = null;
         self.setup_provider_name.clearRetainingCapacity();
@@ -4074,7 +4086,7 @@ const App = struct {
         self.picker_filter.clearRetainingCapacity();
         self.setup_prompt = prompt;
         self.mode = .insert;
-        self.editor.replaceText(initial);
+        self.view.editor.replaceText(initial);
         self.setNotice("{s}", .{notice});
     }
 
@@ -4236,7 +4248,7 @@ const App = struct {
         if (self.setup_apply_pending) return;
         const configured_provider = self.setup_provider_name.items;
         self.conn.sendSensitive(.{ .setup_apply = .{
-            .sid = self.sid,
+            .sid = self.view.sid,
             .model = model,
             .provider_name = configured_provider,
             .base_url = self.setup_base_url.items,
@@ -4249,7 +4261,7 @@ const App = struct {
         };
         if (self.setup_credential.items.len > 0) @memset(self.setup_credential.items, 0);
         self.setup_credential.clearRetainingCapacity();
-        self.editor.clearSensitive();
+        self.view.editor.clearSensitive();
         self.setup_prompt = .none;
         self.picker = null;
         self.setup_apply_pending = true;
@@ -4264,7 +4276,7 @@ const App = struct {
         if (result.session_updated) {
             self.setModelStr(result.model);
             self.setNotice("ready · {s} · /setup changes provider later", .{result.model});
-        } else if (!std.mem.eql(u8, self.model.items, result.model)) {
+        } else if (!std.mem.eql(u8, self.view.model.items, result.model)) {
             self.applyModel(result.model);
         } else {
             self.setNotice("provider setup saved · {s}", .{result.model});
@@ -4278,14 +4290,14 @@ const App = struct {
             return;
         }
         self.history_search_draft.clearRetainingCapacity();
-        self.history_search_draft.appendSlice(self.gpa, self.editor.text.items) catch return;
-        self.history_search_draft_cursor = self.editor.cursor;
+        self.history_search_draft.appendSlice(self.gpa, self.view.editor.text.items) catch return;
+        self.history_search_draft_cursor = self.view.editor.cursor;
         self.history_search_query.clearRetainingCapacity();
         self.history_search_match = null;
         self.history_search_active = true;
         self.refreshHistorySearch(true);
         self.conn.send(.{ .input_history = .{
-            .sid = self.sid,
+            .sid = self.view.sid,
             .limit = Editor.max_history_entries,
         } }) catch {
             // The already-seeded current-session history remains useful when
@@ -4298,21 +4310,21 @@ const App = struct {
         if (!self.history_search_active) return;
         const previous = self.history_search_match;
         var index = if (from_newest)
-            self.editor.history.items.len
+            self.view.editor.history.items.len
         else
-            (self.history_search_match orelse self.editor.history.items.len);
+            (self.history_search_match orelse self.view.editor.history.items.len);
         while (index > 0) {
             index -= 1;
-            const candidate = self.editor.history.items[index];
+            const candidate = self.view.editor.history.items[index];
             if (fuzzyHistoryScore(candidate, self.history_search_query.items) == null) continue;
             self.history_search_match = index;
-            self.editor.replaceText(candidate);
+            self.view.editor.replaceText(candidate);
             return;
         }
         if (!from_newest and previous != null) return;
         self.history_search_match = null;
-        self.editor.replaceText(self.history_search_draft.items);
-        self.editor.cursor = @min(self.history_search_draft_cursor, self.editor.text.items.len);
+        self.view.editor.replaceText(self.history_search_draft.items);
+        self.view.editor.cursor = @min(self.history_search_draft_cursor, self.view.editor.text.items.len);
     }
 
     fn cycleHistorySearch(self: *App) void {
@@ -4321,8 +4333,8 @@ const App = struct {
 
     fn cancelHistorySearch(self: *App) void {
         if (!self.history_search_active) return;
-        self.editor.replaceText(self.history_search_draft.items);
-        self.editor.cursor = @min(self.history_search_draft_cursor, self.editor.text.items.len);
+        self.view.editor.replaceText(self.history_search_draft.items);
+        self.view.editor.cursor = @min(self.history_search_draft_cursor, self.view.editor.text.items.len);
         self.finishHistorySearch();
     }
 
@@ -4507,18 +4519,18 @@ const App = struct {
     }
 
     fn applyModel(self: *App, m: []const u8) void {
-        if (self.state == .running or self.state == .awaiting_approval) {
+        if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot switch model mid-turn", .{});
             return;
         }
-        const current_guest = proto.guestBackend(self.model.items);
+        const current_guest = proto.guestBackend(self.view.model.items);
         const requested_guest = proto.guestBackend(m);
         if (current_guest != null and requested_guest != null and current_guest.? != requested_guest.?) {
             self.setNotice("switch through a native model first so Marlin can hand over between guest agents", .{});
             return;
         }
-        self.conn.send(.{ .session_set_model = .{ .sid = self.sid, .model = m } }) catch return;
-        if (!proto.isGuestModel(self.model.items) and proto.isGuestModel(m)) {
+        self.conn.send(.{ .session_set_model = .{ .sid = self.view.sid, .model = m } }) catch return;
+        if (!proto.isGuestModel(self.view.model.items) and proto.isGuestModel(m)) {
             const guest_name = if (std.mem.startsWith(u8, m, "claudecode/")) m["claudecode/".len..] else m;
             self.setNotice("switching to {s} — generating handover summary…", .{guest_name});
         } else {
@@ -4528,12 +4540,12 @@ const App = struct {
     }
 
     fn applyEffort(self: *App, selected: proto.ReasoningEffort) void {
-        if (self.state == .running or self.state == .awaiting_approval) {
+        if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot switch effort mid-turn", .{});
             return;
         }
-        self.conn.send(.{ .session_set_effort = .{ .sid = self.sid, .effort = selected } }) catch return;
-        self.effort = selected;
+        self.conn.send(.{ .session_set_effort = .{ .sid = self.view.sid, .effort = selected } }) catch return;
+        self.view.effort = selected;
         self.setNotice("effort → {s}", .{@tagName(selected)});
     }
 
@@ -4541,21 +4553,21 @@ const App = struct {
     /// snapshot. Before a snapshot arrives, assume the daemon default (the
     /// snapshot follows within the same connect exchange).
     fn currentSandboxed(self: *const App) bool {
-        if (self.sessionSummary(self.sid)) |summary| return summary.sandboxed;
+        if (self.sessionSummary(self.view.sid)) |summary| return summary.sandboxed;
         return self.conn.sandbox_available;
     }
 
     fn setPlanMode(self: *App, enabled: bool) bool {
-        if (self.state == .running or self.state == .awaiting_approval) {
+        if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot change Plan mode mid-turn", .{});
             return false;
         }
-        self.conn.send(.{ .session_set_plan_mode = .{ .sid = self.sid, .enabled = enabled } }) catch {
+        self.conn.send(.{ .session_set_plan_mode = .{ .sid = self.view.sid, .enabled = enabled } }) catch {
             self.setNotice("could not change Plan mode", .{});
             return false;
         };
-        self.plan_mode = enabled;
-        self.plan_proposal_ready = false;
+        self.view.plan_mode = enabled;
+        self.view.plan_proposal_ready = false;
         if (enabled)
             self.setNotice("Plan mode on · read-only investigation · Shift+Tab exits", .{})
         else
@@ -4564,16 +4576,16 @@ const App = struct {
     }
 
     fn togglePlanMode(self: *App) void {
-        _ = self.setPlanMode(!self.plan_mode);
+        _ = self.setPlanMode(!self.view.plan_mode);
     }
 
     fn acceptPlanProposal(self: *App) void {
-        if (!self.plan_mode or !self.plan_proposal_ready or self.state != .idle) return;
-        self.conn.send(.{ .plan_accept = .{ .sid = self.sid } }) catch {
+        if (!self.view.plan_mode or !self.view.plan_proposal_ready or self.view.state != .idle) return;
+        self.conn.send(.{ .plan_accept = .{ .sid = self.view.sid } }) catch {
             self.setNotice("could not start implementation", .{});
             return;
         };
-        self.plan_proposal_ready = false;
+        self.view.plan_proposal_ready = false;
         self.setNotice("plan accepted · starting implementation…", .{});
     }
 
@@ -4587,14 +4599,14 @@ const App = struct {
         else if (std.mem.eql(u8, arg, "default"))
             false
         else if (arg.len == 0)
-            !self.permissions_full
+            !self.view.permissions_full
         else {
             self.setNotice("usage: /permissions [full|default]", .{});
             return;
         };
         const mode: []const u8 = if (full) "auto" else "default";
-        self.conn.send(.{ .session_set_approvals = .{ .sid = self.sid, .approvals = mode } }) catch return;
-        self.permissions_full = full;
+        self.conn.send(.{ .session_set_approvals = .{ .sid = self.view.sid, .approvals = mode } }) catch return;
+        self.view.permissions_full = full;
         if (full) {
             self.setNotice("permissions: FULL ACCESS — nothing will ask for approval", .{});
         } else {
@@ -4603,11 +4615,11 @@ const App = struct {
     }
 
     fn toggleSandbox(self: *App, arg: []const u8) void {
-        if (proto.isGuestModel(self.model.items)) {
+        if (proto.isGuestModel(self.view.model.items)) {
             self.setNotice("sandbox is Marlin's; guest agents use their own permissions", .{});
             return;
         }
-        if (self.state == .running or self.state == .awaiting_approval) {
+        if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot toggle sandbox mid-turn", .{});
             return;
         }
@@ -4625,7 +4637,7 @@ const App = struct {
             self.setNotice("sandbox unavailable on this platform — per-call approvals retained", .{});
             return;
         }
-        self.conn.send(.{ .session_set_sandbox = .{ .sid = self.sid, .enabled = target } }) catch return;
+        self.conn.send(.{ .session_set_sandbox = .{ .sid = self.view.sid, .enabled = target } }) catch return;
         if (target) {
             self.setNotice("sandbox on — workspace shell runs without prompts", .{});
         } else {
@@ -4634,7 +4646,7 @@ const App = struct {
     }
 
     fn currentNetworkFiltering(self: *const App) bool {
-        if (self.sessionSummary(self.sid)) |summary| return summary.network_filtering;
+        if (self.sessionSummary(self.view.sid)) |summary| return summary.network_filtering;
         return self.conn.network_filtering;
     }
 
@@ -4659,7 +4671,7 @@ const App = struct {
                     self.setNotice("could not start OTLP setup", .{});
                     return;
                 };
-                self.editor.clear();
+                self.view.editor.clear();
                 self.otel_header_prompt = true;
                 self.mode = .insert;
                 self.setNotice("enter OTLP headers: name=value[,name=value] · Enter applies · Esc cancels", .{});
@@ -4682,14 +4694,14 @@ const App = struct {
     }
 
     fn cancelOtelSetup(self: *App) void {
-        self.editor.clearSensitive();
+        self.view.editor.clearSensitive();
         self.otel_endpoint.clearRetainingCapacity();
         self.otel_header_prompt = false;
         self.setNotice("OTLP setup cancelled", .{});
     }
 
     fn networkCommand(self: *App, arg: []const u8) void {
-        if (proto.isGuestModel(self.model.items)) {
+        if (proto.isGuestModel(self.view.model.items)) {
             self.setNotice("dnsblock is Marlin's; guest-agent networking is not filtered here", .{});
             return;
         }
@@ -4710,7 +4722,7 @@ const App = struct {
             });
             return;
         }
-        if (self.state == .running or self.state == .awaiting_approval) {
+        if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot toggle network filtering mid-turn", .{});
             return;
         }
@@ -4730,7 +4742,7 @@ const App = struct {
             }
             return;
         }
-        self.conn.send(.{ .session_set_network_filtering = .{ .sid = self.sid, .enabled = target } }) catch return;
+        self.conn.send(.{ .session_set_network_filtering = .{ .sid = self.view.sid, .enabled = target } }) catch return;
         self.setNotice("network filter {s} for this session", .{if (target) @as([]const u8, "on") else "off"});
     }
 
@@ -4870,7 +4882,7 @@ const App = struct {
                 return;
             }
         }
-        if (sid == self.sid) {
+        if (sid == self.view.sid) {
             self.picker = null;
             self.picker_filter.clearRetainingCapacity();
             self.archiveCurrentSession();
@@ -4886,8 +4898,8 @@ const App = struct {
 
     fn pickerCurrent(self: *const App) []const u8 {
         return switch (self.picker_kind) {
-            .model => self.model.items,
-            .effort => @tagName(self.effort),
+            .model => self.view.model.items,
+            .effort => @tagName(self.view.effort),
             .session, .search_prompt, .search, .council, .council_list, .voice_engine, .voice_mode, .setup_provider => "",
         };
     }
@@ -4909,8 +4921,8 @@ const App = struct {
         if (self.next_input_request_id == 0) self.next_input_request_id = 1;
         try self.conn.send(.{ .session_create = .{
             .cwd = cwd_buf[0..cwd_len],
-            .model = self.model.items,
-            .effort = self.effort,
+            .model = self.view.model.items,
+            .effort = self.view.effort,
             .request_id = request_id,
         } });
         self.pending_new_cwd.clearRetainingCapacity();
@@ -4934,12 +4946,12 @@ const App = struct {
     }
 
     fn archiveCurrentSession(self: *App) void {
-        if (self.state == .running or self.state == .awaiting_approval) {
+        if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot archive a running session — interrupt it first", .{});
             return;
         }
 
-        const archived_sid = self.sid;
+        const archived_sid = self.view.sid;
         var fallback: ?u64 = null;
         if (self.sessionSummary(archived_sid)) |current| {
             if (current.parent_sid) |parent_sid| {
@@ -4983,7 +4995,7 @@ const App = struct {
         var archived: usize = 0;
         var skipped_active: usize = 0;
         for (self.sessions.items) |session| {
-            if (session.parent_sid != self.sid) continue;
+            if (session.parent_sid != self.view.sid) continue;
             if (session.state == .running or session.state == .awaiting_approval) {
                 skipped_active += 1;
                 continue;
@@ -5006,16 +5018,16 @@ const App = struct {
         self.awaiting_new_session = false;
         self.pending_new_session_request_id = 0;
         self.rememberSession(sid);
-        const model = self.gpa.dupe(u8, self.model.items) catch return;
+        const model = self.gpa.dupe(u8, self.view.model.items) catch return;
         defer self.gpa.free(model);
-        const effort = self.effort;
+        const effort = self.view.effort;
         self.switchSession(sid, true) catch {
             self.setNotice("could not switch to new session", .{});
             return;
         };
-        if (self.model.items.len == 0) self.setModelStr(model);
-        self.effort = effort;
-        if (self.cwd.items.len == 0) self.setCwdStr(self.pending_new_cwd.items);
+        if (self.view.model.items.len == 0) self.setModelStr(model);
+        self.view.effort = effort;
+        if (self.view.cwd.items.len == 0) self.setCwdStr(self.pending_new_cwd.items);
         self.pending_new_cwd.clearRetainingCapacity();
         self.shortcut_help = false;
         var handle_buf: session_handle.Full = undefined;
@@ -5023,17 +5035,17 @@ const App = struct {
     }
 
     fn approveReply(self: *App, granted: bool) void {
-        const p = self.pending orelse return;
+        const p = self.view.pending orelse return;
         self.conn.send(.{ .approve = .{
-            .sid = self.sid,
+            .sid = self.view.sid,
             .approval_id = p.id(),
             .decision = if (granted) .granted else .denied,
         } }) catch return;
-        self.pending = null;
+        self.view.pending = null;
     }
 
     fn interrupt(self: *App) void {
-        self.conn.send(.{ .interrupt = .{ .sid = self.sid, .report = true } }) catch {
+        self.conn.send(.{ .interrupt = .{ .sid = self.view.sid, .report = true } }) catch {
             self.setNotice("could not send interrupt", .{});
             return;
         };
@@ -5041,35 +5053,35 @@ const App = struct {
     }
 
     fn clearView(self: *App) void {
-        self.scroll_up = 0;
-        self.sel_anchor = null;
-        self.sel_dragging = false;
-        self.copy_pending = false;
-        self.sel_clear_after_copy = false;
+        self.view.scroll_up = 0;
+        self.view.sel_anchor = null;
+        self.view.sel_dragging = false;
+        self.view.copy_pending = false;
+        self.view.sel_clear_after_copy = false;
         self.notice.clearRetainingCapacity();
         self.refresh_requested = true;
     }
 
     fn requestOlderHistory(self: *App) void {
-        if (self.history_complete or self.history_loading) return;
-        if (self.oldest_seq <= 1) {
-            self.history_complete = true;
+        if (self.view.history_complete or self.view.history_loading) return;
+        if (self.view.oldest_seq <= 1) {
+            self.view.history_complete = true;
             return;
         }
         self.copy_cursor = null;
-        self.sel_anchor = null;
-        self.sel_dragging = false;
+        self.view.sel_anchor = null;
+        self.view.sel_dragging = false;
         self.clearHistoryBackfill();
-        self.history_loading = true;
-        self.history_before_seq = self.oldest_seq;
-        self.history_page_failed = false;
+        self.view.history_loading = true;
+        self.view.history_before_seq = self.view.oldest_seq;
+        self.view.history_page_failed = false;
         self.conn.send(.{ .sub = .{
-            .sid = self.sid,
+            .sid = self.view.sid,
             .tail_limit = initial_replay_blocks,
-            .before_seq = self.history_before_seq,
+            .before_seq = self.view.history_before_seq,
         } }) catch {
-            self.history_loading = false;
-            self.history_before_seq = 0;
+            self.view.history_loading = false;
+            self.view.history_before_seq = 0;
             self.setNotice("could not load older history", .{});
             return;
         };
@@ -5077,9 +5089,9 @@ const App = struct {
     }
 
     fn maybeRequestHistoryAtTop(self: *App) void {
-        if (self.history_complete or self.history_loading) return;
-        const max_scroll = self.last_total_lines -| self.last_view_h;
-        if (self.scroll_up >= max_scroll) self.requestOlderHistory();
+        if (self.view.history_complete or self.view.history_loading) return;
+        const max_scroll = self.view.last_total_lines -| self.view.last_view_h;
+        if (self.view.scroll_up >= max_scroll) self.requestOlderHistory();
     }
 };
 
@@ -5159,7 +5171,7 @@ fn commandQuery(editor: *const Editor) ?[]const u8 {
 }
 
 fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const CommandSuggestion {
-    const query = commandQuery(&app.editor) orelse return &.{};
+    const query = commandQuery(&app.view.editor) orelse return &.{};
     var out: std.ArrayList(CommandSuggestion) = .empty;
     if (query.len > "/council".len and
         std.mem.eql(u8, query[0.."/council".len], "/council") and
@@ -5348,29 +5360,29 @@ fn completeSuggestion(editor: *Editor, suggestion: CommandSuggestion, tab: bool)
 fn transcriptView(app: *App) Transcript {
     return .{
         .io = app.io,
-        .blocks = app.blocks.items,
-        .show_tool_transcript = app.show_tool_transcript,
-        .state = app.state,
-        .layout_epoch = app.layout_epoch,
-        .delta = app.delta.items,
-        .reasoning_delta = app.reasoning_delta.items,
-        .spinner_frame = app.spinner_frame,
-        .turn_started_ms = app.turn_started_ms,
-        .turn_phase = app.turn_phase,
-        .phase_started_ms = app.phase_started_ms,
-        .call_started_ms = app.call_started_ms,
-        .stream_bytes = app.stream_bytes,
-        .stream_quiet_ms = app.stream_quiet_ms,
-        .stream_status_at_ms = app.stream_status_at_ms,
-        .show_working_ticker = !hasUnfinishedPlan(app.plan.items),
-        .cwd = app.cwd.items,
-        .approval = if (app.pending) |*pending| .{
+        .blocks = app.view.blocks.items,
+        .show_tool_transcript = app.view.show_tool_transcript,
+        .state = app.view.state,
+        .layout_epoch = app.view.layout_epoch,
+        .delta = app.view.delta.items,
+        .reasoning_delta = app.view.reasoning_delta.items,
+        .spinner_frame = app.view.spinner_frame,
+        .turn_started_ms = app.view.turn_started_ms,
+        .turn_phase = app.view.turn_phase,
+        .phase_started_ms = app.view.phase_started_ms,
+        .call_started_ms = app.view.call_started_ms,
+        .stream_bytes = app.view.stream_bytes,
+        .stream_quiet_ms = app.view.stream_quiet_ms,
+        .stream_status_at_ms = app.view.stream_status_at_ms,
+        .show_working_ticker = !hasUnfinishedPlan(app.view.plan.items),
+        .cwd = app.view.cwd.items,
+        .approval = if (app.view.pending) |*pending| .{
             .tool = pending.tool(),
             .args = pending.args(),
         } else null,
-        .layout_cache = &app.layout_cache,
-        .tail_layout_cache = &app.tail_layout_cache,
-        .stream_layout_cache = &app.stream_layout_cache,
+        .layout_cache = &app.view.layout_cache,
+        .tail_layout_cache = &app.view.tail_layout_cache,
+        .stream_layout_cache = &app.view.stream_layout_cache,
     };
 }
 
@@ -5667,8 +5679,8 @@ fn tabLabel(
             std.fs.path.basename(session.cwd)
         else
             "session"
-    else if (std.fs.path.basename(app.cwd.items).len > 0)
-        std.fs.path.basename(app.cwd.items)
+    else if (std.fs.path.basename(app.view.cwd.items).len > 0)
+        std.fs.path.basename(app.view.cwd.items)
     else
         "session";
     const raw = try std.fmt.allocPrint(arena, "{s} · {s}", .{ identity, short_handle });
@@ -5681,7 +5693,7 @@ fn tabLabel(
 fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !TabLayout {
     if (width == 0) return .{ .items = &.{} };
 
-    const active_root = app.rootSessionId(app.sid);
+    const active_root = app.rootSessionId(app.view.sid);
     var candidates: std.ArrayList(TabCandidate) = .empty;
     for (app.sessions.items) |*session| {
         if (session.parent_sid != null or session.kind != .root) continue;
@@ -5695,9 +5707,9 @@ fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !TabLay
     }
     if (candidates.items.len == 0) {
         try candidates.append(arena, .{
-            .sid = app.sid,
-            .label = try tabLabel(arena, app, app.sid, null),
-            .activity = tabActivityForState(app.state),
+            .sid = app.view.sid,
+            .label = try tabLabel(arena, app, app.view.sid, null),
+            .activity = tabActivityForState(app.view.state),
             .active = true,
             .created_at = 0,
         });
@@ -5779,7 +5791,7 @@ fn drawCommandMenu(
     input_top: u16,
     width: u16,
 ) !void {
-    if (app.mode != .insert or app.picker != null or app.editor.isWalkingHistory() or commandQuery(&app.editor) == null) return;
+    if (app.mode != .insert or app.picker != null or app.view.editor.isWalkingHistory() or commandQuery(&app.view.editor) == null) return;
     const suggestions = try commandSuggestions(app, arena);
     if (suggestions.len == 0) return;
 
@@ -6019,7 +6031,7 @@ fn drawWelcome(app: *const App, win: vaxis.Window, top_rows: usize, view_h: usiz
         try rows.append(arena, .{ .key = "/quit", .text = "leave without configuring" });
         return drawWelcomeRows(win, top_rows, view_h, arena, rows.items);
     }
-    try rows.append(arena, .{ .key = "model", .text = app.model.items });
+    try rows.append(arena, .{ .key = "model", .text = app.view.model.items });
     try rows.append(arena, .{ .text = "" });
     try rows.append(arena, .{ .key = "Enter", .text = "send a prompt" });
     try rows.append(arena, .{ .key = "/", .text = "slash commands · /model switches model" });
@@ -6216,8 +6228,8 @@ fn planItemTimeMs(app: *const App, item: PlanItemOwned, now_ms: i64) ?u64 {
     if (item.status != .in_progress) return null;
 
     var elapsed = item.duration_ms;
-    if (app.state == .running) {
-        const started = if (item.started_at_ms > 0) item.started_at_ms else app.turn_started_ms;
+    if (app.view.state == .running) {
+        const started = if (item.started_at_ms > 0) item.started_at_ms else app.view.turn_started_ms;
         if (started > 0 and now_ms > started) elapsed +|= @intCast(now_ms - started);
         // Render immediate feedback instead of a blank cell for the first ms.
         if (elapsed == 0) elapsed = 1;
@@ -6236,7 +6248,7 @@ fn drawPlan(
     const panel = win.child(.{ .y_off = top, .height = height, .width = win.width });
     panel.fill(.{ .style = Palette.plan_panel });
     const item_rows = @as(usize, height) -| plan_frame_rows;
-    const range = planDisplayRange(app.plan.items, item_rows);
+    const range = planDisplayRange(app.view.plan.items, item_rows);
     const widths = planTableWidths(win.width);
     const task_header = try planRule(arena, widths.task);
     const time_header = try planRule(arena, widths.time);
@@ -6250,8 +6262,8 @@ fn drawPlan(
     _ = panel.print(&top_border, .{ .wrap = .none });
 
     const now_ms = nowWallMs(app.io);
-    for (app.plan.items[range.start .. range.start + range.len], 0..) |item, row| {
-        const marker = planMarker(item.status, app.state, app.spinner_frame);
+    for (app.view.plan.items[range.start .. range.start + range.len], 0..) |item, row| {
+        const marker = planMarker(item.status, app.view.state, app.view.spinner_frame);
         const available = widths.task -| 3;
         const end = hardCellBreak(item.step, 0, available);
         const left = [_]vaxis.Segment{
@@ -6349,7 +6361,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         }
     else if (app.otel_header_prompt)
         "OTLP headers ❯ "
-    else if (app.plan_mode)
+    else if (app.view.plan_mode)
         if (app.mode == .insert) "PLAN ❯ " else "PLAN : "
     else if (app.mode == .insert)
         "❯ "
@@ -6357,12 +6369,12 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         ": ";
     const panel_inner_w = w -| 2; // one cell of horizontal padding
     const editor_body_w = @max(panel_inner_w -| displayWidth(prompt), 1);
-    const content_h: u16 = @intCast(app.editor.displayHeight(editor_body_w));
-    const proposal_ready = app.plan_mode and app.plan_proposal_ready and app.state == .idle;
+    const content_h: u16 = @intCast(app.view.editor.displayHeight(editor_body_w));
+    const proposal_ready = app.view.plan_mode and app.view.plan_proposal_ready and app.view.state == .idle;
     const input_h: u16 = @intCast(inputPanelHeight(content_h) + @intFromBool(proposal_ready));
     // The plan's final framed row provides breathing room before the composer;
     // the ordinary transcript gap remains above the lowest surface.
-    const surfaces = planSurfaceLayout(h, top_rows, input_h, app.plan.items);
+    const surfaces = planSurfaceLayout(h, top_rows, input_h, app.view.plan.items);
     const plan_h = surfaces.plan_h;
     const view_h = surfaces.view_h;
 
@@ -6373,9 +6385,9 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     transcript.show_working_ticker = plan_h == 0;
     var lines = try layout_mod.layoutLines(arena, app.gpa, &transcript, w);
     const total = lines.items.len;
-    if (app.search_target_seq > 0 and !app.history_loading) {
+    if (app.search_target_seq > 0 and !app.view.history_loading) {
         var target_index: ?usize = null;
-        for (app.blocks.items, 0..) |rendered, index| {
+        for (app.view.blocks.items, 0..) |rendered, index| {
             if (rendered.seq == app.search_target_seq) {
                 target_index = index;
                 break;
@@ -6397,22 +6409,22 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             const target_line = prefix_lines.items.len -| 1;
             const max_scroll = total -| view_h;
             const desired_first = target_line -| (@as(usize, view_h) / 3);
-            app.scroll_up = max_scroll -| @min(desired_first, max_scroll);
+            app.view.scroll_up = max_scroll -| @min(desired_first, max_scroll);
             app.search_highlight_line = target_line;
             // Avoid treating this deliberate reposition as transcript growth.
-            app.last_total_lines = total;
+            app.view.last_total_lines = total;
         }
         app.search_target_seq = 0;
     }
     // Anchor while reading: scroll_up counts from the BOTTOM, so content
     // arriving while scrolled up would slide the view. Compensate by the
     // growth delta; pinned (scroll_up == 0) stays pinned.
-    if (app.scroll_up > 0 and total > app.last_total_lines) {
-        app.scroll_up +|= total - app.last_total_lines;
+    if (app.view.scroll_up > 0 and total > app.view.last_total_lines) {
+        app.view.scroll_up +|= total - app.view.last_total_lines;
     }
-    app.last_total_lines = total;
+    app.view.last_total_lines = total;
     const max_scroll = total -| view_h;
-    if (app.scroll_up > max_scroll) app.scroll_up = max_scroll;
+    if (app.view.scroll_up > max_scroll) app.view.scroll_up = max_scroll;
 
     const DisplayLine = struct {
         line: Line,
@@ -6422,7 +6434,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     var visible: std.ArrayList(DisplayLine) = .empty;
     const prompt_range = layout_mod.activePromptLineRange(&transcript);
     const ordinary_first = total -| view_h;
-    const pin_prompt = app.scroll_up == 0 and prompt_range != null and
+    const pin_prompt = app.view.scroll_up == 0 and prompt_range != null and
         prompt_range.?.len + 2 <= view_h and ordinary_first >= prompt_range.?.start;
     if (pin_prompt) {
         const sticky_prompt = prompt_range.?;
@@ -6452,30 +6464,30 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         for (lines.items[body_first..body_end], body_first..) |ln, abs_line| {
             try visible.append(arena, .{ .line = ln, .abs_line = abs_line, .selectable = true });
         }
-        app.last_pinned_start = sticky_prompt.start;
-        app.last_pinned_rows = pinned_rows;
-        app.last_body_first = body_first;
-        app.last_body_rows = body_end - body_first;
-        app.last_first_visible = body_first;
+        app.view.last_pinned_start = sticky_prompt.start;
+        app.view.last_pinned_rows = pinned_rows;
+        app.view.last_body_first = body_first;
+        app.view.last_body_rows = body_end - body_first;
+        app.view.last_first_visible = body_first;
     } else {
-        const first_visible = (total -| view_h) -| app.scroll_up;
+        const first_visible = (total -| view_h) -| app.view.scroll_up;
         const end_visible = @min(first_visible + view_h, total);
         for (lines.items[first_visible..end_visible], first_visible..) |ln, abs_line| {
             try visible.append(arena, .{ .line = ln, .abs_line = abs_line, .selectable = true });
         }
-        app.last_pinned_start = 0;
-        app.last_pinned_rows = 0;
-        app.last_body_first = first_visible;
-        app.last_body_rows = end_visible - first_visible;
-        app.last_first_visible = first_visible;
+        app.view.last_pinned_start = 0;
+        app.view.last_pinned_rows = 0;
+        app.view.last_body_first = first_visible;
+        app.view.last_body_rows = end_visible - first_visible;
+        app.view.last_first_visible = first_visible;
     }
     // Keep terminal viewport geometry even when the transcript has fewer
     // rows; mouse/copy mapping separately rejects blank rows.
-    app.last_view_h = view_h;
+    app.view.last_view_h = view_h;
 
     // Empty-session welcome card: only when there is genuinely nothing to
     // show (fresh session, replay finished, no turn running).
-    if (total == 0 and !app.history_loading and app.state == .idle)
+    if (total == 0 and !app.view.history_loading and app.view.state == .idle)
         try drawWelcome(app, win, top_rows, view_h, arena);
 
     for (visible.items, 0..) |display, row| {
@@ -6573,9 +6585,9 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         .height = content_h,
     });
     if (app.otel_header_prompt or app.setup_prompt == .credential)
-        app.editor.drawMasked(input_win, prompt, Palette.prompt_mark, Palette.prompt_text)
+        app.view.editor.drawMasked(input_win, prompt, Palette.prompt_mark, Palette.prompt_text)
     else
-        app.editor.draw(input_win, prompt, if (app.plan_mode) Palette.plan_active else Palette.prompt_mark, Palette.prompt_text);
+        app.view.editor.draw(input_win, prompt, if (app.view.plan_mode) Palette.plan_active else Palette.prompt_mark, Palette.prompt_text);
     if (proposal_ready) {
         _ = input_panel.printSegment(.{
             .text = " Enter implement · e revise · Esc/q dismiss",
@@ -6589,25 +6601,25 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // ---- status bar ----
     const status_win = win.child(.{ .y_off = h - 1, .height = 1, .width = w });
     status_win.fill(.{ .style = Palette.status_bar });
-    const state_txt: []const u8 = switch (app.state) {
+    const state_txt: []const u8 = switch (app.view.state) {
         .idle => "idle",
         .running => "running",
         .awaiting_approval => "APPROVAL?",
         .err => "error",
         .done => "done",
     };
-    const state_style: vaxis.Style = switch (app.state) {
+    const state_style: vaxis.Style = switch (app.view.state) {
         .idle, .done => Palette.status_idle,
         .running => Palette.status_running,
         .awaiting_approval => Palette.status_approval,
         .err => Palette.status_error,
     };
-    const guest = proto.isGuestModel(app.model.items);
-    const context_percent = if (app.context_limit > 0)
-        app.context_used * 100 / app.context_limit
+    const guest = proto.isGuestModel(app.view.model.items);
+    const context_percent = if (app.view.context_limit > 0)
+        app.view.context_used * 100 / app.view.context_limit
     else
         0;
-    const ctx_txt = try statusContext(arena, guest, app.context_used, app.context_limit);
+    const ctx_txt = try statusContext(arena, guest, app.view.context_used, app.view.context_limit);
     const ctx_style = if (guest)
         Palette.status_muted
     else if (context_percent >= 90)
@@ -6616,17 +6628,17 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         Palette.status_context_warn
     else
         Palette.status_context;
-    const cwd_txt = try statusCwd(arena, app.cwd.items, app.home.items);
+    const cwd_txt = try statusCwd(arena, app.view.cwd.items, app.home.items);
     var session_handle_buf: session_handle.Full = undefined;
-    const session_txt = try std.fmt.allocPrint(arena, "{s}", .{app.displaySessionHandle(&session_handle_buf, app.sid)});
-    const scroll_txt = try std.fmt.allocPrint(arena, "↕ {d} (G: bottom)", .{app.scroll_up});
-    const focused_parent_sid = if (app.sessionSummary(app.sid)) |summary| summary.parent_sid else null;
+    const session_txt = try std.fmt.allocPrint(arena, "{s}", .{app.displaySessionHandle(&session_handle_buf, app.view.sid)});
+    const scroll_txt = try std.fmt.allocPrint(arena, "↕ {d} (G: bottom)", .{app.view.scroll_up});
+    const focused_parent_sid = if (app.sessionSummary(app.view.sid)) |summary| summary.parent_sid else null;
     var child_count: usize = 0;
     var child_running: usize = 0;
     var child_approvals: usize = 0;
     var child_errors: usize = 0;
     for (app.sessions.items) |session| {
-        if (session.parent_sid != app.sid) continue;
+        if (session.parent_sid != app.view.sid) continue;
         child_count += 1;
         switch (session.state) {
             .running => child_running += 1,
@@ -6677,11 +6689,11 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     var background_running: usize = 0;
     var background_approvals: usize = 0;
     for (app.sessions.items) |session| {
-        if (session.sid == app.sid) continue;
+        if (session.sid == app.view.sid) continue;
         // The hierarchy segment owns the focused parent/child relationship;
         // keep the generic background counter for unrelated sessions and
         // running siblings rather than showing the same activity twice.
-        if (session.parent_sid == app.sid) continue;
+        if (session.parent_sid == app.view.sid) continue;
         if (focused_parent_sid != null and session.sid == focused_parent_sid.?) continue;
         switch (session.state) {
             .running => background_running += 1,
@@ -6708,11 +6720,11 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     status_n += 1;
     status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
     status_n += 1;
-    status_segments[status_n] = .{ .text = try statusModel(arena, app.model.items), .style = Palette.status_model };
+    status_segments[status_n] = .{ .text = try statusModel(arena, app.view.model.items), .style = Palette.status_model };
     status_n += 1;
-    if (app.effort != .auto) {
+    if (app.view.effort != .auto) {
         status_segments[status_n] = .{
-            .text = try std.fmt.allocPrint(arena, " {s}", .{@tagName(app.effort)}),
+            .text = try std.fmt.allocPrint(arena, " {s}", .{@tagName(app.view.effort)}),
             .style = Palette.status_effort,
         };
         status_n += 1;
@@ -6727,7 +6739,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     status_n += 1;
     status_segments[status_n] = .{ .text = cwd_txt, .style = Palette.status_cwd };
     status_n += 1;
-    if (app.scroll_up > 0) {
+    if (app.view.scroll_up > 0) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
         status_segments[status_n] = .{ .text = scroll_txt, .style = Palette.status_bar };
@@ -6804,7 +6816,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         Palette.status_context_warn
     else
         Palette.status_sep;
-    const mode_txt: []const u8 = if (app.plan_mode) "PLAN" else if (app.permissions_full) "FULL ACCESS" else "";
+    const mode_txt: []const u8 = if (app.view.plan_mode) "PLAN" else if (app.view.permissions_full) "FULL ACCESS" else "";
     // Voice dictation state. Invisible until /voice setup enables it —
     // dormant means dormant — then a quiet armed hint that turns loud
     // while a capture or transcription is in flight.
@@ -6850,7 +6862,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             right_n += 1;
         }
         if (mode_txt.len > 0) {
-            right_segments[right_n] = .{ .text = mode_txt, .style = if (app.plan_mode) Palette.plan_active else Palette.status_approval };
+            right_segments[right_n] = .{ .text = mode_txt, .style = if (app.view.plan_mode) Palette.plan_active else Palette.status_approval };
             right_n += 1;
             right_segments[right_n] = .{ .text = " · ", .style = Palette.status_sep };
             right_n += 1;
@@ -6940,7 +6952,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             const f = items[i];
             const done = app.picker_kind == .council and std.mem.eql(u8, f, council_done_item);
             const cur = if (app.picker_kind == .session)
-                (app.sessionIdForLabel(f) orelse 0) == app.sid
+                (app.sessionIdForLabel(f) orelse 0) == app.view.sid
             else if (app.picker_kind == .council)
                 !done and app.councilModelSelected(f)
             else
@@ -7097,9 +7109,9 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
         return false;
     };
     new_conn.send(.{ .council_list = .{} }) catch {};
-    if (app.last_seq == 0) {
+    if (app.view.last_seq == 0) {
         new_conn.send(.{ .sub = .{
-            .sid = app.sid,
+            .sid = app.view.sid,
             .from_seq = 1,
             .tail_limit = initial_replay_blocks,
         } }) catch {
@@ -7108,8 +7120,8 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
         };
     } else {
         new_conn.send(.{ .sub = .{
-            .sid = app.sid,
-            .from_seq = app.last_seq +| 1,
+            .sid = app.view.sid,
+            .from_seq = app.view.last_seq +| 1,
             .replay_limit = initial_replay_blocks,
         } }) catch {
             new_conn.deinit();
@@ -7186,7 +7198,7 @@ fn dispatchEvent(
             handleMouse(app, m);
         },
         .tick => {
-            app.spinner_frame +%= 1;
+            app.view.spinner_frame +%= 1;
             app.voiceTick();
             app.tickUiAnimation();
             app.expireNotice();
@@ -7207,7 +7219,7 @@ fn dispatchEvent(
                 return;
             }
             app.recordUserActivity();
-            app.editor.paste(text);
+            app.view.editor.paste(text);
             if (app.otel_header_prompt or app.setup_prompt == .credential) @memset(@constCast(text), 0);
             gpa.free(@constCast(text));
         },
@@ -7370,14 +7382,16 @@ pub fn run(
         .gpa = gpa,
         .io = io,
         .conn = conn,
+        .view = .{
+            .sid = sid,
+            .editor = Editor.init(gpa),
+            .history_complete = false,
+            .history_loading = true,
+        },
         .environ = environ,
-        .sid = sid,
         .remote_transport = conn.transport == .child,
-        .editor = Editor.init(gpa),
         .known_session_ids = initial_known_ids,
         .cfg = cfg,
-        .history_complete = false,
-        .history_loading = true,
     };
     initial_ids_transferred = true;
     defer app.deinit();
@@ -7389,7 +7403,7 @@ pub fn run(
     app.screensaver_kind = effects.Kind.parse(cfg.ui_screensaver_effect) orelse .matrix;
     app.recordUserActivity();
     app.syncAnimationTicker();
-    app.effort = effort_at_start;
+    app.view.effort = effort_at_start;
     app.setCwdStr(cwd_at_start);
     if (environ.get("HOME")) |home| app.setHomeStr(home);
     app.touchRecentSession(sid);
@@ -7568,8 +7582,8 @@ pub fn run(
 
             // Completed mouse selection → OSC52 copy (before draw so the
             // notice shows this frame; selection stays highlighted).
-            if (app.copy_pending) {
-                app.copy_pending = false;
+            if (app.view.copy_pending) {
+                app.view.copy_pending = false;
                 if (app.selection()) |selection| {
                     const farena = frame_arena.allocator();
                     const sel_lines = try layoutLines(farena, &app, @intCast(app.term_cols));
@@ -7587,9 +7601,9 @@ pub fn run(
                             app.setNotice("clipboard copy failed", .{});
                     }
                 }
-                if (app.sel_clear_after_copy) {
-                    app.sel_clear_after_copy = false;
-                    app.sel_anchor = null;
+                if (app.view.sel_clear_after_copy) {
+                    app.view.sel_clear_after_copy = false;
+                    app.view.sel_anchor = null;
                 }
             }
 
@@ -7646,10 +7660,10 @@ pub fn run(
             errdefer gpa.free(command);
             shell = .{
                 .command = command,
-                .cwd = try gpa.dupe(u8, app.cwd.items),
+                .cwd = try gpa.dupe(u8, app.view.cwd.items),
             };
         }
-        ro.* = .{ .request = app.reboot_request, .shell = shell, .sid = app.sid };
+        ro.* = .{ .request = app.reboot_request, .shell = shell, .sid = app.view.sid };
     }
     if (daemon_disconnect_reason) |reason| {
         try eprint(
@@ -7690,21 +7704,21 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
     if (app.top_view != null) return;
     // Some terminals report the release button as `none`, so complete an
     // active left-button drag based on event type before switching on button.
-    if (m.type == .release and app.sel_dragging) {
-        if (app.last_view_h > 0) {
+    if (m.type == .release and app.view.sel_dragging) {
+        if (app.view.last_view_h > 0) {
             const terminal_row: usize = if (m.row < 0) 0 else @intCast(m.row);
             const raw_row = terminal_row -| app.tabBarRows();
-            const row = @min(raw_row, app.last_view_h - 1);
+            const row = @min(raw_row, app.view.last_view_h - 1);
             const col: usize = if (m.col < 0) 0 else @intCast(m.col);
             if (app.visibleLineAtRow(row)) |line|
-                app.sel_head = .{ .line = line, .col = col };
+                app.view.sel_head = .{ .line = line, .col = col };
         }
-        app.sel_dragging = false;
-        if (app.sel_anchor) |anchor| {
-            if (anchor.line != app.sel_head.line or anchor.col != app.sel_head.col) {
-                app.copy_pending = true;
+        app.view.sel_dragging = false;
+        if (app.view.sel_anchor) |anchor| {
+            if (anchor.line != app.view.sel_head.line or anchor.col != app.view.sel_head.col) {
+                app.view.copy_pending = true;
             } else {
-                app.sel_anchor = null;
+                app.view.sel_anchor = null;
             }
         }
         return;
@@ -7733,16 +7747,16 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
 
     switch (m.button) {
         .wheel_up => {
-            app.scroll_up +|= 3;
+            app.view.scroll_up +|= 3;
             app.maybeRequestHistoryAtTop();
         },
-        .wheel_down => app.scroll_up -|= 3,
+        .wheel_down => app.view.scroll_up -|= 3,
         .left => {
             const row = terminal_row - app.tabBarRows();
             // Only selectable body rows inside the session view participate;
             // the sticky prompt is a duplicate of durable scrollback.
-            if (row >= app.last_view_h or app.visibleLineAtRow(row) == null) {
-                if (m.type == .press) app.sel_anchor = null;
+            if (row >= app.view.last_view_h or app.visibleLineAtRow(row) == null) {
+                if (m.type == .press) app.view.sel_anchor = null;
                 return;
             }
             const point = SelectionPoint{
@@ -7751,12 +7765,12 @@ fn handleMouse(app: *App, m: vaxis.Mouse) void {
             };
             switch (m.type) {
                 .press => {
-                    app.sel_anchor = point;
-                    app.sel_head = point;
-                    app.sel_dragging = true;
+                    app.view.sel_anchor = point;
+                    app.view.sel_head = point;
+                    app.view.sel_dragging = true;
                 },
                 .drag => {
-                    if (app.sel_dragging) app.sel_head = point;
+                    if (app.view.sel_dragging) app.view.sel_head = point;
                 },
                 .release => {}, // active drags are completed above
                 .motion => {},
@@ -7907,7 +7921,7 @@ fn isNewSessionKey(key: vaxis.Key) bool {
 /// the session you were reading is the wrong surprise.
 fn isArchiveCurrentKey(app: *const App, key: vaxis.Key) bool {
     return key.matches('w', .{ .ctrl = true }) and
-        app.editor.isEmpty() and app.attachments.items.len == 0 and
+        app.view.editor.isEmpty() and app.attachments.items.len == 0 and
         app.copy_cursor == null;
 }
 
@@ -8153,9 +8167,9 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     }
 
     if (app.setup_prompt != .none) {
-        const ed = &app.editor;
+        const ed = &app.view.editor;
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('g', .{ .ctrl = true })) {
-            app.editor.clearSensitive();
+            app.view.editor.clearSensitive();
             app.setup_prompt = .none;
             app.openPicker(.setup_provider);
             app.setNotice("provider setup · choose a backend", .{});
@@ -8175,7 +8189,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     }
 
     if (app.otel_header_prompt) {
-        const ed = &app.editor;
+        const ed = &app.view.editor;
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('g', .{ .ctrl = true })) {
             app.cancelOtelSetup();
         } else if (isEnterKey(key)) {
@@ -8194,8 +8208,8 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     }
 
     if (key.matches('t', .{ .ctrl = true })) {
-        app.show_tool_transcript = !app.show_tool_transcript;
-        if (app.show_tool_transcript)
+        app.view.show_tool_transcript = !app.view.show_tool_transcript;
+        if (app.view.show_tool_transcript)
             app.setNotice("tool transcript expanded", .{})
         else
             app.setNotice("tool transcript collapsed", .{});
@@ -8216,7 +8230,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     // after an interrupt transitions the session to idle; quitting then would
     // make the stop gesture race the daemon status update.
     if (key.matches('c', .{ .ctrl = true })) {
-        if (app.state == .running or app.state == .awaiting_approval) {
+        if (app.view.state == .running or app.view.state == .awaiting_approval) {
             app.interrupt();
         } else {
             app.setNotice("nothing to interrupt · q or /quit exits", .{});
@@ -8368,7 +8382,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    if (app.setup_required and app.editor.isEmpty() and isEnterKey(key)) {
+    if (app.setup_required and app.view.editor.isEmpty() and isEnterKey(key)) {
         app.beginSetup(true);
         return;
     }
@@ -8382,18 +8396,18 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     // every other key — tab switches, Ctrl+N, alt+N, pickers — passes
     // through untouched. Esc dismisses (the proposal stays in the
     // transcript; Plan mode remains on).
-    if (app.plan_proposal_ready and app.plan_mode and app.state == .idle) {
+    if (app.view.plan_proposal_ready and app.view.plan_mode and app.view.state == .idle) {
         const action = planProposalAction(key);
         if (action != .none) {
             switch (action) {
                 .implement => app.acceptPlanProposal(),
                 .revise => {
-                    app.plan_proposal_ready = false;
+                    app.view.plan_proposal_ready = false;
                     app.mode = .insert;
                     app.setNotice("revise the plan in the composer", .{});
                 },
                 .dismiss => {
-                    app.plan_proposal_ready = false;
+                    app.view.plan_proposal_ready = false;
                     app.setNotice("proposal dismissed · Plan mode remains on", .{});
                 },
                 .none => unreachable,
@@ -8439,7 +8453,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     }
 
     // Approval hotkeys work in both modes when the input is empty.
-    if (app.pending != null and app.editor.isEmpty()) {
+    if (app.view.pending != null and app.view.editor.isEmpty()) {
         if (key.matches('y', .{})) {
             app.approveReply(true);
             return;
@@ -8452,7 +8466,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
     // Nothing parked HERE but something parked elsewhere: y/n jump to it
     // instead of dead-keying. Deliberately never answers a background
     // approval blind — you approve only what is on screen.
-    if (app.pending == null and app.editor.isEmpty() and
+    if (app.view.pending == null and app.view.editor.isEmpty() and
         (key.matches('y', .{}) or key.matches('n', .{})))
     {
         if (app.firstAwaitingSid()) |awaiting_sid| {
@@ -8464,7 +8478,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
 
     switch (app.mode) {
         .insert => {
-            const ed = &app.editor;
+            const ed = &app.view.editor;
             if (key.matches('r', .{ .ctrl = true })) {
                 app.beginHistorySearch();
                 return;
@@ -8509,7 +8523,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             }
             if (key.matches(vaxis.Key.escape, .{})) {
                 app.mode = .normal; // draft survives: editor state untouched
-                app.sel_anchor = null;
+                app.view.sel_anchor = null;
             } else if (isNewlineKey(key)) {
                 ed.insertNewline();
             } else if (key.matches(vaxis.Key.enter, .{})) {
@@ -8540,7 +8554,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 const count = app.pending_count;
                 app.pending_count = 0;
                 if (key.matches('g', .{})) {
-                    app.scroll_up = std.math.maxInt(usize); // clamped in draw
+                    app.view.scroll_up = std.math.maxInt(usize); // clamped in draw
                     app.maybeRequestHistoryAtTop();
                 } else if (key.matches('s', .{})) {
                     app.mode = .insert;
@@ -8557,8 +8571,8 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             if (app.pending_replace) {
                 app.pending_replace = false;
                 if (key.text) |txt| {
-                    app.editor.pushUndo();
-                    app.editor.replaceUnderCursor(txt);
+                    app.view.editor.pushUndo();
+                    app.view.editor.replaceUnderCursor(txt);
                 }
                 return;
             }
@@ -8587,7 +8601,7 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 var steps = app.takeCount();
                 while (steps > 0) : (steps -= 1) app.cycleTab(direction);
             } else if (key.matches('/', .{})) {
-                app.openSearchPrompt(app.sid);
+                app.openSearchPrompt(app.view.sid);
             } else if (key.matches('n', .{})) {
                 app.nextSearchHit(1);
             } else if (key.matches('N', .{ .shift = true }) or key.matches('N', .{})) {
@@ -8602,37 +8616,37 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 if (app.hasPending()) {
                     app.clearPending();
                 } else {
-                    app.editor.pushUndo();
+                    app.view.editor.pushUndo();
                     app.mode = .insert;
                 }
             } else if (key.matches('i', .{})) {
                 app.clearPending();
-                app.editor.pushUndo();
+                app.view.editor.pushUndo();
                 app.mode = .insert;
             } else if (key.matches(':', .{})) {
                 // The normal-mode prompt shows ':'; honor it. Commands live
                 // behind `/` in insert, so `:` opens that menu on an empty
                 // composer and otherwise just enters insert.
                 app.clearPending();
-                app.editor.pushUndo();
+                app.view.editor.pushUndo();
                 app.mode = .insert;
-                if (app.editor.isEmpty()) app.editor.insertSlice("/");
+                if (app.view.editor.isEmpty()) app.view.editor.insertSlice("/");
             } else if (key.matches('a', .{})) {
                 // Vim append: archive moved to /archive — a destructive-ish
                 // action must not sit on the muscle-memory insert key.
                 app.clearPending();
-                app.editor.pushUndo();
-                app.editor.moveRight();
+                app.view.editor.pushUndo();
+                app.view.editor.moveRight();
                 app.mode = .insert;
             } else if (key.matches('A', .{ .shift = true }) or key.matches('A', .{})) {
                 app.clearPending();
-                app.editor.pushUndo();
-                app.editor.moveLineEnd();
+                app.view.editor.pushUndo();
+                app.view.editor.moveLineEnd();
                 app.mode = .insert;
             } else if (key.matches('I', .{ .shift = true }) or key.matches('I', .{})) {
                 app.clearPending();
-                app.editor.pushUndo();
-                app.editor.moveLineStart();
+                app.view.editor.pushUndo();
+                app.view.editor.moveLineStart();
                 app.mode = .insert;
             } else if (key.matches('q', .{})) {
                 // Sessions are durable, so quitting is a detach; nothing is lost.
@@ -8640,63 +8654,63 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.should_quit = true;
             } else if (key.matches('J', .{ .shift = true }) or key.matches('J', .{})) {
                 // vim J: join lines. Sessions cycle on gt/gT (tab-style).
-                app.editor.pushUndo();
+                app.view.editor.pushUndo();
                 var joins = app.takeCount();
                 joins = if (joins > 1) joins - 1 else 1;
                 while (joins > 0) : (joins -= 1) {
-                    if (!app.editor.joinLines()) break;
+                    if (!app.view.editor.joinLines()) break;
                 }
             } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                app.scroll_up -|= app.takeCount();
+                app.view.scroll_up -|= app.takeCount();
             } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                app.scroll_up +|= app.takeCount();
+                app.view.scroll_up +|= app.takeCount();
                 app.maybeRequestHistoryAtTop();
             } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
-                app.scroll_up -|= 20 * app.takeCount();
+                app.view.scroll_up -|= 20 * app.takeCount();
             } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
-                app.scroll_up +|= 20 * app.takeCount();
+                app.view.scroll_up +|= 20 * app.takeCount();
                 app.maybeRequestHistoryAtTop();
             } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
                 _ = app.takeCount(); // no line addressing in a transcript; consume, don't leak
-                app.scroll_up = 0;
+                app.view.scroll_up = 0;
             } else if (key.matches('g', .{})) {
                 app.pending_g = true;
             } else if (key.matches('v', .{}) or key.matches('V', .{ .shift = true }) or key.matches('V', .{})) {
                 app.enterCopyMode();
             } else if (key.matches('h', .{})) {
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.moveLeft();
+                while (n > 0) : (n -= 1) app.view.editor.moveLeft();
             } else if (key.matches('l', .{})) {
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.moveRight();
+                while (n > 0) : (n -= 1) app.view.editor.moveRight();
             } else if (key.matches('w', .{})) {
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.moveWordStart();
+                while (n > 0) : (n -= 1) app.view.editor.moveWordStart();
             } else if (key.matches('e', .{})) {
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.moveWordRight();
+                while (n > 0) : (n -= 1) app.view.editor.moveWordRight();
             } else if (key.matches('b', .{})) {
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.moveWordLeft();
+                while (n > 0) : (n -= 1) app.view.editor.moveWordLeft();
             } else if (key.matches('W', .{ .shift = true }) or key.matches('W', .{})) {
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.moveWORDStart();
+                while (n > 0) : (n -= 1) app.view.editor.moveWORDStart();
             } else if (key.matches('E', .{ .shift = true }) or key.matches('E', .{})) {
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.moveWORDEnd();
+                while (n > 0) : (n -= 1) app.view.editor.moveWORDEnd();
             } else if (key.matches('B', .{ .shift = true }) or key.matches('B', .{})) {
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.moveWORDLeft();
+                while (n > 0) : (n -= 1) app.view.editor.moveWORDLeft();
             } else if (key.matches('%', .{})) {
                 _ = app.takeCount();
-                app.editor.moveMatchingBracket();
+                app.view.editor.moveMatchingBracket();
             } else if (key.matches('0', .{})) {
-                app.editor.moveLineStart();
+                app.view.editor.moveLineStart();
             } else if (key.matches('^', .{}) or key.matches('_', .{})) {
                 _ = app.takeCount();
-                app.editor.moveFirstNonBlank();
+                app.view.editor.moveFirstNonBlank();
             } else if (key.matches('$', .{})) {
-                app.editor.moveLineEnd();
+                app.view.editor.moveLineEnd();
             } else if (key.matches('f', .{}) or key.matches('t', .{}) or
                 key.matches('F', .{ .shift = true }) or key.matches('T', .{ .shift = true }))
             {
@@ -8725,42 +8739,42 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (key.matches('r', .{})) {
                 app.pending_replace = true;
             } else if (key.matches('~', .{})) {
-                app.editor.pushUndo();
+                app.view.editor.pushUndo();
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.toggleCaseUnderCursor();
+                while (n > 0) : (n -= 1) app.view.editor.toggleCaseUnderCursor();
             } else if (key.matches('x', .{})) {
-                app.editor.pushUndo();
+                app.view.editor.pushUndo();
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.deleteAfter();
+                while (n > 0) : (n -= 1) app.view.editor.deleteAfter();
             } else if (key.matches('X', .{ .shift = true })) {
-                app.editor.pushUndo();
+                app.view.editor.pushUndo();
                 var n = app.takeCount();
-                while (n > 0) : (n -= 1) app.editor.deleteBefore();
+                while (n > 0) : (n -= 1) app.view.editor.deleteBefore();
             } else if (key.matches('s', .{})) {
-                app.editor.pushUndo();
-                app.editor.deleteAfter();
+                app.view.editor.pushUndo();
+                app.view.editor.deleteAfter();
                 app.mode = .insert;
             } else if (key.matches('S', .{ .shift = true })) {
                 app.pending_op = 'c';
                 app.operatorKey(.{ .codepoint = 'c' });
             } else if (key.matches('C', .{ .shift = true })) {
-                app.applyOperator('c', app.editor.toLineEndRange());
+                app.applyOperator('c', app.view.editor.toLineEndRange());
             } else if (key.matches('Y', .{ .shift = true })) {
-                app.applyOperator('y', app.editor.lineRangeAt(true));
+                app.applyOperator('y', app.view.editor.lineRangeAt(true));
             } else if (key.matches('D', .{ .shift = true }) or key.matches('D', .{})) {
-                app.applyOperator('d', app.editor.toLineEndRange());
+                app.applyOperator('d', app.view.editor.toLineEndRange());
             } else if (key.matches('o', .{})) {
-                app.editor.pushUndo();
-                app.editor.openLine(true);
+                app.view.editor.pushUndo();
+                app.view.editor.openLine(true);
                 app.mode = .insert;
             } else if (key.matches('O', .{ .shift = true })) {
-                app.editor.pushUndo();
-                app.editor.openLine(false);
+                app.view.editor.pushUndo();
+                app.view.editor.openLine(false);
                 app.mode = .insert;
             } else if (key.matches('u', .{})) {
-                if (!app.editor.undo()) app.setNotice("already at oldest change", .{});
+                if (!app.view.editor.undo()) app.setNotice("already at oldest change", .{});
             } else if (key.matches('r', .{ .ctrl = true })) {
-                if (!app.editor.redo()) app.setNotice("already at newest change", .{});
+                if (!app.view.editor.redo()) app.setNotice("already at newest change", .{});
             } else if (key.matches('d', .{})) {
                 app.pending_op = 'd';
             } else if (key.matches('c', .{})) {
@@ -8769,17 +8783,17 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.pending_op = 'y';
             } else if (key.matches('p', .{}) or key.matches('P', .{ .shift = true })) {
                 if (app.yank_register.items.len > 0) {
-                    app.editor.pushUndo();
+                    app.view.editor.pushUndo();
                     const before = key.matches('P', .{ .shift = true });
                     if (app.yank_linewise) {
-                        const line = app.editor.lineRangeAt(true);
-                        app.editor.cursor = if (before) line.start else line.end;
-                        const at = app.editor.cursor;
-                        app.editor.insertSlice(app.yank_register.items);
-                        app.editor.cursor = at;
+                        const line = app.view.editor.lineRangeAt(true);
+                        app.view.editor.cursor = if (before) line.start else line.end;
+                        const at = app.view.editor.cursor;
+                        app.view.editor.insertSlice(app.yank_register.items);
+                        app.view.editor.cursor = at;
                     } else {
-                        if (!before) app.editor.moveRight();
-                        app.editor.insertSlice(app.yank_register.items);
+                        if (!before) app.view.editor.moveRight();
+                        app.view.editor.insertSlice(app.yank_register.items);
                     }
                 } else {
                     app.setNotice("yank register empty — y in copy mode (v) fills it", .{});
@@ -8803,7 +8817,7 @@ test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do n
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.mode = .normal;
 
@@ -8829,8 +8843,8 @@ test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do n
     // `:` on an empty composer opens the command menu.
     try handleKey(&app, .{ .codepoint = ':' });
     try std.testing.expectEqual(Mode.insert, app.mode);
-    try std.testing.expectEqualStrings("/", app.editor.text.items);
-    app.editor.clear();
+    try std.testing.expectEqualStrings("/", app.view.editor.text.items);
+    app.view.editor.clear();
     app.mode = .normal;
 
     // `!ls -la` is a shell escape, not an unknown command.
@@ -8858,7 +8872,7 @@ test "manners: notices expire, the plan offer is not a modal, a background appro
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     // Notice TTL: a fresh notice stays; a past deadline clears it on tick.
@@ -8872,17 +8886,17 @@ test "manners: notices expire, the plan offer is not a modal, a background appro
 
     // A ready plan proposal lets unrelated keys through (j still scrolls)…
     app.mode = .normal;
-    app.plan_mode = true;
-    app.plan_proposal_ready = true;
-    app.state = .idle;
-    app.scroll_up = 5;
+    app.view.plan_mode = true;
+    app.view.plan_proposal_ready = true;
+    app.view.state = .idle;
+    app.view.scroll_up = 5;
     try handleKey(&app, .{ .codepoint = 'j' });
-    try std.testing.expectEqual(@as(usize, 4), app.scroll_up);
-    try std.testing.expect(app.plan_proposal_ready);
+    try std.testing.expectEqual(@as(usize, 4), app.view.scroll_up);
+    try std.testing.expect(app.view.plan_proposal_ready);
     // …and Esc dismisses the offer instead of being a no-op trap.
     try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
-    try std.testing.expect(!app.plan_proposal_ready);
-    try std.testing.expect(app.plan_mode);
+    try std.testing.expect(!app.view.plan_proposal_ready);
+    try std.testing.expect(app.view.plan_mode);
 
     // An approval parked on a NON-focused session arms the bell; the
     // focused session's own approval does not.
@@ -8917,58 +8931,58 @@ test "composer WORD motions, %, i<, and vim's cw special case" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.mode = .normal;
 
     // W/E/B are whitespace-delimited where w/e/b split on punctuation.
-    app.editor.insertSlice("foo-bar baz(qux) end");
-    app.editor.moveLineStart();
+    app.view.editor.insertSlice("foo-bar baz(qux) end");
+    app.view.editor.moveLineStart();
     try handleKey(&app, .{ .codepoint = 'W' });
-    try std.testing.expectEqual(@as(usize, 8), app.editor.cursor); // "baz(qux)"
+    try std.testing.expectEqual(@as(usize, 8), app.view.editor.cursor); // "baz(qux)"
     try handleKey(&app, .{ .codepoint = 'E' });
-    try std.testing.expectEqual(@as(usize, 16), app.editor.cursor); // past ")"
+    try std.testing.expectEqual(@as(usize, 16), app.view.editor.cursor); // past ")"
     try handleKey(&app, .{ .codepoint = 'B' });
-    try std.testing.expectEqual(@as(usize, 8), app.editor.cursor);
+    try std.testing.expectEqual(@as(usize, 8), app.view.editor.cursor);
 
     // % jumps between matching brackets, searching forward on the line first.
     try handleKey(&app, .{ .codepoint = '%' }); // from "b" of baz: first bracket is "(" at 11 → ")" at 15
-    try std.testing.expectEqual(@as(usize, 15), app.editor.cursor);
+    try std.testing.expectEqual(@as(usize, 15), app.view.editor.cursor);
     try handleKey(&app, .{ .codepoint = '%' });
-    try std.testing.expectEqual(@as(usize, 11), app.editor.cursor);
+    try std.testing.expectEqual(@as(usize, 11), app.view.editor.cursor);
 
     // dW from the start removes the whole punctuated WORD and its space.
-    app.editor.moveLineStart();
+    app.view.editor.moveLineStart();
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = 'W' });
-    try std.testing.expectEqualStrings("baz(qux) end", app.editor.text.items);
+    try std.testing.expectEqualStrings("baz(qux) end", app.view.editor.text.items);
 
     // i< is a text object like i( and i[.
-    app.editor.clear();
-    app.editor.insertSlice("see <the tag> here");
-    app.editor.cursor = 7;
+    app.view.editor.clear();
+    app.view.editor.insertSlice("see <the tag> here");
+    app.view.editor.cursor = 7;
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = 'i' });
     try handleKey(&app, .{ .codepoint = '<' });
-    try std.testing.expectEqualStrings("see <> here", app.editor.text.items);
+    try std.testing.expectEqualStrings("see <> here", app.view.editor.text.items);
 
     // vim's cw: on a non-blank it changes to the END of the word, keeping the
     // separator — the one place cw and dw legitimately differ.
-    app.editor.clear();
+    app.view.editor.clear();
     app.mode = .normal;
-    app.editor.insertSlice("foo bar");
-    app.editor.moveLineStart();
+    app.view.editor.insertSlice("foo bar");
+    app.view.editor.moveLineStart();
     try handleKey(&app, .{ .codepoint = 'c' });
     try handleKey(&app, .{ .codepoint = 'w' });
-    try std.testing.expectEqualStrings(" bar", app.editor.text.items);
+    try std.testing.expectEqualStrings(" bar", app.view.editor.text.items);
     try std.testing.expectEqual(Mode.insert, app.mode);
     app.mode = .normal;
-    app.editor.clear();
-    app.editor.insertSlice("foo bar");
-    app.editor.moveLineStart();
+    app.view.editor.clear();
+    app.view.editor.insertSlice("foo bar");
+    app.view.editor.moveLineStart();
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = 'w' });
-    try std.testing.expectEqualStrings("bar", app.editor.text.items);
+    try std.testing.expectEqualStrings("bar", app.view.editor.text.items);
 }
 
 test {
@@ -9001,32 +9015,34 @@ test "inline Ctrl+R search refines cycles and restores the draft" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
-    app.editor.pushHistory("banana launcher");
-    app.editor.pushHistory("build release assets");
-    app.editor.insertSlice("draft in progress");
-    try app.history_search_draft.appendSlice(gpa, app.editor.text.items);
-    app.history_search_draft_cursor = app.editor.cursor;
+    app.view.editor.pushHistory("banana launcher");
+    app.view.editor.pushHistory("build release assets");
+    app.view.editor.insertSlice("draft in progress");
+    try app.history_search_draft.appendSlice(gpa, app.view.editor.text.items);
+    app.history_search_draft_cursor = app.view.editor.cursor;
     app.history_search_active = true;
     app.refreshHistorySearch(true);
-    try std.testing.expectEqualStrings("build release assets", app.editor.text.items);
+    try std.testing.expectEqualStrings("build release assets", app.view.editor.text.items);
 
     try app.history_search_query.append(gpa, 'b');
     app.refreshHistorySearch(true);
     app.cycleHistorySearch();
-    try std.testing.expectEqualStrings("banana launcher", app.editor.text.items);
+    try std.testing.expectEqualStrings("banana launcher", app.view.editor.text.items);
 
     app.history_search_query.clearRetainingCapacity();
     try app.history_search_query.appendSlice(gpa, "bln");
     app.refreshHistorySearch(true);
-    try std.testing.expectEqualStrings("banana launcher", app.editor.text.items);
+    try std.testing.expectEqualStrings("banana launcher", app.view.editor.text.items);
 
     app.cancelHistorySearch();
     try std.testing.expect(!app.history_search_active);
-    try std.testing.expectEqualStrings("draft in progress", app.editor.text.items);
+    try std.testing.expectEqualStrings("draft in progress", app.view.editor.text.items);
 }
 
 test "model picker formats provider pricing compactly" {
@@ -9064,7 +9080,7 @@ test "model picker accepts priced and legacy catalogs" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     app.handleDaemonLine(try gpa.dupe(u8,
@@ -9090,8 +9106,10 @@ test "composer suggestions include commands, council actions, and council names"
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
     var council = OwnedCouncil{ .name = try gpa.dupe(u8, "adversarial") };
@@ -9100,13 +9118,13 @@ test "composer suggestions include commands, council actions, and council names"
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    app.editor.insertSlice("/com");
+    app.view.editor.insertSlice("/com");
     var suggestions = try commandSuggestions(&app, arena_state.allocator());
     try std.testing.expectEqual(@as(usize, 1), suggestions.len);
     try std.testing.expectEqualStrings("/compact", suggestions[0].label);
 
-    app.editor.clear();
-    app.editor.insertSlice("/council n");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/council n");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
@@ -9114,8 +9132,8 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqualStrings("/council new", suggestions[0].label);
     try std.testing.expect(!suggestions[0].submit_on_enter);
 
-    app.editor.clear();
-    app.editor.insertSlice("/council adv");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/council adv");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
@@ -9123,11 +9141,11 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqualStrings("/council adversarial", suggestions[0].label);
     try std.testing.expect(suggestions[0].submit_on_enter);
 
-    completeSuggestion(&app.editor, suggestions[0], false);
-    try std.testing.expectEqualStrings("/council adversarial", app.editor.text.items);
+    completeSuggestion(&app.view.editor, suggestions[0], false);
+    try std.testing.expectEqualStrings("/council adversarial", app.view.editor.text.items);
 
-    app.editor.clear();
-    app.editor.insertSlice("/review adv");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/review adv");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
@@ -9135,12 +9153,12 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqualStrings("/review adversarial", suggestions[0].label);
     try std.testing.expect(!suggestions[0].submit_on_enter);
 
-    completeSuggestion(&app.editor, suggestions[0], false);
-    try std.testing.expectEqualStrings("/review adversarial ", app.editor.text.items);
-    try std.testing.expect(commandQuery(&app.editor) == null);
+    completeSuggestion(&app.view.editor, suggestions[0], false);
+    try std.testing.expectEqualStrings("/review adversarial ", app.view.editor.text.items);
+    try std.testing.expect(commandQuery(&app.view.editor) == null);
 
-    app.editor.clear();
-    app.editor.insertSlice("/otel s");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/otel s");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
@@ -9150,8 +9168,8 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqualStrings("/otel status", suggestions[1].label);
     try std.testing.expect(suggestions[1].submit_on_enter);
 
-    app.editor.clear();
-    app.editor.insertSlice("/plan c");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/plan c");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
@@ -9159,8 +9177,8 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqualStrings("/plan clear", suggestions[0].label);
     try std.testing.expect(suggestions[0].submit_on_enter);
 
-    app.editor.clear();
-    app.editor.insertSlice("/animate m");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/animate m");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
@@ -9169,8 +9187,8 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqualStrings("/animate metaballs", suggestions[1].label);
     try std.testing.expect(suggestions[0].submit_on_enter);
 
-    app.editor.clear();
-    app.editor.insertSlice("/animate s");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/animate s");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
@@ -9178,8 +9196,8 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqualStrings("/animate strings", suggestions[0].label);
     try std.testing.expectEqualStrings("/animate stars", suggestions[1].label);
 
-    app.editor.clear();
-    app.editor.insertSlice("/screensaver p");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/screensaver p");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
@@ -9187,16 +9205,16 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqualStrings("/screensaver plasma", suggestions[0].label);
     try std.testing.expectEqualStrings("/screensaver pacman", suggestions[1].label);
 
-    app.editor.clear();
-    app.editor.insertSlice("/screensaver tu");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/screensaver tu");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
     try std.testing.expectEqual(@as(usize, 1), suggestions.len);
     try std.testing.expectEqualStrings("/screensaver tunnel", suggestions[0].label);
 
-    app.editor.clear();
-    app.editor.insertSlice("!rb c");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("!rb c");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
@@ -9213,8 +9231,10 @@ test "named animations and screensavers share the selected effect engine" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -9252,8 +9272,10 @@ test "all effects preserve text transiently and cover it as screensavers" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .term_cols = 48,
         .term_rows = 18,
     };
@@ -9311,8 +9333,10 @@ test "pixel effects start as themselves only with Kitty graphics" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .term_cols = 80,
         .term_rows = 24,
     };
@@ -9348,8 +9372,10 @@ test "manual screensaver wake consumes the first input event" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
     app.startScreensaver(app.screensaver_kind);
@@ -9364,7 +9390,7 @@ test "manual screensaver wake consumes the first input event" {
         &verdicts,
     );
     try std.testing.expect(!app.screensaver_active);
-    try std.testing.expect(app.editor.isEmpty());
+    try std.testing.expect(app.view.editor.isEmpty());
 }
 
 test "mouse activity neither wakes nor postpones the screensaver" {
@@ -9375,8 +9401,10 @@ test "mouse activity neither wakes nor postpones the screensaver" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .screensaver_timeout_ms = 1_000,
     };
     defer app.deinit();
@@ -9414,8 +9442,10 @@ test "idle deadline starts the screensaver without daemon activity" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .screensaver_timeout_ms = 1_000,
     };
     defer app.deinit();
@@ -9432,8 +9462,10 @@ test "gs starts the screensaver and returns to insert mode" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .mode = .normal,
     };
     defer app.deinit();
@@ -9451,20 +9483,22 @@ test "command menu Tab completes and Enter runs the selection" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined, // completion and /help are entirely client-local
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
-    app.editor.insertSlice("/mo");
+    app.view.editor.insertSlice("/mo");
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
-    try std.testing.expectEqualStrings("/model ", app.editor.text.items);
+    try std.testing.expectEqualStrings("/model ", app.view.editor.text.items);
 
-    app.editor.clear();
-    app.editor.insertSlice("/he");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/he");
     try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
-    try std.testing.expect(app.editor.isEmpty());
-    try std.testing.expectEqualStrings("/help", app.editor.history.items[0]);
+    try std.testing.expect(app.view.editor.isEmpty());
+    try std.testing.expectEqualStrings("/help", app.view.editor.history.items[0]);
     try std.testing.expect(app.shortcut_help); // /help opens the panel at COMMANDS
 }
 
@@ -9476,21 +9510,23 @@ test "history walks past recalled local commands without autocomplete capture" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
-    app.editor.pushHistory("ordinary prompt");
-    app.editor.pushHistory("/help");
+    app.view.editor.pushHistory("ordinary prompt");
+    app.view.editor.pushHistory("/help");
     try handleKey(&app, .{ .codepoint = vaxis.Key.up });
-    try std.testing.expectEqualStrings("/help", app.editor.text.items);
-    try std.testing.expect(app.editor.isWalkingHistory());
+    try std.testing.expectEqualStrings("/help", app.view.editor.text.items);
+    try std.testing.expect(app.view.editor.isWalkingHistory());
 
     // `/help` matches the command menu, but this second Up still belongs to
     // history because the text was recalled rather than freshly typed.
     try handleKey(&app, .{ .codepoint = vaxis.Key.up });
-    try std.testing.expectEqualStrings("ordinary prompt", app.editor.text.items);
+    try std.testing.expectEqualStrings("ordinary prompt", app.view.editor.text.items);
 }
 
 test "council list opens inspection before explicit editing" {
@@ -9501,8 +9537,10 @@ test "council list opens inspection before explicit editing" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
     var council = OwnedCouncil{ .name = try gpa.dupe(u8, "core") };
@@ -9547,8 +9585,10 @@ test "council picker reuses catalog with Done and checked multi-select seats" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -9600,8 +9640,10 @@ test "council Done refuses an empty roster without closing the picker" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .picker_kind = .council,
         .picker = 0,
     };
@@ -9622,12 +9664,14 @@ test "/effort opens the shared selector vocabulary" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined, // opening and filtering the selector are local
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
-    app.effort = .high;
+    app.view.effort = .high;
     app.runCommand("/effort");
     try std.testing.expectEqual(PickerKind.effort, app.picker_kind);
     try std.testing.expectEqual(@as(?usize, 5), app.picker);
@@ -9655,8 +9699,10 @@ test "provider setup distinguishes installed guests and advances custom fields w
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -9675,8 +9721,8 @@ test "provider setup distinguishes installed guests and advances custom fields w
     app.submitSetupPrompt("");
     try std.testing.expectEqual(SetupPrompt.model, app.setup_prompt);
     try std.testing.expectEqualStrings("NONE", app.setup_api_key_env.items);
-    try std.testing.expectEqualStrings("acme/", app.editor.text.items);
-    try std.testing.expectEqual(@as(usize, 0), app.editor.history.items.len);
+    try std.testing.expectEqualStrings("acme/", app.view.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 0), app.view.editor.history.items.len);
     app.submitSetupPrompt("acme/");
     try std.testing.expectEqual(SetupPrompt.model, app.setup_prompt);
     try std.testing.expectEqualStrings("model id needs a name after provider/", app.notice.items);
@@ -9690,8 +9736,10 @@ test "required provider setup still permits an explicit quit" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .setup_required = true,
     };
     defer app.deinit();
@@ -9708,8 +9756,10 @@ test "bang shell escape captures commands and bare interactive requests" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -9717,7 +9767,7 @@ test "bang shell escape captures commands and bare interactive requests" {
     try std.testing.expect(app.shell_requested);
     try std.testing.expect(app.should_quit);
     try std.testing.expectEqualStrings("printf 'hello world'", app.shell_command.items);
-    try std.testing.expectEqualStrings("! printf 'hello world'", app.editor.history.items[0]);
+    try std.testing.expectEqualStrings("! printf 'hello world'", app.view.editor.history.items[0]);
 
     app.should_quit = false;
     app.shell_requested = false;
@@ -9735,8 +9785,10 @@ test "bang shell escape refuses remote transport" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .remote_transport = true,
     };
     defer app.deinit();
@@ -9755,8 +9807,10 @@ test "bang rb expands to reboot with build" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -9765,7 +9819,7 @@ test "bang rb expands to reboot with build" {
     try std.testing.expectEqual(RebuildScope.attached, app.reboot_request.rebuild);
     try std.testing.expect(!app.reboot_request.force);
     try std.testing.expect(app.should_quit);
-    try std.testing.expectEqualStrings("!rb", app.editor.history.items[0]);
+    try std.testing.expectEqualStrings("!rb", app.view.editor.history.items[0]);
 }
 
 test "bang rb supports client and both scopes" {
@@ -9776,8 +9830,10 @@ test "bang rb supports client and both scopes" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -9799,9 +9855,11 @@ test "plain reboot refuses a focused approval unless forced" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
-        .state = .awaiting_approval,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+            .state = .awaiting_approval,
+        },
     };
     defer app.deinit();
 
@@ -9877,26 +9935,28 @@ test "Ctrl+L clears transient view state without touching the draft" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
-        .scroll_up = 12,
-        .sel_anchor = .{ .line = 2, .col = 3 },
-        .sel_dragging = true,
-        .copy_pending = true,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+            .scroll_up = 12,
+            .sel_anchor = .{ .line = 2, .col = 3 },
+            .sel_dragging = true,
+            .copy_pending = true,
+        },
     };
     defer app.deinit();
-    app.editor.insertSlice("draft survives");
+    app.view.editor.insertSlice("draft survives");
     app.setNotice("old notice", .{});
 
     try handleKey(&app, .{ .codepoint = 'l', .mods = .{ .ctrl = true } });
 
-    try std.testing.expectEqual(@as(usize, 0), app.scroll_up);
-    try std.testing.expect(app.sel_anchor == null);
-    try std.testing.expect(!app.sel_dragging);
-    try std.testing.expect(!app.copy_pending);
+    try std.testing.expectEqual(@as(usize, 0), app.view.scroll_up);
+    try std.testing.expect(app.view.sel_anchor == null);
+    try std.testing.expect(!app.view.sel_dragging);
+    try std.testing.expect(!app.view.copy_pending);
     try std.testing.expect(app.refresh_requested);
     try std.testing.expectEqualStrings("", app.notice.items);
-    try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
+    try std.testing.expectEqualStrings("draft survives", app.view.editor.text.items);
 }
 
 test "Ctrl+C never exits an idle TUI or destroys its draft" {
@@ -9907,16 +9967,18 @@ test "Ctrl+C never exits an idle TUI or destroys its draft" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
-    app.editor.insertSlice("draft survives");
+    app.view.editor.insertSlice("draft survives");
 
     try handleKey(&app, .{ .codepoint = 'c', .mods = .{ .ctrl = true } });
 
     try std.testing.expect(!app.should_quit);
-    try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
+    try std.testing.expectEqualStrings("draft survives", app.view.editor.text.items);
     try std.testing.expectEqualStrings("nothing to interrupt · q or /quit exits", app.notice.items);
 }
 
@@ -9928,8 +9990,10 @@ test "correlated session creation replies clear only the matching pending reques
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .awaiting_new_session = true,
         .pending_new_session_request_id = 77,
     };
@@ -9972,20 +10036,22 @@ test "Ctrl+N aliases /new in either mode while pickers keep navigation" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         // Avoid touching the deliberately absent test connection: this also
         // verifies key repeat cannot issue a second create request.
         .awaiting_new_session = true,
     };
     defer app.deinit();
-    app.editor.insertSlice("draft survives");
+    app.view.editor.insertSlice("draft survives");
 
     for ([_]Mode{ .insert, .normal }) |mode| {
         app.mode = mode;
         try handleKey(&app, .{ .codepoint = 'n', .mods = .{ .ctrl = true } });
         try std.testing.expectEqualStrings("new session already being created", app.notice.items);
-        try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
+        try std.testing.expectEqualStrings("draft survives", app.view.editor.text.items);
     }
 
     app.awaiting_new_session = false;
@@ -10004,12 +10070,14 @@ test "staging images inserts numbered prompt placeholders" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
-    app.editor.insertSlice("compare");
+    app.view.editor.insertSlice("compare");
     app.addAttachment(.{
         .name = try gpa.dupe(u8, "first.png"),
         .mime = try gpa.dupe(u8, "image/png"),
@@ -10021,7 +10089,7 @@ test "staging images inserts numbered prompt placeholders" {
         .data_base64 = try gpa.dupe(u8, "AA=="),
     });
 
-    try std.testing.expectEqualStrings("compare [image #1] [image #2] ", app.editor.text.items);
+    try std.testing.expectEqualStrings("compare [image #1] [image #2] ", app.view.editor.text.items);
     try std.testing.expectEqual(@as(usize, 2), app.attachments.items.len);
 }
 
@@ -10033,8 +10101,10 @@ test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D neve
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
     const ctrl_d = vaxis.Key{ .codepoint = 'd', .mods = .{ .ctrl = true } };
@@ -10045,10 +10115,10 @@ test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D neve
     try std.testing.expect(!isArchiveCurrentKey(&app, .{ .codepoint = 'd' }));
     try std.testing.expect(!isArchiveCurrentKey(&app, .{ .codepoint = 'w' }));
 
-    app.editor.insertSlice("draft survives");
+    app.view.editor.insertSlice("draft survives");
     try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d));
     try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_w));
-    app.editor.clear();
+    app.view.editor.clear();
 
     try app.attachments.append(gpa, .{
         .name = try gpa.dupe(u8, "image.png"),
@@ -10065,7 +10135,7 @@ test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D neve
     app.copy_cursor = null;
 
     // The shared /archive path retains its running-session guard.
-    app.state = .running;
+    app.view.state = .running;
     try handleKey(&app, ctrl_w);
     try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "interrupt it first") != null);
 }
@@ -10078,13 +10148,15 @@ test "Escape closes an active picker, then a bare Escape returns to insert" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
         .mode = .normal,
         .picker = 0,
     };
     defer app.deinit();
-    app.editor.insertSlice("draft survives");
+    app.view.editor.insertSlice("draft survives");
 
     try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
     try std.testing.expectEqual(Mode.normal, app.mode);
@@ -10093,7 +10165,7 @@ test "Escape closes an active picker, then a bare Escape returns to insert" {
     // Nothing pending: Esc is the way back to typing; the draft survives.
     try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
     try std.testing.expectEqual(Mode.insert, app.mode);
-    try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
+    try std.testing.expectEqualStrings("draft survives", app.view.editor.text.items);
 }
 
 test "question mark opens modal shortcut help in normal mode" {
@@ -10104,10 +10176,12 @@ test "question mark opens modal shortcut help in normal mode" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+            .scroll_up = 8,
+        },
         .mode = .normal,
-        .scroll_up = 8,
     };
     defer app.deinit();
 
@@ -10115,7 +10189,7 @@ test "question mark opens modal shortcut help in normal mode" {
     try std.testing.expect(app.shortcut_help);
 
     try handleKey(&app, .{ .codepoint = 'j' });
-    try std.testing.expectEqual(@as(usize, 8), app.scroll_up);
+    try std.testing.expectEqual(@as(usize, 8), app.view.scroll_up);
     try std.testing.expect(app.shortcut_help);
 
     try handleKey(&app, .{ .codepoint = 'q' });
@@ -10132,25 +10206,25 @@ test "a A I enter insert mode with vim cursor placement" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
-    app.editor.insertSlice("hello");
-    app.editor.moveLineStart();
+    app.view.editor.insertSlice("hello");
+    app.view.editor.moveLineStart();
     app.mode = .normal;
 
     try handleKey(&app, .{ .codepoint = 'A', .mods = .{ .shift = true } });
     try std.testing.expectEqual(Mode.insert, app.mode);
-    try std.testing.expectEqual(app.editor.text.items.len, app.editor.cursor);
+    try std.testing.expectEqual(app.view.editor.text.items.len, app.view.editor.cursor);
 
     app.mode = .normal;
     try handleKey(&app, .{ .codepoint = 'I', .mods = .{ .shift = true } });
     try std.testing.expectEqual(Mode.insert, app.mode);
-    try std.testing.expectEqual(@as(usize, 0), app.editor.cursor);
+    try std.testing.expectEqual(@as(usize, 0), app.view.editor.cursor);
 
     app.mode = .normal;
     try handleKey(&app, .{ .codepoint = 'a' });
     try std.testing.expectEqual(Mode.insert, app.mode);
-    try std.testing.expectEqual(@as(usize, 1), app.editor.cursor);
+    try std.testing.expectEqual(@as(usize, 1), app.view.editor.cursor);
 }
 
 test "archive has no single-key binding; a enters insert even mid-turn" {
@@ -10161,10 +10235,12 @@ test "archive has no single-key binding; a enters insert even mid-turn" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+            .state = .running,
+        },
         .mode = .normal,
-        .state = .running,
     };
     defer app.deinit();
 
@@ -10467,8 +10543,10 @@ test "calls-first parallel tool batches collapse as one transcript run" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -10481,7 +10559,7 @@ test "calls-first parallel tool batches collapse as one transcript run" {
         .{ .tool_result, "matches", "" },
     };
     for (entries) |entry| {
-        try app.blocks.append(gpa, .{
+        try app.view.blocks.append(gpa, .{
             .kind = entry[0],
             .turn_id = 9,
             .text = try gpa.dupe(u8, entry[1]),
@@ -10491,7 +10569,7 @@ test "calls-first parallel tool batches collapse as one transcript run" {
 
     var expand: std.ArrayList(ExpandPair) = .empty;
     defer expand.deinit(gpa);
-    const batch = try scanToolBatch(gpa, app.blocks.items, 0, &expand);
+    const batch = try scanToolBatch(gpa, app.view.blocks.items, 0, &expand);
     try std.testing.expectEqual(@as(usize, 3), batch.ok_count);
     try std.testing.expectEqual(@as(usize, 6), batch.next);
     try std.testing.expect(batch.complete);
@@ -10517,13 +10595,15 @@ test "in-flight calls-first batch renders one compact running line" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
-        .state = .running,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+            .state = .running,
+        },
     };
     defer app.deinit();
     for ([_][]const u8{ "read_file", "grep", "glob" }) |name| {
-        try app.blocks.append(gpa, .{
+        try app.view.blocks.append(gpa, .{
             .kind = .tool_call,
             .turn_id = 9,
             .text = try gpa.dupe(u8, "{}"),
@@ -10550,17 +10630,19 @@ test "failed tool output uses red only for its marker and salient diagnostics" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
-        .show_tool_transcript = true,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+            .show_tool_transcript = true,
+        },
     };
     defer app.deinit();
-    try app.blocks.append(gpa, .{
+    try app.view.blocks.append(gpa, .{
         .kind = .tool_call,
         .text = try gpa.dupe(u8, "{}"),
         .label = try gpa.dupe(u8, "bash"),
     });
-    try app.blocks.append(gpa, .{
+    try app.view.blocks.append(gpa, .{
         .kind = .tool_result,
         .text = try gpa.dupe(
             u8,
@@ -10625,15 +10707,17 @@ test "correlated daemon error removes only its optimistic input and restores sta
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
-    app.state = .done;
-    app.pushInputEcho(.user_msg, "rejected", 41, app.state);
+    app.view.state = .done;
+    app.pushInputEcho(.user_msg, "rejected", 41, app.view.state);
     app.pushInputEcho(.steer, "unrelated", 42, null);
-    app.state = .running;
+    app.view.state = .running;
     app.animation_active.store(true, .release);
 
     const line = try proto.encode(gpa, proto.DaemonMsg{ .err = .{
@@ -10643,12 +10727,12 @@ test "correlated daemon error removes only its optimistic input and restores sta
     } });
     app.handleDaemonLine(line);
 
-    try std.testing.expectEqual(proto.SessionState.done, app.state);
+    try std.testing.expectEqual(proto.SessionState.done, app.view.state);
     try std.testing.expect(!app.animation_active.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
-    try std.testing.expectEqualStrings("unrelated", app.blocks.items[0].text);
-    try std.testing.expectEqual(@as(u64, 42), app.blocks.items[0].pending_request_id);
-    try std.testing.expectEqualStrings("rejected", app.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    try std.testing.expectEqualStrings("unrelated", app.view.blocks.items[0].text);
+    try std.testing.expectEqual(@as(u64, 42), app.view.blocks.items[0].pending_request_id);
+    try std.testing.expectEqualStrings("rejected", app.view.editor.text.items);
 }
 
 test "correlated ok accepts the echo while generic errors cannot reject it" {
@@ -10659,22 +10743,24 @@ test "correlated ok accepts the echo while generic errors cannot reject it" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
     app.pushInputEcho(.user_msg, "accepted", 55, .idle);
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .ok = .{ .request_id = 55 } }));
-    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
-    try std.testing.expect(app.blocks.items[0].pending_echo);
-    try std.testing.expectEqual(@as(u64, 0), app.blocks.items[0].pending_request_id);
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    try std.testing.expect(app.view.blocks.items[0].pending_echo);
+    try std.testing.expectEqual(@as(u64, 0), app.view.blocks.items[0].pending_request_id);
 
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .err = .{
         .code = "other_command",
         .msg = "unrelated",
     } }));
-    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
 }
 
 test "replay marker completes a bounded tail without needing a connection" {
@@ -10685,10 +10771,12 @@ test "replay marker completes a bounded tail without needing a connection" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 7,
-        .editor = Editor.init(gpa),
-        .history_complete = false,
-        .history_loading = true,
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+            .history_complete = false,
+            .history_loading = true,
+        },
     };
     defer app.deinit();
 
@@ -10702,14 +10790,14 @@ test "replay marker completes a bounded tail without needing a connection" {
             .{ .step = "Implement", .status = .in_progress, .started_at_ms = 20_000 },
         },
     } }));
-    try std.testing.expectEqual(@as(u64, 20), app.oldest_seq);
-    try std.testing.expect(!app.history_complete);
-    try std.testing.expect(!app.history_loading);
-    try std.testing.expectEqual(@as(usize, 2), app.plan.items.len);
-    try std.testing.expectEqual(@as(u64, 18_400), app.plan.items[0].duration_ms);
-    try std.testing.expectEqualStrings("Implement", app.plan.items[1].step);
-    try std.testing.expectEqual(block.PlanStatus.in_progress, app.plan.items[1].status);
-    try std.testing.expectEqual(@as(i64, 20_000), app.plan.items[1].started_at_ms);
+    try std.testing.expectEqual(@as(u64, 20), app.view.oldest_seq);
+    try std.testing.expect(!app.view.history_complete);
+    try std.testing.expect(!app.view.history_loading);
+    try std.testing.expectEqual(@as(usize, 2), app.view.plan.items.len);
+    try std.testing.expectEqual(@as(u64, 18_400), app.view.plan.items[0].duration_ms);
+    try std.testing.expectEqualStrings("Implement", app.view.plan.items[1].step);
+    try std.testing.expectEqual(block.PlanStatus.in_progress, app.view.plan.items[1].status);
+    try std.testing.expectEqual(@as(i64, 20_000), app.view.plan.items[1].started_at_ms);
 }
 
 test "replay marker never repins a completed plan" {
@@ -10720,8 +10808,10 @@ test "replay marker never repins a completed plan" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 7,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
     app.setPlan(&.{.{ .step = "Done", .status = .completed, .duration_ms = 1_000 }});
@@ -10731,7 +10821,7 @@ test "replay marker never repins a completed plan" {
         .plan_pinned = true,
         .plan_items = &.{.{ .step = "Done", .status = .completed, .duration_ms = 1_000 }},
     } }));
-    try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.plan.items.len);
 }
 
 test "older replay page is prepended atomically in transcript order" {
@@ -10742,16 +10832,18 @@ test "older replay page is prepended atomically in transcript order" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 7,
-        .editor = Editor.init(gpa),
-        .last_seq = 3,
-        .oldest_seq = 3,
-        .history_complete = false,
-        .history_loading = true,
-        .history_before_seq = 3,
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+            .last_seq = 3,
+            .oldest_seq = 3,
+            .history_complete = false,
+            .history_loading = true,
+            .history_before_seq = 3,
+        },
     };
     defer app.deinit();
-    try app.blocks.append(gpa, .{
+    try app.view.blocks.append(gpa, .{
         .kind = .user_msg,
         .seq = 3,
         .turn_id = 2,
@@ -10776,8 +10868,8 @@ test "older replay page is prepended atomically in transcript order" {
         } }));
     }
     // The visible list does not change before the page marker.
-    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
-    try std.testing.expectEqual(@as(usize, 2), app.history_backfill.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.view.history_backfill.items.len);
 
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{
         .sid = 7,
@@ -10785,15 +10877,15 @@ test "older replay page is prepended atomically in transcript order" {
         .newest_seq = 2,
         .has_older = false,
     } }));
-    try std.testing.expectEqual(@as(usize, 3), app.blocks.items.len);
-    try std.testing.expectEqualStrings("oldest", app.blocks.items[0].text);
-    try std.testing.expectEqualStrings("middle", app.blocks.items[1].text);
-    try std.testing.expectEqualStrings("newest", app.blocks.items[2].text);
-    try std.testing.expectEqual(@as(u64, 1), app.oldest_seq);
-    try std.testing.expect(app.history_complete);
-    try std.testing.expect(!app.history_loading);
-    try std.testing.expectEqual(@as(usize, 0), app.history_backfill.items.len);
-    try std.testing.expectEqual(@as(usize, 3), app.editor.history.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.view.blocks.items.len);
+    try std.testing.expectEqualStrings("oldest", app.view.blocks.items[0].text);
+    try std.testing.expectEqualStrings("middle", app.view.blocks.items[1].text);
+    try std.testing.expectEqualStrings("newest", app.view.blocks.items[2].text);
+    try std.testing.expectEqual(@as(u64, 1), app.view.oldest_seq);
+    try std.testing.expect(app.view.history_complete);
+    try std.testing.expect(!app.view.history_loading);
+    try std.testing.expectEqual(@as(usize, 0), app.view.history_backfill.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.view.editor.history.items.len);
 }
 
 test "failed replay request releases buffered page and can be retried" {
@@ -10804,15 +10896,17 @@ test "failed replay request releases buffered page and can be retried" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 7,
-        .editor = Editor.init(gpa),
-        .oldest_seq = 3,
-        .history_complete = false,
-        .history_loading = true,
-        .history_before_seq = 3,
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+            .oldest_seq = 3,
+            .history_complete = false,
+            .history_loading = true,
+            .history_before_seq = 3,
+        },
     };
     defer app.deinit();
-    try app.history_backfill.append(gpa, .{
+    try app.view.history_backfill.append(gpa, .{
         .kind = .user_msg,
         .seq = 2,
         .text = try gpa.dupe(u8, "owned page text"),
@@ -10823,10 +10917,10 @@ test "failed replay request releases buffered page and can be retried" {
         .code = "request_failed",
         .msg = "store unavailable",
     } }));
-    try std.testing.expect(!app.history_loading);
-    try std.testing.expectEqual(@as(u64, 0), app.history_before_seq);
-    try std.testing.expectEqual(@as(usize, 0), app.history_backfill.items.len);
-    try std.testing.expect(!app.history_complete);
+    try std.testing.expect(!app.view.history_loading);
+    try std.testing.expectEqual(@as(u64, 0), app.view.history_before_seq);
+    try std.testing.expectEqual(@as(usize, 0), app.view.history_backfill.items.len);
+    try std.testing.expect(!app.view.history_complete);
 }
 
 test "diagnostics render in scrollback with the full latest-turn waterfall" {
@@ -10837,8 +10931,10 @@ test "diagnostics render in scrollback with the full latest-turn waterfall" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 7,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -10900,13 +10996,13 @@ test "diagnostics render in scrollback with the full latest-turn waterfall" {
     } };
     app.handleDaemonLine(try proto.encode(gpa, msg));
 
-    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
-    try std.testing.expectEqual(block.BlockKind.system_note, app.blocks.items[0].kind);
-    try std.testing.expectEqualStrings("diagnostics", app.blocks.items[0].label);
-    try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "Provider #1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "Legacy pre-provider") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "500 steps") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app.blocks.items[0].text, "HTTP 401 authorization failed") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    try std.testing.expectEqual(block.BlockKind.system_note, app.view.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("diagnostics", app.view.blocks.items[0].label);
+    try std.testing.expect(std.mem.indexOf(u8, app.view.blocks.items[0].text, "Provider #1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.view.blocks.items[0].text, "Legacy pre-provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.view.blocks.items[0].text, "500 steps") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.view.blocks.items[0].text, "HTTP 401 authorization failed") != null);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -10933,8 +11029,10 @@ test "synthetic and legacy rehydration render as notes, not prompts or history" 
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -10959,11 +11057,11 @@ test "synthetic and legacy rehydration render as notes, not prompts or history" 
         .body = .{ .user_msg = .{ .text = "[rehydrated after compaction] src/main.zig:\nold contents" } },
     });
 
-    try std.testing.expectEqual(@as(usize, 2), app.blocks.items.len);
-    try std.testing.expectEqual(block.BlockKind.system_note, app.blocks.items[0].kind);
-    try std.testing.expectEqualStrings("rehydrated docs/PLAN.md", app.blocks.items[0].text);
-    try std.testing.expectEqualStrings("rehydrated src/main.zig", app.blocks.items[1].text);
-    try std.testing.expectEqual(@as(usize, 0), app.editor.history.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.view.blocks.items.len);
+    try std.testing.expectEqual(block.BlockKind.system_note, app.view.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("rehydrated docs/PLAN.md", app.view.blocks.items[0].text);
+    try std.testing.expectEqualStrings("rehydrated src/main.zig", app.view.blocks.items[1].text);
+    try std.testing.expectEqual(@as(usize, 0), app.view.editor.history.items.len);
 }
 
 test "compaction renders one marker without exposing its summary" {
@@ -10974,8 +11072,10 @@ test "compaction renders one marker without exposing its summary" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
     app.applyBlock(.{
@@ -10999,7 +11099,7 @@ test "compaction renders one marker without exposing its summary" {
         .body = .{ .system_note = .{ .text = "context compacted automatically (headroom); summary + rehydrated files above replace the older conversation" } },
     });
 
-    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const lines = try layoutLines(arena_state.allocator(), &app, 100);
@@ -11021,8 +11121,10 @@ test "legacy provider error notes are display-bounded" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
     const old_raw_error = "provider returned HTTP 400: " ++ ("x" ** 1600) ++ " NEVER_RENDER_THIS_TAIL";
@@ -11048,8 +11150,10 @@ test "session labels round-trip ids and preserve inactive view state" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 0x2a,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 0x2a,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -11065,21 +11169,21 @@ test "session labels round-trip ids and preserve inactive view state" {
     }});
     try std.testing.expectEqual(@as(?u64, 0x2a), app.sessionIdForLabel(app.session_labels.items[0]));
     try std.testing.expectEqual(@as(?u64, null), app.sessionIdForLabel("no session label"));
-    try std.testing.expectEqual(proto.SessionState.running, app.state);
+    try std.testing.expectEqual(proto.SessionState.running, app.view.state);
 
-    app.editor.insertSlice("draft survives");
-    app.scroll_up = 17;
+    app.view.editor.insertSlice("draft survives");
+    app.view.scroll_up = 17;
     app.pushBlock(.assistant_msg, "scrollback survives", "", .ok);
     try app.saveActiveView();
-    try std.testing.expectEqual(@as(usize, 0), app.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.blocks.items.len);
 
     const saved = app.saved_views.get(0x2a).?;
     _ = app.saved_views.remove(0x2a);
     app.restoreSavedView(saved);
     gpa.destroy(saved);
-    try std.testing.expectEqualStrings("draft survives", app.editor.text.items);
-    try std.testing.expectEqual(@as(usize, 17), app.scroll_up);
-    try std.testing.expectEqualStrings("scrollback survives", app.blocks.items[0].text);
+    try std.testing.expectEqualStrings("draft survives", app.view.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 17), app.view.scroll_up);
+    try std.testing.expectEqualStrings("scrollback survives", app.view.blocks.items[0].text);
 }
 
 test "incremental session catalog upserts preserve hierarchy and remove owned state" {
@@ -11090,8 +11194,10 @@ test "incremental session catalog upserts preserve hierarchy and remove owned st
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 20,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 20,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -11157,7 +11263,7 @@ test "incremental session catalog upserts preserve hierarchy and remove owned st
         .running = true,
         .sandboxed = true,
     });
-    try std.testing.expectEqual(proto.SessionState.running, app.state);
+    try std.testing.expectEqual(proto.SessionState.running, app.view.state);
     try std.testing.expectEqualStrings("new-model", app.sessions.items[0].model);
     try std.testing.expect(app.sessions.items[0].sandboxed);
     try std.testing.expect(app.session_labels.items[0].ptr == app.sessions.items[0].label.ptr);
@@ -11175,8 +11281,10 @@ test "top overlay opens from command and Ctrl+S, tracks selection, and closes" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 20,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 20,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
     app.replaceSessionSummaries(&.{
@@ -11207,8 +11315,10 @@ test "top overlay kill requires confirmation before sending" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 20,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 20,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
     app.replaceSessionSummaries(&.{.{ .sid = 20, .title = "root", .model = "m", .status = "idle", .created_at = 20, .running = false }});
@@ -11228,13 +11338,15 @@ test "inactive session view cache evicts least recently used transcripts" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
     for (1..App.max_saved_views + 4) |sid| {
-        app.sid = sid;
+        app.view.sid = sid;
         app.pushBlock(.assistant_msg, "cached transcript", "", .ok);
         try app.saveActiveView();
     }
@@ -11247,7 +11359,7 @@ test "tab bar is permanent, root-only, chronological, and rolls up child activit
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 30, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 30, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     app.replaceSessionSummaries(&.{
@@ -11267,7 +11379,7 @@ test "tab bar is permanent, root-only, chronological, and rolls up child activit
     try std.testing.expectEqual(TabActivity.err, layout.items[1].activity);
     try std.testing.expect(std.mem.indexOf(u8, layout.items[0].label, "alpha") != null);
 
-    var empty = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 99, .editor = Editor.init(gpa) };
+    var empty = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 99, .editor = Editor.init(gpa) } };
     defer empty.deinit();
     const fallback = try layoutTabBar(arena_state.allocator(), &empty, 80);
     try std.testing.expectEqual(@as(usize, 1), fallback.items.len);
@@ -11279,7 +11391,7 @@ test "normal-mode tab navigation follows chronological roots and wraps" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 30, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 30, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     app.replaceSessionSummaries(&.{
@@ -11307,24 +11419,24 @@ test "normal-mode tab navigation follows chronological roots and wraps" {
 
     // With one visible root, every shortcut is a no-op and never repurposes
     // Left/Right as composer movement in normal mode.
-    var one = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 10, .editor = Editor.init(gpa) };
+    var one = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 10, .editor = Editor.init(gpa) } };
     defer one.deinit();
     one.replaceSessionSummaries(&.{.{ .sid = 10, .title = "only", .model = "m", .status = "idle", .created_at = 10, .running = false }});
-    one.editor.insertSlice("draft");
-    one.editor.cursor = 2;
+    one.view.editor.insertSlice("draft");
+    one.view.editor.cursor = 2;
     one.mode = .normal;
     try handleKey(&one, .{ .codepoint = '>' });
     try handleKey(&one, .{ .codepoint = vaxis.Key.left });
     try handleKey(&one, .{ .codepoint = '<' });
     try handleKey(&one, .{ .codepoint = vaxis.Key.right });
-    try std.testing.expectEqual(@as(usize, 2), one.editor.cursor);
+    try std.testing.expectEqual(@as(usize, 2), one.view.editor.cursor);
 }
 
 test "tab overflow retains the active tab and tab hit testing is button-extensible" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 4, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 4, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     app.replaceSessionSummaries(&.{
@@ -11357,15 +11469,15 @@ test "tab overflow retains the active tab and tab hit testing is button-extensib
     // Clicking the already-active tab is a complete no-op and must not begin
     // transcript selection even when no connection object is available.
     handleMouse(&app, .{ .row = 0, .col = 4, .button = .left, .mods = .{}, .type = .press });
-    try std.testing.expect(app.sel_anchor == null);
+    try std.testing.expect(app.view.sel_anchor == null);
     handleMouse(&app, .{ .row = 0, .col = 4, .button = .wheel_up, .mods = .{}, .type = .press });
-    try std.testing.expectEqual(@as(usize, 3), app.scroll_up);
+    try std.testing.expectEqual(@as(usize, 3), app.view.scroll_up);
 
-    app.last_total_lines = 45;
-    app.last_first_visible = 40;
-    app.last_view_h = 5;
+    app.view.last_total_lines = 45;
+    app.view.last_first_visible = 40;
+    app.view.last_view_h = 5;
     handleMouse(&app, .{ .row = 1, .col = 7, .button = .left, .mods = .{}, .type = .press });
-    try std.testing.expectEqual(@as(usize, 40), app.sel_anchor.?.line); // row 0 is the tab strip
+    try std.testing.expectEqual(@as(usize, 40), app.view.sel_anchor.?.line); // row 0 is the tab strip
 }
 
 test "active prompt scrolls normally before sticking at the top" {
@@ -11384,22 +11496,22 @@ test "active prompt scrolls normally before sticking at the top" {
     conn.sandbox_available = false;
     conn.network_filtering = false;
     conn.network_configured = false;
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
-    app.state = .running;
-    try app.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 1, .text = try gpa.dupe(u8, "old prompt"), .label = try gpa.dupe(u8, "") });
-    try app.blocks.append(gpa, .{ .kind = .assistant_msg, .turn_id = 1, .text = try gpa.dupe(u8, "old answer"), .label = try gpa.dupe(u8, "") });
-    try app.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 2, .text = try gpa.dupe(u8, "the active request"), .label = try gpa.dupe(u8, "") });
+    app.view.state = .running;
+    try app.view.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 1, .text = try gpa.dupe(u8, "old prompt"), .label = try gpa.dupe(u8, "") });
+    try app.view.blocks.append(gpa, .{ .kind = .assistant_msg, .turn_id = 1, .text = try gpa.dupe(u8, "old answer"), .label = try gpa.dupe(u8, "") });
+    try app.view.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 2, .text = try gpa.dupe(u8, "the active request"), .label = try gpa.dupe(u8, "") });
 
     var frame = std.heap.ArenaAllocator.init(gpa);
     defer frame.deinit();
     try draw(&app, &vx, frame.allocator());
-    try std.testing.expectEqual(@as(usize, 0), app.last_pinned_rows);
-    try std.testing.expectEqual(app.last_first_visible, app.visibleLineAtRow(0).?);
+    try std.testing.expectEqual(@as(usize, 0), app.view.last_pinned_rows);
+    try std.testing.expectEqual(app.view.last_first_visible, app.visibleLineAtRow(0).?);
 
     var i: usize = 0;
     while (i < 12) : (i += 1) {
-        try app.blocks.append(gpa, .{
+        try app.view.blocks.append(gpa, .{
             .kind = .reasoning,
             .turn_id = 2,
             .text = try std.fmt.allocPrint(gpa, "progress line {d}", .{i}),
@@ -11407,25 +11519,25 @@ test "active prompt scrolls normally before sticking at the top" {
             .commentary = true,
         });
     }
-    app.layout_epoch +%= 1;
+    app.view.layout_epoch +%= 1;
     frame.deinit();
     frame = std.heap.ArenaAllocator.init(gpa);
     try draw(&app, &vx, frame.allocator());
-    try std.testing.expectEqual(@as(usize, 4), app.last_pinned_rows);
-    try std.testing.expect(app.last_body_first > app.last_pinned_start + app.last_pinned_rows);
+    try std.testing.expectEqual(@as(usize, 4), app.view.last_pinned_rows);
+    try std.testing.expect(app.view.last_body_first > app.view.last_pinned_start + app.view.last_pinned_rows);
     try std.testing.expect(app.visibleLineAtRow(0) == null);
-    try std.testing.expect(app.visibleLineAtRow(app.last_pinned_rows - 1) == null);
-    try std.testing.expectEqual(app.last_body_first, app.visibleLineAtRow(app.last_pinned_rows).?);
+    try std.testing.expect(app.visibleLineAtRow(app.view.last_pinned_rows - 1) == null);
+    try std.testing.expectEqual(app.view.last_body_first, app.visibleLineAtRow(app.view.last_pinned_rows).?);
     const pinned_mark = vx.window().readCell(1, @intCast(app.tabBarRows() + 1)).?;
     try std.testing.expectEqualStrings("#", pinned_mark.char.grapheme);
     try std.testing.expect(vaxis.Color.eql(pinned_mark.style.fg, Palette.pinned_prompt_mark.fg));
 
-    app.scroll_up = 1;
+    app.view.scroll_up = 1;
     frame.deinit();
     frame = std.heap.ArenaAllocator.init(gpa);
     try draw(&app, &vx, frame.allocator());
-    try std.testing.expectEqual(@as(usize, 0), app.last_pinned_rows);
-    try std.testing.expectEqual(app.last_first_visible, app.visibleLineAtRow(0).?);
+    try std.testing.expectEqual(@as(usize, 0), app.view.last_pinned_rows);
+    try std.testing.expectEqual(app.view.last_first_visible, app.visibleLineAtRow(0).?);
 }
 
 test "draw permanently reserves and paints the clickable tab row" {
@@ -11444,7 +11556,7 @@ test "draw permanently reserves and paints the clickable tab row" {
     conn.sandbox_available = false;
     conn.network_filtering = false;
     conn.network_configured = false;
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.setCwdStr("/work/marlin");
 
@@ -11454,7 +11566,7 @@ test "draw permanently reserves and paints the clickable tab row" {
 
     try std.testing.expectEqual(@as(usize, 1), app.tab_hits.items.len);
     try std.testing.expectEqual(@as(u64, 1), app.tab_hits.items[0].sid);
-    try std.testing.expectEqual(@as(usize, 6), app.last_view_h);
+    try std.testing.expectEqual(@as(usize, 6), app.view.last_view_h);
     const tab_cell = vx.window().readCell(0, 0).?;
     try std.testing.expect(vaxis.Color.eql(tab_cell.style.bg, Palette.prompt_bg));
 }
@@ -11475,7 +11587,7 @@ test "empty session draws the welcome card; content reclaims it" {
     conn.sandbox_available = true;
     conn.network_filtering = true;
     conn.network_configured = true;
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.setModelStr("openrouter/example/model");
     const dv = "0.0.0-dev";
@@ -11508,7 +11620,7 @@ test "empty session draws the welcome card; content reclaims it" {
 
     // Loading history, a running turn, or any transcript content reclaims
     // the area: the card is empty-state orientation, never chrome.
-    app.history_loading = true;
+    app.view.history_loading = true;
     var frame2 = std.heap.ArenaAllocator.init(gpa);
     defer frame2.deinit();
     try draw(&app, &vx, frame2.allocator());
@@ -11542,8 +11654,10 @@ test "tool results retain full blob refs and inline !c stages clipboard text" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -11560,9 +11674,9 @@ test "tool results retain full blob refs and inline !c stages clipboard text" {
             .full_body_ref = "abc123",
         } },
     });
-    try std.testing.expectEqualStrings("abc123", app.blocks.items[0].full_body_ref.?);
-    app.blocks.items[0].deinit(gpa);
-    app.blocks.clearRetainingCapacity();
+    try std.testing.expectEqualStrings("abc123", app.view.blocks.items[0].full_body_ref.?);
+    app.view.blocks.items[0].deinit(gpa);
+    app.view.blocks.clearRetainingCapacity();
 
     app.pushBlock(.tool_result, "complete output", "", .ok);
     app.runCommand("!c");
@@ -11579,8 +11693,10 @@ test "!c names the folded source it copies (positional batch pairing)" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined, // inline results only; !c never touches the socket
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -11634,15 +11750,17 @@ test "local commands enter editor history" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined, // /help is entirely client-local
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
     app.submitInput("/help");
-    try std.testing.expectEqual(@as(usize, 1), app.editor.history.items.len);
-    app.editor.histUp();
-    try std.testing.expectEqualStrings("/help", app.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 1), app.view.editor.history.items.len);
+    app.view.editor.histUp();
+    try std.testing.expectEqualStrings("/help", app.view.editor.text.items);
 }
 
 test "layout cache: incremental result equals fresh one-shot layout" {
@@ -11656,13 +11774,13 @@ test "layout cache: incremental result equals fresh one-shot layout" {
             var seq: u64 = 1;
             while (t < turns) : (t += 1) {
                 const turn_id = t + 10;
-                try app.blocks.append(a, .{ .kind = .user_msg, .seq = seq, .turn_id = turn_id, .text = try a.dupe(u8, "do the thing"), .label = try a.dupe(u8, "") });
+                try app.view.blocks.append(a, .{ .kind = .user_msg, .seq = seq, .turn_id = turn_id, .text = try a.dupe(u8, "do the thing"), .label = try a.dupe(u8, "") });
                 seq += 1;
-                try app.blocks.append(a, .{ .kind = .tool_call, .seq = seq, .turn_id = turn_id, .text = try a.dupe(u8, "{\"command\":\"zig build test\"}"), .label = try a.dupe(u8, "bash") });
+                try app.view.blocks.append(a, .{ .kind = .tool_call, .seq = seq, .turn_id = turn_id, .text = try a.dupe(u8, "{\"command\":\"zig build test\"}"), .label = try a.dupe(u8, "bash") });
                 seq += 1;
-                try app.blocks.append(a, .{ .kind = .tool_result, .seq = seq, .turn_id = turn_id, .status = if (t % 3 == 0) .err else .ok, .text = try a.dupe(u8, "line one\nline two\nline three"), .label = try a.dupe(u8, "") });
+                try app.view.blocks.append(a, .{ .kind = .tool_result, .seq = seq, .turn_id = turn_id, .status = if (t % 3 == 0) .err else .ok, .text = try a.dupe(u8, "line one\nline two\nline three"), .label = try a.dupe(u8, "") });
                 seq += 1;
-                try app.blocks.append(a, .{ .kind = .assistant_msg, .seq = seq, .turn_id = turn_id, .text = try a.dupe(u8, "done: **ok**"), .label = try a.dupe(u8, "") });
+                try app.view.blocks.append(a, .{ .kind = .assistant_msg, .seq = seq, .turn_id = turn_id, .text = try a.dupe(u8, "done: **ok**"), .label = try a.dupe(u8, "") });
                 seq += 1;
             }
         }
@@ -11678,21 +11796,21 @@ test "layout cache: incremental result equals fresh one-shot layout" {
     };
 
     // Incremental: layout after 3 turns (warms cache), add 2 more, layout again.
-    var warm = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var warm = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer warm.deinit();
     try Fixture.fill(&warm, gpa, 3);
     var arena1 = std.heap.ArenaAllocator.init(gpa);
     defer arena1.deinit();
     _ = try Fixture.rendered(arena1.allocator(), &warm);
-    try std.testing.expect(warm.layout_cache.covered > 0);
-    for (warm.blocks.items) |*rb| rb.deinit(gpa);
-    warm.blocks.clearRetainingCapacity();
+    try std.testing.expect(warm.view.layout_cache.covered > 0);
+    for (warm.view.blocks.items) |*rb| rb.deinit(gpa);
+    warm.view.blocks.clearRetainingCapacity();
     try Fixture.fill(&warm, gpa, 5);
-    warm.layout_epoch +%= 1; // list rebuilt wholesale, as a session switch would
+    warm.view.layout_epoch +%= 1; // list rebuilt wholesale, as a session switch would
     var arena2 = std.heap.ArenaAllocator.init(gpa);
     defer arena2.deinit();
     _ = try Fixture.rendered(arena2.allocator(), &warm);
-    try std.testing.expect(warm.layout_cache.covered > 0);
+    try std.testing.expect(warm.view.layout_cache.covered > 0);
     // Now truly incremental: append one more turn on the warmed cache.
     try Fixture.fill(&warm, gpa, 1);
     var arena3 = std.heap.ArenaAllocator.init(gpa);
@@ -11700,7 +11818,7 @@ test "layout cache: incremental result equals fresh one-shot layout" {
     const incremental = try Fixture.rendered(arena3.allocator(), &warm);
 
     // Fresh app, identical blocks, single cold layout.
-    var fresh = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var fresh = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer fresh.deinit();
     try Fixture.fill(&fresh, gpa, 5);
     try Fixture.fill(&fresh, gpa, 1);
@@ -11715,7 +11833,7 @@ test "layout remains bounded around a dangling call between turns" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     const Entry = struct { block.BlockKind, u64, []const u8, []const u8 };
@@ -11732,7 +11850,7 @@ test "layout remains bounded around a dangling call between turns" {
         .{ .user_msg, 8, "next turn", "" },
         .{ .system_note, 8, "interrupted", "" },
     };
-    for (entries, 0..) |entry, i| try app.blocks.append(gpa, .{
+    for (entries, 0..) |entry, i| try app.view.blocks.append(gpa, .{
         .kind = entry[0],
         .seq = i + 1,
         .turn_id = entry[1],
@@ -11760,19 +11878,19 @@ test "raw provider reasoning folds; commentary narration stays visible" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     // The grok shape: raw reasoning (with a drafted reply inside) followed
     // by the model's deliberate one-line narration, both kind=reasoning.
-    try app.blocks.append(gpa, .{
+    try app.view.blocks.append(gpa, .{
         .kind = .reasoning,
         .seq = 1,
         .turn_id = 7,
         .text = try gpa.dupe(u8, "The user wants a review. Thanks for the update, solid work!"),
         .label = try gpa.dupe(u8, ""),
     });
-    try app.blocks.append(gpa, .{
+    try app.view.blocks.append(gpa, .{
         .kind = .reasoning,
         .seq = 2,
         .turn_id = 7,
@@ -11797,8 +11915,8 @@ test "raw provider reasoning folds; commentary narration stays visible" {
     try std.testing.expect(saw_narration);
 
     // ctrl+t (transcript view) reveals the raw reasoning again.
-    app.show_tool_transcript = true;
-    app.layout_epoch +%= 1;
+    app.view.show_tool_transcript = true;
+    app.view.layout_epoch +%= 1;
     const expanded = try layoutLines(arena, &app, 120);
     saw_raw = false;
     for (expanded.items) |line| {
@@ -11812,7 +11930,7 @@ test "a failing sibling expands alone; healthy batch members stay folded" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     // Calls-first batch of three; the second result fails.
@@ -11826,7 +11944,7 @@ test "a failing sibling expands alone; healthy batch members stay folded" {
     };
     var seq: u64 = 1;
     for (entries) |entry| {
-        try app.blocks.append(gpa, .{
+        try app.view.blocks.append(gpa, .{
             .kind = entry[0],
             .seq = seq,
             .turn_id = 7,
@@ -11861,7 +11979,7 @@ test "tool summaries merge across commentary into one line" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     // Three rounds: commentary + one successful pair each. Previously this
@@ -11869,14 +11987,14 @@ test "tool summaries merge across commentary into one line" {
     var seq: u64 = 1;
     var round: usize = 0;
     while (round < 3) : (round += 1) {
-        try app.blocks.append(gpa, .{ .kind = .reasoning, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "checking things"), .label = try gpa.dupe(u8, "") });
+        try app.view.blocks.append(gpa, .{ .kind = .reasoning, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "checking things"), .label = try gpa.dupe(u8, "") });
         seq += 1;
-        try app.blocks.append(gpa, .{ .kind = .tool_call, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "{\"command\":\"true\"}"), .label = try gpa.dupe(u8, "bash") });
+        try app.view.blocks.append(gpa, .{ .kind = .tool_call, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "{\"command\":\"true\"}"), .label = try gpa.dupe(u8, "bash") });
         seq += 1;
-        try app.blocks.append(gpa, .{ .kind = .tool_result, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "ok"), .label = try gpa.dupe(u8, "") });
+        try app.view.blocks.append(gpa, .{ .kind = .tool_result, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "ok"), .label = try gpa.dupe(u8, "") });
         seq += 1;
     }
-    try app.blocks.append(gpa, .{ .kind = .assistant_msg, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "done"), .label = try gpa.dupe(u8, "") });
+    try app.view.blocks.append(gpa, .{ .kind = .assistant_msg, .seq = seq, .turn_id = 7, .text = try gpa.dupe(u8, "done"), .label = try gpa.dupe(u8, "") });
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -11898,12 +12016,12 @@ test "copy mode: enter, select, yank fills selection and requests copy" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.mode = .normal;
-    app.last_total_lines = 50;
-    app.last_view_h = 10;
-    app.last_first_visible = 40;
+    app.view.last_total_lines = 50;
+    app.view.last_view_h = 10;
+    app.view.last_first_visible = 40;
 
     try handleKey(&app, .{ .codepoint = 'v' });
     try std.testing.expect(app.copy_cursor != null);
@@ -11915,11 +12033,11 @@ test "copy mode: enter, select, yank fills selection and requests copy" {
 
     // Anchor char-wise, extend down one line, yank.
     try handleKey(&app, .{ .codepoint = 'v' });
-    try std.testing.expect(app.sel_anchor != null);
+    try std.testing.expect(app.view.sel_anchor != null);
     try handleKey(&app, .{ .codepoint = 'j' });
-    try std.testing.expectEqual(@as(usize, 48), app.sel_head.line);
+    try std.testing.expectEqual(@as(usize, 48), app.view.sel_head.line);
     try handleKey(&app, .{ .codepoint = 'y' });
-    try std.testing.expect(app.copy_pending);
+    try std.testing.expect(app.view.copy_pending);
     try std.testing.expect(app.copy_cursor == null); // yank exits copy mode
 
     // Line-wise: V spans full lines in the selection endpoints.
@@ -11927,200 +12045,200 @@ test "copy mode: enter, select, yank fills selection and requests copy" {
     try handleKey(&app, .{ .codepoint = 'V', .mods = .{ .shift = true } });
     try handleKey(&app, .{ .codepoint = 'k' });
     try handleKey(&app, .{ .codepoint = 'y' });
-    try std.testing.expectEqual(@as(usize, 0), app.sel_anchor.?.col);
-    try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), app.sel_head.col);
+    try std.testing.expectEqual(@as(usize, 0), app.view.sel_anchor.?.col);
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), app.view.sel_head.col);
 }
 
 test "normal mode: p pastes the yank register into the composer" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.mode = .normal;
     try app.yank_register.appendSlice(gpa, "zig build test");
     try handleKey(&app, .{ .codepoint = 'p' });
-    try std.testing.expectEqualStrings("zig build test", app.editor.text.items);
+    try std.testing.expectEqualStrings("zig build test", app.view.editor.text.items);
 
     // Motions operate on the composer: 0 then w lands after the first word.
     try handleKey(&app, .{ .codepoint = '0' });
     try handleKey(&app, .{ .codepoint = 'w' });
     try handleKey(&app, .{ .codepoint = 'D' });
     // True-vim w: next word START, so D leaves the separator behind.
-    try std.testing.expectEqualStrings("zig ", app.editor.text.items);
+    try std.testing.expectEqualStrings("zig ", app.view.editor.text.items);
 
     // ^ is first non-blank, both as a motion and as an operator target.
-    app.editor.clear();
-    app.editor.insertSlice("   zig build test");
-    app.editor.moveLineEnd();
+    app.view.editor.clear();
+    app.view.editor.insertSlice("   zig build test");
+    app.view.editor.moveLineEnd();
     try handleKey(&app, .{ .codepoint = '^' });
-    try std.testing.expectEqual(@as(usize, 3), app.editor.cursor);
+    try std.testing.expectEqual(@as(usize, 3), app.view.editor.cursor);
     try handleKey(&app, .{ .codepoint = '0' });
     try handleKey(&app, .{ .codepoint = '^' });
-    try std.testing.expectEqual(@as(usize, 3), app.editor.cursor); // forward from the indentation too
-    app.editor.moveLineEnd();
+    try std.testing.expectEqual(@as(usize, 3), app.view.editor.cursor); // forward from the indentation too
+    app.view.editor.moveLineEnd();
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = '^' });
-    try std.testing.expectEqualStrings("   ", app.editor.text.items);
+    try std.testing.expectEqualStrings("   ", app.view.editor.text.items);
 }
 
 test "composer operators: dw ci\" yy dd" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.mode = .normal;
 
     // dw from the start eats the first word and its trailing space.
-    app.editor.insertSlice("zig build test");
-    app.editor.moveLineStart();
+    app.view.editor.insertSlice("zig build test");
+    app.view.editor.moveLineStart();
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = 'w' });
-    try std.testing.expectEqualStrings("build test", app.editor.text.items);
+    try std.testing.expectEqualStrings("build test", app.view.editor.text.items);
     try std.testing.expectEqualStrings("zig ", app.yank_register.items);
 
     // ci" clears the quoted span and enters insert mode.
-    app.editor.clear();
-    app.editor.insertSlice("run \"the old thing\" now");
-    app.editor.cursor = 8;
+    app.view.editor.clear();
+    app.view.editor.insertSlice("run \"the old thing\" now");
+    app.view.editor.cursor = 8;
     try handleKey(&app, .{ .codepoint = 'c' });
     try handleKey(&app, .{ .codepoint = 'i' });
     try handleKey(&app, .{ .codepoint = '"' });
-    try std.testing.expectEqualStrings("run \"\" now", app.editor.text.items);
+    try std.testing.expectEqualStrings("run \"\" now", app.view.editor.text.items);
     try std.testing.expectEqual(Mode.insert, app.mode);
-    try std.testing.expectEqual(@as(usize, 5), app.editor.cursor);
+    try std.testing.expectEqual(@as(usize, 5), app.view.editor.cursor);
 
     // yy fills the register without touching the text.
     app.mode = .normal;
-    app.editor.clear();
-    app.editor.insertSlice("keep me");
+    app.view.editor.clear();
+    app.view.editor.insertSlice("keep me");
     try handleKey(&app, .{ .codepoint = 'y' });
     try handleKey(&app, .{ .codepoint = 'y' });
-    try std.testing.expectEqualStrings("keep me", app.editor.text.items);
+    try std.testing.expectEqualStrings("keep me", app.view.editor.text.items);
     try std.testing.expectEqualStrings("keep me", app.yank_register.items);
 
     // dd removes the cursor's line including its newline.
-    app.editor.clear();
-    app.editor.insertSlice("one\ntwo\nthree");
-    app.editor.cursor = 5;
+    app.view.editor.clear();
+    app.view.editor.insertSlice("one\ntwo\nthree");
+    app.view.editor.cursor = 5;
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = 'd' });
-    try std.testing.expectEqualStrings("one\nthree", app.editor.text.items);
+    try std.testing.expectEqualStrings("one\nthree", app.view.editor.text.items);
 
     // An unknown motion cancels cleanly.
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = 'z' });
-    try std.testing.expectEqualStrings("one\nthree", app.editor.text.items);
+    try std.testing.expectEqualStrings("one\nthree", app.view.editor.text.items);
     try std.testing.expectEqual(@as(u8, 0), app.pending_op);
 
     // di( around the cursor inside brackets.
-    app.editor.clear();
-    app.editor.insertSlice("call(alpha, beta)");
-    app.editor.cursor = 7;
+    app.view.editor.clear();
+    app.view.editor.insertSlice("call(alpha, beta)");
+    app.view.editor.cursor = 7;
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = 'i' });
     try handleKey(&app, .{ .codepoint = '(' });
-    try std.testing.expectEqualStrings("call()", app.editor.text.items);
+    try std.testing.expectEqualStrings("call()", app.view.editor.text.items);
 }
 
 test "vim completeness: counts, find, undo, synonyms, linewise paste" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.mode = .normal;
 
     // d2w with a count: two words and their separators.
-    app.editor.insertSlice("one two three four");
-    app.editor.moveLineStart();
+    app.view.editor.insertSlice("one two three four");
+    app.view.editor.moveLineStart();
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = '2' });
     try handleKey(&app, .{ .codepoint = 'w' });
-    try std.testing.expectEqualStrings("three four", app.editor.text.items);
+    try std.testing.expectEqualStrings("three four", app.view.editor.text.items);
 
     // u undoes it; ctrl+r redoes it.
     try handleKey(&app, .{ .codepoint = 'u' });
-    try std.testing.expectEqualStrings("one two three four", app.editor.text.items);
+    try std.testing.expectEqualStrings("one two three four", app.view.editor.text.items);
     try handleKey(&app, .{ .codepoint = 'r', .mods = .{ .ctrl = true } });
-    try std.testing.expectEqualStrings("three four", app.editor.text.items);
+    try std.testing.expectEqualStrings("three four", app.view.editor.text.items);
 
     // f/t with operator: dt<space> from start eats "three".
     try handleKey(&app, .{ .codepoint = 'd' });
     try handleKey(&app, .{ .codepoint = 't' });
     try handleKey(&app, .{ .codepoint = ' ', .text = " " });
-    try std.testing.expectEqualStrings(" four", app.editor.text.items);
+    try std.testing.expectEqualStrings(" four", app.view.editor.text.items);
 
     // 3w count motion, then x.
-    app.editor.clear();
-    app.editor.insertSlice("a bb ccc dddd");
-    app.editor.moveLineStart();
+    app.view.editor.clear();
+    app.view.editor.insertSlice("a bb ccc dddd");
+    app.view.editor.moveLineStart();
     try handleKey(&app, .{ .codepoint = '3' });
     try handleKey(&app, .{ .codepoint = 'w' });
-    try std.testing.expectEqual(@as(usize, 9), app.editor.cursor); // start of dddd
+    try std.testing.expectEqual(@as(usize, 9), app.view.editor.cursor); // start of dddd
     try handleKey(&app, .{ .codepoint = 'x' });
-    try std.testing.expectEqualStrings("a bb ccc ddd", app.editor.text.items);
+    try std.testing.expectEqualStrings("a bb ccc ddd", app.view.editor.text.items);
 
     // r replaces in place; ~ toggles case.
-    app.editor.moveLineStart();
+    app.view.editor.moveLineStart();
     try handleKey(&app, .{ .codepoint = 'r' });
     try handleKey(&app, .{ .codepoint = 'A', .text = "A" });
-    try std.testing.expectEqualStrings("A bb ccc ddd", app.editor.text.items);
+    try std.testing.expectEqualStrings("A bb ccc ddd", app.view.editor.text.items);
     try handleKey(&app, .{ .codepoint = '~' });
-    try std.testing.expectEqualStrings("a bb ccc ddd", app.editor.text.items);
+    try std.testing.expectEqualStrings("a bb ccc ddd", app.view.editor.text.items);
 
     // C changes to end of line and enters insert.
-    app.editor.cursor = 2;
+    app.view.editor.cursor = 2;
     try handleKey(&app, .{ .codepoint = 'C', .mods = .{ .shift = true } });
-    try std.testing.expectEqualStrings("a ", app.editor.text.items);
+    try std.testing.expectEqualStrings("a ", app.view.editor.text.items);
     try std.testing.expectEqual(Mode.insert, app.mode);
     app.mode = .normal;
 
     // Linewise yank and paste below (Y then p).
-    app.editor.clear();
-    app.editor.insertSlice("alpha\nbeta");
-    app.editor.cursor = 0;
+    app.view.editor.clear();
+    app.view.editor.insertSlice("alpha\nbeta");
+    app.view.editor.cursor = 0;
     try handleKey(&app, .{ .codepoint = 'Y', .mods = .{ .shift = true } });
     try std.testing.expect(app.yank_linewise);
     try handleKey(&app, .{ .codepoint = 'p' });
-    try std.testing.expectEqualStrings("alpha\nalpha\nbeta", app.editor.text.items);
+    try std.testing.expectEqualStrings("alpha\nalpha\nbeta", app.view.editor.text.items);
 
     // o opens a line below and enters insert.
     app.mode = .normal;
     try handleKey(&app, .{ .codepoint = 'o' });
     try std.testing.expectEqual(Mode.insert, app.mode);
-    try std.testing.expect(std.mem.startsWith(u8, app.editor.text.items, "alpha\nalpha\n\n"));
+    try std.testing.expect(std.mem.startsWith(u8, app.view.editor.text.items, "alpha\nalpha\n\n"));
 }
 
 test "J joins lines; gg tops; gt cycles sessions" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.mode = .normal;
 
-    app.editor.insertSlice("one\n  two\nthree");
-    app.editor.cursor = 0;
+    app.view.editor.insertSlice("one\n  two\nthree");
+    app.view.editor.cursor = 0;
     try handleKey(&app, .{ .codepoint = 'J', .mods = .{ .shift = true } });
-    try std.testing.expectEqualStrings("one two\nthree", app.editor.text.items);
+    try std.testing.expectEqualStrings("one two\nthree", app.view.editor.text.items);
     // 3J from the top joins all three lines (two joins).
     try handleKey(&app, .{ .codepoint = 'u' });
-    try std.testing.expectEqualStrings("one\n  two\nthree", app.editor.text.items);
-    app.editor.cursor = 0;
+    try std.testing.expectEqualStrings("one\n  two\nthree", app.view.editor.text.items);
+    app.view.editor.cursor = 0;
     try handleKey(&app, .{ .codepoint = '3' });
     try handleKey(&app, .{ .codepoint = 'J', .mods = .{ .shift = true } });
-    try std.testing.expectEqualStrings("one two three", app.editor.text.items);
+    try std.testing.expectEqualStrings("one two three", app.view.editor.text.items);
 
     // gg scrolls to top (clamped in draw); a lone g arms the prefix only.
-    app.scroll_up = 0;
+    app.view.scroll_up = 0;
     try handleKey(&app, .{ .codepoint = 'g' });
     try std.testing.expect(app.pending_g);
-    try std.testing.expectEqual(@as(usize, 0), app.scroll_up);
+    try std.testing.expectEqual(@as(usize, 0), app.view.scroll_up);
     try handleKey(&app, .{ .codepoint = 'g' });
     try std.testing.expect(!app.pending_g);
-    try std.testing.expect(app.scroll_up > 0);
+    try std.testing.expect(app.view.scroll_up > 0);
 
     // Ngt ordinal math: 1-based, clamps past the end, no-ops on empty.
     try std.testing.expectEqual(@as(?usize, 1), App.recentOrdinalIndex(3, 2));
@@ -12129,12 +12247,12 @@ test "J joins lines; gg tops; gt cycles sessions" {
     try std.testing.expectEqual(@as(?usize, null), App.recentOrdinalIndex(3, 0));
 
     // Yank from copy mode exits it and schedules the highlight clear.
-    app.last_total_lines = 5;
+    app.view.last_total_lines = 5;
     app.copy_cursor = .{ .line = 1, .col = 0 };
     try handleKey(&app, .{ .codepoint = 'y' });
     try std.testing.expect(app.copy_cursor == null);
-    try std.testing.expect(app.copy_pending);
-    try std.testing.expect(app.sel_clear_after_copy);
+    try std.testing.expect(app.view.copy_pending);
+    try std.testing.expect(app.view.sel_clear_after_copy);
 }
 
 test "Plan mode keys distinguish toggle and proposal actions" {
@@ -12155,23 +12273,25 @@ test "Plan clear result removes only the active session todo" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 7,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
-    try app.plan.append(gpa, .{ .step = try gpa.dupe(u8, "stale work"), .status = .in_progress });
+    try app.view.plan.append(gpa, .{ .step = try gpa.dupe(u8, "stale work"), .status = .in_progress });
 
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .plan_clear_result = .{
         .sid = 8,
         .cleared = true,
     } }));
-    try std.testing.expectEqual(@as(usize, 1), app.plan.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.view.plan.items.len);
 
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .plan_clear_result = .{
         .sid = 7,
         .cleared = true,
     } }));
-    try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.plan.items.len);
     try std.testing.expectEqualStrings("execution plan cleared", app.notice.items);
 }
 
@@ -12183,14 +12303,16 @@ test "finalized reasoning clears only its live stream channel across rounds" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 7,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
-    try app.reasoning_delta.appendSlice(gpa, "stale raw current raw");
-    try app.delta.appendSlice(gpa, "stale commentary current commentary");
-    try app.stream_layout_cache.update(gpa, app.delta.items, 80);
+    try app.view.reasoning_delta.appendSlice(gpa, "stale raw current raw");
+    try app.view.delta.appendSlice(gpa, "stale commentary current commentary");
+    try app.view.stream_layout_cache.update(gpa, app.view.delta.items, 80);
 
     app.applyBlock(.{
         .id = 1,
@@ -12200,10 +12322,10 @@ test "finalized reasoning clears only its live stream channel across rounds" {
         .ts = 0,
         .body = .{ .reasoning = .{ .text = "current raw" } },
     });
-    try std.testing.expectEqual(@as(usize, 0), app.reasoning_delta.items.len);
-    try std.testing.expectEqualStrings("stale commentary current commentary", app.delta.items);
+    try std.testing.expectEqual(@as(usize, 0), app.view.reasoning_delta.items.len);
+    try std.testing.expectEqualStrings("stale commentary current commentary", app.view.delta.items);
 
-    try app.reasoning_delta.appendSlice(gpa, "next raw");
+    try app.view.reasoning_delta.appendSlice(gpa, "next raw");
     app.applyBlock(.{
         .id = 2,
         .session_id = 7,
@@ -12212,14 +12334,14 @@ test "finalized reasoning clears only its live stream channel across rounds" {
         .ts = 0,
         .body = .{ .reasoning = .{ .text = "current commentary", .commentary = true } },
     });
-    try std.testing.expectEqual(@as(usize, 0), app.delta.items.len);
-    try std.testing.expectEqualStrings("next raw", app.reasoning_delta.items);
-    try std.testing.expectEqual(@as(usize, 0), app.stream_layout_cache.lines.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.stream_layout_cache.pending.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.stream_layout_cache.source_len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.delta.items.len);
+    try std.testing.expectEqualStrings("next raw", app.view.reasoning_delta.items);
+    try std.testing.expectEqual(@as(usize, 0), app.view.stream_layout_cache.lines.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.stream_layout_cache.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.stream_layout_cache.source_len);
 
-    try app.delta.appendSlice(gpa, "next commentary");
-    try std.testing.expectEqualStrings("next commentary", app.delta.items);
+    try app.view.delta.appendSlice(gpa, "next commentary");
+    try std.testing.expectEqualStrings("next commentary", app.view.delta.items);
 }
 
 test "Plan mode proposal becomes actionable only from a live finalized answer" {
@@ -12230,13 +12352,15 @@ test "Plan mode proposal becomes actionable only from a live finalized answer" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
-        .plan_mode = true,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+            .plan_mode = true,
+        },
     };
     defer app.deinit();
 
-    app.history_loading = true;
+    app.view.history_loading = true;
     app.applyBlock(.{
         .id = 1,
         .session_id = 1,
@@ -12245,9 +12369,9 @@ test "Plan mode proposal becomes actionable only from a live finalized answer" {
         .ts = 0,
         .body = .{ .assistant_msg = .{ .text = "old proposal" } },
     });
-    try std.testing.expect(!app.plan_proposal_ready);
+    try std.testing.expect(!app.view.plan_proposal_ready);
 
-    app.history_loading = false;
+    app.view.history_loading = false;
     app.applyBlock(.{
         .id = 2,
         .session_id = 1,
@@ -12256,7 +12380,7 @@ test "Plan mode proposal becomes actionable only from a live finalized answer" {
         .ts = 0,
         .body = .{ .assistant_msg = .{ .text = "new proposal" } },
     });
-    try std.testing.expect(app.plan_proposal_ready);
+    try std.testing.expect(app.view.plan_proposal_ready);
 
     app.applyBlock(.{
         .id = 3,
@@ -12266,7 +12390,7 @@ test "Plan mode proposal becomes actionable only from a live finalized answer" {
         .ts = 0,
         .body = .{ .user_msg = .{ .text = "revise it" } },
     });
-    try std.testing.expect(!app.plan_proposal_ready);
+    try std.testing.expect(!app.view.plan_proposal_ready);
 }
 
 test "plan table centers current work and retains completed timings" {
@@ -12314,8 +12438,10 @@ test "completed plan leaves the live panel and remains durable in transcript" {
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -12327,8 +12453,8 @@ test "completed plan leaves the live panel and remains durable in transcript" {
         .ts = 0,
         .body = .{ .plan = .{ .items = &.{.{ .step = "Inspect", .status = .in_progress }} } },
     });
-    try std.testing.expectEqual(@as(usize, 0), app.blocks.items.len);
-    try std.testing.expectEqual(@as(usize, 1), app.plan.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.view.plan.items.len);
 
     app.applyBlock(.{
         .id = 2,
@@ -12342,9 +12468,9 @@ test "completed plan leaves the live panel and remains durable in transcript" {
             .duration_ms = 4_200,
         }} } },
     });
-    try std.testing.expectEqual(@as(usize, 1), app.blocks.items.len);
-    try std.testing.expectEqual(block.BlockKind.plan, app.blocks.items[0].kind);
-    try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    try std.testing.expectEqual(block.BlockKind.plan, app.view.blocks.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), app.view.plan.items.len);
 
     app.applyBlock(.{
         .id = 3,
@@ -12354,10 +12480,10 @@ test "completed plan leaves the live panel and remains durable in transcript" {
         .ts = 0,
         .body = .{ .user_msg = .{ .text = "what next?" } },
     });
-    try std.testing.expectEqual(@as(usize, 0), app.plan.items.len);
-    try std.testing.expectEqual(@as(usize, 2), app.blocks.items.len);
-    try std.testing.expectEqual(block.BlockKind.plan, app.blocks.items[0].kind);
-    try std.testing.expectEqualStrings("Inspect", app.blocks.items[0].plan_items[0].step);
+    try std.testing.expectEqual(@as(usize, 0), app.view.plan.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.view.blocks.items.len);
+    try std.testing.expectEqual(block.BlockKind.plan, app.view.blocks.items[0].kind);
+    try std.testing.expectEqualStrings("Inspect", app.view.blocks.items[0].plan_items[0].step);
 }
 
 test "plan table uses semantic markers, stable columns, and concise timing" {
@@ -12410,9 +12536,11 @@ test "plan table uses semantic markers, stable columns, and concise timing" {
         .gpa = std.testing.allocator,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(std.testing.allocator),
-        .state = .running,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(std.testing.allocator),
+            .state = .running,
+        },
     };
     defer app.deinit();
     const timed_active = PlanItemOwned{
@@ -12422,7 +12550,7 @@ test "plan table uses semantic markers, stable columns, and concise timing" {
         .duration_ms = 3_000,
     };
     try std.testing.expectEqual(@as(?u64, 6_000), planItemTimeMs(&app, timed_active, 5_000));
-    app.state = .idle;
+    app.view.state = .idle;
     try std.testing.expectEqual(@as(?u64, 3_000), planItemTimeMs(&app, timed_active, 50_000));
 }
 
@@ -12434,8 +12562,10 @@ test "parked approvals are findable per tree and globally; badge follows the ses
         .gpa = gpa,
         .io = threaded.io(),
         .conn = undefined,
-        .sid = 10,
-        .editor = Editor.init(gpa),
+        .view = .{
+            .sid = 10,
+            .editor = Editor.init(gpa),
+        },
     };
     defer app.deinit();
 
@@ -12483,7 +12613,7 @@ test "parked approvals are findable per tree and globally; badge follows the ses
         .running = false,
         .full_access = true,
     });
-    try std.testing.expect(app.permissions_full);
+    try std.testing.expect(app.view.permissions_full);
     app.upsertSessionSummary(.{
         .sid = 10,
         .title = "focused root",
@@ -12493,7 +12623,7 @@ test "parked approvals are findable per tree and globally; badge follows the ses
         .running = false,
         .full_access = false,
     });
-    try std.testing.expect(!app.permissions_full);
+    try std.testing.expect(!app.view.permissions_full);
 }
 
 test "review prompt expansion names the council, roster, and question" {
@@ -12515,7 +12645,7 @@ test "transcript spacing invariant: every section breathes, nothing doubles" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .sid = 1, .editor = Editor.init(gpa) };
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     // Every block kind, in deliberately hostile adjacency: summaries after
@@ -12541,7 +12671,7 @@ test "transcript spacing invariant: every section breathes, nothing doubles" {
         .{ .user_msg, 8, "next round", "", false },
         .{ .assistant_msg, 8, "done", "", false },
     };
-    for (entries, 0..) |entry, i| try app.blocks.append(gpa, .{
+    for (entries, 0..) |entry, i| try app.view.blocks.append(gpa, .{
         .kind = entry[0],
         .seq = i + 1,
         .turn_id = entry[1],
@@ -12564,9 +12694,9 @@ test "transcript spacing invariant: every section breathes, nothing doubles" {
         .{ .show_transcript = false, .state = .running },
     }) |pass| {
         const show_transcript = pass.show_transcript;
-        app.show_tool_transcript = show_transcript;
-        app.state = pass.state;
-        app.layout_epoch +%= 1;
+        app.view.show_tool_transcript = show_transcript;
+        app.view.state = pass.state;
+        app.view.layout_epoch +%= 1;
         const lines = try layoutLines(arena, &app, 100);
         try std.testing.expect(lines.items.len > 0);
 
