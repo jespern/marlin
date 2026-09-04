@@ -2,7 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const effect = @import("effect.zig");
 
-const StringState = struct {
+pub const StringState = struct {
     amplitude: f32,
     wavelength: f32,
     phase: f32,
@@ -104,23 +104,4 @@ pub const Engine = struct {
 
 fn normalizedSeed(seed: u64) u64 {
     return if (seed == 0) 0x243f6a8885a308d3 else seed;
-}
-
-test "dancing strings are deterministic and phases advance" {
-    var one = Engine.init(std.testing.allocator, 42);
-    defer one.deinit();
-    var two = Engine.init(std.testing.allocator, 42);
-    defer two.deinit();
-    try one.reset(80, 24, 42);
-    try two.reset(80, 24, 42);
-    try std.testing.expectEqualSlices(StringState, &one.strings, &two.strings);
-    const phase = one.strings[0].phase;
-    one.tick();
-    two.tick();
-    try std.testing.expect(one.strings[0].phase != phase);
-    try std.testing.expectEqualSlices(StringState, &one.strings, &two.strings);
-    const advanced_phase = one.strings[0].phase;
-    try one.resize(120, 40);
-    try std.testing.expectEqual(advanced_phase, one.strings[0].phase);
-    try std.testing.expect(one.strings[0].baseline > 0);
 }

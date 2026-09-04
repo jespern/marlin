@@ -74,7 +74,3 @@ fn pump(gpa: std.mem.Allocator, from: *std.Io.Reader, to: *std.Io.Writer) void {
         to.flush() catch break;
     }
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}

@@ -3,7 +3,7 @@ const vaxis = @import("vaxis");
 const effect = @import("effect.zig");
 
 const star_count = 180;
-const Star = struct { x: f32, y: f32, z: f32 };
+pub const Star = struct { x: f32, y: f32, z: f32 };
 
 pub const Engine = struct {
     width: u16 = 0,
@@ -82,20 +82,4 @@ fn randomSigned(value: u64) f32 {
 
 fn normalizedSeed(seed: u64) u64 {
     return if (seed == 0) 0x13198a2e03707344 else seed;
-}
-
-test "starfield is deterministic and recycles near stars" {
-    var one = Engine.init(std.testing.allocator, 99);
-    defer one.deinit();
-    var two = Engine.init(std.testing.allocator, 99);
-    defer two.deinit();
-    try one.reset(80, 24, 99);
-    try two.reset(80, 24, 99);
-    try std.testing.expectEqualSlices(Star, &one.stars, &two.stars);
-    one.stars[0].z = 0.01;
-    two.stars[0].z = 0.01;
-    one.tick();
-    two.tick();
-    try std.testing.expect(one.stars[0].z > 0.9);
-    try std.testing.expectEqualSlices(Star, &one.stars, &two.stars);
 }

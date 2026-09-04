@@ -78,16 +78,3 @@ fn plasmaColor(value: f32, opacity: u8) vaxis.Color {
     const blue = (@sin(value * tau + 4.188) * 0.5 + 0.5) * 225.0 + 25.0;
     return effect.scaledColor(.{ @intFromFloat(red), @intFromFloat(green), @intFromFloat(blue) }, opacity);
 }
-
-test "plasma advances deterministically" {
-    var one = Engine.init(std.testing.allocator, 7);
-    defer one.deinit();
-    var two = Engine.init(std.testing.allocator, 7);
-    defer two.deinit();
-    try one.reset(80, 24, 7);
-    try two.reset(80, 24, 7);
-    one.tick();
-    two.tick();
-    try std.testing.expectEqual(one.frame, two.frame);
-    try std.testing.expectEqual(one.seed_phase, two.seed_phase);
-}

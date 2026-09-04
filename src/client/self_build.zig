@@ -65,7 +65,7 @@ fn verifyCheckout(gpa: std.mem.Allocator, io: Io, root: []const u8) !void {
     if (!isMarlinManifest(manifest)) return error.NotSourceBuild;
 }
 
-fn isMarlinManifest(contents: []const u8) bool {
+pub fn isMarlinManifest(contents: []const u8) bool {
     const name_at = std.mem.indexOf(u8, contents, ".name") orelse return false;
     const line_end = std.mem.indexOfScalarPos(u8, contents, name_at, '\n') orelse contents.len;
     return std.mem.indexOf(u8, contents[name_at..line_end], ".marlin") != null;
@@ -76,19 +76,4 @@ fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     var writer: Io.File.Writer = .init(.stderr(), io, &buf);
     try writer.interface.print(fmt, args);
     try writer.interface.flush();
-}
-
-test "source root requires the active zig-out binary" {
-    try std.testing.expectEqualStrings(
-        "/work/marlin",
-        sourceRootFromExecutable("/work/marlin/zig-out/bin/marlin").?,
-    );
-    try std.testing.expect(sourceRootFromExecutable("/opt/homebrew/bin/marlin") == null);
-    try std.testing.expect(sourceRootFromExecutable("/work/marlin/marlin") == null);
-}
-
-test "source checkout manifest must name marlin" {
-    try std.testing.expect(isMarlinManifest(".{\n    .name = .marlin,\n}"));
-    try std.testing.expect(!isMarlinManifest(".{\n    .name = .another_project,\n}"));
-    try std.testing.expect(!isMarlinManifest(".{ .version = \"1.0\" }"));
 }

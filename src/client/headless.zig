@@ -540,7 +540,7 @@ const InspectOptions = struct {
     plan_only: bool = false,
 };
 
-fn parseInspectOptions(args: []const [:0]const u8) !InspectOptions {
+pub fn parseInspectOptions(args: []const [:0]const u8) !InspectOptions {
     var options = InspectOptions{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1035,7 +1035,7 @@ pub fn compact(
     }
 }
 
-const RebuildScope = enum { none, attached, client, both };
+pub const RebuildScope = enum { none, attached, client, both };
 
 const RebootOptions = struct {
     rebuild: RebuildScope = .none,
@@ -1043,7 +1043,7 @@ const RebootOptions = struct {
     follow_up_at: ?usize = null,
 };
 
-fn parseRebootOptions(args: []const [:0]const u8) error{InvalidArgument}!RebootOptions {
+pub fn parseRebootOptions(args: []const [:0]const u8) error{InvalidArgument}!RebootOptions {
     var options = RebootOptions{};
     for (args, 0..) |arg, i| {
         if (std.mem.eql(u8, arg, "--build")) {
@@ -1064,13 +1064,13 @@ fn parseRebootOptions(args: []const [:0]const u8) error{InvalidArgument}!RebootO
     return options;
 }
 
-const RebuildActions = struct {
+pub const RebuildActions = struct {
     local: bool,
     remote: bool,
     reboot_daemon: bool,
 };
 
-fn rebuildActions(scope: RebuildScope, remote: bool) RebuildActions {
+pub fn rebuildActions(scope: RebuildScope, remote: bool) RebuildActions {
     return .{
         .local = scope == .client or scope == .both or (scope == .attached and !remote),
         .remote = remote and (scope == .attached or scope == .both),
@@ -1250,58 +1250,4 @@ fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     var w: Io.File.Writer = .init(.stderr(), io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
-}
-
-test "reboot scopes map to local and remote actions" {
-    try std.testing.expectEqual(
-        RebuildActions{ .local = true, .remote = false, .reboot_daemon = true },
-        rebuildActions(.attached, false),
-    );
-    try std.testing.expectEqual(
-        RebuildActions{ .local = false, .remote = true, .reboot_daemon = true },
-        rebuildActions(.attached, true),
-    );
-    try std.testing.expectEqual(
-        RebuildActions{ .local = true, .remote = false, .reboot_daemon = false },
-        rebuildActions(.client, true),
-    );
-    try std.testing.expectEqual(
-        RebuildActions{ .local = true, .remote = true, .reboot_daemon = true },
-        rebuildActions(.both, true),
-    );
-}
-
-test "reboot option parsing preserves follow-up arguments" {
-    const args = [_][:0]const u8{ "--build-both", "--force", "--then", "attach", "@7" };
-    const options = try parseRebootOptions(&args);
-    try std.testing.expectEqual(RebuildScope.both, options.rebuild);
-    try std.testing.expect(options.force);
-    try std.testing.expectEqual(@as(?usize, 3), options.follow_up_at);
-    try std.testing.expectError(error.InvalidArgument, parseRebootOptions(&.{"--bogus"}));
-}
-
-test "flag parsing" {
-    const args = [_][:0]const u8{ "--continue", "--model", "openrouter/x", "do stuff" };
-    const f = try parseFlags(&args);
-    try std.testing.expect(f.continue_last);
-    try std.testing.expectEqualStrings("openrouter/x", f.model.?);
-    try std.testing.expectEqualStrings("do stuff", f.task.?);
-}
-
-test "inspect option parsing" {
-    const args = [_][:0]const u8{ "63df", "--json", "--kind", "tool_result", "--limit", "40", "--around", "12", "--turn", "latest" };
-    const options = try parseInspectOptions(&args);
-    try std.testing.expectEqualStrings("63df", options.handle.?);
-    try std.testing.expect(options.json);
-    try std.testing.expectEqual(block.BlockKind.tool_result, options.kind.?);
-    try std.testing.expectEqual(@as(u32, 40), options.limit);
-    try std.testing.expectEqual(@as(u64, 12), options.around_seq);
-    try std.testing.expect(options.latest_turn);
-}
-
-test "inspect option parsing rejects unsafe or contradictory bounds" {
-    try std.testing.expectError(error.InvalidLimit, parseInspectOptions(&.{ "63df", "--limit", "0" }));
-    try std.testing.expectError(error.InvalidKind, parseInspectOptions(&.{ "63df", "--kind", "bogus" }));
-    try std.testing.expectError(error.ConflictingOptions, parseInspectOptions(&.{ "63df", "--plan", "--turn", "latest" }));
-    try std.testing.expectError(error.MissingHandle, parseInspectOptions(&.{"--json"}));
 }

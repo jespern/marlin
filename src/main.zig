@@ -55,6 +55,9 @@ test {
     // Force the whole skeleton into the compile+test graph, including files
     // not yet imported by real code paths. Prune entries as real imports land.
     std.testing.refAllDecls(@This());
+    _ = @import("client/pipe_test.zig");
+    _ = @import("client/headless_test.zig");
+    _ = @import("client/editor_test.zig");
     _ = @import("core/block.zig");
     _ = @import("core/guest.zig");
     _ = @import("core/proto.zig");
@@ -92,30 +95,30 @@ test {
     _ = @import("daemon/provider/registry.zig");
     _ = @import("daemon/provider/codex.zig");
     _ = @import("core/visual_effect.zig");
-    _ = @import("client/attach.zig");
-    _ = @import("client/cc_approve.zig");
-    _ = @import("client/remote_rebuild.zig");
-    _ = @import("client/self_build.zig");
-    _ = @import("client/voice.zig");
-    _ = @import("client/web.zig");
+    _ = @import("client/attach_test.zig");
+    _ = @import("client/cc_approve_test.zig");
+    _ = @import("client/remote_rebuild_test.zig");
+    _ = @import("client/self_build_test.zig");
+    _ = @import("client/voice_test.zig");
+    _ = @import("client/web_test.zig");
     _ = @import("testing/fixture_tests.zig");
-    _ = @import("client/render.zig");
-    _ = @import("client/markdown.zig");
-    _ = @import("client/layout.zig");
+    _ = @import("client/render_test.zig");
+    _ = @import("client/markdown_test.zig");
+    _ = @import("client/layout_test.zig");
     _ = @import("client/effect.zig");
     _ = @import("client/effects.zig");
-    _ = @import("client/media.zig");
-    _ = @import("client/matrix.zig");
-    _ = @import("client/pacman.zig");
+    _ = @import("client/media_test.zig");
+    _ = @import("client/matrix_test.zig");
+    _ = @import("client/pacman_test.zig");
     _ = @import("client/pixel_effects.zig");
     _ = @import("client/shadowbox.zig");
-    _ = @import("client/plasma.zig");
-    _ = @import("client/starfield.zig");
-    _ = @import("client/strings.zig");
+    _ = @import("client/plasma_test.zig");
+    _ = @import("client/starfield_test.zig");
+    _ = @import("client/strings_test.zig");
     _ = @import("client/tui_test.zig");
     _ = @import("client/commands.zig");
     _ = @import("client/keys.zig");
     _ = @import("client/setup.zig");
     _ = @import("client/search.zig");
-    _ = @import("client/top.zig");
+    _ = @import("client/top_test.zig");
 }

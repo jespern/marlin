@@ -1067,22 +1067,3 @@ pub fn appendGlyphNTimes(
 ) !void {
     for (0..count) |_| try out.appendSlice(arena, glyph);
 }
-
-test "informational accents are blue while attention states remain yellow" {
-    try std.testing.expect(vaxis.Color.eql(Palette.note.fg, Palette.soft_blue));
-    try std.testing.expect(vaxis.Color.eql(Palette.md_code.fg, Palette.soft_blue));
-    try std.testing.expect(vaxis.Color.eql(Palette.shell_path.fg, Palette.soft_blue));
-    try std.testing.expect(vaxis.Color.eql(Palette.git_hash.fg, Palette.soft_blue));
-    try std.testing.expect(vaxis.Color.eql(Palette.syntax_constant.fg, Palette.soft_blue));
-    try std.testing.expect(vaxis.Color.eql(Palette.status_running.fg, Palette.soft_blue));
-    try std.testing.expect(vaxis.Color.eql(Palette.status_notice.fg, Palette.soft_blue));
-
-    const attention_yellow: vaxis.Color = .{ .index = 3 };
-    try std.testing.expect(vaxis.Color.eql(Palette.status_approval.fg, attention_yellow));
-    try std.testing.expect(vaxis.Color.eql(Palette.status_context_warn.fg, attention_yellow));
-    try std.testing.expect(vaxis.Color.eql(Palette.approval_card.fg, attention_yellow));
-}
-
-test {
-    std.testing.refAllDecls(@This());
-}

@@ -391,7 +391,7 @@ fn serveHistory(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
 }
 
 /// Extract `sid=<u64>` from a request target's query string.
-fn sidFromQuery(target: []const u8) ?u64 {
+pub fn sidFromQuery(target: []const u8) ?u64 {
     return queryU64(target, "sid");
 }
 
@@ -407,7 +407,7 @@ fn headerValue(req: *const std.http.Server.Request, name: []const u8) ?[]const u
 /// A Host header is ours when it names loopback or the tailnet DNS name
 /// (any port, trailing-dot tolerant). Absent/foreign Hosts — the shape of a
 /// DNS-rebinding request — are rejected.
-fn hostAllowed(tailnet_host: ?[]const u8, host_header: ?[]const u8) bool {
+pub fn hostAllowed(tailnet_host: ?[]const u8, host_header: ?[]const u8) bool {
     const raw = host_header orelse return false;
     const host = std.mem.trimEnd(u8, raw[0 .. std.mem.lastIndexOfScalar(u8, raw, ':') orelse raw.len], ".");
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
@@ -422,7 +422,7 @@ fn hostAllowed(tailnet_host: ?[]const u8, host_header: ?[]const u8) bool {
 /// same-origin request or a non-browser client, both fine. A present Origin
 /// must resolve to an allowed host over http(s) — anything else (including
 /// the literal "null" of sandboxed frames) is a cross-site request.
-fn originAllowed(tailnet_host: ?[]const u8, origin_header: ?[]const u8) bool {
+pub fn originAllowed(tailnet_host: ?[]const u8, origin_header: ?[]const u8) bool {
     const origin = origin_header orelse return true;
     const rest = if (std.mem.startsWith(u8, origin, "https://"))
         origin["https://".len..]
@@ -433,7 +433,7 @@ fn originAllowed(tailnet_host: ?[]const u8, origin_header: ?[]const u8) bool {
     return hostAllowed(tailnet_host, rest);
 }
 
-fn queryU64(target: []const u8, name: []const u8) ?u64 {
+pub fn queryU64(target: []const u8, name: []const u8) ?u64 {
     const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
     var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
     while (it.next()) |pair| {
@@ -442,47 +442,4 @@ fn queryU64(target: []const u8, name: []const u8) ?u64 {
         return std.fmt.parseInt(u64, pair[eq + 1 ..], 10) catch null;
     }
     return null;
-}
-
-test "sid query parsing accepts u64 and rejects garbage" {
-    try std.testing.expectEqual(@as(?u64, 42), sidFromQuery("/events?sid=42"));
-    try std.testing.expectEqual(
-        @as(?u64, 1874397504305914847),
-        sidFromQuery("/events?a=b&sid=1874397504305914847"),
-    );
-    try std.testing.expectEqual(@as(?u64, null), sidFromQuery("/events"));
-    try std.testing.expectEqual(@as(?u64, null), sidFromQuery("/events?sid=abc"));
-    try std.testing.expectEqual(@as(?u64, null), sidFromQuery("/events?side=1"));
-    try std.testing.expectEqual(@as(?u64, 99), queryU64("/history?sid=42&before=99", "before"));
-    try std.testing.expectEqual(@as(?u64, null), queryU64("/history?sid=42&before=nope", "before"));
-}
-
-test "host gate: loopback and tailnet pass, rebinding shapes do not" {
-    const tail: ?[]const u8 = "box.tail1234.ts.net";
-    try std.testing.expect(hostAllowed(tail, "localhost:8377"));
-    try std.testing.expect(hostAllowed(tail, "localhost"));
-    try std.testing.expect(hostAllowed(tail, "127.0.0.1:8377"));
-    try std.testing.expect(hostAllowed(tail, "box.tail1234.ts.net"));
-    try std.testing.expect(hostAllowed(tail, "BOX.tail1234.ts.net:443"));
-    try std.testing.expect(hostAllowed(tail, "box.tail1234.ts.net."));
-    try std.testing.expect(!hostAllowed(tail, "attacker.example"));
-    try std.testing.expect(!hostAllowed(tail, "evil.box.tail1234.ts.net"));
-    try std.testing.expect(!hostAllowed(tail, null));
-    try std.testing.expect(!hostAllowed(null, "box.tail1234.ts.net"));
-    try std.testing.expect(hostAllowed(null, "127.0.0.1:9000"));
-}
-
-test "origin gate: absent or same-host origins pass, cross-site does not" {
-    const tail: ?[]const u8 = "box.tail1234.ts.net";
-    try std.testing.expect(originAllowed(tail, null)); // same-origin / curl
-    try std.testing.expect(originAllowed(tail, "http://localhost:8377"));
-    try std.testing.expect(originAllowed(tail, "https://box.tail1234.ts.net"));
-    try std.testing.expect(!originAllowed(tail, "https://attacker.example"));
-    try std.testing.expect(!originAllowed(tail, "null"));
-    try std.testing.expect(!originAllowed(tail, "file://x"));
-    try std.testing.expect(!originAllowed(null, "https://box.tail1234.ts.net"));
-}
-
-test {
-    std.testing.refAllDecls(@This());
 }

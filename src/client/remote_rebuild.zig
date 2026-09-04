@@ -76,7 +76,3 @@ fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     try writer.interface.print(fmt, args);
     try writer.interface.flush();
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}

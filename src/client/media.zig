@@ -6,7 +6,7 @@ const Io = std.Io;
 
 pub const max_image_bytes: usize = 10 * 1024 * 1024;
 
-const mac_clipboard_script =
+pub const mac_clipboard_script =
     \\ObjC.import('AppKit'); ObjC.import('Foundation');
     \\var p=$.NSPasteboard.generalPasteboard; var t=ObjC.unwrap(p.types).map(ObjC.unwrap); var d=null;
     \\if(t.indexOf('public.png')>=0){d=p.dataForType('public.png');}
@@ -131,34 +131,4 @@ fn detectMime(bytes: []const u8) ?[]const u8 {
 
 fn base64Limit() usize {
     return std.base64.standard.Encoder.calcSize(max_image_bytes) + 1024;
-}
-
-test "path attachment detects and encodes PNG" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, threaded.io(), "marlin-media");
-    defer temp.deinit();
-    const bytes = "\x89PNG\r\n\x1a\nbody";
-    const shot = try std.fs.path.join(gpa, &.{ temp.path, "shot.png" });
-    defer gpa.free(shot);
-    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = shot, .data = bytes });
-    const path = try std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), shot, gpa);
-    defer gpa.free(path);
-    var pending = try fromPath(gpa, threaded.io(), ".", path);
-    defer pending.deinit(gpa);
-    try std.testing.expectEqualStrings("image/png", pending.mime);
-    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(pending.data_base64);
-    const decoded = try gpa.alloc(u8, decoded_len);
-    defer gpa.free(decoded);
-    try std.base64.standard.Decoder.decode(decoded, pending.data_base64);
-    try std.testing.expectEqualStrings(bytes, decoded);
-}
-
-test "mac clipboard script unwraps individual pasteboard type names" {
-    try std.testing.expect(std.mem.indexOf(u8, mac_clipboard_script, "p.types).map(ObjC.unwrap)") != null);
-}
-
-test {
-    std.testing.refAllDecls(@This());
 }
