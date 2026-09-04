@@ -4135,3 +4135,48 @@ test "transcript spacing invariant: every section breathes, nothing doubles" {
         if (show_transcript) try std.testing.expect(saw_dense_flush);
     }
 }
+
+test "/screensaver shadowbox takes an hour or cycle; other effects refuse the word; a bare start clears it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
+        .term_cols = 80,
+        .term_rows = 24,
+    };
+    defer app.deinit();
+
+    app.runCommand("/screensaver shadowbox cycle");
+    try std.testing.expect(app.screensaver_active);
+    try std.testing.expect(app.sky_override != null and app.sky_override.? == .cycle);
+    _ = app.dismissScreensaver();
+
+    app.runCommand("/screensaver shadowbox 18.5");
+    try std.testing.expect(app.screensaver_active);
+    try std.testing.expectEqual(@as(f32, 18.5), app.sky_override.?.hour);
+    _ = app.dismissScreensaver();
+
+    app.runCommand("/screensaver shadowbox");
+    try std.testing.expect(app.screensaver_active);
+    try std.testing.expect(app.sky_override == null);
+    _ = app.dismissScreensaver();
+
+    app.runCommand("/screensaver shadowbox 25");
+    try std.testing.expect(!app.screensaver_active);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "usage: /screensaver shadowbox") != null);
+
+    app.runCommand("/screensaver matrix cycle");
+    try std.testing.expect(!app.screensaver_active);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "takes no hour") != null);
+
+    app.runCommand("/animate shadowbox cycle");
+    try std.testing.expect(app.ui_animation != null);
+    try std.testing.expect(app.sky_override != null);
+}

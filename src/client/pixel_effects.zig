@@ -19,6 +19,7 @@ const vaxis = @import("vaxis");
 const effect = @import("effect.zig");
 const visual_effect = @import("../core/visual_effect.zig");
 const pacman = @import("pacman.zig");
+const shadowbox = @import("shadowbox.zig");
 
 pub const Scene = enum { plasma, tunnel, metaballs, horizon };
 
@@ -55,6 +56,9 @@ pub const Engine = struct {
     /// Ship every Nth tick; very large boards use 2 so deflate stays cheap.
     transmit_every: u8 = 1,
     seed: u64 = 1,
+    /// Where the sun and moon stand; the shadow-box follows it. Set by the
+    /// TUI before each transmit.
+    sky: shadowbox.Sky = shadowbox.Sky.noon,
     /// Board state for the pacman kind (unused otherwise), its cached
     /// background (per maze generation), zlib output, and the compressor's
     /// window.
@@ -86,6 +90,10 @@ pub const Engine = struct {
         self.background = &.{};
         self.zbuf = &.{};
         self.window = &.{};
+    }
+
+    pub fn setSky(self: *Engine, sky: shadowbox.Sky) void {
+        self.sky = sky;
     }
 
     pub fn setCellPixels(self: *Engine, w: u32, h: u32) void {
@@ -127,12 +135,28 @@ pub const Engine = struct {
         if (self.kind == .pacman) {
             self.background = try self.gpa.alloc(u8, pixels * 3);
             errdefer self.gpa.free(self.background);
+            self.background_generation = 0;
+        }
+        if (compressible(self.kind)) {
             self.zbuf = try self.gpa.alloc(u8, pixels * 3 + 4096);
             errdefer self.gpa.free(self.zbuf);
             self.window = try self.gpa.alloc(u8, 2 * std.compress.flate.max_window_len);
-            self.background_generation = 0;
         }
-        self.transmit_every = if (pixels > 700_000) 2 else 1;
+        self.transmit_every = shipEvery(self.kind, pixels);
+    }
+
+    /// Flat or smooth art that zlib pays for; the noisy demoscene scenes are
+    /// sent raw.
+    fn compressible(kind: visual_effect.Kind) bool {
+        return kind == .pacman or kind == .shadowbox;
+    }
+
+    /// Ticks per shipped frame. The shadow-box ran at 20 fps in the browser
+    /// and its zlib frames are the largest, so 15 fps; very large boards
+    /// also halve to keep deflate off the critical path.
+    fn shipEvery(kind: visual_effect.Kind, pixels: usize) u8 {
+        if (kind == .shadowbox) return 2;
+        return if (pixels > 700_000) 2 else 1;
     }
 
     pub fn tick(self: *Engine) void {
@@ -161,6 +185,7 @@ pub const Engine = struct {
             .tunnel => renderScene(.tunnel, self.rgb, self.width, self.height, frame),
             .metaballs => renderScene(.metaballs, self.rgb, self.width, self.height, frame),
             .horizon => renderScene(.horizon, self.rgb, self.width, self.height, frame),
+            .shadowbox => shadowbox.render(self.rgb, self.width, self.height, self.frame, self.seed, self.sky),
             .pacman => {
                 if (self.background_generation != self.game.generation) {
                     pacman.renderBackground(&self.game, self.background, self.width, self.height);
@@ -262,6 +287,17 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
     const r: u32 = @max(rows, 1);
     const win_w = c * cell_px_w;
     const win_h = r * cell_px_h;
+    if (kind == .shadowbox) {
+        // A 1900×900 canvas stretched to the viewport in the original: render
+        // near the window's own pixel size, capped to keep zlib frames cheap.
+        var width: u32 = std.math.clamp(win_w, 480, 960);
+        var height: u32 = @max(width * win_h / @max(win_w, 1), 32);
+        if (height > 540) {
+            height = 540;
+            width = @max(height * win_w / @max(win_h, 1), 64);
+        }
+        return .{ .width = @intCast(width), .height = @intCast(height) };
+    }
     if (kind == .pacman) {
         // Up to 16 px per maze tile; the maze is centered in a framebuffer of
         // the window's aspect (letterboxed, so `.fill` never stretches it).
@@ -280,7 +316,7 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
 
 // ------------------------------------------------------------- scenes --
 
-fn renderDemo(rgb: []u8, scratch: []u8, width: u16, height: u16, frame: u64) void {
+pub fn renderDemo(rgb: []u8, scratch: []u8, width: u16, height: u16, frame: u64) void {
     const scene_frames = @as(u64, fps) * 6;
     const transition_frames = @as(u64, fps);
     const scene_index: u2 = @intCast((frame / scene_frames) % 4);
@@ -479,165 +515,4 @@ fn colorChannel(value: f32) u8 {
 
 fn unitChannel(value: f32) u8 {
     return @intFromFloat(std.math.clamp(value, 0.0, 1.0) * 255.0);
-}
-
-test "framebuffer follows the window aspect within the encoding budget" {
-    const wide = framebufferSize(200, 50, 8, 16, .plasma);
-    try std.testing.expectEqual(@as(u16, 400), wide.width);
-    try std.testing.expectEqual(@as(u16, 200), wide.height);
-    const tiny = framebufferSize(40, 12, 8, 16, .plasma);
-    try std.testing.expectEqual(@as(u16, 160), tiny.width);
-    try std.testing.expect(tiny.height >= 32);
-    const zero = framebufferSize(0, 0, 0, 0, .plasma);
-    try std.testing.expect(zero.width >= 1 and zero.height >= 32);
-}
-
-test "scenes render deterministically and fill every channel" {
-    const gpa = std.testing.allocator;
-    const w: u16 = 32;
-    const h: u16 = 18;
-    const a = try gpa.alloc(u8, @as(usize, w) * h * 3);
-    defer gpa.free(a);
-    const b = try gpa.alloc(u8, a.len);
-    defer gpa.free(b);
-    const scratch = try gpa.alloc(u8, a.len);
-    defer gpa.free(scratch);
-    inline for (std.meta.fields(Scene)) |field| {
-        const scene: Scene = @enumFromInt(field.value);
-        renderScene(scene, a, w, h, 37);
-        renderScene(scene, b, w, h, 37);
-        try std.testing.expectEqualSlices(u8, a, b);
-    }
-    renderDemo(a, scratch, w, h, 30 * 6 - 5); // inside a transition: blends two scenes
-    renderDemo(b, scratch, w, h, 30 * 6 - 5);
-    try std.testing.expectEqualSlices(u8, a, b);
-}
-
-test "engine sizes its buffers and advances frames" {
-    var engine = Engine.init(std.testing.allocator, .tunnel, 9);
-    defer engine.deinit();
-    try engine.reset(120, 40, 9);
-    try std.testing.expectEqual(@as(usize, @as(usize, engine.width) * engine.height * 3), engine.rgb.len);
-    try std.testing.expectEqual(std.base64.standard.Encoder.calcSize(engine.rgb.len), engine.encoded.len);
-    engine.tick();
-    try std.testing.expectEqual(@as(u64, 1), engine.frame);
-    try engine.resize(120, 40); // same dimensions: buffers retained
-    try std.testing.expect(engine.rgb.len > 0);
-    try std.testing.expect(!engine.hasImage());
-}
-
-test "one image per tick, placed by render, freed on the next tick and on release" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var vx = try vaxis.Vaxis.init(threaded.io(), gpa, &env, .{});
-    defer vx.deinit(gpa, &out.writer);
-    vx.caps.kitty_graphics = true;
-    try vx.resize(gpa, &out.writer, .{ .rows = 24, .cols = 80, .x_pixel = 640, .y_pixel = 384 });
-
-    var engine = Engine.init(gpa, .tunnel, 1);
-    defer engine.deinit();
-    engine.setCellPixels(8, 16);
-    try engine.reset(80, 24, 1);
-    out.clearRetainingCapacity();
-
-    try engine.transmit(&vx, &out.writer);
-    engine.draw(vx.window(), .full_screen, 255);
-    try vx.render(&out.writer);
-    const first = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, first, "\x1b_Ga=t,f=24,s=240,v=144,i=1,q=2,m=1;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "\x1b_Ga=p,i=1,r=24,c=80,C=1\x1b\\") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "z=") == null);
-    // The transmit precedes the placement.
-    try std.testing.expect(std.mem.indexOf(u8, first, "a=t,").? < std.mem.indexOf(u8, first, "a=p,").?);
-
-    // A redraw within the same tick (a key, a daemon event) ships nothing new.
-    out.clearRetainingCapacity();
-    try engine.transmit(&vx, &out.writer);
-    try std.testing.expectEqual(@as(usize, 0), out.written().len);
-
-    // Next tick: transmit and place image 2. Image 1 stays alive until image
-    // 2 has been placed, so the screen is never without an image.
-    engine.tick();
-    try engine.transmit(&vx, &out.writer);
-    engine.draw(vx.window(), .full_screen, 255);
-    try vx.render(&out.writer);
-    const second = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, second, "\x1b_Ga=t,f=24,s=240,v=144,i=2,q=2,m=1;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second, "\x1b_Ga=p,i=2,r=24,c=80,C=1\x1b\\") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second, "a=p,i=1,") == null);
-    try std.testing.expect(std.mem.indexOf(u8, second, "a=d,d=I") == null);
-
-    // The tick after that frees image 1 before transmitting image 3.
-    out.clearRetainingCapacity();
-    engine.tick();
-    try engine.transmit(&vx, &out.writer);
-    const third = out.written();
-    const freed = std.mem.indexOf(u8, third, "\x1b_Ga=d,d=I,i=1,q=2;\x1b\\").?;
-    const sent = std.mem.indexOf(u8, third, "\x1b_Ga=t,f=24,s=240,v=144,i=3,q=2,m=1;").?;
-    try std.testing.expect(freed < sent);
-
-    // Ending the effect frees what is left: images 2 and 3.
-    out.clearRetainingCapacity();
-    engine.release(&vx, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b_Ga=d,d=I,i=2,q=2;\x1b\\") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b_Ga=d,d=I,i=3,q=2;\x1b\\") != null);
-    try std.testing.expect(!engine.hasImage());
-
-    // Without the capability, transmit says so instead of writing garbage.
-    vx.caps.kitty_graphics = false;
-    try std.testing.expectError(error.NoGraphicsCapability, engine.transmit(&vx, &out.writer));
-}
-
-test "pacman shapes its maze to the window, sizes a 16 px framebuffer, and ships zlib frames" {
-    const gpa = std.testing.allocator;
-    // 80×24 cells at 8×16 px: a 45×27 maze at 16 px per tile.
-    const dims = framebufferSize(80, 24, 8, 16, .pacman);
-    try std.testing.expectEqual(@as(u16, 720), dims.width);
-    try std.testing.expectEqual(@as(u16, 432), dims.height);
-    const wide = framebufferSize(300, 20, 8, 16, .pacman); // 2400×320: width-capped, letterboxed
-    try std.testing.expectEqual(@as(u16, 1600), wide.width);
-    try std.testing.expectEqual(@as(u16, 432), wide.height);
-
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var vx = try vaxis.Vaxis.init(threaded.io(), gpa, &env, .{});
-    defer vx.deinit(gpa, &out.writer);
-    vx.caps.kitty_graphics = true;
-    try vx.resize(gpa, &out.writer, .{ .rows = 24, .cols = 80, .x_pixel = 640, .y_pixel = 384 });
-
-    var engine = Engine.init(gpa, .pacman, 3);
-    defer engine.deinit();
-    engine.setCellPixels(8, 16);
-    try engine.reset(80, 24, 3);
-    try std.testing.expectEqual(dims.width, engine.width);
-    try std.testing.expectEqual(@as(u16, 45), engine.game.cols);
-    try std.testing.expectEqual(@as(u16, 27), engine.game.rows);
-    try std.testing.expectEqual(@as(u8, 1), engine.transmit_every);
-
-    out.clearRetainingCapacity();
-    try engine.transmit(&vx, &out.writer);
-    const bytes = out.written();
-    const head = std.mem.indexOf(u8, bytes, "\x1b_Ga=t,f=24,s=720,v=432,i=1,q=2,o=z,m=1;").?;
-    // The payload is a zlib stream: its first byte decodes to 0x78.
-    const payload = bytes[head + "\x1b_Ga=t,f=24,s=720,v=432,i=1,q=2,o=z,m=1;".len ..];
-    var first: [3]u8 = undefined;
-    try std.base64.standard.Decoder.decode(&first, payload[0..4]);
-    try std.testing.expectEqual(@as(u8, 0x78), first[0]);
-    // Flat art compresses hard: well under a tenth of the raw frame.
-    try std.testing.expect(bytes.len < engine.rgb.len / 10);
-    try std.testing.expectEqual(engine.game.generation, engine.background_generation);
-
-    const dots_before = engine.game.dots_left;
-    var i: usize = 0;
-    while (i < pacman.step_ticks * 3) : (i += 1) engine.tick();
-    try std.testing.expect(engine.game.dots_left < dots_before or engine.game.freeze > 0);
 }

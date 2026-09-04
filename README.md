@@ -104,8 +104,16 @@ the old rooms?
   `pacman`, a self-playing take on feiss' 1024-byte js1k entry on a maze
   generated to fit your window with the arcade's rules (mirrored, no dead
   ends, a ghost house in the middle, wrap-around tunnels; a new maze every
-  board), a spinning `tunnel`, `metaballs`, a synthwave `horizon`, and
-  `demo`, a 24-second sequence of the last three. Without graphics, Pac-Man draws its maze on
+  board), a spinning `tunnel`, `metaballs`, a synthwave `horizon`, `demo`, a
+  24-second sequence of those three, and `shadowbox`, a paper-cutout
+  landscape after Jani Ylikangas' js1k entry that follows the real sun over
+  your machine: it locates you from your time zone and computes the sun's
+  true altitude and azimuth, so days run long in summer and short in
+  winter, sunrise lands where and when it should, and a Nordic midsummer
+  night keeps its twilight. `/screensaver shadowbox cycle` runs today's
+  whole day every two minutes and `/screensaver shadowbox 18.5` pins an
+  hour (`MARLIN_SHADOWBOX_HOUR` does the same from the environment);
+  `MARLIN_SHADOWBOX_LATLON=lat,lon` overrides the place. Without graphics, Pac-Man draws its maze on
   cells and the other pixel effects start as a cell sibling; either way the
   status line says so. Run `/animate <effect>` over gaps in the current UI
   (opaque for the pixel kinds), or `/screensaver [effect]` for the

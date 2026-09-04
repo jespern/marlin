@@ -44,6 +44,11 @@ const attach = @import("attach.zig");
 const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
+const shadowbox = @import("shadowbox.zig");
+
+/// `/screensaver shadowbox cycle` or `… <hour>`: preview the sky instead of
+/// following the real sun.
+pub const SkyOverride = union(enum) { cycle, hour: f32 };
 const media = @import("media.zig");
 const render = @import("render.zig");
 const top_view = @import("top.zig");
@@ -668,6 +673,11 @@ pub const App = struct {
     /// Cell size in pixels from the winsize report (0 = unknown).
     cell_px_w: u32 = 0,
     cell_px_h: u32 = 0,
+    /// Where the machine is, for the shadow-box's sun; resolved on first use.
+    sky_observer: ?shadowbox.Observer = null,
+    /// `/screensaver shadowbox cycle` or `… 18.5`: preview the sky instead of
+    /// following the real sun. Cleared by a start without the argument.
+    sky_override: ?SkyOverride = null,
     screensaver_active: bool = false,
     screensaver_kind: effects.Kind = .matrix,
     screensaver_timeout_ms: u64 = 0,
@@ -2102,6 +2112,7 @@ pub const App = struct {
         const engine = if (self.effect_engine) |*e| e else return;
         if (!engine.isPixel()) return;
         if (self.screensaver_active or self.ui_animation != null) {
+            engine.setSky(self.effectSky());
             engine.transmit(vx, tty) catch |err| {
                 const requested = engine.kind();
                 self.kitty_graphics = false;
@@ -2113,6 +2124,63 @@ pub const App = struct {
         }
     }
 
+    fn skyObserver(self: *App) shadowbox.Observer {
+        if (self.sky_observer) |observer| return observer;
+        const observer = shadowbox.observerFromSystem(self.gpa, self.io, self.environ);
+        self.sky_observer = observer;
+        return observer;
+    }
+
+    /// The optional last word of `/screensaver shadowbox …`: an hour (0-24)
+    /// pins today's sky at that hour, `cycle` sweeps a day every two minutes,
+    /// nothing follows the real sun. Other effects take no such word.
+    pub fn applySkyArg(self: *App, kind: effects.Kind, arg: ?[]const u8) bool {
+        self.sky_override = null;
+        const value = arg orelse return true;
+        if (kind != .shadowbox) {
+            self.setNotice("{s} takes no hour; only shadowbox follows the sun", .{kind.name()});
+            return false;
+        }
+        if (std.mem.eql(u8, value, "cycle")) {
+            self.sky_override = .cycle;
+            return true;
+        }
+        if (std.fmt.parseFloat(f32, value)) |hour| {
+            if (hour >= 0 and hour <= 24) {
+                self.sky_override = .{ .hour = hour };
+                return true;
+            }
+        } else |_| {}
+        self.setNotice("usage: /screensaver shadowbox [<hour 0-24>|cycle]", .{});
+        return false;
+    }
+
+    /// The sky sun-following effects see: the real sun over the machine's
+    /// place, now — unless a `/screensaver` argument or
+    /// `MARLIN_SHADOWBOX_HOUR` (a number, or `cycle`) picks today's hour.
+    fn effectSky(self: *App) shadowbox.Sky {
+        const observer = self.skyObserver();
+        const clock = shadowbox.localClock(self.io);
+        const cycling_hour: f32 = @as(f32, @floatFromInt(@mod(clock.unix_ms, 120_000))) / 120_000.0 * 24.0;
+        var hour: ?f32 = null;
+        if (self.sky_override) |override| {
+            hour = switch (override) {
+                .cycle => cycling_hour,
+                .hour => |h| h,
+            };
+        } else if (self.environ) |env| {
+            if (env.get("MARLIN_SHADOWBOX_HOUR")) |value| {
+                hour = if (std.mem.eql(u8, value, "cycle")) cycling_hour else std.fmt.parseFloat(f32, value) catch null;
+            }
+        }
+        var at: f64 = @floatFromInt(clock.unix);
+        if (hour) |h| {
+            const midnight = @as(f64, @floatFromInt(clock.unix)) - @as(f64, @floatFromInt(clock.seconds_of_day));
+            at = midnight + @as(f64, @mod(h, 24.0)) * 3600.0;
+        }
+        return shadowbox.skyFor(at, observer);
+    }
+
     pub fn resetEffectEngine(self: *App, requested: effects.Kind) bool {
         const resolved = self.resolveEffect(requested);
         const kind = resolved.kind;
@@ -2120,6 +2188,23 @@ pub const App = struct {
         self.io.random(&seed_bytes);
         if (self.effect_engine) |*engine| engine.deinit();
         self.effect_engine = effects.Engine.init(self.gpa, kind, 1, resolved.backend);
+        if (kind == .shadowbox and resolved.backend == .pixel) {
+            // Say where the sun is being computed for, once, so a wrong guess is visible.
+            const observer = self.skyObserver();
+            const zone = observer.zone();
+            const preview: []const u8 = if (self.sky_override) |override| switch (override) {
+                .cycle => " · a day every two minutes",
+                .hour => " · pinned to today's hour",
+            } else "";
+            self.setNotice("shadowbox follows the sun over {s}{s}{d:.1}°, {d:.1}° ({t}){s}", .{
+                zone,
+                if (zone.len > 0) " at " else "",
+                observer.lat,
+                observer.lon,
+                observer.source,
+                preview,
+            });
+        }
         self.effect_engine.?.setCellPixels(self.cell_px_w, self.cell_px_h);
         self.effect_engine.?.reset(
             @intCast(@min(self.term_cols, std.math.maxInt(u16))),

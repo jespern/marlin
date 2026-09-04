@@ -17,6 +17,7 @@ pub const Kind = enum {
     metaballs,
     horizon,
     demo,
+    shadowbox,
 
     pub fn parse(value: []const u8) ?Kind {
         inline for (std.meta.fields(Kind)) |field| {
@@ -40,6 +41,7 @@ pub const Kind = enum {
             .metaballs => "pixel metaballs (Kitty graphics)",
             .horizon => "synthwave horizon (Kitty graphics)",
             .demo => "24-second pixel demoscene sequence (Kitty graphics)",
+            .shadowbox => "shadow-box landscape that follows your clock (after Jani Ylikangas' js1k entry; Kitty graphics)",
         };
     }
 
@@ -47,7 +49,7 @@ pub const Kind = enum {
     pub fn backend(self: Kind) Backend {
         return switch (self) {
             .matrix, .strings, .stars, .plasma => .cell,
-            .pacman, .tunnel, .metaballs, .horizon, .demo => .pixel,
+            .pacman, .tunnel, .metaballs, .horizon, .demo, .shadowbox => .pixel,
         };
     }
 
@@ -69,7 +71,7 @@ pub const Kind = enum {
         return switch (self) {
             .tunnel, .demo => .plasma,
             .metaballs => .plasma,
-            .horizon => .stars,
+            .horizon, .shadowbox => .stars,
             else => self,
         };
     }
@@ -86,24 +88,3 @@ pub const usage_list = blk: {
     }
     break :blk text;
 };
-
-test "visual effect names parse case-insensitively" {
-    try std.testing.expectEqual(Kind.strings, Kind.parse("STRINGS").?);
-    try std.testing.expectEqual(Kind.stars, Kind.parse("stars").?);
-    try std.testing.expectEqual(Kind.tunnel, Kind.parse("Tunnel").?);
-    try std.testing.expect(Kind.parse("nope") == null);
-}
-
-test "backends, fallbacks, and the generated usage list" {
-    try std.testing.expectEqual(Backend.cell, Kind.matrix.backend());
-    try std.testing.expectEqual(Backend.pixel, Kind.tunnel.backend());
-    try std.testing.expectEqual(Backend.pixel, Kind.pacman.backend());
-    try std.testing.expect(Kind.pacman.cellCapable() and Kind.matrix.cellCapable() and !Kind.tunnel.cellCapable());
-    try std.testing.expectEqual(Kind.pacman, Kind.pacman.fallback());
-    try std.testing.expect(Kind.pacman.fullScreenOnly());
-    try std.testing.expect(!Kind.matrix.fullScreenOnly());
-    try std.testing.expectEqual(Kind.plasma, Kind.tunnel.fallback());
-    try std.testing.expectEqual(Kind.stars, Kind.horizon.fallback());
-    try std.testing.expectEqual(Kind.matrix, Kind.matrix.fallback());
-    try std.testing.expectEqualStrings("matrix|strings|stars|plasma|pacman|tunnel|metaballs|horizon|demo", usage_list);
-}

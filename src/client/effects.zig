@@ -13,11 +13,14 @@ const starfield = @import("starfield.zig");
 const strings = @import("strings.zig");
 const pacman = @import("pacman.zig");
 const pixel_effects = @import("pixel_effects.zig");
+const shadowbox = @import("shadowbox.zig");
 
 pub const Kind = visual_effect.Kind;
 pub const Backend = visual_effect.Backend;
 pub const kinds = visual_effect.kinds;
 pub const usage_list = visual_effect.usage_list;
+/// The sky model the shadow-box follows; the TUI resolves it from the clock.
+pub const Sky = shadowbox.Sky;
 
 pub const Engine = union(enum) {
     matrix: matrix.Engine,
@@ -39,7 +42,7 @@ pub const Engine = union(enum) {
             .stars => .{ .stars = starfield.Engine.init(gpa, seed) },
             .pacman => .{ .pacman = pacman.Engine.init(gpa, seed) },
             // fallback() never names the pixel-only kinds; plasma is the safe cell default.
-            .plasma, .tunnel, .metaballs, .horizon, .demo => .{ .plasma = plasma.Engine.init(gpa, seed) },
+            .plasma, .tunnel, .metaballs, .horizon, .demo, .shadowbox => .{ .plasma = plasma.Engine.init(gpa, seed) },
         };
     }
 
@@ -61,6 +64,14 @@ pub const Engine = union(enum) {
     pub fn deinit(self: *Engine) void {
         switch (self.*) {
             inline else => |*engine| engine.deinit(),
+        }
+    }
+
+    /// Where the sun and moon stand, for effects that follow them (the shadow-box).
+    pub fn setSky(self: *Engine, sky: Sky) void {
+        switch (self.*) {
+            .pixel => |*engine| engine.setSky(sky),
+            else => {},
         }
     }
 
@@ -121,22 +132,3 @@ pub const Engine = union(enum) {
         }
     }
 };
-
-test "every kind constructs an engine for either backend" {
-    const gpa = std.testing.allocator;
-    inline for (kinds) |kind| {
-        var pixel = Engine.init(gpa, kind, 3, .pixel);
-        defer pixel.deinit();
-        try std.testing.expectEqual(kind, pixel.kind());
-        try std.testing.expectEqual(kind.backend() == .pixel, pixel.isPixel());
-        try pixel.reset(80, 24, 3);
-        pixel.tick();
-
-        var cell = Engine.init(gpa, kind, 3, .cell);
-        defer cell.deinit();
-        try std.testing.expectEqual(kind.fallback(), cell.kind());
-        try std.testing.expect(!cell.isPixel());
-        try cell.reset(80, 24, 3);
-        cell.tick();
-    }
-}

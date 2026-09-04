@@ -1152,6 +1152,24 @@ A split pane identifies its session with a compact pane label.
   sine strings, a forward starfield, demoscene plasma. Pixel effects
   (`client/pixel_effects.zig`) render an RGB framebuffer and ship it over
   Kitty graphics: tunnel, metaballs, horizon, a 24-second `demo` sequence,
+  a `shadowbox` landscape (`client/shadowbox.zig`, after Jani Ylikangas'
+  js1k 2019 entry: composed in the original's 1900×900 canvas units and
+  scaled per axis, rasterized with coverage anti-aliasing — the original's
+  faint ranges are sub-pixel fillRect widths, which coverage reproduces.
+  Its two static moods, bat and lightning are replaced by the real sun: the
+  TUI locates the machine from its time zone — zone name from `TZ`, the
+  `/etc/localtime` link or `/etc/timezone`; coordinates from the zone
+  database's own `zone1970.tab`/`zone.tab`, else an area latitude plus a
+  longitude from the UTC offset; `MARLIN_SHADOWBOX_LATLON` overrides — and
+  feeds the scene a `Sky` from the NOAA solar position algorithm for the
+  current instant (a trailing hour or `cycle` on `/screensaver shadowbox`,
+  or `MARLIN_SHADOWBOX_HOUR`, pins or sweeps today's hours instead).
+  The scene keys everything on the sine of the sun's altitude: a sky
+  palette of seven keyframes, the sun placed by azimuth (the viewer faces
+  the equator; a tanh keeps the path in frame) and the moon as the
+  anti-sun, both with radial glows, stars and mist fading in with the dark,
+  drifting soft clouds tinted from the horizon color, tree grays darkening
+  at night, and the sky mirrored and dimmed below the waterline as water),
   and a self-playing Pac-Man (`client/pacman.zig`, rules and wall-bounce
   ghosts after feiss' js1k 2019 entry, a BFS eat-or-flee driver replacing
   the cursor keys). Its maze is generated per board to fit the window's
@@ -1172,9 +1190,10 @@ A split pane identifies its session with a compact pane label.
   to the window's aspect (height ≤ 720, width ≤ 1600). Transport: the main
   loop calls `transmit` before `draw`; one new image per animation tick
   (`a=t`, 4 KiB chunks, `q=2` so the terminal stays quiet, ids from vaxis'
-  counter, `o=z` zlib when smaller — the flat maze compresses ~50×, which is
-  what pays for its resolution; boards over 700k pixels ship every other
-  tick), placed through the cell grid so vaxis' render() emits `a=p` inside
+  counter, `o=z` zlib when smaller — the flat maze compresses ~50× and the
+  shadow-box a few times, which is what pays for their resolution; the
+  shadow-box ships every other tick, as do boards over 700k pixels),
+  placed through the cell grid so vaxis' render() emits `a=p` inside
   the same synchronized update; the previous image is freed one tick after
   its successor is placed, so the screen never lacks an image.
   Placements use the default z-index (above text) because terminals disagree

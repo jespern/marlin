@@ -104,7 +104,7 @@ test {
     _ = @import("daemon/provider/http_test.zig");
     _ = @import("daemon/provider/registry_test.zig");
     _ = @import("daemon/provider/codex_test.zig");
-    _ = @import("core/visual_effect.zig");
+    _ = @import("core/visual_effect_test.zig");
     _ = @import("client/attach_test.zig");
     _ = @import("client/cc_approve_test.zig");
     _ = @import("client/remote_rebuild_test.zig");
@@ -116,7 +116,9 @@ test {
     _ = @import("client/markdown_test.zig");
     _ = @import("client/layout_test.zig");
     _ = @import("client/effect.zig");
-    _ = @import("client/effects.zig");
+    _ = @import("client/effects_test.zig");
+    _ = @import("client/pixel_effects_test.zig");
+    _ = @import("client/shadowbox_test.zig");
     _ = @import("client/media_test.zig");
     _ = @import("client/matrix_test.zig");
     _ = @import("client/pacman_test.zig");

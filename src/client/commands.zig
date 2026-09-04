@@ -665,20 +665,24 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             self.setNotice("unknown effect {s}", .{name});
             return;
         };
+        const sky_arg = it.next();
         if (it.next() != null) {
-            self.setNotice("usage: /animate <" ++ effects.usage_list ++ ">", .{});
+            self.setNotice("usage: /animate <" ++ effects.usage_list ++ "> [hour|cycle]", .{});
             return;
         }
+        if (!self.applySkyArg(kind, sky_arg)) return;
         self.startUiAnimation(kind);
     } else if (std.mem.eql(u8, head, "/screensaver") or std.mem.eql(u8, head, "!s")) {
         const kind = if (it.next()) |name| effects.Kind.parse(name) orelse {
             self.setNotice("unknown effect {s}", .{name});
             return;
         } else self.screensaver_kind;
+        const sky_arg = it.next();
         if (it.next() != null) {
-            self.setNotice("usage: /screensaver [" ++ effects.usage_list ++ "]", .{});
+            self.setNotice("usage: /screensaver [" ++ effects.usage_list ++ "] [hour|cycle]", .{});
             return;
         }
+        if (!self.applySkyArg(kind, sky_arg)) return;
         self.startScreensaver(kind);
     } else if (std.mem.eql(u8, head, "/otel")) {
         self.otelCommand(it.next(), it.rest());
