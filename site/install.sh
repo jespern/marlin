@@ -3,7 +3,7 @@
 #
 # Downloads the matching GitHub release asset into ~/.local/bin (or
 # $MARLIN_INSTALL_DIR), verifies its checksum, and offers to add that directory
-# to the user's PATH. Set MARLIN_VERSION to pin a release (for example, 0.1.2).
+# to the user's PATH. Set MARLIN_VERSION to pin a release (for example, 0.1.3).
 # No sudo and no system-wide writes. Uninstall with: rm ~/.local/bin/marlin
 
 set -eu
