@@ -4,15 +4,20 @@
 //! are screensavers, not a probe; Pac-Man's board lives in pacman.zig and is
 //! rasterized here.
 //!
-//! Transport: each tick's frame is transmitted as a new image (`a=t`, 4 KiB
-//! chunks, `q=2` so the terminal does not answer every frame, `o=z` zlib when
-//! that is smaller — the maze compresses ~50×, which is what pays for its
-//! resolution) with an id from vaxis' counter, then placed through the cell grid with `Image.draw(.fill)`
-//! so vaxis' render() emits the placement in the same synchronized update as
-//! the cells. The previous image is freed at the start of the next transmit,
-//! so the screen never lacks an image. Placements use the default z-index
-//! (above text): terminals disagree on whether negative z sits above or
-//! below an explicit cell background, and the effect is opaque anyway.
+//! Transport: one image id per engine, taken once from vaxis' counter, and
+//! every shipped tick retransmits under that same id (`a=t`, 4 KiB chunks,
+//! `q=2` so the terminal does not answer, `o=z` zlib when that is smaller —
+//! the maze compresses ~50×). Replacing in place means no per-frame delete,
+//! no placement-list rewrite in the terminal, and one image resident instead
+//! of two. Terminals differ on whether a replaced image keeps its
+//! placements, so the transmit opens a synchronized update (DEC 2026) that
+//! vaxis' render() closes after it has re-emitted the `a=p` placement from
+//! the cell grid (`Image.draw(.fill)`): the swap is atomic on screen either
+//! way. A wire budget (`wire_budget_bytes_per_second`) stretches each
+//! effect's ship interval from the size of the last frame it sent, so no
+//! scene can flood the terminal. Placements use the default z-index (above
+//! text): terminals disagree on whether negative z sits above or below an
+//! explicit cell background, and the effect is opaque anyway.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -26,9 +31,10 @@ const wipeout_effect = @import("wipeout_effect.zig");
 pub const Scene = enum { plasma, tunnel, metaballs, horizon };
 
 /// Framebuffer resolution is decoupled from the terminal's pixel size: the
-/// terminal scales the image to the window (`.fill`), and encoding cost is
-/// what bounds frame rate. 400×N at 30 fps is ~400 KiB/s of base64.
-const max_width: u32 = 400;
+/// terminal scales the image to the window (`.fill`). The demoscene scenes
+/// stay within the 320×180 envelope the probe validated in real terminals;
+/// with zlib and the wire budget that lands near 15 fps.
+const max_width: u32 = 320;
 const min_width: u32 = 160;
 /// Assumed cell aspect when the terminal does not report pixel sizes.
 const default_cell_w: u32 = 8;
@@ -53,8 +59,10 @@ pub const Engine = struct {
     encoded: []u8 = &.{},
     /// The image transmitted for the CURRENT frame (placed by draw).
     image: ?vaxis.Image = null,
-    /// Last frame's image, freed at the start of the next transmit.
-    previous_id: ?u32 = null,
+    /// The one terminal image id this engine owns; frames replace it in place.
+    image_id: ?u32 = null,
+    /// Bytes the last shipped frame put on the wire; drives the budget.
+    last_frame_bytes: usize = 0,
     /// The tick `image` was rendered for; renders between ticks reuse it.
     transmitted_frame: ?u64 = null,
     /// Ship every Nth tick; very large boards use 2 so deflate stays cheap.
@@ -157,33 +165,41 @@ pub const Engine = struct {
             errdefer self.gpa.free(self.background);
             self.background_generation = 0;
         }
-        if (compressible(self.kind)) {
-            self.zbuf = try self.gpa.alloc(u8, pixels * 3 + 8192);
-            errdefer self.gpa.free(self.zbuf);
-            self.window = try self.gpa.alloc(u8, 2 * std.compress.flate.max_window_len);
-            // Frames past ~200k pixels are worth splitting across threads;
-            // smaller ones finish faster on one.
-            if (pixels >= 200_000) self.par_encoder = wipeout_effect.parzlib.Encoder.init(self.gpa, parallel_zlib_bands);
-        }
+        // zlib for every kind: flat art shrinks ~50×, gradients a few times,
+        // and the noisy scenes simply go raw when that is smaller.
+        self.zbuf = try self.gpa.alloc(u8, pixels * 3 + 8192);
+        errdefer self.gpa.free(self.zbuf);
+        self.window = try self.gpa.alloc(u8, 2 * std.compress.flate.max_window_len);
+        // Frames past ~200k pixels are worth splitting across threads;
+        // smaller ones finish faster on one.
+        if (pixels >= 200_000) self.par_encoder = wipeout_effect.parzlib.Encoder.init(self.gpa, parallel_zlib_bands);
         self.transmit_every = shipEvery(self.kind, pixels);
         if (self.kind == .wipeout) {
             if (self.wipeout_game) |g| self.transmit_every = g.outputSize().ship_every;
         }
+        self.last_frame_bytes = 0;
     }
 
-    /// Flat or smooth art that zlib pays for; the noisy demoscene scenes are
-    /// sent raw.
-    fn compressible(kind: visual_effect.Kind) bool {
-        return kind == .pacman or kind == .tetris or kind == .shadowbox or kind == .wipeout;
-    }
-
-    /// Ticks per shipped frame. The shadow-box ran at 20 fps in the browser
-    /// and its zlib frames are the largest, so 15 fps; very large boards
-    /// also halve to keep deflate off the critical path.
+    /// Base ticks per shipped frame, before the wire budget. The shadow-box
+    /// moves slowly and its frames are the heaviest, so 10 fps; very large
+    /// boards halve to keep deflate off the critical path.
     fn shipEvery(kind: visual_effect.Kind, pixels: usize) u8 {
-        if (kind == .shadowbox) return 2;
+        if (kind == .shadowbox) return 3;
         if (kind == .wipeout) return 1;
         return if (pixels > 700_000) 2 else 1;
+    }
+
+    /// Ticks per shipped frame after the wire budget: the base rate, stretched
+    /// so that the last frame's size times the resulting rate stays under
+    /// `wire_budget_bytes_per_second`. Nothing shipped yet means the base.
+    pub fn effectiveEvery(self: *const Engine) u8 {
+        // wipEout is a game the player launched by hand and tuned for its own
+        // frame rate (banded parallel zlib, quantised CRT); the budget guards
+        // screensavers that run unattended.
+        if (self.kind == .wipeout) return self.transmit_every;
+        if (self.last_frame_bytes == 0) return self.transmit_every;
+        const needed = (self.last_frame_bytes * ticks_per_second + wire_budget_bytes_per_second - 1) / wire_budget_bytes_per_second;
+        return @intCast(@min(@max(@as(usize, self.transmit_every), needed), ticks_per_second));
     }
 
     pub fn tick(self: *Engine) void {
@@ -208,14 +224,7 @@ pub const Engine = struct {
                 if (out.width != self.width or out.height != self.height) try self.resize(self.cols, self.rows);
             }
         }
-        if (self.image != null and (self.transmitted_frame == self.frame or self.frame % self.transmit_every != 0)) return;
-        // The image placed LAST tick is on screen; freeing it now (before the
-        // new transmit) never leaves a blank frame, and keeps terminal memory
-        // at two images.
-        if (self.previous_id) |id| {
-            freeImage(tty, id);
-            self.previous_id = null;
-        }
+        if (self.image != null and (self.transmitted_frame == self.frame or self.frame % self.effectiveEvery() != 0)) return;
         const frame = self.frame + self.seed_offset;
         switch (self.kind) {
             .demo => renderDemo(self.rgb, self.scratch, self.width, self.height, frame),
@@ -246,21 +255,25 @@ pub const Engine = struct {
             }
         }
         const encoded = std.base64.standard.Encoder.encode(self.encoded, payload);
-        const id = vx.next_img_id;
-        vx.next_img_id += 1;
+        const id = self.image_id orelse blk: {
+            const fresh = vx.next_img_id;
+            vx.next_img_id += 1;
+            self.image_id = fresh;
+            break :blk fresh;
+        };
+        // Open a synchronized update; render() closes it after re-placing the
+        // image, so a terminal that drops placements on replace shows no gap.
+        try tty.writeAll("\x1b[?2026h");
         try transmitEncoded(tty, encoded, id, self.width, self.height, compressed);
-        if (self.image) |old| self.previous_id = old.id;
         self.image = vaxis.Image.init(id, self.width, self.height);
         self.transmitted_frame = self.frame;
+        // Chunk framing adds ~40 bytes per 4 KiB chunk.
+        self.last_frame_bytes = encoded.len + 40 * (encoded.len / 4096 + 1);
     }
 
-    /// Drop the current image from the terminal (effect ended).
+    /// Drop the image from the terminal (effect ended).
     pub fn release(self: *Engine, vx: *vaxis.Vaxis, tty: *std.Io.Writer) void {
         _ = vx;
-        if (self.previous_id) |id| {
-            freeImage(tty, id);
-            self.previous_id = null;
-        }
         if (self.image) |img| {
             freeImage(tty, img.id);
             self.image = null;
@@ -269,7 +282,7 @@ pub const Engine = struct {
     }
 
     pub fn hasImage(self: *const Engine) bool {
-        return self.image != null or self.previous_id != null;
+        return self.image != null;
     }
 
     /// Place the current frame over the whole window (opaque by nature; the
@@ -317,14 +330,26 @@ fn freeImage(tty: *std.Io.Writer, id: u32) void {
     tty.print("\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{id}) catch {};
 }
 
-/// zlib-compress `src` into `dst` (fastest level); null when it does not fit.
+/// Deflate effort. Measured on the shadow-box (gradients) and Pac-Man (flat
+/// art): level 4 shrinks frames 7% and 23% over level 1 at the same cost;
+/// level 6 buys a little more for a third more CPU per frame.
+pub const deflate_options: std.compress.flate.Compress.Options = .level_4;
+
+/// zlib-compress `src` into `dst`; null when it does not fit.
 fn deflate(dst: []u8, window: []u8, src: []const u8) ?[]u8 {
     var out: std.Io.Writer = .fixed(dst);
-    var c = std.compress.flate.Compress.init(&out, window, .zlib, .fastest) catch return null;
+    var c = std.compress.flate.Compress.init(&out, window, .zlib, deflate_options) catch return null;
     c.writer.writeAll(src) catch return null;
     c.finish() catch return null;
     return out.buffered();
 }
+
+/// The animation thread's tick rate; ship intervals are counted in ticks.
+pub const ticks_per_second: usize = 30;
+/// What any one effect may put on the wire. Pac-Man uses a third of it at
+/// 30 fps; the shadow-box lands near 10 fps; a noisy raw scene is throttled
+/// rather than allowed to flood the terminal.
+pub const wire_budget_bytes_per_second: usize = 2_000_000;
 
 pub const Dimensions = struct { width: u16, height: u16 };
 
@@ -365,11 +390,13 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
     const win_h = r * cell_px_h;
     if (kind == .shadowbox) {
         // A 1900×900 canvas stretched to the viewport in the original: render
-        // near the window's own pixel size, capped to keep zlib frames cheap.
-        var width: u32 = std.math.clamp(win_w, 480, 960);
+        // near the window's own pixel size, inside the envelope Pac-Man has
+        // proven (720×405 is ~0.8 of its pixels) since these frames compress
+        // only a few times.
+        var width: u32 = std.math.clamp(win_w, 480, 720);
         var height: u32 = @max(width * win_h / @max(win_w, 1), 32);
-        if (height > 540) {
-            height = 540;
+        if (height > 405) {
+            height = 405;
             width = @max(height * win_w / @max(win_h, 1), 64);
         }
         return .{ .width = @intCast(width), .height = @intCast(height) };

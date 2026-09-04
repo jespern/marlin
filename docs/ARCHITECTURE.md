@@ -1240,17 +1240,23 @@ A split pane identifies its session with a compact pane label.
   rounded outer corners from a rectangle-distance field), `renderPixels`
   adds dots and anti-aliased sprites gliding between tiles, and a cell
   `Engine` draws the same board with glyphs where graphics are missing.
-  Demoscene framebuffers are 160–400 px wide with the window's pixel aspect
+  Demoscene framebuffers are 160–320 px wide with the window's pixel aspect
   (from the winsize report); the maze uses up to 16 px per tile, letterboxed
   to the window's aspect (height ≤ 720, width ≤ 1600). Transport: the main
-  loop calls `transmit` before `draw`; one new image per animation tick
-  (`a=t`, 4 KiB chunks, `q=2` so the terminal stays quiet, ids from vaxis'
-  counter, `o=z` zlib when smaller — the flat maze compresses ~50× and the
-  shadow-box a few times, which is what pays for their resolution; the
-  shadow-box ships every other tick, as do boards over 700k pixels),
-  placed through the cell grid so vaxis' render() emits `a=p` inside
-  the same synchronized update; the previous image is freed one tick after
-  its successor is placed, so the screen never lacks an image.
+  loop calls `transmit` before `draw`; each engine owns one image id from
+  vaxis' counter and every shipped tick retransmits under it (`a=t`, 4 KiB
+  chunks, `q=2` so the terminal stays quiet, `o=z` zlib when smaller — the
+  flat maze compresses ~50×, the shadow-box a few times), so the terminal
+  holds one image and never runs a delete per frame. Terminals differ on
+  whether a replaced image keeps its placements, so the transmit opens a
+  synchronized update (DEC 2026) that vaxis' render() closes after
+  re-emitting the `a=p` placement from the cell grid: the swap is atomic.
+  A wire budget of 2 MB/s (`pixel_effects.wire_budget_bytes_per_second`)
+  stretches each effect's base ship interval from the size of its last
+  frame: Pac-Man stays at 30 fps, the shadow-box (720×405 at most, base
+  10 fps) and the demoscene scenes (320 px wide) settle where their bytes
+  allow, and a noisy scene is throttled rather than allowed to flood the
+  terminal — the load that took Ghostty 1.3.1 down on 2026-09-04 was ~7 MB/s.
   Placements use the default z-index (above text) because terminals disagree
   on where negative z sits relative to an explicit cell background.
   Capability comes from `vx.caps.kitty_graphics`; without it Tetris and Pac-Man

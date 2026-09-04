@@ -21,8 +21,8 @@ test {
 
 test "framebuffer follows the window aspect within the encoding budget" {
     const wide = framebufferSize(200, 50, 8, 16, .plasma);
-    try std.testing.expectEqual(@as(u16, 400), wide.width);
-    try std.testing.expectEqual(@as(u16, 200), wide.height);
+    try std.testing.expectEqual(@as(u16, 320), wide.width);
+    try std.testing.expectEqual(@as(u16, 160), wide.height);
     const tiny = framebufferSize(40, 12, 8, 16, .plasma);
     try std.testing.expectEqual(@as(u16, 160), tiny.width);
     try std.testing.expect(tiny.height >= 32);
@@ -64,7 +64,7 @@ test "engine sizes its buffers and advances frames" {
     try std.testing.expect(!engine.hasImage());
 }
 
-test "one image per tick, placed by render, freed on the next tick and on release" {
+test "one image id per engine: frames replace it in place inside a synchronized update; release frees it" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -87,43 +87,38 @@ test "one image per tick, placed by render, freed on the next tick and on releas
     engine.draw(vx.window(), .full_screen, 255);
     try vx.render(&out.writer);
     const first = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, first, "\x1b_Ga=t,f=24,s=240,v=144,i=1,q=2,m=1;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "\x1b_Ga=p,i=1,r=24,c=80,C=1\x1b\\") != null);
+    // The transmit opens a synchronized update; render's placement closes it.
+    const bsu = std.mem.indexOf(u8, first, "\x1b[?2026h").?;
+    const sent = std.mem.indexOf(u8, first, "\x1b_Ga=t,f=24,s=240,v=144,i=1,q=2").?;
+    const placed = std.mem.indexOf(u8, first, "\x1b_Ga=p,i=1,r=24,c=80,C=1\x1b\\").?;
+    const esu = std.mem.lastIndexOf(u8, first, "\x1b[?2026l").?;
+    try std.testing.expect(bsu < sent and sent < placed and placed < esu);
     try std.testing.expect(std.mem.indexOf(u8, first, "z=") == null);
-    // The transmit precedes the placement.
-    try std.testing.expect(std.mem.indexOf(u8, first, "a=t,").? < std.mem.indexOf(u8, first, "a=p,").?);
+    try std.testing.expect(std.mem.indexOf(u8, first, "a=d,d=I") == null);
+    try std.testing.expect(engine.last_frame_bytes > 0);
 
     // A redraw within the same tick (a key, a daemon event) ships nothing new.
     out.clearRetainingCapacity();
     try engine.transmit(&vx, &out.writer);
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
 
-    // Next tick: transmit and place image 2. Image 1 stays alive until image
-    // 2 has been placed, so the screen is never without an image.
-    engine.tick();
-    try engine.transmit(&vx, &out.writer);
-    engine.draw(vx.window(), .full_screen, 255);
-    try vx.render(&out.writer);
-    const second = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, second, "\x1b_Ga=t,f=24,s=240,v=144,i=2,q=2,m=1;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second, "\x1b_Ga=p,i=2,r=24,c=80,C=1\x1b\\") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second, "a=p,i=1,") == null);
-    try std.testing.expect(std.mem.indexOf(u8, second, "a=d,d=I") == null);
+    // The next shipped tick replaces the SAME id; nothing is deleted, no new
+    // id is taken, and the interval is what the budget allows.
+    var ticks: usize = 0;
+    while (out.written().len == 0 and ticks < 30) : (ticks += 1) {
+        engine.tick();
+        try engine.transmit(&vx, &out.writer);
+    }
+    try std.testing.expectEqual(@as(usize, engine.effectiveEvery()), ticks);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b_Ga=t,f=24,s=240,v=144,i=1,q=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "i=2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "a=d,d=I") == null);
+    try std.testing.expectEqual(@as(u32, 2), vx.next_img_id);
 
-    // The tick after that frees image 1 before transmitting image 3.
-    out.clearRetainingCapacity();
-    engine.tick();
-    try engine.transmit(&vx, &out.writer);
-    const third = out.written();
-    const freed = std.mem.indexOf(u8, third, "\x1b_Ga=d,d=I,i=1,q=2;\x1b\\").?;
-    const sent = std.mem.indexOf(u8, third, "\x1b_Ga=t,f=24,s=240,v=144,i=3,q=2,m=1;").?;
-    try std.testing.expect(freed < sent);
-
-    // Ending the effect frees what is left: images 2 and 3.
+    // Ending the effect frees the one image.
     out.clearRetainingCapacity();
     engine.release(&vx, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b_Ga=d,d=I,i=2,q=2;\x1b\\") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b_Ga=d,d=I,i=3,q=2;\x1b\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b_Ga=d,d=I,i=1,q=2;\x1b\\") != null);
     try std.testing.expect(!engine.hasImage());
 
     // Without the capability, transmit says so instead of writing garbage.
@@ -131,6 +126,20 @@ test "one image per tick, placed by render, freed on the next tick and on releas
     try std.testing.expectError(error.NoGraphicsCapability, engine.transmit(&vx, &out.writer));
 }
 
+test "the wire budget stretches the ship interval for heavy frames" {
+    var engine = Engine.init(std.testing.allocator, .tunnel, 1);
+    defer engine.deinit();
+    try std.testing.expectEqual(@as(u8, 1), engine.effectiveEvery()); // nothing shipped yet: the base rate
+    engine.last_frame_bytes = 20_000; // Pac-Man-sized: 0.6 MB/s at 30 fps, untouched
+    try std.testing.expectEqual(@as(u8, 1), engine.effectiveEvery());
+    engine.last_frame_bytes = 480_000; // the old shadow-box: 14 MB/s wanted → every 8th tick
+    try std.testing.expectEqual(@as(u8, 8), engine.effectiveEvery());
+    engine.transmit_every = 3;
+    engine.last_frame_bytes = 100_000; // 3 MB/s wanted → every 2nd, but the base is 3
+    try std.testing.expectEqual(@as(u8, 3), engine.effectiveEvery());
+    engine.last_frame_bytes = 100_000_000; // absurd: never slower than one frame a second
+    try std.testing.expectEqual(@as(u8, 30), engine.effectiveEvery());
+}
 test "pacman shapes its maze to the window, sizes a 16 px framebuffer, and ships zlib frames" {
     const gpa = std.testing.allocator;
     // 80×24 cells at 8×16 px: a 51×27 maze under a 3-row HUD at 16 px per tile.
@@ -172,6 +181,7 @@ test "pacman shapes its maze to the window, sizes a 16 px framebuffer, and ships
     try std.testing.expectEqual(@as(u8, 0x78), first[0]);
     // Flat art compresses hard: well under a tenth of the raw frame.
     try std.testing.expect(bytes.len < engine.rgb.len / 10);
+    try std.testing.expectEqual(@as(u8, 1), engine.effectiveEvery()); // well inside the wire budget
     try std.testing.expectEqual(engine.game.generation, engine.background_generation);
 
     // Through "READY!" and three board steps.
@@ -222,13 +232,17 @@ test "tetris fills the viewport with a compressed arcade cabinet and advances it
         engine.tetris_game.pieces > 0);
 }
 
-test "shadowbox renders near window size and ships compressed frames at half rate" {
+test "shadowbox stays inside the 720×405 envelope and ships compressed frames at a tenth of the ticks or slower" {
     const gpa = std.testing.allocator;
+    // 80×24 cells at 8×16 px: the window's own 640×384 fits the envelope.
     const dims = framebufferSize(80, 24, 8, 16, .shadowbox);
     try std.testing.expectEqual(@as(u16, 640), dims.width);
     try std.testing.expectEqual(@as(u16, 384), dims.height);
+    const retina = framebufferSize(200, 60, 18, 38, .shadowbox); // 3600×2280: capped, aspect kept
+    try std.testing.expectEqual(@as(u16, 405), retina.height);
+    try std.testing.expect(retina.width <= 720 and retina.width >= 600);
     const tall = framebufferSize(60, 60, 8, 16, .shadowbox); // 480×960: height-capped
-    try std.testing.expectEqual(@as(u16, 540), tall.height);
+    try std.testing.expectEqual(@as(u16, 405), tall.height);
 
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -246,17 +260,22 @@ test "shadowbox renders near window size and ships compressed frames at half rat
     engine.setCellPixels(8, 16);
     engine.setSky(shadowbox.Sky.forHour(19.5));
     try engine.reset(80, 24, 3);
-    try std.testing.expectEqual(@as(u8, 2), engine.transmit_every);
+    try std.testing.expectEqual(@as(u8, 3), engine.transmit_every);
     out.clearRetainingCapacity();
     try engine.transmit(&vx, &out.writer);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b_Ga=t,f=24,s=640,v=384,i=1,q=2,o=z,m=1;") != null);
     try std.testing.expect(out.written().len < engine.rgb.len);
-    // Odd ticks reuse the shipped image; even ticks ship again.
-    engine.tick();
+    // The budget never lets it exceed 2 MB/s.
+    const every = engine.effectiveEvery();
+    try std.testing.expect(every >= 3);
+    try std.testing.expect(engine.last_frame_bytes * 30 / every <= 2_000_000);
+    // Ticks between shipped frames match, and the same id is replaced.
     out.clearRetainingCapacity();
-    try engine.transmit(&vx, &out.writer);
-    try std.testing.expectEqual(@as(usize, 0), out.written().len);
-    engine.tick();
-    try engine.transmit(&vx, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), ",i=2,q=2,o=z,m=1;") != null);
+    var ticks: usize = 0;
+    while (out.written().len == 0 and ticks < 30) : (ticks += 1) {
+        engine.tick();
+        try engine.transmit(&vx, &out.writer);
+    }
+    try std.testing.expectEqual(@as(usize, every), ticks);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), ",i=1,q=2,o=z,m=1;") != null);
 }
