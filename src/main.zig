@@ -62,6 +62,7 @@ test {
     _ = @import("daemon/guest/claude_code_turn_test.zig");
     _ = @import("daemon/shell_network_test.zig");
     _ = @import("daemon/process_io_test.zig");
+    _ = @import("daemon/power_test.zig");
     _ = @import("core/effort_test.zig");
     _ = @import("core/credentials_test.zig");
     _ = @import("core/config_toml_test.zig");

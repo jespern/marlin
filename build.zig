@@ -24,6 +24,15 @@ const sqlite_flags = &.{
     "-DSQLITE_ENABLE_FTS5",
 };
 
+/// The daemon's scoped idle-sleep assertion (src/daemon/power.zig) calls
+/// IOKit/CoreFoundation directly; other platforms compile it as a no-op and
+/// link nothing extra.
+fn configurePower(module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+    module.linkFramework("IOKit", .{});
+    module.linkFramework("CoreFoundation", .{});
+}
+
 fn configureSqlite(module: *std.Build.Module, b: *std.Build, embedded: bool) void {
     module.link_libc = true;
     if (embedded) {
@@ -82,6 +91,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     configureSqlite(exe.root_module, b, embedded_sqlite);
+    configurePower(exe.root_module, target);
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     exe.root_module.addOptions("build_options", build_options);
@@ -106,6 +116,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     configureSqlite(test_module, b, embedded_sqlite);
+    configurePower(test_module, target);
     test_module.addOptions("build_options", build_options);
     const exe_tests = b.addTest(.{ .root_module = test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);

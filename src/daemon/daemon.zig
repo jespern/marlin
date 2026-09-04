@@ -46,6 +46,7 @@ const config = @import("../core/config.zig");
 const credentials = @import("../core/credentials.zig");
 const queue = @import("../core/queue.zig");
 const store_mod = @import("store.zig");
+const power = @import("power.zig");
 const loop = @import("loop.zig");
 const context = @import("context.zig");
 const approval = @import("approval.zig");
@@ -340,6 +341,9 @@ pub const Daemon = struct {
     /// Daemon-lifetime on purpose: a restart still returns every session to
     /// default approvals.
     retained_approvals: std.AutoHashMapUnmanaged(u64, approval.Mode) = .empty,
+    /// Held while any session is running a turn (macOS: prevents idle system
+    /// sleep; elsewhere a no-op). Dispatcher-owned, synced after every event.
+    sleep_assertion: power.SleepAssertion = .{},
     next_client_id: u64 = 1,
     running: bool = true,
     /// /reboot in flight: client id awaiting the coordinated shutdown.
@@ -800,9 +804,20 @@ pub const Daemon = struct {
             self.handleEvent(ev) catch |e| {
                 std.log.warn("dispatch error: {t}", .{e});
             };
+            // Every state transition happens on this thread, so syncing once
+            // per event cannot miss a turn starting or ending.
+            self.sleep_assertion.sync(self.anyTurnRunning());
             if (!self.running) break;
         }
         self.shutdownCleanup();
+    }
+
+    fn anyTurnRunning(self: *Daemon) bool {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            if (sp.*.state == .running) return true;
+        }
+        return false;
     }
 
     fn handleEvent(self: *Daemon, ev: Event) !void {
@@ -3994,6 +4009,7 @@ pub const Daemon = struct {
     }
 
     fn shutdownCleanup(self: *Daemon) void {
+        self.sleep_assertion.sync(false);
         self.clients_mutex.lockUncancelable(self.io);
         self.accepting_clients = false;
         self.clients_mutex.unlock(self.io);
