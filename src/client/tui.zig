@@ -51,6 +51,7 @@ const markdown = @import("markdown.zig");
 const layout_mod = @import("layout.zig");
 const commands = @import("commands.zig");
 const keys = @import("keys.zig");
+const setup_mod = @import("setup.zig");
 const LayoutCache = layout_mod.LayoutCache;
 const TailLayoutCache = layout_mod.TailLayoutCache;
 const StreamLayoutCache = layout_mod.StreamLayoutCache;
@@ -161,47 +162,12 @@ const CommandSuggestion = commands.CommandSuggestion;
 
 pub const PickerKind = enum { model, effort, session, search_prompt, search, council, council_list, voice_engine, voice_mode, setup_provider };
 
-const SetupProvider = enum { openrouter, codex, claude_code, vercel, anthropic, litellm, local, custom };
-const SetupPrompt = enum { none, credential, base_url, model, provider_name };
+const SetupProvider = setup_mod.SetupProvider;
+const SetupPrompt = setup_mod.SetupPrompt;
 
-const setup_provider_items = [_][]const u8{
-    "OpenRouter · native · one key, many models",
-    "Codex · guest · ChatGPT login",
-    "Claude Code · guest · Claude login",
-    "Vercel AI Gateway · native",
-    "Anthropic API · native",
-    "LiteLLM · local gateway",
-    "Local · OpenAI-compatible server",
-    "Custom · OpenAI-compatible endpoint",
-};
+const setup_provider_items = setup_mod.setup_provider_items;
 
-const SetupReadiness = struct {
-    completed: bool = false,
-    codex_available: bool = false,
-    codex_authenticated: bool = false,
-    claude_code_available: bool = false,
-    claude_code_authenticated: bool = false,
-    openrouter_ready: bool = false,
-    vercel_ready: bool = false,
-    anthropic_ready: bool = false,
-    litellm_ready: bool = false,
-    local_ready: bool = false,
-
-    fn fromWire(status: proto.SetupStatus) SetupReadiness {
-        return .{
-            .completed = status.completed,
-            .codex_available = status.codex_available,
-            .codex_authenticated = status.codex_authenticated,
-            .claude_code_available = status.claude_code_available,
-            .claude_code_authenticated = status.claude_code_authenticated,
-            .openrouter_ready = status.openrouter_ready,
-            .vercel_ready = status.vercel_ready,
-            .anthropic_ready = status.anthropic_ready,
-            .litellm_ready = status.litellm_ready,
-            .local_ready = status.local_ready,
-        };
-    }
-};
+const SetupReadiness = setup_mod.SetupReadiness;
 
 const OtelCommand = commands.OtelCommand;
 
@@ -539,6 +505,23 @@ pub const VimState = struct {
     last_find_ch: u8 = 0,
 };
 
+/// Provider onboarding is a client-side draft backed by daemon-owned
+/// persistence. Only the credential field is masked, and it is scrubbed
+/// immediately after setup_apply is encoded. One value per App.
+pub const SetupState = struct {
+    readiness: SetupReadiness = .{},
+    provider: ?SetupProvider = null,
+    prompt: SetupPrompt = .none,
+    required: bool = false,
+    replace_empty_session: bool = false,
+    status_pending: bool = false,
+    apply_pending: bool = false,
+    provider_name: std.ArrayList(u8) = .empty,
+    base_url: std.ArrayList(u8) = .empty,
+    api_key_env: std.ArrayList(u8) = .empty,
+    credential: std.ArrayList(u8) = .empty,
+};
+
 pub const App = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -577,20 +560,8 @@ pub const App = struct {
     command_selection: usize = 0,
     /// Type-to-filter query while the picker is open.
     picker_filter: std.ArrayList(u8) = .empty,
-    /// Provider onboarding is a client-side draft backed by daemon-owned
-    /// persistence. Only the credential field is masked, and it is scrubbed
-    /// immediately after setup_apply is encoded.
-    setup_readiness: SetupReadiness = .{},
-    setup_provider: ?SetupProvider = null,
-    setup_prompt: SetupPrompt = .none,
-    setup_required: bool = false,
-    setup_replace_empty_session: bool = false,
-    setup_status_pending: bool = false,
-    setup_apply_pending: bool = false,
-    setup_provider_name: std.ArrayList(u8) = .empty,
-    setup_base_url: std.ArrayList(u8) = .empty,
-    setup_api_key_env: std.ArrayList(u8) = .empty,
-    setup_credential: std.ArrayList(u8) = .empty,
+    /// Provider onboarding draft; see setup.zig.
+    setup: SetupState = .{},
     /// Process-local OTLP setup. The endpoint survives only until the masked
     /// header entry is submitted or cancelled; neither value enters history.
     otel_endpoint: std.ArrayList(u8) = .empty,
@@ -739,10 +710,10 @@ pub const App = struct {
         self.yank_register.deinit(self.gpa);
         self.picker_filter.deinit(self.gpa);
         self.clearSetupDraft();
-        self.setup_provider_name.deinit(self.gpa);
-        self.setup_base_url.deinit(self.gpa);
-        self.setup_api_key_env.deinit(self.gpa);
-        self.setup_credential.deinit(self.gpa);
+        self.setup.provider_name.deinit(self.gpa);
+        self.setup.base_url.deinit(self.gpa);
+        self.setup.api_key_env.deinit(self.gpa);
+        self.setup.credential.deinit(self.gpa);
         self.otel_endpoint.deinit(self.gpa);
         self.history_search_query.deinit(self.gpa);
         self.history_search_draft.deinit(self.gpa);
@@ -1884,10 +1855,10 @@ pub const App = struct {
             },
             .err => |e| {
                 self.rejectInput(e.request_id);
-                self.setup_status_pending = false;
-                if (self.setup_apply_pending) {
-                    self.setup_apply_pending = false;
-                    self.beginSetup(self.setup_required);
+                self.setup.status_pending = false;
+                if (self.setup.apply_pending) {
+                    self.setup.apply_pending = false;
+                    self.beginSetup(self.setup.required);
                 }
                 if (self.awaiting_new_session and e.request_id != 0 and e.request_id == self.pending_new_session_request_id) {
                     self.awaiting_new_session = false;
@@ -2076,7 +2047,7 @@ pub const App = struct {
             std.mem.eql(u8, trimmed, "/q") or
             std.mem.eql(u8, trimmed, "/detach") or
             (is_command and trimmed[0] == '!');
-        if (self.setup_required and !allowed_during_setup) {
+        if (self.setup.required and !allowed_during_setup) {
             self.beginSetup(true);
             self.setNotice("choose a backend before sending the first prompt", .{});
             return;
@@ -3060,290 +3031,6 @@ pub const App = struct {
         }
     }
 
-    pub fn clearSetupDraft(self: *App) void {
-        if (self.setup_prompt != .none) self.view.editor.clearSensitive();
-        self.setup_prompt = .none;
-        self.setup_provider = null;
-        self.setup_provider_name.clearRetainingCapacity();
-        self.setup_base_url.clearRetainingCapacity();
-        self.setup_api_key_env.clearRetainingCapacity();
-        if (self.setup_credential.items.len > 0) @memset(self.setup_credential.items, 0);
-        self.setup_credential.clearRetainingCapacity();
-    }
-
-    pub fn requestSetup(self: *App, required: bool) void {
-        if (self.setup_status_pending or self.setup_apply_pending) return;
-        self.setup_required = self.setup_required or required;
-        if (required) self.setup_replace_empty_session = true;
-        self.setup_status_pending = true;
-        self.conn.send(.{ .setup_status = .{} }) catch {
-            self.setup_status_pending = false;
-            self.setNotice("could not query provider setup", .{});
-        };
-    }
-
-    pub fn beginSetup(self: *App, required: bool) void {
-        self.clearSetupDraft();
-        self.setup_required = self.setup_required or required;
-        if (required) self.setup_replace_empty_session = true;
-        self.openPicker(.setup_provider);
-        self.setNotice("choose how Marlin should run models · keys are saved by the daemon host", .{});
-    }
-
-    pub fn applySetupStatus(self: *App, status: proto.SetupStatus) void {
-        self.setup_readiness = .fromWire(status);
-        if (!self.setup_status_pending) return;
-        self.setup_status_pending = false;
-        self.beginSetup(self.setup_required);
-    }
-
-    pub fn setupProviderFromItem(item: []const u8) ?SetupProvider {
-        for (setup_provider_items, 0..) |candidate, index| {
-            if (std.mem.eql(u8, item, candidate)) return @enumFromInt(index);
-        }
-        return null;
-    }
-
-    pub fn setupProviderReady(self: *const App, provider: SetupProvider) bool {
-        return switch (provider) {
-            .openrouter => self.setup_readiness.openrouter_ready,
-            .codex => self.setup_readiness.codex_authenticated,
-            .claude_code => self.setup_readiness.claude_code_authenticated,
-            .vercel => self.setup_readiness.vercel_ready,
-            .anthropic => self.setup_readiness.anthropic_ready,
-            .litellm => self.setup_readiness.litellm_ready,
-            .local => self.setup_readiness.local_ready,
-            .custom => false,
-        };
-    }
-
-    pub fn setupProviderNote(self: *const App, item: []const u8) []const u8 {
-        const provider = setupProviderFromItem(item) orelse return "";
-        if (self.setupProviderReady(provider)) return switch (provider) {
-            .codex, .claude_code => "  ✓ signed in",
-            .local => "  ✓ configured",
-            else => "  ✓ key found",
-        };
-        return switch (provider) {
-            .codex => if (self.setup_readiness.codex_available) "  · login needed" else "  · not installed",
-            .claude_code => if (self.setup_readiness.claude_code_available) "  · login needed" else "  · not installed",
-            .custom => "",
-            else => "  · setup needed",
-        };
-    }
-
-    pub fn setSetupBuffer(self: *App, buffer: *std.ArrayList(u8), value: []const u8) bool {
-        buffer.clearRetainingCapacity();
-        buffer.appendSlice(self.gpa, value) catch {
-            self.setNotice("could not continue provider setup", .{});
-            return false;
-        };
-        return true;
-    }
-
-    pub fn startSetupPrompt(self: *App, prompt: SetupPrompt, initial: []const u8, notice: []const u8) void {
-        self.picker = null;
-        self.picker_filter.clearRetainingCapacity();
-        self.setup_prompt = prompt;
-        self.mode = .insert;
-        self.view.editor.replaceText(initial);
-        self.setNotice("{s}", .{notice});
-    }
-
-    pub fn setupProviderChosen(self: *App, item: []const u8) void {
-        const provider = setupProviderFromItem(item) orelse return;
-        self.clearSetupDraft();
-        self.setup_provider = provider;
-        switch (provider) {
-            .codex => {
-                if (!self.setup_readiness.codex_available) {
-                    self.openPicker(.setup_provider);
-                    self.setNotice("Codex is not installed on the daemon host · install it, then retry /setup", .{});
-                    return;
-                }
-                if (!self.setup_readiness.codex_authenticated) {
-                    self.openPicker(.setup_provider);
-                    self.setNotice("Codex guest needs a ChatGPT session · run `codex login` on the daemon host, then /setup", .{});
-                    return;
-                }
-                self.finishSetup("codex/default");
-            },
-            .claude_code => {
-                if (!self.setup_readiness.claude_code_available) {
-                    self.openPicker(.setup_provider);
-                    self.setNotice("Claude Code is not installed on the daemon host · install it, then retry /setup", .{});
-                    return;
-                }
-                if (!self.setup_readiness.claude_code_authenticated) {
-                    self.openPicker(.setup_provider);
-                    self.setNotice("Claude Code needs a login · run `claude auth login` on the daemon host, then /setup", .{});
-                    return;
-                }
-                self.finishSetup("claudecode/default");
-            },
-            .openrouter => {
-                if (!self.setSetupBuffer(&self.setup_provider_name, "openrouter")) return;
-                if (!self.setSetupBuffer(&self.setup_base_url, "https://openrouter.ai/api/v1")) return;
-                if (!self.setSetupBuffer(&self.setup_api_key_env, "OPENROUTER_API_KEY")) return;
-                if (self.setup_readiness.openrouter_ready)
-                    self.startSetupPrompt(.model, "openrouter/anthropic/claude-sonnet-4.5", "choose a registry model id · Enter accepts the suggested model")
-                else
-                    self.startSetupPrompt(.credential, "", "paste an OpenRouter API key · input is masked · Esc goes back");
-            },
-            .vercel => {
-                if (!self.setSetupBuffer(&self.setup_provider_name, "vercel")) return;
-                if (!self.setSetupBuffer(&self.setup_base_url, "https://ai-gateway.vercel.sh/v1")) return;
-                if (!self.setSetupBuffer(&self.setup_api_key_env, "AI_GATEWAY_API_KEY")) return;
-                if (self.setup_readiness.vercel_ready)
-                    self.startSetupPrompt(.model, "vercel/anthropic/claude-sonnet-4.5", "choose a Vercel gateway model id · Enter accepts the suggestion")
-                else
-                    self.startSetupPrompt(.credential, "", "paste a Vercel AI Gateway API key · input is masked · Esc goes back");
-            },
-            .anthropic => {
-                if (!self.setSetupBuffer(&self.setup_provider_name, "anthropic")) return;
-                if (!self.setSetupBuffer(&self.setup_base_url, "https://api.anthropic.com/v1")) return;
-                if (!self.setSetupBuffer(&self.setup_api_key_env, "ANTHROPIC_API_KEY")) return;
-                if (self.setup_readiness.anthropic_ready)
-                    self.startSetupPrompt(.model, "anthropic/claude-sonnet-4-5", "choose an Anthropic model id · Enter accepts the suggestion")
-                else
-                    self.startSetupPrompt(.credential, "", "paste an Anthropic API key · input is masked · Esc goes back");
-            },
-            .litellm => {
-                if (!self.setSetupBuffer(&self.setup_provider_name, "litellm")) return;
-                if (!self.setSetupBuffer(&self.setup_api_key_env, "LITELLM_API_KEY")) return;
-                self.startSetupPrompt(.base_url, "http://127.0.0.1:4000/v1", "LiteLLM base URL · Enter accepts the local default");
-            },
-            .local => {
-                if (!self.setSetupBuffer(&self.setup_provider_name, "local")) return;
-                if (!self.setSetupBuffer(&self.setup_api_key_env, "MARLIN_LOCAL_API_KEY")) return;
-                self.startSetupPrompt(.base_url, "http://127.0.0.1:11434/v1", "OpenAI-compatible base URL · edit the suggested local address if needed");
-            },
-            .custom => self.startSetupPrompt(.provider_name, "", "short provider name, for example acme · model ids will use acme/…"),
-        }
-    }
-
-    pub fn setupCredentialRequired(self: *const App) bool {
-        return switch (self.setup_provider orelse return false) {
-            .openrouter, .vercel, .anthropic => true,
-            else => false,
-        };
-    }
-
-    pub fn setupModelSuggestion(self: *const App) []const u8 {
-        return switch (self.setup_provider orelse return "") {
-            .openrouter => "openrouter/anthropic/claude-sonnet-4.5",
-            .vercel => "vercel/anthropic/claude-sonnet-4.5",
-            .anthropic => "anthropic/claude-sonnet-4-5",
-            .litellm => "litellm/",
-            .local => "local/",
-            .custom => "",
-            .codex, .claude_code => "",
-        };
-    }
-
-    pub fn submitSetupPrompt(self: *App, raw: []const u8) void {
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        switch (self.setup_prompt) {
-            .none => {},
-            .provider_name => {
-                if (!validSetupProviderName(value)) {
-                    self.setNotice("provider name must use letters, digits, - or _", .{});
-                    return;
-                }
-                if (!self.setSetupBuffer(&self.setup_provider_name, value)) return;
-                var env_name: [96]u8 = undefined;
-                if (value.len + "_API_KEY".len > env_name.len) {
-                    self.setNotice("provider name is too long", .{});
-                    return;
-                }
-                for (value, 0..) |byte, i| env_name[i] = if (byte == '-') '_' else std.ascii.toUpper(byte);
-                @memcpy(env_name[value.len..][0.."_API_KEY".len], "_API_KEY");
-                if (!self.setSetupBuffer(&self.setup_api_key_env, env_name[0 .. value.len + "_API_KEY".len])) return;
-                self.startSetupPrompt(.base_url, "https://", "OpenAI-compatible base URL, including /v1 when your provider requires it");
-            },
-            .base_url => {
-                if (!(std.mem.startsWith(u8, value, "http://") or std.mem.startsWith(u8, value, "https://"))) {
-                    self.setNotice("base URL must start with http:// or https://", .{});
-                    return;
-                }
-                if (!self.setSetupBuffer(&self.setup_base_url, value)) return;
-                self.startSetupPrompt(.credential, "", "API key (optional for local gateways) · Enter skips · input is masked");
-            },
-            .credential => {
-                if (self.setupCredentialRequired() and value.len < 8) {
-                    self.setNotice("that does not look like an API key · Esc goes back", .{});
-                    return;
-                }
-                if (!self.setSetupBuffer(&self.setup_credential, value)) return;
-                if (value.len == 0 and self.setup_provider != .openrouter and self.setup_provider != .vercel and self.setup_provider != .anthropic) {
-                    if (!self.setSetupBuffer(&self.setup_api_key_env, "NONE")) return;
-                }
-                const suggestion = if (self.setup_provider == .custom)
-                    std.fmt.allocPrint(self.gpa, "{s}/", .{self.setup_provider_name.items}) catch return
-                else
-                    self.gpa.dupe(u8, self.setupModelSuggestion()) catch return;
-                defer self.gpa.free(suggestion);
-                self.startSetupPrompt(.model, suggestion, "finish the model id in provider/model form");
-            },
-            .model => {
-                const slash = std.mem.indexOfScalar(u8, value, '/') orelse {
-                    self.setNotice("model must use provider/model form", .{});
-                    return;
-                };
-                if (slash == 0 or slash + 1 == value.len) {
-                    self.setNotice("model id needs a name after provider/", .{});
-                    return;
-                }
-                const expected = self.setup_provider_name.items;
-                if (expected.len > 0 and !std.mem.eql(u8, value[0..slash], expected)) {
-                    self.setNotice("model id must start with {s}/", .{expected});
-                    return;
-                }
-                self.finishSetup(value);
-            },
-        }
-    }
-
-    pub fn finishSetup(self: *App, model: []const u8) void {
-        if (self.setup_apply_pending) return;
-        const configured_provider = self.setup_provider_name.items;
-        self.conn.sendSensitive(.{ .setup_apply = .{
-            .sid = self.view.sid,
-            .model = model,
-            .provider_name = configured_provider,
-            .base_url = self.setup_base_url.items,
-            .api_key_env = self.setup_api_key_env.items,
-            .credential = self.setup_credential.items,
-            .replace_empty_session = self.setup_replace_empty_session,
-        } }) catch {
-            self.setNotice("could not send provider setup to the daemon", .{});
-            return;
-        };
-        if (self.setup_credential.items.len > 0) @memset(self.setup_credential.items, 0);
-        self.setup_credential.clearRetainingCapacity();
-        self.view.editor.clearSensitive();
-        self.setup_prompt = .none;
-        self.picker = null;
-        self.setup_apply_pending = true;
-        self.setNotice("activating provider setup on the daemon host…", .{});
-    }
-
-    pub fn applySetupResult(self: *App, result: @FieldType(proto.DaemonMsg, "setup_result")) void {
-        self.setup_apply_pending = false;
-        self.setup_readiness.completed = true;
-        self.setup_required = false;
-        self.setup_replace_empty_session = false;
-        if (result.session_updated) {
-            self.setModelStr(result.model);
-            self.setNotice("ready · {s} · /setup changes provider later", .{result.model});
-        } else if (!std.mem.eql(u8, self.view.model.items, result.model)) {
-            self.applyModel(result.model);
-        } else {
-            self.setNotice("provider setup saved · {s}", .{result.model});
-        }
-        self.clearSetupDraft();
-    }
-
     pub fn beginHistorySearch(self: *App) void {
         if (self.history_search_active) {
             self.cycleHistorySearch();
@@ -3813,7 +3500,7 @@ pub const App = struct {
     }
 
     pub fn newSession(self: *App) !void {
-        if (self.setup_required) {
+        if (self.setup.required) {
             self.beginSetup(true);
             self.setNotice("finish provider setup before creating another session", .{});
             return;
@@ -4023,6 +3710,23 @@ pub const App = struct {
     pub const applyOperator = keys.applyOperator;
     pub const operatorKey = keys.operatorKey;
     pub const copyModeKey = keys.copyModeKey;
+
+    // Implemented in setup.zig (setup_mod); exposed here so call sites keep method syntax.
+    pub const clearSetupDraft = setup_mod.clearSetupDraft;
+    pub const requestSetup = setup_mod.requestSetup;
+    pub const beginSetup = setup_mod.beginSetup;
+    pub const applySetupStatus = setup_mod.applySetupStatus;
+    pub const setupProviderFromItem = setup_mod.setupProviderFromItem;
+    pub const setupProviderReady = setup_mod.setupProviderReady;
+    pub const setupProviderNote = setup_mod.setupProviderNote;
+    pub const setSetupBuffer = setup_mod.setSetupBuffer;
+    pub const startSetupPrompt = setup_mod.startSetupPrompt;
+    pub const setupProviderChosen = setup_mod.setupProviderChosen;
+    pub const setupCredentialRequired = setup_mod.setupCredentialRequired;
+    pub const setupModelSuggestion = setup_mod.setupModelSuggestion;
+    pub const submitSetupPrompt = setup_mod.submitSetupPrompt;
+    pub const finishSetup = setup_mod.finishSetup;
+    pub const applySetupResult = setup_mod.applySetupResult;
 };
 
 // ------------------------------------------------------------- rendering --
@@ -4716,7 +4420,7 @@ fn drawWelcome(app: *const App, win: vaxis.Window, top_rows: usize, view_h: usiz
         try rows.append(arena, .{ .text = "⚠ daemon runs a different build — /reboot to sync", .style = Palette.welcome_warn });
     }
     try rows.append(arena, .{ .text = "" });
-    if (app.setup_required) {
+    if (app.setup.required) {
         try rows.append(arena, .{ .key = "setup", .text = "choose a provider or guest agent", .style = Palette.welcome_title });
         try rows.append(arena, .{ .key = "Enter", .text = "reopen backend selection" });
         try rows.append(arena, .{ .key = "/quit", .text = "leave without configuring" });
@@ -5042,8 +4746,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         const query = app.history_search_query.items;
         const query_end = hardCellBreak(query, 0, @max(@as(usize, w) / 3, 1));
         break :search_prompt try std.fmt.allocPrint(arena, "⌕ '{s}'▏: ", .{query[0..query_end]});
-    } else if (app.setup_prompt != .none)
-        switch (app.setup_prompt) {
+    } else if (app.setup.prompt != .none)
+        switch (app.setup.prompt) {
             .none => unreachable,
             .credential => "API key ❯ ",
             .base_url => "base URL ❯ ",
@@ -5275,7 +4979,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         .width = panel_inner_w,
         .height = content_h,
     });
-    if (app.otel_header_prompt or app.setup_prompt == .credential)
+    if (app.otel_header_prompt or app.setup.prompt == .credential)
         app.view.editor.drawMasked(input_win, prompt, Palette.prompt_mark, Palette.prompt_text)
     else
         app.view.editor.draw(input_win, prompt, if (app.view.plan_mode) Palette.plan_active else Palette.prompt_mark, Palette.prompt_text);
@@ -5286,7 +4990,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         }, .{ .row_offset = input_h - 1, .wrap = .none });
     }
     if (app.mode == .normal or app.history_search_active) win.hideCursor();
-    if (app.setup_prompt == .none and !app.otel_header_prompt)
+    if (app.setup.prompt == .none and !app.otel_header_prompt)
         try drawCommandMenu(app, win, arena, input_top, w);
 
     // ---- status bar ----
@@ -5915,7 +5619,7 @@ fn dispatchEvent(
             }
             app.recordUserActivity();
             app.view.editor.paste(text);
-            if (app.otel_header_prompt or app.setup_prompt == .credential) @memset(@constCast(text), 0);
+            if (app.otel_header_prompt or app.setup.prompt == .credential) @memset(@constCast(text), 0);
             gpa.free(@constCast(text));
         },
         .daemon_line => |line| app.handleDaemonLine(line),
@@ -6091,7 +5795,7 @@ pub fn run(
     initial_ids_transferred = true;
     defer app.deinit();
     app.setModelStr(model_at_start);
-    if (setup_at_start) |readiness| app.setup_readiness = readiness;
+    if (setup_at_start) |readiness| app.setup.readiness = readiness;
     app.show_tab_bar = cfg.ui_tab_bar;
     app.bell_enabled = cfg.ui_bell;
     app.screensaver_timeout_ms = cfg.ui_screensaver_after_ms;
@@ -6634,13 +6338,7 @@ fn mediaErrorMessage(err: anyerror) []const u8 {
     };
 }
 
-fn validSetupProviderName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 64) return false;
-    for (name) |byte| {
-        if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_')) return false;
-    }
-    return !std.mem.eql(u8, name, "codex") and !std.mem.eql(u8, name, "claudecode");
-}
+const validSetupProviderName = setup_mod.validSetupProviderName;
 
 const handleKey = keys.handleKey;
 
@@ -7592,25 +7290,25 @@ test "provider setup distinguishes installed guests and advances custom fields w
     };
     defer app.deinit();
 
-    app.setup_readiness.codex_available = true;
+    app.setup.readiness.codex_available = true;
     try std.testing.expectEqualStrings("  · login needed", app.setupProviderNote(setup_provider_items[1]));
-    app.setup_readiness.codex_authenticated = true;
+    app.setup.readiness.codex_authenticated = true;
     try std.testing.expectEqualStrings("  ✓ signed in", app.setupProviderNote(setup_provider_items[1]));
 
     app.setupProviderChosen(setup_provider_items[7]);
-    try std.testing.expectEqual(SetupPrompt.provider_name, app.setup_prompt);
+    try std.testing.expectEqual(SetupPrompt.provider_name, app.setup.prompt);
     app.submitSetupPrompt("acme");
-    try std.testing.expectEqual(SetupPrompt.base_url, app.setup_prompt);
-    try std.testing.expectEqualStrings("ACME_API_KEY", app.setup_api_key_env.items);
+    try std.testing.expectEqual(SetupPrompt.base_url, app.setup.prompt);
+    try std.testing.expectEqualStrings("ACME_API_KEY", app.setup.api_key_env.items);
     app.submitSetupPrompt("https://gateway.acme.test/v1");
-    try std.testing.expectEqual(SetupPrompt.credential, app.setup_prompt);
+    try std.testing.expectEqual(SetupPrompt.credential, app.setup.prompt);
     app.submitSetupPrompt("");
-    try std.testing.expectEqual(SetupPrompt.model, app.setup_prompt);
-    try std.testing.expectEqualStrings("NONE", app.setup_api_key_env.items);
+    try std.testing.expectEqual(SetupPrompt.model, app.setup.prompt);
+    try std.testing.expectEqualStrings("NONE", app.setup.api_key_env.items);
     try std.testing.expectEqualStrings("acme/", app.view.editor.text.items);
     try std.testing.expectEqual(@as(usize, 0), app.view.editor.history.items.len);
     app.submitSetupPrompt("acme/");
-    try std.testing.expectEqual(SetupPrompt.model, app.setup_prompt);
+    try std.testing.expectEqual(SetupPrompt.model, app.setup.prompt);
     try std.testing.expectEqualStrings("model id needs a name after provider/", app.notice.items);
 }
 
@@ -7626,7 +7324,7 @@ test "required provider setup still permits an explicit quit" {
             .sid = 1,
             .editor = Editor.init(gpa),
         },
-        .setup_required = true,
+        .setup = .{ .required = true },
     };
     defer app.deinit();
 

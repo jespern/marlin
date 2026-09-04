@@ -114,5 +114,6 @@ test {
     _ = @import("client/tui.zig");
     _ = @import("client/commands.zig");
     _ = @import("client/keys.zig");
+    _ = @import("client/setup.zig");
     _ = @import("client/top.zig");
 }
