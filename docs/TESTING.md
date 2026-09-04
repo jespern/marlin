@@ -15,7 +15,7 @@ implementation to format all Zig source and `build.zig`.
 | Layer | Command | What it proves | Network | When it runs |
 |---|---|---|---|---|
 | 0. Format | `zig build fmt-check` | Zig source matches the canonical formatter | none | every commit |
-| 1. Unit | `zig build test` | each module's logic, inline `test` blocks | none | every save |
+| 1. Unit | `zig build test` | each module's logic, in a sibling `<name>_test.zig` | none | every save |
 | 2. Fixture | `zig build test` (same step) | real recorded provider streams still parse | none | every save |
 | 3. e2e | `zig build e2e` | the REAL binary against a scripted fake provider | localhost only | every commit |
 | 4. Smoke | `zig build smoke` | live provider behavior hasn't drifted | real OpenRouter (~1¢) | nightly / manual |
@@ -27,9 +27,18 @@ that's an architecture smell to fix, not a mock to write.
 
 ## Layer 1 — unit tests
 
-Inline `test` blocks next to the code they test. Every file is forced through
-the compiler by the import block at the bottom of `src/main.zig` — when you
-add a file, add it there or its tests silently never run.
+Tests live in a sibling file, `foo_test.zig` next to `foo.zig`, never inline
+in the source. A source file is for reading end to end; its test file reads
+as the spec. Zig has no friend access, so anything a test reaches into is
+`pub` in the source — internal modules already treat `pub` as "reachable
+from a sibling", so that promises nothing new. Each test file starts with
+`test { std.testing.refAllDecls(foo); }` so every declaration in the module
+is compiled. Shared fixtures go in `src/testing/`. Every test file is forced
+through the compiler by the import block at the bottom of `src/main.zig` —
+when you add one, add it there or its tests silently never run.
+
+(Migration in progress: `client/tui_test.zig` is the first; files that still
+carry inline tests move as they are touched.)
 
 **The bug rule: every bug found at a higher layer gets reproduced as a test at
 the LOWEST layer that can express it** — a protocol bug becomes a unit test on

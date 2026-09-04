@@ -108,10 +108,11 @@ test {
     _ = @import("client/matrix.zig");
     _ = @import("client/pacman.zig");
     _ = @import("client/pixel_effects.zig");
+    _ = @import("client/shadowbox.zig");
     _ = @import("client/plasma.zig");
     _ = @import("client/starfield.zig");
     _ = @import("client/strings.zig");
-    _ = @import("client/tui.zig");
+    _ = @import("client/tui_test.zig");
     _ = @import("client/commands.zig");
     _ = @import("client/keys.zig");
     _ = @import("client/setup.zig");
