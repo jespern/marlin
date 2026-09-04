@@ -60,10 +60,11 @@ and leaves the codebase better even if the next never happens.
 **Status: merged to main (2026-09-04) as "Extract SessionView from App" and
 "Fold SavedSessionView into SessionView".** The field move, the cache move,
 and the `SavedSessionView` fold-in below all landed; unit and e2e were green
-at merge. Still open from this slice: the event handler continues to compare
-against `app.view.sid` and drop non-focused traffic rather than looking a
-view up by sid; and the two near-identical switch sequences (in
-`switchSession` and the search-result jump) could share one helper.
+at merge. The follow-up cleanup landed the same day: per-session daemon
+traffic routes through `App.liveView(sid)` (today: the focused view or
+null; a pane layout widens only that lookup), and every focus change goes
+through `App.focusSession`, which replaced two hand-rolled copies of the
+switch sequence. Nothing from this slice is open.
 
 Move the per-session fields off `App` into one struct. `App` holds exactly one
 `SessionView` plus the global chrome (tab bar, notices, modals, search,

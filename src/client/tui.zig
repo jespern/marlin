@@ -1133,8 +1133,13 @@ const App = struct {
         self.recent_cursor = 0;
     }
 
-    fn switchSession(self: *App, sid: u64, touch_recent: bool) !void {
-        if (sid == self.view.sid) return;
+    /// Park the focused view and make `sid` the focused session: restore
+    /// its cached view or seed a fresh one from the session summary, claim
+    /// any approval that parked while it was in the background, and take the
+    /// permission badge from server truth. Subscribing is left to the caller,
+    /// which knows what replay shape it wants. Every focus change goes
+    /// through here; two hand-rolled copies once drifted apart.
+    fn focusSession(self: *App, sid: u64, touch_recent: bool) !void {
         const old_sid = self.view.sid;
         try self.saveActiveView();
         self.conn.send(.{ .unsub = .{ .sid = old_sid } }) catch {};
@@ -1162,6 +1167,11 @@ const App = struct {
 
         if (touch_recent) self.touchRecentSession(sid);
         self.syncAnimationTicker();
+    }
+
+    fn switchSession(self: *App, sid: u64, touch_recent: bool) !void {
+        if (sid == self.view.sid) return;
+        try self.focusSession(sid, touch_recent);
         if (self.view.last_seq == 0) {
             self.view.history_complete = false;
             self.view.history_loading = true;
@@ -1220,28 +1230,7 @@ const App = struct {
             }
         }
         if (sid != self.view.sid) {
-            const old_sid = self.view.sid;
-            try self.saveActiveView();
-            self.conn.send(.{ .unsub = .{ .sid = old_sid } }) catch {};
-            self.view.sid = sid;
-            if (self.saved_views.get(sid)) |saved| {
-                _ = self.saved_views.remove(sid);
-                self.restoreSavedView(saved);
-                self.gpa.destroy(saved);
-            } else if (self.sessionSummary(sid)) |summary| {
-                try self.view.model.appendSlice(self.gpa, summary.model);
-                try self.view.cwd.appendSlice(self.gpa, summary.cwd);
-                self.view.effort = summary.effort;
-                self.view.state = summary.state;
-                self.view.plan_mode = summary.plan_mode;
-            }
-            if (self.background_approvals.get(sid)) |pending| {
-                self.view.pending = pending;
-                _ = self.background_approvals.remove(sid);
-            }
-            self.view.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
-            self.touchRecentSession(sid);
-            self.syncAnimationTicker();
+            try self.focusSession(sid, true);
         } else {
             self.conn.send(.{ .unsub = .{ .sid = sid } }) catch {};
         }
@@ -1658,6 +1647,16 @@ const App = struct {
 
     // ------------------------------------------------------ daemon input --
 
+    /// The live view for `sid`, or null when that session is not on screen.
+    /// Per-session daemon traffic routes through this instead of comparing
+    /// against `view.sid`, so a layout that shows several sessions at once
+    /// only has to widen the lookup. Parked views in `saved_views` are
+    /// deliberately not returned: they are unsubscribed and receive only
+    /// the status/approval events handled explicitly below.
+    fn liveView(self: *App, sid: u64) ?*SessionView {
+        return if (sid == self.view.sid) &self.view else null;
+    }
+
     fn handleDaemonLine(self: *App, line: []u8) void {
         defer self.gpa.free(line);
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
@@ -1666,39 +1665,39 @@ const App = struct {
 
         switch (msg) {
             .blk => |b| {
-                if (b.sid != self.view.sid) return;
-                if (self.view.history_loading and self.view.history_before_seq > 0 and b.b.seq < self.view.history_before_seq) {
+                const view = self.liveView(b.sid) orelse return;
+                if (view.history_loading and view.history_before_seq > 0 and b.b.seq < view.history_before_seq) {
                     self.bufferOlderBlock(b.b);
                     return;
                 }
-                if (b.b.seq <= self.view.last_seq) return;
-                if (self.view.oldest_seq == 0) {
-                    self.view.oldest_seq = b.b.seq;
+                if (b.b.seq <= view.last_seq) return;
+                if (view.oldest_seq == 0) {
+                    view.oldest_seq = b.b.seq;
                     // Compatibility with an older daemon that ignores the
                     // tail request and performs a full replay without a
                     // replay_done marker.
                     if (b.b.seq == 1) {
-                        self.view.history_complete = true;
-                        if (self.view.history_before_seq == 0) self.view.history_loading = false;
+                        view.history_complete = true;
+                        if (view.history_before_seq == 0) view.history_loading = false;
                     }
                 }
-                self.view.last_seq = b.b.seq;
+                view.last_seq = b.b.seq;
                 self.applyBlock(b.b);
             },
             .replay_done => |replay| {
-                if (replay.sid != self.view.sid) return;
+                const view = self.liveView(replay.sid) orelse return;
                 if (!replay.has_newer) {
                     if (replay.plan_pinned and hasUnfinishedPlan(replay.plan_items)) {
                         self.setPlan(replay.plan_items);
                     } else {
-                        deinitPlan(self.gpa, &self.view.plan);
+                        deinitPlan(self.gpa, &view.plan);
                     }
                 }
                 if (!replay.forward and replay.has_newer and replay.newest_seq > 0) {
-                    if (replay.oldest_seq > 0) self.view.oldest_seq = replay.oldest_seq;
-                    self.view.history_complete = !replay.has_older;
+                    if (replay.oldest_seq > 0) view.oldest_seq = replay.oldest_seq;
+                    view.history_complete = !replay.has_older;
                     self.conn.send(.{ .sub = .{
-                        .sid = self.view.sid,
+                        .sid = view.sid,
                         .from_seq = replay.newest_seq +| 1,
                         .replay_limit = initial_replay_blocks,
                     } }) catch self.setNotice("could not continue session replay", .{});
@@ -1707,42 +1706,42 @@ const App = struct {
                 if (replay.forward) {
                     if (replay.has_newer and replay.newest_seq > 0) {
                         self.conn.send(.{ .sub = .{
-                            .sid = self.view.sid,
+                            .sid = view.sid,
                             .from_seq = replay.newest_seq +| 1,
                             .replay_limit = initial_replay_blocks,
                         } }) catch self.setNotice("could not continue session replay", .{});
                     } else {
-                        self.view.history_loading = false;
+                        view.history_loading = false;
                     }
                     return;
                 }
-                if (self.view.history_before_seq > 0) {
+                if (view.history_before_seq > 0) {
                     self.finishOlderHistoryPage(replay.oldest_seq, replay.has_older);
                     return;
                 }
-                if (replay.oldest_seq > 0) self.view.oldest_seq = replay.oldest_seq;
-                self.view.history_complete = !replay.has_older;
-                self.view.history_loading = false;
-                self.view.history_before_seq = 0;
-                if (self.view.scroll_up > 0) self.view.scroll_up = std.math.maxInt(usize);
+                if (replay.oldest_seq > 0) view.oldest_seq = replay.oldest_seq;
+                view.history_complete = !replay.has_older;
+                view.history_loading = false;
+                view.history_before_seq = 0;
+                if (view.scroll_up > 0) view.scroll_up = std.math.maxInt(usize);
             },
             .delta => |d| {
-                if (d.sid != self.view.sid) return;
-                self.view.delta.appendSlice(self.gpa, d.text) catch {};
+                const view = self.liveView(d.sid) orelse return;
+                view.delta.appendSlice(self.gpa, d.text) catch {};
             },
             .reasoning_delta => |d| {
-                if (d.sid != self.view.sid) return;
-                self.view.reasoning_delta.appendSlice(self.gpa, d.text) catch {};
+                const view = self.liveView(d.sid) orelse return;
+                view.reasoning_delta.appendSlice(self.gpa, d.text) catch {};
             },
             .stream_status => |ss| {
-                if (ss.sid != self.view.sid) return;
-                self.view.stream_bytes = ss.bytes;
-                self.view.stream_quiet_ms = ss.quiet_ms;
-                self.view.stream_status_at_ms = nowWallMs(self.io);
+                const view = self.liveView(ss.sid) orelse return;
+                view.stream_bytes = ss.bytes;
+                view.stream_quiet_ms = ss.quiet_ms;
+                view.stream_status_at_ms = nowWallMs(self.io);
             },
             .status => |s| {
                 self.updateSessionSummaryState(s.sid, s.state);
-                if (s.sid != self.view.sid) {
+                const view = self.liveView(s.sid) orelse {
                     if (self.saved_views.get(s.sid)) |saved| {
                         saved.state = s.state;
                         if (s.phase) |phase| {
@@ -1766,39 +1765,39 @@ const App = struct {
                         }
                     }
                     return;
-                }
+                };
                 // Old daemons ignore tail_limit/replay_done and finish their
                 // full replay with status. Recognize that safe fallback.
-                if (self.view.history_loading and self.view.history_before_seq == 0 and self.view.oldest_seq <= 1) {
-                    self.view.history_complete = true;
-                    self.view.history_loading = false;
+                if (view.history_loading and view.history_before_seq == 0 and view.oldest_seq <= 1) {
+                    view.history_complete = true;
+                    view.history_loading = false;
                 }
-                if (s.state == .running and self.view.state != .running) {
+                if (s.state == .running and view.state != .running) {
                     self.clearCompletedPlan();
-                    self.view.spinner_frame = 0;
-                    self.view.turn_started_ms = nowWallMs(self.io);
-                    self.view.turn_phase = .starting;
-                    self.view.phase_started_ms = self.view.turn_started_ms;
+                    view.spinner_frame = 0;
+                    view.turn_started_ms = nowWallMs(self.io);
+                    view.turn_phase = .starting;
+                    view.phase_started_ms = view.turn_started_ms;
                 }
                 if (s.phase) |phase| {
-                    if (self.view.turn_phase != phase) {
-                        self.view.phase_started_ms = nowWallMs(self.io);
+                    if (view.turn_phase != phase) {
+                        view.phase_started_ms = nowWallMs(self.io);
                         if (phase == .provider) {
-                            self.view.stream_bytes = 0;
-                            self.view.stream_quiet_ms = 0;
-                            self.view.stream_status_at_ms = 0;
+                            view.stream_bytes = 0;
+                            view.stream_quiet_ms = 0;
+                            view.stream_status_at_ms = 0;
                         }
                     }
-                    self.view.turn_phase = phase;
+                    view.turn_phase = phase;
                 }
                 if (s.state != .running) {
-                    self.view.stream_status_at_ms = 0;
-                    self.view.turn_phase = .idle;
-                    self.view.phase_started_ms = 0;
+                    view.stream_status_at_ms = 0;
+                    view.turn_phase = .idle;
+                    view.phase_started_ms = 0;
                 }
-                self.view.state = s.state;
+                view.state = s.state;
                 self.syncAnimationTicker();
-                if (s.state != .awaiting_approval) self.view.pending = null;
+                if (s.state != .awaiting_approval) view.pending = null;
                 if (s.state == .idle or s.state == .err or s.state == .done)
                     self.releaseStreamingBuffers();
                 // An error state never arrives bare: show its reason in the
@@ -1814,8 +1813,8 @@ const App = struct {
                 @memcpy(p.tool_buf[0..p.tool_len], ar.tool[0..p.tool_len]);
                 p.args_len = @min(ar.args_json.len, p.args_buf.len);
                 @memcpy(p.args_buf[0..p.args_len], ar.args_json[0..p.args_len]);
-                if (ar.sid == self.view.sid) {
-                    self.view.pending = p;
+                if (self.liveView(ar.sid)) |view| {
+                    view.pending = p;
                 } else {
                     self.background_approvals.put(self.gpa, ar.sid, p) catch {};
                     // The one out-of-band signal: you are looking elsewhere
@@ -1837,7 +1836,7 @@ const App = struct {
             },
             .search_result => |result| self.replaceSearchHits(result),
             .diagnostics_result => |report| {
-                if (report.sid != self.view.sid) return;
+                if (self.liveView(report.sid) == null) return;
                 const rendered = formatDiagnostics(self.gpa, report) catch {
                     self.setNotice("could not render diagnostics", .{});
                     return;
@@ -1855,7 +1854,7 @@ const App = struct {
             .session_upsert => |su| self.upsertSessionSummary(su.session),
             .session_remove => |sr| self.removeSessionSummary(sr.sid),
             .interrupt_result => |result| {
-                if (result.sid != self.view.sid) return;
+                if (self.liveView(result.sid) == null) return;
                 if (!result.active) {
                     self.setNotice("nothing to interrupt", .{});
                 } else if (result.already_requested) {
@@ -1909,21 +1908,21 @@ const App = struct {
             },
             .council_list_result => |result| self.applyCouncils(result.councils),
             .plan_clear_result => |result| {
-                if (result.sid != self.view.sid) return;
+                const view = self.liveView(result.sid) orelse return;
                 if (result.cleared) {
-                    deinitPlan(self.gpa, &self.view.plan);
-                    self.view.layout_epoch +%= 1;
+                    deinitPlan(self.gpa, &view.plan);
+                    view.layout_epoch +%= 1;
                     self.setNotice("execution plan cleared", .{});
                 } else {
                     self.setNotice("no unfinished execution plan", .{});
                 }
             },
             .session_meta => |m| {
-                if (m.sid != self.view.sid) return;
-                self.view.tokens_in = m.tokens_in;
-                self.view.tokens_out = m.tokens_out;
-                if (m.context_used > 0) self.view.context_used = m.context_used;
-                if (m.context_limit > 0) self.view.context_limit = m.context_limit;
+                const view = self.liveView(m.sid) orelse return;
+                view.tokens_in = m.tokens_in;
+                view.tokens_out = m.tokens_out;
+                if (m.context_used > 0) view.context_used = m.context_used;
+                if (m.context_limit > 0) view.context_limit = m.context_limit;
             },
             .err => |e| {
                 self.rejectInput(e.request_id);
