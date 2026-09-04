@@ -37,8 +37,10 @@ is compiled. Shared fixtures go in `src/testing/`. Every test file is forced
 through the compiler by the import block at the bottom of `src/main.zig` —
 when you add one, add it there or its tests silently never run.
 
-(Migration in progress: `client/tui_test.zig` is the first; files that still
-carry inline tests move as they are touched.)
+(Migration status, 2026-09-04: every module is converted except a few that
+had uncommitted work in flight at the time — `client/effects.zig`,
+`client/pixel_effects.zig`, `client/shadowbox.zig`, `core/visual_effect.zig`,
+`daemon/daemon.zig`. Move their tests when that work lands.)
 
 **The bug rule: every bug found at a higher layer gets reproduced as a test at
 the LOWEST layer that can express it** — a protocol bug becomes a unit test on
