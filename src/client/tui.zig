@@ -23,9 +23,11 @@
 //!            Alt/Option+1..9 jumps to that tab
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /search <query>, /animate <effect>,
-//!             /screensaver [effect], /new, /compact, /archive, /reboot [--build], /help, /quit
+//!             /screensaver [effect], /new, /compact, /archive, /reboot [--build], /help,
+//!             /quit (alias /detach — sessions keep running in the daemon)
 //!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
-//!              !c (copy last full tool output), !rb [client|both] (scoped rebuild)
+//!              !c (copy last full tool output), !rb [client|both] (scoped rebuild),
+//!              !s [effect] (screensaver)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
 //!            chips, expanded into the message on send.
 
@@ -185,9 +187,11 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/config", .usage = " [tabbar|bell on|off|screensaver <duration|effect> [effect]]", .description = "view or change UI settings (persisted)", .accepts_args = true },
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
-    .{ .name = "/quit", .description = "leave Marlin" },
+    .{ .name = "/quit", .description = "leave Marlin (sessions keep running)" },
+    .{ .name = "/detach", .description = "leave Marlin (sessions keep running)" },
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
+    .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
 };
 
@@ -762,8 +766,6 @@ const App = struct {
     pending_replace: bool = false,
     /// g pressed, awaiting g/t/T (gg top, gt/gT session cycling).
     pending_g: bool = false,
-    /// `q` warned once about live sessions; the next `q` detaches.
-    quit_armed: bool = false,
     /// Last f/t/F/T for ; and , repeats.
     last_find_kind: u8 = 0,
     last_find_ch: u8 = 0,
@@ -2249,6 +2251,7 @@ const App = struct {
         const is_command = isCommandInput(text);
         const allowed_during_setup = std.mem.eql(u8, trimmed, "/quit") or
             std.mem.eql(u8, trimmed, "/q") or
+            std.mem.eql(u8, trimmed, "/detach") or
             (is_command and trimmed[0] == '!');
         if (self.setup_required and !allowed_during_setup) {
             self.beginSetup(true);
@@ -2449,7 +2452,9 @@ const App = struct {
         var it = std.mem.tokenizeScalar(u8, cmd, ' ');
         const head = it.next() orelse return;
 
-        if (std.mem.eql(u8, head, "/quit") or std.mem.eql(u8, head, "/q")) {
+        if (std.mem.eql(u8, head, "/quit") or std.mem.eql(u8, head, "/q") or
+            std.mem.eql(u8, head, "/detach"))
+        {
             self.should_quit = true;
         } else if (std.mem.eql(u8, head, "/setup")) {
             self.requestSetup(false);
@@ -2778,7 +2783,7 @@ const App = struct {
                 return;
             }
             self.startUiAnimation(kind);
-        } else if (std.mem.eql(u8, head, "/screensaver")) {
+        } else if (std.mem.eql(u8, head, "/screensaver") or std.mem.eql(u8, head, "!s")) {
             const kind = if (it.next()) |name| effects.Kind.parse(name) orelse {
                 self.setNotice("unknown effect {s}", .{name});
                 return;
@@ -3455,16 +3460,6 @@ const App = struct {
         self.pending_find = 0;
         self.pending_g = false;
         self.pending_replace = false;
-    }
-
-    /// Sessions with a live turn or parked approval — what `q` mentions once
-    /// before detaching, since a quit here is a detach, not a kill.
-    fn busySessionCount(self: *const App) usize {
-        var n: usize = 0;
-        for (self.sessions.items) |session| {
-            if (session.state == .running or session.state == .awaiting_approval) n += 1;
-        }
-        return n;
     }
 
     /// `! <cmd>` / `!cmd`: run through $SHELL in the focused session cwd
@@ -5850,7 +5845,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "gg / G", .description = "jump to top / bottom" },
     .{ .key = "/ · n/N", .description = "search transcript · next/previous match" },
     .{ .key = "?", .description = "toggle shortcut help" },
-    .{ .key = "q", .description = "detach (sessions keep running; warns once)" },
+    .{ .key = "q", .description = "detach (sessions keep running)" },
     .{ .description = "COMPOSER (vim)", .heading = true },
     .{ .key = "h l w b e W B E 0 ^ $ %", .description = "move in the input line" },
     .{ .key = "x / D", .description = "delete char / to line end" },
@@ -8540,7 +8535,6 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.copyModeKey(key);
                 return;
             }
-            if (!key.matches('q', .{})) app.quit_armed = false;
             if (app.pending_g) {
                 app.pending_g = false;
                 const count = app.pending_count;
@@ -8641,19 +8635,9 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.editor.moveLineStart();
                 app.mode = .insert;
             } else if (key.matches('q', .{})) {
-                // Sessions are durable, so quitting is a detach — but say so
-                // once when work is live rather than vanishing silently.
+                // Sessions are durable, so quitting is a detach; nothing is lost.
                 _ = app.takeCount();
-                const busy = app.busySessionCount();
-                if (busy > 0 and !app.quit_armed) {
-                    app.quit_armed = true;
-                    app.setNotice("{d} session{s} still running — they keep going; q again to detach", .{
-                        busy,
-                        if (busy == 1) "" else "s",
-                    });
-                } else {
-                    app.should_quit = true;
-                }
+                app.should_quit = true;
             } else if (key.matches('J', .{ .shift = true }) or key.matches('J', .{})) {
                 // vim J: join lines. Sessions cycle on gt/gT (tab-style).
                 app.editor.pushUndo();
@@ -8815,7 +8799,7 @@ test "command input: / and ! lead, a leading space sends verbatim" {
     try std.testing.expect(!isCommandInput(""));
 }
 
-test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do not leak, q warns once" {
+test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do not leak, q detaches" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -8856,18 +8840,17 @@ test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do n
     app.shell_requested = false;
     app.should_quit = false;
 
-    // q with live sessions warns once; the second q detaches.
+    // q detaches immediately, even with live sessions — they keep running
+    // in the daemon, so nothing is lost.
     app.replaceSessionSummaries(&.{
         .{ .sid = 1, .title = "busy", .model = "m", .status = "running", .state = .running, .created_at = 1, .running = true },
     });
     try handleKey(&app, .{ .codepoint = 'q' });
-    try std.testing.expect(!app.should_quit);
-    try std.testing.expect(app.quit_armed);
-    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "still running") != null);
-    try handleKey(&app, .{ .codepoint = 'j' }); // any other key disarms
-    try std.testing.expect(!app.quit_armed);
-    try handleKey(&app, .{ .codepoint = 'q' });
-    try handleKey(&app, .{ .codepoint = 'q' });
+    try std.testing.expect(app.should_quit);
+
+    // /detach is an alias for /quit.
+    app.should_quit = false;
+    app.runCommand("/detach");
     try std.testing.expect(app.should_quit);
 }
 
@@ -9251,6 +9234,13 @@ test "named animations and screensavers share the selected effect engine" {
     try std.testing.expectEqual(effects.Kind.stars, app.effect_engine.?.kind());
     app.tickUiAnimation();
     try std.testing.expectEqual(@as(u64, 1), app.effect_engine.?.stars.frame);
+    try std.testing.expect(app.dismissScreensaver());
+
+    // `!s [effect]` is the /screensaver shortcut, not a shell escape.
+    app.runCommand("!s strings");
+    try std.testing.expect(app.screensaver_active);
+    try std.testing.expect(!app.shell_requested);
+    try std.testing.expectEqual(effects.Kind.strings, app.effect_engine.?.kind());
     try std.testing.expect(app.dismissScreensaver());
 }
 
