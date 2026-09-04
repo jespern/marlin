@@ -112,5 +112,6 @@ test {
     _ = @import("client/starfield.zig");
     _ = @import("client/strings.zig");
     _ = @import("client/tui.zig");
+    _ = @import("client/commands.zig");
     _ = @import("client/top.zig");
 }

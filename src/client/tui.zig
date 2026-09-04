@@ -49,6 +49,7 @@ const render = @import("render.zig");
 const top_view = @import("top.zig");
 const markdown = @import("markdown.zig");
 const layout_mod = @import("layout.zig");
+const commands = @import("commands.zig");
 const LayoutCache = layout_mod.LayoutCache;
 const TailLayoutCache = layout_mod.TailLayoutCache;
 const StreamLayoutCache = layout_mod.StreamLayoutCache;
@@ -151,57 +152,11 @@ pub const RebootRequest = struct {
     force: bool = false,
 };
 
-const ComposerCommand = struct {
-    name: []const u8,
-    usage: []const u8 = "",
-    description: []const u8,
-    accepts_args: bool = false,
-};
+const ComposerCommand = commands.ComposerCommand;
 
-/// Visible canonical commands and terse aliases. `/q` remains accepted by
-/// the dispatcher, while prefix matching completes it to `/quit`.
-const composer_commands = [_]ComposerCommand{
-    .{ .name = "/model", .usage = " [model]", .description = "switch model or open the picker", .accepts_args = true },
-    .{ .name = "/setup", .description = "choose and authenticate a provider or guest agent" },
-    .{ .name = "/effort", .usage = " [level]", .description = "set reasoning effort or open the picker", .accepts_args = true },
-    .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
-    .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
-    .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
-    .{ .name = "/mcp", .usage = " [add|remove|restart|reload]", .description = "inspect and manage MCP servers", .accepts_args = true },
-    .{ .name = "/council", .usage = " [<name>|new <name>|edit <name>|remove <name>]", .description = "list, inspect, or edit review councils", .accepts_args = true },
-    .{ .name = "/voice", .usage = " [setup|mode|off]", .description = "dictate into the composer (local STT; setup on first use)", .accepts_args = true },
-    .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
-    .{ .name = "/plan", .usage = " [task|off|clear]", .description = "enter Plan mode or manage its execution todo", .accepts_args = true },
-    .{ .name = "/sessions", .description = "switch sessions" },
-    .{ .name = "/top", .description = "live session overview and switcher" },
-    .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
-    .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
-    .{ .name = "/animate", .usage = " <" ++ effects.usage_list ++ ">", .description = "play a transient screen effect", .accepts_args = true },
-    .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "]", .description = "start a continuous full-screen effect", .accepts_args = true },
-    .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
-    .{ .name = "/new", .description = "start a new session" },
-    .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
-    .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
-    .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
-    .{ .name = "/compact", .description = "compact the current context" },
-    .{ .name = "/config", .usage = " [tabbar|bell on|off|screensaver <duration|effect> [effect]]", .description = "view or change UI settings (persisted)", .accepts_args = true },
-    .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
-    .{ .name = "/help", .description = "show commands and key bindings" },
-    .{ .name = "/quit", .description = "leave Marlin (sessions keep running)" },
-    .{ .name = "/detach", .description = "leave Marlin (sessions keep running)" },
-    .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
-    .{ .name = "!c", .description = "copy the last full tool output" },
-    .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
-    .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
-};
+const composer_commands = commands.composer_commands;
 
-const CommandSuggestion = struct {
-    label: []const u8,
-    usage: []const u8 = "",
-    description: []const u8,
-    replacement: []const u8,
-    submit_on_enter: bool,
-};
+const CommandSuggestion = commands.CommandSuggestion;
 
 const PickerKind = enum { model, effort, session, search_prompt, search, council, council_list, voice_engine, voice_mode, setup_provider };
 
@@ -247,12 +202,7 @@ const SetupReadiness = struct {
     }
 };
 
-const OtelCommand = union(enum) {
-    status,
-    off,
-    set: []const u8,
-    content: bool,
-};
+const OtelCommand = commands.OtelCommand;
 
 const council_done_item = "Done";
 
@@ -359,7 +309,7 @@ const SessionSummary = struct {
     }
 };
 
-const OwnedCouncil = struct {
+pub const OwnedCouncil = struct {
     name: []u8,
     models: std.ArrayList([]u8) = .empty,
 
@@ -568,7 +518,7 @@ const SessionView = struct {
     }
 };
 
-const App = struct {
+pub const App = struct {
     gpa: std.mem.Allocator,
     io: Io,
     conn: *attach.Conn,
@@ -774,7 +724,7 @@ const App = struct {
     remote_transport: bool = false,
     next_input_request_id: u64 = 1,
 
-    fn deinit(self: *App) void {
+    pub fn deinit(self: *App) void {
         self.clearAttachments();
         self.attachments.deinit(self.gpa);
         self.copy_cursor_line_text.deinit(self.gpa);
@@ -826,12 +776,12 @@ const App = struct {
         self.view.deinit(self.gpa);
     }
 
-    fn clearAttachments(self: *App) void {
+    pub fn clearAttachments(self: *App) void {
         for (self.attachments.items) |*attachment| attachment.deinit(self.gpa);
         self.attachments.clearRetainingCapacity();
     }
 
-    fn addAttachment(self: *App, pending_value: media.Pending) void {
+    pub fn addAttachment(self: *App, pending_value: media.Pending) void {
         var pending = pending_value;
         if (self.attachments.items.len >= 4) {
             pending.deinit(self.gpa);
@@ -850,7 +800,7 @@ const App = struct {
         });
     }
 
-    fn attachPath(self: *App, path: []const u8) void {
+    pub fn attachPath(self: *App, path: []const u8) void {
         const pending = media.fromPath(self.gpa, self.io, self.view.cwd.items, path) catch |err| {
             self.setNotice("could not attach image: {s}", .{mediaErrorMessage(err)});
             return;
@@ -858,7 +808,7 @@ const App = struct {
         self.addAttachment(pending);
     }
 
-    fn attachClipboard(self: *App) void {
+    pub fn attachClipboard(self: *App) void {
         const pending = media.fromClipboard(self.gpa, self.io, self.environ) catch |err| {
             self.setNotice("image paste failed: {s}", .{mediaErrorMessage(err)});
             return;
@@ -869,36 +819,36 @@ const App = struct {
     /// Notices are transient by construction: they self-clear after a few
     /// seconds instead of squatting on the status bar until something else
     /// overwrites them ("session → 3f2a" used to live there for hours).
-    const notice_ttl_ms: i64 = 8_000;
+    pub const notice_ttl_ms: i64 = 8_000;
 
-    fn setNotice(self: *App, comptime fmt: []const u8, args: anytype) void {
+    pub fn setNotice(self: *App, comptime fmt: []const u8, args: anytype) void {
         self.notice.clearRetainingCapacity();
         self.notice.print(self.gpa, fmt, args) catch {};
         self.armNoticeExpiry(notice_ttl_ms);
     }
 
-    fn armNoticeExpiry(self: *App, ttl_ms: i64) void {
+    pub fn armNoticeExpiry(self: *App, ttl_ms: i64) void {
         self.notice_deadline_ms.store(nowWallMs(self.io) + ttl_ms, .release);
     }
 
     /// Called on every tick; clears an expired notice.
-    fn expireNotice(self: *App) void {
+    pub fn expireNotice(self: *App) void {
         const deadline = self.notice_deadline_ms.load(.acquire);
         if (deadline == 0 or nowWallMs(self.io) < deadline) return;
         self.notice_deadline_ms.store(0, .release);
         self.notice.clearRetainingCapacity();
     }
 
-    fn clearHistoryBackfill(self: *App) void {
+    pub fn clearHistoryBackfill(self: *App) void {
         for (self.view.history_backfill.items) |*rendered| rendered.deinit(self.gpa);
         self.view.history_backfill.clearRetainingCapacity();
     }
 
-    fn releaseStreamingBuffers(self: *App) void {
+    pub fn releaseStreamingBuffers(self: *App) void {
         self.view.releaseStreamingBuffers(self.gpa);
     }
 
-    fn cacheWelcomeFacts(self: *App) void {
+    pub fn cacheWelcomeFacts(self: *App) void {
         self.welcome_daemon_version_len = @min(self.conn.daemon_version_len, self.welcome_daemon_version.len);
         @memcpy(
             self.welcome_daemon_version[0..self.welcome_daemon_version_len],
@@ -908,17 +858,17 @@ const App = struct {
         self.welcome_dnsblock_rules = if (self.conn.network_filtering) self.conn.network_rule_count else 0;
     }
 
-    fn setModelStr(self: *App, m: []const u8) void {
+    pub fn setModelStr(self: *App, m: []const u8) void {
         self.view.model.clearRetainingCapacity();
         self.view.model.appendSlice(self.gpa, m) catch {};
     }
 
-    fn setCwdStr(self: *App, cwd: []const u8) void {
+    pub fn setCwdStr(self: *App, cwd: []const u8) void {
         self.view.cwd.clearRetainingCapacity();
         self.view.cwd.appendSlice(self.gpa, cwd) catch {};
     }
 
-    fn setPlan(self: *App, source: []const block.PlanItem) void {
+    pub fn setPlan(self: *App, source: []const block.PlanItem) void {
         var replacement: std.ArrayList(PlanItemOwned) = .empty;
         for (source) |item| {
             const step = self.gpa.dupe(u8, item.step) catch {
@@ -940,14 +890,14 @@ const App = struct {
         self.view.plan = replacement;
     }
 
-    fn clearCompletedPlan(self: *App) void {
+    pub fn clearCompletedPlan(self: *App) void {
         if (self.view.plan.items.len > 0 and !hasUnfinishedPlan(self.view.plan.items)) {
             deinitPlan(self.gpa, &self.view.plan);
             self.view.layout_epoch +%= 1;
         }
     }
 
-    fn restoreLatestUnfinishedPlan(self: *App) void {
+    pub fn restoreLatestUnfinishedPlan(self: *App) void {
         if (self.view.plan.items.len > 0) return;
         var i = self.view.blocks.items.len;
         while (i > 0) {
@@ -959,19 +909,19 @@ const App = struct {
         }
     }
 
-    fn setHomeStr(self: *App, home: []const u8) void {
+    pub fn setHomeStr(self: *App, home: []const u8) void {
         self.home.clearRetainingCapacity();
         self.home.appendSlice(self.gpa, home) catch {};
     }
 
-    fn sessionSummary(self: *const App, sid: u64) ?*const SessionSummary {
+    pub fn sessionSummary(self: *const App, sid: u64) ?*const SessionSummary {
         for (self.sessions.items) |*session| {
             if (session.sid == sid) return session;
         }
         return null;
     }
 
-    fn updateSessionSummaryState(self: *App, sid: u64, state: proto.SessionState) void {
+    pub fn updateSessionSummaryState(self: *App, sid: u64, state: proto.SessionState) void {
         for (self.sessions.items) |*session| {
             if (session.sid == sid) {
                 session.state = state;
@@ -980,7 +930,7 @@ const App = struct {
         }
     }
 
-    fn rootSessionId(self: *const App, sid: u64) u64 {
+    pub fn rootSessionId(self: *const App, sid: u64) u64 {
         var cursor = sid;
         var remaining = self.sessions.items.len + 1;
         while (remaining > 0) : (remaining -= 1) {
@@ -990,7 +940,7 @@ const App = struct {
         return sid; // malformed cycle: retain a safe, deterministic focus
     }
 
-    fn tabActivity(self: *const App, root_sid: u64) TabActivity {
+    pub fn tabActivity(self: *const App, root_sid: u64) TabActivity {
         var activity: TabActivity = .idle;
         for (self.sessions.items) |session| {
             if (!self.sessionBelongsToTree(session.sid, root_sid)) continue;
@@ -1003,11 +953,11 @@ const App = struct {
     /// Rows the tab strip occupies at the top of the screen; every layout
     /// and mouse computation offsets by this so hiding the bar reflows
     /// everything else for free.
-    fn tabBarRows(self: *const App) usize {
+    pub fn tabBarRows(self: *const App) usize {
         return if (self.show_tab_bar) tab_bar_height else 0;
     }
 
-    fn tabAtColumn(self: *const App, col: usize) ?u64 {
+    pub fn tabAtColumn(self: *const App, col: usize) ?u64 {
         for (self.tab_hits.items) |hit| {
             if (hit.contains(col)) return hit.sid;
         }
@@ -1017,7 +967,7 @@ const App = struct {
     /// The session parked on an approval inside this tab's tree, if any —
     /// the ! indicator aggregates over the tree, so activating the tab must
     /// land where the approval can actually be answered.
-    fn awaitingSessionInTree(self: *const App, root_sid: u64) ?u64 {
+    pub fn awaitingSessionInTree(self: *const App, root_sid: u64) ?u64 {
         for (self.sessions.items) |session| {
             if (session.state != .awaiting_approval) continue;
             if (self.sessionBelongsToTree(session.sid, root_sid)) return session.sid;
@@ -1026,7 +976,7 @@ const App = struct {
     }
 
     /// First non-focused session parked on an approval, anywhere.
-    fn firstAwaitingSid(self: *const App) ?u64 {
+    pub fn firstAwaitingSid(self: *const App) ?u64 {
         for (self.sessions.items) |session| {
             if (session.sid == self.view.sid) continue;
             if (session.state == .awaiting_approval) return session.sid;
@@ -1034,16 +984,16 @@ const App = struct {
         return null;
     }
 
-    fn rememberSession(self: *App, sid: u64) void {
+    pub fn rememberSession(self: *App, sid: u64) void {
         for (self.known_session_ids.items) |known| if (known == sid) return;
         self.known_session_ids.append(self.gpa, sid) catch {};
     }
 
-    fn displaySessionHandle(self: *const App, buf: *session_handle.Full, sid: u64) []const u8 {
+    pub fn displaySessionHandle(self: *const App, buf: *session_handle.Full, sid: u64) []const u8 {
         return session_handle.display(buf, sid, self.known_session_ids.items);
     }
 
-    fn sessionIdForLabel(self: *const App, label: []const u8) ?u64 {
+    pub fn sessionIdForLabel(self: *const App, label: []const u8) ?u64 {
         for (self.sessions.items) |session| {
             if (std.mem.eql(u8, session.label, label)) return session.sid;
         }
@@ -1052,7 +1002,7 @@ const App = struct {
 
     /// App-level chrome that addresses the focused view (search, copy mode)
     /// is meaningless once that view has moved.
-    fn resetChromeAfterMove(self: *App) void {
+    pub fn resetChromeAfterMove(self: *App) void {
         self.history_search_active = false;
         self.history_search_query.clearRetainingCapacity();
         self.history_search_draft.clearRetainingCapacity();
@@ -1063,7 +1013,7 @@ const App = struct {
 
     /// Park the focused view in the MRU cache and leave a fresh, empty view
     /// (same sid until the caller reassigns it) in its place.
-    fn saveActiveView(self: *App) !void {
+    pub fn saveActiveView(self: *App) !void {
         const saved = try self.gpa.create(SessionView);
         errdefer self.gpa.destroy(saved);
         self.saved_view_clock +%= 1;
@@ -1086,7 +1036,7 @@ const App = struct {
     /// Inactive views are a cache, not durable state. Keep a small MRU set;
     /// an evicted session replays from seq 1 when reopened. This bounds the
     /// number of full transcripts retained by a long-lived TUI.
-    fn trimSavedViews(self: *App) void {
+    pub fn trimSavedViews(self: *App) void {
         while (self.saved_views.count() > max_saved_views) {
             var oldest_sid: ?u64 = null;
             var oldest_tick: u64 = std.math.maxInt(u64);
@@ -1109,7 +1059,7 @@ const App = struct {
 
     /// Make a cached view focused again. The caller has already parked the
     /// previous view and owns (and frees) the `saved` allocation.
-    fn restoreSavedView(self: *App, saved: *SessionView) void {
+    pub fn restoreSavedView(self: *App, saved: *SessionView) void {
         self.copy_cursor = null;
         self.view.deinit(self.gpa);
         self.view = saved.*;
@@ -1122,7 +1072,7 @@ const App = struct {
         self.view.last_used = 0;
     }
 
-    fn touchRecentSession(self: *App, sid: u64) void {
+    pub fn touchRecentSession(self: *App, sid: u64) void {
         for (self.recent_sessions.items, 0..) |recent, i| {
             if (recent == sid) {
                 _ = self.recent_sessions.orderedRemove(i);
@@ -1139,7 +1089,7 @@ const App = struct {
     /// permission badge from server truth. Subscribing is left to the caller,
     /// which knows what replay shape it wants. Every focus change goes
     /// through here; two hand-rolled copies once drifted apart.
-    fn focusSession(self: *App, sid: u64, touch_recent: bool) !void {
+    pub fn focusSession(self: *App, sid: u64, touch_recent: bool) !void {
         const old_sid = self.view.sid;
         try self.saveActiveView();
         self.conn.send(.{ .unsub = .{ .sid = old_sid } }) catch {};
@@ -1169,7 +1119,7 @@ const App = struct {
         self.syncAnimationTicker();
     }
 
-    fn switchSession(self: *App, sid: u64, touch_recent: bool) !void {
+    pub fn switchSession(self: *App, sid: u64, touch_recent: bool) !void {
         if (sid == self.view.sid) return;
         try self.focusSession(sid, touch_recent);
         if (self.view.last_seq == 0) {
@@ -1193,7 +1143,7 @@ const App = struct {
         self.setNotice("session → {s}", .{self.displaySessionHandle(&handle_buf, sid)});
     }
 
-    fn clearTranscriptForSearch(self: *App) void {
+    pub fn clearTranscriptForSearch(self: *App) void {
         self.clearHistoryBackfill();
         for (self.view.blocks.items) |*rendered| rendered.deinit(self.gpa);
         self.view.blocks.clearRetainingCapacity();
@@ -1218,7 +1168,7 @@ const App = struct {
         self.view.sel_anchor = null;
     }
 
-    fn jumpToSearchHit(self: *App, sid: u64, seq: u64) !void {
+    pub fn jumpToSearchHit(self: *App, sid: u64, seq: u64) !void {
         if (sid == self.view.sid) {
             for (self.view.blocks.items) |rendered| {
                 if (rendered.seq != seq) continue;
@@ -1247,7 +1197,7 @@ const App = struct {
         self.setNotice("match → {s}:{d}", .{ self.displaySessionHandle(&handle_buf, sid), seq });
     }
 
-    fn cycleSession(self: *App, direction: i8) void {
+    pub fn cycleSession(self: *App, direction: i8) void {
         if (self.recent_sessions.items.len < 2) return;
         const len = self.recent_sessions.items.len;
         if (direction > 0) {
@@ -1262,7 +1212,7 @@ const App = struct {
     /// Move in the same chronological root-session order shown by the tab
     /// strip. This is deliberately separate from gt/gT, whose useful Vim-like
     /// contract is MRU navigation across every session (including children).
-    fn cycleTab(self: *App, direction: i8) void {
+    pub fn cycleTab(self: *App, direction: i8) void {
         const active_root = self.rootSessionId(self.view.sid);
         const sid = nextRootTabSid(self.sessions.items, active_root, direction) orelse return;
         if (sid == self.view.sid) return;
@@ -1272,7 +1222,7 @@ const App = struct {
     /// Option/Alt+N: jump straight to the Nth tab in the strip's
     /// chronological order (1-based), from any mode. From a focused child
     /// this also jumps to its own root (the highlighted tab).
-    fn jumpToTab(self: *App, index: usize) void {
+    pub fn jumpToTab(self: *App, index: usize) void {
         const sid = rootTabSidAtIndex(self.sessions.items, index) orelse {
             self.setNotice("no tab {d}", .{index});
             return;
@@ -1283,19 +1233,19 @@ const App = struct {
 
     /// Ngt: jump to the Nth most-recent session (1 = current top of the
     /// recency list). Counts past the end clamp to the oldest, like vim.
-    fn jumpToSession(self: *App, ordinal: usize) void {
+    pub fn jumpToSession(self: *App, ordinal: usize) void {
         const idx = recentOrdinalIndex(self.recent_sessions.items.len, ordinal) orelse return;
         self.recent_cursor = idx;
         const sid = self.recent_sessions.items[idx];
         self.switchSession(sid, false) catch self.setNotice("could not switch session", .{});
     }
 
-    fn recentOrdinalIndex(len: usize, ordinal: usize) ?usize {
+    pub fn recentOrdinalIndex(len: usize, ordinal: usize) ?usize {
         if (len == 0 or ordinal == 0) return null;
         return @min(ordinal - 1, len - 1);
     }
 
-    fn replaceSessionSummaries(self: *App, incoming: []const proto.SessionInfo) void {
+    pub fn replaceSessionSummaries(self: *App, incoming: []const proto.SessionInfo) void {
         for (incoming) |info| self.rememberSession(info.sid);
         for (self.sessions.items) |*session| session.deinit(self.gpa);
         self.sessions.clearRetainingCapacity();
@@ -1369,7 +1319,7 @@ const App = struct {
         self.normalizeTopSelection();
     }
 
-    fn allocSessionSummary(self: *App, info: proto.SessionInfo) ?SessionSummary {
+    pub fn allocSessionSummary(self: *App, info: proto.SessionInfo) ?SessionSummary {
         const title = self.gpa.dupe(u8, info.title) catch return null;
         const cwd = self.gpa.dupe(u8, info.cwd) catch {
             self.gpa.free(title);
@@ -1413,7 +1363,7 @@ const App = struct {
         };
     }
 
-    fn upsertSessionSummary(self: *App, info: proto.SessionInfo) void {
+    pub fn upsertSessionSummary(self: *App, info: proto.SessionInfo) void {
         self.rememberSession(info.sid);
         var summary = self.allocSessionSummary(info) orelse return;
 
@@ -1485,7 +1435,7 @@ const App = struct {
         self.normalizeTopSelection();
     }
 
-    fn removeSessionSummary(self: *App, sid: u64) void {
+    pub fn removeSessionSummary(self: *App, sid: u64) void {
         for (self.sessions.items, 0..) |*summary, i| {
             if (summary.sid != sid) continue;
             summary.deinit(self.gpa);
@@ -1514,15 +1464,15 @@ const App = struct {
         _ = self.background_approvals.remove(sid);
     }
 
-    fn currentInflightCall(self: *const App) ?InflightCall {
+    pub fn currentInflightCall(self: *const App) ?InflightCall {
         return layout_mod.currentInflightCall(self.view.blocks.items);
     }
 
-    fn pushBlock(self: *App, kind: block.BlockKind, text: []const u8, label: []const u8, status: block.ToolStatus) void {
+    pub fn pushBlock(self: *App, kind: block.BlockKind, text: []const u8, label: []const u8, status: block.ToolStatus) void {
         self.pushBlockPending(kind, text, label, status, false);
     }
 
-    fn pushDurableBlock(
+    pub fn pushDurableBlock(
         self: *App,
         b: block.Block,
         kind: block.BlockKind,
@@ -1539,7 +1489,7 @@ const App = struct {
         }
     }
 
-    fn pushDurableToolResult(
+    pub fn pushDurableToolResult(
         self: *App,
         b: block.Block,
         text: []const u8,
@@ -1555,7 +1505,7 @@ const App = struct {
         }
     }
 
-    fn pushBlockPending(
+    pub fn pushBlockPending(
         self: *App,
         kind: block.BlockKind,
         text: []const u8,
@@ -1580,7 +1530,7 @@ const App = struct {
         };
     }
 
-    fn pushInputEcho(
+    pub fn pushInputEcho(
         self: *App,
         kind: block.BlockKind,
         text: []const u8,
@@ -1590,7 +1540,7 @@ const App = struct {
         self.pushInputEchoLabel(kind, text, "", request_id, prior_state);
     }
 
-    fn pushInputEchoLabel(
+    pub fn pushInputEchoLabel(
         self: *App,
         kind: block.BlockKind,
         text: []const u8,
@@ -1606,7 +1556,7 @@ const App = struct {
         rendered.pending_prior_state = prior_state;
     }
 
-    fn acknowledgeInput(self: *App, request_id: u64) void {
+    pub fn acknowledgeInput(self: *App, request_id: u64) void {
         if (request_id == 0) return;
         if (acknowledgeInputInBlocks(self.view.blocks.items, request_id)) return;
         var it = self.saved_views.valueIterator();
@@ -1615,7 +1565,7 @@ const App = struct {
         }
     }
 
-    fn rejectInput(self: *App, request_id: u64) void {
+    pub fn rejectInput(self: *App, request_id: u64) void {
         if (request_id == 0) return;
         if (rejectInputInBlocks(self.gpa, &self.view.blocks, request_id)) |rejected| {
             defer self.gpa.free(rejected.text);
@@ -1653,11 +1603,11 @@ const App = struct {
     /// only has to widen the lookup. Parked views in `saved_views` are
     /// deliberately not returned: they are unsubscribed and receive only
     /// the status/approval events handled explicitly below.
-    fn liveView(self: *App, sid: u64) ?*SessionView {
+    pub fn liveView(self: *App, sid: u64) ?*SessionView {
         return if (sid == self.view.sid) &self.view else null;
     }
 
-    fn handleDaemonLine(self: *App, line: []u8) void {
+    pub fn handleDaemonLine(self: *App, line: []u8) void {
         defer self.gpa.free(line);
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -1949,7 +1899,7 @@ const App = struct {
         }
     }
 
-    fn applyBlock(self: *App, b: block.Block) void {
+    pub fn applyBlock(self: *App, b: block.Block) void {
         switch (b.body) {
             .user_msg => |u| {
                 if (!u.synthetic and !isLegacyRehydration(u.text)) {
@@ -2052,7 +2002,7 @@ const App = struct {
         if (self.view.scroll_up > 0) self.view.scroll_up +|= 0; // stay where they are
     }
 
-    fn bufferOlderBlock(self: *App, b: block.Block) void {
+    pub fn bufferOlderBlock(self: *App, b: block.Block) void {
         if (self.view.history_page_failed) return;
         if (self.view.history_backfill.items.len > 0 and
             self.view.history_backfill.items[self.view.history_backfill.items.len - 1].seq >= b.seq) return;
@@ -2069,7 +2019,7 @@ const App = struct {
         };
     }
 
-    fn finishOlderHistoryPage(self: *App, oldest_seq: u64, has_older: bool) void {
+    pub fn finishOlderHistoryPage(self: *App, oldest_seq: u64, has_older: bool) void {
         defer {
             self.view.history_loading = false;
             self.view.history_before_seq = 0;
@@ -2110,7 +2060,7 @@ const App = struct {
 
     // -------------------------------------------------------- user input --
 
-    fn submitInput(self: *App, text: []const u8) void {
+    pub fn submitInput(self: *App, text: []const u8) void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.attachments.items.len == 0) return;
         const is_command = isCommandInput(text);
@@ -2179,7 +2129,7 @@ const App = struct {
         self.view.scroll_up = 0;
     }
 
-    fn needsAnimationTick(self: *const App) bool {
+    pub fn needsAnimationTick(self: *const App) bool {
         return self.view.state == .running or
             self.top_view != null or
             self.voice_rt.download != null or
@@ -2187,11 +2137,11 @@ const App = struct {
             self.ui_animation_active.load(.acquire);
     }
 
-    fn syncAnimationTicker(self: *App) void {
+    pub fn syncAnimationTicker(self: *App) void {
         self.animation_active.store(self.needsAnimationTick(), .release);
     }
 
-    fn recordCellPixels(self: *App, ws: vaxis.Winsize) void {
+    pub fn recordCellPixels(self: *App, ws: vaxis.Winsize) void {
         if (ws.cols > 0 and ws.rows > 0 and ws.x_pixel > 0 and ws.y_pixel > 0) {
             self.cell_px_w = @as(u32, ws.x_pixel) / ws.cols;
             self.cell_px_h = @as(u32, ws.y_pixel) / ws.rows;
@@ -2203,7 +2153,7 @@ const App = struct {
     /// Pixel effects need Kitty graphics; without it the request runs on
     /// cells — the same kind when it has a cell renderer (Pac-Man), else a
     /// cell sibling — and says so once.
-    fn resolveEffect(self: *App, requested: effects.Kind) ResolvedEffect {
+    pub fn resolveEffect(self: *App, requested: effects.Kind) ResolvedEffect {
         if (requested.backend() == .pixel and !self.kitty_graphics) {
             const fallback = requested.fallback();
             if (fallback == requested)
@@ -2218,7 +2168,7 @@ const App = struct {
     /// Pixel effects ship a frame before every draw. Runs in the main loop
     /// with the tty writer in hand; cell effects are untouched. A terminal
     /// that refuses mid-flight degrades to the cell fallback.
-    fn pumpPixelEffect(self: *App, vx: *vaxis.Vaxis, tty: *std.Io.Writer) void {
+    pub fn pumpPixelEffect(self: *App, vx: *vaxis.Vaxis, tty: *std.Io.Writer) void {
         const engine = if (self.effect_engine) |*e| e else return;
         if (!engine.isPixel()) return;
         if (self.screensaver_active or self.ui_animation != null) {
@@ -2233,7 +2183,7 @@ const App = struct {
         }
     }
 
-    fn resetEffectEngine(self: *App, requested: effects.Kind) bool {
+    pub fn resetEffectEngine(self: *App, requested: effects.Kind) bool {
         const resolved = self.resolveEffect(requested);
         const kind = resolved.kind;
         var seed_bytes: [8]u8 = undefined;
@@ -2254,7 +2204,7 @@ const App = struct {
         return true;
     }
 
-    fn startUiAnimation(self: *App, kind: effects.Kind) void {
+    pub fn startUiAnimation(self: *App, kind: effects.Kind) void {
         if (!self.resetEffectEngine(kind)) return;
         self.screensaver_active = false;
         self.ui_animation = kind;
@@ -2263,7 +2213,7 @@ const App = struct {
         self.syncAnimationTicker();
     }
 
-    fn startScreensaver(self: *App, kind: effects.Kind) void {
+    pub fn startScreensaver(self: *App, kind: effects.Kind) void {
         if (!self.resetEffectEngine(kind)) return;
         self.ui_animation = null;
         self.ui_animation_frame = 0;
@@ -2273,7 +2223,7 @@ const App = struct {
         self.syncAnimationTicker();
     }
 
-    fn dismissScreensaver(self: *App) bool {
+    pub fn dismissScreensaver(self: *App) bool {
         if (!self.screensaver_active) return false;
         self.screensaver_active = false;
         self.ui_animation_active.store(false, .release);
@@ -2283,7 +2233,7 @@ const App = struct {
         return true;
     }
 
-    fn recordUserActivity(self: *App) void {
+    pub fn recordUserActivity(self: *App) void {
         const now = nowWallMs(self.io);
         const deadline = if (self.screensaver_timeout_ms == 0)
             0
@@ -2292,13 +2242,13 @@ const App = struct {
         self.screensaver_deadline_ms.store(deadline, .release);
     }
 
-    fn maybeStartScreensaver(self: *App) void {
+    pub fn maybeStartScreensaver(self: *App) void {
         if (self.screensaver_active or self.screensaver_timeout_ms == 0) return;
         const deadline = self.screensaver_deadline_ms.load(.acquire);
         if (deadline != 0 and nowWallMs(self.io) >= deadline) self.startScreensaver(self.screensaver_kind);
     }
 
-    fn tickUiAnimation(self: *App) void {
+    pub fn tickUiAnimation(self: *App) void {
         self.maybeStartScreensaver();
         if (self.ui_animation == null and !self.screensaver_active) return;
         if (self.effect_engine) |*engine| engine.tick();
@@ -2313,499 +2263,18 @@ const App = struct {
         }
     }
 
-    fn runCommand(self: *App, cmd: []const u8) void {
-        var it = std.mem.tokenizeScalar(u8, cmd, ' ');
-        const head = it.next() orelse return;
-
-        if (std.mem.eql(u8, head, "/quit") or std.mem.eql(u8, head, "/q") or
-            std.mem.eql(u8, head, "/detach"))
-        {
-            self.should_quit = true;
-        } else if (std.mem.eql(u8, head, "/setup")) {
-            self.requestSetup(false);
-        } else if (std.mem.eql(u8, head, "/model")) {
-            const m = it.rest();
-            if (m.len == 0) {
-                self.openPicker(.model);
-                // Ask the daemon for the full catalog (async; picker shows
-                // favorites until the reply lands).
-                if (self.catalog.items.len == 0) {
-                    self.conn.send(.{ .model_list = .{} }) catch {};
-                }
-                return;
-            }
-            self.applyModel(m);
-        } else if (std.mem.eql(u8, head, "/effort")) {
-            const value = it.rest();
-            if (value.len == 0) {
-                self.openPicker(.effort);
-                return;
-            }
-            const selected = proto.ReasoningEffort.parse(value) orelse {
-                self.setNotice("unknown effort {s} — use auto, none, minimal, low, medium, high, xhigh, or max", .{value});
-                return;
-            };
-            self.applyEffort(selected);
-        } else if (std.mem.eql(u8, head, "/search")) {
-            const query = std.mem.trim(u8, it.rest(), " \t\r\n");
-            self.openSearchPrompt(0);
-            if (query.len > 0) {
-                self.picker_filter.appendSlice(self.gpa, query) catch {
-                    self.picker = null;
-                    self.setNotice("could not start search", .{});
-                    return;
-                };
-                self.submitSearch();
-            }
-        } else if (std.mem.eql(u8, head, "/permissions")) {
-            self.setPermissions(it.rest());
-        } else if (std.mem.eql(u8, head, "/sandbox")) {
-            self.toggleSandbox(it.rest());
-        } else if (std.mem.eql(u8, head, "/network")) {
-            self.networkCommand(it.rest());
-        } else if (std.mem.eql(u8, head, "/mcp")) {
-            const action = it.next();
-            if (action == null) {
-                self.conn.send(.{ .mcp_list = .{} }) catch {
-                    self.setNotice("could not request MCP status", .{});
-                };
-            } else if (std.mem.eql(u8, action.?, "restart")) {
-                const name = it.next() orelse {
-                    self.setNotice("usage: /mcp restart <name>", .{});
-                    return;
-                };
-                if (it.next() != null) {
-                    self.setNotice("usage: /mcp restart <name>", .{});
-                    return;
-                }
-                self.conn.send(.{ .mcp_restart = .{ .name = name } }) catch {
-                    self.setNotice("could not restart MCP server", .{});
-                };
-            } else if (std.mem.eql(u8, action.?, "add")) {
-                const name = it.next() orelse {
-                    self.setNotice("usage: /mcp add <name> <command> [args...]", .{});
-                    return;
-                };
-                var command: std.ArrayList([]const u8) = .empty;
-                defer command.deinit(self.gpa);
-                while (it.next()) |arg| command.append(self.gpa, arg) catch {
-                    self.setNotice("could not allocate MCP command", .{});
-                    return;
-                };
-                if (command.items.len == 0) {
-                    self.setNotice("usage: /mcp add <name> <command> [args...]", .{});
-                    return;
-                }
-                self.conn.send(.{ .mcp_add = .{ .name = name, .cmd = command.items } }) catch {
-                    self.setNotice("could not add MCP server", .{});
-                };
-            } else if (std.mem.eql(u8, action.?, "remove")) {
-                const name = it.next() orelse {
-                    self.setNotice("usage: /mcp remove <name>", .{});
-                    return;
-                };
-                if (it.next() != null) {
-                    self.setNotice("usage: /mcp remove <name>", .{});
-                    return;
-                }
-                self.conn.send(.{ .mcp_remove = .{ .name = name } }) catch {
-                    self.setNotice("could not remove MCP server", .{});
-                };
-            } else if (std.mem.eql(u8, action.?, "reload") and it.next() == null) {
-                self.conn.send(.{ .mcp_reload = .{} }) catch {
-                    self.setNotice("could not reload MCP config", .{});
-                };
-            } else {
-                self.setNotice("usage: /mcp [add <name> <command> [args...]|remove <name>|restart <name>|reload]", .{});
-            }
-        } else if (std.mem.eql(u8, head, "/council")) {
-            const action = it.next();
-            if (action == null or std.mem.eql(u8, action.?, "list")) {
-                if (self.councils.items.len > 0)
-                    self.openCouncilList()
-                else
-                    self.council_list_pending = true;
-                self.conn.send(.{ .council_list = .{} }) catch {
-                    self.council_list_pending = false;
-                    self.setNotice("could not request councils", .{});
-                };
-            } else if (std.mem.eql(u8, action.?, "new") or std.mem.eql(u8, action.?, "edit")) {
-                const name = it.next() orelse {
-                    self.setNotice("usage: /council {s} <name>", .{action.?});
-                    return;
-                };
-                if (it.next() != null) {
-                    self.setNotice("usage: /council {s} <name>", .{action.?});
-                    return;
-                }
-                if (std.mem.eql(u8, action.?, "new") and self.councilByName(name) != null) {
-                    self.setNotice("council '{s}' already exists — use /council edit {s}", .{ name, name });
-                    return;
-                }
-                self.openCouncilPicker(name);
-            } else if (std.mem.eql(u8, action.?, "set") or std.mem.eql(u8, action.?, "add")) {
-                const name = it.next() orelse {
-                    self.setNotice("usage: /council set <name> <model...>", .{});
-                    return;
-                };
-                var models: std.ArrayList([]const u8) = .empty;
-                defer models.deinit(self.gpa);
-                while (it.next()) |model| models.append(self.gpa, model) catch return;
-                if (models.items.len == 0) {
-                    self.setNotice("usage: /council set <name> <model...>", .{});
-                    return;
-                }
-                self.council_notice_pending = true;
-                self.conn.send(.{ .council_set = .{ .name = name, .models = models.items } }) catch {
-                    self.setNotice("could not save council", .{});
-                };
-            } else if (std.mem.eql(u8, action.?, "remove") or std.mem.eql(u8, action.?, "delete")) {
-                const name = it.next() orelse {
-                    self.setNotice("usage: /council remove <name>", .{});
-                    return;
-                };
-                self.council_notice_pending = true;
-                self.conn.send(.{ .council_remove = .{ .name = name } }) catch {
-                    self.setNotice("could not remove council", .{});
-                };
-            } else if (it.next() == null) {
-                self.showCouncilDetail(action.?);
-            } else {
-                self.setNotice("usage: /council [<name>|new <name>|edit <name>|remove <name>]", .{});
-            }
-        } else if (std.mem.eql(u8, head, "/plan")) {
-            const arg = std.mem.trim(u8, it.rest(), " \t");
-            if (std.mem.eql(u8, arg, "clear")) {
-                if (self.view.state == .running or self.view.state == .awaiting_approval) {
-                    self.setNotice("cannot clear a plan mid-turn", .{});
-                    return;
-                }
-                self.conn.send(.{ .plan_clear = .{ .sid = self.view.sid } }) catch {
-                    self.setNotice("could not clear plan", .{});
-                };
-            } else if (std.mem.eql(u8, arg, "off")) {
-                _ = self.setPlanMode(false);
-            } else if (arg.len == 0) {
-                _ = self.setPlanMode(true);
-            } else if (self.setPlanMode(true)) {
-                self.submitInput(arg);
-            }
-        } else if (std.mem.eql(u8, head, "/review")) {
-            const name = it.next() orelse {
-                self.setNotice("usage: /review <council> <question>", .{});
-                return;
-            };
-            const question = std.mem.trim(u8, it.rest(), " \t");
-            if (question.len == 0) {
-                self.setNotice("usage: /review <council> <question>", .{});
-                return;
-            }
-            const council = self.councilByName(name) orelse {
-                if (self.councils.items.len == 0)
-                    self.setNotice("no councils configured — /council new <name>", .{})
-                else
-                    self.setNotice("unknown council '{s}' — /council lists them", .{name});
-                return;
-            };
-            if (proto.isGuestModel(self.view.model.items)) {
-                self.setNotice("councils need a native session (guest sessions have no marlin tools)", .{});
-                return;
-            }
-            const expanded = buildReviewPrompt(self.gpa, council, question) catch {
-                self.setNotice("could not compose review prompt", .{});
-                return;
-            };
-            defer self.gpa.free(expanded);
-            self.submitInput(expanded);
-        } else if (std.mem.eql(u8, head, "/voice")) {
-            const action = it.next();
-            if (action == null) {
-                if (!self.voice_rt.enabled) self.startVoiceSetup() else self.voiceStatusNotice();
-            } else if (std.mem.eql(u8, action.?, "setup")) {
-                self.startVoiceSetup();
-            } else if (std.mem.eql(u8, action.?, "off")) {
-                if (self.voice_rt.setup) |st| {
-                    const environ = self.environ orelse return;
-                    config.setVoice(self.gpa, self.io, environ, false, st.engine.configName(), if (st.mode == .toggle) "toggle" else "ptt", st.model_path, st.stt_bin) catch {};
-                }
-                self.voice_rt.enabled = false;
-                self.setNotice("voice off — /voice turns it back on", .{});
-            } else if (std.mem.eql(u8, action.?, "on")) {
-                if (self.voice_rt.setup) |st| {
-                    const environ = self.environ orelse return;
-                    config.setVoice(self.gpa, self.io, environ, true, st.engine.configName(), if (st.mode == .toggle) "toggle" else "ptt", st.model_path, st.stt_bin) catch {};
-                    self.voice_rt.enabled = true;
-                    self.voiceStatusNotice();
-                } else self.startVoiceSetup();
-            } else if (std.mem.eql(u8, action.?, "mode")) {
-                const which = it.next() orelse {
-                    self.setNotice("usage: /voice mode ptt|toggle", .{});
-                    return;
-                };
-                const mode: voice.Mode = if (std.mem.eql(u8, which, "toggle")) .toggle else .ptt;
-                if (self.voice_rt.setup) |*st| {
-                    st.mode = mode;
-                    const environ = self.environ orelse return;
-                    config.setVoice(self.gpa, self.io, environ, self.voice_rt.enabled, st.engine.configName(), if (mode == .toggle) "toggle" else "ptt", st.model_path, st.stt_bin) catch {};
-                    self.voiceStatusNotice();
-                } else self.setNotice("voice is not set up — /voice setup first", .{});
-            } else {
-                self.setNotice("usage: /voice [setup|mode ptt|toggle|off|on]", .{});
-            }
-        } else if (std.mem.eql(u8, head, "/sessions")) {
-            self.openPicker(.session);
-        } else if (std.mem.eql(u8, head, "/top")) {
-            self.openTop();
-        } else if (std.mem.eql(u8, head, "/new")) {
-            self.newSession() catch {
-                self.setNotice("could not create session", .{});
-            };
-        } else if (std.mem.eql(u8, head, "/rename")) {
-            const title = std.mem.trim(u8, it.rest(), " \t");
-            if (title.len == 0) {
-                self.setNotice("usage: /rename <title>", .{});
-                return;
-            }
-            self.conn.send(.{ .session_rename = .{ .sid = self.view.sid, .title = title } }) catch {
-                self.setNotice("could not rename session", .{});
-                return;
-            };
-            self.setNotice("renamed to {s}", .{title});
-        } else if (std.mem.eql(u8, head, "/archive")) {
-            const arg = it.rest();
-            if (arg.len == 0) {
-                self.archiveCurrentSession();
-            } else if (std.mem.eql(u8, arg, "children")) {
-                self.archiveFinishedChildren();
-            } else {
-                self.setNotice("usage: /archive [children]", .{});
-            }
-        } else if (std.mem.eql(u8, head, "/attach")) {
-            self.attachPath(it.rest());
-        } else if (std.mem.eql(u8, head, "!")) {
-            self.shellEscape(it.rest());
-        } else if (std.mem.eql(u8, head, "!c")) {
-            self.copyLastToolOutput();
-        } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
-            var rebuild: RebuildScope = if (std.mem.eql(u8, head, "!rb")) .attached else .none;
-            var force = false;
-            while (it.next()) |arg| {
-                if (std.mem.eql(u8, arg, "--build")) {
-                    rebuild = .attached;
-                } else if (std.mem.eql(u8, arg, "--force")) {
-                    force = true;
-                } else if (std.mem.eql(u8, head, "!rb") and std.mem.eql(u8, arg, "client")) {
-                    rebuild = .client;
-                } else if (std.mem.eql(u8, head, "!rb") and std.mem.eql(u8, arg, "both")) {
-                    rebuild = .both;
-                } else {
-                    if (std.mem.eql(u8, head, "!rb"))
-                        self.setNotice("usage: !rb [client|both] [--force]", .{})
-                    else
-                        self.setNotice("usage: /reboot [--build] [--force]", .{});
-                    return;
-                }
-            }
-            if (self.view.state == .awaiting_approval and !force and rebuild != .client) {
-                self.setNotice("approval pending — answer it, interrupt, or /reboot --force", .{});
-                return;
-            }
-            if (self.view.state == .running and rebuild != .client) {
-                self.setNotice("turn running — /reboot waits for it (interrupt first if you want force)", .{});
-            }
-            self.reboot_request = .{ .requested = true, .rebuild = rebuild, .force = force };
-            self.should_quit = true;
-        } else if (std.mem.eql(u8, head, "/compact")) {
-            if (proto.isGuestModel(self.view.model.items)) {
-                self.setNotice("guest agents manage their own context — /compact is native-only", .{});
-                return;
-            }
-            if (self.view.state == .running or self.view.state == .awaiting_approval) {
-                self.setNotice("cannot compact mid-turn", .{});
-                return;
-            }
-            self.conn.send(.{ .session_compact = .{ .sid = self.view.sid } }) catch return;
-            self.setNotice("compacting…", .{});
-        } else if (std.mem.eql(u8, head, "/diagnostics")) {
-            if (it.next() != null) {
-                self.setNotice("usage: /diagnostics", .{});
-                return;
-            }
-            self.conn.send(.{ .diagnostics = .{ .sid = self.view.sid } }) catch {
-                self.setNotice("could not request diagnostics", .{});
-            };
-        } else if (std.mem.eql(u8, head, "/animate")) {
-            const name = it.next() orelse {
-                self.setNotice("usage: /animate <" ++ effects.usage_list ++ ">", .{});
-                return;
-            };
-            const kind = effects.Kind.parse(name) orelse {
-                self.setNotice("unknown effect {s}", .{name});
-                return;
-            };
-            if (it.next() != null) {
-                self.setNotice("usage: /animate <" ++ effects.usage_list ++ ">", .{});
-                return;
-            }
-            self.startUiAnimation(kind);
-        } else if (std.mem.eql(u8, head, "/screensaver") or std.mem.eql(u8, head, "!s")) {
-            const kind = if (it.next()) |name| effects.Kind.parse(name) orelse {
-                self.setNotice("unknown effect {s}", .{name});
-                return;
-            } else self.screensaver_kind;
-            if (it.next() != null) {
-                self.setNotice("usage: /screensaver [" ++ effects.usage_list ++ "]", .{});
-                return;
-            }
-            self.startScreensaver(kind);
-        } else if (std.mem.eql(u8, head, "/otel")) {
-            self.otelCommand(it.next(), it.rest());
-        } else if (std.mem.eql(u8, head, "/config")) {
-            const setting = it.next();
-            const value = it.next();
-            const extra = it.next();
-            if (it.next() != null) {
-                self.setNotice("too many /config arguments", .{});
-                return;
-            }
-            self.configCommand(setting, value, extra);
-        } else if (std.mem.eql(u8, head, "/help")) {
-            // The status bar is one row; the catalog is not. Open the help
-            // panel scrolled to its generated COMMANDS section instead.
-            self.shortcut_help = true;
-            self.help_scroll = shortcut_help_rows.len;
-        } else if (head.len > 1 and head[0] == '!') {
-            // `!ls -la` — every shell and vim accept the bang glued to the
-            // command. The exact `!c`/`!rb` shortcuts matched above.
-            self.shellEscape(cmd[1..]);
-        } else {
-            self.setNotice("unknown command {s} (try /help)", .{head});
-        }
-    }
-
-    /// `/config` — durable UI preferences serialized by the daemon.
-    fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra: ?[]const u8) void {
-        const name = setting orelse {
-            var duration_buf: [32]u8 = undefined;
-            self.setNotice("config · tabbar {s} · bell {s} · screensaver {s} {s}", .{
-                onOff(self.show_tab_bar),
-                onOff(self.bell_enabled),
-                config.formatDuration(&duration_buf, self.screensaver_timeout_ms) catch "invalid",
-                self.screensaver_kind.name(),
-            });
-            return;
-        };
-        if (std.mem.eql(u8, name, "screensaver")) {
-            const raw = value orelse {
-                self.setNotice("usage: /config screensaver <30s|10m|1h|off|effect> [effect]", .{});
-                return;
-            };
-            var after_ms = self.screensaver_timeout_ms;
-            var kind = self.screensaver_kind;
-            if (effects.Kind.parse(raw)) |parsed| {
-                if (extra != null) {
-                    self.setNotice("usage: /config screensaver <duration|effect> [effect]", .{});
-                    return;
-                }
-                kind = parsed;
-            } else {
-                after_ms = config.parseDurationMs(raw) catch {
-                    self.setNotice("usage: /config screensaver <30s|10m|1h|off> [" ++ effects.usage_list ++ "]", .{});
-                    return;
-                };
-                if (extra) |effect_name| {
-                    kind = effects.Kind.parse(effect_name) orelse {
-                        self.setNotice("unknown effect {s}", .{effect_name});
-                        return;
-                    };
-                }
-            }
-            const previous_timeout = self.screensaver_timeout_ms;
-            const previous_kind = self.screensaver_kind;
-            self.screensaver_timeout_ms = after_ms;
-            self.screensaver_kind = kind;
-            self.recordUserActivity();
-            self.syncAnimationTicker();
-            self.conn.send(.{ .ui_set_screensaver = .{
-                .after_ms = after_ms,
-                .effect = kind.name(),
-            } }) catch |err| {
-                self.screensaver_timeout_ms = previous_timeout;
-                self.screensaver_kind = previous_kind;
-                self.recordUserActivity();
-                self.syncAnimationTicker();
-                self.setNotice("screensaver setting not saved: {t}", .{err});
-                return;
-            };
-            var duration_buf: [32]u8 = undefined;
-            self.setNotice("screensaver {s} {s} (saving…)", .{
-                config.formatDuration(&duration_buf, after_ms) catch "invalid",
-                kind.name(),
-            });
-            return;
-        }
-
-        const is_tabbar = std.mem.eql(u8, name, "tabbar");
-        const is_bell = std.mem.eql(u8, name, "bell");
-        if (!is_tabbar and !is_bell) {
-            self.setNotice("usage: /config <tabbar|bell> [on|off] or /config screensaver <duration|effect> [effect]", .{});
-            return;
-        }
-        const current = if (is_tabbar) self.show_tab_bar else self.bell_enabled;
-        const enable = if (value) |v| blk: {
-            if (std.mem.eql(u8, v, "on") or std.mem.eql(u8, v, "true")) break :blk true;
-            if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false")) break :blk false;
-            self.setNotice("usage: /config <tabbar|bell> [on|off]", .{});
-            return;
-        } else !current;
-        if (is_tabbar) {
-            self.show_tab_bar = enable;
-            self.refresh_requested = true;
-        } else {
-            self.bell_enabled = enable;
-        }
-        const msg: proto.ClientMsg = if (is_tabbar)
-            .{ .ui_set_tab_bar = .{ .enabled = enable } }
-        else
-            .{ .ui_set_bell = .{ .enabled = enable } };
-        self.conn.send(msg) catch |err| {
-            self.setNotice("{s} {s} (not saved: {t})", .{ name, onOff(enable), err });
-            return;
-        };
-        self.setNotice("{s} {s} (saving…)", .{ name, onOff(enable) });
-    }
-
-    fn showMcpStatus(self: *App, servers: []const proto.McpServerInfo) void {
-        self.notice.clearRetainingCapacity();
-        self.armNoticeExpiry(2 * notice_ttl_ms); // a list the user asked to read
-        if (servers.len == 0) {
-            self.notice.appendSlice(self.gpa, "MCP · no servers configured") catch {};
-            return;
-        }
-        self.notice.appendSlice(self.gpa, "MCP · ") catch return;
-        for (servers, 0..) |server, i| {
-            if (i > 0) self.notice.appendSlice(self.gpa, " · ") catch return;
-            if (server.ready) {
-                self.notice.print(self.gpa, "{s} ✓ {d} tools", .{ server.name, server.tool_count }) catch return;
-            } else {
-                const message = server.error_message orelse "unavailable";
-                self.notice.print(self.gpa, "{s} ✗ {s}", .{ server.name, message[0..@min(message.len, 96)] }) catch return;
-            }
-        }
-    }
-
-    fn clearCouncilEdit(self: *App) void {
+    pub fn clearCouncilEdit(self: *App) void {
         self.council_edit_name.clearRetainingCapacity();
         for (self.council_edit_models.items) |model| self.gpa.free(model);
         self.council_edit_models.clearRetainingCapacity();
     }
 
-    fn clearCouncils(self: *App) void {
+    pub fn clearCouncils(self: *App) void {
         for (self.councils.items) |*council| council.deinit(self.gpa);
         self.councils.clearRetainingCapacity();
     }
 
-    fn applyCouncils(self: *App, councils: []const proto.CouncilInfo) void {
+    pub fn applyCouncils(self: *App, councils: []const proto.CouncilInfo) void {
         self.clearCouncils();
         for (councils) |info| {
             var owned = OwnedCouncil{ .name = self.gpa.dupe(u8, info.name) catch return };
@@ -2847,7 +2316,7 @@ const App = struct {
         }
     }
 
-    fn councilByName(self: *const App, name: []const u8) ?*const OwnedCouncil {
+    pub fn councilByName(self: *const App, name: []const u8) ?*const OwnedCouncil {
         for (self.councils.items) |*council| {
             if (std.mem.eql(u8, council.name, name)) return council;
         }
@@ -2859,7 +2328,7 @@ const App = struct {
     /// Resolve [voice] config into a runnable runtime, silently: a broken
     /// or absent setup leaves voice dormant with zero noise — dependencies
     /// are only ever mentioned inside /voice itself.
-    fn initVoiceFromConfig(self: *App) void {
+    pub fn initVoiceFromConfig(self: *App) void {
         const cfg = self.cfg;
         if (!cfg.voice_enabled) return;
         const engine = voice.Engine.parse(cfg.voice_engine) orelse return;
@@ -2885,7 +2354,7 @@ const App = struct {
         self.voice_rt.enabled = true;
     }
 
-    fn voiceStatusNotice(self: *App) void {
+    pub fn voiceStatusNotice(self: *App) void {
         const rt = &self.voice_rt;
         if (!rt.enabled or rt.setup == null) {
             self.setNotice("voice is not set up — /voice setup walks through it (local, offline)", .{});
@@ -2899,7 +2368,7 @@ const App = struct {
         });
     }
 
-    fn startVoiceSetup(self: *App) void {
+    pub fn startVoiceSetup(self: *App) void {
         const environ = self.environ orelse return;
         // The only place dependencies are ever mentioned.
         const ffmpeg = (voice.findBinary(self.gpa, self.io, environ, &.{"ffmpeg"}) catch null) orelse {
@@ -2913,7 +2382,7 @@ const App = struct {
         self.openPicker(.voice_engine);
     }
 
-    fn voiceWizardEngineChosen(self: *App, item: []const u8) void {
+    pub fn voiceWizardEngineChosen(self: *App, item: []const u8) void {
         const environ = self.environ orelse return;
         var chosen: ?voice.Engine = null;
         for (voice_engine_items, 0..) |label, i| {
@@ -2932,7 +2401,7 @@ const App = struct {
         self.openPicker(.voice_mode);
     }
 
-    fn voiceWizardModeChosen(self: *App, item: []const u8) void {
+    pub fn voiceWizardModeChosen(self: *App, item: []const u8) void {
         const rt = &self.voice_rt;
         const engine = rt.wiz_engine orelse return;
         rt.wiz_mode = if (std.mem.startsWith(u8, item, "toggle")) .toggle else .ptt;
@@ -2988,7 +2457,7 @@ const App = struct {
         self.setNotice("voice: downloading {s}…", .{engine.modelFileName().?});
     }
 
-    fn finishVoiceSetup(self: *App, model_path: []const u8) void {
+    pub fn finishVoiceSetup(self: *App, model_path: []const u8) void {
         const rt = &self.voice_rt;
         const engine = rt.wiz_engine orelse return;
         const mode = rt.wiz_mode orelse .ptt;
@@ -3027,7 +2496,7 @@ const App = struct {
     /// Download progress → status notice, driven by animation ticks. A
     /// dedicated modal would be prettier; the status line is honest and
     /// already everywhere.
-    fn voiceTick(self: *App) void {
+    pub fn voiceTick(self: *App) void {
         const rt = &self.voice_rt;
         const progress = rt.download orelse return;
         const done = progress.done.load(.acquire);
@@ -3055,7 +2524,7 @@ const App = struct {
         }
     }
 
-    fn voiceDownloadFinished(self: *App, failure: ?[]const u8) void {
+    pub fn voiceDownloadFinished(self: *App, failure: ?[]const u8) void {
         const rt = &self.voice_rt;
         if (rt.download_thread) |t| t.join();
         rt.download_thread = null;
@@ -3070,7 +2539,7 @@ const App = struct {
         self.finishVoiceSetup(dest);
     }
 
-    fn voiceCancelDownload(self: *App) void {
+    pub fn voiceCancelDownload(self: *App) void {
         const rt = &self.voice_rt;
         const progress = rt.download orelse return;
         progress.cancel.store(true, .release);
@@ -3078,7 +2547,7 @@ const App = struct {
         // file stays for the next /voice setup to resume.
     }
 
-    fn startVoiceRecording(self: *App) void {
+    pub fn startVoiceRecording(self: *App) void {
         const rt = &self.voice_rt;
         if (rt.phase != .idle or !rt.enabled) return;
         const setup = rt.setup orelse return;
@@ -3120,7 +2589,7 @@ const App = struct {
     /// While the user is talking, pull the model through the page cache so
     /// the transcriber starts hot. Rate-limited: a cached re-read is cheap
     /// but not free, and one warm pass a minute keeps residency fresh.
-    fn prewarmVoiceModel(self: *App) void {
+    pub fn prewarmVoiceModel(self: *App) void {
         const rt = &self.voice_rt;
         const setup = rt.setup orelse return;
         if (setup.model_path.len == 0) return;
@@ -3141,7 +2610,7 @@ const App = struct {
         thread.detach();
     }
 
-    fn stopVoiceRecording(self: *App) void {
+    pub fn stopVoiceRecording(self: *App) void {
         const rt = &self.voice_rt;
         if (rt.phase != .recording) return;
         const setup = rt.setup orelse return;
@@ -3171,7 +2640,7 @@ const App = struct {
         thread.detach();
     }
 
-    fn abortVoiceRecording(self: *App) void {
+    pub fn abortVoiceRecording(self: *App) void {
         const rt = &self.voice_rt;
         if (rt.phase != .recording) return;
         if (rt.recorder) |*recorder| {
@@ -3189,7 +2658,7 @@ const App = struct {
         self.setNotice("voice: recording discarded", .{});
     }
 
-    fn handleVoiceEvent(self: *App, ev: VoiceEvent) void {
+    pub fn handleVoiceEvent(self: *App, ev: VoiceEvent) void {
         switch (ev) {
             .transcript => |text| {
                 defer self.gpa.free(text);
@@ -3215,7 +2684,7 @@ const App = struct {
     }
 
     /// The ctrl+space press in either mode. Returns true when consumed.
-    fn handleVoiceKey(self: *App) bool {
+    pub fn handleVoiceKey(self: *App) bool {
         const rt = &self.voice_rt;
         if (!rt.enabled or rt.setup == null) return false;
         switch (rt.phase) {
@@ -3232,7 +2701,7 @@ const App = struct {
         }
     }
 
-    fn stageClipboard(self: *App, text: []const u8) void {
+    pub fn stageClipboard(self: *App, text: []const u8) void {
         if (text.len == 0) {
             self.setNotice("last tool output is empty", .{});
             return;
@@ -3248,7 +2717,7 @@ const App = struct {
     /// Which call produced the tool_result at `idx`. Results persist in
     /// call order within a turn, so the k-th result pairs with the turn's
     /// k-th call (the same positional invariant scanToolBatch folds by).
-    fn toolResultSource(self: *const App, idx: usize) ToolResultSource {
+    pub fn toolResultSource(self: *const App, idx: usize) ToolResultSource {
         const turn_id = self.view.blocks.items[idx].turn_id;
         var start = idx;
         while (start > 0 and self.view.blocks.items[start - 1].turn_id == turn_id) start -= 1;
@@ -3269,7 +2738,7 @@ const App = struct {
     }
 
     /// Stage the human-readable copy source for the frame-loop notice.
-    fn setClipboardDesc(self: *App, src: ToolResultSource) void {
+    pub fn setClipboardDesc(self: *App, src: ToolResultSource) void {
         const max_arg = 48;
         self.clipboard_desc.clearRetainingCapacity();
         self.clipboard_desc.appendSlice(self.gpa, src.name) catch return;
@@ -3280,7 +2749,7 @@ const App = struct {
         if (arg.len > max_arg) self.clipboard_desc.appendSlice(self.gpa, "…") catch return;
     }
 
-    fn copyLastToolOutput(self: *App) void {
+    pub fn copyLastToolOutput(self: *App) void {
         var i = self.view.blocks.items.len;
         while (i > 0) {
             i -= 1;
@@ -3305,13 +2774,13 @@ const App = struct {
     }
 
     /// Consume the numeric prefix (default 1).
-    fn takeCount(self: *App) usize {
+    pub fn takeCount(self: *App) usize {
         const n = if (self.pending_count == 0) 1 else self.pending_count;
         self.pending_count = 0;
         return n;
     }
 
-    fn hasPending(self: *const App) bool {
+    pub fn hasPending(self: *const App) bool {
         return self.pending_count != 0 or self.pending_op != 0 or self.pending_find != 0 or
             self.pending_g or self.pending_replace;
     }
@@ -3319,7 +2788,7 @@ const App = struct {
     /// Cancel whatever is half-typed — count, operator, find, `g` prefix,
     /// `r`. Also run on every insert-mode entry so a stale count never
     /// survives a round trip.
-    fn clearPending(self: *App) void {
+    pub fn clearPending(self: *App) void {
         self.pending_count = 0;
         self.pending_op = 0;
         self.pending_find = 0;
@@ -3330,7 +2799,7 @@ const App = struct {
     /// `! <cmd>` / `!cmd`: run through $SHELL in the focused session cwd
     /// (bare `!` = interactive shell). The TUI tears down first; the
     /// entry point reattaches when the shell exits.
-    fn shellEscape(self: *App, command: []const u8) void {
+    pub fn shellEscape(self: *App, command: []const u8) void {
         if (self.remote_transport) {
             self.setNotice("shell escape unavailable over --remote — run Marlin inside ssh/mosh", .{});
             return;
@@ -3346,7 +2815,7 @@ const App = struct {
 
     /// Repeat a forward range motion `n` times from the cursor by walking a
     /// scratch cursor; the editor is restored before returning.
-    fn repeatForwardRange(self: *App, comptime range_fn: fn (*const Editor) Editor.Range, n: usize) Editor.Range {
+    pub fn repeatForwardRange(self: *App, comptime range_fn: fn (*const Editor) Editor.Range, n: usize) Editor.Range {
         const ed = &self.view.editor;
         const saved = ed.cursor;
         var end = saved;
@@ -3361,7 +2830,7 @@ const App = struct {
         return .{ .start = saved, .end = end };
     }
 
-    fn repeatBackwardRange(self: *App, comptime range_fn: fn (*const Editor) Editor.Range, n: usize) Editor.Range {
+    pub fn repeatBackwardRange(self: *App, comptime range_fn: fn (*const Editor) Editor.Range, n: usize) Editor.Range {
         const ed = &self.view.editor;
         const saved = ed.cursor;
         var start = saved;
@@ -3378,7 +2847,7 @@ const App = struct {
 
     /// Resolve a completed f/t/F/T: either move the cursor or feed the
     /// pending operator (df" / ct)). Inclusive for f, exclusive for t.
-    fn resolveFind(self: *App, kind: u8, ch: u8, count: usize) void {
+    pub fn resolveFind(self: *App, kind: u8, ch: u8, count: usize) void {
         const ed = &self.view.editor;
         const forward = kind == 'f' or kind == 't';
         const target = ed.findOnLine(ch, forward, count) orelse {
@@ -3409,7 +2878,7 @@ const App = struct {
         };
     }
 
-    fn applyOperator(self: *App, op: u8, range: Editor.Range) void {
+    pub fn applyOperator(self: *App, op: u8, range: Editor.Range) void {
         if (range.end <= range.start) return;
         const slice = self.view.editor.text.items[range.start..range.end];
         self.yank_register.clearRetainingCapacity();
@@ -3433,7 +2902,7 @@ const App = struct {
     /// Second (and third) key of a d/c/y sequence: a motion, a doubled
     /// operator for the whole line, or an i/a text object. Anything else
     /// cancels, vim-style.
-    fn operatorKey(self: *App, key: vaxis.Key) void {
+    pub fn operatorKey(self: *App, key: vaxis.Key) void {
         const op = self.pending_op;
         const ed = &self.view.editor;
         if (self.pending_obj != 0) {
@@ -3527,7 +2996,7 @@ const App = struct {
     /// durable transcript lines. Mouse/copy coordinates map only the
     /// contiguous body below them; the original prompt remains selectable
     /// through ordinary scrollback.
-    fn visibleLineAtRow(self: *const App, row: usize) ?usize {
+    pub fn visibleLineAtRow(self: *const App, row: usize) ?usize {
         if (row >= self.view.last_view_h) return null;
         if (self.view.last_pinned_rows == 0 and self.view.last_body_rows == 0) {
             const line = self.view.last_first_visible + row;
@@ -3540,7 +3009,7 @@ const App = struct {
         return null;
     }
 
-    fn lineVisible(self: *const App, line: usize) bool {
+    pub fn lineVisible(self: *const App, line: usize) bool {
         if (self.view.last_pinned_rows == 0 and self.view.last_body_rows == 0)
             return line < self.view.last_total_lines and
                 line >= self.view.last_first_visible and line < self.view.last_first_visible + self.view.last_view_h;
@@ -3548,7 +3017,7 @@ const App = struct {
     }
 
     /// Enter transcript copy mode with the cursor on the bottom visible line.
-    fn enterCopyMode(self: *App) void {
+    pub fn enterCopyMode(self: *App) void {
         if (self.view.last_total_lines == 0) return;
         var row = self.view.last_view_h;
         while (row > 0) {
@@ -3564,7 +3033,7 @@ const App = struct {
 
     /// Keep the copy cursor inside the visible window by adjusting scroll_up
     /// (geometry from the previous frame; draw clamps the rest).
-    fn followCopyCursor(self: *App) void {
+    pub fn followCopyCursor(self: *App) void {
         const cursor = self.copy_cursor orelse return;
         if (self.lineVisible(cursor.line)) return;
         const total = self.view.last_total_lines;
@@ -3581,7 +3050,7 @@ const App = struct {
     }
 
     /// Clamp the cursor into the (possibly non-contiguous) visible view.
-    fn clampCopyCursorToView(self: *App) void {
+    pub fn clampCopyCursorToView(self: *App) void {
         var cursor = self.copy_cursor orelse return;
         if (self.lineVisible(cursor.line)) return;
         if (self.view.last_view_h == 0) return;
@@ -3592,7 +3061,7 @@ const App = struct {
         if (self.view.sel_anchor != null) self.updateCopySelection(cursor);
     }
 
-    fn updateCopySelection(self: *App, cursor: SelectionPoint) void {
+    pub fn updateCopySelection(self: *App, cursor: SelectionPoint) void {
         const a = self.view.sel_anchor orelse return;
         if (self.copy_linewise) {
             const lo = @min(a.line, cursor.line);
@@ -3604,7 +3073,7 @@ const App = struct {
         }
     }
 
-    fn yankSelection(self: *App, cursor: SelectionPoint) void {
+    pub fn yankSelection(self: *App, cursor: SelectionPoint) void {
         if (self.view.sel_anchor == null) {
             // Bare y yanks the whole cursor line, vim's yy in spirit.
             self.copy_linewise = true;
@@ -3617,7 +3086,7 @@ const App = struct {
         self.copy_cursor = null; // yank ends copy mode
     }
 
-    fn copyModeKey(self: *App, key: vaxis.Key) void {
+    pub fn copyModeKey(self: *App, key: vaxis.Key) void {
         var cursor = self.copy_cursor orelse return;
         const total = if (self.view.last_total_lines > 0) self.view.last_total_lines else 1;
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
@@ -3685,12 +3154,12 @@ const App = struct {
         self.maybeRequestHistoryAtTop();
     }
 
-    fn selection(self: *const App) ?Selection {
+    pub fn selection(self: *const App) ?Selection {
         const a = self.view.sel_anchor orelse return null;
         return Selection.init(a, self.view.sel_head);
     }
 
-    fn openPicker(self: *App, kind: PickerKind) void {
+    pub fn openPicker(self: *App, kind: PickerKind) void {
         self.picker_kind = kind;
         self.picker = 0;
         self.picker_filter.clearRetainingCapacity();
@@ -3708,18 +3177,18 @@ const App = struct {
         }
     }
 
-    fn openTop(self: *App) void {
+    pub fn openTop(self: *App) void {
         self.notice.clearRetainingCapacity();
         self.top_view = .{ .selected_sid = self.view.sid };
         self.syncAnimationTicker();
     }
 
-    fn closeTop(self: *App) void {
+    pub fn closeTop(self: *App) void {
         self.top_view = null;
         self.syncAnimationTicker();
     }
 
-    fn topRows(self: *const App, arena: std.mem.Allocator) ![]const top_view.RowView {
+    pub fn topRows(self: *const App, arena: std.mem.Allocator) ![]const top_view.RowView {
         const rows = try arena.alloc(top_view.RowView, self.sessions.items.len);
         for (self.sessions.items, 0..) |session, i| rows[i] = .{
             .sid = session.sid,
@@ -3734,7 +3203,7 @@ const App = struct {
         return rows;
     }
 
-    fn topSelectedIndex(self: *const App) ?usize {
+    pub fn topSelectedIndex(self: *const App) ?usize {
         const view = self.top_view orelse return null;
         if (self.sessions.items.len == 0) return null;
         if (view.selected_sid) |sid| for (self.sessions.items, 0..) |session, i| {
@@ -3743,7 +3212,7 @@ const App = struct {
         return @min(view.selected_fallback, self.sessions.items.len - 1);
     }
 
-    fn normalizeTopSelection(self: *App) void {
+    pub fn normalizeTopSelection(self: *App) void {
         if (self.top_view == null) return;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -3763,7 +3232,7 @@ const App = struct {
         self.top_view.?.selected_sid = ordered[i].sid;
     }
 
-    fn moveTopSelection(self: *App, delta: isize) void {
+    pub fn moveTopSelection(self: *App, delta: isize) void {
         if (self.top_view == null) return;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -3786,7 +3255,7 @@ const App = struct {
         self.top_view.?.confirm_kill = null;
     }
 
-    fn setTopEdgeSelection(self: *App, last: bool) void {
+    pub fn setTopEdgeSelection(self: *App, last: bool) void {
         if (self.top_view == null) return;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -3798,7 +3267,7 @@ const App = struct {
         self.top_view.?.selected_sid = ordered[i].sid;
     }
 
-    fn archiveTopSession(self: *App, sid: u64) void {
+    pub fn archiveTopSession(self: *App, sid: u64) void {
         for (self.sessions.items) |session| {
             if (!self.sessionBelongsToTree(session.sid, sid)) continue;
             if (session.state == .running or session.state == .awaiting_approval) {
@@ -3819,7 +3288,7 @@ const App = struct {
         self.setNotice("archiving session {s}", .{self.displaySessionHandle(&handle_buf, sid)});
     }
 
-    fn killTopSession(self: *App, sid: u64) void {
+    pub fn killTopSession(self: *App, sid: u64) void {
         var fallback: ?u64 = null;
         if (sid == self.view.sid) {
             if (self.sessionSummary(sid)) |current| {
@@ -3853,7 +3322,7 @@ const App = struct {
         }
     }
 
-    fn clearSetupDraft(self: *App) void {
+    pub fn clearSetupDraft(self: *App) void {
         if (self.setup_prompt != .none) self.view.editor.clearSensitive();
         self.setup_prompt = .none;
         self.setup_provider = null;
@@ -3864,7 +3333,7 @@ const App = struct {
         self.setup_credential.clearRetainingCapacity();
     }
 
-    fn requestSetup(self: *App, required: bool) void {
+    pub fn requestSetup(self: *App, required: bool) void {
         if (self.setup_status_pending or self.setup_apply_pending) return;
         self.setup_required = self.setup_required or required;
         if (required) self.setup_replace_empty_session = true;
@@ -3875,7 +3344,7 @@ const App = struct {
         };
     }
 
-    fn beginSetup(self: *App, required: bool) void {
+    pub fn beginSetup(self: *App, required: bool) void {
         self.clearSetupDraft();
         self.setup_required = self.setup_required or required;
         if (required) self.setup_replace_empty_session = true;
@@ -3883,21 +3352,21 @@ const App = struct {
         self.setNotice("choose how Marlin should run models · keys are saved by the daemon host", .{});
     }
 
-    fn applySetupStatus(self: *App, status: proto.SetupStatus) void {
+    pub fn applySetupStatus(self: *App, status: proto.SetupStatus) void {
         self.setup_readiness = .fromWire(status);
         if (!self.setup_status_pending) return;
         self.setup_status_pending = false;
         self.beginSetup(self.setup_required);
     }
 
-    fn setupProviderFromItem(item: []const u8) ?SetupProvider {
+    pub fn setupProviderFromItem(item: []const u8) ?SetupProvider {
         for (setup_provider_items, 0..) |candidate, index| {
             if (std.mem.eql(u8, item, candidate)) return @enumFromInt(index);
         }
         return null;
     }
 
-    fn setupProviderReady(self: *const App, provider: SetupProvider) bool {
+    pub fn setupProviderReady(self: *const App, provider: SetupProvider) bool {
         return switch (provider) {
             .openrouter => self.setup_readiness.openrouter_ready,
             .codex => self.setup_readiness.codex_authenticated,
@@ -3910,7 +3379,7 @@ const App = struct {
         };
     }
 
-    fn setupProviderNote(self: *const App, item: []const u8) []const u8 {
+    pub fn setupProviderNote(self: *const App, item: []const u8) []const u8 {
         const provider = setupProviderFromItem(item) orelse return "";
         if (self.setupProviderReady(provider)) return switch (provider) {
             .codex, .claude_code => "  ✓ signed in",
@@ -3925,7 +3394,7 @@ const App = struct {
         };
     }
 
-    fn setSetupBuffer(self: *App, buffer: *std.ArrayList(u8), value: []const u8) bool {
+    pub fn setSetupBuffer(self: *App, buffer: *std.ArrayList(u8), value: []const u8) bool {
         buffer.clearRetainingCapacity();
         buffer.appendSlice(self.gpa, value) catch {
             self.setNotice("could not continue provider setup", .{});
@@ -3934,7 +3403,7 @@ const App = struct {
         return true;
     }
 
-    fn startSetupPrompt(self: *App, prompt: SetupPrompt, initial: []const u8, notice: []const u8) void {
+    pub fn startSetupPrompt(self: *App, prompt: SetupPrompt, initial: []const u8, notice: []const u8) void {
         self.picker = null;
         self.picker_filter.clearRetainingCapacity();
         self.setup_prompt = prompt;
@@ -3943,7 +3412,7 @@ const App = struct {
         self.setNotice("{s}", .{notice});
     }
 
-    fn setupProviderChosen(self: *App, item: []const u8) void {
+    pub fn setupProviderChosen(self: *App, item: []const u8) void {
         const provider = setupProviderFromItem(item) orelse return;
         self.clearSetupDraft();
         self.setup_provider = provider;
@@ -4015,14 +3484,14 @@ const App = struct {
         }
     }
 
-    fn setupCredentialRequired(self: *const App) bool {
+    pub fn setupCredentialRequired(self: *const App) bool {
         return switch (self.setup_provider orelse return false) {
             .openrouter, .vercel, .anthropic => true,
             else => false,
         };
     }
 
-    fn setupModelSuggestion(self: *const App) []const u8 {
+    pub fn setupModelSuggestion(self: *const App) []const u8 {
         return switch (self.setup_provider orelse return "") {
             .openrouter => "openrouter/anthropic/claude-sonnet-4.5",
             .vercel => "vercel/anthropic/claude-sonnet-4.5",
@@ -4034,7 +3503,7 @@ const App = struct {
         };
     }
 
-    fn submitSetupPrompt(self: *App, raw: []const u8) void {
+    pub fn submitSetupPrompt(self: *App, raw: []const u8) void {
         const value = std.mem.trim(u8, raw, " \t\r\n");
         switch (self.setup_prompt) {
             .none => {},
@@ -4097,7 +3566,7 @@ const App = struct {
         }
     }
 
-    fn finishSetup(self: *App, model: []const u8) void {
+    pub fn finishSetup(self: *App, model: []const u8) void {
         if (self.setup_apply_pending) return;
         const configured_provider = self.setup_provider_name.items;
         self.conn.sendSensitive(.{ .setup_apply = .{
@@ -4121,7 +3590,7 @@ const App = struct {
         self.setNotice("activating provider setup on the daemon host…", .{});
     }
 
-    fn applySetupResult(self: *App, result: @FieldType(proto.DaemonMsg, "setup_result")) void {
+    pub fn applySetupResult(self: *App, result: @FieldType(proto.DaemonMsg, "setup_result")) void {
         self.setup_apply_pending = false;
         self.setup_readiness.completed = true;
         self.setup_required = false;
@@ -4137,7 +3606,7 @@ const App = struct {
         self.clearSetupDraft();
     }
 
-    fn beginHistorySearch(self: *App) void {
+    pub fn beginHistorySearch(self: *App) void {
         if (self.history_search_active) {
             self.cycleHistorySearch();
             return;
@@ -4159,7 +3628,7 @@ const App = struct {
         };
     }
 
-    fn refreshHistorySearch(self: *App, from_newest: bool) void {
+    pub fn refreshHistorySearch(self: *App, from_newest: bool) void {
         if (!self.history_search_active) return;
         const previous = self.history_search_match;
         var index = if (from_newest)
@@ -4180,44 +3649,44 @@ const App = struct {
         self.view.editor.cursor = @min(self.history_search_draft_cursor, self.view.editor.text.items.len);
     }
 
-    fn cycleHistorySearch(self: *App) void {
+    pub fn cycleHistorySearch(self: *App) void {
         self.refreshHistorySearch(false);
     }
 
-    fn cancelHistorySearch(self: *App) void {
+    pub fn cancelHistorySearch(self: *App) void {
         if (!self.history_search_active) return;
         self.view.editor.replaceText(self.history_search_draft.items);
         self.view.editor.cursor = @min(self.history_search_draft_cursor, self.view.editor.text.items.len);
         self.finishHistorySearch();
     }
 
-    fn acceptHistorySearch(self: *App) void {
+    pub fn acceptHistorySearch(self: *App) void {
         if (!self.history_search_active) return;
         self.finishHistorySearch();
     }
 
-    fn finishHistorySearch(self: *App) void {
+    pub fn finishHistorySearch(self: *App) void {
         self.history_search_active = false;
         self.history_search_query.clearRetainingCapacity();
         self.history_search_draft.clearRetainingCapacity();
         self.history_search_match = null;
     }
 
-    fn clearSearchHits(self: *App) void {
+    pub fn clearSearchHits(self: *App) void {
         for (self.search_hits.items) |*hit| hit.deinit(self.gpa);
         self.search_hits.clearRetainingCapacity();
         self.search_labels.clearRetainingCapacity();
         self.search_cursor = 0;
     }
 
-    fn openSearchPrompt(self: *App, session_id: u64) void {
+    pub fn openSearchPrompt(self: *App, session_id: u64) void {
         self.clearSearchHits();
         self.search_scope_sid = session_id;
         self.search_pending = false;
         self.openPicker(.search_prompt);
     }
 
-    fn submitSearch(self: *App) void {
+    pub fn submitSearch(self: *App) void {
         const query = std.mem.trim(u8, self.picker_filter.items, " \t\r\n");
         if (query.len == 0 or self.search_pending) return;
         self.search_pending = true;
@@ -4231,7 +3700,7 @@ const App = struct {
         };
     }
 
-    fn replaceSearchHits(self: *App, result: @FieldType(proto.DaemonMsg, "search_result")) void {
+    pub fn replaceSearchHits(self: *App, result: @FieldType(proto.DaemonMsg, "search_result")) void {
         if (!self.search_pending or result.sid != self.search_scope_sid) return;
         self.search_pending = false;
         self.clearSearchHits();
@@ -4270,7 +3739,7 @@ const App = struct {
         self.picker_filter.clearRetainingCapacity();
     }
 
-    fn selectSearchHit(self: *App, label: []const u8) ?SearchHitOwned {
+    pub fn selectSearchHit(self: *App, label: []const u8) ?SearchHitOwned {
         for (self.search_hits.items, 0..) |hit, index| {
             if (!std.mem.eql(u8, hit.label, label)) continue;
             self.search_cursor = index;
@@ -4279,7 +3748,7 @@ const App = struct {
         return null;
     }
 
-    fn nextSearchHit(self: *App, direction: i8) void {
+    pub fn nextSearchHit(self: *App, direction: i8) void {
         const len = self.search_hits.items.len;
         if (len == 0) {
             self.setNotice("no active search · press /", .{});
@@ -4295,7 +3764,7 @@ const App = struct {
 
     /// The picker's source list: full model catalog/favorites, or the fixed
     /// effort vocabulary shared with persistence and provider adapters.
-    fn pickerSource(self: *const App) []const []const u8 {
+    pub fn pickerSource(self: *const App) []const []const u8 {
         return switch (self.picker_kind) {
             .model, .council => if (self.catalog.items.len > 0) @ptrCast(self.catalog.items) else self.cfg.model_favorites,
             .effort => &proto.ReasoningEffort.choices,
@@ -4312,7 +3781,7 @@ const App = struct {
     /// Filtered picker items (arena-allocated indices into pickerSource).
     /// Filter: case-insensitive substring; multiple space-separated words
     /// must ALL match ("son 4.5" → claude-sonnet-4.5).
-    fn pickerItems(self: *const App, arena: std.mem.Allocator) ![]const []const u8 {
+    pub fn pickerItems(self: *const App, arena: std.mem.Allocator) ![]const []const u8 {
         const source = self.pickerSource();
         const q = self.picker_filter.items;
         if (self.picker_kind == .search_prompt) return &.{};
@@ -4350,7 +3819,7 @@ const App = struct {
         return out.items;
     }
 
-    fn pickerSourceCount(self: *const App) usize {
+    pub fn pickerSourceCount(self: *const App) usize {
         if (self.picker_kind == .council_list) return self.councils.items.len;
         const source = self.pickerSource();
         if (self.picker_kind != .council) return source.len;
@@ -4364,14 +3833,14 @@ const App = struct {
         return total;
     }
 
-    fn pricingForModel(self: *const App, model: []const u8) ?proto.ModelPricing {
+    pub fn pricingForModel(self: *const App, model: []const u8) ?proto.ModelPricing {
         for (self.catalog_pricing.items) |pricing| {
             if (std.mem.eql(u8, pricing.model, model)) return pricing;
         }
         return null;
     }
 
-    fn applyModel(self: *App, m: []const u8) void {
+    pub fn applyModel(self: *App, m: []const u8) void {
         if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot switch model mid-turn", .{});
             return;
@@ -4392,7 +3861,7 @@ const App = struct {
         }
     }
 
-    fn applyEffort(self: *App, selected: proto.ReasoningEffort) void {
+    pub fn applyEffort(self: *App, selected: proto.ReasoningEffort) void {
         if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot switch effort mid-turn", .{});
             return;
@@ -4405,12 +3874,12 @@ const App = struct {
     /// Effective sandbox state of the active session, from the last watch
     /// snapshot. Before a snapshot arrives, assume the daemon default (the
     /// snapshot follows within the same connect exchange).
-    fn currentSandboxed(self: *const App) bool {
+    pub fn currentSandboxed(self: *const App) bool {
         if (self.sessionSummary(self.view.sid)) |summary| return summary.sandboxed;
         return self.conn.sandbox_available;
     }
 
-    fn setPlanMode(self: *App, enabled: bool) bool {
+    pub fn setPlanMode(self: *App, enabled: bool) bool {
         if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot change Plan mode mid-turn", .{});
             return false;
@@ -4428,11 +3897,11 @@ const App = struct {
         return true;
     }
 
-    fn togglePlanMode(self: *App) void {
+    pub fn togglePlanMode(self: *App) void {
         _ = self.setPlanMode(!self.view.plan_mode);
     }
 
-    fn acceptPlanProposal(self: *App) void {
+    pub fn acceptPlanProposal(self: *App) void {
         if (!self.view.plan_mode or !self.view.plan_proposal_ready or self.view.state != .idle) return;
         self.conn.send(.{ .plan_accept = .{ .sid = self.view.sid } }) catch {
             self.setNotice("could not start implementation", .{});
@@ -4442,171 +3911,19 @@ const App = struct {
         self.setNotice("plan accepted · starting implementation…", .{});
     }
 
-    /// /permissions full|default — session-wide approval switch. Full
-    /// access means NOTHING asks (the --yolo mode, chosen mid-session);
-    /// default restores boundary-crossing prompts. Tracked optimistically:
-    /// the daemon rejects mid-turn switches with a visible err notice.
-    fn setPermissions(self: *App, arg: []const u8) void {
-        const full = if (std.mem.eql(u8, arg, "full"))
-            true
-        else if (std.mem.eql(u8, arg, "default"))
-            false
-        else if (arg.len == 0)
-            !self.view.permissions_full
-        else {
-            self.setNotice("usage: /permissions [full|default]", .{});
-            return;
-        };
-        const mode: []const u8 = if (full) "auto" else "default";
-        self.conn.send(.{ .session_set_approvals = .{ .sid = self.view.sid, .approvals = mode } }) catch return;
-        self.view.permissions_full = full;
-        if (full) {
-            self.setNotice("permissions: FULL ACCESS — nothing will ask for approval", .{});
-        } else {
-            self.setNotice("permissions: default — boundary-crossing tools ask again", .{});
-        }
-    }
-
-    fn toggleSandbox(self: *App, arg: []const u8) void {
-        if (proto.isGuestModel(self.view.model.items)) {
-            self.setNotice("sandbox is Marlin's; guest agents use their own permissions", .{});
-            return;
-        }
-        if (self.view.state == .running or self.view.state == .awaiting_approval) {
-            self.setNotice("cannot toggle sandbox mid-turn", .{});
-            return;
-        }
-        const target = if (arg.len == 0)
-            !self.currentSandboxed()
-        else if (std.mem.eql(u8, arg, "on"))
-            true
-        else if (std.mem.eql(u8, arg, "off"))
-            false
-        else {
-            self.setNotice("usage: /sandbox [on|off]", .{});
-            return;
-        };
-        if (target and !self.conn.sandbox_available) {
-            self.setNotice("sandbox unavailable on this platform — per-call approvals retained", .{});
-            return;
-        }
-        self.conn.send(.{ .session_set_sandbox = .{ .sid = self.view.sid, .enabled = target } }) catch return;
-        if (target) {
-            self.setNotice("sandbox on — workspace shell runs without prompts", .{});
-        } else {
-            self.setNotice("sandbox off — every shell call asks again", .{});
-        }
-    }
-
-    fn currentNetworkFiltering(self: *const App) bool {
+    pub fn currentNetworkFiltering(self: *const App) bool {
         if (self.sessionSummary(self.view.sid)) |summary| return summary.network_filtering;
         return self.conn.network_filtering;
     }
 
-    fn otelCommand(self: *App, action_arg: ?[]const u8, rest_arg: []const u8) void {
-        const parsed = parseOtelCommand(action_arg, rest_arg) orelse {
-            self.setNotice("usage: /otel [status|off|set <endpoint>|content on|content off]", .{});
-            return;
-        };
-        switch (parsed) {
-            .status => self.conn.send(.{ .otel_status = .{} }) catch {
-                self.setNotice("could not request OTLP status", .{});
-            },
-            .off => self.conn.send(.{ .otel_configure = .{} }) catch {
-                self.setNotice("could not disable OTLP export", .{});
-            },
-            .content => |enabled| self.conn.send(.{ .otel_content = .{ .enabled = enabled } }) catch {
-                self.setNotice("could not toggle OTLP content capture", .{});
-            },
-            .set => |endpoint| {
-                self.otel_endpoint.clearRetainingCapacity();
-                self.otel_endpoint.appendSlice(self.gpa, endpoint) catch {
-                    self.setNotice("could not start OTLP setup", .{});
-                    return;
-                };
-                self.view.editor.clear();
-                self.otel_header_prompt = true;
-                self.mode = .insert;
-                self.setNotice("enter OTLP headers: name=value[,name=value] · Enter applies · Esc cancels", .{});
-            },
-        }
-    }
-
-    fn submitOtelHeaders(self: *App, headers: []const u8) void {
-        if (!self.otel_header_prompt) return;
-        self.otel_header_prompt = false;
-        defer self.otel_endpoint.clearRetainingCapacity();
-        self.conn.sendSensitive(.{ .otel_configure = .{
-            .endpoint = self.otel_endpoint.items,
-            .headers = headers,
-        } }) catch {
-            self.setNotice("could not configure OTLP export", .{});
-            return;
-        };
-        self.setNotice("configuring OTLP export…", .{});
-    }
-
-    fn cancelOtelSetup(self: *App) void {
-        self.view.editor.clearSensitive();
-        self.otel_endpoint.clearRetainingCapacity();
-        self.otel_header_prompt = false;
-        self.setNotice("OTLP setup cancelled", .{});
-    }
-
-    fn networkCommand(self: *App, arg: []const u8) void {
-        if (proto.isGuestModel(self.view.model.items)) {
-            self.setNotice("dnsblock is Marlin's; guest-agent networking is not filtered here", .{});
-            return;
-        }
-        if (arg.len == 0 or std.mem.eql(u8, arg, "status")) {
-            if (!self.conn.network_filtering) {
-                if (self.conn.network_configured) {
-                    self.setNotice("network filter unavailable — configured rules failed to load; networking is fail-open", .{});
-                } else {
-                    self.setNotice("network filter off — no blocklist or deny rules configured", .{});
-                }
-                return;
-            }
-            const state = if (self.currentNetworkFiltering()) "on" else "off";
-            self.setNotice("network filter {s} — {d} rules from {d} feeds; fetch enforced · shell literals screened", .{
-                state,
-                self.conn.network_rule_count,
-                self.conn.network_feed_count,
-            });
-            return;
-        }
-        if (self.view.state == .running or self.view.state == .awaiting_approval) {
-            self.setNotice("cannot toggle network filtering mid-turn", .{});
-            return;
-        }
-        const target = if (std.mem.eql(u8, arg, "on"))
-            true
-        else if (std.mem.eql(u8, arg, "off"))
-            false
-        else {
-            self.setNotice("usage: /network [on|off|status]", .{});
-            return;
-        };
-        if (target and !self.conn.network_filtering) {
-            if (self.conn.network_configured) {
-                self.setNotice("network filter unavailable — configured rules failed to load; reboot after connectivity returns", .{});
-            } else {
-                self.setNotice("network filter off — add [network] blocklists or deny rules, then reboot", .{});
-            }
-            return;
-        }
-        self.conn.send(.{ .session_set_network_filtering = .{ .sid = self.view.sid, .enabled = target } }) catch return;
-        self.setNotice("network filter {s} for this session", .{if (target) @as([]const u8, "on") else "off"});
-    }
-
-    fn councilModelSelected(self: *const App, model: []const u8) bool {
+    pub fn councilModelSelected(self: *const App, model: []const u8) bool {
         for (self.council_edit_models.items) |selected| {
             if (std.mem.eql(u8, selected, model)) return true;
         }
         return false;
     }
 
-    fn openCouncilPicker(self: *App, name: []const u8) void {
+    pub fn openCouncilPicker(self: *App, name: []const u8) void {
         if (!validCouncilName(name)) {
             self.setNotice("council names are letters, digits, - and _", .{});
             return;
@@ -4635,7 +3952,7 @@ const App = struct {
         if (self.catalog.items.len == 0) self.conn.send(.{ .model_list = .{} }) catch {};
     }
 
-    fn toggleCouncilModel(self: *App, model: []const u8) void {
+    pub fn toggleCouncilModel(self: *App, model: []const u8) void {
         for (self.council_edit_models.items, 0..) |selected, i| {
             if (!std.mem.eql(u8, selected, model)) continue;
             self.gpa.free(selected);
@@ -4652,7 +3969,7 @@ const App = struct {
         };
     }
 
-    fn saveCouncilEdit(self: *App) void {
+    pub fn saveCouncilEdit(self: *App) void {
         if (self.council_edit_models.items.len == 0) {
             self.setNotice("choose at least one model before Done", .{});
             return;
@@ -4675,7 +3992,7 @@ const App = struct {
         self.clearCouncilEdit();
     }
 
-    fn cancelCouncilEdit(self: *App) void {
+    pub fn cancelCouncilEdit(self: *App) void {
         const had_draft = self.council_edit_name.items.len > 0;
         self.clearCouncilEdit();
         self.picker = null;
@@ -4683,7 +4000,7 @@ const App = struct {
         if (had_draft) self.setNotice("council edit cancelled", .{});
     }
 
-    fn openCouncilList(self: *App) void {
+    pub fn openCouncilList(self: *App) void {
         if (self.councils.items.len == 0) {
             self.setNotice("no councils configured — /council new <name>", .{});
             return;
@@ -4691,7 +4008,7 @@ const App = struct {
         self.openPicker(.council_list);
     }
 
-    fn showCouncilDetail(self: *App, name: []const u8) void {
+    pub fn showCouncilDetail(self: *App, name: []const u8) void {
         if (self.councilByName(name) == null) {
             self.setNotice("unknown council '{s}' — /council lists them", .{name});
             return;
@@ -4703,11 +4020,11 @@ const App = struct {
         };
     }
 
-    fn closeCouncilDetail(self: *App) void {
+    pub fn closeCouncilDetail(self: *App) void {
         self.council_detail_name.clearRetainingCapacity();
     }
 
-    fn applyPickerItem(self: *App, item: []const u8) void {
+    pub fn applyPickerItem(self: *App, item: []const u8) void {
         switch (self.picker_kind) {
             .model => self.applyModel(item),
             .effort => self.applyEffort(proto.ReasoningEffort.parse(item) orelse return),
@@ -4726,7 +4043,7 @@ const App = struct {
         }
     }
 
-    fn archivePickerSession(self: *App, item: []const u8) void {
+    pub fn archivePickerSession(self: *App, item: []const u8) void {
         const sid = self.sessionIdForLabel(item) orelse return;
         for (self.sessions.items) |session| {
             if (!self.sessionBelongsToTree(session.sid, sid)) continue;
@@ -4749,7 +4066,7 @@ const App = struct {
         self.setNotice("archiving session {s}", .{self.displaySessionHandle(&handle_buf, sid)});
     }
 
-    fn pickerCurrent(self: *const App) []const u8 {
+    pub fn pickerCurrent(self: *const App) []const u8 {
         return switch (self.picker_kind) {
             .model => self.view.model.items,
             .effort => @tagName(self.view.effort),
@@ -4757,7 +4074,7 @@ const App = struct {
         };
     }
 
-    fn newSession(self: *App) !void {
+    pub fn newSession(self: *App) !void {
         if (self.setup_required) {
             self.beginSetup(true);
             self.setNotice("finish provider setup before creating another session", .{});
@@ -4788,7 +4105,7 @@ const App = struct {
         self.pending_new_session_request_id = request_id;
     }
 
-    fn sessionBelongsToTree(self: *const App, candidate_sid: u64, root_sid: u64) bool {
+    pub fn sessionBelongsToTree(self: *const App, candidate_sid: u64, root_sid: u64) bool {
         var cursor: ?u64 = candidate_sid;
         while (cursor) |sid| {
             if (sid == root_sid) return true;
@@ -4798,7 +4115,7 @@ const App = struct {
         return false;
     }
 
-    fn archiveCurrentSession(self: *App) void {
+    pub fn archiveCurrentSession(self: *App) void {
         if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot archive a running session — interrupt it first", .{});
             return;
@@ -4844,7 +4161,7 @@ const App = struct {
     /// in one sweep — the one-command answer to a status bar stuck on
     /// "N children · N errors" after task children have been dealt with.
     /// Running or approval-parked children are deliberately left alone.
-    fn archiveFinishedChildren(self: *App) void {
+    pub fn archiveFinishedChildren(self: *App) void {
         var archived: usize = 0;
         var skipped_active: usize = 0;
         for (self.sessions.items) |session| {
@@ -4865,7 +4182,7 @@ const App = struct {
         }
     }
 
-    fn handleSessionCreated(self: *App, sid: u64, request_id: u64) void {
+    pub fn handleSessionCreated(self: *App, sid: u64, request_id: u64) void {
         if (!self.awaiting_new_session) return;
         if (request_id != 0 and request_id != self.pending_new_session_request_id) return;
         self.awaiting_new_session = false;
@@ -4887,7 +4204,7 @@ const App = struct {
         self.setNotice("new session {s}", .{self.displaySessionHandle(&handle_buf, sid)});
     }
 
-    fn approveReply(self: *App, granted: bool) void {
+    pub fn approveReply(self: *App, granted: bool) void {
         const p = self.view.pending orelse return;
         self.conn.send(.{ .approve = .{
             .sid = self.view.sid,
@@ -4897,7 +4214,7 @@ const App = struct {
         self.view.pending = null;
     }
 
-    fn interrupt(self: *App) void {
+    pub fn interrupt(self: *App) void {
         self.conn.send(.{ .interrupt = .{ .sid = self.view.sid, .report = true } }) catch {
             self.setNotice("could not send interrupt", .{});
             return;
@@ -4905,7 +4222,7 @@ const App = struct {
         self.setNotice("interrupt requested", .{});
     }
 
-    fn clearView(self: *App) void {
+    pub fn clearView(self: *App) void {
         self.view.scroll_up = 0;
         self.view.sel_anchor = null;
         self.view.sel_dragging = false;
@@ -4915,7 +4232,7 @@ const App = struct {
         self.refresh_requested = true;
     }
 
-    fn requestOlderHistory(self: *App) void {
+    pub fn requestOlderHistory(self: *App) void {
         if (self.view.history_complete or self.view.history_loading) return;
         if (self.view.oldest_seq <= 1) {
             self.view.history_complete = true;
@@ -4941,11 +4258,22 @@ const App = struct {
         self.setNotice("loading older history…", .{});
     }
 
-    fn maybeRequestHistoryAtTop(self: *App) void {
+    pub fn maybeRequestHistoryAtTop(self: *App) void {
         if (self.view.history_complete or self.view.history_loading) return;
         const max_scroll = self.view.last_total_lines -| self.view.last_view_h;
         if (self.view.scroll_up >= max_scroll) self.requestOlderHistory();
     }
+
+    // Implemented in commands.zig; exposed here so call sites keep method syntax.
+    pub const runCommand = commands.runCommand;
+    pub const configCommand = commands.configCommand;
+    pub const showMcpStatus = commands.showMcpStatus;
+    pub const otelCommand = commands.otelCommand;
+    pub const submitOtelHeaders = commands.submitOtelHeaders;
+    pub const cancelOtelSetup = commands.cancelOtelSetup;
+    pub const networkCommand = commands.networkCommand;
+    pub const setPermissions = commands.setPermissions;
+    pub const toggleSandbox = commands.toggleSandbox;
 };
 
 // ------------------------------------------------------------- rendering --
@@ -4989,226 +4317,13 @@ fn validCouncilName(name: []const u8) bool {
     return true;
 }
 
-fn parseOtelCommand(action_arg: ?[]const u8, rest_arg: []const u8) ?OtelCommand {
-    const action = action_arg orelse "status";
-    const rest = std.mem.trim(u8, rest_arg, " \t\r\n");
-    if (std.mem.eql(u8, action, "status") and rest.len == 0) return .status;
-    if (std.mem.eql(u8, action, "off") and rest.len == 0) return .off;
-    if (std.mem.eql(u8, action, "set") and rest.len > 0 and
-        std.mem.indexOfAny(u8, rest, " \t\r\n") == null)
-        return .{ .set = rest };
-    if (std.mem.eql(u8, action, "content")) {
-        if (std.mem.eql(u8, rest, "on")) return .{ .content = true };
-        if (std.mem.eql(u8, rest, "off")) return .{ .content = false };
-    }
-    return null;
-}
+const parseOtelCommand = commands.parseOtelCommand;
 
-fn commandQuery(editor: *const Editor) ?[]const u8 {
-    const text = editor.text.items;
-    if (text.len == 0 or (text[0] != '/' and text[0] != '!')) return null;
-    if (std.mem.indexOfAny(u8, text, "\r\n") != null) return null;
-    if (std.mem.indexOfAny(u8, text, " \t")) |space| {
-        const head = text[0..space];
-        if (!std.mem.eql(u8, head, "/council") and
-            !std.mem.eql(u8, head, "/review") and
-            !std.mem.eql(u8, head, "/plan") and
-            !std.mem.eql(u8, head, "/animate") and
-            !std.mem.eql(u8, head, "/screensaver") and
-            !std.mem.eql(u8, head, "/otel") and
-            !std.mem.eql(u8, head, "!rb")) return null;
-        const rest = std.mem.trimStart(u8, text[space..], " \t");
-        if (std.mem.indexOfAny(u8, rest, " \t") != null) return null;
-    }
-    return text;
-}
+const commandQuery = commands.commandQuery;
 
-fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const CommandSuggestion {
-    const query = commandQuery(&app.view.editor) orelse return &.{};
-    var out: std.ArrayList(CommandSuggestion) = .empty;
-    if (query.len > "/council".len and
-        std.mem.eql(u8, query[0.."/council".len], "/council") and
-        (query["/council".len] == ' ' or query["/council".len] == '\t'))
-    {
-        const rest = std.mem.trimStart(u8, query["/council".len..], " \t");
-        const actions = [_]struct { name: []const u8, description: []const u8 }{
-            .{ .name = "new", .description = "create a council" },
-            .{ .name = "edit", .description = "edit a council roster" },
-            .{ .name = "remove", .description = "remove a council" },
-        };
-        for (actions) |action| {
-            if (rest.len <= action.name.len and std.ascii.eqlIgnoreCase(rest, action.name[0..rest.len])) {
-                const replacement = try std.fmt.allocPrint(arena, "/council {s} ", .{action.name});
-                try out.append(arena, .{
-                    .label = try std.fmt.allocPrint(arena, "/council {s}", .{action.name}),
-                    .description = action.description,
-                    .replacement = replacement,
-                    .submit_on_enter = false,
-                });
-            }
-        }
-        for (app.councils.items) |council| {
-            if (rest.len <= council.name.len and std.ascii.eqlIgnoreCase(rest, council.name[0..rest.len])) {
-                const replacement = try std.fmt.allocPrint(arena, "/council {s}", .{council.name});
-                try out.append(arena, .{
-                    .label = replacement,
-                    .description = try std.fmt.allocPrint(arena, "show council · {d} models", .{council.models.items.len}),
-                    .replacement = replacement,
-                    .submit_on_enter = true,
-                });
-            }
-        }
-        return out.items;
-    }
-    if (query.len > "/review".len and
-        std.mem.eql(u8, query[0.."/review".len], "/review") and
-        (query["/review".len] == ' ' or query["/review".len] == '\t'))
-    {
-        const rest = std.mem.trimStart(u8, query["/review".len..], " \t");
-        for (app.councils.items) |council| {
-            if (rest.len <= council.name.len and std.ascii.eqlIgnoreCase(rest, council.name[0..rest.len])) {
-                const replacement = try std.fmt.allocPrint(arena, "/review {s} ", .{council.name});
-                try out.append(arena, .{
-                    .label = try std.fmt.allocPrint(arena, "/review {s}", .{council.name}),
-                    .description = try std.fmt.allocPrint(arena, "review with council · {d} models", .{council.models.items.len}),
-                    .replacement = replacement,
-                    .submit_on_enter = false,
-                });
-            }
-        }
-        return out.items;
-    }
-    if (query.len > "/otel".len and
-        std.mem.eql(u8, query[0.."/otel".len], "/otel") and
-        (query["/otel".len] == ' ' or query["/otel".len] == '\t'))
-    {
-        const rest = std.mem.trimStart(u8, query["/otel".len..], " \t");
-        const actions = [_]struct { name: []const u8, description: []const u8, submit: bool }{
-            .{ .name = "set", .description = "set endpoint, then enter masked headers", .submit = false },
-            .{ .name = "status", .description = "show live OTLP exporter state", .submit = true },
-            .{ .name = "off", .description = "disable live OTLP export", .submit = true },
-        };
-        for (actions) |action| {
-            if (rest.len <= action.name.len and std.ascii.eqlIgnoreCase(rest, action.name[0..rest.len])) {
-                const replacement = try std.fmt.allocPrint(arena, "/otel {s}{s}", .{ action.name, if (action.submit) "" else " " });
-                try out.append(arena, .{
-                    .label = try std.fmt.allocPrint(arena, "/otel {s}", .{action.name}),
-                    .description = action.description,
-                    .replacement = replacement,
-                    .submit_on_enter = action.submit,
-                });
-            }
-        }
-        return out.items;
-    }
-    if (query.len > "!rb".len and
-        std.mem.eql(u8, query[0.."!rb".len], "!rb") and
-        (query["!rb".len] == ' ' or query["!rb".len] == '\t'))
-    {
-        const rest = std.mem.trimStart(u8, query["!rb".len..], " \t");
-        const actions = [_]struct { name: []const u8, description: []const u8 }{
-            .{ .name = "client", .description = "rebuild only the local client" },
-            .{ .name = "both", .description = "rebuild the local client and attached Marlin" },
-        };
-        for (actions) |action| {
-            if (rest.len <= action.name.len and std.ascii.eqlIgnoreCase(rest, action.name[0..rest.len])) {
-                const replacement = try std.fmt.allocPrint(arena, "!rb {s}", .{action.name});
-                try out.append(arena, .{
-                    .label = replacement,
-                    .description = action.description,
-                    .replacement = replacement,
-                    .submit_on_enter = true,
-                });
-            }
-        }
-        return out.items;
-    }
-    if (query.len > "/animate".len and
-        std.mem.eql(u8, query[0.."/animate".len], "/animate") and
-        (query["/animate".len] == ' ' or query["/animate".len] == '\t'))
-    {
-        const rest = std.mem.trimStart(u8, query["/animate".len..], " \t");
-        for (effects.kinds) |kind| {
-            const name = kind.name();
-            if (rest.len <= name.len and std.ascii.eqlIgnoreCase(rest, name[0..rest.len])) {
-                const replacement = try std.fmt.allocPrint(arena, "/animate {s}", .{name});
-                try out.append(arena, .{
-                    .label = replacement,
-                    .description = kind.description(),
-                    .replacement = replacement,
-                    .submit_on_enter = true,
-                });
-            }
-        }
-        return out.items;
-    }
-    if (query.len > "/screensaver".len and
-        std.mem.eql(u8, query[0.."/screensaver".len], "/screensaver") and
-        (query["/screensaver".len] == ' ' or query["/screensaver".len] == '\t'))
-    {
-        const rest = std.mem.trimStart(u8, query["/screensaver".len..], " \t");
-        for (effects.kinds) |kind| {
-            const name = kind.name();
-            if (rest.len <= name.len and std.ascii.eqlIgnoreCase(rest, name[0..rest.len])) {
-                const replacement = try std.fmt.allocPrint(arena, "/screensaver {s}", .{name});
-                try out.append(arena, .{
-                    .label = replacement,
-                    .description = kind.description(),
-                    .replacement = replacement,
-                    .submit_on_enter = true,
-                });
-            }
-        }
-        return out.items;
-    }
-    if (query.len > "/plan".len and
-        std.mem.eql(u8, query[0.."/plan".len], "/plan") and
-        (query["/plan".len] == ' ' or query["/plan".len] == '\t'))
-    {
-        const rest = std.mem.trimStart(u8, query["/plan".len..], " \t");
-        const actions = [_]struct { name: []const u8, description: []const u8 }{
-            .{ .name = "off", .description = "leave Plan mode" },
-            .{ .name = "clear", .description = "clear the durable execution todo" },
-        };
-        for (actions) |action| {
-            if (rest.len <= action.name.len and std.ascii.eqlIgnoreCase(rest, action.name[0..rest.len])) {
-                const replacement = try std.fmt.allocPrint(arena, "/plan {s}", .{action.name});
-                try out.append(arena, .{
-                    .label = replacement,
-                    .description = action.description,
-                    .replacement = replacement,
-                    .submit_on_enter = true,
-                });
-            }
-        }
-        return out.items;
-    }
-    for (composer_commands) |command| {
-        if (query.len <= command.name.len and std.ascii.eqlIgnoreCase(query, command.name[0..query.len])) {
-            try out.append(arena, .{
-                .label = command.name,
-                .usage = command.usage,
-                .description = command.description,
-                .replacement = command.name,
-                .submit_on_enter = true,
-            });
-        }
-    }
-    return out.items;
-}
+const commandSuggestions = commands.commandSuggestions;
 
-fn completeSuggestion(editor: *Editor, suggestion: CommandSuggestion, tab: bool) void {
-    editor.clear();
-    editor.insertSlice(suggestion.replacement);
-    if (tab and suggestion.submit_on_enter) {
-        for (composer_commands) |command| {
-            if (std.mem.eql(u8, suggestion.replacement, command.name) and command.accepts_args) {
-                editor.insertSlice(" ");
-                break;
-            }
-        }
-    }
-}
+const completeSuggestion = commands.completeSuggestion;
 
 fn transcriptView(app: *App) Transcript {
     return .{
@@ -5396,33 +4511,7 @@ fn pickerTextPreview(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     return out.items;
 }
 
-/// Expand `/review <council> <question>` into the parent agent's turn input:
-/// the named roster plus the council procedure, so invocation costs the user
-/// one line. Caller frees.
-fn buildReviewPrompt(gpa: std.mem.Allocator, council: *const OwnedCouncil, question: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.print(gpa, "Convene the review council \"{s}\". Reviewers, in order:\n", .{council.name});
-    for (council.models.items) |model| try out.print(gpa, "- {s}\n", .{model});
-    try out.appendSlice(gpa,
-        \\
-        \\Load the `council` skill and follow its procedure with exactly this
-        \\roster. If the skill is unavailable: write ONE self-contained review
-        \\prompt (paths the read-only reviewers can open; paste diff hunks for
-        \\anything uncommitted; require verdict, findings with file:line, and
-        \\confidence), fan it out with task_batch calls of at most eight tasks
-        \\each — one task per reviewer, identical prompt, the model ids above,
-        \\and task for a final one-reviewer remainder, max_rounds 12 — then
-        \\consolidate: agreements and disagreements
-        \\attributed by model, false
-        \\positives, and your recommendation. Report reviewers that fail.
-        \\
-        \\Question for the council:
-    );
-    try out.append(gpa, ' ');
-    try out.appendSlice(gpa, question);
-    return out.toOwnedSlice(gpa);
-}
+const buildReviewPrompt = commands.buildReviewPrompt;
 
 fn tabActivityForState(state: proto.SessionState) TabActivity {
     return switch (state) {
@@ -5695,7 +4784,7 @@ const ShortcutHelpRow = struct {
     heading: bool = false,
 };
 
-const shortcut_help_rows = [_]ShortcutHelpRow{
+pub const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Esc / i", .description = "return to insert mode (Esc first cancels a pending count/operator)" },
     .{ .key = ":", .description = "open the command menu" },
     .{ .key = "</> or ←/→", .description = "previous / next tab" },
@@ -7036,6 +6125,10 @@ fn dispatchEvent(
 ) !void {
     switch (event) {
         .key_press => |key| {
+            // A lone modifier press is not intent: cmd-tab away from the
+            // terminal reports the cmd press itself (kitty protocol), and
+            // that must not dismiss the screensaver or count as activity.
+            if (key.isModifier()) return;
             if (app.dismissScreensaver()) return;
             app.recordUserActivity();
             try handleKey(app, key);
@@ -7536,7 +6629,7 @@ fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     try writer.interface.flush();
 }
 
-fn onOff(enabled: bool) []const u8 {
+pub fn onOff(enabled: bool) []const u8 {
     return if (enabled) "on" else "off";
 }
 
@@ -7746,15 +6839,7 @@ fn editCommand(key: vaxis.Key) ?EditCommand {
     return null;
 }
 
-/// Composer text is a command when it starts with `/` or `!` — unless the
-/// user typed a leading space, which means "send this verbatim" (the shell's
-/// own history convention). That is the escape hatch for messages such as
-/// `/usr/local/lib/foo.so is missing` or `!important`.
-fn isCommandInput(text: []const u8) bool {
-    if (text.len > 0 and (text[0] == ' ' or text[0] == '\t')) return false;
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    return trimmed.len > 0 and (trimmed[0] == '/' or trimmed[0] == '!');
-}
+const isCommandInput = commands.isCommandInput;
 
 fn isPreviousInputRowKey(key: vaxis.Key) bool {
     return key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true });
@@ -9244,6 +8329,51 @@ test "manual screensaver wake consumes the first input event" {
     );
     try std.testing.expect(!app.screensaver_active);
     try std.testing.expect(app.view.editor.isEmpty());
+}
+
+test "a lone modifier neither wakes the screensaver nor counts as activity" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
+        .screensaver_timeout_ms = 1_000,
+    };
+    defer app.deinit();
+    const deadline = nowWallMs(app.io) + 500;
+    app.screensaver_deadline_ms.store(deadline, .release);
+    app.startScreensaver(app.screensaver_kind);
+
+    // cmd-tab away from the terminal: the kitty protocol reports the lone
+    // cmd press itself, which must not tear the screensaver down.
+    var verdicts = TransportVerdicts{};
+    try dispatchEvent(
+        &app,
+        undefined,
+        undefined,
+        gpa,
+        .{ .key_press = .{ .codepoint = vaxis.Key.left_super } },
+        &verdicts,
+    );
+    try std.testing.expect(app.screensaver_active);
+    try std.testing.expectEqual(deadline, app.screensaver_deadline_ms.load(.acquire));
+
+    // A real key still dismisses.
+    try dispatchEvent(
+        &app,
+        undefined,
+        undefined,
+        gpa,
+        .{ .key_press = .{ .codepoint = 'a', .text = "a" } },
+        &verdicts,
+    );
+    try std.testing.expect(!app.screensaver_active);
 }
 
 test "mouse activity neither wakes nor postpones the screensaver" {
