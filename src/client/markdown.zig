@@ -441,14 +441,18 @@ pub fn expandCodeTabs(arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
     return out.items;
 }
 
+pub const copy_affordance = "⧉ copy";
+
 pub fn appendCodeBorder(
     arena: std.mem.Allocator,
     lines: *std.ArrayList(Line),
     gutter: []const u8,
     panel_width: usize,
     label: ?[]const u8,
+    copy_payload: ?[]const u8,
 ) !void {
     var panel: std.ArrayList(u8) = .empty;
+    var styles: []const SyntaxSpan = &.{};
     if (label) |header| {
         try panel.appendSlice(arena, "╭─ ");
         const label_capacity = panel_width -| 5;
@@ -456,7 +460,25 @@ pub fn appendCodeBorder(
         try panel.appendSlice(arena, header[0..label_end]);
         try panel.append(arena, ' ');
         const used = displayWidth(panel.items) + 1;
-        if (used < panel_width) try appendGlyphNTimes(arena, &panel, "─", panel_width - used);
+        const copyw = displayWidth(copy_affordance) + 2;
+        if (copy_payload != null and used + copyw + 2 <= panel_width) {
+            // ╭─ zig ────── ⧉ copy ─╮  ·  the whole header row is the
+            // click target; the label only advertises it.
+            try appendGlyphNTimes(arena, &panel, "─", panel_width - used - copyw - 1);
+            try panel.append(arena, ' ');
+            const affordance_start = gutter.len + panel.items.len;
+            try panel.appendSlice(arena, copy_affordance);
+            const spans = try arena.alloc(SyntaxSpan, 1);
+            spans[0] = .{
+                .start = affordance_start,
+                .end = gutter.len + panel.items.len,
+                .style = Palette.md_code_copy,
+            };
+            styles = spans;
+            try panel.appendSlice(arena, " ─");
+        } else if (used < panel_width) {
+            try appendGlyphNTimes(arena, &panel, "─", panel_width - used);
+        }
         try panel.appendSlice(arena, "╮");
     } else {
         try panel.appendSlice(arena, "╰");
@@ -468,7 +490,9 @@ pub fn appendCodeBorder(
         .style = .{},
         .text2 = panel.items,
         .style2 = Palette.md_code_border,
+        .syntax = styles,
         .links_resolved = true,
+        .copy_payload = copy_payload,
     });
 }
 
@@ -491,7 +515,11 @@ pub fn appendCodeBlock(
     if (panel_width < 12) return;
     const language_label = std.mem.trim(u8, info, " \t\r");
     const header = if (language_label.len > 0) language_label else "code";
-    try appendCodeBorder(arena, lines, gutter, panel_width, header);
+    const copy_payload: ?[]const u8 = if (code_lines.len > 0)
+        try std.mem.join(arena, "\n", code_lines)
+    else
+        null;
+    try appendCodeBorder(arena, lines, gutter, panel_width, header, copy_payload);
 
     const language = languageForFence(language_label);
     const line_digits = decimalDigits(@max(code_lines.len, 1));
@@ -546,7 +574,7 @@ pub fn appendCodeBlock(
             start = end;
         }
     }
-    try appendCodeBorder(arena, lines, gutter, panel_width, null);
+    try appendCodeBorder(arena, lines, gutter, panel_width, null, null);
 }
 
 pub const CalloutKind = enum { note, tip, important, warning, caution, status };

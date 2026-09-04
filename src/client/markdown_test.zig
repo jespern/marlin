@@ -163,6 +163,44 @@ test "assistant Markdown renders code panels and semantic callouts" {
     try std.testing.expect(saw_warning);
 }
 
+test "code panel headers carry a copy payload and advertise it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+    try wrapMarkdown(
+        arena,
+        &lines,
+        "```zig\nconst a = 1;\nconst b = 2;\n```",
+        80,
+    );
+
+    var header: ?Line = null;
+    for (lines.items) |line| {
+        if (line.copy_payload != null) {
+            try std.testing.expect(header == null); // exactly one per block
+            header = line;
+        }
+    }
+    // The payload is the raw code, unwrapped and without panel chrome.
+    try std.testing.expectEqualStrings("const a = 1;\nconst b = 2;", header.?.copy_payload.?);
+    const text = try lineText(arena, header.?);
+    try std.testing.expect(std.mem.indexOf(u8, text, markdown.copy_affordance) != null);
+    try std.testing.expect(header.?.syntax.len == 1);
+
+    // Too narrow for the affordance: the label disappears, the click
+    // target (payload on the header row) remains.
+    var narrow: std.ArrayList(Line) = .empty;
+    try wrapMarkdown(arena, &narrow, "```zig\nconst a = 1;\n```", 14);
+    var narrow_header: ?Line = null;
+    for (narrow.items) |line| {
+        if (line.copy_payload != null) narrow_header = line;
+    }
+    const narrow_text = try lineText(arena, narrow_header.?);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_text, markdown.copy_affordance) == null);
+    try std.testing.expectEqualStrings("const a = 1;", narrow_header.?.copy_payload.?);
+}
+
 test "assistant inline Markdown supports emphasis and strikethrough" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

@@ -53,6 +53,9 @@ pub const Palette = struct {
     pub const md_code: vaxis.Style = .{ .fg = soft_blue, .bg = md_inline_code_bg };
     pub const md_code_panel: vaxis.Style = .{ .bg = md_inline_code_bg };
     pub const md_code_border: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = md_inline_code_bg, .dim = true };
+    /// The ⧉ copy affordance on a code panel's header: brighter than the
+    /// border it interrupts, so it reads as clickable.
+    pub const md_code_copy: vaxis.Style = .{ .fg = .{ .index = 7 }, .bg = md_inline_code_bg };
     pub const md_table_header_bg: vaxis.Color = .{ .rgb = .{ 0x32, 0x35, 0x3b } };
     /// Table borders and cell separators recede; bright default-fg chrome
     /// made every table louder than its contents.
@@ -183,6 +186,10 @@ pub const Line = struct {
     /// Wrapped message lines resolve links against the unbroken source URL.
     /// Other line kinds are scanned once after layout is complete.
     links_resolved: bool = false,
+    /// Set on a code panel's header border: the block's raw text, staged to
+    /// the clipboard when the row is clicked. Owned by the layout arena or
+    /// cache like every other Line slice.
+    copy_payload: ?[]const u8 = null,
 };
 
 pub const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };

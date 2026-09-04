@@ -675,7 +675,8 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
 /// Mouse: the wheel ALWAYS scrolls the session view — never the input box,
 /// never history. A left click on the permanent top strip activates its tab.
 /// Left press/drag/release below it selects terminal-cell ranges; release
-/// copies the precise range via OSC52.
+/// copies the precise range via OSC52. A left press on a code panel's header
+/// row (the ⧉ copy affordance) copies the whole block instead.
 pub fn handleMouse(app: *App, m: vaxis.Mouse) void {
     if (app.top_view != null) return;
     // Some terminals report the release button as `none`, so complete an
@@ -741,6 +742,9 @@ pub fn handleMouse(app: *App, m: vaxis.Mouse) void {
             };
             switch (m.type) {
                 .press => {
+                    // Code panel header rows are copy buttons, not
+                    // selectable content; a press there stages the block.
+                    if (app.stageCodeBlockCopy(point.line)) return;
                     app.view.sel_anchor = point;
                     app.view.sel_head = point;
                     app.view.sel_dragging = true;

@@ -2829,6 +2829,24 @@ pub const App = struct {
         return line >= self.view.last_body_first and line < self.view.last_body_first + self.view.last_body_rows;
     }
 
+    /// A left press on a code panel's header row copies the block's raw
+    /// text: stage it for the OSC52 path the way !c does. Returns true when
+    /// the click was consumed. Layout is cache-backed, so re-deriving it for
+    /// one click costs no more than a frame does.
+    pub fn stageCodeBlockCopy(self: *App, line_index: usize) bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const lines = layoutLines(arena_state.allocator(), self, @intCast(@min(self.term_cols, std.math.maxInt(u16)))) catch return false;
+        if (line_index >= lines.items.len) return false;
+        const payload = lines.items[line_index].copy_payload orelse return false;
+        if (payload.len == 0) return false;
+        self.clipboard_pending.clearRetainingCapacity();
+        self.clipboard_pending.appendSlice(self.gpa, payload) catch return false;
+        self.clipboard_desc.clearRetainingCapacity();
+        self.clipboard_desc.appendSlice(self.gpa, "code block") catch {};
+        return true;
+    }
+
     /// Enter transcript copy mode with the cursor on the bottom visible line.
     pub fn enterCopyMode(self: *App) void {
         if (self.view.last_total_lines == 0) return;
