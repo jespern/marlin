@@ -72,5 +72,13 @@ jobs:
       - name: Live smoke against OpenRouter
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: zig build smoke
+        # A missing secret is a configuration state, not provider drift: skip
+        # loudly (visible in the run summary) instead of failing main nightly.
+        # A run WITH a key that fails is the signal this job exists for.
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::warning title=live smoke skipped::OPENROUTER_API_KEY secret is not set; run 'gh secret set OPENROUTER_API_KEY' to enable the nightly provider smoke"
+            exit 0
+          fi
+          zig build smoke
 

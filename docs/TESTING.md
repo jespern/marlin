@@ -141,7 +141,9 @@ zig build smoke              # skips (exit 0) when the key is unset
 
 Four checks against a cheap real model: completion, tool round trip,
 --continue recall. Catches the category fixtures can't: live provider drift.
-CI runs it nightly and on manual dispatch, never on PRs.
+CI runs it nightly and on manual dispatch, never on PRs. Without the
+`OPENROUTER_API_KEY` repository secret the job skips with a visible warning
+rather than failing; set the secret to arm it.
 
 ## CI
 
