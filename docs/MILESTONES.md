@@ -164,7 +164,8 @@ its root tab and the status bar shows only actionable background totals. Session
 session's view and draft. Mouse selection + OSC52 and the `!c` family finish
 the focused terminal workflow. Two-pane
 splits and cross-session registers are candidate slices, not exit
-requirements; decide them in `docs/M4_PLAN.md` before work starts. Remote
+requirements; decide them in `docs/M4_PLAN.md` before work starts (the
+split design and cost review lives in `docs/PANES_PLAN.md`). Remote
 attach shipped as `marlin --remote <host>` (ARCHITECTURE.md, Mode B). The post-M4 rich-input slice now supplies remote-safe clipboard/path
 image attachments and provider vision mapping.
 *Exit: several local sessions can run and be revisited from one full-width

@@ -69,6 +69,11 @@ abstraction internally, but do not expose splits until side-by-side sessions
 prove useful in dogfooding. If they do, add a maximum of two panes; do not build
 arbitrary tiling pre-emptively.
 
+A 2026-09-04 feasibility review of splits, per-pane status bars, resize/zoom,
+and a scriptable per-project Marlinfile is recorded in `docs/PANES_PLAN.md`,
+including what the current `tui.zig` shape costs and the slice order that
+pays off even if splits never ship.
+
 ### 2. Background-session visibility
 
 **Proposed:** no persistent idle counts. Show `2 running`, `1 approval`, or a
