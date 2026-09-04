@@ -72,6 +72,8 @@ pub const Document = struct {
     web_tailscale: ?bool = null,
     ui_tab_bar: ?bool = null,
     ui_bell: ?bool = null,
+    ui_screensaver_after_ms: ?u64 = null,
+    ui_screensaver_effect: ?[]const u8 = null,
     network_blocklists: ?[]const u8 = null,
     network_allow: ?[]const u8 = null,
     network_deny: ?[]const u8 = null,
@@ -219,6 +221,8 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             .ui => {
                 if (std.mem.eql(u8, key, "tab_bar")) doc.ui_tab_bar = try boolean(value);
                 if (std.mem.eql(u8, key, "bell")) doc.ui_bell = try boolean(value);
+                if (std.mem.eql(u8, key, "screensaver_after")) doc.ui_screensaver_after_ms = try durationMs(value);
+                if (std.mem.eql(u8, key, "screensaver_effect")) doc.ui_screensaver_effect = try string(arena, value);
             },
             .voice => {
                 if (std.mem.eql(u8, key, "enabled")) doc.voice_enabled = try boolean(value);
@@ -410,6 +414,27 @@ fn optionalString(arena: std.mem.Allocator, value: []const u8) !?[]const u8 {
     return try string(arena, value);
 }
 
+fn durationMs(value: []const u8) !u64 {
+    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return error.ExpectedDuration;
+    return parseDurationMs(value[1 .. value.len - 1]) catch return error.ExpectedDuration;
+}
+
+pub fn parseDurationMs(raw: []const u8) !u64 {
+    if (std.mem.eql(u8, raw, "off")) return 0;
+    if (raw.len < 2) return error.InvalidDuration;
+    const multiplier: u64 = switch (raw[raw.len - 1]) {
+        's' => std.time.ms_per_s,
+        'm' => std.time.ms_per_min,
+        'h' => std.time.ms_per_hour,
+        else => return error.InvalidDuration,
+    };
+    const amount = std.fmt.parseInt(u64, raw[0 .. raw.len - 1], 10) catch return error.InvalidDuration;
+    if (amount == 0) return error.InvalidDuration;
+    const duration = std.math.mul(u64, amount, multiplier) catch return error.InvalidDuration;
+    if (duration > std.math.maxInt(i64)) return error.InvalidDuration;
+    return duration;
+}
+
 fn command(arena: std.mem.Allocator, value: []const u8) ![]const []const u8 {
     if (value.len > 0 and value[0] == '[') return stringArray(arena, value);
     const one = try arena.alloc([]const u8, 1);
@@ -529,6 +554,10 @@ test "known malformed values fail" {
         \\[[tools.exec]]
         \\name = "broken"
     ));
+    try std.testing.expectError(error.ExpectedDuration, parse(arena_state.allocator(),
+        \\[ui]
+        \\screensaver_after = "eventually"
+    ));
 }
 
 test "web tailscale and ui tab_bar flags parse" {
@@ -541,6 +570,8 @@ test "web tailscale and ui tab_bar flags parse" {
         \\[ui]
         \\tab_bar = false
         \\bell = false
+        \\screensaver_after = "10m"
+        \\screensaver_effect = "strings"
         \\[model]
         \\default = "local/qwen"
     );
@@ -548,6 +579,8 @@ test "web tailscale and ui tab_bar flags parse" {
     try std.testing.expect(!doc.web_tailscale.?);
     try std.testing.expect(!doc.ui_tab_bar.?);
     try std.testing.expect(!doc.ui_bell.?);
+    try std.testing.expectEqual(@as(u64, 600_000), doc.ui_screensaver_after_ms.?);
+    try std.testing.expectEqualStrings("strings", doc.ui_screensaver_effect.?);
     try std.testing.expectEqualStrings("local/qwen", doc.model_default.?);
 }
 

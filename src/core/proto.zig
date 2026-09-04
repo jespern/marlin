@@ -17,7 +17,7 @@ const guest = @import("guest.zig");
 pub const ReasoningEffort = @import("effort.zig").Effort;
 pub const GuestBackend = guest.Backend;
 
-pub const proto_version: u32 = 4;
+pub const proto_version: u32 = 5;
 /// Maximum complete NDJSON record, including its trailing newline. Large
 /// blob replies can JSON-escape to several times their raw size, so this is
 /// deliberately larger than any supported tool capture while still bounding
@@ -343,6 +343,8 @@ pub const ClientMsg = union(enum) {
     ui_set_tab_bar: struct { enabled: bool },
     /// Persist `[ui] bell` (terminal BEL on a background approval).
     ui_set_bell: struct { enabled: bool },
+    /// Persist the client-local inactivity delay and selected effect.
+    ui_set_screensaver: struct { after_ms: u64, effect: []const u8 = "matrix" },
     /// Re-read config and atomically replace extensions while no turn is live.
     mcp_reload: struct {},
     interrupt: struct {
@@ -471,8 +473,13 @@ pub const DaemonMsg = union(enum) {
     setup_status_result: SetupStatus,
     setup_result: struct { model: []const u8, session_updated: bool = false },
     mcp_list_result: struct { servers: []const McpServerInfo },
-    /// Terminal reply to ui_set_tab_bar after config.toml is durable.
-    ui_config_result: struct { tab_bar: bool, bell: bool = true },
+    /// Terminal reply after a UI preference is durable.
+    ui_config_result: struct {
+        tab_bar: bool,
+        bell: bool = true,
+        screensaver_after_ms: u64 = 0,
+        screensaver_effect: []const u8 = "matrix",
+    },
     /// Reply to blob_get. Bytes are JSON-escaped on the NDJSON wire and may
     /// contain arbitrary command output (including NULs).
     blob_result: struct { hash: []const u8, bytes: []const u8 },
@@ -682,6 +689,20 @@ test "round trip: client messages" {
     defer gpa.free(ui_line);
     const ui_back = try decode(ClientMsg, arena, ui_line);
     try std.testing.expect(!ui_back.ui_set_tab_bar.enabled);
+
+    const screensaver_line = try encode(gpa, ClientMsg{ .ui_set_screensaver = .{
+        .after_ms = 600_000,
+        .effect = "strings",
+    } });
+    defer gpa.free(screensaver_line);
+    const screensaver_back = try decode(ClientMsg, arena, screensaver_line);
+    try std.testing.expectEqual(@as(u64, 600_000), screensaver_back.ui_set_screensaver.after_ms);
+    try std.testing.expectEqualStrings("strings", screensaver_back.ui_set_screensaver.effect);
+    const screensaver_off_line = try encode(gpa, ClientMsg{ .ui_set_screensaver = .{ .after_ms = 0 } });
+    defer gpa.free(screensaver_off_line);
+    const screensaver_off_back = try decode(ClientMsg, arena, screensaver_off_line);
+    try std.testing.expectEqual(@as(u64, 0), screensaver_off_back.ui_set_screensaver.after_ms);
+    try std.testing.expectEqualStrings("matrix", screensaver_off_back.ui_set_screensaver.effect);
 
     const blob_line = try encode(gpa, ClientMsg{ .blob_get = .{ .hash = "abc123" } });
     defer gpa.free(blob_line);
@@ -960,6 +981,16 @@ test "older hello defaults network configuration state" {
     try std.testing.expect(!m.hello_ok.network_configured);
     try std.testing.expect(!m.hello_ok.network_filtering);
     try std.testing.expectEqual(@as(i64, 0), m.hello_ok.daemon_exe_mtime_ms);
+}
+
+test "older ui config replies default the screensaver off" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const msg = try decode(DaemonMsg, arena_state.allocator(),
+        \\{"ui_config_result":{"tab_bar":true,"bell":false}}
+    );
+    try std.testing.expectEqual(@as(u64, 0), msg.ui_config_result.screensaver_after_ms);
+    try std.testing.expectEqualStrings("matrix", msg.ui_config_result.screensaver_effect);
 }
 
 test "status phase is additive and decode-compatible" {

@@ -97,8 +97,16 @@ the old rooms?
   inline in the composer, repeated `Ctrl+R` walks older matches, and Esc
   restores the draft. Normal-mode `/` searches the current transcript; `/search <query>` and
   `marlin search <query>` search every durable session.
-- `/animate matrix` sends a fast, fluid wave of falling Unicode glyphs from the
-  top through gaps around the current UI, then fades away after its tail passes.
+- Terminal-native effects share one finite-animation/full-screen-saver surface:
+  `matrix` rain, `strings` dancing sine curves, a forward `stars` field, and
+  color-cycling `plasma`. Run `/animate <effect>` over gaps in the current UI,
+  or `/screensaver [effect]` for its opaque continuous form. Normal-mode `gs`
+  starts the configured effect and returns to insert mode on wake. A key or
+  paste wakes it and is consumed; mouse activity is ignored. Automatic
+  activation is off by default; `/config screensaver 10m strings` enables it,
+  `/config screensaver plasma` changes only the effect, and `off` disables it.
+  The equivalent TOML keys are `[ui] screensaver_after` and
+  `screensaver_effect`.
 - During a turn, the live activity row distinguishes request preparation, model
   wait/streaming, tool execution, child-agent work, compaction, and finalization,
   with total and current-phase timers. Streaming shows a green up arrow while

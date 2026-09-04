@@ -10,7 +10,7 @@ never an accidental wire limit. Clients reject oversized outbound messages
 before optimistic UI state; the daemon drains an oversized inbound record and
 returns `err{line_too_long}` instead of silently dropping the connection.
 
-proto_version: 4
+proto_version: 5
 
 ## Connection lifecycle
 
@@ -76,8 +76,9 @@ policy that failed open. Both default false when decoding an older daemon.
 | mcp_list | — | mcp_list_result with per-server readiness, tool count, and discovery error |
 | mcp_add | name, cmd[] | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
 | mcp_remove | name | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
-| ui_set_tab_bar | enabled | ui_config_result{tab_bar, bell} after daemon-serialized atomic persistence to config.toml |
-| ui_set_bell | enabled | ui_config_result{tab_bar, bell}; `[ui] bell` — BEL on a non-focused approval |
+| ui_set_tab_bar | enabled | ui_config_result{tab_bar, bell, screensaver_after_ms, screensaver_effect} after daemon-serialized atomic persistence to config.toml |
+| ui_set_bell | enabled | ui_config_result with all UI preferences; `[ui] bell` — BEL on a non-focused approval |
+| ui_set_screensaver | after_ms, effect? | ui_config_result with all UI preferences; whole seconds only, persisted as canonical `Ns`, `Nm`, or `Nh` plus `screensaver_effect`; zero means `off`, and an omitted additive effect defaults to `matrix` |
 | mcp_restart | name | mcp_list_result after rediscovery; failure is reported as server health, not daemon failure |
 | mcp_reload | — | mcp_list_result after atomic registry replacement; old registry survives invalid config/build failure |
 | approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |

@@ -8,6 +8,7 @@ const Io = std.Io;
 const Effort = @import("effort.zig").Effort;
 const credentials = @import("credentials.zig");
 const toml = @import("config_toml.zig");
+const visual_effect = @import("visual_effect.zig");
 
 pub const ExecTool = toml.ExecTool;
 pub const McpServer = toml.McpServer;
@@ -114,10 +115,27 @@ pub const Config = struct {
     /// the one out-of-band signal a multiplexer owes you while you look
     /// elsewhere. `[ui] bell = false` / `/config bell off` silences it.
     ui_bell: bool = true,
+    /// Client-local inactivity delay before an opaque effect. Zero is off.
+    ui_screensaver_after_ms: u64 = 0,
+    ui_screensaver_effect: []const u8 = "matrix",
 };
 
 pub fn defaults() Config {
     return .{};
+}
+
+pub fn parseDurationMs(value: []const u8) !u64 {
+    return toml.parseDurationMs(value);
+}
+
+pub fn formatDuration(buf: []u8, duration_ms: u64) ![]const u8 {
+    if (duration_ms == 0) return "off";
+    if (duration_ms % std.time.ms_per_s != 0) return error.InvalidDuration;
+    if (duration_ms % std.time.ms_per_hour == 0)
+        return std.fmt.bufPrint(buf, "{d}h", .{duration_ms / std.time.ms_per_hour});
+    if (duration_ms % std.time.ms_per_min == 0)
+        return std.fmt.bufPrint(buf, "{d}m", .{duration_ms / std.time.ms_per_min});
+    return std.fmt.bufPrint(buf, "{d}s", .{duration_ms / std.time.ms_per_s});
 }
 
 /// Defaults plus environment overrides, primarily for focused tests and the
@@ -285,6 +303,41 @@ pub fn setUiFlag(
     const current = try readRawAlloc(gpa, io, environ);
     defer gpa.free(current);
     const updated = try setScalarText(gpa, current, "ui", key, if (enabled) "true" else "false");
+    defer gpa.free(updated);
+    try replaceRaw(gpa, io, environ, updated);
+}
+
+pub fn canonicalScreensaverEffect(value: []const u8) ![]const u8 {
+    return (visual_effect.Kind.parse(value) orelse return error.InvalidScreensaverEffect).name();
+}
+
+pub fn validateScreensaverEffect(value: []const u8) !void {
+    _ = try canonicalScreensaverEffect(value);
+}
+
+/// Persist the client-local screensaver timeout and effect in one atomic edit.
+pub fn setUiScreensaver(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    duration: []const u8,
+    effect_name: []const u8,
+) !void {
+    _ = try parseDurationMs(duration);
+    const canonical_effect = try canonicalScreensaverEffect(effect_name);
+    const current = try readRawAlloc(gpa, io, environ);
+    defer gpa.free(current);
+
+    var duration_literal: std.ArrayList(u8) = .empty;
+    defer duration_literal.deinit(gpa);
+    try appendTomlString(&duration_literal, gpa, duration);
+    const with_duration = try setScalarText(gpa, current, "ui", "screensaver_after", duration_literal.items);
+    defer gpa.free(with_duration);
+
+    var effect_literal: std.ArrayList(u8) = .empty;
+    defer effect_literal.deinit(gpa);
+    try appendTomlString(&effect_literal, gpa, canonical_effect);
+    const updated = try setScalarText(gpa, with_duration, "ui", "screensaver_effect", effect_literal.items);
     defer gpa.free(updated);
     try replaceRaw(gpa, io, environ, updated);
 }
@@ -679,6 +732,26 @@ fn appendTomlString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, value: []co
     try out.append(gpa, '"');
 }
 
+test "screensaver durations are strict and canonical" {
+    try std.testing.expectEqual(@as(u64, 0), try parseDurationMs("off"));
+    try std.testing.expectEqual(@as(u64, 30_000), try parseDurationMs("30s"));
+    try std.testing.expectEqual(@as(u64, 600_000), try parseDurationMs("10m"));
+    try std.testing.expectEqual(@as(u64, 3_600_000), try parseDurationMs("1h"));
+    try std.testing.expectError(error.InvalidDuration, parseDurationMs("10"));
+    try std.testing.expectError(error.InvalidDuration, parseDurationMs("0m"));
+    try std.testing.expectError(error.InvalidDuration, parseDurationMs("999999999999999999h"));
+
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("off", try formatDuration(&buf, 0));
+    try std.testing.expectEqualStrings("10m", try formatDuration(&buf, 600_000));
+    try std.testing.expectError(error.InvalidDuration, formatDuration(&buf, 1));
+    try validateScreensaverEffect("matrix");
+    try validateScreensaverEffect("strings");
+    try validateScreensaverEffect("stars");
+    try validateScreensaverEffect("plasma");
+    try std.testing.expectError(error.InvalidScreensaverEffect, validateScreensaverEffect("tunnel"));
+}
+
 test "web ui stays off unless deliberately enabled" {
     const gpa = std.testing.allocator;
     var environ = std.process.Environ.Map.init(gpa);
@@ -730,6 +803,8 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.web_tailscale) |value| cfg.web_tailscale = value;
     if (doc.ui_tab_bar) |value| cfg.ui_tab_bar = value;
     if (doc.ui_bell) |value| cfg.ui_bell = value;
+    if (doc.ui_screensaver_after_ms) |value| cfg.ui_screensaver_after_ms = value;
+    if (doc.ui_screensaver_effect) |value| cfg.ui_screensaver_effect = value;
     if (doc.network_blocklists) |value| cfg.network_blocklists = value;
     if (doc.network_allow) |value| cfg.network_allow = value;
     if (doc.network_deny) |value| cfg.network_deny = value;
@@ -748,6 +823,7 @@ fn applyDocument(cfg: *Config, doc: toml.Document) void {
 }
 
 fn validate(gpa: std.mem.Allocator, cfg: Config) !void {
+    try validateScreensaverEffect(cfg.ui_screensaver_effect);
     if (cfg.model_default.len == 0) return error.EmptyDefaultModel;
     if (cfg.output_headroom_tokens == 0 or cfg.inline_tool_cap_bytes == 0) return error.InvalidContextLimit;
     if (cfg.prune_protect_tokens <= cfg.prune_min_reclaim_tokens) return error.InvalidPruneThresholds;
@@ -840,6 +916,8 @@ test "defaults are sane" {
     try std.testing.expect(c.prune_protect_tokens > c.prune_min_reclaim_tokens);
     try std.testing.expect(c.permissions_enabled);
     try std.testing.expect(!c.workspace_enabled);
+    try std.testing.expectEqual(@as(u64, 0), c.ui_screensaver_after_ms);
+    try std.testing.expectEqualStrings("matrix", c.ui_screensaver_effect);
 }
 
 test "configured providers validate without storing secret material" {
@@ -1072,6 +1150,56 @@ test "ui scalar edits: replace in place, insert into section, append section" {
     const web_at = std.mem.indexOf(u8, inserted, "[web]").?;
     try std.testing.expect(ui_at < key_at and key_at < web_at);
     try std.testing.expect(std.mem.indexOf(u8, inserted, "# chrome prefs") != null);
+
+    const screensaver = try setScalarText(gpa, inserted, "ui", "screensaver_after", "\"10m\"");
+    defer gpa.free(screensaver);
+    try std.testing.expect(std.mem.indexOf(u8, screensaver, "screensaver_after = \"10m\"") != null);
+}
+
+test "invalid screensaver effect rejects the loaded config" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-invalid-saver");
+    defer temp.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("XDG_CONFIG_HOME", temp.path);
+    const path = try std.fs.path.join(gpa, &.{ temp.path, "marlin", "config.toml" });
+    defer gpa.free(path);
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[ui]\nscreensaver_effect = \"tunnel\"\n" });
+    try std.testing.expectError(error.InvalidScreensaverEffect, load(gpa, io, &environ));
+}
+
+test "screensaver timeout and effect persist and reload atomically" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-screensaver-config");
+    defer temp.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("XDG_CONFIG_HOME", temp.path);
+
+    var initial = try load(gpa, io, &environ);
+    try std.testing.expectEqual(@as(u64, 0), initial.value.ui_screensaver_after_ms);
+    initial.deinit();
+
+    try setUiScreensaver(gpa, io, &environ, "10m", "strings");
+    var enabled = try load(gpa, io, &environ);
+    try std.testing.expectEqual(@as(u64, 600_000), enabled.value.ui_screensaver_after_ms);
+    try std.testing.expectEqualStrings("strings", enabled.value.ui_screensaver_effect);
+    enabled.deinit();
+
+    try setUiScreensaver(gpa, io, &environ, "off", "plasma");
+    var disabled = try load(gpa, io, &environ);
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(u64, 0), disabled.value.ui_screensaver_after_ms);
+    try std.testing.expectEqualStrings("plasma", disabled.value.ui_screensaver_effect);
 }
 
 test "provider setup persists completion, default model, and custom endpoint atomically" {

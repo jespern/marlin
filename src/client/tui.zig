@@ -15,15 +15,15 @@
 //!            Ctrl+R fuzzy-searches authored input history;
 //!            readline/macOS movement and deletion chords are supported;
 //!            Esc → normal (draft survives); Ctrl+C interrupts active work
-//!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom;
+//!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom; gs screensaver;
 //!            / searches this transcript; </> or Left/Right switch tabs; q quit
 //!   global:  Ctrl+N creates a session; Ctrl+D/Ctrl+W archive when input is empty;
 //!            Ctrl+L clears/redraws and returns to bottom;
 //!            Ctrl+T toggles the expanded tool transcript;
 //!            Alt/Option+1..9 jumps to that tab
 //!   approval pending: y approve, n deny (both modes, input empty)
-//!   commands: /model <m>, /effort <level>, /search <query>, /animate matrix,
-//!             /new, /compact, /archive, /reboot [--build], /help, /quit
+//!   commands: /model <m>, /effort <level>, /search <query>, /animate <effect>,
+//!             /screensaver [effect], /new, /compact, /archive, /reboot [--build], /help, /quit
 //!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
 //!              !c (copy last full tool output), !rb [client|both] (scoped rebuild)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
@@ -41,6 +41,7 @@ const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
+const effects = @import("effects.zig");
 const media = @import("media.zig");
 const render = @import("render.zig");
 const top_view = @import("top.zig");
@@ -131,7 +132,7 @@ pub const VoiceEvent = union(enum) {
 
 const Mode = enum { insert, normal };
 
-const UiAnimation = enum { none, matrix };
+const transient_animation_frames: usize = 180;
 
 const TopView = struct {
     selected_sid: ?u64 = null,
@@ -139,14 +140,6 @@ const TopView = struct {
     scroll_top: usize = 0,
     confirm_kill: ?u64 = null,
 };
-
-fn matrixTrailLength(height: u16) usize {
-    return @max(@as(usize, height) * 5 / 8, 8);
-}
-
-fn matrixAnimationFrames(height: u16) usize {
-    return (@as(usize, height) + matrixTrailLength(height)) * 2;
-}
 
 pub const RebuildScope = enum { none, attached, client, both };
 
@@ -181,14 +174,15 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/top", .description = "live session overview and switcher" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
-    .{ .name = "/animate", .usage = " matrix", .description = "play a transient screen animation", .accepts_args = true },
+    .{ .name = "/animate", .usage = " <matrix|strings|stars|plasma>", .description = "play a transient screen effect", .accepts_args = true },
+    .{ .name = "/screensaver", .usage = " [matrix|strings|stars|plasma]", .description = "start a continuous full-screen effect", .accepts_args = true },
     .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
     .{ .name = "/compact", .description = "compact the current context" },
-    .{ .name = "/config", .usage = " [tabbar|bell on|off]", .description = "view or change UI settings (persisted)", .accepts_args = true },
+    .{ .name = "/config", .usage = " [tabbar|bell on|off|screensaver <duration|effect> [effect]]", .description = "view or change UI settings (persisted)", .accepts_args = true },
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
     .{ .name = "/quit", .description = "leave Marlin" },
@@ -717,10 +711,13 @@ const App = struct {
     stream_bytes: u64 = 0,
     stream_quiet_ms: u64 = 0,
     stream_status_at_ms: i64 = 0,
-    ui_animation: UiAnimation = .none,
+    ui_animation: ?effects.Kind = null,
     ui_animation_frame: usize = 0,
-    ui_animation_frames: usize = matrixAnimationFrames(24),
-    ui_animation_seed: u64 = 0,
+    effect_engine: ?effects.Engine = null,
+    screensaver_active: bool = false,
+    screensaver_kind: effects.Kind = .matrix,
+    screensaver_timeout_ms: u64 = 0,
+    screensaver_deadline_ms: std.atomic.Value(i64) = .init(0),
     ui_animation_active: std.atomic.Value(bool) = .init(false),
     animation_active: std.atomic.Value(bool) = .init(false),
     animation_stop: std.atomic.Value(bool) = .init(false),
@@ -827,6 +824,7 @@ const App = struct {
         self.clearCouncils();
         self.councils.deinit(self.gpa);
         self.voice_rt.deinit(self.gpa);
+        if (self.effect_engine) |*engine| engine.deinit();
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.pending_new_cwd.deinit(self.gpa);
@@ -2024,8 +2022,16 @@ const App = struct {
             .ui_config_result => |result| {
                 self.show_tab_bar = result.tab_bar;
                 self.bell_enabled = result.bell;
+                self.screensaver_timeout_ms = result.screensaver_after_ms;
+                self.screensaver_kind = effects.Kind.parse(result.screensaver_effect) orelse .matrix;
                 self.refresh_requested = true;
-                self.setNotice("saved · tabbar {s} · bell {s}", .{ onOff(result.tab_bar), onOff(result.bell) });
+                var duration_buf: [32]u8 = undefined;
+                self.setNotice("saved · tabbar {s} · bell {s} · screensaver {s} {s}", .{
+                    onOff(result.tab_bar),
+                    onOff(result.bell),
+                    config.formatDuration(&duration_buf, result.screensaver_after_ms) catch "invalid",
+                    self.screensaver_kind.name(),
+                });
             },
             .council_list_result => |result| self.applyCouncils(result.councils),
             .plan_clear_result => |result| {
@@ -2311,22 +2317,76 @@ const App = struct {
         self.animation_active.store(self.needsAnimationTick(), .release);
     }
 
-    fn startUiAnimation(self: *App, animation: UiAnimation) void {
+    fn resetEffectEngine(self: *App, kind: effects.Kind) bool {
         var seed_bytes: [8]u8 = undefined;
         self.io.random(&seed_bytes);
-        self.ui_animation = animation;
+        if (self.effect_engine) |*engine| engine.deinit();
+        self.effect_engine = effects.Engine.init(self.gpa, kind, 1);
+        self.effect_engine.?.reset(
+            @intCast(@min(self.term_cols, std.math.maxInt(u16))),
+            self.term_rows,
+            std.mem.readInt(u64, &seed_bytes, .little),
+        ) catch {
+            self.effect_engine.?.deinit();
+            self.effect_engine = null;
+            self.setNotice("could not start {s} effect", .{kind.name()});
+            return false;
+        };
+        return true;
+    }
+
+    fn startUiAnimation(self: *App, kind: effects.Kind) void {
+        if (!self.resetEffectEngine(kind)) return;
+        self.screensaver_active = false;
+        self.ui_animation = kind;
         self.ui_animation_frame = 0;
-        self.ui_animation_frames = matrixAnimationFrames(self.term_rows);
-        self.ui_animation_seed = std.mem.readInt(u64, &seed_bytes, .little);
         self.ui_animation_active.store(true, .release);
         self.syncAnimationTicker();
     }
 
+    fn startScreensaver(self: *App, kind: effects.Kind) void {
+        if (!self.resetEffectEngine(kind)) return;
+        self.ui_animation = null;
+        self.ui_animation_frame = 0;
+        self.screensaver_active = true;
+        self.ui_animation_active.store(true, .release);
+        self.clearPending();
+        self.syncAnimationTicker();
+    }
+
+    fn dismissScreensaver(self: *App) bool {
+        if (!self.screensaver_active) return false;
+        self.screensaver_active = false;
+        self.ui_animation_active.store(false, .release);
+        self.recordUserActivity();
+        self.refresh_requested = true;
+        self.syncAnimationTicker();
+        return true;
+    }
+
+    fn recordUserActivity(self: *App) void {
+        const now = nowWallMs(self.io);
+        const deadline = if (self.screensaver_timeout_ms == 0)
+            0
+        else
+            now +| @as(i64, @intCast(self.screensaver_timeout_ms));
+        self.screensaver_deadline_ms.store(deadline, .release);
+    }
+
+    fn maybeStartScreensaver(self: *App) void {
+        if (self.screensaver_active or self.screensaver_timeout_ms == 0) return;
+        const deadline = self.screensaver_deadline_ms.load(.acquire);
+        if (deadline != 0 and nowWallMs(self.io) >= deadline) self.startScreensaver(self.screensaver_kind);
+    }
+
     fn tickUiAnimation(self: *App) void {
-        if (self.ui_animation == .none) return;
+        self.maybeStartScreensaver();
+        if (self.ui_animation == null and !self.screensaver_active) return;
+        if (self.effect_engine) |*engine| engine.tick();
+        if (self.screensaver_active) return;
         self.ui_animation_frame += 1;
-        if (self.ui_animation_frame >= self.ui_animation_frames) {
-            self.ui_animation = .none;
+        if (self.ui_animation_frame >= transient_animation_frames) {
+            self.ui_animation = null;
             self.ui_animation_frame = 0;
             self.ui_animation_active.store(false, .release);
             self.refresh_requested = true;
@@ -2655,18 +2715,39 @@ const App = struct {
             };
         } else if (std.mem.eql(u8, head, "/animate")) {
             const name = it.next() orelse {
-                self.setNotice("usage: /animate matrix", .{});
+                self.setNotice("usage: /animate <matrix|strings|stars|plasma>", .{});
                 return;
             };
-            if (it.next() != null or !std.mem.eql(u8, name, "matrix")) {
-                self.setNotice("usage: /animate matrix", .{});
+            const kind = effects.Kind.parse(name) orelse {
+                self.setNotice("unknown effect {s}", .{name});
+                return;
+            };
+            if (it.next() != null) {
+                self.setNotice("usage: /animate <matrix|strings|stars|plasma>", .{});
                 return;
             }
-            self.startUiAnimation(.matrix);
+            self.startUiAnimation(kind);
+        } else if (std.mem.eql(u8, head, "/screensaver")) {
+            const kind = if (it.next()) |name| effects.Kind.parse(name) orelse {
+                self.setNotice("unknown effect {s}", .{name});
+                return;
+            } else self.screensaver_kind;
+            if (it.next() != null) {
+                self.setNotice("usage: /screensaver [matrix|strings|stars|plasma]", .{});
+                return;
+            }
+            self.startScreensaver(kind);
         } else if (std.mem.eql(u8, head, "/otel")) {
             self.otelCommand(it.next(), it.rest());
         } else if (std.mem.eql(u8, head, "/config")) {
-            self.configCommand(it.next(), it.next());
+            const setting = it.next();
+            const value = it.next();
+            const extra = it.next();
+            if (it.next() != null) {
+                self.setNotice("too many /config arguments", .{});
+                return;
+            }
+            self.configCommand(setting, value, extra);
         } else if (std.mem.eql(u8, head, "/help")) {
             // The status bar is one row; the catalog is not. Open the help
             // panel scrolled to its generated COMMANDS section instead.
@@ -2681,21 +2762,72 @@ const App = struct {
         }
     }
 
-    /// `/config` — the durable UI-preference surface. No args shows current
-    /// values; `tabbar [on|off]` (bare = toggle) applies live and persists to
-    /// config.toml, so the choice survives reboots and other clients.
-    fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8) void {
+    /// `/config` — durable UI preferences serialized by the daemon.
+    fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra: ?[]const u8) void {
         const name = setting orelse {
-            self.setNotice("config · tabbar {s} · bell {s} — /config <tabbar|bell> [on|off]", .{
+            var duration_buf: [32]u8 = undefined;
+            self.setNotice("config · tabbar {s} · bell {s} · screensaver {s} {s}", .{
                 onOff(self.show_tab_bar),
                 onOff(self.bell_enabled),
+                config.formatDuration(&duration_buf, self.screensaver_timeout_ms) catch "invalid",
+                self.screensaver_kind.name(),
             });
             return;
         };
+        if (std.mem.eql(u8, name, "screensaver")) {
+            const raw = value orelse {
+                self.setNotice("usage: /config screensaver <30s|10m|1h|off|effect> [effect]", .{});
+                return;
+            };
+            var after_ms = self.screensaver_timeout_ms;
+            var kind = self.screensaver_kind;
+            if (effects.Kind.parse(raw)) |parsed| {
+                if (extra != null) {
+                    self.setNotice("usage: /config screensaver <duration|effect> [effect]", .{});
+                    return;
+                }
+                kind = parsed;
+            } else {
+                after_ms = config.parseDurationMs(raw) catch {
+                    self.setNotice("usage: /config screensaver <30s|10m|1h|off> [matrix|strings|stars|plasma]", .{});
+                    return;
+                };
+                if (extra) |effect_name| {
+                    kind = effects.Kind.parse(effect_name) orelse {
+                        self.setNotice("unknown effect {s}", .{effect_name});
+                        return;
+                    };
+                }
+            }
+            const previous_timeout = self.screensaver_timeout_ms;
+            const previous_kind = self.screensaver_kind;
+            self.screensaver_timeout_ms = after_ms;
+            self.screensaver_kind = kind;
+            self.recordUserActivity();
+            self.syncAnimationTicker();
+            self.conn.send(.{ .ui_set_screensaver = .{
+                .after_ms = after_ms,
+                .effect = kind.name(),
+            } }) catch |err| {
+                self.screensaver_timeout_ms = previous_timeout;
+                self.screensaver_kind = previous_kind;
+                self.recordUserActivity();
+                self.syncAnimationTicker();
+                self.setNotice("screensaver setting not saved: {t}", .{err});
+                return;
+            };
+            var duration_buf: [32]u8 = undefined;
+            self.setNotice("screensaver {s} {s} (saving…)", .{
+                config.formatDuration(&duration_buf, after_ms) catch "invalid",
+                kind.name(),
+            });
+            return;
+        }
+
         const is_tabbar = std.mem.eql(u8, name, "tabbar");
         const is_bell = std.mem.eql(u8, name, "bell");
         if (!is_tabbar and !is_bell) {
-            self.setNotice("usage: /config <tabbar|bell> [on|off]", .{});
+            self.setNotice("usage: /config <tabbar|bell> [on|off] or /config screensaver <duration|effect> [effect]", .{});
             return;
         }
         const current = if (is_tabbar) self.show_tab_bar else self.bell_enabled;
@@ -4944,6 +5076,7 @@ fn commandQuery(editor: *const Editor) ?[]const u8 {
             !std.mem.eql(u8, head, "/review") and
             !std.mem.eql(u8, head, "/plan") and
             !std.mem.eql(u8, head, "/animate") and
+            !std.mem.eql(u8, head, "/screensaver") and
             !std.mem.eql(u8, head, "/otel") and
             !std.mem.eql(u8, head, "!rb")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
@@ -5057,13 +5190,36 @@ fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Comman
         (query["/animate".len] == ' ' or query["/animate".len] == '\t'))
     {
         const rest = std.mem.trimStart(u8, query["/animate".len..], " \t");
-        if (rest.len <= "matrix".len and std.ascii.eqlIgnoreCase(rest, "matrix"[0..rest.len])) {
-            try out.append(arena, .{
-                .label = "/animate matrix",
-                .description = "play falling green symbols over the current screen",
-                .replacement = "/animate matrix",
-                .submit_on_enter = true,
-            });
+        for (effects.kinds) |kind| {
+            const name = kind.name();
+            if (rest.len <= name.len and std.ascii.eqlIgnoreCase(rest, name[0..rest.len])) {
+                const replacement = try std.fmt.allocPrint(arena, "/animate {s}", .{name});
+                try out.append(arena, .{
+                    .label = replacement,
+                    .description = kind.description(),
+                    .replacement = replacement,
+                    .submit_on_enter = true,
+                });
+            }
+        }
+        return out.items;
+    }
+    if (query.len > "/screensaver".len and
+        std.mem.eql(u8, query[0.."/screensaver".len], "/screensaver") and
+        (query["/screensaver".len] == ' ' or query["/screensaver".len] == '\t'))
+    {
+        const rest = std.mem.trimStart(u8, query["/screensaver".len..], " \t");
+        for (effects.kinds) |kind| {
+            const name = kind.name();
+            if (rest.len <= name.len and std.ascii.eqlIgnoreCase(rest, name[0..rest.len])) {
+                const replacement = try std.fmt.allocPrint(arena, "/screensaver {s}", .{name});
+                try out.append(arena, .{
+                    .label = replacement,
+                    .description = kind.description(),
+                    .replacement = replacement,
+                    .submit_on_enter = true,
+                });
+            }
         }
         return out.items;
     }
@@ -5608,6 +5764,7 @@ const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "⌥1–⌥9", .description = "jump to Nth tab (works in insert mode too)" },
     .{ .key = "Ctrl+V", .description = "attach clipboard image (Control, not Command)" },
     .{ .key = "gt / gT", .description = "switch sessions · Ngt = Nth recent" },
+    .{ .key = "gs", .description = "start the configured screensaver effect" },
     .{ .key = "J", .description = "join lines" },
     .{ .key = "a / A / I", .description = "insert after cursor / line end / line start" },
     .{ .key = "j / k", .description = "scroll one line" },
@@ -6762,183 +6919,23 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     drawUiAnimation(app, win);
 }
 
-fn matrixHash(value: u64) u64 {
-    var x = value;
-    x ^= x >> 30;
-    x *%= 0xbf58476d1ce4e5b9;
-    x ^= x >> 27;
-    x *%= 0x94d049bb133111eb;
-    return x ^ (x >> 31);
-}
-
-fn drawUiAnimation(app: *const App, win: vaxis.Window) void {
-    switch (app.ui_animation) {
-        .none => {},
-        .matrix => drawMatrixAnimation(app, win),
-    }
-}
-
-fn matrixWaveOpacity(frame: usize, total_frames: usize) u8 {
-    const fade_in_frames: usize = 10;
-    const fade_out_frames: usize = 22;
-    if (frame < fade_in_frames)
-        return @intCast(frame * 255 / fade_in_frames);
-
-    const remaining = (total_frames - 1) -| frame;
-    if (remaining < fade_out_frames)
-        return @intCast(remaining * 255 / fade_out_frames);
+fn transientAnimationOpacity(frame: usize) u8 {
+    const fade_frames: usize = 18;
+    if (frame < fade_frames) return @intCast(frame * 255 / fade_frames);
+    const remaining = (transient_animation_frames - 1) -| frame;
+    if (remaining < fade_frames) return @intCast(remaining * 255 / fade_frames);
     return 255;
 }
 
-fn matrixWaveFront(frame: usize, total_frames: usize, height: u16, max_trail: usize) i64 {
-    const start: i64 = 2;
-    const end = @as(i64, height) + @as(i64, @intCast(max_trail));
-    const clamped_frame = @min(frame, total_frames - 1);
-    return start + @divTrunc(
-        @as(i64, @intCast(clamped_frame)) * (end - start),
-        @as(i64, @intCast(total_frames - 1)),
-    );
-}
-
-fn matrixWaveColor(base: [3]u8, opacity: u8) vaxis.Color {
-    return .{ .rgb = .{
-        @intCast(@as(u16, base[0]) * opacity / 255),
-        @intCast(@as(u16, base[1]) * opacity / 255),
-        @intCast(@as(u16, base[2]) * opacity / 255),
-    } };
-}
-
-fn matrixCellIsOpen(win: vaxis.Window, col: u16, row: u16) bool {
-    const cell = win.readCell(col, row) orelse return false;
-    if (!std.mem.eql(u8, cell.char.grapheme, " ")) return false;
-    if (col == 0) return true;
-
-    const previous = win.readCell(col - 1, row) orelse return true;
-    const previous_width = if (previous.char.width > 0)
-        previous.char.width
-    else
-        win.gwidth(previous.char.grapheme);
-    return previous_width <= 1;
-}
-
-fn drawMatrixAnimation(app: *const App, win: vaxis.Window) void {
-    if (win.width == 0 or win.height == 0) return;
-    const glyphs = [_][]const u8{
-        "ｱ",
-        "ｲ",
-        "ｳ",
-        "ｴ",
-        "ｵ",
-        "ｶ",
-        "ｷ",
-        "ｸ",
-        "ｹ",
-        "ｺ",
-        "ｻ",
-        "ｼ",
-        "ｽ",
-        "ｾ",
-        "ｿ",
-        "ﾀ",
-        "ﾁ",
-        "ﾂ",
-        "ﾃ",
-        "ﾄ",
-        "ﾅ",
-        "ﾆ",
-        "ﾇ",
-        "ﾈ",
-        "ﾉ",
-        "ﾊ",
-        "ﾋ",
-        "ﾌ",
-        "ﾍ",
-        "ﾎ",
-        "ﾏ",
-        "ﾐ",
-        "ﾑ",
-        "ﾒ",
-        "ﾓ",
-        "ﾔ",
-        "ﾕ",
-        "ﾖ",
-        "ﾗ",
-        "ﾘ",
-        "ﾙ",
-        "ﾚ",
-        "ﾛ",
-        "ﾜ",
-        "ｦ",
-        "ﾝ",
-        "0",
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "7",
-        "8",
-        "9",
-        "◦",
-        "·",
-        "¦",
-        "┊",
-        "╎",
-        "╌",
-        "⌁",
-        "⟡",
-    };
-    const max_trail = matrixTrailLength(win.height);
-    const min_trail = @min(max_trail, @max(@as(usize, win.height) / 2, 6));
-    const streams_per_column = 3;
-    const opacity = matrixWaveOpacity(app.ui_animation_frame, app.ui_animation_frames);
-    const wave_front = matrixWaveFront(app.ui_animation_frame, app.ui_animation_frames, win.height, max_trail);
-
-    var col: u16 = 0;
-    while (col < win.width) : (col += 1) {
-        for (0..streams_per_column) |lane| {
-            const stream = matrixHash(app.ui_animation_seed +%
-                @as(u64, col) *% 0x9e3779b97f4a7c15 +%
-                @as(u64, lane) *% 0xd1b54a32d192ed03);
-            if (lane > 0 and stream % 7 == 0) continue;
-
-            const trail_len = min_trail + @as(usize, @intCast((stream >> 24) % (max_trail - min_trail + 1)));
-            const stagger: i64 = @intCast((stream >> 40) % 9);
-            const lane_offset: i64 = @intCast(lane * 4);
-            const head = wave_front - stagger - lane_offset;
-
-            var trail: usize = 0;
-            while (trail < trail_len) : (trail += 1) {
-                const row = head - @as(i64, @intCast(trail));
-                if (row < 0 or row >= win.height) continue;
-                if (!matrixCellIsOpen(win, col, @intCast(row))) continue;
-
-                const visibility = matrixHash(stream +%
-                    @as(u64, @intCast(row)) *% 0x94d049bb133111eb +%
-                    @as(u64, trail) *% 0xbf58476d1ce4e5b9);
-                if (visibility & 0xff >= opacity) continue;
-
-                var cell = win.readCell(col, @intCast(row)) orelse continue;
-                const glyph_hash = matrixHash(stream +%
-                    @as(u64, app.ui_animation_frame / 2) *% 17 +%
-                    @as(u64, trail));
-                cell.char = .{ .grapheme = glyphs[glyph_hash % glyphs.len], .width = 1 };
-                cell.style.fg = if (trail == 0)
-                    matrixWaveColor(.{ 0xd8, 0xff, 0xdc }, opacity)
-                else if (trail < 4)
-                    matrixWaveColor(.{ 0x68, 0xf5, 0x82 }, opacity)
-                else
-                    matrixWaveColor(.{ 0x18, 0xa8, 0x45 }, opacity);
-                cell.style.bold = trail <= 1;
-                cell.style.dim = trail > trail_len / 2;
-                cell.link = .{};
-                cell.image = null;
-                cell.default = false;
-                win.writeCell(col, @intCast(row), cell);
-            }
-        }
+fn drawUiAnimation(app: *const App, win: vaxis.Window) void {
+    const engine = if (app.effect_engine) |*value| value else return;
+    if (app.screensaver_active) {
+        engine.draw(win, .full_screen, 255);
+        win.hideCursor();
+        return;
     }
+    if (app.ui_animation != null)
+        engine.draw(win, .interleaved, transientAnimationOpacity(app.ui_animation_frame));
 }
 
 // ------------------------------------------------------------ entry point --
@@ -7092,14 +7089,21 @@ fn dispatchEvent(
     verdicts: *TransportVerdicts,
 ) !void {
     switch (event) {
-        .key_press => |key| try handleKey(app, key),
+        .key_press => |key| {
+            if (app.dismissScreensaver()) return;
+            app.recordUserActivity();
+            try handleKey(app, key);
+        },
         .key_release => |key| {
             if (isVoiceKey(key) and app.voice_rt.phase == .recording and
                 app.voice_rt.setup != null and app.voice_rt.setup.?.mode == .ptt)
                 app.stopVoiceRecording();
         },
         .voice => |vev| app.handleVoiceEvent(vev),
-        .mouse => |m| handleMouse(app, m),
+        .mouse => |m| {
+            if (app.screensaver_active) return;
+            handleMouse(app, m);
+        },
         .tick => {
             app.spinner_frame +%= 1;
             app.voiceTick();
@@ -7109,9 +7113,16 @@ fn dispatchEvent(
         .winsize => |ws| {
             app.term_cols = ws.cols;
             app.term_rows = ws.rows;
+            if (app.effect_engine) |*engine|
+                try engine.resize(@intCast(@min(ws.cols, std.math.maxInt(u16))), ws.rows);
             try vx.resize(gpa, tty.writer(), ws);
         },
         .paste => |text| {
+            if (app.dismissScreensaver()) {
+                gpa.free(@constCast(text));
+                return;
+            }
+            app.recordUserActivity();
             app.editor.paste(text);
             if (app.otel_header_prompt or app.setup_prompt == .credential) @memset(@constCast(text), 0);
             gpa.free(@constCast(text));
@@ -7124,15 +7135,21 @@ fn dispatchEvent(
 
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     while (!app.animation_stop.load(.acquire)) {
-        if (app.animation_active.load(.acquire)) {
+        if (app.ui_animation_active.load(.acquire)) {
             loop.postEvent(.tick) catch return;
-            const delay_ms: i64 = if (app.ui_animation_active.load(.acquire)) 33 else 90;
-            app.io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
+            app.io.sleep(.fromMilliseconds(33), .awake) catch {};
+        } else if (app.animation_active.load(.acquire)) {
+            loop.postEvent(.tick) catch return;
+            app.io.sleep(.fromMilliseconds(90), .awake) catch {};
         } else {
             app.io.sleep(.fromMilliseconds(200), .awake) catch {};
-            // An idle TUI posts no ticks; a pending notice expiry needs one.
-            const deadline = app.notice_deadline_ms.load(.acquire);
-            if (deadline != 0 and nowWallMs(app.io) >= deadline) loop.postEvent(.tick) catch return;
+            // An idle TUI posts no ticks; pending deadlines need one.
+            const now = nowWallMs(app.io);
+            const notice_deadline = app.notice_deadline_ms.load(.acquire);
+            const saver_deadline = app.screensaver_deadline_ms.load(.acquire);
+            if ((notice_deadline != 0 and now >= notice_deadline) or
+                (saver_deadline != 0 and now >= saver_deadline))
+                loop.postEvent(.tick) catch return;
         }
     }
 }
@@ -7284,6 +7301,10 @@ pub fn run(
     if (setup_at_start) |readiness| app.setup_readiness = readiness;
     app.show_tab_bar = cfg.ui_tab_bar;
     app.bell_enabled = cfg.ui_bell;
+    app.screensaver_timeout_ms = cfg.ui_screensaver_after_ms;
+    app.screensaver_kind = effects.Kind.parse(cfg.ui_screensaver_effect) orelse .matrix;
+    app.recordUserActivity();
+    app.syncAnimationTicker();
     app.effort = effort_at_start;
     app.setCwdStr(cwd_at_start);
     if (environ.get("HOME")) |home| app.setHomeStr(home);
@@ -8434,6 +8455,9 @@ fn handleKey(app: *App, key: vaxis.Key) !void {
                 if (key.matches('g', .{})) {
                     app.scroll_up = std.math.maxInt(usize); // clamped in draw
                     app.maybeRequestHistoryAtTop();
+                } else if (key.matches('s', .{})) {
+                    app.mode = .insert;
+                    app.startScreensaver(app.screensaver_kind);
                 } else if (key.matches('t', .{})) {
                     // vim Ngt is absolute; here N indexes the recency list.
                     if (count > 0) app.jumpToSession(count) else app.cycleSession(1);
@@ -8996,6 +9020,23 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expect(suggestions[0].submit_on_enter);
 
     app.editor.clear();
+    app.editor.insertSlice("/animate s");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 2), suggestions.len);
+    try std.testing.expectEqualStrings("/animate strings", suggestions[0].label);
+    try std.testing.expectEqualStrings("/animate stars", suggestions[1].label);
+
+    app.editor.clear();
+    app.editor.insertSlice("/screensaver p");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/screensaver plasma", suggestions[0].label);
+
+    app.editor.clear();
     app.editor.insertSlice("!rb c");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -9005,7 +9046,7 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expect(suggestions[0].submit_on_enter);
 }
 
-test "/animate matrix starts and expires a client-only animation" {
+test "named animations and screensavers share the selected effect engine" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -9018,33 +9059,26 @@ test "/animate matrix starts and expires a client-only animation" {
     };
     defer app.deinit();
 
-    app.runCommand("/animate matrix");
-    try std.testing.expectEqual(UiAnimation.matrix, app.ui_animation);
-    try std.testing.expect(app.ui_animation_active.load(.acquire));
-    try std.testing.expect(app.animation_active.load(.acquire));
+    app.runCommand("/animate strings");
+    try std.testing.expectEqual(effects.Kind.strings, app.ui_animation.?);
+    try std.testing.expectEqual(effects.Kind.strings, std.meta.activeTag(app.effect_engine.?));
+    app.tickUiAnimation();
+    try std.testing.expectEqual(@as(u64, 1), app.effect_engine.?.strings.frame);
 
-    const animation_frames = matrixAnimationFrames(app.term_rows);
-    try std.testing.expectEqual(animation_frames, app.ui_animation_frames);
-    for (0..animation_frames) |_| app.tickUiAnimation();
-    try std.testing.expectEqual(UiAnimation.none, app.ui_animation);
+    for (1..transient_animation_frames) |_| app.tickUiAnimation();
+    try std.testing.expect(app.ui_animation == null);
     try std.testing.expect(!app.ui_animation_active.load(.acquire));
-    try std.testing.expect(!app.animation_active.load(.acquire));
-    try std.testing.expect(app.refresh_requested);
 
-    app.runCommand("/animate unknown");
-    try std.testing.expectEqualStrings("usage: /animate matrix", app.notice.items);
+    app.runCommand("/screensaver stars");
+    try std.testing.expect(app.screensaver_active);
+    try std.testing.expectEqual(effects.Kind.matrix, app.screensaver_kind);
+    try std.testing.expectEqual(effects.Kind.stars, std.meta.activeTag(app.effect_engine.?));
+    app.tickUiAnimation();
+    try std.testing.expectEqual(@as(u64, 1), app.effect_engine.?.stars.frame);
+    try std.testing.expect(app.dismissScreensaver());
 }
 
-test "matrix rain is about half a viewport height long" {
-    for ([_]u16{ 12, 24, 60 }) |height| {
-        const trail = matrixTrailLength(height);
-        try std.testing.expect(trail >= @as(usize, height) / 2);
-        try std.testing.expect(trail <= @max(@as(usize, height) * 3 / 4, 8));
-        try std.testing.expect(matrixAnimationFrames(height) > trail);
-    }
-}
-
-test "matrix wave enters at the top, crosses the viewport, and fades out" {
+test "all effects preserve text transiently and cover it as screensavers" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -9054,9 +9088,8 @@ test "matrix wave enters at the top, crosses the viewport, and fades out" {
         .conn = undefined,
         .sid = 1,
         .editor = Editor.init(gpa),
-        .ui_animation = .matrix,
-        .ui_animation_frames = matrixAnimationFrames(18),
-        .ui_animation_seed = 0x12345678,
+        .term_cols = 48,
+        .term_rows = 18,
     };
     defer app.deinit();
 
@@ -9076,196 +9109,128 @@ test "matrix wave enters at the top, crosses the viewport, and fades out" {
         .height = 18,
         .screen = &screen,
     };
+    const baseline: vaxis.Style = .{ .fg = .{ .index = 4 }, .bg = .{ .index = 5 } };
 
-    const countRows = struct {
-        const Counts = struct { top: usize, bottom: usize };
+    for (effects.kinds) |kind| {
+        try std.testing.expect(app.resetEffectEngine(kind));
+        for (0..40) |_| app.effect_engine.?.tick();
+        win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = baseline });
+        win.writeCell(10, 8, .{ .char = .{ .grapheme = "x", .width = 1 }, .style = baseline });
 
-        fn run(window: vaxis.Window, split: u16) Counts {
-            var counts: Counts = .{ .top = 0, .bottom = 0 };
-            for (0..window.height) |row| for (0..window.width) |col| {
-                const cell = window.readCell(@intCast(col), @intCast(row)).?;
-                if (cell.default) continue;
-                if (row < split) counts.top += 1 else counts.bottom += 1;
-            };
-            return counts;
-        }
-    }.run;
+        app.ui_animation = kind;
+        app.ui_animation_frame = 30;
+        app.screensaver_active = false;
+        drawUiAnimation(&app, win);
+        try std.testing.expectEqualStrings("x", win.readCell(10, 8).?.char.grapheme);
 
-    app.ui_animation_frame = 6;
-    win.clear();
-    drawUiAnimation(&app, win);
-    const early = countRows(win, win.height / 2);
-    try std.testing.expect(early.top > 0);
-    try std.testing.expectEqual(@as(usize, 0), early.bottom);
-
-    app.ui_animation_frame = app.ui_animation_frames / 2;
-    win.clear();
-    drawUiAnimation(&app, win);
-    const middle = countRows(win, win.height / 2);
-    try std.testing.expect(middle.top > 0 and middle.bottom > 0);
-
-    app.ui_animation_frame = app.ui_animation_frames - 2;
-    win.clear();
-    drawUiAnimation(&app, win);
-    const late = countRows(win, win.height / 2);
-    try std.testing.expect(late.bottom > 0);
-    try std.testing.expect(late.top < late.bottom);
-    try std.testing.expect(late.top + late.bottom < middle.top + middle.bottom);
-
-    try std.testing.expectEqual(@as(u8, 0), matrixWaveOpacity(0, app.ui_animation_frames));
-    try std.testing.expectEqual(@as(u8, 0), matrixWaveOpacity(app.ui_animation_frames - 1, app.ui_animation_frames));
-}
-
-test "matrix animation paints default blank cells across the screen" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var app = App{
-        .gpa = gpa,
-        .io = threaded.io(),
-        .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
-        .ui_animation = .matrix,
-        .ui_animation_frame = matrixAnimationFrames(12) / 2,
-        .ui_animation_frames = matrixAnimationFrames(12),
-        .ui_animation_seed = 0x12345678,
-    };
-    defer app.deinit();
-
-    var screen = try vaxis.Screen.init(gpa, .{
-        .rows = 12,
-        .cols = 32,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(gpa);
-    const win = vaxis.Window{
-        .x_off = 0,
-        .y_off = 0,
-        .parent_x_off = 0,
-        .parent_y_off = 0,
-        .width = 32,
-        .height = 12,
-        .screen = &screen,
-    };
-    win.clear();
-
-    drawUiAnimation(&app, win);
-
-    var matrix_cells: usize = 0;
-    var top_cells: usize = 0;
-    var bottom_cells: usize = 0;
-    var left_cells: usize = 0;
-    var right_cells: usize = 0;
-    for (0..win.height) |row| for (0..win.width) |col| {
-        const cell = win.readCell(@intCast(col), @intCast(row)).?;
-        if (!cell.default) {
-            matrix_cells += 1;
-            top_cells += @intFromBool(row < win.height / 2);
-            bottom_cells += @intFromBool(row >= win.height / 2);
-            left_cells += @intFromBool(col < win.width / 2);
-            right_cells += @intFromBool(col >= win.width / 2);
-            try std.testing.expect(!std.mem.eql(u8, cell.char.grapheme, " "));
-            try std.testing.expectEqual(@as(u16, 1), win.gwidth(cell.char.grapheme));
-        }
-    };
-    try std.testing.expect(matrix_cells > 0);
-    try std.testing.expect(top_cells > 0 and bottom_cells > 0);
-    try std.testing.expect(left_cells > 0 and right_cells > 0);
-}
-
-test "matrix animation interleaves around existing text at high density" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var app = App{
-        .gpa = gpa,
-        .io = threaded.io(),
-        .conn = undefined,
-        .sid = 1,
-        .editor = Editor.init(gpa),
-        .ui_animation = .matrix,
-        .ui_animation_frame = matrixAnimationFrames(18) / 2,
-        .ui_animation_frames = matrixAnimationFrames(18),
-        .ui_animation_seed = 0x12345678,
-    };
-    defer app.deinit();
-
-    var screen = try vaxis.Screen.init(gpa, .{
-        .rows = 18,
-        .cols = 48,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(gpa);
-    const win = vaxis.Window{
-        .x_off = 0,
-        .y_off = 0,
-        .parent_x_off = 0,
-        .parent_y_off = 0,
-        .width = 48,
-        .height = 18,
-        .screen = &screen,
-    };
-    const baseline_style: vaxis.Style = .{ .fg = .{ .index = 4 }, .bg = .{ .index = 5 } };
-    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = baseline_style });
-    for (0..win.height) |row| {
-        if (row % 3 != 1) continue;
-        var col: u16 = 4;
-        while (col < win.width - 4) : (col += 7)
-            win.writeCell(col, @intCast(row), .{ .char = .{ .grapheme = "x", .width = 1 }, .style = baseline_style });
+        app.ui_animation = null;
+        app.screensaver_active = true;
+        drawUiAnimation(&app, win);
+        try std.testing.expect(!std.mem.eql(u8, win.readCell(10, 8).?.char.grapheme, "x"));
     }
-
-    drawUiAnimation(&app, win);
-
-    var matrix_cells: usize = 0;
-    var unicode_cells: usize = 0;
-    var text_cells: usize = 0;
-    var blank_cells: usize = 0;
-    for (0..win.height) |row| for (0..win.width) |col| {
-        const cell = win.readCell(@intCast(col), @intCast(row)).?;
-        if (std.mem.eql(u8, cell.char.grapheme, "x")) {
-            text_cells += 1;
-            try std.testing.expect(vaxis.Style.eql(cell.style, baseline_style));
-        } else if (std.mem.eql(u8, cell.char.grapheme, " ")) {
-            blank_cells += 1;
-        } else {
-            matrix_cells += 1;
-            unicode_cells += @intFromBool(cell.char.grapheme.len > 1);
-            try std.testing.expect(!cell.default);
-            try std.testing.expect(vaxis.Color.eql(cell.style.bg, baseline_style.bg));
-        }
-    };
-    try std.testing.expect(text_cells > 0);
-    try std.testing.expect(matrix_cells > blank_cells);
-    try std.testing.expect(unicode_cells > 0);
 }
 
-test "matrix animation does not paint wide-character continuation cells" {
+test "manual screensaver wake consumes the first input event" {
     const gpa = std.testing.allocator;
-    var screen = try vaxis.Screen.init(gpa, .{
-        .rows = 2,
-        .cols = 4,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(gpa);
-    const win = vaxis.Window{
-        .x_off = 0,
-        .y_off = 0,
-        .parent_x_off = 0,
-        .parent_y_off = 0,
-        .width = 4,
-        .height = 2,
-        .screen = &screen,
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
     };
-    win.clear();
-    win.writeCell(1, 0, .{ .char = .{ .grapheme = "界", .width = 2 } });
+    defer app.deinit();
+    app.startScreensaver(app.screensaver_kind);
 
-    try std.testing.expect(!matrixCellIsOpen(win, 1, 0));
-    try std.testing.expect(!matrixCellIsOpen(win, 2, 0));
-    try std.testing.expect(matrixCellIsOpen(win, 3, 0));
+    var verdicts = TransportVerdicts{};
+    try dispatchEvent(
+        &app,
+        undefined,
+        undefined,
+        gpa,
+        .{ .key_press = .{ .codepoint = 'a', .text = "a" } },
+        &verdicts,
+    );
+    try std.testing.expect(!app.screensaver_active);
+    try std.testing.expect(app.editor.isEmpty());
+}
+
+test "mouse activity neither wakes nor postpones the screensaver" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .screensaver_timeout_ms = 1_000,
+    };
+    defer app.deinit();
+    const deadline = nowWallMs(app.io) + 500;
+    app.screensaver_deadline_ms.store(deadline, .release);
+
+    var verdicts = TransportVerdicts{};
+    try dispatchEvent(
+        &app,
+        undefined,
+        undefined,
+        gpa,
+        .{ .mouse = .{ .col = 0, .row = 0, .button = .none, .mods = .{}, .type = .motion } },
+        &verdicts,
+    );
+    try std.testing.expectEqual(deadline, app.screensaver_deadline_ms.load(.acquire));
+
+    app.startScreensaver(app.screensaver_kind);
+    try dispatchEvent(
+        &app,
+        undefined,
+        undefined,
+        gpa,
+        .{ .mouse = .{ .col = 0, .row = 0, .button = .none, .mods = .{}, .type = .motion } },
+        &verdicts,
+    );
+    try std.testing.expect(app.screensaver_active);
+}
+
+test "idle deadline starts the screensaver without daemon activity" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .screensaver_timeout_ms = 1_000,
+    };
+    defer app.deinit();
+    app.screensaver_deadline_ms.store(nowWallMs(app.io) - 1, .release);
+    app.tickUiAnimation();
+    try std.testing.expect(app.screensaver_active);
+}
+
+test "gs starts the screensaver and returns to insert mode" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .mode = .normal,
+    };
+    defer app.deinit();
+    try handleKey(&app, .{ .codepoint = 'g' });
+    try handleKey(&app, .{ .codepoint = 's' });
+    try std.testing.expect(app.screensaver_active);
+    try std.testing.expectEqual(Mode.insert, app.mode);
 }
 
 test "command menu Tab completes and Enter runs the selection" {

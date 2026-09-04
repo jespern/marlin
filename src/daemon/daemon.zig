@@ -2081,7 +2081,12 @@ pub const Daemon = struct {
                     return;
                 };
                 self.cfg.ui_tab_bar = request.enabled;
-                self.sendTo(client, .{ .ui_config_result = .{ .tab_bar = self.cfg.ui_tab_bar, .bell = self.cfg.ui_bell } });
+                self.sendTo(client, .{ .ui_config_result = .{
+                    .tab_bar = self.cfg.ui_tab_bar,
+                    .bell = self.cfg.ui_bell,
+                    .screensaver_after_ms = self.cfg.ui_screensaver_after_ms,
+                    .screensaver_effect = self.cfg.ui_screensaver_effect,
+                } });
             },
             .ui_set_bell => |request| {
                 config.setUiFlag(self.gpa, self.io, self.environ, "bell", request.enabled) catch |err| {
@@ -2093,7 +2098,38 @@ pub const Daemon = struct {
                     return;
                 };
                 self.cfg.ui_bell = request.enabled;
-                self.sendTo(client, .{ .ui_config_result = .{ .tab_bar = self.cfg.ui_tab_bar, .bell = self.cfg.ui_bell } });
+                self.sendTo(client, .{ .ui_config_result = .{
+                    .tab_bar = self.cfg.ui_tab_bar,
+                    .bell = self.cfg.ui_bell,
+                    .screensaver_after_ms = self.cfg.ui_screensaver_after_ms,
+                    .screensaver_effect = self.cfg.ui_screensaver_effect,
+                } });
+            },
+            .ui_set_screensaver => |request| {
+                var duration_buf: [32]u8 = undefined;
+                const duration = config.formatDuration(&duration_buf, request.after_ms) catch {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "config",
+                        .msg = "screensaver timeout must be zero or whole seconds",
+                    } });
+                    return;
+                };
+                config.setUiScreensaver(self.gpa, self.io, self.environ, duration, request.effect) catch |err| {
+                    std.log.warn("could not persist screensaver preference: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{
+                        .code = "config",
+                        .msg = "could not save screensaver preference to config.toml",
+                    } });
+                    return;
+                };
+                self.cfg.ui_screensaver_after_ms = request.after_ms;
+                self.cfg.ui_screensaver_effect = config.canonicalScreensaverEffect(request.effect) catch unreachable;
+                self.sendTo(client, .{ .ui_config_result = .{
+                    .tab_bar = self.cfg.ui_tab_bar,
+                    .bell = self.cfg.ui_bell,
+                    .screensaver_after_ms = self.cfg.ui_screensaver_after_ms,
+                    .screensaver_effect = self.cfg.ui_screensaver_effect,
+                } });
             },
             .mcp_remove => |request| {
                 if (self.anySessionBusy()) {
