@@ -749,7 +749,9 @@ test "screensaver durations are strict and canonical" {
     try validateScreensaverEffect("strings");
     try validateScreensaverEffect("stars");
     try validateScreensaverEffect("plasma");
-    try std.testing.expectError(error.InvalidScreensaverEffect, validateScreensaverEffect("tunnel"));
+    try validateScreensaverEffect("pacman");
+    try validateScreensaverEffect("tunnel");
+    try std.testing.expectError(error.InvalidScreensaverEffect, validateScreensaverEffect("disco"));
 }
 
 test "web ui stays off unless deliberately enabled" {
@@ -1169,7 +1171,7 @@ test "invalid screensaver effect rejects the loaded config" {
     const path = try std.fs.path.join(gpa, &.{ temp.path, "marlin", "config.toml" });
     defer gpa.free(path);
     try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[ui]\nscreensaver_effect = \"tunnel\"\n" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[ui]\nscreensaver_effect = \"disco\"\n" });
     try std.testing.expectError(error.InvalidScreensaverEffect, load(gpa, io, &environ));
 }
 

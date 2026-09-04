@@ -106,6 +106,8 @@ test {
     _ = @import("client/effects.zig");
     _ = @import("client/media.zig");
     _ = @import("client/matrix.zig");
+    _ = @import("client/pacman.zig");
+    _ = @import("client/pixel_effects.zig");
     _ = @import("client/plasma.zig");
     _ = @import("client/starfield.zig");
     _ = @import("client/strings.zig");

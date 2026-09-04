@@ -174,8 +174,8 @@ const composer_commands = [_]ComposerCommand{
     .{ .name = "/top", .description = "live session overview and switcher" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
-    .{ .name = "/animate", .usage = " <matrix|strings|stars|plasma>", .description = "play a transient screen effect", .accepts_args = true },
-    .{ .name = "/screensaver", .usage = " [matrix|strings|stars|plasma]", .description = "start a continuous full-screen effect", .accepts_args = true },
+    .{ .name = "/animate", .usage = " <" ++ effects.usage_list ++ ">", .description = "play a transient screen effect", .accepts_args = true },
+    .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "]", .description = "start a continuous full-screen effect", .accepts_args = true },
     .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
@@ -714,6 +714,12 @@ const App = struct {
     ui_animation: ?effects.Kind = null,
     ui_animation_frame: usize = 0,
     effect_engine: ?effects.Engine = null,
+    /// Terminal capability from queryTerminal; pixel effects need it and
+    /// otherwise start as their cell fallback.
+    kitty_graphics: bool = false,
+    /// Cell size in pixels from the winsize report (0 = unknown).
+    cell_px_w: u32 = 0,
+    cell_px_h: u32 = 0,
     screensaver_active: bool = false,
     screensaver_kind: effects.Kind = .matrix,
     screensaver_timeout_ms: u64 = 0,
@@ -2317,11 +2323,56 @@ const App = struct {
         self.animation_active.store(self.needsAnimationTick(), .release);
     }
 
-    fn resetEffectEngine(self: *App, kind: effects.Kind) bool {
+    fn recordCellPixels(self: *App, ws: vaxis.Winsize) void {
+        if (ws.cols > 0 and ws.rows > 0 and ws.x_pixel > 0 and ws.y_pixel > 0) {
+            self.cell_px_w = @as(u32, ws.x_pixel) / ws.cols;
+            self.cell_px_h = @as(u32, ws.y_pixel) / ws.rows;
+        }
+    }
+
+    const ResolvedEffect = struct { kind: effects.Kind, backend: effects.Backend };
+
+    /// Pixel effects need Kitty graphics; without it the request runs on
+    /// cells — the same kind when it has a cell renderer (Pac-Man), else a
+    /// cell sibling — and says so once.
+    fn resolveEffect(self: *App, requested: effects.Kind) ResolvedEffect {
+        if (requested.backend() == .pixel and !self.kitty_graphics) {
+            const fallback = requested.fallback();
+            if (fallback == requested)
+                self.setNotice("{s} on cells — this terminal has no Kitty graphics", .{requested.name()})
+            else
+                self.setNotice("{s} needs Kitty graphics — this terminal has none; using {s}", .{ requested.name(), fallback.name() });
+            return .{ .kind = fallback, .backend = .cell };
+        }
+        return .{ .kind = requested, .backend = requested.backend() };
+    }
+
+    /// Pixel effects ship a frame before every draw. Runs in the main loop
+    /// with the tty writer in hand; cell effects are untouched. A terminal
+    /// that refuses mid-flight degrades to the cell fallback.
+    fn pumpPixelEffect(self: *App, vx: *vaxis.Vaxis, tty: *std.Io.Writer) void {
+        const engine = if (self.effect_engine) |*e| e else return;
+        if (!engine.isPixel()) return;
+        if (self.screensaver_active or self.ui_animation != null) {
+            engine.transmit(vx, tty) catch |err| {
+                const requested = engine.kind();
+                self.kitty_graphics = false;
+                _ = self.resetEffectEngine(requested);
+                self.setNotice("Kitty graphics failed ({t}); {s} on cells", .{ err, requested.fallback().name() });
+            };
+        } else if (engine.hasImage()) {
+            engine.release(vx, tty);
+        }
+    }
+
+    fn resetEffectEngine(self: *App, requested: effects.Kind) bool {
+        const resolved = self.resolveEffect(requested);
+        const kind = resolved.kind;
         var seed_bytes: [8]u8 = undefined;
         self.io.random(&seed_bytes);
         if (self.effect_engine) |*engine| engine.deinit();
-        self.effect_engine = effects.Engine.init(self.gpa, kind, 1);
+        self.effect_engine = effects.Engine.init(self.gpa, kind, 1, resolved.backend);
+        self.effect_engine.?.setCellPixels(self.cell_px_w, self.cell_px_h);
         self.effect_engine.?.reset(
             @intCast(@min(self.term_cols, std.math.maxInt(u16))),
             self.term_rows,
@@ -2715,7 +2766,7 @@ const App = struct {
             };
         } else if (std.mem.eql(u8, head, "/animate")) {
             const name = it.next() orelse {
-                self.setNotice("usage: /animate <matrix|strings|stars|plasma>", .{});
+                self.setNotice("usage: /animate <" ++ effects.usage_list ++ ">", .{});
                 return;
             };
             const kind = effects.Kind.parse(name) orelse {
@@ -2723,7 +2774,7 @@ const App = struct {
                 return;
             };
             if (it.next() != null) {
-                self.setNotice("usage: /animate <matrix|strings|stars|plasma>", .{});
+                self.setNotice("usage: /animate <" ++ effects.usage_list ++ ">", .{});
                 return;
             }
             self.startUiAnimation(kind);
@@ -2733,7 +2784,7 @@ const App = struct {
                 return;
             } else self.screensaver_kind;
             if (it.next() != null) {
-                self.setNotice("usage: /screensaver [matrix|strings|stars|plasma]", .{});
+                self.setNotice("usage: /screensaver [" ++ effects.usage_list ++ "]", .{});
                 return;
             }
             self.startScreensaver(kind);
@@ -2789,7 +2840,7 @@ const App = struct {
                 kind = parsed;
             } else {
                 after_ms = config.parseDurationMs(raw) catch {
-                    self.setNotice("usage: /config screensaver <30s|10m|1h|off> [matrix|strings|stars|plasma]", .{});
+                    self.setNotice("usage: /config screensaver <30s|10m|1h|off> [" ++ effects.usage_list ++ "]", .{});
                     return;
                 };
                 if (extra) |effect_name| {
@@ -6961,8 +7012,16 @@ fn drawUiAnimation(app: *const App, win: vaxis.Window) void {
         win.hideCursor();
         return;
     }
-    if (app.ui_animation != null)
-        engine.draw(win, .interleaved, transientAnimationOpacity(app.ui_animation_frame));
+    if (app.ui_animation != null) {
+        // Pixel images and the maze cannot interleave with text: a transient
+        // /animate of those runs opaque for its duration instead.
+        if (engine.kind().fullScreenOnly()) {
+            engine.draw(win, .full_screen, 255);
+            win.hideCursor();
+        } else {
+            engine.draw(win, .interleaved, transientAnimationOpacity(app.ui_animation_frame));
+        }
+    }
 }
 
 // ------------------------------------------------------------ entry point --
@@ -7140,8 +7199,11 @@ fn dispatchEvent(
         .winsize => |ws| {
             app.term_cols = ws.cols;
             app.term_rows = ws.rows;
-            if (app.effect_engine) |*engine|
+            app.recordCellPixels(ws);
+            if (app.effect_engine) |*engine| {
+                engine.setCellPixels(app.cell_px_w, app.cell_px_h);
                 try engine.resize(@intCast(@min(ws.cols, std.math.maxInt(u16))), ws.rows);
+            }
             try vx.resize(gpa, tty.writer(), ws);
         },
         .paste => |text| {
@@ -7388,6 +7450,7 @@ pub fn run(
         try writer.flush();
         try vx.queryTerminal(tty.writer(), .fromSeconds(1));
         app.voice_rt.kitty_release = vx.caps.kitty_keyboard;
+        app.kitty_graphics = vx.caps.kitty_graphics;
         app.initVoiceFromConfig();
         try vx.setBracketedPaste(writer, true);
         // Mouse: wheel scrolls the session view; native cell-precise selection
@@ -7402,6 +7465,7 @@ pub fn run(
             if (ws.rows == 0 or ws.cols == 0) ws = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 };
             app.term_cols = ws.cols;
             app.term_rows = ws.rows;
+            app.recordCellPixels(ws);
             try vx.resize(gpa, tty.writer(), ws);
         }
 
@@ -7435,6 +7499,7 @@ pub fn run(
         {
             var frame_arena = std.heap.ArenaAllocator.init(gpa);
             defer frame_arena.deinit();
+            app.pumpPixelEffect(&vx, writer);
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
             if (app.bell_pending) {
@@ -7554,6 +7619,7 @@ pub fn run(
                 app.clipboard_desc.clearRetainingCapacity();
             }
 
+            app.pumpPixelEffect(&vx, writer);
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
             if (app.bell_pending) {
@@ -9115,8 +9181,9 @@ test "composer suggestions include commands, council actions, and council names"
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
-    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqual(@as(usize, 2), suggestions.len); // matrix, metaballs
     try std.testing.expectEqualStrings("/animate matrix", suggestions[0].label);
+    try std.testing.expectEqualStrings("/animate metaballs", suggestions[1].label);
     try std.testing.expect(suggestions[0].submit_on_enter);
 
     app.editor.clear();
@@ -9133,8 +9200,17 @@ test "composer suggestions include commands, council actions, and council names"
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
-    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqual(@as(usize, 2), suggestions.len); // plasma, pacman
     try std.testing.expectEqualStrings("/screensaver plasma", suggestions[0].label);
+    try std.testing.expectEqualStrings("/screensaver pacman", suggestions[1].label);
+
+    app.editor.clear();
+    app.editor.insertSlice("/screensaver tu");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/screensaver tunnel", suggestions[0].label);
 
     app.editor.clear();
     app.editor.insertSlice("!rb c");
@@ -9161,7 +9237,7 @@ test "named animations and screensavers share the selected effect engine" {
 
     app.runCommand("/animate strings");
     try std.testing.expectEqual(effects.Kind.strings, app.ui_animation.?);
-    try std.testing.expectEqual(effects.Kind.strings, std.meta.activeTag(app.effect_engine.?));
+    try std.testing.expectEqual(effects.Kind.strings, app.effect_engine.?.kind());
     app.tickUiAnimation();
     try std.testing.expectEqual(@as(u64, 1), app.effect_engine.?.strings.frame);
 
@@ -9172,7 +9248,7 @@ test "named animations and screensavers share the selected effect engine" {
     app.runCommand("/screensaver stars");
     try std.testing.expect(app.screensaver_active);
     try std.testing.expectEqual(effects.Kind.matrix, app.screensaver_kind);
-    try std.testing.expectEqual(effects.Kind.stars, std.meta.activeTag(app.effect_engine.?));
+    try std.testing.expectEqual(effects.Kind.stars, app.effect_engine.?.kind());
     app.tickUiAnimation();
     try std.testing.expectEqual(@as(u64, 1), app.effect_engine.?.stars.frame);
     try std.testing.expect(app.dismissScreensaver());
@@ -9213,6 +9289,8 @@ test "all effects preserve text transiently and cover it as screensavers" {
 
     for (effects.kinds) |kind| {
         try std.testing.expect(app.resetEffectEngine(kind));
+        // No Kitty graphics in a test App: pixel kinds start as their cell sibling.
+        try std.testing.expectEqual(kind.fallback(), app.effect_engine.?.kind());
         for (0..40) |_| app.effect_engine.?.tick();
         win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = baseline });
         win.writeCell(10, 8, .{ .char = .{ .grapheme = "x", .width = 1 }, .style = baseline });
@@ -9221,13 +9299,55 @@ test "all effects preserve text transiently and cover it as screensavers" {
         app.ui_animation_frame = 30;
         app.screensaver_active = false;
         drawUiAnimation(&app, win);
-        try std.testing.expectEqualStrings("x", win.readCell(10, 8).?.char.grapheme);
+        if (app.effect_engine.?.kind().fullScreenOnly()) {
+            // The maze has no interleaved form: a transient run is opaque.
+            try std.testing.expect(!std.mem.eql(u8, win.readCell(10, 8).?.char.grapheme, "x"));
+        } else {
+            try std.testing.expectEqualStrings("x", win.readCell(10, 8).?.char.grapheme);
+        }
 
         app.ui_animation = null;
         app.screensaver_active = true;
         drawUiAnimation(&app, win);
         try std.testing.expect(!std.mem.eql(u8, win.readCell(10, 8).?.char.grapheme, "x"));
     }
+}
+
+test "pixel effects start as themselves only with Kitty graphics" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .term_cols = 80,
+        .term_rows = 24,
+    };
+    defer app.deinit();
+
+    try std.testing.expect(app.resetEffectEngine(.tunnel));
+    try std.testing.expectEqual(effects.Kind.plasma, app.effect_engine.?.kind());
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "needs Kitty graphics") != null);
+    // Pac-Man keeps its kind and drops to its cell renderer.
+    try std.testing.expect(app.resetEffectEngine(.pacman));
+    try std.testing.expectEqual(effects.Kind.pacman, app.effect_engine.?.kind());
+    try std.testing.expect(!app.effect_engine.?.isPixel());
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "pacman on cells") != null);
+
+    app.kitty_graphics = true;
+    app.cell_px_w = 8;
+    app.cell_px_h = 16;
+    try std.testing.expect(app.resetEffectEngine(.tunnel));
+    try std.testing.expectEqual(effects.Kind.tunnel, app.effect_engine.?.kind());
+    try std.testing.expect(app.effect_engine.?.isPixel());
+    try std.testing.expect(!app.effect_engine.?.hasImage()); // nothing transmitted yet
+    app.effect_engine.?.tick();
+    try std.testing.expect(app.resetEffectEngine(.pacman));
+    try std.testing.expectEqual(effects.Kind.pacman, app.effect_engine.?.kind());
+    try std.testing.expect(app.effect_engine.?.isPixel());
 }
 
 test "manual screensaver wake consumes the first input event" {

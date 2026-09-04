@@ -1108,7 +1108,10 @@ A split pane identifies its session with a compact pane label.
   arbitrary attach, v visual-select,
   y yank).
 - **Splits (not yet implemented)**: binary-tree layout, each pane = a
-  session view (or the same session twice). No VTE anywhere.
+  session view (or the same session twice). No VTE anywhere. The daemon
+  already fans blocks out to every session a client has subscribed, so splits
+  are a client-only change; the prerequisite `SessionView` extraction and the
+  rest of the plan are in `docs/PANES_PLAN.md`.
 - **Scrollback**: virtual list over the block log. While following the bottom
   of a running turn, the initiating user prompt scrolls normally until it
   reaches the top, then stays there above the growing live tail. Scrolling up
@@ -1139,13 +1142,50 @@ A split pane identifies its session with a compact pane label.
   register are future work.
 - **Command namespace**: `/` = session & harness commands (`/sessions`,
   `/model`, `/compact`, `/new`, `/archive`, `/animate`, `/screensaver`); `!` =
-  terse frequent actions. A client-owned effect union exposes one reset/tick/
-  resize/draw contract for Matrix rain, dancing sine strings, a forward
-  starfield, and demoscene plasma. `/animate <effect>` renders a finite 30 FPS
-  burst through blank cells, preserving UI glyphs; `/screensaver [effect]` runs
-  the same engine continuously as an opaque full-viewport overlay. Bare
-  `/screensaver`, automatic activation, and normal-mode `gs` use `[ui]
-  screensaver_effect` (default `"matrix"`). `gs` switches to insert mode before
+  terse frequent actions. A client-owned effect union (`client/effects.zig`)
+  exposes one reset/tick/resize/draw contract over two backends declared in
+  `core/visual_effect.zig`. Cell effects paint the grid: Matrix rain, dancing
+  sine strings, a forward starfield, demoscene plasma. Pixel effects
+  (`client/pixel_effects.zig`) render an RGB framebuffer and ship it over
+  Kitty graphics: tunnel, metaballs, horizon, a 24-second `demo` sequence,
+  and a self-playing Pac-Man (`client/pacman.zig`, rules and wall-bounce
+  ghosts after feiss' js1k 2019 entry, a BFS eat-or-flee driver replacing
+  the cursor keys). Its maze is generated per board to fit the window's
+  aspect, arcade style: a mirrored half-map of 3×3-tile cells whose 2×2 wall
+  blocks are merged into small tetromino-like pieces; corridors are exactly
+  the seams between different pieces, which makes dead ends impossible by
+  construction (three closed seams around a lattice node force the fourth
+  closed too); pieces on the center line may join their mirror; a ghost
+  house with a ghosts-only door sits in the middle; the house row's edge
+  tiles wrap as tunnels; a BFS soundness check retries a bad draw. `Game`
+  is the board, `renderBackground` draws the static maze once per generation
+  as an anti-aliased outline band following the wall shape (the arcade look,
+  rounded outer corners from a rectangle-distance field), `renderPixels`
+  adds dots and anti-aliased sprites gliding between tiles, and a cell
+  `Engine` draws the same board with glyphs where graphics are missing.
+  Demoscene framebuffers are 160–400 px wide with the window's pixel aspect
+  (from the winsize report); the maze uses up to 16 px per tile, letterboxed
+  to the window's aspect (height ≤ 720, width ≤ 1600). Transport: the main
+  loop calls `transmit` before `draw`; one new image per animation tick
+  (`a=t`, 4 KiB chunks, `q=2` so the terminal stays quiet, ids from vaxis'
+  counter, `o=z` zlib when smaller — the flat maze compresses ~50×, which is
+  what pays for its resolution; boards over 700k pixels ship every other
+  tick), placed through the cell grid so vaxis' render() emits `a=p` inside
+  the same synchronized update; the previous image is freed one tick after
+  its successor is placed, so the screen never lacks an image.
+  Placements use the default z-index (above text) because terminals disagree
+  on where negative z sits relative to an explicit cell background.
+  Capability comes from `vx.caps.kitty_graphics`; without it Pac-Man runs its
+  cell renderer and the other pixel kinds start as their `fallback()` cell
+  sibling, each with a notice, and a transmit failure mid-run degrades the
+  same way. Pixel kinds are `fullScreenOnly`: a transient `/animate` of those
+  runs opaque. The usage strings for
+  `/animate`, `/screensaver`, and `/config screensaver` are generated from the
+  kind list. `/animate <effect>` renders a finite 30 FPS burst through blank
+  cells, preserving UI glyphs; `/screensaver [effect]` runs the same engine
+  continuously as an opaque full-viewport overlay. Bare `/screensaver`,
+  automatic activation, and normal-mode `gs` use `[ui] screensaver_effect`
+  (default `"matrix"`). `gs` switches to insert mode before
   entering the saver. A key or paste dismisses it and is consumed; mouse events
   are ignored and do not reset inactivity. `[ui] screensaver_after = "10m"`
   enables per-client inactivity activation; absent or `"off"` disables it.

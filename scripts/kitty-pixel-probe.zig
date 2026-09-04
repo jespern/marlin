@@ -1,5 +1,10 @@
 //! Kitty graphics transport probe for animated RGB framebuffers.
 //!
+//! The scenes below graduated into src/client/pixel_effects.zig, where they
+//! are screensavers (`/screensaver tunnel|metaballs|horizon|demo`) shipped
+//! through vaxis. This script stays as the standalone bandwidth/latency
+//! probe (`--sweep`) for validating a terminal without running marlin.
+//!
 //! Run a single rate:
 //!   zig run -O ReleaseFast scripts/kitty-pixel-probe.zig -- --fps 30 --seconds 5
 //!
