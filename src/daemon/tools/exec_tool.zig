@@ -82,36 +82,3 @@ fn failure(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Resu
         .status = .err,
     };
 }
-
-test "exec tool receives JSON on stdin" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const result = run(
-        gpa,
-        threaded.io(),
-        &.{ "sh", "-c", "input=$(cat); printf 'seen:%s' \"$input\"" },
-        "{\"value\":42}",
-        "/tmp",
-        null,
-        2_000,
-        null,
-    );
-    defer gpa.free(result.output);
-    try std.testing.expectEqual(block.ToolStatus.ok, result.status);
-    try std.testing.expectEqualStrings("seen:{\"value\":42}", result.output);
-}
-
-test "exec tool makes nonzero exit model-visible" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const result = run(gpa, threaded.io(), &.{ "sh", "-c", "printf nope; exit 7" }, "{}", "/tmp", null, 2_000, null);
-    defer gpa.free(result.output);
-    try std.testing.expectEqual(block.ToolStatus.err, result.status);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "exit code: 7") != null);
-}
-
-test {
-    std.testing.refAllDecls(@This());
-}

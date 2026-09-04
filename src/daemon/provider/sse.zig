@@ -111,11 +111,11 @@ pub const Parser = struct {
 
 // ---------------------------------------------------------------- tests --
 
-const TestSink = struct {
+pub const TestSink = struct {
     events: std.ArrayList(struct { name: []u8, data: []u8 }) = .empty,
     gpa: std.mem.Allocator,
 
-    fn deinit(self: *TestSink) void {
+    pub fn deinit(self: *TestSink) void {
         for (self.events.items) |e| {
             self.gpa.free(e.name);
             self.gpa.free(e.data);
@@ -123,91 +123,9 @@ const TestSink = struct {
         self.events.deinit(self.gpa);
     }
 
-    fn on(self: *TestSink, ev: Event) void {
+    pub fn on(self: *TestSink, ev: Event) void {
         const n = self.gpa.dupe(u8, ev.name) catch unreachable;
         const d = self.gpa.dupe(u8, ev.data) catch unreachable;
         self.events.append(self.gpa, .{ .name = n, .data = d }) catch unreachable;
     }
 };
-
-fn feedAll(p: *Parser, s: *TestSink, input: []const u8, chunk_size: usize) !void {
-    var i: usize = 0;
-    while (i < input.len) {
-        const end = @min(i + chunk_size, input.len);
-        try p.feed(input[i..end], s, TestSink.on);
-        i = end;
-    }
-}
-
-test "basic event dispatch, LF" {
-    const gpa = std.testing.allocator;
-    var p = Parser.init(gpa);
-    defer p.deinit();
-    var s = TestSink{ .gpa = gpa };
-    defer s.deinit();
-
-    try p.feed("data: {\"x\":1}\n\ndata: [DONE]\n\n", &s, TestSink.on);
-    try std.testing.expectEqual(@as(usize, 2), s.events.items.len);
-    try std.testing.expectEqualStrings("{\"x\":1}", s.events.items[0].data);
-    try std.testing.expectEqualStrings("[DONE]", s.events.items[1].data);
-}
-
-test "CRLF, comments, event names, multi-line data" {
-    const gpa = std.testing.allocator;
-    var p = Parser.init(gpa);
-    defer p.deinit();
-    var s = TestSink{ .gpa = gpa };
-    defer s.deinit();
-
-    const input = ": keep-alive\r\n" ++
-        "event: content_block_delta\r\n" ++
-        "data: line1\r\n" ++
-        "data: line2\r\n" ++
-        "\r\n";
-    try p.feed(input, &s, TestSink.on);
-    try std.testing.expectEqual(@as(usize, 1), s.events.items.len);
-    try std.testing.expectEqualStrings("content_block_delta", s.events.items[0].name);
-    try std.testing.expectEqualStrings("line1\nline2", s.events.items[0].data);
-}
-
-test "torture: 1-byte chunks across everything" {
-    const gpa = std.testing.allocator;
-    var p = Parser.init(gpa);
-    defer p.deinit();
-    var s = TestSink{ .gpa = gpa };
-    defer s.deinit();
-
-    const input = "event: e1\ndata: {\"a\":\"é\"}\n\ndata: two\n\n";
-    try feedAll(&p, &s, input, 1);
-    try std.testing.expectEqual(@as(usize, 2), s.events.items.len);
-    try std.testing.expectEqualStrings("{\"a\":\"é\"}", s.events.items[0].data);
-    try std.testing.expectEqualStrings("e1", s.events.items[0].name);
-    try std.testing.expectEqualStrings("two", s.events.items[1].data);
-    try std.testing.expectEqualStrings("", s.events.items[1].name);
-}
-
-test "no trailing blank line → no dispatch (partial event held)" {
-    const gpa = std.testing.allocator;
-    var p = Parser.init(gpa);
-    defer p.deinit();
-    var s = TestSink{ .gpa = gpa };
-    defer s.deinit();
-
-    try p.feed("data: partial", &s, TestSink.on);
-    try std.testing.expectEqual(@as(usize, 0), s.events.items.len);
-    try p.feed("\n\n", &s, TestSink.on);
-    try std.testing.expectEqual(@as(usize, 1), s.events.items.len);
-    try std.testing.expectEqualStrings("partial", s.events.items[0].data);
-}
-
-test "oversized event rejected" {
-    const gpa = std.testing.allocator;
-    var p = Parser.init(gpa);
-    defer p.deinit();
-    p.max_event_bytes = 16;
-    var s = TestSink{ .gpa = gpa };
-    defer s.deinit();
-
-    const r = p.feed("data: aaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n", &s, TestSink.on);
-    try std.testing.expectError(error.EventTooLarge, r);
-}

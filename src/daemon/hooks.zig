@@ -34,7 +34,7 @@ pub fn fire(
     return fireArgv(gpa, io, &.{script}, kind, payload_json, child_environ);
 }
 
-fn fireArgv(
+pub fn fireArgv(
     gpa: std.mem.Allocator,
     io: Io,
     argv: []const []const u8,
@@ -69,36 +69,4 @@ fn fireArgv(
         return error.HookFailed;
     }
     if (result.stderr.len > 0) std.log.info("hook {s}: {s}", .{ @tagName(kind), result.stderr });
-}
-
-test "hook receives a stable event envelope" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    try fireArgv(
-        gpa,
-        threaded.io(),
-        &.{ "sh", "-c", "input=$(cat); case \"$input\" in *'\"event\":\"on_turn_done\"'*'\"sid\":7'*) exit 0;; *) exit 9;; esac" },
-        .on_turn_done,
-        "{\"sid\":7}",
-        null,
-    );
-}
-
-test "hook rejects non-object payloads before spawn" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    try std.testing.expectError(error.HookPayloadMustBeObject, fireArgv(
-        gpa,
-        threaded.io(),
-        &.{"false"},
-        .on_error,
-        "[]",
-        null,
-    ));
-}
-
-test {
-    std.testing.refAllDecls(@This());
 }

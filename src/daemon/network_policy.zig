@@ -148,7 +148,7 @@ pub const Policy = struct {
         return self.checkHost(host.bytes);
     }
 
-    fn addOverrides(
+    pub fn addOverrides(
         self: *Policy,
         map: *std.StringHashMapUnmanaged(void),
         raw: ?[]const u8,
@@ -215,7 +215,7 @@ pub const Policy = struct {
         });
     }
 
-    fn addFeedBuffer(self: *Policy, feed_index: usize, buffer: []u8) !void {
+    pub fn addFeedBuffer(self: *Policy, feed_index: usize, buffer: []u8) !void {
         lowercaseAscii(buffer);
         var entry_count: usize = 0;
         var counting = std.mem.splitScalar(u8, buffer, '\n');
@@ -338,45 +338,3 @@ fn cacheFeed(gpa: std.mem.Allocator, io: Io, path: []const u8, body: []const u8)
 }
 
 // ---------------------------------------------------------------- tests --
-
-test "domain rules cover subdomains and explicit allow overrides feeds" {
-    const gpa = std.testing.allocator;
-    var policy = Policy{ .gpa = gpa };
-    defer policy.deinit();
-
-    const feed = try gpa.dupe(u8,
-        \\# sample
-        \\bad.example
-        \\0.0.0.0 malware.test
-        \\
-    );
-    try policy.addFeedBuffer(0, feed);
-    try policy.loaded_feeds.append(gpa, 0);
-    try policy.addOverrides(&policy.explicit_allow, "safe.bad.example");
-    try policy.addOverrides(&policy.explicit_deny, "always.blocked");
-
-    try std.testing.expectEqualStrings("bad.example", policy.checkHost("BAD.EXAMPLE.").?.domain);
-    try std.testing.expectEqualStrings("bad.example", policy.checkHost("deep.bad.example").?.domain);
-    try std.testing.expect(policy.checkHost("safe.bad.example") == null);
-    try std.testing.expectEqualStrings("explicit deny", policy.checkHost("x.always.blocked").?.source);
-    try std.testing.expectEqualStrings("malware.test", policy.checkHost("malware.test").?.domain);
-    try std.testing.expect(policy.checkHost("example.org") == null);
-}
-
-test "URL extraction checks only http hostnames" {
-    const gpa = std.testing.allocator;
-    var policy = Policy{ .gpa = gpa };
-    defer policy.deinit();
-    try policy.addOverrides(&policy.explicit_deny, "blocked.test");
-
-    try std.testing.expect((try policy.checkUrl("https://sub.blocked.test/path?q=1")) != null);
-    try std.testing.expect((try policy.checkUrl("http://allowed.test/")) == null);
-    try std.testing.expectError(error.UnsupportedScheme, policy.checkUrl("file:///etc/passwd"));
-}
-
-test "catalog ids are unique and use https" {
-    for (catalog, 0..) |feed, i| {
-        try std.testing.expect(std.mem.startsWith(u8, feed.url, "https://"));
-        for (catalog[i + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, feed.id, other.id));
-    }
-}

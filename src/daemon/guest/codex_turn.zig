@@ -640,7 +640,3 @@ pub fn runCodexTurn(
         .tokens_out = tokens_out,
     };
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}

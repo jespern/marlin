@@ -439,7 +439,3 @@ pub fn runClaudeCodeTurn(
         .tokens_out = total_out,
     };
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}

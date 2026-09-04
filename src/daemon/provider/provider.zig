@@ -72,7 +72,3 @@ pub const Usage = struct {
     reasoning_tokens: u64 = 0,
     web_search_requests: u64 = 0,
 };
-
-test {
-    std.testing.refAllDecls(@This());
-}
