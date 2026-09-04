@@ -428,67 +428,6 @@ fn deinitPlan(gpa: std.mem.Allocator, items: *std.ArrayList(PlanItemOwned)) void
     items.* = .empty;
 }
 
-/// Inactive sessions keep their complete client-side view state without
-/// remaining subscribed to their block streams. Moving these containers in
-/// and out of App is allocation-free after the first visit.
-const SavedSessionView = struct {
-    editor: Editor,
-    blocks: std.ArrayList(RenderBlock),
-    delta: std.ArrayList(u8),
-    reasoning_delta: std.ArrayList(u8),
-    plan: std.ArrayList(PlanItemOwned) = .empty,
-    state: proto.SessionState,
-    model: std.ArrayList(u8),
-    effort: proto.ReasoningEffort,
-    cwd: std.ArrayList(u8),
-    tokens_in: u64,
-    tokens_out: u64,
-    context_used: u64,
-    context_limit: u64,
-    plan_mode: bool,
-    plan_proposal_ready: bool,
-    scroll_up: usize,
-    last_total_lines: usize,
-    last_first_visible: usize,
-    last_view_h: usize,
-    pending: ?PendingApproval,
-    sel_anchor: ?SelectionPoint,
-    sel_head: SelectionPoint,
-    sel_dragging: bool,
-    copy_pending: bool,
-    show_tool_transcript: bool,
-    spinner_frame: usize,
-    turn_started_ms: i64,
-    turn_phase: proto.TurnPhase,
-    phase_started_ms: i64,
-    call_started_ms: i64,
-    stream_bytes: u64,
-    stream_quiet_ms: u64,
-    stream_status_at_ms: i64,
-    last_seq: u64,
-    oldest_seq: u64,
-    history_complete: bool,
-    last_used: u64 = 0,
-
-    fn deinit(self: *SavedSessionView, gpa: std.mem.Allocator) void {
-        self.editor.deinit();
-        for (self.blocks.items) |*rb| rb.deinit(gpa);
-        self.blocks.deinit(gpa);
-        self.delta.deinit(gpa);
-        self.reasoning_delta.deinit(gpa);
-        deinitPlan(gpa, &self.plan);
-        self.model.deinit(gpa);
-        self.cwd.deinit(gpa);
-    }
-
-    fn releaseStreamingBuffers(self: *SavedSessionView, gpa: std.mem.Allocator) void {
-        self.delta.deinit(gpa);
-        self.delta = .empty;
-        self.reasoning_delta.deinit(gpa);
-        self.reasoning_delta = .empty;
-    }
-};
-
 const SearchHitOwned = struct {
     sid: u64,
     seq: u64,
@@ -597,6 +536,36 @@ const SessionView = struct {
     /// Bumped whenever existing blocks mutate in place or the block list is
     /// replaced (session switch) — invalidates layout_cache.
     layout_epoch: u64 = 0,
+    /// MRU tick while the view sits in App.saved_views; unused when focused.
+    /// Inactive views are a cache, not durable state: an evicted session
+    /// replays from seq 1 when reopened.
+    last_used: u64 = 0,
+
+    fn deinit(self: *SessionView, gpa: std.mem.Allocator) void {
+        self.editor.deinit();
+        for (self.blocks.items) |*rb| rb.deinit(gpa);
+        self.blocks.deinit(gpa);
+        for (self.history_backfill.items) |*rb| rb.deinit(gpa);
+        self.history_backfill.deinit(gpa);
+        self.delta.deinit(gpa);
+        self.reasoning_delta.deinit(gpa);
+        deinitPlan(gpa, &self.plan);
+        self.model.deinit(gpa);
+        self.cwd.deinit(gpa);
+        self.layout_cache.reset(gpa);
+        self.tail_layout_cache.reset(gpa);
+        self.stream_layout_cache.reset(gpa);
+    }
+
+    /// Drop provisional streaming text once a turn settles so an idle view,
+    /// focused or cached, holds only its durable transcript.
+    fn releaseStreamingBuffers(self: *SessionView, gpa: std.mem.Allocator) void {
+        self.delta.deinit(gpa);
+        self.delta = .empty;
+        self.reasoning_delta.deinit(gpa);
+        self.reasoning_delta = .empty;
+        self.stream_layout_cache.reset(gpa);
+    }
 };
 
 const App = struct {
@@ -702,7 +671,10 @@ const App = struct {
     /// the TUI. It lets visible handles remain globally unambiguous even
     /// though session_watch intentionally omits archived rows.
     known_session_ids: std.ArrayList(u64) = .empty,
-    saved_views: std.AutoHashMapUnmanaged(u64, *SavedSessionView) = .empty,
+    /// Inactive sessions keep their complete view without remaining
+    /// subscribed to their block streams. Moving a view in and out of App is
+    /// allocation-free after the first visit.
+    saved_views: std.AutoHashMapUnmanaged(u64, *SessionView) = .empty,
     saved_view_clock: u64 = 0,
     background_approvals: std.AutoHashMapUnmanaged(u64, PendingApproval) = .empty,
     /// Council cache from the daemon (durable config); refreshed by every
@@ -807,9 +779,6 @@ const App = struct {
         self.attachments.deinit(self.gpa);
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
-        self.view.tail_layout_cache.reset(self.gpa);
-        self.view.stream_layout_cache.reset(self.gpa);
-        self.view.layout_cache.reset(self.gpa);
         self.picker_filter.deinit(self.gpa);
         self.clearSetupDraft();
         self.setup_provider_name.deinit(self.gpa);
@@ -851,19 +820,10 @@ const App = struct {
         self.shell_command.deinit(self.gpa);
         self.clipboard_pending.deinit(self.gpa);
         self.clipboard_desc.deinit(self.gpa);
-        self.clearHistoryBackfill();
-        self.view.history_backfill.deinit(self.gpa);
-        for (self.view.blocks.items) |*rb| rb.deinit(self.gpa);
-        self.view.blocks.deinit(self.gpa);
-        self.view.delta.deinit(self.gpa);
-        self.view.reasoning_delta.deinit(self.gpa);
-        deinitPlan(self.gpa, &self.view.plan);
-        self.view.model.deinit(self.gpa);
-        self.view.cwd.deinit(self.gpa);
         self.home.deinit(self.gpa);
         self.notice.deinit(self.gpa);
         if (self.otel_header_prompt) self.view.editor.clearSensitive();
-        self.view.editor.deinit();
+        self.view.deinit(self.gpa);
     }
 
     fn clearAttachments(self: *App) void {
@@ -935,11 +895,7 @@ const App = struct {
     }
 
     fn releaseStreamingBuffers(self: *App) void {
-        self.view.delta.deinit(self.gpa);
-        self.view.delta = .empty;
-        self.view.reasoning_delta.deinit(self.gpa);
-        self.view.reasoning_delta = .empty;
-        self.view.stream_layout_cache.reset(self.gpa);
+        self.view.releaseStreamingBuffers(self.gpa);
     }
 
     fn cacheWelcomeFacts(self: *App) void {
@@ -1094,108 +1050,35 @@ const App = struct {
         return null;
     }
 
-    fn resetActiveAfterMove(self: *App) void {
-        self.clearHistoryBackfill();
+    /// App-level chrome that addresses the focused view (search, copy mode)
+    /// is meaningless once that view has moved.
+    fn resetChromeAfterMove(self: *App) void {
         self.history_search_active = false;
         self.history_search_query.clearRetainingCapacity();
         self.history_search_draft.clearRetainingCapacity();
         self.history_search_match = null;
         self.copy_cursor = null;
-        self.view.stream_layout_cache.reset(self.gpa);
-        self.view.layout_epoch +%= 1;
-        self.view.editor = Editor.init(self.gpa);
-        self.view.blocks = .empty;
-        self.view.delta = .empty;
-        self.view.reasoning_delta = .empty;
-        self.view.plan = .empty;
-        self.view.state = .idle;
-        self.view.model = .empty;
-        self.view.effort = .auto;
-        self.view.cwd = .empty;
-        self.view.tokens_in = 0;
-        self.view.tokens_out = 0;
-        self.view.context_used = 0;
-        self.view.context_limit = 0;
-        self.view.plan_mode = false;
-        self.view.plan_proposal_ready = false;
-        self.view.last_seq = 0;
-        self.view.oldest_seq = 0;
-        self.view.history_complete = true;
-        self.view.history_loading = false;
-        self.view.history_before_seq = 0;
-        self.view.history_page_failed = false;
-        self.view.scroll_up = 0;
-        self.view.last_total_lines = 0;
-        self.view.last_first_visible = 0;
         self.search_highlight_line = null;
-        self.view.last_view_h = 0;
-        self.view.last_pinned_start = 0;
-        self.view.last_pinned_rows = 0;
-        self.view.last_body_first = 0;
-        self.view.last_body_rows = 0;
-        self.view.pending = null;
-        self.view.sel_anchor = null;
-        self.view.sel_head = .{ .line = 0, .col = 0 };
-        self.view.sel_dragging = false;
-        self.view.copy_pending = false;
-        self.view.sel_clear_after_copy = false;
-        self.view.show_tool_transcript = false;
-        self.view.spinner_frame = 0;
-        self.view.turn_started_ms = 0;
-        self.view.turn_phase = .idle;
-        self.view.phase_started_ms = 0;
-        self.view.call_started_ms = 0;
-        self.view.stream_bytes = 0;
-        self.view.stream_quiet_ms = 0;
-        self.view.stream_status_at_ms = 0;
     }
 
+    /// Park the focused view in the MRU cache and leave a fresh, empty view
+    /// (same sid until the caller reassigns it) in its place.
     fn saveActiveView(self: *App) !void {
-        const saved = try self.gpa.create(SavedSessionView);
+        const saved = try self.gpa.create(SessionView);
         errdefer self.gpa.destroy(saved);
         self.saved_view_clock +%= 1;
-        saved.* = .{
-            .editor = self.view.editor,
-            .blocks = self.view.blocks,
-            .delta = self.view.delta,
-            .reasoning_delta = self.view.reasoning_delta,
-            .plan = self.view.plan,
-            .state = self.view.state,
-            .model = self.view.model,
-            .effort = self.view.effort,
-            .cwd = self.view.cwd,
-            .tokens_in = self.view.tokens_in,
-            .tokens_out = self.view.tokens_out,
-            .context_used = self.view.context_used,
-            .context_limit = self.view.context_limit,
-            .plan_mode = self.view.plan_mode,
-            .plan_proposal_ready = self.view.plan_proposal_ready,
-            .scroll_up = self.view.scroll_up,
-            .last_total_lines = self.view.last_total_lines,
-            .last_first_visible = self.view.last_first_visible,
-            .last_view_h = self.view.last_view_h,
-            .pending = self.view.pending,
-            .sel_anchor = self.view.sel_anchor,
-            .sel_head = self.view.sel_head,
-            .sel_dragging = self.view.sel_dragging,
-            .copy_pending = self.view.copy_pending,
-            .show_tool_transcript = self.view.show_tool_transcript,
-            .spinner_frame = self.view.spinner_frame,
-            .turn_started_ms = self.view.turn_started_ms,
-            .turn_phase = self.view.turn_phase,
-            .phase_started_ms = self.view.phase_started_ms,
-            .call_started_ms = self.view.call_started_ms,
-            .stream_bytes = self.view.stream_bytes,
-            .stream_quiet_ms = self.view.stream_quiet_ms,
-            .stream_status_at_ms = self.view.stream_status_at_ms,
-            .last_seq = self.view.last_seq,
-            .oldest_seq = self.view.oldest_seq,
-            .history_complete = self.view.history_complete,
-            .last_used = self.saved_view_clock,
-        };
-        try self.saved_views.put(self.gpa, self.view.sid, saved);
+        // A half-buffered older page and baked layout are cheap to redo and
+        // would otherwise keep every cached transcript's layout alive.
+        self.clearHistoryBackfill();
+        self.view.layout_cache.reset(self.gpa);
+        self.view.tail_layout_cache.reset(self.gpa);
+        self.view.stream_layout_cache.reset(self.gpa);
+        saved.* = self.view;
+        saved.last_used = self.saved_view_clock;
+        try self.saved_views.put(self.gpa, saved.sid, saved);
+        self.view = .{ .sid = saved.sid, .editor = Editor.init(self.gpa) };
+        self.resetChromeAfterMove();
         self.trimSavedViews();
-        self.resetActiveAfterMove();
     }
 
     const max_saved_views = 8;
@@ -1224,48 +1107,19 @@ const App = struct {
         }
     }
 
-    fn restoreSavedView(self: *App, saved: *SavedSessionView) void {
+    /// Make a cached view focused again. The caller has already parked the
+    /// previous view and owns (and frees) the `saved` allocation.
+    fn restoreSavedView(self: *App, saved: *SessionView) void {
         self.copy_cursor = null;
+        self.view.deinit(self.gpa);
+        self.view = saved.*;
         self.view.layout_epoch +%= 1;
-        self.view.editor = saved.editor;
-        self.view.blocks = saved.blocks;
-        self.view.delta = saved.delta;
-        self.view.reasoning_delta = saved.reasoning_delta;
-        self.view.plan = saved.plan;
-        self.view.state = saved.state;
-        self.view.model = saved.model;
-        self.view.effort = saved.effort;
-        self.view.cwd = saved.cwd;
-        self.view.tokens_in = saved.tokens_in;
-        self.view.tokens_out = saved.tokens_out;
-        self.view.context_used = saved.context_used;
-        self.view.context_limit = saved.context_limit;
-        self.view.plan_mode = saved.plan_mode;
-        self.view.plan_proposal_ready = saved.plan_proposal_ready;
-        self.view.scroll_up = saved.scroll_up;
-        self.view.last_total_lines = saved.last_total_lines;
-        self.view.last_first_visible = saved.last_first_visible;
-        self.view.last_view_h = saved.last_view_h;
-        self.view.pending = saved.pending;
-        self.view.sel_anchor = saved.sel_anchor;
-        self.view.sel_head = saved.sel_head;
-        self.view.sel_dragging = saved.sel_dragging;
-        self.view.copy_pending = saved.copy_pending;
-        self.view.show_tool_transcript = saved.show_tool_transcript;
-        self.view.spinner_frame = saved.spinner_frame;
-        self.view.turn_started_ms = saved.turn_started_ms;
-        self.view.turn_phase = saved.turn_phase;
-        self.view.phase_started_ms = saved.phase_started_ms;
-        self.view.call_started_ms = saved.call_started_ms;
-        self.view.stream_bytes = saved.stream_bytes;
-        self.view.stream_quiet_ms = saved.stream_quiet_ms;
-        self.view.stream_status_at_ms = saved.stream_status_at_ms;
-        self.view.last_seq = saved.last_seq;
-        self.view.oldest_seq = saved.oldest_seq;
-        self.view.history_complete = saved.history_complete;
+        // Any page that was in flight when the view was parked is stale.
         self.view.history_loading = false;
         self.view.history_before_seq = 0;
         self.view.history_page_failed = false;
+        self.view.sel_clear_after_copy = false;
+        self.view.last_used = 0;
     }
 
     fn touchRecentSession(self: *App, sid: u64) void {
