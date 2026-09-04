@@ -35,11 +35,11 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    if (app.setup_prompt != .none) {
+    if (app.setup.prompt != .none) {
         const ed = &app.view.editor;
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('g', .{ .ctrl = true })) {
             app.view.editor.clearSensitive();
-            app.setup_prompt = .none;
+            app.setup.prompt = .none;
             app.openPicker(.setup_provider);
             app.setNotice("provider setup · choose a backend", .{});
         } else if (isEnterKey(key)) {
@@ -173,7 +173,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
 
     // Readline-style reverse-i-search stays inside the composer. The editor
     // displays the candidate; printable keys edit the independent query.
-    if (app.history_search_active) {
+    if (app.history_search.active) {
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('g', .{ .ctrl = true })) {
             app.cancelHistorySearch();
         } else if (key.matches('r', .{ .ctrl = true })) {
@@ -181,11 +181,11 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         } else if (isEnterKey(key)) {
             app.acceptHistorySearch();
         } else if (key.matches(vaxis.Key.backspace, .{}) or key.matches('h', .{ .ctrl = true })) {
-            popLastCodepoint(&app.history_search_query);
+            popLastCodepoint(&app.history_search.query);
             app.refreshHistorySearch(true);
         } else if (key.text) |text| {
             if (text.len > 0 and text[0] >= 0x20 and text[0] != 0x7f) {
-                app.history_search_query.appendSlice(app.gpa, text) catch {};
+                app.history_search.query.appendSlice(app.gpa, text) catch {};
                 app.refreshHistorySearch(true);
             }
         }
@@ -200,7 +200,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.cancelCouncilEdit()
             else {
                 if (app.picker_kind == .search_prompt or app.picker_kind == .search) {
-                    app.search_pending = false;
+                    app.search.pending = false;
                     app.clearSearchHits();
                 }
                 app.picker = null;
@@ -251,7 +251,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    if (app.setup_required and app.view.editor.isEmpty() and isEnterKey(key)) {
+    if (app.setup.required and app.view.editor.isEmpty() and isEnterKey(key)) {
         app.beginSetup(true);
         return;
     }
