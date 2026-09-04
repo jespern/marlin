@@ -479,8 +479,17 @@ pub fn runCodexTurn(
 
     var line_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer line_arena_state.deinit();
+    var line_acc: std.ArrayList(u8) = .empty;
+    defer line_acc.deinit(gpa);
     while (!done) {
-        const line = reader.takeDelimiterInclusive('\n') catch break;
+        const line = shared.takeEventLine(reader, gpa, &line_acc, shared.max_event_line_bytes) catch |err| switch (err) {
+            error.LineTooLong => {
+                _ = try ap.append(.{ .system_note = .{ .text = "codex: one event line exceeded 64 MiB and was dropped" } });
+                continue;
+            },
+            error.ReadFailed => break,
+            error.OutOfMemory => return error.OutOfMemory,
+        } orelse break;
         _ = line_arena_state.reset(.retain_capacity);
         const line_arena = line_arena_state.allocator();
         const inbound = codex.decodeLine(line_arena, line) catch continue;

@@ -67,7 +67,11 @@ Guest is a session regime, not a model. Kitchen-sink is chasing parity so
 a guest tab feels like a native tab. The guest boundary is frozen at:
 
 1. spawn the official binary (`claude -p` or `codex app-server`)
-2. map its structured event stream → blocks
+2. map its structured event stream → blocks. One event line can be far
+   larger than the reader's buffer (Claude Code embeds whole-file contents
+   in Edit results), so the reader assembles oversized lines rather than
+   mistaking them for end of stream; only a line over 64 MiB is dropped,
+   with a visible system note (`guest/shared.zig` `takeEventLine`)
 3. interrupt / reboot / resume
 4. permission requests onto the existing approval bar (mux UX, not harness UX)
 5. session status (running / awaiting_approval / idle)
