@@ -66,7 +66,11 @@ marlin/
 │   ├── client/
 │   │   ├── attach.zig         # socket/ssh transports, autostart handshake, hello
 │   │   ├── pipe.zig           # `marlin _pipe`: stdio↔daemon.sock bridge (remote far end)
-│   │   ├── tui.zig            # App, draw orchestration, protocol, tabs, keys
+│   │   ├── tui.zig            # App + SessionView, event loop, daemon protocol, draw, tabs
+│   │   ├── commands.zig       # / and ! command table, completion, command handlers
+│   │   ├── keys.zig           # key/mouse dispatch, vim operators (VimState), copy-mode keys
+│   │   ├── setup.zig          # /setup provider onboarding wizard (SetupState)
+│   │   ├── search.zig         # Ctrl+R history search, /search transcripts, hit jump
 │   │   ├── render.zig         # terminal lines, palette, syntax, wrapping
 │   │   ├── markdown.zig       # inline/block Markdown, tables, panels, callouts
 │   │   ├── layout.zig         # transcript view, caches, tool folding, diffs, plan table
