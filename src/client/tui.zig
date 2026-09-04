@@ -52,6 +52,7 @@ const layout_mod = @import("layout.zig");
 const commands = @import("commands.zig");
 const keys = @import("keys.zig");
 const setup_mod = @import("setup.zig");
+const search_mod = @import("search.zig");
 const LayoutCache = layout_mod.LayoutCache;
 const TailLayoutCache = layout_mod.TailLayoutCache;
 const StreamLayoutCache = layout_mod.StreamLayoutCache;
@@ -101,7 +102,7 @@ const spinner_frames = render.spinner_frames;
 
 /// Keep startup and first session-switch latency independent of transcript
 /// length. Reaching the top explicitly backfills the complete durable log.
-const initial_replay_blocks: u32 = 256;
+pub const initial_replay_blocks: u32 = 256;
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -339,21 +340,13 @@ fn hasUnfinishedPlan(items: anytype) bool {
     return false;
 }
 
-fn deinitPlan(gpa: std.mem.Allocator, items: *std.ArrayList(PlanItemOwned)) void {
+pub fn deinitPlan(gpa: std.mem.Allocator, items: *std.ArrayList(PlanItemOwned)) void {
     for (items.items) |item| gpa.free(item.step);
     items.deinit(gpa);
     items.* = .empty;
 }
 
-const SearchHitOwned = struct {
-    sid: u64,
-    seq: u64,
-    label: []u8,
-
-    fn deinit(self: *SearchHitOwned, gpa: std.mem.Allocator) void {
-        gpa.free(self.label);
-    }
-};
+const SearchHitOwned = search_mod.SearchHitOwned;
 
 /// Everything the client knows about one session: its transcript, composer
 /// draft, viewport, selection, approval, turn timers, and layout caches. The
@@ -522,6 +515,33 @@ pub const SetupState = struct {
     credential: std.ArrayList(u8) = .empty,
 };
 
+/// Inline readline-style reverse history search. The editor shows the current candidate while these buffers preserve the original draft and collect the query independently of the candidate text.
+pub const HistorySearchState = struct {
+    /// Inline readline-style reverse history search. The editor shows the
+    /// current candidate while these buffers preserve the original draft and
+    /// collect the query independently of the candidate text.
+    active: bool = false,
+    query: std.ArrayList(u8) = .empty,
+    draft: std.ArrayList(u8) = .empty,
+    draft_cursor: usize = 0,
+    match: ?usize = null,
+};
+
+/// Durable transcript-search results and the viewport positioning a selected hit still needs.
+pub const SearchState = struct {
+    /// Durable transcript-search results. Labels are separate so the generic
+    /// picker can filter them without knowing search metadata.
+    hits: std.ArrayList(SearchHitOwned) = .empty,
+    labels: std.ArrayList([]const u8) = .empty,
+    scope_sid: u64 = 0,
+    pending: bool = false,
+    cursor: usize = 0,
+    /// Non-zero while a centered search replay still needs viewport
+    /// positioning after its durable pages arrive.
+    target_seq: u64 = 0,
+    highlight_line: ?usize = null,
+};
+
 pub const App = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -566,25 +586,10 @@ pub const App = struct {
     /// header entry is submitted or cancelled; neither value enters history.
     otel_endpoint: std.ArrayList(u8) = .empty,
     otel_header_prompt: bool = false,
-    /// Inline readline-style reverse history search. The editor shows the
-    /// current candidate while these buffers preserve the original draft and
-    /// collect the query independently of the candidate text.
-    history_search_active: bool = false,
-    history_search_query: std.ArrayList(u8) = .empty,
-    history_search_draft: std.ArrayList(u8) = .empty,
-    history_search_draft_cursor: usize = 0,
-    history_search_match: ?usize = null,
-    /// Durable transcript-search results. Labels are separate so the generic
-    /// picker can filter them without knowing search metadata.
-    search_hits: std.ArrayList(SearchHitOwned) = .empty,
-    search_labels: std.ArrayList([]const u8) = .empty,
-    search_scope_sid: u64 = 0,
-    search_pending: bool = false,
-    search_cursor: usize = 0,
-    /// Non-zero while a centered search replay still needs viewport
-    /// positioning after its durable pages arrive.
-    search_target_seq: u64 = 0,
-    search_highlight_line: ?usize = null,
+    /// Ctrl+R reverse history search over authored prompts; see search.zig.
+    history_search: HistorySearchState = .{},
+    /// Durable transcript search state; see search.zig.
+    search: SearchState = .{},
     /// Council editor state. The draft survives filter changes and is sent
     /// atomically only when the Done row is chosen; Esc discards it.
     council_edit_name: std.ArrayList(u8) = .empty,
@@ -715,11 +720,11 @@ pub const App = struct {
         self.setup.api_key_env.deinit(self.gpa);
         self.setup.credential.deinit(self.gpa);
         self.otel_endpoint.deinit(self.gpa);
-        self.history_search_query.deinit(self.gpa);
-        self.history_search_draft.deinit(self.gpa);
+        self.history_search.query.deinit(self.gpa);
+        self.history_search.draft.deinit(self.gpa);
         self.clearSearchHits();
-        self.search_hits.deinit(self.gpa);
-        self.search_labels.deinit(self.gpa);
+        self.search.hits.deinit(self.gpa);
+        self.search.labels.deinit(self.gpa);
         self.council_detail_name.deinit(self.gpa);
         self.clearCouncilEdit();
         self.council_edit_name.deinit(self.gpa);
@@ -982,12 +987,12 @@ pub const App = struct {
     /// App-level chrome that addresses the focused view (search, copy mode)
     /// is meaningless once that view has moved.
     pub fn resetChromeAfterMove(self: *App) void {
-        self.history_search_active = false;
-        self.history_search_query.clearRetainingCapacity();
-        self.history_search_draft.clearRetainingCapacity();
-        self.history_search_match = null;
+        self.history_search.active = false;
+        self.history_search.query.clearRetainingCapacity();
+        self.history_search.draft.clearRetainingCapacity();
+        self.history_search.match = null;
         self.copy_cursor = null;
-        self.search_highlight_line = null;
+        self.search.highlight_line = null;
     }
 
     /// Park the focused view in the MRU cache and leave a fresh, empty view
@@ -1120,60 +1125,6 @@ pub const App = struct {
         self.rememberSession(sid);
         var handle_buf: session_handle.Full = undefined;
         self.setNotice("session → {s}", .{self.displaySessionHandle(&handle_buf, sid)});
-    }
-
-    pub fn clearTranscriptForSearch(self: *App) void {
-        self.clearHistoryBackfill();
-        for (self.view.blocks.items) |*rendered| rendered.deinit(self.gpa);
-        self.view.blocks.clearRetainingCapacity();
-        self.view.delta.clearRetainingCapacity();
-        self.view.reasoning_delta.clearRetainingCapacity();
-        deinitPlan(self.gpa, &self.view.plan);
-        self.view.layout_cache.reset(self.gpa);
-        self.view.tail_layout_cache.reset(self.gpa);
-        self.view.stream_layout_cache.reset(self.gpa);
-        self.view.layout_epoch +%= 1;
-        self.view.last_seq = 0;
-        self.view.oldest_seq = 0;
-        self.view.history_complete = false;
-        self.view.history_loading = true;
-        self.view.history_before_seq = 0;
-        self.view.history_page_failed = false;
-        self.view.scroll_up = 0;
-        self.view.last_total_lines = 0;
-        self.view.last_first_visible = 0;
-        self.search_highlight_line = null;
-        self.copy_cursor = null;
-        self.view.sel_anchor = null;
-    }
-
-    pub fn jumpToSearchHit(self: *App, sid: u64, seq: u64) !void {
-        if (sid == self.view.sid) {
-            for (self.view.blocks.items) |rendered| {
-                if (rendered.seq != seq) continue;
-                self.search_target_seq = seq;
-                self.search_highlight_line = null;
-                var handle_buf: session_handle.Full = undefined;
-                self.setNotice("match → {s}:{d}", .{ self.displaySessionHandle(&handle_buf, sid), seq });
-                return;
-            }
-        }
-        if (sid != self.view.sid) {
-            try self.focusSession(sid, true);
-        } else {
-            self.conn.send(.{ .unsub = .{ .sid = sid } }) catch {};
-        }
-
-        self.clearTranscriptForSearch();
-        self.search_target_seq = seq;
-        try self.conn.send(.{ .sub = .{
-            .sid = sid,
-            .tail_limit = initial_replay_blocks,
-            .around_seq = seq,
-        } });
-        self.rememberSession(sid);
-        var handle_buf: session_handle.Full = undefined;
-        self.setNotice("match → {s}:{d}", .{ self.displaySessionHandle(&handle_buf, sid), seq });
     }
 
     pub fn cycleSession(self: *App, direction: i8) void {
@@ -1761,7 +1712,7 @@ pub const App = struct {
                     i -= 1;
                     self.view.editor.pushHistory(history.entries[i].text);
                 }
-                if (self.history_search_active) self.refreshHistorySearch(true);
+                if (self.history_search.active) self.refreshHistorySearch(true);
             },
             .search_result => |result| self.replaceSearchHits(result),
             .diagnostics_result => |report| {
@@ -3031,162 +2982,6 @@ pub const App = struct {
         }
     }
 
-    pub fn beginHistorySearch(self: *App) void {
-        if (self.history_search_active) {
-            self.cycleHistorySearch();
-            return;
-        }
-        self.history_search_draft.clearRetainingCapacity();
-        self.history_search_draft.appendSlice(self.gpa, self.view.editor.text.items) catch return;
-        self.history_search_draft_cursor = self.view.editor.cursor;
-        self.history_search_query.clearRetainingCapacity();
-        self.history_search_match = null;
-        self.history_search_active = true;
-        self.refreshHistorySearch(true);
-        self.conn.send(.{ .input_history = .{
-            .sid = self.view.sid,
-            .limit = Editor.max_history_entries,
-        } }) catch {
-            // The already-seeded current-session history remains useful when
-            // a reconnect races the shortcut.
-            self.setNotice("global input history unavailable", .{});
-        };
-    }
-
-    pub fn refreshHistorySearch(self: *App, from_newest: bool) void {
-        if (!self.history_search_active) return;
-        const previous = self.history_search_match;
-        var index = if (from_newest)
-            self.view.editor.history.items.len
-        else
-            (self.history_search_match orelse self.view.editor.history.items.len);
-        while (index > 0) {
-            index -= 1;
-            const candidate = self.view.editor.history.items[index];
-            if (fuzzyHistoryScore(candidate, self.history_search_query.items) == null) continue;
-            self.history_search_match = index;
-            self.view.editor.replaceText(candidate);
-            return;
-        }
-        if (!from_newest and previous != null) return;
-        self.history_search_match = null;
-        self.view.editor.replaceText(self.history_search_draft.items);
-        self.view.editor.cursor = @min(self.history_search_draft_cursor, self.view.editor.text.items.len);
-    }
-
-    pub fn cycleHistorySearch(self: *App) void {
-        self.refreshHistorySearch(false);
-    }
-
-    pub fn cancelHistorySearch(self: *App) void {
-        if (!self.history_search_active) return;
-        self.view.editor.replaceText(self.history_search_draft.items);
-        self.view.editor.cursor = @min(self.history_search_draft_cursor, self.view.editor.text.items.len);
-        self.finishHistorySearch();
-    }
-
-    pub fn acceptHistorySearch(self: *App) void {
-        if (!self.history_search_active) return;
-        self.finishHistorySearch();
-    }
-
-    pub fn finishHistorySearch(self: *App) void {
-        self.history_search_active = false;
-        self.history_search_query.clearRetainingCapacity();
-        self.history_search_draft.clearRetainingCapacity();
-        self.history_search_match = null;
-    }
-
-    pub fn clearSearchHits(self: *App) void {
-        for (self.search_hits.items) |*hit| hit.deinit(self.gpa);
-        self.search_hits.clearRetainingCapacity();
-        self.search_labels.clearRetainingCapacity();
-        self.search_cursor = 0;
-    }
-
-    pub fn openSearchPrompt(self: *App, session_id: u64) void {
-        self.clearSearchHits();
-        self.search_scope_sid = session_id;
-        self.search_pending = false;
-        self.openPicker(.search_prompt);
-    }
-
-    pub fn submitSearch(self: *App) void {
-        const query = std.mem.trim(u8, self.picker_filter.items, " \t\r\n");
-        if (query.len == 0 or self.search_pending) return;
-        self.search_pending = true;
-        self.conn.send(.{ .search = .{
-            .query = query,
-            .sid = self.search_scope_sid,
-            .limit = 100,
-        } }) catch {
-            self.search_pending = false;
-            self.setNotice("could not search transcript", .{});
-        };
-    }
-
-    pub fn replaceSearchHits(self: *App, result: @FieldType(proto.DaemonMsg, "search_result")) void {
-        if (!self.search_pending or result.sid != self.search_scope_sid) return;
-        self.search_pending = false;
-        self.clearSearchHits();
-        for (result.hits) |hit| {
-            self.rememberSession(hit.sid);
-            var handle_buf: session_handle.Full = undefined;
-            const location = if (hit.title.len > 0) hit.title else hit.cwd;
-            const label = std.fmt.allocPrint(self.gpa, "{s}:{d} · {s} · {s} · {s}", .{
-                self.displaySessionHandle(&handle_buf, hit.sid),
-                hit.seq,
-                location,
-                @tagName(hit.kind),
-                hit.snippet,
-            }) catch continue;
-            self.search_hits.append(self.gpa, .{
-                .sid = hit.sid,
-                .seq = hit.seq,
-                .label = label,
-            }) catch {
-                self.gpa.free(label);
-                continue;
-            };
-            self.search_labels.append(self.gpa, label) catch {
-                var removed = self.search_hits.pop().?;
-                removed.deinit(self.gpa);
-            };
-        }
-        if (self.search_hits.items.len == 0) {
-            self.picker = null;
-            self.picker_filter.clearRetainingCapacity();
-            self.setNotice("no transcript matches", .{});
-            return;
-        }
-        self.picker_kind = .search;
-        self.picker = 0;
-        self.picker_filter.clearRetainingCapacity();
-    }
-
-    pub fn selectSearchHit(self: *App, label: []const u8) ?SearchHitOwned {
-        for (self.search_hits.items, 0..) |hit, index| {
-            if (!std.mem.eql(u8, hit.label, label)) continue;
-            self.search_cursor = index;
-            return hit;
-        }
-        return null;
-    }
-
-    pub fn nextSearchHit(self: *App, direction: i8) void {
-        const len = self.search_hits.items.len;
-        if (len == 0) {
-            self.setNotice("no active search · press /", .{});
-            return;
-        }
-        self.search_cursor = if (direction < 0)
-            (self.search_cursor + len - 1) % len
-        else
-            (self.search_cursor + 1) % len;
-        const hit = self.search_hits.items[self.search_cursor];
-        self.jumpToSearchHit(hit.sid, hit.seq) catch self.setNotice("could not open search match", .{});
-    }
-
     /// The picker's source list: full model catalog/favorites, or the fixed
     /// effort vocabulary shared with persistence and provider adapters.
     pub fn pickerSource(self: *const App) []const []const u8 {
@@ -3194,7 +2989,7 @@ pub const App = struct {
             .model, .council => if (self.catalog.items.len > 0) @ptrCast(self.catalog.items) else self.cfg.model_favorites,
             .effort => &proto.ReasoningEffort.choices,
             .session => self.session_labels.items,
-            .search => self.search_labels.items,
+            .search => self.search.labels.items,
             .search_prompt => &.{},
             .council_list => &.{},
             .voice_engine => &voice_engine_items,
@@ -3727,6 +3522,22 @@ pub const App = struct {
     pub const submitSetupPrompt = setup_mod.submitSetupPrompt;
     pub const finishSetup = setup_mod.finishSetup;
     pub const applySetupResult = setup_mod.applySetupResult;
+
+    // Implemented in search_mod.zig; exposed here so call sites keep method syntax.
+    pub const clearTranscriptForSearch = search_mod.clearTranscriptForSearch;
+    pub const jumpToSearchHit = search_mod.jumpToSearchHit;
+    pub const beginHistorySearch = search_mod.beginHistorySearch;
+    pub const refreshHistorySearch = search_mod.refreshHistorySearch;
+    pub const cycleHistorySearch = search_mod.cycleHistorySearch;
+    pub const cancelHistorySearch = search_mod.cancelHistorySearch;
+    pub const acceptHistorySearch = search_mod.acceptHistorySearch;
+    pub const finishHistorySearch = search_mod.finishHistorySearch;
+    pub const clearSearchHits = search_mod.clearSearchHits;
+    pub const openSearchPrompt = search_mod.openSearchPrompt;
+    pub const submitSearch = search_mod.submitSearch;
+    pub const replaceSearchHits = search_mod.replaceSearchHits;
+    pub const selectSearchHit = search_mod.selectSearchHit;
+    pub const nextSearchHit = search_mod.nextSearchHit;
 };
 
 // ------------------------------------------------------------- rendering --
@@ -4742,8 +4553,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     // The composer is a three-row panel for a one-line prompt (padding,
     // content, padding) and grows with multiline input.
-    const prompt: []const u8 = if (app.history_search_active) search_prompt: {
-        const query = app.history_search_query.items;
+    const prompt: []const u8 = if (app.history_search.active) search_prompt: {
+        const query = app.history_search.query.items;
         const query_end = hardCellBreak(query, 0, @max(@as(usize, w) / 3, 1));
         break :search_prompt try std.fmt.allocPrint(arena, "⌕ '{s}'▏: ", .{query[0..query_end]});
     } else if (app.setup.prompt != .none)
@@ -4780,10 +4591,10 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     transcript.show_working_ticker = plan_h == 0;
     var lines = try layout_mod.layoutLines(arena, app.gpa, &transcript, w);
     const total = lines.items.len;
-    if (app.search_target_seq > 0 and !app.view.history_loading) {
+    if (app.search.target_seq > 0 and !app.view.history_loading) {
         var target_index: ?usize = null;
         for (app.view.blocks.items, 0..) |rendered, index| {
-            if (rendered.seq == app.search_target_seq) {
+            if (rendered.seq == app.search.target_seq) {
                 target_index = index;
                 break;
             }
@@ -4805,11 +4616,11 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             const max_scroll = total -| view_h;
             const desired_first = target_line -| (@as(usize, view_h) / 3);
             app.view.scroll_up = max_scroll -| @min(desired_first, max_scroll);
-            app.search_highlight_line = target_line;
+            app.search.highlight_line = target_line;
             // Avoid treating this deliberate reposition as transcript growth.
             app.view.last_total_lines = total;
         }
-        app.search_target_seq = 0;
+        app.search.target_seq = 0;
     }
     // Anchor while reading: scroll_up counts from the BOTTOM, so content
     // arriving while scrolled up would slide the view. Compensate by the
@@ -4917,7 +4728,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         });
         applyLineSyntax(win, @intCast(top_rows + row), ln);
         applyLineLinks(win, @intCast(top_rows + row), ln);
-        if (display.selectable and app.search_highlight_line == abs_line) {
+        if (display.selectable and app.search.highlight_line == abs_line) {
             var col: usize = 0;
             const width = @min(lineWidth(win, ln), @as(usize, w));
             while (col < width) : (col += 1) {
@@ -4989,7 +4800,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             .style = Palette.plan_active,
         }, .{ .row_offset = input_h - 1, .wrap = .none });
     }
-    if (app.mode == .normal or app.history_search_active) win.hideCursor();
+    if (app.mode == .normal or app.history_search.active) win.hideCursor();
     if (app.setup.prompt == .none and !app.otel_header_prompt)
         try drawCommandMenu(app, win, arena, input_top, w);
 
@@ -5282,8 +5093,8 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             .model => "model",
             .effort => "effort",
             .session => "sessions",
-            .search_prompt => if (app.search_scope_sid == 0) "search all sessions" else "search this session",
-            .search => if (app.search_scope_sid == 0) "search results" else "session matches",
+            .search_prompt => if (app.search.scope_sid == 0) "search all sessions" else "search this session",
+            .search => if (app.search.scope_sid == 0) "search results" else "session matches",
             .council => try std.fmt.allocPrint(arena, "council {s} · {d} selected", .{
                 app.council_edit_name.items,
                 app.council_edit_models.items.len,
@@ -5381,7 +5192,7 @@ fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         }
         const hint = switch (app.picker_kind) {
             .session => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter · Del/Ctrl+D archive · Esc", .{ items.len, total_src }),
-            .search_prompt => if (app.search_pending) " searching… · Esc" else " type query · Enter search · Esc",
+            .search_prompt => if (app.search.pending) " searching… · Esc" else " type query · Enter search · Esc",
             .search => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter jump · Esc", .{ items.len, total_src }),
             .council => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter toggle/Done · Esc cancel", .{ items.len -| 1, total_src }),
             .council_list => try std.fmt.allocPrint(arena, " {d}/{d} · type=filter · ↑↓ · Enter inspect · Esc", .{ items.len, total_src }),
@@ -6090,47 +5901,9 @@ const tabMouseAction = keys.tabMouseAction;
 
 const handleMouse = keys.handleMouse;
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or haystack.len < needle.len) return null;
-    var i: usize = 0;
-    while (i <= haystack.len - needle.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
-}
+const containsIgnoreCase = search_mod.containsIgnoreCase;
 
-/// Small, allocation-free fuzzy matcher for authored-input recall. FTS is
-/// intentionally not involved: Ctrl+R should match sparse subsequences and
-/// reward word starts/contiguous runs like a shell-history picker.
-fn fuzzyHistoryScore(candidate: []const u8, query: []const u8) ?i64 {
-    if (query.len == 0) return 0;
-    var at: usize = 0;
-    var previous: ?usize = null;
-    var score: i64 = 0;
-    for (query) |query_byte| {
-        const q = std.ascii.toLower(query_byte);
-        var found: ?usize = null;
-        while (at < candidate.len) : (at += 1) {
-            if (std.ascii.toLower(candidate[at]) == q) {
-                found = at;
-                break;
-            }
-        }
-        const index = found orelse return null;
-        score += 10;
-        if (previous) |prev| {
-            if (index == prev + 1) score += 12;
-        }
-        if (index == 0 or std.ascii.isWhitespace(candidate[index - 1]) or
-            std.mem.indexOfScalar(u8, "/_-.:", candidate[index - 1]) != null)
-            score += 8;
-        score -= @intCast(@min(index, 100));
-        previous = index;
-        at = index + 1;
-    }
-    score -= @intCast(@min(candidate.len / 16, 100));
-    return score;
-}
+const fuzzyHistoryScore = search_mod.fuzzyHistoryScore;
 
 pub fn popLastCodepoint(bytes: *std.ArrayList(u8)) void {
     if (bytes.items.len == 0) return;
@@ -6563,24 +6336,24 @@ test "inline Ctrl+R search refines cycles and restores the draft" {
     app.view.editor.pushHistory("banana launcher");
     app.view.editor.pushHistory("build release assets");
     app.view.editor.insertSlice("draft in progress");
-    try app.history_search_draft.appendSlice(gpa, app.view.editor.text.items);
-    app.history_search_draft_cursor = app.view.editor.cursor;
-    app.history_search_active = true;
+    try app.history_search.draft.appendSlice(gpa, app.view.editor.text.items);
+    app.history_search.draft_cursor = app.view.editor.cursor;
+    app.history_search.active = true;
     app.refreshHistorySearch(true);
     try std.testing.expectEqualStrings("build release assets", app.view.editor.text.items);
 
-    try app.history_search_query.append(gpa, 'b');
+    try app.history_search.query.append(gpa, 'b');
     app.refreshHistorySearch(true);
     app.cycleHistorySearch();
     try std.testing.expectEqualStrings("banana launcher", app.view.editor.text.items);
 
-    app.history_search_query.clearRetainingCapacity();
-    try app.history_search_query.appendSlice(gpa, "bln");
+    app.history_search.query.clearRetainingCapacity();
+    try app.history_search.query.appendSlice(gpa, "bln");
     app.refreshHistorySearch(true);
     try std.testing.expectEqualStrings("banana launcher", app.view.editor.text.items);
 
     app.cancelHistorySearch();
-    try std.testing.expect(!app.history_search_active);
+    try std.testing.expect(!app.history_search.active);
     try std.testing.expectEqualStrings("draft in progress", app.view.editor.text.items);
 }
 
