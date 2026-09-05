@@ -11,7 +11,8 @@ pub const Kind = enum {
     strings,
     stars,
     plasma,
-    // pixel effects (Kitty graphics); pacman also has a cell renderer
+    // pixel effects (Kitty graphics); tetris and pacman also have cell renderers
+    tetris,
     pacman,
     tunnel,
     metaballs,
@@ -36,6 +37,7 @@ pub const Kind = enum {
             .strings => "dancing sine curves",
             .stars => "forward-flying starfield",
             .plasma => "color-cycling demoscene plasma",
+            .tetris => "self-playing arcade Tetris (Kitty graphics, or cells; manual only)",
             .pacman => "self-playing Pac-Man (after feiss' js1k entry; Kitty graphics, or cells)",
             .tunnel => "spinning pixel tunnel (Kitty graphics)",
             .metaballs => "pixel metaballs (Kitty graphics)",
@@ -49,19 +51,25 @@ pub const Kind = enum {
     pub fn backend(self: Kind) Backend {
         return switch (self) {
             .matrix, .strings, .stars, .plasma => .cell,
-            .pacman, .tunnel, .metaballs, .horizon, .demo, .shadowbox => .pixel,
+            .tetris, .pacman, .tunnel, .metaballs, .horizon, .demo, .shadowbox => .pixel,
         };
     }
 
-    /// Kinds that can also be drawn on cells (every cell kind, plus Pac-Man).
+    /// Kinds that can also be drawn on cells (every cell kind, plus the games).
     pub fn cellCapable(self: Kind) bool {
-        return self.backend() == .cell or self == .pacman;
+        return self.backend() == .cell or self == .pacman or self == .tetris;
     }
 
     /// Effects that only make sense opaque: pixel images cannot interleave
-    /// with text, and a maze needs its whole board.
+    /// with text, and games need their whole board.
     pub fn fullScreenOnly(self: Kind) bool {
-        return self.backend() == .pixel or self == .pacman;
+        return self.backend() == .pixel or self == .pacman or self == .tetris;
+    }
+
+    /// Manual-only effects may be named by `/animate` or `/screensaver`, but
+    /// cannot become the idle timer or bare `gs` default.
+    pub fn configurable(self: Kind) bool {
+        return self != .tetris;
     }
 
     /// What to run on cells when a pixel effect is requested on a terminal
@@ -85,6 +93,18 @@ pub const usage_list = blk: {
     var text: []const u8 = "";
     for (std.meta.fields(Kind), 0..) |field, i| {
         text = text ++ (if (i == 0) "" else "|") ++ field.name;
+    }
+    break :blk text;
+};
+
+pub const configurable_usage_list = blk: {
+    var text: []const u8 = "";
+    var count: usize = 0;
+    for (std.meta.fields(Kind)) |field| {
+        const kind: Kind = @enumFromInt(field.value);
+        if (!kind.configurable()) continue;
+        text = text ++ (if (count == 0) "" else "|") ++ field.name;
+        count += 1;
     }
     break :blk text;
 };

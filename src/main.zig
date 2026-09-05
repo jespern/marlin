@@ -123,6 +123,7 @@ test {
     _ = @import("client/media_test.zig");
     _ = @import("client/matrix_test.zig");
     _ = @import("client/pacman_test.zig");
+    _ = @import("client/tetris_test.zig");
     _ = @import("client/pixel_effects.zig");
     _ = @import("client/shadowbox.zig");
     _ = @import("client/plasma_test.zig");

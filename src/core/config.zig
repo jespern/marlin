@@ -308,7 +308,9 @@ pub fn setUiFlag(
 }
 
 pub fn canonicalScreensaverEffect(value: []const u8) ![]const u8 {
-    return (visual_effect.Kind.parse(value) orelse return error.InvalidScreensaverEffect).name();
+    const kind = visual_effect.Kind.parse(value) orelse return error.InvalidScreensaverEffect;
+    if (!kind.configurable()) return error.InvalidScreensaverEffect;
+    return kind.name();
 }
 
 pub fn validateScreensaverEffect(value: []const u8) !void {

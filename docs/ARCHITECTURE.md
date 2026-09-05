@@ -1154,9 +1154,14 @@ A split pane identifies its session with a compact pane label.
   terse frequent actions. A client-owned effect union (`client/effects.zig`)
   exposes one reset/tick/resize/draw contract over two backends declared in
   `core/visual_effect.zig`. Cell effects paint the grid: Matrix rain, dancing
-  sine strings, a forward starfield, demoscene plasma. Pixel effects
+  sine strings, a forward starfield, and demoscene plasma. Pixel effects
   (`client/pixel_effects.zig`) render an RGB framebuffer and ship it over
-  Kitty graphics: tunnel, metaballs, horizon, a 24-second `demo` sequence,
+  Kitty graphics: a self-playing Tetris (`client/tetris.zig`) presented as a
+  full-viewport neon arcade cabinet with beveled blocks, ghost landing, next
+  piece, score, lines, level, scanlines, and a cell fallback. Its deterministic
+  seven-bag game searches every legal rotation and landing column, scores line
+  clears, height, holes, and roughness, then visibly drops the selected piece;
+  tunnel, metaballs, horizon, a 24-second `demo` sequence,
   a `shadowbox` landscape (`client/shadowbox.zig`, after Jani Ylikangas'
   js1k 2019 entry: composed in the original's 1900×900 canvas units and
   scaled per axis, rasterized with coverage anti-aliasing — the original's
@@ -1203,16 +1208,18 @@ A split pane identifies its session with a compact pane label.
   its successor is placed, so the screen never lacks an image.
   Placements use the default z-index (above text) because terminals disagree
   on where negative z sits relative to an explicit cell background.
-  Capability comes from `vx.caps.kitty_graphics`; without it Pac-Man runs its
-  cell renderer and the other pixel kinds start as their `fallback()` cell
-  sibling, each with a notice, and a transmit failure mid-run degrades the
+  Capability comes from `vx.caps.kitty_graphics`; without it Tetris and Pac-Man
+  run their cell renderers and the other pixel kinds start as their `fallback()`
+  cell sibling, each with a notice, and a transmit failure mid-run degrades the
   same way. Pixel kinds are `fullScreenOnly`: a transient `/animate` of those
   runs opaque. The usage strings for
-  `/animate`, `/screensaver`, and `/config screensaver` are generated from the
-  kind list. `/animate <effect>` renders a finite 30 FPS burst through blank
-  cells, preserving UI glyphs; `/screensaver [effect]` runs the same engine
-  continuously as an opaque full-viewport overlay. Bare `/screensaver`,
-  automatic activation, and normal-mode `gs` use `[ui] screensaver_effect`
+  `/animate` and `/screensaver` choices are generated from the kind list.
+  `/animate <effect>` renders a finite 30 FPS burst through blank cells,
+  preserving UI glyphs; `/screensaver [effect]` runs the same engine
+  continuously as an opaque full-viewport overlay. Tetris is manual-only:
+  `/screensaver tetris` and `/animate tetris` work, while `/config screensaver`
+  and config-file validation reject it. Bare `/screensaver`, automatic
+  activation, and normal-mode `gs` use `[ui] screensaver_effect`
   (default `"matrix"`). `gs` switches to insert mode before
   entering the saver. A key or paste dismisses it and is consumed; mouse events
   are ignored and do not reset inactivity. `[ui] screensaver_after = "10m"`

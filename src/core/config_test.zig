@@ -57,6 +57,7 @@ test "screensaver durations are strict and canonical" {
     try validateScreensaverEffect("plasma");
     try validateScreensaverEffect("pacman");
     try validateScreensaverEffect("tunnel");
+    try std.testing.expectError(error.InvalidScreensaverEffect, validateScreensaverEffect("tetris"));
     try std.testing.expectError(error.InvalidScreensaverEffect, validateScreensaverEffect("disco"));
 }
 

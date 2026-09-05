@@ -2092,8 +2092,8 @@ pub const App = struct {
     const ResolvedEffect = struct { kind: effects.Kind, backend: effects.Backend };
 
     /// Pixel effects need Kitty graphics; without it the request runs on
-    /// cells — the same kind when it has a cell renderer (Pac-Man), else a
-    /// cell sibling — and says so once.
+    /// cells — the same kind when it has a cell renderer (Tetris/Pac-Man),
+    /// else a cell sibling — and says so once.
     pub fn resolveEffect(self: *App, requested: effects.Kind) ResolvedEffect {
         if (requested.backend() == .pixel and !self.kitty_graphics) {
             const fallback = requested.fallback();

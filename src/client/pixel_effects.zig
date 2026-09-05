@@ -19,6 +19,7 @@ const vaxis = @import("vaxis");
 const effect = @import("effect.zig");
 const visual_effect = @import("../core/visual_effect.zig");
 const pacman = @import("pacman.zig");
+const tetris = @import("tetris.zig");
 const shadowbox = @import("shadowbox.zig");
 
 pub const Scene = enum { plasma, tunnel, metaballs, horizon };
@@ -63,13 +64,14 @@ pub const Engine = struct {
     /// background (per maze generation), zlib output, and the compressor's
     /// window.
     game: pacman.Game,
+    tetris_game: tetris.Game,
     background: []u8 = &.{},
     background_generation: u64 = 0,
     zbuf: []u8 = &.{},
     window: []u8 = &.{},
 
     pub fn init(gpa: std.mem.Allocator, kind: visual_effect.Kind, seed: u64) Engine {
-        return .{ .gpa = gpa, .kind = kind, .seed = seed, .seed_offset = effect.hash(seed) % 600, .game = pacman.Game.init(seed) };
+        return .{ .gpa = gpa, .kind = kind, .seed = seed, .seed_offset = effect.hash(seed) % 600, .game = pacman.Game.init(seed), .tetris_game = tetris.Game.init(seed) };
     }
 
     pub fn deinit(self: *Engine) void {
@@ -110,6 +112,7 @@ pub const Engine = struct {
         self.seed_offset = effect.hash(seed) % 600;
         try self.resize(cols, rows);
         if (self.kind == .pacman) self.game.reset(seed);
+        if (self.kind == .tetris) self.tetris_game.reset(seed);
     }
 
     pub fn resize(self: *Engine, cols: u16, rows: u16) !void {
@@ -148,7 +151,7 @@ pub const Engine = struct {
     /// Flat or smooth art that zlib pays for; the noisy demoscene scenes are
     /// sent raw.
     fn compressible(kind: visual_effect.Kind) bool {
-        return kind == .pacman or kind == .shadowbox;
+        return kind == .pacman or kind == .tetris or kind == .shadowbox;
     }
 
     /// Ticks per shipped frame. The shadow-box ran at 20 fps in the browser
@@ -162,6 +165,7 @@ pub const Engine = struct {
     pub fn tick(self: *Engine) void {
         self.frame +%= 1;
         if (self.kind == .pacman) self.game.tick();
+        if (self.kind == .tetris) self.tetris_game.tick();
     }
 
     /// Render this tick's frame and ship it. Must run before draw() so the
@@ -186,6 +190,7 @@ pub const Engine = struct {
             .metaballs => renderScene(.metaballs, self.rgb, self.width, self.height, frame),
             .horizon => renderScene(.horizon, self.rgb, self.width, self.height, frame),
             .shadowbox => shadowbox.render(self.rgb, self.width, self.height, self.frame, self.seed, self.sky),
+            .tetris => tetris.renderPixels(&self.tetris_game, self.rgb, self.width, self.height),
             .pacman => {
                 if (self.background_generation != self.game.generation) {
                     pacman.renderBackground(&self.game, self.background, self.width, self.height);
@@ -307,6 +312,17 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
         const by_aspect: u32 = height * win_w / @max(win_h, 1);
         const width: u32 = std.math.clamp(by_aspect, @as(u32, layout.cols) * t, 1600);
         return .{ .width = @intCast(width), .height = @intCast(height) };
+    }
+    if (kind == .tetris) {
+        // The arcade cabinet uses the entire viewport. Render near terminal
+        // resolution so its type and beveled blocks stay crisp when scaled.
+        var tetris_width: u32 = std.math.clamp(win_w, 480, 960);
+        var tetris_height: u32 = @max(tetris_width * win_h / @max(win_w, 1), 270);
+        if (tetris_height > 720) {
+            tetris_height = 720;
+            tetris_width = @max(tetris_height * win_w / @max(win_h, 1), 320);
+        }
+        return .{ .width = @intCast(tetris_width), .height = @intCast(tetris_height) };
     }
     const width: u32 = @min(max_width, @max(min_width, c * 3));
     var height: u32 = width * win_h / @max(win_w, 1);

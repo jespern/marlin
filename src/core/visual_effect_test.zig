@@ -7,6 +7,7 @@ const visual_effect = @import("visual_effect.zig");
 const Backend = visual_effect.Backend;
 const Kind = visual_effect.Kind;
 const usage_list = visual_effect.usage_list;
+const configurable_usage_list = visual_effect.configurable_usage_list;
 
 test {
     std.testing.refAllDecls(visual_effect);
@@ -23,13 +24,18 @@ test "backends, fallbacks, and the generated usage list" {
     try std.testing.expectEqual(Backend.cell, Kind.matrix.backend());
     try std.testing.expectEqual(Backend.pixel, Kind.tunnel.backend());
     try std.testing.expectEqual(Backend.pixel, Kind.pacman.backend());
-    try std.testing.expect(Kind.pacman.cellCapable() and Kind.matrix.cellCapable() and !Kind.tunnel.cellCapable());
+    try std.testing.expectEqual(Backend.pixel, Kind.tetris.backend());
+    try std.testing.expect(Kind.pacman.cellCapable() and Kind.tetris.cellCapable() and Kind.matrix.cellCapable() and !Kind.tunnel.cellCapable());
     try std.testing.expectEqual(Kind.pacman, Kind.pacman.fallback());
     try std.testing.expect(Kind.pacman.fullScreenOnly());
+    try std.testing.expect(Kind.tetris.fullScreenOnly());
+    try std.testing.expect(Kind.matrix.configurable());
+    try std.testing.expect(!Kind.tetris.configurable());
     try std.testing.expect(!Kind.matrix.fullScreenOnly());
     try std.testing.expectEqual(Kind.plasma, Kind.tunnel.fallback());
     try std.testing.expectEqual(Kind.stars, Kind.horizon.fallback());
     try std.testing.expectEqual(Kind.stars, Kind.shadowbox.fallback());
     try std.testing.expectEqual(Kind.matrix, Kind.matrix.fallback());
-    try std.testing.expectEqualStrings("matrix|strings|stars|plasma|pacman|tunnel|metaballs|horizon|demo|shadowbox", usage_list);
+    try std.testing.expectEqualStrings("matrix|strings|stars|plasma|tetris|pacman|tunnel|metaballs|horizon|demo|shadowbox", usage_list);
+    try std.testing.expectEqualStrings("matrix|strings|stars|plasma|pacman|tunnel|metaballs|horizon|demo|shadowbox", configurable_usage_list);
 }

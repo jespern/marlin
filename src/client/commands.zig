@@ -733,10 +733,14 @@ pub fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra
                 self.setNotice("usage: /config screensaver <duration|effect> [effect]", .{});
                 return;
             }
+            if (!parsed.configurable()) {
+                self.setNotice("{s} is manual-only; use /screensaver {s}", .{ parsed.name(), parsed.name() });
+                return;
+            }
             kind = parsed;
         } else {
             after_ms = config.parseDurationMs(raw) catch {
-                self.setNotice("usage: /config screensaver <30s|10m|1h|off> [" ++ effects.usage_list ++ "]", .{});
+                self.setNotice("usage: /config screensaver <30s|10m|1h|off> [" ++ effects.configurable_usage_list ++ "]", .{});
                 return;
             };
             if (extra) |effect_name| {
@@ -744,6 +748,10 @@ pub fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra
                     self.setNotice("unknown effect {s}", .{effect_name});
                     return;
                 };
+                if (!kind.configurable()) {
+                    self.setNotice("{s} is manual-only; use /screensaver {s}", .{ kind.name(), kind.name() });
+                    return;
+                }
             }
         }
         const previous_timeout = self.screensaver_timeout_ms;

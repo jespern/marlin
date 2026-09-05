@@ -8,6 +8,7 @@ const vaxis = @import("vaxis");
 const pixel_effects = @import("pixel_effects.zig");
 const pacman = @import("pacman.zig");
 const shadowbox = @import("shadowbox.zig");
+const tetris = @import("tetris.zig");
 const Engine = pixel_effects.Engine;
 const Scene = pixel_effects.Scene;
 const framebufferSize = pixel_effects.framebufferSize;
@@ -177,6 +178,42 @@ test "pacman shapes its maze to the window, sizes a 16 px framebuffer, and ships
     var i: usize = 0;
     while (i < pacman.step_ticks * 3) : (i += 1) engine.tick();
     try std.testing.expect(engine.game.dots_left < dots_before or engine.game.freeze > 0);
+}
+
+test "tetris fills the viewport with a compressed arcade cabinet and advances its game" {
+    const gpa = std.testing.allocator;
+    const dims = framebufferSize(80, 24, 8, 16, .tetris);
+    try std.testing.expectEqual(@as(u16, 640), dims.width);
+    try std.testing.expectEqual(@as(u16, 384), dims.height);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var vx = try vaxis.Vaxis.init(threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &out.writer);
+    vx.caps.kitty_graphics = true;
+    try vx.resize(gpa, &out.writer, .{ .rows = 24, .cols = 80, .x_pixel = 640, .y_pixel = 384 });
+
+    var engine = Engine.init(gpa, .tetris, 3);
+    defer engine.deinit();
+    engine.setCellPixels(8, 16);
+    try engine.reset(80, 24, 3);
+    try std.testing.expectEqual(dims.width, engine.width);
+    try std.testing.expectEqual(dims.height, engine.height);
+    try std.testing.expectEqual(@as(u8, 1), engine.transmit_every);
+
+    out.clearRetainingCapacity();
+    try engine.transmit(&vx, &out.writer);
+    const bytes = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b_Ga=t,f=24,s=640,v=384,i=1,q=2,o=z,m=1;") != null);
+    try std.testing.expect(bytes.len < engine.rgb.len / 2);
+
+    const before = engine.tetris_game.active.y;
+    for (0..tetris.drop_frames) |_| engine.tick();
+    try std.testing.expect(engine.tetris_game.active.y > before or engine.tetris_game.pieces > 0);
 }
 
 test "shadowbox renders near window size and ships compressed frames at half rate" {

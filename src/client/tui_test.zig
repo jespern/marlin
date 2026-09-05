@@ -601,6 +601,12 @@ test "named animations and screensavers share the selected effect engine" {
     try std.testing.expect(app.ui_animation == null);
     try std.testing.expect(!app.ui_animation_active.load(.acquire));
 
+    app.runCommand("/screensaver tetris");
+    try std.testing.expect(app.screensaver_active);
+    try std.testing.expectEqual(effects.Kind.tetris, app.effect_engine.?.kind());
+    try std.testing.expectEqual(effects.Kind.matrix, app.screensaver_kind);
+    try std.testing.expect(app.dismissScreensaver());
+
     app.runCommand("/screensaver stars");
     try std.testing.expect(app.screensaver_active);
     try std.testing.expectEqual(effects.Kind.matrix, app.screensaver_kind);
@@ -615,6 +621,31 @@ test "named animations and screensavers share the selected effect engine" {
     try std.testing.expect(!app.shell_requested);
     try std.testing.expectEqual(effects.Kind.strings, app.effect_engine.?.kind());
     try std.testing.expect(app.dismissScreensaver());
+}
+
+test "manual-only Tetris cannot become the automatic screensaver" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
+    };
+    defer app.deinit();
+
+    app.runCommand("/config screensaver tetris");
+    try std.testing.expectEqual(effects.Kind.matrix, app.screensaver_kind);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "manual-only") != null);
+
+    app.runCommand("/config screensaver 10m tetris");
+    try std.testing.expectEqual(@as(u64, 0), app.screensaver_timeout_ms);
+    try std.testing.expectEqual(effects.Kind.matrix, app.screensaver_kind);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "manual-only") != null);
 }
 
 test "all effects preserve text transiently and cover it as screensavers" {
@@ -698,7 +729,11 @@ test "pixel effects start as themselves only with Kitty graphics" {
     try std.testing.expect(app.resetEffectEngine(.tunnel));
     try std.testing.expectEqual(effects.Kind.plasma, app.effect_engine.?.kind());
     try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "needs Kitty graphics") != null);
-    // Pac-Man keeps its kind and drops to its cell renderer.
+    // The games keep their kind and drop to their cell renderers.
+    try std.testing.expect(app.resetEffectEngine(.tetris));
+    try std.testing.expectEqual(effects.Kind.tetris, app.effect_engine.?.kind());
+    try std.testing.expect(!app.effect_engine.?.isPixel());
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "tetris on cells") != null);
     try std.testing.expect(app.resetEffectEngine(.pacman));
     try std.testing.expectEqual(effects.Kind.pacman, app.effect_engine.?.kind());
     try std.testing.expect(!app.effect_engine.?.isPixel());
@@ -707,6 +742,9 @@ test "pixel effects start as themselves only with Kitty graphics" {
     app.kitty_graphics = true;
     app.cell_px_w = 8;
     app.cell_px_h = 16;
+    try std.testing.expect(app.resetEffectEngine(.tetris));
+    try std.testing.expectEqual(effects.Kind.tetris, app.effect_engine.?.kind());
+    try std.testing.expect(app.effect_engine.?.isPixel());
     try std.testing.expect(app.resetEffectEngine(.tunnel));
     try std.testing.expectEqual(effects.Kind.tunnel, app.effect_engine.?.kind());
     try std.testing.expect(app.effect_engine.?.isPixel());

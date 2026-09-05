@@ -11,6 +11,7 @@ const matrix = @import("matrix.zig");
 const plasma = @import("plasma.zig");
 const starfield = @import("starfield.zig");
 const strings = @import("strings.zig");
+const tetris = @import("tetris.zig");
 const pacman = @import("pacman.zig");
 const pixel_effects = @import("pixel_effects.zig");
 const shadowbox = @import("shadowbox.zig");
@@ -19,6 +20,7 @@ pub const Kind = visual_effect.Kind;
 pub const Backend = visual_effect.Backend;
 pub const kinds = visual_effect.kinds;
 pub const usage_list = visual_effect.usage_list;
+pub const configurable_usage_list = visual_effect.configurable_usage_list;
 /// The sky model the shadow-box follows; the TUI resolves it from the clock.
 pub const Sky = shadowbox.Sky;
 
@@ -27,12 +29,13 @@ pub const Engine = union(enum) {
     strings: strings.Engine,
     stars: starfield.Engine,
     plasma: plasma.Engine,
+    tetris: tetris.Engine,
     pacman: pacman.Engine,
     pixel: pixel_effects.Engine,
 
     /// `backend` is what the terminal can do: with `.pixel`, pixel kinds get
     /// the pixel engine; with `.cell`, every kind runs as its `fallback()`
-    /// (Pac-Man on cells, the demoscene kinds as a cell sibling).
+    /// (Tetris/Pac-Man on cells, the demoscene kinds as a cell sibling).
     pub fn init(gpa: std.mem.Allocator, which: Kind, seed: u64, backend: Backend) Engine {
         if (backend == .pixel and which.backend() == .pixel)
             return .{ .pixel = pixel_effects.Engine.init(gpa, which, seed) };
@@ -40,6 +43,7 @@ pub const Engine = union(enum) {
             .matrix => .{ .matrix = matrix.Engine.init(gpa, seed) },
             .strings => .{ .strings = strings.Engine.init(gpa, seed) },
             .stars => .{ .stars = starfield.Engine.init(gpa, seed) },
+            .tetris => .{ .tetris = tetris.Engine.init(gpa, seed) },
             .pacman => .{ .pacman = pacman.Engine.init(gpa, seed) },
             // fallback() never names the pixel-only kinds; plasma is the safe cell default.
             .plasma, .tunnel, .metaballs, .horizon, .demo, .shadowbox => .{ .plasma = plasma.Engine.init(gpa, seed) },
@@ -52,6 +56,7 @@ pub const Engine = union(enum) {
             .strings => .strings,
             .stars => .stars,
             .plasma => .plasma,
+            .tetris => .tetris,
             .pacman => .pacman,
             .pixel => |*engine| engine.kind,
         };
