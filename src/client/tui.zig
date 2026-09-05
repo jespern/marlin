@@ -320,6 +320,7 @@ pub const TabMouseAction = enum { activate, context_menu };
 
 const TabLayoutItem = struct {
     sid: u64,
+    index: usize,
     label: []const u8,
     activity: TabActivity,
     active: bool,
@@ -3912,16 +3913,24 @@ fn tabActivityText(activity: TabActivity) []const u8 {
 
 const TabCandidate = struct {
     sid: u64,
+    index: usize = 0,
     label: []const u8,
     activity: TabActivity,
     active: bool,
     created_at: i64,
 
     fn width(self: TabCandidate) usize {
-        // leading space + label + fixed-width activity + trailing space
-        return displayWidth(self.label) + 4;
+        // leading space + index + separator + label + activity + trailing space
+        return decimalDigits(self.index) + displayWidth(self.label) + 5;
     }
 };
+
+fn decimalDigits(value: usize) usize {
+    var digits: usize = 1;
+    var remaining = value;
+    while (remaining >= 10) : (remaining /= 10) digits += 1;
+    return digits;
+}
 
 fn rootTabPrecedes(a: *const SessionSummary, b: *const SessionSummary) bool {
     return a.created_at < b.created_at or (a.created_at == b.created_at and a.sid < b.sid);
@@ -3972,15 +3981,7 @@ pub fn rootTabSidAtIndex(sessions: []const SessionSummary, index: usize) ?u64 {
     return null;
 }
 
-fn tabLabel(
-    arena: std.mem.Allocator,
-    app: *const App,
-    sid: u64,
-    summary: ?*const SessionSummary,
-) ![]const u8 {
-    var handle_buf: session_handle.Full = undefined;
-    const handle = app.displaySessionHandle(&handle_buf, sid);
-    const short_handle = handle[0..@min(handle.len, 4)];
+fn tabLabel(app: *const App, summary: ?*const SessionSummary) []const u8 {
     const identity = if (summary) |session|
         if (session.title.len > 0)
             session.title
@@ -3992,8 +3993,7 @@ fn tabLabel(
         std.fs.path.basename(app.view.cwd.items)
     else
         "session";
-    const raw = try std.fmt.allocPrint(arena, "{s} · {s}", .{ identity, short_handle });
-    return raw[0..hardCellBreak(raw, 0, tab_label_max_cells)];
+    return identity[0..hardCellBreak(identity, 0, tab_label_max_cells)];
 }
 
 /// Build a chronological, root-only tab window. When the full strip does not
@@ -4008,7 +4008,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
         if (session.parent_sid != null or session.kind != .root) continue;
         try candidates.append(arena, .{
             .sid = session.sid,
-            .label = try tabLabel(arena, app, session.sid, session),
+            .label = tabLabel(app, session),
             .activity = app.tabActivity(session.sid),
             .active = session.sid == active_root,
             .created_at = session.created_at,
@@ -4017,7 +4017,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
     if (candidates.items.len == 0) {
         try candidates.append(arena, .{
             .sid = app.view.sid,
-            .label = try tabLabel(arena, app, app.view.sid, null),
+            .label = tabLabel(app, null),
             .activity = tabActivityForState(app.view.state),
             .active = true,
             .created_at = 0,
@@ -4028,6 +4028,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
             return a.created_at < b.created_at or (a.created_at == b.created_at and a.sid < b.sid);
         }
     }.lessThan);
+    for (candidates.items, 1..) |*candidate, index| candidate.index = index;
 
     var active_index: usize = 0;
     var total_width: usize = candidates.items.len - 1; // one-cell gaps
@@ -4075,6 +4076,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
         const item_width = @min(candidate.width(), right_limit - x);
         try items.append(arena, .{
             .sid = candidate.sid,
+            .index = candidate.index,
             .label = candidate.label,
             .activity = candidate.activity,
             .active = candidate.active,
@@ -4414,9 +4416,15 @@ fn drawTabBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
             .height = 1,
         });
         tab.fill(.{ .style = style });
-        const label_capacity = item.width -| 4;
+        const index_text = try std.fmt.allocPrint(arena, "{d}", .{item.index});
+        var index_style = style;
+        index_style.bold = false;
+        index_style.dim = true;
+        const label_capacity = item.width -| (5 + displayWidth(index_text));
         const label_end = hardCellBreak(item.label, 0, label_capacity);
         const segments = [_]vaxis.Segment{
+            .{ .text = " ", .style = style },
+            .{ .text = index_text, .style = index_style },
             .{ .text = " ", .style = style },
             .{ .text = item.label[0..label_end], .style = style },
             .{ .text = tabActivityText(item.activity), .style = tabActivityStyle(item.activity, item.active) },

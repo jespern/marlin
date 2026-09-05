@@ -2752,10 +2752,12 @@ test "tab bar is permanent, root-only, chronological, and rolls up child activit
     try std.testing.expectEqual(@as(usize, 2), layout.items.len);
     try std.testing.expectEqual(@as(u64, 10), layout.items[0].sid);
     try std.testing.expectEqual(@as(u64, 20), layout.items[1].sid);
+    try std.testing.expectEqual(@as(usize, 1), layout.items[0].index);
+    try std.testing.expectEqual(@as(usize, 2), layout.items[1].index);
     try std.testing.expect(!layout.items[0].active);
     try std.testing.expect(layout.items[1].active); // focused child highlights its root
     try std.testing.expectEqual(TabActivity.err, layout.items[1].activity);
-    try std.testing.expect(std.mem.indexOf(u8, layout.items[0].label, "alpha") != null);
+    try std.testing.expectEqualStrings("alpha", layout.items[0].label);
 
     var empty = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 99, .editor = Editor.init(gpa) } };
     defer empty.deinit();
@@ -2947,6 +2949,13 @@ test "draw permanently reserves and paints the clickable tab row" {
     try std.testing.expectEqual(@as(usize, 6), app.view.last_view_h);
     const tab_cell = vx.window().readCell(0, 0).?;
     try std.testing.expect(vaxis.Color.eql(tab_cell.style.bg, Palette.prompt_bg));
+    const index_cell = vx.window().readCell(1, 0).?;
+    try std.testing.expectEqualStrings("1", index_cell.char.grapheme);
+    try std.testing.expect(index_cell.style.dim);
+    try std.testing.expect(!index_cell.style.bold);
+    const title_cell = vx.window().readCell(3, 0).?;
+    try std.testing.expectEqualStrings("m", title_cell.char.grapheme);
+    try std.testing.expect(title_cell.style.bold);
 }
 
 test "empty session draws the welcome card; content reclaims it" {

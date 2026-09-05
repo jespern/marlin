@@ -232,9 +232,6 @@ const Session = struct {
     parent_block_id: ?u64 = null,
     max_rounds: u32 = 128,
     archived: bool = false,
-    /// Whether the durable row already has a non-empty title. Cleared rows
-    /// get auto-titled from the first user message of a turn.
-    titled: bool = false,
     model: []u8, // gpa-owned
     effort: proto.ReasoningEffort = .auto,
     cwd: []u8, // gpa-owned
@@ -1270,7 +1267,6 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "store", .msg = "could not update session title" } });
                     return;
                 };
-                session.titled = true;
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sr.sid);
             },
@@ -1684,17 +1680,13 @@ pub const Daemon = struct {
                     self.sendInputError(client, inp.request_id, "internal", "could not start turn");
                     return;
                 };
-                // Root sessions are created without a title; adopt the first
-                // message the same way task children adopt their prompt. A
-                // store failure only delays titling to the next message.
-                if (!session.titled) {
-                    const title = taskTitle(inp.text);
-                    if (title.len > 0) {
-                        if (self.store.setSessionTitle(inp.sid, title)) |_| {
-                            session.titled = true;
-                            self.broadcastSessionUpsert(inp.sid);
-                        } else |_| {}
-                    }
+                // A root tab describes its latest task. Steers stay part of
+                // the active turn and never retitle it; child titles remain
+                // fixed to the prompt that created the child.
+                if (turnTitle(session.kind, inp.text)) |title| {
+                    if (self.store.setSessionTitle(inp.sid, title)) |_| {
+                        self.broadcastSessionUpsert(inp.sid);
+                    } else |_| {}
                 }
                 self.sendTo(client, .{ .ok = .{ .request_id = inp.request_id } });
             },
@@ -2335,7 +2327,6 @@ pub const Daemon = struct {
             .parent_block_id = row.parent_block_id,
             .max_rounds = if (row.max_rounds > 0) row.max_rounds else 128,
             .archived = row.archived,
-            .titled = row.title.len > 0,
             .model = model,
             .effort = row.effort,
             .cwd = cwd,
@@ -2581,7 +2572,6 @@ pub const Daemon = struct {
             .kind = .task_child,
             .parent_block_id = cs.parent_block_id,
             .max_rounds = cs.max_rounds,
-            .titled = title.len > 0,
             .model = model,
             .effort = effort,
             .cwd = cwd,
@@ -4328,6 +4318,19 @@ fn taskTitle(prompt: []const u8) []const u8 {
     // Avoid cutting a valid UTF-8 title in the middle of a continuation run.
     while (end > 0 and end < trimmed.len and (trimmed[end] & 0xc0) == 0x80) end -= 1;
     return trimmed[0..end];
+}
+
+fn turnTitle(kind: proto.SessionKind, prompt: []const u8) ?[]const u8 {
+    if (kind != .root) return null;
+    const title = taskTitle(prompt);
+    return if (title.len > 0) title else null;
+}
+
+test "root turns continuously derive titles from their latest prompt" {
+    try std.testing.expectEqualStrings("integrating tetris client", turnTitle(.root, "  integrating tetris client  \nextra context").?);
+    try std.testing.expect(turnTitle(.root, "  \nignored") == null);
+    try std.testing.expect(turnTitle(.task_child, "child prompt") == null);
+    try std.testing.expect(turnTitle(.review_child, "review prompt") == null);
 }
 
 test "only successful child turns auto-archive" {

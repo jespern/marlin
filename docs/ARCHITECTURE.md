@@ -1075,10 +1075,12 @@ get these right; Hermes is the counter-example):
 
 **Permanent tabs; no persistent sidebar.** Every unarchived root session has a
 tab in a one-row strip that remains visible even when only one session exists.
-Tabs are clickable; normal-mode `>`/`<` and Right/Left move through the visible
-tab order, while `gt`/`gT` (with optional count) retains MRU session navigation.
-Child activity rolls up to its root tab and overflow keeps the focused tab
-visible. `/sessions` remains the fuzzy complete hierarchy picker showing title,
+Tabs are clickable and begin with their dimmed 1-based position, matching
+Alt/Option+1..9 navigation. Normal-mode `>`/`<` and Right/Left move through the
+visible tab order, while `gt`/`gT` (with optional count) retains MRU session
+navigation. A root tab's title follows its latest newly started prompt; steers
+do not retitle it. Child activity rolls up to its root tab and overflow keeps
+the focused tab visible. `/sessions` remains the fuzzy complete hierarchy picker showing title,
 workspace, recency, and state. `/council` opens a filtered council list, while
 `/council <name>` inspects the durable roster. Contextual command completion
 offers council actions and configured names for both `/council` and `/review`.
@@ -1089,7 +1091,7 @@ reports background sessions only when actionable (`2 running · 1 approval`).
 A split pane identifies its session with a compact pane label.
 
 ```
-┌ api-fix · 63df ● │ crypto-review · a82c ! ──────────┐
+┌ 1 api-fix ● │ 2 crypto-review ! ────────────────────┐
 ├─ main: api-fix ● ───────────────────────────────────┤
 │ blocks rendered as cards:                           │
 │ user / assistant md / collapsed tools               │
