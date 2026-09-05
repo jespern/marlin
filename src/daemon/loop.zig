@@ -313,45 +313,6 @@ fn latestPlanBlock(history: []const block.Block) ?*const block.Block {
     return null;
 }
 
-/// Completed work must have appeared as active in the immediately preceding
-/// plan revision. Without that transition the daemon has no honest start time
-/// from which to derive a duration.
-pub fn skippedPlanCompletion(items: []const block.PlanItem, history: []const block.Block) ?[]const u8 {
-    const previous = latestPlanBlock(history);
-    for (items) |item| {
-        if (item.status != .completed) continue;
-        const prior_status: ?block.PlanStatus = if (previous) |prior_block| status: {
-            for (prior_block.body.plan.items) |candidate| {
-                if (std.mem.eql(u8, candidate.step, item.step)) break :status candidate.status;
-            }
-            break :status null;
-        } else null;
-        if (prior_status == null or prior_status.? == .pending) return item.step;
-    }
-    return null;
-}
-
-pub fn enforcePlanTransitions(
-    gpa: std.mem.Allocator,
-    exec: *tools_registry.ExecOut,
-    history: []const block.Block,
-) !void {
-    if (exec.status != .ok) return;
-    const items = exec.plan_items orelse return;
-    const step = skippedPlanCompletion(items, history) orelse return;
-    const output = try std.fmt.allocPrint(
-        gpa,
-        "error: plan_update step '{s}' was not in_progress in the preceding plan; omit work completed before planning, or mark the step in_progress before doing it and complete it in a later update",
-        .{step},
-    );
-    gpa.free(exec.output);
-    for (items) |item| gpa.free(@constCast(item.step));
-    gpa.free(items);
-    exec.output = output;
-    exec.status = .err;
-    exec.plan_items = null;
-}
-
 pub fn stampPlanTimings(
     store: *Store,
     session_id: u64,
@@ -962,8 +923,6 @@ pub fn runTurn(
         // Results stay in provider call order even when execution completed
         // out of order. The transcript is therefore deterministic and valid.
         for (prepared) |*call| {
-            try enforcePlanTransitions(gpa, &call.exec.?, history.items);
-
             // Capture-time redaction, BEFORE hashing/capping/blobbing: the
             // append-only store makes anything persisted immortal.
             if (try permissions.redactSecrets(gpa, opts.secrets, call.exec.?.output)) |clean| {

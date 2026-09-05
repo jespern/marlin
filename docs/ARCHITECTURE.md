@@ -387,8 +387,8 @@ Key decisions:
   revision; assembly retains the newest unfinished revision across compaction,
   and bounded replay restores it separately from scrollback depth. A terminal
   completed revision becomes a closed transcript table immediately. The daemon
-  times only `in_progress` work and rejects `pending` → `completed` jumps, so
-  every displayed completion duration has an observed start.
+  times only observed `in_progress` work; a direct `pending` → `completed` jump
+  is accepted but remains untimed rather than inventing a duration.
 - **Synthetic `user_msg` blocks are model context, not user authorship.** File
   windows rehydrated after compaction carry `synthetic=true`; clients collapse
   them to a filename note and exclude them from input history. The default is

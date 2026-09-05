@@ -37,7 +37,6 @@ const AnthropicWireChecks = loop.AnthropicWireChecks;
 const RunOpts = loop.RunOpts;
 const SteeringWireChecks = loop.SteeringWireChecks;
 const codex_turn = loop.codex_turn;
-const enforcePlanTransitions = loop.enforcePlanTransitions;
 const environmentBlock = loop.environmentBlock;
 const max_parallel_tool_workers = loop.max_parallel_tool_workers;
 const openrouter_web_search_prompt = loop.openrouter_web_search_prompt;
@@ -46,7 +45,6 @@ const projectInstructions = loop.projectInstructions;
 const providerErrorNote = loop.providerErrorNote;
 const runTaskBatch = loop.runTaskBatch;
 const runTurn = loop.runTurn;
-const skippedPlanCompletion = loop.skippedPlanCompletion;
 const stampPlanTimings = loop.stampPlanTimings;
 const summarize = loop.summarize;
 const toolAllowed = loop.toolAllowed;
@@ -213,10 +211,10 @@ test "plan timing survives revisions without counting idle gaps" {
     try std.testing.expectEqual(@as(u64, 3_250), unchanged[0].duration_ms);
 }
 
-test "plan completion requires a preceding in-progress revision" {
+test "plan timing leaves direct completions untimed" {
     const prior_items = [_]block.PlanItem{
-        .{ .step = "Inspect", .status = .completed },
-        .{ .step = "Implement", .status = .in_progress },
+        .{ .step = "Inspect", .status = .completed, .duration_ms = 300 },
+        .{ .step = "Implement", .status = .in_progress, .started_at_ms = 1_000 },
         .{ .step = "Verify", .status = .pending },
     };
     const history = [_]block.Block{.{
@@ -228,37 +226,19 @@ test "plan completion requires a preceding in-progress revision" {
         .body = .{ .plan = .{ .items = &prior_items } },
     }};
 
-    const valid = [_]block.PlanItem{
-        .{ .step = "Inspect", .status = .completed },
-        .{ .step = "Implement", .status = .completed },
-        .{ .step = "Verify", .status = .in_progress },
-    };
-    try std.testing.expect(skippedPlanCompletion(&valid, &history) == null);
-
-    const skipped = [_]block.PlanItem{
+    var current = [_]block.PlanItem{
         .{ .step = "Inspect", .status = .completed },
         .{ .step = "Implement", .status = .completed },
         .{ .step = "Verify", .status = .completed },
     };
-    try std.testing.expectEqualStrings("Verify", skippedPlanCompletion(&skipped, &history).?);
+    var store = try Store.open(std.testing.allocator, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+    try stampPlanTimings(&store, 1, 1, &current, &history, 4_000);
 
-    const retrospective = [_]block.PlanItem{.{ .step = "Already done", .status = .completed }};
-    try std.testing.expectEqualStrings("Already done", skippedPlanCompletion(&retrospective, &.{}).?);
-
-    const gpa = std.testing.allocator;
-    const owned_items = try gpa.alloc(block.PlanItem, 1);
-    owned_items[0] = .{ .step = try gpa.dupe(u8, "Verify"), .status = .completed };
-    var exec = tools_registry.ExecOut{
-        .output = try gpa.dupe(u8, "plan updated: 3/3 completed"),
-        .status = .ok,
-        .plan_items = owned_items,
-    };
-    defer exec.deinit(gpa);
-    try enforcePlanTransitions(gpa, &exec, &history);
-    try std.testing.expectEqual(block.ToolStatus.err, exec.status);
-    try std.testing.expect(exec.plan_items == null);
-    try std.testing.expect(std.mem.indexOf(u8, exec.output, "was not in_progress") != null);
-    try std.testing.expect(std.mem.indexOf(u8, exec.output, "omit work completed before planning") != null);
+    try std.testing.expectEqual(@as(u64, 300), current[0].duration_ms);
+    try std.testing.expectEqual(@as(u64, 3_000), current[1].duration_ms);
+    try std.testing.expectEqual(@as(u64, 0), current[2].duration_ms);
 }
 
 test "plan tool profile permits investigation and denies execution mutations" {

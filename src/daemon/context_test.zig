@@ -155,7 +155,8 @@ test "assemble: system prompt carries instructions, environment, and suffix" {
     try std.testing.expect(std.mem.indexOf(u8, sys, "PLANNING") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "call `plan_update`") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "only current and remaining work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sys, "step directly to completed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "complete it directly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "without inventing a duration") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "Do not merely announce") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "DELEGATION AND PARALLELISM") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "Invoke `task_batch` without waiting") != null);

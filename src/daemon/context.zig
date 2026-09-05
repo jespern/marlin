@@ -86,9 +86,9 @@ pub const system_prompt_base =
     \\  while work remains, mark completed steps promptly, and revise the
     \\  remaining steps when evidence changes the path. Do not merely announce
     \\  a plan in prose or repeat the displayed plan in progress commentary.
-    \\- Never move a pending step directly to completed: first make it
-    \\  in_progress, then complete it in a later update so elapsed time remains
-    \\  accurate.
+    \\- Mark a step in_progress before working on it so Marlin can measure
+    \\  elapsed time. If work finishes before that update, complete it directly;
+    \\  Marlin records the completion without inventing a duration.
     \\- Execute the plan through completion. Use `task` or `task_batch` within
     \\  a step when independent read-only work benefits from parallelism, then
     \\  synthesize the children before advancing the plan.
