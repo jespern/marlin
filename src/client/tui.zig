@@ -20,7 +20,7 @@
 //!   global:  Ctrl+N creates a session; Ctrl+D/Ctrl+W archive when input is empty;
 //!            Ctrl+L clears/redraws and returns to bottom;
 //!            Ctrl+T toggles the expanded tool transcript;
-//!            Alt/Option+1..9 jumps to that tab
+//!            Alt/Option+Left/Right cycles tabs; Alt/Option+1..9 jumps to a tab
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /cwd <path>, /search <query>, /animate <effect>,
 //!             /screensaver [effect], /new, /compact, /archive, /reboot [--build], /help,
@@ -488,7 +488,7 @@ pub const App = struct {
     /// hide the source block, so the notice must identify it.
     clipboard_desc: std.ArrayList(u8) = .empty,
     /// Top tab strip ([ui] tab_bar; /config tabbar toggles + persists).
-    /// Hiding the bar only removes CHROME: alt+N, gt/gT, </> keep working.
+    /// Hiding the bar only removes CHROME: alt+N, alt+arrows, gt/gT, </> keep working.
     show_tab_bar: bool = true,
     /// [ui] bell: ring the terminal when a NON-focused session parks on an
     /// approval. The one out-of-band signal; everything else stays quiet.
@@ -4019,7 +4019,8 @@ const ShortcutHelpRow = struct {
 pub const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Esc / i", .description = "return to insert mode (Esc first cancels a pending count/operator)" },
     .{ .key = ":", .description = "open the command menu" },
-    .{ .key = "</> or ←/→", .description = "previous / next tab" },
+    .{ .key = "</> or ←/→", .description = "previous / next tab (normal mode)" },
+    .{ .key = "⌥← / ⌥→", .description = "previous / next tab (works in insert mode too)" },
     .{ .key = "⌥1–⌥9", .description = "jump to Nth tab (works in insert mode too)" },
     .{ .key = "Ctrl+V", .description = "attach clipboard image (Control, not Command)" },
     .{ .key = "gt / gT", .description = "switch sessions · Ngt = Nth recent" },
@@ -6065,6 +6066,8 @@ const VoiceRt = struct {
 };
 
 pub const planProposalAction = keys.planProposalAction;
+
+pub const optionTabNavigationDirection = keys.optionTabNavigationDirection;
 
 pub const tabNavigationDirection = keys.tabNavigationDirection;
 

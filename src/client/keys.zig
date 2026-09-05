@@ -298,6 +298,13 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
+    // Option/Alt+Left/Right cycles tabs from either mode. Handle it before
+    // insert-mode editing, where the same chord otherwise moves by word.
+    if (optionTabNavigationDirection(key)) |direction| {
+        app.cycleTab(direction);
+        return;
+    }
+
     // Option/Alt+1..9 jumps straight to that tab (strip order) from either
     // mode. Below the modal blocks on purpose: an open picker or help panel
     // keeps swallowing every key.
@@ -901,6 +908,12 @@ pub fn planProposalAction(key: vaxis.Key) PlanProposalAction {
     if (key.matches('e', .{})) return .revise;
     if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) return .dismiss;
     return .none;
+}
+
+pub fn optionTabNavigationDirection(key: vaxis.Key) ?i8 {
+    if (key.matchExact(vaxis.Key.right, .{ .alt = true })) return 1;
+    if (key.matchExact(vaxis.Key.left, .{ .alt = true })) return -1;
+    return null;
 }
 
 pub fn tabNavigationDirection(key: vaxis.Key) ?i8 {

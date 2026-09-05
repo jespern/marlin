@@ -109,6 +109,7 @@ const isPreviousInputRowKey = tui.isPreviousInputRowKey;
 const layoutLines = tui.layoutLines;
 const layoutTabBar = tui.layoutTabBar;
 const nextRootTabSid = tui.nextRootTabSid;
+const optionTabNavigationDirection = tui.optionTabNavigationDirection;
 const parseOtelCommand = tui.parseOtelCommand;
 const pickerModelLine = tui.pickerModelLine;
 const planDisplayRange = tui.planDisplayRange;
@@ -1372,7 +1373,21 @@ test "standard editor key bindings map to commands" {
     try std.testing.expect(!isNewSessionKey(.{ .codepoint = 'n' }));
 }
 
-test "normal-mode tab shortcuts recognize angle brackets and arrows" {
+test "tab shortcuts recognize option-arrows and normal-mode keys" {
+    try std.testing.expectEqual(@as(?i8, 1), optionTabNavigationDirection(.{
+        .codepoint = vaxis.Key.right,
+        .mods = .{ .alt = true },
+    }));
+    try std.testing.expectEqual(@as(?i8, -1), optionTabNavigationDirection(.{
+        .codepoint = vaxis.Key.left,
+        .mods = .{ .alt = true },
+    }));
+    try std.testing.expectEqual(@as(?i8, null), optionTabNavigationDirection(.{ .codepoint = vaxis.Key.right }));
+    try std.testing.expectEqual(@as(?i8, null), optionTabNavigationDirection(.{
+        .codepoint = vaxis.Key.right,
+        .mods = .{ .alt = true, .shift = true },
+    }));
+
     try std.testing.expectEqual(@as(?i8, 1), tabNavigationDirection(.{ .codepoint = '>' }));
     try std.testing.expectEqual(@as(?i8, -1), tabNavigationDirection(.{ .codepoint = '<' }));
     try std.testing.expectEqual(@as(?i8, 1), tabNavigationDirection(.{ .codepoint = vaxis.Key.right }));
@@ -2850,11 +2865,16 @@ test "tab bar is permanent, root-only, chronological, and rolls up child activit
     try std.testing.expectEqual(@as(u64, 99), fallback.items[0].sid);
 }
 
-test "normal-mode tab navigation follows chronological roots and wraps" {
+test "tab navigation follows chronological roots and wraps" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 30, .editor = Editor.init(gpa) } };
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 30, .editor = Editor.init(gpa) } };
     defer app.deinit();
 
     app.replaceSessionSummaries(&.{
@@ -2879,6 +2899,18 @@ test "normal-mode tab navigation follows chronological roots and wraps" {
     try std.testing.expectEqual(@as(?u64, 20), nextRootTabSid(app.sessions.items, 10, 1));
     try std.testing.expectEqual(@as(?u64, 40), nextRootTabSid(app.sessions.items, 10, -1));
     try std.testing.expectEqual(@as(?u64, 10), nextRootTabSid(app.sessions.items, 40, 1));
+
+    // Option-arrows use visible tab order in insert mode without moving the
+    // composer cursor. Switching from a child starts relative to its root.
+    app.view.editor.insertSlice("draft");
+    app.view.editor.cursor = 2;
+    try handleKey(&app, .{ .codepoint = vaxis.Key.right, .mods = .{ .alt = true } });
+    try std.testing.expectEqual(@as(u64, 40), app.view.sid);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.left, .mods = .{ .alt = true } });
+    try std.testing.expectEqual(@as(u64, 20), app.view.sid);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.left, .mods = .{ .alt = true } });
+    try std.testing.expectEqual(@as(u64, 10), app.view.sid);
+    try std.testing.expectEqual(@as(usize, 2), app.saved_views.get(30).?.editor.cursor);
 
     // With one visible root, every shortcut is a no-op and never repurposes
     // Left/Right as composer movement in normal mode.
