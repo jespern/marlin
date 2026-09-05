@@ -1150,7 +1150,7 @@ A split pane identifies its session with a compact pane label.
   it). The `!c msg`/`!c code`/`!c all` variants and the `!y`/`!p` daemon-side
   register are future work.
 - **Command namespace**: `/` = session & harness commands (`/sessions`,
-  `/model`, `/compact`, `/new`, `/archive`, `/animate`, `/screensaver`); `!` =
+  `/model`, `/cwd`, `/compact`, `/new`, `/archive`, `/animate`, `/screensaver`); `!` =
   terse frequent actions. A client-owned effect union (`client/effects.zig`)
   exposes one reset/tick/resize/draw contract over two backends declared in
   `core/visual_effect.zig`. Cell effects paint the grid: Matrix rain, dancing
@@ -1225,6 +1225,10 @@ A split pane identifies its session with a compact pane label.
   are ignored and do not reset inactivity. `[ui] screensaver_after = "10m"`
   enables per-client inactivity activation; absent or `"off"` disables it.
   Daemon/provider activity does not count as user activity.
+  `/cwd <path>` changes the focused session's durable working directory while
+  idle. Relative paths resolve against its current cwd; the daemon requires an
+  existing directory, canonicalizes it, and broadcasts the new value. Native
+  turns and guest turns use that value on their next start/resume.
   `! <command>` runs through `$SHELL -c` in the focused session cwd;
   bare `!` starts `$SHELL` interactively. The client tears the TUI down before
   spawning the inherited-stdio child and reattaches to the durable session when

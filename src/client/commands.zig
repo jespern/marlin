@@ -46,6 +46,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "]", .description = "start a continuous full-screen effect", .accepts_args = true },
     .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
+    .{ .name = "/cwd", .usage = " <path>", .description = "change this session's working directory", .accepts_args = true },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
@@ -582,6 +583,13 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.newSession() catch {
             self.setNotice("could not create session", .{});
         };
+    } else if (std.mem.eql(u8, head, "/cwd")) {
+        const cwd = std.mem.trim(u8, it.rest(), " \t");
+        if (cwd.len == 0) {
+            self.setNotice("usage: /cwd <path>", .{});
+            return;
+        }
+        self.applyCwd(cwd);
     } else if (std.mem.eql(u8, head, "/rename")) {
         const title = std.mem.trim(u8, it.rest(), " \t");
         if (title.len == 0) {

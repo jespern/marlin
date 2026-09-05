@@ -428,6 +428,31 @@ test "native to guest model selection updates status model before handover finis
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"session_set_model\"") != null);
 }
 
+test "cwd command waits for daemon canonical path and applies session upsert" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr("/old");
+
+    app.runCommand("/cwd ../project");
+
+    try std.testing.expectEqualStrings("/old", app.view.cwd.items);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"session_set_cwd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "../project") != null);
+
+    app.handleDaemonLine(try gpa.dupe(u8,
+        \\{"session_upsert":{"session":{"sid":42,"title":"","cwd":"/canonical/project","model":"openrouter/example/model","status":"idle","created_at":1,"running":false}}}
+    ));
+    try std.testing.expectEqualStrings("/canonical/project", app.view.cwd.items);
+}
+
 test "model picker accepts priced and legacy catalogs" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

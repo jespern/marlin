@@ -22,7 +22,7 @@
 //!            Ctrl+T toggles the expanded tool transcript;
 //!            Alt/Option+1..9 jumps to that tab
 //!   approval pending: y approve, n deny (both modes, input empty)
-//!   commands: /model <m>, /effort <level>, /search <query>, /animate <effect>,
+//!   commands: /model <m>, /effort <level>, /cwd <path>, /search <query>, /animate <effect>,
 //!             /screensaver [effect], /new, /compact, /archive, /reboot [--build], /help,
 //!             /quit (alias /detach — sessions keep running in the daemon)
 //!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
@@ -371,8 +371,8 @@ const SessionView = struct {
     state: proto.SessionState = .idle,
     model: std.ArrayList(u8) = .empty,
     effort: proto.ReasoningEffort = .auto,
-    /// Session root from daemon metadata, not necessarily the attach
-    /// process's current directory.
+    /// Session working directory from daemon metadata, not necessarily the
+    /// attach process's current directory.
     cwd: std.ArrayList(u8) = .empty,
     tokens_in: u64 = 0,
     tokens_out: u64 = 0,
@@ -1212,10 +1212,13 @@ pub const App = struct {
 
             if (info.sid == self.view.sid) {
                 self.view.state = info.state;
+                self.setCwdStr(info.cwd);
                 self.view.plan_mode = info.plan_mode;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
             } else if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
+                saved.cwd.clearRetainingCapacity();
+                saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
                 if (!info.plan_mode) saved.plan_proposal_ready = false;
             }
@@ -1316,12 +1319,15 @@ pub const App = struct {
             if (info.sid == self.view.sid) {
                 self.view.state = info.state;
                 self.setModelStr(info.model);
+                self.setCwdStr(info.cwd);
                 self.view.permissions_full = info.full_access;
                 self.view.plan_mode = info.plan_mode;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
             }
             if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
+                saved.cwd.clearRetainingCapacity();
+                saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
                 if (!info.plan_mode) saved.plan_proposal_ready = false;
             }
@@ -1370,6 +1376,7 @@ pub const App = struct {
         if (!known_recent) self.recent_sessions.append(self.gpa, info.sid) catch {};
         if (info.sid == self.view.sid) {
             self.view.state = info.state;
+            self.setCwdStr(info.cwd);
             self.view.plan_mode = info.plan_mode;
             if (!info.plan_mode) self.view.plan_proposal_ready = false;
         }
@@ -3162,6 +3169,18 @@ pub const App = struct {
             if (std.mem.eql(u8, pricing.model, model)) return pricing;
         }
         return null;
+    }
+
+    pub fn applyCwd(self: *App, cwd: []const u8) void {
+        if (self.view.state == .running or self.view.state == .awaiting_approval) {
+            self.setNotice("cannot change working directory mid-turn", .{});
+            return;
+        }
+        self.conn.send(.{ .session_set_cwd = .{ .sid = self.view.sid, .cwd = cwd } }) catch {
+            self.setNotice("could not change working directory", .{});
+            return;
+        };
+        self.setNotice("working directory → {s}", .{cwd});
     }
 
     pub fn applyModel(self: *App, m: []const u8) void {

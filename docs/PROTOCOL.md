@@ -10,7 +10,7 @@ never an accidental wire limit. Clients reject oversized outbound messages
 before optimistic UI state; the daemon drains an oversized inbound record and
 returns `err{line_too_long}` instead of silently dropping the connection.
 
-proto_version: 5
+proto_version: 6
 
 ## Connection lifecycle
 
@@ -59,6 +59,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
 | session_set_model | sid, model | ok, or err{busy} mid-turn. Native→guest (`claudecode/` or `codex/`) starts a native handover turn. Switching directly between different guest backends returns err{guest_switch}; go through a native model to create a handover. |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
+| session_set_cwd | sid, cwd | ok, or err{busy} mid-turn / err{bad_cwd}; relative paths resolve against the current session cwd, and the canonical existing directory is persisted and broadcast as session_upsert |
 | session_rename | sid, title | ok; title normalized like auto-titles (first line, trimmed, capped) and broadcast as session_upsert |
 | session_set_approvals | sid, approvals ("default" \| "auto") | ok; applies to the RUNNING turn too — granting full access resolves a parked prompt immediately |
 | session_set_plan_mode | sid, enabled | ok, or err{busy} mid-turn; persists collaboration mode with the session |

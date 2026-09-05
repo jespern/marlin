@@ -50,9 +50,11 @@ test "session + block round trip (in-memory)" {
     try std.testing.expectEqualStrings("openrouter/foo", sessions[0].model);
     try std.testing.expectEqual(Effort.high, sessions[0].effort);
 
+    try store.setSessionCwd(42, "/var/tmp");
     try store.setSessionEffort(42, .low);
     const session = try store.getSession(42);
     defer store.freeSession(session);
+    try std.testing.expectEqualStrings("/var/tmp", session.cwd);
     try std.testing.expectEqual(Effort.low, session.effort);
 
     const blk1 = block.Block{

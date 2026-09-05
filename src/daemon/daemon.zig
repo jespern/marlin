@@ -1272,6 +1272,33 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sr.sid);
             },
+            .session_set_cwd => |sc| {
+                const session = (try self.getOrLoadSession(sc.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (self.rejectArchivedSession(client, session)) return;
+                if (session.state == .running or session.state == .awaiting_approval) {
+                    self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot change working directory mid-turn" } });
+                    return;
+                }
+                const new_cwd = resolveSessionCwd(self.gpa, self.io, session.cwd, sc.cwd) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        self.sendTo(client, .{ .err = .{ .code = "bad_cwd", .msg = "working directory must be an existing directory" } });
+                        return;
+                    },
+                };
+                self.store.setSessionCwd(sc.sid, new_cwd) catch {
+                    self.gpa.free(new_cwd);
+                    self.sendTo(client, .{ .err = .{ .code = "store", .msg = "could not update working directory" } });
+                    return;
+                };
+                self.gpa.free(session.cwd);
+                session.cwd = new_cwd;
+                self.sendTo(client, .{ .ok = .{} });
+                self.broadcastSessionUpsert(sc.sid);
+            },
             .session_set_model => |sm| {
                 const session = (try self.getOrLoadSession(sm.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
@@ -4364,11 +4391,48 @@ fn isGenericFollowUp(title: []const u8) bool {
     return false;
 }
 
+fn resolveSessionCwd(gpa: std.mem.Allocator, io: Io, current_cwd: []const u8, requested: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, requested, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPath;
+    const resolved = if (std.fs.path.isAbsolute(trimmed))
+        try std.fs.path.resolve(gpa, &.{trimmed})
+    else
+        try std.fs.path.resolve(gpa, &.{ current_cwd, trimmed });
+    defer gpa.free(resolved);
+    const real = try Io.Dir.realPathFileAbsoluteAlloc(io, resolved, gpa);
+    errdefer gpa.free(real);
+    const dir = try Io.Dir.openDirAbsolute(io, real, .{});
+    dir.close(io);
+    const owned = try gpa.dupe(u8, real);
+    gpa.free(real);
+    return owned;
+}
+
 fn turnTitle(kind: proto.SessionKind, has_title: bool, prompt: []const u8) ?[]const u8 {
     if (kind != .root) return null;
     const title = taskTitle(prompt);
     if (title.len == 0 or (has_title and isGenericFollowUp(title))) return null;
     return title;
+}
+
+test "session cwd resolves relative paths and requires an existing directory" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-session-cwd");
+    defer temp.deinit();
+    const child = try std.fs.path.join(gpa, &.{ temp.path, "child" });
+    defer gpa.free(child);
+    try Io.Dir.cwd().createDirPath(io, child);
+
+    const resolved = try resolveSessionCwd(gpa, io, temp.path, "child/../child");
+    defer gpa.free(resolved);
+    const expected = try Io.Dir.realPathFileAbsoluteAlloc(io, child, gpa);
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+    try std.testing.expectError(error.FileNotFound, resolveSessionCwd(gpa, io, temp.path, "missing"));
+    try std.testing.expectError(error.InvalidPath, resolveSessionCwd(gpa, io, temp.path, "  \t"));
 }
 
 test "root turns derive titles from substantive prompts" {

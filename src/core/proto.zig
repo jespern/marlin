@@ -17,7 +17,7 @@ const guest = @import("guest.zig");
 pub const ReasoningEffort = @import("effort.zig").Effort;
 pub const GuestBackend = guest.Backend;
 
-pub const proto_version: u32 = 5;
+pub const proto_version: u32 = 6;
 /// Maximum complete NDJSON record, including its trailing newline. Large
 /// blob replies can JSON-escape to several times their raw size, so this is
 /// deliberately larger than any supported tool capture while still bounding
@@ -253,6 +253,9 @@ pub const ClientMsg = union(enum) {
     /// Set a session's display title. The daemon normalizes it like
     /// auto-generated titles (first line, trimmed, length-capped).
     session_rename: struct { sid: u64, title: []const u8 },
+    /// Change the working directory used by subsequent turns. Relative paths
+    /// resolve against the session's current working directory.
+    session_set_cwd: struct { sid: u64, cwd: []const u8 },
     session_set_model: struct { sid: u64, model: []const u8 },
     session_set_effort: struct { sid: u64, effort: ReasoningEffort },
     /// Persist the session collaboration mode. Plan mode is daemon-enforced
@@ -512,7 +515,7 @@ pub const SessionInfo = struct {
     /// Durable round budget for child sessions; 0 means the root default.
     max_rounds: u32 = 0,
     title: []const u8,
-    /// Session root as recorded at creation time. Default keeps decoding
+    /// Working directory for subsequent turns. Default keeps decoding
     /// compatible with daemons that predate this field.
     cwd: []const u8 = "",
     model: []const u8,

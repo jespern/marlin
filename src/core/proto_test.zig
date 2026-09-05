@@ -47,6 +47,12 @@ test "round trip: client messages" {
     try std.testing.expectEqualStrings("hi \"there\"\nline2", back.input.text);
     try std.testing.expectEqual(@as(u64, 42), back.input.request_id);
 
+    const cwd_msg: ClientMsg = .{ .session_set_cwd = .{ .sid = 9, .cwd = "../other" } };
+    const cwd_line = try encode(gpa, cwd_msg);
+    defer gpa.free(cwd_line);
+    const cwd_back = try decode(ClientMsg, arena, cwd_line);
+    try std.testing.expectEqualStrings("../other", cwd_back.session_set_cwd.cwd);
+
     const effort_msg: ClientMsg = .{ .session_set_effort = .{ .sid = 9, .effort = .xhigh } };
     const effort_line = try encode(gpa, effort_msg);
     defer gpa.free(effort_line);
