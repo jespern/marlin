@@ -1185,7 +1185,14 @@ A split pane identifies its session with a compact pane label.
   at night, and the sky mirrored and dimmed below the waterline as water),
   and a self-playing Pac-Man (`client/pacman.zig`, rules and wall-bounce
   ghosts after feiss' js1k 2019 entry, a BFS eat-or-flee driver replacing
-  the cursor keys). Its maze is generated per board to fit the window's
+  the cursor keys; added over the original, after the arcade: four corner
+  energizers that frighten the ghosts for thirty steps — Pac-Man hunts them,
+  an eaten ghost walks home as eyes and comes back out — arcade scoring with
+  the 200/400/800/1600 ghost run and the level's fruit appearing twice a
+  board below the house, a "1UP" / "HIGH SCORE" header drawn with a 5×7
+  pixel font and a footer of spare lives and level fruit, "READY!" before
+  each life, and "GAME OVER" before a fresh game; the HUD takes two tile
+  rows above the board and one below). Its maze is generated per board to fit the window's
   aspect, arcade style: a mirrored half-map of 3×3-tile cells whose 2×2 wall
   blocks are merged into small tetromino-like pieces; corridors are exactly
   the seams between different pieces, which makes dead ends impossible by

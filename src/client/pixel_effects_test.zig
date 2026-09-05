@@ -133,13 +133,13 @@ test "one image per tick, placed by render, freed on the next tick and on releas
 
 test "pacman shapes its maze to the window, sizes a 16 px framebuffer, and ships zlib frames" {
     const gpa = std.testing.allocator;
-    // 80×24 cells at 8×16 px: a 45×27 maze at 16 px per tile.
+    // 80×24 cells at 8×16 px: a 51×27 maze under a 3-row HUD at 16 px per tile.
     const dims = framebufferSize(80, 24, 8, 16, .pacman);
-    try std.testing.expectEqual(@as(u16, 720), dims.width);
-    try std.testing.expectEqual(@as(u16, 432), dims.height);
+    try std.testing.expectEqual(@as(u16, 816), dims.width);
+    try std.testing.expectEqual(@as(u16, 480), dims.height);
     const wide = framebufferSize(300, 20, 8, 16, .pacman); // 2400×320: width-capped, letterboxed
     try std.testing.expectEqual(@as(u16, 1600), wide.width);
-    try std.testing.expectEqual(@as(u16, 432), wide.height);
+    try std.testing.expectEqual(@as(u16, 480), wide.height);
 
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -157,16 +157,16 @@ test "pacman shapes its maze to the window, sizes a 16 px framebuffer, and ships
     engine.setCellPixels(8, 16);
     try engine.reset(80, 24, 3);
     try std.testing.expectEqual(dims.width, engine.width);
-    try std.testing.expectEqual(@as(u16, 45), engine.game.cols);
+    try std.testing.expectEqual(@as(u16, 51), engine.game.cols);
     try std.testing.expectEqual(@as(u16, 27), engine.game.rows);
     try std.testing.expectEqual(@as(u8, 1), engine.transmit_every);
 
     out.clearRetainingCapacity();
     try engine.transmit(&vx, &out.writer);
     const bytes = out.written();
-    const head = std.mem.indexOf(u8, bytes, "\x1b_Ga=t,f=24,s=720,v=432,i=1,q=2,o=z,m=1;").?;
+    const head = std.mem.indexOf(u8, bytes, "\x1b_Ga=t,f=24,s=816,v=480,i=1,q=2,o=z,m=1;").?;
     // The payload is a zlib stream: its first byte decodes to 0x78.
-    const payload = bytes[head + "\x1b_Ga=t,f=24,s=720,v=432,i=1,q=2,o=z,m=1;".len ..];
+    const payload = bytes[head + "\x1b_Ga=t,f=24,s=816,v=480,i=1,q=2,o=z,m=1;".len ..];
     var first: [3]u8 = undefined;
     try std.base64.standard.Decoder.decode(&first, payload[0..4]);
     try std.testing.expectEqual(@as(u8, 0x78), first[0]);
@@ -174,9 +174,10 @@ test "pacman shapes its maze to the window, sizes a 16 px framebuffer, and ships
     try std.testing.expect(bytes.len < engine.rgb.len / 10);
     try std.testing.expectEqual(engine.game.generation, engine.background_generation);
 
+    // Through "READY!" and three board steps.
     const dots_before = engine.game.dots_left;
     var i: usize = 0;
-    while (i < pacman.step_ticks * 3) : (i += 1) engine.tick();
+    while (i < pacman.ready_ticks + pacman.step_ticks * 3) : (i += 1) engine.tick();
     try std.testing.expect(engine.game.dots_left < dots_before or engine.game.freeze > 0);
 }
 

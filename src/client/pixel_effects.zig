@@ -304,11 +304,13 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
         return .{ .width = @intCast(width), .height = @intCast(height) };
     }
     if (kind == .pacman) {
-        // Up to 16 px per maze tile; the maze is centered in a framebuffer of
-        // the window's aspect (letterboxed, so `.fill` never stretches it).
+        // Up to 16 px per maze tile; the maze and its HUD rows are centered
+        // in a framebuffer of the window's aspect (letterboxed, so `.fill`
+        // never stretches it).
         const layout = pacman.layoutForAspect(win_w, win_h);
-        const t: u32 = std.math.clamp(@min(1600 / @as(u32, layout.cols), 720 / @as(u32, layout.rows)), 4, 16);
-        const height: u32 = @as(u32, layout.rows) * t;
+        const total_rows: u32 = @as(u32, layout.rows) + pacman.hud_rows;
+        const t: u32 = std.math.clamp(@min(1600 / @as(u32, layout.cols), 720 / total_rows), 4, 16);
+        const height: u32 = total_rows * t;
         const by_aspect: u32 = height * win_w / @max(win_h, 1);
         const width: u32 = std.math.clamp(by_aspect, @as(u32, layout.cols) * t, 1600);
         return .{ .width = @intCast(width), .height = @intCast(height) };
