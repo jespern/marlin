@@ -67,7 +67,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | sub | sid, from_seq, tail_limit?, before_seq?, around_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
 | unsub | sid | ok |
 | blob_get | hash | blob_result{hash, bytes}; the uncapped tool output behind a truncated inline body (`!c`) |
-| input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer while an agent turn is accepting them (running/awaiting approval); each newly started root turn updates the session title from the prompt's normalized first line, while steers and child turns do not retitle; compact, handover, and the atomic finishing edge return `err{not_steerable}` |
+| input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer while an agent turn is accepting them (running/awaiting approval); newly started root turns update the session title from the prompt's normalized first line, except generic follow-ups such as `commit it` preserve an existing title; steers and child turns do not retitle; compact, handover, and the atomic finishing edge return `err{not_steerable}` |
 | council_list | — | council_list_result with every configured [[council]] roster |
 | council_set | name, models[] | council_list_result after atomically persisting the (new or replaced) [[council]] table to config.toml |
 | council_remove | name | council_list_result after atomically removing the table; err{council} when unknown |

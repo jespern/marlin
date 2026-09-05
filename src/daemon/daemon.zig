@@ -232,6 +232,7 @@ const Session = struct {
     parent_block_id: ?u64 = null,
     max_rounds: u32 = 128,
     archived: bool = false,
+    has_title: bool = false,
     model: []u8, // gpa-owned
     effort: proto.ReasoningEffort = .auto,
     cwd: []u8, // gpa-owned
@@ -1267,6 +1268,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "store", .msg = "could not update session title" } });
                     return;
                 };
+                session.has_title = true;
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sr.sid);
             },
@@ -1680,11 +1682,12 @@ pub const Daemon = struct {
                     self.sendInputError(client, inp.request_id, "internal", "could not start turn");
                     return;
                 };
-                // A root tab describes its latest task. Steers stay part of
-                // the active turn and never retitle it; child titles remain
-                // fixed to the prompt that created the child.
-                if (turnTitle(session.kind, inp.text)) |title| {
+                // A root tab describes its latest substantive task. Generic
+                // follow-ups and steers preserve it; child titles stay fixed
+                // to the prompt that created the child.
+                if (turnTitle(session.kind, session.has_title, inp.text)) |title| {
                     if (self.store.setSessionTitle(inp.sid, title)) |_| {
+                        session.has_title = true;
                         self.broadcastSessionUpsert(inp.sid);
                     } else |_| {}
                 }
@@ -2327,6 +2330,7 @@ pub const Daemon = struct {
             .parent_block_id = row.parent_block_id,
             .max_rounds = if (row.max_rounds > 0) row.max_rounds else 128,
             .archived = row.archived,
+            .has_title = row.title.len > 0,
             .model = model,
             .effort = row.effort,
             .cwd = cwd,
@@ -4320,17 +4324,74 @@ fn taskTitle(prompt: []const u8) []const u8 {
     return trimmed[0..end];
 }
 
-fn turnTitle(kind: proto.SessionKind, prompt: []const u8) ?[]const u8 {
-    if (kind != .root) return null;
-    const title = taskTitle(prompt);
-    return if (title.len > 0) title else null;
+fn isGenericFollowUp(title: []const u8) bool {
+    var normalized_buf: [72]u8 = undefined;
+    var normalized_len: usize = 0;
+    var pending_space = false;
+    for (title) |byte| {
+        if (!std.ascii.isAscii(byte)) return false;
+        if (std.ascii.isAlphanumeric(byte)) {
+            if (pending_space and normalized_len > 0) {
+                normalized_buf[normalized_len] = ' ';
+                normalized_len += 1;
+            }
+            normalized_buf[normalized_len] = std.ascii.toLower(byte);
+            normalized_len += 1;
+            pending_space = false;
+        } else {
+            pending_space = true;
+        }
+    }
+    const normalized = normalized_buf[0..normalized_len];
+    const generic = [_][]const u8{
+        "yes",                "yep",                  "yeah",
+        "ok",                 "okay",                 "sure",
+        "great",              "thanks",               "thank you",
+        "sounds good",        "looks good",           "do it",
+        "yes do it",          "yep do it",            "yeah do it",
+        "ok do it",           "okay do it",           "please do it",
+        "go ahead",           "make it so",           "continue",
+        "continue please",    "please continue",      "try again",
+        "retry",              "fix that",             "run tests",
+        "run the tests",      "commit it",            "commit this",
+        "commit that",        "commit these changes", "commit the changes",
+        "please commit it",   "ok commit it",         "okay commit it",
+        "can you commit it",  "commit it please",
+    };
+    for (generic) |candidate| {
+        if (std.mem.eql(u8, normalized, candidate)) return true;
+    }
+    return false;
 }
 
-test "root turns continuously derive titles from their latest prompt" {
-    try std.testing.expectEqualStrings("integrating tetris client", turnTitle(.root, "  integrating tetris client  \nextra context").?);
-    try std.testing.expect(turnTitle(.root, "  \nignored") == null);
-    try std.testing.expect(turnTitle(.task_child, "child prompt") == null);
-    try std.testing.expect(turnTitle(.review_child, "review prompt") == null);
+fn turnTitle(kind: proto.SessionKind, has_title: bool, prompt: []const u8) ?[]const u8 {
+    if (kind != .root) return null;
+    const title = taskTitle(prompt);
+    if (title.len == 0 or (has_title and isGenericFollowUp(title))) return null;
+    return title;
+}
+
+test "root turns derive titles from substantive prompts" {
+    try std.testing.expectEqualStrings("integrating tetris client", turnTitle(.root, true, "  integrating tetris client  \nextra context").?);
+    try std.testing.expectEqualStrings("fix CI", turnTitle(.root, true, "fix CI").?);
+    try std.testing.expectEqualStrings("commit it", turnTitle(.root, false, "commit it").?);
+    try std.testing.expect(turnTitle(.root, true, "  \nignored") == null);
+    try std.testing.expect(turnTitle(.task_child, true, "child prompt") == null);
+    try std.testing.expect(turnTitle(.review_child, true, "review prompt") == null);
+}
+
+test "generic follow-ups preserve an existing root title" {
+    const prompts = [_][]const u8{
+        "commit it",
+        "OK, commit it!",
+        "continue please",
+        "yeah",
+        "do it",
+        "fix that",
+        "run the tests",
+        "try again",
+    };
+    for (prompts) |prompt| try std.testing.expect(turnTitle(.root, true, prompt) == null);
 }
 
 test "only successful child turns auto-archive" {
