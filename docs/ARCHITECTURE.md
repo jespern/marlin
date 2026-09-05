@@ -124,7 +124,9 @@ then the wall is how Marlin stays small.
   turn, then flips the model. Guest `/compact` refuses at the protocol
   (`err{guest}`).
 - Picker and status name the regime: guest models keep their place in
-  the list, prefixed `(guest)`. Status shows `(guest) {name}` and dims
+  the list, prefixed `(guest)`. Status switches to the selected target as soon
+  as `/model` is accepted, including while a native→guest handover is still
+  running. Guest status shows `(guest) {name}` and dims
   ctx/sandbox/dnsblock as `n/a` (unavailable, not off — Marlin does not
   own the guest's context window). Native remains the `/new` default.
 - Permission bridge (`marlin cc_approve`) is mux: fail-closed to *ask*,

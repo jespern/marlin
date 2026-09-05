@@ -3175,12 +3175,13 @@ pub const App = struct {
             self.setNotice("switch through a native model first so Marlin can hand over between guest agents", .{});
             return;
         }
+        const starts_handover = !proto.isGuestModel(self.view.model.items) and proto.isGuestModel(m);
         self.conn.send(.{ .session_set_model = .{ .sid = self.view.sid, .model = m } }) catch return;
-        if (!proto.isGuestModel(self.view.model.items) and proto.isGuestModel(m)) {
+        self.setModelStr(m);
+        if (starts_handover) {
             const guest_name = if (std.mem.startsWith(u8, m, "claudecode/")) m["claudecode/".len..] else m;
             self.setNotice("switching to {s} — generating handover summary…", .{guest_name});
         } else {
-            self.setModelStr(m);
             self.setNotice("model → {s}", .{m});
         }
     }

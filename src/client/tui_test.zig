@@ -408,6 +408,26 @@ test "model picker formats provider pricing compactly" {
     try std.testing.expectEqual(@as(?f64, null), validCatalogRate(std.math.nan(f64)));
 }
 
+test "native to guest model selection updates status model before handover finishes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setModelStr("openrouter/anthropic/claude-sonnet-4.5");
+
+    app.applyModel("claudecode/fable");
+
+    try std.testing.expectEqualStrings("claudecode/fable", app.view.model.items);
+    try std.testing.expectEqualStrings("switching to fable — generating handover summary…", app.notice.items);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"session_set_model\"") != null);
+}
+
 test "model picker accepts priced and legacy catalogs" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
