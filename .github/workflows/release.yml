@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - uses: mlugg/setup-zig@v2
+      - uses: ./.github/actions/setup-zig
         with:
           version: 0.16.0
       - name: Install system deps (Linux)
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: ./.github/actions/setup-zig
         with:
           version: 0.16.0
 
@@ -60,7 +60,12 @@ jobs:
         env:
           MARLIN_VERSION: ${{ github.ref_name }}
           MARLIN_TARGET: ${{ matrix.target }}
-        run: zig build -Dtarget="$MARLIN_TARGET" -Doptimize=ReleaseSafe -Dembedded-sqlite=true -Dversion="${MARLIN_VERSION#v}"
+        run: |
+          set --
+          if [ "$RUNNER_OS" = macOS ]; then
+            set -- --sysroot "$(xcrun --sdk macosx --show-sdk-path)"
+          fi
+          zig build "$@" -Dtarget="$MARLIN_TARGET" -Doptimize=ReleaseSafe -Dembedded-sqlite=true -Dversion="${MARLIN_VERSION#v}"
 
       - name: Package release assets
         env:
@@ -87,7 +92,7 @@ jobs:
           done
 
       - name: Upload release assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/
@@ -100,7 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
