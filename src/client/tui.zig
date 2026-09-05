@@ -41,6 +41,7 @@ const block = @import("../core/block.zig");
 const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
+const session_file = @import("session_file.zig");
 const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
@@ -5613,6 +5614,7 @@ pub fn run(
     environ: *std.process.Environ.Map,
     self_exe: []const u8,
     sid_arg: ?[]const u8,
+    session_file_path: ?[]const u8,
     reboot_out: ?*RebootPlan,
 ) !u8 {
     // -- connect + pick session BEFORE entering the TUI --
@@ -5709,6 +5711,13 @@ pub fn run(
             } });
             const created = try conn.recvUntil(arena, .session_created);
             sid = created.sid;
+            try initial_known_ids.append(gpa, sid);
+        }
+        if (session_file_path) |path| {
+            session_file.write(io, path, sid) catch |err| {
+                std.log.err("cannot write session file '{s}': {t}", .{ path, err });
+                return 1;
+            };
         }
         // Fast initial attach: the newest bounded window. The TUI backfills
         // the durable log if the user actually reaches this window's top.

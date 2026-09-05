@@ -41,7 +41,10 @@ with the latter, it's simpler to ship):
   unarchive <handle> / kill <handle>` — thin protocol clients for scripting.
   `inspect` is the supported read-only investigation surface: it combines the
   session catalog, bounded block replay, latest plan, live status, and local
-  diagnostics without exposing SQLite schema details.
+  diagnostics without exposing SQLite schema details. `marlin attach [handle]
+  --session-file <path>` atomically writes the selected session's complete
+  stable handle, plus a newline, once selection or creation succeeds and before
+  the TUI starts. The path belongs to the client host, including remote attach.
 
 ### Native vs guest agents
 

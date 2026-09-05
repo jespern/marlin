@@ -112,7 +112,7 @@ pub fn dispatch(
             if (pick.sid) |sid| {
                 var sid_buf: [25]u8 = undefined;
                 const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{sid});
-                return runTui(gpa, io, environ, self_exe, sid_str);
+                return runTui(gpa, io, environ, self_exe, sid_str, null);
             }
             return code;
         },
@@ -129,14 +129,40 @@ pub fn dispatch(
         .shutdown => return headless.shutdown(gpa, io, environ),
         .web => return web.serve(gpa, io, environ, self_exe, rest),
         .attach => {
-            if (rest.len > 1) {
-                try stdoutPrint(io, "usage: marlin attach [session-handle]\n", .{});
+            const options = parseAttachArgs(rest) catch {
+                try stdoutPrint(io, "usage: marlin attach [session-handle] [--session-file <path>]\n", .{});
                 return 2;
-            }
-            return runTui(gpa, io, environ, self_exe, if (rest.len == 1) rest[0] else null);
+            };
+            return runTui(gpa, io, environ, self_exe, options.handle, options.session_file);
         },
     }
     return 0;
+}
+
+pub const AttachOptions = struct {
+    handle: ?[:0]const u8 = null,
+    session_file: ?[:0]const u8 = null,
+};
+
+pub fn parseAttachArgs(args: []const [:0]const u8) !AttachOptions {
+    var options = AttachOptions{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--session-file")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0 or options.session_file != null)
+                return error.InvalidAttachArgs;
+            options.session_file = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.InvalidAttachArgs;
+        } else if (options.handle == null) {
+            options.handle = arg;
+        } else {
+            return error.InvalidAttachArgs;
+        }
+    }
+    return options;
 }
 
 fn runTui(
@@ -145,12 +171,13 @@ fn runTui(
     environ: *std.process.Environ.Map,
     self_exe: []const u8,
     sid_arg: ?[]const u8,
+    session_file_path: ?[:0]const u8,
 ) !u8 {
     var reattach_sid_buf: [25]u8 = undefined;
     var next_sid = sid_arg;
     while (true) {
         var plan = tui.RebootPlan{};
-        const code = try tui.run(gpa, io, environ, self_exe, next_sid, &plan);
+        const code = try tui.run(gpa, io, environ, self_exe, next_sid, session_file_path, &plan);
         if (plan.shell) |request| {
             const shell_result = runShellRequest(io, environ, request, true);
             request.deinit(gpa);
@@ -176,6 +203,10 @@ fn runTui(
         try argv.append(gpa, "--then");
         try argv.append(gpa, "attach");
         try argv.append(gpa, sid_str);
+        if (session_file_path) |path| {
+            try argv.append(gpa, "--session-file");
+            try argv.append(gpa, path);
+        }
         return headless.reboot(gpa, io, environ, self_exe, argv.items);
     }
 }
@@ -280,7 +311,8 @@ const help_text =
     \\
     \\usage:
     \\  marlin                 attach to the daemon (TUI, newest session)
-    \\  marlin attach <handle> attach TUI to a session (unique prefix, min 4)
+    \\  marlin attach [handle] [--session-file <path>]
+    \\                         attach TUI and atomically publish its full handle
     \\  marlin run [--continue] [--model <m>] [--image <path>] [--quiet] [--ask] "task"
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls [--all]      list sessions

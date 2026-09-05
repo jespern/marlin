@@ -6,7 +6,7 @@
 //!   marlin run "task"     → headless one-shot session                [M0]
 //!   marlin ls [--all]     → list sessions                            [M1]
 //!   marlin inspect <handle> → inspect session state and history
-//!   marlin attach <handle>    → attach TUI to a session               [M2]
+//!   marlin attach [handle]    → attach TUI; optionally publish its handle [M2]
 //!   marlin archive <handle>   → hide a durable session hierarchy      [M6]
 //!   marlin unarchive <handle> → restore an archived hierarchy         [M6]
 //!   marlin kill <handle>      → interrupt a session                   [M1]
@@ -107,6 +107,7 @@ test {
     _ = @import("daemon/provider/codex_test.zig");
     _ = @import("core/visual_effect_test.zig");
     _ = @import("client/attach_test.zig");
+    _ = @import("client/session_file_test.zig");
     _ = @import("client/cc_approve_test.zig");
     _ = @import("client/remote_rebuild_test.zig");
     _ = @import("client/self_build_test.zig");

@@ -75,6 +75,8 @@ the old rooms?
   rolls up into the root's running, approval, or error indicator.
 - Sessions have short stable handles: `marlin ls` prints eight characters and
   `marlin attach 63df` accepts any unique prefix of four or more.
+  `marlin attach [handle] --session-file <path>` atomically publishes the full
+  selected handle for launchers that need to discover the settled session.
   `marlin inspect 63df --json` is the supported read-only view for metadata,
   live state, bounded blocks, the latest plan, and diagnostics—no SQLite schema
   knowledge required.

@@ -19,6 +19,7 @@ const web = @import("client/web.zig");
 
 const cli = @import("cli.zig");
 const Command = cli.Command;
+const parseAttachArgs = cli.parseAttachArgs;
 const runShellRequest = cli.runShellRequest;
 
 test {
@@ -73,6 +74,36 @@ test "shell request returns command exit status" {
     defer request.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 7), try runShellRequest(io, &environ, request, false));
+}
+
+test "attach option parsing accepts a handle and session file in either order" {
+    const args = [_][:0]const u8{ "63df", "--session-file", "/tmp/marlin-session" };
+    const options = try parseAttachArgs(&args);
+    try std.testing.expectEqualStrings("63df", options.handle.?);
+    try std.testing.expectEqualStrings("/tmp/marlin-session", options.session_file.?);
+
+    const reversed = [_][:0]const u8{ "--session-file", "/tmp/marlin-session", "63df" };
+    const reversed_options = try parseAttachArgs(&reversed);
+    try std.testing.expectEqualStrings("63df", reversed_options.handle.?);
+    try std.testing.expectEqualStrings("/tmp/marlin-session", reversed_options.session_file.?);
+}
+
+test "attach option parsing permits session-file without an explicit handle" {
+    const args = [_][:0]const u8{ "--session-file", "/tmp/marlin-session" };
+    const options = try parseAttachArgs(&args);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), options.handle);
+    try std.testing.expectEqualStrings("/tmp/marlin-session", options.session_file.?);
+}
+
+test "attach option parsing rejects malformed arguments" {
+    const missing_path = [_][:0]const u8{"--session-file"};
+    try std.testing.expectError(error.InvalidAttachArgs, parseAttachArgs(&missing_path));
+    const duplicate = [_][:0]const u8{ "--session-file", "one", "--session-file", "two" };
+    try std.testing.expectError(error.InvalidAttachArgs, parseAttachArgs(&duplicate));
+    const extra_handle = [_][:0]const u8{ "63df", "beef" };
+    try std.testing.expectError(error.InvalidAttachArgs, parseAttachArgs(&extra_handle));
+    const unknown = [_][:0]const u8{"--wat"};
+    try std.testing.expectError(error.InvalidAttachArgs, parseAttachArgs(&unknown));
 }
 
 test "command parse" {
