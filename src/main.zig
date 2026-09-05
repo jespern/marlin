@@ -131,6 +131,7 @@ test {
     _ = @import("client/starfield_test.zig");
     _ = @import("client/strings_test.zig");
     _ = @import("client/tui_test.zig");
+    _ = @import("client/session_view_test.zig");
     _ = @import("client/commands.zig");
     _ = @import("client/keys.zig");
     _ = @import("client/setup.zig");

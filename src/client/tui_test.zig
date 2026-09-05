@@ -4272,3 +4272,19 @@ test "/screensaver shadowbox takes an hour or cycle; other effects refuse the wo
     try std.testing.expect(app.ui_animation != null);
     try std.testing.expect(app.sky_override != null);
 }
+
+test "deliberate daemon shutdown exits the TUI before reconnect" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{ .sid = 1, .editor = Editor.init(gpa) },
+    };
+    defer app.deinit();
+    try std.testing.expect(!app.should_quit);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .daemon_stopping = .{} }));
+    try std.testing.expect(app.should_quit);
+}

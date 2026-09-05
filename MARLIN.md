@@ -2,8 +2,10 @@
 
 Marlin is a daemon-based AI coding agent in Zig (0.16): `marlind` owns all
 state (sessions, agent loop, sqlite store, provider connections); the TUI and
-headless CLI are thin socket clients. Docs are the contract — start with
-`docs/ARCHITECTURE.md`, then the active milestone plan in `docs/`.
+headless CLI are thin socket clients. Start with `docs/ARCHITECTURE.md` for
+the design and `docs/TESTING.md` for verification. Shipped behavior is defined by the code and its tests; docs
+marked planned/design describe future work. Update stale docs when found.
+`docs/TESTING.md` owns test conventions; this file summarizes them.
 
 ## Product discipline
 
@@ -45,24 +47,26 @@ answer is no. Standing walls: README Principles, and ARCHITECTURE
 - `src/core/` — shared: wire protocol (`proto.zig`), config, block model,
   credentials. Protocol changes must stay decode-compatible: new fields need
   defaults; unknown fields are ignored on read.
-- `src/daemon/` — `daemon.zig` (threads/ownership: Store and Session structs
-  are dispatcher-thread only — read the header before touching), `loop.zig`
-  (native turn loop; guest Claude Code turns also live here today — a
-  wall leak, see ARCHITECTURE.md Native vs guest), `context.zig`,
+- `src/daemon/` — `daemon.zig` (dispatcher-owned session lifecycle;
+  store writes also occur on turn threads through serialized SQLite — read
+  the ownership rules in its header before touching), `loop.zig`
+  (native turn loop and routing to `guest/` adapters), `context.zig`,
   `store.zig` (sqlite), `tools/`, `sandbox.zig`, `permissions.zig`,
   `network_policy.zig`. `provider/claude_code.zig` is a guest adapter, not
   a third wire dialect.
-- `src/client/` — TUI and headless. DEPENDENCY RULE: `client/` imports only
-  `core/`, never `daemon/`.
+- `src/client/` — TUI and headless; `session_view.zig` owns view buffers and
+  cleanup, while `tui.zig` owns routing, focus, and global chrome.
+  DEPENDENCY RULE: `client/` imports only `core/`, never `daemon/`.
 - `src/testing/` — e2e runner, fake provider, scenarios.
 - `zig-pkg/` — vendored deps; never edit.
 
 ## Conventions
 
-- New source files must be added to the test import block in `src/main.zig`
-  or their tests will silently not run.
-- Tests live in-file in `test` blocks; prefer real filesystem/e2e probes
-  over mocks (see the Seatbelt canary tests for the house style).
+- Add each new sibling test file to the test import block in `src/main.zig`
+  or its tests will silently not run.
+- Tests live in sibling `<name>_test.zig` files, per `docs/TESTING.md`.
+  Prefer real filesystem/process/network-boundary probes; fake external peers
+  rather than internal components. Existing inline daemon tests await migration.
 - Tool/runtime errors are data returned to the model, never crashes.
 - Comments are sparse and explain constraints the code can't express; no
   change-narration.

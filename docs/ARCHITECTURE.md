@@ -8,7 +8,7 @@ the code and the per-milestone docs (M*_PLAN.md, PERMISSIONS.md, PROTOCOL.md)
 win; fix this file rather than trusting it.
 
 Product thesis, standing over every section below: Marlin is a **daily
-driver** — a session multiplexer with one native agent and one guest,
+driver** — a session multiplexer with a native agent and vendor guests,
 meant to be lived in all day, and nothing else. It consolidates a
 heterogeneous model fleet (subscription Fable as guest; grok/GLM/GPT and
 the rest as native sessions, picked per task by preference or credits)
@@ -21,8 +21,7 @@ the document.
 
 ## 1. Process model
 
-Two binaries built from one codebase (or one binary with subcommands — start
-with the latter, it's simpler to ship):
+One binary with subcommands:
 
 - `marlin daemon` — **marlind**. Owns all state: sessions, agent loops, SQLite,
   provider connections, tool execution, MCP clients, hooks. Runs until killed.

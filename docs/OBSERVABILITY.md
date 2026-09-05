@@ -35,6 +35,65 @@ legacy turn-start-to-first-provider gap for older rows and report its
 p50/p95/max plus the count at or above one second. It does not duplicate
 prompts, completions, tool arguments, or tool output into telemetry.
 
+## Transport failures and recovery
+
+Native turns, compaction, and native-to-guest handovers share the HTTP
+transport and its failure formatter. Failure notes preserve the operation,
+stage, destination host, and underlying socket/TLS error when available, for
+example `turn failed: ConnectFailed (response head api.example: ConnectionResetByPeer)`.
+Timeouts name the DNS, response-head, idle-body, or total-request deadline.
+The detail is captured on the request thread before another request can
+replace it; unrelated errors do not inherit old transport detail.
+
+Before sending a new request, the direct connection-pool path discards sockets
+with peer closure or unexpected buffered bytes. Healthy keep-alive connections
+remain reusable. Failed writes and response headers retire their connection.
+A failed POST is not automatically replayed: a peer can accept a paid generation
+and disconnect before returning headers. A fresh connection for the next
+explicit request is safe; assuming the previous generation never ran is not.
+
+When investigating a failure, inspect the durable system note and distinguish
+its destination and stage. A refused local endpoint is different from DNS,
+TLS, or a peer reset. Guest-labelled transcripts can contain failures from
+Marlin's native handover operation; the label alone does not identify the
+network client that failed.
+
+Check the running daemon as well as the installed binary:
+
+```sh
+marlin diagnostics --daemon
+marlin diagnostics --daemon --json
+```
+
+This reports the connected daemon's PID, executable path, start time, version,
+and executable mtime captured at startup, alongside the client path. It works
+without any sessions. Local inspection does not autostart a missing daemon;
+remote inspection uses the normal SSH attachment path. Older daemons report
+unknown PID/path/start time until upgraded. These fields also travel in
+`hello_ok`; the existing session diagnostics JSON is unchanged.
+
+Source builds share a dev version, and rebuilding a file does not replace an
+already running process. `!rb` waits for a reboot ACK and then for the old
+connection to close before replacing the client. Missing ACK, refusal, or a
+120-second timeout aborts client replacement with a visible error; a timed-out
+request that was still waiting for quiescence is cancelled when the daemon
+observes the requesting client disconnect. `marlin shutdown` similarly requires
+ACK and connection closure, with a 30-second deadline. Deliberate
+shutdown sends an opt-in notice so current TUIs exit instead of automatically
+starting another daemon. Reboot retains automatic reconnection. Older TUIs
+must be upgraded or detached to avoid their old autostart behavior. Connection
+closure confirms retirement of that connection, not OS-level process exit;
+leftover processes after retirement still require lifecycle investigation.
+
+During reboot the old daemon keeps its socket path and instance lock through
+turn-thread and shared-resource teardown. It retires that gate immediately
+before closing client connections. The EOF observed by a rebooting client
+therefore means a replacement may acquire the lock; a daemon stuck earlier in
+cleanup cannot coexist with an autostarted replacement.
+
+Older plain `ConnectFailed` notes cannot retrospectively recover details that
+were never persisted.
+
 ## OTLP/HTTP export (Mirador included)
 
 Export uses the standard OpenTelemetry variables and is off unless an endpoint

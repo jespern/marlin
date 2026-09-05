@@ -21,19 +21,16 @@ half. The Marlinfile and per-pane status bar do not need that gate.
 These are the facts that determine cost. Verify them against
 `src/client/tui.zig` before starting; the file churns.
 
-- **App is the pane.** Roughly forty per-session fields (editor, blocks,
-  deltas, plan, state, model, effort, cwd, token counters, scroll, selection,
-  pending approval, turn/phase timers, seq cursors) live directly on `App`.
-  They are touched as `app.blocks`, `app.editor`, `app.scroll_up` and so on in
-  about 500 places across a 12,600-line file.
-- **The event handler assumes one live session.** Block, delta, status, and
-  result handlers early-return when the message's `sid` differs from
-  `app.sid`. Only session-list, approval, and meta events are processed for
-  other sessions (feeding the tab bar and `background_approvals`).
-- **`SavedSessionView` is a cache, not a pane abstraction.** It holds the same
-  field list for dormant sessions, moves them in and out of `App` wholesale on
-  switch, and evicts beyond eight entries (MRU). It is the *field list* that
-  is reusable; the mechanism is the opposite of what two hot panes need.
+- **View ownership is extracted.** `client/session_view.zig` owns the
+  transcript, composer, provisional deltas, approval, timers, viewport,
+  selection, and layout caches, with their cleanup methods. `App` holds one
+  focused `SessionView` and an MRU cache of dormant views of the same type.
+- **Event routing has one lookup boundary.** Session events route through
+  `App.liveView(sid)`. Today it returns only the focused view; panes must
+  deliver events to every visible view for a session, including duplicates.
+- **Focus still assumes tabs.** `focusSession` parks the old view and
+  unsubscribes it. Panes need separate focus changes and subscription lifetime:
+  moving keyboard focus must not unsubscribe a still-visible session.
 - **The daemon already supports multiple subscriptions per client.** Each
   `Client` keeps a `subs` list of session ids and fans blocks out to every
   subscribed client. Two panes are two `sub` messages without the intervening
@@ -41,8 +38,8 @@ These are the facts that determine cost. Verify them against
 - **Transcript layout is width-parameterised.** `layout.layoutLines` takes a
   width, so laying out a narrow pane is not new work. But the three layout
   caches (`layout_cache`, `tail_layout_cache`, `stream_layout_cache`) are
-  singletons on `App`, and `draw()` computes composer height, plan surface,
-  tab bar rows, and scroll anchoring against the whole window.
+  owned by each `SessionView`. `draw()` still computes composer height, plan
+  surface, tab bar rows, and scroll anchoring against the whole window.
 - **Mouse plumbing exists.** vaxis mouse mode is on; tab bar hit-testing
   (`tab_hits`) and drag selection (`sel_anchor`/`sel_dragging`) are the
   patterns a divider-drag would copy.
@@ -77,13 +74,20 @@ The three layout caches move into the view. The event handler dispatches on
 `sid` to a view lookup instead of comparing against `app.sid`, even while
 there is only one view.
 
-This is a multi-day mechanical refactor across a large fraction of the file.
-**Land any outstanding `tui.zig` work first**; rebasing across it will hurt.
+The module extraction now also lives in the working tree. Existing TUI
+lifecycle tests exercise the same view type; a sibling module test verifies
+that settling one view preserves another view's streaming state.
+
+Before allowing the same session in two panes, distinguish session data from
+view state: scroll, selection, width-dependent caches, and drafts must remain
+independent, while incoming blocks/status must reach both. `liveView` returning
+one pointer is a tab-era constraint, not the final pane API. Keep subscription
+counts per session so closing one duplicate does not detach the other.
 
 ### 2. Per-pane status bar (cheap once views exist)
 
-The status bar already renders state, model, context, and cwd from what are
-about to become view fields. It becomes a one-row footer inside each pane.
+The status bar already renders state, model, context, and cwd from view
+fields. It becomes a one-row footer inside each pane.
 New work is only truncation priority for narrow panes (state and context
 first, cwd last) and deciding what the global bar keeps (background
 actionable counts, notices, mode).

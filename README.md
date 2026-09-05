@@ -1,10 +1,10 @@
 # marlin
 
-**A fast, simple AI agent harness in Zig — a session multiplexer that actually understands its sessions.**
+**A durable session multiplexer for AI agents, written in Zig.**
 
 One static binary. A daemon that owns your agent sessions and keeps them running;
-thin clients that attach from anywhere. herdr's ergonomics, but the multiplexer
-sees structured events instead of scraping a character grid.
+thin clients that attach locally or over SSH. Run native and vendor agents
+in one workspace, with searchable transcripts and structured approvals.
 
 ## Install
 
@@ -39,143 +39,64 @@ run the turn. `/setup` reopens the flow later. `marlin run` never prompts; on a
 fresh unconfigured daemon it exits with an instruction to complete interactive
 setup or pass an explicit model whose credentials already exist on that host.
 
-## The pitch
+## One place for ongoing agent work
 
-Every agent harness today picks one of two shapes:
+Marlin keeps agent sessions running in a daemon. The terminal UI, headless
+CLI, and optional phone web client all consume the same structured protocol.
+Close a client, move to another machine, and attach again: the daemon keeps
+working as long as its host stays running.
 
-1. **Monolithic TUI** (pi, Claude Code, zag) — great single-session experience,
-   but persistence and remoting are outsourced to tmux/herdr, which only see
-   pixels. Kill the terminal, lose the process. Status detection is heuristic
-   scraping.
-2. **Kitchen-sink framework** (Hermes, Wintermolt) — daemon-ish, multi-surface,
-   enormously capable, and enormously large. Python/Node runtimes, hundreds of
-   files, breadth over speed.
+Use Marlin's native agent with OpenRouter, Anthropic, or an OpenAI-compatible
+endpoint, or host installed Claude Code and Codex agents using their existing
+logins. Guest agents own their inference, tools, context, and permissions;
+Marlin supplies the shared session interface. Switching between native and
+guest backends involves a context handover; see
+[native and guest sessions](docs/ARCHITECTURE.md#native-vs-guest-agents).
 
-marlin takes the unclaimed third shape: **daemon-native structured sessions,
-multiplexed by a TUI that is just another client.** Some of those sessions
-run Marlin's own agent. Some host an official vendor agent as a *guest*:
-Claude Code for subscription Fable, or Codex through `codex app-server`
-using the user's existing ChatGPT login. Guest is a session regime, not
-another wire dialect; the multiplexer still sees blocks, not pixels. See
-[Native vs guest](docs/ARCHITECTURE.md#native-vs-guest-agents).
+```sh
+marlin                         # open the TUI; setup runs on first use
+marlin ls                      # list durable sessions and short handles
+marlin attach 63df              # reattach using a unique handle prefix
+marlin attach --session-file .marlin-session  # publish the selected full handle
+marlin inspect 63df --json      # inspect state, recent blocks, and diagnostics
+marlin top                     # live session tree, including child work
+```
 
-What that consolidates: one multiplexer over your whole model fleet. The
-workflow marlin replaces is three or four vendor CLIs cycling under a
-terminal multiplexer plus a desktop app on the side — each with its own UX,
-each picked per task by preference or remaining credits, findings shuttled
-between them by hand. In marlin that is tabs in one room: Fable and Codex
-through their official binaries as guests, grok/GLM/GPT and everything else
-OpenRouter carries as native sessions, switched per task. The
-migration test for every feature: does it delete a reason to open one of
-the old rooms?
+Inside the TUI, `/new` starts a session, `/model` selects its agent/model,
+`/cwd <path>` changes its working directory while idle, `Ctrl+S` opens the
+session switcher, and `/detach` closes the client while work
+continues. `marlin --remote <host>` attaches through SSH.
 
-- Sessions live in the daemon. Detach, reboot your laptop, ssh in from another
-  machine, reattach — the agent never noticed.
-- Unarchived root sessions are always visible as clickable tabs; child work
-  rolls up into the root's running, approval, or error indicator.
-- Sessions have short stable handles: `marlin ls` prints eight characters and
-  `marlin attach 63df` accepts any unique prefix of four or more.
-  `marlin attach [handle] --session-file <path>` atomically publishes the full
-  selected handle for launchers that need to discover the settled session.
-  `marlin inspect 63df --json` is the supported read-only view for metadata,
-  live state, bounded blocks, the latest plan, and diagnostics—no SQLite schema
-  knowledge required.
-  `marlin top` opens a live chronological tree with archive/kill shortcuts;
-  inside the TUI,
-  `/top` or `Ctrl+S` opens the same overview as a session switcher.
-- The multiplexer knows "session 3 is awaiting approval for `rm -rf`" as a
-  *typed event*, not a guess from terminal output. Tap-to-approve from a phone
-  becomes a protocol message, not a screen-scrape.
-- Run `!<command>` (or `! <command>`) in the focused session's workspace, or
-  enter bare `!` for an interactive local shell. A leading space sends a
-  message that starts with `/` or `!` verbatim. Marlin leaves the alternate screen completely,
-  then reattaches to the durable session when the shell exits. Direct
-  `--remote` attachments refuse shell escapes; run Marlin inside SSH or mosh
-  when the terminal and workspace live on another host.
-- Copy the last tool output with `!c` — a query over structured blocks, not a
-  rectangle of screen cells. Paste it into another session without touching the
-  OS clipboard.
-- Recall anything you previously wrote with insert-mode `Ctrl+R`: it searches
-  inline in the composer, repeated `Ctrl+R` walks older matches, and Esc
-  restores the draft. Normal-mode `/` searches the current transcript; `/search <query>` and
-  `marlin search <query>` search every durable session.
-- Terminal-native effects share one finite-animation/full-screen-saver surface.
-  Cell effects paint the grid: `matrix` rain, `strings` dancing sine curves, a
-  forward `stars` field, and color-cycling `plasma`. Pixel effects render a
-  framebuffer over the Kitty graphics protocol (Kitty, Ghostty, WezTerm):
-  `tetris`, a full-screen neon arcade cabinet with beveled blocks, a ghost
-  landing, next-piece preview, score, lines, and level around a bot that
-  searches legal rotations and landings; `pacman`, a self-playing take on feiss' 1024-byte js1k entry on a maze
-  generated to fit your window with the arcade's rules (mirrored, no dead
-  ends, a ghost house in the middle, wrap-around tunnels; a new maze every
-  board), a spinning `tunnel`, `metaballs`, a synthwave `horizon`, `demo`, a
-  24-second sequence of those three, and `shadowbox`, a paper-cutout
-  landscape after Jani Ylikangas' js1k entry that follows the real sun over
-  your machine: it locates you from your time zone and computes the sun's
-  true altitude and azimuth, so days run long in summer and short in
-  winter, sunrise lands where and when it should, and a Nordic midsummer
-  night keeps its twilight. `/screensaver shadowbox cycle` runs today's
-  whole day every two minutes and `/screensaver shadowbox 18.5` pins an
-  hour (`MARLIN_SHADOWBOX_HOUR` does the same from the environment);
-  `MARLIN_SHADOWBOX_LATLON=lat,lon` overrides the place. Without graphics,
-  Tetris and Pac-Man draw cell fallbacks and the other pixel effects start as a
-  cell sibling; either way the
-  status line says so. Run `/animate <effect>` over gaps in the current UI
-  (opaque for the pixel kinds), or `/screensaver [effect]` for the
-  continuous form. Tetris is deliberately manual-only: start it with
-  `/screensaver tetris` (or `/animate tetris`); it cannot be selected for idle
-  activation. Normal-mode `gs` starts the configured effect and returns to
-  insert mode on wake. A key or paste wakes it and is consumed; mouse activity
-  is ignored. Automatic activation is off by default; `/config screensaver 10m
-  strings` enables it, `/config screensaver tunnel` changes only the effect,
-  and `off` disables it. The equivalent TOML keys are `[ui] screensaver_after`
-  and `screensaver_effect`.
-- During a turn, the live activity row distinguishes request preparation, model
-  wait/streaming, tool execution, child-agent work, compaction, and finalization,
-  with total and current-phase timers. Streaming shows a green up arrow while
-  tokens are arriving and a red down arrow after three quiet seconds. A running
-  Bash command keeps the same shell syntax highlighting used by completed tool
-  rows.
-- `/diagnostics` and `marlin diagnostics [handle] [--json]` separate provider
-  latency, TTFT, tool time, and failures. Optional OTLP/HTTP export uses a
-  durable retry outbox, supports restart-free `/otel set|off|status`, and
-  correlates OpenRouter Broadcast under the same trace; see
-  [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
-- OpenRouter sessions can search the web with the same API key and preserve
-  cited source URLs; `fetch` opens known pages for deeper reading.
-- `/model codex/default` hosts the installed Codex agent through its stable
-  app-server protocol. It uses `codex login`/the existing ChatGPT session, so
-  Marlin needs no additional search or inference API key. The guest route
-  refuses an API-key Codex login instead of silently changing the biller.
-- Paste an image with Ctrl+V (Control-V, not Command-V on macOS) or attach one
-  by path. Staged images appear in the prompt as `[image #1]`, `[image #2]`, and
-  so on. The client uploads them through the protocol—no shared path
-  assumption—and images remain durable, content-addressed transcript
-  attachments.
-- Delegate one focused investigation with `task`, or fan out two to eight with
-  `task_batch`; every read-only child is durable, attachable, and grouped under
-  its parent while results return in requested order.
-- Build a multi-model review council with `/council new core`: filter the
-  model catalog, toggle as many seats as you want, then choose `Done`. After
-  that, `/review core <question>` fans a self-contained review prompt to the
-  roster via `task_batch` and the parent consolidates agreements, splits,
-  and a recommendation. Councils are durable config (`[[council]]` in
-  config.toml); the procedure is a markdown skill
-  ([skills/council.md](skills/council.md)), not core machinery. The first
-  live council reviewed marlin's own sandbox policy and found a real bug.
-- Shift+Tab enters persistent Plan mode: the agent investigates with a
-  daemon-enforced read-only tool profile, then offers Implement, Revise, Stay,
-  or Dismiss. `/plan <task>` enters directly, `/plan off` exits, and `/plan
-  clear` closes a stale durable execution todo.
-- Substantial implementation gets a durable execution plan: the active step
-  stays pinned above the composer, revisions survive reboot and compaction,
-  and delegated child activity attaches to the step it is helping complete.
-- Source-built self-hosting works across remote attachments: `!rb` rebuilds the
-  attached daemon side, `!rb client` rebuilds only the local client, and `!rb
-  both` builds both before restarting. Package-installed binaries refuse these
-  builds and remain owned by install.sh or Homebrew.
-- ssh/mosh remain the transport. We never reinvent them; we just put structure
-  on the wire above them.
+## What makes it useful
+
+- **Durable, searchable work.** Messages, tool calls, results, plans, and
+  approvals are structured blocks in SQLite. Compaction changes what the
+  model sees while preserving the original transcript and full tool outputs.
+  `/search <query>` searches across sessions; `!c` copies the last tool output.
+- **A clear view of ongoing work.** Root tabs roll up child activity and
+  approvals. The activity row distinguishes model wait, streaming, tools,
+  delegation, and compaction. `/diagnostics` separates provider latency,
+  time to first token, tool time, and failures.
+- **Approvals you can return to.** Permission requests are protocol events.
+  Attach from another terminal or use the optional phone client to answer a
+  parked request. Native and guest permissions have different owners; the
+  interface reports that distinction.
+- **Planning and delegation.** Shift+Tab enters Plan mode. Native execution
+  plans survive compaction and restart; `task` and `task_batch` create durable,
+  attachable children for focused read-only work. Configured review councils
+  combine model perspectives through the same delegation mechanism.
+- **Terminal ergonomics.** Modal editing, `Ctrl+R` input history, transcript
+  search, image attachments, and shell escapes keep routine work close.
+  `!<command>` runs in the session workspace; bare `!` opens a local shell.
+  Direct remote attachments refuse shell escapes; use Marlin inside SSH or
+  mosh when the terminal and workspace live on another host.
+  See [terminal effects](docs/TERMINAL_EFFECTS.md) for the optional playful bits.
+- **Small deployment footprint.** One native binary, daemon-owned setup and
+  credentials, and SSH for remote transport. MCP servers, custom tools, and
+  hooks extend it at process boundaries.
+
+Marlin is a daily driver under active development. Multiple panes are
+[planned](docs/PANES_PLAN.md); the current TUI uses tabs and one focused view.
 
 ## Principles
 
@@ -204,9 +125,8 @@ the old rooms?
 7. **Daily driver, not kitchen sink.** Marlin exists to be driven all day,
    and that is the whole test: a feature earns its place by surviving
    dogfood, not by being well designed, and a surface that stops earning
-   its keep gets deleted rather than maintained. Designed doors (councils,
-   remote transport, workspace snapshots) stay shut until daily use — not
-   momentum — demands one. When in doubt, the answer is no.
+   its keep gets deleted rather than maintained. Unshipped work, including workspace snapshots, waits until daily use
+   demands it. When in doubt, the answer is no.
 
 ## MCP servers
 

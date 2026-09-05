@@ -105,6 +105,8 @@ test "connect retries when a dying daemon closes during hello" {
 
     try std.testing.expect(!flaky.failed.load(.acquire));
     try std.testing.expect(conn.network_filtering);
+    try std.testing.expectEqual(@as(u64, 0), conn.daemon_pid);
+    try std.testing.expectEqualStrings("", conn.daemonExe());
 }
 
 test "child transport handshakes over subprocess stdio" {
@@ -116,8 +118,9 @@ test "child transport handshakes over subprocess stdio" {
     // A fake `_pipe`: consume the hello line, answer hello_ok, then swallow
     // everything until stdin EOF (which deinit provides by closing it).
     const conn = try spawnChildConn(gpa, io, &.{
-        "/bin/sh",                                                                                                                             "-c",
-        "read line; printf '{\"hello_ok\":{\"proto_version\":2,\"daemon_version\":\"fake\",\"sandbox_available\":true}}\\n'; cat > /dev/null",
+        "/bin/sh",
+        "-c",
+        "read line; printf '{\"hello_ok\":{\"proto_version\":2,\"daemon_version\":\"fake\",\"sandbox_available\":true,\"daemon_pid\":4242,\"daemon_exe\":\"/srv/marlin\",\"daemon_started_at_ms\":123,\"daemon_exe_mtime_ms\":100}}\\n'; cat > /dev/null",
     });
     handshake(conn, 5_000, null) catch |err| {
         conn.deinit();
@@ -126,6 +129,10 @@ test "child transport handshakes over subprocess stdio" {
     defer conn.deinit();
     try std.testing.expect(conn.sandbox_available);
     try std.testing.expect(conn.transport == .child);
+    try std.testing.expectEqual(@as(u64, 4242), conn.daemon_pid);
+    try std.testing.expectEqualStrings("/srv/marlin", conn.daemonExe());
+    try std.testing.expectEqual(@as(i64, 123), conn.daemon_started_at_ms);
+    try std.testing.expectEqual(@as(i64, 100), conn.daemon_exe_mtime_ms);
 }
 
 test "handshake cancellation interrupts a blocked child transport" {
@@ -180,4 +187,31 @@ test "connect times out when an accepted socket never completes hello" {
         connect(gpa, io, &environ, "/unused/marlin"),
     );
     try std.testing.expect(!silent.failed.load(.acquire));
+}
+
+fn stopFixture(script: []const u8, command: proto.ClientMsg, expected: ?anyerror) !void {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const conn = try spawnChildConn(gpa, threaded.io(), &.{ "/bin/sh", "-c", script });
+    defer conn.deinit();
+    const result = attach.requestStop(conn, command, 200);
+    if (expected) |err| {
+        try std.testing.expectError(err, result);
+    } else try result;
+}
+
+test "reboot requires acknowledgement before disconnect" {
+    try stopFixture("read line; exit 0", .{ .reboot = .{} }, error.EndOfStream);
+    try stopFixture("read line; printf '{\"ok\":{}}\\n'", .{ .reboot = .{} }, null);
+}
+
+test "shutdown acknowledgement without disconnect times out" {
+    try stopFixture("read line; printf '{\"ok\":{}}\\n'; sleep 30", .{ .shutdown = .{} }, error.DaemonStopTimedOut);
+    try stopFixture("read line; read again", .{ .shutdown = .{} }, error.DaemonStopTimedOut);
+    try stopFixture("read line; printf '{\"ok\":{}}\\n'", .{ .shutdown = .{} }, null);
+}
+
+test "remote stop closes its command stream after acknowledgement" {
+    try stopFixture("read line; printf '{\"ok\":{}}\\n'; read again", .{ .reboot = .{} }, null);
 }

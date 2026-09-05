@@ -202,7 +202,7 @@ pub const AttachmentUpload = struct {
 
 /// Client → daemon.
 pub const ClientMsg = union(enum) {
-    hello: struct { proto_version: u32, client_kind: []const u8 = "generic" },
+    hello: struct { proto_version: u32, client_kind: []const u8 = "generic", lifecycle_events: bool = false },
     session_create: struct {
         cwd: []const u8,
         model: []const u8,
@@ -386,6 +386,8 @@ pub const ApprovalAnswer = enum { granted, denied };
 
 /// Daemon → client.
 pub const DaemonMsg = union(enum) {
+    /// Opt-in via hello.lifecycle_events; deliberate shutdown must not autostart.
+    daemon_stopping: struct {},
     hello_ok: struct {
         proto_version: u32,
         daemon_version: []const u8,
@@ -404,6 +406,11 @@ pub const DaemonMsg = union(enum) {
         /// startup; 0 when unknown. Lets a client spot a stale daemon even in
         /// dev, where every build shares one version string.
         daemon_exe_mtime_ms: i64 = 0,
+        /// Process identity is reported by the connected daemon, never inferred
+        /// from the client executable or a pidfile. Zero/empty means unknown.
+        daemon_pid: u64 = 0,
+        daemon_exe: []const u8 = "",
+        daemon_started_at_ms: i64 = 0,
     },
     session_created: struct { sid: u64, request_id: u64 = 0 },
     session_list_result: struct { sessions: []const SessionInfo },

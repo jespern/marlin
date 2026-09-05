@@ -1206,7 +1206,8 @@ fn maybeCompact(
         context.compaction_prompt,
         null,
     ) catch |e| {
-        const msg = try std.fmt.allocPrint(arena, "compaction failed ({t}) — continuing uncompacted", .{e});
+        const failure = try http.failureText(arena, e);
+        const msg = try std.fmt.allocPrint(arena, "compaction failed ({s}) — continuing uncompacted", .{failure});
         _ = try ap.append(.{ .system_note = .{ .text = msg } });
         return false;
     };
@@ -1402,10 +1403,11 @@ pub fn writeHandover(
         context.handover_prompt,
         &opts,
     ) catch |e| {
+        const failure = try http.failureText(arena, e);
         const msg = try std.fmt.allocPrint(
             arena,
-            "{s}Handover summary failed ({t}). {s} will start without a briefing; the Marlin transcript above is still the session log.",
-            .{ block.handover_prefix, e, guest_label },
+            "{s}Handover summary failed ({s}). {s} will start without a briefing; the Marlin transcript above is still the session log.",
+            .{ block.handover_prefix, failure, guest_label },
         );
         _ = try ap.append(.{ .system_note = .{ .text = msg } });
         return;

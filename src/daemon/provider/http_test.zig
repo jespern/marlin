@@ -14,6 +14,7 @@ const StreamRequest = http.StreamRequest;
 const discardChunk = http.discardChunk;
 const ensureTlsReady = http.ensureTlsReady;
 const lastTransportCause = http.lastTransportCause;
+const lastTransportDetail = http.lastTransportDetail;
 const readTestRequest = http.readTestRequest;
 const serveDelayedResponse = http.serveDelayedResponse;
 const streamPost = http.streamPost;
@@ -194,6 +195,9 @@ test "flattened transport errors record their underlying cause" {
     // The whole point of the side channel: the flattened error still names
     // the std-level cause for the failure note.
     try std.testing.expect(lastTransportCause() != null);
+    const detail = lastTransportDetail() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, detail, "127.0.0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, @errorName(lastTransportCause().?)) != null);
 }
 
 test "direct TLS connect initializes the certificate clock (no null-now panic)" {
@@ -275,8 +279,23 @@ test "stream response-head timeout aborts a silent provider" {
     const io = threaded.io();
     var server = try testServer(io);
     defer server.deinit(io);
-    var cancel: std.atomic.Value(bool) = .init(false);
-    try std.testing.expectError(error.HttpTimeout, requestCompletes(io, &server, &cancel, 5_000, 2_000, 100));
+    const url = try testUrl(gpa, &server);
+    defer gpa.free(url);
+    const server_thread = try std.Thread.spawn(.{}, serveDelayedResponse, .{ io, &server, 5_000, "ok" });
+    defer server_thread.join();
+
+    const result = streamPost(gpa, io, .{
+        .url = url,
+        .bearer = null,
+        .body_json = "{}",
+        .connect_timeout_ms = 2_000,
+        .response_head_timeout_ms = 100,
+        .idle_timeout_ms = 100,
+    }, {}, discardChunk);
+    try std.testing.expectError(error.HttpTimeout, result);
+    const detail = lastTransportDetail() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, detail, "127.0.0.1") != null);
+    try std.testing.expect(std.mem.endsWith(u8, detail, "timed out after 100 ms"));
 }
 
 test "connected provider may take longer than connect timeout to return headers" {
@@ -474,4 +493,57 @@ test "absolute stream deadline cannot be extended by request activity" {
             return;
         },
     };
+}
+
+fn serveInvalidHeadThenFresh(io: Io, server: *Io.net.Server) void {
+    var first = server.accept(io) catch return;
+    defer first.close(io);
+    readTestRequest(io, first) catch return;
+    var buffer: [4096]u8 = undefined;
+    var writer = Io.net.Stream.Writer.init(first, io, &buffer);
+    writer.interface.writeAll("HTTP/9.9 200 Invalid\r\ncontent-length: 0\r\n\r\n") catch return;
+    writer.interface.flush() catch return;
+    // Keep the first socket open. The next request must discard it even
+    // though its response head was complete and no FIN is available to peek.
+    var second = server.accept(io) catch return;
+    defer second.close(io);
+    readTestRequest(io, second) catch return;
+    writeTestResponse(io, second, false) catch return;
+}
+
+test "invalid response head is diagnosed without replay and next request uses fresh connection" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testServer(io);
+    const url = try testUrl(gpa, &server);
+    defer gpa.free(url);
+    const thread = try std.Thread.spawn(.{}, serveInvalidHeadThenFresh, .{ io, &server });
+    defer thread.join();
+    defer server.deinit(io);
+    var pool = try Pool.init(gpa, io, null);
+    defer pool.deinit();
+    var client = try pool.acquire();
+    defer client.deinit();
+    try std.testing.expectError(error.ConnectFailed, client.streamPost(gpa, .{
+        .url = url,
+        .bearer = null,
+        .body_json = "{}",
+        .response_head_timeout_ms = 500,
+    }, {}, discardChunk));
+    try std.testing.expectEqual(error.HttpHeadersInvalid, lastTransportCause().?);
+    for ([_][]const u8{ "turn", "compaction", "handover" }) |operation| {
+        const note = try http.failureNote(gpa, operation, error.ConnectFailed);
+        defer gpa.free(note);
+        const expected = try std.fmt.allocPrint(gpa, "{s} failed: ConnectFailed (response head 127.0.0.1: HttpHeadersInvalid)", .{operation});
+        defer gpa.free(expected);
+        try std.testing.expectEqualStrings(expected, note);
+    }
+    const unrelated = try http.failureNote(gpa, "turn", error.InvalidRequest);
+    defer gpa.free(unrelated);
+    try std.testing.expectEqualStrings("turn failed: InvalidRequest", unrelated);
+    try expectPostOk(&client, gpa, url);
+    try std.testing.expect(lastTransportCause() == null);
+    try std.testing.expect(lastTransportDetail() == null);
 }

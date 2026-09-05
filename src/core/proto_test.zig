@@ -582,3 +582,16 @@ test "garbage line is an error, not a crash" {
         decode(ClientMsg, arena_state.allocator(), "{\"nope\":{}}"),
     );
 }
+
+test "lifecycle notifications require explicit hello opt-in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const legacy = try decode(ClientMsg, arena.allocator(), "{\"hello\":{\"proto_version\":5}}");
+    try std.testing.expect(!legacy.hello.lifecycle_events);
+    const current = try decode(ClientMsg, arena.allocator(), "{\"hello\":{\"proto_version\":5,\"lifecycle_events\":true}}");
+    try std.testing.expect(current.hello.lifecycle_events);
+    const wire = try encode(arena.allocator(), DaemonMsg{ .daemon_stopping = .{} });
+    try std.testing.expectEqualStrings("{\"daemon_stopping\":{}}\n", wire);
+    const notice = try decode(DaemonMsg, arena.allocator(), wire);
+    try std.testing.expect(notice == .daemon_stopping);
+}

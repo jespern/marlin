@@ -39,6 +39,7 @@ pub const Transport = union(enum) {
         stdout: Io.File,
         reader: Io.File.Reader,
         writer: Io.File.Writer,
+        stdin_closed: bool = false,
         /// Set by the handshake watchdog; deinit must not kill twice.
         killed: bool = false,
     };
@@ -66,6 +67,14 @@ pub const Conn = struct {
     daemon_version_buf: [64]u8 = undefined,
     daemon_version_len: usize = 0,
     daemon_exe_mtime_ms: i64 = 0,
+    daemon_pid: u64 = 0,
+    daemon_started_at_ms: i64 = 0,
+    daemon_exe_buf: [4096]u8 = undefined,
+    daemon_exe_len: usize = 0,
+
+    pub fn daemonExe(self: *const Conn) []const u8 {
+        return self.daemon_exe_buf[0..self.daemon_exe_len];
+    }
 
     pub fn deinit(self: *Conn) void {
         switch (self.transport) {
@@ -73,7 +82,7 @@ pub const Conn = struct {
             .child => |*c| {
                 // Closing stdio first gives ssh/_pipe the EOF they exit on;
                 // kill covers hung transports and reaps either way.
-                c.stdin.close(self.io);
+                if (!c.stdin_closed) c.stdin.close(self.io);
                 c.stdout.close(self.io);
                 if (!c.killed) c.process.kill(self.io);
             },
@@ -92,6 +101,19 @@ pub const Conn = struct {
             .child => |*c| {
                 c.process.kill(self.io);
                 c.killed = true;
+            },
+        }
+    }
+
+    /// No command follows a shutdown/reboot ACK. Half-close that direction
+    /// while retaining daemon output: on a remote child this releases
+    /// `_pipe`'s stdin pump so the SSH process can exit after daemon EOF.
+    pub fn closeWrite(self: *Conn) void {
+        switch (self.transport) {
+            .socket => |*s| s.stream.shutdown(self.io, .send) catch {},
+            .child => |*c| if (!c.stdin_closed) {
+                c.stdin.close(self.io);
+                c.stdin_closed = true;
             },
         }
     }
@@ -267,13 +289,46 @@ const HandshakeDeadline = struct {
     }
 };
 
+/// An ACK means the command was accepted, not that cleanup finished. Require
+/// the requesting connection to close too; timeout or missing ACK is uncertain
+/// shutdown, never permission to announce a successful reboot.
+pub fn requestStop(conn: *Conn, command: proto.ClientMsg, timeout_ms: u32) !void {
+    switch (command) {
+        .shutdown, .reboot => {},
+        else => return error.InvalidArgument,
+    }
+    var deadline = HandshakeDeadline{ .conn = conn, .timeout_ms = timeout_ms };
+    try deadline.start();
+    defer deadline.finish();
+    requestStopRun(conn, command) catch |err| {
+        if (deadline.fired.load(.acquire)) return error.DaemonStopTimedOut;
+        return err;
+    };
+    if (deadline.fired.load(.acquire)) return error.DaemonStopTimedOut;
+}
+
+fn requestStopRun(conn: *Conn, command: proto.ClientMsg) !void {
+    try conn.send(command);
+    var arena = std.heap.ArenaAllocator.init(conn.gpa);
+    defer arena.deinit();
+    _ = try conn.recvUntil(arena.allocator(), .ok);
+    conn.closeWrite();
+    while (true) {
+        const line = conn.readLine() catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
+        conn.gpa.free(line);
+    }
+}
+
 pub fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !void {
     if (connectCancelled(cancel)) return error.ConnectCanceled;
     var deadline = HandshakeDeadline{ .conn = conn, .timeout_ms = timeout_ms, .cancel = cancel };
     try deadline.start();
     defer deadline.finish();
 
-    try conn.send(.{ .hello = .{ .proto_version = proto.proto_version } });
+    try conn.send(.{ .hello = .{ .proto_version = proto.proto_version, .lifecycle_events = true } });
     var arena_state = std.heap.ArenaAllocator.init(conn.gpa);
     defer arena_state.deinit();
     const hello = conn.recvUntil(arena_state.allocator(), .hello_ok) catch |err| {
@@ -291,6 +346,10 @@ pub fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !v
     conn.daemon_version_len = @min(hello.daemon_version.len, conn.daemon_version_buf.len);
     @memcpy(conn.daemon_version_buf[0..conn.daemon_version_len], hello.daemon_version[0..conn.daemon_version_len]);
     conn.daemon_exe_mtime_ms = hello.daemon_exe_mtime_ms;
+    conn.daemon_pid = hello.daemon_pid;
+    conn.daemon_started_at_ms = hello.daemon_started_at_ms;
+    conn.daemon_exe_len = @min(hello.daemon_exe.len, conn.daemon_exe_buf.len);
+    @memcpy(conn.daemon_exe_buf[0..conn.daemon_exe_len], hello.daemon_exe[0..conn.daemon_exe_len]);
 }
 
 /// Connect, autostarting the daemon if needed. Handshakes (hello/hello_ok).

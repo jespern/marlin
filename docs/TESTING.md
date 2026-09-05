@@ -67,8 +67,9 @@ Wanted-but-not-yet-recorded: mid-stream disconnect, 429 with Retry-After, and
 real reasoning deltas (o-series / Claude via OpenRouter). Parallel tool calls
 are covered synthetically and by the full-binary e2e batch scenario.
 
-Guest adapters are tested at their process boundary in `loop.zig`: executable
-fixture peers validate argv and JSONL in both directions. The Codex fixture
+Guest adapters are tested at their process boundary in `guest/*_test.zig`
+and provider adapter tests: executable fixture peers validate argv and JSONL
+in both directions. The Codex fixture
 covers initialize/account checks, durable `thread/resume`, item-to-block
 projection, approval responses, token usage, and secret-environment scrubbing.
 

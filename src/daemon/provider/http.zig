@@ -40,14 +40,14 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Zig errors carry no payload, so the flattening in mapConnect would erase
-/// the underlying std error — which is exactly what made a broken TLS clock
-/// surface as an opaque "turn failed: ConnectFailed". The cause is recorded
-/// here instead; failure notes read it via lastTransportCause() to render
-/// "ConnectFailed (TlsInitializationFailed)". Thread-local because requests
-/// run inline on the turn thread that reports the failure; cleared at the
-/// start of every request so a stale cause can never label a later error.
+/// Zig errors carry no payload, so transport flattening would erase the
+/// underlying stage, destination, and std error. Record them thread-locally:
+/// requests run inline on the turn thread that reports the durable failure.
+/// Each request clears this state before starting so stale detail cannot label
+/// a later error.
 threadlocal var transport_cause: ?anyerror = null;
+threadlocal var transport_detail_buf: [256]u8 = undefined;
+threadlocal var transport_detail_len: usize = 0;
 
 /// The std-level error behind this thread's most recent flattened transport
 /// failure, or null when the current request never recorded one.
@@ -55,18 +55,71 @@ pub fn lastTransportCause() ?anyerror {
     return transport_cause;
 }
 
-/// Classify a transport failure from before any body bytes arrived.
-fn mapConnect(err: anyerror) Error {
-    if (err == error.OutOfMemory) return error.OutOfMemory;
+/// Stage and destination for the most recent transport failure. This is kept
+/// beside the typed cause because `ConnectFailed (NetworkUnreachable)` still
+/// does not say whether DNS, TCP, TLS, or a pooled write failed.
+pub fn lastTransportDetail() ?[]const u8 {
+    return if (transport_detail_len == 0) null else transport_detail_buf[0..transport_detail_len];
+}
+
+/// Format on the request thread before another request can replace its detail.
+/// Non-transport errors must never inherit a previous request's cause.
+pub fn failureText(gpa: std.mem.Allocator, err: anyerror) ![]u8 {
+    switch (err) {
+        error.ConnectFailed, error.ReadFailed, error.HttpTimeout => {
+            if (lastTransportDetail()) |detail|
+                return std.fmt.allocPrint(gpa, "{t} ({s})", .{ err, detail });
+            if (err != error.HttpTimeout) {
+                if (lastTransportCause()) |cause|
+                    return std.fmt.allocPrint(gpa, "{t} ({t})", .{ err, cause });
+            }
+        },
+        else => {},
+    }
+    return std.fmt.allocPrint(gpa, "{t}", .{err});
+}
+
+pub fn failureNote(gpa: std.mem.Allocator, operation: []const u8, err: anyerror) ![]u8 {
+    const detail = try failureText(gpa, err);
+    defer gpa.free(detail);
+    return std.fmt.allocPrint(gpa, "{s} failed: {s}", .{ operation, detail });
+}
+
+fn setTransportDetail(comptime fmt: []const u8, args: anytype) void {
+    const detail = std.fmt.bufPrint(&transport_detail_buf, fmt, args) catch {
+        transport_detail_len = 0;
+        return;
+    };
+    transport_detail_len = detail.len;
+}
+
+fn urlHost(url: []const u8, buffer: *[Io.net.HostName.max_len]u8) []const u8 {
+    const uri = std.Uri.parse(url) catch return "unknown host";
+    return (uri.getHost(buffer) catch return "unknown host").bytes;
+}
+
+fn recordTransportFailure(stage: []const u8, host: []const u8, err: anyerror) void {
     transport_cause = err;
-    std.log.debug("http connect-phase failure: {t}", .{err});
+    setTransportDetail("{s} {s}: {t}", .{ stage, host, err });
+    std.log.debug("http {s} failure for {s}: {t}", .{ stage, host, err });
+}
+
+/// Classify a transport failure from before any response bytes arrived.
+fn mapConnectAt(stage: []const u8, host: []const u8, err: anyerror) Error {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    recordTransportFailure(stage, host, err);
     return error.ConnectFailed;
+}
+
+fn mapUrlConnect(url: []const u8, stage: []const u8, err: anyerror) Error {
+    var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+    return mapConnectAt(stage, urlHost(url, &host_buffer), err);
 }
 
 /// A failed write makes the HTTP framing state unknowable. Never return that
 /// socket to the free pool: a later request would otherwise inherit the same
 /// broken connection and fail in a loop.
-fn mapRequestConnect(request: *std.http.Client.Request, err: anyerror) Error {
+fn mapRequestConnect(request: *std.http.Client.Request, url: []const u8, err: anyerror) Error {
     var cause = err;
     if (request.connection) |connection| {
         connection.closing = true;
@@ -74,7 +127,18 @@ fn mapRequestConnect(request: *std.http.Client.Request, err: anyerror) Error {
             if (connection.stream_writer.err) |underlying| cause = underlying;
         }
     }
-    return mapConnect(cause);
+    return mapUrlConnect(url, "request write", cause);
+}
+
+fn mapResponseHead(request: *std.http.Client.Request, url: []const u8, err: anyerror) Error {
+    var cause = err;
+    if (request.connection) |connection| {
+        // Parsing errors also leave the framing uncertain. Never pool this
+        // connection, even when std.http failed after reading a complete head.
+        connection.closing = true;
+        if (err == error.ReadFailed) cause = connection.getReadError() orelse err;
+    }
+    return mapUrlConnect(url, "response head", cause);
 }
 
 /// std.http.Client loads its CA bundle and certificate clock (`client.now`)
@@ -246,7 +310,13 @@ fn shutdownConnection(io: Io, connection: *std.http.Client.Connection) void {
     connection.stream_reader.stream.shutdown(io, .both) catch {};
 }
 
-const DeadlineReason = enum(u8) { none, cancelled, timed_out };
+const DeadlineReason = enum(u8) {
+    none,
+    cancelled,
+    response_head_timeout,
+    idle_timeout,
+    total_timeout,
+};
 
 const StreamDeadline = struct {
     io: Io,
@@ -288,8 +358,9 @@ const StreamDeadline = struct {
             }
             const timeout_ms = @max(if (response_started) self.idle_timeout_ms else self.response_head_timeout_ms, 1);
             const total_timeout_ms = @max(self.total_timeout_ms, 1);
-            if (elapsed_ms >= timeout_ms or total_elapsed_ms >= total_timeout_ms)
-                return self.fire(.timed_out);
+            if (total_elapsed_ms >= total_timeout_ms) return self.fire(.total_timeout);
+            if (elapsed_ms >= timeout_ms)
+                return self.fire(if (response_started) .idle_timeout else .response_head_timeout);
             if (!response_started and elapsed_ms - last_wait_report_ms >= 1000) {
                 if (self.on_wait) |cb| cb(self.on_wait_ctx, @intCast(elapsed_ms));
                 last_wait_report_ms = elapsed_ms;
@@ -316,6 +387,7 @@ fn streamPostTimed(
     comptime on_chunk: fn (@TypeOf(ctx), []const u8) bool,
 ) Error!Response {
     transport_cause = null;
+    transport_detail_len = 0;
     if (stream_req.on_wait) |cb| cb(stream_req.on_wait_ctx, 0);
     const pooled = try acquirePooledOrPreflightDns(
         client,
@@ -347,7 +419,30 @@ fn streamPostTimed(
         } else |_| {}
         return switch (reason) {
             .cancelled => error.Cancelled,
-            .timed_out => error.HttpTimeout,
+            .response_head_timeout => {
+                var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+                setTransportDetail(
+                    "response head {s}: timed out after {d} ms",
+                    .{ urlHost(stream_req.url, &host_buffer), stream_req.response_head_timeout_ms },
+                );
+                return error.HttpTimeout;
+            },
+            .idle_timeout => {
+                var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+                setTransportDetail(
+                    "response body {s}: idle for {d} ms",
+                    .{ urlHost(stream_req.url, &host_buffer), stream_req.idle_timeout_ms },
+                );
+                return error.HttpTimeout;
+            },
+            .total_timeout => {
+                var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+                setTransportDetail(
+                    "request {s}: exceeded {d} ms total deadline",
+                    .{ urlHost(stream_req.url, &host_buffer), stream_req.total_timeout_ms },
+                );
+                return error.HttpTimeout;
+            },
             .none => unreachable,
         };
     }
@@ -402,7 +497,7 @@ fn streamPostRun(
         .extra_headers = header_storage,
     }) catch |err| {
         if (pooled_connection) |connection| connection.closing = true;
-        return mapConnect(err);
+        return mapUrlConnect(stream_req.url, "request setup", err);
     };
     owns_pooled_connection = false;
     defer request.deinit();
@@ -411,12 +506,12 @@ fn streamPostRun(
     if (progress.aborted.load(.acquire)) return error.Cancelled;
 
     request.transfer_encoding = .{ .content_length = stream_req.body_json.len };
-    var body_writer = request.sendBodyUnflushed(&.{}) catch |err| return mapRequestConnect(&request, err);
-    body_writer.writer.writeAll(stream_req.body_json) catch |err| return mapRequestConnect(&request, err);
-    body_writer.end() catch |err| return mapRequestConnect(&request, err);
-    request.connection.?.flush() catch |err| return mapRequestConnect(&request, err);
+    var body_writer = request.sendBodyUnflushed(&.{}) catch |err| return mapRequestConnect(&request, stream_req.url, err);
+    body_writer.writer.writeAll(stream_req.body_json) catch |err| return mapRequestConnect(&request, stream_req.url, err);
+    body_writer.end() catch |err| return mapRequestConnect(&request, stream_req.url, err);
+    request.connection.?.flush() catch |err| return mapRequestConnect(&request, stream_req.url, err);
 
-    var response = request.receiveHead(&.{}) catch |err| return mapConnect(err);
+    var response = request.receiveHead(&.{}) catch |err| return mapResponseHead(&request, stream_req.url, err);
     progress.response_started.store(true, .release);
     markActivity(progress);
     const status: i64 = @intFromEnum(response.head.status);
@@ -438,10 +533,9 @@ fn streamPostRun(
         reader.fill(1) catch |err| switch (err) {
             error.EndOfStream => break,
             error.ReadFailed => {
-                if (response.bodyErr()) |cause| {
-                    transport_cause = cause;
-                    std.log.debug("stream body failure: {t}", .{cause});
-                }
+                const cause = response.bodyErr() orelse error.ReadFailed;
+                var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+                recordTransportFailure("response body", urlHost(stream_req.url, &host_buffer), cause);
                 return error.ReadFailed;
             },
         };
@@ -488,7 +582,7 @@ pub fn get(
     timeout_ms: i64,
     cancel: ?*std.atomic.Value(bool),
 ) Error!GetResult {
-    var pool = Pool.init(gpa, io, environ) catch |err| return mapConnect(err);
+    var pool = Pool.init(gpa, io, environ) catch |err| return mapUrlConnect(url, "http setup", err);
     defer pool.deinit();
     const result = try getImpl(&pool.client, gpa, url, max_bytes, timeout_ms, cancel, .init(5));
     if (result.location) |location| gpa.free(location);
@@ -506,7 +600,7 @@ pub fn getOne(
     timeout_ms: i64,
     cancel: ?*std.atomic.Value(bool),
 ) Error!GetOneResult {
-    var pool = Pool.init(gpa, io, environ) catch |err| return mapConnect(err);
+    var pool = Pool.init(gpa, io, environ) catch |err| return mapUrlConnect(url, "http setup", err);
     defer pool.deinit();
     return getImpl(&pool.client, gpa, url, max_bytes, timeout_ms, cancel, .unhandled);
 }
@@ -521,6 +615,7 @@ fn getImpl(
     redirect_behavior: std.http.Client.Request.RedirectBehavior,
 ) Error!GetOneResult {
     transport_cause = null;
+    transport_detail_len = 0;
     const pooled = try acquirePooledOrPreflightDns(client, gpa, url, timeout_ms, cancel);
     var progress = StreamProgress{};
     var deadline = StreamDeadline{
@@ -545,7 +640,14 @@ fn getImpl(
         } else |_| {}
         return switch (reason) {
             .cancelled => error.Cancelled,
-            .timed_out => error.HttpTimeout,
+            .response_head_timeout, .idle_timeout, .total_timeout => {
+                var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+                setTransportDetail(
+                    "request {s}: timed out after {d} ms",
+                    .{ urlHost(url, &host_buffer), timeout_ms },
+                );
+                return error.HttpTimeout;
+            },
             .none => unreachable,
         };
     }
@@ -574,17 +676,17 @@ fn getRun(
         .headers = .{ .user_agent = .{ .override = "marlin/0.0" } },
     }) catch |err| {
         if (pooled_connection) |connection| connection.closing = true;
-        return mapConnect(err);
+        return mapUrlConnect(url, "request setup", err);
     };
     owns_pooled_connection = false;
     defer request.deinit();
     progress.registerConnection(client.io, request.connection.?);
     defer progress.clearConnection(client.io);
     if (progress.aborted.load(.acquire)) return error.Cancelled;
-    request.sendBodiless() catch |err| return mapRequestConnect(&request, err);
+    request.sendBodiless() catch |err| return mapRequestConnect(&request, url, err);
 
     var redirect_buffer: [8192]u8 = undefined;
-    var response = request.receiveHead(if (redirect_behavior == .unhandled) &.{} else &redirect_buffer) catch |err| return mapConnect(err);
+    var response = request.receiveHead(if (redirect_behavior == .unhandled) &.{} else &redirect_buffer) catch |err| return mapResponseHead(&request, url, err);
     const status: i64 = @intFromEnum(response.head.status);
     const content_type = if (response.head.content_type) |value| try gpa.dupe(u8, value) else null;
     errdefer if (content_type) |value| gpa.free(value);
@@ -609,10 +711,9 @@ fn getRun(
         }
         const n = reader.readSliceShort(chunk[0..@min(chunk.len, max_bytes - body.items.len)]) catch |err| switch (err) {
             error.ReadFailed => {
-                if (response.bodyErr()) |cause| {
-                    transport_cause = cause;
-                    std.log.debug("get body failure: {t}", .{cause});
-                }
+                const cause = response.bodyErr() orelse error.ReadFailed;
+                var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+                recordTransportFailure("response body", urlHost(url, &host_buffer), cause);
                 return error.ReadFailed;
             },
         };
@@ -708,7 +809,8 @@ fn acquirePooledOrPreflightDns(
     if (Io.net.IpAddress.parse(host.bytes, resolve_port)) |_| return null else |_| {}
     if (isCancelled(cancel)) return error.Cancelled;
 
-    const executable = std.process.executablePathAlloc(client.io, gpa) catch return error.ConnectFailed;
+    const executable = std.process.executablePathAlloc(client.io, gpa) catch |err|
+        return mapConnectAt("resolver setup", host.bytes, err);
     defer gpa.free(executable);
     var port_buffer: [8]u8 = undefined;
     const port_text = std.fmt.bufPrint(&port_buffer, "{d}", .{resolve_port}) catch return error.InvalidRequest;
@@ -721,16 +823,32 @@ fn acquirePooledOrPreflightDns(
         .cancel = cancel,
     }) catch |err| switch (err) {
         error.Cancelled => return error.Cancelled,
-        else => return error.ConnectFailed,
+        else => return mapConnectAt("resolver spawn", host.bytes, err),
     };
     defer result.deinit(gpa);
-    if (result.timed_out) return error.HttpTimeout;
-    if (result.term != .exited or result.term.exited != 0)
+    if (result.timed_out) {
+        setTransportDetail("dns {s}: timed out after {d} ms", .{ host.bytes, bounded_ms });
+        return error.HttpTimeout;
+    }
+    if (result.term != .exited or result.term.exited != 0) {
+        const stderr = std.mem.trim(u8, result.stderr, " \t\r\n");
+        const stderr_excerpt = stderr[0..@min(stderr.len, 120)];
+        if (stderr_excerpt.len > 0)
+            setTransportDetail("dns {s}: resolver {t}: {s}", .{ host.bytes, result.term, stderr_excerpt })
+        else
+            setTransportDetail("dns {s}: resolver {t}", .{ host.bytes, result.term });
+        transport_cause = error.NameResolutionFailed;
         return error.ConnectFailed;
+    }
     const resolved_text = std.mem.trim(u8, result.stdout, " \t\r\n");
-    const resolved_host = Io.net.HostName.init(resolved_text) catch return error.ConnectFailed;
+    const resolved_host = Io.net.HostName.init(resolved_text) catch |err|
+        return mapConnectAt("resolver output", host.bytes, err);
     const connect_protocol = if (proxy) |configured| configured.protocol else protocol;
-    if (connect_protocol == .tls) try ensureTlsReady(client);
+    if (connect_protocol == .tls) ensureTlsReady(client) catch |err| {
+        if (err == error.ConnectFailed)
+            setTransportDetail("tls setup {s}: {t}", .{ host.bytes, transport_cause orelse err });
+        return err;
+    };
     const connection = client.connectTcpOptions(.{
         .host = resolved_host,
         .port = resolve_port,
@@ -740,7 +858,7 @@ fn acquirePooledOrPreflightDns(
         // proxy), never for the numeric address used by connect(2).
         .proxied_host = host,
         .proxied_port = resolve_port,
-    }) catch |err| return mapConnect(err);
+    }) catch |err| return mapConnectAt("tcp connect", host.bytes, err);
     if (proxy != null) {
         // Prime the proxy connection under its logical hostname. client.connect
         // will acquire it and apply CONNECT/ordinary-proxy semantics itself.

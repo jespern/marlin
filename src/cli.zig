@@ -321,6 +321,7 @@ const help_text =
     \\  marlin inspect <handle> [options]  inspect session state, plan, blocks, and diagnostics
     \\      --json | --plan | --kind <kind> | --limit N | --around SEQ | --turn latest
     \\  marlin diagnostics [handle] [--json]  inspect recent turn timings
+    \\  marlin diagnostics --daemon [--json]  identify the connected daemon
     \\  marlin archive <handle> hide a session tree without deleting it
     \\  marlin unarchive <handle> restore an archived session tree
     \\  marlin kill <handle>   interrupt a session's running turn

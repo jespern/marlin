@@ -30,8 +30,8 @@ Autostart: clients try to connect; on failure they spawn `marlin daemon`,
 poll the socket (50ms × 100), then handshake. The daemon holds a single
 instance with a non-blocking advisory lock beside the socket. Only the lock
 owner may remove a stale socket and bind; crashes release ownership in the
-kernel. Coordinated reboot removes the old socket and releases the lock before
-acknowledging the handoff, so the replacement can bind immediately.
+kernel. Coordinated reboot retains both through worker teardown, then retires
+them immediately before closing client connections and permitting autostart.
 
 `hello_ok.network_configured` reports whether a blocklist or explicit deny was
 requested, while `network_filtering` reports whether blocking rules actually
@@ -42,7 +42,7 @@ policy that failed open. Both default false when decoding an older daemon.
 
 | message | payload | reply |
 |---|---|---|
-| hello | proto_version, client_kind | hello_ok or err |
+| hello | proto_version, client_kind, lifecycle_events? | hello_ok or err |
 | session_create | cwd, model, effort?, title?, approvals?, request_id? | session_created{sid, request_id}; request_failed echoes request_id |
 | session_list | include_archived? | session_list_result{sessions}; archived omitted by default |
 | input_history | sid?, limit? | input_history_result{entries}; authored user/steer text across sessions, current sid first then newest, capped at 1024 |
@@ -86,8 +86,8 @@ policy that failed open. Both default false when decoding an older daemon.
 | cc_approval | sid, tool, args_json | cc_approval_result — immediately when policy auto-allows/denies (read-only guest children deny writes outright), otherwise after a human answers the parked approval_request; sent by the `marlin cc_approve` bridge |
 | session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn, err{guest} on guest sessions |
 | interrupt | sid, report? | ok, or interrupt_result with phase/elapsed diagnostics when report=true (cooperative cancel; also denies a pending approval) |
-| reboot | force? | quiesce (wait for turns; force interrupts), retire the listening socket, then ok RIGHT BEFORE daemon exit — requester's cue to re-exec; non-force returns err{approval_pending} rather than wait on an approval with no client |
-| shutdown | — | ok, then daemon exits cleanly |
+| reboot | force? | quiesce (wait for turns; force interrupts), acknowledge, finish teardown, retire the listener/lock, then close the connection — EOF is the requester's cue to re-exec; non-force returns err{approval_pending} rather than wait on an approval with no client |
+| shutdown | — | optional daemon_stopping notice, ok, then clean teardown and connection close |
 | gc | expire_before_ms? | gc report (orphan blobs, expired blobs, bytes reclaimed); holds the store's connection mutex across its transaction |
 
 `session_create.approvals`: `"default"` (mutating tools ask) or `"auto"`
@@ -180,6 +180,7 @@ flag is read at export time, so it covers everything still in the outbox.
 
 | message | when |
 |---|---|
+| daemon_stopping | deliberate shutdown, only for clients that opted into lifecycle_events |
 | hello_ok | handshake |
 | session_created | reply to session_create |
 | session_list_result | reply to session_list |
@@ -277,3 +278,26 @@ socket owned by a zombie process.
   against the daemon with the fake provider behind it.
 - TODO (from docs/TESTING.md M1 rules): scripted protocol-client mode in the
   e2e runner for golden transcripts (multi-client fan-out, replay, steer).
+
+### Daemon identity and stop confirmation
+
+`hello_ok` optionally includes `daemon_pid` (u64), `daemon_exe` (string), and
+`daemon_started_at_ms` (i64), in addition to `daemon_exe_mtime_ms`. Missing
+fields default to zero/empty for older daemons. Identity comes from the daemon
+serving the connection, including over SSH.
+
+Shutdown/reboot `ok` acknowledges acceptance. Current clients also wait for
+EOF on that connection before declaring retirement; EOF without an ACK is
+uncertain and fails. A timeout fails visibly without claiming that the pending
+request completed. A pending reboot is cancelled if its requesting client
+disconnects before quiescence. The daemon flushes the shutdown ACK before
+closing client sockets. Clients may opt in with
+`hello.lifecycle_events = true` (default false).
+After receiving the ACK, a stop client half-closes its command direction. This
+leaves daemon output readable and lets the remote `_pipe` stdin pump terminate,
+so SSH can carry the daemon-side EOF back without a circular wait.
+The daemon sends `daemon_stopping:{}` before deliberate shutdown, including
+SIGTERM, only to opted-in clients. The TUI exits instead of entering its
+crash-reconnect/autostart path. Reboot does not send this notice: other attached
+TUIs should reconnect to the replacement. Old clients receive no unknown tag
+and may still autostart after shutdown; upgrade/detach them before stopping.

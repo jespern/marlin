@@ -5,8 +5,8 @@
 //!   main thread        accept() loop on the unix socket; spawns client threads
 //!   client reader ×N   reads bounded NDJSON records into dispatcher commands
 //!   client writer ×N   drains one bounded outbox into that client's socket
-//!   dispatcher thread  single consumer of the central MPSC queue; owns ALL
-//!                      session state and the store; fans events out to
+//!   dispatcher thread  single consumer of the central MPSC queue; owns
+//!                      session lifecycle; fans events out to
 //!                      subscribed clients' outboxes
 //!   turn thread ×M     one per running agent turn; produces events into the
 //!                      central queue via loop.zig callbacks
@@ -153,6 +153,7 @@ const Client = struct {
     flushed_outbox_seq: std.atomic.Value(u64) = .init(0),
     subs: std.ArrayList(u64) = .empty, // subscribed session ids
     said_hello: bool = false,
+    lifecycle_events: bool = false,
     /// Receives refreshed session-list snapshots without subscribing to every
     /// session's block stream (M4 multiplexer/background activity contract).
     watches_sessions: bool = false,
@@ -343,16 +344,19 @@ pub const Daemon = struct {
     /// sleep; elsewhere a no-op). Dispatcher-owned, synced after every event.
     sleep_assertion: power.SleepAssertion = .{},
     next_client_id: u64 = 1,
-    running: bool = true,
+    running: std.atomic.Value(bool) = .init(true),
     /// /reboot in flight: client id awaiting the coordinated shutdown.
     /// The daemon quiesces (waits for turns to reach done) then acks + exits.
     pending_reboot: ?u64 = null,
-    /// Set when reboot unlinks the listener before ACK. Cleanup must not
-    /// unlink the same pathname again after the replacement daemon binds it.
+    /// Set when reboot cleanup retires the listener before closing clients.
+    /// The final cleanup tail must not unlink a replacement daemon's socket.
     socket_retired: bool = false,
+    /// Coordinated reboot delays opening the replacement gate until workers
+    /// and shared resources are gone. Client EOF is emitted only afterward.
+    rebooting: bool = false,
     /// Advisory lock held for the public socket's lifetime. A crash releases
-    /// it in the kernel; coordinated reboot releases it before ACK so the
-    /// replacement daemon can acquire it immediately.
+    /// it in the kernel; coordinated reboot releases it after worker teardown
+    /// and immediately before client EOF permits replacement autostart.
     instance_lock: ?Io.File = null,
     /// Absolute path to this marlin binary (gpa-owned), handed to delegated
     /// Claude Code sessions so their permission bridge can call back here.
@@ -361,6 +365,7 @@ pub const Daemon = struct {
     /// rebuild it still describes the running build, which is exactly what
     /// lets clients detect a stale daemon. 0 when unknown.
     exe_mtime_ms: i64 = 0,
+    started_at_ms: i64 = 0,
     /// Secret values this process holds (slice gpa-owned; values reference
     /// the daemon environ), redacted from tool output at capture time.
     secrets: []const permissions.Secret = &.{},
@@ -488,6 +493,7 @@ pub const Daemon = struct {
             // bridge stays unwired (headless prompts auto-deny as before).
             .marlin_exe = marlin_exe,
             .exe_mtime_ms = exe_mtime_ms,
+            .started_at_ms = startup_began_ms,
             // Secret values this process holds, for capture-time redaction
             // of tool output before it reaches the append-only store.
             .secrets = permissions.collectSecrets(gpa, environ) catch &.{},
@@ -592,7 +598,7 @@ pub const Daemon = struct {
         // (dispatcher deletes the socket file on shutdown to unblock us).
         while (true) {
             const stream = server.accept(io) catch break;
-            if (!self.running) {
+            if (!self.running.load(.acquire)) {
                 stream.close(io);
                 break;
             }
@@ -805,7 +811,7 @@ pub const Daemon = struct {
             // Every state transition happens on this thread, so syncing once
             // per event cannot miss a turn starting or ending.
             self.sleep_assertion.sync(self.anyTurnRunning());
-            if (!self.running) break;
+            if (!self.running.load(.acquire)) break;
         }
         self.shutdownCleanup();
     }
@@ -868,6 +874,11 @@ pub const Daemon = struct {
                 };
             },
             .client_gone => |cg| {
+                // A reboot request belongs to its waiting client. If that
+                // client times out or exits before the daemon can acknowledge
+                // quiescence, cancel the pending reboot instead of surprising
+                // the user with a delayed shutdown minutes later.
+                if (self.pending_reboot == cg.client_id) self.pending_reboot = null;
                 self.dropCcPendingForClient(cg.client_id);
                 if (self.removeClient(cg.client_id)) |client| {
                     // The registry no longer contains this client, so each
@@ -1061,6 +1072,7 @@ pub const Daemon = struct {
                 };
             },
             .shutdown => {
+                self.notifyShutdownClients();
                 // Freeze the producer boundary before leaving the dispatcher.
                 // In particular, a task child queued just behind this event
                 // owns a future on its parent turn's stack; cleanup must
@@ -1071,7 +1083,7 @@ pub const Daemon = struct {
                 // is still true is consumed as an ordinary client and the
                 // loop re-blocks in accept(2) with nobody left to wake it
                 // (the observed SIGTERM hang).
-                self.running = false;
+                self.running.store(false, .release);
                 self.nudgeAcceptLoop();
             },
         }
@@ -1089,6 +1101,7 @@ pub const Daemon = struct {
                     return;
                 }
                 client.said_hello = true;
+                client.lifecycle_events = h.lifecycle_events;
                 self.sendTo(client, .{ .hello_ok = .{
                     .proto_version = proto.proto_version,
                     .daemon_version = daemon_version,
@@ -1098,6 +1111,9 @@ pub const Daemon = struct {
                     .network_feed_count = self.network.feedCount(),
                     .network_rule_count = self.network.ruleCount(),
                     .daemon_exe_mtime_ms = self.exe_mtime_ms,
+                    .daemon_pid = @intCast(std.c.getpid()),
+                    .daemon_exe = self.marlin_exe orelse "",
+                    .daemon_started_at_ms = self.started_at_ms,
                 } });
             },
             .session_create => |sc| {
@@ -2258,14 +2274,18 @@ pub const Daemon = struct {
                 } });
             },
             .shutdown => {
-                self.sendTo(client, .{ .ok = .{} });
+                self.notifyShutdownClients();
+                if (self.sendToTracked(client, .{ .ok = .{} })) |ack_seq| {
+                    if (!self.waitForClientFlush(client, ack_seq, 2_000))
+                        std.log.warn("shutdown ACK did not flush to client {d}", .{client.id});
+                }
                 // Same sequence as Event.shutdown (the SIGTERM path): freeze
                 // the producer boundary FIRST, so a turn finishing after
                 // /quit cannot leak payloads into an open queue whose deinit
                 // does not free interiors — then flip running and nudge the
                 // accept loop with a dummy same-process connection.
                 self.events.close(self.io);
-                self.running = false;
+                self.running.store(false, .release);
                 self.nudgeAcceptLoop();
             },
             .reboot => |r| {
@@ -3025,14 +3045,6 @@ pub const Daemon = struct {
             .try_close_steer = TurnHooks.tryCloseSteer,
             .max_rounds = job.max_rounds,
         }, job.text, job.attachments) catch |e| {
-            // Transport errors are flattened by the http layer; the recorded
-            // cause turns "ConnectFailed" into "ConnectFailed
-            // (TlsInitializationFailed)" — the difference between a shrug
-            // and a diagnosis. Same thread: the request ran on this turn.
-            const cause: ?anyerror = switch (e) {
-                error.ConnectFailed, error.ReadFailed => http.lastTransportCause(),
-                else => null,
-            };
             // Delegated failures carry actionable prose (missing binary,
             // login required, or guest-reported error); prefer that detail.
             const delegate_detail: ?[]const u8 = switch (e) {
@@ -3045,10 +3057,8 @@ pub const Daemon = struct {
                 self.gpa.dupe(u8, "provider returned no user-visible answer or tool call after one recovery attempt") catch null
             else if (e == error.ProviderContentFiltered)
                 self.gpa.dupe(u8, "provider blocked the response before producing a user-visible answer") catch null
-            else if (cause) |c|
-                std.fmt.allocPrint(self.gpa, "turn failed: {t} ({t})", .{ e, c }) catch null
             else
-                std.fmt.allocPrint(self.gpa, "turn failed: {t}", .{e}) catch null;
+                http.failureNote(self.gpa, "turn", e) catch null;
             // The reason must survive in the transcript: turn_done frees
             // err_text after status fan-out, so without a durable note the
             // user sees a bare "error" state with no explanation. Provider
@@ -3133,7 +3143,7 @@ pub const Daemon = struct {
             .on_delta_ctx = job,
             .cancel = job.cancel,
         }) catch |e| {
-            const t = std.fmt.allocPrint(self.gpa, "compaction failed: {t}", .{e}) catch null;
+            const t = http.failureNote(self.gpa, "compaction", e) catch null;
             self.persistTurnNote(job, t orelse "compaction failed");
             self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
@@ -3180,7 +3190,7 @@ pub const Daemon = struct {
             .on_delta_ctx = job,
             .cancel = job.cancel,
         }, job.text) catch |e| {
-            const t = std.fmt.allocPrint(self.gpa, "handover failed: {t}", .{e}) catch null;
+            const t = http.failureNote(self.gpa, "handover", e) catch null;
             self.persistTurnNote(job, t orelse "handover failed");
             self.finishTurn(job.sid, false, false, t, null, 0, 0);
             return;
@@ -3855,26 +3865,32 @@ pub const Daemon = struct {
         // a payload pushed after that drain into a still-open queue is never
         // freed. Every exit path must close before flipping `running`.
         self.events.close(self.io);
-        // Wake OUR still-linked listener before releasing the instance lock.
-        // Once the ACK reaches the client a replacement daemon may bind the
-        // public path; nudging after that can connect to the replacement and
-        // leave this accept loop blocked forever on its unlinked old socket.
-        // The dispatcher remains inside this handler until the ACK flushes,
-        // so running=false cannot start cleanup underneath the writer.
-        self.running = false;
+        // Wake OUR still-linked listener. The replacement gate (socket path
+        // plus instance lock) stays owned until cleanup has joined all turn
+        // threads and released shared resources. Releasing it here allowed a
+        // reconnecting TUI to start a new daemon while this process remained
+        // stuck in cleanup, producing two marlind processes.
+        self.running.store(false, .release);
         self.nudgeAcceptLoop();
-        // Retire the public socket before ACKing. The ACK tells the client it
-        // may exec immediately, so no new process may still connect to this
-        // dying daemon and lose its hello request during cleanup.
-        self.removeSocketFile();
-        self.socket_retired = true;
-        self.releaseInstanceLock();
+        self.rebooting = true;
         if (self.lookupClient(requester)) |client| {
             if (self.sendToTracked(client, .{ .ok = .{} })) |ack_seq| {
                 if (!self.waitForClientFlush(client, ack_seq, 2_000))
                     std.log.warn("reboot ACK did not flush to client {d}", .{requester});
             }
         }
+    }
+
+    fn notifyShutdownClients(self: *Daemon) void {
+        self.forEachClient(self, struct {
+            fn notify(daemon: *Daemon, client: *Client) void {
+                if (!client.said_hello or !client.lifecycle_events) return;
+                if (daemon.sendToTracked(client, .{ .daemon_stopping = .{} })) |seq| {
+                    if (!daemon.waitForClientFlush(client, seq, 2_000))
+                        std.log.warn("shutdown notice did not flush to client {d}", .{client.id});
+                }
+            }
+        }.notify);
     }
 
     fn waitForClientFlush(self: *Daemon, client: *Client, target_seq: u64, timeout_ms: u32) bool {
@@ -4075,6 +4091,15 @@ pub const Daemon = struct {
         self.sessions.deinit(self.gpa);
         self.retained_approvals.deinit(self.gpa);
         self.http_pool.deinit();
+
+        // A reboot client waits for ACK plus EOF. Open the replacement gate
+        // only after worker teardown, but before closing client sockets, so
+        // that EOF is a reliable signal that autostart may acquire the lock.
+        if (self.rebooting) {
+            self.removeSocketFile();
+            self.socket_retired = true;
+            self.releaseInstanceLock();
+        }
 
         // Close all client outboxes; writer threads exit, readers hit EOF.
         self.clients_mutex.lockUncancelable(self.io);
@@ -4371,19 +4396,19 @@ fn isGenericFollowUp(title: []const u8) bool {
     }
     const normalized = normalized_buf[0..normalized_len];
     const generic = [_][]const u8{
-        "yes",                "yep",                  "yeah",
-        "ok",                 "okay",                 "sure",
-        "great",              "thanks",               "thank you",
-        "sounds good",        "looks good",           "do it",
-        "yes do it",          "yep do it",            "yeah do it",
-        "ok do it",           "okay do it",           "please do it",
-        "go ahead",           "make it so",           "continue",
-        "continue please",    "please continue",      "try again",
-        "retry",              "fix that",             "run tests",
-        "run the tests",      "commit it",            "commit this",
-        "commit that",        "commit these changes", "commit the changes",
-        "please commit it",   "ok commit it",         "okay commit it",
-        "can you commit it",  "commit it please",
+        "yes",               "yep",                  "yeah",
+        "ok",                "okay",                 "sure",
+        "great",             "thanks",               "thank you",
+        "sounds good",       "looks good",           "do it",
+        "yes do it",         "yep do it",            "yeah do it",
+        "ok do it",          "okay do it",           "please do it",
+        "go ahead",          "make it so",           "continue",
+        "continue please",   "please continue",      "try again",
+        "retry",             "fix that",             "run tests",
+        "run the tests",     "commit it",            "commit this",
+        "commit that",       "commit these changes", "commit the changes",
+        "please commit it",  "ok commit it",         "okay commit it",
+        "can you commit it", "commit it please",
     };
     for (generic) |candidate| {
         if (std.mem.eql(u8, normalized, candidate)) return true;
@@ -4749,4 +4774,26 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     daemon.unloadSession(11);
     const reloaded = (try daemon.getOrLoadSession(11)).?;
     try std.testing.expectEqual(approval.Mode.default, reloaded.approval_mode);
+}
+
+test "a disconnected requester cannot leave a delayed reboot armed" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var daemon: Daemon = undefined;
+    daemon.gpa = gpa;
+    daemon.io = threaded.io();
+    daemon.clients = .empty;
+    daemon.clients_mutex = .init;
+    defer daemon.clients.deinit(gpa);
+    daemon.sessions = .empty;
+    defer daemon.sessions.deinit(gpa);
+
+    daemon.pending_reboot = 41;
+    try daemon.handleEvent(.{ .client_gone = .{ .client_id = 7 } });
+    try std.testing.expectEqual(@as(?u64, 41), daemon.pending_reboot);
+
+    try daemon.handleEvent(.{ .client_gone = .{ .client_id = 41 } });
+    try std.testing.expectEqual(@as(?u64, null), daemon.pending_reboot);
 }

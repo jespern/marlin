@@ -79,8 +79,46 @@ pub fn search(
     return 0;
 }
 
+fn daemonDiagnostics(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, self_exe: []const u8, json: bool) !u8 {
+    const remote = environ.get(attach.remote_env);
+    const conn = if (remote != null)
+        try attach.connect(gpa, io, environ, self_exe)
+    else blk: {
+        const local = (try attach.tryConnect(gpa, io, environ)) orelse {
+            try eprint(io, "marlin: no daemon listening\n", .{});
+            return 1;
+        };
+        errdefer local.deinit();
+        try attach.handshake(local, 2_000, null);
+        break :blk local;
+    };
+    defer conn.deinit();
+    const identity = .{
+        .daemon_pid = conn.daemon_pid,
+        .daemon_exe = conn.daemonExe(),
+        .daemon_version = conn.daemonVersion(),
+        .daemon_started_at_ms = conn.daemon_started_at_ms,
+        .daemon_exe_mtime_ms = conn.daemon_exe_mtime_ms,
+        .client_exe = self_exe,
+        .remote = remote,
+    };
+    if (json) {
+        const encoded = try std.json.Stringify.valueAlloc(gpa, identity, .{});
+        defer gpa.free(encoded);
+        try print(io, "{s}\n", .{encoded});
+    } else {
+        try print(io, "daemon pid: {d}\nexecutable: {s}\nversion: {s}\nstarted (epoch ms): {d}\nbuild mtime (epoch ms): {d}\nclient: {s}\n", .{
+            identity.daemon_pid,           identity.daemon_exe,          identity.daemon_version,
+            identity.daemon_started_at_ms, identity.daemon_exe_mtime_ms, self_exe,
+        });
+        if (identity.daemon_pid == 0) try print(io, "daemon predates process identity reporting; PID/start time are unknown\n", .{});
+    }
+    return 0;
+}
+
 /// `marlin diagnostics [handle] [--json]` — durable local timing evidence.
-/// Without a handle, inspect the newest non-archived session.
+/// `--daemon` reports the connected process without requiring a session.
+/// Without either, inspect the newest non-archived session.
 pub fn diagnostics(
     gpa: std.mem.Allocator,
     io: Io,
@@ -89,16 +127,27 @@ pub fn diagnostics(
     args: []const [:0]const u8,
 ) !u8 {
     var json = false;
+    var daemon_only = false;
     var handle: ?[]const u8 = null;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
             json = true;
+        } else if (std.mem.eql(u8, arg, "--daemon")) {
+            daemon_only = true;
         } else if (handle == null) {
             handle = arg;
         } else {
-            try eprint(io, "usage: marlin diagnostics [session-handle] [--json]\n", .{});
+            try eprint(io, "usage: marlin diagnostics [session-handle | --daemon] [--json]\n", .{});
             return 2;
         }
+    }
+
+    if (daemon_only) {
+        if (handle != null) {
+            try eprint(io, "usage: marlin diagnostics [session-handle | --daemon] [--json]\n", .{});
+            return 2;
+        }
+        return daemonDiagnostics(gpa, io, environ, self_exe, json);
     }
 
     const conn = attach.connect(gpa, io, environ, self_exe) catch |err| {
@@ -896,12 +945,11 @@ pub fn shutdown(
         return 0;
     };
     defer conn.deinit();
-    try conn.send(.{ .hello = .{ .proto_version = proto.proto_version } });
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    _ = try conn.recvUntil(arena_state.allocator(), .hello_ok);
-    try conn.send(.{ .shutdown = .{} });
-    _ = conn.recvUntil(arena_state.allocator(), .ok) catch {};
+    try attach.handshake(conn, 2_000, null);
+    attach.requestStop(conn, .{ .shutdown = .{} }, 30_000) catch |err| {
+        try eprint(io, "marlin: shutdown not confirmed ({t}); daemon may still be stopping\n", .{err});
+        return 1;
+    };
     return 0;
 }
 
@@ -1217,23 +1265,19 @@ fn rebootLocalDaemon(
 ) !bool {
     const conn = (attach.tryConnect(gpa, io, environ) catch null) orelse return true;
     defer conn.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    try conn.send(.{ .hello = .{ .proto_version = proto.proto_version, .client_kind = "reboot" } });
-    _ = try conn.recvUntil(arena_state.allocator(), .hello_ok);
+    try attach.handshake(conn, 2_000, null);
     return requestReboot(gpa, io, conn, force);
 }
 
 fn requestReboot(gpa: std.mem.Allocator, io: Io, conn: *attach.Conn, force: bool) !bool {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    try conn.send(.{ .reboot = .{ .force = force } });
-    _ = conn.recvUntil(arena_state.allocator(), .ok) catch |err| {
-        if (err == error.DaemonError) {
-            try eprint(io, "marlin: reboot refused; daemon remains running\n", .{});
-            return false;
-        }
-        try eprint(io, "marlin: daemon did not ack reboot (crashed?) — proceeding\n", .{});
+    _ = gpa;
+    try eprint(io, "marlin: waiting for daemon {d} to quiesce and close (up to 120s)...\n", .{conn.daemon_pid});
+    attach.requestStop(conn, .{ .reboot = .{ .force = force } }, 120_000) catch |err| {
+        if (err == error.DaemonError)
+            try eprint(io, "marlin: reboot refused; daemon remains running\n", .{})
+        else
+            try eprint(io, "marlin: reboot not confirmed ({t}); client replacement aborted. Disconnect cancels a reboot still waiting for quiescence.\n", .{err});
+        return false;
     };
     return true;
 }
