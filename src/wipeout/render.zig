@@ -66,6 +66,18 @@ pub const Renderer = struct {
     height: u32,
     color: []Rgba,
     depth: []f32,
+    /// Per-pixel count of fragments that passed coverage and depth, before
+    /// the alpha discard. Diagnostic only; lets a crack detector tell "no
+    /// triangle here" from "triangle here but its texel was transparent".
+    covered: []u8,
+    /// Diagnostic: which mesh last wrote each pixel (see `draw_id`).
+    owner: []u16,
+    /// Diagnostic tag callers set before submitting a mesh; recorded into
+    /// `owner` on every depth write.
+    draw_id: u16 = 0,
+    /// Diagnostic: when set, every triangle whose bounding box touches this
+    /// pixel prints its edge values there and whether the pixel was accepted.
+    debug_pixel: ?[2]u32 = null,
 
     textures: [textures_max]Texture = undefined,
     textures_len: u16 = 0,
@@ -76,7 +88,6 @@ pub const Renderer = struct {
     view: Mat4 = Mat4.identity,
     view_projection: Mat4 = Mat4.identity,
     model: Mat4 = Mat4.identity,
-    mvp: Mat4 = Mat4.identity,
     sprite_mat: Mat4 = Mat4.identity,
     camera_pos: Vec3 = Vec3.zero,
     fade_enabled: bool = true,
@@ -86,6 +97,12 @@ pub const Renderer = struct {
     depth_offset: f32 = 0,
     cull_backface: bool = true,
     blend: BlendMode = .normal,
+    /// Grow every triangle outwards by this many 1/16-pixel units. Scenery
+    /// and track meshes in the data abut with sub-pixel gaps rather than
+    /// sharing vertices; point sampling leaves single sky-coloured pixels in
+    /// those slivers, and a small dilation closes them while the depth test
+    /// resolves the resulting overlap. Zero gives exact point sampling.
+    edge_dilation: i64 = default_edge_dilation,
 
     stats: Stats = .{},
 
@@ -95,6 +112,10 @@ pub const Renderer = struct {
         errdefer gpa.free(color);
         const depth = try gpa.alloc(f32, pixel_count);
         errdefer gpa.free(depth);
+        const covered = try gpa.alloc(u8, pixel_count);
+        errdefer gpa.free(covered);
+        const owner = try gpa.alloc(u16, pixel_count);
+        errdefer gpa.free(owner);
 
         var self = Renderer{
             .gpa = gpa,
@@ -102,6 +123,8 @@ pub const Renderer = struct {
             .height = height,
             .color = color,
             .depth = depth,
+            .covered = covered,
+            .owner = owner,
         };
         self.setScreenSize(width, height);
         const grey = [_]Rgba{Rgba.white} ** 4;
@@ -114,6 +137,8 @@ pub const Renderer = struct {
         while (i < self.textures_len) : (i += 1) self.gpa.free(self.textures[i].pixels);
         self.gpa.free(self.color);
         self.gpa.free(self.depth);
+        self.gpa.free(self.covered);
+        self.gpa.free(self.owner);
     }
 
     fn setScreenSize(self: *Renderer, width: u32, height: u32) void {
@@ -147,6 +172,8 @@ pub const Renderer = struct {
     pub fn framePrepare(self: *Renderer) void {
         @memset(self.color, Rgba.init(0, 0, 0, 255));
         @memset(self.depth, 1.0);
+        @memset(self.covered, 0);
+        @memset(self.owner, 0xffff);
         self.stats = .{};
     }
 
@@ -177,7 +204,6 @@ pub const Renderer = struct {
 
     pub fn setModelMat(self: *Renderer, m: *const Mat4) void {
         self.model = m.*;
-        self.mvp = self.view_projection.mul(&self.model);
     }
 
     pub fn setDepthWrite(self: *Renderer, enabled: bool) void {
@@ -203,10 +229,9 @@ pub const Renderer = struct {
 
     // -- geometry submission -------------------------------------------------
 
-    fn vertexColor(self: *const Renderer, v: Vertex) Vec4 {
+    fn vertexColor(self: *const Renderer, v: Vertex, world: Vec3) Vec4 {
         var alpha = @as(f32, @floatFromInt(v.color.a)) / 255.0;
         if (self.fade_enabled) {
-            const world = v.pos.transform(&self.model);
             const dist = world.sub(self.camera_pos).len();
             alpha *= math.smoothstep(fadeout_far, fadeout_near, dist);
         }
@@ -220,12 +245,20 @@ pub const Renderer = struct {
 
     pub fn pushTris(self: *Renderer, tris: Tris, texture_index: u16) void {
         const texture = &self.textures[texture_index];
+        // Transform to world space first, then apply view-projection, as the
+        // original's vertex shader does. The asset data is integer-valued,
+        // so a boundary vertex shared by two meshes with different model
+        // matrices lands on the identical world position and therefore the
+        // identical clip position in both. Folding the model matrix into a
+        // combined MVP first would round differently per mesh and open
+        // 1/16-pixel cracks along every seam between abutting objects.
         var in: [3]ClipVert = undefined;
         for (tris.vertices, 0..) |v, i| {
+            const world = v.pos.transform(&self.model);
             in[i] = .{
-                .pos = v.pos.transformPerspective(&self.mvp),
+                .pos = world.transformPerspective(&self.view_projection),
                 .uv = v.uv,
-                .color = self.vertexColor(v),
+                .color = self.vertexColor(v, world),
             };
         }
 
@@ -321,6 +354,7 @@ pub const Renderer = struct {
 
     /// Sub-pixel precision of the fixed-point edge functions (1/16 pixel).
     const subpixel_bits = 4;
+    pub const default_edge_dilation: i64 = 2;
     const subpixel: f32 = 1 << subpixel_bits;
     /// Guard band: screen coordinates beyond this are clamped before the
     /// fixed-point conversion so products stay far inside i64.
@@ -358,10 +392,11 @@ pub const Renderer = struct {
 
         const fw: i64 = @intCast(self.width);
         const fh: i64 = @intCast(self.height);
-        const min_x: i64 = @max(@divFloor(@min(ax, @min(bx, cx)), 1 << subpixel_bits), 0);
-        const max_x: i64 = @min(@divFloor(@max(ax, @max(bx, cx)), 1 << subpixel_bits), fw - 1);
-        const min_y: i64 = @max(@divFloor(@min(ay, @min(by, cy)), 1 << subpixel_bits), 0);
-        const max_y: i64 = @min(@divFloor(@max(ay, @max(by, cy)), 1 << subpixel_bits), fh - 1);
+        const grow = self.edge_dilation;
+        const min_x: i64 = @max(@divFloor(@min(ax, @min(bx, cx)) - grow, 1 << subpixel_bits), 0);
+        const max_x: i64 = @min(@divFloor(@max(ax, @max(bx, cx)) + grow, 1 << subpixel_bits), fw - 1);
+        const min_y: i64 = @max(@divFloor(@min(ay, @min(by, cy)) - grow, 1 << subpixel_bits), 0);
+        const max_y: i64 = @min(@divFloor(@max(ay, @max(by, cy)) + grow, 1 << subpixel_bits), fh - 1);
         if (min_x > max_x or min_y > max_y) return;
 
         self.stats.tris += 1;
@@ -376,11 +411,30 @@ pub const Renderer = struct {
         const e1_dy = -(ax - cx);
         const e2_dx = by - ay;
         const e2_dy = -(bx - ax);
-        const bias0: i64 = if (isTopLeft(bx, by, cx, cy)) 0 else -1;
-        const bias1: i64 = if (isTopLeft(cx, cy, ax, ay)) 0 else -1;
-        const bias2: i64 = if (isTopLeft(ax, ay, bx, by)) 0 else -1;
+        // Edge values are distance × edge length, so a dilation in pixels
+        // becomes dilation × length in edge units.
+        const dilation = self.edge_dilation;
+        const bias0: i64 = (if (isTopLeft(bx, by, cx, cy)) @as(i64, 0) else -1) + dilation * edgeLength(bx, by, cx, cy);
+        const bias1: i64 = (if (isTopLeft(cx, cy, ax, ay)) @as(i64, 0) else -1) + dilation * edgeLength(cx, cy, ax, ay);
+        const bias2: i64 = (if (isTopLeft(ax, ay, bx, by)) @as(i64, 0) else -1) + dilation * edgeLength(ax, ay, bx, by);
 
         const half: i64 = 1 << (subpixel_bits - 1);
+        if (self.debug_pixel) |dp| {
+            const dx: i64 = dp[0];
+            const dy: i64 = dp[1];
+            if (dx >= min_x and dx <= max_x and dy >= min_y and dy <= max_y) {
+                const sx = (dx << subpixel_bits) + half;
+                const sy = (dy << subpixel_bits) + half;
+                const d0 = (sx - bx) * e0_dx + (sy - by) * e0_dy;
+                const d1 = (sx - cx) * e1_dx + (sy - cy) * e1_dy;
+                const d2 = (sx - ax) * e2_dx + (sy - ay) * e2_dy;
+                const inside = (d0 + bias0) >= 0 and (d1 + bias1) >= 0 and (d2 + bias2) >= 0;
+                std.debug.print(
+                    "  mesh {d}: edges {d} {d} {d} (bias {d} {d} {d}) area2 {d} inside={} verts ({d:.2},{d:.2}) ({d:.2},{d:.2}) ({d:.2},{d:.2}) z {d:.5} {d:.5} {d:.5}\n",
+                    .{ self.draw_id, d0, d1, d2, bias0, bias1, bias2, -doubled, inside, a.x, a.y, b.x, b.y, c.x, c.y, a.z, b.z, c.z },
+                );
+            }
+        }
         const px0 = (min_x << subpixel_bits) + half;
         const py0 = (min_y << subpixel_bits) + half;
         var e0_row = (px0 - bx) * e0_dx + (py0 - by) * e0_dy;
@@ -415,6 +469,12 @@ pub const Renderer = struct {
         }
     }
 
+    fn edgeLength(x0: i64, y0: i64, x1: i64, y1: i64) i64 {
+        const dx: f64 = @floatFromInt(x1 - x0);
+        const dy: f64 = @floatFromInt(y1 - y0);
+        return @intFromFloat(@ceil(@sqrt(dx * dx + dy * dy)));
+    }
+
     fn toFixed(v: f32) i64 {
         const clamped = std.math.clamp(v, -guard_band, guard_band);
         return @intFromFloat(@round(clamped * subpixel));
@@ -447,11 +507,15 @@ pub const Renderer = struct {
         const index = @as(usize, y) * self.width + x;
         const z = a.z * l0 + b.z * l1 + c.z * l2;
         const depth = math.clamp01(z * 0.5 + depth_bias);
+        if (self.debug_pixel) |dp| {
+            if (dp[0] == x and dp[1] == y) std.debug.print("    shade mesh {d}: depth {d:.6} vs buffer {d:.6} -> {s}\n", .{ self.draw_id, depth, self.depth[index], if (self.depth_test and depth >= self.depth[index]) "REJECT" else "pass" });
+        }
         if (self.depth_test and depth >= self.depth[index]) return;
 
         const q = a.q * l0 + b.q * l1 + c.q * l2;
         if (q <= 1e-9) return;
         const iq = 1.0 / q;
+        if (self.depth_write) self.covered[index] +|= 1;
 
         const u = (a.uv_q.x * l0 + b.uv_q.x * l1 + c.uv_q.x * l2) * iq;
         const v = (a.uv_q.y * l0 + b.uv_q.y * l1 + c.uv_q.y * l2) * iq;
@@ -497,7 +561,10 @@ pub const Renderer = struct {
             @intFromFloat(out_b * 255.0 + 0.5),
             255,
         );
-        if (self.depth_write) self.depth[index] = depth;
+        if (self.depth_write) {
+            self.depth[index] = depth;
+            self.owner[index] = self.draw_id;
+        }
         self.stats.pixels += 1;
     }
 };

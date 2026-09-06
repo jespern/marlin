@@ -16,6 +16,7 @@ const Rgba = math.Rgba;
 const Tris = math.Tris;
 
 pub const track_version: i16 = 8;
+pub const section_cull_behind: f32 = 6144;
 pub const none: i32 = -1;
 
 pub const FaceFlags = struct {
@@ -93,13 +94,21 @@ pub const Track = struct {
     }
 
     /// Draw every section in front of the camera and within fade distance.
+    /// Diagnostic owner tag used for every track face.
+    pub const draw_id: u16 = 0xfffe;
+
     pub fn draw(self: *const Track, r: *render.Renderer, cam_pos: Vec3, cam_dir: Vec3) void {
         r.setModelMat(&math.Mat4.identity);
+        r.draw_id = draw_id;
         for (self.sections) |*s| {
             const diff = cam_pos.sub(s.center);
             const cam_dot = diff.dot(cam_dir);
             const dist_sq = diff.dot(diff);
-            if (cam_dot < 2048 and dist_sq < render.fadeout_far * render.fadeout_far) {
+            // The original culls sections whose centre is more than 2048
+            // units behind the camera plane; with a camera that rides higher
+            // than the ship's, faces of the section underneath still reach
+            // into view, so allow a few sections more.
+            if (cam_dot < section_cull_behind and dist_sq < render.fadeout_far * render.fadeout_far) {
                 self.drawSection(r, s);
             }
         }

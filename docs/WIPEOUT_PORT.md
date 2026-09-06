@@ -90,6 +90,39 @@ fill rule, so an edge shared by two triangles is owned by exactly one of
 them and meshes are watertight: no dotted seams where hill faces meet and
 no double-blended pixels on shared edges of translucent geometry.
 
+Scenery and track are drawn with back-face culling off and ships with it
+on, as in the original race loop; the scenery winding is not consistent.
+Vertices go to world space first and then through view-projection, in the
+shader's order, rather than through a pre-multiplied MVP.
+
+### Seams between meshes
+
+The scenery objects and the track do not share boundary vertices; they abut
+with sub-pixel gaps (measured about 0.06 px at typical distances). Exact
+point sampling therefore leaves isolated sky-coloured pixels along hill and
+track boundaries, which at 240p scaled to a window read as fat blue dots.
+The renderer dilates every triangle by `edge_dilation` sixteenths of a
+pixel and lets the depth test resolve the overlap. Over a 6000-frame lap of
+track01 at 60 fps:
+
+| Dilation | Pixels covered by no triangle | Transparent-texel discards |
+|---|---|---|
+| 0 | 23,260 | 7,675 |
+| 1/16 px | 1,820 | 7,222 |
+| 2/16 px (default) | 1,534 | 7,193 |
+| 4/16 px | 1,479 | 7,190 |
+
+The discards are texels whose PSX colour is 0x0000, which the format
+defines as transparent; the original shader drops them identically. Render
+cost is unchanged.
+
+Diagnostics for this live in the probe: `--scan-cracks DIR` flies a lap
+headless and dumps the frames with the most uncovered pixels together with
+their coordinates and the mesh ids on either side; `--probe-pixel X,Y` with
+`--snapshot` prints every triangle touching one pixel with its edge
+distances and depth-test outcome. Boost pads are tinted blue by the game
+data itself and are not holes.
+
 Not yet ported: the CRT post effect, 2D HUD text, additive-blend particles
 (the blend mode exists, nothing uses it), and mipmaps (unneeded at 240p).
 

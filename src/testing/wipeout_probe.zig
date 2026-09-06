@@ -35,6 +35,13 @@ pub const Options = struct {
     raw: bool = false,
     snapshot: ?[]const u8 = null,
     frame: u32 = 0,
+    /// Headless: fly for --seconds, write the frames with the most uncovered
+    /// pixels into this directory as PPM plus a coordinate list.
+    scan_cracks: ?[]const u8 = null,
+    /// With --snapshot: print rasterizer decisions for this pixel ("x,y").
+    probe_pixel: ?[2]u32 = null,
+    /// Triangle edge dilation in 1/16 px (renderer default when unset).
+    dilation: ?i64 = null,
     assets: ?[]const u8 = null,
     /// Camera speed along the centre line, in world units per second.
     speed: f32 = 6000,
@@ -157,7 +164,7 @@ pub fn main(init: std.process.Init) !u8 {
         return if (err == error.HelpRequested) 0 else 2;
     };
 
-    const live = !options.dry_run and options.snapshot == null;
+    const live = !options.dry_run and options.snapshot == null and options.scan_cracks == null;
     if (live and !(Io.File.stdout().isTty(init.io) catch false)) {
         stderrPrint(init.io, "wipeout-probe: stdout is not a terminal; use --dry-run or --snapshot\n", .{});
         return 2;
@@ -218,6 +225,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
 
     var renderer = try wipeout.render.Renderer.init(gpa, options.width, options.height);
     defer renderer.deinit();
+    if (options.dilation) |d| renderer.edge_dilation = d;
 
     const load_start = now(io);
     var track = try wipeout.track.load(gpa, &assets, &renderer, dir);
@@ -251,10 +259,17 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     var camera = FlyCamera{};
     const units_per_frame = options.speed / @as(f32, @floatFromInt(options.fps));
 
+    if (options.scan_cracks) |dir_out| {
+        try scanCracks(io, &renderer, &track, &scene, &camera, options, units_per_frame, rgb, dir_out);
+        return;
+    }
+
     if (options.snapshot) |path| {
         var i: u32 = 0;
         while (i <= options.frame) : (i += 1) camera.advance(&track, units_per_frame, options.height_above, options.look_ahead);
+        renderer.debug_pixel = options.probe_pixel;
         renderFrame(&renderer, &track, &scene, &camera);
+        renderer.debug_pixel = null;
         renderer.writeRgb(rgb);
         try writePpm(io, path, options.width, options.height, rgb);
         stderrPrint(io, "wrote {s} (frame {d}, {d} tris, {d} pixels shaded, camera section {d}, {d} crack pixels)\n", .{
@@ -414,8 +429,13 @@ fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.T
     renderer.framePrepare();
     renderer.setView(camera.position, camera.angle);
     const forward = wipeout.cameraForward(camera.angle);
+    // As in the original race loop: scenery and track are drawn with
+    // back-face culling off (their winding is not consistent), ships and
+    // effects with it on.
+    renderer.setCullBackface(false);
     scene.draw(renderer, camera.position, forward);
     track.draw(renderer, camera.position, forward);
+    renderer.setCullBackface(true);
 }
 
 /// Pixels never written by opaque geometry (depth still at the clear value)
@@ -423,6 +443,15 @@ fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.T
 /// adjacent triangles. Sky is drawn without depth writes, so genuine sky
 /// shows as large connected regions and does not trip this.
 fn countCracks(renderer: *const wipeout.render.Renderer) u32 {
+    return collectCracks(renderer, null);
+}
+
+/// Pixels never written by opaque geometry (depth still at the clear value)
+/// whose four neighbours all were: the signature of a crack between
+/// adjacent triangles. Sky is drawn without depth writes, so genuine sky
+/// shows as large connected regions and does not trip this. Coordinates go
+/// into `out` (x, y pairs) when provided.
+fn collectCracks(renderer: *const wipeout.render.Renderer, out: ?*std.ArrayList([3]u32)) u32 {
     const w = renderer.width;
     const h = renderer.height;
     var count: u32 = 0;
@@ -435,12 +464,124 @@ fn countCracks(renderer: *const wipeout.render.Renderer) u32 {
             if (renderer.depth[i - 1] < 1.0 and renderer.depth[i + 1] < 1.0 and
                 renderer.depth[i - w] < 1.0 and renderer.depth[i + w] < 1.0)
             {
-                if (count < 12) std.debug.print("crack at {d},{d}\n", .{ x, y });
                 count += 1;
+                // Third component: 0 = no triangle covered this pixel (a real
+                // crack), 1 = covered but discarded as a transparent texel.
+                const kind: u32 = if (renderer.covered[i] == 0) 0 else 1;
+                if (out) |list| list.appendBounded(.{ x, y, kind }) catch {};
             }
         }
     }
     return count;
+}
+
+const ScanHit = struct { frame: u32, count: u32, section: u32 };
+
+fn scanCracks(
+    io: Io,
+    renderer: *wipeout.render.Renderer,
+    track: *const wipeout.track.Track,
+    scene: *wipeout.scene.Scene,
+    camera: *FlyCamera,
+    options: Options,
+    units_per_frame: f32,
+    rgb: []u8,
+    dir_out: []const u8,
+) !void {
+    Io.Dir.cwd().createDirPath(io, dir_out) catch {};
+    const total_frames = @as(u32, options.fps) * options.seconds;
+    var coords_buf: [512][3]u32 = undefined;
+    var coords = std.ArrayList([3]u32).initBuffer(&coords_buf);
+    var worst = [_]ScanHit{.{ .frame = 0, .count = 0, .section = 0 }} ** 4;
+    // Owner pairs (left/right, then top/bottom) around uncovered pixels:
+    // same-mesh pairs point at a rasterizer or data-tessellation problem,
+    // cross-mesh pairs at meshes that merely abut in the data.
+    var same_mesh: u64 = 0;
+    var track_vs_scene: u64 = 0;
+    var scene_vs_scene: u64 = 0;
+    var other_pair: u64 = 0;
+    var total_cracks: u64 = 0;
+    var true_cracks: u64 = 0;
+    var discards: u64 = 0;
+    var frames_with_cracks: u32 = 0;
+
+    var frame: u32 = 0;
+    while (frame < total_frames) : (frame += 1) {
+        camera.advance(track, units_per_frame, options.height_above, options.look_ahead);
+        renderFrame(renderer, track, scene, camera);
+        coords.clearRetainingCapacity();
+        const count = collectCracks(renderer, &coords);
+        total_cracks += count;
+        for (coords.items) |c| {
+            if (c[2] == 0) true_cracks += 1 else discards += 1;
+            if (c[2] != 0) continue;
+            const w = renderer.width;
+            const i = c[1] * w + c[0];
+            const pairs = [2][2]u16{
+                .{ renderer.owner[i - 1], renderer.owner[i + 1] },
+                .{ renderer.owner[i - w], renderer.owner[i + w] },
+            };
+            for (pairs) |pair| {
+                const a = pair[0];
+                const b = pair[1];
+                if (a == b) {
+                    same_mesh += 1;
+                } else if ((a == wipeout.track.Track.draw_id) != (b == wipeout.track.Track.draw_id)) {
+                    track_vs_scene += 1;
+                } else if (a < 0xfff0 and b < 0xfff0) {
+                    scene_vs_scene += 1;
+                } else {
+                    other_pair += 1;
+                }
+            }
+        }
+        if (count > 0) frames_with_cracks += 1;
+
+        // Keep the four worst frames; write each as soon as it qualifies.
+        var slot: ?usize = null;
+        var min_count: u32 = std.math.maxInt(u32);
+        for (worst, 0..) |hit, i| {
+            if (hit.count < min_count) {
+                min_count = hit.count;
+                slot = i;
+            }
+        }
+        if (count > min_count and slot != null) {
+            worst[slot.?] = .{ .frame = frame, .count = count, .section = camera.section };
+            var name_buf: [64]u8 = undefined;
+            const ppm = try std.fmt.bufPrint(&name_buf, "slot{d}.ppm", .{slot.?});
+            const ppm_path = try std.fs.path.join(renderer.gpa, &.{ dir_out, ppm });
+            defer renderer.gpa.free(ppm_path);
+            renderer.writeRgb(rgb);
+            try writePpm(io, ppm_path, options.width, options.height, rgb);
+
+            var txt_buf: [64]u8 = undefined;
+            const txt = try std.fmt.bufPrint(&txt_buf, "slot{d}.txt", .{slot.?});
+            const txt_path = try std.fs.path.join(renderer.gpa, &.{ dir_out, txt });
+            defer renderer.gpa.free(txt_path);
+            const file = try Io.Dir.cwd().createFile(io, txt_path, .{ .truncate = true });
+            defer file.close(io);
+            var buffer: [8192]u8 = undefined;
+            var writer: Io.File.Writer = .init(file, io, &buffer);
+            try writer.interface.print("frame {d} section {d} count {d}\n", .{ frame, camera.section, count });
+            for (coords.items) |c| {
+                const w = renderer.width;
+                const i = c[1] * w + c[0];
+                try writer.interface.print("{d},{d},{d} owners l{d} r{d} t{d} b{d}\n", .{
+                    c[0],                  c[1],                  c[2],
+                    renderer.owner[i - 1], renderer.owner[i + 1], renderer.owner[i - w],
+                    renderer.owner[i + w],
+                });
+            }
+            try writer.interface.flush();
+        }
+    }
+
+    stderrPrint(io, "scanned {d} frames: {d} with uncovered pixels, {d} total ({d} uncovered by any triangle, {d} transparent-texel discards)\n", .{ total_frames, frames_with_cracks, total_cracks, true_cracks, discards });
+    stderrPrint(io, "  neighbour owners around uncovered pixels: same mesh {d}, track/scenery {d}, scenery/scenery {d}, other {d}\n", .{ same_mesh, track_vs_scene, scene_vs_scene, other_pair });
+    for (worst, 0..) |hit, i| {
+        if (hit.count > 0) stderrPrint(io, "  slot{d}: frame {d} section {d} count {d}\n", .{ i, hit.frame, hit.section, hit.count });
+    }
 }
 
 fn writePpm(io: Io, path: []const u8, width: u32, height: u32, rgb: []const u8) !void {
@@ -578,6 +719,19 @@ fn parseArgs(args: []const []const u8) !Options {
             options.frame = try nextUnsigned(u32, args, &index);
         } else if (std.mem.eql(u8, arg, "--snapshot")) {
             options.snapshot = try nextString(args, &index);
+        } else if (std.mem.eql(u8, arg, "--probe-pixel")) {
+            const text = try nextString(args, &index);
+            const comma = std.mem.indexOfScalar(u8, text, ',') orelse return error.InvalidValue;
+            options.probe_pixel = .{
+                try std.fmt.parseUnsigned(u32, text[0..comma], 10),
+                try std.fmt.parseUnsigned(u32, text[comma + 1 ..], 10),
+            };
+        } else if (std.mem.eql(u8, arg, "--dilation")) {
+            index += 1;
+            if (index >= args.len) return error.MissingValue;
+            options.dilation = try std.fmt.parseInt(i64, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--scan-cracks")) {
+            options.scan_cracks = try nextString(args, &index);
         } else if (std.mem.eql(u8, arg, "--assets")) {
             options.assets = try nextString(args, &index);
         } else if (std.mem.eql(u8, arg, "--speed")) {
@@ -632,6 +786,9 @@ fn usage(io: Io) void {
         \\  --dry-run          render, compress, and encode without Kitty output
         \\  --snapshot FILE    write one frame as PPM and exit (see --frame)
         \\  --frame N          which frame --snapshot captures (default 0)
+        \\  --scan-cracks DIR  headless lap scan; dump the frames with most uncovered pixels
+        \\  --dilation N       triangle edge dilation in 1/16 px (default 2; 0 = exact)
+        \\  --probe-pixel X,Y  with --snapshot: print rasterizer decisions for one pixel
         \\  --raw              disable zlib compression
         \\
     , .{});

@@ -27,7 +27,8 @@ pub const Scene = struct {
         }
         r.setDepthWrite(true);
 
-        for (self.objects) |*obj| {
+        for (self.objects, 0..) |*obj, index| {
+            r.draw_id = @intCast(index);
             const diff = cam_pos.sub(obj.origin);
             const cam_dot = diff.dot(cam_dir);
             const dist_sq = diff.dot(diff);
