@@ -129,11 +129,27 @@ const statusCwd = tui.statusCwd;
 const statusModel = tui.statusModel;
 const tabMouseAction = tui.tabMouseAction;
 const tabNavigationDirection = tui.tabNavigationDirection;
+const terminalTitle = tui.terminalTitle;
 const transient_animation_frames = tui.transient_animation_frames;
 const validCatalogRate = tui.validCatalogRate;
 
 test {
     std.testing.refAllDecls(tui);
+}
+
+test "terminal title follows focused project and running spinner" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("marlin", terminalTitle(&buf, "", .idle, 0));
+    try std.testing.expectEqualStrings("marlin", terminalTitle(&buf, "/", .idle, 0));
+    try std.testing.expectEqualStrings("alpha", terminalTitle(&buf, "/work/alpha", .idle, 0));
+    try std.testing.expectEqualStrings("alpha", terminalTitle(&buf, "/work/alpha/", .awaiting_approval, 4));
+
+    const running = terminalTitle(&buf, "/work/beta", .running, 3);
+    try std.testing.expectEqualStrings(spinner_frames[3] ++ " beta", running);
+    try std.testing.expectEqualStrings(
+        spinner_frames[4] ++ " beta",
+        terminalTitle(&buf, "/work/beta", .running, 4),
+    );
 }
 
 test "command input: / and ! lead, a leading space sends verbatim" {

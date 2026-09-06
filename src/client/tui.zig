@@ -480,6 +480,9 @@ pub const App = struct {
     /// Click targets from the most recently rendered tab strip. The entries
     /// contain no behavior, leaving room for button-specific actions later.
     tab_hits: std.ArrayList(TabHit) = .empty,
+    /// Last OSC 2 title sent, avoiding redundant terminal writes between
+    /// state changes and animation frames.
+    terminal_title: std.ArrayList(u8) = .empty,
     /// Text ready for the event loop to send through OSC52. Blob responses
     /// arrive in the daemon reader path, where the terminal writer is not
     /// available, so `!c` stages the bytes here for the next frame.
@@ -599,6 +602,7 @@ pub const App = struct {
         if (self.effect_engine) |*engine| engine.deinit();
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
+        self.terminal_title.deinit(self.gpa);
         self.pending_new_cwd.deinit(self.gpa);
         self.shell_command.deinit(self.gpa);
         self.clipboard_pending.deinit(self.gpa);
@@ -3844,6 +3848,38 @@ pub fn rootTabSidAtIndex(sessions: []const SessionSummary, index: usize) ?u64 {
     return null;
 }
 
+pub fn terminalTitle(buf: []u8, cwd: []const u8, state: proto.SessionState, spinner_frame: usize) []const u8 {
+    const project = std.fs.path.basename(cwd);
+    const name = if (project.len > 0) project else "marlin";
+    var len: usize = 0;
+    if (state == .running) {
+        const spinner = spinner_frames[spinner_frame % spinner_frames.len];
+        const prefix_len = @min(spinner.len, buf.len);
+        @memcpy(buf[0..prefix_len], spinner[0..prefix_len]);
+        len = prefix_len;
+        if (len < buf.len) {
+            buf[len] = ' ';
+            len += 1;
+        }
+    }
+    for (name) |byte| {
+        if (len == buf.len) break;
+        if (byte < 0x20 or byte == 0x7f) continue;
+        buf[len] = byte;
+        len += 1;
+    }
+    return buf[0..len];
+}
+
+pub fn updateTerminalTitle(app: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) !void {
+    var buf: [512]u8 = undefined;
+    const title = terminalTitle(&buf, app.view.cwd.items, app.view.state, app.view.spinner_frame);
+    if (std.mem.eql(u8, title, app.terminal_title.items)) return;
+    try vx.setTitle(writer, title);
+    app.terminal_title.clearRetainingCapacity();
+    try app.terminal_title.appendSlice(app.gpa, title);
+}
+
 fn tabLabel(app: *const App, summary: ?*const SessionSummary) []const u8 {
     const identity = if (summary) |session|
         if (session.title.len > 0)
@@ -5649,6 +5685,9 @@ pub fn run(
         defer loop.stop();
 
         try vx.enterAltScreen(writer);
+        defer {
+            vx.setTitle(writer, "") catch {};
+        }
         try writer.flush();
         try vx.queryTerminal(tty.writer(), .fromSeconds(1));
         app.voice_rt.kitty_release = vx.caps.kitty_keyboard;
@@ -5702,6 +5741,7 @@ pub fn run(
             var frame_arena = std.heap.ArenaAllocator.init(gpa);
             defer frame_arena.deinit();
             app.pumpPixelEffect(&vx, writer);
+            try updateTerminalTitle(&app, &vx, writer);
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
             if (app.bell_pending) {
@@ -5822,6 +5862,7 @@ pub fn run(
             }
 
             app.pumpPixelEffect(&vx, writer);
+            try updateTerminalTitle(&app, &vx, writer);
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
             if (app.bell_pending) {
