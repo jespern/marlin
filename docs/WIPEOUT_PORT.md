@@ -6,8 +6,9 @@ software rasterizer at 320x240, shipped over the Kitty graphics protocol by a
 standalone probe. A single player ship flies with the original's physics,
 track collision, jump handling and rescue, under keyboard control or a
 simple autopilot, and a replay harness shows the trajectory matches the
-reference build to within 0.01 units over a full lap. No opponents,
-weapons, HUD, audio, or snapshots yet.
+reference build to within 0.01 units over a full lap. The game runs inside
+the marlin client as `!wipeout`, pausing on Escape and resuming where it
+left off. No opponents, weapons, HUD, audio, or on-disk snapshots yet.
 
 ## Goals
 
@@ -42,6 +43,7 @@ weapons, HUD, audio, or snapshots yet.
 | `src/wipeout/ship.zig` | Ship state, player flight model, track collision, jump and rescue, models and shadow |
 | `src/wipeout/camera.zig` | External chase camera and cockpit view |
 | `src/wipeout/root.zig` | Module root, camera angle helpers |
+| `src/client/wipeout_effect.zig` | The game inside marlin: owns the race, steps on wall time, renders for the pixel effect, maps keys |
 | `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots |
 
 Build steps: `zig build wipeout-test` (unit tests) and `zig build`, which
@@ -248,6 +250,31 @@ was on. The residual is the difference between Apple's libm and Zig's
 sine, cosine and arc-cosine, one ulp per call, and it does not compound
 into different decisions over the run.
 
+## Inside marlin
+
+`!wipeout [track 1-14] [pilot 0-7] [rapier|venom] [nointro]` loads the
+circuit and shows it as a pixel effect. While it is up the client is in
+game mode: every key press and release goes to the ship (the same bindings
+as the probe) and Escape or Ctrl-C pauses the game and hands the terminal
+back. `!wipeout` again resumes the same race; a different track or pilot
+starts a new one. The race object is owned by the App, not by the effect
+engine, so running another screensaver in between does not lose it, and
+the effect engine keeps state alive when hidden as marlin's other pixel
+effects already do.
+
+Integration points, all in the client:
+
+- `visual_effect.Kind.wipeout`: a manual-only pixel kind whose fallback on
+  a terminal without Kitty graphics is refused with a notice.
+- `pixel_effects.Engine`: a borrowed `wipeout_game` pointer, a fixed
+  320x240 framebuffer, and a draw that letterboxes the image into the
+  largest centered 4:3 cell rectangle instead of stretching it.
+- `tui.App`: `game_mode` gates key routing ahead of the screensaver
+  dismissal in `dispatchEvent`; `game_active` selects a 16 ms tier in the
+  animation thread. The game steps on wall time in fixed 1/60 s steps, at
+  most four per tick, so ticker jitter changes smoothness, not speed.
+- `commands.zig`: the `!wipeout` entry and its argument parsing.
+
 ## Snapshots
 
 ```
@@ -259,8 +286,7 @@ renderer was verified without a live session.
 
 ## Next slices
 
-1. Modal game input in the client (Kitty key press/release), and the game
-   as a pixel effect engine so pausing keeps state alive.
-2. Snapshot/restore with a version tag and asset hash.
-3. HUD, menus, AI opponents, weapons, particles.
-4. CRT post pass and first-run asset download.
+1. Snapshot/restore with a version tag and asset hash, so a race survives
+   a marlin restart.
+2. HUD, menus, AI opponents, weapons, particles.
+3. CRT post pass and first-run asset download.

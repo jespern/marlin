@@ -19,6 +19,8 @@ pub const Kind = enum {
     horizon,
     demo,
     shadowbox,
+    /// wipEout: a playable game, not a screensaver. Manual only.
+    wipeout,
 
     pub fn parse(value: []const u8) ?Kind {
         inline for (std.meta.fields(Kind)) |field| {
@@ -44,6 +46,7 @@ pub const Kind = enum {
             .horizon => "synthwave horizon (Kitty graphics)",
             .demo => "24-second pixel demoscene sequence (Kitty graphics)",
             .shadowbox => "shadow-box landscape that follows your clock (after Jani Ylikangas' js1k entry; Kitty graphics)",
+            .wipeout => "wipEout, playable (Kitty graphics; start with !wipeout)",
         };
     }
 
@@ -51,7 +54,7 @@ pub const Kind = enum {
     pub fn backend(self: Kind) Backend {
         return switch (self) {
             .matrix, .strings, .stars, .plasma => .cell,
-            .tetris, .pacman, .tunnel, .metaballs, .horizon, .demo, .shadowbox => .pixel,
+            .tetris, .pacman, .tunnel, .metaballs, .horizon, .demo, .shadowbox, .wipeout => .pixel,
         };
     }
 
@@ -69,7 +72,7 @@ pub const Kind = enum {
     /// Manual-only effects may be named by `/animate` or `/screensaver`, but
     /// cannot become the idle timer or bare `gs` default.
     pub fn configurable(self: Kind) bool {
-        return self != .tetris;
+        return self != .tetris and self != .wipeout;
     }
 
     /// What to run on cells when a pixel effect is requested on a terminal
@@ -79,7 +82,7 @@ pub const Kind = enum {
         return switch (self) {
             .tunnel, .demo => .plasma,
             .metaballs => .plasma,
-            .horizon, .shadowbox => .stars,
+            .horizon, .shadowbox, .wipeout => .stars,
             else => self,
         };
     }

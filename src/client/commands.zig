@@ -60,6 +60,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
+    .{ .name = "!wipeout", .usage = " [track 1-14] [pilot 0-7] [rapier]", .description = "play wipEout (Esc pauses and returns; !wipeout resumes)", .accepts_args = true },
 };
 
 pub const CommandSuggestion = struct {
@@ -104,7 +105,8 @@ pub fn commandQuery(editor: *const Editor) ?[]const u8 {
             !std.mem.eql(u8, head, "/animate") and
             !std.mem.eql(u8, head, "/screensaver") and
             !std.mem.eql(u8, head, "/otel") and
-            !std.mem.eql(u8, head, "!rb")) return null;
+            !std.mem.eql(u8, head, "!rb") and
+            !std.mem.eql(u8, head, "!wipeout")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
         if (std.mem.indexOfAny(u8, rest, " \t") != null) return null;
     }
@@ -692,6 +694,25 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         }
         if (!self.applySkyArg(kind, sky_arg)) return;
         self.startScreensaver(kind);
+    } else if (std.mem.eql(u8, head, "!wipeout")) {
+        var options = tui.WipeoutOptions{};
+        var positional: usize = 0;
+        while (it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "rapier")) {
+                options.rapier = true;
+            } else if (std.mem.eql(u8, arg, "venom")) {
+                options.rapier = false;
+            } else if (std.mem.eql(u8, arg, "nointro")) {
+                options.intro = false;
+            } else if (std.fmt.parseUnsigned(u8, arg, 10)) |value| {
+                if (positional == 0) options.track = value else options.pilot = value;
+                positional += 1;
+            } else |_| {
+                self.setNotice("usage: !wipeout [track 1-14] [pilot 0-7] [rapier|venom] [nointro]", .{});
+                return;
+            }
+        }
+        self.startWipeout(options);
     } else if (std.mem.eql(u8, head, "/otel")) {
         self.otelCommand(it.next(), it.rest());
     } else if (std.mem.eql(u8, head, "/config")) {

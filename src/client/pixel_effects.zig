@@ -21,6 +21,7 @@ const visual_effect = @import("../core/visual_effect.zig");
 const pacman = @import("pacman.zig");
 const tetris = @import("tetris.zig");
 const shadowbox = @import("shadowbox.zig");
+const wipeout_effect = @import("wipeout_effect.zig");
 
 pub const Scene = enum { plasma, tunnel, metaballs, horizon };
 
@@ -65,6 +66,9 @@ pub const Engine = struct {
     /// window.
     game: pacman.Game,
     tetris_game: tetris.Game,
+    /// The wipEout race for the wipeout kind. Owned by the App (it outlives
+    /// engines so a hidden game resumes); null renders black.
+    wipeout_game: ?*wipeout_effect.Game = null,
     background: []u8 = &.{},
     background_generation: u64 = 0,
     zbuf: []u8 = &.{},
@@ -151,7 +155,7 @@ pub const Engine = struct {
     /// Flat or smooth art that zlib pays for; the noisy demoscene scenes are
     /// sent raw.
     fn compressible(kind: visual_effect.Kind) bool {
-        return kind == .pacman or kind == .tetris or kind == .shadowbox;
+        return kind == .pacman or kind == .tetris or kind == .shadowbox or kind == .wipeout;
     }
 
     /// Ticks per shipped frame. The shadow-box ran at 20 fps in the browser
@@ -166,6 +170,9 @@ pub const Engine = struct {
         self.frame +%= 1;
         if (self.kind == .pacman) self.game.tick();
         if (self.kind == .tetris) self.tetris_game.tick();
+        if (self.kind == .wipeout) {
+            if (self.wipeout_game) |g| g.tick();
+        }
     }
 
     /// Render this tick's frame and ship it. Must run before draw() so the
@@ -191,6 +198,7 @@ pub const Engine = struct {
             .horizon => renderScene(.horizon, self.rgb, self.width, self.height, frame),
             .shadowbox => shadowbox.render(self.rgb, self.width, self.height, self.frame, self.seed, self.sky),
             .tetris => tetris.renderPixels(&self.tetris_game, self.rgb, self.width, self.height),
+            .wipeout => if (self.wipeout_game) |g| g.render(self.rgb) else @memset(self.rgb, 0),
             .pacman => {
                 if (self.background_generation != self.game.generation) {
                     pacman.renderBackground(&self.game, self.background, self.width, self.height);
@@ -244,7 +252,16 @@ pub const Engine = struct {
         _ = opacity;
         effect.prepare(win, .full_screen);
         win.hideCursor();
-        if (self.image) |img| img.draw(win, .{ .scale = .fill }) catch {};
+        const img = self.image orelse return;
+        if (self.kind == .wipeout) {
+            // Letterbox: the largest centered 4:3 area, so the game is never
+            // stretched by `.fill` on a wide window.
+            const box = letterbox(win.width, win.height, self.cell_px_w, self.cell_px_h, 4, 3);
+            const child = win.child(.{ .x_off = box.x, .y_off = box.y, .width = box.cols, .height = box.rows });
+            img.draw(child, .{ .scale = .fill }) catch {};
+            return;
+        }
+        img.draw(win, .{ .scale = .fill }) catch {};
     }
 };
 
@@ -284,6 +301,33 @@ fn deflate(dst: []u8, window: []u8, src: []const u8) ?[]u8 {
 
 pub const Dimensions = struct { width: u16, height: u16 };
 
+pub const Letterbox = struct { x: i17, y: i17, cols: u16, rows: u16 };
+
+/// Largest `aspect_w:aspect_h` cell rectangle centered in a window, given
+/// the cell pixel size.
+pub fn letterbox(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, aspect_w: u32, aspect_h: u32) Letterbox {
+    if (cols == 0 or rows == 0) return .{ .x = 0, .y = 0, .cols = cols, .rows = rows };
+    const cw: u32 = if (cell_px_w > 0) cell_px_w else default_cell_w;
+    const ch: u32 = if (cell_px_h > 0) cell_px_h else default_cell_h;
+    const full_w: u64 = @as(u64, cols) * cw;
+    const full_h: u64 = @as(u64, rows) * ch;
+    var out_cols: u32 = cols;
+    var out_rows: u32 = rows;
+    if (full_w * aspect_h > full_h * aspect_w) {
+        out_cols = @intCast(@max((full_h * aspect_w / aspect_h + cw / 2) / cw, 1));
+    } else {
+        out_rows = @intCast(@max((full_w * aspect_h / aspect_w + ch / 2) / ch, 1));
+    }
+    out_cols = @min(out_cols, cols);
+    out_rows = @min(out_rows, rows);
+    return .{
+        .x = @intCast((cols - out_cols) / 2),
+        .y = @intCast((rows - out_rows) / 2),
+        .cols = @intCast(out_cols),
+        .rows = @intCast(out_rows),
+    };
+}
+
 /// Pick a framebuffer whose aspect matches the window's pixel aspect, with
 /// the width clamped into the band that keeps 30 fps encoding cheap. The
 /// maze wants vertical resolution (30 board rows), so it sizes from height.
@@ -314,6 +358,10 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
         const by_aspect: u32 = height * win_w / @max(win_h, 1);
         const width: u32 = std.math.clamp(by_aspect, @as(u32, layout.cols) * t, 1600);
         return .{ .width = @intCast(width), .height = @intCast(height) };
+    }
+    if (kind == .wipeout) {
+        // PSX-native 240p; the image is letterboxed to 4:3 at draw time.
+        return .{ .width = wipeout_effect.width, .height = wipeout_effect.height };
     }
     if (kind == .tetris) {
         // The arcade cabinet uses the entire viewport. Render near terminal

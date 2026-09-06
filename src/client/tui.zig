@@ -47,6 +47,9 @@ const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const shadowbox = @import("shadowbox.zig");
+const wipeout_effect = @import("wipeout_effect.zig");
+
+pub const WipeoutOptions = wipeout_effect.Options;
 
 /// `/screensaver shadowbox cycle` or `… <hour>`: preview the sky instead of
 /// following the real sun.
@@ -528,6 +531,13 @@ pub const App = struct {
     ui_animation: ?effects.Kind = null,
     ui_animation_frame: usize = 0,
     effect_engine: ?effects.Engine = null,
+    /// The wipEout race. Owned here rather than by the effect engine so a
+    /// hidden game (Esc, or another screensaver in between) resumes intact.
+    wipeout_game: ?*wipeout_effect.Game = null,
+    /// While set, key presses and releases go to the game until Escape.
+    game_mode: bool = false,
+    /// Ticker hint: the game wants ~60 Hz ticks, not the 30 Hz effect tier.
+    game_active: std.atomic.Value(bool) = .init(false),
     /// Terminal capability from queryTerminal; pixel effects need it and
     /// otherwise start as their cell fallback.
     kitty_graphics: bool = false,
@@ -619,6 +629,7 @@ pub const App = struct {
         self.councils.deinit(self.gpa);
         self.voice_rt.deinit(self.gpa);
         if (self.effect_engine) |*engine| engine.deinit();
+        if (self.wipeout_game) |game| game.destroy();
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.terminal_title.deinit(self.gpa);
@@ -2156,6 +2167,77 @@ pub const App = struct {
         self.recordUserActivity();
         self.refresh_requested = true;
         self.syncAnimationTicker();
+        return true;
+    }
+
+    /// `!wipeout`: load (or reuse) the race and show it as the pixel effect,
+    /// with keys routed to the ship until Escape.
+    pub fn startWipeout(self: *App, options: WipeoutOptions) void {
+        if (!self.kitty_graphics) {
+            self.setNotice("wipEout needs Kitty graphics — this terminal has none", .{});
+            return;
+        }
+        if (self.wipeout_game) |game| {
+            if (!game.matches(options)) {
+                game.destroy();
+                self.wipeout_game = null;
+            }
+        }
+        if (self.wipeout_game == null) {
+            const env = self.environ orelse {
+                self.setNotice("wipEout: no environment to locate game data", .{});
+                return;
+            };
+            self.wipeout_game = wipeout_effect.Game.create(self.gpa, self.io, env, options) catch |err| {
+                self.setNotice("wipEout: {t} — game data goes in $XDG_DATA_HOME/marlin/wipeout-data/wipeout", .{err});
+                return;
+            };
+        }
+        if (!self.resetEffectEngine(.wipeout)) return;
+        switch (self.effect_engine.?) {
+            .pixel => |*engine| engine.wipeout_game = self.wipeout_game,
+            else => {
+                self.setNotice("wipEout needs Kitty graphics — this terminal has none", .{});
+                return;
+            },
+        }
+        self.ui_animation = null;
+        self.ui_animation_frame = 0;
+        self.screensaver_active = true;
+        self.ui_animation_active.store(true, .release);
+        self.clearPending();
+        self.game_mode = true;
+        self.game_active.store(true, .release);
+        self.wipeout_game.?.resume_();
+        self.syncAnimationTicker();
+        self.setNotice("wipEout — arrows steer/pitch, x thrust, z/c airbrakes, v view, Esc pauses", .{});
+    }
+
+    /// Leave the game: hide the effect and stop the fast ticker. The race
+    /// state stays for the next `!wipeout`.
+    pub fn exitGameMode(self: *App) void {
+        if (!self.game_mode) return;
+        self.game_mode = false;
+        self.game_active.store(false, .release);
+        if (self.wipeout_game) |game| game.pause();
+        _ = self.dismissScreensaver();
+        self.syncAnimationTicker();
+    }
+
+    /// Route a key event to the game. Returns true when it was consumed;
+    /// while playing every key is, and Escape ends the mode.
+    pub fn gameKey(self: *App, key: vaxis.Key, down: bool) bool {
+        if (!self.game_mode) return false;
+        if (!self.screensaver_active or self.wipeout_game == null) {
+            // Something else hid the effect; do not keep swallowing keys.
+            self.exitGameMode();
+            return false;
+        }
+        if (down and (key.codepoint == vaxis.Key.escape or key.matches('c', .{ .ctrl = true }))) {
+            self.exitGameMode();
+            return true;
+        }
+        _ = self.wipeout_game.?.setKey(key, down);
         return true;
     }
 
@@ -5550,6 +5632,7 @@ pub fn dispatchEvent(
             if (key.codepoint == vaxis.Key.left_super or key.codepoint == vaxis.Key.right_super)
                 app.link_super_held = true;
             if (key.isModifier()) return;
+            if (app.gameKey(key, true)) return;
             if (app.dismissScreensaver()) return;
             app.recordUserActivity();
             try handleKey(app, key);
@@ -5557,6 +5640,7 @@ pub fn dispatchEvent(
         .key_release => |key| {
             if (key.codepoint == vaxis.Key.left_super or key.codepoint == vaxis.Key.right_super)
                 app.link_super_held = false;
+            if (app.game_mode) _ = app.gameKey(key, false);
             if (isVoiceKey(key) and app.voice_rt.phase == .recording and
                 app.voice_rt.setup != null and app.voice_rt.setup.?.mode == .ptt)
                 app.stopVoiceRecording();
@@ -5609,7 +5693,12 @@ pub fn dispatchEvent(
 
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     while (!app.animation_stop.load(.acquire)) {
-        if (app.ui_animation_active.load(.acquire)) {
+        if (app.game_active.load(.acquire)) {
+            // A playable game steps on wall time; ticks just need to be
+            // frequent enough for 60 fps presentation.
+            loop.postEvent(.tick) catch return;
+            app.io.sleep(.fromMilliseconds(16), .awake) catch {};
+        } else if (app.ui_animation_active.load(.acquire)) {
             loop.postEvent(.tick) catch return;
             app.io.sleep(.fromMilliseconds(33), .awake) catch {};
         } else if (app.animation_active.load(.acquire)) {
