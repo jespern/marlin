@@ -94,6 +94,8 @@ pub const Renderer = struct {
     sprite_mat: Mat4 = Mat4.identity,
     camera_pos: Vec3 = Vec3.zero,
     fade_enabled: bool = true,
+    /// NDC offset added to every vertex (camera shake); zero for the 2D pass.
+    screen_position: Vec2 = Vec2.init(0, 0),
 
     depth_test: bool = true,
     depth_write: bool = true,
@@ -196,7 +198,12 @@ pub const Renderer = struct {
         self.setModelMat(&Mat4.identity);
     }
 
+    pub fn setScreenPosition(self: *Renderer, offset: Vec2) void {
+        self.screen_position = offset;
+    }
+
     pub fn setView2d(self: *Renderer) void {
+        self.screen_position = Vec2.init(0, 0);
         self.depth_test = false;
         self.depth_write = false;
         self.fade_enabled = false;
@@ -258,8 +265,11 @@ pub const Renderer = struct {
         var in: [3]ClipVert = undefined;
         for (tris.vertices, 0..) |v, i| {
             const world = v.pos.transform(&self.model);
+            var pos = world.transformPerspective(&self.view_projection);
+            pos.x += self.screen_position.x * pos.w;
+            pos.y += self.screen_position.y * pos.w;
             in[i] = .{
-                .pos = world.transformPerspective(&self.view_projection),
+                .pos = pos,
                 .uv = v.uv,
                 .color = self.vertexColor(v, world),
             };

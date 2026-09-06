@@ -63,11 +63,10 @@ pub const Game = struct {
     renderer: wipeout.render.Renderer,
     track: wipeout.track.Track,
     scene: wipeout.scene.Scene,
-    models: wipeout.ship.Models,
+    assets: wipeout.race.Assets,
     ui: wipeout.ui.Ui,
     hud: wipeout.hud.Hud,
     race: wipeout.race.Race,
-    camera: wipeout.camera.Camera,
     /// What the keyboard says; the ship sees this, or the autopilot's
     /// steering when it is on and no key is held.
     input: wipeout.input.State = .{},
@@ -101,15 +100,15 @@ pub const Game = struct {
         errdefer track.deinit(gpa);
         var scene = try wipeout.scene.load(gpa, &assets, &renderer, dir, circuit.sky_y_offset);
         errdefer scene.deinit(gpa);
-        var models = try wipeout.ship.loadModels(gpa, &assets, &renderer);
-        errdefer models.deinit(gpa);
+        var race_assets = try wipeout.race.loadAssets(gpa, &assets, &renderer);
+        errdefer race_assets.deinit(gpa);
         const ui = try wipeout.ui.Ui.load(gpa, &assets, &renderer);
         const hud = try wipeout.hud.Hud.load(gpa, &assets, &renderer);
 
         var seed_bytes: [4]u8 = undefined;
         io.random(&seed_bytes);
         var rng = wipeout.rng.Rng.seed(std.mem.readInt(u32, &seed_bytes, .little));
-        const race = wipeout.race.Race.init(&track, options.raceOptions(), &rng);
+        const race = wipeout.race.Race.init(&track, options.raceOptions(), &rng, race_assets.particle_textures.start);
 
         self.* = .{
             .gpa = gpa,
@@ -118,11 +117,10 @@ pub const Game = struct {
             .renderer = renderer,
             .track = track,
             .scene = scene,
-            .models = models,
+            .assets = race_assets,
             .ui = ui,
             .hud = hud,
             .race = race,
-            .camera = wipeout.camera.Camera.init(&track, 0),
             .rng = rng,
             .start_line_pos = circuit.start_line_pos,
             .crt = options.crt,
@@ -134,7 +132,7 @@ pub const Game = struct {
 
     pub fn destroy(self: *Game) void {
         const gpa = self.gpa;
-        self.models.deinit(gpa);
+        self.assets.deinit(gpa);
         self.scene.deinit(gpa);
         self.track.deinit(gpa);
         self.renderer.deinit();
@@ -150,7 +148,6 @@ pub const Game = struct {
             .crt = @intFromBool(self.crt),
             .steps = self.steps,
             .race = self.race,
-            .camera = self.camera,
             .rng = self.rng,
         };
     }
@@ -165,7 +162,7 @@ pub const Game = struct {
         };
         if (options.track < 1 or options.track > 14 or options.pilot >= wipeout.defs.num_pilots) return error.BadSnapshot;
         const self = try create(gpa, io, environ, options);
-        if (snap.camera.section >= self.track.sections.len) {
+        if (snap.race.camera.section >= self.track.sections.len) {
             self.destroy();
             return error.BadSnapshot;
         }
@@ -178,7 +175,6 @@ pub const Game = struct {
         self.race = snap.race;
         self.options.time_trial = snap.race.race_type == .time_trial;
         self.options.difficulty = snap.race.difficulty;
-        self.camera = snap.camera;
         self.rng = snap.rng;
         self.steps = snap.steps;
         self.cycle_time = @as(f32, @floatFromInt(snap.steps)) * @as(f32, @floatCast(step_seconds));
@@ -229,10 +225,7 @@ pub const Game = struct {
     fn step(self: *Game) void {
         var effective = self.input;
         if (self.autopilot and !self.input.anyHeld()) wipeout.autopilot.steer(self.race.playerShip(), &self.track, &effective);
-        self.race.update(&self.track, &effective, &self.rng, step_seconds, &self.models);
-        const player = self.race.playerShip();
-        self.camera.mode = if (player.flags.view_internal) .internal else .external;
-        self.camera.update(&self.track, player, @floatCast(step_seconds));
+        self.race.update(&self.track, &effective, &self.rng, step_seconds, &self.assets);
         self.input.endFrame();
         self.steps += 1;
         self.cycle_time += @floatCast(step_seconds);
@@ -250,14 +243,23 @@ pub const Game = struct {
     pub fn render(self: *Game, rgb: []u8, out_w: usize, out_h: usize) void {
         const r = &self.renderer;
         r.framePrepare();
-        r.setView(self.camera.position, self.camera.angle);
-        const forward = self.camera.forward();
+        const camera = &self.race.camera;
+        r.setView(camera.position, camera.angle);
+        r.setScreenPosition(camera.shake);
+        const forward = camera.forward();
         r.setCullBackface(false);
-        self.scene.draw(r, self.camera.position, forward);
-        self.track.draw(r, self.camera.position, forward);
+        self.scene.draw(r, camera.position, forward);
+        self.track.draw(r, camera.position, forward);
         r.setCullBackface(true);
-        wipeout.race.drawShips(&self.race, r, &self.track, &self.models);
-        self.hud.draw(r, &self.ui, self.race.playerShipConst(), self.race.race_type != .time_trial, self.autopilot);
+        self.race.draw(r, &self.track, &self.assets, @floatCast(step_seconds));
+        const player = self.race.playerShipConst();
+        self.hud.draw(r, &self.ui, player, .{
+            .show_position = self.race.race_type != .time_trial,
+            .autopilot = self.autopilot,
+            .weapon_icons = self.assets.weapon_icons,
+            .reticle = self.assets.reticle,
+            .target_position = if (player.weapon_target >= 0) self.race.ships[@intCast(player.weapon_target)].position else null,
+        });
         if (self.crt) {
             wipeout.post.crt(r.color, r.width, r.height, rgb, out_w, out_h, self.cycle_time);
         } else if (out_w == r.width and out_h == r.height) {
@@ -285,6 +287,7 @@ pub const Game = struct {
             'a', 'A' => .left,
             'd', 'D' => .right,
             'v', 'V' => .change_view,
+            'f', 'F', vaxis.Key.enter => .fire,
             else => null,
         };
     }
@@ -311,8 +314,7 @@ pub const Game = struct {
 
     /// Back to the grid with the same circuit, pilot and class.
     pub fn restart(self: *Game) void {
-        self.race = wipeout.race.Race.init(&self.track, self.options.raceOptions(), &self.rng);
-        self.camera = wipeout.camera.Camera.init(&self.track, 0);
+        self.race = wipeout.race.Race.init(&self.track, self.options.raceOptions(), &self.rng, self.assets.particle_textures.start);
         self.input = .{};
         self.steps = 0;
         self.cycle_time = 0;

@@ -9,6 +9,7 @@ const image = @import("image.zig");
 const ui_mod = @import("ui.zig");
 const ship_mod = @import("ship.zig");
 const defs = @import("defs.zig");
+const object = @import("object.zig");
 const assets_mod = @import("assets.zig");
 const Vec2 = math.Vec2;
 const Vec2i = math.Vec2i;
@@ -49,7 +50,18 @@ pub const Hud = struct {
 
     /// Draw over a frame whose 3D pass is complete. Switches the renderer
     /// to the 2D view.
-    pub fn draw(self: *const Hud, r: *render.Renderer, ui: *const Ui, ship: *const ship_mod.Ship, show_position: bool, autopilot: bool) void {
+    pub const Extras = struct {
+        show_position: bool,
+        autopilot: bool,
+        weapon_icons: ?object.TextureList = null,
+        reticle: ?u16 = null,
+        /// World position of the weapon target, when there is one.
+        target_position: ?Vec3 = null,
+    };
+
+    pub fn draw(self: *const Hud, r: *render.Renderer, ui: *const Ui, ship: *const ship_mod.Ship, extras: Extras) void {
+        const show_position = extras.show_position;
+        const autopilot = extras.autopilot;
         r.setView2d();
         r.setCullBackface(false);
 
@@ -93,7 +105,32 @@ pub const Hud = struct {
 
         self.drawSpeedo(r, ui, ship.speed, ship.thrust_mag);
         if (autopilot) ui.drawText(r, "AUTO", ui.pos(Anchor.top | Anchor.right, Vec2i.init(-48, 38)), .px8, ui_mod.color_accent);
+
+        if (ship.weapon_type != .none) {
+            if (extras.weapon_icons) |icons| {
+                const index: i16 = @as(i16, @intFromEnum(ship.weapon_type)) - 1;
+                if (icons.resolve(index)) |texture| {
+                    r.push2d(ui.pos(Anchor.top | Anchor.center, Vec2i.init(-16, 20)), ui.scaled(Vec2i.init(32, 32)), Rgba.white, texture);
+                } else |_| {}
+            }
+        }
+        if (extras.target_position) |target| {
+            if (extras.reticle) |reticle| drawTargetIcon(r, ui, reticle, target);
+        }
         r.setCullBackface(true);
+    }
+
+    fn drawTargetIcon(r: *render.Renderer, ui: *const Ui, reticle: u16, position: Vec3) void {
+        const size = ui.scaled(r.textureSize(reticle));
+        const projected = r.transform(position);
+        if (projected.x < -1 or projected.x > 1 or projected.y < -1 or projected.y > 1 or projected.z >= 1) return;
+        const sx: f32 = @floatFromInt(ui.screen.x);
+        const sy: f32 = @floatFromInt(ui.screen.y);
+        const pos = Vec2i.init(
+            @as(i32, @intFromFloat(((projected.x + 1.0) / 2.0) * sx)) - @divTrunc(size.x, 2),
+            @as(i32, @intFromFloat(((-projected.y + 1.0) / 2.0) * sy)) - @divTrunc(size.y, 2),
+        );
+        r.push2d(pos, size, Rgba.init(128, 128, 128, 128), reticle);
     }
 
     /// The end-of-race statistics page, dimmed over the scene, laid out

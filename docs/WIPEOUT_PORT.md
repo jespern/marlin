@@ -10,8 +10,8 @@ reference build to within 0.01 units over a full lap. The game runs inside
 the marlin client as `!wipeout` with the original HUD and an optional CRT
 pass, pausing on Escape and resuming where it left off, including across
 marlin restarts through an on-disk snapshot. Seven AI opponents race with
-the original's controller and collide with each other and the player.
-No pickups, weapons, rescue droid or audio yet.
+the original's controller and collide with each other and the player;
+pickups, all six weapons, particles and the rescue droid are in. No audio.
 
 ## Goals
 
@@ -45,7 +45,10 @@ No pickups, weapons, rescue droid or audio yet.
 | `src/wipeout/rng.zig` | Deterministic xorshift owned by game state |
 | `src/wipeout/ship.zig` | Ship state, player flight model, track collision, jump and rescue, models and shadow |
 | `src/wipeout/camera.zig` | External chase camera and cockpit view |
-| `src/wipeout/race.zig` | The eight-ship field: grid order, per-step update, collisions, race positions |
+| `src/wipeout/race.zig` | The race: field, camera, pickups, weapons, particles, droid; per-step update and draw order |
+| `src/wipeout/weapon.zig` | Mines, missiles, rockets, electro-bolts, shields, turbo: firing, homing, hits |
+| `src/wipeout/particle.zig` | Additive sprite pool for trails and impacts |
+| `src/wipeout/droid.zig` | Rescue droid: intro, idle above the jump, tow after a fall |
 | `src/wipeout/ui.zig` | Bitmap text from the three font textures, screen anchors |
 | `src/wipeout/hud.zig` | Lap counter and times, wrong-way warning, speedo |
 | `src/wipeout/post.zig` | CRT post pass (the original's fragment shader on the CPU) and nearest upscale |
@@ -315,9 +318,37 @@ Difficulty scales the original opponent tuning: `easy` 0.75, `normal`
 to the AI at a gentle cruise as the original does, and the results page
 appears.
 
-Not yet ported from the AI: the weapon decisions (mines, shields, rockets,
-missiles, electro-bolts) fall back to blocking until the weapon systems
-exist, and there is no pickup collection.
+## Pickups and weapons
+
+Pickup pads are the base faces flagged in the track data (thirteen on
+track01). Their state, armed, collected, cooldown, lives in the race and
+the face colours are derived from it each step: a rainbow cycle while
+armed, white when taken, dark during the one-second cooldown. The player
+draws a weapon from the original's weighted table (projectiles only while
+shielded); AI ships always receive a mine, as in the reference, and choose
+what to actually fire in their decision code: mines or a shield when
+blocking just ahead of the player, rockets, a missile or an electro-bolt
+when just behind, after the original's 1.1 s delay.
+
+`weapon.zig` keeps a pool of sixty-four in-flight weapons. Mines drop five
+at a time and spin in place, projectiles launch on the original's
+trajectory and hug the track surface, missiles and bolts home on their
+target, and each has the reference's duration, drag and hit effect: a
+mine or missile scrubs the player's speed and shakes the camera, an
+electro-bolt jitters the victim and cuts its thrust at random, a shield
+absorbs everything for its duration, turbo is an instant shove. Trails and
+impacts are additive sprite particles from `effects.cmp`. Keys: `f` or
+Enter fires; the HUD shows the held weapon's icon and a reticle over a
+missile or bolt target.
+
+The rescue droid flies the original's intro over the grid, waits above the
+first jump, and when the player falls off comes in under the remote
+camera, tows the ship back, and returns to its post. Camera shake is an
+NDC offset in the renderer, as the original's `screen` uniform.
+
+Render-time animation on shared models (mine lights, shield colours, the
+droid's lamps) mutates primitive colours on the loaded object each frame;
+it is derived from time and never persisted.
 
 ## HUD
 
@@ -383,6 +414,7 @@ renderer was verified without a live session.
 
 ## Next slices
 
-1. Pickups and weapons, particles, the rescue droid.
-2. Menus, championship and highscores.
+1. Menus, championship and highscores.
+2. Polish: cockpit roll option, attract cameras after the race, pause on
+   focus loss.
 3. First-run asset download.

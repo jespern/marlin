@@ -24,6 +24,9 @@ pub const snapshot = @import("snapshot.zig");
 pub const autopilot = @import("autopilot.zig");
 pub const parzlib = @import("parzlib.zig");
 pub const race = @import("race.zig");
+pub const weapon = @import("weapon.zig");
+pub const particle = @import("particle.zig");
+pub const droid = @import("droid.zig");
 
 /// Per-circuit sky placement from the original game definition, indexed
 /// by PSX track directory number (1-14).

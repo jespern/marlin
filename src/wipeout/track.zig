@@ -72,9 +72,15 @@ pub const Error = error{
     CorruptTrack,
 } || bytes.Error || image.Error || render.Error || std.mem.Allocator.Error;
 
+pub const max_pickups = 64;
+pub const pickup_cooldown_time: f32 = 1;
+
 pub const Track = struct {
     faces: []Face,
     sections: []Section,
+    /// Base faces flagged as pickups, in section order.
+    pickup_faces: [max_pickups]u32 = undefined,
+    pickup_count: u8 = 0,
     texture_start: u16,
     texture_len: u16,
     total_section_nums: i32,
@@ -211,6 +217,10 @@ pub fn load(gpa: std.mem.Allocator, assets: *const assets_mod.Assets, r: *render
         var f: usize = 0;
         while (f < 2 and base_index + f < track.faces.len) : (f += 1) {
             const face = &track.faces[base_index + f];
+            if ((face.flags & (FaceFlags.pickup_left | FaceFlags.pickup_right)) != 0 and track.pickup_count < max_pickups) {
+                track.pickup_faces[track.pickup_count] = @intCast(base_index + f);
+                track.pickup_count += 1;
+            }
             if ((face.flags & FaceFlags.boost) != 0) face.setColor(Rgba.init(0, 0, 255, 255));
         }
     }

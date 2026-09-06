@@ -22,4 +22,6 @@ pub fn steer(ship: *const ship_mod.Ship, track: *const track_mod.Track, in: *inp
     in.set(.down, false);
     in.set(.brake_left, false);
     in.set(.brake_right, false);
+    // Use whatever was picked up as soon as it is held.
+    in.set(.fire, ship.weapon_type != .none);
 }

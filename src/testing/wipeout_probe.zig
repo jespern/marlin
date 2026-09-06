@@ -59,6 +59,8 @@ pub const Options = struct {
     crt: bool = false,
     /// Only the player on the track (the parity harness uses this).
     time_trial: bool = false,
+    /// Headless test hook: throw the player off the track at this frame.
+    fall_at: ?u64 = null,
     difficulty: wipeout.race.Difficulty = .normal,
     /// zlib encoder threads (1 = single-stream std deflate).
     bands: u8 = 6,
@@ -301,8 +303,8 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     const circuit = wipeout.defs.circuitSettings(options.track);
     var race: ?Race = null;
     if (options.drive or options.autopilot or options.replay_input != null) {
-        var models = try wipeout.ship.loadModels(gpa, &assets, &renderer);
-        errdefer models.deinit(gpa);
+        var race_assets = try wipeout.race.loadAssets(gpa, &assets, &renderer);
+        errdefer race_assets.deinit(gpa);
         const ui = try wipeout.ui.Ui.load(gpa, &assets, &renderer);
         const hud = try wipeout.hud.Hud.load(gpa, &assets, &renderer);
         var rng = wipeout.rng.Rng.seed(0x5eed);
@@ -313,17 +315,17 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
             .race_type = if (options.time_trial) .time_trial else .single,
             .difficulty = options.difficulty,
             .intro = options.intro,
-        }, &rng);
+        }, &rng, race_assets.particle_textures.start);
         race = .{
-            .models = models,
+            .assets = race_assets,
             .ui = ui,
             .hud = hud,
             .field = field,
-            .camera = wipeout.camera.Camera.init(&track, 0),
             .input = .{},
             .rng = rng,
             .start_line_pos = circuit.start_line_pos,
             .autopilot = options.autopilot,
+            .fall_at = options.fall_at,
         };
         if (options.replay_input) |path| {
             race.?.replay = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024));
@@ -346,7 +348,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         if (r.record_writer) |*w| w.interface.flush() catch {};
         if (r.record_file) |f| f.close(io);
         if (r.replay) |data| gpa.free(data);
-        r.models.deinit(gpa);
+        r.assets.deinit(gpa);
     };
 
     if (options.dump_model) {
@@ -392,9 +394,16 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
             stderrPrint(io, "ship: section {d} pos ({d:.0},{d:.0},{d:.0}) speed {d:.0} lap {d} flying={} rank {d}\n", .{
                 sh.section, sh.position.x, sh.position.y, sh.position.z, sh.speed, sh.lap, sh.flags.flying, sh.position_rank,
             });
+            var active_pads: u32 = 0;
+            for (r.field.pickups[0..r.field.pickup_count]) |pad| active_pads += pad.active;
+            const pl = r.field.playerShipConst();
+            stderrPrint(io, "  weapons active {d}, particles {d}, droid {s}, pickups {d} ({d} armed), player mode {s} rescue={} tow={} remote={} camera {s}\n", .{
+                r.field.weapons.active, r.field.particles.active, @tagName(r.field.droid.mode), r.field.pickup_count, active_pads,
+                @tagName(pl.mode),      pl.flags.in_rescue,       pl.flags.in_tow,              pl.flags.view_remote, @tagName(r.field.camera.mode),
+            });
             for (r.field.ships, 0..) |other, pi| {
-                stderrPrint(io, "  pilot {d}: mode {s} progress {d} rank {d} speed {d:.0} section {d} flying={}\n", .{
-                    pi, @tagName(other.mode), other.total_section_num, other.position_rank, other.speed, other.section, other.flags.flying,
+                stderrPrint(io, "  pilot {d}: mode {s} progress {d} rank {d} speed {d:.0} section {d} flying={} weapon {s} over_face {d}\n", .{
+                    pi, @tagName(other.mode), other.total_section_num, other.position_rank, other.speed, other.section, other.flags.flying, @tagName(other.weapon_type), other.over_face,
                 });
             }
         }
@@ -555,7 +564,7 @@ const PreparedFrame = struct {
 fn prepareFrame(
     io: Io,
     renderer: *wipeout.render.Renderer,
-    track: *const wipeout.track.Track,
+    track: *wipeout.track.Track,
     scene: *wipeout.scene.Scene,
     camera: *FlyCamera,
     race: ?*Race,
@@ -610,13 +619,14 @@ fn prepareFrame(
     };
 }
 
-fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.Track, scene: *wipeout.scene.Scene, camera: *const FlyCamera, race: ?*const Race) void {
+fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.Track, scene: *wipeout.scene.Scene, camera: *const FlyCamera, race: ?*Race) void {
     renderer.framePrepare();
     var position = camera.position;
     var angle = camera.angle;
     if (race) |r| {
-        position = r.camera.position;
-        angle = r.camera.angle;
+        position = r.field.camera.position;
+        angle = r.field.camera.angle;
+        renderer.setScreenPosition(r.field.camera.shake);
     }
     renderer.setView(position, angle);
     const forward = wipeout.cameraForward(angle);
@@ -633,9 +643,16 @@ fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.T
     if (race) |r| {
         renderer.draw_id = 0xfffd;
         renderer.debug_prim_ids = tag_prims;
-        wipeout.race.drawShips(&r.field, renderer, track, &r.models);
+        r.field.draw(renderer, track, &r.assets, 1.0 / 60.0);
         renderer.debug_prim_ids = false;
-        r.hud.draw(renderer, &r.ui, r.field.playerShipConst(), r.field.race_type != .time_trial, r.autopilot);
+        const player = r.field.playerShipConst();
+        r.hud.draw(renderer, &r.ui, player, .{
+            .show_position = r.field.race_type != .time_trial,
+            .autopilot = r.autopilot,
+            .weapon_icons = r.assets.weapon_icons,
+            .reticle = r.assets.reticle,
+            .target_position = if (player.weapon_target >= 0) r.field.ships[@intCast(player.weapon_target)].position else null,
+        });
     }
 }
 
@@ -724,15 +741,15 @@ fn dumpModel(io: Io, obj: *const wipeout.object.Object) void {
 
 /// A single player ship, its camera, and the input feeding it.
 const Race = struct {
-    models: wipeout.ship.Models,
+    assets: wipeout.race.Assets,
     ui: wipeout.ui.Ui,
     hud: wipeout.hud.Hud,
     field: wipeout.race.Race,
-    camera: wipeout.camera.Camera,
     input: wipeout.input.State,
     rng: wipeout.rng.Rng,
     start_line_pos: u16,
     autopilot: bool,
+    fall_at: ?u64 = null,
     frame: u64 = 0,
     replay: ?[]u8 = null,
     replay_pos: usize = 0,
@@ -743,7 +760,7 @@ const Race = struct {
     log_buffer: [16 * 1024]u8 = undefined,
     log_writer: ?Io.File.Writer = null,
 
-    fn step(self: *Race, track: *const wipeout.track.Track, keys: ?*KeyReader, dt: f32) void {
+    fn step(self: *Race, track: *wipeout.track.Track, keys: ?*KeyReader, dt: f32) void {
         // The physics step is f64 like the reference's system_tick(); the
         // f32 dt only feeds the camera.
         const tick: f64 = 1.0 / @round(1.0 / @as(f64, dt));
@@ -780,10 +797,14 @@ const Race = struct {
             w.interface.print("{d}\n", .{mask}) catch {};
         }
 
-        self.field.update(track, &self.input, &self.rng, tick, &self.models);
-        const player = self.field.playerShip();
-        self.camera.mode = if (player.flags.view_internal) .internal else .external;
-        self.camera.update(track, player, dt);
+        if (self.fall_at) |at| {
+            if (self.frame == at) {
+                const player = self.field.playerShip();
+                player.position = player.position.add(wipeout.math.Vec3.init(0, -6000, 12000));
+                player.velocity = wipeout.math.Vec3.zero;
+            }
+        }
+        self.field.update(track, &self.input, &self.rng, tick, &self.assets);
         self.input.endFrame();
 
         if (self.log_writer) |*w| {
@@ -1309,6 +1330,8 @@ fn parseArgs(args: []const []const u8) !Options {
             options.crt = true;
         } else if (std.mem.eql(u8, arg, "--time-trial")) {
             options.time_trial = true;
+        } else if (std.mem.eql(u8, arg, "--fall-at")) {
+            options.fall_at = try nextUnsigned(u64, args, &index);
         } else if (std.mem.eql(u8, arg, "--ai")) {
             const level = try nextString(args, &index);
             options.difficulty = std.meta.stringToEnum(wipeout.race.Difficulty, level) orelse return error.InvalidValue;

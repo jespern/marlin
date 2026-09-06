@@ -21,6 +21,7 @@ const image = @import("image.zig");
 const assets_mod = @import("assets.zig");
 const track_mod = @import("track.zig");
 const Rng = @import("rng.zig").Rng;
+const weapon_mod = @import("weapon.zig");
 const Vec2 = math.Vec2;
 const Vec3 = math.Vec3;
 const Mat4 = math.Mat4;
@@ -106,6 +107,8 @@ pub const Context = struct {
     player: u8 = 0,
     /// Circuit tuning for the AI's catch-up speed.
     behind_speed: f32 = 300,
+    /// Weapon pool to fire into; null in contexts without weapons.
+    weapons: ?*weapon_mod.Weapons = null,
 };
 
 pub const Ship = extern struct {
@@ -168,6 +171,9 @@ pub const Ship = extern struct {
     weapon_type: defs.WeaponType,
     /// Pilot index of the current weapon target, or -1.
     weapon_target: i32,
+    /// Base face under the ship this step (left or right half), for pickup
+    /// collection by the race.
+    over_face: u32,
     ebolt_timer: f32,
     ebolt_effect_timer: f32,
 
@@ -234,6 +240,7 @@ pub const Ship = extern struct {
             .strategy = .hold_center,
             .weapon_type = .none,
             .weapon_target = -1,
+            .over_face = 0,
             .ebolt_timer = 0,
             .ebolt_effect_timer = 0,
         };
@@ -304,7 +311,7 @@ pub const Ship = extern struct {
         const to_face_vector = base_face.tris[0].vertices[0].pos.sub(base_face.tris[0].vertices[1].pos);
         const direction = section.center.sub(self.position);
         self.flags.left_side = direction.dot(to_face_vector) > 0;
-        // (Pickup collection happens here in the original.)
+        self.over_face = @intCast(if (self.flags.left_side) base else @min(base + 1, track.faces.len - 1));
 
         self.last_impact_time = f(self.last_impact_time + ctx.tick);
 
@@ -460,6 +467,15 @@ pub const Ship = extern struct {
 
         self.toggleView(ctx);
 
+        if (self.weapon_type == .missile or self.weapon_type == .ebolt) {
+            self.weapon_target = self.findTarget(ctx);
+        } else {
+            self.weapon_target = -1;
+        }
+        if (in.isPressed(.fire) and self.weapon_type != .none and !self.flags.shielded) {
+            if (ctx.weapons) |weapons| weapons.fire(self, self.weapon_type, track);
+        }
+
         // Thrust acts along the ship's own forward axis.
         const fwd = self.forward();
         self.thrust = fwd.scale(self.thrust_mag * 64);
@@ -588,6 +604,41 @@ pub const Ship = extern struct {
         }
     }
 
+    /// The nearest ship ahead within ten sections, following junctions the
+    /// way the original does; -1 when none.
+    fn findTarget(self: *const Ship, ctx: Context) i32 {
+        const sections = ctx.track.sections;
+        var shortest: i32 = 256;
+        var nearest: i32 = -1;
+        const own = &sections[self.section];
+        const own_on_branch = (own.flags & SectionFlags.junction) != 0;
+        for (ctx.ships, 0..) |*other, i| {
+            if (i == self.pilot) continue;
+            const other_section = &sections[other.section];
+            const other_on_branch = (other_section.flags & SectionFlags.junction) != 0;
+            if (own_on_branch == other_on_branch) {
+                const distance: i32 = other_section.num - own.num;
+                if (distance < shortest and distance > 0) {
+                    shortest = distance;
+                    nearest = @intCast(i);
+                }
+            } else {
+                var section: u32 = self.section;
+                var distance: i32 = 0;
+                while (distance < 10) : (distance += 1) {
+                    const s = &sections[section];
+                    section = if (!own_on_branch and s.junction != track_mod.none) @intCast(s.junction) else s.next;
+                    if (other.section == section and distance < shortest and distance > 0) {
+                        shortest = distance;
+                        nearest = @intCast(i);
+                        break;
+                    }
+                }
+            }
+        }
+        return if (shortest < 10) nearest else -1;
+    }
+
     // -- AI -----------------------------------------------------------------
 
     fn updateAiIntro(self: *Ship, ctx: Context) void {
@@ -676,10 +727,21 @@ pub const Ship = extern struct {
                     const chance = ctx.rng.int(0, 64);
                     self.update_timer = update_time_just_front;
                     if (self.fight_back != 0) {
-                        // Block, mine, or shield: the latter two need the
-                        // weapon systems and fall back to blocking for now.
+                        // Block; or block and drop mines; or block behind a shield.
                         self.strategy = .block;
-                        _ = chance;
+                        if (chance < 40 or self.weapon_type == .none) {
+                            // plain block
+                        } else if (chance < 52) {
+                            if (!self.flags.shielded and self.flags.racing) {
+                                self.weapon_type = .mine;
+                                if (ctx.weapons) |weapons| weapons.fireDelayed(self, .mine);
+                            }
+                        } else {
+                            if (!self.flags.shielded) {
+                                self.weapon_type = .shield;
+                                if (ctx.weapons) |weapons| weapons.fire(self, .shield, track);
+                            }
+                        }
                     } else {
                         self.strategy = .avoid;
                     }
@@ -705,6 +767,18 @@ pub const Ship = extern struct {
                             } else {
                                 self.strategy = .avoid;
                                 self.flags.overtaken = false;
+                                if (!self.flags.shielded and self.flags.racing) {
+                                    if (chance < 54) {
+                                        self.weapon_type = .rocket;
+                                    } else if (chance < 60) {
+                                        self.weapon_type = .missile;
+                                        self.weapon_target = ctx.player;
+                                    } else {
+                                        self.weapon_type = .ebolt;
+                                        self.weapon_target = ctx.player;
+                                    }
+                                    if (ctx.weapons) |weapons| weapons.fireDelayed(self, self.weapon_type);
+                                }
                             }
                         }
                     } else {
@@ -933,9 +1007,8 @@ pub const Ship = extern struct {
         other.flags.coll = true;
     }
 
-    /// Towed back onto the track. The original has the rescue droid fly to
-    /// the ship first and set `in_tow` on arrival; without the droid the
-    /// tow starts immediately.
+    /// Towed back onto the track once the droid has arrived and set
+    /// `in_tow`.
     fn updateRescue(self: *Ship, ctx: Context) void {
         const track = ctx.track;
         const tick = ctx.tick;
@@ -971,7 +1044,6 @@ pub const Ship = extern struct {
         self.update_timer = update_time_rescue;
         self.flags.in_rescue = true;
         self.flags.flying = true;
-        self.flags.in_tow = true;
         self.section = section_index;
         const section = &track.sections[section_index];
         self.temp_target = section.center.add(track.sections[section.next].center).scale(0.55);
