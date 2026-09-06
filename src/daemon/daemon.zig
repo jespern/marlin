@@ -3797,9 +3797,9 @@ pub const Daemon = struct {
         return false;
     }
 
-    /// Worker thread: GET /models from OpenRouter, parse ids, hand the
-    /// result to the dispatcher. Failure → empty list (client falls back to
-    /// favorites) plus the error, so the requester hears WHY, not silence.
+    /// Worker thread: merge remote OpenRouter models with the installed
+    /// Codex app-server catalog, then hand owned ids to the dispatcher.
+    /// Total failure falls back to favorites with a visible reason.
     fn catalogFetchMain(self: *Daemon, client_id: u64) void {
         var fetch_err: ?anyerror = null;
         const models = self.fetchCatalog() catch |e| blk: {
@@ -3813,6 +3813,58 @@ pub const Daemon = struct {
     }
 
     fn fetchCatalog(self: *Daemon) ![]CatalogModel {
+        var out: std.ArrayList(CatalogModel) = .empty;
+        errdefer {
+            for (out.items) |model| self.gpa.free(model.id);
+            out.deinit(self.gpa);
+        }
+        var any_source = false;
+        var last_err: ?anyerror = null;
+
+        const openrouter_models = self.fetchOpenRouterCatalog() catch |err| blk: {
+            last_err = err;
+            break :blk null;
+        };
+        if (openrouter_models) |models| {
+            defer self.gpa.free(models);
+            try out.appendSlice(self.gpa, models);
+            any_source = true;
+        }
+
+        if (self.codexAvailable()) {
+            var child_environ = try permissions.toolEnvironment(self.gpa, self.environ);
+            defer child_environ.deinit();
+            const codex_models = codex.fetchModels(
+                self.gpa,
+                self.io,
+                &child_environ,
+                &self.catalog_cancel,
+            ) catch |err| blk: {
+                last_err = err;
+                break :blk null;
+            };
+            if (codex_models) |models| {
+                defer self.gpa.free(models);
+                var transferred: usize = 0;
+                errdefer for (models[transferred..]) |model| self.gpa.free(model.id);
+                for (models) |model| {
+                    try out.append(self.gpa, .{ .id = model.id });
+                    transferred += 1;
+                }
+                any_source = true;
+            }
+        }
+
+        if (!any_source) return last_err orelse error.CatalogUnavailable;
+        std.mem.sort(CatalogModel, out.items, {}, struct {
+            fn lessThan(_: void, a: CatalogModel, b: CatalogModel) bool {
+                return std.mem.lessThan(u8, a.id, b.id);
+            }
+        }.lessThan);
+        return out.toOwnedSlice(self.gpa);
+    }
+
+    fn fetchOpenRouterCatalog(self: *Daemon) ![]CatalogModel {
         const url = try registry.openrouterModelsUrl(self.gpa, self.environ, self.cfg);
         defer self.gpa.free(url);
 

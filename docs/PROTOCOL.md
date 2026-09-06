@@ -48,7 +48,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | input_history | sid?, limit? | input_history_result{entries}; authored user/steer text across sessions, current sid first then newest, capped at 1024 |
 | search | query, sid?, limit? | search_result{query,sid,hits}; sid=0 searches all sessions, capped at 200 results |
 | diagnostics | sid, turn_limit? | diagnostics_result; bounded provider/TTFT and local-preparation summary plus the latest turn waterfall |
-| model_list | — | model_list_result{models, pricing?}; the provider catalog (cached ~1h), empty on fetch failure so clients fall back to favorites |
+| model_list | — | model_list_result{models, pricing?}; merged OpenRouter and installed Codex app-server catalogs (cached ~1h), empty on total fetch failure so clients fall back to favorites |
 | otel_configure | endpoint?, traces_endpoint?, headers… | reconfigures OTLP export without a restart and persists it; err on failure |
 | otel_status | — | the exporter's current status (endpoint, pending outbox, last error) |
 | otel_content | enabled | ok/err; toggles opt-in GenAI content capture on exported spans (requires an active exporter) |
