@@ -104,6 +104,7 @@ const hardCellBreak = render.hardCellBreak;
 const utf8Floor = render.utf8Floor;
 const spaces = render.spaces;
 const spinner_frames = render.spinner_frames;
+const terminal_osc = @import("terminal_osc.zig");
 
 /// Keep startup and first session-switch latency independent of transcript
 /// length. Reaching the top explicitly backfills the complete durable log.
@@ -112,6 +113,10 @@ pub const initial_replay_blocks: u32 = 256;
 const Event = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
+    mouse_leave,
+    focus_in,
+    focus_out,
+    color_report: vaxis.Color.Report,
     winsize: vaxis.Winsize,
     /// Animation clock; posted only while a turn is running.
     tick,
@@ -487,6 +492,16 @@ pub const App = struct {
     /// Last OSC 2 title sent, avoiding redundant terminal writes between
     /// state changes and animation frames.
     terminal_title: std.ArrayList(u8) = .empty,
+    /// Terminal-level state follows the focused view. These caches prevent
+    /// frame-rate OSC traffic and make future pane focus the only owner swap.
+    terminal_cwd: std.ArrayList(u8) = .empty,
+    terminal_restore_cwd: std.ArrayList(u8) = .empty,
+    terminal_progress: ?terminal_osc.Progress = null,
+    terminal_focused: bool = true,
+    terminal_theme: terminal_osc.Theme = .{},
+    notification_sid: u64 = 0,
+    notification_title: std.ArrayList(u8) = .empty,
+    notification_body: std.ArrayList(u8) = .empty,
     /// Text ready for the event loop to send through OSC52. Blob responses
     /// arrive in the daemon reader path, where the terminal writer is not
     /// available, so `!c` stages the bytes here for the next frame.
@@ -607,6 +622,10 @@ pub const App = struct {
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.terminal_title.deinit(self.gpa);
+        self.terminal_cwd.deinit(self.gpa);
+        self.terminal_restore_cwd.deinit(self.gpa);
+        self.notification_title.deinit(self.gpa);
+        self.notification_body.deinit(self.gpa);
         self.pending_new_cwd.deinit(self.gpa);
         self.shell_command.deinit(self.gpa);
         self.clipboard_pending.deinit(self.gpa);
@@ -707,6 +726,22 @@ pub const App = struct {
     pub fn setCwdStr(self: *App, cwd: []const u8) void {
         self.view.cwd.clearRetainingCapacity();
         self.view.cwd.appendSlice(self.gpa, cwd) catch {};
+    }
+
+    fn queueTerminalNotification(self: *App, sid: u64, body: []const u8) void {
+        const summary = self.sessionSummary(sid);
+        const identity = if (summary) |session|
+            if (session.title.len > 0) session.title else std.fs.path.basename(session.cwd)
+        else
+            "session";
+        self.notification_title.clearRetainingCapacity();
+        self.notification_title.print(self.gpa, "Marlin · {s}", .{if (identity.len > 0) identity else "session"}) catch return;
+        self.notification_body.clearRetainingCapacity();
+        self.notification_body.appendSlice(self.gpa, body) catch {
+            self.notification_title.clearRetainingCapacity();
+            return;
+        };
+        self.notification_sid = sid;
     }
 
     pub fn setPlan(self: *App, source: []const block.PlanItem) void {
@@ -1489,7 +1524,21 @@ pub const App = struct {
                 view.stream_status_at_ms = nowWallMs(self.io);
             },
             .status => |s| {
+                const prior_state = if (self.sessionSummary(s.sid)) |summary|
+                    summary.state
+                else if (self.liveView(s.sid)) |view|
+                    view.state
+                else
+                    null;
                 self.updateSessionSummaryState(s.sid, s.state);
+                if (prior_state == .running and s.state != .running and
+                    (s.sid != self.view.sid or !self.terminal_focused))
+                {
+                    if (s.state == .err)
+                        self.queueTerminalNotification(s.sid, s.err_text orelse "Turn failed")
+                    else if (s.state == .idle or s.state == .done)
+                        self.queueTerminalNotification(s.sid, "Turn finished");
+                }
                 const view = self.liveView(s.sid) orelse {
                     if (self.saved_views.get(s.sid)) |saved| {
                         saved.state = s.state;
@@ -1564,11 +1613,14 @@ pub const App = struct {
                 @memcpy(p.args_buf[0..p.args_len], ar.args_json[0..p.args_len]);
                 if (self.liveView(ar.sid)) |view| {
                     view.pending = p;
+                    if (!self.terminal_focused)
+                        self.queueTerminalNotification(ar.sid, "Approval needed");
                 } else {
                     self.background_approvals.put(self.gpa, ar.sid, p) catch {};
                     // The one out-of-band signal: you are looking elsewhere
                     // and a session needs a human. Everything else stays quiet.
                     if (self.bell_enabled) self.bell_pending = true;
+                    self.queueTerminalNotification(ar.sid, "Approval needed");
                 }
             },
             .session_created => |sc| self.handleSessionCreated(sc.sid, sc.request_id),
@@ -3574,6 +3626,7 @@ fn transcriptView(app: *App) Transcript {
         .delta = app.view.delta.items,
         .reasoning_delta = app.view.reasoning_delta.items,
         .spinner_frame = app.view.spinner_frame,
+        .shimmer_shades = &app.terminal_theme.shimmer,
         .turn_started_ms = app.view.turn_started_ms,
         .turn_phase = app.view.turn_phase,
         .phase_started_ms = app.view.phase_started_ms,
@@ -3882,6 +3935,50 @@ pub fn updateTerminalTitle(app: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) 
     try vx.setTitle(writer, title);
     app.terminal_title.clearRetainingCapacity();
     try app.terminal_title.appendSlice(app.gpa, title);
+}
+
+pub fn updateTerminalWorkingDirectory(app: *App, writer: *std.Io.Writer) !void {
+    if (app.remote_transport or app.view.cwd.items.len == 0 or
+        std.mem.eql(u8, app.view.cwd.items, app.terminal_cwd.items)) return;
+    try terminal_osc.writeWorkingDirectory(
+        writer,
+        if (app.environ) |env_map| env_map.get("HOSTNAME") orelse "localhost" else "localhost",
+        app.view.cwd.items,
+    );
+    app.terminal_cwd.clearRetainingCapacity();
+    try app.terminal_cwd.appendSlice(app.gpa, app.view.cwd.items);
+}
+
+pub fn terminalProgress(app: *const App) terminal_osc.Progress {
+    var running = app.view.state == .running;
+    if (app.view.state == .awaiting_approval) return .warning;
+    for (app.sessions.items) |session| switch (session.state) {
+        .awaiting_approval => return .warning,
+        .running => running = true,
+        else => {},
+    };
+    return if (running) .indeterminate else .hidden;
+}
+
+pub fn updateTerminalProgress(app: *App, writer: *std.Io.Writer) !void {
+    const progress = terminalProgress(app);
+    if (app.terminal_progress == progress) return;
+    try terminal_osc.writeProgress(writer, progress, 0);
+    app.terminal_progress = progress;
+}
+
+fn flushTerminalNotification(app: *App, writer: *std.Io.Writer, arena: std.mem.Allocator) !void {
+    if (app.notification_body.items.len == 0) return;
+    try terminal_osc.writeNotification(
+        writer,
+        arena,
+        app.notification_sid,
+        app.notification_title.items,
+        app.notification_body.items,
+    );
+    app.notification_title.clearRetainingCapacity();
+    app.notification_body.clearRetainingCapacity();
+    app.notification_sid = 0;
 }
 
 fn tabLabel(app: *const App, summary: ?*const SessionSummary) []const u8 {
@@ -5394,15 +5491,21 @@ pub const TransportVerdicts = struct {
 /// Mouse tracking prevents some terminals from handling OSC 8 activation
 /// themselves. Ctrl/Command+left-click is therefore handled by Marlin using
 /// the link metadata already painted into the current Vaxis screen.
-pub fn linkAtMouse(win: vaxis.Window, mouse: vaxis.Mouse, super_held: bool) ?[]const u8 {
-    if (mouse.type != .press or mouse.button != .left or (!mouse.mods.ctrl and !super_held)) return null;
+pub fn linkUriAtMouse(win: vaxis.Window, mouse: vaxis.Mouse) ?[]const u8 {
     if (mouse.col < 0 or mouse.row < 0) return null;
     const col: u16 = @intCast(mouse.col);
     const row: u16 = @intCast(mouse.row);
     if (col >= win.width or row >= win.height) return null;
     const uri = (win.readCell(col, row) orelse return null).link.uri;
-    if (!std.mem.startsWith(u8, uri, "https://") and !std.mem.startsWith(u8, uri, "http://")) return null;
+    if (!std.mem.startsWith(u8, uri, "https://") and
+        !std.mem.startsWith(u8, uri, "http://") and
+        !std.mem.startsWith(u8, uri, "file://")) return null;
     return uri;
+}
+
+pub fn linkAtMouse(win: vaxis.Window, mouse: vaxis.Mouse, super_held: bool) ?[]const u8 {
+    if (mouse.type != .press or mouse.button != .left or (!mouse.mods.ctrl and !super_held)) return null;
+    return linkUriAtMouse(win, mouse);
 }
 
 fn openExternalLink(app: *App, uri: []const u8) void {
@@ -5461,12 +5564,17 @@ pub fn dispatchEvent(
         .voice => |vev| app.handleVoiceEvent(vev),
         .mouse => |m| {
             if (app.screensaver_active) return;
+            vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null) .pointer else .default);
             if (linkAtMouse(vx.window(), m, app.link_super_held)) |uri| {
                 openExternalLink(app, uri);
                 return;
             }
             handleMouse(app, m);
         },
+        .mouse_leave => vx.setMouseShape(.default),
+        .focus_in => app.terminal_focused = true,
+        .focus_out => app.terminal_focused = false,
+        .color_report => |report| app.terminal_theme.applyReport(report),
         .tick => {
             app.view.spinner_frame +%= 1;
             app.voiceTick();
@@ -5673,6 +5781,10 @@ pub fn run(
     };
     initial_ids_transferred = true;
     defer app.deinit();
+    var terminal_restore_buf: [4096]u8 = undefined;
+    if (std.process.currentPath(io, &terminal_restore_buf)) |len| {
+        try app.terminal_restore_cwd.appendSlice(gpa, terminal_restore_buf[0..len]);
+    } else |_| {}
     app.setModelStr(model_at_start);
     if (setup_at_start) |readiness| app.setup.readiness = readiness;
     app.show_tab_bar = cfg.ui_tab_bar;
@@ -5736,9 +5848,22 @@ pub fn run(
         try vx.enterAltScreen(writer);
         defer {
             vx.setTitle(writer, "") catch {};
+            terminal_osc.writeProgress(writer, .hidden, 0) catch {};
+            if (app.terminal_restore_cwd.items.len > 0)
+                terminal_osc.writeWorkingDirectory(
+                    writer,
+                    if (app.environ) |env_map| env_map.get("HOSTNAME") orelse "localhost" else "localhost",
+                    app.terminal_restore_cwd.items,
+                ) catch {};
+            writer.flush() catch {};
         }
         try writer.flush();
         try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+        var color_index: u8 = 0;
+        while (color_index < 16) : (color_index += 1)
+            try vx.queryColor(writer, .{ .index = color_index });
+        try vx.queryColor(writer, .fg);
+        try vx.queryColor(writer, .bg);
         app.voice_rt.kitty_release = vx.caps.kitty_keyboard;
         app.kitty_graphics = vx.caps.kitty_graphics;
         app.initVoiceFromConfig();
@@ -5791,6 +5916,9 @@ pub fn run(
             defer frame_arena.deinit();
             app.pumpPixelEffect(&vx, writer);
             try updateTerminalTitle(&app, &vx, writer);
+            try updateTerminalWorkingDirectory(&app, writer);
+            try updateTerminalProgress(&app, writer);
+            try flushTerminalNotification(&app, writer, frame_arena.allocator());
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
             if (app.bell_pending) {
@@ -5912,6 +6040,9 @@ pub fn run(
 
             app.pumpPixelEffect(&vx, writer);
             try updateTerminalTitle(&app, &vx, writer);
+            try updateTerminalWorkingDirectory(&app, writer);
+            try updateTerminalProgress(&app, writer);
+            try flushTerminalNotification(&app, writer, frame_arena.allocator());
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
             if (app.bell_pending) {

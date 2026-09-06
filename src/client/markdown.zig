@@ -38,9 +38,63 @@ pub fn appendInlineStyle(
     if (start < end) try styles.append(arena, .{ .start = start, .end = end, .style = style });
 }
 
+fn isUriSafeByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '/' or byte == '-' or byte == '_' or byte == '.' or byte == '~';
+}
+
+/// Turn the absolute paths emitted by coding agents into an OSC 8 file URI.
+/// A trailing `:line` stays useful as a fragment without becoming part of
+/// the filesystem path. Relative paths remain visible Markdown because their
+/// meaning depends on session cwd and cannot be represented honestly here.
+pub fn localFileUri(arena: std.mem.Allocator, raw_target: []const u8) !?[]const u8 {
+    var target = std.mem.trim(u8, raw_target, " \t");
+    if (target.len >= 2 and target[0] == '<' and target[target.len - 1] == '>')
+        target = target[1 .. target.len - 1];
+    if (target.len == 0 or target[0] != '/') return null;
+
+    var path = target;
+    var line: []const u8 = "";
+    if (std.mem.lastIndexOfScalar(u8, target, ':')) |colon| {
+        const suffix = target[colon + 1 ..];
+        var digits = suffix.len > 0;
+        for (suffix) |byte| if (!std.ascii.isDigit(byte)) {
+            digits = false;
+            break;
+        };
+        if (digits) {
+            path = target[0..colon];
+            line = suffix;
+        }
+    }
+
+    var uri: std.ArrayList(u8) = .empty;
+    try uri.appendSlice(arena, "file://");
+    const hex = "0123456789ABCDEF";
+    for (path) |byte| {
+        if (isUriSafeByte(byte)) {
+            try uri.append(arena, byte);
+        } else {
+            try uri.appendSlice(arena, &.{ '%', hex[byte >> 4], hex[byte & 0x0f] });
+        }
+    }
+    if (line.len > 0) {
+        try uri.appendSlice(arena, "#L");
+        try uri.appendSlice(arena, line);
+    }
+    return uri.items;
+}
+
+fn linkUri(arena: std.mem.Allocator, raw_target: []const u8) !?[]const u8 {
+    var target = std.mem.trim(u8, raw_target, " \t");
+    if (target.len >= 2 and target[0] == '<' and target[target.len - 1] == '>')
+        target = target[1 .. target.len - 1];
+    if (isUrlStart(target, 0)) return target;
+    return localFileUri(arena, raw_target);
+}
+
 /// Small, deliberately conservative inline Markdown pass. It removes the
 /// punctuation users do not want to read in a terminal while retaining
-/// emphasis, inline-code styling, and safe HTTP(S) link metadata.
+/// emphasis, inline-code styling, and safe HTTP(S)/absolute-file link metadata.
 pub fn inlineMarkdown(arena: std.mem.Allocator, source: []const u8) !InlineMarkdown {
     var out: std.ArrayList(u8) = .empty;
     var styles: std.ArrayList(SyntaxSpan) = .empty;
@@ -93,8 +147,7 @@ pub fn inlineMarkdown(arena: std.mem.Allocator, source: []const u8) !InlineMarkd
             if (std.mem.indexOfPos(u8, source, i + 1, "](")) |label_end| {
                 const uri_start = label_end + 2;
                 if (std.mem.indexOfScalarPos(u8, source, uri_start, ')')) |uri_end| {
-                    const uri = source[uri_start..uri_end];
-                    if (isUrlStart(uri, 0)) {
+                    if (try linkUri(arena, source[uri_start..uri_end])) |uri| {
                         const start = out.items.len;
                         try out.appendSlice(arena, source[i + 1 .. label_end]);
                         try links.append(arena, .{ .start = start, .end = out.items.len, .uri = uri });

@@ -49,6 +49,26 @@ test "assistant Markdown removes punctuation and retains styles and links" {
     try std.testing.expect(vaxis.Color.eql(rendered.styles[1].style.bg, Palette.md_inline_code_bg));
 }
 
+test "assistant Markdown renders absolute local file links as labels" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const plain = try inlineMarkdown(arena, "See [HTTP transport](/Users/jespern/Work/marlin/src/daemon/provider/http.zig:504).");
+    try std.testing.expectEqualStrings("See HTTP transport.", plain.text);
+    try std.testing.expectEqual(@as(usize, 1), plain.links.len);
+    try std.testing.expectEqualStrings("HTTP transport", plain.text[plain.links[0].start..plain.links[0].end]);
+    try std.testing.expectEqualStrings("file:///Users/jespern/Work/marlin/src/daemon/provider/http.zig#L504", plain.links[0].uri);
+
+    const spaced = try inlineMarkdown(arena, "Open [the report](</Users/jespern/Work/My Project/report.md:3>).");
+    try std.testing.expectEqualStrings("Open the report.", spaced.text);
+    try std.testing.expectEqualStrings("file:///Users/jespern/Work/My%20Project/report.md#L3", spaced.links[0].uri);
+
+    const relative = try inlineMarkdown(arena, "Keep [this](src/main.zig:1) literal.");
+    try std.testing.expectEqualStrings("Keep [this](src/main.zig:1) literal.", relative.text);
+    try std.testing.expectEqual(@as(usize, 0), relative.links.len);
+}
+
 test "assistant Markdown renders bounded tables with header surfaces and inline styles" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

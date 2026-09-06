@@ -17,6 +17,7 @@ const media = @import("media.zig");
 const render = @import("render.zig");
 const top_view = @import("top.zig");
 const markdown = @import("markdown.zig");
+const terminal_osc = @import("terminal_osc.zig");
 const layout_mod = @import("layout.zig");
 const commands = @import("commands.zig");
 const keys = @import("keys.zig");
@@ -131,6 +132,7 @@ const statusModel = tui.statusModel;
 const tabMouseAction = tui.tabMouseAction;
 const tabNavigationDirection = tui.tabNavigationDirection;
 const terminalTitle = tui.terminalTitle;
+const terminalProgress = tui.terminalProgress;
 const transient_animation_frames = tui.transient_animation_frames;
 const validCatalogRate = tui.validCatalogRate;
 
@@ -151,6 +153,23 @@ test "terminal title follows focused project and running spinner" {
         spinner_frames[4] ++ " beta",
         terminalTitle(&buf, "/work/beta", .running, 4),
     );
+}
+
+test "terminal progress reflects active work and approvals" {
+    const gpa = std.testing.allocator;
+    var app = App{
+        .gpa = gpa,
+        .io = undefined,
+        .conn = undefined,
+        .view = .{ .sid = 1, .editor = Editor.init(gpa) },
+    };
+    defer app.deinit();
+
+    try std.testing.expectEqual(terminal_osc.Progress.hidden, terminalProgress(&app));
+    app.view.state = .running;
+    try std.testing.expectEqual(terminal_osc.Progress.indeterminate, terminalProgress(&app));
+    app.view.state = .awaiting_approval;
+    try std.testing.expectEqual(terminal_osc.Progress.warning, terminalProgress(&app));
 }
 
 test "command input: / and ! lead, a leading space sends verbatim" {
@@ -2049,6 +2068,12 @@ test "ctrl or command click resolves the OSC 8 link under the pointer" {
     try std.testing.expectEqualStrings(
         "https://marlin.wtf/docs",
         linkAtMouse(win, .{ .row = 1, .col = 4, .button = .left, .mods = .{}, .type = .press }, true).?,
+    );
+    cell.link = .{ .uri = "file:///Users/me/project/main.zig#L4" };
+    win.writeCell(4, 1, cell);
+    try std.testing.expectEqualStrings(
+        "file:///Users/me/project/main.zig#L4",
+        linkAtMouse(win, .{ .row = 1, .col = 4, .button = .left, .mods = .{ .ctrl = true }, .type = .press }, false).?,
     );
     try std.testing.expect(linkAtMouse(win, .{ .row = 1, .col = 4, .button = .left, .mods = .{}, .type = .press }, false) == null);
     try std.testing.expect(linkAtMouse(win, .{ .row = 1, .col = 3, .button = .left, .mods = .{ .ctrl = true }, .type = .press }, false) == null);

@@ -144,7 +144,7 @@ pub const LinkSpan = struct {
     /// Byte offsets in the concatenated visible text of a Line.
     start: usize,
     end: usize,
-    /// OSC 8 destination. Always an allowlisted http(s) URL.
+    /// OSC 8 destination. An allowlisted HTTP(S) or absolute local file URI.
     uri: []const u8,
 };
 
@@ -213,6 +213,7 @@ pub fn shimmerSpans(
     text: []const u8,
     offset: usize,
     frame: usize,
+    shades: []const vaxis.Color,
 ) ![]const SyntaxSpan {
     var spans: std.ArrayList(SyntaxSpan) = .empty;
     var i: usize = 0;
@@ -224,7 +225,7 @@ pub fn shimmerSpans(
             .start = offset + i,
             .end = offset + end,
             .style = .{
-                .fg = shimmer_shades[(char_index + frame) % shimmer_shades.len],
+                .fg = shades[(char_index + frame) % shades.len],
                 .bold = true,
             },
         });

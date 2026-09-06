@@ -1074,8 +1074,18 @@ get these right; Hermes is the counter-example):
   Effects needing interpolation (shimmer gradient, dimmed diff variants)
   query the terminal's actual RGB for the relevant slots via OSC 4/10/11 at
   startup and derive from those — gradients match the user's theme instead
-  of a hardcoded rainbow. (Check what libvaxis exposes for OSC queries;
-  it's Ghostty-adjacent so likely most of it.)
+  of a hardcoded rainbow. The current client retains ANSI-16 plus default
+  foreground/background reports and derives the live Working shimmer from
+  the latter; terminals that do not reply keep the compiled fallback ramp.
+
+**Terminal-owned state follows client focus.** The client emits OSC 2 and OSC
+7 for the focused session's title and cwd, OSC 9;4 for aggregate running or
+approval state, OSC 22 for interactive pointer shape, and OSC 99 for hidden or
+unfocused turn/approval notifications. This remains a client responsibility:
+the daemon supplies session lifecycle facts but cannot know terminal focus or
+which future pane owns focus. Remote attaches omit OSC 7 until the protocol can
+name the daemon host, rather than mislabeling a remote cwd as a local file URI.
+Clean exit restores the attach process cwd and clears title/progress state.
 
 **Permanent tabs; no persistent sidebar.** Every unarchived root session has a
 tab in a one-row strip that remains visible even when only one session exists.
@@ -1150,7 +1160,8 @@ A split pane identifies its session with a compact pane label.
   arrow. When the active call is Bash, its command preview uses the same
   semantic shell highlighting as the durable tool row. Provisional
   assistant text wraps append-only and receives full Markdown treatment when
-  its block finalizes. Spinner/token frames therefore
+  its block finalizes. Inline links render as their label; HTTP(S) and absolute
+  local-file destinations remain attached as OSC 8 metadata. Spinner/token frames therefore
   do not re-layout the accumulated turn. Inactive full
   session views are an eight-entry MRU cache; evicted views reopen from a
   bounded durable tail instead of accumulating for the lifetime of the TUI.

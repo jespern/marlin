@@ -116,6 +116,7 @@ test {
     _ = @import("testing/fixture_tests.zig");
     _ = @import("client/render_test.zig");
     _ = @import("client/markdown_test.zig");
+    _ = @import("client/terminal_osc_test.zig");
     _ = @import("client/layout_test.zig");
     _ = @import("client/effect.zig");
     _ = @import("client/effects_test.zig");

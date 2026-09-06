@@ -1110,6 +1110,7 @@ pub const Transcript = struct {
     delta: []const u8,
     reasoning_delta: []const u8,
     spinner_frame: usize,
+    shimmer_shades: []const vaxis.Color = &render.shimmer_shades,
     turn_started_ms: i64,
     turn_phase: proto.TurnPhase = .idle,
     phase_started_ms: i64 = 0,
@@ -1639,7 +1640,7 @@ pub fn layoutLines(
                 });
             }
         }
-        try syntax.appendSlice(arena, try shimmerSpans(arena, word, head.len, transcript.spinner_frame));
+        try syntax.appendSlice(arena, try shimmerSpans(arena, word, head.len, transcript.spinner_frame, transcript.shimmer_shades));
         if (detail.shell_command) |command| {
             try syntax.appendSlice(arena, try shellCommandSpans(
                 arena,
