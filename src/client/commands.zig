@@ -43,7 +43,8 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
     .{ .name = "/animate", .usage = " <" ++ effects.usage_list ++ ">", .description = "play a transient screen effect", .accepts_args = true },
-    .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "]", .description = "start a continuous full-screen effect", .accepts_args = true },
+    .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "|mariokart]", .description = "start a continuous full-screen effect", .accepts_args = true },
+    .{ .name = "/mk64", .usage = " [absolute bundle or ROM path]", .description = "play Mario Kart (pure Zig)", .accepts_args = true },
     .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/cwd", .usage = " <path>", .description = "change this session's working directory", .accepts_args = true },
@@ -58,6 +59,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/detach", .description = "leave Marlin (sessions keep running)" },
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
+    .{ .name = "!mk", .usage = " [absolute bundle or ROM path]", .description = "play Mario Kart", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
 };
@@ -235,6 +237,10 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
         (query["/screensaver".len] == ' ' or query["/screensaver".len] == '\t'))
     {
         const rest = std.mem.trimStart(u8, query["/screensaver".len..], " \t");
+        const mario = "mariokart";
+        if (rest.len <= mario.len and std.ascii.eqlIgnoreCase(rest, mario[0..rest.len])) {
+            try out.append(arena, .{ .label = "/screensaver mariokart", .replacement = "/screensaver mariokart", .description = "Mario Kart autopilot (full-screen)", .submit_on_enter = true });
+        }
         for (effects.kinds) |kind| {
             const name = kind.name();
             if (rest.len <= name.len and std.ascii.eqlIgnoreCase(rest, name[0..rest.len])) {
@@ -344,6 +350,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         std.mem.eql(u8, head, "/detach"))
     {
         self.should_quit = true;
+    } else if (std.mem.eql(u8, head, "/mk64") or std.mem.eql(u8, head, "!mk")) {
+        launchMarioKart(self, it.rest(), false);
     } else if (std.mem.eql(u8, head, "/setup")) {
         self.requestSetup(false);
     } else if (std.mem.eql(u8, head, "/model")) {
@@ -681,7 +689,12 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         if (!self.applySkyArg(kind, sky_arg)) return;
         self.startUiAnimation(kind);
     } else if (std.mem.eql(u8, head, "/screensaver") or std.mem.eql(u8, head, "!s")) {
-        const kind = if (it.next()) |name| effects.Kind.parse(name) orelse {
+        const selected = it.next();
+        if (selected) |name| if (std.ascii.eqlIgnoreCase(name, "mariokart")) {
+            launchMarioKart(self, it.rest(), true);
+            return;
+        };
+        const kind = if (selected) |name| effects.Kind.parse(name) orelse {
             self.setNotice("unknown effect {s}", .{name});
             return;
         } else self.screensaver_kind;
@@ -986,4 +999,20 @@ pub fn toggleSandbox(self: *App, arg: []const u8) void {
     } else {
         self.setNotice("sandbox off — every shell call asks again", .{});
     }
+}
+
+fn launchMarioKart(self: *App, raw_arg: []const u8, autoplay: bool) void {
+    const raw = std.mem.trim(u8, raw_arg, " \t");
+    const arg = if (raw.len >= 2 and ((raw[0] == '"' and raw[raw.len - 1] == '"') or (raw[0] == '\'' and raw[raw.len - 1] == '\''))) raw[1 .. raw.len - 1] else raw;
+    const configured = if (self.environ) |env| env.get("MARLIN_MK64_ASSETS") orelse env.get("MARLIN_MK64_ROM") else null;
+    const path = if (arg.len > 0) arg else configured orelse "";
+    if (path.len > 0 and !std.fs.path.isAbsolute(path)) {
+        self.setNotice("Mario Kart needs an absolute bundle or US ROM path", .{});
+        return;
+    }
+    const copy = self.gpa.dupe(u8, path) catch return;
+    if (self.mk64_rom) |old| self.gpa.free(old);
+    self.mk64_rom = copy;
+    self.mk64_autopilot = autoplay;
+    self.should_quit = true;
 }

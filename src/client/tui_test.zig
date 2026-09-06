@@ -4394,3 +4394,57 @@ test "deliberate daemon shutdown exits the TUI before reconnect" {
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .daemon_stopping = .{} }));
     try std.testing.expect(app.should_quit);
 }
+
+test "Mario Kart TUI aliases select manual or autoplay without shell escape" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp/mario-home");
+    var app = App{ .gpa = gpa, .io = threaded.io(), .environ = &environ, .conn = undefined, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.runCommand("!mk");
+    try std.testing.expect(app.should_quit and !app.shell_requested and !app.mk64_autopilot);
+    try std.testing.expectEqualStrings("", app.mk64_rom.?);
+    app.should_quit = false;
+    app.runCommand("/screensaver mariokart '/tmp/ROM with spaces.z64'");
+    try std.testing.expect(app.should_quit and app.mk64_autopilot and !app.shell_requested);
+    try std.testing.expectEqualStrings("/tmp/ROM with spaces.z64", app.mk64_rom.?);
+    try std.testing.expectEqual(@as(u64, 7), app.view.sid);
+    app.should_quit = false;
+    try environ.put("MARLIN_MK64_ROM", "/tmp/ROM with spaces.z64");
+    app.runCommand("!mk");
+    try std.testing.expect(!app.mk64_autopilot);
+    try std.testing.expectEqualStrings("/tmp/ROM with spaces.z64", app.mk64_rom.?);
+    app.should_quit = false;
+    app.runCommand("!s mariokart");
+    try std.testing.expect(app.mk64_autopilot and app.should_quit);
+    app.should_quit = false;
+    try environ.put("MARLIN_MK64_ASSETS", "/tmp/custom.mkassets");
+    app.runCommand("!mk");
+    try std.testing.expectEqualStrings("/tmp/custom.mkassets", app.mk64_rom.?);
+    app.should_quit = false;
+    app.runCommand("!mk relative.z64");
+    try std.testing.expect(!app.should_quit);
+}
+
+test "Mario Kart launch commands are discoverable in completion" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    app.view.editor.insertSlice("!mk");
+    var suggestions = try commandSuggestions(&app, arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("!mk", suggestions[0].replacement);
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/screensaver mari");
+    suggestions = try commandSuggestions(&app, arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/screensaver mariokart", suggestions[0].replacement);
+    try std.testing.expect(suggestions[0].submit_on_enter);
+}

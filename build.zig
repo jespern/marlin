@@ -107,6 +107,45 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     run_step.dependOn(&run_cmd.step);
 
+    // ---- Pure-Zig Mario Kart 64 port ----
+    const mk64_module = b.createModule(.{
+        .root_source_file = b.path("src/mk64/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const asset_import = b.addExecutable(.{
+        .name = "mk64-import",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/mk64_import.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mk64", .module = mk64_module }},
+        }),
+    });
+    const asset_run = b.addRunArtifact(asset_import);
+    if (b.args) |args| asset_run.addArgs(args);
+    asset_run.has_side_effects = true;
+    b.step("mk64-import", "Regenerate the versioned MK64 asset bundle from the USA ROM").dependOn(&asset_run.step);
+    const mk64_probe = b.addExecutable(.{
+        .name = "mk64-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/mk64_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mk64", .module = mk64_module }},
+        }),
+    });
+    const mk64_run = b.addRunArtifact(mk64_probe);
+    if (b.args) |args| mk64_run.addArgs(args);
+    mk64_run.has_side_effects = true;
+    b.step("mk64-probe", "Render Luigi Raceway from a US ROM to PPM").dependOn(&mk64_run.step);
+    const mk64_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/mk64/root.zig"),
+        .target = target,
+        .optimize = .Debug,
+    }) });
+    b.step("mk64-test", "Test the pure-Zig MK64 port").dependOn(&b.addRunArtifact(mk64_tests).step);
+
     // ---- wipEout port probe ----
     const wipeout_module = b.createModule(.{
         .root_source_file = b.path("src/wipeout/root.zig"),

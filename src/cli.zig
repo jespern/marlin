@@ -23,6 +23,7 @@ pub const Command = enum {
     run,
     ls,
     top,
+    mk64,
     search,
     inspect,
     diagnostics,
@@ -76,6 +77,18 @@ pub fn dispatch(
     const rest = if (effective.len == 0) effective else effective[1..];
 
     switch (cmd) {
+        .mk64 => {
+            if (rest.len > 1) {
+                try stderrPrint(io, "usage: marlin mk64 [bundle.mkassets|US-ROM.z64]\n", .{});
+                return 2;
+            }
+            const path = if (rest.len == 1) rest[0] else environ.get("MARLIN_MK64_ASSETS") orelse environ.get("MARLIN_MK64_ROM") orelse "";
+            @import("client/mk64.zig").run(gpa, io, environ, path) catch |err| {
+                try stderrPrint(io, "marlin mk64: {t}\n", .{err});
+                return 1;
+            };
+            return 0;
+        },
         .version => try stdoutPrint(io, "marlin {s}\n", .{build_options.version}),
         .resolve_host => return resolveHost(io, rest),
         // Internal permission bridge for delegated Claude Code sessions
@@ -175,9 +188,22 @@ fn runTui(
 ) !u8 {
     var reattach_sid_buf: [25]u8 = undefined;
     var next_sid = sid_arg;
+    var activity_notice: ?[]u8 = null;
+    defer if (activity_notice) |notice| gpa.free(notice);
     while (true) {
-        var plan = tui.RebootPlan{};
+        var plan = tui.RebootPlan{ .startup_notice = activity_notice };
         const code = try tui.run(gpa, io, environ, self_exe, next_sid, session_file_path, &plan);
+        if (activity_notice) |notice| gpa.free(notice);
+        activity_notice = null;
+        if (plan.mk64_rom) |path| {
+            defer gpa.free(path);
+            try environ.put("MARLIN_MK64_ASSETS", path);
+            @import("client/mk64.zig").runWithOptions(gpa, io, environ, path, .{ .autopilot = plan.mk64_autopilot }) catch |err| {
+                activity_notice = try std.fmt.allocPrint(gpa, "MK64: {s}", .{@errorName(err)});
+            };
+            next_sid = try std.fmt.bufPrintZ(&reattach_sid_buf, "@{d}", .{plan.sid});
+            continue;
+        }
         if (plan.shell) |request| {
             const shell_result = runShellRequest(io, environ, request, true);
             request.deinit(gpa);
@@ -317,6 +343,7 @@ const help_text =
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls [--all]      list sessions
     \\  marlin top             live session overview and switcher
+    \\  marlin mk64 [assets]      experimental pure-Zig Luigi Raceway drive test
     \\  marlin search <query>  search durable transcripts across sessions
     \\  marlin inspect <handle> [options]  inspect session state, plan, blocks, and diagnostics
     \\      --json | --plan | --kind <kind> | --limit N | --around SEQ | --turn latest

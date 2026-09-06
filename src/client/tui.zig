@@ -576,6 +576,8 @@ pub const App = struct {
     /// cli.zig runs the user's shell, then reattach to this durable session.
     shell_command: std.ArrayList(u8) = .empty,
     shell_requested: bool = false,
+    mk64_rom: ?[]u8 = null,
+    mk64_autopilot: bool = false,
     remote_transport: bool = false,
     next_input_request_id: u64 = 1,
 
@@ -628,6 +630,7 @@ pub const App = struct {
         self.notification_body.deinit(self.gpa);
         self.pending_new_cwd.deinit(self.gpa);
         self.shell_command.deinit(self.gpa);
+        if (self.mk64_rom) |path| self.gpa.free(path);
         self.clipboard_pending.deinit(self.gpa);
         self.clipboard_desc.deinit(self.gpa);
         self.home.deinit(self.gpa);
@@ -5639,8 +5642,12 @@ pub const ShellRequest = struct {
 };
 
 pub const RebootPlan = struct {
+    /// Optional incoming notice from a client-local activity; copied into App on attach.
+    startup_notice: ?[]const u8 = null,
     request: RebootRequest = .{},
     shell: ?ShellRequest = null,
+    mk64_rom: ?[]u8 = null,
+    mk64_autopilot: bool = false,
     sid: u64 = 0,
 };
 
@@ -5821,6 +5828,7 @@ pub fn run(
         }
     }
     if (start_setup) app.requestSetup(true);
+    if (reboot_out) |plan| if (plan.startup_notice) |notice| app.setNotice("{s}", .{notice});
 
     var daemon_disconnect_reason: ?[]const u8 = null;
     {
@@ -6077,7 +6085,8 @@ pub fn run(
                 .cwd = try gpa.dupe(u8, app.view.cwd.items),
             };
         }
-        ro.* = .{ .request = app.reboot_request, .shell = shell, .sid = app.view.sid };
+        ro.* = .{ .request = app.reboot_request, .shell = shell, .mk64_rom = app.mk64_rom, .mk64_autopilot = app.mk64_autopilot, .sid = app.view.sid };
+        app.mk64_rom = null; // Ownership moves to the CLI, which reattaches after the game.
     }
     if (daemon_disconnect_reason) |reason| {
         try eprint(
