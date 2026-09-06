@@ -152,15 +152,19 @@ pub const Ui = struct {
         self.drawText(r, text, at, size, color);
     }
 
-    /// mm:ss.t as the original formats lap times.
+    /// mm:ss.t as the original formats lap times, digits assembled by hand
+    /// so the zero padding never depends on a format spec.
     pub fn drawTime(self: *const Ui, r: *render.Renderer, seconds: f32, at: Vec2i, size: Size, color: Rgba) void {
         const msec: i64 = @intFromFloat(@max(seconds, 0) * 1000.0);
-        const tenths = @mod(@divTrunc(msec, 100), 10);
-        const secs = @mod(@divTrunc(msec, 1000), 60);
-        const mins = @divTrunc(msec, 60 * 1000);
-        var buf: [8]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{d:0>2}:{d:0>2}.{d}", .{ @mod(mins, 100), secs, tenths }) catch return;
-        self.drawText(r, text, at, size, color);
+        const tenths: u8 = @intCast(@mod(@divTrunc(msec, 100), 10));
+        const secs: u8 = @intCast(@mod(@divTrunc(msec, 1000), 60));
+        const mins: u8 = @intCast(@mod(@divTrunc(msec, 60 * 1000), 100));
+        const text = [7]u8{
+            '0' + mins / 10, '0' + mins % 10, ':',
+            '0' + secs / 10, '0' + secs % 10, '.',
+            '0' + tenths,
+        };
+        self.drawText(r, &text, at, size, color);
     }
 
     pub fn drawImage(self: *const Ui, r: *render.Renderer, at: Vec2i, texture: u16) void {

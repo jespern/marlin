@@ -53,6 +53,14 @@ pub const Hud = struct {
         r.setView2d();
         r.setCullBackface(false);
 
+        // Once the race is over the original replaces the HUD with the
+        // results page.
+        if (ship.finished()) {
+            drawResults(r, ui, ship);
+            r.setCullBackface(true);
+            return;
+        }
+
         // Current lap time and the completed laps above it.
         if (ship.lap >= 0) {
             ui.drawTime(r, ship.lap_time, ui.pos(Anchor.bottom | Anchor.left, Vec2i.init(16, -30)), .px16, ui_mod.color_default);
@@ -79,7 +87,6 @@ pub const Hud = struct {
         }
 
         self.drawSpeedo(r, ui, ship.speed, ship.thrust_mag);
-        if (ship.finished()) drawResults(r, ui, ship);
         r.setCullBackface(true);
     }
 
