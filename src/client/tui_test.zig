@@ -636,6 +636,15 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqual(@as(usize, 1), suggestions.len);
     try std.testing.expectEqualStrings("!rb client", suggestions[0].label);
     try std.testing.expect(suggestions[0].submit_on_enter);
+
+    app.view.editor.clear();
+    app.view.editor.insertSlice("!rbc");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("!rbc", suggestions[0].label);
+    try std.testing.expect(suggestions[0].submit_on_enter);
 }
 
 test "named animations and screensavers share the selected effect engine" {
@@ -1348,6 +1357,13 @@ test "bang rb supports client and both scopes" {
 
     app.runCommand("!rb client");
     try std.testing.expectEqual(RebuildScope.client, app.reboot_request.rebuild);
+
+    app.should_quit = false;
+    app.reboot_request = .{};
+    app.runCommand("!rbc");
+    try std.testing.expectEqual(RebuildScope.client, app.reboot_request.rebuild);
+    try std.testing.expect(!app.reboot_request.force);
+    try std.testing.expect(app.should_quit);
 
     app.should_quit = false;
     app.reboot_request = .{};

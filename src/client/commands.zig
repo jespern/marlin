@@ -60,6 +60,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
+    .{ .name = "!rbc", .description = "rebuild only the local client (alias for !rb client)" },
     .{ .name = "!wipeout", .usage = " [track] [pilot] [rapier] [easy|hard] [trial] [new]", .description = "play wipEout (Esc pauses; bare !wipeout resumes, also after a restart)", .accepts_args = true },
 };
 
@@ -618,14 +619,19 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.shellEscape(it.rest());
     } else if (std.mem.eql(u8, head, "!c")) {
         self.copyLastToolOutput();
-    } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
-        var rebuild: RebuildScope = if (std.mem.eql(u8, head, "!rb")) .attached else .none;
+    } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb") or std.mem.eql(u8, head, "!rbc")) {
+        var rebuild: RebuildScope = if (std.mem.eql(u8, head, "!rbc"))
+            .client
+        else if (std.mem.eql(u8, head, "!rb"))
+            .attached
+        else
+            .none;
         var force = false;
         while (it.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--build")) {
-                rebuild = .attached;
-            } else if (std.mem.eql(u8, arg, "--force")) {
+            if (std.mem.eql(u8, arg, "--force")) {
                 force = true;
+            } else if (!std.mem.eql(u8, head, "!rbc") and std.mem.eql(u8, arg, "--build")) {
+                rebuild = .attached;
             } else if (std.mem.eql(u8, head, "!rb") and std.mem.eql(u8, arg, "client")) {
                 rebuild = .client;
             } else if (std.mem.eql(u8, head, "!rb") and std.mem.eql(u8, arg, "both")) {
@@ -633,6 +639,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             } else {
                 if (std.mem.eql(u8, head, "!rb"))
                     self.setNotice("usage: !rb [client|both] [--force]", .{})
+                else if (std.mem.eql(u8, head, "!rbc"))
+                    self.setNotice("usage: !rbc [--force]", .{})
                 else
                     self.setNotice("usage: /reboot [--build] [--force]", .{});
                 return;
@@ -767,7 +775,7 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.help_scroll = shortcut_help_rows.len;
     } else if (head.len > 1 and head[0] == '!') {
         // `!ls -la` — every shell and vim accept the bang glued to the
-        // command. The exact `!c`/`!rb` shortcuts matched above.
+        // command. The exact `!c`/`!rb`/`!rbc` shortcuts matched above.
         self.shellEscape(cmd[1..]);
     } else {
         self.setNotice("unknown command {s} (try /help)", .{head});

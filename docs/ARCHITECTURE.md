@@ -213,7 +213,7 @@ remains a Mode A transport only — it carries terminal frames, not stdio.
 `marlin` must be installed on the remote and findable by a login shell (the
 connect error says how to test). Source-built installations get scoped
 self-hosting rebuilds: bare `!rb` rebuilds the side hosting the attached daemon,
-`!rb client` rebuilds only the local client, and `!rb both` builds both before
+`!rb client` (or `!rbc`) rebuilds only the local client, and `!rb both` builds both before
 restarting anything. Each build is gated on the running executable resolving to
 `<checkout>/zig-out/bin/marlin` with Marlin checkout markers; install.sh and
 Homebrew binaries refuse with package-manager guidance rather than guessing an
@@ -273,8 +273,8 @@ Sequence:
 1. **Binary selection.** `/reboot` restarts the attached daemon and re-execs
    the current client without building. `!rb` (the `/reboot --build` alias)
    rebuilds the side hosting the attached daemon; under Mode B the build runs
-   through SSH on the remote. `!rb client` rebuilds/re-execs only the local
-   client and leaves a remote daemon running. `!rb both` builds both candidates
+   through SSH on the remote. `!rb client` (or `!rbc`) rebuilds/re-execs only
+   the local client and leaves a remote daemon running. `!rb both` builds both candidates
    before rebooting the attached daemon, which is the protocol-change path.
    Source builds require the running executable to resolve to
    `<checkout>/zig-out/bin/marlin` and the checkout markers `.git`, `build.zig`,
@@ -1263,7 +1263,7 @@ A split pane identifies its session with a compact pane label.
   transport refuses shell escapes because its local terminal and the daemon
   workspace are on different hosts; running Marlin inside SSH or mosh keeps
   both co-located. `!rb` rebuilds the attached daemon side, `!rb client`
-  rebuilds only the local client, `!rb both` rebuilds both, and `!c` copies the
+  (or `!rbc`) rebuilds only the local client, `!rb both` rebuilds both, and `!c` copies the
   last output.
   Plain text + `Enter` starts a turn when idle and queues steering
   while an agent turn is active; a leading space sends text that begins

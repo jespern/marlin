@@ -26,7 +26,7 @@
 //!             /screensaver [effect], /new, /compact, /archive, /reboot [--build], /help,
 //!             /quit (alias /detach — sessions keep running in the daemon)
 //!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
-//!              !c (copy last full tool output), !rb [client|both] (scoped rebuild),
+//!              !c (copy last full tool output), !rb [client|both] / !rbc (scoped rebuild),
 //!              !s [effect] (screensaver)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
 //!            chips, expanded into the message on send.
