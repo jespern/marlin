@@ -795,9 +795,13 @@ to configured favorites when neither source is available.
   crossing a cap closes the socket and persists a visible turn failure. The
   layer's failure vocabulary is a typed `http.Error`
   (Cancelled / HttpTimeout / InvalidRequest / ConnectFailed / ReadFailed /
-  UnsupportedEncoding / ConsumerAborted / ConcurrencyUnavailable / OutOfMemory), so a
-  "turn failed:" system_note distinguishes user interrupt, hung provider,
-  and mid-body transport death instead of leaking std.http error soup.
+  UnsupportedEncoding / ConsumerAborted / ConcurrencyUnavailable / OutOfMemory).
+  Transport failures also retain a bounded stage, hostname, and underlying
+  cause—DNS helper, TCP connect, TLS setup, request write, response head, or
+  response body—so the durable failure note is diagnostic without a debug log.
+  Claude Code guest errors use its structured result plus captured stderr when
+  available; a bare guest `ConnectFailed` is labeled as missing upstream detail
+  rather than presented as a native transport diagnosis.
 
 ## 6. Context assembly & compaction
 

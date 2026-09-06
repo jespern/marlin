@@ -67,6 +67,49 @@ const CcOutcome = struct {
     stderr_len: usize = 0,
 };
 
+fn compactDiagnostic(allocator: std.mem.Allocator, text: []const u8, max: usize) ![]u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const clipped = trimmed[0..@min(trimmed.len, max)];
+    const compact = try allocator.dupe(u8, clipped);
+    for (compact) |*ch| ch.* = switch (ch.*) {
+        '\r', '\n', '\t' => ' ',
+        else => ch.*,
+    };
+    return compact;
+}
+
+fn isGenericConnectionError(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return std.mem.eql(u8, trimmed, "ConnectFailed") or
+        std.mem.eql(u8, trimmed, "SocketUnconnected") or
+        std.mem.eql(u8, trimmed, "ReadFailed");
+}
+
+pub fn claudeErrorNote(
+    allocator: std.mem.Allocator,
+    detail: []const u8,
+    stderr: []const u8,
+) ![]u8 {
+    const trimmed_detail = std.mem.trim(u8, detail, " \t\r\n");
+    const compact_stderr = try compactDiagnostic(allocator, stderr, 512);
+    defer allocator.free(compact_stderr);
+    if (isGenericConnectionError(trimmed_detail)) {
+        if (compact_stderr.len > 0) {
+            return std.fmt.allocPrint(
+                allocator,
+                "claude code connection failed: {s} (stderr: {s})",
+                .{ trimmed_detail, compact_stderr },
+            );
+        }
+        return std.fmt.allocPrint(
+            allocator,
+            "claude code connection failed: {s} (no transport detail reported by Claude Code)",
+            .{trimmed_detail},
+        );
+    }
+    return std.fmt.allocPrint(allocator, "claude code error: {s}", .{trimmed_detail});
+}
+
 /// One `claude -p` invocation: spawn, decode stream-json, persist blocks.
 fn ccInvoke(
     gpa: std.mem.Allocator,
@@ -368,13 +411,19 @@ pub fn runClaudeCodeTurn(
             return error.DelegateTimeout;
         }
         if (!outcome.got_result) {
+            const stderr = try compactDiagnostic(
+                gpa,
+                outcome.stderr_tail[0..outcome.stderr_len],
+                512,
+            );
+            defer gpa.free(stderr);
             const note = try std.fmt.allocPrint(
                 gpa,
                 "claude code exited without a result (exit {d}){s}{s}",
                 .{
                     outcome.exit_code,
-                    if (outcome.stderr_len > 0) ": " else "",
-                    outcome.stderr_tail[0..outcome.stderr_len],
+                    if (stderr.len > 0) ": " else "",
+                    stderr,
                 },
             );
             defer gpa.free(note);
@@ -391,7 +440,11 @@ pub fn runClaudeCodeTurn(
                 outcome.final_text.items
             else
                 "no detail reported";
-            const note = try std.fmt.allocPrint(gpa, "claude code error: {s}", .{detail});
+            const note = try claudeErrorNote(
+                gpa,
+                detail,
+                outcome.stderr_tail[0..outcome.stderr_len],
+            );
             defer gpa.free(note);
             setDelegateError(note);
             _ = try ap.append(.{ .system_note = .{ .text = note } });
