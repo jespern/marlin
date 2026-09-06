@@ -264,8 +264,14 @@ effects already do.
 
 Integration points, all in the client:
 
-- `visual_effect.Kind.wipeout`: a manual-only pixel kind whose fallback on
-  a terminal without Kitty graphics is refused with a notice.
+- `visual_effect.Kind.wipeout`: a pixel kind marked `playable()`. It is
+  reachable only through `!wipeout`: `/animate` and `/screensaver` refuse
+  it with a pointer to the command, it is left out of the effect usage
+  lists, and it can never be the idle screensaver. On a terminal without
+  Kitty graphics `!wipeout` declines rather than falling back to cells.
+- Full-screen takeover: the game runs in the screensaver slot, which the
+  TUI draws last over the whole window with the cursor hidden. It never
+  uses the interleaved mode that `/animate` paints into gaps between text.
 - `pixel_effects.Engine`: a borrowed `wipeout_game` pointer, a fixed
   320x240 framebuffer, and a draw that letterboxes the image into the
   largest centered 4:3 cell rectangle instead of stretching it.

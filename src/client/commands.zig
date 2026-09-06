@@ -675,6 +675,10 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             self.setNotice("unknown effect {s}", .{name});
             return;
         };
+        if (kind.playable()) {
+            self.setNotice("{s} is a game, not an effect — start it with !{s}", .{ kind.name(), kind.name() });
+            return;
+        }
         const sky_arg = it.next();
         if (it.next() != null) {
             self.setNotice("usage: /animate <" ++ effects.usage_list ++ "> [hour|cycle]", .{});
@@ -687,6 +691,10 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             self.setNotice("unknown effect {s}", .{name});
             return;
         } else self.screensaver_kind;
+        if (kind.playable()) {
+            self.setNotice("{s} is a game, not a screensaver — start it with !{s}", .{ kind.name(), kind.name() });
+            return;
+        }
         const sky_arg = it.next();
         if (it.next() != null) {
             self.setNotice("usage: /screensaver [" ++ effects.usage_list ++ "] [hour|cycle]", .{});

@@ -75,6 +75,13 @@ pub const Kind = enum {
         return self != .tetris and self != .wipeout;
     }
 
+    /// Games with their own command (`!wipeout`): they take the whole
+    /// screen and the keyboard, so `/animate` and `/screensaver` refuse
+    /// them and the usage lists leave them out.
+    pub fn playable(self: Kind) bool {
+        return self == .wipeout;
+    }
+
     /// What to run on cells when a pixel effect is requested on a terminal
     /// without Kitty graphics: the kind itself when it has a cell renderer,
     /// otherwise a cell sibling chosen for visual kinship.
@@ -94,8 +101,12 @@ pub const kinds = std.enums.values(Kind);
 /// never be missing from the help.
 pub const usage_list = blk: {
     var text: []const u8 = "";
-    for (std.meta.fields(Kind), 0..) |field, i| {
-        text = text ++ (if (i == 0) "" else "|") ++ field.name;
+    var count: usize = 0;
+    for (std.meta.fields(Kind)) |field| {
+        const kind: Kind = @enumFromInt(field.value);
+        if (kind.playable()) continue;
+        text = text ++ (if (count == 0) "" else "|") ++ field.name;
+        count += 1;
     }
     break :blk text;
 };
@@ -105,7 +116,7 @@ pub const configurable_usage_list = blk: {
     var count: usize = 0;
     for (std.meta.fields(Kind)) |field| {
         const kind: Kind = @enumFromInt(field.value);
-        if (!kind.configurable()) continue;
+        if (!kind.configurable() or kind.playable()) continue;
         text = text ++ (if (count == 0) "" else "|") ++ field.name;
         count += 1;
     }
