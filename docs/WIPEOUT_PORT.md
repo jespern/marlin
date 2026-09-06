@@ -181,7 +181,8 @@ boundary.
 ```
 
 Arrow keys steer and pitch, `x` or space is thrust, `z` and `c` are the
-left and right airbrakes, `v` toggles the cockpit view, `q` or Escape quits.
+left and right airbrakes, `v` toggles the cockpit view, Tab toggles the
+autopilot (which yields to any held key), `q` or Escape quits.
 Key releases come from the Kitty keyboard protocol (flags 1, 2 and 8), which
 Ghostty and Kitty support; without it, keys cannot be held. The race starts
 immediately; `--intro` keeps the countdown hover, during which building
@@ -261,8 +262,9 @@ into different decisions over the run.
 `!wipeout [track 1-14] [pilot 0-7] [rapier|venom] [nointro]` loads the
 circuit and shows it as a pixel effect. While it is up the client is in
 game mode: every key press and release goes to the ship (the same bindings
-as the probe) and Escape or Ctrl-C pauses the game and hands the terminal
-back. `!wipeout` again resumes the same race; a different track or pilot
+as the probe, plus `p` for the CRT pass and Tab for the autopilot, shown as
+"AUTO" on the HUD) and Escape or Ctrl-C pauses the game and hands the
+terminal back. `!wipeout` again resumes the same race; a different track or pilot
 starts a new one. The race object is owned by the App, not by the effect
 engine, so running another screensaver in between does not lose it, and
 the effect engine keeps state alive when hidden as marlin's other pixel
@@ -312,12 +314,16 @@ Escape leaves as usual, and the finished race is what gets saved.
 barrel curvature, colour fringing with a slow horizontal wobble,
 vignette, scanlines, flicker and an alternate-column mask. The shader
 runs at window resolution over the 240p image in the original, so at 1x it
-degenerates into fat bars; the port evaluates it at 2x (640x480). That
-frame deflates poorly (about 15 ms) on top of a 14 ms render, so with the
-pass on the effect ships at 30 fps; without it the game presents 240p at
+degenerates into fat bars; the port evaluates it at 2x (640x480). The pass
+runs across six row-band threads (about 3 ms for 640x480, down from 10 on
+one core), but that frame deflates poorly, about 15 ms at the fastest
+level, so with the pass on the effect ships at 30 fps: a forced 60 fps run
+measures 44 fps, deflate-bound. Without it the game presents 240p at
 60 fps. It is off by default; `p` toggles it in game and `!wipeout crt`
 starts with it on. The per-row sine and power terms come from tables
-rebuilt each frame.
+rebuilt each frame. Getting CRT to 60 fps would need the deflate off the
+main thread as well: either a pipelined encoder one frame behind, or a
+banded zlib stream compressed in parallel with sync-flushed blocks.
 
 ## Save and resume
 

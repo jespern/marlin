@@ -624,7 +624,7 @@ fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.T
             renderer.setDepthOffset(0);
             renderer.setDepthWrite(true);
         }
-        r.hud.draw(renderer, &r.ui, &r.ship);
+        r.hud.draw(renderer, &r.ui, &r.ship, r.autopilot);
     }
 }
 
@@ -738,6 +738,8 @@ const Race = struct {
         const tick: f64 = 1.0 / @round(1.0 / @as(f64, dt));
         var any_key = false;
         if (keys) |k| {
+            const toggles = k.autopilot_toggles.swap(0, .acq_rel);
+            if (toggles % 2 == 1) self.autopilot = !self.autopilot;
             const snapshot = k.snapshot();
             for (snapshot, 0..) |down, i| {
                 self.input.set(@enumFromInt(i), down);
@@ -802,22 +804,8 @@ const Race = struct {
         self.frame += 1;
     }
 
-    /// Full thrust, steering towards a point two sections ahead. Not the
-    /// original's AI, just enough to lap a course headless.
     fn steerAutomatically(self: *Race, track: *const wipeout.track.Track) void {
-        const sections = track.sections;
-        var ahead = sections[self.ship.section].next;
-        ahead = sections[ahead].next;
-        const target = sections[ahead].center.sub(self.ship.position);
-        const desired_yaw = -std.math.atan2(target.x, target.z);
-        const delta = wipeout.math.wrapAngle(desired_yaw - self.ship.angle.y);
-        self.input.set(.thrust, self.ship.mode != .intro and !self.ship.finished());
-        self.input.set(.left, delta > 0.02);
-        self.input.set(.right, delta < -0.02);
-        self.input.set(.up, false);
-        self.input.set(.down, false);
-        self.input.set(.brake_left, false);
-        self.input.set(.brake_right, false);
+        wipeout.autopilot.steer(&self.ship, track, &self.input);
     }
 };
 
@@ -838,6 +826,8 @@ const KeyReader = struct {
     held: [wipeout.input.count]std.atomic.Value(bool) = undefined,
     quit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    /// Tab presses not yet consumed by the race loop.
+    autopilot_toggles: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     fn start(gpa: std.mem.Allocator, io: Io) !*KeyReader {
         const self = try gpa.create(KeyReader);
@@ -993,6 +983,10 @@ const KeyReader = struct {
                 'v', 'V' => .change_view,
                 'q', 'Q', 27 => blk: {
                     if (down) self.quit.store(true, .release);
+                    break :blk null;
+                },
+                9 => blk: {
+                    if (down) _ = self.autopilot_toggles.fetchAdd(1, .acq_rel);
                     break :blk null;
                 },
                 else => null,
@@ -1390,7 +1384,7 @@ fn usage(io: Io) void {
         \\  --dilation N       triangle edge dilation in 1/16 px (default 2; 0 = exact)
         \\  --log-frames FILE  write per-frame timings and payload sizes as CSV
         \\  --drive            fly a ship with the keyboard (arrows steer/pitch, x or space
-        \\                     thrust, z/c airbrakes, v view, q quits)
+        \\                     thrust, z/c airbrakes, v view, Tab autopilot, q quits)
         \\  --autopilot        let the probe steer the ship along the track
         \\  --pilot N          pilot 0-7 (default 0, John Dekka / AG Systems)
         \\  --rapier           Rapier class handling instead of Venom

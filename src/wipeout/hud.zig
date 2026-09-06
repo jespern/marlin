@@ -49,7 +49,7 @@ pub const Hud = struct {
 
     /// Draw over a frame whose 3D pass is complete. Switches the renderer
     /// to the 2D view.
-    pub fn draw(self: *const Hud, r: *render.Renderer, ui: *const Ui, ship: *const ship_mod.Ship) void {
+    pub fn draw(self: *const Hud, r: *render.Renderer, ui: *const Ui, ship: *const ship_mod.Ship, autopilot: bool) void {
         r.setView2d();
         r.setCullBackface(false);
 
@@ -87,6 +87,7 @@ pub const Hud = struct {
         }
 
         self.drawSpeedo(r, ui, ship.speed, ship.thrust_mag);
+        if (autopilot) ui.drawText(r, "AUTO", ui.pos(Anchor.top | Anchor.right, Vec2i.init(-48, 8)), .px8, ui_mod.color_accent);
         r.setCullBackface(true);
     }
 

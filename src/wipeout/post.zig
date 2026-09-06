@@ -58,16 +58,44 @@ const Tables = struct {
 /// `out_width`×`out_height`. The original evaluates this at window
 /// resolution over the 240p image, so callers upscale (2x is plenty).
 /// `time` is the game's cycle time in seconds.
+/// Row bands the CRT pass is split across, each on its own thread; the
+/// pass is embarrassingly parallel and the tables are shared read-only.
+pub const crt_threads: usize = 6;
+
 pub fn crt(src: []const Rgba, width: usize, height: usize, dst: []u8, out_width: usize, out_height: usize, time: f32) void {
+    std.debug.assert(src.len >= width * height and dst.len >= out_width * out_height * 3);
+    const tables = Tables.build(time, @floatFromInt(out_height));
+    var threads: [crt_threads]?std.Thread = .{null} ** crt_threads;
+    const rows_per = (out_height + crt_threads - 1) / crt_threads;
+    var i: usize = 0;
+    while (i < crt_threads) : (i += 1) {
+        const y0 = i * rows_per;
+        const y1 = @min(y0 + rows_per, out_height);
+        if (y0 >= y1) break;
+        if (y1 == out_height) {
+            // The last band runs on the calling thread.
+            crtRows(src, width, height, dst, out_width, out_height, time, &tables, y0, y1);
+            break;
+        }
+        threads[i] = std.Thread.spawn(.{}, crtRows, .{ src, width, height, dst, out_width, out_height, time, &tables, y0, y1 }) catch blk: {
+            crtRows(src, width, height, dst, out_width, out_height, time, &tables, y0, y1);
+            break :blk null;
+        };
+    }
+    for (threads) |maybe| {
+        if (maybe) |th| th.join();
+    }
+}
+
+fn crtRows(src: []const Rgba, width: usize, height: usize, dst: []u8, out_width: usize, out_height: usize, time: f32, tables: *const Tables, row_start: usize, row_end: usize) void {
     std.debug.assert(src.len >= width * height and dst.len >= out_width * out_height * 3);
     const sampler = Sampler{ .src = src, .width = width, .height = height, .fw = @floatFromInt(width), .fh = @floatFromInt(height) };
     const screen_w: f32 = @floatFromInt(out_width);
     const screen_h: f32 = @floatFromInt(out_height);
     const flicker = 1.0 + 0.01 * @sin(110.0 * time);
-    const tables = Tables.build(time, screen_h);
 
-    var oy: usize = 0;
-    while (oy < out_height) : (oy += 1) {
+    var oy: usize = row_start;
+    while (oy < row_end) : (oy += 1) {
         // Fragment y counts from the bottom in GL.
         const frag_y = (@as(f32, @floatFromInt(out_height - 1 - oy)) + 0.5) / screen_h;
         const base_uy = (frag_y - 0.5) * 2.0 * 1.1;

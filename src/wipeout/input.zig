@@ -35,6 +35,13 @@ pub const State = extern struct {
         self.held[i] = if (down) 1 else 0;
     }
 
+    pub fn anyHeld(self: *const State) bool {
+        for (self.held) |h| {
+            if (h != 0) return true;
+        }
+        return false;
+    }
+
     /// Clear edge-triggered presses; call once per game step.
     pub fn endFrame(self: *State) void {
         @memset(&self.pressed, false);

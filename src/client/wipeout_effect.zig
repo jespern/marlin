@@ -53,7 +53,10 @@ pub const Game = struct {
     hud: wipeout.hud.Hud,
     ship: wipeout.ship.Ship,
     camera: wipeout.camera.Camera,
+    /// What the keyboard says; the ship sees this, or the autopilot's
+    /// steering when it is on and no key is held.
     input: wipeout.input.State = .{},
+    autopilot: bool = false,
     rng: wipeout.rng.Rng,
     start_line_pos: u16,
     /// Wall-clock accumulator for fixed-step simulation, in nanoseconds.
@@ -205,9 +208,11 @@ pub const Game = struct {
     }
 
     fn step(self: *Game) void {
+        var effective = self.input;
+        if (self.autopilot and !self.input.anyHeld()) wipeout.autopilot.steer(&self.ship, &self.track, &effective);
         self.ship.update(.{
             .track = &self.track,
-            .input = &self.input,
+            .input = &effective,
             .rng = &self.rng,
             .tick = step_seconds,
             .start_line_pos = self.start_line_pos,
@@ -246,7 +251,7 @@ pub const Game = struct {
             r.setDepthOffset(0);
             r.setDepthWrite(true);
         }
-        self.hud.draw(r, &self.ui, &self.ship);
+        self.hud.draw(r, &self.ui, &self.ship, self.autopilot);
         if (self.crt) {
             wipeout.post.crt(r.color, r.width, r.height, rgb, out_w, out_h, self.cycle_time);
         } else if (out_w == r.width and out_h == r.height) {
@@ -281,6 +286,10 @@ pub const Game = struct {
     pub fn setKey(self: *Game, key: vaxis.Key, down: bool) bool {
         if (key.codepoint == 'p' or key.codepoint == 'P') {
             if (down) self.toggleCrt();
+            return true;
+        }
+        if (key.codepoint == vaxis.Key.tab) {
+            if (down) self.autopilot = !self.autopilot;
             return true;
         }
         const action = actionForKey(key) orelse return false;

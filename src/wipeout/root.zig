@@ -21,6 +21,7 @@ pub const post = @import("post.zig");
 pub const ui = @import("ui.zig");
 pub const hud = @import("hud.zig");
 pub const snapshot = @import("snapshot.zig");
+pub const autopilot = @import("autopilot.zig");
 
 /// Per-circuit sky placement from the original game definition, indexed
 /// by PSX track directory number (1-14).
