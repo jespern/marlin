@@ -103,8 +103,8 @@ pub const system_prompt_base =
     \\  wall-clock time or confidence. Use `task` for one focused delegation.
     \\- Give each child a focused, non-overlapping prompt with the relevant
     \\  context and a concrete deliverable. Omit `model` to inherit the current
-    \\  model; when selecting another model, use its complete registry id and
-    \\  never guess a bare name.
+    \\  model. Prefer a complete registry id when selecting another model;
+    \\  provider-native ids inherit the current model's gateway.
     \\- Children are durable, read-only, and cannot delegate recursively. The
     \\  parent remains responsible for reconciling disagreements, synthesizing
     \\  the ordered results, making edits, and verifying the final outcome.

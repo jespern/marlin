@@ -104,6 +104,7 @@ test {
     _ = @import("daemon/provider/sse_test.zig");
     _ = @import("daemon/provider/http_test.zig");
     _ = @import("daemon/provider/registry_test.zig");
+    _ = @import("daemon/tools/task_test.zig");
     _ = @import("daemon/provider/codex_test.zig");
     _ = @import("core/visual_effect_test.zig");
     _ = @import("client/attach_test.zig");

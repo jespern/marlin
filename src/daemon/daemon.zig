@@ -3281,34 +3281,43 @@ pub const Daemon = struct {
 
             // Validate a requested model BEFORE creating the child: an
             // unresolvable model would otherwise die pre-loop and leave a
-            // blank err-state session behind (observed with a bare model
-            // name like "gpt-5.3-codex" — registry ids are provider-prefixed).
-            if (args.model) |m| {
-                if (registry.resolve(self.gpa, self.environ, self.cfg, m)) |probe| {
+            // blank err-state session behind. Provider-native ids returned by
+            // APIs (for example openai/gpt-5.2) inherit the parent's gateway.
+            var model: ?[]u8 = null;
+            if (args.model) |requested| {
+                if (requested.len == 0) return taskError(self.gpa, "task model must not be empty");
+                if (registry.resolve(self.gpa, self.environ, self.cfg, requested)) |probe| {
                     probe.deinit(self.gpa);
-                } else |e| {
-                    const msg = std.fmt.allocPrint(
-                        self.gpa,
-                        "task model '{s}' is not resolvable ({t}); use a registry-form id like 'openrouter/anthropic/claude-sonnet-4.5' or omit model to inherit this session's",
-                        .{ m, e },
-                    ) catch return taskError(self.gpa, "out of memory");
-                    defer self.gpa.free(msg);
-                    return taskError(self.gpa, msg);
+                    model = self.gpa.dupe(u8, requested) catch return taskError(self.gpa, "out of memory");
+                } else |direct_err| {
+                    const qualified = task_tool.qualifyModel(self.gpa, job.model, requested) catch |err| switch (err) {
+                        error.OutOfMemory => return taskError(self.gpa, "out of memory"),
+                        error.InvalidModel, error.NoParentGateway => null,
+                    };
+                    if (qualified) |candidate| {
+                        if (registry.resolve(self.gpa, self.environ, self.cfg, candidate)) |probe| {
+                            probe.deinit(self.gpa);
+                            model = candidate;
+                        } else |_| {
+                            self.gpa.free(candidate);
+                        }
+                    }
+                    if (model == null) {
+                        const msg = std.fmt.allocPrint(
+                            self.gpa,
+                            "task model '{s}' is not resolvable ({t}); use a full registry id like 'openrouter/{s}' or omit model to inherit this session's",
+                            .{ requested, direct_err, requested },
+                        ) catch return taskError(self.gpa, "out of memory");
+                        defer self.gpa.free(msg);
+                        return taskError(self.gpa, msg);
+                    }
                 }
             }
 
-            const prompt = self.gpa.dupe(u8, args.prompt) catch return taskError(self.gpa, "out of memory");
-            var model: ?[]u8 = null;
-            if (args.model) |m| {
-                if (m.len == 0) {
-                    self.gpa.free(prompt);
-                    return taskError(self.gpa, "task model must not be empty");
-                }
-                model = self.gpa.dupe(u8, m) catch {
-                    self.gpa.free(prompt);
-                    return taskError(self.gpa, "out of memory");
-                };
-            }
+            const prompt = self.gpa.dupe(u8, args.prompt) catch {
+                if (model) |m| self.gpa.free(m);
+                return taskError(self.gpa, "out of memory");
+            };
 
             var future = TaskFuture{};
             self.events.push(self.io, .{ .child_start = .{

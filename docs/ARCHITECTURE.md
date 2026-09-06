@@ -846,8 +846,11 @@ The cascade (in order; each layer only fires if the previous wasn't enough):
 - **L3 — subagents (M6a active).** `task` spawns a durable child through the
   dispatcher with its own context, optional model/effort, read-only tools, and
   a round budget; only its structured final result enters the parent as a
-  tool_result. Child sessions are ordinary sessions (visible in `marlin ls`
-  and attachable) and the multiplexer groups them beneath the parent.
+  tool_result. A full registry model id is accepted directly. A provider-native
+  id such as `openai/gpt-5.2` inherits the parent's outer gateway, so a parent
+  on `openrouter/anthropic/claude-sonnet-4.5` resolves it as
+  `openrouter/openai/gpt-5.2`. Child sessions are ordinary sessions (visible in
+  `marlin ls` and attachable) and the multiplexer groups them beneath the parent.
   `task_batch` launches two to eight through the same dispatcher-owned path,
   waits concurrently, and returns results in input order. Child profiles still
   forbid recursive delegation.
