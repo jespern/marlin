@@ -31,6 +31,7 @@ pub const save = @import("save.zig");
 pub const menu = @import("menu.zig");
 pub const game = @import("game.zig");
 pub const session = @import("session.zig");
+pub const bundle = @import("bundle.zig");
 
 /// Per-circuit sky placement from the original game definition, indexed
 /// by PSX track directory number (1-14).

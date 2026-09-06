@@ -51,6 +51,8 @@ pub const Session = struct {
     gpa: std.mem.Allocator,
     io: Io,
     root: []u8,
+    /// Set when the assets come from the single-file bundle.
+    bundle: ?*@import("bundle.zig").Bundle = null,
     assets: assets_mod.Assets,
     renderer: render_mod.Renderer,
     race_assets: race_mod.Assets,
@@ -79,6 +81,8 @@ pub const Session = struct {
     /// The last circuit load failed; the state was sent back to the menu.
     load_error: ?anyerror = null,
 
+    /// Fails with `error.AssetsMissing` when neither the extracted tree
+    /// nor the bundle is under the data root; the host downloads then.
     pub fn create(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, options: StartOptions) !*Session {
         const root = try assets_mod.defaultRoot(gpa, environ);
         errdefer gpa.free(root);
@@ -92,7 +96,20 @@ pub const Session = struct {
     pub fn createWithRoot(gpa: std.mem.Allocator, io: Io, root: []u8, save_path: ?[]u8, saved: save_mod.SaveData, options: StartOptions) !*Session {
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
-        const assets = assets_mod.Assets.init(io, gpa, root);
+        self.bundle = null;
+        switch (try assets_mod.openSource(gpa, io, root)) {
+            .tree => {},
+            .bundle => |opened| {
+                const owned = try gpa.create(@import("bundle.zig").Bundle);
+                owned.* = opened;
+                self.bundle = owned;
+            },
+        }
+        errdefer if (self.bundle) |b| {
+            b.deinit();
+            gpa.destroy(b);
+        };
+        const assets = if (self.bundle) |b| assets_mod.Assets.initBundle(io, gpa, root, b) else assets_mod.Assets.init(io, gpa, root);
 
         var renderer = try render_mod.Renderer.init(gpa, render_width, render_height);
         errdefer renderer.deinit();
@@ -116,10 +133,12 @@ pub const Session = struct {
             state.startRaceDirect(options.track, options.pilot, options.time_trial);
         }
 
+        const bundle = self.bundle;
         self.* = .{
             .gpa = gpa,
             .io = io,
             .root = root,
+            .bundle = bundle,
             .assets = assets,
             .renderer = renderer,
             .race_assets = race_assets,
@@ -141,6 +160,10 @@ pub const Session = struct {
         self.menu_assets.deinit(gpa);
         self.race_assets.deinit(gpa);
         self.renderer.deinit();
+        if (self.bundle) |b| {
+            b.deinit();
+            gpa.destroy(b);
+        }
         if (self.save_path) |p| gpa.free(p);
         gpa.free(self.root);
         gpa.destroy(self);

@@ -138,6 +138,13 @@ const Event = union(enum) {
     key_release: vaxis.Key,
     /// Voice worker verdicts (transcription and model-download threads).
     voice: VoiceEvent,
+    /// wipEout asset-bundle download verdicts.
+    wipeout: WipeoutEvent,
+};
+
+pub const WipeoutEvent = union(enum) {
+    download_done,
+    download_failed: []const u8,
 };
 
 pub const VoiceEvent = union(enum) {
@@ -535,6 +542,11 @@ pub const App = struct {
     /// The wipEout race. Owned here rather than by the effect engine so a
     /// hidden game (Esc, or another screensaver in between) resumes intact.
     wipeout_game: ?*wipeout_effect.Game = null,
+    /// First-run asset bundle download (progress shared with the worker).
+    wipeout_download: ?*voice.DownloadProgress = null,
+    wipeout_download_thread: ?std.Thread = null,
+    /// The `!wipeout` that triggered the download; re-run when it lands.
+    wipeout_pending: ?WipeoutOptions = null,
     /// While set, key presses and releases go to the game until Escape.
     game_mode: bool = false,
     /// Ticker hint: the game wants ~60 Hz ticks, not the 30 Hz effect tier.
@@ -632,6 +644,9 @@ pub const App = struct {
         if (self.effect_engine) |*engine| engine.deinit();
         self.saveWipeout();
         if (self.wipeout_game) |game| game.destroy();
+        if (self.wipeout_download) |progress| progress.cancel.store(true, .release);
+        if (self.wipeout_download_thread) |t| t.join();
+        if (self.wipeout_download) |progress| self.gpa.destroy(progress);
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.terminal_title.deinit(self.gpa);
@@ -2031,6 +2046,7 @@ pub const App = struct {
             self.view.state == .awaiting_approval or
             self.top_view != null or
             self.voice_rt.download != null or
+            self.wipeout_download != null or
             self.voice_rt.phase != .idle or
             self.ui_animation_active.load(.acquire);
     }
@@ -2242,7 +2258,11 @@ pub const App = struct {
             }
             if (!restored) {
                 self.wipeout_game = wipeout_effect.Game.create(self.gpa, self.io, env, options) catch |err| {
-                    self.setNotice("wipEout: {t} — game data goes in $XDG_DATA_HOME/marlin/wipeout-data/wipeout", .{err});
+                    if (err == error.AssetsMissing) {
+                        self.startWipeoutDownload(options);
+                    } else {
+                        self.setNotice("wipEout: {t} — game data goes in $XDG_DATA_HOME/marlin/wipeout-data", .{err});
+                    }
                     return;
                 };
             }
@@ -2277,6 +2297,72 @@ pub const App = struct {
         self.saveWipeout();
         _ = self.dismissScreensaver();
         self.syncAnimationTicker();
+    }
+
+    /// First run: fetch the asset bundle (about 3.5 MB) into the data
+    /// root on a worker thread, then start the game that asked for it.
+    fn startWipeoutDownload(self: *App, options: WipeoutOptions) void {
+        if (self.wipeout_download != null) {
+            self.setNotice("wipEout: game data is still downloading", .{});
+            return;
+        }
+        const env = self.environ orelse return;
+        const loop = self.loop orelse return;
+        const dest = wipeout_effect.bundleDestination(self.gpa, env) catch {
+            self.setNotice("wipEout: cannot resolve the data directory", .{});
+            return;
+        };
+        const progress = self.gpa.create(voice.DownloadProgress) catch {
+            self.gpa.free(dest);
+            return;
+        };
+        progress.* = .{};
+        const job = self.gpa.create(WipeoutDownloadJob) catch {
+            self.gpa.destroy(progress);
+            self.gpa.free(dest);
+            return;
+        };
+        job.* = .{ .gpa = self.gpa, .io = self.io, .loop = loop, .url = wipeout_effect.bundleUrl(env), .dest = dest, .progress = progress };
+        self.wipeout_download_thread = std.Thread.spawn(.{}, WipeoutDownloadJob.run, .{job}) catch {
+            self.gpa.destroy(progress);
+            self.gpa.free(dest);
+            self.gpa.destroy(job);
+            self.setNotice("wipEout: could not start the game data download", .{});
+            return;
+        };
+        self.wipeout_download = progress;
+        self.wipeout_pending = options;
+        self.syncAnimationTicker();
+        self.setNotice("wipEout: downloading game data…", .{});
+    }
+
+    /// Download progress in the status line, driven by animation ticks.
+    pub fn wipeoutDownloadTick(self: *App) void {
+        const progress = self.wipeout_download orelse return;
+        const done = progress.done.load(.acquire);
+        const total = progress.total.load(.acquire);
+        var bar: [24]u8 = undefined;
+        const filled = if (total > 0) @min(bar.len, done * bar.len / total) else 0;
+        for (0..bar.len) |i| bar[i] = if (i < filled) '#' else '-';
+        if (total > 0) {
+            self.setNotice("wipEout data  [{s}] {d}% · {d}/{d} KB", .{ bar[0..], done * 100 / total, done >> 10, total >> 10 });
+        } else {
+            self.setNotice("wipEout data  connecting… {d} KB", .{done >> 10});
+        }
+    }
+
+    pub fn handleWipeoutEvent(self: *App, ev: WipeoutEvent) void {
+        if (self.wipeout_download_thread) |t| t.join();
+        self.wipeout_download_thread = null;
+        if (self.wipeout_download) |progress| self.gpa.destroy(progress);
+        self.wipeout_download = null;
+        self.syncAnimationTicker();
+        const pending = self.wipeout_pending;
+        self.wipeout_pending = null;
+        switch (ev) {
+            .download_failed => |name| self.setNotice("wipEout: game data download failed ({s}) — !wipeout retries and resumes it", .{name}),
+            .download_done => if (pending) |options| self.startWipeout(options),
+        }
     }
 
     fn wipeoutSavePath(self: *App) ?[]u8 {
@@ -5722,6 +5808,7 @@ pub fn dispatchEvent(
                 app.stopVoiceRecording();
         },
         .voice => |vev| app.handleVoiceEvent(vev),
+        .wipeout => |wev| app.handleWipeoutEvent(wev),
         .mouse => |m| {
             if (app.screensaver_active) return;
             vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null) .pointer else .default);
@@ -5738,6 +5825,7 @@ pub fn dispatchEvent(
         .tick => {
             app.view.spinner_frame +%= 1;
             app.voiceTick();
+            app.wipeoutDownloadTick();
             app.tickUiAnimation();
             app.expireNotice();
         },
@@ -6400,6 +6488,27 @@ const VoiceDownloadJob = struct {
             return;
         };
         job.loop.postEvent(.{ .voice = .download_done }) catch {};
+    }
+};
+
+/// Asset bundle download worker for `!wipeout`'s first run. Resumable:
+/// a lost connection leaves `wipeout.pak.part` for the next attempt.
+const WipeoutDownloadJob = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    loop: *vaxis.Loop(Event),
+    url: []const u8,
+    dest: []u8,
+    progress: *voice.DownloadProgress,
+
+    fn run(job: *WipeoutDownloadJob) void {
+        defer job.gpa.destroy(job);
+        defer job.gpa.free(job.dest);
+        voice.download(job.gpa, job.io, job.url, job.dest, job.progress) catch |err| {
+            job.loop.postEvent(.{ .wipeout = .{ .download_failed = @errorName(err) } }) catch {};
+            return;
+        };
+        job.loop.postEvent(.{ .wipeout = .download_done }) catch {};
     }
 };
 

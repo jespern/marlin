@@ -35,7 +35,8 @@ pickups, all six weapons, particles and the rescue droid are in. No audio.
 | `src/wipeout/math.zig` | `Vec2/3/4`, column-major `Mat4`, `Rgba`, angle helpers, GLSL `smoothstep` |
 | `src/wipeout/bytes.zig` | Bounds-checked cursor for the mixed big/little-endian formats |
 | `src/wipeout/image.zig` | TIM decoding (4/8/16 bpp), LZSS, CMP bundles |
-| `src/wipeout/assets.zig` | Asset root resolution and file loading |
+| `src/wipeout/assets.zig` | Asset root resolution, file loading from the tree or the bundle, bundle URL |
+| `src/wipeout/bundle.zig` | The single-file asset bundle: xz over a small path/offset table plus file data |
 | `src/wipeout/render.zig` | Software renderer: near clipping, edge-function rasterizer, depth, blend, fade |
 | `src/wipeout/track.zig` | TRV/TRF/TRS/TTF loaders, section numbering, index-linked sections |
 | `src/wipeout/object.zig` | PRM model parser and drawer |
@@ -62,6 +63,8 @@ pickups, all six weapons, particles and the rescue droid are in. No audio.
 | `src/wipeout/root.zig` | Module root, camera angle helpers |
 | `src/client/wipeout_effect.zig` | The game inside marlin: a session plus the terminal key mapping |
 | `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots, scripted whole-game runs |
+| `scripts/wipeout_pack.py` | Builds `assets/wipeout.pak` from an extracted data tree |
+| `assets/wipeout.pak` | The bundle the client downloads on first run (3.4 MB) |
 
 Build steps: `zig build wipeout-test` (unit tests) and `zig build`, which
 installs `zig-out/bin/wipeout-probe`.
@@ -102,15 +105,34 @@ zig build
 
 ## Assets
 
-The data root defaults to `$XDG_DATA_HOME/marlin/wipeout-data` (else
-`~/.local/share/marlin/wipeout-data`), overridable with `MARLIN_WIPEOUT_DATA`
-or `--assets`. It must contain the original `wipeout/` tree (`track01/`…
-`track14/`, `common/`, `textures/`). Only the PSX circuits are supported; the
-2097 and N64 code paths are intentionally omitted.
+The port reads only graphics: the common models and textures and the
+fourteen track directories, 184 files and 11.2 MB of the original data.
+Music (122 MB), sound effects and the intro video are never touched.
 
-A first-run downloader is planned but not written. Core graphics data is
-about 20 MB; the music and intro video that we skip make up the rest of the
-142 MB bundle.
+Those files ship as one bundle, `assets/wipeout.pak`, built by
+
+```
+scripts/wipeout_pack.py <data-root> assets/wipeout.pak
+```
+
+from a tree laid out like the reference build (`<data-root>/wipeout/...`).
+The container is a path/offset/size table followed by the file bytes, xz
+compressed as a whole (3.4 MB; zstd would be 3.9, deflate 6.3). Zig's
+standard library decompresses xz, so the loader is pure Zig. Opening the
+bundle inflates it into memory once (about 11 MB, well under a second)
+and serves files as slices; a frame rendered from the bundle is byte
+identical to one rendered from the tree.
+
+The data root is `$MARLIN_WIPEOUT_DATA`, else `$XDG_DATA_HOME/marlin/wipeout-data`,
+else `~/.local/share/marlin/wipeout-data`. An extracted tree there wins
+(the parity harness and the probe use one); otherwise `wipeout.pak` in
+the root is opened. With neither, `!wipeout` downloads the bundle from
+raw GitHub (`MARLIN_WIPEOUT_URL` overrides the location) on a worker
+thread with progress in the status line, resumable through a `.part`
+file, and starts the game when it lands.
+
+The assets are Sony's 1995 game data; bundling them here means this
+repository redistributes them.
 
 ## Renderer notes
 
@@ -456,4 +478,3 @@ renderer was verified without a live session.
 ## Next slices
 
 1. Polish: attract cameras after the race, pause on focus loss.
-2. First-run asset download.
