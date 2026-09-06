@@ -272,6 +272,90 @@ fn completedPlan(items: []const block.PlanItem) bool {
     return true;
 }
 
+const commentary_word_delimiters = " \t\r\n-_/\\.,:;!?()[]{}<>`'\"|+=*&^%$#@~";
+const commentary_stop_words = [_][]const u8{
+    "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "only", "or", "the", "to", "with",
+};
+
+fn significantCommentaryWord(word: []const u8) bool {
+    if (word.len < 2) return false;
+    for (commentary_stop_words) |stop| {
+        if (std.ascii.eqlIgnoreCase(word, stop)) return false;
+    }
+    return true;
+}
+
+fn commentaryWordStem(word: []const u8) []const u8 {
+    const suffixes = [_][]const u8{ "ing", "ed", "es", "s" };
+    for (suffixes) |suffix| {
+        if (word.len >= suffix.len + 4 and std.ascii.endsWithIgnoreCase(word, suffix))
+            return word[0 .. word.len - suffix.len];
+    }
+    return word;
+}
+
+fn commentaryWordsEqual(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(commentaryWordStem(a), commentaryWordStem(b));
+}
+
+fn commentaryHasWord(text: []const u8, word: []const u8) bool {
+    var words = std.mem.tokenizeAny(u8, text, commentary_word_delimiters);
+    while (words.next()) |candidate| {
+        if (significantCommentaryWord(candidate) and commentaryWordsEqual(candidate, word)) return true;
+    }
+    return false;
+}
+
+fn commentaryWordSeenBefore(text: []const u8, word: []const u8) bool {
+    const offset = @intFromPtr(word.ptr) - @intFromPtr(text.ptr);
+    return commentaryHasWord(text[0..offset], word);
+}
+
+fn normalizedCommentaryEqual(a: []const u8, b: []const u8) bool {
+    var ai: usize = 0;
+    var bi: usize = 0;
+    while (true) {
+        while (ai < a.len and !std.ascii.isAlphanumeric(a[ai])) ai += 1;
+        while (bi < b.len and !std.ascii.isAlphanumeric(b[bi])) bi += 1;
+        if (ai == a.len or bi == b.len) return ai == a.len and bi == b.len;
+        if (std.ascii.toLower(a[ai]) != std.ascii.toLower(b[bi])) return false;
+        ai += 1;
+        bi += 1;
+    }
+}
+
+pub fn commentaryNearDuplicate(a: []const u8, b: []const u8) bool {
+    if (normalizedCommentaryEqual(a, b)) return true;
+
+    var a_count: usize = 0;
+    var b_count: usize = 0;
+    var shared: usize = 0;
+    var a_words = std.mem.tokenizeAny(u8, a, commentary_word_delimiters);
+    while (a_words.next()) |word| {
+        if (!significantCommentaryWord(word) or commentaryWordSeenBefore(a, word)) continue;
+        a_count += 1;
+        if (commentaryHasWord(b, word)) shared += 1;
+    }
+    var b_words = std.mem.tokenizeAny(u8, b, commentary_word_delimiters);
+    while (b_words.next()) |word| {
+        if (significantCommentaryWord(word) and !commentaryWordSeenBefore(b, word)) b_count += 1;
+    }
+    const smaller = @min(a_count, b_count);
+    return smaller >= 5 and shared * 10 >= smaller * 7;
+}
+
+fn commentarySuperseded(blocks: []const RenderBlock, index: usize) bool {
+    const current = blocks[index];
+    var next = index + 1;
+    while (next < blocks.len and blocks[next].turn_id == current.turn_id) : (next += 1) {
+        const candidate = blocks[next];
+        if ((candidate.kind == .reasoning and candidate.commentary) or candidate.kind == .assistant_msg) {
+            if (commentaryNearDuplicate(current.text, candidate.text)) return true;
+        }
+    }
+    return false;
+}
+
 fn clonePlanItems(gpa: std.mem.Allocator, source: []const block.PlanItem) ![]block.PlanItem {
     if (source.len == 0) return &.{};
     const items = try gpa.alloc(block.PlanItem, source.len);
@@ -432,8 +516,8 @@ pub fn wrapPromptCard(
     try lines.append(arena, .{ .text = "", .style = Palette.prompt_text, .fill_style = Palette.prompt_panel });
 }
 
-/// Reasoning/progress narration: a small mark and muted text, flat on the
-/// default background. CONTENT-ONLY like every renderer — the layout loop
+/// Reasoning/progress narration: a small mark and assistant-priority text,
+/// flat on the default background. CONTENT-ONLY like every renderer — the layout loop
 /// owns all separating air (see layoutBlockRange's section discipline).
 pub fn wrapReasoningCard(
     arena: std.mem.Allocator,
@@ -1342,8 +1426,11 @@ pub fn layoutBlockRange(
                 // models (grok) fill it with drafted replies and summarizer
                 // fragments, which reads as two narrators fighting. The
                 // model's deliberate one-line narration (commentary=true)
-                // stays; ctrl+t reveals everything.
-                if (transcript.show_tool_transcript or rb.commentary) {
+                // stays unless a later commentary/final answer says the same
+                // thing. ctrl+t reveals the complete durable transcript.
+                if (transcript.show_tool_transcript or
+                    (rb.commentary and !commentarySuperseded(transcript.blocks, block_idx)))
+                {
                     try blankLine(alloc, lines);
                     try wrapReasoningCard(alloc, lines, try clipText(alloc, rb.text, 280), w);
                 }
@@ -1526,7 +1613,7 @@ pub fn layoutLines(
             .text = "  · ",
             .style = Palette.reasoning_mark,
             .text2 = tail[0..utf8Floor(tail, cap)],
-            .style2 = Palette.collapse_hint,
+            .style2 = Palette.reasoning,
         });
     }
     if (transcript.delta.len > 0) {

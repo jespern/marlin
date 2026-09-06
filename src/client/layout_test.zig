@@ -56,6 +56,7 @@ const activePromptLineRange = layout.activePromptLineRange;
 const appendNetworkSuccessLine = layout.appendNetworkSuccessLine;
 const appendToolCallLine = layout.appendToolCallLine;
 const currentInflightCall = layout.currentInflightCall;
+const commentaryNearDuplicate = layout.commentaryNearDuplicate;
 const diffIntroNote = layout.diffIntroNote;
 const diffSummaryNote = layout.diffSummaryNote;
 const layoutBlockRange = layout.layoutBlockRange;
@@ -407,6 +408,84 @@ test "layout line safety limit produces a visible truncation" {
     );
 }
 
+test "commentary duplicate detection ignores casing, punctuation, and modest rewording" {
+    try std.testing.expect(commentaryNearDuplicate(
+        "Isolating terminal-title hunks from concurrent workspace changes.",
+        "Isolating terminal title hunks from concurrent workspace changes",
+    ));
+    try std.testing.expect(commentaryNearDuplicate(
+        "Staging only terminal-title hunks while preserving all other workspace changes.",
+        "Only the terminal title implementation is staged; all other workspace changes are preserved.",
+    ));
+    try std.testing.expect(!commentaryNearDuplicate(
+        "Checking the approval gate in loop.zig.",
+        "Running the focused TUI tests.",
+    ));
+    try std.testing.expect(!commentaryNearDuplicate(
+        "Reading layout.zig.",
+        "Reviewing layout.zig.",
+    ));
+}
+
+test "default transcript suppresses repeated commentary within a turn" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{
+        .{ .kind = .reasoning, .turn_id = 7, .text = @constCast("Isolating terminal-title hunks from concurrent workspace changes."), .label = @constCast(""), .commentary = true },
+        .{ .kind = .reasoning, .turn_id = 7, .text = @constCast("Isolating terminal title hunks from concurrent workspace changes"), .label = @constCast(""), .commentary = true },
+        .{ .kind = .reasoning, .turn_id = 7, .text = @constCast("Staging only terminal-title hunks while preserving all other workspace changes."), .label = @constCast(""), .commentary = true },
+        .{ .kind = .assistant_msg, .turn_id = 7, .text = @constCast("Only the terminal title implementation is staged; all other workspace changes are preserved."), .label = @constCast("") },
+    };
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const collapsed = try layoutLines(arena, gpa, &transcript, 120);
+    var commentary_count: usize = 0;
+    var final_count: usize = 0;
+    for (collapsed.items) |line| {
+        if (std.mem.eql(u8, line.text, "  · ")) commentary_count += 1;
+        const text = try lineText(arena, line);
+        if (std.mem.indexOf(u8, text, "Only the terminal title implementation") != null) final_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), commentary_count);
+    try std.testing.expectEqual(@as(usize, 1), final_count);
+
+    transcript.show_tool_transcript = true;
+    const expanded = try layoutLines(arena, gpa, &transcript, 120);
+    commentary_count = 0;
+    for (expanded.items) |line| {
+        if (std.mem.eql(u8, line.text, "  · ")) commentary_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), commentary_count);
+}
+
 test "active prompt range identifies the running turn card" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -533,6 +612,45 @@ test "completed plan moves immediately into transcript with timing summary" {
     try std.testing.expect(saw_summary);
     try std.testing.expect(saw_recap);
     try std.testing.expect(summary_line.? < recap_line.?);
+}
+
+test "live reasoning uses assistant-priority text" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &.{},
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "checking the implementation",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = try layoutLines(arena_state.allocator(), gpa, &transcript, 80);
+    const reasoning = lines.items[lines.items.len - 1];
+
+    try std.testing.expectEqualStrings("  · ", reasoning.text);
+    try std.testing.expectEqualStrings("checking the implementation", reasoning.text2);
+    try std.testing.expectEqual(Palette.assistant, reasoning.style2);
 }
 
 test "working activity names each operational phase" {

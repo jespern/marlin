@@ -1776,7 +1776,7 @@ test "one-line composer and scrollback prompt cards are three rows" {
     try std.testing.expect(lines.items[2].fill_style != null);
 }
 
-test "reasoning cards are muted, padded, and inset" {
+test "reasoning cards use assistant-priority text and remain inset" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1793,11 +1793,11 @@ test "reasoning cards are muted, padded, and inset" {
     try std.testing.expectEqualStrings("  · ", lines.items[0].text);
     try std.testing.expect(lines.items[0].style.bold);
     try std.testing.expect(lines.items[lines.items.len - 1].text2.len > 0);
-    // Completed commentary is secondary narration: the same muted index-7
-    // grey it streamed in as, one step below the assistant's final prose.
+    // Commentary has the same foreground priority as final assistant prose.
     try std.testing.expect(!lines.items[0].style2.italic);
     try std.testing.expect(!lines.items[0].style2.bold);
-    try std.testing.expect(vaxis.Color.eql(lines.items[0].style2.fg, Palette.reasoning.fg));
+    try std.testing.expectEqual(Palette.assistant, lines.items[0].style2);
+    try std.testing.expectEqual(Palette.assistant, Palette.reasoning);
     for (lines.items) |line| {
         // Flat CC-style narration: no background panel, ever — a filled
         // card highlighted the least important content and its padding

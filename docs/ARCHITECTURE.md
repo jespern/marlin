@@ -1140,7 +1140,11 @@ A split pane identifies its session with a compact pane label.
   `provider`, `tool`, `child`, `compaction`, `finishing`) as ephemeral additive
   status metadata;
   the live activity row names that work and shows total plus current-phase
-  elapsed time. Provider byte/quiet telemetry and exact persisted tool calls
+  elapsed time. Live and completed reasoning commentary uses the same foreground
+  priority as final assistant prose; its dot rail, not grey text, distinguishes it.
+  In the default view, later commentary or the final answer suppresses earlier
+  same-turn narration that repeats substantially the same words; Ctrl+T retains
+  the complete durable transcript. Provider byte/quiet telemetry and exact persisted tool calls
   refine the phase without adding durable transcript chatter. Active provider
   traffic shows a green up arrow; three quiet seconds change it to a red down
   arrow. When the active call is Bash, its command preview uses the same
