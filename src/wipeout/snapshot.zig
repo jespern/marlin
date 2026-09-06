@@ -5,13 +5,14 @@
 
 const std = @import("std");
 const ship_mod = @import("ship.zig");
+const race_mod = @import("race.zig");
 const camera_mod = @import("camera.zig");
 const input_mod = @import("input.zig");
 const rng_mod = @import("rng.zig");
 const Io = std.Io;
 
 pub const magic: u32 = 0x5750_4f53; // "WPOS"
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 
 pub const Snapshot = extern struct {
     magic: u32 = magic,
@@ -22,7 +23,7 @@ pub const Snapshot = extern struct {
     rapier: u8,
     crt: u8,
     steps: u64,
-    ship: ship_mod.Ship,
+    race: race_mod.Race,
     camera: camera_mod.Camera,
     rng: rng_mod.Rng,
     _reserved: [4]u32 = .{ 0, 0, 0, 0 },
@@ -69,16 +70,16 @@ test "snapshot round-trips through bytes and rejects other layouts" {
         .rapier = 1,
         .crt = 1,
         .steps = 1234,
-        .ship = std.mem.zeroes(ship_mod.Ship),
+        .race = std.mem.zeroes(race_mod.Race),
         .camera = .{},
         .rng = rng_mod.Rng.seed(7),
     };
-    snap.ship.position.x = 42.5;
+    snap.race.ships[0].position.x = 42.5;
     const bytes = std.mem.asBytes(&snap);
     var back: Snapshot = undefined;
     @memcpy(std.mem.asBytes(&back), bytes);
     try std.testing.expect(back.valid());
-    try std.testing.expectEqual(@as(f32, 42.5), back.ship.position.x);
+    try std.testing.expectEqual(@as(f32, 42.5), back.race.ships[0].position.x);
     try std.testing.expectEqual(@as(u64, 1234), back.steps);
     back.version += 1;
     try std.testing.expect(!back.valid());

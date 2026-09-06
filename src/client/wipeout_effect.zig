@@ -37,9 +37,23 @@ pub const Options = struct {
     rapier: bool = false,
     intro: bool = true,
     crt: bool = false,
+    /// Time trial: no opponents, only the player is simulated.
+    time_trial: bool = false,
+    difficulty: wipeout.race.Difficulty = .normal,
     /// Set when the user named a track/pilot/class explicitly; a bare
     /// `!wipeout` prefers a saved race over these defaults.
     explicit: bool = false,
+
+    pub fn raceOptions(self: Options) wipeout.race.Options {
+        return .{
+            .track = self.track,
+            .pilot = self.pilot,
+            .class = if (self.rapier) .rapier else .venom,
+            .race_type = if (self.time_trial) .time_trial else .single,
+            .difficulty = self.difficulty,
+            .intro = self.intro,
+        };
+    }
 };
 
 pub const Game = struct {
@@ -52,7 +66,7 @@ pub const Game = struct {
     models: wipeout.ship.Models,
     ui: wipeout.ui.Ui,
     hud: wipeout.hud.Hud,
-    ship: wipeout.ship.Ship,
+    race: wipeout.race.Race,
     camera: wipeout.camera.Camera,
     /// What the keyboard says; the ship sees this, or the autopilot's
     /// steering when it is on and no key is held.
@@ -92,15 +106,10 @@ pub const Game = struct {
         const ui = try wipeout.ui.Ui.load(gpa, &assets, &renderer);
         const hud = try wipeout.hud.Hud.load(gpa, &assets, &renderer);
 
-        // The player takes the rear grid slot, start_line_pos - 15 sections in.
-        var start: u32 = 0;
-        var i: usize = 0;
-        while (i + 15 < circuit.start_line_pos) : (i += 1) start = track.sections[start].next;
-        var ship = wipeout.ship.Ship.init(&track, start, options.pilot, 0, if (options.rapier) .rapier else .venom);
-        if (!options.intro) ship.skipIntro();
-
         var seed_bytes: [4]u8 = undefined;
         io.random(&seed_bytes);
+        var rng = wipeout.rng.Rng.seed(std.mem.readInt(u32, &seed_bytes, .little));
+        const race = wipeout.race.Race.init(&track, options.raceOptions(), &rng);
 
         self.* = .{
             .gpa = gpa,
@@ -112,9 +121,9 @@ pub const Game = struct {
             .models = models,
             .ui = ui,
             .hud = hud,
-            .ship = ship,
+            .race = race,
             .camera = wipeout.camera.Camera.init(&track, 0),
-            .rng = wipeout.rng.Rng.seed(std.mem.readInt(u32, &seed_bytes, .little)),
+            .rng = rng,
             .start_line_pos = circuit.start_line_pos,
             .crt = options.crt,
         };
@@ -140,7 +149,7 @@ pub const Game = struct {
             .rapier = @intFromBool(self.options.rapier),
             .crt = @intFromBool(self.crt),
             .steps = self.steps,
-            .ship = self.ship,
+            .race = self.race,
             .camera = self.camera,
             .rng = self.rng,
         };
@@ -156,11 +165,19 @@ pub const Game = struct {
         };
         if (options.track < 1 or options.track > 14 or options.pilot >= wipeout.defs.num_pilots) return error.BadSnapshot;
         const self = try create(gpa, io, environ, options);
-        if (snap.ship.section >= self.track.sections.len or snap.camera.section >= self.track.sections.len) {
+        if (snap.camera.section >= self.track.sections.len) {
             self.destroy();
             return error.BadSnapshot;
         }
-        self.ship = snap.ship;
+        for (snap.race.ships) |s| {
+            if (s.section >= self.track.sections.len) {
+                self.destroy();
+                return error.BadSnapshot;
+            }
+        }
+        self.race = snap.race;
+        self.options.time_trial = snap.race.race_type == .time_trial;
+        self.options.difficulty = snap.race.difficulty;
         self.camera = snap.camera;
         self.rng = snap.rng;
         self.steps = snap.steps;
@@ -169,7 +186,8 @@ pub const Game = struct {
     }
 
     pub fn matches(self: *const Game, options: Options) bool {
-        return self.options.track == options.track and self.options.pilot == options.pilot and self.options.rapier == options.rapier;
+        return self.options.track == options.track and self.options.pilot == options.pilot and self.options.rapier == options.rapier and
+            self.options.time_trial == options.time_trial and self.options.difficulty == options.difficulty;
     }
 
     /// Begin or continue play; the clock restarts so a pause never turns
@@ -210,16 +228,11 @@ pub const Game = struct {
 
     fn step(self: *Game) void {
         var effective = self.input;
-        if (self.autopilot and !self.input.anyHeld()) wipeout.autopilot.steer(&self.ship, &self.track, &effective);
-        self.ship.update(.{
-            .track = &self.track,
-            .input = &effective,
-            .rng = &self.rng,
-            .tick = step_seconds,
-            .start_line_pos = self.start_line_pos,
-        });
-        self.camera.mode = if (self.ship.flags.view_internal) .internal else .external;
-        self.camera.update(&self.track, &self.ship, @floatCast(step_seconds));
+        if (self.autopilot and !self.input.anyHeld()) wipeout.autopilot.steer(self.race.playerShip(), &self.track, &effective);
+        self.race.update(&self.track, &effective, &self.rng, step_seconds, &self.models);
+        const player = self.race.playerShip();
+        self.camera.mode = if (player.flags.view_internal) .internal else .external;
+        self.camera.update(&self.track, player, @floatCast(step_seconds));
         self.input.endFrame();
         self.steps += 1;
         self.cycle_time += @floatCast(step_seconds);
@@ -243,16 +256,8 @@ pub const Game = struct {
         self.scene.draw(r, self.camera.position, forward);
         self.track.draw(r, self.camera.position, forward);
         r.setCullBackface(true);
-        if (!(self.ship.flags.view_internal and !self.ship.flags.in_rescue)) self.ship.draw(r, &self.models);
-        if (self.ship.flags.visible and !self.ship.flags.flying) {
-            r.setModelMat(&wipeout.math.Mat4.identity);
-            r.setDepthWrite(false);
-            r.setDepthOffset(-32.0);
-            self.ship.drawShadow(r, &self.track, &self.models);
-            r.setDepthOffset(0);
-            r.setDepthWrite(true);
-        }
-        self.hud.draw(r, &self.ui, &self.ship, self.autopilot);
+        wipeout.race.drawShips(&self.race, r, &self.track, &self.models);
+        self.hud.draw(r, &self.ui, self.race.playerShipConst(), self.race.race_type != .time_trial, self.autopilot);
         if (self.crt) {
             wipeout.post.crt(r.color, r.width, r.height, rgb, out_w, out_h, self.cycle_time);
         } else if (out_w == r.width and out_h == r.height) {
@@ -294,7 +299,7 @@ pub const Game = struct {
             return true;
         }
         const action = actionForKey(key) orelse return false;
-        if (self.ship.finished()) {
+        if (self.race.playerShipConst().finished()) {
             // On the results page thrust starts a new race on the same
             // circuit; the ship ignores everything else.
             if (action == .thrust and down) self.restart();
@@ -306,12 +311,7 @@ pub const Game = struct {
 
     /// Back to the grid with the same circuit, pilot and class.
     pub fn restart(self: *Game) void {
-        const circuit = wipeout.defs.circuitSettings(self.options.track);
-        var start: u32 = 0;
-        var i: usize = 0;
-        while (i + 15 < circuit.start_line_pos) : (i += 1) start = self.track.sections[start].next;
-        self.ship = wipeout.ship.Ship.init(&self.track, start, self.options.pilot, 0, if (self.options.rapier) .rapier else .venom);
-        if (!self.options.intro) self.ship.skipIntro();
+        self.race = wipeout.race.Race.init(&self.track, self.options.raceOptions(), &self.rng);
         self.camera = wipeout.camera.Camera.init(&self.track, 0);
         self.input = .{};
         self.steps = 0;

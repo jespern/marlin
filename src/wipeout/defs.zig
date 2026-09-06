@@ -99,26 +99,78 @@ pub fn shipAttributes(team: Team, class: RaceClass) ShipAttributes {
 pub const CircuitSettings = struct {
     start_line_pos: u16,
     sky_y_offset: f32,
+    /// Extra speed granted to AI ships that have fallen behind the player.
+    behind_speed: f32,
+    /// Start-line stagger: the n-th AI ship waits n*(base + n*factor) frames.
+    spread_base: f32,
+    spread_factor: f32,
+};
+
+pub const AiSetting = struct {
+    thrust_max: f32,
+    thrust_magnitude: f32,
+    fight_back: bool,
+};
+
+/// Opponent tuning by class, from the back of the grid forwards (the
+/// original indexes it by inverse start rank minus one).
+pub const ai_settings = [2][7]AiSetting{
+    .{
+        .{ .thrust_max = 2550, .thrust_magnitude = 44, .fight_back = true },
+        .{ .thrust_max = 2600, .thrust_magnitude = 45, .fight_back = true },
+        .{ .thrust_max = 2630, .thrust_magnitude = 45, .fight_back = true },
+        .{ .thrust_max = 2660, .thrust_magnitude = 46, .fight_back = true },
+        .{ .thrust_max = 2700, .thrust_magnitude = 47, .fight_back = true },
+        .{ .thrust_max = 2720, .thrust_magnitude = 48, .fight_back = true },
+        .{ .thrust_max = 2750, .thrust_magnitude = 49, .fight_back = true },
+    },
+    .{
+        .{ .thrust_max = 3750, .thrust_magnitude = 50, .fight_back = true },
+        .{ .thrust_max = 3780, .thrust_magnitude = 53, .fight_back = true },
+        .{ .thrust_max = 3800, .thrust_magnitude = 55, .fight_back = true },
+        .{ .thrust_max = 3850, .thrust_magnitude = 57, .fight_back = true },
+        .{ .thrust_max = 3900, .thrust_magnitude = 60, .fight_back = true },
+        .{ .thrust_max = 3950, .thrust_magnitude = 62, .fight_back = true },
+        .{ .thrust_max = 4000, .thrust_magnitude = 65, .fight_back = true },
+    },
+};
+
+pub fn aiSetting(class: RaceClass, inv_start_rank: u8) AiSetting {
+    const index: usize = @min(@max(inv_start_rank, 1) - 1, 6);
+    return ai_settings[@intFromEnum(class)][index];
+}
+
+pub const WeaponType = enum(u8) {
+    none = 0,
+    mine,
+    missile,
+    rocket,
+    special,
+    ebolt,
+    flare,
+    rev_con,
+    shield,
+    turbo,
 };
 
 /// Settings by PSX track directory number (1-14). Each circuit has a
 /// Venom and a Rapier layout in separate directories.
 pub fn circuitSettings(track_number: u8) CircuitSettings {
     return switch (track_number) {
-        1 => .{ .start_line_pos = 27, .sky_y_offset = -820 },
-        2 => .{ .start_line_pos = 27, .sky_y_offset = -2520 },
-        3 => .{ .start_line_pos = 27, .sky_y_offset = -1930 },
-        4 => .{ .start_line_pos = 16, .sky_y_offset = -5000 },
-        5 => .{ .start_line_pos = 16, .sky_y_offset = -5000 },
-        6 => .{ .start_line_pos = 27, .sky_y_offset = 0 },
-        7 => .{ .start_line_pos = 16, .sky_y_offset = -2260 },
-        8 => .{ .start_line_pos = 16, .sky_y_offset = -40 },
-        9 => .{ .start_line_pos = 16, .sky_y_offset = -2700 },
-        10 => .{ .start_line_pos = 27, .sky_y_offset = 0 },
-        11 => .{ .start_line_pos = 16, .sky_y_offset = -240 },
-        12 => .{ .start_line_pos = 16, .sky_y_offset = -2120 },
-        13 => .{ .start_line_pos = 16, .sky_y_offset = -2700 },
-        else => .{ .start_line_pos = 27, .sky_y_offset = 0 },
+        1 => .{ .start_line_pos = 27, .sky_y_offset = -820, .behind_speed = 350, .spread_base = 60, .spread_factor = 11 },
+        2 => .{ .start_line_pos = 27, .sky_y_offset = -2520, .behind_speed = 300, .spread_base = 80, .spread_factor = 20 },
+        3 => .{ .start_line_pos = 27, .sky_y_offset = -1930, .behind_speed = 500, .spread_base = 80, .spread_factor = 11 },
+        4 => .{ .start_line_pos = 16, .sky_y_offset = -5000, .behind_speed = 200, .spread_base = 10, .spread_factor = 8 },
+        5 => .{ .start_line_pos = 16, .sky_y_offset = -5000, .behind_speed = 500, .spread_base = 10, .spread_factor = 8 },
+        6 => .{ .start_line_pos = 27, .sky_y_offset = 0, .behind_speed = 500, .spread_base = 10, .spread_factor = 8 },
+        7 => .{ .start_line_pos = 16, .sky_y_offset = -2260, .behind_speed = 500, .spread_base = 30, .spread_factor = 11 },
+        8 => .{ .start_line_pos = 16, .sky_y_offset = -40, .behind_speed = 350, .spread_base = 80, .spread_factor = 15 },
+        9 => .{ .start_line_pos = 16, .sky_y_offset = -2700, .behind_speed = 150, .spread_base = 10, .spread_factor = 8 },
+        10 => .{ .start_line_pos = 27, .sky_y_offset = 0, .behind_speed = 200, .spread_base = 40, .spread_factor = 11 },
+        11 => .{ .start_line_pos = 16, .sky_y_offset = -240, .behind_speed = 450, .spread_base = 30, .spread_factor = 11 },
+        12 => .{ .start_line_pos = 16, .sky_y_offset = -2120, .behind_speed = 450, .spread_base = 40, .spread_factor = 11 },
+        13 => .{ .start_line_pos = 16, .sky_y_offset = -2700, .behind_speed = 150, .spread_base = 10, .spread_factor = 8 },
+        else => .{ .start_line_pos = 27, .sky_y_offset = 0, .behind_speed = 500, .spread_base = 40, .spread_factor = 11 },
     };
 }
 

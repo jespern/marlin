@@ -49,7 +49,7 @@ pub const Hud = struct {
 
     /// Draw over a frame whose 3D pass is complete. Switches the renderer
     /// to the 2D view.
-    pub fn draw(self: *const Hud, r: *render.Renderer, ui: *const Ui, ship: *const ship_mod.Ship, autopilot: bool) void {
+    pub fn draw(self: *const Hud, r: *render.Renderer, ui: *const Ui, ship: *const ship_mod.Ship, show_position: bool, autopilot: bool) void {
         r.setView2d();
         r.setCullBackface(false);
 
@@ -78,6 +78,11 @@ pub const Hud = struct {
         ui.drawText(r, "OF", ui.scaled(Vec2i.init(10 + width, 27)), .px8, ui_mod.color_accent);
         ui.drawNumber(r, defs.num_laps, ui.scaled(Vec2i.init(32 + width, 19)), .px16, ui_mod.color_default);
 
+        if (show_position) {
+            ui.drawText(r, "POSITION", ui.pos(Anchor.top | Anchor.right, Vec2i.init(-90, 8)), .px8, ui_mod.color_accent);
+            ui.drawNumber(r, ship.position_rank, ui.pos(Anchor.top | Anchor.right, Vec2i.init(-60, 19)), .px16, ui_mod.color_default);
+        }
+
         // Best lap this session stands in for the saved lap record.
         ui.drawText(r, "LAP RECORD", ui.scaled(Vec2i.init(15, 43)), .px8, ui_mod.color_accent);
         ui.drawTime(r, ship.bestLap(), ui.scaled(Vec2i.init(15, 55)), .px8, ui_mod.color_default);
@@ -87,7 +92,7 @@ pub const Hud = struct {
         }
 
         self.drawSpeedo(r, ui, ship.speed, ship.thrust_mag);
-        if (autopilot) ui.drawText(r, "AUTO", ui.pos(Anchor.top | Anchor.right, Vec2i.init(-48, 8)), .px8, ui_mod.color_accent);
+        if (autopilot) ui.drawText(r, "AUTO", ui.pos(Anchor.top | Anchor.right, Vec2i.init(-48, 38)), .px8, ui_mod.color_accent);
         r.setCullBackface(true);
     }
 

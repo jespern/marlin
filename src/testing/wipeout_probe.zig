@@ -57,6 +57,9 @@ pub const Options = struct {
     intro: bool = false,
     /// Apply the CRT post pass to the output.
     crt: bool = false,
+    /// Only the player on the track (the parity harness uses this).
+    time_trial: bool = false,
+    difficulty: wipeout.race.Difficulty = .normal,
     /// zlib encoder threads (1 = single-stream std deflate).
     bands: u8 = 6,
     /// Output scale over the render size (the CRT pass wants 2).
@@ -302,21 +305,23 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         errdefer models.deinit(gpa);
         const ui = try wipeout.ui.Ui.load(gpa, &assets, &renderer);
         const hud = try wipeout.hud.Hud.load(gpa, &assets, &renderer);
-        var start: u32 = 0;
-        var i: usize = 0;
-        // ships_init: the grid begins start_line_pos - 15 sections in, and
-        // the player occupies the rear slot.
-        while (i + 15 < circuit.start_line_pos) : (i += 1) start = track.sections[start].next;
-        var player = wipeout.ship.Ship.init(&track, start, options.pilot, 0, if (options.rapier) .rapier else .venom);
-        if (!options.intro) player.skipIntro();
+        var rng = wipeout.rng.Rng.seed(0x5eed);
+        const field = wipeout.race.Race.init(&track, .{
+            .track = options.track,
+            .pilot = options.pilot,
+            .class = if (options.rapier) .rapier else .venom,
+            .race_type = if (options.time_trial) .time_trial else .single,
+            .difficulty = options.difficulty,
+            .intro = options.intro,
+        }, &rng);
         race = .{
             .models = models,
             .ui = ui,
             .hud = hud,
-            .ship = player,
+            .field = field,
             .camera = wipeout.camera.Camera.init(&track, 0),
             .input = .{},
-            .rng = wipeout.rng.Rng.seed(0x5eed),
+            .rng = rng,
             .start_line_pos = circuit.start_line_pos,
             .autopilot = options.autopilot,
         };
@@ -382,9 +387,17 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
             try ow.interface.writeAll(std.mem.sliceAsBytes(renderer.owner));
             try ow.interface.flush();
         }
-        if (race) |*r| stderrPrint(io, "ship: section {d} pos ({d:.0},{d:.0},{d:.0}) speed {d:.0} lap {d} flying={}\n", .{
-            r.ship.section, r.ship.position.x, r.ship.position.y, r.ship.position.z, r.ship.speed, r.ship.lap, r.ship.flags.flying,
-        });
+        if (race) |*r| {
+            const sh = r.field.playerShipConst();
+            stderrPrint(io, "ship: section {d} pos ({d:.0},{d:.0},{d:.0}) speed {d:.0} lap {d} flying={} rank {d}\n", .{
+                sh.section, sh.position.x, sh.position.y, sh.position.z, sh.speed, sh.lap, sh.flags.flying, sh.position_rank,
+            });
+            for (r.field.ships, 0..) |other, pi| {
+                stderrPrint(io, "  pilot {d}: mode {s} progress {d} rank {d} speed {d:.0} section {d} flying={}\n", .{
+                    pi, @tagName(other.mode), other.total_section_num, other.position_rank, other.speed, other.section, other.flags.flying,
+                });
+            }
+        }
         try writePpm(io, path, @as(u32, options.width) * options.scale, @as(u32, options.height) * options.scale, rgb);
         stderrPrint(io, "wrote {s} (frame {d}, {d} tris, {d} pixels shaded, camera section {d}, {d} crack pixels)\n", .{
             path,
@@ -593,7 +606,7 @@ fn prepareFrame(
         .tris = renderer.stats.tris,
         .pixels = renderer.stats.pixels,
         .visited = renderer.stats.visited,
-        .section = if (race) |r| r.ship.section else camera.section,
+        .section = if (race) |r| r.field.playerShipConst().section else camera.section,
     };
 }
 
@@ -620,18 +633,9 @@ fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.T
     if (race) |r| {
         renderer.draw_id = 0xfffd;
         renderer.debug_prim_ids = tag_prims;
-        if (!(r.ship.flags.view_internal and !r.ship.flags.in_rescue)) r.ship.draw(renderer, &r.models);
+        wipeout.race.drawShips(&r.field, renderer, track, &r.models);
         renderer.debug_prim_ids = false;
-        if (r.ship.flags.visible and !r.ship.flags.flying) {
-            renderer.setModelMat(&wipeout.math.Mat4.identity);
-            renderer.setDepthWrite(false);
-            renderer.setDepthOffset(-32.0);
-            renderer.draw_id = 0xfffc;
-            r.ship.drawShadow(renderer, track, &r.models);
-            renderer.setDepthOffset(0);
-            renderer.setDepthWrite(true);
-        }
-        r.hud.draw(renderer, &r.ui, &r.ship, r.autopilot);
+        r.hud.draw(renderer, &r.ui, r.field.playerShipConst(), r.field.race_type != .time_trial, r.autopilot);
     }
 }
 
@@ -723,7 +727,7 @@ const Race = struct {
     models: wipeout.ship.Models,
     ui: wipeout.ui.Ui,
     hud: wipeout.hud.Hud,
-    ship: wipeout.ship.Ship,
+    field: wipeout.race.Race,
     camera: wipeout.camera.Camera,
     input: wipeout.input.State,
     rng: wipeout.rng.Rng,
@@ -776,19 +780,14 @@ const Race = struct {
             w.interface.print("{d}\n", .{mask}) catch {};
         }
 
-        self.ship.update(.{
-            .track = track,
-            .input = &self.input,
-            .rng = &self.rng,
-            .tick = tick,
-            .start_line_pos = self.start_line_pos,
-        });
-        self.camera.mode = if (self.ship.flags.view_internal) .internal else .external;
-        self.camera.update(track, &self.ship, dt);
+        self.field.update(track, &self.input, &self.rng, tick, &self.models);
+        const player = self.field.playerShip();
+        self.camera.mode = if (player.flags.view_internal) .internal else .external;
+        self.camera.update(track, player, dt);
         self.input.endFrame();
 
         if (self.log_writer) |*w| {
-            const sh = &self.ship;
+            const sh = self.field.playerShipConst();
             w.interface.print("{d},{d},{d},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.6},{d:.6},{d:.6},{d:.4},{d:.4},{d},{d}\n", .{
                 self.frame,
                 sh.section,
@@ -812,7 +811,7 @@ const Race = struct {
     }
 
     fn steerAutomatically(self: *Race, track: *const wipeout.track.Track) void {
-        wipeout.autopilot.steer(&self.ship, track, &self.input);
+        wipeout.autopilot.steer(self.field.playerShipConst(), track, &self.input);
     }
 };
 
@@ -1308,6 +1307,11 @@ fn parseArgs(args: []const []const u8) !Options {
             options.intro = true;
         } else if (std.mem.eql(u8, arg, "--crt")) {
             options.crt = true;
+        } else if (std.mem.eql(u8, arg, "--time-trial")) {
+            options.time_trial = true;
+        } else if (std.mem.eql(u8, arg, "--ai")) {
+            const level = try nextString(args, &index);
+            options.difficulty = std.meta.stringToEnum(wipeout.race.Difficulty, level) orelse return error.InvalidValue;
         } else if (std.mem.eql(u8, arg, "--bands")) {
             options.bands = try nextUnsigned(u8, args, &index);
             if (options.scale == 1) options.scale = 2;
@@ -1399,6 +1403,8 @@ fn usage(io: Io) void {
         \\  --rapier           Rapier class handling instead of Venom
         \\  --intro            start with the countdown hover instead of racing at once
         \\  --crt              apply the CRT post pass (implies --scale 2)
+        \\  --time-trial       no opponents (parity replays use this)
+        \\  --ai LEVEL         opponent strength: easy, normal, hard
         \\  --scale N          output N× the render size (nearest, or through the CRT pass)
         \\  --record-input F   write the per-frame action bitmask (for the parity harness)
         \\  --replay-input F   drive from a recorded bitmask file (implies --dry-run)

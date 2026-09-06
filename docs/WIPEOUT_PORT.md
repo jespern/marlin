@@ -9,8 +9,9 @@ simple autopilot, and a replay harness shows the trajectory matches the
 reference build to within 0.01 units over a full lap. The game runs inside
 the marlin client as `!wipeout` with the original HUD and an optional CRT
 pass, pausing on Escape and resuming where it left off, including across
-marlin restarts through an on-disk snapshot. No opponents, weapons or
-audio yet.
+marlin restarts through an on-disk snapshot. Seven AI opponents race with
+the original's controller and collide with each other and the player.
+No pickups, weapons, rescue droid or audio yet.
 
 ## Goals
 
@@ -44,6 +45,7 @@ audio yet.
 | `src/wipeout/rng.zig` | Deterministic xorshift owned by game state |
 | `src/wipeout/ship.zig` | Ship state, player flight model, track collision, jump and rescue, models and shadow |
 | `src/wipeout/camera.zig` | External chase camera and cockpit view |
+| `src/wipeout/race.zig` | The eight-ship field: grid order, per-step update, collisions, race positions |
 | `src/wipeout/ui.zig` | Bitmap text from the three font textures, screen anchors |
 | `src/wipeout/hud.zig` | Lap counter and times, wrong-way warning, speedo |
 | `src/wipeout/post.zig` | CRT post pass (the original's fragment shader on the CPU) and nearest upscale |
@@ -291,6 +293,32 @@ Integration points, all in the client:
   most four per tick, so ticker jitter changes smoothness, not speed.
 - `commands.zig`: the `!wipeout` entry and its argument parsing.
 
+## Opponents
+
+`race.zig` holds the field as the original's `ships_init`/`ships_update`
+do: a shuffled grid with the player at the back in two-ship rows, every
+ship updated each step, pairwise collision tests, and an insertion sort by
+progress that writes race positions. The AI controller in `ship.zig` is a
+translation of the reference: each opponent picks a lateral strategy
+(hold centre, left or right, block the player's side, avoid it, zig-zag)
+and a target speed from how many sections it is from the player, with the
+same rubber band: well ahead it eases to half throttle, well behind it gets
+the circuit's extra catch-up speed, and the staggered launch off the grid
+follows the circuit's spread settings. Ships steer along the centre line
+plus that offset; airborne they aim two sections ahead. Collision uses the
+four-vertex hulls from `alcol.prm` and the original's edge-through-face
+test and momentum exchange.
+
+Difficulty scales the original opponent tuning: `easy` 0.75, `normal`
+0.88 (the default, deliberately below the original), `hard` 1.0.
+`!wipeout trial` races alone. When the player finishes, the ship is handed
+to the AI at a gentle cruise as the original does, and the results page
+appears.
+
+Not yet ported from the AI: the weapon decisions (mines, shields, rockets,
+missiles, electro-bolts) fall back to blocking until the weapon systems
+exist, and there is no pickup collection.
+
 ## HUD
 
 `hud.zig` draws what the original's in-race HUD shows for a single ship:
@@ -355,7 +383,6 @@ renderer was verified without a live session.
 
 ## Next slices
 
-1. AI opponents, ship collisions, pickups, weapons, particles, the rescue
-   droid and race end: the bulk of the remaining game logic.
+1. Pickups and weapons, particles, the rescue droid.
 2. Menus, championship and highscores.
 3. First-run asset download.

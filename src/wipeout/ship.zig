@@ -81,7 +81,14 @@ pub const Flags = packed struct(u32) {
     _pad: u14 = 0,
 };
 
-pub const Mode = enum(u8) { intro, race, rescue };
+pub const Mode = enum(u8) { intro, race, rescue, ai_intro, ai_race };
+
+/// How an AI ship positions itself across the track this decision period.
+pub const Strategy = enum(u8) { hold_center, hold_left, hold_right, block, avoid, avoid_other, zig_zag };
+
+const update_time_just_front: f32 = 150.0 / 30.0;
+const update_time_just_behind: f32 = 200.0 / 30.0;
+const update_time_in_sight: f32 = 200.0 / 30.0;
 
 /// Everything the flight model needs from outside the ship for one step.
 pub const Context = struct {
@@ -93,6 +100,12 @@ pub const Context = struct {
     start_line_pos: u16,
     /// Exponent applied to analog steering; 1 for digital input.
     analog_response: f32 = 1.0,
+    /// Every ship in the race (including this one) and the player's index;
+    /// the AI reads the others' positions and flags.
+    ships: []const Ship = &.{},
+    player: u8 = 0,
+    /// Circuit tuning for the AI's catch-up speed.
+    behind_speed: f32 = 300,
 };
 
 pub const Ship = extern struct {
@@ -143,12 +156,31 @@ pub const Ship = extern struct {
 
     mat: Mat4,
 
+    // AI ("remote") attributes; the player's are used after the race ends,
+    // when the original hands the ship to the AI.
+    remote_thrust_max: f32,
+    remote_thrust_mag: f32,
+    fight_back: u8,
+    start_accelerate_timer: f32,
+    position_rank: i32,
+    strategy: Strategy,
+
+    weapon_type: defs.WeaponType,
+    /// Pilot index of the current weapon target, or -1.
+    weapon_target: i32,
+    ebolt_timer: f32,
+    ebolt_effect_timer: f32,
+
     /// Place the ship on the start grid: `inv_start_rank` 0 is the back row
     /// (where the player always starts); odd ranks take the right-hand
     /// face of the grid section.
-    pub fn init(track: *const Track, section_index: u32, pilot: u8, inv_start_rank: u8, class: defs.RaceClass) Ship {
+    /// `ai` is null for the player. `strength` scales the opponent tuning
+    /// (1 = the original); `circuit` supplies the start-line stagger.
+    pub fn init(track: *const Track, section_index: u32, pilot: u8, inv_start_rank: u8, class: defs.RaceClass, ai: ?defs.AiSetting, circuit: defs.CircuitSettings, strength: f32) Ship {
         const attributes = defs.shipAttributes(defs.pilot_team[pilot], class);
         const section = &track.sections[section_index];
+        const p: f32 = @as(f32, @floatFromInt(inv_start_rank)) - 1;
+        const stagger: f32 = p * (circuit.spread_base + p * circuit.spread_factor) * (1.0 / 30.0);
 
         var face_index: usize = @as(usize, section.face_start) + 1;
         if ((inv_start_rank % 2) != 0) face_index += 1;
@@ -161,7 +193,7 @@ pub const Ship = extern struct {
         return .{
             .pilot = pilot,
             .flags = .{ .racing = true, .visible = true, .direction_forward = true },
-            .mode = .intro,
+            .mode = if (ai != null) .ai_intro else .intro,
             .section = section_index,
             .prev_section = section_index,
             .position = face_point.add(face.normal.scale(200)),
@@ -194,6 +226,16 @@ pub const Ship = extern struct {
             .update_timer = update_time_initial,
             .last_impact_time = 0,
             .mat = Mat4.identity,
+            .remote_thrust_max = if (ai) |a| a.thrust_max * strength else 2900,
+            .remote_thrust_mag = if (ai) |a| a.thrust_magnitude * strength else 46,
+            .fight_back = if (ai) |a| @intFromBool(a.fight_back) else 0,
+            .start_accelerate_timer = if (ai != null) stagger else 0,
+            .position_rank = @as(i32, defs.num_pilots) - inv_start_rank,
+            .strategy = .hold_center,
+            .weapon_type = .none,
+            .weapon_target = -1,
+            .ebolt_timer = 0,
+            .ebolt_effect_timer = 0,
         };
     }
 
@@ -270,6 +312,8 @@ pub const Ship = extern struct {
             .intro => self.updateIntro(ctx),
             .race => self.updateRace(ctx),
             .rescue => self.updateRescue(ctx),
+            .ai_intro => self.updateAiIntro(ctx),
+            .ai_race => self.updateAiRace(ctx),
         }
 
         self.mat = Mat4.identity;
@@ -294,9 +338,15 @@ pub const Ship = extern struct {
                     self.lap_times[@intCast(self.lap - 1)] = self.lap_time;
                 }
                 self.lap_time = 0;
-                // Final lap complete: the race is over. The original hands
-                // the ship to the AI here; ours coasts with no input.
-                if (self.lap == defs.num_laps) self.flags.racing = false;
+                // Final lap complete for the player: the race is over and the
+                // original hands the ship to the AI at a gentle cruise.
+                if (self.lap == defs.num_laps and self.pilot == ctx.player and self.flags.racing) {
+                    self.flags.racing = false;
+                    self.remote_thrust_max = 3160;
+                    self.remote_thrust_mag = 32;
+                    self.speed = 3160;
+                    self.mode = .ai_race;
+                }
             }
         }
 
@@ -341,12 +391,13 @@ pub const Ship = extern struct {
         }
     }
 
-    /// Once the race is over the player's input no longer reaches the ship.
-    const no_input = input.State{};
-
     fn updateRace(self: *Ship, ctx: Context) void {
+        if (!self.flags.racing) {
+            self.mode = .ai_race;
+            return;
+        }
         const track = ctx.track;
-        const in: *const input.State = if (self.flags.racing) ctx.input else &no_input;
+        const in: *const input.State = ctx.input;
         const tick = ctx.tick;
         const dt32: f32 = f(tick);
         const section = &track.sections[self.section];
@@ -535,6 +586,351 @@ pub const Ship = extern struct {
             const repulse = track.sections[section.next].center.sub(section.center);
             self.velocity = self.velocity.add(repulse.scale(2));
         }
+    }
+
+    // -- AI -----------------------------------------------------------------
+
+    fn updateAiIntro(self: *Ship, ctx: Context) void {
+        if (self.update_timer >= update_time_initial) self.temp_target = self.position;
+        const rate: f64 = 80.0 + @as(f64, @floatFromInt(self.pilot)) * 3.0;
+        self.position.y = self.temp_target.y + @sin(f(@as(f64, self.update_timer) * rate * 30.0 * math.pi64 * 2.0 / 4096.0)) * 32;
+        self.update_timer = f(self.update_timer - ctx.tick);
+        if (self.update_timer <= 0) self.mode = .ai_race;
+    }
+
+    fn holdLeft(face: *const Face) Vec3 {
+        return face.tris[0].vertices[1].pos.sub(face.tris[0].vertices[0].pos).scale(0.5);
+    }
+
+    fn holdRight(face: *const Face) Vec3 {
+        return face.tris[0].vertices[0].pos.sub(face.tris[0].vertices[1].pos).scale(0.5);
+    }
+
+    /// Lateral offset from the centre line for the current strategy.
+    fn strategyOffset(self: *const Ship, ctx: Context, face: *const Face) Vec3 {
+        const player_left = ctx.ships[ctx.player].flags.left_side;
+        return switch (self.strategy) {
+            .hold_center => Vec3.zero,
+            .hold_left => holdLeft(face),
+            .hold_right => holdRight(face),
+            .block => if (player_left) holdLeft(face) else holdRight(face),
+            .avoid => if (player_left) holdRight(face) else holdLeft(face),
+            // The original's avoid-other never finds a ship to avoid (its
+            // search threshold starts above its acceptance window), so it
+            // holds the centre.
+            .avoid_other => Vec3.zero,
+            .zig_zag => blk: {
+                const count: i32 = @intFromFloat(@floor(self.update_timer * 30.0 / 50.0));
+                break :blk if (@mod(count, 2) == 1) holdRight(face) else holdLeft(face);
+            },
+        };
+    }
+
+    fn accelerateTowards(self: *Ship, ceiling: f32, magnitude: f32, dt: f32) void {
+        if (ceiling > self.speed) self.speed += magnitude * 30 * dt;
+    }
+
+    /// The original's opponent controller: pick a lateral strategy and a
+    /// target speed from the ship's relation to the player, then steer the
+    /// craft along the section centre line plus that offset. Also drives
+    /// the player's ship after the race is over.
+    fn updateAiRace(self: *Ship, ctx: Context) void {
+        const track = ctx.track;
+        const dt: f32 = f(ctx.tick);
+        const sections = track.sections;
+        const player = &ctx.ships[ctx.player];
+        const is_player = self.pilot == ctx.player;
+        const behind_speed = ctx.behind_speed;
+
+        if (self.ebolt_timer > 0) {
+            self.ebolt_timer -= dt;
+        } else {
+            self.flags.electroed = false;
+        }
+
+        if (!self.flags.flying) {
+            const section = &sections[self.section];
+            const base = track.baseFaceIndex(section);
+            const face = &track.faces[base];
+            const section_diff: i32 = self.total_section_num - player.total_section_num;
+            self.flags.just_in_front = false;
+
+            if (is_player) {
+                self.strategy = .avoid_other;
+                self.accelerateTowards(self.remote_thrust_max, self.remote_thrust_mag, dt);
+            } else if (self.start_accelerate_timer > 0) {
+                // Staggered launch off the grid.
+                self.start_accelerate_timer -= dt;
+                self.update_timer = 0;
+                self.strategy = .avoid;
+                self.accelerateTowards(self.remote_thrust_max + 1200, self.remote_thrust_mag + 150, dt);
+            } else if (section_diff < -10) {
+                // Well behind: get out of the way and catch up.
+                self.update_timer = 0;
+                self.strategy = .avoid;
+                self.accelerateTowards(self.remote_thrust_max + behind_speed, self.remote_thrust_mag, dt);
+            } else if (section_diff <= 4 and section_diff > 0) {
+                // Just ahead of the player.
+                self.flags.just_in_front = true;
+                if (self.update_timer <= 0) {
+                    const chance = ctx.rng.int(0, 64);
+                    self.update_timer = update_time_just_front;
+                    if (self.fight_back != 0) {
+                        // Block, mine, or shield: the latter two need the
+                        // weapon systems and fall back to blocking for now.
+                        self.strategy = .block;
+                        _ = chance;
+                    } else {
+                        self.strategy = .avoid;
+                    }
+                }
+                self.update_timer -= dt;
+                if (self.flags.overtaken) {
+                    self.accelerateTowards(self.remote_thrust_max + behind_speed, self.remote_thrust_mag, dt);
+                } else {
+                    self.accelerateTowards(self.remote_thrust_max + behind_speed * 0.5, self.remote_thrust_mag, dt);
+                }
+            } else if (section_diff >= -10 and section_diff <= 0) {
+                // Just behind: decide whether to have a go back.
+                if (self.update_timer <= 0) {
+                    self.update_timer = update_time_just_behind;
+                    if (self.fight_back != 0) {
+                        if (self.weapon_type == .none) {
+                            self.strategy = .avoid;
+                            self.flags.overtaken = true;
+                        } else {
+                            const chance = ctx.rng.int(0, 64);
+                            if (chance < 48) {
+                                self.strategy = .block;
+                            } else {
+                                self.strategy = .avoid;
+                                self.flags.overtaken = false;
+                            }
+                        }
+                    } else {
+                        self.remote_thrust_max = 2100;
+                        self.remote_thrust_mag = 25;
+                        self.speed = 2100;
+                        self.strategy = .avoid;
+                        self.flags.overtaken = false;
+                    }
+                }
+                for (ctx.ships) |*other| {
+                    if (other.flags.just_in_front) {
+                        self.strategy = .avoid;
+                        self.flags.overtaken = false;
+                    }
+                }
+                self.update_timer -= dt;
+                if (self.flags.overtaken) {
+                    self.accelerateTowards(self.remote_thrust_max + 700, self.remote_thrust_mag * 2, dt);
+                } else {
+                    self.accelerateTowards(self.remote_thrust_max + behind_speed, self.remote_thrust_mag, dt);
+                }
+            } else if (section_diff > (@as(i32, defs.num_pilots) - self.position_rank) * 15 and section_diff < 150) {
+                // Well ahead: ease off so the player can catch up.
+                self.speed += self.remote_thrust_mag * 0.5 * 30 * dt;
+                if (self.speed > self.remote_thrust_max * 0.5) self.speed = self.remote_thrust_max * 0.5;
+                self.update_timer = 0;
+                self.strategy = .hold_center;
+            } else if (section_diff >= 150) {
+                self.update_timer = 0;
+                self.strategy = .avoid;
+                self.accelerateTowards(self.remote_thrust_max, self.remote_thrust_mag, dt);
+            } else if (section_diff <= 10 and section_diff > 4) {
+                // In sight ahead: pick a line at random for a while.
+                if (self.update_timer <= 0) {
+                    self.update_timer = update_time_in_sight;
+                    self.strategy = switch (ctx.rng.int(0, 5)) {
+                        0 => .hold_center,
+                        1 => .hold_left,
+                        2 => .hold_right,
+                        3 => .block,
+                        else => .zig_zag,
+                    };
+                }
+                self.update_timer -= dt;
+                self.accelerateTowards(self.remote_thrust_max, self.remote_thrust_mag, dt);
+            } else {
+                self.update_timer = 0;
+                self.strategy = .hold_center;
+                self.accelerateTowards(self.remote_thrust_max, self.remote_thrust_mag, dt);
+            }
+
+            const offset = self.strategyOffset(ctx, face);
+
+            // Junction choice, made a few sections ahead of one.
+            var probe = sections[section.prev].next;
+            var i: usize = 0;
+            while (i < 3) : (i += 1) probe = sections[probe].next;
+            if (sections[probe].junction != track_mod.none) {
+                const junction = &sections[@intCast(sections[probe].junction)];
+                if ((junction.flags & SectionFlags.junction_start) != 0) {
+                    self.flags.junction_left = ctx.rng.int(0, 2) == 0;
+                }
+            }
+            var ahead = section.prev;
+            i = 0;
+            while (i < 4) : (i += 1) {
+                const s = &sections[ahead];
+                if (s.junction != track_mod.none and
+                    (sections[@intCast(s.junction)].flags & SectionFlags.junction_start) != 0 and
+                    self.flags.junction_left)
+                {
+                    ahead = @intCast(s.junction);
+                } else {
+                    ahead = s.next;
+                }
+            }
+            const next = &sections[sections[ahead].next];
+
+            // Bleed speed while turning; boosts add some back.
+            self.speed -= @abs(self.speed * self.angular_velocity.y) * 4 / (math.pi * 2) * dt;
+            self.speed -= @abs(self.speed * self.angular_velocity.x) * 4 / (math.pi * 2) * dt;
+            if ((face.flags & FaceFlags.boost) != 0 and (self.strategy == .hold_left or self.strategy == .hold_center)) {
+                self.speed += 200 * 30 * dt;
+            }
+            const face2 = &track.faces[@min(base + 1, track.faces.len - 1)];
+            if ((face2.flags & FaceFlags.boost) != 0 and (self.strategy == .hold_right or self.strategy == .hold_center)) {
+                self.speed += 200 * 30 * dt;
+            }
+
+            var track_target = if ((section.flags & SectionFlags.jump) != 0)
+                section.center.sub(sections[section.prev].center)
+            else
+                next.center.sub(section.center);
+            const gap_length = track_target.len();
+            track_target = track_target.scale(self.speed / gap_length);
+
+            const path1 = section.center.add(offset);
+            const path2 = next.center.add(offset);
+            const best_path = self.position.projectToRay(path2, path1);
+            self.acceleration = track_target.add(best_path.sub(self.position).scale(0.5));
+
+            const face_point = face2.tris[0].vertices[0].pos;
+            var height = self.position.distanceToPlane(face_point, face2.normal);
+            height = @max(height, 50);
+            const lift = face2.normal.scale((track_float * track_magnet) / height).sub(face2.normal.scale(track_magnet)).scale(16.0);
+            self.acceleration = self.acceleration.add(lift);
+            self.velocity = self.velocity.add(self.acceleration.scale(30 * dt));
+
+            const xy_dist = track_target.mul(Vec3.init(1, 0, 1)).len();
+            self.angular_velocity.x = math.wrapAngle(f(-std.math.atan2(@as(f64, track_target.y), @as(f64, xy_dist)) - @as(f64, self.angle.x))) * (1.0 / 16.0) * 30;
+            self.angular_velocity.y = math.wrapAngle(f(-std.math.atan2(@as(f64, track_target.x), @as(f64, track_target.z)) - @as(f64, self.angle.y))) * (1.0 / 16.0) * 30 + self.turn_rate_from_hit;
+        } else {
+            // Airborne: aim two sections ahead and fall.
+            const section = &sections[sections[sections[self.section].next].next];
+            const next = &sections[section.next];
+            self.strategy = .hold_center;
+            if (self.remote_thrust_max > self.speed) self.speed += self.remote_thrust_mag;
+            self.speed -= @abs(self.speed * self.angular_velocity.y) * (4 * math.pi * 2) * dt;
+
+            var track_target = next.center.sub(section.center);
+            const gap_length = track_target.len();
+            track_target.x = (track_target.x * self.speed) / gap_length;
+            track_target.z = (track_target.z * self.speed) / gap_length;
+            track_target.y = 500;
+
+            const best_path = self.position.projectToRay(next.center, sections[self.section].center);
+            self.acceleration = Vec3.init(
+                track_target.x + ((best_path.x - self.position.x) * 0.5),
+                track_target.y,
+                track_target.z + ((best_path.z - self.position.z) * 0.5),
+            );
+            self.velocity = self.velocity.add(self.acceleration.scale(30 * dt));
+            self.angular_velocity.x = -0.3 - self.angle.x * 30;
+            self.angular_velocity.y = math.wrapAngle(f(-std.math.atan2(@as(f64, track_target.x), @as(f64, track_target.z)) - @as(f64, self.angle.y))) * (1.0 / 16.0) * 30;
+        }
+
+        self.angular_velocity.z += (self.angular_velocity.y * 2.0 - self.angular_velocity.z * 0.5) * 30 * dt;
+        self.turn_rate_from_hit -= self.turn_rate_from_hit * 0.125 * 30 * dt;
+
+        self.angle = self.angle.add(self.angular_velocity.scale(dt));
+        self.angle.z -= self.angle.z * 0.125 * 30 * dt;
+        self.angle = self.angle.wrapAngles();
+
+        self.velocity = self.velocity.sub(self.velocity.scale(0.125 * 30 * dt));
+        self.position = self.position.add(self.velocity.scale(0.015625 * 30 * dt));
+
+        if (self.flags.electroed) {
+            self.ebolt_effect_timer += dt;
+            if (self.ebolt_effect_timer > 0.1) {
+                self.ebolt_effect_timer -= 0.1;
+                self.position = self.position.add(Vec3.init(ctx.rng.float(-20, 20), ctx.rng.float(-20, 20), ctx.rng.float(-20, 20)));
+                if (ctx.rng.int(0, 10) == 0) self.speed -= self.speed * 0.5;
+            }
+        }
+    }
+
+    // -- ship-to-ship collision --------------------------------------------
+
+    /// Tetrahedral collision hulls: does any edge of `other`'s hull pass
+    /// through a face of ours?
+    fn intersects(self: *const Ship, other: *const Ship, models: *const Models) bool {
+        const om = &models.collision[defs.pilotToModel(other.pilot)];
+        const sm = &models.collision[defs.pilotToModel(self.pilot)];
+        if (om.vertices.len < 4 or sm.vertices.len < 4) return false;
+        const a = om.vertices[0].transform(&other.mat);
+        const b = om.vertices[1].transform(&other.mat);
+        const c = om.vertices[2].transform(&other.mat);
+        const d = om.vertices[3].transform(&other.mat);
+        const other_points = [6]Vec3{ b, a, d, a, a, b };
+        const other_lines = [6]Vec3{ c.sub(b), c.sub(a), c.sub(d), b.sub(a), d.sub(a), d.sub(b) };
+
+        for (sm.primitives) |prim| {
+            switch (prim.kind) {
+                .f3, .g3, .ft3, .gt3 => {},
+                else => continue,
+            }
+            const p1 = sm.vertices[prim.coords[0]].transform(&self.mat);
+            const p2 = sm.vertices[prim.coords[1]].transform(&self.mat);
+            const p3 = sm.vertices[prim.coords[2]].transform(&self.mat);
+            const plane = p2.sub(p1).cross(p3.sub(p1));
+            for (other_points, other_lines) |point, line| {
+                const dp1 = p1.sub(point).dot(plane);
+                const dp2 = line.dot(plane);
+                if (dp2 == 0) continue;
+                const norm = dp1 / dp2;
+                if (norm < 0 or norm > 1) continue;
+                const hit = point.add(line.scale(norm));
+                const v0 = p1.sub(hit);
+                const v1 = p2.sub(hit);
+                const v2 = p3.sub(hit);
+                const angle = v0.angleBetween(v1) + v1.angleBetween(v2) + v2.angleBetween(v0);
+                if (angle >= math.pi * 2 - math.pi * 0.1) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Resolve a collision between two ships as the original does: move to
+    /// the common velocity, back both out, and push them apart.
+    pub fn collideWithShip(self: *Ship, other: *Ship, models: *const Models) void {
+        const distance = self.position.sub(other.position).len();
+        if (distance > 960) {
+            self.flags.coll = false;
+            other.flags.coll = false;
+            return;
+        }
+        if (!self.intersects(other, models)) return;
+
+        const vc = self.velocity.scale(self.mass).add(other.velocity.scale(other.mass)).div(self.mass + other.mass);
+        const self_react = vc.sub(self.velocity).scale(0.5);
+        const other_react = vc.sub(other.velocity).scale(0.5);
+        self.position = self.position.sub(self.velocity.scale(0.015625));
+        other.position = other.position.sub(other.velocity.scale(0.015625));
+        self.velocity = vc.add(self_react);
+        other.velocity = vc.add(other_react);
+
+        const res = self.position.sub(other.position);
+        self.velocity = self.velocity.add(res.scale(4));
+        self.position = self.position.add(self.velocity.scale(0.015625));
+        other.velocity = other.velocity.sub(res.scale(4));
+        other.position = other.position.add(other.velocity.scale(0.015625));
+
+        if (!self.flags.coll and !other.flags.coll and self.last_impact_time > 0.2) self.last_impact_time = 0;
+        self.flags.coll = true;
+        other.flags.coll = true;
     }
 
     /// Towed back onto the track. The original has the rescue droid fly to
@@ -793,10 +1189,13 @@ pub const Ship = extern struct {
 /// Ship meshes and shadow textures shared by all ships.
 pub const Models = struct {
     objects: []object.Object,
+    /// Four-vertex collision hulls in the same pilot order as `objects`.
+    collision: []object.Object,
     shadow_texture_start: u16,
 
     pub fn deinit(self: *Models, gpa: std.mem.Allocator) void {
         object.free(gpa, self.objects);
+        object.free(gpa, self.collision);
     }
 };
 
@@ -806,6 +1205,9 @@ pub fn loadModels(gpa: std.mem.Allocator, assets: *const assets_mod.Assets, r: *
     const objects = try scene.loadModel(gpa, assets, r, "wipeout/common", "allsh.cmp", "allsh.prm");
     errdefer object.free(gpa, objects);
     if (objects.len < defs.num_pilots) return error.MissingShipModels;
+    const collision = try scene.loadModel(gpa, assets, r, "wipeout/common", "alcol.cmp", "alcol.prm");
+    errdefer object.free(gpa, collision);
+    if (collision.len < defs.num_pilots) return error.MissingShipModels;
 
     // Engine polygons render translucent in the exhaust colour.
     for (objects) |*obj| {
@@ -827,5 +1229,5 @@ pub fn loadModels(gpa: std.mem.Allocator, assets: *const assets_mod.Assets, r: *
         _ = try r.createTexture(img.width, img.height, img.pixels);
     }
 
-    return .{ .objects = objects, .shadow_texture_start = shadow_start };
+    return .{ .objects = objects, .collision = collision, .shadow_texture_start = shadow_start };
 }
