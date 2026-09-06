@@ -1445,6 +1445,15 @@ test "tab shortcuts recognize option-arrows and normal-mode keys" {
         .codepoint = vaxis.Key.left,
         .mods = .{ .alt = true },
     }));
+    // macOS terminals commonly encode Option+Arrow as readline's Esc-f/Esc-b.
+    try std.testing.expectEqual(@as(?i8, 1), optionTabNavigationDirection(.{
+        .codepoint = 'f',
+        .mods = .{ .alt = true },
+    }));
+    try std.testing.expectEqual(@as(?i8, -1), optionTabNavigationDirection(.{
+        .codepoint = 'b',
+        .mods = .{ .alt = true },
+    }));
     try std.testing.expectEqual(@as(?i8, null), optionTabNavigationDirection(.{ .codepoint = vaxis.Key.right }));
     try std.testing.expectEqual(@as(?i8, null), optionTabNavigationDirection(.{
         .codepoint = vaxis.Key.right,

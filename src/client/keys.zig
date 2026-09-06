@@ -298,8 +298,8 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    // Option/Alt+Left/Right cycles tabs from either mode. Handle it before
-    // insert-mode editing, where the same chord otherwise moves by word.
+    // Option/Alt+Left/Right cycles tabs from either mode. Ghostty's default
+    // bindings encode these as Esc-b/Esc-f, so handle them before editing.
     if (optionTabNavigationDirection(key)) |direction| {
         app.cycleTab(direction);
         return;
@@ -911,8 +911,8 @@ pub fn planProposalAction(key: vaxis.Key) PlanProposalAction {
 }
 
 pub fn optionTabNavigationDirection(key: vaxis.Key) ?i8 {
-    if (key.matchExact(vaxis.Key.right, .{ .alt = true })) return 1;
-    if (key.matchExact(vaxis.Key.left, .{ .alt = true })) return -1;
+    if (key.matchExact(vaxis.Key.right, .{ .alt = true }) or key.matches('f', .{ .alt = true })) return 1;
+    if (key.matchExact(vaxis.Key.left, .{ .alt = true }) or key.matches('b', .{ .alt = true })) return -1;
     return null;
 }
 
