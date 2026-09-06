@@ -1,0 +1,94 @@
+# wipEout port
+
+Status: foundation slice on branch `wipeout-port` (2026-09-06). Track, scenery
+and sky load from the original PSX data and render through a pure-Zig
+software rasterizer at 320x240, shipped over the Kitty graphics protocol by a
+standalone probe. No game logic, input, HUD, audio, or snapshots yet.
+
+## Goals
+
+- 100% Zig. No vendored C, no GPU. The reference C implementation
+  (`~/Work/wipeout-rewrite`) is used only as a behavioural oracle.
+- Runs inside the terminal via Kitty graphics, keeping the original look:
+  per-vertex distance fade, PSX 2x vertex-colour modulation, nearest
+  texture sampling, and later the CRT post effect, all reproduced in
+  software.
+- Full state recoverability: every piece of runtime state lives in plain
+  structs that reference assets by index, never by pointer, so a game can be
+  snapshotted bytewise and resumed after a marlin restart.
+- Identical physics: same formulas and constants as the original, run at a
+  fixed 30 Hz step (the PSX rate) instead of the rewrite's variable delta.
+- Out of scope: intro video, music, sound effects.
+
+## Layout
+
+| File | Role |
+|---|---|
+| `src/wipeout/math.zig` | `Vec2/3/4`, column-major `Mat4`, `Rgba`, angle helpers, GLSL `smoothstep` |
+| `src/wipeout/bytes.zig` | Bounds-checked cursor for the mixed big/little-endian formats |
+| `src/wipeout/image.zig` | TIM decoding (4/8/16 bpp), LZSS, CMP bundles |
+| `src/wipeout/assets.zig` | Asset root resolution and file loading |
+| `src/wipeout/render.zig` | Software renderer: near clipping, edge-function rasterizer, depth, blend, fade |
+| `src/wipeout/track.zig` | TRV/TRF/TRS/TTF loaders, section numbering, index-linked sections |
+| `src/wipeout/object.zig` | PRM model parser and drawer |
+| `src/wipeout/scene.zig` | Sky dome plus static scenery per circuit |
+| `src/wipeout/root.zig` | Module root, per-circuit sky offsets, camera angle helpers |
+| `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots |
+
+Build steps: `zig build wipeout-test` (unit tests) and `zig build
+wipeout-probe -- [options]`.
+
+## Assets
+
+The data root defaults to `$XDG_DATA_HOME/marlin/wipeout-data` (else
+`~/.local/share/marlin/wipeout-data`), overridable with `MARLIN_WIPEOUT_DATA`
+or `--assets`. It must contain the original `wipeout/` tree (`track01/`…
+`track14/`, `common/`, `textures/`). Only the PSX circuits are supported; the
+2097 and N64 code paths are intentionally omitted.
+
+A first-run downloader is planned but not written. Core graphics data is
+about 20 MB; the music and intro video that we skip make up the rest of the
+142 MB bundle.
+
+## Renderer notes
+
+The GL path in the original is two small shaders. The game shader is
+reproduced per pixel: `texture × vertex colour × 2`, alpha discard, and a
+`smoothstep(64000, 48000, distance)` alpha fade computed per vertex in world
+space. Back faces are culled by default, matching `GL_CULL_FACE`; sky is
+drawn with depth writes off. Textures are sampled nearest with clamp, which
+is exactly what the original does in its 240p and 480p modes.
+
+Not yet ported: the CRT post effect, 2D HUD text, additive-blend particles
+(the blend mode exists, nothing uses it), and mipmaps (unneeded at 240p).
+
+## Measurements (Apple Silicon, ReleaseFast, track01 fly-through, dry run)
+
+| Buffer | Render | Deflate | Wire at 30 fps |
+|---|---|---|---|
+| 320x240 | 4.8 ms | 2.9 ms | 2.2 MiB/s |
+| 640x480 | 11.6 ms | 6.4 ms | 6.4 MiB/s |
+
+Both fit a 33 ms frame with room for game logic. 480p transport has not been
+verified against a live terminal yet; run `zig build wipeout-probe --
+--width 640 --height 480` in Kitty or Ghostty and watch for dropped frames.
+
+## Snapshots
+
+```
+zig build wipeout-probe -- --snapshot /tmp/frame.ppm --frame 200
+```
+
+writes one 320x240 PPM without touching the terminal, which is how the
+renderer was verified without a live session.
+
+## Next slices
+
+1. Game state struct and fixed-step loop: ship physics, track collision,
+   camera modes, translated from the reference with a parity harness that
+   replays recorded inputs through both implementations.
+2. Modal game input in the client (Kitty key press/release), and the game
+   as a pixel effect engine so pausing keeps state alive.
+3. Snapshot/restore with a version tag and asset hash.
+4. HUD, menus, AI opponents, weapons, particles.
+5. CRT post pass and first-run asset download.

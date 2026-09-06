@@ -107,6 +107,40 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     run_step.dependOn(&run_cmd.step);
 
+    // ---- wipEout port probe ----
+    const wipeout_module = b.createModule(.{
+        .root_source_file = b.path("src/wipeout/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wipeout_probe = b.addExecutable(.{
+        .name = "wipeout-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/wipeout_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wipeout", .module = wipeout_module },
+                .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+            },
+        }),
+    });
+    const wipeout_probe_cmd = b.addRunArtifact(wipeout_probe);
+    if (b.args) |args| wipeout_probe_cmd.addArgs(args);
+    wipeout_probe_cmd.has_side_effects = true;
+    const wipeout_probe_step = b.step("wipeout-probe", "Run the wipEout track renderer probe");
+    wipeout_probe_step.dependOn(&wipeout_probe_cmd.step);
+
+    const wipeout_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wipeout/root.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
+    });
+    const wipeout_test_step = b.step("wipeout-test", "Run wipEout port unit tests");
+    wipeout_test_step.dependOn(&b.addRunArtifact(wipeout_tests).step);
+
     // ---- unit tests ----
     // Dedicated Debug module: safety checks stay on and test compiles stay
     // fast regardless of the install optimize mode.
