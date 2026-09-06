@@ -257,12 +257,13 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         renderFrame(&renderer, &track, &scene, &camera);
         renderer.writeRgb(rgb);
         try writePpm(io, path, options.width, options.height, rgb);
-        stderrPrint(io, "wrote {s} (frame {d}, {d} tris, {d} pixels shaded, camera section {d})\n", .{
+        stderrPrint(io, "wrote {s} (frame {d}, {d} tris, {d} pixels shaded, camera section {d}, {d} crack pixels)\n", .{
             path,
             options.frame,
             renderer.stats.tris,
             renderer.stats.pixels,
             camera.section,
+            countCracks(&renderer),
         });
         return;
     }
@@ -415,6 +416,31 @@ fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.T
     const forward = wipeout.cameraForward(camera.angle);
     scene.draw(renderer, camera.position, forward);
     track.draw(renderer, camera.position, forward);
+}
+
+/// Pixels never written by opaque geometry (depth still at the clear value)
+/// whose four neighbours all were: the signature of a crack between
+/// adjacent triangles. Sky is drawn without depth writes, so genuine sky
+/// shows as large connected regions and does not trip this.
+fn countCracks(renderer: *const wipeout.render.Renderer) u32 {
+    const w = renderer.width;
+    const h = renderer.height;
+    var count: u32 = 0;
+    var y: u32 = 1;
+    while (y + 1 < h) : (y += 1) {
+        var x: u32 = 1;
+        while (x + 1 < w) : (x += 1) {
+            const i = y * w + x;
+            if (renderer.depth[i] < 1.0) continue;
+            if (renderer.depth[i - 1] < 1.0 and renderer.depth[i + 1] < 1.0 and
+                renderer.depth[i - w] < 1.0 and renderer.depth[i + w] < 1.0)
+            {
+                if (count < 12) std.debug.print("crack at {d},{d}\n", .{ x, y });
+                count += 1;
+            }
+        }
+    }
+    return count;
 }
 
 fn writePpm(io: Io, path: []const u8, width: u32, height: u32, rgb: []const u8) !void {
