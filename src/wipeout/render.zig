@@ -78,6 +78,9 @@ pub const Renderer = struct {
     /// Diagnostic: when set, every triangle whose bounding box touches this
     /// pixel prints its edge values there and whether the pixel was accepted.
     debug_pixel: ?[2]u32 = null,
+    /// Diagnostic: when set, `Object.draw` tags each primitive with
+    /// 0x4000 + its index so the owner map identifies individual polygons.
+    debug_prim_ids: bool = false,
 
     textures: [textures_max]Texture = undefined,
     textures_len: u16 = 0,

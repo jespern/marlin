@@ -44,6 +44,21 @@ pub const Options = struct {
     dilation: ?i64 = null,
     /// Append one CSV line per frame (timings, payload size, tris) here.
     log_frames: ?[]const u8 = null,
+    /// Put a player ship on the grid and read the keyboard instead of flying
+    /// the free camera.
+    drive: bool = false,
+    /// Steer the ship automatically along the centre line (headless demo
+    /// and physics smoke test; with --drive it yields to real key presses).
+    autopilot: bool = false,
+    pilot: u8 = 0,
+    rapier: bool = false,
+    /// Keep the countdown hover instead of starting the race at once.
+    intro: bool = false,
+    /// Print primitive statistics for the given pilot's ship model and exit.
+    dump_model: bool = false,
+    /// With --snapshot: also write the per-pixel owner ids (u16 LE, row
+    /// major) to this file, tagging each ship polygon individually.
+    owner_map: ?[]const u8 = null,
     assets: ?[]const u8 = null,
     /// Camera speed along the centre line, in world units per second.
     speed: f32 = 6000,
@@ -223,6 +238,7 @@ fn fitDisplay(term_cols: u16, term_rows: u16, pixel_width: u16, pixel_height: u1
 }
 
 fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, display: Display) !void {
+    const live = !options.dry_run and options.snapshot == null and options.scan_cracks == null;
     const assets = wipeout.assets.Assets.init(io, gpa, root);
     var dir_buf: [32]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dir_buf, "wipeout/track{d:0>2}", .{options.track});
@@ -263,17 +279,70 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     var camera = FlyCamera{};
     const units_per_frame = options.speed / @as(f32, @floatFromInt(options.fps));
 
+    const circuit = wipeout.defs.circuitSettings(options.track);
+    var race: ?Race = null;
+    if (options.drive or options.autopilot) {
+        var models = try wipeout.ship.loadModels(gpa, &assets, &renderer);
+        errdefer models.deinit(gpa);
+        var start: u32 = 0;
+        var i: usize = 0;
+        // ships_init: the grid begins start_line_pos - 15 sections in, and
+        // the player occupies the rear slot.
+        while (i + 15 < circuit.start_line_pos) : (i += 1) start = track.sections[start].next;
+        var player = wipeout.ship.Ship.init(&track, start, options.pilot, 0, if (options.rapier) .rapier else .venom);
+        if (!options.intro) player.skipIntro();
+        race = .{
+            .models = models,
+            .ship = player,
+            .camera = wipeout.camera.Camera.init(&track, 0),
+            .input = .{},
+            .rng = wipeout.rng.Rng.seed(0x5eed),
+            .start_line_pos = circuit.start_line_pos,
+            .autopilot = options.autopilot,
+        };
+    }
+    defer if (race) |*r| r.models.deinit(gpa);
+
+    if (options.dump_model) {
+        var models = try wipeout.ship.loadModels(gpa, &assets, &renderer);
+        defer models.deinit(gpa);
+        dumpModel(io, &models.objects[wipeout.defs.pilotToModel(options.pilot)]);
+        return;
+    }
+
+    var keys: ?*KeyReader = null;
+    defer if (keys) |k| k.stop();
+    if (options.drive and live) {
+        keys = try KeyReader.start(gpa, io);
+    }
+
     if (options.scan_cracks) |dir_out| {
         try scanCracks(io, &renderer, &track, &scene, &camera, options, units_per_frame, rgb, dir_out);
         return;
     }
 
     if (options.snapshot) |path| {
+        const dt = 1.0 / @as(f32, @floatFromInt(options.fps));
         var i: u32 = 0;
-        while (i <= options.frame) : (i += 1) camera.advance(&track, units_per_frame, options.height_above, options.look_ahead);
+        while (i <= options.frame) : (i += 1) {
+            if (race) |*r| r.step(&track, null, dt) else camera.advance(&track, units_per_frame, options.height_above, options.look_ahead);
+        }
         renderer.debug_pixel = options.probe_pixel;
-        renderFrame(&renderer, &track, &scene, &camera);
+        renderer.debug_prim_ids = options.owner_map != null;
+        renderFrame(&renderer, &track, &scene, &camera, if (race) |*r| r else null);
         renderer.debug_pixel = null;
+        renderer.debug_prim_ids = false;
+        if (options.owner_map) |owner_path| {
+            const file = try Io.Dir.cwd().createFile(io, owner_path, .{ .truncate = true });
+            defer file.close(io);
+            var obuf: [64 * 1024]u8 = undefined;
+            var ow: Io.File.Writer = .init(file, io, &obuf);
+            try ow.interface.writeAll(std.mem.sliceAsBytes(renderer.owner));
+            try ow.interface.flush();
+        }
+        if (race) |*r| stderrPrint(io, "ship: section {d} pos ({d:.0},{d:.0},{d:.0}) speed {d:.0} lap {d} flying={}\n", .{
+            r.ship.section, r.ship.position.x, r.ship.position.y, r.ship.position.z, r.ship.speed, r.ship.lap, r.ship.flags.flying,
+        });
         renderer.writeRgb(rgb);
         try writePpm(io, path, options.width, options.height, rgb);
         stderrPrint(io, "wrote {s} (frame {d}, {d} tris, {d} pixels shaded, camera section {d}, {d} crack pixels)\n", .{
@@ -320,7 +389,8 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     }
     defer if (log_writer) |*lw| lw.interface.flush() catch {};
 
-    var pending = prepareFrame(io, &renderer, &track, &scene, &camera, options, units_per_frame, rgb, zbuf, window, encoded);
+    const race_ptr: ?*Race = if (race) |*r| r else null;
+    var pending = prepareFrame(io, &renderer, &track, &scene, &camera, race_ptr, keys, options, units_per_frame, rgb, zbuf, window, encoded);
     var began = now(io);
     const wall_start = began;
 
@@ -391,7 +461,10 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
             }
         }
 
-        pending = prepareFrame(io, &renderer, &track, &scene, &camera, options, units_per_frame, rgb, zbuf, window, encoded);
+        if (keys) |k| {
+            if (k.wantsQuit()) break;
+        }
+        pending = prepareFrame(io, &renderer, &track, &scene, &camera, race_ptr, keys, options, units_per_frame, rgb, zbuf, window, encoded);
     }
 
     report(io, options, display, totals, now(io) - wall_start);
@@ -421,6 +494,8 @@ fn prepareFrame(
     track: *const wipeout.track.Track,
     scene: *wipeout.scene.Scene,
     camera: *FlyCamera,
+    race: ?*Race,
+    keys: ?*KeyReader,
     options: Options,
     units_per_frame: f32,
     rgb: []u8,
@@ -428,10 +503,15 @@ fn prepareFrame(
     window: []u8,
     encoded: []u8,
 ) PreparedFrame {
-    camera.advance(track, units_per_frame, options.height_above, options.look_ahead);
+    const dt = 1.0 / @as(f32, @floatFromInt(options.fps));
+    if (race) |r| {
+        r.step(track, keys, dt);
+    } else {
+        camera.advance(track, units_per_frame, options.height_above, options.look_ahead);
+    }
 
     const render_start = now(io);
-    renderFrame(renderer, track, scene, camera);
+    renderFrame(renderer, track, scene, camera, race);
     renderer.writeRgb(rgb);
     const render_end = now(io);
 
@@ -459,22 +539,329 @@ fn prepareFrame(
         .tris = renderer.stats.tris,
         .pixels = renderer.stats.pixels,
         .visited = renderer.stats.visited,
-        .section = camera.section,
+        .section = if (race) |r| r.ship.section else camera.section,
     };
 }
 
-fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.Track, scene: *wipeout.scene.Scene, camera: *const FlyCamera) void {
+fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.Track, scene: *wipeout.scene.Scene, camera: *const FlyCamera, race: ?*const Race) void {
     renderer.framePrepare();
-    renderer.setView(camera.position, camera.angle);
-    const forward = wipeout.cameraForward(camera.angle);
+    var position = camera.position;
+    var angle = camera.angle;
+    if (race) |r| {
+        position = r.camera.position;
+        angle = r.camera.angle;
+    }
+    renderer.setView(position, angle);
+    const forward = wipeout.cameraForward(angle);
+    // Per-polygon owner tags are only meaningful for the ship.
+    const tag_prims = renderer.debug_prim_ids;
+    renderer.debug_prim_ids = false;
     // As in the original race loop: scenery and track are drawn with
     // back-face culling off (their winding is not consistent), ships and
     // effects with it on.
     renderer.setCullBackface(false);
-    scene.draw(renderer, camera.position, forward);
-    track.draw(renderer, camera.position, forward);
+    scene.draw(renderer, position, forward);
+    track.draw(renderer, position, forward);
     renderer.setCullBackface(true);
+    if (race) |r| {
+        renderer.draw_id = 0xfffd;
+        renderer.debug_prim_ids = tag_prims;
+        if (!(r.ship.flags.view_internal and !r.ship.flags.in_rescue)) r.ship.draw(renderer, &r.models);
+        renderer.debug_prim_ids = false;
+        if (r.ship.flags.visible and !r.ship.flags.flying) {
+            renderer.setModelMat(&wipeout.math.Mat4.identity);
+            renderer.setDepthWrite(false);
+            renderer.setDepthOffset(-32.0);
+            renderer.draw_id = 0xfffc;
+            r.ship.drawShadow(renderer, track, &r.models);
+            renderer.setDepthOffset(0);
+            renderer.setDepthWrite(true);
+        }
+    }
 }
+
+fn dumpModel(io: Io, obj: *const wipeout.object.Object) void {
+    stderrPrint(io, "model '{s}': {d} vertices, {d} primitives, radius {d:.0}\n", .{ obj.nameSlice(), obj.vertices.len, obj.primitives.len, obj.radius });
+    var counts = [_]u32{0} ** 11;
+    for (obj.primitives) |p| counts[@intFromEnum(p.kind)] += 1;
+    inline for (@typeInfo(wipeout.object.Kind).@"enum".fields, 0..) |f, i| {
+        if (counts[i] > 0) stderrPrint(io, "  {s}: {d}\n", .{ f.name, counts[i] });
+    }
+    // Longest edge per primitive; report the worst few.
+    var worst_len = [_]f32{0} ** 6;
+    var worst_idx = [_]usize{0} ** 6;
+    for (obj.primitives, 0..) |p, pi| {
+        const n: usize = switch (p.kind) {
+            .f3, .ft3, .g3, .gt3 => 3,
+            .f4, .ft4, .g4, .gt4 => 4,
+            else => 0,
+        };
+        if (n == 0) continue;
+        var longest: f32 = 0;
+        var a: usize = 0;
+        while (a < n) : (a += 1) {
+            var b: usize = a + 1;
+            while (b < n) : (b += 1) {
+                longest = @max(longest, obj.vertices[p.coords[a]].sub(obj.vertices[p.coords[b]]).len());
+            }
+        }
+        var slot: usize = 0;
+        var min: f32 = std.math.floatMax(f32);
+        for (worst_len, 0..) |l, i| {
+            if (l < min) {
+                min = l;
+                slot = i;
+            }
+        }
+        if (longest > min) {
+            worst_len[slot] = longest;
+            worst_idx[slot] = pi;
+        }
+    }
+    // The first primitives, verbatim, plus the longest-edged ones.
+    var first: [6]usize = .{ 0, 1, 2, 3, 4, 5 };
+    for (&first, 0..) |*f, i| f.* = @min(i, obj.primitives.len - 1);
+    for (first) |pi| {
+        const p = obj.primitives[pi];
+        stderrPrint(io, "  prim {d} {s} flag 0x{x} tex {d}:", .{ pi, @tagName(p.kind), @as(u16, @bitCast(p.flag)), p.texture });
+        const n: usize = switch (p.kind) {
+            .f3, .ft3, .g3, .gt3 => 3,
+            .f4, .ft4, .g4, .gt4 => 4,
+            else => 1,
+        };
+        for (p.coords[0..n]) |c| {
+            const v = obj.vertices[c];
+            stderrPrint(io, " [{d}]=({d:.0},{d:.0},{d:.0})", .{ c, v.x, v.y, v.z });
+        }
+        stderrPrint(io, "\n", .{});
+    }
+    for (worst_idx, 0..) |pi, i| {
+        const p = obj.primitives[pi];
+        stderrPrint(io, "  prim {d} {s} flag 0x{x} longest edge {d:.0}:", .{ pi, @tagName(p.kind), @as(u16, @bitCast(p.flag)), worst_len[i] });
+        const n: usize = switch (p.kind) {
+            .f3, .ft3, .g3, .gt3 => 3,
+            else => 4,
+        };
+        for (p.coords[0..n]) |c| {
+            const v = obj.vertices[c];
+            stderrPrint(io, " [{d}]=({d:.0},{d:.0},{d:.0})", .{ c, v.x, v.y, v.z });
+        }
+        stderrPrint(io, "\n", .{});
+    }
+}
+
+/// A single player ship, its camera, and the input feeding it.
+const Race = struct {
+    models: wipeout.ship.Models,
+    ship: wipeout.ship.Ship,
+    camera: wipeout.camera.Camera,
+    input: wipeout.input.State,
+    rng: wipeout.rng.Rng,
+    start_line_pos: u16,
+    autopilot: bool,
+
+    fn step(self: *Race, track: *const wipeout.track.Track, keys: ?*KeyReader, dt: f32) void {
+        var any_key = false;
+        if (keys) |k| {
+            const snapshot = k.snapshot();
+            for (snapshot, 0..) |down, i| {
+                self.input.set(@enumFromInt(i), down);
+                if (down) any_key = true;
+            }
+        }
+        if (self.autopilot and !any_key) self.steerAutomatically(track);
+
+        self.ship.update(.{
+            .track = track,
+            .input = &self.input,
+            .rng = &self.rng,
+            .dt = dt,
+            .start_line_pos = self.start_line_pos,
+        });
+        self.camera.mode = if (self.ship.flags.view_internal) .internal else .external;
+        self.camera.update(track, &self.ship, dt);
+        self.input.endFrame();
+    }
+
+    /// Full thrust, steering towards a point two sections ahead. Not the
+    /// original's AI, just enough to lap a course headless.
+    fn steerAutomatically(self: *Race, track: *const wipeout.track.Track) void {
+        const sections = track.sections;
+        var ahead = sections[self.ship.section].next;
+        ahead = sections[ahead].next;
+        const target = sections[ahead].center.sub(self.ship.position);
+        const desired_yaw = -std.math.atan2(target.x, target.z);
+        const delta = wipeout.math.wrapAngle(desired_yaw - self.ship.angle.y);
+        self.input.set(.thrust, true);
+        self.input.set(.left, delta > 0.02);
+        self.input.set(.right, delta < -0.02);
+        self.input.set(.up, false);
+        self.input.set(.down, false);
+        self.input.set(.brake_left, false);
+        self.input.set(.brake_right, false);
+    }
+};
+
+/// Reads the terminal in a thread and keeps a held-down table per action.
+/// Uses the Kitty keyboard protocol so key releases are reported; without
+/// it a game needs auto-repeat hacks to know when a key is let go.
+const KeyReader = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    tty: vaxis.Tty,
+    tty_buffer: [4096]u8 = undefined,
+    thread: ?std.Thread = null,
+    held: [wipeout.input.count]std.atomic.Value(bool) = undefined,
+    quit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+
+    fn start(gpa: std.mem.Allocator, io: Io) !*KeyReader {
+        const self = try gpa.create(KeyReader);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .io = io, .tty = undefined };
+        for (&self.held) |*h| h.* = std.atomic.Value(bool).init(false);
+        self.tty = try vaxis.Tty.init(io, &self.tty_buffer);
+        // Push Kitty keyboard flags: disambiguate (1), report event types
+        // (2), report all keys as escape codes (8).
+        self.writeRaw("\x1b[>11u");
+        self.thread = try std.Thread.spawn(.{}, readLoop, .{self});
+        return self;
+    }
+
+    fn stop(self: *KeyReader) void {
+        self.running.store(false, .release);
+        self.writeRaw("\x1b[<u");
+        // The reader thread is blocked in read(); restoring the terminal
+        // and exiting the process ends it. Detach rather than join.
+        if (self.thread) |t| t.detach();
+        self.tty.deinit();
+    }
+
+    fn writeRaw(self: *KeyReader, bytes: []const u8) void {
+        var buffer: [64]u8 = undefined;
+        var writer: Io.File.Writer = .init(self.tty.fd, self.io, &buffer);
+        writer.interface.writeAll(bytes) catch return;
+        writer.interface.flush() catch {};
+    }
+
+    fn snapshot(self: *const KeyReader) [wipeout.input.count]bool {
+        var out: [wipeout.input.count]bool = undefined;
+        for (&out, 0..) |*o, i| o.* = self.held[i].load(.acquire);
+        return out;
+    }
+
+    fn wantsQuit(self: *const KeyReader) bool {
+        return self.quit.load(.acquire);
+    }
+
+    fn setAction(self: *KeyReader, action: wipeout.input.Action, down: bool) void {
+        self.held[@intFromEnum(action)].store(down, .release);
+    }
+
+    fn readLoop(self: *KeyReader) void {
+        var buf: [256]u8 = undefined;
+        var pending: [512]u8 = undefined;
+        var pending_len: usize = 0;
+        while (self.running.load(.acquire)) {
+            const n = std.posix.read(self.tty.fd.handle, &buf) catch return;
+            if (n == 0) return;
+            for (buf[0..n]) |byte| {
+                if (pending_len < pending.len) {
+                    pending[pending_len] = byte;
+                    pending_len += 1;
+                }
+            }
+            pending_len = self.consume(pending[0..pending_len]);
+        }
+    }
+
+    /// Parse complete sequences from `bytes`; returns how many bytes of
+    /// incomplete trailing input to keep.
+    fn consume(self: *KeyReader, bytes: []u8) usize {
+        var i: usize = 0;
+        while (i < bytes.len) {
+            const b = bytes[i];
+            if (b == 0x1b) {
+                if (i + 1 >= bytes.len) break; // need more
+                if (bytes[i + 1] != '[') {
+                    // Bare escape: quit.
+                    self.quit.store(true, .release);
+                    i += 1;
+                    continue;
+                }
+                // CSI: find the final byte in 0x40..0x7e.
+                var j = i + 2;
+                while (j < bytes.len and (bytes[j] < 0x40 or bytes[j] > 0x7e)) j += 1;
+                if (j >= bytes.len) break; // incomplete
+                self.handleCsi(bytes[i + 2 .. j], bytes[j]);
+                i = j + 1;
+            } else {
+                // Legacy plain byte (protocol not supported): treat as a
+                // press with no release; only quit is reliable this way.
+                if (b == 'q' or b == 3) self.quit.store(true, .release);
+                i += 1;
+            }
+        }
+        // Shift the remainder to the front.
+        const rest = bytes.len - i;
+        if (rest > 0 and i > 0) std.mem.copyForwards(u8, bytes[0..rest], bytes[i..]);
+        return rest;
+    }
+
+    fn handleCsi(self: *KeyReader, params: []const u8, final: u8) void {
+        // params: "key[:shifted[:base]];[mods[:event]]" for 'u', or
+        // "1;mods:event" for arrows and other legacy-final keys.
+        var key: u32 = 0;
+        var event: u32 = 1;
+        var section: usize = 0;
+        var sub: usize = 0;
+        var value: u32 = 0;
+        var have_value = false;
+        var it: usize = 0;
+        while (it <= params.len) : (it += 1) {
+            const c: u8 = if (it < params.len) params[it] else ';';
+            if (c >= '0' and c <= '9') {
+                value = value * 10 + (c - '0');
+                have_value = true;
+            } else if (c == ':' or c == ';') {
+                if (have_value) {
+                    if (section == 0 and sub == 0) key = value;
+                    if (section == 1 and sub == 1) event = value;
+                }
+                if (c == ':') {
+                    sub += 1;
+                } else {
+                    section += 1;
+                    sub = 0;
+                }
+                value = 0;
+                have_value = false;
+            }
+        }
+        const down = event != 3; // 1 press, 2 repeat, 3 release
+        const action: ?wipeout.input.Action = switch (final) {
+            'A' => .up,
+            'B' => .down,
+            'C' => .right,
+            'D' => .left,
+            'u' => switch (key) {
+                'x', 'X', ' ', 'w', 'W' => .thrust,
+                'z', 'Z' => .brake_left,
+                'c', 'C' => .brake_right,
+                'a', 'A' => .left,
+                'd', 'D' => .right,
+                'v', 'V' => .change_view,
+                'q', 'Q', 27 => blk: {
+                    if (down) self.quit.store(true, .release);
+                    break :blk null;
+                },
+                else => null,
+            },
+            else => null,
+        };
+        if (action) |a| self.setAction(a, down);
+    }
+};
 
 /// Pixels never written by opaque geometry (depth still at the clear value)
 /// whose four neighbours all were: the signature of a crack between
@@ -546,7 +933,7 @@ fn scanCracks(
     var frame: u32 = 0;
     while (frame < total_frames) : (frame += 1) {
         camera.advance(track, units_per_frame, options.height_above, options.look_ahead);
-        renderFrame(renderer, track, scene, camera);
+        renderFrame(renderer, track, scene, camera, null);
         coords.clearRetainingCapacity();
         const count = collectCracks(renderer, &coords);
         total_cracks += count;
@@ -769,6 +1156,21 @@ fn parseArgs(args: []const []const u8) !Options {
             index += 1;
             if (index >= args.len) return error.MissingValue;
             options.dilation = try std.fmt.parseInt(i64, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--drive")) {
+            options.drive = true;
+        } else if (std.mem.eql(u8, arg, "--autopilot")) {
+            options.autopilot = true;
+        } else if (std.mem.eql(u8, arg, "--intro")) {
+            options.intro = true;
+        } else if (std.mem.eql(u8, arg, "--rapier")) {
+            options.rapier = true;
+        } else if (std.mem.eql(u8, arg, "--owner-map")) {
+            options.owner_map = try nextString(args, &index);
+        } else if (std.mem.eql(u8, arg, "--dump-model")) {
+            options.dump_model = true;
+            options.dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--pilot")) {
+            options.pilot = try nextUnsigned(u8, args, &index);
         } else if (std.mem.eql(u8, arg, "--log-frames")) {
             options.log_frames = try nextString(args, &index);
         } else if (std.mem.eql(u8, arg, "--scan-cracks")) {
@@ -787,6 +1189,7 @@ fn parseArgs(args: []const []const u8) !Options {
             return error.UnknownArgument;
         }
     }
+    if (options.pilot >= wipeout.defs.num_pilots) return error.InvalidValue;
     if (options.track < 1 or options.track > 14 or options.fps == 0 or options.fps > 60 or options.seconds == 0 or
         options.width < 16 or options.height < 16 or options.width > 1920 or options.height > 1200 or
         (options.cols != null and options.cols.? == 0) or
@@ -830,6 +1233,12 @@ fn usage(io: Io) void {
         \\  --scan-cracks DIR  headless lap scan; dump the frames with most uncovered pixels
         \\  --dilation N       triangle edge dilation in 1/16 px (default 2; 0 = exact)
         \\  --log-frames FILE  write per-frame timings and payload sizes as CSV
+        \\  --drive            fly a ship with the keyboard (arrows steer/pitch, x or space
+        \\                     thrust, z/c airbrakes, v view, q quits)
+        \\  --autopilot        let the probe steer the ship along the track
+        \\  --pilot N          pilot 0-7 (default 0, John Dekka / AG Systems)
+        \\  --rapier           Rapier class handling instead of Venom
+        \\  --intro            start with the countdown hover instead of racing at once
         \\  --probe-pixel X,Y  with --snapshot: print rasterizer decisions for one pixel
         \\  --raw              disable zlib compression
         \\

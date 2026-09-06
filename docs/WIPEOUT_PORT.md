@@ -1,9 +1,12 @@
 # wipEout port
 
-Status: foundation slice on branch `wipeout-port` (2026-09-06). Track, scenery
+Status: ship slice on branch `wipeout-port` (2026-09-06). Track, scenery
 and sky load from the original PSX data and render through a pure-Zig
 software rasterizer at 320x240, shipped over the Kitty graphics protocol by a
-standalone probe. No game logic, input, HUD, audio, or snapshots yet.
+standalone probe. A single player ship flies with the original's physics,
+track collision, jump handling and rescue, under keyboard control or a
+simple autopilot. No opponents, weapons, HUD, audio, or snapshots yet, and
+the parity harness against the reference build is still to be written.
 
 ## Goals
 
@@ -32,7 +35,12 @@ standalone probe. No game logic, input, HUD, audio, or snapshots yet.
 | `src/wipeout/track.zig` | TRV/TRF/TRS/TTF loaders, section numbering, index-linked sections |
 | `src/wipeout/object.zig` | PRM model parser and drawer |
 | `src/wipeout/scene.zig` | Sky dome plus static scenery per circuit |
-| `src/wipeout/root.zig` | Module root, per-circuit sky offsets, camera angle helpers |
+| `src/wipeout/defs.zig` | Teams, pilots, per-class handling attributes, per-circuit settings |
+| `src/wipeout/input.zig` | Game actions with held and edge-triggered state |
+| `src/wipeout/rng.zig` | Deterministic xorshift owned by game state |
+| `src/wipeout/ship.zig` | Ship state, player flight model, track collision, jump and rescue, models and shadow |
+| `src/wipeout/camera.zig` | External chase camera and cockpit view |
+| `src/wipeout/root.zig` | Module root, camera angle helpers |
 | `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots |
 
 Build steps: `zig build wipeout-test` (unit tests) and `zig build`, which
@@ -155,6 +163,37 @@ smoothed. Earlier versions moved at a constant number of sections per
 second, which pulsed with section length and snapped the heading every
 boundary.
 
+## Driving
+
+```
+./zig-out/bin/wipeout-probe --drive --fps 60
+./zig-out/bin/wipeout-probe --drive --fps 60 --pilot 6 --rapier --track 3
+./zig-out/bin/wipeout-probe --autopilot --fps 60      # hands-off lap
+```
+
+Arrow keys steer and pitch, `x` or space is thrust, `z` and `c` are the
+left and right airbrakes, `v` toggles the cockpit view, `q` or Escape quits.
+Key releases come from the Kitty keyboard protocol (flags 1, 2 and 8), which
+Ghostty and Kitty support; without it, keys cannot be held. The race starts
+immediately; `--intro` keeps the countdown hover, during which building
+thrust to between 680 and 700 gives the original's start boost and holding
+more stalls the engine.
+
+The ship module is a translation of the reference flight model: hover force
+against the base face, resistance and skid, wall collisions at nose and wing
+tips with the junction special cases, jump detection by projecting onto the
+ramp face, flying gravity, and rescue back to the track. The physics step
+is the presentation frame (1/60 s at 60 fps); every rate is per second so
+the model is rate-independent within the original's tolerances. Known gaps
+against the original: the rescue tow starts immediately instead of waiting
+for the droid to arrive, exhaust plume vertices are not animated, ship to
+ship collision and pickups are absent because there is only one ship, and
+the autopilot is a two-sections-ahead heading controller rather than the
+original AI.
+
+Ship state references the track by section and face index and holds no
+pointers, so it is snapshot-ready by construction.
+
 ## Snapshots
 
 ```
@@ -166,9 +205,9 @@ renderer was verified without a live session.
 
 ## Next slices
 
-1. Game state struct and fixed-step loop: ship physics, track collision,
-   camera modes, translated from the reference with a parity harness that
-   replays recorded inputs through both implementations.
+1. Parity harness: build the reference with its null platform and renderer,
+   replay a recorded input sequence at a fixed step through both, and diff
+   ship position and orientation per frame.
 2. Modal game input in the client (Kitty key press/release), and the game
    as a pixel effect engine so pausing keeps state alive.
 3. Snapshot/restore with a version tag and asset hash.

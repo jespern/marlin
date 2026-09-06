@@ -82,7 +82,8 @@ pub const Object = struct {
     pub fn draw(self: *const Object, r: *render.Renderer, mat: *const Mat4) void {
         r.setModelMat(mat);
         const v = self.vertices;
-        for (self.primitives) |p| {
+        for (self.primitives, 0..) |p, index| {
+            if (r.debug_prim_ids) r.draw_id = @intCast(0x4000 + (index & 0x3fff));
             switch (p.kind) {
                 .f3, .ft3, .g3, .gt3 => {
                     const tex = if (p.kind == .f3 or p.kind == .g3) r.no_texture else p.texture;
