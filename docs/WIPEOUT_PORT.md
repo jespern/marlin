@@ -49,6 +49,14 @@ refresh boundary. At 60 fps a 240p frame costs about 8 ms of work, so
 `--fps 60` is a valid choice on a 60 Hz terminal and halves the judder that
 a 30 fps stream shows when its cadence drifts against the refresh.
 
+If presentation falls more than a whole frame behind, the schedule
+resynchronises to now and reports the skipped slots as dropped, rather than
+presenting every missed frame back to back and burying the terminal
+further. `--log-frames FILE` writes per-frame render, deflate and write
+times plus payload size as CSV, which is the first thing to look at when a
+live run stutters: a write time that spikes while render stays flat means
+the terminal or PTY stalled, not the renderer.
+
 Frame pacing is pipelined: the frame for deadline N is rendered and encoded
 right after frame N-1 is presented, so only the terminal write happens at
 the deadline. Sporadic 40-80 ms scheduling stalls were observed in dry runs

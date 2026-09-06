@@ -42,6 +42,8 @@ pub const Options = struct {
     probe_pixel: ?[2]u32 = null,
     /// Triangle edge dilation in 1/16 px (renderer default when unset).
     dilation: ?i64 = null,
+    /// Append one CSV line per frame (timings, payload size, tris) here.
+    log_frames: ?[]const u8 = null,
     assets: ?[]const u8 = null,
     /// Camera speed along the centre line, in world units per second.
     speed: f32 = 6000,
@@ -61,6 +63,8 @@ const Display = struct {
 const Totals = struct {
     frames: u64 = 0,
     late_frames: u64 = 0,
+    /// Schedule slots skipped after falling more than a frame behind.
+    dropped_frames: u64 = 0,
     raw_bytes: u64 = 0,
     payload_bytes: u64 = 0,
     wire_bytes: u64 = 0,
@@ -305,16 +309,38 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     // right after frame N-1 is presented, so the only work left at the
     // deadline is the terminal write. A scheduling stall shorter than the
     // slack (~25 ms at 30 fps for this scene) then never reaches the screen.
+    var log_file: ?Io.File = null;
+    defer if (log_file) |f| f.close(io);
+    var log_buffer: [64 * 1024]u8 = undefined;
+    var log_writer: ?Io.File.Writer = null;
+    if (options.log_frames) |path| {
+        log_file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        log_writer = .init(log_file.?, io, &log_buffer);
+        try log_writer.?.interface.writeAll("frame,section,render_ms,deflate_ms,write_ms,payload_bytes,tris,pixels\n");
+    }
+    defer if (log_writer) |*lw| lw.interface.flush() catch {};
+
     var pending = prepareFrame(io, &renderer, &track, &scene, &camera, options, units_per_frame, rgb, zbuf, window, encoded);
-    const began = now(io);
+    var began = now(io);
+    const wall_start = began;
 
     while (totals.frames < target_frames) : (totals.frames += 1) {
-        const deadline = began + @as(i128, @intCast(totals.frames + 1)) * frame_ns;
+        var deadline = began + @as(i128, @intCast(totals.frames + 1)) * frame_ns;
         const slack = deadline - now(io);
         if (slack > spin_margin_ns) {
             io.sleep(.fromNanoseconds(@intCast(slack - spin_margin_ns)), .awake) catch {};
         } else if (slack < 0) {
             totals.late_frames += 1;
+            if (-slack > frame_ns) {
+                // More than a whole frame behind (the terminal stalled on a
+                // write, or the machine did): resynchronise the schedule to
+                // now instead of presenting every missed frame back to back,
+                // which would only bury the terminal deeper.
+                const behind: u64 = @intCast(@divFloor(-slack, frame_ns));
+                totals.dropped_frames += behind;
+                began += @as(i128, @intCast(behind)) * frame_ns;
+                deadline = began + @as(i128, @intCast(totals.frames + 1)) * frame_ns;
+            }
         }
         while (now(io) < deadline) std.atomic.spinLoopHint();
 
@@ -335,6 +361,18 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         totals.encode_ns += pending.encode_ns;
         totals.write_ns += write_end - write_start;
         totals.tris += pending.tris;
+        if (log_writer) |*lw| {
+            lw.interface.print("{d},{d},{d:.3},{d:.3},{d:.3},{d},{d},{d}\n", .{
+                totals.frames,
+                pending.section,
+                @as(f64, @floatFromInt(pending.render_ns)) / std.time.ns_per_ms,
+                @as(f64, @floatFromInt(pending.compress_ns)) / std.time.ns_per_ms,
+                @as(f64, @floatFromInt(write_end - write_start)) / std.time.ns_per_ms,
+                pending.payload_len,
+                pending.tris,
+                pending.pixels,
+            }) catch {};
+        }
         const frame_work = pending.render_ns + pending.compress_ns + pending.encode_ns + (write_end - write_start);
         if (frame_work > totals.max_frame_ns) {
             totals.max_frame_ns = frame_work;
@@ -356,7 +394,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         pending = prepareFrame(io, &renderer, &track, &scene, &camera, options, units_per_frame, rgb, zbuf, window, encoded);
     }
 
-    report(io, options, display, totals, now(io) - began);
+    report(io, options, display, totals, now(io) - wall_start);
     if (totals.slow_logged > 0) {
         stderrPrint(io, "  slow frame indices:", .{});
         for (totals.slow_indices[0..totals.slow_logged]) |i| stderrPrint(io, " {d}", .{i});
@@ -647,7 +685,7 @@ fn report(io: Io, options: Options, display: Display, totals: Totals, elapsed_ns
     const wire_mib = @as(f64, @floatFromInt(totals.wire_bytes)) / (1024.0 * 1024.0);
     stderrPrint(io,
         \\wipEout probe · track{d:0>2} · {d}x{d} -> {d}x{d} cells · {d} fps for {d}s{s}
-        \\  achieved: {d:.2} fps · late {d}/{d} frames · {d:.0} tris/frame · worst frame {d:.1} ms · {d} frames over 20 ms
+        \\  achieved: {d:.2} fps · late {d}/{d} frames · {d} schedule slots dropped · {d:.0} tris/frame · worst frame {d:.1} ms · {d} frames over 20 ms
         \\  worst frame: #{d} at section {d}: render {d:.1} ms, {d} tris, {d} px visited, {d} px shaded
         \\  average: render {d:.3} ms · deflate {d:.3} ms · base64 {d:.3} ms · write {d:.3} ms
         \\  payload: raw {d:.2} MiB · after deflate {d:.2} MiB ({d:.1}%)
@@ -665,6 +703,7 @@ fn report(io: Io, options: Options, display: Display, totals: Totals, elapsed_ns
         frames / elapsed_s,
         totals.late_frames,
         totals.frames,
+        totals.dropped_frames,
         @as(f64, @floatFromInt(totals.tris)) / @max(frames, 1),
         @as(f64, @floatFromInt(totals.max_frame_ns)) / std.time.ns_per_ms,
         totals.slow_frames,
@@ -730,6 +769,8 @@ fn parseArgs(args: []const []const u8) !Options {
             index += 1;
             if (index >= args.len) return error.MissingValue;
             options.dilation = try std.fmt.parseInt(i64, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--log-frames")) {
+            options.log_frames = try nextString(args, &index);
         } else if (std.mem.eql(u8, arg, "--scan-cracks")) {
             options.scan_cracks = try nextString(args, &index);
         } else if (std.mem.eql(u8, arg, "--assets")) {
@@ -788,6 +829,7 @@ fn usage(io: Io) void {
         \\  --frame N          which frame --snapshot captures (default 0)
         \\  --scan-cracks DIR  headless lap scan; dump the frames with most uncovered pixels
         \\  --dilation N       triangle edge dilation in 1/16 px (default 2; 0 = exact)
+        \\  --log-frames FILE  write per-frame timings and payload sizes as CSV
         \\  --probe-pixel X,Y  with --snapshot: print rasterizer decisions for one pixel
         \\  --raw              disable zlib compression
         \\
