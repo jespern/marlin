@@ -212,9 +212,14 @@ test "tetris fills the viewport with a compressed arcade cabinet and advances it
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b_Ga=t,f=24,s=640,v=384,i=1,q=2,o=z,m=1;") != null);
     try std.testing.expect(bytes.len < engine.rgb.len / 2);
 
-    const before = engine.tetris_game.active.y;
+    const before = engine.tetris_game.active;
     for (0..tetris.drop_frames) |_| engine.tick();
-    try std.testing.expect(engine.tetris_game.active.y > before or engine.tetris_game.pieces > 0);
+    const after = engine.tetris_game.active;
+    try std.testing.expect(after.rotation != before.rotation or
+        after.x != before.x or
+        after.y != before.y or
+        after.route_index != before.route_index or
+        engine.tetris_game.pieces > 0);
 }
 
 test "shadowbox renders near window size and ships compressed frames at half rate" {

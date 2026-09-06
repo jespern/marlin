@@ -15,7 +15,7 @@ test {
 test "self-player is deterministic, places pieces, and keeps cells valid" {
     var one = Game.init(17);
     var two = Game.init(17);
-    for (0..1200) |_| {
+    for (0..2400) |_| {
         one.tick();
         two.tick();
     }
@@ -29,6 +29,55 @@ test "self-player is deterministic, places pieces, and keeps cells valid" {
     for (one.board) |row| {
         for (row) |cell| try std.testing.expect(cell <= 7);
     }
+}
+
+test "pieces spawn centered and execute movement over time" {
+    var game = Game.init(17);
+    try std.testing.expectEqual(@as(u2, 0), game.active.rotation);
+    try std.testing.expectEqual(@as(i8, 3), game.active.x);
+    try std.testing.expectEqual(@as(u8, 0), game.active.route_index);
+    try std.testing.expect(game.active.route_len > 0);
+
+    const before = game.active;
+    for (0..tetris.drop_frames - 1) |_| game.tick();
+    try std.testing.expectEqual(before.rotation, game.active.rotation);
+    try std.testing.expectEqual(before.x, game.active.x);
+    try std.testing.expectEqual(before.y, game.active.y);
+
+    game.tick();
+    try std.testing.expectEqual(@as(u8, 1), game.active.route_index);
+    try std.testing.expect(game.active.rotation != before.rotation or
+        game.active.x != before.x or game.active.y != before.y);
+}
+
+test "reachable planner can descend before sliding beneath an overhang" {
+    var game = Game.init(1);
+    game.board = @splat(@splat(0));
+    game.board[10][1] = 1;
+    game.board[tetris.board_rows - 2] = @splat(1);
+    game.board[tetris.board_rows - 1] = @splat(1);
+    game.board[tetris.board_rows - 2][1] = 0;
+    game.board[tetris.board_rows - 2][2] = 0;
+    game.board[tetris.board_rows - 1][1] = 0;
+    game.board[tetris.board_rows - 1][2] = 0;
+    game.active = .{ .piece = .o, .rotation = 0, .x = 3, .y = 0 };
+    game.frame = 0;
+    game.game_over = 0;
+
+    try std.testing.expect(game.replan());
+    var saw_down = false;
+    var saw_late_shift = false;
+    for (game.active.route[0..game.active.route_len]) |action| {
+        if (action == .down) saw_down = true;
+        if (saw_down and (action == .left or action == .right)) saw_late_shift = true;
+    }
+    try std.testing.expect(saw_late_shift);
+
+    const route_len = game.active.route_len;
+    for (0..@as(usize, route_len) * tetris.drop_frames) |_| game.tick();
+    try std.testing.expectEqual(route_len, game.active.route_index);
+    try std.testing.expectEqual(@as(i8, 0), game.active.x);
+    try std.testing.expectEqual(@as(i8, 18), game.active.y);
 }
 
 test "line clearing compacts the board" {

@@ -1179,8 +1179,10 @@ A split pane identifies its session with a compact pane label.
   Kitty graphics: a self-playing Tetris (`client/tetris.zig`) presented as a
   full-viewport neon arcade cabinet with beveled blocks, ghost landing, next
   piece, score, lines, level, scanlines, and a cell fallback. Its deterministic
-  seven-bag game searches every legal rotation and landing column, scores line
-  clears, height, holes, and roughness, then visibly drops the selected piece;
+  seven-bag game spawns each piece centered and unrotated, searches the bounded
+  reachable movement graph, scores reachable landings by lines, height, holes,
+  and roughness, then visibly executes rotations, shifts, descents, and late
+  slides beneath overhangs;
   tunnel, metaballs, horizon, a 24-second `demo` sequence,
   a `shadowbox` landscape (`client/shadowbox.zig`, after Jani Ylikangas'
   js1k 2019 entry: composed in the original's 1900×900 canvas units and

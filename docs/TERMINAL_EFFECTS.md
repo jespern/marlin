@@ -8,8 +8,9 @@ Terminal-native effects share one finite-animation/full-screen-saver surface.
   forward `stars` field, and color-cycling `plasma`. Pixel effects render a
   framebuffer over the Kitty graphics protocol (Kitty, Ghostty, WezTerm):
   `tetris`, a full-screen neon arcade cabinet with beveled blocks, a ghost
-  landing, next-piece preview, score, lines, and level around a bot that
-  searches legal rotations and landings; `pacman`, a self-playing take on feiss' 1024-byte js1k entry on a maze
+  landing, next-piece preview, score, lines, and level around a bot whose pieces
+  spawn centered and unrotated, then visibly follow reachable rotate, shift, and
+  descent routes—including late slides beneath overhangs; `pacman`, a self-playing take on feiss' 1024-byte js1k entry on a maze
   generated to fit your window with the arcade's rules (mirrored, no dead
   ends, a ghost house in the middle, wrap-around tunnels, four energizers
   that turn the ghosts blue and edible, bonus fruit, arcade scoring under a
