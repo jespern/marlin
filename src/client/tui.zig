@@ -32,6 +32,7 @@
 //!            chips, expanded into the message on send.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const build_options = @import("build_options");
 const vaxis = @import("vaxis");
@@ -394,6 +395,9 @@ pub const App = struct {
     /// Event loop handle for worker threads spawned from App methods
     /// (voice transcription/download); set once in run().
     loop: ?*vaxis.Loop(Event) = null,
+    /// Mouse protocols carry Ctrl but not Command/Super. Kitty keyboard events
+    /// let us bridge that modifier to the following mouse press.
+    link_super_held: bool = false,
     voice_rt: VoiceRt = .{},
     /// The focused session's complete client-side view. Everything that is
     /// per-session lives there so a switch (or, later, a second pane) moves
@@ -5387,6 +5391,43 @@ pub const TransportVerdicts = struct {
     reconnect: ??*attach.Conn = null,
 };
 
+/// Mouse tracking prevents some terminals from handling OSC 8 activation
+/// themselves. Ctrl/Command+left-click is therefore handled by Marlin using
+/// the link metadata already painted into the current Vaxis screen.
+pub fn linkAtMouse(win: vaxis.Window, mouse: vaxis.Mouse, super_held: bool) ?[]const u8 {
+    if (mouse.type != .press or mouse.button != .left or (!mouse.mods.ctrl and !super_held)) return null;
+    if (mouse.col < 0 or mouse.row < 0) return null;
+    const col: u16 = @intCast(mouse.col);
+    const row: u16 = @intCast(mouse.row);
+    if (col >= win.width or row >= win.height) return null;
+    const uri = (win.readCell(col, row) orelse return null).link.uri;
+    if (!std.mem.startsWith(u8, uri, "https://") and !std.mem.startsWith(u8, uri, "http://")) return null;
+    return uri;
+}
+
+fn openExternalLink(app: *App, uri: []const u8) void {
+    const opener = switch (builtin.os.tag) {
+        .macos => "/usr/bin/open",
+        .linux => "xdg-open",
+        else => {
+            app.setNotice("opening links is unsupported on this platform", .{});
+            return;
+        },
+    };
+    const result = std.process.run(app.gpa, app.io, .{
+        .argv = &.{ opener, uri },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch {
+        app.setNotice("could not open link", .{});
+        return;
+    };
+    defer app.gpa.free(result.stdout);
+    defer app.gpa.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0)
+        app.setNotice("could not open link", .{});
+}
+
 /// The one place every Event variant is handled. The main loop calls it for
 /// the event it woke on and for each event drained behind a daemon line, so
 /// a new variant is added here once and the compiler enforces coverage.
@@ -5403,12 +5444,16 @@ pub fn dispatchEvent(
             // A lone modifier press is not intent: cmd-tab away from the
             // terminal reports the cmd press itself (kitty protocol), and
             // that must not dismiss the screensaver or count as activity.
+            if (key.codepoint == vaxis.Key.left_super or key.codepoint == vaxis.Key.right_super)
+                app.link_super_held = true;
             if (key.isModifier()) return;
             if (app.dismissScreensaver()) return;
             app.recordUserActivity();
             try handleKey(app, key);
         },
         .key_release => |key| {
+            if (key.codepoint == vaxis.Key.left_super or key.codepoint == vaxis.Key.right_super)
+                app.link_super_held = false;
             if (isVoiceKey(key) and app.voice_rt.phase == .recording and
                 app.voice_rt.setup != null and app.voice_rt.setup.?.mode == .ptt)
                 app.stopVoiceRecording();
@@ -5416,6 +5461,10 @@ pub fn dispatchEvent(
         .voice => |vev| app.handleVoiceEvent(vev),
         .mouse => |m| {
             if (app.screensaver_active) return;
+            if (linkAtMouse(vx.window(), m, app.link_super_held)) |uri| {
+                openExternalLink(app, uri);
+                return;
+            }
             handleMouse(app, m);
         },
         .tick => {

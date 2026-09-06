@@ -95,6 +95,7 @@ const formatModelPricing = tui.formatModelPricing;
 const formatPlanDuration = tui.formatPlanDuration;
 const handleKey = tui.handleKey;
 const handleMouse = tui.handleMouse;
+const linkAtMouse = tui.linkAtMouse;
 const hasUnfinishedPlan = tui.hasUnfinishedPlan;
 const inputPanelHeight = tui.inputPanelHeight;
 const isArchiveCurrentKey = tui.isArchiveCurrentKey;
@@ -857,7 +858,18 @@ test "a lone modifier neither wakes the screensaver nor counts as activity" {
         &verdicts,
     );
     try std.testing.expect(app.screensaver_active);
+    try std.testing.expect(app.link_super_held);
     try std.testing.expectEqual(deadline, app.screensaver_deadline_ms.load(.acquire));
+
+    try dispatchEvent(
+        &app,
+        undefined,
+        undefined,
+        gpa,
+        .{ .key_release = .{ .codepoint = vaxis.Key.left_super } },
+        &verdicts,
+    );
+    try std.testing.expect(!app.link_super_held);
 
     // A real key still dismisses.
     try dispatchEvent(
@@ -2019,6 +2031,27 @@ test "link spans attach OSC 8 metadata to rendered cells" {
     try std.testing.expectEqualStrings("https://marlin.wtf", linked.link.uri);
     try std.testing.expectEqual(vaxis.Cell.Style.Underline.single, linked.style.ul_style);
     try std.testing.expectEqualStrings("", win.readCell(0, 0).?.link.uri);
+}
+
+test "ctrl or command click resolves the OSC 8 link under the pointer" {
+    const gpa = std.testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .rows = 2, .cols = 32, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 32, .height = 2, .screen = &screen };
+    var cell = win.readCell(4, 1).?;
+    cell.link = .{ .uri = "https://marlin.wtf/docs" };
+    win.writeCell(4, 1, cell);
+
+    try std.testing.expectEqualStrings(
+        "https://marlin.wtf/docs",
+        linkAtMouse(win, .{ .row = 1, .col = 4, .button = .left, .mods = .{ .ctrl = true }, .type = .press }, false).?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://marlin.wtf/docs",
+        linkAtMouse(win, .{ .row = 1, .col = 4, .button = .left, .mods = .{}, .type = .press }, true).?,
+    );
+    try std.testing.expect(linkAtMouse(win, .{ .row = 1, .col = 4, .button = .left, .mods = .{}, .type = .press }, false) == null);
+    try std.testing.expect(linkAtMouse(win, .{ .row = 1, .col = 3, .button = .left, .mods = .{ .ctrl = true }, .type = .press }, false) == null);
 }
 
 test "URL punctuation trimming keeps balanced path delimiters" {
