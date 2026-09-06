@@ -120,6 +120,7 @@ const Event = union(enum) {
     // From turn threads (loop.zig callbacks). All payloads gpa-owned.
     turn_block: struct { sid: u64, line: []u8 }, // pre-encoded proto.DaemonMsg.blk
     turn_delta: struct { sid: u64, line: []u8 },
+    turn_usage_credits: struct { sid: u64, active: bool },
     /// A tool call needs a client decision; fan out approval_request and
     /// flip session status to awaiting_approval. Line pre-encoded.
     turn_awaiting: struct { sid: u64, line: []u8 },
@@ -245,6 +246,7 @@ const Session = struct {
     /// cancellation diagnostics. Cancellation request bookkeeping itself is
     /// dispatcher-owned.
     phase: std.atomic.Value(u8) = .init(@intFromEnum(proto.TurnPhase.idle)),
+    turn_started_at_ms: std.atomic.Value(i64) = .init(0),
     phase_started_at_ms: std.atomic.Value(i64) = .init(0),
     cancel_requested_at_ms: i64 = 0,
     cancel_requests: u32 = 0,
@@ -262,6 +264,9 @@ const Session = struct {
     /// Per-session gate for the daemon-global managed-tool hostname policy.
     /// A restart restores the default: enabled when blocking rules loaded.
     network_filtering_enabled: bool = false,
+    /// Claude Code's latest structured overage signal. Ephemeral: the guest
+    /// reports it again when rate-limit state changes.
+    usage_credits: std.atomic.Value(bool) = .init(false),
     /// Gate the turn thread parks on for `ask` decisions.
     gate: approval.Gate = .{},
     /// Complete encoded approval_request retained while the gate is armed.
@@ -896,6 +901,10 @@ pub const Daemon = struct {
                 defer self.gpa.free(td.line);
                 self.fanOutLine(td.sid, td.line);
             },
+            .turn_usage_credits => |usage| {
+                const session = self.sessions.get(usage.sid) orelse return;
+                self.broadcastUsageCredits(usage.sid, session.state, usage.active);
+            },
             .turn_awaiting => |ta| {
                 if (self.sessions.get(ta.sid)) |session| {
                     if (session.pending_approval_line) |old| self.gpa.free(old);
@@ -962,6 +971,7 @@ pub const Daemon = struct {
                     self.store.setSessionModel(td.sid, guest) catch {};
                     self.gpa.free(session.model);
                     session.model = guest;
+                    session.usage_credits.store(false, .release);
                     self.broadcastSessionUpsert(td.sid);
                 }
                 // A bridge prompt cannot outlive its turn; deny any stray one
@@ -972,6 +982,7 @@ pub const Daemon = struct {
                 session.cancel.store(false, .release);
                 session.cancel_requested_at_ms = 0;
                 session.cancel_requests = 0;
+                session.turn_started_at_ms.store(0, .release);
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
                 session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
                 session.state = if (td.err_text != null) .err else .idle;
@@ -1358,6 +1369,7 @@ pub const Daemon = struct {
                 try self.store.setSessionModel(sm.sid, sm.model);
                 self.gpa.free(session.model);
                 session.model = new_model;
+                session.usage_credits.store(false, .release);
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sm.sid);
             },
@@ -1643,13 +1655,23 @@ pub const Daemon = struct {
                     if (ses.pending_approval_line) |line| self.sendLine(client, line);
                     break :blk ses.state;
                 } else .idle;
+                const status_now = nowMs(self.io);
                 self.sendTo(client, .{ .status = .{
                     .sid = s.sid,
                     .state = state,
-                    .phase = if (session) |ses| if (state == .running)
+                    .phase = if (session) |ses| if (state == .running or state == .awaiting_approval)
                         @enumFromInt(ses.phase.load(.acquire))
                     else
                         null else null,
+                    .turn_ms = if (session) |ses| if (state == .running or state == .awaiting_approval)
+                        elapsedSince(ses.turn_started_at_ms.load(.acquire), status_now)
+                    else
+                        null else null,
+                    .phase_ms = if (session) |ses| if (state == .running or state == .awaiting_approval)
+                        elapsedSince(ses.phase_started_at_ms.load(.acquire), status_now)
+                    else
+                        null else null,
+                    .usage_credits = if (session) |ses| ses.usage_credits.load(.acquire) else false,
                 } });
             },
             .unsub => |u| {
@@ -1806,6 +1828,8 @@ pub const Daemon = struct {
                 session.cc_pending = .{ .approval_id = approval_id, .client_id = client.id };
                 if (session.pending_approval_line) |old| self.gpa.free(old);
                 session.pending_approval_line = line;
+                session.phase_started_at_ms.store(nowMs(self.io), .release);
+                session.phase.store(@intFromEnum(proto.TurnPhase.approval), .release);
                 session.state = .awaiting_approval;
                 self.store.setSessionStatus(ca.sid, "awaiting_approval") catch {};
                 self.refusePendingRebootForApproval();
@@ -1863,7 +1887,10 @@ pub const Daemon = struct {
                 session.steer_mutex.lockUncancelable(self.io);
                 session.steer_accepting = false;
                 session.steer_mutex.unlock(self.io);
-                session.phase_started_at_ms.store(nowMs(self.io), .release);
+                const started_at = nowMs(self.io);
+                job.started_at_ms = started_at;
+                session.turn_started_at_ms.store(started_at, .release);
+                session.phase_started_at_ms.store(started_at, .release);
                 session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
                 session.state = .running;
                 const thread = std.Thread.spawn(.{}, compactMain, .{job}) catch |err| {
@@ -2013,6 +2040,7 @@ pub const Daemon = struct {
                     const owned = try self.gpa.dupe(u8, request.model);
                     self.gpa.free(session.model);
                     session.model = owned;
+                    session.usage_credits.store(false, .release);
                     session_updated = true;
                     self.broadcastSessionUpsert(session.id);
                 }
@@ -2750,7 +2778,8 @@ pub const Daemon = struct {
         session.steer_mutex.lockUncancelable(self.io);
         session.steer_accepting = true;
         session.steer_mutex.unlock(self.io);
-        session.phase_started_at_ms.store(nowMs(self.io), .release);
+        session.turn_started_at_ms.store(job.started_at_ms, .release);
+        session.phase_started_at_ms.store(job.started_at_ms, .release);
         session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
         session.state = .running;
         const thread = std.Thread.spawn(.{}, turnMain, .{job}) catch |err| {
@@ -2799,7 +2828,10 @@ pub const Daemon = struct {
         session.steer_mutex.lockUncancelable(self.io);
         session.steer_accepting = false;
         session.steer_mutex.unlock(self.io);
-        session.phase_started_at_ms.store(nowMs(self.io), .release);
+        const started_at = nowMs(self.io);
+        job.started_at_ms = started_at;
+        session.turn_started_at_ms.store(started_at, .release);
+        session.phase_started_at_ms.store(started_at, .release);
         session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
         session.state = .running;
         const thread = std.Thread.spawn(.{}, handoverMain, .{job}) catch |err| {
@@ -3034,6 +3066,8 @@ pub const Daemon = struct {
             .on_reasoning_delta = TurnHooks.onReasoningDelta,
             .on_stream_status = TurnHooks.onStreamStatus,
             .on_phase = TurnHooks.onPhase,
+            .usage_credits_live = &job.session.usage_credits,
+            .on_usage_credits = TurnHooks.onUsageCredits,
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
             .on_task = if (job.kind == .root) TurnHooks.onTask else null,
@@ -3260,8 +3294,23 @@ pub const Daemon = struct {
             const self = job.daemon;
             job.session.phase_started_at_ms.store(nowMs(self.io), .release);
             job.session.phase.store(@intFromEnum(phase), .release);
-            const line = encodeTurnPhaseStatus(self.gpa, job.sid, phase) catch return;
+            const line = encodeTurnPhaseStatus(
+                self.gpa,
+                job.sid,
+                phase,
+                elapsedSince(job.session.turn_started_at_ms.load(.acquire), nowMs(self.io)),
+                0,
+                job.session.usage_credits.load(.acquire),
+            ) catch return;
             self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+        }
+
+        fn onUsageCredits(ctx: ?*anyopaque, active: bool) void {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            job.daemon.events.push(job.daemon.io, .{ .turn_usage_credits = .{
+                .sid = job.sid,
+                .active = active,
+            } }) catch {};
         }
 
         fn onTask(ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut {
@@ -3457,6 +3506,9 @@ pub const Daemon = struct {
         }
         self.clearPendingApproval(session);
         if (session.state == .awaiting_approval) {
+            const phase_started = nowMs(self.io);
+            session.phase_started_at_ms.store(phase_started, .release);
+            session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
             session.state = .running;
             self.store.setSessionStatus(session.id, "running") catch {};
             self.broadcastStatus(session.id, .running);
@@ -3474,6 +3526,9 @@ pub const Daemon = struct {
             session.cc_pending = null;
             self.clearPendingApproval(session);
             if (session.state == .awaiting_approval) {
+                const phase_started = nowMs(self.io);
+                session.phase_started_at_ms.store(phase_started, .release);
+                session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
                 session.state = .running;
                 self.store.setSessionStatus(session.id, "running") catch {};
                 self.broadcastStatus(session.id, .running);
@@ -3494,18 +3549,60 @@ pub const Daemon = struct {
         self.broadcastStatusErr(sid, state, null);
     }
 
+    fn broadcastUsageCredits(self: *Daemon, sid: u64, state: proto.SessionState, active: bool) void {
+        const session = self.sessions.get(sid);
+        const status_now = nowMs(self.io);
+        const active_turn = state == .running or state == .awaiting_approval;
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{
+            .sid = sid,
+            .state = state,
+            .phase = if (session) |ses| if (active_turn)
+                @enumFromInt(ses.phase.load(.acquire))
+            else
+                null else null,
+            .turn_ms = if (session) |ses| if (active_turn)
+                elapsedSince(ses.turn_started_at_ms.load(.acquire), status_now)
+            else
+                null else null,
+            .phase_ms = if (session) |ses| if (active_turn)
+                elapsedSince(ses.phase_started_at_ms.load(.acquire), status_now)
+            else
+                null else null,
+            .usage_credits = active,
+        } }) catch return;
+        defer self.gpa.free(line);
+        const ctx = FanCtx{ .self = self, .sid = sid, .line = line };
+        self.forEachClient(ctx, struct {
+            fn send(value: FanCtx, client: *Client) void {
+                if (!client.said_hello or (!client.subscribed(value.sid) and !client.watches_sessions)) return;
+                value.self.sendLine(client, value.line);
+            }
+        }.send);
+    }
+
     /// Status with its reason attached: an error state must never reach a
     /// client without the text that explains it.
     fn broadcastStatusErr(self: *Daemon, sid: u64, state: proto.SessionState, err_text: ?[]const u8) void {
-        const phase: ?proto.TurnPhase = if (state == .running)
-            if (self.sessions.get(sid)) |session| @enumFromInt(session.phase.load(.acquire)) else null
-        else
-            null;
+        const session = self.sessions.get(sid);
+        const status_now = nowMs(self.io);
+        const active_turn = state == .running or state == .awaiting_approval;
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{
             .sid = sid,
             .state = state,
             .err_text = err_text,
-            .phase = phase,
+            .phase = if (session) |ses| if (active_turn)
+                @enumFromInt(ses.phase.load(.acquire))
+            else
+                null else null,
+            .turn_ms = if (session) |ses| if (active_turn)
+                elapsedSince(ses.turn_started_at_ms.load(.acquire), status_now)
+            else
+                null else null,
+            .phase_ms = if (session) |ses| if (active_turn)
+                elapsedSince(ses.phase_started_at_ms.load(.acquire), status_now)
+            else
+                null else null,
+            .usage_credits = if (session) |ses| ses.usage_credits.load(.acquire) else false,
         } }) catch return;
         defer self.gpa.free(line);
         const ctx = FanCtx{ .self = self, .sid = sid, .line = line };
@@ -3573,6 +3670,7 @@ pub const Daemon = struct {
                     (if (live) |session| session.sandbox_enabled else self.cfg.permissions_enabled),
                 .full_access = if (live) |session| session.approval_mode == .auto else false,
                 .plan_mode = if (live) |session| session.plan_mode else row.plan_mode,
+                .usage_credits = if (live) |session| session.usage_credits.load(.acquire) else false,
                 .network_filtering = self.network.isActive() and
                     (if (live) |session| session.network_filtering_enabled else true),
                 .archived = row.archived,
@@ -4185,7 +4283,7 @@ pub const Daemon = struct {
     fn discardShutdownEvent(self: *Daemon, event: Event) void {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
-            .client_gone, .turn_resumed, .shutdown => {},
+            .client_gone, .turn_resumed, .turn_usage_credits, .shutdown => {},
             .turn_block => |value| self.gpa.free(value.line),
             .turn_delta => |value| self.gpa.free(value.line),
             .turn_awaiting => |value| self.gpa.free(value.line),
@@ -4561,17 +4659,34 @@ test "only healthy root round checkpoints auto-continue" {
     try std.testing.expect(!shouldAutoContinueRoundBudget(.root, true, false, null, true));
 }
 
-fn encodeTurnPhaseStatus(gpa: std.mem.Allocator, sid: u64, phase: proto.TurnPhase) ![]u8 {
+fn elapsedSince(started_at_ms: i64, now_ms: i64) u64 {
+    return if (started_at_ms > 0 and now_ms > started_at_ms)
+        @intCast(now_ms - started_at_ms)
+    else
+        0;
+}
+
+fn encodeTurnPhaseStatus(
+    gpa: std.mem.Allocator,
+    sid: u64,
+    phase: proto.TurnPhase,
+    turn_ms: u64,
+    phase_ms: u64,
+    usage_credits: bool,
+) ![]u8 {
     return proto.encode(gpa, proto.DaemonMsg{ .status = .{
         .sid = sid,
         .state = .running,
         .phase = phase,
+        .turn_ms = turn_ms,
+        .phase_ms = phase_ms,
+        .usage_credits = usage_credits,
     } });
 }
 
 test "turn phase status carries running phase metadata" {
     const gpa = std.testing.allocator;
-    const line = try encodeTurnPhaseStatus(gpa, 42, .tool);
+    const line = try encodeTurnPhaseStatus(gpa, 42, .tool, 12_000, 3_000, true);
     defer gpa.free(line);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -4580,6 +4695,9 @@ test "turn phase status carries running phase metadata" {
     try std.testing.expectEqual(@as(u64, 42), msg.status.sid);
     try std.testing.expectEqual(proto.SessionState.running, msg.status.state);
     try std.testing.expectEqual(proto.TurnPhase.tool, msg.status.phase.?);
+    try std.testing.expectEqual(@as(u64, 12_000), msg.status.turn_ms.?);
+    try std.testing.expectEqual(@as(u64, 3_000), msg.status.phase_ms.?);
+    try std.testing.expect(msg.status.usage_credits.?);
 }
 
 fn nowMs(io: Io) i64 {

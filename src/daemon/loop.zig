@@ -147,6 +147,9 @@ pub const RunOpts = struct {
     /// Coarse phase transitions for cancellation diagnostics. The callback
     /// must be non-blocking; the daemon publishes it through atomics.
     on_phase: ?*const fn (ctx: ?*anyopaque, phase: proto.TurnPhase) void = null,
+    /// Guest billing state shared with the daemon and transition notification.
+    usage_credits_live: ?*std.atomic.Value(bool) = null,
+    on_usage_credits: ?*const fn (ctx: ?*anyopaque, active: bool) void = null,
     on_delta_ctx: ?*anyopaque = null,
     /// Called when a tool starts/finishes (for progress display).
     on_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, phase: ToolPhase) void = null,

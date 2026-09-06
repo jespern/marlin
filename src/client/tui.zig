@@ -264,6 +264,7 @@ const SessionSummary = struct {
     /// Approval mode is "auto" (/permissions full) for this session.
     full_access: bool,
     plan_mode: bool,
+    usage_credits: bool,
 
     fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
@@ -993,6 +994,7 @@ pub const App = struct {
             self.view.effort = summary.effort;
             self.view.state = summary.state;
             self.view.plan_mode = summary.plan_mode;
+            self.view.usage_credits = summary.usage_credits;
         }
         if (self.background_approvals.get(sid)) |pending| {
             self.view.pending = pending;
@@ -1107,12 +1109,14 @@ pub const App = struct {
                 self.view.state = info.state;
                 self.setCwdStr(info.cwd);
                 self.view.plan_mode = info.plan_mode;
+                self.view.usage_credits = info.usage_credits;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
             } else if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
                 saved.cwd.clearRetainingCapacity();
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
+                saved.usage_credits = info.usage_credits;
                 if (!info.plan_mode) saved.plan_proposal_ready = false;
             }
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
@@ -1197,6 +1201,7 @@ pub const App = struct {
             .network_filtering = info.network_filtering,
             .full_access = info.full_access,
             .plan_mode = info.plan_mode,
+            .usage_credits = info.usage_credits,
         };
     }
 
@@ -1215,6 +1220,7 @@ pub const App = struct {
                 self.setCwdStr(info.cwd);
                 self.view.permissions_full = info.full_access;
                 self.view.plan_mode = info.plan_mode;
+                self.view.usage_credits = info.usage_credits;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
             }
             if (self.saved_views.get(info.sid)) |saved| {
@@ -1222,6 +1228,7 @@ pub const App = struct {
                 saved.cwd.clearRetainingCapacity();
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
+                saved.usage_credits = info.usage_credits;
                 if (!info.plan_mode) saved.plan_proposal_ready = false;
             }
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
@@ -1271,7 +1278,15 @@ pub const App = struct {
             self.view.state = info.state;
             self.setCwdStr(info.cwd);
             self.view.plan_mode = info.plan_mode;
+            self.view.usage_credits = info.usage_credits;
             if (!info.plan_mode) self.view.plan_proposal_ready = false;
+        } else if (self.saved_views.get(info.sid)) |saved| {
+            saved.state = info.state;
+            saved.cwd.clearRetainingCapacity();
+            saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
+            saved.plan_mode = info.plan_mode;
+            saved.usage_credits = info.usage_credits;
+            if (!info.plan_mode) saved.plan_proposal_ready = false;
         }
         self.normalizeTopSelection();
     }
@@ -1536,6 +1551,7 @@ pub const App = struct {
                 view.stream_status_at_ms = nowWallMs(self.io);
             },
             .status => |s| {
+                const status_now = nowWallMs(self.io);
                 const prior_state = if (self.sessionSummary(s.sid)) |summary|
                     summary.state
                 else if (self.liveView(s.sid)) |view|
@@ -1554,14 +1570,21 @@ pub const App = struct {
                 const view = self.liveView(s.sid) orelse {
                     if (self.saved_views.get(s.sid)) |saved| {
                         saved.state = s.state;
+                        if (s.usage_credits) |active| saved.usage_credits = active;
+                        if (s.turn_ms) |elapsed| saved.turn_started_ms = status_now - @as(i64, @intCast(elapsed));
                         if (s.phase) |phase| {
                             if (saved.turn_phase != phase) {
-                                saved.phase_started_ms = nowWallMs(self.io);
+                                saved.phase_started_ms = if (s.phase_ms) |elapsed|
+                                    status_now - @as(i64, @intCast(elapsed))
+                                else
+                                    status_now;
                                 if (phase == .provider) {
                                     saved.stream_bytes = 0;
                                     saved.stream_quiet_ms = 0;
                                     saved.stream_status_at_ms = 0;
                                 }
+                            } else if (s.phase_ms) |elapsed| {
+                                saved.phase_started_ms = status_now - @as(i64, @intCast(elapsed));
                             }
                             saved.turn_phase = phase;
                         }
@@ -1582,30 +1605,41 @@ pub const App = struct {
                     view.history_complete = true;
                     view.history_loading = false;
                 }
-                if (s.state == .running and view.state != .running) {
+                if (s.state == .running and view.state != .running and view.state != .awaiting_approval) {
                     self.clearCompletedPlan();
                     view.spinner_frame = 0;
-                    view.turn_started_ms = nowWallMs(self.io);
+                    view.turn_started_ms = if (s.turn_ms) |elapsed|
+                        status_now - @as(i64, @intCast(elapsed))
+                    else
+                        status_now;
                     view.turn_phase = .starting;
                     view.phase_started_ms = view.turn_started_ms;
+                } else if (s.turn_ms) |elapsed| {
+                    view.turn_started_ms = status_now - @as(i64, @intCast(elapsed));
                 }
                 if (s.phase) |phase| {
                     if (view.turn_phase != phase) {
-                        view.phase_started_ms = nowWallMs(self.io);
+                        view.phase_started_ms = if (s.phase_ms) |elapsed|
+                            status_now - @as(i64, @intCast(elapsed))
+                        else
+                            status_now;
                         if (phase == .provider) {
                             view.stream_bytes = 0;
                             view.stream_quiet_ms = 0;
                             view.stream_status_at_ms = 0;
                         }
+                    } else if (s.phase_ms) |elapsed| {
+                        view.phase_started_ms = status_now - @as(i64, @intCast(elapsed));
                     }
                     view.turn_phase = phase;
                 }
-                if (s.state != .running) {
+                if (s.state != .running and s.state != .awaiting_approval) {
                     view.stream_status_at_ms = 0;
                     view.turn_phase = .idle;
                     view.phase_started_ms = 0;
                 }
                 view.state = s.state;
+                if (s.usage_credits) |active| view.usage_credits = active;
                 self.syncAnimationTicker();
                 if (s.state != .awaiting_approval) view.pending = null;
                 if (s.state == .idle or s.state == .err or s.state == .done)
@@ -1994,6 +2028,7 @@ pub const App = struct {
 
     pub fn needsAnimationTick(self: *const App) bool {
         return self.view.state == .running or
+            self.view.state == .awaiting_approval or
             self.top_view != null or
             self.voice_rt.download != null or
             self.voice_rt.phase != .idle or
@@ -3700,8 +3735,8 @@ pub fn statusModel(arena: std.mem.Allocator, model: []const u8) ![]const u8 {
 
 /// Guest sessions do not run Marlin's assembler, so ctx% is always a lie
 /// (used stays 0; the limit lookup even matches `claudecode` as `claude`).
-pub fn statusContext(arena: std.mem.Allocator, guest: bool, used: u64, limit: u64) ![]const u8 {
-    if (guest) return "ctx n/a";
+pub fn statusContext(arena: std.mem.Allocator, guest: bool, usage_credits: bool, used: u64, limit: u64) ![]const u8 {
+    if (guest) return if (usage_credits) "(using api credits)" else "ctx n/a";
     if (limit == 0) return "";
     return std.fmt.allocPrint(arena, "ctx {d}%", .{used * 100 / limit});
 }
@@ -5054,7 +5089,13 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         app.view.context_used * 100 / app.view.context_limit
     else
         0;
-    const ctx_txt = try statusContext(arena, guest, app.view.context_used, app.view.context_limit);
+    const ctx_txt = try statusContext(
+        arena,
+        guest,
+        app.view.usage_credits,
+        app.view.context_used,
+        app.view.context_limit,
+    );
     const ctx_style = if (guest)
         Palette.status_muted
     else if (context_percent >= 90)

@@ -1916,9 +1916,10 @@ test "status metadata is compact without losing its identity" {
         "(guest) codex/default",
         try statusModel(arena, "codex/default"),
     );
-    try std.testing.expectEqualStrings("ctx n/a", try statusContext(arena, true, 0, 200_000));
-    try std.testing.expectEqualStrings("ctx 12%", try statusContext(arena, false, 24_000, 200_000));
-    try std.testing.expectEqualStrings("", try statusContext(arena, false, 0, 0));
+    try std.testing.expectEqualStrings("ctx n/a", try statusContext(arena, true, false, 0, 200_000));
+    try std.testing.expectEqualStrings("(using api credits)", try statusContext(arena, true, true, 0, 200_000));
+    try std.testing.expectEqualStrings("ctx 12%", try statusContext(arena, false, false, 24_000, 200_000));
+    try std.testing.expectEqualStrings("", try statusContext(arena, false, false, 0, 0));
     try std.testing.expectEqualStrings(
         "~/Work/marlin",
         try statusCwd(arena, "/Users/jespern/Work/marlin", "/Users/jespern"),
@@ -3894,6 +3895,58 @@ test "Plan clear result removes only the active session todo" {
     } }));
     try std.testing.expectEqual(@as(usize, 0), app.view.plan.items.len);
     try std.testing.expectEqualStrings("execution plan cleared", app.notice.items);
+}
+
+test "approval state keeps the timer animation active" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+            .state = .awaiting_approval,
+        },
+    };
+    defer app.deinit();
+
+    try std.testing.expect(app.needsAnimationTick());
+}
+
+test "status elapsed metadata survives approval resume and reconnect" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+            .state = .awaiting_approval,
+            .turn_started_ms = 1,
+            .turn_phase = .approval,
+            .phase_started_ms = 2,
+        },
+    };
+    defer app.deinit();
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{
+        .sid = 7,
+        .state = .running,
+        .phase = .provider,
+        .turn_ms = 73_000,
+        .phase_ms = 4_000,
+    } }));
+
+    const now_ms = nowWallMs(app.io);
+    try std.testing.expect(@abs((now_ms - app.view.turn_started_ms) - 73_000) <= 100);
+    try std.testing.expect(@abs((now_ms - app.view.phase_started_ms) - 4_000) <= 100);
+    try std.testing.expectEqual(proto.TurnPhase.provider, app.view.turn_phase);
 }
 
 test "finalized reasoning clears only its live stream channel across rounds" {

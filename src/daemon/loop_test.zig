@@ -339,7 +339,7 @@ test "root round budget becomes an automatic continuation checkpoint" {
     try std.testing.expectEqualStrings("internal round checkpoint reached", loaded[1].blk.body.system_note.text);
 }
 
-test "delegated claude code turn persists the event stream as blocks" {
+test "delegated claude code turn persists rate-limit transitions through its ordered appender" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -354,12 +354,18 @@ test "delegated claude code turn persists the event stream as blocks" {
     const script =
         \\#!/bin/sh
         \\case "$*" in *"--output-format stream-json"*) ;; *) exit 9 ;; esac
+        \\case "$*" in *"--include-partial-messages"*) ;; *) exit 9 ;; esac
         \\case "$*" in *"--session-id "*) ;; *) exit 9 ;; esac
         \\case "$*" in *"--dangerously-skip-permissions"*) ;; *) exit 9 ;; esac
         \\case "$*" in *"--model fable-5"*) ;; *) exit 9 ;; esac
         \\echo '{"type":"system","subtype":"init","session_id":"x"}'
-        \\echo '{"type":"assistant","message":{"content":[{"type":"text","text":"scanning repo"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}'
+        \\echo '{"type":"rate_limit_event","rate_limit_info":{"isUsingOverage":true}}'
+        \\echo '{"type":"rate_limit_event","rate_limit_info":{"isUsingOverage":true}}'
+        \\echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"checking live reasoning"}}}'
+        \\echo '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"streaming live prose"}}}'
+        \\echo '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"checked repo"},{"type":"text","text":"scanning repo"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}'
         \\echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"file.txt"}]}}'
+        \\echo '{"type":"rate_limit_event","rate_limit_info":{"isUsingOverage":false}}'
         \\echo '{"type":"result","subtype":"success","result":"DELEGATE-OK","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":90}}'
         \\
     ;
@@ -377,6 +383,24 @@ test "delegated claude code turn persists the event stream as blocks" {
     defer store.close();
     try store.createSession(1, 0, temp.path, "claudecode/fable-5", .auto);
 
+    const DeltaProbe = struct {
+        text: std.ArrayList(u8) = .empty,
+        reasoning: std.ArrayList(u8) = .empty,
+
+        fn onText(ctx: ?*anyopaque, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.text.appendSlice(std.testing.allocator, text) catch @panic("oom");
+        }
+
+        fn onReasoning(ctx: ?*anyopaque, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.reasoning.appendSlice(std.testing.allocator, text) catch @panic("oom");
+        }
+    };
+    var probe = DeltaProbe{};
+    defer probe.text.deinit(gpa);
+    defer probe.reasoning.deinit(gpa);
+    var usage_credits = std.atomic.Value(bool).init(false);
     const result = try runTurn(gpa, io, &store, .{
         .session_id = 1,
         .cwd = temp.path,
@@ -384,10 +408,16 @@ test "delegated claude code turn persists the event stream as blocks" {
         .cfg = .{},
         .tool_environ = &env,
         .approval_mode = .auto,
+        .usage_credits_live = &usage_credits,
+        .on_delta = DeltaProbe.onText,
+        .on_reasoning_delta = DeltaProbe.onReasoning,
+        .on_delta_ctx = &probe,
     }, "do the thing", &.{});
     defer gpa.free(result.text);
 
     try std.testing.expectEqualStrings("DELEGATE-OK", result.text);
+    try std.testing.expectEqualStrings("streaming live prose", probe.text.items);
+    try std.testing.expectEqualStrings("checking live reasoning", probe.reasoning.items);
     try std.testing.expectEqual(@as(u64, 100), result.tokens_in);
     try std.testing.expectEqual(@as(u64, 5), result.tokens_out);
 
@@ -396,16 +426,30 @@ test "delegated claude code turn persists the event stream as blocks" {
         for (loaded) |*lb| lb.deinit();
         gpa.free(loaded);
     }
-    const expected_kinds = [_][]const u8{ "user_msg", "reasoning", "tool_call", "tool_result", "assistant_msg" };
+    const expected_kinds = [_][]const u8{
+        "user_msg",
+        "system_note",
+        "reasoning",
+        "reasoning",
+        "tool_call",
+        "tool_result",
+        "system_note",
+        "assistant_msg",
+    };
     try std.testing.expectEqual(expected_kinds.len, loaded.len);
     for (expected_kinds, loaded) |want, lb| {
         try std.testing.expectEqualStrings(want, @tagName(lb.blk.body));
     }
-    // The between-rounds prose became visible commentary, not raw reasoning.
-    try std.testing.expect(loaded[1].blk.body.reasoning.commentary);
-    try std.testing.expectEqualStrings("scanning repo", loaded[1].blk.body.reasoning.text);
-    try std.testing.expectEqualStrings("Bash", loaded[2].blk.body.tool_call.name);
-    try std.testing.expectEqualStrings("file.txt", loaded[3].blk.body.tool_result.inline_body);
+    try std.testing.expectEqualStrings("Claude Code is now using API credits", loaded[1].blk.body.system_note.text);
+    // The duplicate active event produces no duplicate durable note.
+    try std.testing.expect(!loaded[2].blk.body.reasoning.commentary);
+    try std.testing.expectEqualStrings("checked repo", loaded[2].blk.body.reasoning.text);
+    try std.testing.expect(loaded[3].blk.body.reasoning.commentary);
+    try std.testing.expectEqualStrings("scanning repo", loaded[3].blk.body.reasoning.text);
+    try std.testing.expectEqualStrings("Bash", loaded[4].blk.body.tool_call.name);
+    try std.testing.expectEqualStrings("file.txt", loaded[5].blk.body.tool_result.inline_body);
+    try std.testing.expectEqualStrings("Claude Code returned to subscription usage", loaded[6].blk.body.system_note.text);
+    try std.testing.expect(!usage_credits.load(.acquire));
 }
 
 test "delegated claude code turn consumes a steer racing finalization" {

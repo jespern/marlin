@@ -44,11 +44,12 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
         .permissions = .accept_edits,
         .max_turns = 32,
     });
-    try std.testing.expectEqualStrings("--session-id", fresh[8]);
-    try std.testing.expectEqualStrings("--model", fresh[6]);
-    try std.testing.expectEqualStrings("fable-5", fresh[7]);
-    try std.testing.expectEqualStrings("--permission-mode", fresh[10]);
-    try std.testing.expectEqualStrings("acceptEdits", fresh[11]);
+    try std.testing.expectEqualStrings("--include-partial-messages", fresh[6]);
+    try std.testing.expectEqualStrings("--model", fresh[7]);
+    try std.testing.expectEqualStrings("fable-5", fresh[8]);
+    try std.testing.expectEqualStrings("--session-id", fresh[9]);
+    try std.testing.expectEqualStrings("--permission-mode", fresh[11]);
+    try std.testing.expectEqualStrings("acceptEdits", fresh[12]);
     for (fresh) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--effort"));
 
     const high = try buildArgv(arena, .{
@@ -78,8 +79,9 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     });
     // "default" model omits --model entirely.
     for (resumed) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--model"));
-    try std.testing.expectEqualStrings("--resume", resumed[6]);
-    try std.testing.expectEqualStrings("--dangerously-skip-permissions", resumed[8]);
+    try std.testing.expectEqualStrings("--include-partial-messages", resumed[6]);
+    try std.testing.expectEqualStrings("--resume", resumed[7]);
+    try std.testing.expectEqualStrings("--dangerously-skip-permissions", resumed[9]);
 
     const planned = try buildArgv(arena, .{
         .binary = "claude",
@@ -90,8 +92,8 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
         .permissions = .plan,
         .max_turns = 8,
     });
-    try std.testing.expectEqualStrings("--permission-mode", planned[8]);
-    try std.testing.expectEqualStrings("plan", planned[9]);
+    try std.testing.expectEqualStrings("--permission-mode", planned[9]);
+    try std.testing.expectEqualStrings("plan", planned[10]);
     for (planned) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--dangerously-skip-permissions"));
 
     const bridged = try buildArgv(arena, .{
@@ -104,13 +106,13 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
         .bridge = .{ .marlin_exe = "/opt/marlin", .sid = 42 },
         .max_turns = 8,
     });
-    try std.testing.expectEqualStrings("--permission-mode", bridged[8]);
-    try std.testing.expectEqualStrings("default", bridged[9]);
-    try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[10]);
-    try std.testing.expectEqualStrings("mcp__marlin__approve", bridged[11]);
-    try std.testing.expectEqualStrings("--mcp-config", bridged[12]);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"command\":\"/opt/marlin\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"--sid\",\"42\"") != null);
+    try std.testing.expectEqualStrings("--permission-mode", bridged[9]);
+    try std.testing.expectEqualStrings("default", bridged[10]);
+    try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[11]);
+    try std.testing.expectEqualStrings("mcp__marlin__approve", bridged[12]);
+    try std.testing.expectEqualStrings("--mcp-config", bridged[13]);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[14], "\"command\":\"/opt/marlin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[14], "\"--sid\",\"42\"") != null);
 
     // Bridge wiring never overrides an explicit bypass.
     const yolo = try buildArgv(arena, .{
@@ -134,7 +136,13 @@ test "decode: init, assistant blocks, tool_result shapes, result usage" {
 
     try decodeLine(arena, "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}", &events);
     try decodeLine(arena,
-        \\{"type":"assistant","message":{"content":[{"type":"text","text":"working"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}
+        \\{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"checking"}}}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"work"}}}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"checked"},{"type":"text","text":"working"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}
     , &events);
     try decodeLine(arena,
         \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"is_error":false}]}}
@@ -145,18 +153,46 @@ test "decode: init, assistant blocks, tool_result shapes, result usage" {
     // Unknown types are ignored, not errors.
     try decodeLine(arena, "{\"type\":\"stream_event\",\"event\":{}}", &events);
 
-    try std.testing.expectEqual(@as(usize, 5), events.items.len);
+    try std.testing.expectEqual(@as(usize, 8), events.items.len);
     try std.testing.expect(events.items[0] == .init);
-    try std.testing.expectEqualStrings("working", events.items[1].text);
-    try std.testing.expectEqualStrings("Bash", events.items[2].tool_use.name);
-    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", events.items[2].tool_use.input_json);
-    try std.testing.expectEqualStrings("a\nb", events.items[3].tool_result.text);
-    const result = events.items[4].result;
+    try std.testing.expectEqualStrings("checking", events.items[1].reasoning_delta);
+    try std.testing.expectEqualStrings("work", events.items[2].text_delta);
+    try std.testing.expectEqualStrings("checked", events.items[3].reasoning);
+    try std.testing.expectEqualStrings("working", events.items[4].text);
+    try std.testing.expectEqualStrings("Bash", events.items[5].tool_use.name);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", events.items[5].tool_use.input_json);
+    try std.testing.expectEqualStrings("a\nb", events.items[6].tool_result.text);
+    const result = events.items[7].result;
     try std.testing.expectEqualStrings("done", result.text);
     try std.testing.expectEqual(@as(u64, 100), result.tokens_in);
     try std.testing.expectEqual(@as(u64, 5), result.tokens_out);
     try std.testing.expectEqual(@as(u64, 90), result.cached_tokens);
     try std.testing.expect(!result.is_error);
+}
+
+test "decode: rate limit event reports usage credit state" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+
+    try decodeLine(arena,
+        \\{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","isUsingOverage":true,"overageInUse":true}}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","isUsingOverage":false,"overageInUse":false}}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","isUsingOverage":true}}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}
+    , &events);
+
+    try std.testing.expectEqual(@as(usize, 3), events.items.len);
+    try std.testing.expect(events.items[0].usage_credits);
+    try std.testing.expect(!events.items[1].usage_credits);
+    try std.testing.expect(events.items[2].usage_credits);
 }
 
 test "decode: logged-out result is an error despite subtype success" {

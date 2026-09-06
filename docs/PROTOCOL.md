@@ -195,7 +195,7 @@ flag is read at export time, so it covers everything still in the outbox.
 | reasoning_delta {sid, turn_id, text} | provider reasoning stream (ephemeral, rendered separately from assistant text) |
 | stream_status {sid, bytes, quiet_ms} | stream liveness while receiving from the provider: cumulative body bytes this round + ms since the last visible delta; throttled to ~1/s (ephemeral) |
 | replay_done {sid, oldest_seq, newest_seq, has_older, has_newer, forward, plan_items, plan_pinned} | requested replay page finished; bounded clients page backward with `has_older` or forward with `has_newer`; the final page restores the latest plan only while it remains pinned |
-| status {sid, state} | session state change: idle/running/awaiting_approval/err/done |
+| status {sid, state, phase?, turn_ms?, phase_ms?} | session state change: idle/running/awaiting_approval/err/done; active-turn elapsed fields let reconnecting clients restore stable total/current-phase timers |
 | approval_request {sid, approval_id, call_id, tool, args_json} | a mutating tool call parked on the gate; answer with `approve` |
 | session_meta {sid, tokens_in, tokens_out, context_used, context_limit} | after each turn; ALWAYS sent before the closing status. context_* feed the status-bar gauge (0 = unmeasured) |
 | model_list_result {models, pricing} | reply to `model_list`; `pricing` optionally supplies input/output USD per million tokens and a tiered-rate flag keyed by model id |

@@ -69,7 +69,9 @@ Guest is a session regime, not a model. Kitchen-sink is chasing parity so
 a guest tab feels like a native tab. The guest boundary is frozen at:
 
 1. spawn the official binary (`claude -p` or `codex app-server`)
-2. map its structured event stream → blocks. One event line can be far
+2. map its structured event stream → blocks. Claude Code partial text and
+   thinking deltas feed the same ephemeral live channels as native providers;
+   completed events remain the durable block truth. One event line can be far
    larger than the reader's buffer (Claude Code embeds whole-file contents
    in Edit results), so the reader assembles oversized lines rather than
    mistaking them for end of stream; only a line over 64 MiB is dropped,
@@ -131,7 +133,10 @@ then the wall is how Marlin stays small.
   as `/model` is accepted, including while a native→guest handover is still
   running. Guest status shows `(guest) {name}` and dims
   ctx/sandbox/dnsblock as `n/a` (unavailable, not off — Marlin does not
-  own the guest's context window). Native remains the `/new` default.
+  own the guest's context window). When Claude Code's structured rate-limit
+  event reports overage use, the context slot instead shows `(using api credits)`
+  and each transition is recorded as a system note through the active turn's
+  ordered block appender. Native remains the `/new` default.
 - Permission bridge (`marlin cc_approve`) is mux: fail-closed to *ask*,
   never a shell parser, never applied to native `read_file`. Auto-allow
   of CC `Read` (including paths outside the workspace) is CC's policy,

@@ -50,6 +50,13 @@ const CcStderrDrain = shared.CcStderrDrain;
 /// internal turn management, this only prevents an unkillable zombie run.
 const claude_code_deadline_ms: i64 = 60 * 60 * 1000;
 
+pub fn usageCreditsTransitionNote(active: bool) []const u8 {
+    return if (active)
+        "Claude Code is now using API credits"
+    else
+        "Claude Code returned to subscription usage";
+}
+
 const CcOutcome = struct {
     got_init: bool = false,
     got_result: bool = false,
@@ -116,6 +123,7 @@ fn ccInvoke(
     io: Io,
     opts: RunOpts,
     ap: *Appender,
+    usage_credits: *bool,
     prompt: []const u8,
     fresh: bool,
 ) !CcOutcome {
@@ -274,9 +282,18 @@ fn ccInvoke(
             claude_code.decodeLine(line_arena, line, &events) catch continue;
             for (events.items) |ev| switch (ev) {
                 .init => outcome.got_init = true,
+                .text_delta => |text| {
+                    if (opts.on_delta) |cb| cb(opts.on_delta_ctx, text);
+                },
+                .reasoning_delta => |text| {
+                    if (opts.on_reasoning_delta) |cb| cb(opts.on_delta_ctx, text);
+                },
                 .text => |text| {
                     if (pending_text.items.len > 0) try pending_text.append(gpa, '\n');
                     try pending_text.appendSlice(gpa, text);
+                },
+                .reasoning => |text| {
+                    _ = try ap.append(.{ .reasoning = .{ .text = text } });
                 },
                 .tool_use => |tu| {
                     if (pending_text.items.len > 0) {
@@ -305,6 +322,13 @@ fn ccInvoke(
                         .full_body_ref = null,
                     } });
                     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, "claude", .done);
+                },
+                .usage_credits => |active| {
+                    if (usage_credits.* == active) continue;
+                    _ = try ap.append(.{ .system_note = .{ .text = usageCreditsTransitionNote(active) } });
+                    usage_credits.* = active;
+                    if (opts.usage_credits_live) |live| live.store(active, .release);
+                    if (opts.on_usage_credits) |cb| cb(opts.on_delta_ctx, active);
                 },
                 .result => |r| {
                     outcome.got_result = true;
@@ -379,10 +403,11 @@ pub fn runClaudeCodeTurn(
 
     var final_text: std.ArrayList(u8) = .empty;
     defer final_text.deinit(gpa);
+    var usage_credits = if (opts.usage_credits_live) |live| live.load(.acquire) else false;
 
     while (true) {
         rounds += 1;
-        var outcome = try ccInvoke(gpa, io, opts, ap, prompt.items, fresh);
+        var outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh);
         // Session-identity mismatch: an invocation that never INITIALIZED
         // didn't run at all — `--resume` of an id Claude Code has never seen
         // exits 0 with an is_error result and no init event (observed live),
@@ -391,7 +416,7 @@ pub fn runClaudeCodeTurn(
         if (!outcome.got_init and !outcome.cancelled and !outcome.timed_out) {
             outcome.final_text.deinit(gpa);
             fresh = !fresh;
-            outcome = try ccInvoke(gpa, io, opts, ap, prompt.items, fresh);
+            outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh);
         }
         defer outcome.final_text.deinit(gpa);
 

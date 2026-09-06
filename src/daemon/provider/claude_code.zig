@@ -79,6 +79,7 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
         "--output-format",
         "stream-json",
         "--verbose",
+        "--include-partial-messages",
     });
     if (!std.mem.eql(u8, opts.model, "default")) {
         try argv.appendSlice(arena, &.{ "--model", opts.model });
@@ -154,8 +155,14 @@ pub fn sessionUuid(buf: *[36]u8, sid: u64) []const u8 {
 pub const Event = union(enum) {
     /// system/init: the Claude Code session is live.
     init,
-    /// Assistant text content block (progress commentary or the final prose).
+    /// Incremental assistant prose from --include-partial-messages.
+    text_delta: []const u8,
+    /// Incremental thinking from --include-partial-messages.
+    reasoning_delta: []const u8,
+    /// Completed assistant text content block (progress commentary or final prose).
     text: []const u8,
+    /// Completed assistant thinking content block.
+    reasoning: []const u8,
     /// Assistant tool_use content block.
     tool_use: struct {
         id: []const u8,
@@ -169,6 +176,8 @@ pub const Event = union(enum) {
         text: []const u8,
         is_error: bool,
     },
+    /// Claude Code's structured signal that paid usage credits are active.
+    usage_credits: bool,
     /// Terminal event: the turn's outcome and usage.
     result: struct {
         text: []const u8,
@@ -212,6 +221,9 @@ pub fn decodeLine(
             if (std.mem.eql(u8, bt, "text")) {
                 const text = strField(item.object, "text") orelse continue;
                 if (text.len > 0) try out.append(arena, .{ .text = text });
+            } else if (std.mem.eql(u8, bt, "thinking")) {
+                const text = strField(item.object, "thinking") orelse continue;
+                if (text.len > 0) try out.append(arena, .{ .reasoning = text });
             } else if (std.mem.eql(u8, bt, "tool_use")) {
                 const input = item.object.get("input") orelse std.json.Value{ .null = {} };
                 try out.append(arena, .{ .tool_use = .{
@@ -220,6 +232,22 @@ pub fn decodeLine(
                     .input_json = try stringifyValue(arena, input),
                 } });
             }
+        }
+        return;
+    }
+    if (std.mem.eql(u8, t, "stream_event")) {
+        const event = root.get("event") orelse return;
+        if (event != .object) return;
+        if (!std.mem.eql(u8, strField(event.object, "type") orelse "", "content_block_delta")) return;
+        const delta = event.object.get("delta") orelse return;
+        if (delta != .object) return;
+        const dt = strField(delta.object, "type") orelse return;
+        if (std.mem.eql(u8, dt, "text_delta")) {
+            const text = strField(delta.object, "text") orelse return;
+            if (text.len > 0) try out.append(arena, .{ .text_delta = text });
+        } else if (std.mem.eql(u8, dt, "thinking_delta")) {
+            const text = strField(delta.object, "thinking") orelse return;
+            if (text.len > 0) try out.append(arena, .{ .reasoning_delta = text });
         }
         return;
     }
@@ -247,6 +275,17 @@ pub fn decodeLine(
                 if (diffFromToolUseResult(arena, root)) |diff| tr.text = diff;
             }
         }
+        return;
+    }
+    if (std.mem.eql(u8, t, "rate_limit_event")) {
+        const info = root.get("rate_limit_info") orelse return;
+        if (info != .object) return;
+        const overage_in_use = boolField(info.object, "overageInUse");
+        const using_overage = boolField(info.object, "isUsingOverage");
+        if (overage_in_use == null and using_overage == null) return;
+        try out.append(arena, .{
+            .usage_credits = (overage_in_use orelse false) or (using_overage orelse false),
+        });
         return;
     }
     if (std.mem.eql(u8, t, "result")) {
@@ -282,7 +321,7 @@ pub fn decodeLine(
         });
         return;
     }
-    // stream_event (partial deltas, not requested), unknown types: ignore.
+    // Unknown types are forward-compatible and ignored.
 }
 
 fn messageContent(root: std.json.ObjectMap) ?[]std.json.Value {

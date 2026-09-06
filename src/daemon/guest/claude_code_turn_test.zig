@@ -65,3 +65,14 @@ test "specific Claude errors keep their original text" {
         note,
     );
 }
+
+test "usage credit notifications describe both transitions" {
+    try std.testing.expectEqualStrings(
+        "Claude Code is now using API credits",
+        claude_code_turn.usageCreditsTransitionNote(true),
+    );
+    try std.testing.expectEqualStrings(
+        "Claude Code returned to subscription usage",
+        claude_code_turn.usageCreditsTransitionNote(false),
+    );
+}

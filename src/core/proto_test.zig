@@ -422,15 +422,24 @@ test "status phase is additive and decode-compatible" {
         \\{"status":{"sid":7,"state":"running"}}
     );
     try std.testing.expect(old.status.phase == null);
+    try std.testing.expect(old.status.turn_ms == null);
+    try std.testing.expect(old.status.phase_ms == null);
+    try std.testing.expect(old.status.usage_credits == null);
 
     const line = try encode(std.testing.allocator, DaemonMsg{ .status = .{
         .sid = 7,
         .state = .running,
         .phase = .provider,
+        .turn_ms = 12_000,
+        .phase_ms = 3_000,
+        .usage_credits = true,
     } });
     defer std.testing.allocator.free(line);
     const carried = try decode(DaemonMsg, arena, line);
     try std.testing.expectEqual(TurnPhase.provider, carried.status.phase.?);
+    try std.testing.expectEqual(@as(u64, 12_000), carried.status.turn_ms.?);
+    try std.testing.expectEqual(@as(u64, 3_000), carried.status.phase_ms.?);
+    try std.testing.expect(carried.status.usage_credits.?);
 }
 
 test "status err_text is additive: absent from old daemons, carried when set" {

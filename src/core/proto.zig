@@ -454,6 +454,12 @@ pub const DaemonMsg = union(enum) {
         /// Ephemeral operational detail for running turns. Optional so old
         /// daemons decode as unknown phase and old clients ignore the field.
         phase: ?TurnPhase = null,
+        /// Elapsed wall time for the active turn and its current phase.
+        /// Defaults preserve older daemon/client compatibility.
+        turn_ms: ?u64 = null,
+        phase_ms: ?u64 = null,
+        /// Claude guest billing state when this status carries an update.
+        usage_credits: ?bool = null,
     },
     approval_request: struct {
         sid: u64,
@@ -544,6 +550,8 @@ pub const SessionInfo = struct {
     network_filtering: bool = false,
     /// Persistent collaboration mode. Defaults false for older daemons.
     plan_mode: bool = false,
+    /// Claude guest is currently consuming paid API usage credits.
+    usage_credits: bool = false,
     /// Archived sessions appear only in explicitly inclusive list requests.
     archived: bool = false,
 };
