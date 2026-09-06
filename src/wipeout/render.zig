@@ -37,7 +37,10 @@ pub const Texture = struct {
 
 pub const Stats = struct {
     tris: u32 = 0,
+    /// Pixels that passed depth, alpha, and texture tests and were written.
     pixels: u32 = 0,
+    /// Pixel positions visited by the rasterizer (bounding-box work).
+    visited: u32 = 0,
 };
 
 pub const Error = error{TexturesExhausted} || std.mem.Allocator.Error;
@@ -347,6 +350,7 @@ pub const Renderer = struct {
         const max_y: u32 = @intFromFloat(max_y_f);
 
         self.stats.tris += 1;
+        self.stats.visited += (max_x - min_x + 1) * (max_y - min_y + 1);
 
         // Edge functions: e0 opposite a (edge b->c), e1 opposite b (c->a),
         // e2 opposite c (a->b). After the swap above the triangle is

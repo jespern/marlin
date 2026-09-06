@@ -31,10 +31,12 @@ pub const Options = struct {
     snapshot: ?[]const u8 = null,
     frame: u32 = 0,
     assets: ?[]const u8 = null,
-    /// Sections traversed per second along the circuit.
-    speed: f32 = 4.0,
+    /// Camera speed along the centre line, in world units per second.
+    speed: f32 = 6000,
     /// Camera height above the track centre line, in world units (+y is down).
     height_above: f32 = 700,
+    /// How far ahead along the centre line the camera looks, in world units.
+    look_ahead: f32 = 9000,
 };
 
 const Display = struct {
@@ -55,31 +57,89 @@ const Totals = struct {
     encode_ns: i128 = 0,
     write_ns: i128 = 0,
     tris: u64 = 0,
+    /// Longest render+deflate+encode+write span of any frame.
+    max_frame_ns: i128 = 0,
+    /// Frames whose local work exceeded 20 ms before pacing.
+    slow_frames: u64 = 0,
+    worst_frame_index: u64 = 0,
+    worst_tris: u32 = 0,
+    worst_pixels: u32 = 0,
+    worst_visited: u32 = 0,
+    worst_section: u32 = 0,
+    worst_render_ns: i128 = 0,
+    slow_indices: [24]u64 = undefined,
+    slow_logged: usize = 0,
 };
 
-/// Camera that glides along the section chain, looking a few sections ahead.
+/// Camera that glides along the section centre line at constant speed and
+/// looks at a point a fixed distance further along, so neither position nor
+/// heading jumps when a section boundary is crossed. Both are lightly
+/// smoothed to round off the corners of the polyline.
 const FlyCamera = struct {
     section: u32 = 0,
     frac: f32 = 0,
     position: Vec3 = Vec3.zero,
+    look: Vec3 = Vec3.zero,
     angle: Vec3 = Vec3.zero,
+    started: bool = false,
 
-    fn advance(self: *FlyCamera, track: *const wipeout.track.Track, sections_per_frame: f32, height_above: f32) void {
-        self.frac += sections_per_frame;
-        while (self.frac >= 1.0) : (self.frac -= 1.0) {
-            self.section = track.sections[self.section].next;
-        }
+    const smoothing: f32 = 0.2;
+
+    fn advance(self: *FlyCamera, track: *const wipeout.track.Track, units_per_frame: f32, height_above: f32, look_ahead: f32) void {
         const sections = track.sections;
-        const here = sections[self.section];
-        const next = sections[here.next];
-        const base = here.center.lerp(next.center, self.frac);
-        self.position = base.add(Vec3.init(0, -height_above, 0));
+        var remaining = units_per_frame;
+        var guard: usize = 0;
+        while (guard < sections.len) : (guard += 1) {
+            const here = sections[self.section];
+            const seg_len = @max(sections[here.next].center.sub(here.center).len(), 1.0);
+            const left = (1.0 - self.frac) * seg_len;
+            if (remaining < left) {
+                self.frac += remaining / seg_len;
+                break;
+            }
+            remaining -= left;
+            self.section = here.next;
+            self.frac = 0;
+        }
 
-        var ahead: u32 = here.next;
-        var i: usize = 0;
-        while (i < 4) : (i += 1) ahead = sections[ahead].next;
-        const target = sections[ahead].center.add(Vec3.init(0, -height_above * 0.35, 0));
-        self.angle = wipeout.anglesTowards(target.sub(self.position));
+        const path_pos = pointAt(sections, self.section, self.frac).add(Vec3.init(0, -height_above, 0));
+        const ahead = pointAhead(sections, self.section, self.frac, look_ahead).add(Vec3.init(0, -height_above * 0.35, 0));
+
+        if (!self.started) {
+            self.position = path_pos;
+            self.look = ahead;
+            self.started = true;
+        } else {
+            self.position = self.position.lerp(path_pos, smoothing);
+            self.look = self.look.lerp(ahead, smoothing);
+        }
+        self.angle = wipeout.anglesTowards(self.look.sub(self.position));
+    }
+
+    fn pointAt(sections: []const wipeout.track.Section, section: u32, frac: f32) Vec3 {
+        const here = sections[section];
+        return here.center.lerp(sections[here.next].center, frac);
+    }
+
+    /// Walk `distance` units forward along the centre line from (section, frac).
+    fn pointAhead(sections: []const wipeout.track.Section, start_section: u32, start_frac: f32, distance: f32) Vec3 {
+        var section = start_section;
+        var frac = start_frac;
+        var remaining = distance;
+        var guard: usize = 0;
+        while (guard < sections.len) : (guard += 1) {
+            const here = sections[section];
+            const seg_len = @max(sections[here.next].center.sub(here.center).len(), 1.0);
+            const left = (1.0 - frac) * seg_len;
+            if (remaining < left) {
+                frac += remaining / seg_len;
+                break;
+            }
+            remaining -= left;
+            section = here.next;
+            frac = 0;
+        }
+        return pointAt(sections, section, frac);
     }
 };
 
@@ -161,9 +221,12 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     defer scene.deinit(gpa);
     const load_ns = now(io) - load_start;
 
-    stderrPrint(io, "loaded {s}: {d} sections, {d} faces, {d} scenery objects, {d} textures in {d:.1} ms\n", .{
+    var lap_length: f32 = 0;
+    for (track.sections) |s| lap_length += track.sections[s.next].center.sub(s.center).len();
+    stderrPrint(io, "loaded {s}: {d} sections ({d:.0} units per lap), {d} faces, {d} scenery objects, {d} textures in {d:.1} ms\n", .{
         dir,
         track.sections.len,
+        lap_length,
         track.faces.len,
         scene.objects.len,
         renderer.texturesLen(),
@@ -181,11 +244,11 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     defer gpa.free(encoded);
 
     var camera = FlyCamera{};
-    const sections_per_frame = options.speed / @as(f32, @floatFromInt(options.fps));
+    const units_per_frame = options.speed / @as(f32, @floatFromInt(options.fps));
 
     if (options.snapshot) |path| {
         var i: u32 = 0;
-        while (i <= options.frame) : (i += 1) camera.advance(&track, sections_per_frame, options.height_above);
+        while (i <= options.frame) : (i += 1) camera.advance(&track, units_per_frame, options.height_above, options.look_ahead);
         renderFrame(&renderer, &track, &scene, &camera);
         renderer.writeRgb(rgb);
         try writePpm(io, path, options.width, options.height, rgb);
@@ -219,7 +282,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     var totals: Totals = .{};
 
     while (totals.frames < target_frames) : (totals.frames += 1) {
-        camera.advance(&track, sections_per_frame, options.height_above);
+        camera.advance(&track, units_per_frame, options.height_above, options.look_ahead);
 
         const render_start = now(io);
         renderFrame(&renderer, &track, &scene, &camera);
@@ -254,6 +317,23 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         totals.encode_ns += encode_end - compress_end;
         totals.write_ns += write_end - encode_end;
         totals.tris += renderer.stats.tris;
+        const frame_work = write_end - render_start;
+        if (frame_work > totals.max_frame_ns) {
+            totals.max_frame_ns = frame_work;
+            totals.worst_frame_index = totals.frames;
+            totals.worst_tris = renderer.stats.tris;
+            totals.worst_pixels = renderer.stats.pixels;
+            totals.worst_visited = renderer.stats.visited;
+            totals.worst_section = camera.section;
+            totals.worst_render_ns = render_end - render_start;
+        }
+        if (frame_work > 20 * std.time.ns_per_ms) {
+            totals.slow_frames += 1;
+            if (totals.slow_logged < totals.slow_indices.len) {
+                totals.slow_indices[totals.slow_logged] = totals.frames;
+                totals.slow_logged += 1;
+            }
+        }
 
         const deadline = began + @as(i128, @intCast(totals.frames + 1)) * frame_ns;
         const remaining = deadline - now(io);
@@ -265,6 +345,11 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     }
 
     report(io, options, display, totals, now(io) - began);
+    if (totals.slow_logged > 0) {
+        stderrPrint(io, "  slow frame indices:", .{});
+        for (totals.slow_indices[0..totals.slow_logged]) |i| stderrPrint(io, " {d}", .{i});
+        stderrPrint(io, "\n", .{});
+    }
 }
 
 fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.Track, scene: *wipeout.scene.Scene, camera: *const FlyCamera) void {
@@ -338,7 +423,8 @@ fn report(io: Io, options: Options, display: Display, totals: Totals, elapsed_ns
     const wire_mib = @as(f64, @floatFromInt(totals.wire_bytes)) / (1024.0 * 1024.0);
     stderrPrint(io,
         \\wipEout probe · track{d:0>2} · {d}x{d} -> {d}x{d} cells · {d} fps for {d}s{s}
-        \\  achieved: {d:.2} fps · late {d}/{d} frames · {d:.0} tris/frame
+        \\  achieved: {d:.2} fps · late {d}/{d} frames · {d:.0} tris/frame · worst frame {d:.1} ms · {d} frames over 20 ms
+        \\  worst frame: #{d} at section {d}: render {d:.1} ms, {d} tris, {d} px visited, {d} px shaded
         \\  average: render {d:.3} ms · deflate {d:.3} ms · base64 {d:.3} ms · write {d:.3} ms
         \\  payload: raw {d:.2} MiB · after deflate {d:.2} MiB ({d:.1}%)
         \\  transport: {d:.2} MiB total · {d:.2} MiB/s · {d:.2} Mbit/s
@@ -356,6 +442,14 @@ fn report(io: Io, options: Options, display: Display, totals: Totals, elapsed_ns
         totals.late_frames,
         totals.frames,
         @as(f64, @floatFromInt(totals.tris)) / @max(frames, 1),
+        @as(f64, @floatFromInt(totals.max_frame_ns)) / std.time.ns_per_ms,
+        totals.slow_frames,
+        totals.worst_frame_index,
+        totals.worst_section,
+        @as(f64, @floatFromInt(totals.worst_render_ns)) / std.time.ns_per_ms,
+        totals.worst_tris,
+        totals.worst_visited,
+        totals.worst_pixels,
         nsPerFrame(totals.render_ns, totals.frames),
         nsPerFrame(totals.compress_ns, totals.frames),
         nsPerFrame(totals.encode_ns, totals.frames),
@@ -407,6 +501,8 @@ fn parseArgs(args: []const []const u8) !Options {
             options.speed = try nextFloat(args, &index);
         } else if (std.mem.eql(u8, arg, "--height-above")) {
             options.height_above = try nextFloat(args, &index);
+        } else if (std.mem.eql(u8, arg, "--look-ahead")) {
+            options.look_ahead = try nextFloat(args, &index);
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return error.HelpRequested;
         } else {
@@ -446,8 +542,9 @@ fn usage(io: Io) void {
         \\  --seconds N        duration (default 10)
         \\  --width/--height   framebuffer size (default 320x240)
         \\  --cols/--rows      override automatic fullscreen placement
-        \\  --speed F          sections per second (default 4)
+        \\  --speed F          camera speed in world units per second (default 6000)
         \\  --height-above F   camera height above the track (default 700)
+        \\  --look-ahead F     look-at distance along the track (default 9000)
         \\  --assets DIR       data root containing wipeout/ (default XDG data dir)
         \\  --dry-run          render, compress, and encode without Kitty output
         \\  --snapshot FILE    write one frame as PPM and exit (see --frame)

@@ -35,8 +35,20 @@ standalone probe. No game logic, input, HUD, audio, or snapshots yet.
 | `src/wipeout/root.zig` | Module root, per-circuit sky offsets, camera angle helpers |
 | `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots |
 
-Build steps: `zig build wipeout-test` (unit tests) and `zig build
-wipeout-probe -- [options]`.
+Build steps: `zig build wipeout-test` (unit tests) and `zig build`, which
+installs `zig-out/bin/wipeout-probe`.
+
+Run the probe binary directly, not through `zig build wipeout-probe`. Under
+the build runner the same binary stalls for 50-80 ms every second or so
+(measured: worst frame 83 ms with 6-9 frames over 20 ms per 10 s), which
+shows up as periodic micro-freezes. Run directly, the worst frame in a 10 s
+fly-through is about 10 ms and no frame exceeds 20 ms.
+
+```
+zig build
+./zig-out/bin/wipeout-probe --track 1 --seconds 15
+./zig-out/bin/wipeout-probe --width 640 --height 480
+```
 
 ## Assets
 
@@ -73,10 +85,20 @@ Both fit a 33 ms frame with room for game logic. 480p transport has not been
 verified against a live terminal yet; run `zig build wipeout-probe --
 --width 640 --height 480` in Kitty or Ghostty and watch for dropped frames.
 
+## Probe camera
+
+The fly-through moves at a constant world-unit speed along the section
+centre line (default 6000 units/s; track01 is about 586,000 units per lap)
+and looks at a point a fixed distance further along the same line, so
+neither position nor heading jumps at section boundaries. Both are lightly
+smoothed. Earlier versions moved at a constant number of sections per
+second, which pulsed with section length and snapped the heading every
+boundary.
+
 ## Snapshots
 
 ```
-zig build wipeout-probe -- --snapshot /tmp/frame.ppm --frame 200
+./zig-out/bin/wipeout-probe --snapshot /tmp/frame.ppm --frame 200
 ```
 
 writes one 320x240 PPM without touching the terminal, which is how the

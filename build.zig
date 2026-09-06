@@ -125,6 +125,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    b.installArtifact(wipeout_probe);
     const wipeout_probe_cmd = b.addRunArtifact(wipeout_probe);
     if (b.args) |args| wipeout_probe_cmd.addArgs(args);
     wipeout_probe_cmd.has_side_effects = true;
