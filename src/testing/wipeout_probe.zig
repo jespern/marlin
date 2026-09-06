@@ -811,7 +811,7 @@ const Race = struct {
         const target = sections[ahead].center.sub(self.ship.position);
         const desired_yaw = -std.math.atan2(target.x, target.z);
         const delta = wipeout.math.wrapAngle(desired_yaw - self.ship.angle.y);
-        self.input.set(.thrust, self.ship.mode != .intro);
+        self.input.set(.thrust, self.ship.mode != .intro and !self.ship.finished());
         self.input.set(.left, delta > 0.02);
         self.input.set(.right, delta < -0.02);
         self.input.set(.up, false);

@@ -284,7 +284,27 @@ pub const Game = struct {
             return true;
         }
         const action = actionForKey(key) orelse return false;
+        if (self.ship.finished()) {
+            // On the results page thrust starts a new race on the same
+            // circuit; the ship ignores everything else.
+            if (action == .thrust and down) self.restart();
+            return true;
+        }
         self.input.set(action, down);
         return true;
+    }
+
+    /// Back to the grid with the same circuit, pilot and class.
+    pub fn restart(self: *Game) void {
+        const circuit = wipeout.defs.circuitSettings(self.options.track);
+        var start: u32 = 0;
+        var i: usize = 0;
+        while (i + 15 < circuit.start_line_pos) : (i += 1) start = self.track.sections[start].next;
+        self.ship = wipeout.ship.Ship.init(&self.track, start, self.options.pilot, 0, if (self.options.rapier) .rapier else .venom);
+        if (!self.options.intro) self.ship.skipIntro();
+        self.camera = wipeout.camera.Camera.init(&self.track, 0);
+        self.input = .{};
+        self.steps = 0;
+        self.cycle_time = 0;
     }
 };

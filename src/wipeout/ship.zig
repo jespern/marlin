@@ -205,6 +205,25 @@ pub const Ship = extern struct {
         self.temp_target = self.position;
     }
 
+    pub fn finished(self: *const Ship) bool {
+        return !self.flags.racing;
+    }
+
+    /// Sum of the recorded lap times.
+    pub fn raceTime(self: *const Ship) f32 {
+        var total: f32 = 0;
+        for (self.lap_times) |t| total += t;
+        return total;
+    }
+
+    pub fn bestLap(self: *const Ship) f32 {
+        var best: f32 = 0;
+        for (self.lap_times) |t| {
+            if (t > 0 and (best == 0 or t < best)) best = t;
+        }
+        return best;
+    }
+
     pub fn forward(self: *const Ship) Vec3 {
         return self.mat.forward();
     }
@@ -275,6 +294,9 @@ pub const Ship = extern struct {
                     self.lap_times[@intCast(self.lap - 1)] = self.lap_time;
                 }
                 self.lap_time = 0;
+                // Final lap complete: the race is over. The original hands
+                // the ship to the AI here; ours coasts with no input.
+                if (self.lap == defs.num_laps) self.flags.racing = false;
             }
         }
 
@@ -319,9 +341,12 @@ pub const Ship = extern struct {
         }
     }
 
+    /// Once the race is over the player's input no longer reaches the ship.
+    const no_input = input.State{};
+
     fn updateRace(self: *Ship, ctx: Context) void {
         const track = ctx.track;
-        const in = ctx.input;
+        const in: *const input.State = if (self.flags.racing) ctx.input else &no_input;
         const tick = ctx.tick;
         const dt32: f32 = f(tick);
         const section = &track.sections[self.section];

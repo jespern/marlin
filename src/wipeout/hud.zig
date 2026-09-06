@@ -63,7 +63,7 @@ pub const Hud = struct {
         }
 
         // Lap counter.
-        const display_lap: i64 = @max(0, ship.lap + 1);
+        const display_lap: i64 = @min(@max(0, ship.lap + 1), defs.num_laps);
         ui.drawText(r, "LAP", ui.scaled(Vec2i.init(15, 8)), .px8, ui_mod.color_accent);
         ui.drawNumber(r, display_lap, ui.scaled(Vec2i.init(10, 19)), .px16, ui_mod.color_default);
         const width = Ui.charWidth(@intCast('0' + @as(u8, @intCast(@min(display_lap, 9)))), .px16);
@@ -72,18 +72,44 @@ pub const Hud = struct {
 
         // Best lap this session stands in for the saved lap record.
         ui.drawText(r, "LAP RECORD", ui.scaled(Vec2i.init(15, 43)), .px8, ui_mod.color_accent);
-        var best: f32 = 0;
-        for (ship.lap_times) |t| {
-            if (t > 0 and (best == 0 or t < best)) best = t;
-        }
-        ui.drawTime(r, best, ui.scaled(Vec2i.init(15, 55)), .px8, ui_mod.color_default);
+        ui.drawTime(r, ship.bestLap(), ui.scaled(Vec2i.init(15, 55)), .px8, ui_mod.color_default);
 
         if (!ship.flags.direction_forward) {
             ui.drawTextCentered(r, "WRONG WAY", ui.pos(Anchor.middle | Anchor.center, Vec2i.init(-20, 0)), .px16, ui_mod.color_accent);
         }
 
         self.drawSpeedo(r, ui, ship.speed, ship.thrust_mag);
+        if (ship.finished()) drawResults(r, ui, ship);
         r.setCullBackface(true);
+    }
+
+    /// The end-of-race statistics page, dimmed over the scene, laid out
+    /// like the original's (time trial variant: no position or portrait).
+    fn drawResults(r: *render.Renderer, ui: *const Ui, ship: *const ship_mod.Ship) void {
+        r.push2d(Vec2i.init(0, 0), ui.screen, Rgba.init(0, 0, 0, 128), r.no_texture);
+        const anchor = Anchor.middle | Anchor.center;
+        ui.drawTextCentered(r, "RACE OVER", ui.pos(anchor, Vec2i.init(0, -100)), .px16, ui_mod.color_accent);
+
+        var pos = Vec2i.init(-140, -100 + 32 + 32);
+        ui.drawText(r, "RACE STATISTICS", ui.pos(anchor, pos), .px8, ui_mod.color_accent);
+        pos.y += 16;
+        var i: usize = 0;
+        while (i < defs.num_laps) : (i += 1) {
+            ui.drawText(r, "LAP", ui.pos(anchor, Vec2i.init(pos.x + 8, pos.y)), .px8, ui_mod.color_accent);
+            ui.drawNumber(r, @intCast(i + 1), ui.pos(anchor, Vec2i.init(pos.x + 50, pos.y)), .px8, ui_mod.color_accent);
+            ui.drawTime(r, ship.lap_times[i], ui.pos(anchor, Vec2i.init(pos.x + 72, pos.y)), .px8, ui_mod.color_default);
+            pos.y += 12;
+        }
+        pos.y += 12;
+        ui.drawText(r, "RACE TIME", ui.pos(anchor, pos), .px8, ui_mod.color_accent);
+        pos.y += 12;
+        ui.drawTime(r, ship.raceTime(), ui.pos(anchor, Vec2i.init(pos.x + 8, pos.y)), .px8, ui_mod.color_default);
+        pos.y += 12;
+        ui.drawText(r, "BEST LAP", ui.pos(anchor, pos), .px8, ui_mod.color_accent);
+        pos.y += 12;
+        ui.drawTime(r, ship.bestLap(), ui.pos(anchor, Vec2i.init(pos.x + 8, pos.y)), .px8, ui_mod.color_default);
+
+        ui.drawTextCentered(r, "X FOR A NEW RACE", ui.pos(anchor, Vec2i.init(0, 96)), .px8, ui_mod.color_accent);
     }
 
     fn drawSpeedo(self: *const Hud, r: *render.Renderer, ui: *const Ui, speed: f32, thrust: f32) void {

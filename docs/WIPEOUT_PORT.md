@@ -299,6 +299,13 @@ slot shows the best lap of the current session because there are no
 saved highscores yet. Race position and the weapon icon wait for
 opponents and weapons.
 
+Crossing the line on the final lap ends the race, as in the original's
+ship update. The reference hands the ship to the AI and cycles attract
+cameras; here the ship simply stops taking input and coasts to a halt,
+and the HUD draws the results page (lap times, race time, best lap) dimmed
+over the scene. Thrust on that page starts a new race on the same circuit;
+Escape leaves as usual, and the finished race is what gets saved.
+
 ## CRT pass
 
 `post.zig` evaluates the original's CRT fragment shader per pixel:
