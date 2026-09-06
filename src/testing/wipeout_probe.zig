@@ -60,6 +60,13 @@ pub const Options = struct {
     /// With --snapshot: also write the per-pixel owner ids (u16 LE, row
     /// major) to this file, tagging each ship polygon individually.
     owner_map: ?[]const u8 = null,
+    /// Write the action bitmask fed to the ship each frame (one decimal per
+    /// line, bit i = action i) for replay through the reference build.
+    record_input: ?[]const u8 = null,
+    /// Drive the ship from a recorded bitmask file instead of keys/autopilot.
+    replay_input: ?[]const u8 = null,
+    /// Write ship state per frame as CSV for parity comparison.
+    ship_log: ?[]const u8 = null,
     assets: ?[]const u8 = null,
     /// Camera speed along the centre line, in world units per second.
     speed: f32 = 6000,
@@ -282,7 +289,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
 
     const circuit = wipeout.defs.circuitSettings(options.track);
     var race: ?Race = null;
-    if (options.drive or options.autopilot) {
+    if (options.drive or options.autopilot or options.replay_input != null) {
         var models = try wipeout.ship.loadModels(gpa, &assets, &renderer);
         errdefer models.deinit(gpa);
         var start: u32 = 0;
@@ -301,8 +308,29 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
             .start_line_pos = circuit.start_line_pos,
             .autopilot = options.autopilot,
         };
+        if (options.replay_input) |path| {
+            race.?.replay = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024));
+        }
+        if (options.record_input) |path| {
+            race.?.record_file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        }
+        if (options.ship_log) |path| {
+            race.?.log_file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+            race.?.log_writer = .init(race.?.log_file.?, io, &race.?.log_buffer);
+            try race.?.log_writer.?.interface.writeAll("frame,section,num,px,py,pz,vx,vy,vz,ax,ay,az,speed,thrust,flying,mode\n");
+        }
+        if (options.record_input) |_| {
+            race.?.record_writer = .init(race.?.record_file.?, io, &race.?.record_buffer);
+        }
     }
-    defer if (race) |*r| r.models.deinit(gpa);
+    defer if (race) |*r| {
+        if (r.log_writer) |*w| w.interface.flush() catch {};
+        if (r.log_file) |f| f.close(io);
+        if (r.record_writer) |*w| w.interface.flush() catch {};
+        if (r.record_file) |f| f.close(io);
+        if (r.replay) |data| gpa.free(data);
+        r.models.deinit(gpa);
+    };
 
     if (options.dump_model) {
         var models = try wipeout.ship.loadModels(gpa, &assets, &renderer);
@@ -667,8 +695,20 @@ const Race = struct {
     rng: wipeout.rng.Rng,
     start_line_pos: u16,
     autopilot: bool,
+    frame: u64 = 0,
+    replay: ?[]u8 = null,
+    replay_pos: usize = 0,
+    record_file: ?Io.File = null,
+    record_buffer: [4096]u8 = undefined,
+    record_writer: ?Io.File.Writer = null,
+    log_file: ?Io.File = null,
+    log_buffer: [16 * 1024]u8 = undefined,
+    log_writer: ?Io.File.Writer = null,
 
     fn step(self: *Race, track: *const wipeout.track.Track, keys: ?*KeyReader, dt: f32) void {
+        // The physics step is f64 like the reference's system_tick(); the
+        // f32 dt only feeds the camera.
+        const tick: f64 = 1.0 / @round(1.0 / @as(f64, dt));
         var any_key = false;
         if (keys) |k| {
             const snapshot = k.snapshot();
@@ -677,18 +717,62 @@ const Race = struct {
                 if (down) any_key = true;
             }
         }
-        if (self.autopilot and !any_key) self.steerAutomatically(track);
+        if (self.replay) |data| {
+            // One decimal bitmask per line; past the end, no input.
+            var mask: u32 = 0;
+            if (self.replay_pos < data.len) {
+                const end = std.mem.indexOfScalarPos(u8, data, self.replay_pos, '\n') orelse data.len;
+                mask = std.fmt.parseUnsigned(u32, std.mem.trim(u8, data[self.replay_pos..end], " \r"), 10) catch 0;
+                self.replay_pos = end + 1;
+            }
+            var i: usize = 0;
+            while (i < wipeout.input.count) : (i += 1) self.input.set(@enumFromInt(i), (mask >> @intCast(i)) & 1 == 1);
+        } else if (self.autopilot and !any_key) {
+            self.steerAutomatically(track);
+        }
+
+        if (self.record_writer) |*w| {
+            var mask: u32 = 0;
+            var i: usize = 0;
+            while (i < wipeout.input.count) : (i += 1) {
+                if (self.input.held[i] != 0) mask |= @as(u32, 1) << @intCast(i);
+            }
+            w.interface.print("{d}\n", .{mask}) catch {};
+        }
 
         self.ship.update(.{
             .track = track,
             .input = &self.input,
             .rng = &self.rng,
-            .dt = dt,
+            .tick = tick,
             .start_line_pos = self.start_line_pos,
         });
         self.camera.mode = if (self.ship.flags.view_internal) .internal else .external;
         self.camera.update(track, &self.ship, dt);
         self.input.endFrame();
+
+        if (self.log_writer) |*w| {
+            const sh = &self.ship;
+            w.interface.print("{d},{d},{d},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.6},{d:.6},{d:.6},{d:.4},{d:.4},{d},{d}\n", .{
+                self.frame,
+                sh.section,
+                track.sections[sh.section].num,
+                sh.position.x,
+                sh.position.y,
+                sh.position.z,
+                sh.velocity.x,
+                sh.velocity.y,
+                sh.velocity.z,
+                sh.angle.x,
+                sh.angle.y,
+                sh.angle.z,
+                sh.speed,
+                sh.thrust_mag,
+                @intFromBool(sh.flags.flying),
+                @intFromEnum(sh.mode),
+            }) catch {};
+        }
+        self.frame += 1;
     }
 
     /// Full thrust, steering towards a point two sections ahead. Not the
@@ -700,7 +784,7 @@ const Race = struct {
         const target = sections[ahead].center.sub(self.ship.position);
         const desired_yaw = -std.math.atan2(target.x, target.z);
         const delta = wipeout.math.wrapAngle(desired_yaw - self.ship.angle.y);
-        self.input.set(.thrust, true);
+        self.input.set(.thrust, self.ship.mode != .intro);
         self.input.set(.left, delta > 0.02);
         self.input.set(.right, delta < -0.02);
         self.input.set(.up, false);
@@ -1196,6 +1280,13 @@ fn parseArgs(args: []const []const u8) !Options {
             options.intro = true;
         } else if (std.mem.eql(u8, arg, "--rapier")) {
             options.rapier = true;
+        } else if (std.mem.eql(u8, arg, "--record-input")) {
+            options.record_input = try nextString(args, &index);
+        } else if (std.mem.eql(u8, arg, "--replay-input")) {
+            options.replay_input = try nextString(args, &index);
+            options.dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--ship-log")) {
+            options.ship_log = try nextString(args, &index);
         } else if (std.mem.eql(u8, arg, "--owner-map")) {
             options.owner_map = try nextString(args, &index);
         } else if (std.mem.eql(u8, arg, "--dump-model")) {
@@ -1271,6 +1362,9 @@ fn usage(io: Io) void {
         \\  --pilot N          pilot 0-7 (default 0, John Dekka / AG Systems)
         \\  --rapier           Rapier class handling instead of Venom
         \\  --intro            start with the countdown hover instead of racing at once
+        \\  --record-input F   write the per-frame action bitmask (for the parity harness)
+        \\  --replay-input F   drive from a recorded bitmask file (implies --dry-run)
+        \\  --ship-log F       write ship state per frame as CSV
         \\  --probe-pixel X,Y  with --snapshot: print rasterizer decisions for one pixel
         \\  --raw              disable zlib compression
         \\

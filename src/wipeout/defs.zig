@@ -40,27 +40,30 @@ pub fn pilotToModel(pilot: u8) u8 {
     return 0;
 }
 
-// PSX fixed point and NTSC frame-rate conversions.
-pub fn fixedToFloat(v: f32) f32 {
+// PSX fixed point and NTSC frame-rate conversions. These are evaluated in
+// f64 with the reference's left-to-right macro order and narrowed to f32
+// only where the reference assigns to a float, so the constants match the
+// C build bit for bit.
+pub fn fixedToFloat(v: f64) f64 {
     return v * (1.0 / 4096.0);
 }
-pub fn angleNormToRadian(v: f32) f32 {
-    return v * math.pi * 2.0;
+pub fn angleNormToRadian(v: f64) f64 {
+    return v * math.pi64 * 2.0;
 }
-pub fn ntscVelocity(v: f32) f32 {
+pub fn ntscVelocity(v: f64) f64 {
     return v * 30.0;
 }
-pub fn ntscAcceleration(v: f32) f32 {
-    return v * 30.0 * 30.0;
+pub fn ntscAcceleration(v: f64) f64 {
+    return ntscVelocity(ntscVelocity(v));
 }
-fn yawVelocity(v: f32) f32 {
+fn yawVelocity(v: f64) f64 {
     return v * (1.0 / 64.0);
 }
-fn turnAccel(v: f32) f32 {
-    return ntscAcceleration(angleNormToRadian(fixedToFloat(yawVelocity(v))));
+fn turnAccel(v: f64) f32 {
+    return @floatCast(ntscAcceleration(angleNormToRadian(fixedToFloat(yawVelocity(v)))));
 }
-fn turnVel(v: f32) f32 {
-    return ntscVelocity(angleNormToRadian(fixedToFloat(yawVelocity(v))));
+fn turnVel(v: f64) f32 {
+    return @floatCast(ntscVelocity(angleNormToRadian(fixedToFloat(yawVelocity(v)))));
 }
 
 pub const ShipAttributes = struct {
@@ -121,6 +124,6 @@ pub fn circuitSettings(track_number: u8) CircuitSettings {
 
 test "turn constants match the reference formulas" {
     // TURN_VEL(2560) = 2560/64/4096 * 2π * 30
-    const expected = 2560.0 / 64.0 / 4096.0 * math.pi * 2.0 * 30.0;
-    try std.testing.expectApproxEqRel(expected, shipAttributes(.feisar, .venom).turn_rate_max, 1e-6);
+    const expected: f64 = 2560.0 / 64.0 / 4096.0 * math.pi64 * 2.0 * 30.0;
+    try std.testing.expectApproxEqRel(@as(f32, @floatCast(expected)), shipAttributes(.feisar, .venom).turn_rate_max, 1e-6);
 }

@@ -42,16 +42,22 @@ const max_resistance: f32 = 74;
 const track_magnet: f32 = 64;
 const track_float: f32 = 256;
 
-const pitch_accel: f32 = defs.ntscAcceleration(defs.angleNormToRadian(defs.fixedToFloat(30.0 / 16.0)));
-const thrust_rate: f32 = defs.ntscVelocity(16);
-const thrust_falloff: f32 = defs.ntscVelocity(8);
-const brake_rate: f32 = defs.ntscVelocity(32);
+// Scalar constants stay f64: the reference applies them in double
+// expressions and narrows to float only on assignment.
+const pitch_accel: f64 = defs.ntscAcceleration(defs.angleNormToRadian(defs.fixedToFloat(30.0 * (1.0 / 16.0))));
+const thrust_rate: f64 = defs.ntscVelocity(16);
+const thrust_falloff: f64 = defs.ntscVelocity(8);
+const brake_rate: f64 = defs.ntscVelocity(32);
 /// Pitch correction applied while the nose is clear of the track.
-const nose_up_accel: f32 = defs.ntscAcceleration(defs.angleNormToRadian(defs.fixedToFloat(-50.0 / 16.0)));
+const nose_up_accel: f64 = defs.ntscAcceleration(defs.angleNormToRadian(defs.fixedToFloat(-50.0 / 16.0)));
+
+inline fn f(x: f64) f32 {
+    return @floatCast(x);
+}
 
 /// Sum-of-angles threshold that decides whether a projected point lies on
 /// a track face (a full turn less a safety margin).
-const on_face_angle: f32 = 0.91552734375 * math.pi * 2.0;
+const on_face_angle: f64 = 0.91552734375 * math.pi64 * 2.0;
 
 pub const Flags = packed struct(u32) {
     in_tow: bool = false,
@@ -82,7 +88,8 @@ pub const Context = struct {
     track: *const Track,
     input: *const input.State,
     rng: *Rng,
-    dt: f32,
+    /// Step length in seconds. f64 like the reference's `system_tick()`.
+    tick: f64,
     start_line_pos: u16,
     /// Exponent applied to analog steering; 1 for digital input.
     analog_response: f32 = 1.0,
@@ -161,7 +168,7 @@ pub const Ship = struct {
             .velocity = Vec3.zero,
             .acceleration = Vec3.zero,
             .thrust = Vec3.zero,
-            .angle = Vec3.init(0, -std.math.atan2(direction.x, direction.z), 0),
+            .angle = Vec3.init(0, f(-std.math.atan2(@as(f64, direction.x), @as(f64, direction.z))), 0),
             .angular_velocity = Vec3.zero,
             .angular_acceleration = Vec3.zero,
             .temp_target = Vec3.zero,
@@ -238,7 +245,7 @@ pub const Ship = struct {
         self.flags.left_side = direction.dot(to_face_vector) > 0;
         // (Pickup collection happens here in the original.)
 
-        self.last_impact_time += ctx.dt;
+        self.last_impact_time = f(self.last_impact_time + ctx.tick);
 
         switch (self.mode) {
             .intro => self.updateIntro(ctx),
@@ -255,7 +262,7 @@ pub const Ship = struct {
 
     fn updateLap(self: *Ship, ctx: Context) void {
         const track = ctx.track;
-        self.lap_time += ctx.dt;
+        self.lap_time = f(self.lap_time + ctx.tick);
         const start: i32 = ctx.start_line_pos;
 
         if (self.prev_section_num == start + 1 and self.section_num <= start) {
@@ -286,14 +293,14 @@ pub const Ship = struct {
     /// holding full thrust and rewards a narrow band just below it.
     fn updateIntro(self: *Ship, ctx: Context) void {
         if (self.update_timer >= update_time_initial) self.temp_target = self.position;
-        self.update_timer -= ctx.dt;
-        self.position.y = self.temp_target.y + @sin(self.update_timer * 80.0 * 30.0 * math.pi * 2.0 / 4096.0) * 32;
+        self.update_timer = f(self.update_timer - ctx.tick);
+        self.position.y = self.temp_target.y + @sin(f(@as(f64, self.update_timer) * 80.0 * 30.0 * math.pi64 * 2.0 / 4096.0)) * 32;
 
-        const thrust_input = ctx.input.state(.thrust);
+        const thrust_input: f64 = ctx.input.state(.thrust);
         if (thrust_input != 0) {
-            self.thrust_mag += thrust_input * thrust_rate * ctx.dt;
+            self.thrust_mag = f(self.thrust_mag + thrust_input * thrust_rate * ctx.tick);
         } else {
-            self.thrust_mag -= thrust_rate * ctx.dt;
+            self.thrust_mag = f(self.thrust_mag - thrust_rate * ctx.tick);
         }
         self.thrust_mag = std.math.clamp(self.thrust_mag, 0, self.thrust_max);
         self.toggleView(ctx);
@@ -315,7 +322,8 @@ pub const Ship = struct {
     fn updateRace(self: *Ship, ctx: Context) void {
         const track = ctx.track;
         const in = ctx.input;
-        const dt = ctx.dt;
+        const tick = ctx.tick;
+        const dt32: f32 = f(tick);
         const section = &track.sections[self.section];
 
         // Steering. Reversing direction gets double acceleration; otherwise
@@ -339,36 +347,38 @@ pub const Ship = struct {
             }
         }
 
-        self.angular_acceleration.x += in.state(.down) * pitch_accel;
-        self.angular_acceleration.x -= in.state(.up) * pitch_accel;
+        self.angular_acceleration.x = f(self.angular_acceleration.x + @as(f64, in.state(.down)) * pitch_accel);
+        self.angular_acceleration.x = f(self.angular_acceleration.x - @as(f64, in.state(.up)) * pitch_accel);
 
         // Stall or boost after the start, then normal thrust ceiling.
         if (self.update_timer > 0) {
-            if (self.current_thrust_max < 500) self.current_thrust_max += ctx.rng.float(0, 165) * dt;
-            self.update_timer -= dt;
+            if (self.current_thrust_max < 500) {
+                self.current_thrust_max = f(self.current_thrust_max + @as(f64, ctx.rng.float(0, 165)) * tick);
+            }
+            self.update_timer = f(self.update_timer - tick);
         } else {
             self.current_thrust_max = self.thrust_max;
         }
 
-        const thrust_input = in.state(.thrust);
+        const thrust_input: f64 = in.state(.thrust);
         if (thrust_input != 0) {
-            self.thrust_mag += thrust_input * thrust_rate * dt;
+            self.thrust_mag = f(self.thrust_mag + thrust_input * thrust_rate * tick);
         } else {
-            self.thrust_mag -= thrust_falloff * dt;
+            self.thrust_mag = f(self.thrust_mag - thrust_falloff * tick);
         }
         self.thrust_mag = std.math.clamp(self.thrust_mag, 0, self.current_thrust_max);
 
         if (in.state(.brake_right) != 0) {
-            self.brake_right += brake_rate * dt;
+            self.brake_right = f(self.brake_right + brake_rate * tick);
         } else if (self.brake_right > 0) {
-            self.brake_right -= brake_rate * dt;
+            self.brake_right = f(self.brake_right - brake_rate * tick);
         }
         self.brake_right = std.math.clamp(self.brake_right, 0, 256);
 
         if (in.state(.brake_left) != 0) {
-            self.brake_left += brake_rate * dt;
+            self.brake_left = f(self.brake_left + brake_rate * tick);
         } else if (self.brake_left > 0) {
-            self.brake_left -= brake_rate * dt;
+            self.brake_left = f(self.brake_left - brake_rate * tick);
         }
         self.brake_left = std.math.clamp(self.brake_left, 0, 256);
 
@@ -395,7 +405,7 @@ pub const Ship = struct {
             const v2 = plane_point.sub(f1.tris[0].vertices[0].pos);
             const v3 = plane_point.sub(f1.tris[1].vertices[0].pos);
             const angle = v0.angleBetween(v2) + v2.angleBetween(v3) + v3.angleBetween(v1) + v1.angleBetween(v0);
-            if (angle < on_face_angle) self.flags.flying = true;
+            if (@as(f64, angle) < on_face_angle) self.flags.flying = true;
         }
 
         if (!self.flags.flying) {
@@ -408,7 +418,7 @@ pub const Ship = struct {
 
             if (!self.flags.specialed and (face.flags & FaceFlags.boost) != 0) {
                 const track_direction = track.sections[section.next].center.sub(section.center);
-                self.velocity = self.velocity.add(track_direction.scale(30 * dt));
+                self.velocity = self.velocity.add(track_direction.scale(f(30.0 * tick)));
             }
 
             const face_point = face.tris[0].vertices[0].pos;
@@ -417,21 +427,21 @@ pub const Ship = struct {
             if (height <= 0) {
                 if (self.last_impact_time > 0.2) self.last_impact_time = 0;
                 self.velocity = self.velocity.reflect(face.normal, 2).scale(0.875);
-                self.velocity = self.velocity.sub(face.normal.scale(64.0 * 30 * dt));
+                self.velocity = self.velocity.sub(face.normal.scale(f(64.0 * 30.0 * tick)));
             } else if (height < 30) {
-                self.velocity = self.velocity.add(face.normal.scale(64.0 * 30 * dt));
+                self.velocity = self.velocity.add(face.normal.scale(f(64.0 * 30.0 * tick)));
             }
             height = @max(height, 50);
 
             const brake = self.brake_left + self.brake_right;
-            const resistance = (self.resistance * (max_resistance - (brake * 0.125))) * 0.0078125;
-            const track_repulsion = 4096 * (track_magnet * track_float / height - track_magnet);
+            const resistance: f32 = f((@as(f64, self.resistance) * (max_resistance - (@as(f64, brake) * 0.125))) * 0.0078125);
+            const track_repulsion: f32 = 4096 * ((track_magnet * track_float) / height - track_magnet);
 
             var force = on_track_gravity;
             force = force.add(face.normal.scale(track_repulsion));
             force = force.add(self.thrust);
 
-            self.acceleration = forward_velocity.sub(self.velocity).div(self.skid + brake * 0.25);
+            self.acceleration = forward_velocity.sub(self.velocity).div(f(@as(f64, self.skid) + @as(f64, brake) * 0.25));
             self.acceleration = self.acceleration.add(force.div(self.mass));
             self.acceleration = self.acceleration.sub(self.velocity.div(resistance));
 
@@ -439,9 +449,10 @@ pub const Ship = struct {
             const nose_pos = Vec3.init(0, 0, 128).transform(&self.mat);
             const nose_height = nose_pos.distanceToPlane(face_point, face.normal);
             if (nose_height < 600) {
-                self.angular_acceleration.x += defs.ntscAcceleration(defs.angleNormToRadian(defs.fixedToFloat((height - nose_height + 5) * (1.0 / 16.0))));
+                const dip: f32 = height - nose_height + 5;
+                self.angular_acceleration.x = f(self.angular_acceleration.x + defs.ntscAcceleration(defs.angleNormToRadian(defs.fixedToFloat(@as(f64, dip) * (1.0 / 16.0)))));
             } else {
-                self.angular_acceleration.x += nose_up_accel;
+                self.angular_acceleration.x = f(self.angular_acceleration.x + nose_up_accel);
             }
         } else {
             const distance = self.distanceFromTrack(track);
@@ -458,40 +469,40 @@ pub const Ship = struct {
                 self.beginRescue(track, section.prev);
             } else {
                 const brake = self.brake_left + self.brake_right;
-                const resistance = (self.resistance * (max_resistance - (brake * 0.125))) * 0.0078125;
+                const resistance: f32 = f((@as(f64, self.resistance) * (max_resistance - (@as(f64, brake) * 0.125))) * 0.0078125);
                 const force = flying_gravity.add(self.thrust);
                 self.acceleration = forward_velocity.sub(self.velocity).div(min_resistance + brake * 4);
                 self.acceleration = self.acceleration.add(force.div(self.mass));
                 self.acceleration = self.acceleration.sub(self.velocity.div(resistance));
-                self.angular_acceleration.x += nose_up_accel;
+                self.angular_acceleration.x = f(self.angular_acceleration.x + nose_up_accel);
             }
         }
 
         // Integrate. Velocity is in units per PSX frame scaled by 64, which
         // is where the 0.015625 (1/64) and 30 factors come from.
-        self.velocity = self.velocity.add(self.acceleration.scale(30 * dt));
-        self.position = self.position.add(self.velocity.scale(0.015625 * 30 * dt));
+        self.velocity = self.velocity.add(self.acceleration.scale(f(30.0 * tick)));
+        self.position = self.position.add(self.velocity.scale(f(0.015625 * 30.0 * tick)));
 
-        self.angular_acceleration.x -= self.angular_velocity.x * 0.25 * 30;
-        self.angular_acceleration.z += (self.angular_velocity.y - (0.5 * self.angular_velocity.z)) * 30;
+        self.angular_acceleration.x = f(self.angular_acceleration.x - @as(f64, self.angular_velocity.x) * 0.25 * 30.0);
+        self.angular_acceleration.z = f(self.angular_acceleration.z + (@as(f64, self.angular_velocity.y) - (0.5 * @as(f64, self.angular_velocity.z))) * 30.0);
 
         // Without steering input, bleed yaw rate off at the turn rate.
         if (self.angular_acceleration.y == 0) {
             if (self.angular_velocity.y > 0) {
-                self.angular_acceleration.y -= @min(self.turn_rate, self.angular_velocity.y / dt);
+                self.angular_acceleration.y = f(self.angular_acceleration.y - @min(@as(f64, self.turn_rate), @as(f64, self.angular_velocity.y) / tick));
             } else if (self.angular_velocity.y < 0) {
-                self.angular_acceleration.y += @min(self.turn_rate, -self.angular_velocity.y / dt);
+                self.angular_acceleration.y = f(self.angular_acceleration.y + @min(@as(f64, self.turn_rate), -@as(f64, self.angular_velocity.y) / tick));
             }
         }
 
-        self.angular_velocity = self.angular_velocity.add(self.angular_acceleration.scale(dt));
+        self.angular_velocity = self.angular_velocity.add(self.angular_acceleration.scale(dt32));
         self.angular_velocity.y = std.math.clamp(self.angular_velocity.y, -self.turn_rate_max, self.turn_rate_max);
 
-        const brake_dir = (self.brake_left - self.brake_right) * (0.125 / 4096.0);
-        self.angle.y += brake_dir * self.speed * 0.000030517578125 * math.pi * 2 * 30 * dt;
+        const brake_dir: f32 = f(@as(f64, self.brake_left - self.brake_right) * (0.125 / 4096.0));
+        self.angle.y = f(self.angle.y + @as(f64, brake_dir) * @as(f64, self.speed) * 0.000030517578125 * math.pi64 * 2.0 * 30.0 * tick);
 
-        self.angle = self.angle.add(self.angular_velocity.scale(dt));
-        self.angle.z -= self.angle.z * 0.125 * 30 * dt;
+        self.angle = self.angle.add(self.angular_velocity.scale(dt32));
+        self.angle.z = f(self.angle.z - @as(f64, self.angle.z) * 0.125 * 30.0 * tick);
         self.angle = self.angle.wrapAngles();
 
         // Going backwards onto a jump landing pushes the ship forward again.
@@ -506,7 +517,7 @@ pub const Ship = struct {
     /// tow starts immediately.
     fn updateRescue(self: *Ship, ctx: Context) void {
         const track = ctx.track;
-        const dt = ctx.dt;
+        const tick = ctx.tick;
         const section = &track.sections[self.section];
         const next = &track.sections[section.next];
 
@@ -514,15 +525,16 @@ pub const Ship = struct {
             self.temp_target = self.temp_target.add(next.center.sub(self.temp_target).scale(0.0078125));
             self.velocity = self.temp_target.sub(self.position);
             const target_dir = next.center.sub(section.center);
-            self.angular_velocity.y = math.wrapAngle(-std.math.atan2(target_dir.x, target_dir.z) - self.angle.y) * 0.015625 * 30;
-            self.angle.y = math.wrapAngle(self.angle.y + self.angular_velocity.y * dt);
+            const heading = -std.math.atan2(@as(f64, target_dir.x), @as(f64, target_dir.z));
+            self.angular_velocity.y = f(@as(f64, math.wrapAngle(f(heading - @as(f64, self.angle.y)))) * 0.015625 * 30.0);
+            self.angle.y = math.wrapAngle(f(@as(f64, self.angle.y) + @as(f64, self.angular_velocity.y) * tick));
         }
 
-        self.angle.x -= self.angle.x * 0.125 * 30 * dt;
-        self.angle.z -= self.angle.z * 0.03125 * 30 * dt;
+        self.angle.x = f(self.angle.x - @as(f64, self.angle.x) * 0.125 * 30.0 * tick);
+        self.angle.z = f(self.angle.z - @as(f64, self.angle.z) * 0.03125 * 30.0 * tick);
 
-        self.velocity = self.velocity.sub(self.velocity.scale(0.0625 * 30 * dt));
-        self.position = self.position.add(self.velocity.scale(0.03125 * 30 * dt));
+        self.velocity = self.velocity.sub(self.velocity.scale(f(0.0625 * 30.0 * tick)));
+        self.position = self.position.add(self.velocity.scale(f(0.03125 * 30.0 * tick)));
 
         if (self.flags.in_tow and self.distanceFromTrack(track) < 300) {
             self.mode = .race;
@@ -554,7 +566,7 @@ pub const Ship = struct {
         const best_path = self.position.projectToRay(next.center, section.center);
         var distance = best_path.sub(self.position);
         if (distance.y > -512) {
-            distance.y = distance.y * 0.0001;
+            distance.y = f(@as(f64, distance.y) * 0.0001);
         } else {
             distance = distance.scale(8);
         }
@@ -570,7 +582,7 @@ pub const Ship = struct {
         const v2 = plane_point.sub(face.tris[0].vertices[0].pos);
         const v3 = plane_point.sub(face.tris[1].vertices[0].pos);
         const angle = v0.angleBetween(v2) + v2.angleBetween(v3) + v3.angleBetween(v1) + v1.angleBetween(v0);
-        return angle > on_face_angle;
+        return @as(f64, angle) > on_face_angle;
     }
 
     fn resolveWingCollision(self: *Ship, track: *const Track, face: *const Face, direction: f32) void {
@@ -582,7 +594,7 @@ pub const Ship = struct {
         self.velocity = self.velocity.sub(self.velocity.scale(0.5));
         self.velocity = self.velocity.add(face.normal.scale(4096.0));
 
-        const magnitude = (@abs(angle) * self.speed) * 2 * math.pi / 4096.0;
+        const magnitude: f32 = f(@as(f64, (@abs(angle) * self.speed) * 2) * math.pi64 / 4096.0);
         if (direction > 0) {
             self.angular_velocity.z += magnitude;
         } else {
@@ -597,7 +609,7 @@ pub const Ship = struct {
         self.velocity = self.velocity.sub(self.velocity.scale(0.5));
         self.velocity = self.velocity.add(face.normal.scale(4096));
 
-        const magnitude = ((self.speed * 0.0625) + 400) * 2 * math.pi / 4096.0;
+        const magnitude: f32 = f(((@as(f64, self.speed) * 0.0625) + 400.0) * 2.0 * math.pi64 / 4096.0);
         if (direction > 0) {
             self.angular_velocity.y += magnitude;
         } else {

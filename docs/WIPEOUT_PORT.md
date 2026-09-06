@@ -5,8 +5,9 @@ and sky load from the original PSX data and render through a pure-Zig
 software rasterizer at 320x240, shipped over the Kitty graphics protocol by a
 standalone probe. A single player ship flies with the original's physics,
 track collision, jump handling and rescue, under keyboard control or a
-simple autopilot. No opponents, weapons, HUD, audio, or snapshots yet, and
-the parity harness against the reference build is still to be written.
+simple autopilot, and a replay harness shows the trajectory matches the
+reference build to within 0.01 units over a full lap. No opponents,
+weapons, HUD, audio, or snapshots yet.
 
 ## Goals
 
@@ -194,6 +195,59 @@ original AI.
 Ship state references the track by section and face index and holds no
 pointers, so it is snapshot-ready by construction.
 
+Track directories map to circuits as in the original definition table:
+track01 and 06 are Terramax, 02 and 03 Altima VII, 04 and 05 Karbonis V,
+12 and 07 Korodera, 08 and 11 Arridos IV, 09 and 13 Silverstream, 10 and 14
+Firestar (Venom layout first, Rapier second).
+
+## Parity harness
+
+The reference is built headless from its own sources with a small driver
+that replaces the platform layer: a controllable clock stepping 1/60 s, the
+null renderer, and a recorded per-frame action bitmask fed through the
+input bindings. It lives outside this repository, next to the reference
+sources, because it is C:
+
+```
+~/Work/wipeout-rewrite/harness/parity_main.c   driver
+~/Work/wipeout-rewrite/harness/build.sh        clang -O2 -ffp-contract=off
+```
+
+A run records the autopilot's decisions from the Zig side and replays them
+into both implementations, then diffs the ship per frame:
+
+```
+./zig-out/bin/wipeout-probe --autopilot --intro --dry-run --fps 60 --seconds 60 \
+    --record-input /tmp/input.txt --ship-log /tmp/zig.csv
+~/Work/wipeout-rewrite/harness/parity ~/Work/wipeout-rewrite/ /tmp/input.txt /tmp/ref.csv 3600 0 0 2
+scripts/wipeout_parity.py /tmp/zig.csv /tmp/ref.csv
+```
+
+The last three harness arguments are pilot, race class and circuit index
+(2 is Terramax, whose Venom layout is track01). The countdown is kept on
+both sides and the autopilot holds thrust off until "go", which keeps the
+reference's start-stall code off its random path.
+
+Result on track01, 3600 frames (one lap and a third of the next):
+
+| Window | Position error max | Angle error max |
+|---|---|---|
+| Countdown (390 frames) | 0 (bit-identical) | 0 |
+| 0–10 s racing | 0.0020 units | 1e-6 rad |
+| 10–30 s | 0.0020 | 1e-6 |
+| 30–60 s | 0.0073 | 1e-6 |
+
+Section, mode and flying flags never disagree. Getting here required
+mirroring the reference's evaluation types: it computes scalar factors
+such as `0.015625 * 30 * system_tick()` in double and narrows to float on
+assignment, and the port's constants and per-step scalars now follow the
+same order and widths (see `f()` in `ship.zig` and the f64 conversion
+chains in `defs.zig`). Before that the two diverged chaotically after 20 s
+when a last-bit difference flipped which side of the centre line the ship
+was on. The residual is the difference between Apple's libm and Zig's
+sine, cosine and arc-cosine, one ulp per call, and it does not compound
+into different decisions over the run.
+
 ## Snapshots
 
 ```
@@ -205,11 +259,8 @@ renderer was verified without a live session.
 
 ## Next slices
 
-1. Parity harness: build the reference with its null platform and renderer,
-   replay a recorded input sequence at a fixed step through both, and diff
-   ship position and orientation per frame.
-2. Modal game input in the client (Kitty key press/release), and the game
+1. Modal game input in the client (Kitty key press/release), and the game
    as a pixel effect engine so pausing keeps state alive.
-3. Snapshot/restore with a version tag and asset hash.
-4. HUD, menus, AI opponents, weapons, particles.
-5. CRT post pass and first-run asset download.
+2. Snapshot/restore with a version tag and asset hash.
+3. HUD, menus, AI opponents, weapons, particles.
+4. CRT post pass and first-run asset download.
