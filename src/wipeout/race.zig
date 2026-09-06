@@ -46,6 +46,9 @@ pub const Options = struct {
     race_type: Type,
     difficulty: Difficulty,
     intro: bool,
+    /// Grid order (front to back) instead of the shuffled default; the
+    /// championship uses the previous race's finishing order.
+    grid: ?[defs.num_pilots]u8 = null,
 };
 
 /// Pickup pad state; the face colours are derived from it every step.
@@ -147,7 +150,9 @@ pub const Race = extern struct {
         // Grid order: shuffled for a single race, player always at the back.
         var order: [defs.num_pilots]u8 = undefined;
         for (&order, 0..) |*o, i| o.* = @intCast(i);
-        if (options.race_type == .single) {
+        if (options.grid) |grid| {
+            order = grid;
+        } else if (options.race_type == .single) {
             var i: usize = order.len - 1;
             while (i > 0) : (i -= 1) {
                 const j: usize = @intCast(rng.int(0, @intCast(i + 1)));

@@ -96,6 +96,31 @@ pub fn shipAttributes(team: Team, class: RaceClass) ShipAttributes {
     };
 }
 
+pub const num_circuits = 7;
+pub const num_non_bonus_circuits = 6;
+pub const qualifying_rank = 3;
+pub const num_lives = 3;
+pub const race_points_for_rank = [num_pilots]i32{ 9, 7, 5, 3, 2, 1, 0, 0 };
+
+pub const circuit_names = [num_circuits][]const u8{ "ALTIMA VII", "KARBONIS V", "TERRAMAX", "KORODERA", "ARRIDOS IV", "SILVERSTREAM", "FIRESTAR" };
+pub const circuit_is_bonus = [num_circuits]bool{ false, false, false, false, false, false, true };
+/// PSX track directory per circuit, Venom then Rapier layout.
+pub const circuit_tracks = [num_circuits][2]u8{ .{ 2, 3 }, .{ 4, 5 }, .{ 1, 6 }, .{ 12, 7 }, .{ 8, 11 }, .{ 9, 13 }, .{ 10, 14 } };
+pub const race_class_names = [2][]const u8{ "VENOM CLASS", "RAPIER CLASS" };
+pub const race_type_names = [3][]const u8{ "CHAMPIONSHIP RACE", "SINGLE RACE", "TIME TRIAL" };
+pub const team_names = [4][]const u8{ "AG SYSTEMS", "AURICOM", "QIREX", "FEISAR" };
+pub const team_pilots = [4][2]u8{ .{ 0, 1 }, .{ 2, 3 }, .{ 4, 5 }, .{ 6, 7 } };
+/// Pilot logo model index in `pilot.prm`.
+pub const pilot_logo_model = [num_pilots]u8{ 0, 4, 6, 7, 2, 5, 1, 3 };
+pub const pilot_portraits = [num_pilots][]const u8{
+    "wipeout/textures/dekka.cmp", "wipeout/textures/chang.cmp", "wipeout/textures/arial.cmp", "wipeout/textures/anast.cmp",
+    "wipeout/textures/solar.cmp", "wipeout/textures/arian.cmp", "wipeout/textures/sophi.cmp", "wipeout/textures/paul.cmp",
+};
+
+pub fn trackNumber(circuit: u8, class: RaceClass) u8 {
+    return circuit_tracks[circuit][@intFromEnum(class)];
+}
+
 pub const CircuitSettings = struct {
     start_line_pos: u16,
     sky_y_offset: f32,

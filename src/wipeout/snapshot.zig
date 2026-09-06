@@ -1,28 +1,25 @@
-//! Bytewise race snapshots. Everything the simulation needs to continue is
-//! plain data referencing assets by index, so a snapshot is the state
-//! structs themselves behind a small header. A mismatch in magic, version
+//! Bytewise game snapshots. Everything the game needs to continue, menus
+//! and race alike, is plain data referencing assets by index, so a
+//! snapshot is the state structs themselves behind a small header. A mismatch in magic, version
 //! or size is treated as "no snapshot" rather than an error.
 
 const std = @import("std");
-const ship_mod = @import("ship.zig");
-const race_mod = @import("race.zig");
-const input_mod = @import("input.zig");
+const game = @import("game.zig");
+const save_mod = @import("save.zig");
 const rng_mod = @import("rng.zig");
 const Io = std.Io;
 
 pub const magic: u32 = 0x5750_4f53; // "WPOS"
-pub const version: u32 = 3;
+pub const version: u32 = 4;
 
 pub const Snapshot = extern struct {
     magic: u32 = magic,
     version: u32 = version,
     size: u32 = @sizeOf(Snapshot),
-    track: u8,
-    pilot: u8,
-    rapier: u8,
-    crt: u8,
+    autopilot: u8,
+    _pad: [3]u8 = .{ 0, 0, 0 },
     steps: u64,
-    race: race_mod.Race,
+    state: game.State,
     rng: rng_mod.Rng,
     _reserved: [4]u32 = .{ 0, 0, 0, 0 },
 
@@ -63,20 +60,17 @@ pub fn remove(io: Io, path: []const u8) void {
 
 test "snapshot round-trips through bytes and rejects other layouts" {
     var snap = Snapshot{
-        .track = 3,
-        .pilot = 6,
-        .rapier = 1,
-        .crt = 1,
+        .autopilot = 1,
         .steps = 1234,
-        .race = std.mem.zeroes(race_mod.Race),
+        .state = game.State.init(save_mod.defaults),
         .rng = rng_mod.Rng.seed(7),
     };
-    snap.race.ships[0].position.x = 42.5;
+    snap.state.race.ships[0].position.x = 42.5;
     const bytes = std.mem.asBytes(&snap);
     var back: Snapshot = undefined;
     @memcpy(std.mem.asBytes(&back), bytes);
     try std.testing.expect(back.valid());
-    try std.testing.expectEqual(@as(f32, 42.5), back.race.ships[0].position.x);
+    try std.testing.expectEqual(@as(f32, 42.5), back.state.race.ships[0].position.x);
     try std.testing.expectEqual(@as(u64, 1234), back.steps);
     back.version += 1;
     try std.testing.expect(!back.valid());

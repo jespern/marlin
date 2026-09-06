@@ -13,6 +13,13 @@ pub const Action = enum(u8) {
     thrust,
     fire,
     change_view,
+    menu_up,
+    menu_down,
+    menu_left,
+    menu_right,
+    menu_back,
+    menu_select,
+    menu_start,
 };
 
 pub const count = @typeInfo(Action).@"enum".fields.len;

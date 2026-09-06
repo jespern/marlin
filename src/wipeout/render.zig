@@ -172,6 +172,14 @@ pub const Renderer = struct {
         return self.textures_len;
     }
 
+    /// Free every texture created after the first `len`; used when a
+    /// circuit's track and scenery are replaced by another's.
+    pub fn resetTextures(self: *Renderer, len: u16) void {
+        var i: usize = len;
+        while (i < self.textures_len) : (i += 1) self.gpa.free(self.textures[i].pixels);
+        self.textures_len = @min(len, self.textures_len);
+    }
+
     // -- frame state ---------------------------------------------------------
 
     pub fn framePrepare(self: *Renderer) void {

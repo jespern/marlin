@@ -61,7 +61,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
     .{ .name = "!rbc", .description = "rebuild only the local client (alias for !rb client)" },
-    .{ .name = "!wipeout", .usage = " [track] [pilot] [rapier] [easy|hard] [trial] [new]", .description = "play wipEout (Esc pauses; bare !wipeout resumes, also after a restart)", .accepts_args = true },
+    .{ .name = "!wipeout", .usage = " [track] [pilot] [rapier] [easy|hard] [trial] [new]", .description = "play wipEout (menus, championship, best times; Esc leaves, bare !wipeout resumes)", .accepts_args = true },
 };
 
 pub const CommandSuggestion = struct {

@@ -52,12 +52,16 @@ pickups, all six weapons, particles and the rescue droid are in. No audio.
 | `src/wipeout/ui.zig` | Bitmap text from the three font textures, screen anchors |
 | `src/wipeout/hud.zig` | Lap counter and times, wrong-way warning, speedo |
 | `src/wipeout/post.zig` | CRT post pass (the original's fragment shader on the CPU) and nearest upscale |
-| `src/wipeout/snapshot.zig` | Bytewise race snapshot with header, default path, read/write |
+| `src/wipeout/save.zig` | Options and best-times tables (the original's factory defaults), save file |
+| `src/wipeout/menu.zig` | Page stack with buttons and toggles, vertical/horizontal/fixed layouts, cursor blink |
+| `src/wipeout/game.zig` | The state machine: title, main menu and race setup, pause, results, points, hall of fame, championship |
+| `src/wipeout/session.zig` | A running game: assets loaded once, circuit loaded on demand, fixed-step clock, save file, RGB output |
+| `src/wipeout/snapshot.zig` | Bytewise game snapshot with header, default path, read/write |
 | `src/wipeout/autopilot.zig` | Heading controller for hands-off laps and replays |
 | `src/wipeout/parzlib.zig` | Banded multi-threaded zlib encoder producing one valid stream |
 | `src/wipeout/root.zig` | Module root, camera angle helpers |
-| `src/client/wipeout_effect.zig` | The game inside marlin: owns the race, steps on wall time, renders for the pixel effect, maps keys |
-| `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots |
+| `src/client/wipeout_effect.zig` | The game inside marlin: a session plus the terminal key mapping |
+| `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots, scripted whole-game runs |
 
 Build steps: `zig build wipeout-test` (unit tests) and `zig build`, which
 installs `zig-out/bin/wipeout-probe`.
@@ -390,18 +394,55 @@ is bandwidth: about 24 MB/s deflated (32 MB/s as base64) through the PTY,
 against roughly 2 MB/s for plain 240p. It is off by default; `p` toggles it
 in game and `!wipeout crt` starts with it on.
 
+## Menus and game flow
+
+`game.State` is the original's `main_menu.c`, `ingame_menus.c` and the
+flow parts of `game.c`/`race.c` as one plain-data state machine over a
+`menu.Menu` page stack. A bare `!wipeout` opens the title screen; Enter
+leads to the main menu (START GAME / OPTIONS / QUIT) with the rotating
+menu models from `msdos.prm`, `leeg.prm`, `teams.prm`, `pilot.prm`,
+`alopt.prm` and `pad1.prm`, then racing class, race type (championship,
+single race, time trial), team, pilot and circuit, with the circuit
+thumbnail from `track.cmp`. Options cover internal view roll, screen
+shake, the CRT pass and opponent strength; best times shows the five
+entries and lap record per class and circuit.
+
+In a race Enter pauses (CONTINUE / RESTART / QUIT, with confirmations).
+Finishing shows race statistics with the pilot portrait, then for a
+championship the race points and the championship table, then the hall
+of fame when the time beats one of the five entries. Points per finishing
+rank are 9/7/5/3/2/1/0/0; finishing outside the top three fails to
+qualify and costs a life (three per championship, then GAME OVER). The
+next championship race starts from the previous finishing order with the
+player at the back, as the original. Winning the last circuit unlocks the
+Rapier class or the bonus circuit and shows the congratulations scroller.
+
+`!wipeout <track> [pilot] [rapier] [trial] ...` still skips the menus and
+starts that race directly.
+
+The probe drives all of this headless:
+
+```
+./zig-out/bin/wipeout-probe --game "10:menu_start,50:menu_select,90:shot" --shots /tmp/wg
+```
+
+where entries are `frame:action` (any `input.Action` name), `+name` and
+`-name` to hold and release, `shot` to write a PPM, and `hall` to open
+the hall of fame entry as a test hook.
+
 ## Save and resume
 
-Escape (and marlin exit) writes the race to
-`$XDG_STATE_HOME/marlin/wipeout-race.bin`, else under
-`~/.local/state/marlin/`. A bare `!wipeout` with no game in memory
-restores it: assets reload, and ship, camera, RNG and step count are
-copied in. Naming a track, pilot or class, or passing `new`, starts fresh
-instead. The snapshot is the state structs behind a header with magic,
-version and size; any mismatch is treated as no snapshot, so a build that
-changes a struct simply starts a new race. Everything in it references
-the track by index, which is why the design insisted on that from the
-first commit.
+Options and best times live in `$XDG_STATE_HOME/marlin/wipeout-save.bin`
+(else under `~/.local/state/marlin/`), written whenever they change.
+Escape (and marlin exit) writes the whole game state, menus and race
+alike, to `wipeout-race.bin` next to it. A bare `!wipeout` with no game
+in memory restores it: assets reload, the circuit the state wants loads,
+and the state, RNG and step count are copied in. Naming a track, pilot or
+class, or passing `new`, starts fresh instead. The snapshot is the state
+structs behind a header with magic, version and size; any mismatch is
+treated as no snapshot, so a build that changes a struct simply starts
+at the title. Everything in it references the track by index, which is
+why the design insisted on that from the first commit.
 
 ## Snapshots
 
@@ -414,7 +455,5 @@ renderer was verified without a live session.
 
 ## Next slices
 
-1. Menus, championship and highscores.
-2. Polish: cockpit roll option, attract cameras after the race, pause on
-   focus loss.
-3. First-run asset download.
+1. Polish: attract cameras after the race, pause on focus loss.
+2. First-run asset download.

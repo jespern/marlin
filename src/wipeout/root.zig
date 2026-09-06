@@ -27,6 +27,10 @@ pub const race = @import("race.zig");
 pub const weapon = @import("weapon.zig");
 pub const particle = @import("particle.zig");
 pub const droid = @import("droid.zig");
+pub const save = @import("save.zig");
+pub const menu = @import("menu.zig");
+pub const game = @import("game.zig");
+pub const session = @import("session.zig");
 
 /// Per-circuit sky placement from the original game definition, indexed
 /// by PSX track directory number (1-14).

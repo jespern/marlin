@@ -2229,7 +2229,7 @@ pub const App = struct {
         self.game_active.store(true, .release);
         self.wipeout_game.?.resume_();
         self.syncAnimationTicker();
-        self.setNotice("wipEout — arrows steer/pitch, x thrust, z/c airbrakes, v view, Esc pauses", .{});
+        self.setNotice("wipEout — arrows steer/pitch, x thrust, z/c airbrakes, f fire, v view, Enter pauses, Esc leaves", .{});
     }
 
     /// Leave the game: hide the effect and stop the fast ticker. The race

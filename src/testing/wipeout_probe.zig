@@ -79,6 +79,11 @@ pub const Options = struct {
     /// Write ship state per frame as CSV for parity comparison.
     ship_log: ?[]const u8 = null,
     assets: ?[]const u8 = null,
+    /// Headless: drive the whole game (title, menus, races) from a script
+    /// of "frame:action" entries; see `runGame`.
+    game_script: ?[]const u8 = null,
+    /// Path prefix for the frames a game script asks for.
+    shots: []const u8 = "/tmp/wipeout-game",
     /// Camera speed along the centre line, in world units per second.
     speed: f32 = 6000,
     /// Camera height above the track centre line, in world units (+y is down).
@@ -202,7 +207,7 @@ pub fn main(init: std.process.Init) !u8 {
         return if (err == error.HelpRequested) 0 else 2;
     };
 
-    const live = !options.dry_run and options.snapshot == null and options.scan_cracks == null;
+    const live = !options.dry_run and options.snapshot == null and options.scan_cracks == null and options.game_script == null;
     if (live and !(Io.File.stdout().isTty(init.io) catch false)) {
         stderrPrint(init.io, "wipeout-probe: stdout is not a terminal; use --dry-run or --snapshot\n", .{});
         return 2;
@@ -222,6 +227,14 @@ pub fn main(init: std.process.Init) !u8 {
         fitDisplay(80, 24, 640, 384)
     else
         terminalDisplay(init.io) catch fitDisplay(80, 24, 640, 384);
+
+    if (options.game_script) |script| {
+        runGame(init.gpa, init.io, options, root, script) catch |err| {
+            stderrPrint(init.io, "wipeout-probe: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        return 0;
+    }
 
     run(init.gpa, init.io, options, root, display) catch |err| {
         stderrPrint(init.io, "wipeout-probe: {s}\n", .{@errorName(err)});
@@ -257,7 +270,7 @@ fn fitDisplay(term_cols: u16, term_rows: u16, pixel_width: u16, pixel_height: u1
 }
 
 fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, display: Display) !void {
-    const live = !options.dry_run and options.snapshot == null and options.scan_cracks == null;
+    const live = !options.dry_run and options.snapshot == null and options.scan_cracks == null and options.game_script == null;
     const assets = wipeout.assets.Assets.init(io, gpa, root);
     var dir_buf: [32]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dir_buf, "wipeout/track{d:0>2}", .{options.track});
@@ -1330,6 +1343,14 @@ fn parseArgs(args: []const []const u8) !Options {
             options.crt = true;
         } else if (std.mem.eql(u8, arg, "--time-trial")) {
             options.time_trial = true;
+        } else if (std.mem.eql(u8, arg, "--game")) {
+            index += 1;
+            if (index >= args.len) return error.MissingValue;
+            options.game_script = args[index];
+        } else if (std.mem.eql(u8, arg, "--shots")) {
+            index += 1;
+            if (index >= args.len) return error.MissingValue;
+            options.shots = args[index];
         } else if (std.mem.eql(u8, arg, "--fall-at")) {
             options.fall_at = try nextUnsigned(u64, args, &index);
         } else if (std.mem.eql(u8, arg, "--ai")) {
@@ -1425,6 +1446,11 @@ fn usage(io: Io) void {
         \\  --pilot N          pilot 0-7 (default 0, John Dekka / AG Systems)
         \\  --rapier           Rapier class handling instead of Venom
         \\  --intro            start with the countdown hover instead of racing at once
+        \\  --game SCRIPT      headless: run the whole game (title, menus, races) from
+        \\                     "frame:action,..." where action is an input name
+        \\                     (menu_start, menu_down, thrust, ...), +name/-name to hold
+        \\                     and release, or "shot" to write a frame as PPM
+        \\  --shots PREFIX     PPM prefix for --game shots (default /tmp/wipeout-game)
         \\  --crt              apply the CRT post pass (implies --scale 2)
         \\  --time-trial       no opponents (parity replays use this)
         \\  --ai LEVEL         opponent strength: easy, normal, hard
@@ -1447,4 +1473,83 @@ fn stderrPrint(io: Io, comptime fmt: []const u8, args: anytype) void {
     var writer: Io.File.Writer = .init(.stderr(), io, &buffer);
     writer.interface.print(fmt, args) catch return;
     writer.interface.flush() catch {};
+}
+
+/// Scripted end-to-end run of the game through `wipeout.session`.
+fn runGame(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, script: []const u8) !void {
+    const Step = struct { frame: u64, kind: enum { press, hold, release, shot, hall }, action: wipeout.input.Action };
+    var steps: std.ArrayList(Step) = .empty;
+    defer steps.deinit(gpa);
+    var it = std.mem.splitScalar(u8, script, ',');
+    var last_frame: u64 = 0;
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " ");
+        if (trimmed.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.InvalidValue;
+        const frame = try std.fmt.parseUnsigned(u64, trimmed[0..colon], 10);
+        var name = trimmed[colon + 1 ..];
+        var step = Step{ .frame = frame, .kind = .press, .action = .thrust };
+        if (std.mem.eql(u8, name, "shot")) {
+            step.kind = .shot;
+        } else if (std.mem.eql(u8, name, "hall")) {
+            step.kind = .hall;
+        } else {
+            if (name.len > 0 and name[0] == '+') {
+                step.kind = .hold;
+                name = name[1..];
+            } else if (name.len > 0 and name[0] == '-') {
+                step.kind = .release;
+                name = name[1..];
+            }
+            step.action = std.meta.stringToEnum(wipeout.input.Action, name) orelse return error.InvalidValue;
+        }
+        try steps.append(gpa, step);
+        last_frame = @max(last_frame, frame);
+    }
+
+    const session = try wipeout.session.Session.createWithRoot(gpa, io, try gpa.dupe(u8, root), null, wipeout.save.defaults, .{
+        .crt = options.crt,
+        .intro = options.intro,
+    });
+    defer session.destroy();
+    session.autopilot = options.autopilot;
+    const size = session.outputSize();
+    const rgb = try gpa.alloc(u8, @as(usize, size.width) * size.height * 3);
+    defer gpa.free(rgb);
+
+    var release_next: ?wipeout.input.Action = null;
+    var frame: u64 = 0;
+    while (frame <= last_frame) : (frame += 1) {
+        if (release_next) |action| {
+            session.input.set(action, false);
+            release_next = null;
+        }
+        for (steps.items) |step| {
+            if (step.frame != frame) continue;
+            switch (step.kind) {
+                .press => {
+                    session.input.set(step.action, true);
+                    release_next = step.action;
+                },
+                .hold => session.input.set(step.action, true),
+                .release => session.input.set(step.action, false),
+                .hall => session.state.debugHallOfFame(65.0),
+                .shot => {
+                    const shot_size = session.outputSize();
+                    const shot = try gpa.alloc(u8, @as(usize, shot_size.width) * shot_size.height * 3);
+                    defer gpa.free(shot);
+                    session.render(shot, shot_size.width, shot_size.height);
+                    var path_buf: [256]u8 = undefined;
+                    const path = try std.fmt.bufPrint(&path_buf, "{s}_{d}.ppm", .{ options.shots, frame });
+                    try writePpm(io, path, shot_size.width, shot_size.height, shot);
+                    stderrPrint(io, "frame {d}: scene {t} menu depth {d} -> {s}\n", .{ frame, session.state.scene, session.state.menu.depth(), path });
+                },
+            }
+        }
+        session.step();
+    }
+    if (session.load_error) |err| stderrPrint(io, "circuit load failed: {s}\n", .{@errorName(err)});
+    stderrPrint(io, "done: scene {t} race_active {d} circuit {d} class {d} pilot {d} lives {d}\n", .{
+        session.state.scene, session.state.race_active, session.state.circuit, session.state.race_class, session.state.pilot, session.state.lives,
+    });
 }
