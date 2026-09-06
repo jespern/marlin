@@ -41,6 +41,14 @@ installs `zig-out/bin/wipeout-probe`.
 Run the installed binary directly rather than through `zig build
 wipeout-probe`, so the build runner is not competing for the CPU.
 
+Frames alternate between two Kitty image ids: each frame is placed as a
+new image and the previous id is deleted afterwards in the same flush, so
+the terminal never shows a gap. Pacing sleeps to 2 ms before the deadline
+and spins the rest, since sleep wake-up jitter alone can cross a terminal
+refresh boundary. At 60 fps a 240p frame costs about 8 ms of work, so
+`--fps 60` is a valid choice on a 60 Hz terminal and halves the judder that
+a 30 fps stream shows when its cadence drifts against the refresh.
+
 Frame pacing is pipelined: the frame for deadline N is rendered and encoded
 right after frame N-1 is presented, so only the terminal write happens at
 the deadline. Sporadic 40-80 ms scheduling stalls were observed in dry runs
@@ -76,6 +84,11 @@ reproduced per pixel: `texture × vertex colour × 2`, alpha discard, and a
 space. Back faces are culled by default, matching `GL_CULL_FACE`; sky is
 drawn with depth writes off. Textures are sampled nearest with clamp, which
 is exactly what the original does in its 240p and 480p modes.
+
+Coverage uses fixed-point edge functions at 1/16 pixel with the top-left
+fill rule, so an edge shared by two triangles is owned by exactly one of
+them and meshes are watertight: no dotted seams where hill faces meet and
+no double-blended pixels on shared edges of translucent geometry.
 
 Not yet ported: the CRT post effect, 2D HUD text, additive-blend particles
 (the blend mode exists, nothing uses it), and mipmaps (unneeded at 240p).

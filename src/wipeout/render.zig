@@ -319,6 +319,13 @@ pub const Renderer = struct {
 
     // -- rasterizer ----------------------------------------------------------
 
+    /// Sub-pixel precision of the fixed-point edge functions (1/16 pixel).
+    const subpixel_bits = 4;
+    const subpixel: f32 = 1 << subpixel_bits;
+    /// Guard band: screen coordinates beyond this are clamped before the
+    /// fixed-point conversion so products stay far inside i64.
+    const guard_band: f32 = 1 << 20;
+
     fn rasterize(self: *Renderer, a_in: ScreenVert, b_in: ScreenVert, c_in: ScreenVert, texture: *const Texture) void {
         var a = a_in;
         var b = b_in;
@@ -326,47 +333,60 @@ pub const Renderer = struct {
 
         // Signed area in screen space (y down). Clip space was CCW-front in
         // GL's y-up convention, so a front face is clockwise here.
-        var area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        const area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
         if (area == 0) return;
         if (area > 0) {
             if (self.cull_backface) return;
             std.mem.swap(ScreenVert, &a, &b);
-            area = -area;
         }
-        // Barycentric weights are edge / |area|; edges are positive inside
-        // for this (clockwise on screen) orientation.
-        const inv_area = -1.0 / area;
 
-        const fw: f32 = @floatFromInt(self.width);
-        const fh: f32 = @floatFromInt(self.height);
-        const min_x_f = @max(@floor(@min(a.x, @min(b.x, c.x))), 0);
-        const max_x_f = @min(@ceil(@max(a.x, @max(b.x, c.x))), fw - 1);
-        const min_y_f = @max(@floor(@min(a.y, @min(b.y, c.y))), 0);
-        const max_y_f = @min(@ceil(@max(a.y, @max(b.y, c.y))), fh - 1);
-        if (min_x_f > max_x_f or min_y_f > max_y_f) return;
-        const min_x: u32 = @intFromFloat(min_x_f);
-        const max_x: u32 = @intFromFloat(max_x_f);
-        const min_y: u32 = @intFromFloat(min_y_f);
-        const max_y: u32 = @intFromFloat(max_y_f);
+        // Snap vertices to a fixed-point grid so that an edge shared by two
+        // triangles evaluates to exactly complementary values in both, and
+        // apply the top-left fill rule: pixels on a shared edge belong to
+        // exactly one triangle. Together these make meshes watertight.
+        const ax = toFixed(a.x);
+        const ay = toFixed(a.y);
+        const bx = toFixed(b.x);
+        const by = toFixed(b.y);
+        const cx = toFixed(c.x);
+        const cy = toFixed(c.y);
+
+        // Twice the signed area in fixed units; positive for our orientation.
+        const doubled = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if (doubled >= 0) return;
+        const inv_area = -1.0 / @as(f32, @floatFromInt(doubled));
+
+        const fw: i64 = @intCast(self.width);
+        const fh: i64 = @intCast(self.height);
+        const min_x: i64 = @max(@divFloor(@min(ax, @min(bx, cx)), 1 << subpixel_bits), 0);
+        const max_x: i64 = @min(@divFloor(@max(ax, @max(bx, cx)), 1 << subpixel_bits), fw - 1);
+        const min_y: i64 = @max(@divFloor(@min(ay, @min(by, cy)), 1 << subpixel_bits), 0);
+        const max_y: i64 = @min(@divFloor(@max(ay, @max(by, cy)), 1 << subpixel_bits), fh - 1);
+        if (min_x > max_x or min_y > max_y) return;
 
         self.stats.tris += 1;
-        self.stats.visited += (max_x - min_x + 1) * (max_y - min_y + 1);
+        self.stats.visited += @intCast((max_x - min_x + 1) * (max_y - min_y + 1));
 
         // Edge functions: e0 opposite a (edge b->c), e1 opposite b (c->a),
-        // e2 opposite c (a->b). After the swap above the triangle is
-        // oriented so that inside means all three are >= 0.
-        const e0_dx = c.y - b.y;
-        const e0_dy = -(c.x - b.x);
-        const e1_dx = a.y - c.y;
-        const e1_dy = -(a.x - c.x);
-        const e2_dx = b.y - a.y;
-        const e2_dy = -(b.x - a.x);
+        // e2 opposite c (a->b). Inside means all three are >= 0, with
+        // non-top-left edges tightened to > 0 through a -1 bias.
+        const e0_dx = cy - by;
+        const e0_dy = -(cx - bx);
+        const e1_dx = ay - cy;
+        const e1_dy = -(ax - cx);
+        const e2_dx = by - ay;
+        const e2_dy = -(bx - ax);
+        const bias0: i64 = if (isTopLeft(bx, by, cx, cy)) 0 else -1;
+        const bias1: i64 = if (isTopLeft(cx, cy, ax, ay)) 0 else -1;
+        const bias2: i64 = if (isTopLeft(ax, ay, bx, by)) 0 else -1;
 
-        const px0 = min_x_f + 0.5;
-        const py0 = min_y_f + 0.5;
-        var e0_row = (px0 - b.x) * e0_dx + (py0 - b.y) * e0_dy;
-        var e1_row = (px0 - c.x) * e1_dx + (py0 - c.y) * e1_dy;
-        var e2_row = (px0 - a.x) * e2_dx + (py0 - a.y) * e2_dy;
+        const half: i64 = 1 << (subpixel_bits - 1);
+        const px0 = (min_x << subpixel_bits) + half;
+        const py0 = (min_y << subpixel_bits) + half;
+        var e0_row = (px0 - bx) * e0_dx + (py0 - by) * e0_dy;
+        var e1_row = (px0 - cx) * e1_dx + (py0 - cy) * e1_dy;
+        var e2_row = (px0 - ax) * e2_dx + (py0 - ay) * e2_dy;
+        const step = @as(i64, 1) << subpixel_bits;
 
         const depth_bias = 0.5 - (self.depth_offset / far_plane);
         const tex_w: f32 = @floatFromInt(texture.width);
@@ -379,20 +399,34 @@ pub const Renderer = struct {
             var e2 = e2_row;
             var x = min_x;
             while (x <= max_x) : (x += 1) {
-                if (e0 >= 0 and e1 >= 0 and e2 >= 0) {
-                    const l0 = e0 * inv_area;
-                    const l1 = e1 * inv_area;
-                    const l2 = e2 * inv_area;
-                    self.shade(x, y, a, b, c, l0, l1, l2, depth_bias, texture, tex_w, tex_h);
+                if ((e0 + bias0) >= 0 and (e1 + bias1) >= 0 and (e2 + bias2) >= 0) {
+                    const l0 = @as(f32, @floatFromInt(e0)) * inv_area;
+                    const l1 = @as(f32, @floatFromInt(e1)) * inv_area;
+                    const l2 = @as(f32, @floatFromInt(e2)) * inv_area;
+                    self.shade(@intCast(x), @intCast(y), a, b, c, l0, l1, l2, depth_bias, texture, tex_w, tex_h);
                 }
-                e0 += e0_dx;
-                e1 += e1_dx;
-                e2 += e2_dx;
+                e0 += e0_dx * step;
+                e1 += e1_dx * step;
+                e2 += e2_dx * step;
             }
-            e0_row += e0_dy;
-            e1_row += e1_dy;
-            e2_row += e2_dy;
+            e0_row += e0_dy * step;
+            e1_row += e1_dy * step;
+            e2_row += e2_dy * step;
         }
+    }
+
+    fn toFixed(v: f32) i64 {
+        const clamped = std.math.clamp(v, -guard_band, guard_band);
+        return @intFromFloat(@round(clamped * subpixel));
+    }
+
+    /// For our on-screen orientation the interior lies on the positive side
+    /// of each edge; a "top" edge is horizontal with the interior below it
+    /// and a "left" edge runs downwards with the interior to its right.
+    fn isTopLeft(x0: i64, y0: i64, x1: i64, y1: i64) bool {
+        const dx = x1 - x0;
+        const dy = y1 - y0;
+        return dy > 0 or (dy == 0 and dx < 0);
     }
 
     inline fn shade(

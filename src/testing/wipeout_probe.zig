@@ -15,8 +15,13 @@ const wipeout = @import("wipeout");
 const math = wipeout.math;
 const Vec3 = math.Vec3;
 
-const image_id: u32 = 0x57_49_50_31;
+/// Two image ids alternate so each frame is placed as a new image before the
+/// previous one is deleted; the terminal never shows a gap between frames.
+const image_ids = [2]u32{ 0x57_49_50_31, 0x57_49_50_32 };
 const chunk_size: usize = 4096;
+/// Sleep to this close to the deadline, then spin: sleep wake-up jitter is
+/// a few ms, which is enough to cross a terminal refresh boundary and judder.
+const spin_margin_ns: i128 = 2 * std.time.ns_per_ms;
 
 pub const Options = struct {
     track: u8 = 1,
@@ -271,7 +276,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         try out.flush();
     }
     defer if (!options.dry_run) {
-        deleteImage(out) catch {};
+        for (image_ids) |id| deleteImage(out, id) catch {};
         out.writeAll("\x1b[?25h\x1b[?1049l") catch {};
         out.flush() catch {};
     };
@@ -289,17 +294,19 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
 
     while (totals.frames < target_frames) : (totals.frames += 1) {
         const deadline = began + @as(i128, @intCast(totals.frames + 1)) * frame_ns;
-        const before_present = now(io);
-        const slack = deadline - before_present;
-        if (slack > 0) {
-            io.sleep(.fromNanoseconds(@intCast(slack)), .awake) catch {};
-        } else {
+        const slack = deadline - now(io);
+        if (slack > spin_margin_ns) {
+            io.sleep(.fromNanoseconds(@intCast(slack - spin_margin_ns)), .awake) catch {};
+        } else if (slack < 0) {
             totals.late_frames += 1;
         }
+        while (now(io) < deadline) std.atomic.spinLoopHint();
 
         const write_start = now(io);
         if (!options.dry_run) {
-            try transmitFrame(out, pending.encoded, options, display, pending.compressed);
+            const id = image_ids[@intCast(totals.frames % 2)];
+            try transmitFrame(out, pending.encoded, options, display, pending.compressed, id);
+            if (totals.frames > 0) try deleteImage(out, image_ids[@intCast((totals.frames + 1) % 2)]);
             try out.flush();
         }
         const write_end = now(io);
@@ -430,7 +437,7 @@ fn deflate(dst: []u8, window: []u8, src: []const u8) ?[]u8 {
     return out.buffered();
 }
 
-fn transmitFrame(out: *Io.Writer, encoded: []const u8, options: Options, display: Display, compressed: bool) !void {
+fn transmitFrame(out: *Io.Writer, encoded: []const u8, options: Options, display: Display, compressed: bool, id: u32) !void {
     try out.print("\x1b[{d};{d}H", .{ display.row + 1, display.col + 1 });
     const first_end: usize = @min(chunk_size, encoded.len);
     const more: u1 = if (first_end < encoded.len) 1 else 0;
@@ -439,7 +446,7 @@ fn transmitFrame(out: *Io.Writer, encoded: []const u8, options: Options, display
         .{
             options.width,
             options.height,
-            image_id,
+            id,
             if (compressed) ",o=z" else "",
             more,
             display.cols,
@@ -456,8 +463,8 @@ fn transmitFrame(out: *Io.Writer, encoded: []const u8, options: Options, display
     }
 }
 
-fn deleteImage(out: *Io.Writer) !void {
-    try out.print("\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{image_id});
+fn deleteImage(out: *Io.Writer, id: u32) !void {
+    try out.print("\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{id});
 }
 
 fn protocolOverhead(encoded_len: usize) usize {
