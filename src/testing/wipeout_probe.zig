@@ -26,7 +26,8 @@ const spin_margin_ns: i128 = 2 * std.time.ns_per_ms;
 pub const Options = struct {
     track: u8 = 1,
     fps: u16 = 30,
-    seconds: u16 = 10,
+    /// Run length; drive mode runs until quit when unset.
+    seconds: ?u16 = null,
     width: u32 = 320,
     height: u32 = 240,
     cols: ?u16 = null,
@@ -362,16 +363,23 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
 
     if (!options.dry_run) {
         try out.writeAll("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+        // Keyboard flags are per screen, so push them only after switching
+        // to the alternate screen: disambiguate (1), report event types
+        // (2), report all keys as escape codes (8).
+        if (keys != null) try out.writeAll("\x1b[>11u");
         try out.flush();
     }
     defer if (!options.dry_run) {
         for (image_ids) |id| deleteImage(out, id) catch {};
+        if (keys != null) out.writeAll("\x1b[<u") catch {};
         out.writeAll("\x1b[?25h\x1b[?1049l") catch {};
         out.flush() catch {};
     };
 
     const frame_ns: i128 = @divFloor(std.time.ns_per_s, @as(i128, options.fps));
-    const target_frames = @as(u64, options.fps) * options.seconds;
+    const seconds: u64 = options.seconds orelse 10;
+    const unlimited = options.seconds == null and options.drive and live;
+    const target_frames = @as(u64, options.fps) * seconds;
     var totals: Totals = .{};
 
     // Render-ahead pipeline: the frame for deadline N is rendered and encoded
@@ -394,7 +402,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     var began = now(io);
     const wall_start = began;
 
-    while (totals.frames < target_frames) : (totals.frames += 1) {
+    while (unlimited or totals.frames < target_frames) : (totals.frames += 1) {
         var deadline = began + @as(i128, @intCast(totals.frames + 1)) * frame_ns;
         const slack = deadline - now(io);
         if (slack > spin_margin_ns) {
@@ -706,9 +714,14 @@ const Race = struct {
 /// Uses the Kitty keyboard protocol so key releases are reported; without
 /// it a game needs auto-repeat hacks to know when a key is let go.
 const KeyReader = struct {
+    const legacy_hold_ns: i128 = 180 * std.time.ns_per_ms;
+
     gpa: std.mem.Allocator,
     io: Io,
     tty: vaxis.Tty,
+    /// Legacy (non-Kitty) input has no key releases; a plain-byte press
+    /// stays held until `legacy_hold_ns` pass without a repeat.
+    legacy_until: [wipeout.input.count]std.atomic.Value(i128) = undefined,
     tty_buffer: [4096]u8 = undefined,
     thread: ?std.Thread = null,
     held: [wipeout.input.count]std.atomic.Value(bool) = undefined,
@@ -720,34 +733,38 @@ const KeyReader = struct {
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .io = io, .tty = undefined };
         for (&self.held) |*h| h.* = std.atomic.Value(bool).init(false);
+        for (&self.legacy_until) |*l| l.* = std.atomic.Value(i128).init(0);
         self.tty = try vaxis.Tty.init(io, &self.tty_buffer);
-        // Push Kitty keyboard flags: disambiguate (1), report event types
-        // (2), report all keys as escape codes (8).
-        self.writeRaw("\x1b[>11u");
         self.thread = try std.Thread.spawn(.{}, readLoop, .{self});
         return self;
     }
 
     fn stop(self: *KeyReader) void {
         self.running.store(false, .release);
-        self.writeRaw("\x1b[<u");
         // The reader thread is blocked in read(); restoring the terminal
         // and exiting the process ends it. Detach rather than join.
         if (self.thread) |t| t.detach();
         self.tty.deinit();
     }
 
-    fn writeRaw(self: *KeyReader, bytes: []const u8) void {
-        var buffer: [64]u8 = undefined;
-        var writer: Io.File.Writer = .init(self.tty.fd, self.io, &buffer);
-        writer.interface.writeAll(bytes) catch return;
-        writer.interface.flush() catch {};
+    fn snapshot(self: *KeyReader) [wipeout.input.count]bool {
+        var out: [wipeout.input.count]bool = undefined;
+        const t = now(self.io);
+        for (&out, 0..) |*o, i| {
+            const until = self.legacy_until[i].load(.acquire);
+            if (until != 0 and t > until) {
+                self.held[i].store(false, .release);
+                self.legacy_until[i].store(0, .release);
+            }
+            o.* = self.held[i].load(.acquire);
+        }
+        return out;
     }
 
-    fn snapshot(self: *const KeyReader) [wipeout.input.count]bool {
-        var out: [wipeout.input.count]bool = undefined;
-        for (&out, 0..) |*o, i| o.* = self.held[i].load(.acquire);
-        return out;
+    /// Plain-byte press with no release to come: hold briefly.
+    fn legacyPress(self: *KeyReader, action: wipeout.input.Action) void {
+        self.held[@intFromEnum(action)].store(true, .release);
+        self.legacy_until[@intFromEnum(action)].store(now(self.io) + legacy_hold_ns, .release);
     }
 
     fn wantsQuit(self: *const KeyReader) bool {
@@ -796,9 +813,18 @@ const KeyReader = struct {
                 self.handleCsi(bytes[i + 2 .. j], bytes[j]);
                 i = j + 1;
             } else {
-                // Legacy plain byte (protocol not supported): treat as a
-                // press with no release; only quit is reliable this way.
-                if (b == 'q' or b == 3) self.quit.store(true, .release);
+                // Legacy plain byte (protocol not supported or not active):
+                // a press with no release to follow, held for a short time.
+                switch (b) {
+                    'q', 'Q', 3 => self.quit.store(true, .release),
+                    'x', 'X', ' ', 'w', 'W' => self.legacyPress(.thrust),
+                    'z', 'Z' => self.legacyPress(.brake_left),
+                    'c', 'C' => self.legacyPress(.brake_right),
+                    'a', 'A' => self.legacyPress(.left),
+                    'd', 'D' => self.legacyPress(.right),
+                    'v', 'V' => self.legacyPress(.change_view),
+                    else => {},
+                }
                 i += 1;
             }
         }
@@ -839,6 +865,9 @@ const KeyReader = struct {
             }
         }
         const down = event != 3; // 1 press, 2 repeat, 3 release
+        // "CSI D" with no parameters is a legacy arrow press that will never
+        // report a release; hold it briefly like a plain byte.
+        const legacy = params.len == 0 and final != 'u';
         const action: ?wipeout.input.Action = switch (final) {
             'A' => .up,
             'B' => .down,
@@ -859,7 +888,9 @@ const KeyReader = struct {
             },
             else => null,
         };
-        if (action) |a| self.setAction(a, down);
+        if (action) |a| {
+            if (legacy) self.legacyPress(a) else self.setAction(a, down);
+        }
     }
 };
 
@@ -914,7 +945,7 @@ fn scanCracks(
     dir_out: []const u8,
 ) !void {
     Io.Dir.cwd().createDirPath(io, dir_out) catch {};
-    const total_frames = @as(u32, options.fps) * options.seconds;
+    const total_frames = @as(u32, options.fps) * (options.seconds orelse 10);
     var coords_buf: [512][3]u32 = undefined;
     var coords = std.ArrayList([3]u32).initBuffer(&coords_buf);
     var worst = [_]ScanHit{.{ .frame = 0, .count = 0, .section = 0 }} ** 4;
@@ -1085,7 +1116,7 @@ fn report(io: Io, options: Options, display: Display, totals: Totals, elapsed_ns
         display.cols,
         display.rows,
         options.fps,
-        options.seconds,
+        options.seconds orelse 10,
         if (options.dry_run) " (dry run)" else "",
         frames / elapsed_s,
         totals.late_frames,
@@ -1133,6 +1164,7 @@ fn parseArgs(args: []const []const u8) !Options {
             options.fps = try nextUnsigned(u16, args, &index);
         } else if (std.mem.eql(u8, arg, "--seconds")) {
             options.seconds = try nextUnsigned(u16, args, &index);
+            if (options.seconds.? == 0) return error.InvalidValue;
         } else if (std.mem.eql(u8, arg, "--width")) {
             options.width = try nextUnsigned(u32, args, &index);
         } else if (std.mem.eql(u8, arg, "--height")) {
@@ -1190,7 +1222,7 @@ fn parseArgs(args: []const []const u8) !Options {
         }
     }
     if (options.pilot >= wipeout.defs.num_pilots) return error.InvalidValue;
-    if (options.track < 1 or options.track > 14 or options.fps == 0 or options.fps > 60 or options.seconds == 0 or
+    if (options.track < 1 or options.track > 14 or options.fps == 0 or options.fps > 60 or
         options.width < 16 or options.height < 16 or options.width > 1920 or options.height > 1200 or
         (options.cols != null and options.cols.? == 0) or
         (options.rows != null and options.rows.? == 0)) return error.InvalidValue;
