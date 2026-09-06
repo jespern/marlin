@@ -13,6 +13,7 @@ const wipeout = @import("../wipeout/root.zig");
 const Io = std.Io;
 
 pub const snapshot = wipeout.snapshot;
+pub const parzlib = wipeout.parzlib;
 
 /// The simulation renders at PSX-native 240p and, without the CRT pass,
 /// ships that at 60 fps. The CRT pass needs room for its scanlines and
@@ -226,7 +227,7 @@ pub const Game = struct {
 
     pub fn outputSize(self: *const Game) OutputSize {
         return if (self.crt)
-            .{ .width = render_width * crt_scale, .height = render_height * crt_scale, .ship_every = 2 }
+            .{ .width = render_width * crt_scale, .height = render_height * crt_scale, .ship_every = 1 }
         else
             .{ .width = render_width, .height = render_height, .ship_every = 1 };
     }

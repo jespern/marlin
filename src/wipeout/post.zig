@@ -29,8 +29,12 @@ inline fn channel(c: u8) f32 {
     return @as(f32, @floatFromInt(c)) / 255.0;
 }
 
+/// CRT output is quantised to 6 bits per channel: invisible under the
+/// scanline mask, and it roughly halves the deflated frame, which is what
+/// bounds the pass at 60 fps over the terminal.
 inline fn toByte(v: f32) u8 {
-    return @intFromFloat(std.math.clamp(v, 0.0, 1.0) * 255.0 + 0.5);
+    const b: u8 = @intFromFloat(std.math.clamp(v, 0.0, 1.0) * 255.0 + 0.5);
+    return b & 0xfc;
 }
 
 const lut_size = 4096;

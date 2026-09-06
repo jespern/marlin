@@ -48,6 +48,8 @@ audio yet.
 | `src/wipeout/hud.zig` | Lap counter and times, wrong-way warning, speedo |
 | `src/wipeout/post.zig` | CRT post pass (the original's fragment shader on the CPU) and nearest upscale |
 | `src/wipeout/snapshot.zig` | Bytewise race snapshot with header, default path, read/write |
+| `src/wipeout/autopilot.zig` | Heading controller for hands-off laps and replays |
+| `src/wipeout/parzlib.zig` | Banded multi-threaded zlib encoder producing one valid stream |
 | `src/wipeout/root.zig` | Module root, camera angle helpers |
 | `src/client/wipeout_effect.zig` | The game inside marlin: owns the race, steps on wall time, renders for the pixel effect, maps keys |
 | `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots |
@@ -315,15 +317,19 @@ barrel curvature, colour fringing with a slow horizontal wobble,
 vignette, scanlines, flicker and an alternate-column mask. The shader
 runs at window resolution over the 240p image in the original, so at 1x it
 degenerates into fat bars; the port evaluates it at 2x (640x480). The pass
-runs across six row-band threads (about 3 ms for 640x480, down from 10 on
-one core), but that frame deflates poorly, about 15 ms at the fastest
-level, so with the pass on the effect ships at 30 fps: a forced 60 fps run
-measures 44 fps, deflate-bound. Without it the game presents 240p at
-60 fps. It is off by default; `p` toggles it in game and `!wipeout crt`
-starts with it on. The per-row sine and power terms come from tables
-rebuilt each frame. Getting CRT to 60 fps would need the deflate off the
-main thread as well: either a pipelined encoder one frame behind, or a
-banded zlib stream compressed in parallel with sync-flushed blocks.
+runs across six row-band threads (about 3 ms for 640x480). Its output is
+quantised to 6 bits per channel, invisible under the mask but it takes the
+deflated frame from 70% to 46% of raw. Encoding uses `parzlib.zig`: the
+frame is cut into six row bands, each deflated on its own thread as a raw
+stream ending in a sync flush (byte aligned, last block non-final), and the
+fragments are joined under one zlib header with an Adler-32 trailer, which
+any decoder, the terminal included, reads as a single stream. The pixel
+engine uses it for every compressible frame over 200k pixels, so the
+other large effects benefit too. Result for CRT at 2x, 60 fps, headless:
+render 7.8 ms, deflate 3.8 ms, 59.8 fps achieved. The cost that remains
+is bandwidth: about 24 MB/s deflated (32 MB/s as base64) through the PTY,
+against roughly 2 MB/s for plain 240p. It is off by default; `p` toggles it
+in game and `!wipeout crt` starts with it on.
 
 ## Save and resume
 

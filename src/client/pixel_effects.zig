@@ -34,6 +34,8 @@ const min_width: u32 = 160;
 const default_cell_w: u32 = 8;
 const default_cell_h: u32 = 16;
 const fps: u16 = 30;
+/// Threads for the banded zlib encoder on large framebuffers.
+const parallel_zlib_bands: usize = 6;
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -73,6 +75,9 @@ pub const Engine = struct {
     background_generation: u64 = 0,
     zbuf: []u8 = &.{},
     window: []u8 = &.{},
+    /// Banded multi-threaded zlib for large frames; null uses the
+    /// single-stream compressor.
+    par_encoder: ?wipeout_effect.parzlib.Encoder = null,
 
     pub fn init(gpa: std.mem.Allocator, kind: visual_effect.Kind, seed: u64) Engine {
         return .{ .gpa = gpa, .kind = kind, .seed = seed, .seed_offset = effect.hash(seed) % 600, .game = pacman.Game.init(seed), .tetris_game = tetris.Game.init(seed) };
@@ -90,6 +95,8 @@ pub const Engine = struct {
         if (self.background.len > 0) self.gpa.free(self.background);
         if (self.zbuf.len > 0) self.gpa.free(self.zbuf);
         if (self.window.len > 0) self.gpa.free(self.window);
+        if (self.par_encoder) |*enc| enc.deinit();
+        self.par_encoder = null;
         self.rgb = &.{};
         self.scratch = &.{};
         self.encoded = &.{};
@@ -151,9 +158,12 @@ pub const Engine = struct {
             self.background_generation = 0;
         }
         if (compressible(self.kind)) {
-            self.zbuf = try self.gpa.alloc(u8, pixels * 3 + 4096);
+            self.zbuf = try self.gpa.alloc(u8, pixels * 3 + 8192);
             errdefer self.gpa.free(self.zbuf);
             self.window = try self.gpa.alloc(u8, 2 * std.compress.flate.max_window_len);
+            // Frames past ~200k pixels are worth splitting across threads;
+            // smaller ones finish faster on one.
+            if (pixels >= 200_000) self.par_encoder = wipeout_effect.parzlib.Encoder.init(self.gpa, parallel_zlib_bands);
         }
         self.transmit_every = shipEvery(self.kind, pixels);
         if (self.kind == .wipeout) {
@@ -172,6 +182,7 @@ pub const Engine = struct {
     /// also halve to keep deflate off the critical path.
     fn shipEvery(kind: visual_effect.Kind, pixels: usize) u8 {
         if (kind == .shadowbox) return 2;
+        if (kind == .wipeout) return 1;
         return if (pixels > 700_000) 2 else 1;
     }
 
@@ -226,9 +237,10 @@ pub const Engine = struct {
         var payload: []const u8 = self.rgb;
         var compressed = false;
         if (self.zbuf.len > 0) {
-            if (deflate(self.zbuf, self.window, self.rgb)) |z| {
-                if (z.len < self.rgb.len) {
-                    payload = z;
+            const z: ?[]u8 = if (self.par_encoder) |*enc| enc.compress(self.zbuf, self.rgb) else deflate(self.zbuf, self.window, self.rgb);
+            if (z) |zz| {
+                if (zz.len < self.rgb.len) {
+                    payload = zz;
                     compressed = true;
                 }
             }

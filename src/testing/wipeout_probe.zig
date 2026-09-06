@@ -57,6 +57,8 @@ pub const Options = struct {
     intro: bool = false,
     /// Apply the CRT post pass to the output.
     crt: bool = false,
+    /// zlib encoder threads (1 = single-stream std deflate).
+    bands: u8 = 6,
     /// Output scale over the render size (the CRT pass wants 2).
     scale: u8 = 1,
     /// Print primitive statistics for the given pilot's ship model and exit.
@@ -436,7 +438,10 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     defer if (log_writer) |*lw| lw.interface.flush() catch {};
 
     const race_ptr: ?*Race = if (race) |*r| r else null;
-    var pending = prepareFrame(io, &renderer, &track, &scene, &camera, race_ptr, keys, options, units_per_frame, rgb, zbuf, window, encoded);
+    var par_encoder = wipeout.parzlib.Encoder.init(gpa, options.bands);
+    defer par_encoder.deinit();
+    const encoder: ?*wipeout.parzlib.Encoder = if (options.bands > 1) &par_encoder else null;
+    var pending = prepareFrame(io, &renderer, &track, &scene, &camera, race_ptr, keys, options, units_per_frame, rgb, zbuf, window, encoded, encoder);
     var began = now(io);
     const wall_start = began;
 
@@ -510,7 +515,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         if (keys) |k| {
             if (k.wantsQuit()) break;
         }
-        pending = prepareFrame(io, &renderer, &track, &scene, &camera, race_ptr, keys, options, units_per_frame, rgb, zbuf, window, encoded);
+        pending = prepareFrame(io, &renderer, &track, &scene, &camera, race_ptr, keys, options, units_per_frame, rgb, zbuf, window, encoded, encoder);
     }
 
     report(io, options, display, totals, now(io) - wall_start);
@@ -548,6 +553,7 @@ fn prepareFrame(
     zbuf: []u8,
     window: []u8,
     encoded: []u8,
+    encoder: ?*wipeout.parzlib.Encoder,
 ) PreparedFrame {
     const dt = 1.0 / @as(f32, @floatFromInt(options.fps));
     if (race) |r| {
@@ -565,9 +571,10 @@ fn prepareFrame(
     var payload: []const u8 = rgb;
     var compressed = false;
     if (!options.raw) {
-        if (deflate(zbuf, window, rgb)) |z| {
-            if (z.len < rgb.len) {
-                payload = z;
+        const z: ?[]u8 = if (encoder) |enc| enc.compress(zbuf, rgb) else deflate(zbuf, window, rgb);
+        if (z) |zz| {
+            if (zz.len < rgb.len) {
+                payload = zz;
                 compressed = true;
             }
         }
@@ -1301,6 +1308,8 @@ fn parseArgs(args: []const []const u8) !Options {
             options.intro = true;
         } else if (std.mem.eql(u8, arg, "--crt")) {
             options.crt = true;
+        } else if (std.mem.eql(u8, arg, "--bands")) {
+            options.bands = try nextUnsigned(u8, args, &index);
             if (options.scale == 1) options.scale = 2;
         } else if (std.mem.eql(u8, arg, "--scale")) {
             options.scale = try nextUnsigned(u8, args, &index);
