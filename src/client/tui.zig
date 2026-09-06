@@ -629,6 +629,7 @@ pub const App = struct {
         self.councils.deinit(self.gpa);
         self.voice_rt.deinit(self.gpa);
         if (self.effect_engine) |*engine| engine.deinit();
+        self.saveWipeout();
         if (self.wipeout_game) |game| game.destroy();
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
@@ -2188,10 +2189,28 @@ pub const App = struct {
                 self.setNotice("wipEout: no environment to locate game data", .{});
                 return;
             };
-            self.wipeout_game = wipeout_effect.Game.create(self.gpa, self.io, env, options) catch |err| {
-                self.setNotice("wipEout: {t} — game data goes in $XDG_DATA_HOME/marlin/wipeout-data/wipeout", .{err});
-                return;
-            };
+            // A bare `!wipeout` continues the race saved by the last pause
+            // or exit; naming a track or pilot always starts fresh.
+            var restored = false;
+            if (!options.explicit) {
+                if (self.wipeoutSavePath()) |path| {
+                    defer self.gpa.free(path);
+                    if (wipeout_effect.snapshot.read(self.io, self.gpa, path)) |snap| {
+                        if (wipeout_effect.Game.restore(self.gpa, self.io, env, &snap)) |game| {
+                            self.wipeout_game = game;
+                            restored = true;
+                        } else |_| {
+                            wipeout_effect.snapshot.remove(self.io, path);
+                        }
+                    }
+                }
+            }
+            if (!restored) {
+                self.wipeout_game = wipeout_effect.Game.create(self.gpa, self.io, env, options) catch |err| {
+                    self.setNotice("wipEout: {t} — game data goes in $XDG_DATA_HOME/marlin/wipeout-data/wipeout", .{err});
+                    return;
+                };
+            }
         }
         if (!self.resetEffectEngine(.wipeout)) return;
         switch (self.effect_engine.?) {
@@ -2214,14 +2233,30 @@ pub const App = struct {
     }
 
     /// Leave the game: hide the effect and stop the fast ticker. The race
-    /// state stays for the next `!wipeout`.
+    /// state stays for the next `!wipeout`, in memory and on disk.
     pub fn exitGameMode(self: *App) void {
         if (!self.game_mode) return;
         self.game_mode = false;
         self.game_active.store(false, .release);
         if (self.wipeout_game) |game| game.pause();
+        self.saveWipeout();
         _ = self.dismissScreensaver();
         self.syncAnimationTicker();
+    }
+
+    fn wipeoutSavePath(self: *App) ?[]u8 {
+        const env = self.environ orelse return null;
+        return wipeout_effect.snapshot.defaultPath(self.gpa, env) catch null;
+    }
+
+    /// Write the race to the state directory; a failure only costs the
+    /// ability to resume after a restart, so it is silent.
+    pub fn saveWipeout(self: *App) void {
+        const game = self.wipeout_game orelse return;
+        const path = self.wipeoutSavePath() orelse return;
+        defer self.gpa.free(path);
+        const snap = game.snapshot();
+        wipeout_effect.snapshot.write(self.io, path, &snap) catch {};
     }
 
     /// Route a key event to the game. Returns true when it was consumed;

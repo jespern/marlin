@@ -10,7 +10,7 @@ const Mat4 = math.Mat4;
 
 pub const Mode = enum(u8) { external, internal };
 
-pub const Camera = struct {
+pub const Camera = extern struct {
     position: Vec3 = Vec3.zero,
     velocity: Vec3 = Vec3.zero,
     angle: Vec3 = Vec3.zero,

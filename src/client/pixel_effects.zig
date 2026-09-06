@@ -127,7 +127,13 @@ pub const Engine = struct {
             const layout = pacman.layoutForAspect(@as(u32, @max(cols, 1)) * self.cell_px_w, @as(u32, @max(rows, 1)) * self.cell_px_h);
             if (layout.cols != self.game.cols or layout.rows != self.game.rows) self.game.configure(layout.cols, layout.rows);
         }
-        const dims = framebufferSize(cols, rows, self.cell_px_w, self.cell_px_h, self.kind);
+        var dims = framebufferSize(cols, rows, self.cell_px_w, self.cell_px_h, self.kind);
+        if (self.kind == .wipeout) {
+            if (self.wipeout_game) |g| {
+                const out = g.outputSize();
+                dims = .{ .width = out.width, .height = out.height };
+            }
+        }
         if (dims.width == self.width and dims.height == self.height and self.rgb.len > 0) return;
         self.freeBuffers();
         self.width = dims.width;
@@ -150,6 +156,9 @@ pub const Engine = struct {
             self.window = try self.gpa.alloc(u8, 2 * std.compress.flate.max_window_len);
         }
         self.transmit_every = shipEvery(self.kind, pixels);
+        if (self.kind == .wipeout) {
+            if (self.wipeout_game) |g| self.transmit_every = g.outputSize().ship_every;
+        }
     }
 
     /// Flat or smooth art that zlib pays for; the noisy demoscene scenes are
@@ -182,6 +191,12 @@ pub const Engine = struct {
     pub fn transmit(self: *Engine, vx: *vaxis.Vaxis, tty: *std.Io.Writer) !void {
         if (!vx.caps.kitty_graphics) return error.NoGraphicsCapability;
         if (self.rgb.len == 0) try self.resize(self.cols, self.rows);
+        if (self.kind == .wipeout) {
+            if (self.wipeout_game) |g| {
+                const out = g.outputSize();
+                if (out.width != self.width or out.height != self.height) try self.resize(self.cols, self.rows);
+            }
+        }
         if (self.image != null and (self.transmitted_frame == self.frame or self.frame % self.transmit_every != 0)) return;
         // The image placed LAST tick is on screen; freeing it now (before the
         // new transmit) never leaves a blank frame, and keeps terminal memory
@@ -198,7 +213,7 @@ pub const Engine = struct {
             .horizon => renderScene(.horizon, self.rgb, self.width, self.height, frame),
             .shadowbox => shadowbox.render(self.rgb, self.width, self.height, self.frame, self.seed, self.sky),
             .tetris => tetris.renderPixels(&self.tetris_game, self.rgb, self.width, self.height),
-            .wipeout => if (self.wipeout_game) |g| g.render(self.rgb) else @memset(self.rgb, 0),
+            .wipeout => if (self.wipeout_game) |g| g.render(self.rgb, self.width, self.height) else @memset(self.rgb, 0),
             .pacman => {
                 if (self.background_generation != self.game.generation) {
                     pacman.renderBackground(&self.game, self.background, self.width, self.height);
@@ -360,8 +375,9 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
         return .{ .width = @intCast(width), .height = @intCast(height) };
     }
     if (kind == .wipeout) {
-        // PSX-native 240p; the image is letterboxed to 4:3 at draw time.
-        return .{ .width = wipeout_effect.width, .height = wipeout_effect.height };
+        // PSX-native 240p (2x with the CRT pass, see Engine.resize); the
+        // image is letterboxed to 4:3 at draw time.
+        return .{ .width = wipeout_effect.render_width, .height = wipeout_effect.render_height };
     }
     if (kind == .tetris) {
         // The arcade cabinet uses the entire viewport. Render near terminal

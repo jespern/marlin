@@ -55,6 +55,10 @@ pub const Options = struct {
     rapier: bool = false,
     /// Keep the countdown hover instead of starting the race at once.
     intro: bool = false,
+    /// Apply the CRT post pass to the output.
+    crt: bool = false,
+    /// Output scale over the render size (the CRT pass wants 2).
+    scale: u8 = 1,
     /// Print primitive statistics for the given pilot's ship model and exit.
     dump_model: bool = false,
     /// With --snapshot: also write the per-pixel owner ids (u16 LE, row
@@ -274,7 +278,9 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         @as(f64, @floatFromInt(load_ns)) / std.time.ns_per_ms,
     });
 
-    const raw_len = @as(usize, options.width) * options.height * 3;
+    const out_w: u32 = @as(u32, options.width) * options.scale;
+    const out_h: u32 = @as(u32, options.height) * options.scale;
+    const raw_len = @as(usize, out_w) * out_h * 3;
     const rgb = try gpa.alloc(u8, raw_len);
     defer gpa.free(rgb);
     const zbuf = try gpa.alloc(u8, raw_len + 4096);
@@ -292,6 +298,8 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
     if (options.drive or options.autopilot or options.replay_input != null) {
         var models = try wipeout.ship.loadModels(gpa, &assets, &renderer);
         errdefer models.deinit(gpa);
+        const ui = try wipeout.ui.Ui.load(gpa, &assets, &renderer);
+        const hud = try wipeout.hud.Hud.load(gpa, &assets, &renderer);
         var start: u32 = 0;
         var i: usize = 0;
         // ships_init: the grid begins start_line_pos - 15 sections in, and
@@ -301,6 +309,8 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         if (!options.intro) player.skipIntro();
         race = .{
             .models = models,
+            .ui = ui,
+            .hud = hud,
             .ship = player,
             .camera = wipeout.camera.Camera.init(&track, 0),
             .input = .{},
@@ -361,6 +371,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         renderFrame(&renderer, &track, &scene, &camera, if (race) |*r| r else null);
         renderer.debug_pixel = null;
         renderer.debug_prim_ids = false;
+        presentFrame(&renderer, options, rgb, @as(f32, @floatFromInt(options.frame)) * dt);
         if (options.owner_map) |owner_path| {
             const file = try Io.Dir.cwd().createFile(io, owner_path, .{ .truncate = true });
             defer file.close(io);
@@ -372,8 +383,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         if (race) |*r| stderrPrint(io, "ship: section {d} pos ({d:.0},{d:.0},{d:.0}) speed {d:.0} lap {d} flying={}\n", .{
             r.ship.section, r.ship.position.x, r.ship.position.y, r.ship.position.z, r.ship.speed, r.ship.lap, r.ship.flags.flying,
         });
-        renderer.writeRgb(rgb);
-        try writePpm(io, path, options.width, options.height, rgb);
+        try writePpm(io, path, @as(u32, options.width) * options.scale, @as(u32, options.height) * options.scale, rgb);
         stderrPrint(io, "wrote {s} (frame {d}, {d} tris, {d} pixels shaded, camera section {d}, {d} crack pixels)\n", .{
             path,
             options.frame,
@@ -548,7 +558,8 @@ fn prepareFrame(
 
     const render_start = now(io);
     renderFrame(renderer, track, scene, camera, race);
-    renderer.writeRgb(rgb);
+    const time: f32 = if (race) |r| @as(f32, @floatFromInt(r.frame)) * dt else @as(f32, @floatFromInt(camera.section)) * 0.1;
+    presentFrame(renderer, options, rgb, time);
     const render_end = now(io);
 
     var payload: []const u8 = rgb;
@@ -613,6 +624,20 @@ fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.T
             renderer.setDepthOffset(0);
             renderer.setDepthWrite(true);
         }
+        r.hud.draw(renderer, &r.ui, &r.ship);
+    }
+}
+
+/// Copy the finished frame out, through the CRT pass when requested.
+fn presentFrame(renderer: *wipeout.render.Renderer, options: Options, rgb: []u8, time: f32) void {
+    const out_w: usize = @as(usize, options.width) * options.scale;
+    const out_h: usize = @as(usize, options.height) * options.scale;
+    if (options.crt) {
+        wipeout.post.crt(renderer.color, renderer.width, renderer.height, rgb, out_w, out_h, time);
+    } else if (options.scale == 1) {
+        renderer.writeRgb(rgb);
+    } else {
+        wipeout.post.upscale(renderer.color, renderer.width, renderer.height, rgb, out_w, out_h);
     }
 }
 
@@ -689,6 +714,8 @@ fn dumpModel(io: Io, obj: *const wipeout.object.Object) void {
 /// A single player ship, its camera, and the input feeding it.
 const Race = struct {
     models: wipeout.ship.Models,
+    ui: wipeout.ui.Ui,
+    hud: wipeout.hud.Hud,
     ship: wipeout.ship.Ship,
     camera: wipeout.camera.Camera,
     input: wipeout.input.State,
@@ -1151,8 +1178,8 @@ fn transmitFrame(out: *Io.Writer, encoded: []const u8, options: Options, display
     try out.print(
         "\x1b_Ga=T,f=24,s={d},v={d},i={d},q=2{s},m={d},c={d},r={d},C=1;{s}\x1b\\",
         .{
-            options.width,
-            options.height,
+            @as(u32, options.width) * options.scale,
+            @as(u32, options.height) * options.scale,
             id,
             if (compressed) ",o=z" else "",
             more,
@@ -1278,6 +1305,12 @@ fn parseArgs(args: []const []const u8) !Options {
             options.autopilot = true;
         } else if (std.mem.eql(u8, arg, "--intro")) {
             options.intro = true;
+        } else if (std.mem.eql(u8, arg, "--crt")) {
+            options.crt = true;
+            if (options.scale == 1) options.scale = 2;
+        } else if (std.mem.eql(u8, arg, "--scale")) {
+            options.scale = try nextUnsigned(u8, args, &index);
+            if (options.scale == 0 or options.scale > 4) return error.InvalidValue;
         } else if (std.mem.eql(u8, arg, "--rapier")) {
             options.rapier = true;
         } else if (std.mem.eql(u8, arg, "--record-input")) {
@@ -1362,6 +1395,8 @@ fn usage(io: Io) void {
         \\  --pilot N          pilot 0-7 (default 0, John Dekka / AG Systems)
         \\  --rapier           Rapier class handling instead of Venom
         \\  --intro            start with the countdown hover instead of racing at once
+        \\  --crt              apply the CRT post pass (implies --scale 2)
+        \\  --scale N          output N× the render size (nearest, or through the CRT pass)
         \\  --record-input F   write the per-frame action bitmask (for the parity harness)
         \\  --replay-input F   drive from a recorded bitmask file (implies --dry-run)
         \\  --ship-log F       write ship state per frame as CSV

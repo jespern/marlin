@@ -95,7 +95,7 @@ pub const Context = struct {
     analog_response: f32 = 1.0,
 };
 
-pub const Ship = struct {
+pub const Ship = extern struct {
     pilot: u8,
     flags: Flags,
     mode: Mode,

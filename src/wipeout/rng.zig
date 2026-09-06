@@ -2,7 +2,7 @@
 //! resumes with the same sequence. xorshift32; only quality-insensitive
 //! gameplay jitter depends on it.
 
-pub const Rng = struct {
+pub const Rng = extern struct {
     state: u32 = 0x9e37_79b9,
 
     pub fn seed(s: u32) Rng {

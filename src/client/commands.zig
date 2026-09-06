@@ -60,7 +60,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
-    .{ .name = "!wipeout", .usage = " [track 1-14] [pilot 0-7] [rapier]", .description = "play wipEout (Esc pauses and returns; !wipeout resumes)", .accepts_args = true },
+    .{ .name = "!wipeout", .usage = " [track] [pilot] [rapier] [new]", .description = "play wipEout (Esc pauses; bare !wipeout resumes, also after a restart)", .accepts_args = true },
 };
 
 pub const CommandSuggestion = struct {
@@ -708,17 +708,30 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         while (it.next()) |arg| {
             if (std.mem.eql(u8, arg, "rapier")) {
                 options.rapier = true;
+                options.explicit = true;
             } else if (std.mem.eql(u8, arg, "venom")) {
                 options.rapier = false;
+                options.explicit = true;
             } else if (std.mem.eql(u8, arg, "nointro")) {
                 options.intro = false;
+            } else if (std.mem.eql(u8, arg, "crt")) {
+                options.crt = true;
+            } else if (std.mem.eql(u8, arg, "nocrt")) {
+                options.crt = false;
+            } else if (std.mem.eql(u8, arg, "new")) {
+                options.explicit = true;
             } else if (std.fmt.parseUnsigned(u8, arg, 10)) |value| {
                 if (positional == 0) options.track = value else options.pilot = value;
                 positional += 1;
+                options.explicit = true;
             } else |_| {
-                self.setNotice("usage: !wipeout [track 1-14] [pilot 0-7] [rapier|venom] [nointro]", .{});
+                self.setNotice("usage: !wipeout [track 1-14] [pilot 0-7] [rapier|venom] [nointro] [crt|nocrt] [new]", .{});
                 return;
             }
+        }
+        if (options.track < 1 or options.track > 14 or options.pilot > 7) {
+            self.setNotice("usage: !wipeout [track 1-14] [pilot 0-7] [rapier|venom] [nointro] [crt|nocrt] [new]", .{});
+            return;
         }
         self.startWipeout(options);
     } else if (std.mem.eql(u8, head, "/otel")) {

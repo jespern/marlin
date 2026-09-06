@@ -17,7 +17,7 @@ pub const Action = enum(u8) {
 
 pub const count = @typeInfo(Action).@"enum".fields.len;
 
-pub const State = struct {
+pub const State = extern struct {
     held: [count]f32 = [_]f32{0} ** count,
     pressed: [count]bool = [_]bool{false} ** count,
 

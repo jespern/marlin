@@ -12,8 +12,18 @@ const vaxis = @import("vaxis");
 const wipeout = @import("../wipeout/root.zig");
 const Io = std.Io;
 
-pub const width: u16 = 320;
-pub const height: u16 = 240;
+pub const snapshot = wipeout.snapshot;
+
+/// The simulation renders at PSX-native 240p and, without the CRT pass,
+/// ships that at 60 fps. The CRT pass needs room for its scanlines and
+/// column mask (the original evaluates it at window resolution over the
+/// low-res image), so with it on the effect outputs 2x and ships at 30 fps:
+/// a 640x480 CRT frame deflates poorly and would not fit a 16 ms budget.
+pub const render_width: u16 = 320;
+pub const render_height: u16 = 240;
+pub const crt_scale: u16 = 2;
+
+pub const OutputSize = struct { width: u16, height: u16, ship_every: u8 };
 /// Fixed physics step; presentation may run at any rate.
 pub const step_hz: u32 = 60;
 pub const step_seconds: f64 = 1.0 / @as(f64, @floatFromInt(step_hz));
@@ -25,6 +35,10 @@ pub const Options = struct {
     pilot: u8 = 0,
     rapier: bool = false,
     intro: bool = true,
+    crt: bool = false,
+    /// Set when the user named a track/pilot/class explicitly; a bare
+    /// `!wipeout` prefers a saved race over these defaults.
+    explicit: bool = false,
 };
 
 pub const Game = struct {
@@ -35,6 +49,8 @@ pub const Game = struct {
     track: wipeout.track.Track,
     scene: wipeout.scene.Scene,
     models: wipeout.ship.Models,
+    ui: wipeout.ui.Ui,
+    hud: wipeout.hud.Hud,
     ship: wipeout.ship.Ship,
     camera: wipeout.camera.Camera,
     input: wipeout.input.State = .{},
@@ -45,6 +61,9 @@ pub const Game = struct {
     last_tick_ns: ?i128 = null,
     paused: bool = true,
     steps: u64 = 0,
+    /// Simulated seconds, drives the CRT pass's animation.
+    cycle_time: f32 = 0,
+    crt: bool = false,
 
     pub fn create(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, options: Options) !*Game {
         const root = try wipeout.assets.defaultRoot(gpa, environ);
@@ -58,7 +77,7 @@ pub const Game = struct {
         const self = try gpa.create(Game);
         errdefer gpa.destroy(self);
 
-        var renderer = try wipeout.render.Renderer.init(gpa, width, height);
+        var renderer = try wipeout.render.Renderer.init(gpa, render_width, render_height);
         errdefer renderer.deinit();
         var track = try wipeout.track.load(gpa, &assets, &renderer, dir);
         errdefer track.deinit(gpa);
@@ -66,6 +85,8 @@ pub const Game = struct {
         errdefer scene.deinit(gpa);
         var models = try wipeout.ship.loadModels(gpa, &assets, &renderer);
         errdefer models.deinit(gpa);
+        const ui = try wipeout.ui.Ui.load(gpa, &assets, &renderer);
+        const hud = try wipeout.hud.Hud.load(gpa, &assets, &renderer);
 
         // The player takes the rear grid slot, start_line_pos - 15 sections in.
         var start: u32 = 0;
@@ -85,10 +106,13 @@ pub const Game = struct {
             .track = track,
             .scene = scene,
             .models = models,
+            .ui = ui,
+            .hud = hud,
             .ship = ship,
             .camera = wipeout.camera.Camera.init(&track, 0),
             .rng = wipeout.rng.Rng.seed(std.mem.readInt(u32, &seed_bytes, .little)),
             .start_line_pos = circuit.start_line_pos,
+            .crt = options.crt,
         };
         // The track and scene slices were moved into the struct; the local
         // copies must not be freed twice.
@@ -102,6 +126,42 @@ pub const Game = struct {
         self.track.deinit(gpa);
         self.renderer.deinit();
         gpa.destroy(self);
+    }
+
+    /// Capture the race for `snapshot.write`.
+    pub fn snapshot(self: *const Game) wipeout.snapshot.Snapshot {
+        return .{
+            .track = self.options.track,
+            .pilot = self.options.pilot,
+            .rapier = @intFromBool(self.options.rapier),
+            .crt = @intFromBool(self.crt),
+            .steps = self.steps,
+            .ship = self.ship,
+            .camera = self.camera,
+            .rng = self.rng,
+        };
+    }
+
+    /// Rebuild a game from a snapshot: assets reload, state is copied in.
+    pub fn restore(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, snap: *const wipeout.snapshot.Snapshot) !*Game {
+        const options = Options{
+            .track = snap.track,
+            .pilot = snap.pilot,
+            .rapier = snap.rapier != 0,
+            .crt = snap.crt != 0,
+        };
+        if (options.track < 1 or options.track > 14 or options.pilot >= wipeout.defs.num_pilots) return error.BadSnapshot;
+        const self = try create(gpa, io, environ, options);
+        if (snap.ship.section >= self.track.sections.len or snap.camera.section >= self.track.sections.len) {
+            self.destroy();
+            return error.BadSnapshot;
+        }
+        self.ship = snap.ship;
+        self.camera = snap.camera;
+        self.rng = snap.rng;
+        self.steps = snap.steps;
+        self.cycle_time = @as(f32, @floatFromInt(snap.steps)) * @as(f32, @floatCast(step_seconds));
+        return self;
     }
 
     pub fn matches(self: *const Game, options: Options) bool {
@@ -156,10 +216,19 @@ pub const Game = struct {
         self.camera.update(&self.track, &self.ship, @floatCast(step_seconds));
         self.input.endFrame();
         self.steps += 1;
+        self.cycle_time += @floatCast(step_seconds);
     }
 
-    /// Render the current state into a packed RGB buffer of `width`×`height`.
-    pub fn render(self: *Game, rgb: []u8) void {
+    pub fn outputSize(self: *const Game) OutputSize {
+        return if (self.crt)
+            .{ .width = render_width * crt_scale, .height = render_height * crt_scale, .ship_every = 2 }
+        else
+            .{ .width = render_width, .height = render_height, .ship_every = 1 };
+    }
+
+    /// Render the current state into a packed RGB buffer of `out_w`×`out_h`
+    /// (see `outputSize`).
+    pub fn render(self: *Game, rgb: []u8, out_w: usize, out_h: usize) void {
         const r = &self.renderer;
         r.framePrepare();
         r.setView(self.camera.position, self.camera.angle);
@@ -177,7 +246,18 @@ pub const Game = struct {
             r.setDepthOffset(0);
             r.setDepthWrite(true);
         }
-        r.writeRgb(rgb);
+        self.hud.draw(r, &self.ui, &self.ship);
+        if (self.crt) {
+            wipeout.post.crt(r.color, r.width, r.height, rgb, out_w, out_h, self.cycle_time);
+        } else if (out_w == r.width and out_h == r.height) {
+            r.writeRgb(rgb);
+        } else {
+            wipeout.post.upscale(r.color, r.width, r.height, rgb, out_w, out_h);
+        }
+    }
+
+    pub fn toggleCrt(self: *Game) void {
+        self.crt = !self.crt;
     }
 
     /// Map a terminal key to a game action. Arrows steer and pitch; `x` or
@@ -199,6 +279,10 @@ pub const Game = struct {
     }
 
     pub fn setKey(self: *Game, key: vaxis.Key, down: bool) bool {
+        if (key.codepoint == 'p' or key.codepoint == 'P') {
+            if (down) self.toggleCrt();
+            return true;
+        }
         const action = actionForKey(key) orelse return false;
         self.input.set(action, down);
         return true;

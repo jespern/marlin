@@ -7,8 +7,10 @@ standalone probe. A single player ship flies with the original's physics,
 track collision, jump handling and rescue, under keyboard control or a
 simple autopilot, and a replay harness shows the trajectory matches the
 reference build to within 0.01 units over a full lap. The game runs inside
-the marlin client as `!wipeout`, pausing on Escape and resuming where it
-left off. No opponents, weapons, HUD, audio, or on-disk snapshots yet.
+the marlin client as `!wipeout` with the original HUD and an optional CRT
+pass, pausing on Escape and resuming where it left off, including across
+marlin restarts through an on-disk snapshot. No opponents, weapons or
+audio yet.
 
 ## Goals
 
@@ -42,6 +44,10 @@ left off. No opponents, weapons, HUD, audio, or on-disk snapshots yet.
 | `src/wipeout/rng.zig` | Deterministic xorshift owned by game state |
 | `src/wipeout/ship.zig` | Ship state, player flight model, track collision, jump and rescue, models and shadow |
 | `src/wipeout/camera.zig` | External chase camera and cockpit view |
+| `src/wipeout/ui.zig` | Bitmap text from the three font textures, screen anchors |
+| `src/wipeout/hud.zig` | Lap counter and times, wrong-way warning, speedo |
+| `src/wipeout/post.zig` | CRT post pass (the original's fragment shader on the CPU) and nearest upscale |
+| `src/wipeout/snapshot.zig` | Bytewise race snapshot with header, default path, read/write |
 | `src/wipeout/root.zig` | Module root, camera angle helpers |
 | `src/client/wipeout_effect.zig` | The game inside marlin: owns the race, steps on wall time, renders for the pixel effect, maps keys |
 | `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots |
@@ -281,6 +287,44 @@ Integration points, all in the client:
   most four per tick, so ticker jitter changes smoothness, not speed.
 - `commands.zig`: the `!wipeout` entry and its argument parsing.
 
+## HUD
+
+`hud.zig` draws what the original's in-race HUD shows for a single ship:
+lap counter, the running lap time with completed laps above it, the
+"WRONG WAY" warning, and the speedo whose thirteen coloured bars track
+speed with a red overlay for thrust, under the facia texture. Text comes
+from the original's three bitmap fonts with their glyph metrics; the
+digits, colon and full stop are the only punctuation. The "LAP RECORD"
+slot shows the best lap of the current session because there are no
+saved highscores yet. Race position and the weapon icon wait for
+opponents and weapons.
+
+## CRT pass
+
+`post.zig` evaluates the original's CRT fragment shader per pixel:
+barrel curvature, colour fringing with a slow horizontal wobble,
+vignette, scanlines, flicker and an alternate-column mask. The shader
+runs at window resolution over the 240p image in the original, so at 1x it
+degenerates into fat bars; the port evaluates it at 2x (640x480). That
+frame deflates poorly (about 15 ms) on top of a 14 ms render, so with the
+pass on the effect ships at 30 fps; without it the game presents 240p at
+60 fps. It is off by default; `p` toggles it in game and `!wipeout crt`
+starts with it on. The per-row sine and power terms come from tables
+rebuilt each frame.
+
+## Save and resume
+
+Escape (and marlin exit) writes the race to
+`$XDG_STATE_HOME/marlin/wipeout-race.bin`, else under
+`~/.local/state/marlin/`. A bare `!wipeout` with no game in memory
+restores it: assets reload, and ship, camera, RNG and step count are
+copied in. Naming a track, pilot or class, or passing `new`, starts fresh
+instead. The snapshot is the state structs behind a header with magic,
+version and size; any mismatch is treated as no snapshot, so a build that
+changes a struct simply starts a new race. Everything in it references
+the track by index, which is why the design insisted on that from the
+first commit.
+
 ## Snapshots
 
 ```
@@ -292,7 +336,7 @@ renderer was verified without a live session.
 
 ## Next slices
 
-1. Snapshot/restore with a version tag and asset hash, so a race survives
-   a marlin restart.
-2. HUD, menus, AI opponents, weapons, particles.
-3. CRT post pass and first-run asset download.
+1. AI opponents, ship collisions, pickups, weapons, particles, the rescue
+   droid and race end: the bulk of the remaining game logic.
+2. Menus, championship and highscores.
+3. First-run asset download.
