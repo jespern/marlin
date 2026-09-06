@@ -38,11 +38,17 @@ standalone probe. No game logic, input, HUD, audio, or snapshots yet.
 Build steps: `zig build wipeout-test` (unit tests) and `zig build`, which
 installs `zig-out/bin/wipeout-probe`.
 
-Run the probe binary directly, not through `zig build wipeout-probe`. Under
-the build runner the same binary stalls for 50-80 ms every second or so
-(measured: worst frame 83 ms with 6-9 frames over 20 ms per 10 s), which
-shows up as periodic micro-freezes. Run directly, the worst frame in a 10 s
-fly-through is about 10 ms and no frame exceeds 20 ms.
+Run the installed binary directly rather than through `zig build
+wipeout-probe`, so the build runner is not competing for the CPU.
+
+Frame pacing is pipelined: the frame for deadline N is rendered and encoded
+right after frame N-1 is presented, so only the terminal write happens at
+the deadline. Sporadic 40-80 ms scheduling stalls were observed in dry runs
+with no change in rendering work (macOS moving the thread or preempting
+it); with the pipeline any stall shorter than the ~25 ms of slack per 30 fps
+frame never reaches the screen. Requesting user-interactive thread QoS was
+tried and made stalls worse under load, so it is not used. The report
+prints the worst frame and the number of frames over 20 ms.
 
 ```
 zig build

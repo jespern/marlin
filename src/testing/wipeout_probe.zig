@@ -278,54 +278,49 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
 
     const frame_ns: i128 = @divFloor(std.time.ns_per_s, @as(i128, options.fps));
     const target_frames = @as(u64, options.fps) * options.seconds;
-    const began = now(io);
     var totals: Totals = .{};
 
+    // Render-ahead pipeline: the frame for deadline N is rendered and encoded
+    // right after frame N-1 is presented, so the only work left at the
+    // deadline is the terminal write. A scheduling stall shorter than the
+    // slack (~25 ms at 30 fps for this scene) then never reaches the screen.
+    var pending = prepareFrame(io, &renderer, &track, &scene, &camera, options, units_per_frame, rgb, zbuf, window, encoded);
+    const began = now(io);
+
     while (totals.frames < target_frames) : (totals.frames += 1) {
-        camera.advance(&track, units_per_frame, options.height_above, options.look_ahead);
-
-        const render_start = now(io);
-        renderFrame(&renderer, &track, &scene, &camera);
-        renderer.writeRgb(rgb);
-        const render_end = now(io);
-
-        var payload: []const u8 = rgb;
-        var compressed = false;
-        if (!options.raw) {
-            if (deflate(zbuf, window, rgb)) |z| {
-                if (z.len < rgb.len) {
-                    payload = z;
-                    compressed = true;
-                }
-            }
+        const deadline = began + @as(i128, @intCast(totals.frames + 1)) * frame_ns;
+        const before_present = now(io);
+        const slack = deadline - before_present;
+        if (slack > 0) {
+            io.sleep(.fromNanoseconds(@intCast(slack)), .awake) catch {};
+        } else {
+            totals.late_frames += 1;
         }
-        const compress_end = now(io);
-        const encoded_frame = std.base64.standard.Encoder.encode(encoded[0..std.base64.standard.Encoder.calcSize(payload.len)], payload);
-        const encode_end = now(io);
 
+        const write_start = now(io);
         if (!options.dry_run) {
-            try transmitFrame(out, encoded_frame, options, display, compressed);
+            try transmitFrame(out, pending.encoded, options, display, pending.compressed);
             try out.flush();
         }
         const write_end = now(io);
 
         totals.raw_bytes += rgb.len;
-        totals.payload_bytes += payload.len;
-        totals.wire_bytes += encoded_frame.len + protocolOverhead(encoded_frame.len);
-        totals.render_ns += render_end - render_start;
-        totals.compress_ns += compress_end - render_end;
-        totals.encode_ns += encode_end - compress_end;
-        totals.write_ns += write_end - encode_end;
-        totals.tris += renderer.stats.tris;
-        const frame_work = write_end - render_start;
+        totals.payload_bytes += pending.payload_len;
+        totals.wire_bytes += pending.encoded.len + protocolOverhead(pending.encoded.len);
+        totals.render_ns += pending.render_ns;
+        totals.compress_ns += pending.compress_ns;
+        totals.encode_ns += pending.encode_ns;
+        totals.write_ns += write_end - write_start;
+        totals.tris += pending.tris;
+        const frame_work = pending.render_ns + pending.compress_ns + pending.encode_ns + (write_end - write_start);
         if (frame_work > totals.max_frame_ns) {
             totals.max_frame_ns = frame_work;
             totals.worst_frame_index = totals.frames;
-            totals.worst_tris = renderer.stats.tris;
-            totals.worst_pixels = renderer.stats.pixels;
-            totals.worst_visited = renderer.stats.visited;
-            totals.worst_section = camera.section;
-            totals.worst_render_ns = render_end - render_start;
+            totals.worst_tris = pending.tris;
+            totals.worst_pixels = pending.pixels;
+            totals.worst_visited = pending.visited;
+            totals.worst_section = pending.section;
+            totals.worst_render_ns = pending.render_ns;
         }
         if (frame_work > 20 * std.time.ns_per_ms) {
             totals.slow_frames += 1;
@@ -335,13 +330,7 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
             }
         }
 
-        const deadline = began + @as(i128, @intCast(totals.frames + 1)) * frame_ns;
-        const remaining = deadline - now(io);
-        if (remaining > 0) {
-            io.sleep(.fromNanoseconds(@intCast(remaining)), .awake) catch {};
-        } else {
-            totals.late_frames += 1;
-        }
+        pending = prepareFrame(io, &renderer, &track, &scene, &camera, options, units_per_frame, rgb, zbuf, window, encoded);
     }
 
     report(io, options, display, totals, now(io) - began);
@@ -350,6 +339,67 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         for (totals.slow_indices[0..totals.slow_logged]) |i| stderrPrint(io, " {d}", .{i});
         stderrPrint(io, "\n", .{});
     }
+}
+
+const PreparedFrame = struct {
+    encoded: []const u8,
+    compressed: bool,
+    payload_len: usize,
+    render_ns: i128,
+    compress_ns: i128,
+    encode_ns: i128,
+    tris: u32,
+    pixels: u32,
+    visited: u32,
+    section: u32,
+};
+
+fn prepareFrame(
+    io: Io,
+    renderer: *wipeout.render.Renderer,
+    track: *const wipeout.track.Track,
+    scene: *wipeout.scene.Scene,
+    camera: *FlyCamera,
+    options: Options,
+    units_per_frame: f32,
+    rgb: []u8,
+    zbuf: []u8,
+    window: []u8,
+    encoded: []u8,
+) PreparedFrame {
+    camera.advance(track, units_per_frame, options.height_above, options.look_ahead);
+
+    const render_start = now(io);
+    renderFrame(renderer, track, scene, camera);
+    renderer.writeRgb(rgb);
+    const render_end = now(io);
+
+    var payload: []const u8 = rgb;
+    var compressed = false;
+    if (!options.raw) {
+        if (deflate(zbuf, window, rgb)) |z| {
+            if (z.len < rgb.len) {
+                payload = z;
+                compressed = true;
+            }
+        }
+    }
+    const compress_end = now(io);
+    const encoded_frame = std.base64.standard.Encoder.encode(encoded[0..std.base64.standard.Encoder.calcSize(payload.len)], payload);
+    const encode_end = now(io);
+
+    return .{
+        .encoded = encoded_frame,
+        .compressed = compressed,
+        .payload_len = payload.len,
+        .render_ns = render_end - render_start,
+        .compress_ns = compress_end - render_end,
+        .encode_ns = encode_end - compress_end,
+        .tris = renderer.stats.tris,
+        .pixels = renderer.stats.pixels,
+        .visited = renderer.stats.visited,
+        .section = camera.section,
+    };
 }
 
 fn renderFrame(renderer: *wipeout.render.Renderer, track: *const wipeout.track.Track, scene: *wipeout.scene.Scene, camera: *const FlyCamera) void {
