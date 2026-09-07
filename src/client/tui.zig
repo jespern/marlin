@@ -2287,7 +2287,7 @@ pub const App = struct {
         self.game_active.store(true, .release);
         self.wipeout_game.?.resume_();
         self.syncAnimationTicker();
-        self.setNotice("wipEout — arrows steer/pitch, x thrust, z/c airbrakes, f fire, v view, Enter pauses, Esc leaves", .{});
+        self.setNotice("wipEout — arrows steer/pitch, x thrust, z/c airbrakes, f fire, Enter pauses, Backspace menu, Esc leaves", .{});
     }
 
     /// Leave the game: hide the effect and stop the fast ticker. The race
@@ -5585,7 +5585,7 @@ pub fn drawUiAnimation(app: *const App, win: vaxis.Window) void {
         return;
     }
     if (app.ui_animation != null) {
-        // Pixel images and the maze cannot interleave with text: a transient
+        // Pixel images and game boards cannot interleave with text: a transient
         // /animate of those runs opaque for its duration instead.
         if (engine.kind().fullScreenOnly()) {
             engine.draw(win, .full_screen, 255);
@@ -5823,7 +5823,10 @@ pub fn dispatchEvent(
         },
         .mouse_leave => vx.setMouseShape(.default),
         .focus_in => app.terminal_focused = true,
-        .focus_out => app.terminal_focused = false,
+        .focus_out => {
+            app.terminal_focused = false;
+            if (app.game_mode) if (app.wipeout_game) |game| game.releaseKeys();
+        },
         .color_report => |report| app.terminal_theme.applyReport(report),
         .tick => {
             app.view.spinner_frame +%= 1;

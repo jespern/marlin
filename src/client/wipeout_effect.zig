@@ -38,7 +38,7 @@ pub const Game = struct {
     pub fn snapshot(self: *const Game) wipeout.snapshot.Snapshot {
         const s = self.session;
         return .{
-            .autopilot = @intFromBool(s.autopilot),
+            .autopilot = 0,
             .steps = s.steps,
             .state = s.state,
             .rng = s.rng,
@@ -49,7 +49,7 @@ pub const Game = struct {
     pub fn restore(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, snap: *const wipeout.snapshot.Snapshot) !*Game {
         const self = try create(gpa, io, environ, .{});
         errdefer self.destroy();
-        try self.session.restoreState(&snap.state, snap.rng, snap.steps, snap.autopilot != 0);
+        try self.session.restoreState(&snap.state, snap.rng, snap.steps, false);
         return self;
     }
 
@@ -58,11 +58,17 @@ pub const Game = struct {
     }
 
     pub fn resume_(self: *Game) void {
+        self.session.autopilot = false;
         self.session.resume_();
     }
 
     pub fn pause(self: *Game) void {
         self.session.pause();
+    }
+
+    pub fn releaseKeys(self: *Game) void {
+        self.session.input = .{};
+        self.session.autopilot = false;
     }
 
     pub fn tick(self: *Game) void {
@@ -84,7 +90,7 @@ pub const Game = struct {
     /// Map a terminal key to game actions. Arrows steer and pitch and move
     /// the menu cursor; `x` or space thrusts and selects; `z`/`c` are the
     /// airbrakes; `v` toggles the view; `f` fires; Enter starts and pauses;
-    /// Backspace goes back a menu page.
+    /// Backspace returns a race to the main menu or goes back one menu page.
     pub fn actionsForKey(key: vaxis.Key) [2]?wipeout.input.Action {
         return switch (key.codepoint) {
             vaxis.Key.left => .{ .left, .menu_left },
@@ -110,8 +116,9 @@ pub const Game = struct {
             if (down) self.toggleCrt();
             return true;
         }
-        if (key.codepoint == vaxis.Key.tab) {
-            if (down) self.session.autopilot = !self.session.autopilot;
+        if (down and key.codepoint == vaxis.Key.backspace and self.session.state.scene == .race) {
+            self.session.state.goToMainMenu();
+            self.releaseKeys();
             return true;
         }
         const actions = actionsForKey(key);

@@ -11,6 +11,8 @@ const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const voice = @import("voice.zig");
+const wipeout_effect = @import("wipeout_effect.zig");
+const wipeout = @import("../wipeout/root.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const media = @import("media.zig");
@@ -911,6 +913,39 @@ test "a lone modifier neither wakes the screensaver nor counts as activity" {
     try std.testing.expect(!app.screensaver_active);
 }
 
+test "focus loss releases held wipEout controls" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
+        .game_mode = true,
+    };
+    defer app.deinit();
+
+    var session: wipeout.session.Session = undefined;
+    session.input = .{};
+    session.input.set(.left, true);
+    session.input.set(.fire, true);
+    session.autopilot = true;
+    var game = wipeout_effect.Game{ .session = &session, .gpa = undefined };
+    app.wipeout_game = &game;
+    defer app.wipeout_game = null;
+
+    var verdicts = TransportVerdicts{};
+    try dispatchEvent(&app, undefined, undefined, gpa, .focus_out, &verdicts);
+    try std.testing.expect(!app.terminal_focused);
+    try std.testing.expect(!session.input.anyHeld());
+    try std.testing.expect(!session.input.isPressed(.fire));
+    try std.testing.expect(!session.autopilot);
+}
+
 test "mouse activity neither wakes nor postpones the screensaver" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -929,10 +964,18 @@ test "mouse activity neither wakes nor postpones the screensaver" {
     const deadline = nowWallMs(app.io) + 500;
     app.screensaver_deadline_ms.store(deadline, .release);
 
+    // The mouse path reads the Vaxis window, so it needs a real instance.
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var vx = try vaxis.Vaxis.init(threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &out.writer);
+
     var verdicts = TransportVerdicts{};
     try dispatchEvent(
         &app,
-        undefined,
+        &vx,
         undefined,
         gpa,
         .{ .mouse = .{ .col = 0, .row = 0, .button = .none, .mods = .{}, .type = .motion } },
@@ -943,7 +986,7 @@ test "mouse activity neither wakes nor postpones the screensaver" {
     app.startScreensaver(app.screensaver_kind);
     try dispatchEvent(
         &app,
-        undefined,
+        &vx,
         undefined,
         gpa,
         .{ .mouse = .{ .col = 0, .row = 0, .button = .none, .mods = .{}, .type = .motion } },

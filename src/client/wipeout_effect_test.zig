@@ -1,8 +1,48 @@
 const std = @import("std");
 const Io = std.Io;
+const vaxis = @import("vaxis");
 const wipeout_effect = @import("wipeout_effect.zig");
 const voice = @import("voice.zig");
 const wipeout = @import("../wipeout/root.zig");
+
+test "Backspace returns a race to the main menu and releases controls" {
+    var session: wipeout.session.Session = undefined;
+    session.state = wipeout.game.State.init(wipeout.save.defaults);
+    session.state.startRaceDirect(1, 0, false);
+    session.input = .{};
+    session.input.set(.left, true);
+    session.input.set(.fire, true);
+    session.autopilot = true;
+    var game = wipeout_effect.Game{ .session = &session, .gpa = undefined };
+
+    try std.testing.expect(game.setKey(.{ .codepoint = vaxis.Key.backspace }, true));
+    try std.testing.expectEqual(wipeout.game.Scene.main_menu, session.state.scene);
+    try std.testing.expect(!session.input.anyHeld());
+    try std.testing.expect(!session.autopilot);
+}
+
+test "Tab cannot enable the client autopilot" {
+    var session: wipeout.session.Session = undefined;
+    session.autopilot = false;
+    var game = wipeout_effect.Game{ .session = &session, .gpa = undefined };
+
+    try std.testing.expect(!game.setKey(.{ .codepoint = vaxis.Key.tab }, true));
+    try std.testing.expect(!session.autopilot);
+}
+
+test "releaseKeys clears held controls and autopilot" {
+    var session: wipeout.session.Session = undefined;
+    session.input = .{};
+    session.input.set(.right, true);
+    session.input.set(.fire, true);
+    session.autopilot = true;
+    var game = wipeout_effect.Game{ .session = &session, .gpa = undefined };
+
+    game.releaseKeys();
+    try std.testing.expect(!session.input.anyHeld());
+    try std.testing.expect(!session.input.isPressed(.fire));
+    try std.testing.expect(!session.autopilot);
+}
 
 test "bundle destination sits in the data root" {
     const gpa = std.testing.allocator;
