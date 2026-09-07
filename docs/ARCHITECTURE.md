@@ -1170,7 +1170,12 @@ A split pane identifies its session with a compact pane label.
   priority as final assistant prose; its dot rail, not grey text, distinguishes it.
   In the default view, later commentary or the final answer suppresses earlier
   same-turn narration that repeats substantially the same words; Ctrl+T retains
-  the complete durable transcript. Provider byte/quiet telemetry and exact persisted tool calls
+  the complete durable transcript. Guest sessions (`Transcript.guest`) render
+  differently because headless Claude Code and Codex emit no thinking: their
+  between-tool prose is the whole narration, so it is laid out as ordinary
+  assistant text (full length, no dot rail), and their tool calls show as a
+  one-line `⚙` trail instead of folding into "Ran N commands"; successful
+  result bodies stay hidden except authored diffs, failures always show. Provider byte/quiet telemetry and exact persisted tool calls
   refine the phase without adding durable transcript chatter. Active provider
   traffic shows a green up arrow; three quiet seconds change it to a red down
   arrow. When the active call is Bash, its command preview uses the same

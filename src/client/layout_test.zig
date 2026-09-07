@@ -931,3 +931,144 @@ test "handover in progress uses the generating-handover working word" {
         try std.testing.expect(std.mem.indexOf(u8, line.text2, "Generating handover") == null);
     }
 }
+
+test "guest commentary renders as full assistant prose instead of a clipped reasoning card" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const long = "Starting the extraction now: moving the field declarations into the new struct, then the mechanical rename across about a thousand access sites, then the test literals, then a compile to find whatever the regex missed, and finally the fold-in of the saved view type so the two copy functions can go away for good.";
+    try std.testing.expect(long.len > 280);
+    const blocks = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("go"), .label = @constCast("") },
+        .{ .kind = .reasoning, .turn_id = 1, .text = @constCast(long), .label = @constCast(""), .commentary = true },
+        .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{\"command\":\"zig build test\"}"), .label = @constCast("Bash") },
+    };
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .guest = true,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const lines = try layoutLines(arena, gpa, &transcript, 120);
+    var joined: std.ArrayList(u8) = .empty;
+    var card_marks: usize = 0;
+    for (lines.items) |line| {
+        if (std.mem.eql(u8, line.text, "  · ")) card_marks += 1;
+        try joined.appendSlice(arena, try lineText(arena, line));
+        try joined.append(arena, ' ');
+    }
+    // The tail of the narration survives (a reasoning card would clip at 280
+    // cells with an ellipsis) and no dim card marker was used.
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "can go away for good.") != null);
+    try std.testing.expectEqual(@as(usize, 0), card_marks);
+
+    // Native sessions keep the clipped card.
+    transcript.guest = false;
+    transcript.layout_epoch = 1;
+    const native = try layoutLines(arena, gpa, &transcript, 120);
+    card_marks = 0;
+    var clipped = false;
+    for (native.items) |line| {
+        if (std.mem.eql(u8, line.text, "  · ")) card_marks += 1;
+        if (std.mem.indexOf(u8, try lineText(arena, line), "…") != null) clipped = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), card_marks);
+    try std.testing.expect(clipped);
+}
+
+test "guest tool calls show as a one-line trail instead of folding into Ran N commands" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("go"), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{\"file_path\":\"/w/src/client/tui.zig\"}"), .label = @constCast("Read") },
+        .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("1\tconst std = @import(\"std\");\n2\t..."), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{\"command\":\"zig build test\"}"), .label = @constCast("Bash") },
+        .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("Build Summary: 7/7 steps succeeded"), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{\"file_path\":\"/w/README.md\"}"), .label = @constCast("Edit") },
+        .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("<tool_use_error>File has been modified since read</tool_use_error>"), .label = @constCast(""), .status = .err },
+        .{ .kind = .assistant_msg, .turn_id = 1, .text = @constCast("Done."), .label = @constCast("") },
+    };
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .guest = true,
+        .cwd = "/w",
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const lines = try layoutLines(arena, gpa, &transcript, 120);
+    var calls: usize = 0;
+    var ran_summary = false;
+    var ok_body = false;
+    var err_body = false;
+    for (lines.items) |line| {
+        const text = try lineText(arena, line);
+        if (std.mem.startsWith(u8, line.text, "  ⚙ ")) calls += 1;
+        if (std.mem.indexOf(u8, text, "Ran 2 commands") != null or std.mem.indexOf(u8, text, "Ran 3 commands") != null) ran_summary = true;
+        if (std.mem.indexOf(u8, text, "Build Summary") != null) ok_body = true;
+        if (std.mem.indexOf(u8, text, "modified since read") != null) err_body = true;
+    }
+    try std.testing.expectEqual(@as(usize, 3), calls);
+    try std.testing.expect(!ran_summary);
+    try std.testing.expect(!ok_body);
+    try std.testing.expect(err_body);
+
+    // Native sessions still fold.
+    transcript.guest = false;
+    transcript.layout_epoch = 1;
+    const native = try layoutLines(arena, gpa, &transcript, 120);
+    ran_summary = false;
+    for (native.items) |line| {
+        if (std.mem.indexOf(u8, try lineText(arena, line), "Ran 2 commands") != null) ran_summary = true;
+    }
+    try std.testing.expect(ran_summary);
+}

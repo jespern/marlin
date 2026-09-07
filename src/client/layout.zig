@@ -1121,6 +1121,11 @@ pub const Transcript = struct {
     /// The TUI's TODO table supplies its own spinner and active-step timer;
     /// suppress this competing live-status row while that table is visible.
     show_working_ticker: bool = true,
+    /// The session runs a guest agent (Claude Code, Codex). Guests emit no
+    /// thinking, so their between-tool prose is the whole narration and is
+    /// rendered as ordinary assistant text, and their tool calls show as a
+    /// compact one-line trail instead of folding into "Ran N commands".
+    guest: bool = false,
     cwd: []const u8 = "",
     approval: ?ApprovalView,
     layout_cache: *LayoutCache,
@@ -1290,7 +1295,7 @@ pub fn layoutBlockRange(
         }
         layout_steps += 1;
         const rb = transcript.blocks[block_idx];
-        if (!transcript.show_tool_transcript and rb.kind == .tool_call) {
+        if (!transcript.show_tool_transcript and !transcript.guest and rb.kind == .tool_call) {
             const blocks_all = transcript.blocks;
             // Fold completed batches into one summary, merging consecutive
             // batches of this turn. Failed pairs (and author-diffs) stay
@@ -1429,7 +1434,15 @@ pub fn layoutBlockRange(
                 // model's deliberate one-line narration (commentary=true)
                 // stays unless a later commentary/final answer says the same
                 // thing. ctrl+t reveals the complete durable transcript.
-                if (transcript.show_tool_transcript or
+                if (transcript.guest and rb.commentary) {
+                    // A guest's only narration: full text, assistant styling.
+                    // Still superseded by a later message saying the same.
+                    if (transcript.show_tool_transcript or !commentarySuperseded(transcript.blocks, block_idx)) {
+                        try flushRanSummary(alloc, lines, &pending_ran);
+                        try blankLine(alloc, lines);
+                        try wrapMarkdown(alloc, lines, rb.text, w);
+                    }
+                } else if (transcript.show_tool_transcript or
                     (rb.commentary and !commentarySuperseded(transcript.blocks, block_idx)))
                 {
                     try blankLine(alloc, lines);
@@ -1442,7 +1455,14 @@ pub fn layoutBlockRange(
                 last_tool_label.* = rb.label;
                 try appendToolCallLine(alloc, lines, rb, transcript.cwd, w, null);
             },
-            .tool_result => try appendToolResultLines(alloc, lines, rb, last_tool_label.*),
+            .tool_result => {
+                // Guest trail: the call line is the progress signal; a
+                // successful result body is machinery unless it is an
+                // authored diff. Failures always show.
+                if (transcript.guest and !transcript.show_tool_transcript and rb.status == .ok and
+                    !(isFileEditTool(last_tool_label.*) and isDiffOutput(rb.text))) continue;
+                try appendToolResultLines(alloc, lines, rb, last_tool_label.*);
+            },
             .approval => {
                 const txt = try std.fmt.allocPrint(alloc, "    [approval: {s}]", .{rb.text});
                 try wrapInto(alloc, lines, txt, .{ .text = txt, .style = Palette.note });

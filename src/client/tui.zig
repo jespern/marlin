@@ -3877,6 +3877,7 @@ fn transcriptView(app: *App) Transcript {
         .stream_status_at_ms = app.view.stream_status_at_ms,
         .show_working_ticker = !hasUnfinishedPlan(app.view.plan.items),
         .cwd = app.view.cwd.items,
+        .guest = proto.isGuestModel(app.view.model.items),
         .approval = if (app.view.pending) |*pending| .{
             .tool = pending.tool(),
             .args = pending.args(),
