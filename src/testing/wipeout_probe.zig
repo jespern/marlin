@@ -34,6 +34,12 @@ pub const Options = struct {
     rows: ?u16 = null,
     dry_run: bool = false,
     raw: bool = false,
+    /// Mirror the marlin client's Kitty transport instead of the probe's:
+    /// one fixed image id replaced in place every frame, a delete-all-
+    /// placements before it (vaxis does that on every render), and the whole
+    /// frame inside a DEC 2026 synchronized update. For A/B tests against a
+    /// terminal that dies under one transport and not the other.
+    client_transport: bool = false,
     snapshot: ?[]const u8 = null,
     frame: u32 = 0,
     /// Headless: fly for --seconds, write the frames with the most uncovered
@@ -512,9 +518,15 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
 
         const write_start = now(io);
         if (!options.dry_run) {
-            const id = image_ids[@intCast(totals.frames % 2)];
-            try transmitFrame(out, pending.encoded, options, display, pending.compressed, id);
-            if (totals.frames > 0) try deleteImage(out, image_ids[@intCast((totals.frames + 1) % 2)]);
+            if (options.client_transport) {
+                try out.writeAll("\x1b[?2026h\x1b_Ga=d\x1b\\");
+                try transmitFrame(out, pending.encoded, options, display, pending.compressed, image_ids[0]);
+                try out.writeAll("\x1b[?2026l");
+            } else {
+                const id = image_ids[@intCast(totals.frames % 2)];
+                try transmitFrame(out, pending.encoded, options, display, pending.compressed, id);
+                if (totals.frames > 0) try deleteImage(out, image_ids[@intCast((totals.frames + 1) % 2)]);
+            }
             try out.flush();
         }
         const write_end = now(io);
@@ -1313,6 +1325,8 @@ fn parseArgs(args: []const []const u8) !Options {
             options.dry_run = true;
         } else if (std.mem.eql(u8, arg, "--raw")) {
             options.raw = true;
+        } else if (std.mem.eql(u8, arg, "--client-transport")) {
+            options.client_transport = true;
         } else if (std.mem.eql(u8, arg, "--track")) {
             options.track = try nextUnsigned(u8, args, &index);
         } else if (std.mem.eql(u8, arg, "--fps")) {
@@ -1470,6 +1484,7 @@ fn usage(io: Io) void {
         \\  --ship-log F       write ship state per frame as CSV
         \\  --probe-pixel X,Y  with --snapshot: print rasterizer decisions for one pixel
         \\  --raw              disable zlib compression
+        \\  --client-transport one image id replaced in place inside DEC 2026, as the marlin client ships frames
         \\
     , .{});
 }
