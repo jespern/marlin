@@ -294,11 +294,12 @@ into different decisions over the run.
 
 `!wipeout [track 1-14] [pilot 0-7] [rapier|venom] [nointro]` loads the
 circuit and shows it as a pixel effect. While it is up the client is in
-game mode: every key press and release goes to the ship (the same bindings
-as the probe, plus `p` for the CRT pass and Tab for the autopilot, shown as
-"AUTO" on the HUD) and Escape or Ctrl-C pauses the game and hands the
-terminal back. `!wipeout` again resumes the same race; a different track or pilot
-starts a new one. The race object is owned by the App, not by the effect
+game mode: every key press and release goes to the ship (the same driving
+bindings as the probe, plus `p` for the CRT pass). Backspace returns a race
+to the main menu; Escape or Ctrl-C pauses the game and hands the terminal
+back. Losing terminal focus clears held controls so a missed release cannot
+leave steering, thrust, or fire stuck. `!wipeout` again resumes the same
+race; a different track or pilot starts a new one. The race object is owned by the App, not by the effect
 engine, so running another screensaver in between does not lose it, and
 the effect engine keeps state alive when hidden as marlin's other pixel
 effects already do.

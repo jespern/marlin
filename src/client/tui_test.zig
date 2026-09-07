@@ -11,6 +11,8 @@ const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const voice = @import("voice.zig");
+const wipeout_effect = @import("wipeout_effect.zig");
+const wipeout = @import("../wipeout/root.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const media = @import("media.zig");
@@ -909,6 +911,39 @@ test "a lone modifier neither wakes the screensaver nor counts as activity" {
         &verdicts,
     );
     try std.testing.expect(!app.screensaver_active);
+}
+
+test "focus loss releases held wipEout controls" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
+        .game_mode = true,
+    };
+    defer app.deinit();
+
+    var session: wipeout.session.Session = undefined;
+    session.input = .{};
+    session.input.set(.left, true);
+    session.input.set(.fire, true);
+    session.autopilot = true;
+    var game = wipeout_effect.Game{ .session = &session, .gpa = undefined };
+    app.wipeout_game = &game;
+    defer app.wipeout_game = null;
+
+    var verdicts = TransportVerdicts{};
+    try dispatchEvent(&app, undefined, undefined, gpa, .focus_out, &verdicts);
+    try std.testing.expect(!app.terminal_focused);
+    try std.testing.expect(!session.input.anyHeld());
+    try std.testing.expect(!session.input.isPressed(.fire));
+    try std.testing.expect(!session.autopilot);
 }
 
 test "mouse activity neither wakes nor postpones the screensaver" {
