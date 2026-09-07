@@ -67,6 +67,10 @@ pub fn build(b: *std.Build) void {
         "Compile vendored SQLite into Marlin (official releases enable this)",
     ) orelse false;
 
+    const asset_store = b.createModule(.{ .root_source_file = b.path("src/asset_store.zig"), .target = target });
+    const asset_store_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/asset_store.zig"), .target = target, .optimize = .Debug }) });
+    const asset_store_run = b.addRunArtifact(asset_store_tests);
+    b.step("asset-store-test", "Test shared asset verification and caching").dependOn(&asset_store_run.step);
     // ---- source formatting ----
     const format = b.addFmt(.{ .paths = &.{ "src", "build.zig" } });
     const format_step = b.step("fmt", "Format Zig source");
@@ -94,6 +98,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addImport("asset_store", asset_store);
     configureSqlite(exe.root_module, b, embedded_sqlite);
     configurePower(exe.root_module, b, target);
     const build_options = b.addOptions();
@@ -113,6 +118,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    mk64_module.addImport("asset_store", asset_store);
     const asset_import = b.addExecutable(.{
         .name = "mk64-import",
         .root_module = b.createModule(.{
@@ -144,6 +150,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .Debug,
     }) });
+    mk64_tests.root_module.addImport("asset_store", asset_store);
     b.step("mk64-test", "Test the pure-Zig MK64 port").dependOn(&b.addRunArtifact(mk64_tests).step);
 
     // ---- wipEout port probe ----
@@ -152,6 +159,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    wipeout_module.addImport("asset_store", asset_store);
     const wipeout_probe = b.addExecutable(.{
         .name = "wipeout-probe",
         .root_module = b.createModule(.{
@@ -178,6 +186,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
+    wipeout_tests.root_module.addImport("asset_store", asset_store);
     const wipeout_test_step = b.step("wipeout-test", "Run wipEout port unit tests");
     wipeout_test_step.dependOn(&b.addRunArtifact(wipeout_tests).step);
 
@@ -193,6 +202,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "regex", .module = regex.module("regex") },
         },
     });
+    test_module.addImport("asset_store", asset_store);
     configureSqlite(test_module, b, embedded_sqlite);
     configurePower(test_module, b, target);
     test_module.addOptions("build_options", build_options);
@@ -200,6 +210,7 @@ pub fn build(b: *std.Build) void {
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit + fixture tests");
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&asset_store_run.step);
 
     // ---- fake provider ----
     const fakeprov = b.addExecutable(.{

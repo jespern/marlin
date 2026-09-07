@@ -86,6 +86,15 @@ pub const Session = struct {
     pub fn create(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, options: StartOptions) !*Session {
         const root = try assets_mod.defaultRoot(gpa, environ);
         errdefer gpa.free(root);
+        // Default downloads must be verified on every launch; custom extracted
+        // roots retain their development behavior.
+        if (if (environ.get("MARLIN_WIPEOUT_DATA")) |value| value.len == 0 else true) {
+            const path = try assets_mod.bundlePath(gpa, root);
+            defer gpa.free(path);
+            try assets_mod.migrateLegacy(gpa, io, environ, path);
+            const bytes = try @import("asset_store").readCached(gpa, io, assets_mod.spec, path) orelse return error.AssetsMissing;
+            gpa.free(bytes);
+        }
         const save_path: ?[]u8 = save_mod.defaultPath(gpa, environ) catch null;
         errdefer if (save_path) |p| gpa.free(p);
         const saved = if (save_path) |p| save_mod.read(io, gpa, p) else save_mod.defaults;

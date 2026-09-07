@@ -22,6 +22,7 @@ pub const ComposerCommand = struct {
     usage: []const u8 = "",
     description: []const u8,
     accepts_args: bool = false,
+    hidden: bool = false,
 };
 
 /// Visible canonical commands and terse aliases. `/q` remains accepted by
@@ -43,8 +44,8 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
     .{ .name = "/animate", .usage = " <" ++ effects.usage_list ++ ">", .description = "play a transient screen effect", .accepts_args = true },
-    .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "|mariokart]", .description = "start a continuous full-screen effect", .accepts_args = true },
-    .{ .name = "/mk64", .usage = " [absolute bundle or ROM path]", .description = "play Mario Kart (pure Zig)", .accepts_args = true },
+    .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "]", .description = "start a continuous full-screen effect", .accepts_args = true },
+    .{ .name = "/mk64", .hidden = true, .usage = " [absolute bundle or ROM path]", .description = "play Mario Kart (pure Zig)", .accepts_args = true },
     .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/cwd", .usage = " <path>", .description = "change this session's working directory", .accepts_args = true },
@@ -59,11 +60,11 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/detach", .description = "leave Marlin (sessions keep running)" },
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
-    .{ .name = "!mk", .usage = " [absolute bundle or ROM path]", .description = "play Mario Kart", .accepts_args = true },
+    .{ .name = "!mk", .hidden = true, .usage = " [absolute bundle or ROM path]", .description = "play Mario Kart", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
     .{ .name = "!rbc", .description = "rebuild only the local client (alias for !rb client)" },
-    .{ .name = "!wipeout", .usage = " [track] [pilot] [rapier] [easy|hard] [trial] [new]", .description = "play wipEout (menus, championship, best times; Esc leaves, bare !wipeout resumes)", .accepts_args = true },
+    .{ .name = "!wipeout", .hidden = true, .usage = " [track] [pilot] [rapier] [easy|hard] [trial] [new]", .description = "play wipEout (menus, championship, best times; Esc leaves, bare !wipeout resumes)", .accepts_args = true },
 };
 
 pub const CommandSuggestion = struct {
@@ -222,6 +223,7 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
     {
         const rest = std.mem.trimStart(u8, query["/animate".len..], " \t");
         for (effects.kinds) |kind| {
+            if (kind.playable() and rest.len == 0) continue;
             const name = kind.name();
             if (rest.len <= name.len and std.ascii.eqlIgnoreCase(rest, name[0..rest.len])) {
                 const replacement = try std.fmt.allocPrint(arena, "/animate {s}", .{name});
@@ -241,10 +243,11 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
     {
         const rest = std.mem.trimStart(u8, query["/screensaver".len..], " \t");
         const mario = "mariokart";
-        if (rest.len <= mario.len and std.ascii.eqlIgnoreCase(rest, mario[0..rest.len])) {
+        if (rest.len > 0 and rest.len <= mario.len and std.ascii.eqlIgnoreCase(rest, mario[0..rest.len])) {
             try out.append(arena, .{ .label = "/screensaver mariokart", .replacement = "/screensaver mariokart", .description = "Mario Kart autopilot (full-screen)", .submit_on_enter = true });
         }
         for (effects.kinds) |kind| {
+            if (kind.playable() and rest.len == 0) continue;
             const name = kind.name();
             if (rest.len <= name.len and std.ascii.eqlIgnoreCase(rest, name[0..rest.len])) {
                 const replacement = try std.fmt.allocPrint(arena, "/screensaver {s}", .{name});
@@ -281,6 +284,7 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
         return out.items;
     }
     for (composer_commands) |command| {
+        if (command.hidden and query.len <= 1) continue;
         if (query.len <= command.name.len and std.ascii.eqlIgnoreCase(query, command.name[0..query.len])) {
             try out.append(arena, .{
                 .label = command.name,

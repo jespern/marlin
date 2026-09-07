@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack the wipEout graphics assets into one xz-compressed bundle.
 
-    scripts/wipeout_pack.py <data-root> assets/wipeout.pak
+    scripts/wipeout_pack.py <data-root> assets/wo.pak
 
 <data-root> is the directory that holds `wipeout/` (the layout the reference
 build uses). Only what the port loads goes in: common models, textures and

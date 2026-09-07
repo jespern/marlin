@@ -343,7 +343,6 @@ const help_text =
     \\  marlin daemon          run the daemon in the foreground
     \\  marlin ls [--all]      list sessions
     \\  marlin top             live session overview and switcher
-    \\  marlin mk64 [assets]      experimental pure-Zig Luigi Raceway drive test
     \\  marlin search <query>  search durable transcripts across sessions
     \\  marlin inspect <handle> [options]  inspect session state, plan, blocks, and diagnostics
     \\      --json | --plan | --kind <kind> | --limit N | --around SEQ | --turn latest

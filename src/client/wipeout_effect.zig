@@ -130,7 +130,7 @@ pub const Game = struct {
     }
 };
 
-/// Where the asset bundle lands: `<data root>/wipeout.pak`. Caller frees.
+/// Where the asset bundle lands: `<data root>/wo.pak`. Caller frees.
 pub fn bundleDestination(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
     const root = try wipeout.assets.defaultRoot(gpa, environ);
     defer gpa.free(root);

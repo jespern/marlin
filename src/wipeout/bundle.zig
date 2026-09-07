@@ -13,7 +13,7 @@ const std = @import("std");
 const Io = std.Io;
 
 pub const magic = "WPK1";
-pub const file_name = "wipeout.pak";
+pub const file_name = "wo.pak";
 /// Decompressed size guard; the real image is about 11 MiB.
 pub const max_unpacked_bytes: usize = 64 * 1024 * 1024;
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const vaxis = @import("vaxis");
 const wipeout_effect = @import("wipeout_effect.zig");
-const voice = @import("voice.zig");
+const store = @import("asset_store");
 const wipeout = @import("../wipeout/root.zig");
 
 test "Backspace returns a race to the main menu and releases controls" {
@@ -51,7 +51,7 @@ test "bundle destination sits in the data root" {
     try environ.put("MARLIN_WIPEOUT_DATA", "/tmp/wp-root");
     const dest = try wipeout_effect.bundleDestination(gpa, &environ);
     defer gpa.free(dest);
-    try std.testing.expectEqualStrings("/tmp/wp-root/wipeout.pak", dest);
+    try std.testing.expectEqualStrings("/tmp/wp-root/wo.pak", dest);
     try std.testing.expectEqualStrings(wipeout.assets.default_bundle_url, wipeout_effect.bundleUrl(&environ));
     try environ.put("MARLIN_WIPEOUT_URL", "http://127.0.0.1:1/x.pak");
     try std.testing.expectEqualStrings("http://127.0.0.1:1/x.pak", wipeout_effect.bundleUrl(&environ));
@@ -68,7 +68,8 @@ test "bundle download: real network smoke (MARLIN_WIPEOUT_NET_TEST=1)" {
     defer temp.deinit();
     var environ = std.process.Environ.Map.init(gpa);
     defer environ.deinit();
-    try environ.put("MARLIN_WIPEOUT_DATA", temp.path);
+    try environ.put("XDG_CACHE_HOME", temp.path);
+    try environ.put("XDG_DATA_HOME", temp.path);
     if (std.c.getenv("MARLIN_WIPEOUT_URL")) |url| try environ.put("MARLIN_WIPEOUT_URL", std.mem.span(url));
     try environ.put("XDG_STATE_HOME", temp.path);
 
@@ -77,8 +78,8 @@ test "bundle download: real network smoke (MARLIN_WIPEOUT_NET_TEST=1)" {
 
     const dest = try wipeout_effect.bundleDestination(gpa, &environ);
     defer gpa.free(dest);
-    var progress = voice.DownloadProgress{};
-    try voice.download(gpa, io, wipeout_effect.bundleUrl(&environ), dest, &progress);
+    var progress = store.Progress{};
+    try wipeout.assets.download(gpa, io, wipeout_effect.bundleUrl(&environ), dest, &progress);
     try std.testing.expect(progress.done.load(.acquire) > 1024 * 1024);
 
     var bundle = try wipeout.bundle.Bundle.open(gpa, io, dest);

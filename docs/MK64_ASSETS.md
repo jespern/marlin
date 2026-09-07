@@ -1,16 +1,17 @@
 # Mario Kart assets
 
-The 235.4 KiB bundle lives under `assets/mk64/`, outside the executable.
+The 235.4 KiB bundle lives under `assets/mk.pak`, outside the executable.
 On first launch, `marlin mk64`, `!mk` and `/screensaver mariokart` download it from
-`https://raw.githubusercontent.com/jespern/marlin/main/assets/mk64/<sha256>.mkassets`.
+`https://raw.githubusercontent.com/jespern/marlin/main/assets/mk.pak`.
 The expected SHA256 and URL are pinned in `src/mk64/cache.zig`. A valid cached file
 needs no network. Downloads are bounded, validated and atomically installed;
 a corrupt cache is repaired on the next successful download. Failures offer retry
 or a local `MARLIN_MK64_ASSETS` override and do not install incomplete data.
 
-Cache: `$XDG_CACHE_HOME/marlin/mk64/<sha256>.mkassets`, falling back to
-`~/.cache/marlin/mk64/<sha256>.mkassets`. Explicit bundle/ROM paths bypass downloads.
-The raw URL is not live until this asset file is published to `main`.
+Cache: `$XDG_CACHE_HOME/marlin/assets/<sha256>/mk.pak`, falling back to
+`~/.cache/marlin/assets/<sha256>/mk.pak`. Explicit bundle/ROM paths bypass downloads.
+The renamed raw URL is not live until this asset file is published to `main`.
+See [ASSETS.md](ASSETS.md) for shared cache policy and publishing.
 
 ## Regenerate or extend
 
@@ -24,10 +25,10 @@ course/kart/HUD loaders used during development, encodes the bundle, reloads it,
 and compares every consumed resource against direct ROM loading before writing.
 Output is deterministic. The ROM and intermediate decoded assets stay outside
 Git; the generated `.mkassets` file belongs in the repository alongside its recipe.
-Copy the result to `assets/mk64/<printed-sha256>.mkassets` and update
+Copy the result to `assets/mk.pak` and update
 `digest_hex` in `src/mk64/cache.zig`. Run `zig build mk64-test` and `zig build`.
 Publish the new asset to `main` before distributing a binary pinned to it.
-Keep old hash-named files available for older clients. Each changed bundle gets
+Pin the raw URL to the published commit so older clients retain their exact bundle. Each changed bundle gets
 a new cache entry automatically; users need not delete their cache.
 
 To expand the asset set:

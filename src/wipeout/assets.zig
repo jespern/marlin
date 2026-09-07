@@ -2,17 +2,16 @@
 //!
 //! The on-disk layout mirrors the original game (`<root>/wipeout/track01/…`)
 //! so the same tree can feed both this port and the reference C build.
-//! The default root is `$XDG_DATA_HOME/marlin/wipeout-data`, falling back to
-//! `~/.local/share/marlin/wipeout-data`. A root either holds the extracted
-//! tree or the single-file bundle `wipeout.pak` (see `bundle.zig`), which
-//! the client downloads on first run.
+//! Default bundles use the shared, checksum-addressed cache. Explicit
+//! MARLIN_WIPEOUT_DATA roots may contain an extracted tree or a bundle.
 
 const std = @import("std");
 const Io = std.Io;
+const store = @import("asset_store");
 const bundle_mod = @import("bundle.zig");
 
 /// Where the client fetches the bundle from; `MARLIN_WIPEOUT_URL` overrides.
-pub const default_bundle_url = "https://raw.githubusercontent.com/jespern/marlin/main/assets/wipeout.pak";
+pub const default_bundle_url = "https://raw.githubusercontent.com/jespern/marlin/main/assets/wo.pak";
 /// Present in every complete extracted tree; its absence means "no tree".
 pub const tree_probe_file = "wipeout/common/allsh.prm";
 
@@ -63,14 +62,12 @@ pub fn defaultRoot(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) 
     if (env.get("MARLIN_WIPEOUT_DATA")) |explicit| {
         if (explicit.len > 0) return gpa.dupe(u8, explicit);
     }
-    if (env.get("XDG_DATA_HOME")) |xdg| {
-        if (xdg.len > 0) return std.fs.path.join(gpa, &.{ xdg, "marlin", "wipeout-data" });
-    }
-    const home = env.get("HOME") orelse return error.NoHome;
-    return std.fs.path.join(gpa, &.{ home, ".local", "share", "marlin", "wipeout-data" });
+    const path = try store.cachePath(gpa, env, spec);
+    defer gpa.free(path);
+    return gpa.dupe(u8, std.fs.path.dirname(path).?);
 }
 
-/// `<root>/wipeout.pak`. Caller owns the result.
+/// `<root>/wo.pak`. Caller owns the result.
 pub fn bundlePath(gpa: std.mem.Allocator, root: []const u8) ![]u8 {
     return std.fs.path.join(gpa, &.{ root, bundle_mod.file_name });
 }
@@ -99,6 +96,43 @@ pub fn openSource(gpa: std.mem.Allocator, io: Io, root: []const u8) !Source {
     } else |_| {}
     const pak = try bundlePath(gpa, root);
     defer gpa.free(pak);
-    _ = Io.Dir.cwd().statFile(io, pak, .{}) catch return error.AssetsMissing;
+    _ = Io.Dir.cwd().statFile(io, pak, .{}) catch |err| {
+        if (err != error.FileNotFound) return err;
+        const old = try std.fs.path.join(gpa, &.{ root, "wipeout.pak" });
+        defer gpa.free(old);
+        return .{ .bundle = bundle_mod.Bundle.open(gpa, io, old) catch |e| switch (e) {
+            error.FileNotFound => return error.AssetsMissing,
+            else => return e,
+        } };
+    };
     return .{ .bundle = try bundle_mod.Bundle.open(gpa, io, pak) };
+}
+
+pub const spec = store.Spec{ .filename = "wo.pak", .sha256 = "d32379e6d0882b5f5c040f4ffda8fc2f5bd36ab9e8f5e3834104ca751ae46d63", .url = default_bundle_url, .max_bytes = 32 * 1024 * 1024, .validate = validateBundle };
+fn validateBundle(a: std.mem.Allocator, bytes: []const u8) !void {
+    var b = try bundle_mod.Bundle.unpack(a, bytes);
+    defer b.deinit();
+    if (b.get(tree_probe_file) == null) return error.BadBundle;
+}
+pub fn download(a: std.mem.Allocator, io: Io, url: []const u8, dest: []const u8, progress: *store.Progress) !void {
+    var selected = spec;
+    selected.url = url;
+    a.free(try store.acquireAt(a, io, selected, dest, progress));
+}
+
+pub fn migrateLegacy(a: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, dest: []const u8) !void {
+    const base = if (env.get("XDG_DATA_HOME")) |dir| try a.dupe(u8, dir) else try std.fs.path.join(a, &.{ env.get("HOME") orelse return, ".local", "share" });
+    defer a.free(base);
+    const old = try std.fs.path.join(a, &.{ base, "marlin", "wipeout-data", "wipeout.pak" });
+    defer a.free(old);
+    try store.migrate(a, io, spec, old, dest);
+}
+
+test "repository bundle satisfies pinned digest and file index validator" {
+    const a = std.testing.allocator;
+    var threaded: Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const bytes = try Io.Dir.cwd().readFileAlloc(threaded.io(), "assets/wo.pak", a, .limited(spec.max_bytes));
+    defer a.free(bytes);
+    try store.verify(a, spec, bytes);
 }

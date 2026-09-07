@@ -543,7 +543,7 @@ pub const App = struct {
     /// hidden game (Esc, or another screensaver in between) resumes intact.
     wipeout_game: ?*wipeout_effect.Game = null,
     /// First-run asset bundle download (progress shared with the worker).
-    wipeout_download: ?*voice.DownloadProgress = null,
+    wipeout_download: ?*@import("asset_store").Progress = null,
     wipeout_download_thread: ?std.Thread = null,
     /// The `!wipeout` that triggered the download; re-run when it lands.
     wipeout_pending: ?WipeoutOptions = null,
@@ -2264,7 +2264,7 @@ pub const App = struct {
                     if (err == error.AssetsMissing) {
                         self.startWipeoutDownload(options);
                     } else {
-                        self.setNotice("wipEout: {t} — game data goes in $XDG_DATA_HOME/marlin/wipeout-data", .{err});
+                        self.setNotice("wipEout: {t} — set MARLIN_WIPEOUT_DATA for a local asset tree", .{err});
                     }
                     return;
                 };
@@ -2315,7 +2315,7 @@ pub const App = struct {
             self.setNotice("wipEout: cannot resolve the data directory", .{});
             return;
         };
-        const progress = self.gpa.create(voice.DownloadProgress) catch {
+        const progress = self.gpa.create(@import("asset_store").Progress) catch {
             self.gpa.free(dest);
             return;
         };
@@ -2363,7 +2363,7 @@ pub const App = struct {
         const pending = self.wipeout_pending;
         self.wipeout_pending = null;
         switch (ev) {
-            .download_failed => |name| self.setNotice("wipEout: game data download failed ({s}) — !wipeout retries and resumes it", .{name}),
+            .download_failed => |name| self.setNotice("wipEout: game data download failed ({s}) — !wipeout retries", .{name}),
             .download_done => if (pending) |options| self.startWipeout(options),
         }
     }
@@ -4492,6 +4492,7 @@ fn drawShortcutHelp(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !voi
     try rows.appendSlice(arena, &shortcut_help_rows);
     try rows.append(arena, .{ .description = "COMMANDS", .heading = true });
     for (composer_commands) |cmd| {
+        if (cmd.hidden) continue;
         try rows.append(arena, .{
             .key = try std.fmt.allocPrint(arena, "{s}{s}", .{ cmd.name, cmd.usage }),
             .description = cmd.description,
@@ -6503,20 +6504,20 @@ const VoiceDownloadJob = struct {
     }
 };
 
-/// Asset bundle download worker for `!wipeout`'s first run. Resumable:
-/// a lost connection leaves `wipeout.pak.part` for the next attempt.
+/// Asset bundle download worker for `!wipeout`'s first run:
+/// only verified downloads replace the cache; cancellation removes temporary files.
 const WipeoutDownloadJob = struct {
     gpa: std.mem.Allocator,
     io: Io,
     loop: *vaxis.Loop(Event),
     url: []const u8,
     dest: []u8,
-    progress: *voice.DownloadProgress,
+    progress: *@import("asset_store").Progress,
 
     fn run(job: *WipeoutDownloadJob) void {
         defer job.gpa.destroy(job);
         defer job.gpa.free(job.dest);
-        voice.download(job.gpa, job.io, job.url, job.dest, job.progress) catch |err| {
+        @import("../wipeout/assets.zig").download(job.gpa, job.io, job.url, job.dest, job.progress) catch |err| {
             job.loop.postEvent(.{ .wipeout = .{ .download_failed = @errorName(err) } }) catch {};
             return;
         };

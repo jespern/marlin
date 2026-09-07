@@ -63,8 +63,8 @@ pickups, all six weapons, particles and the rescue droid are in. No audio.
 | `src/wipeout/root.zig` | Module root, camera angle helpers |
 | `src/client/wipeout_effect.zig` | The game inside marlin: a session plus the terminal key mapping |
 | `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots, scripted whole-game runs |
-| `scripts/wipeout_pack.py` | Builds `assets/wipeout.pak` from an extracted data tree |
-| `assets/wipeout.pak` | The bundle the client downloads on first run (3.4 MB) |
+| `scripts/wipeout_pack.py` | Builds `assets/wo.pak` from an extracted data tree |
+| `assets/wo.pak` | The bundle the client downloads on first run (3.4 MB) |
 
 Build steps: `zig build wipeout-test` (unit tests) and `zig build`, which
 installs `zig-out/bin/wipeout-probe`.
@@ -109,10 +109,10 @@ The port reads only graphics: the common models and textures and the
 fourteen track directories, 184 files and 11.2 MB of the original data.
 Music (122 MB), sound effects and the intro video are never touched.
 
-Those files ship as one bundle, `assets/wipeout.pak`, built by
+Those files ship as one bundle, `assets/wo.pak`, built by
 
 ```
-scripts/wipeout_pack.py <data-root> assets/wipeout.pak
+scripts/wipeout_pack.py <data-root> assets/wo.pak
 ```
 
 from a tree laid out like the reference build (`<data-root>/wipeout/...`).
@@ -123,13 +123,14 @@ bundle inflates it into memory once (about 11 MB, well under a second)
 and serves files as slices; a frame rendered from the bundle is byte
 identical to one rendered from the tree.
 
-The data root is `$MARLIN_WIPEOUT_DATA`, else `$XDG_DATA_HOME/marlin/wipeout-data`,
-else `~/.local/share/marlin/wipeout-data`. An extracted tree there wins
-(the parity harness and the probe use one); otherwise `wipeout.pak` in
-the root is opened. With neither, `!wipeout` downloads the bundle from
-raw GitHub (`MARLIN_WIPEOUT_URL` overrides the location) on a worker
-thread with progress in the status line, resumable through a `.part`
-file, and starts the game when it lands.
+Default downloads use the same verified asset store as the other optional game:
+`$XDG_CACHE_HOME/marlin/assets/<sha256>/wo.pak`, falling back to `~/.cache`.
+The existing data-directory bundle is migrated after verification. Explicit
+`MARLIN_WIPEOUT_DATA` roots still support extracted trees, `wo.pak` and the legacy
+bundle name. `MARLIN_WIPEOUT_URL` selects a mirror for the same pinned bytes.
+Downloads run on a worker with progress and cancellation; only a checksum- and
+format-verified file is atomically installed. Interrupted transfers restart.
+See [ASSETS.md](ASSETS.md) for the shared policy and publishing workflow.
 
 The assets are Sony's 1995 game data; bundling them here means this
 repository redistributes them.

@@ -83,8 +83,8 @@ with tempfile.TemporaryDirectory(prefix="mk64-cache-") as cache, tempfile.Tempor
  if not rom:
   root = Path(__file__).resolve().parent.parent
   digest = re.search(r'digest_hex = "([a-f0-9]+)"', (root / 'src/mk64/cache.zig').read_text()).group(1)
-  fixture = root / 'assets/mk64' / (digest + '.mkassets')
-  dest = Path(cache) / 'marlin/mk64' / fixture.name
+  fixture = root / 'assets/mk.pak'
+  dest = Path(cache) / 'marlin/assets' / digest / fixture.name
   dest.parent.mkdir(parents=True)
   shutil.copyfile(fixture, dest)
  os.environ["MARLIN_MK64_STATE_DIR"]=state

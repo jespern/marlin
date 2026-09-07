@@ -4569,3 +4569,23 @@ test "Mario Kart launch commands are discoverable in completion" {
     try std.testing.expectEqualStrings("/screensaver mariokart", suggestions[0].replacement);
     try std.testing.expect(suggestions[0].submit_on_enter);
 }
+
+test "optional games stay out of general command and effect suggestions" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    for ([_][]const u8{ "!", "/", "/screensaver ", "/animate " }) |query| {
+        app.view.editor.clear();
+        app.view.editor.insertSlice(query);
+        for (try commandSuggestions(&app, arena.allocator())) |suggestion| {
+            try std.testing.expect(std.mem.indexOf(u8, suggestion.replacement, "wipeout") == null);
+            try std.testing.expect(std.mem.indexOf(u8, suggestion.replacement, "mariokart") == null);
+            try std.testing.expect(!std.mem.eql(u8, suggestion.replacement, "!mk"));
+            try std.testing.expect(!std.mem.eql(u8, suggestion.replacement, "/mk64"));
+        }
+    }
+}

@@ -16,8 +16,8 @@ with tempfile.TemporaryDirectory(prefix='mk-tui-') as state:
  if not asset:
   root = Path(__file__).resolve().parent.parent
   digest = re.search(r'digest_hex = "([a-f0-9]+)"', (root / 'src/mk64/cache.zig').read_text()).group(1)
-  fixture = root / 'assets/mk64' / (digest + '.mkassets')
-  dest = Path(env['XDG_CACHE_HOME']) / 'marlin/mk64' / fixture.name
+  fixture = root / 'assets/mk.pak'
+  dest = Path(env['XDG_CACHE_HOME']) / 'marlin/assets' / digest / fixture.name
   dest.parent.mkdir(parents=True)
   shutil.copyfile(fixture, dest)
  env.pop('MARLIN_MK64_ROM', None)
