@@ -90,10 +90,13 @@ test "the probe's transport: one a=T per shipped frame at the placement, nothing
     const first = out.written();
     const id = Engine.imageId(.tunnel);
     var header: [96]u8 = undefined;
-    const want = try std.fmt.bufPrint(&header, "\x1b[1;1H\x1b_Ga=T,f=24,s=240,v=144,i={d},q=2", .{id});
+    const want = try std.fmt.bufPrint(&header, "\x1b[?2026h\x1b[1;1H\x1b_Ga=T,f=24,s=240,v=144,i={d},q=2", .{id});
     const at = std.mem.indexOf(u8, first, want).?;
     const semi = std.mem.indexOfScalarPos(u8, first, at + want.len, ';').?; // past the cursor move's own ';'
     try std.testing.expect(std.mem.endsWith(u8, first[at..semi], ",m=1,c=80,r=24,C=1")); // zlib or not, placed at the window
+    // The frame's last chunk is followed by the end of its synchronized update.
+    const last_chunk_end = std.mem.lastIndexOf(u8, first, "\x1b\\\x1b[?2026l").?;
+    try std.testing.expect(last_chunk_end > at);
     // vaxis emits no graphics at all, and there is no stray synchronized update.
     try std.testing.expect(std.mem.indexOf(u8, first, "a=p,") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "\x1b_Ga=d\x1b\\") == null);

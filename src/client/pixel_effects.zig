@@ -274,11 +274,17 @@ pub const Engine = struct {
         }
         const encoded = std.base64.standard.Encoder.encode(self.encoded, payload);
         const id = imageId(self.kind);
-        // Cursor to the placement's top-left, then transmit-and-display in
-        // one command: the frame replaces the previous one atomically.
+        // One synchronized update per frame: the terminal presents each frame
+        // as it completes instead of on its own timer, which beat against a
+        // 60 fps stream and read as judder. Cursor to the placement's
+        // top-left, then transmit-and-display in one command: the frame
+        // replaces the previous one atomically.
         const box = self.placementBox();
+        try tty.writeAll("\x1b[?2026h");
         try tty.print("\x1b[{d};{d}H", .{ @as(u32, @intCast(box.y)) + 1, @as(u32, @intCast(box.x)) + 1 });
         try transmitEncoded(tty, encoded, id, self.width, self.height, compressed, box);
+        try tty.writeAll("\x1b[?2026l");
+        try tty.flush();
         self.image = vaxis.Image.init(id, self.width, self.height);
         self.transmitted_frame = self.frame;
         // Chunk framing adds ~40 bytes per 4 KiB chunk.
@@ -330,7 +336,6 @@ fn transmitEncoded(tty: *std.Io.Writer, encoded: []const u8, id: u32, width: u16
         try tty.print("\x1b_Gm={d};{s}\x1b\\", .{ m, encoded[offset..end] });
         offset = end;
     }
-    try tty.flush();
 }
 
 fn freeImage(tty: *std.Io.Writer, id: u32) void {
