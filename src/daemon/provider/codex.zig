@@ -2,10 +2,13 @@
 //!
 //! The app-server owns inference, context, and tools using the user's existing
 //! ChatGPT login. Marlin owns process lifecycle, transcript projection, and
-//! approval presentation. This module deliberately contains only the stable
-//! stdio JSONL boundary; the turn driver lives in loop.zig.
+//! approval presentation. This module contains the stable stdio JSONL boundary
+//! and account-scoped model discovery; the turn driver lives in loop.zig.
 
 const std = @import("std");
+const build_options = @import("build_options");
+const Io = std.Io;
+const process_io = @import("../process_io.zig");
 
 pub const binary_env = "MARLIN_CODEX_BIN";
 pub const default_binary = "codex";
@@ -37,6 +40,170 @@ pub fn buildArgv(
     if (otel) |cfg| try appendOtelOverrides(arena, &argv, cfg);
     try argv.appendSlice(arena, &.{ "app-server", "--listen", "stdio://" });
     return argv.items;
+}
+
+pub const CatalogModel = struct {
+    id: []u8,
+};
+
+fn writeJsonLine(arena: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
+    const encoded = try std.json.Stringify.valueAlloc(arena, value, .{});
+    try writer.writeAll(encoded);
+    try writer.writeByte('\n');
+    try writer.flush();
+}
+
+const CatalogWatcher = struct {
+    io: Io,
+    cancel: ?*const std.atomic.Value(bool),
+    group: std.posix.pid_t,
+    done: std.atomic.Value(bool) = .init(false),
+    timed_out: std.atomic.Value(bool) = .init(false),
+
+    fn run(watcher: *CatalogWatcher) void {
+        const deadline = Io.Timestamp.now(watcher.io, .awake).nanoseconds + 10 * std.time.ns_per_s;
+        while (!watcher.done.load(.acquire)) {
+            const cancelled = if (watcher.cancel) |flag| flag.load(.acquire) else false;
+            if (cancelled or Io.Timestamp.now(watcher.io, .awake).nanoseconds >= deadline) {
+                if (!cancelled) watcher.timed_out.store(true, .release);
+                process_io.terminateProcessGroup(watcher.io, watcher.group, 100);
+                return;
+            }
+            watcher.io.sleep(.fromMilliseconds(50), .awake) catch return;
+        }
+    }
+};
+
+const StderrDrain = struct {
+    io: Io,
+    file: Io.File,
+
+    fn run(drain: *StderrDrain) void {
+        var buffer: [4096]u8 = undefined;
+        var reader = drain.file.reader(drain.io, &buffer);
+        while (true) {
+            const available = reader.interface.peekGreedy(1) catch return;
+            reader.interface.toss(available.len);
+        }
+    }
+};
+
+fn waitResponse(arena: std.mem.Allocator, reader: *Io.Reader, request_id: i64) !Response {
+    while (true) {
+        const line = reader.takeDelimiterInclusive('\n') catch return error.CodexAppServerExited;
+        const inbound = decodeLine(arena, line) catch continue;
+        switch (inbound) {
+            .response => |response| if (response.id == request_id) return response,
+            else => {},
+        }
+    }
+}
+
+pub fn fetchModels(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    cancel: ?*const std.atomic.Value(bool),
+) ![]CatalogModel {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var child = try std.process.spawn(io, .{
+        .argv = try buildArgv(arena, environ, null),
+        .environ_map = environ,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
+    var watcher = CatalogWatcher{ .io = io, .cancel = cancel, .group = child.id.? };
+    const watcher_thread = std.Thread.spawn(.{}, CatalogWatcher.run, .{&watcher}) catch |err| {
+        process_io.terminateProcessTree(&child, io, 100);
+        return err;
+    };
+    var drain = StderrDrain{ .io = io, .file = child.stderr.? };
+    const drain_thread = std.Thread.spawn(.{}, StderrDrain.run, .{&drain}) catch |err| {
+        watcher.done.store(true, .release);
+        watcher_thread.join();
+        process_io.terminateProcessTree(&child, io, 100);
+        return err;
+    };
+    defer {
+        watcher.done.store(true, .release);
+        watcher_thread.join();
+        process_io.terminateProcessGroup(io, child.id.?, 0);
+        drain_thread.join();
+        _ = child.wait(io) catch {};
+    }
+
+    var writer_buffer: [16 * 1024]u8 = undefined;
+    var writer_file = child.stdin.?.writer(io, &writer_buffer);
+    const writer = &writer_file.interface;
+    const line_buffer = try gpa.alloc(u8, 4 * 1024 * 1024);
+    defer gpa.free(line_buffer);
+    var reader_file = child.stdout.?.reader(io, line_buffer);
+    const reader = &reader_file.interface;
+
+    try writeJsonLine(arena, writer, .{
+        .method = "initialize",
+        .id = 1,
+        .params = .{ .clientInfo = .{
+            .name = "marlin",
+            .title = "Marlin",
+            .version = build_options.version,
+        } },
+    });
+    const initialized = try waitResponse(arena, reader, 1);
+    if (initialized.err != null) return error.CodexCatalogRpc;
+    try writeJsonLine(arena, writer, .{ .method = "initialized" });
+    try writeJsonLine(arena, writer, .{
+        .method = "model/list",
+        .id = 2,
+        .params = .{ .includeHidden = false, .limit = 1000 },
+    });
+    const response = waitResponse(arena, reader, 2) catch |err| {
+        if (watcher.timed_out.load(.acquire)) return error.CodexCatalogTimeout;
+        return err;
+    };
+    if (response.err != null) return error.CodexCatalogRpc;
+    return parseModels(gpa, response.result orelse return error.BadCodexCatalog);
+}
+
+pub fn parseModels(gpa: std.mem.Allocator, result: std.json.Value) ![]CatalogModel {
+    const data = field(result, "data") orelse return error.BadCodexCatalog;
+    if (data != .array) return error.BadCodexCatalog;
+
+    var out: std.ArrayList(CatalogModel) = .empty;
+    errdefer {
+        for (out.items) |model| gpa.free(model.id);
+        out.deinit(gpa);
+    }
+    for (data.array.items) |entry| {
+        if (entry != .object) continue;
+        if (boolField(entry, "hidden") orelse false) continue;
+        const model = strField(entry, "model") orelse strField(entry, "id") orelse continue;
+        if (model.len == 0 or std.mem.eql(u8, model, "default") or std.mem.indexOfScalar(u8, model, '/') != null) continue;
+        const id = try std.fmt.allocPrint(gpa, "codex/{s}", .{model});
+        errdefer gpa.free(id);
+        var duplicate = false;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing.id, id)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            gpa.free(id);
+            continue;
+        }
+        try out.append(gpa, .{ .id = id });
+    }
+    std.mem.sort(CatalogModel, out.items, {}, struct {
+        fn lessThan(_: void, a: CatalogModel, b: CatalogModel) bool {
+            return std.mem.lessThan(u8, a.id, b.id);
+        }
+    }.lessThan);
+    return out.toOwnedSlice(gpa);
 }
 
 /// Trace spans are structural (names, timings, counts) and follow whenever a

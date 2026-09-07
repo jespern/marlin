@@ -46,7 +46,7 @@ pub const Engine = union(enum) {
             .tetris => .{ .tetris = tetris.Engine.init(gpa, seed) },
             .pacman => .{ .pacman = pacman.Engine.init(gpa, seed) },
             // fallback() never names the pixel-only kinds; plasma is the safe cell default.
-            .plasma, .tunnel, .metaballs, .horizon, .demo, .shadowbox => .{ .plasma = plasma.Engine.init(gpa, seed) },
+            .plasma, .tunnel, .metaballs, .horizon, .demo, .shadowbox, .wipeout => .{ .plasma = plasma.Engine.init(gpa, seed) },
         };
     }
 

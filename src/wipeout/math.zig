@@ -328,10 +328,16 @@ pub const Tris = extern struct {
     vertices: [3]Vertex,
 };
 
+pub const pi64: f64 = std.math.pi;
+
+/// Wrap to [-π, π). Mirrors the reference's evaluation order and types:
+/// the offsets are added in double and narrowed to float, and the modulo
+/// keeps the dividend's sign (C `fmodf`).
 pub fn wrapAngle(a_in: f32) f32 {
-    var a = @mod(a_in + pi, pi * 2);
-    if (a < 0) a += pi * 2;
-    return a - pi;
+    var a: f32 = @floatCast(@as(f64, a_in) + pi64);
+    a = @rem(a, @as(f32, @floatCast(pi64 * 2.0)));
+    if (a < 0) a = @floatCast(@as(f64, a) + pi64 * 2.0);
+    return @floatCast(@as(f64, a) - pi64);
 }
 
 pub fn lerp(a: f32, b: f32, t: f32) f32 {

@@ -19,6 +19,8 @@ pub const Kind = enum {
     horizon,
     demo,
     shadowbox,
+    /// wipEout: a playable game, not a screensaver. Manual only.
+    wipeout,
 
     pub fn parse(value: []const u8) ?Kind {
         inline for (std.meta.fields(Kind)) |field| {
@@ -44,6 +46,7 @@ pub const Kind = enum {
             .horizon => "synthwave horizon (Kitty graphics)",
             .demo => "24-second pixel demoscene sequence (Kitty graphics)",
             .shadowbox => "shadow-box landscape that follows your clock (after Jani Ylikangas' js1k entry; Kitty graphics)",
+            .wipeout => "wipEout, playable (Kitty graphics; start with !wipeout)",
         };
     }
 
@@ -51,7 +54,7 @@ pub const Kind = enum {
     pub fn backend(self: Kind) Backend {
         return switch (self) {
             .matrix, .strings, .stars, .plasma => .cell,
-            .tetris, .pacman, .tunnel, .metaballs, .horizon, .demo, .shadowbox => .pixel,
+            .tetris, .pacman, .tunnel, .metaballs, .horizon, .demo, .shadowbox, .wipeout => .pixel,
         };
     }
 
@@ -69,7 +72,14 @@ pub const Kind = enum {
     /// Manual-only effects may be named by `/animate` or `/screensaver`, but
     /// cannot become the idle timer or bare `gs` default.
     pub fn configurable(self: Kind) bool {
-        return self != .tetris;
+        return self != .tetris and self != .wipeout;
+    }
+
+    /// Games with their own command (`!wipeout`): they take the whole
+    /// screen and the keyboard, so `/animate` and `/screensaver` refuse
+    /// them and the usage lists leave them out.
+    pub fn playable(self: Kind) bool {
+        return self == .wipeout;
     }
 
     /// What to run on cells when a pixel effect is requested on a terminal
@@ -79,7 +89,7 @@ pub const Kind = enum {
         return switch (self) {
             .tunnel, .demo => .plasma,
             .metaballs => .plasma,
-            .horizon, .shadowbox => .stars,
+            .horizon, .shadowbox, .wipeout => .stars,
             else => self,
         };
     }
@@ -91,8 +101,12 @@ pub const kinds = std.enums.values(Kind);
 /// never be missing from the help.
 pub const usage_list = blk: {
     var text: []const u8 = "";
-    for (std.meta.fields(Kind), 0..) |field, i| {
-        text = text ++ (if (i == 0) "" else "|") ++ field.name;
+    var count: usize = 0;
+    for (std.meta.fields(Kind)) |field| {
+        const kind: Kind = @enumFromInt(field.value);
+        if (kind.playable()) continue;
+        text = text ++ (if (count == 0) "" else "|") ++ field.name;
+        count += 1;
     }
     break :blk text;
 };
@@ -102,7 +116,7 @@ pub const configurable_usage_list = blk: {
     var count: usize = 0;
     for (std.meta.fields(Kind)) |field| {
         const kind: Kind = @enumFromInt(field.value);
-        if (!kind.configurable()) continue;
+        if (!kind.configurable() or kind.playable()) continue;
         text = text ++ (if (count == 0) "" else "|") ++ field.name;
         count += 1;
     }

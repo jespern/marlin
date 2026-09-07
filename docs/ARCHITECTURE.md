@@ -69,7 +69,9 @@ Guest is a session regime, not a model. Kitchen-sink is chasing parity so
 a guest tab feels like a native tab. The guest boundary is frozen at:
 
 1. spawn the official binary (`claude -p` or `codex app-server`)
-2. map its structured event stream → blocks. One event line can be far
+2. map its structured event stream → blocks. Claude Code partial text and
+   thinking deltas feed the same ephemeral live channels as native providers;
+   completed events remain the durable block truth. One event line can be far
    larger than the reader's buffer (Claude Code embeds whole-file contents
    in Edit results), so the reader assembles oversized lines rather than
    mistaking them for end of stream; only a line over 64 MiB is dropped,
@@ -77,6 +79,7 @@ a guest tab feels like a native tab. The guest boundary is frozen at:
 3. interrupt / reboot / resume
 4. permission requests onto the existing approval bar (mux UX, not harness UX)
 5. session status (running / awaiting_approval / idle)
+6. account-scoped model discovery for the shared `/model` picker
 
 Nothing else. Semantic rendering of unknown tools is a TUI fact, not a
 guest-tool catalogue. Images stay durable in Marlin and are not smuggled
@@ -130,7 +133,10 @@ then the wall is how Marlin stays small.
   as `/model` is accepted, including while a native→guest handover is still
   running. Guest status shows `(guest) {name}` and dims
   ctx/sandbox/dnsblock as `n/a` (unavailable, not off — Marlin does not
-  own the guest's context window). Native remains the `/new` default.
+  own the guest's context window). When Claude Code's structured rate-limit
+  event reports overage use, the context slot instead shows `(using api credits)`
+  and each transition is recorded as a system note through the active turn's
+  ordered block appender. Native remains the `/new` default.
 - Permission bridge (`marlin cc_approve`) is mux: fail-closed to *ask*,
   never a shell parser, never applied to native `read_file`. Auto-allow
   of CC `Read` (including paths outside the workspace) is CC's policy,
@@ -213,7 +219,7 @@ remains a Mode A transport only — it carries terminal frames, not stdio.
 `marlin` must be installed on the remote and findable by a login shell (the
 connect error says how to test). Source-built installations get scoped
 self-hosting rebuilds: bare `!rb` rebuilds the side hosting the attached daemon,
-`!rb client` rebuilds only the local client, and `!rb both` builds both before
+`!rb client` (or `!rbc`) rebuilds only the local client, and `!rb both` builds both before
 restarting anything. Each build is gated on the running executable resolving to
 `<checkout>/zig-out/bin/marlin` with Marlin checkout markers; install.sh and
 Homebrew binaries refuse with package-manager guidance rather than guessing an
@@ -273,8 +279,8 @@ Sequence:
 1. **Binary selection.** `/reboot` restarts the attached daemon and re-execs
    the current client without building. `!rb` (the `/reboot --build` alias)
    rebuilds the side hosting the attached daemon; under Mode B the build runs
-   through SSH on the remote. `!rb client` rebuilds/re-execs only the local
-   client and leaves a remote daemon running. `!rb both` builds both candidates
+   through SSH on the remote. `!rb client` (or `!rbc`) rebuilds/re-execs only
+   the local client and leaves a remote daemon running. `!rb both` builds both candidates
    before rebooting the attached daemon, which is the protocol-change path.
    Source builds require the running executable to resolve to
    `<checkout>/zig-out/bin/marlin` and the checkout markers `.git`, `build.zig`,
@@ -748,8 +754,11 @@ that daily use justifies another private runtime and context store.
 **Accounting footnote:** OpenRouter reports $ directly; direct providers
 report only tokens. The status-bar `$` needs a small local price table
 for direct routes (or degrades to tokens-only) — don't let it lie.
-The `/model` catalog does not need that table: it shows OpenRouter's published
-input/output rates directly and leaves local or unpublished rates unknown.
+The `/model` catalog does not need that table: it merges OpenRouter's published
+models with the installed Codex app-server's account-scoped `model/list`
+response. OpenRouter rates are shown directly; guest and unpublished rates
+remain unknown. Catalog discovery runs off the dispatcher thread and degrades
+to configured favorites when neither source is available.
 
 - **Usage accounting is provider-reported**: every response's `usage` field is
   stored on the session (`session.meta` event carries it to clients). Token
@@ -791,9 +800,13 @@ input/output rates directly and leaves local or unpublished rates unknown.
   crossing a cap closes the socket and persists a visible turn failure. The
   layer's failure vocabulary is a typed `http.Error`
   (Cancelled / HttpTimeout / InvalidRequest / ConnectFailed / ReadFailed /
-  UnsupportedEncoding / ConsumerAborted / ConcurrencyUnavailable / OutOfMemory), so a
-  "turn failed:" system_note distinguishes user interrupt, hung provider,
-  and mid-body transport death instead of leaking std.http error soup.
+  UnsupportedEncoding / ConsumerAborted / ConcurrencyUnavailable / OutOfMemory).
+  Transport failures also retain a bounded stage, hostname, and underlying
+  cause—DNS helper, TCP connect, TLS setup, request write, response head, or
+  response body—so the durable failure note is diagnostic without a debug log.
+  Claude Code guest errors use its structured result plus captured stderr when
+  available; a bare guest `ConnectFailed` is labeled as missing upstream detail
+  rather than presented as a native transport diagnosis.
 
 ## 6. Context assembly & compaction
 
@@ -846,8 +859,11 @@ The cascade (in order; each layer only fires if the previous wasn't enough):
 - **L3 — subagents (M6a active).** `task` spawns a durable child through the
   dispatcher with its own context, optional model/effort, read-only tools, and
   a round budget; only its structured final result enters the parent as a
-  tool_result. Child sessions are ordinary sessions (visible in `marlin ls`
-  and attachable) and the multiplexer groups them beneath the parent.
+  tool_result. A full registry model id is accepted directly. A provider-native
+  id such as `openai/gpt-5.2` inherits the parent's outer gateway, so a parent
+  on `openrouter/anthropic/claude-sonnet-4.5` resolves it as
+  `openrouter/openai/gpt-5.2`. Child sessions are ordinary sessions (visible in
+  `marlin ls` and attachable) and the multiplexer groups them beneath the parent.
   `task_batch` launches two to eight through the same dispatcher-owned path,
   waits concurrently, and returns results in input order. Child profiles still
   forbid recursive delegation.
@@ -1179,8 +1195,10 @@ A split pane identifies its session with a compact pane label.
   Kitty graphics: a self-playing Tetris (`client/tetris.zig`) presented as a
   full-viewport neon arcade cabinet with beveled blocks, ghost landing, next
   piece, score, lines, level, scanlines, and a cell fallback. Its deterministic
-  seven-bag game searches every legal rotation and landing column, scores line
-  clears, height, holes, and roughness, then visibly drops the selected piece;
+  seven-bag game spawns each piece centered and unrotated, searches the bounded
+  reachable movement graph, scores reachable landings by lines, height, holes,
+  and roughness, then visibly executes rotations, shifts, descents, and late
+  slides beneath overhangs;
   tunnel, metaballs, horizon, a 24-second `demo` sequence,
   a `shadowbox` landscape (`client/shadowbox.zig`, after Jani Ylikangas'
   js1k 2019 entry: composed in the original's 1900×900 canvas units and
@@ -1263,7 +1281,7 @@ A split pane identifies its session with a compact pane label.
   transport refuses shell escapes because its local terminal and the daemon
   workspace are on different hosts; running Marlin inside SSH or mosh keeps
   both co-located. `!rb` rebuilds the attached daemon side, `!rb client`
-  rebuilds only the local client, `!rb both` rebuilds both, and `!c` copies the
+  (or `!rbc`) rebuilds only the local client, `!rb both` rebuilds both, and `!c` copies the
   last output.
   Plain text + `Enter` starts a turn when idle and queues steering
   while an agent turn is active; a leading space sends text that begins

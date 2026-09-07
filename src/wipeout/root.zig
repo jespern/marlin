@@ -12,6 +12,26 @@ pub const render = @import("render.zig");
 pub const track = @import("track.zig");
 pub const object = @import("object.zig");
 pub const scene = @import("scene.zig");
+pub const defs = @import("defs.zig");
+pub const input = @import("input.zig");
+pub const rng = @import("rng.zig");
+pub const ship = @import("ship.zig");
+pub const camera = @import("camera.zig");
+pub const post = @import("post.zig");
+pub const ui = @import("ui.zig");
+pub const hud = @import("hud.zig");
+pub const snapshot = @import("snapshot.zig");
+pub const autopilot = @import("autopilot.zig");
+pub const parzlib = @import("parzlib.zig");
+pub const race = @import("race.zig");
+pub const weapon = @import("weapon.zig");
+pub const particle = @import("particle.zig");
+pub const droid = @import("droid.zig");
+pub const save = @import("save.zig");
+pub const menu = @import("menu.zig");
+pub const game = @import("game.zig");
+pub const session = @import("session.zig");
+pub const bundle = @import("bundle.zig");
 
 /// Per-circuit sky placement from the original game definition, indexed
 /// by PSX track directory number (1-14).

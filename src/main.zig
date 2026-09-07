@@ -104,6 +104,7 @@ test {
     _ = @import("daemon/provider/sse_test.zig");
     _ = @import("daemon/provider/http_test.zig");
     _ = @import("daemon/provider/registry_test.zig");
+    _ = @import("daemon/tools/task_test.zig");
     _ = @import("daemon/provider/codex_test.zig");
     _ = @import("core/visual_effect_test.zig");
     _ = @import("client/attach_test.zig");
@@ -112,6 +113,7 @@ test {
     _ = @import("client/remote_rebuild_test.zig");
     _ = @import("client/self_build_test.zig");
     _ = @import("client/voice_test.zig");
+    _ = @import("client/wipeout_effect_test.zig");
     _ = @import("client/web_test.zig");
     _ = @import("testing/fixture_tests.zig");
     _ = @import("client/render_test.zig");

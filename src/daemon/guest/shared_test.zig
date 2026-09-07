@@ -46,3 +46,22 @@ test "takeEventLine drops one over-limit line and keeps reading" {
     try std.testing.expectEqualStrings("after\n", (try takeEventLine(&tr.interface, gpa, &acc, 64)).?);
     try std.testing.expect((try takeEventLine(&tr.interface, gpa, &acc, 64)) == null);
 }
+
+test "stderr drain retains the latest bytes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    var drain = shared.CcStderrDrain{
+        .io = threaded.io(),
+        .file = undefined,
+    };
+    drain.append("old");
+    var padding: [4096]u8 = undefined;
+    @memset(&padding, 'x');
+    drain.append(&padding);
+    drain.append("latest");
+
+    try std.testing.expectEqual(@as(usize, drain.tail.len), drain.len);
+    try std.testing.expect(std.mem.endsWith(u8, drain.tail[0..drain.len], "latest"));
+    try std.testing.expect(std.mem.indexOf(u8, drain.tail[0..drain.len], "old") == null);
+}

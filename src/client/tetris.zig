@@ -1,6 +1,6 @@
-//! Self-playing terminal Tetris. Each piece searches every legal rotation and
-//! landing column, then chooses the board with the best height, hole, line,
-//! and roughness score. The chosen piece falls visibly before locking.
+//! Self-playing terminal Tetris. Each piece spawns centered and unrotated,
+//! searches the reachable movement graph for its best landing, then visibly
+//! executes that route while falling before it locks.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -10,6 +10,14 @@ pub const board_cols: usize = 10;
 pub const board_rows: usize = 20;
 pub const drop_frames: u8 = 3;
 const game_over_frames: u8 = 45;
+const max_route_actions: usize = 64;
+const min_state_x: i8 = -3;
+const max_state_x: i8 = @intCast(board_cols - 1);
+const min_state_y: i8 = -3;
+const max_state_y: i8 = @intCast(board_rows - 1);
+const state_x_count: usize = @intCast(max_state_x - min_state_x + 1);
+const state_y_count: usize = @intCast(max_state_y - min_state_y + 1);
+const state_count: usize = 4 * state_x_count * state_y_count;
 
 pub const Piece = enum(u8) { i, o, t, s, z, j, l };
 
@@ -68,11 +76,28 @@ const shapes = [7][4]Shape{
     },
 };
 
+pub const Action = enum(u2) { left, right, rotate, down };
+
+const State = struct {
+    rotation: u2,
+    x: i8,
+    y: i8,
+};
+
+const SearchNode = struct {
+    state: State,
+    parent: u16,
+    action: Action,
+};
+
 pub const Active = struct {
     piece: Piece,
     rotation: u2,
     x: i8,
     y: i8,
+    route: [max_route_actions]Action = undefined,
+    route_len: u8 = 0,
+    route_index: u8 = 0,
 };
 
 pub const Game = struct {
@@ -113,8 +138,9 @@ pub const Game = struct {
             return;
         }
         if (self.frame % drop_frames != 0) return;
-        if (self.fits(self.active.piece, self.active.rotation, self.active.x, self.active.y + 1)) {
-            self.active.y += 1;
+        if (self.active.route_index < self.active.route_len) {
+            self.applyAction(self.active.route[self.active.route_index]);
+            self.active.route_index += 1;
             return;
         }
         self.lock();
@@ -128,31 +154,106 @@ pub const Game = struct {
     fn spawn(self: *Game) void {
         const piece = self.next;
         self.next = self.nextPiece();
-        var best: ?Active = null;
+        const bounds = shapeBounds(piece, 0);
+        const width = bounds[1] - bounds[0] + 1;
+        const start = State{
+            .rotation = 0,
+            .x = @divTrunc(@as(i8, @intCast(board_cols)) - width, 2) - bounds[0],
+            .y = -bounds[2],
+        };
+        self.active = .{
+            .piece = piece,
+            .rotation = start.rotation,
+            .x = start.x,
+            .y = start.y,
+        };
+        if (!self.fits(piece, start.rotation, start.x, start.y) or !self.replan())
+            self.game_over = game_over_frames;
+    }
+
+    pub fn replan(self: *Game) bool {
+        self.active.route_len = 0;
+        self.active.route_index = 0;
+        return self.planRoute(.{
+            .rotation = self.active.rotation,
+            .x = self.active.x,
+            .y = self.active.y,
+        });
+    }
+
+    fn planRoute(self: *Game, start: State) bool {
+        var nodes: [state_count]SearchNode = undefined;
+        var visited: [state_count]bool = @splat(false);
+        nodes[0] = .{
+            .state = start,
+            .parent = std.math.maxInt(u16),
+            .action = .down,
+        };
+        visited[stateIndex(start)] = true;
+        var head: usize = 0;
+        var tail: usize = 1;
+        var best_index: ?usize = null;
         var best_score: i32 = std.math.minInt(i32);
-        var rotation: u8 = 0;
-        while (rotation < 4) : (rotation += 1) {
-            const bounds = shapeBounds(piece, @intCast(rotation));
-            var x: i8 = -bounds[0];
-            const last_x: i8 = @as(i8, @intCast(board_cols)) - 1 - bounds[1];
-            while (x <= last_x) : (x += 1) {
-                const y = self.landingY(piece, @intCast(rotation), x) orelse continue;
+
+        while (head < tail) : (head += 1) {
+            const node = nodes[head];
+            if (!self.fits(self.active.piece, node.state.rotation, node.state.x, node.state.y + 1) and
+                stateVisible(self.active.piece, node.state))
+            {
                 var board = self.board;
-                place(&board, piece, @intCast(rotation), x, y);
+                place(&board, self.active.piece, node.state.rotation, node.state.x, node.state.y);
                 const cleared = clearBoardLines(&board);
                 const score = evaluate(board, cleared);
                 if (score > best_score or (score == best_score and self.random() & 1 == 0)) {
                     best_score = score;
-                    best = .{ .piece = piece, .rotation = @intCast(rotation), .x = x, .y = -bounds[2] };
+                    best_index = head;
                 }
             }
+
+            const actions = [_]Action{ .rotate, .left, .right, .down };
+            for (actions) |action| {
+                const next = movedState(node.state, action);
+                if (!stateInBounds(next) or !self.fits(self.active.piece, next.rotation, next.x, next.y)) continue;
+                const index = stateIndex(next);
+                if (visited[index]) continue;
+                visited[index] = true;
+                nodes[tail] = .{
+                    .state = next,
+                    .parent = @intCast(head),
+                    .action = action,
+                };
+                tail += 1;
+            }
         }
-        self.active = best orelse {
-            self.game_over = game_over_frames;
-            return;
-        };
-        if (!self.fits(self.active.piece, self.active.rotation, self.active.x, self.active.y))
-            self.game_over = game_over_frames;
+
+        const landing_index = best_index orelse return false;
+        var reverse: [max_route_actions]Action = undefined;
+        var route_len: usize = 0;
+        var index = landing_index;
+        while (nodes[index].parent != std.math.maxInt(u16)) {
+            if (route_len == reverse.len) return false;
+            reverse[route_len] = nodes[index].action;
+            route_len += 1;
+            index = nodes[index].parent;
+        }
+        for (0..route_len) |route_index| {
+            self.active.route[route_index] = reverse[route_len - route_index - 1];
+        }
+        self.active.route_len = @intCast(route_len);
+        self.active.route_index = 0;
+        return true;
+    }
+
+    fn applyAction(self: *Game, action: Action) void {
+        const next = movedState(.{
+            .rotation = self.active.rotation,
+            .x = self.active.x,
+            .y = self.active.y,
+        }, action);
+        if (!self.fits(self.active.piece, next.rotation, next.x, next.y)) return;
+        self.active.rotation = next.rotation;
+        self.active.x = next.x;
+        self.active.y = next.y;
     }
 
     fn nextPiece(self: *Game) Piece {
@@ -169,14 +270,6 @@ pub const Game = struct {
         const piece = self.bag[self.bag_index];
         self.bag_index += 1;
         return piece;
-    }
-
-    fn landingY(self: *const Game, piece: Piece, rotation: u2, x: i8) ?i8 {
-        const bounds = shapeBounds(piece, rotation);
-        var y: i8 = -bounds[2];
-        if (!self.fits(piece, rotation, x, y)) return null;
-        while (self.fits(piece, rotation, x, y + 1)) y += 1;
-        return y;
     }
 
     pub fn fits(self: *const Game, piece: Piece, rotation: u2, x: i8, y: i8) bool {
@@ -202,6 +295,34 @@ pub const Game = struct {
         return effect.hash(self.rng);
     }
 };
+
+fn movedState(state: State, action: Action) State {
+    return switch (action) {
+        .left => .{ .rotation = state.rotation, .x = state.x - 1, .y = state.y },
+        .right => .{ .rotation = state.rotation, .x = state.x + 1, .y = state.y },
+        .rotate => .{ .rotation = state.rotation +% 1, .x = state.x, .y = state.y },
+        .down => .{ .rotation = state.rotation, .x = state.x, .y = state.y + 1 },
+    };
+}
+
+fn stateInBounds(state: State) bool {
+    return state.x >= min_state_x and state.x <= max_state_x and
+        state.y >= min_state_y and state.y <= max_state_y;
+}
+
+fn stateIndex(state: State) usize {
+    const rotation: usize = state.rotation;
+    const y: usize = @intCast(state.y - min_state_y);
+    const x: usize = @intCast(state.x - min_state_x);
+    return (rotation * state_y_count + y) * state_x_count + x;
+}
+
+fn stateVisible(piece: Piece, state: State) bool {
+    for (shape(piece, state.rotation)) |point| {
+        if (state.y + point.y >= 0) return true;
+    }
+    return false;
+}
 
 fn shape(piece: Piece, rotation: u2) Shape {
     return shapes[@intFromEnum(piece)][rotation];
@@ -423,8 +544,9 @@ fn drawBoard(fb: PixelBuffer, game: *const Game, ox: i32, oy: i32, tile: i32) vo
         }
     }
 
-    const can_fall = game.fits(game.active.piece, game.active.rotation, game.active.x, game.active.y + 1);
-    const phase: i32 = if (can_fall) @intCast(game.frame % drop_frames) else 0;
+    const next_is_down = game.active.route_index < game.active.route_len and
+        game.active.route[game.active.route_index] == .down;
+    const phase: i32 = if (next_is_down) @intCast(game.frame % drop_frames) else 0;
     const offset = @divTrunc(phase * tile, drop_frames);
     for (shape(game.active.piece, game.active.rotation)) |point| {
         const x = game.active.x + point.x;

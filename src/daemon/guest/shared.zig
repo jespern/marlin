@@ -68,6 +68,21 @@ pub const CcStderrDrain = struct {
     tail: [4096]u8 = undefined,
     len: usize = 0,
 
+    pub fn append(d: *CcStderrDrain, bytes: []const u8) void {
+        if (bytes.len >= d.tail.len) {
+            @memcpy(d.tail[0..], bytes[bytes.len - d.tail.len ..]);
+            d.len = d.tail.len;
+            return;
+        }
+        const overflow = d.len + bytes.len -| d.tail.len;
+        if (overflow > 0) {
+            std.mem.copyForwards(u8, d.tail[0 .. d.len - overflow], d.tail[overflow..d.len]);
+            d.len -= overflow;
+        }
+        @memcpy(d.tail[d.len .. d.len + bytes.len], bytes);
+        d.len += bytes.len;
+    }
+
     pub fn run(d: *CcStderrDrain) void {
         var buf: [4096]u8 = undefined;
         var reader = d.file.reader(d.io, &buf);
@@ -78,19 +93,13 @@ pub const CcStderrDrain = struct {
             const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
                 error.StreamTooLong => {
                     const head = reader.interface.buffered();
-                    const room = d.tail.len - d.len;
-                    const n = @min(room, head.len);
-                    @memcpy(d.tail[d.len .. d.len + n], head[0..n]);
-                    d.len += n;
+                    d.append(head);
                     reader.interface.toss(head.len);
                     continue;
                 },
                 else => return,
             };
-            const room = d.tail.len - d.len;
-            const n = @min(room, line.len);
-            @memcpy(d.tail[d.len .. d.len + n], line[0..n]);
-            d.len += n;
+            d.append(line);
         }
     }
 };

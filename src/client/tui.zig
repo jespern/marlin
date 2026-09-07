@@ -26,7 +26,7 @@
 //!             /screensaver [effect], /new, /compact, /archive, /reboot [--build], /help,
 //!             /quit (alias /detach — sessions keep running in the daemon)
 //!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
-//!              !c (copy last full tool output), !rb [client|both] (scoped rebuild),
+//!              !c (copy last full tool output), !rb [client|both] / !rbc (scoped rebuild),
 //!              !s [effect] (screensaver)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
 //!            chips, expanded into the message on send.
@@ -47,6 +47,9 @@ const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const shadowbox = @import("shadowbox.zig");
+const wipeout_effect = @import("wipeout_effect.zig");
+
+pub const WipeoutOptions = wipeout_effect.Options;
 
 /// `/screensaver shadowbox cycle` or `… <hour>`: preview the sky instead of
 /// following the real sun.
@@ -135,6 +138,13 @@ const Event = union(enum) {
     key_release: vaxis.Key,
     /// Voice worker verdicts (transcription and model-download threads).
     voice: VoiceEvent,
+    /// wipEout asset-bundle download verdicts.
+    wipeout: WipeoutEvent,
+};
+
+pub const WipeoutEvent = union(enum) {
+    download_done,
+    download_failed: []const u8,
 };
 
 pub const VoiceEvent = union(enum) {
@@ -261,6 +271,7 @@ const SessionSummary = struct {
     /// Approval mode is "auto" (/permissions full) for this session.
     full_access: bool,
     plan_mode: bool,
+    usage_credits: bool,
 
     fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
@@ -528,6 +539,18 @@ pub const App = struct {
     ui_animation: ?effects.Kind = null,
     ui_animation_frame: usize = 0,
     effect_engine: ?effects.Engine = null,
+    /// The wipEout race. Owned here rather than by the effect engine so a
+    /// hidden game (Esc, or another screensaver in between) resumes intact.
+    wipeout_game: ?*wipeout_effect.Game = null,
+    /// First-run asset bundle download (progress shared with the worker).
+    wipeout_download: ?*voice.DownloadProgress = null,
+    wipeout_download_thread: ?std.Thread = null,
+    /// The `!wipeout` that triggered the download; re-run when it lands.
+    wipeout_pending: ?WipeoutOptions = null,
+    /// While set, key presses and releases go to the game until Escape.
+    game_mode: bool = false,
+    /// Ticker hint: the game wants ~60 Hz ticks, not the 30 Hz effect tier.
+    game_active: std.atomic.Value(bool) = .init(false),
     /// Terminal capability from queryTerminal; pixel effects need it and
     /// otherwise start as their cell fallback.
     kitty_graphics: bool = false,
@@ -621,6 +644,11 @@ pub const App = struct {
         self.councils.deinit(self.gpa);
         self.voice_rt.deinit(self.gpa);
         if (self.effect_engine) |*engine| engine.deinit();
+        self.saveWipeout();
+        if (self.wipeout_game) |game| game.destroy();
+        if (self.wipeout_download) |progress| progress.cancel.store(true, .release);
+        if (self.wipeout_download_thread) |t| t.join();
+        if (self.wipeout_download) |progress| self.gpa.destroy(progress);
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.terminal_title.deinit(self.gpa);
@@ -984,6 +1012,7 @@ pub const App = struct {
             self.view.effort = summary.effort;
             self.view.state = summary.state;
             self.view.plan_mode = summary.plan_mode;
+            self.view.usage_credits = summary.usage_credits;
         }
         if (self.background_approvals.get(sid)) |pending| {
             self.view.pending = pending;
@@ -1098,12 +1127,14 @@ pub const App = struct {
                 self.view.state = info.state;
                 self.setCwdStr(info.cwd);
                 self.view.plan_mode = info.plan_mode;
+                self.view.usage_credits = info.usage_credits;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
             } else if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
                 saved.cwd.clearRetainingCapacity();
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
+                saved.usage_credits = info.usage_credits;
                 if (!info.plan_mode) saved.plan_proposal_ready = false;
             }
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
@@ -1188,6 +1219,7 @@ pub const App = struct {
             .network_filtering = info.network_filtering,
             .full_access = info.full_access,
             .plan_mode = info.plan_mode,
+            .usage_credits = info.usage_credits,
         };
     }
 
@@ -1206,6 +1238,7 @@ pub const App = struct {
                 self.setCwdStr(info.cwd);
                 self.view.permissions_full = info.full_access;
                 self.view.plan_mode = info.plan_mode;
+                self.view.usage_credits = info.usage_credits;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
             }
             if (self.saved_views.get(info.sid)) |saved| {
@@ -1213,6 +1246,7 @@ pub const App = struct {
                 saved.cwd.clearRetainingCapacity();
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
+                saved.usage_credits = info.usage_credits;
                 if (!info.plan_mode) saved.plan_proposal_ready = false;
             }
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
@@ -1262,7 +1296,15 @@ pub const App = struct {
             self.view.state = info.state;
             self.setCwdStr(info.cwd);
             self.view.plan_mode = info.plan_mode;
+            self.view.usage_credits = info.usage_credits;
             if (!info.plan_mode) self.view.plan_proposal_ready = false;
+        } else if (self.saved_views.get(info.sid)) |saved| {
+            saved.state = info.state;
+            saved.cwd.clearRetainingCapacity();
+            saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
+            saved.plan_mode = info.plan_mode;
+            saved.usage_credits = info.usage_credits;
+            if (!info.plan_mode) saved.plan_proposal_ready = false;
         }
         self.normalizeTopSelection();
     }
@@ -1527,6 +1569,7 @@ pub const App = struct {
                 view.stream_status_at_ms = nowWallMs(self.io);
             },
             .status => |s| {
+                const status_now = nowWallMs(self.io);
                 const prior_state = if (self.sessionSummary(s.sid)) |summary|
                     summary.state
                 else if (self.liveView(s.sid)) |view|
@@ -1545,14 +1588,21 @@ pub const App = struct {
                 const view = self.liveView(s.sid) orelse {
                     if (self.saved_views.get(s.sid)) |saved| {
                         saved.state = s.state;
+                        if (s.usage_credits) |active| saved.usage_credits = active;
+                        if (s.turn_ms) |elapsed| saved.turn_started_ms = status_now - @as(i64, @intCast(elapsed));
                         if (s.phase) |phase| {
                             if (saved.turn_phase != phase) {
-                                saved.phase_started_ms = nowWallMs(self.io);
+                                saved.phase_started_ms = if (s.phase_ms) |elapsed|
+                                    status_now - @as(i64, @intCast(elapsed))
+                                else
+                                    status_now;
                                 if (phase == .provider) {
                                     saved.stream_bytes = 0;
                                     saved.stream_quiet_ms = 0;
                                     saved.stream_status_at_ms = 0;
                                 }
+                            } else if (s.phase_ms) |elapsed| {
+                                saved.phase_started_ms = status_now - @as(i64, @intCast(elapsed));
                             }
                             saved.turn_phase = phase;
                         }
@@ -1573,30 +1623,41 @@ pub const App = struct {
                     view.history_complete = true;
                     view.history_loading = false;
                 }
-                if (s.state == .running and view.state != .running) {
+                if (s.state == .running and view.state != .running and view.state != .awaiting_approval) {
                     self.clearCompletedPlan();
                     view.spinner_frame = 0;
-                    view.turn_started_ms = nowWallMs(self.io);
+                    view.turn_started_ms = if (s.turn_ms) |elapsed|
+                        status_now - @as(i64, @intCast(elapsed))
+                    else
+                        status_now;
                     view.turn_phase = .starting;
                     view.phase_started_ms = view.turn_started_ms;
+                } else if (s.turn_ms) |elapsed| {
+                    view.turn_started_ms = status_now - @as(i64, @intCast(elapsed));
                 }
                 if (s.phase) |phase| {
                     if (view.turn_phase != phase) {
-                        view.phase_started_ms = nowWallMs(self.io);
+                        view.phase_started_ms = if (s.phase_ms) |elapsed|
+                            status_now - @as(i64, @intCast(elapsed))
+                        else
+                            status_now;
                         if (phase == .provider) {
                             view.stream_bytes = 0;
                             view.stream_quiet_ms = 0;
                             view.stream_status_at_ms = 0;
                         }
+                    } else if (s.phase_ms) |elapsed| {
+                        view.phase_started_ms = status_now - @as(i64, @intCast(elapsed));
                     }
                     view.turn_phase = phase;
                 }
-                if (s.state != .running) {
+                if (s.state != .running and s.state != .awaiting_approval) {
                     view.stream_status_at_ms = 0;
                     view.turn_phase = .idle;
                     view.phase_started_ms = 0;
                 }
                 view.state = s.state;
+                if (s.usage_credits) |active| view.usage_credits = active;
                 self.syncAnimationTicker();
                 if (s.state != .awaiting_approval) view.pending = null;
                 if (s.state == .idle or s.state == .err or s.state == .done)
@@ -1985,8 +2046,10 @@ pub const App = struct {
 
     pub fn needsAnimationTick(self: *const App) bool {
         return self.view.state == .running or
+            self.view.state == .awaiting_approval or
             self.top_view != null or
             self.voice_rt.download != null or
+            self.wipeout_download != null or
             self.voice_rt.phase != .idle or
             self.ui_animation_active.load(.acquire);
     }
@@ -2159,6 +2222,181 @@ pub const App = struct {
         self.recordUserActivity();
         self.refresh_requested = true;
         self.syncAnimationTicker();
+        return true;
+    }
+
+    /// `!wipeout`: load (or reuse) the race and show it as the pixel effect,
+    /// with keys routed to the ship until Escape.
+    pub fn startWipeout(self: *App, options: WipeoutOptions) void {
+        if (!self.kitty_graphics) {
+            self.setNotice("wipEout needs Kitty graphics — this terminal has none", .{});
+            return;
+        }
+        if (self.wipeout_game) |game| {
+            if (!game.matches(options)) {
+                game.destroy();
+                self.wipeout_game = null;
+            }
+        }
+        if (self.wipeout_game == null) {
+            const env = self.environ orelse {
+                self.setNotice("wipEout: no environment to locate game data", .{});
+                return;
+            };
+            // A bare `!wipeout` continues the race saved by the last pause
+            // or exit; naming a track or pilot always starts fresh.
+            var restored = false;
+            if (!options.explicit) {
+                if (self.wipeoutSavePath()) |path| {
+                    defer self.gpa.free(path);
+                    if (wipeout_effect.snapshot.read(self.io, self.gpa, path)) |snap| {
+                        if (wipeout_effect.Game.restore(self.gpa, self.io, env, &snap)) |game| {
+                            self.wipeout_game = game;
+                            restored = true;
+                        } else |_| {
+                            wipeout_effect.snapshot.remove(self.io, path);
+                        }
+                    }
+                }
+            }
+            if (!restored) {
+                self.wipeout_game = wipeout_effect.Game.create(self.gpa, self.io, env, options) catch |err| {
+                    if (err == error.AssetsMissing) {
+                        self.startWipeoutDownload(options);
+                    } else {
+                        self.setNotice("wipEout: {t} — game data goes in $XDG_DATA_HOME/marlin/wipeout-data", .{err});
+                    }
+                    return;
+                };
+            }
+        }
+        if (!self.resetEffectEngine(.wipeout)) return;
+        switch (self.effect_engine.?) {
+            .pixel => |*engine| engine.wipeout_game = self.wipeout_game,
+            else => {
+                self.setNotice("wipEout needs Kitty graphics — this terminal has none", .{});
+                return;
+            },
+        }
+        self.ui_animation = null;
+        self.ui_animation_frame = 0;
+        self.screensaver_active = true;
+        self.ui_animation_active.store(true, .release);
+        self.clearPending();
+        self.game_mode = true;
+        self.game_active.store(true, .release);
+        self.wipeout_game.?.resume_();
+        self.syncAnimationTicker();
+        self.setNotice("wipEout — arrows steer/pitch, x thrust, z/c airbrakes, f fire, v view, Enter pauses, Esc leaves", .{});
+    }
+
+    /// Leave the game: hide the effect and stop the fast ticker. The race
+    /// state stays for the next `!wipeout`, in memory and on disk.
+    pub fn exitGameMode(self: *App) void {
+        if (!self.game_mode) return;
+        self.game_mode = false;
+        self.game_active.store(false, .release);
+        if (self.wipeout_game) |game| game.pause();
+        self.saveWipeout();
+        _ = self.dismissScreensaver();
+        self.syncAnimationTicker();
+    }
+
+    /// First run: fetch the asset bundle (about 3.5 MB) into the data
+    /// root on a worker thread, then start the game that asked for it.
+    fn startWipeoutDownload(self: *App, options: WipeoutOptions) void {
+        if (self.wipeout_download != null) {
+            self.setNotice("wipEout: game data is still downloading", .{});
+            return;
+        }
+        const env = self.environ orelse return;
+        const loop = self.loop orelse return;
+        const dest = wipeout_effect.bundleDestination(self.gpa, env) catch {
+            self.setNotice("wipEout: cannot resolve the data directory", .{});
+            return;
+        };
+        const progress = self.gpa.create(voice.DownloadProgress) catch {
+            self.gpa.free(dest);
+            return;
+        };
+        progress.* = .{};
+        const job = self.gpa.create(WipeoutDownloadJob) catch {
+            self.gpa.destroy(progress);
+            self.gpa.free(dest);
+            return;
+        };
+        job.* = .{ .gpa = self.gpa, .io = self.io, .loop = loop, .url = wipeout_effect.bundleUrl(env), .dest = dest, .progress = progress };
+        self.wipeout_download_thread = std.Thread.spawn(.{}, WipeoutDownloadJob.run, .{job}) catch {
+            self.gpa.destroy(progress);
+            self.gpa.free(dest);
+            self.gpa.destroy(job);
+            self.setNotice("wipEout: could not start the game data download", .{});
+            return;
+        };
+        self.wipeout_download = progress;
+        self.wipeout_pending = options;
+        self.syncAnimationTicker();
+        self.setNotice("wipEout: downloading game data…", .{});
+    }
+
+    /// Download progress in the status line, driven by animation ticks.
+    pub fn wipeoutDownloadTick(self: *App) void {
+        const progress = self.wipeout_download orelse return;
+        const done = progress.done.load(.acquire);
+        const total = progress.total.load(.acquire);
+        var bar: [24]u8 = undefined;
+        const filled = if (total > 0) @min(bar.len, done * bar.len / total) else 0;
+        for (0..bar.len) |i| bar[i] = if (i < filled) '#' else '-';
+        if (total > 0) {
+            self.setNotice("wipEout data  [{s}] {d}% · {d}/{d} KB", .{ bar[0..], done * 100 / total, done >> 10, total >> 10 });
+        } else {
+            self.setNotice("wipEout data  connecting… {d} KB", .{done >> 10});
+        }
+    }
+
+    pub fn handleWipeoutEvent(self: *App, ev: WipeoutEvent) void {
+        if (self.wipeout_download_thread) |t| t.join();
+        self.wipeout_download_thread = null;
+        if (self.wipeout_download) |progress| self.gpa.destroy(progress);
+        self.wipeout_download = null;
+        self.syncAnimationTicker();
+        const pending = self.wipeout_pending;
+        self.wipeout_pending = null;
+        switch (ev) {
+            .download_failed => |name| self.setNotice("wipEout: game data download failed ({s}) — !wipeout retries and resumes it", .{name}),
+            .download_done => if (pending) |options| self.startWipeout(options),
+        }
+    }
+
+    fn wipeoutSavePath(self: *App) ?[]u8 {
+        const env = self.environ orelse return null;
+        return wipeout_effect.snapshot.defaultPath(self.gpa, env) catch null;
+    }
+
+    /// Write the race to the state directory; a failure only costs the
+    /// ability to resume after a restart, so it is silent.
+    pub fn saveWipeout(self: *App) void {
+        const game = self.wipeout_game orelse return;
+        const path = self.wipeoutSavePath() orelse return;
+        defer self.gpa.free(path);
+        const snap = game.snapshot();
+        wipeout_effect.snapshot.write(self.io, path, &snap) catch {};
+    }
+
+    /// Route a key event to the game. Returns true when it was consumed;
+    /// while playing every key is, and Escape ends the mode.
+    pub fn gameKey(self: *App, key: vaxis.Key, down: bool) bool {
+        if (!self.game_mode) return false;
+        if (!self.screensaver_active or self.wipeout_game == null) {
+            // Something else hid the effect; do not keep swallowing keys.
+            self.exitGameMode();
+            return false;
+        }
+        if (down and (key.codepoint == vaxis.Key.escape or key.matches('c', .{ .ctrl = true }))) {
+            self.exitGameMode();
+            return true;
+        }
+        _ = self.wipeout_game.?.setKey(key, down);
         return true;
     }
 
@@ -3586,8 +3824,8 @@ pub fn statusModel(arena: std.mem.Allocator, model: []const u8) ![]const u8 {
 
 /// Guest sessions do not run Marlin's assembler, so ctx% is always a lie
 /// (used stays 0; the limit lookup even matches `claudecode` as `claude`).
-pub fn statusContext(arena: std.mem.Allocator, guest: bool, used: u64, limit: u64) ![]const u8 {
-    if (guest) return "ctx n/a";
+pub fn statusContext(arena: std.mem.Allocator, guest: bool, usage_credits: bool, used: u64, limit: u64) ![]const u8 {
+    if (guest) return if (usage_credits) "(using api credits)" else "ctx n/a";
     if (limit == 0) return "";
     return std.fmt.allocPrint(arena, "ctx {d}%", .{used * 100 / limit});
 }
@@ -4940,7 +5178,13 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         app.view.context_used * 100 / app.view.context_limit
     else
         0;
-    const ctx_txt = try statusContext(arena, guest, app.view.context_used, app.view.context_limit);
+    const ctx_txt = try statusContext(
+        arena,
+        guest,
+        app.view.usage_credits,
+        app.view.context_used,
+        app.view.context_limit,
+    );
     const ctx_style = if (guest)
         Palette.status_muted
     else if (context_percent >= 90)
@@ -5553,6 +5797,7 @@ pub fn dispatchEvent(
             if (key.codepoint == vaxis.Key.left_super or key.codepoint == vaxis.Key.right_super)
                 app.link_super_held = true;
             if (key.isModifier()) return;
+            if (app.gameKey(key, true)) return;
             if (app.dismissScreensaver()) return;
             app.recordUserActivity();
             try handleKey(app, key);
@@ -5560,11 +5805,13 @@ pub fn dispatchEvent(
         .key_release => |key| {
             if (key.codepoint == vaxis.Key.left_super or key.codepoint == vaxis.Key.right_super)
                 app.link_super_held = false;
+            if (app.game_mode) _ = app.gameKey(key, false);
             if (isVoiceKey(key) and app.voice_rt.phase == .recording and
                 app.voice_rt.setup != null and app.voice_rt.setup.?.mode == .ptt)
                 app.stopVoiceRecording();
         },
         .voice => |vev| app.handleVoiceEvent(vev),
+        .wipeout => |wev| app.handleWipeoutEvent(wev),
         .mouse => |m| {
             if (app.screensaver_active) return;
             vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null) .pointer else .default);
@@ -5581,6 +5828,7 @@ pub fn dispatchEvent(
         .tick => {
             app.view.spinner_frame +%= 1;
             app.voiceTick();
+            app.wipeoutDownloadTick();
             app.tickUiAnimation();
             app.expireNotice();
         },
@@ -5612,7 +5860,12 @@ pub fn dispatchEvent(
 
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     while (!app.animation_stop.load(.acquire)) {
-        if (app.ui_animation_active.load(.acquire)) {
+        if (app.game_active.load(.acquire)) {
+            // A playable game steps on wall time; ticks just need to be
+            // frequent enough for 60 fps presentation.
+            loop.postEvent(.tick) catch return;
+            app.io.sleep(.fromMilliseconds(16), .awake) catch {};
+        } else if (app.ui_animation_active.load(.acquire)) {
             loop.postEvent(.tick) catch return;
             app.io.sleep(.fromMilliseconds(33), .awake) catch {};
         } else if (app.animation_active.load(.acquire)) {
@@ -6244,6 +6497,27 @@ const VoiceDownloadJob = struct {
             return;
         };
         job.loop.postEvent(.{ .voice = .download_done }) catch {};
+    }
+};
+
+/// Asset bundle download worker for `!wipeout`'s first run. Resumable:
+/// a lost connection leaves `wipeout.pak.part` for the next attempt.
+const WipeoutDownloadJob = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    loop: *vaxis.Loop(Event),
+    url: []const u8,
+    dest: []u8,
+    progress: *voice.DownloadProgress,
+
+    fn run(job: *WipeoutDownloadJob) void {
+        defer job.gpa.destroy(job);
+        defer job.gpa.free(job.dest);
+        voice.download(job.gpa, job.io, job.url, job.dest, job.progress) catch |err| {
+            job.loop.postEvent(.{ .wipeout = .{ .download_failed = @errorName(err) } }) catch {};
+            return;
+        };
+        job.loop.postEvent(.{ .wipeout = .download_done }) catch {};
     }
 };
 

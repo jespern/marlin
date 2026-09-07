@@ -78,6 +78,9 @@ pub const Renderer = struct {
     /// Diagnostic: when set, every triangle whose bounding box touches this
     /// pixel prints its edge values there and whether the pixel was accepted.
     debug_pixel: ?[2]u32 = null,
+    /// Diagnostic: when set, `Object.draw` tags each primitive with
+    /// 0x4000 + its index so the owner map identifies individual polygons.
+    debug_prim_ids: bool = false,
 
     textures: [textures_max]Texture = undefined,
     textures_len: u16 = 0,
@@ -91,6 +94,8 @@ pub const Renderer = struct {
     sprite_mat: Mat4 = Mat4.identity,
     camera_pos: Vec3 = Vec3.zero,
     fade_enabled: bool = true,
+    /// NDC offset added to every vertex (camera shake); zero for the 2D pass.
+    screen_position: Vec2 = Vec2.init(0, 0),
 
     depth_test: bool = true,
     depth_write: bool = true,
@@ -151,8 +156,18 @@ pub const Renderer = struct {
 
     pub fn createTexture(self: *Renderer, width: u32, height: u32, pixels: []const Rgba) Error!u16 {
         if (self.textures_len >= textures_max) return error.TexturesExhausted;
-        const copy = try self.gpa.dupe(Rgba, pixels[0 .. @as(usize, width) * height]);
         const index = self.textures_len;
+        if (width == 0 or height == 0) {
+            // A few shipped TIMs are degenerate (alopt.cmp holds a 0x1
+            // image the stopwatch model maps). Sampling must stay in
+            // bounds, so such a texture becomes one neutral texel and the
+            // primitive shows its vertex colour.
+            const neutral = try self.gpa.dupe(Rgba, &.{Rgba.init(128, 128, 128, 255)});
+            self.textures[index] = .{ .width = 1, .height = 1, .pixels = neutral };
+            self.textures_len += 1;
+            return index;
+        }
+        const copy = try self.gpa.dupe(Rgba, pixels[0 .. @as(usize, width) * height]);
         self.textures[index] = .{ .width = width, .height = height, .pixels = copy };
         self.textures_len += 1;
         return index;
@@ -165,6 +180,14 @@ pub const Renderer = struct {
 
     pub fn texturesLen(self: *const Renderer) u16 {
         return self.textures_len;
+    }
+
+    /// Free every texture created after the first `len`; used when a
+    /// circuit's track and scenery are replaced by another's.
+    pub fn resetTextures(self: *Renderer, len: u16) void {
+        var i: usize = len;
+        while (i < self.textures_len) : (i += 1) self.gpa.free(self.textures[i].pixels);
+        self.textures_len = @min(len, self.textures_len);
     }
 
     // -- frame state ---------------------------------------------------------
@@ -193,7 +216,12 @@ pub const Renderer = struct {
         self.setModelMat(&Mat4.identity);
     }
 
+    pub fn setScreenPosition(self: *Renderer, offset: Vec2) void {
+        self.screen_position = offset;
+    }
+
     pub fn setView2d(self: *Renderer) void {
+        self.screen_position = Vec2.init(0, 0);
         self.depth_test = false;
         self.depth_write = false;
         self.fade_enabled = false;
@@ -255,8 +283,11 @@ pub const Renderer = struct {
         var in: [3]ClipVert = undefined;
         for (tris.vertices, 0..) |v, i| {
             const world = v.pos.transform(&self.model);
+            var pos = world.transformPerspective(&self.view_projection);
+            pos.x += self.screen_position.x * pos.w;
+            pos.y += self.screen_position.y * pos.w;
             in[i] = .{
-                .pos = world.transformPerspective(&self.view_projection),
+                .pos = pos,
                 .uv = v.uv,
                 .color = self.vertexColor(v, world),
             };
@@ -555,10 +586,14 @@ pub const Renderer = struct {
                 out_b = @min(db + sb * alpha, 1.0);
             },
         }
+        // Dilated pixels sit slightly outside the triangle, so the
+        // barycentric weights (and with them colour and alpha) can leave
+        // [0, 1]; a tiny triangle makes the excursion large. Clamp before
+        // narrowing to bytes.
         self.color[index] = Rgba.init(
-            @intFromFloat(out_r * 255.0 + 0.5),
-            @intFromFloat(out_g * 255.0 + 0.5),
-            @intFromFloat(out_b * 255.0 + 0.5),
+            @intFromFloat(math.clamp01(out_r) * 255.0 + 0.5),
+            @intFromFloat(math.clamp01(out_g) * 255.0 + 0.5),
+            @intFromFloat(math.clamp01(out_b) * 255.0 + 0.5),
             255,
         );
         if (self.depth_write) {
@@ -610,6 +645,18 @@ test "2d quad fills its rectangle" {
     try std.testing.expect(r.color[16 * 32 + 16].r > 100);
     try std.testing.expectEqual(@as(u8, 0), r.color[2 * 32 + 2].r);
     try std.testing.expectEqual(@as(u8, 0), r.color[30 * 32 + 30].r);
+}
+
+test "a zero-sized texture draws as one neutral texel" {
+    var r = try Renderer.init(std.testing.allocator, 32, 32);
+    defer r.deinit();
+    const empty = try r.createTexture(0, 1, &.{});
+    try std.testing.expectEqual(Vec2i.init(1, 1), r.textureSize(empty));
+    r.framePrepare();
+    r.setView2d();
+    r.setCullBackface(false);
+    r.push2d(Vec2i.init(8, 8), Vec2i.init(16, 16), Rgba.white, empty);
+    try std.testing.expect(r.color[16 * 32 + 16].r > 100);
 }
 
 test "near clipping keeps a triangle straddling the camera" {

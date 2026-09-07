@@ -62,6 +62,8 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "!mk", .usage = " [absolute bundle or ROM path]", .description = "play Mario Kart", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
+    .{ .name = "!rbc", .description = "rebuild only the local client (alias for !rb client)" },
+    .{ .name = "!wipeout", .usage = " [track] [pilot] [rapier] [easy|hard] [trial] [new]", .description = "play wipEout (menus, championship, best times; Esc leaves, bare !wipeout resumes)", .accepts_args = true },
 };
 
 pub const CommandSuggestion = struct {
@@ -106,7 +108,8 @@ pub fn commandQuery(editor: *const Editor) ?[]const u8 {
             !std.mem.eql(u8, head, "/animate") and
             !std.mem.eql(u8, head, "/screensaver") and
             !std.mem.eql(u8, head, "/otel") and
-            !std.mem.eql(u8, head, "!rb")) return null;
+            !std.mem.eql(u8, head, "!rb") and
+            !std.mem.eql(u8, head, "!wipeout")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
         if (std.mem.indexOfAny(u8, rest, " \t") != null) return null;
     }
@@ -624,14 +627,19 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.shellEscape(it.rest());
     } else if (std.mem.eql(u8, head, "!c")) {
         self.copyLastToolOutput();
-    } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb")) {
-        var rebuild: RebuildScope = if (std.mem.eql(u8, head, "!rb")) .attached else .none;
+    } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb") or std.mem.eql(u8, head, "!rbc")) {
+        var rebuild: RebuildScope = if (std.mem.eql(u8, head, "!rbc"))
+            .client
+        else if (std.mem.eql(u8, head, "!rb"))
+            .attached
+        else
+            .none;
         var force = false;
         while (it.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--build")) {
-                rebuild = .attached;
-            } else if (std.mem.eql(u8, arg, "--force")) {
+            if (std.mem.eql(u8, arg, "--force")) {
                 force = true;
+            } else if (!std.mem.eql(u8, head, "!rbc") and std.mem.eql(u8, arg, "--build")) {
+                rebuild = .attached;
             } else if (std.mem.eql(u8, head, "!rb") and std.mem.eql(u8, arg, "client")) {
                 rebuild = .client;
             } else if (std.mem.eql(u8, head, "!rb") and std.mem.eql(u8, arg, "both")) {
@@ -639,6 +647,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             } else {
                 if (std.mem.eql(u8, head, "!rb"))
                     self.setNotice("usage: !rb [client|both] [--force]", .{})
+                else if (std.mem.eql(u8, head, "!rbc"))
+                    self.setNotice("usage: !rbc [--force]", .{})
                 else
                     self.setNotice("usage: /reboot [--build] [--force]", .{});
                 return;
@@ -681,6 +691,10 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             self.setNotice("unknown effect {s}", .{name});
             return;
         };
+        if (kind.playable()) {
+            self.setNotice("{s} is a game, not an effect — start it with !{s}", .{ kind.name(), kind.name() });
+            return;
+        }
         const sky_arg = it.next();
         if (it.next() != null) {
             self.setNotice("usage: /animate <" ++ effects.usage_list ++ "> [hour|cycle]", .{});
@@ -698,6 +712,10 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             self.setNotice("unknown effect {s}", .{name});
             return;
         } else self.screensaver_kind;
+        if (kind.playable()) {
+            self.setNotice("{s} is a game, not a screensaver — start it with !{s}", .{ kind.name(), kind.name() });
+            return;
+        }
         const sky_arg = it.next();
         if (it.next() != null) {
             self.setNotice("usage: /screensaver [" ++ effects.usage_list ++ "] [hour|cycle]", .{});
@@ -705,6 +723,53 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         }
         if (!self.applySkyArg(kind, sky_arg)) return;
         self.startScreensaver(kind);
+    } else if (std.mem.eql(u8, head, "!wipeout")) {
+        var options = tui.WipeoutOptions{};
+        var positional: usize = 0;
+        while (it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "rapier")) {
+                options.rapier = true;
+                options.explicit = true;
+            } else if (std.mem.eql(u8, arg, "venom")) {
+                options.rapier = false;
+                options.explicit = true;
+            } else if (std.mem.eql(u8, arg, "nointro")) {
+                options.intro = false;
+            } else if (std.mem.eql(u8, arg, "crt")) {
+                options.crt = true;
+            } else if (std.mem.eql(u8, arg, "nocrt")) {
+                options.crt = false;
+            } else if (std.mem.eql(u8, arg, "new")) {
+                options.explicit = true;
+            } else if (std.mem.eql(u8, arg, "trial")) {
+                options.time_trial = true;
+                options.explicit = true;
+            } else if (std.mem.eql(u8, arg, "race")) {
+                options.time_trial = false;
+                options.explicit = true;
+            } else if (std.mem.eql(u8, arg, "easy")) {
+                options.difficulty = .easy;
+                options.explicit = true;
+            } else if (std.mem.eql(u8, arg, "normal")) {
+                options.difficulty = .normal;
+                options.explicit = true;
+            } else if (std.mem.eql(u8, arg, "hard")) {
+                options.difficulty = .hard;
+                options.explicit = true;
+            } else if (std.fmt.parseUnsigned(u8, arg, 10)) |value| {
+                if (positional == 0) options.track = value else options.pilot = value;
+                positional += 1;
+                options.explicit = true;
+            } else |_| {
+                self.setNotice("usage: !wipeout [track 1-14] [pilot 0-7] [rapier|venom] [easy|normal|hard] [trial] [nointro] [crt|nocrt] [new]", .{});
+                return;
+            }
+        }
+        if (options.track < 1 or options.track > 14 or options.pilot > 7) {
+            self.setNotice("usage: !wipeout [track 1-14] [pilot 0-7] [rapier|venom] [easy|normal|hard] [trial] [nointro] [crt|nocrt] [new]", .{});
+            return;
+        }
+        self.startWipeout(options);
     } else if (std.mem.eql(u8, head, "/otel")) {
         self.otelCommand(it.next(), it.rest());
     } else if (std.mem.eql(u8, head, "/config")) {
@@ -723,7 +788,7 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.help_scroll = shortcut_help_rows.len;
     } else if (head.len > 1 and head[0] == '!') {
         // `!ls -la` — every shell and vim accept the bang glued to the
-        // command. The exact `!c`/`!rb` shortcuts matched above.
+        // command. The exact `!c`/`!rb`/`!rbc` shortcuts matched above.
         self.shellEscape(cmd[1..]);
     } else {
         self.setNotice("unknown command {s} (try /help)", .{head});

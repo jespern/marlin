@@ -26,3 +26,53 @@ const claude_code_turn = @import("claude_code_turn.zig");
 test {
     std.testing.refAllDecls(claude_code_turn);
 }
+
+test "generic Claude connection errors name the missing detail" {
+    const note = try claude_code_turn.claudeErrorNote(
+        std.testing.allocator,
+        "ConnectFailed",
+        "",
+    );
+    defer std.testing.allocator.free(note);
+    try std.testing.expectEqualStrings(
+        "claude code connection failed: ConnectFailed (no transport detail reported by Claude Code)",
+        note,
+    );
+}
+
+test "generic Claude connection errors include captured stderr" {
+    const note = try claude_code_turn.claudeErrorNote(
+        std.testing.allocator,
+        "SocketUnconnected",
+        "  network changed\nwhile connecting\n",
+    );
+    defer std.testing.allocator.free(note);
+    try std.testing.expectEqualStrings(
+        "claude code connection failed: SocketUnconnected (stderr: network changed while connecting)",
+        note,
+    );
+}
+
+test "specific Claude errors keep their original text" {
+    const note = try claude_code_turn.claudeErrorNote(
+        std.testing.allocator,
+        "Not logged in · Please run /login",
+        "ignored",
+    );
+    defer std.testing.allocator.free(note);
+    try std.testing.expectEqualStrings(
+        "claude code error: Not logged in · Please run /login",
+        note,
+    );
+}
+
+test "usage credit notifications describe both transitions" {
+    try std.testing.expectEqualStrings(
+        "Claude Code is now using API credits",
+        claude_code_turn.usageCreditsTransitionNote(true),
+    );
+    try std.testing.expectEqualStrings(
+        "Claude Code returned to subscription usage",
+        claude_code_turn.usageCreditsTransitionNote(false),
+    );
+}

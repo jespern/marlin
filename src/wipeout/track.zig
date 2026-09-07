@@ -17,6 +17,8 @@ const Tris = math.Tris;
 
 pub const track_version: i16 = 8;
 pub const section_cull_behind: f32 = 6144;
+pub const search_look_back = 3;
+pub const search_look_ahead = 6;
 pub const none: i32 = -1;
 
 pub const FaceFlags = struct {
@@ -70,9 +72,15 @@ pub const Error = error{
     CorruptTrack,
 } || bytes.Error || image.Error || render.Error || std.mem.Allocator.Error;
 
+pub const max_pickups = 64;
+pub const pickup_cooldown_time: f32 = 1;
+
 pub const Track = struct {
     faces: []Face,
     sections: []Section,
+    /// Base faces flagged as pickups, in section order.
+    pickup_faces: [max_pickups]u32 = undefined,
+    pickup_count: u8 = 0,
     texture_start: u16,
     texture_len: u16,
     total_section_nums: i32,
@@ -85,6 +93,58 @@ pub const Track = struct {
     pub fn textureIndex(self: *const Track, face: *const Face) u16 {
         const local: u16 = @min(face.texture, self.texture_len -| 1);
         return self.texture_start + local;
+    }
+
+    /// Index of the first face flagged as track base in `section`.
+    pub fn baseFaceIndex(self: *const Track, section: *const Section) usize {
+        var i: usize = section.face_start;
+        while (i + 1 < self.faces.len and (self.faces[i].flags & FaceFlags.track_base) == 0) i += 1;
+        return i;
+    }
+
+    /// The original's nearest-section search: look a few sections back and
+    /// several ahead from `start`, plus down any junction branch found on
+    /// the way. `bias` scales the difference per axis before measuring.
+    pub fn nearestSection(self: *const Track, pos: Vec3, bias: Vec3, start: u32, distance_out: ?*f32) u32 {
+        const sections = self.sections;
+        var section = start;
+        var i: usize = 0;
+        while (i < search_look_back) : (i += 1) section = sections[section].prev;
+
+        var shortest: f32 = 1_000_000_000.0;
+        var nearest = section;
+        var junction: i32 = none;
+        i = 0;
+        while (i < search_look_ahead) : (i += 1) {
+            if (sections[section].junction != none) junction = sections[section].junction;
+            const d = pos.sub(sections[section].center).mul(bias).len();
+            if (d < shortest) {
+                shortest = d;
+                nearest = section;
+            }
+            section = sections[section].next;
+        }
+
+        if (junction != none) {
+            const junction_index: u32 = @intCast(junction);
+            section = junction_index;
+            i = 0;
+            while (i < search_look_ahead) : (i += 1) {
+                const d = pos.sub(sections[section].center).mul(bias).len();
+                if (d < shortest) {
+                    shortest = d;
+                    nearest = section;
+                }
+                if ((sections[junction_index].flags & SectionFlags.junction_start) != 0) {
+                    section = sections[section].next;
+                } else {
+                    section = sections[section].prev;
+                }
+            }
+        }
+
+        if (distance_out) |out| out.* = shortest;
+        return nearest;
     }
 
     pub fn baseFace(self: *const Track, section: *const Section) *Face {
@@ -157,6 +217,10 @@ pub fn load(gpa: std.mem.Allocator, assets: *const assets_mod.Assets, r: *render
         var f: usize = 0;
         while (f < 2 and base_index + f < track.faces.len) : (f += 1) {
             const face = &track.faces[base_index + f];
+            if ((face.flags & (FaceFlags.pickup_left | FaceFlags.pickup_right)) != 0 and track.pickup_count < max_pickups) {
+                track.pickup_faces[track.pickup_count] = @intCast(base_index + f);
+                track.pickup_count += 1;
+            }
             if ((face.flags & FaceFlags.boost) != 0) face.setColor(Rgba.init(0, 0, 255, 255));
         }
     }
