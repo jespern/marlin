@@ -197,9 +197,10 @@ pub const Engine = struct {
         self.last_frame_bytes = 0;
     }
 
-    /// Base ticks per shipped frame, before the wire budget. Daybreak
-    /// moves slowly and its frames are the heaviest, so 10 fps; very large
-    /// boards halve to keep deflate off the critical path.
+    /// Base ticks per shipped frame, before the wire budget. Daybreak moves
+    /// slowly and its frames are the heaviest, so 10 fps; very large boards
+    /// halve to keep deflate off the critical path; wipEout ships every
+    /// 60 Hz tick.
     fn shipEvery(kind: visual_effect.Kind, pixels: usize) u8 {
         if (kind == .daybreak) return 3;
         if (kind == .wipeout) return 1;
@@ -210,9 +211,8 @@ pub const Engine = struct {
     /// so that the last frame's size times the resulting rate stays under
     /// `wire_budget_bytes_per_second`. Nothing shipped yet means the base.
     pub fn effectiveEvery(self: *const Engine) u8 {
-        // No exemptions: wipEout at 60 Hz was 4-9 MiB/s and took Ghostty
-        // down with it on 2026-09-07 (the game keeps simulating at 60 Hz;
-        // only the shipped frames thin out).
+        // Applies to every kind, wipEout included (the game keeps simulating
+        // at 60 Hz whatever the shipped rate).
         if (self.last_frame_bytes == 0 or wire_budget_bytes_per_second == 0) return self.transmit_every;
         const rate = tickRate(self.kind);
         const needed = (self.last_frame_bytes * rate + wire_budget_bytes_per_second - 1) / wire_budget_bytes_per_second;
@@ -360,13 +360,14 @@ pub const game_ticks_per_second: usize = 60;
 pub fn tickRate(kind: visual_effect.Kind) usize {
     return if (kind == .wipeout) game_ticks_per_second else ticks_per_second;
 }
-/// What any one effect may put on the wire. Pac-Man uses a third of it at
-/// 30 fps; daybreak lands near 10 fps; a noisy raw scene is throttled
-/// rather than allowed to flood the terminal.
-pub var wire_budget_bytes_per_second: usize = 2_000_000;
+/// What any one effect may put on the wire — a courtesy cap, not a crash
+/// guard: Ghostty 1.3.1 took 14 MiB/s of raw frames for 40 s and 2 min of
+/// wipEout at 60 fps (~4 MiB/s) without complaint once the placement churn
+/// was gone (2026-09-07). 10 MB/s lets every effect ship at its base rate,
+/// wipEout's CRT pass included, and still throttles a runaway scene.
+pub var wire_budget_bytes_per_second: usize = 10_000_000;
 
-/// `MARLIN_WIRE_BUDGET`: bytes per second, 0 for no budget (for finding a
-/// terminal's limits, not for everyday use).
+/// `MARLIN_WIRE_BUDGET`: bytes per second, 0 for no budget.
 pub fn setWireBudget(bytes_per_second: usize) void {
     wire_budget_bytes_per_second = bytes_per_second;
 }

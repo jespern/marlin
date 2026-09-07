@@ -147,7 +147,7 @@ test "wipEout is placed in the largest centered 4:3 box; other effects fill the 
     try std.testing.expectEqual(@as(u16, 24), whole.rows);
     // The budget knob: 0 means every base tick ships.
     pixel_effects.setWireBudget(0);
-    defer pixel_effects.setWireBudget(2_000_000);
+    defer pixel_effects.setWireBudget(10_000_000);
     game.last_frame_bytes = 1_000_000;
     try std.testing.expectEqual(@as(u8, 1), game.effectiveEvery());
 }
@@ -157,24 +157,27 @@ test "the wire budget stretches the ship interval for heavy frames" {
     try std.testing.expectEqual(@as(u8, 1), engine.effectiveEvery()); // nothing shipped yet: the base rate
     engine.last_frame_bytes = 20_000; // Pac-Man-sized: 0.6 MB/s at 30 fps, untouched
     try std.testing.expectEqual(@as(u8, 1), engine.effectiveEvery());
-    engine.last_frame_bytes = 480_000; // the old daybreak: 14 MB/s wanted → every 8th tick
-    try std.testing.expectEqual(@as(u8, 8), engine.effectiveEvery());
+    engine.last_frame_bytes = 480_000; // 14 MB/s wanted at 30 fps → every 2nd tick under 10 MB/s
+    try std.testing.expectEqual(@as(u8, 2), engine.effectiveEvery());
     engine.transmit_every = 3;
-    engine.last_frame_bytes = 100_000; // 3 MB/s wanted → every 2nd, but the base is 3
+    engine.last_frame_bytes = 100_000; // 3 MB/s wanted: well inside, so the base of 3 stands
     try std.testing.expectEqual(@as(u8, 3), engine.effectiveEvery());
     engine.last_frame_bytes = 100_000_000; // absurd: never slower than one frame a second
     try std.testing.expectEqual(@as(u8, 30), engine.effectiveEvery());
 
-    // wipEout is driven at 60 Hz and gets no exemption: 320×240 frames
-    // (~62 KB) ship every other tick, the 2x CRT pass (~150 KB) every fifth.
+    // wipEout is driven at 60 Hz: 320×240 frames (~62 KB) and the 2x CRT
+    // pass (~150 KB) both ship every tick under the 10 MB/s budget; a
+    // 200 KB frame would drop to every second tick.
     var game = Engine.init(std.testing.allocator, .wipeout, 1);
     defer game.deinit();
     try std.testing.expectEqual(@as(usize, 60), pixel_effects.tickRate(.wipeout));
     game.last_frame_bytes = 62_000;
-    try std.testing.expectEqual(@as(u8, 2), game.effectiveEvery());
+    try std.testing.expectEqual(@as(u8, 1), game.effectiveEvery());
     game.last_frame_bytes = 150_000;
-    try std.testing.expectEqual(@as(u8, 5), game.effectiveEvery());
-    try std.testing.expect(game.last_frame_bytes * 60 / game.effectiveEvery() <= 2_000_000);
+    try std.testing.expectEqual(@as(u8, 1), game.effectiveEvery());
+    game.last_frame_bytes = 200_000;
+    try std.testing.expectEqual(@as(u8, 2), game.effectiveEvery());
+    try std.testing.expect(game.last_frame_bytes * 60 / game.effectiveEvery() <= pixel_effects.wire_budget_bytes_per_second);
 }
 test "pacman shapes its maze to the window, sizes a 16 px framebuffer, and ships zlib frames" {
     const gpa = std.testing.allocator;
@@ -309,7 +312,7 @@ test "daybreak stays inside the 720×405 envelope and ships compressed frames at
     // The budget never lets it exceed 2 MB/s.
     const every = engine.effectiveEvery();
     try std.testing.expect(every >= 3);
-    try std.testing.expect(engine.last_frame_bytes * 30 / every <= 2_000_000);
+    try std.testing.expect(engine.last_frame_bytes * 30 / every <= pixel_effects.wire_budget_bytes_per_second);
     // Ticks between shipped frames match, and the same id is replaced.
     out.clearRetainingCapacity();
     var ticks: usize = 0;

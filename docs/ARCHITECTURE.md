@@ -1258,12 +1258,14 @@ A split pane identifies its session with a compact pane label.
   placements and re-placed the image on every redraw, so game ticks and held
   keys re-placed an unretransmitted image ~60×/s, the one traffic shape the
   surviving probe stream never had and the leading suspect for Ghostty
-  1.3.1 dying under marlin alone. A wire budget of 2 MB/s
+  1.3.1 dying under marlin alone — confirmed 2026-09-07: with the churn
+  gone, two minutes of wipEout at 60 fps (~4 MiB/s) and a 14 MiB/s raw
+  stress run both left the terminal flat. A wire budget of 10 MB/s
   (`pixel_effects.wire_budget_bytes_per_second`; `MARLIN_WIRE_BUDGET`
-  overrides it, 0 for none) stretches each effect's base ship interval from
-  the size of its last frame: Pac-Man stays at 30 fps, daybreak (720×405 at
-  most) and the demoscene scenes (320 px wide) settle where their bytes
-  allow, wipEout ships every other 60 Hz tick.
+  overrides it, 0 for none) is a courtesy cap that lets every effect ship at
+  its base rate — Pac-Man 30 fps, daybreak (720×405 at most) 10 fps, the
+  demoscene scenes (320 px wide) 30, wipEout every 60 Hz tick — and still
+  reins in a runaway scene.
   Placements use the default z-index (above text) because terminals disagree
   on where negative z sits relative to an explicit cell background.
   Capability comes from `vx.caps.kitty_graphics`; without it Tetris and Pac-Man
