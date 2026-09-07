@@ -4,20 +4,19 @@
 //! are screensavers, not a probe; Pac-Man's board lives in pacman.zig and is
 //! rasterized here.
 //!
-//! Transport: one image id per engine, taken once from vaxis' counter, and
-//! every shipped tick retransmits under that same id (`a=t`, 4 KiB chunks,
-//! `q=2` so the terminal does not answer, `o=z` zlib when that is smaller —
-//! the maze compresses ~50×). Replacing in place means no per-frame delete,
-//! no placement-list rewrite in the terminal, and one image resident instead
-//! of two. Terminals differ on whether a replaced image keeps its
-//! placements, so the transmit opens a synchronized update (DEC 2026) that
-//! vaxis' render() closes after it has re-emitted the `a=p` placement from
-//! the cell grid (`Image.draw(.fill)`): the swap is atomic on screen either
-//! way. A wire budget (`wire_budget_bytes_per_second`) stretches each
-//! effect's ship interval from the size of the last frame it sent, so no
-//! scene can flood the terminal. Placements use the default z-index (above
-//! text): terminals disagree on whether negative z sits above or below an
-//! explicit cell background, and the effect is opaque anyway.
+//! Transport: the probe's, which has survived every stress run a terminal
+//! has been put through. Each shipped frame is one Kitty `a=T`
+//! (transmit-and-display) under a fixed per-kind image id, placed at the
+//! effect's rectangle with `c=,r=` so the terminal scales it, `q=2` so it
+//! does not answer, `o=z` zlib when smaller, 4 KiB chunks. vaxis is kept
+//! out of graphics entirely (the TUI clears `caps.kitty_graphics` after
+//! the query): its render used to delete every placement and re-place the
+//! image on each redraw, so a game tick or a held key re-placed an image
+//! that had not been retransmitted, sixty-odd times a second — the one
+//! shape of traffic the surviving probe stream never carried, and the
+//! leading suspect for Ghostty 1.3.1 dying under marlin and only marlin.
+//! A wire budget (`wire_budget_bytes_per_second`, `MARLIN_WIRE_BUDGET`)
+//! stretches each effect's ship interval from the size of its last frame.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -59,8 +58,9 @@ pub const Engine = struct {
     encoded: []u8 = &.{},
     /// The image transmitted for the CURRENT frame (placed by draw).
     image: ?vaxis.Image = null,
-    /// The one terminal image id this engine owns; frames replace it in place.
-    image_id: ?u32 = null,
+    /// Whether the terminal takes Kitty graphics at all (the TUI decides
+    /// from its capability query; vaxis' own flag is deliberately off).
+    graphics: bool = false,
     /// Bytes the last shipped frame put on the wire; drives the budget.
     last_frame_bytes: usize = 0,
     /// The tick `image` was rendered for; renders between ticks reuse it.
@@ -111,6 +111,23 @@ pub const Engine = struct {
         self.background = &.{};
         self.zbuf = &.{};
         self.window = &.{};
+    }
+
+    pub fn setGraphics(self: *Engine, available: bool) void {
+        self.graphics = available;
+    }
+
+    /// The image id this engine transmits under: fixed per kind, replaced in
+    /// place every frame.
+    pub fn imageId(kind: visual_effect.Kind) u32 {
+        return 0x4d61_7200 + @as(u32, @intFromEnum(kind)); // "Mar" + kind
+    }
+
+    /// Where the frame lands, in cells: the whole window, or for wipEout the
+    /// largest centered 4:3 rectangle so `.fill` scaling never stretches it.
+    pub fn placementBox(self: *const Engine) Letterbox {
+        if (self.kind == .wipeout) return letterbox(self.cols, self.rows, self.cell_px_w, self.cell_px_h, 4, 3);
+        return .{ .x = 0, .y = 0, .cols = self.cols, .rows = self.rows };
     }
 
     pub fn setSky(self: *Engine, sky: daybreak.Sky) void {
@@ -196,7 +213,7 @@ pub const Engine = struct {
         // No exemptions: wipEout at 60 Hz was 4-9 MiB/s and took Ghostty
         // down with it on 2026-09-07 (the game keeps simulating at 60 Hz;
         // only the shipped frames thin out).
-        if (self.last_frame_bytes == 0) return self.transmit_every;
+        if (self.last_frame_bytes == 0 or wire_budget_bytes_per_second == 0) return self.transmit_every;
         const rate = tickRate(self.kind);
         const needed = (self.last_frame_bytes * rate + wire_budget_bytes_per_second - 1) / wire_budget_bytes_per_second;
         return @intCast(@min(@max(@as(usize, self.transmit_every), needed), rate));
@@ -216,7 +233,8 @@ pub const Engine = struct {
     /// a daemon event) reuse the image already in the terminal. The caller
     /// handles NoGraphicsCapability by falling back to a cell effect.
     pub fn transmit(self: *Engine, vx: *vaxis.Vaxis, tty: *std.Io.Writer) !void {
-        if (!vx.caps.kitty_graphics) return error.NoGraphicsCapability;
+        _ = vx;
+        if (!self.graphics) return error.NoGraphicsCapability;
         if (self.rgb.len == 0) try self.resize(self.cols, self.rows);
         if (self.kind == .wipeout) {
             if (self.wipeout_game) |g| {
@@ -255,16 +273,12 @@ pub const Engine = struct {
             }
         }
         const encoded = std.base64.standard.Encoder.encode(self.encoded, payload);
-        const id = self.image_id orelse blk: {
-            const fresh = vx.next_img_id;
-            vx.next_img_id += 1;
-            self.image_id = fresh;
-            break :blk fresh;
-        };
-        // Open a synchronized update; render() closes it after re-placing the
-        // image, so a terminal that drops placements on replace shows no gap.
-        try tty.writeAll("\x1b[?2026h");
-        try transmitEncoded(tty, encoded, id, self.width, self.height, compressed);
+        const id = imageId(self.kind);
+        // Cursor to the placement's top-left, then transmit-and-display in
+        // one command: the frame replaces the previous one atomically.
+        const box = self.placementBox();
+        try tty.print("\x1b[{d};{d}H", .{ @as(u32, @intCast(box.y)) + 1, @as(u32, @intCast(box.x)) + 1 });
+        try transmitEncoded(tty, encoded, id, self.width, self.height, compressed, box);
         self.image = vaxis.Image.init(id, self.width, self.height);
         self.transmitted_frame = self.frame;
         // Chunk framing adds ~40 bytes per 4 KiB chunk.
@@ -290,31 +304,24 @@ pub const Engine = struct {
     pub fn draw(self: *const Engine, win: vaxis.Window, mode: effect.DrawMode, opacity: u8) void {
         _ = mode;
         _ = opacity;
+        // Black under the image; the placement itself lives in the terminal
+        // from `transmit`, so nothing here touches graphics.
+        _ = self;
         effect.prepare(win, .full_screen);
         win.hideCursor();
-        const img = self.image orelse return;
-        if (self.kind == .wipeout) {
-            // Letterbox: the largest centered 4:3 area, so the game is never
-            // stretched by `.fill` on a wide window.
-            const box = letterbox(win.width, win.height, self.cell_px_w, self.cell_px_h, 4, 3);
-            const child = win.child(.{ .x_off = box.x, .y_off = box.y, .width = box.cols, .height = box.rows });
-            img.draw(child, .{ .scale = .fill }) catch {};
-            return;
-        }
-        img.draw(win, .{ .scale = .fill }) catch {};
     }
 };
 
-/// Kitty `a=t` transmit of a base64 RGB frame (zlib-compressed when
-/// `compressed`) in 4 KiB chunks; `q=2` keeps the terminal from answering.
-/// The placement comes from vaxis' render().
-fn transmitEncoded(tty: *std.Io.Writer, encoded: []const u8, id: u32, width: u16, height: u16, compressed: bool) !void {
+/// Kitty `a=T` transmit-and-display of a base64 RGB frame (zlib-compressed
+/// when `compressed`) in 4 KiB chunks, scaled into `box` cells at the
+/// cursor; `q=2` keeps the terminal from answering, `C=1` leaves the cursor.
+fn transmitEncoded(tty: *std.Io.Writer, encoded: []const u8, id: u32, width: u16, height: u16, compressed: bool, box: Letterbox) !void {
     const chunk: usize = 4096;
     const first_end: usize = @min(chunk, encoded.len);
     const more: u1 = if (first_end < encoded.len) 1 else 0;
     try tty.print(
-        "\x1b_Ga=t,f=24,s={d},v={d},i={d},q=2{s},m={d};{s}\x1b\\",
-        .{ width, height, id, if (compressed) ",o=z" else "", more, encoded[0..first_end] },
+        "\x1b_Ga=T,f=24,s={d},v={d},i={d},q=2{s},m={d},c={d},r={d},C=1;{s}\x1b\\",
+        .{ width, height, id, if (compressed) ",o=z" else "", more, box.cols, box.rows, encoded[0..first_end] },
     );
     var offset: usize = first_end;
     while (offset < encoded.len) {
@@ -356,7 +363,13 @@ pub fn tickRate(kind: visual_effect.Kind) usize {
 /// What any one effect may put on the wire. Pac-Man uses a third of it at
 /// 30 fps; daybreak lands near 10 fps; a noisy raw scene is throttled
 /// rather than allowed to flood the terminal.
-pub const wire_budget_bytes_per_second: usize = 2_000_000;
+pub var wire_budget_bytes_per_second: usize = 2_000_000;
+
+/// `MARLIN_WIRE_BUDGET`: bytes per second, 0 for no budget (for finding a
+/// terminal's limits, not for everyday use).
+pub fn setWireBudget(bytes_per_second: usize) void {
+    wire_budget_bytes_per_second = bytes_per_second;
+}
 
 pub const Dimensions = struct { width: u16, height: u16 };
 

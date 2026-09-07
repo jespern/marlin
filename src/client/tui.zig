@@ -2183,6 +2183,7 @@ pub const App = struct {
             });
         }
         self.effect_engine.?.setCellPixels(self.cell_px_w, self.cell_px_h);
+        self.effect_engine.?.setGraphics(self.kitty_graphics);
         self.effect_engine.?.reset(
             @intCast(@min(self.term_cols, std.math.maxInt(u16))),
             self.term_rows,
@@ -6134,6 +6135,15 @@ pub fn run(
         try vx.queryColor(writer, .bg);
         app.voice_rt.kitty_release = vx.caps.kitty_keyboard;
         app.kitty_graphics = vx.caps.kitty_graphics;
+        // Pixel effects place their own images (one a=T per frame); vaxis must
+        // not delete and re-place them on every redraw, so it is told there
+        // are no graphics at all.
+        vx.caps.kitty_graphics = false;
+        if (app.environ) |env| {
+            if (env.get("MARLIN_WIRE_BUDGET")) |value| {
+                if (std.fmt.parseUnsigned(usize, value, 10)) |budget| effects.setWireBudget(budget) else |_| {}
+            }
+        }
         app.initVoiceFromConfig();
         try vx.setBracketedPaste(writer, true);
         // Mouse: wheel scrolls the session view; native cell-precise selection

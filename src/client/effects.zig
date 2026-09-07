@@ -21,6 +21,8 @@ pub const Backend = visual_effect.Backend;
 pub const kinds = visual_effect.kinds;
 pub const usage_list = visual_effect.usage_list;
 pub const configurable_usage_list = visual_effect.configurable_usage_list;
+/// The terminal wire budget knob (`MARLIN_WIRE_BUDGET`).
+pub const setWireBudget = pixel_effects.setWireBudget;
 /// The sky model daybreak follows; the TUI resolves it from the clock.
 pub const Sky = daybreak.Sky;
 
@@ -69,6 +71,14 @@ pub const Engine = union(enum) {
     pub fn deinit(self: *Engine) void {
         switch (self.*) {
             inline else => |*engine| engine.deinit(),
+        }
+    }
+
+    /// Whether the terminal takes Kitty graphics; pixel effects transmit only then.
+    pub fn setGraphics(self: *Engine, available: bool) void {
+        switch (self.*) {
+            .pixel => |*engine| engine.setGraphics(available),
+            else => {},
         }
     }
 
