@@ -964,10 +964,18 @@ test "mouse activity neither wakes nor postpones the screensaver" {
     const deadline = nowWallMs(app.io) + 500;
     app.screensaver_deadline_ms.store(deadline, .release);
 
+    // The mouse path reads the Vaxis window, so it needs a real instance.
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var vx = try vaxis.Vaxis.init(threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &out.writer);
+
     var verdicts = TransportVerdicts{};
     try dispatchEvent(
         &app,
-        undefined,
+        &vx,
         undefined,
         gpa,
         .{ .mouse = .{ .col = 0, .row = 0, .button = .none, .mods = .{}, .type = .motion } },
@@ -978,7 +986,7 @@ test "mouse activity neither wakes nor postpones the screensaver" {
     app.startScreensaver(app.screensaver_kind);
     try dispatchEvent(
         &app,
-        undefined,
+        &vx,
         undefined,
         gpa,
         .{ .mouse = .{ .col = 0, .row = 0, .button = .none, .mods = .{}, .type = .motion } },
