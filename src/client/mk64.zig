@@ -4,7 +4,12 @@ const vaxis = @import("vaxis");
 const mk64 = @import("../mk64/root.zig");
 const Io = std.Io;
 const Event = union(enum) { key_press: vaxis.Key, key_release: vaxis.Key, winsize: vaxis.Winsize, focus_in, focus_out };
-const image_ids = [2]u32{ 0x4d4b3630, 0x4d4b3631 };
+/// One image id, retransmitted in place every frame. Alternating two ids
+/// and deleting the previous one each frame is the placement churn that
+/// crashed Ghostty (see pixel_effects.zig); a=T on an existing id replaces
+/// the image and its placement atomically, so nothing needs deleting until
+/// the game exits.
+const image_id: u32 = 0x4d4b3630;
 
 pub const Options = struct { autopilot: bool = false };
 pub fn run(gpa: std.mem.Allocator, io: Io, environ: *std.process.Environ.Map, path: []const u8) !void {
@@ -66,7 +71,7 @@ pub fn runWithOptions(gpa: std.mem.Allocator, io: Io, environ: *std.process.Envi
     try writer.writeAll("\x1b[?25l\x1b[?1004h");
     try writer.flush();
     defer {
-        for (image_ids) |id| writer.print("\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{id}) catch {};
+        writer.print("\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{image_id}) catch {};
         writer.writeAll("\x1b[?2026l\x1b[?1004l\x1b[?25h") catch {};
         writer.flush() catch {};
     }
@@ -78,7 +83,9 @@ pub fn runWithOptions(gpa: std.mem.Allocator, io: Io, environ: *std.process.Envi
     var mode_held = false;
     var item_held = false;
     var item_backward = false;
-    var overlay = options.autopilot;
+    // The status/keys overlay is opt-in everywhere: a screensaver wants a
+    // clean frame, and autopilot in game mode is no less watchable. H shows it.
+    var overlay = false;
     var overlay_held = false;
     var ghost_visible = true;
     var ghost_held = false;
@@ -153,7 +160,6 @@ pub fn runWithOptions(gpa: std.mem.Allocator, io: Io, environ: *std.process.Envi
                     focus_driver = null;
                     driver.mode = if (driver.mode == .off) .race else .off;
                     if (driver.mode != .off) trial.assisted = true;
-                    overlay = true;
                     keys = .{};
                     applied = .{};
                 }
@@ -167,7 +173,6 @@ pub fn runWithOptions(gpa: std.mem.Allocator, io: Io, environ: *std.process.Envi
                     driver = .{ .mode = .drift_demo };
                     trial = mk64.trial.Trial.practice();
                     recording.clearRetainingCapacity();
-                    overlay = true;
                     keys = .{};
                     applied = .{};
                 }
@@ -304,10 +309,8 @@ pub fn runWithOptions(gpa: std.mem.Allocator, io: Io, environ: *std.process.Envi
         try compressor.finish();
         const payload = if (out.buffered().len < renderer.rgb.len) out.buffered() else &renderer.rgb;
         const base64 = std.base64.standard.Encoder.encode(encoded, payload);
-        const id = image_ids[frame % 2];
         try writer.writeAll("\x1b[?2026h");
-        try transmit(writer, base64, display, id, payload.len < renderer.rgb.len);
-        if (frame > 0) try writer.print("\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{image_ids[(frame + 1) % 2]});
+        try transmit(writer, base64, display, image_id, payload.len < renderer.rgb.len);
         if (overlay) {
             var status_buf: [200]u8 = undefined;
             const status = try std.fmt.bufPrint(&status_buf, "{d:.0} km/h | Lap {d}/3 | {d:.1}s | {s}", .{ game.speed * 12, @min(game.laps + 1, 3), @as(f32, @floatFromInt(game.ticks)) / mk64.game.tick_hz, if (game.finished) "FINISH - R restart" else if (game.paused) "PAUSED - P resume" else if (game.controller.drift.turbo_ticks > 0) "MINI-TURBO!" else if (game.controller.drift.charge >= 2) "DRIFT READY - release Space" else if (game.controller.drift.charge == 1) "DRIFT 1/2 - countersteer again" else if (game.controller.drift.drifting) "DRIFT - countersteer then steer in" else "Space drift | O auto | T demo | P pause | R reset" });
@@ -370,7 +373,12 @@ fn transmit(out: *Io.Writer, bytes: []const u8, display: Display, id: u32, compr
     var offset: usize = 0;
     while (offset < bytes.len) {
         const end = @min(offset + 4096, bytes.len);
-        if (offset == 0) try out.print("\x1b_Ga=T,f=24,s=320,v=240,i={d},q=2{s},m={d},c={d},r={d},C=1;", .{ id, if (compressed) ",o=z" else "", @intFromBool(end < bytes.len), display.cols, display.rows }) else try out.print("\x1b_Gm={d};", .{@intFromBool(end < bytes.len)});
+        // p=1: an explicit placement id makes each frame REPLACE the previous
+        // placement. Without it every a=T adds a new placement of the same
+        // image on Ghostty 1.3.1, which does not clear placements on
+        // retransmit (fixed upstream in b8222f4); hundreds pile up within
+        // seconds and the terminal draws them all, which is the stutter.
+        if (offset == 0) try out.print("\x1b_Ga=T,f=24,s=320,v=240,i={d},p=1,q=2{s},m={d},c={d},r={d},C=1;", .{ id, if (compressed) ",o=z" else "", @intFromBool(end < bytes.len), display.cols, display.rows }) else try out.print("\x1b_Gm={d};", .{@intFromBool(end < bytes.len)});
         try out.writeAll(bytes[offset..end]);
         try out.writeAll("\x1b\\");
         offset = end;
