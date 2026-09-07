@@ -1309,7 +1309,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot change working directory mid-turn" } });
                     return;
                 }
-                const new_cwd = resolveSessionCwd(self.gpa, self.io, session.cwd, sc.cwd) catch |err| switch (err) {
+                const new_cwd = resolveSessionCwd(self.gpa, self.io, session.cwd, sc.cwd, self.environ.get("HOME")) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => {
                         self.sendTo(client, .{ .err = .{ .code = "bad_cwd", .msg = "working directory must be an existing directory" } });
@@ -4008,9 +4008,8 @@ pub const Daemon = struct {
     // ---------------------------------------------------------- shutdown --
 
     /// Complete a pending /reboot once every session is quiescent. Sends the
-    /// ok ack to the requesting client (its cue to exec the new binary),
-    /// then shuts down exactly like `shutdown` — the client's autostart
-    /// brings up the new binary. One restart mechanism, not two.
+    /// ok ack, tears down, then closes the requesting connection; ACK plus EOF
+    /// is the client's cue to exec and autostart the new binary.
     fn maybeFinishReboot(self: *Daemon) void {
         const requester = self.pending_reboot orelse return;
         var sit = self.sessions.valueIterator();
@@ -4575,10 +4574,20 @@ fn isGenericFollowUp(title: []const u8) bool {
     return false;
 }
 
-fn resolveSessionCwd(gpa: std.mem.Allocator, io: Io, current_cwd: []const u8, requested: []const u8) ![]u8 {
+fn resolveSessionCwd(
+    gpa: std.mem.Allocator,
+    io: Io,
+    current_cwd: []const u8,
+    requested: []const u8,
+    home: ?[]const u8,
+) ![]u8 {
     const trimmed = std.mem.trim(u8, requested, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidPath;
-    const resolved = if (std.fs.path.isAbsolute(trimmed))
+    const resolved = if (std.mem.eql(u8, trimmed, "~"))
+        try std.fs.path.resolve(gpa, &.{home orelse return error.NoHome})
+    else if (std.mem.startsWith(u8, trimmed, "~/"))
+        try std.fs.path.resolve(gpa, &.{ home orelse return error.NoHome, trimmed[2..] })
+    else if (std.fs.path.isAbsolute(trimmed))
         try std.fs.path.resolve(gpa, &.{trimmed})
     else
         try std.fs.path.resolve(gpa, &.{ current_cwd, trimmed });
@@ -4610,13 +4619,25 @@ test "session cwd resolves relative paths and requires an existing directory" {
     defer gpa.free(child);
     try Io.Dir.cwd().createDirPath(io, child);
 
-    const resolved = try resolveSessionCwd(gpa, io, temp.path, "child/../child");
+    const resolved = try resolveSessionCwd(gpa, io, temp.path, "child/../child", null);
     defer gpa.free(resolved);
     const expected = try Io.Dir.realPathFileAbsoluteAlloc(io, child, gpa);
     defer gpa.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
-    try std.testing.expectError(error.FileNotFound, resolveSessionCwd(gpa, io, temp.path, "missing"));
-    try std.testing.expectError(error.InvalidPath, resolveSessionCwd(gpa, io, temp.path, "  \t"));
+
+    const home = try resolveSessionCwd(gpa, io, child, "~", temp.path);
+    defer gpa.free(home);
+    const expected_home = try Io.Dir.realPathFileAbsoluteAlloc(io, temp.path, gpa);
+    defer gpa.free(expected_home);
+    try std.testing.expectEqualStrings(expected_home, home);
+
+    const home_child = try resolveSessionCwd(gpa, io, temp.path, "~/child", temp.path);
+    defer gpa.free(home_child);
+    try std.testing.expectEqualStrings(expected, home_child);
+
+    try std.testing.expectError(error.NoHome, resolveSessionCwd(gpa, io, temp.path, "~", null));
+    try std.testing.expectError(error.FileNotFound, resolveSessionCwd(gpa, io, temp.path, "missing", null));
+    try std.testing.expectError(error.InvalidPath, resolveSessionCwd(gpa, io, temp.path, "  \t", null));
 }
 
 test "root turns derive titles from substantive prompts" {

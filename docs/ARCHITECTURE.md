@@ -1264,14 +1264,15 @@ A split pane identifies its session with a compact pane label.
   continuously as an opaque full-viewport overlay. Tetris is manual-only:
   `/screensaver tetris` and `/animate tetris` work, while `/config screensaver`
   and config-file validation reject it. Bare `/screensaver`, automatic
-  activation, and normal-mode `gs` use `[ui] screensaver_effect`
-  (default `"matrix"`). `gs` switches to insert mode before
+  activation, and normal-mode `gs` use `[ui] screensaver_effect` (default
+  `"matrix"`). `gs` switches to insert mode before
   entering the saver. A key or paste dismisses it and is consumed; mouse events
   are ignored and do not reset inactivity. `[ui] screensaver_after = "10m"`
   enables per-client inactivity activation; absent or `"off"` disables it.
   Daemon/provider activity does not count as user activity.
   `/cwd <path>` changes the focused session's durable working directory while
-  idle. Relative paths resolve against its current cwd; the daemon requires an
+  idle. `~` and `~/…` resolve against the daemon user's home; other relative
+  paths resolve against the session's current cwd. The daemon requires an
   existing directory, canonicalizes it, and broadcasts the new value. Native
   turns and guest turns use that value on their next start/resume.
   `! <command>` runs through `$SHELL -c` in the focused session cwd;
