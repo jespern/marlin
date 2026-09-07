@@ -146,6 +146,35 @@ pub const Ui = struct {
         self.drawText(r, text, p, size, color);
     }
 
+    /// The pixel box `drawTextCenteredMagnified` covers for `text`.
+    pub fn magnifiedTextSize(self: *const Ui, text: []const u8, size: Size, magnification: i32) Vec2i {
+        const m = self.scale * @max(magnification, 1);
+        return Vec2i.init(textWidth(text, size) * m, @as(i32, @intCast(char_sets[@intFromEnum(size)].height)) * m);
+    }
+
+    /// Text centered on a point at `magnification` times the UI scale: the
+    /// same glyphs, blown up whole pixels, for the few words that must be
+    /// read from across the room (the start countdown).
+    pub fn drawTextCenteredMagnified(self: *const Ui, r: *render.Renderer, text: []const u8, center: Vec2i, size: Size, magnification: i32, color: Rgba) void {
+        const set = &char_sets[@intFromEnum(size)];
+        const texture = self.font_textures[@intFromEnum(size)];
+        const m = self.scale * @max(magnification, 1);
+        const height: i32 = @intCast(set.height);
+        var p = Vec2i.init(center.x - @divTrunc(textWidth(text, size) * m, 2), center.y - @divTrunc(height * m, 2));
+        for (text) |c| {
+            if (c == ' ') {
+                p.x += 8 * m;
+                continue;
+            }
+            const index = glyphIndex(c) orelse continue;
+            const glyph = set.glyphs[index];
+            const width: i32 = @intCast(glyph.width);
+            const cell = Vec2i.init(width, height);
+            r.push2dTile(p, Vec2i.init(glyph.x, glyph.y), cell, Vec2i.init(width * m, height * m), color, texture);
+            p.x += width * m;
+        }
+    }
+
     pub fn drawNumber(self: *const Ui, r: *render.Renderer, num: i64, at: Vec2i, size: Size, color: Rgba) void {
         var buf: [20]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, "{d}", .{@max(num, 0)}) catch return;

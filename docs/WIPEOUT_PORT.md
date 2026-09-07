@@ -11,7 +11,9 @@ the marlin client as `!wipeout` with the original HUD and an optional CRT
 pass, pausing on Escape and resuming where it left off, including across
 marlin restarts through an on-disk snapshot. Seven AI opponents race with
 the original's controller and collide with each other and the player;
-pickups, all six weapons, particles and the rescue droid are in. No audio.
+pickups, all six weapons, particles and the rescue droid are in. No audio;
+the start countdown that the original beeps is written on screen instead
+(GET READY through the grid hover, then 3, 2, 1 and GO in the HUD font).
 
 ## Goals
 

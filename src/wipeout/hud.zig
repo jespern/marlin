@@ -37,6 +37,50 @@ const speedo_bars = [13]SpeedoBar{
     .{ .x = 126, .y = 1, .height = 16, .color = Rgba.init(255, 255, 255, 255) },
 };
 
+/// What the start countdown shows this frame. With no audio there are no
+/// beeps to mark the grid hover, so it is written on the screen instead:
+/// GET READY while the ship hovers, then 3, 2, 1 as the last seconds run
+/// out, and GO for the first second of racing. Each cue lands at full
+/// brightness and fades, so the beat is visible even at a glance.
+pub const Countdown = struct {
+    text: []const u8,
+    /// PSX convention: 128 is full brightness; alpha 255 is opaque.
+    color: Rgba,
+    /// Digits and GO are drawn magnified; GET READY at HUD size.
+    big: bool,
+};
+
+const digit_texts = [_][]const u8{ "1", "2", "3" };
+
+/// Derived from the ship alone: in `intro` the update timer counts down to
+/// "go"; at "go" the ship restarts it at `update_time_stall` for the stall
+/// check, which doubles as the GO cue's clock. A skipped intro leaves the
+/// timer at zero, so nothing is shown.
+pub fn countdown(mode: ship_mod.Mode, update_timer: f32) ?Countdown {
+    switch (mode) {
+        .intro => {
+            if (update_timer <= 0) return null;
+            if (update_timer > 3.0) return .{ .text = "GET READY", .color = ui_mod.color_accent, .big = false };
+            const n: usize = @intFromFloat(@ceil(update_timer)); // 3, 2, 1
+            const into = @as(f32, @floatFromInt(n)) - update_timer; // 0 as the digit appears → 1 as it expires
+            return .{ .text = digit_texts[n - 1], .color = Rgba.init(128, 128, 128, fade(into)), .big = true };
+        },
+        .race => {
+            const since_go = ship_mod.update_time_stall - update_timer;
+            if (update_timer <= 0 or since_go < 0 or since_go >= 1.0) return null;
+            return .{ .text = "GO", .color = Rgba.init(123, 98, 12, fade(since_go)), .big = true };
+        },
+        else => return null,
+    }
+}
+
+/// Full brightness as a cue lands, easing to ~80% as it expires: enough
+/// of a pulse to mark the beat, never faint against busy scenery.
+fn fade(progress: f32) u8 {
+    const p = std.math.clamp(progress, 0.0, 1.0);
+    return @intFromFloat(255.0 - 55.0 * p);
+}
+
 pub const Hud = struct {
     speedo_facia: u16,
 
@@ -116,6 +160,25 @@ pub const Hud = struct {
         }
         if (extras.target_position) |target| {
             if (extras.reticle) |reticle| drawTargetIcon(r, ui, reticle, target);
+        }
+        // The start countdown, on top of everything, a little above center.
+        if (countdown(ship.mode, ship.update_timer)) |cue| {
+            const center = ui.pos(Anchor.middle | Anchor.center, Vec2i.init(0, -30));
+            if (cue.big) {
+                // A dimmed plate behind the numeral, as the results page dims
+                // the scene: the track behind the grid is bright and busy.
+                const box = ui.magnifiedTextSize(cue.text, .px16, 3);
+                const pad = 6 * ui.scale;
+                r.push2d(
+                    Vec2i.init(center.x - @divTrunc(box.x, 2) - pad, center.y - @divTrunc(box.y, 2) - pad),
+                    Vec2i.init(box.x + 2 * pad, box.y + 2 * pad),
+                    Rgba.init(0, 0, 0, 150),
+                    r.no_texture,
+                );
+                ui.drawTextCenteredMagnified(r, cue.text, center, .px16, 3, cue.color);
+            } else {
+                ui.drawTextCentered(r, cue.text, center, .px8, cue.color);
+            }
         }
         r.setCullBackface(true);
     }

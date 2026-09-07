@@ -271,7 +271,17 @@ fn fitDisplay(term_cols: u16, term_rows: u16, pixel_width: u16, pixel_height: u1
 
 fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, display: Display) !void {
     const live = !options.dry_run and options.snapshot == null and options.scan_cracks == null and options.game_script == null;
-    const assets = wipeout.assets.Assets.init(io, gpa, root);
+    // The extracted tree when it is there, else the bundle (the checkout
+    // ships one under assets/), the same way the client opens them.
+    var source = wipeout.assets.openSource(gpa, io, root) catch |err| {
+        stderrPrint(io, "wipeout-probe: no wipEout data under {s}: {s}\n", .{ root, @errorName(err) });
+        return err;
+    };
+    defer if (source == .bundle) source.bundle.deinit();
+    const assets = switch (source) {
+        .tree => wipeout.assets.Assets.init(io, gpa, root),
+        .bundle => |*b| wipeout.assets.Assets.initBundle(io, gpa, root, b),
+    };
     var dir_buf: [32]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dir_buf, "wipeout/track{d:0>2}", .{options.track});
 
