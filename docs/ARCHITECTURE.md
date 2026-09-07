@@ -1249,8 +1249,12 @@ A split pane identifies its session with a compact pane label.
   (from the winsize report); the maze uses up to 16 px per tile, letterboxed
   to the window's aspect (height ≤ 720, width ≤ 1600). Transport: the main
   loop calls `transmit` before `draw`; each shipped frame is one Kitty
-  `a=T` transmit-and-display under a fixed per-kind image id, placed at the
-  effect's cell rectangle (the window, or wipEout's centered 4:3 box) with
+  `a=T` transmit-and-display under a fixed per-kind image id and placement
+  id `p=1` (the protocol replaces a placement with the same image id and
+  placement id; without one every display adds another, and a 60 fps game
+  piled up thousands the terminal drew each frame until it stuttered),
+  placed at the effect's cell rectangle (the window, or wipEout's centered
+  4:3 box) with
   `c=,r=` so the terminal scales it, `q=2` so it stays quiet, `o=z` zlib
   when smaller, 4 KiB chunks — the probe's transport, which has survived
   every stress run. vaxis is kept out of graphics (the TUI clears

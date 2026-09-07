@@ -124,6 +124,7 @@ test {
     _ = @import("client/effect.zig");
     _ = @import("client/effects_test.zig");
     _ = @import("client/pixel_effects_test.zig");
+    _ = @import("wipeout/kitty_transport_test.zig");
     _ = @import("client/daybreak_test.zig");
     _ = @import("client/media_test.zig");
     _ = @import("client/matrix_test.zig");

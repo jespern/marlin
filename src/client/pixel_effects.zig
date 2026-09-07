@@ -6,9 +6,13 @@
 //!
 //! Transport: the probe's, which has survived every stress run a terminal
 //! has been put through. Each shipped frame is one Kitty `a=T`
-//! (transmit-and-display) under a fixed per-kind image id, placed at the
-//! effect's rectangle with `c=,r=` so the terminal scales it, `q=2` so it
-//! does not answer, `o=z` zlib when smaller, 4 KiB chunks. vaxis is kept
+//! (transmit-and-display) under a fixed per-kind image id and placement id
+//! (`p=1`, so the terminal replaces the placement; without one every
+//! display mints another, and a 60 fps game piles up thousands the terminal
+//! draws each frame), placed at the effect's rectangle with `c=,r=` so the
+//! terminal scales it, `q=2` so it does not answer, `o=z` zlib when
+//! smaller, 4 KiB chunks. The bytes come from wipeout/kitty_transport.zig,
+//! which the probe's `--client-transport` shares. vaxis is kept
 //! out of graphics entirely (the TUI clears `caps.kitty_graphics` after
 //! the query): its render used to delete every placement and re-place the
 //! image on each redraw, so a game tick or a held key re-placed an image
@@ -26,6 +30,7 @@ const pacman = @import("pacman.zig");
 const tetris = @import("tetris.zig");
 const daybreak = @import("daybreak.zig");
 const wipeout_effect = @import("wipeout_effect.zig");
+const kitty = @import("../wipeout/kitty_transport.zig");
 
 pub const Scene = enum { plasma, tunnel, metaballs, horizon };
 
@@ -274,28 +279,27 @@ pub const Engine = struct {
         }
         const encoded = std.base64.standard.Encoder.encode(self.encoded, payload);
         const id = imageId(self.kind);
-        // One synchronized update per frame: the terminal presents each frame
-        // as it completes instead of on its own timer, which beat against a
-        // 60 fps stream and read as judder. Cursor to the placement's
-        // top-left, then transmit-and-display in one command: the frame
-        // replaces the previous one atomically.
+        // One frame is one synchronized update holding one a=T under this
+        // kind's image id and placement id 1: the terminal replaces the
+        // placement rather than adding one per frame (kitty_transport.zig).
         const box = self.placementBox();
-        try tty.writeAll("\x1b[?2026h");
-        try tty.print("\x1b[{d};{d}H", .{ @as(u32, @intCast(box.y)) + 1, @as(u32, @intCast(box.x)) + 1 });
-        try transmitEncoded(tty, encoded, id, self.width, self.height, compressed, box);
-        try tty.writeAll("\x1b[?2026l");
+        try kitty.shipFrame(tty, encoded, id, self.width, self.height, compressed, .{
+            .col = @intCast(box.x),
+            .row = @intCast(box.y),
+            .cols = box.cols,
+            .rows = box.rows,
+        });
         try tty.flush();
         self.image = vaxis.Image.init(id, self.width, self.height);
         self.transmitted_frame = self.frame;
-        // Chunk framing adds ~40 bytes per 4 KiB chunk.
-        self.last_frame_bytes = encoded.len + 40 * (encoded.len / 4096 + 1);
+        self.last_frame_bytes = kitty.wireBytes(encoded.len);
     }
 
     /// Drop the image from the terminal (effect ended).
     pub fn release(self: *Engine, vx: *vaxis.Vaxis, tty: *std.Io.Writer) void {
         _ = vx;
         if (self.image) |img| {
-            freeImage(tty, img.id);
+            kitty.freeImage(tty, img.id) catch {};
             self.image = null;
         }
         self.transmitted_frame = null;
@@ -321,27 +325,6 @@ pub const Engine = struct {
 /// Kitty `a=T` transmit-and-display of a base64 RGB frame (zlib-compressed
 /// when `compressed`) in 4 KiB chunks, scaled into `box` cells at the
 /// cursor; `q=2` keeps the terminal from answering, `C=1` leaves the cursor.
-fn transmitEncoded(tty: *std.Io.Writer, encoded: []const u8, id: u32, width: u16, height: u16, compressed: bool, box: Letterbox) !void {
-    const chunk: usize = 4096;
-    const first_end: usize = @min(chunk, encoded.len);
-    const more: u1 = if (first_end < encoded.len) 1 else 0;
-    try tty.print(
-        "\x1b_Ga=T,f=24,s={d},v={d},i={d},q=2{s},m={d},c={d},r={d},C=1;{s}\x1b\\",
-        .{ width, height, id, if (compressed) ",o=z" else "", more, box.cols, box.rows, encoded[0..first_end] },
-    );
-    var offset: usize = first_end;
-    while (offset < encoded.len) {
-        const end: usize = @min(offset + chunk, encoded.len);
-        const m: u1 = if (end < encoded.len) 1 else 0;
-        try tty.print("\x1b_Gm={d};{s}\x1b\\", .{ m, encoded[offset..end] });
-        offset = end;
-    }
-}
-
-fn freeImage(tty: *std.Io.Writer, id: u32) void {
-    tty.print("\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{id}) catch {};
-}
-
 /// Deflate effort. Measured on daybreak (gradients) and Pac-Man (flat
 /// art): level 4 shrinks frames 7% and 23% over level 1 at the same cost;
 /// level 6 buys a little more for a third more CPU per frame.

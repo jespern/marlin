@@ -519,9 +519,14 @@ fn run(gpa: std.mem.Allocator, io: Io, options: Options, root: []const u8, displ
         const write_start = now(io);
         if (!options.dry_run) {
             if (options.client_transport) {
-                try out.writeAll("\x1b[?2026h\x1b_Ga=d\x1b\\");
-                try transmitFrame(out, pending.encoded, options, display, pending.compressed, image_ids[0]);
-                try out.writeAll("\x1b[?2026l");
+                // The client's exact bytes: one sync update, one a=T under a
+                // fixed image id and placement id, never a delete.
+                try wipeout.kitty_transport.shipFrame(out, pending.encoded, image_ids[0], @as(u32, options.width) * options.scale, @as(u32, options.height) * options.scale, pending.compressed, .{
+                    .col = @intCast(display.col),
+                    .row = @intCast(display.row),
+                    .cols = @intCast(display.cols),
+                    .rows = @intCast(display.rows),
+                });
             } else {
                 const id = image_ids[@intCast(totals.frames % 2)];
                 try transmitFrame(out, pending.encoded, options, display, pending.compressed, id);
@@ -1484,7 +1489,7 @@ fn usage(io: Io) void {
         \\  --ship-log F       write ship state per frame as CSV
         \\  --probe-pixel X,Y  with --snapshot: print rasterizer decisions for one pixel
         \\  --raw              disable zlib compression
-        \\  --client-transport one image id replaced in place inside DEC 2026, as the marlin client ships frames
+        \\  --client-transport the marlin client's exact bytes (wipeout.kitty_transport): one a=T per frame under a fixed image id and placement id, inside DEC 2026
         \\
     , .{});
 }

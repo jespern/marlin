@@ -23,6 +23,7 @@ pub const hud = @import("hud.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const autopilot = @import("autopilot.zig");
 pub const parzlib = @import("parzlib.zig");
+pub const kitty_transport = @import("kitty_transport.zig");
 pub const race = @import("race.zig");
 pub const weapon = @import("weapon.zig");
 pub const particle = @import("particle.zig");

@@ -90,7 +90,7 @@ test "the probe's transport: one a=T per shipped frame at the placement, nothing
     const first = out.written();
     const id = Engine.imageId(.tunnel);
     var header: [96]u8 = undefined;
-    const want = try std.fmt.bufPrint(&header, "\x1b[?2026h\x1b[1;1H\x1b_Ga=T,f=24,s=240,v=144,i={d},q=2", .{id});
+    const want = try std.fmt.bufPrint(&header, "\x1b[?2026h\x1b[1;1H\x1b_Ga=T,f=24,s=240,v=144,i={d},p=1,q=2", .{id});
     const at = std.mem.indexOf(u8, first, want).?;
     const semi = std.mem.indexOfScalarPos(u8, first, at + want.len, ';').?; // past the cursor move's own ';'
     try std.testing.expect(std.mem.endsWith(u8, first[at..semi], ",m=1,c=80,r=24,C=1")); // zlib or not, placed at the window
