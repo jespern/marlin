@@ -193,13 +193,13 @@ pub const Engine = struct {
     /// so that the last frame's size times the resulting rate stays under
     /// `wire_budget_bytes_per_second`. Nothing shipped yet means the base.
     pub fn effectiveEvery(self: *const Engine) u8 {
-        // wipEout is a game the player launched by hand and tuned for its own
-        // frame rate (banded parallel zlib, quantised CRT); the budget guards
-        // screensavers that run unattended.
-        if (self.kind == .wipeout) return self.transmit_every;
+        // No exemptions: wipEout at 60 Hz was 4-9 MiB/s and took Ghostty
+        // down with it on 2026-09-07 (the game keeps simulating at 60 Hz;
+        // only the shipped frames thin out).
         if (self.last_frame_bytes == 0) return self.transmit_every;
-        const needed = (self.last_frame_bytes * ticks_per_second + wire_budget_bytes_per_second - 1) / wire_budget_bytes_per_second;
-        return @intCast(@min(@max(@as(usize, self.transmit_every), needed), ticks_per_second));
+        const rate = tickRate(self.kind);
+        const needed = (self.last_frame_bytes * rate + wire_budget_bytes_per_second - 1) / wire_budget_bytes_per_second;
+        return @intCast(@min(@max(@as(usize, self.transmit_every), needed), rate));
     }
 
     pub fn tick(self: *Engine) void {
@@ -346,6 +346,13 @@ fn deflate(dst: []u8, window: []u8, src: []const u8) ?[]u8 {
 
 /// The animation thread's tick rate; ship intervals are counted in ticks.
 pub const ticks_per_second: usize = 30;
+/// The game tier's tick rate (16 ms) while wipEout is up.
+pub const game_ticks_per_second: usize = 60;
+
+/// Ticks per second an engine of this kind is driven at.
+pub fn tickRate(kind: visual_effect.Kind) usize {
+    return if (kind == .wipeout) game_ticks_per_second else ticks_per_second;
+}
 /// What any one effect may put on the wire. Pac-Man uses a third of it at
 /// 30 fps; daybreak lands near 10 fps; a noisy raw scene is throttled
 /// rather than allowed to flood the terminal.

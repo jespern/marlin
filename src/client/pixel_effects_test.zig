@@ -139,6 +139,17 @@ test "the wire budget stretches the ship interval for heavy frames" {
     try std.testing.expectEqual(@as(u8, 3), engine.effectiveEvery());
     engine.last_frame_bytes = 100_000_000; // absurd: never slower than one frame a second
     try std.testing.expectEqual(@as(u8, 30), engine.effectiveEvery());
+
+    // wipEout is driven at 60 Hz and gets no exemption: 320×240 frames
+    // (~62 KB) ship every other tick, the 2x CRT pass (~150 KB) every fifth.
+    var game = Engine.init(std.testing.allocator, .wipeout, 1);
+    defer game.deinit();
+    try std.testing.expectEqual(@as(usize, 60), pixel_effects.tickRate(.wipeout));
+    game.last_frame_bytes = 62_000;
+    try std.testing.expectEqual(@as(u8, 2), game.effectiveEvery());
+    game.last_frame_bytes = 150_000;
+    try std.testing.expectEqual(@as(u8, 5), game.effectiveEvery());
+    try std.testing.expect(game.last_frame_bytes * 60 / game.effectiveEvery() <= 2_000_000);
 }
 test "pacman shapes its maze to the window, sizes a 16 px framebuffer, and ships zlib frames" {
     const gpa = std.testing.allocator;

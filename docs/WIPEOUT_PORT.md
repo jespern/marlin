@@ -310,7 +310,10 @@ leave steering, thrust, or fire stuck. `!wipeout` again resumes the same
 race; a different track or pilot starts a new one. The race object is owned by the App, not by the effect
 engine, so running another screensaver in between does not lose it, and
 the effect engine keeps state alive when hidden as marlin's other pixel
-effects already do.
+effects already do. Frames ship under the client's 2 MB/s terminal budget
+like every pixel effect: about 30 fps at 320×240, fewer with the 2x CRT
+pass. The simulation stays at 60 Hz; only presentation thins out. Shipping
+every 60 Hz tick was 4-9 MiB/s and crashed Ghostty 1.3.1 on 2026-09-07.
 
 Integration points, all in the client:
 
