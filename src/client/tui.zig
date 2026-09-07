@@ -2287,7 +2287,9 @@ pub const App = struct {
         self.game_active.store(true, .release);
         self.wipeout_game.?.resume_();
         self.syncAnimationTicker();
-        self.setNotice("wipEout — arrows steer/pitch, x thrust, z/c airbrakes, f fire, Enter pauses, Backspace menu, Esc leaves", .{});
+        var chosen_buf: [96]u8 = undefined;
+        const chosen: []const u8 = if (options.explicit) wipeout_effect.describeSelection(options, &chosen_buf) else "";
+        self.setNotice("wipEout{s}{s} — arrows steer/pitch, x thrust, z/c airbrakes, f fire, Enter pauses, Backspace menu, Esc leaves", .{ if (chosen.len > 0) " · " else "", chosen });
     }
 
     /// Leave the game: hide the effect and stop the fast ticker. The race

@@ -91,3 +91,70 @@ test "bundle download: real network smoke (MARLIN_WIPEOUT_NET_TEST=1)" {
     defer game.destroy();
     try std.testing.expect(game.session.bundle != null);
 }
+
+test "!wipeout arguments: circuits and pilots by name, flags in any order, raw PSX numbers on request" {
+    var buf: [256]u8 = undefined;
+    const parse = wipeout_effect.parseLaunchArgs;
+
+    const terramax = parse(&.{ "terramax", "rapier" }, &buf).ok;
+    try std.testing.expectEqual(@as(u8, 6), terramax.track); // TERRAMAX's Rapier layout
+    try std.testing.expect(terramax.rapier and terramax.explicit);
+    try std.testing.expectEqual(@as(u8, 4), parse(&.{"karb"}, &buf).ok.track); // KARBONIS V, Venom
+    try std.testing.expectEqual(@as(u8, 6), parse(&.{ "RAPIER", "Terr" }, &buf).ok.track); // order and case do not matter
+    try std.testing.expectEqual(@as(u8, 1), parse(&.{"3"}, &buf).ok.track); // circuit 3 = TERRAMAX = PSX track 1
+    try std.testing.expectEqual(@as(u8, 12), parse(&.{"track12"}, &buf).ok.track);
+    try std.testing.expectEqual(@as(u8, 2), parse(&.{"arial"}, &buf).ok.pilot);
+    try std.testing.expectEqual(@as(u8, 5), parse(&.{"arian"}, &buf).ok.pilot);
+    try std.testing.expectEqual(@as(u8, 6), parse(&.{"feisar"}, &buf).ok.pilot); // a team names its first pilot
+    try std.testing.expectEqual(@as(u8, 5), parse(&.{"pilot5"}, &buf).ok.pilot);
+
+    const flags = parse(&.{ "dekka", "easy", "trial", "nointro", "nocrt" }, &buf).ok;
+    try std.testing.expectEqual(@as(u8, 0), flags.pilot);
+    try std.testing.expectEqual(wipeout.race.Difficulty.easy, flags.difficulty.?);
+    try std.testing.expect(flags.time_trial and !flags.intro and flags.crt.? == false and flags.explicit);
+
+    const bare = parse(&.{}, &buf).ok;
+    try std.testing.expect(!bare.explicit); // resumes
+    try std.testing.expect(parse(&.{"crt"}, &buf).ok.explicit == false); // a display flag alone still resumes
+
+    // Refusals say what would work.
+    const ambiguous = parse(&.{"k"}, &buf).invalid;
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "karbonis korodera") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parse(&.{"tetsuo"}, &buf).invalid, "surname") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parse(&.{"bogus"}, &buf).invalid, "circuits:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parse(&.{"9"}, &buf).invalid, "1-7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parse(&.{"track15"}, &buf).invalid, "1-14") != null);
+}
+
+test "!wipeout suggestions: circuits first, then pilots and flags, filtered by the word being typed" {
+    var out: [32]wipeout_effect.Candidate = undefined;
+    const first = wipeout_effect.launchCandidates(&.{}, "", &out);
+    try std.testing.expectEqual(@as(usize, 7), first.len);
+    try std.testing.expectEqualStrings("altima", first[0].word);
+    try std.testing.expectEqualStrings("FIRESTAR · circuit 7 (bonus)", first[6].description);
+
+    const te = wipeout_effect.launchCandidates(&.{}, "te", &out);
+    try std.testing.expectEqual(@as(usize, 1), te.len);
+    try std.testing.expectEqualStrings("terramax", te[0].word);
+
+    const after_circuit = wipeout_effect.launchCandidates(&.{"terramax"}, "", &out);
+    try std.testing.expectEqualStrings("dekka", after_circuit[0].word); // pilots come next
+    for (after_circuit) |c| try std.testing.expect(!std.mem.eql(u8, c.word, "altima"));
+
+    const r = wipeout_effect.launchCandidates(&.{"terramax"}, "r", &out);
+    try std.testing.expectEqual(@as(usize, 2), r.len);
+    try std.testing.expectEqualStrings("rapier", r[0].word);
+    try std.testing.expectEqualStrings("race", r[1].word);
+
+    const done = wipeout_effect.launchCandidates(&.{ "terramax", "arial", "rapier", "hard", "trial" }, "", &out);
+    for (done) |c| try std.testing.expect(std.mem.eql(u8, c.word, "nointro") or std.mem.eql(u8, c.word, "crt") or std.mem.eql(u8, c.word, "nocrt") or std.mem.eql(u8, c.word, "new"));
+
+    var buf: [96]u8 = undefined;
+    const label = wipeout_effect.describeSelection(.{ .track = 6, .rapier = true, .pilot = 2, .explicit = true }, &buf);
+    try std.testing.expectEqualStrings("TERRAMAX · RAPIER CLASS · ARIAL TETSUO", label);
+    // Every key is the first word of the arcade name it stands for.
+    for (wipeout_effect.circuit_keys, wipeout.defs.circuit_names) |key, name| {
+        var words = std.mem.splitScalar(u8, name, ' ');
+        try std.testing.expect(std.ascii.eqlIgnoreCase(key, words.next().?));
+    }
+}

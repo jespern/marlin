@@ -7,6 +7,7 @@ const std = @import("std");
 const proto = @import("../core/proto.zig");
 const config = @import("../core/config.zig");
 const effects = @import("effects.zig");
+const wipeout_effect = @import("wipeout_effect.zig");
 const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const tui = @import("tui.zig");
@@ -45,7 +46,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
     .{ .name = "/animate", .usage = " <" ++ effects.usage_list ++ ">", .description = "play a transient screen effect", .accepts_args = true },
     .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "]", .description = "start a continuous full-screen effect", .accepts_args = true },
-    .{ .name = "/mk64", .hidden = true, .usage = " [absolute bundle or ROM path]", .description = "play Mario Kart (pure Zig)", .accepts_args = true },
+    .{ .name = "/mk64", .hidden = true, .description = "play Mario Kart (pure Zig)", .accepts_args = true },
     .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/cwd", .usage = " <path>", .description = "change this session's working directory", .accepts_args = true },
@@ -60,11 +61,11 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/detach", .description = "leave Marlin (sessions keep running)" },
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
-    .{ .name = "!mk", .hidden = true, .usage = " [absolute bundle or ROM path]", .description = "play Mario Kart", .accepts_args = true },
+    .{ .name = "!mk", .hidden = true, .description = "play Mario Kart", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
     .{ .name = "!rbc", .description = "rebuild only the local client (alias for !rb client)" },
-    .{ .name = "!wipeout", .hidden = true, .usage = " [track] [pilot] [rapier] [easy|hard] [trial] [new]", .description = "play wipEout (menus, championship, best times; Esc leaves, bare !wipeout resumes)", .accepts_args = true },
+    .{ .name = "!wipeout", .hidden = true, .usage = " [circuit] [pilot] [venom|rapier] [easy|normal|hard] [trial] [nointro] [crt|nocrt] [new]", .description = "play wipEout — type `!wipeout ` to pick a circuit; Esc leaves, bare !wipeout resumes", .accepts_args = true },
 };
 
 pub const CommandSuggestion = struct {
@@ -112,7 +113,9 @@ pub fn commandQuery(editor: *const Editor) ?[]const u8 {
             !std.mem.eql(u8, head, "!rb") and
             !std.mem.eql(u8, head, "!wipeout")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
-        if (std.mem.indexOfAny(u8, rest, " \t") != null) return null;
+        // One argument is the rule; `!wipeout` stacks words (circuit, pilot,
+        // class, flags) and offers the next one at each step.
+        if (!std.mem.eql(u8, head, "!wipeout") and std.mem.indexOfAny(u8, rest, " \t") != null) return null;
     }
     return text;
 }
@@ -214,6 +217,37 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
                     .submit_on_enter = true,
                 });
             }
+        }
+        return out.items;
+    }
+    if (query.len > "!wipeout".len and
+        std.mem.eql(u8, query[0.."!wipeout".len], "!wipeout") and
+        (query["!wipeout".len] == ' ' or query["!wipeout".len] == '\t'))
+    {
+        // Circuits by name first, then pilots and flags, filtered by the word
+        // being typed; Enter launches.
+        const rest = query["!wipeout".len..];
+        var tokens: [12][]const u8 = undefined;
+        var n: usize = 0;
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        while (words.next()) |w| {
+            if (n == tokens.len) break;
+            tokens[n] = w;
+            n += 1;
+        }
+        const typing = rest.len > 0 and rest[rest.len - 1] != ' ' and rest[rest.len - 1] != '\t' and n > 0;
+        const partial: []const u8 = if (typing) tokens[n - 1] else "";
+        const complete = if (typing) tokens[0 .. n - 1] else tokens[0..n];
+        var candidates: [32]wipeout_effect.Candidate = undefined;
+        const base = query[0 .. query.len - partial.len];
+        for (wipeout_effect.launchCandidates(complete, partial, &candidates)) |c| {
+            const replacement = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, c.word });
+            try out.append(arena, .{
+                .label = replacement,
+                .description = c.description,
+                .replacement = replacement,
+                .submit_on_enter = true,
+            });
         }
         return out.items;
     }
@@ -728,52 +762,18 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         if (!self.applySkyArg(kind, sky_arg)) return;
         self.startScreensaver(kind);
     } else if (std.mem.eql(u8, head, "!wipeout")) {
-        var options = tui.WipeoutOptions{};
-        var positional: usize = 0;
+        var args: [12][]const u8 = undefined;
+        var count: usize = 0;
         while (it.next()) |arg| {
-            if (std.mem.eql(u8, arg, "rapier")) {
-                options.rapier = true;
-                options.explicit = true;
-            } else if (std.mem.eql(u8, arg, "venom")) {
-                options.rapier = false;
-                options.explicit = true;
-            } else if (std.mem.eql(u8, arg, "nointro")) {
-                options.intro = false;
-            } else if (std.mem.eql(u8, arg, "crt")) {
-                options.crt = true;
-            } else if (std.mem.eql(u8, arg, "nocrt")) {
-                options.crt = false;
-            } else if (std.mem.eql(u8, arg, "new")) {
-                options.explicit = true;
-            } else if (std.mem.eql(u8, arg, "trial")) {
-                options.time_trial = true;
-                options.explicit = true;
-            } else if (std.mem.eql(u8, arg, "race")) {
-                options.time_trial = false;
-                options.explicit = true;
-            } else if (std.mem.eql(u8, arg, "easy")) {
-                options.difficulty = .easy;
-                options.explicit = true;
-            } else if (std.mem.eql(u8, arg, "normal")) {
-                options.difficulty = .normal;
-                options.explicit = true;
-            } else if (std.mem.eql(u8, arg, "hard")) {
-                options.difficulty = .hard;
-                options.explicit = true;
-            } else if (std.fmt.parseUnsigned(u8, arg, 10)) |value| {
-                if (positional == 0) options.track = value else options.pilot = value;
-                positional += 1;
-                options.explicit = true;
-            } else |_| {
-                self.setNotice("usage: !wipeout [track 1-14] [pilot 0-7] [rapier|venom] [easy|normal|hard] [trial] [nointro] [crt|nocrt] [new]", .{});
-                return;
-            }
+            if (count == args.len) break;
+            args[count] = arg;
+            count += 1;
         }
-        if (options.track < 1 or options.track > 14 or options.pilot > 7) {
-            self.setNotice("usage: !wipeout [track 1-14] [pilot 0-7] [rapier|venom] [easy|normal|hard] [trial] [nointro] [crt|nocrt] [new]", .{});
-            return;
+        var message: [256]u8 = undefined;
+        switch (wipeout_effect.parseLaunchArgs(args[0..count], &message)) {
+            .ok => |options| self.startWipeout(options),
+            .invalid => |why| self.setNotice("!wipeout: {s} · usage: !wipeout [circuit] [pilot] [venom|rapier] [easy|normal|hard] [trial] [nointro] [crt|nocrt] [new]", .{why}),
         }
-        self.startWipeout(options);
     } else if (std.mem.eql(u8, head, "/otel")) {
         self.otelCommand(it.next(), it.rest());
     } else if (std.mem.eql(u8, head, "/config")) {

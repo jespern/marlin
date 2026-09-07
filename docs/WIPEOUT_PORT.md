@@ -295,8 +295,13 @@ into different decisions over the run.
 
 ## Inside marlin
 
-`!wipeout [track 1-14] [pilot 0-7] [rapier|venom] [nointro]` loads the
-circuit and shows it as a pixel effect. While it is up the client is in
+`!wipeout [circuit] [pilot] [venom|rapier] [easy|normal|hard] [trial]
+[nointro] [crt|nocrt] [new]` loads the circuit and shows it as a pixel
+effect. Circuits and pilots go by name and any unique prefix will do
+(`!wipeout terramax rapier arial`, `!wipeout karb`); typing `!wipeout ` in
+the composer lists the seven circuits, then pilots and flags, and Enter
+launches. `trackN` (1-14) and `pilotN` (0-7) keep the raw PSX numbering
+for the parity tooling. A refused line says which words would have worked. While it is up the client is in
 game mode: every key press and release goes to the ship (the same driving
 bindings as the probe, plus `p` for the CRT pass). Backspace returns a race
 to the main menu; Escape or Ctrl-C pauses the game and hands the terminal

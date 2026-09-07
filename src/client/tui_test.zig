@@ -4597,3 +4597,42 @@ test "optional games stay out of general command and effect suggestions" {
         }
     }
 }
+
+test "typing `!wipeout ` in the composer lists the circuits by name, then pilots and flags" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{ .sid = 1, .editor = Editor.init(gpa) },
+    };
+    defer app.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    app.view.editor.insertSlice("!wipeout ");
+    var suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 7), suggestions.len);
+    try std.testing.expectEqualStrings("!wipeout altima", suggestions[0].label);
+    try std.testing.expectEqualStrings("ALTIMA VII · circuit 1", suggestions[0].description);
+    try std.testing.expect(suggestions[0].submit_on_enter);
+
+    app.view.editor.clear();
+    app.view.editor.insertSlice("!wipeout te");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("!wipeout terramax", suggestions[0].replacement);
+
+    app.view.editor.clear();
+    app.view.editor.insertSlice("!wipeout terramax r");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 2), suggestions.len);
+    try std.testing.expectEqualStrings("!wipeout terramax rapier", suggestions[0].replacement);
+    try std.testing.expectEqualStrings("!wipeout terramax race", suggestions[1].replacement);
+}
