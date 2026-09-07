@@ -14,11 +14,12 @@ Unique temporary names prevent concurrent launches sharing partial files.
 Failures and cancellation leave no installed partial file. Old verified caches
 are copied into the new layout; explicit development sources remain supported.
 
-A source checkout running `zig-out/bin/marlin` uses `<checkout>/assets/<filename>`
-when the cache is empty, held to the same digest and validator as a download and
-installed into the cache from there. Development builds therefore work before the
-bundles are published, and a checkout with a stale or edited bundle falls back to
-the network like any other miss.
+A source checkout running `zig-out/bin/marlin` (or `zig build run` from the
+checkout root) uses `<checkout>/assets/<filename>` when the cache is empty, held
+to the same digest and validator as a download and installed into the cache from
+there. Development builds therefore work before the bundles are published, and a
+checkout with a stale or edited bundle falls back to the network like any other
+miss.
 
 Both games use the same download routine. The wipEout UI retains its worker thread,
 atomic byte progress and cooperative cancellation between reads. MK uses the same

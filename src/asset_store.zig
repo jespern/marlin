@@ -80,12 +80,18 @@ fn install(a: std.mem.Allocator, io: Io, path: []const u8, bytes: []const u8, pr
 /// validator as a download, so it only ever substitutes for the network,
 /// never for verification; anything else is a miss.
 fn readCheckout(a: std.mem.Allocator, io: Io, spec: Spec) !?[]u8 {
-    const exe = std.process.executablePathAlloc(io, a) catch return null;
-    defer a.free(exe);
-    const bin_dir = std.fs.path.dirname(exe) orelse return null;
-    const path = try std.fs.path.join(a, &.{ bin_dir, "..", "..", "assets", spec.filename });
-    defer a.free(path);
-    return readCached(a, io, spec, path);
+    if (std.process.executablePathAlloc(io, a)) |exe| {
+        defer a.free(exe);
+        if (std.fs.path.dirname(exe)) |bin_dir| {
+            const path = try std.fs.path.join(a, &.{ bin_dir, "..", "..", "assets", spec.filename });
+            defer a.free(path);
+            if (try readCached(a, io, spec, path)) |bytes| return bytes;
+        }
+    } else |_| {}
+    // `zig build run` and the test runner execute from the checkout root.
+    const local = try std.fs.path.join(a, &.{ "assets", spec.filename });
+    defer a.free(local);
+    return readCached(a, io, spec, local);
 }
 
 /// Copy an old cache only after verifying it against the current pinned bundle.
