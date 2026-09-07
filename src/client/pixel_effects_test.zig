@@ -7,7 +7,7 @@ const vaxis = @import("vaxis");
 
 const pixel_effects = @import("pixel_effects.zig");
 const pacman = @import("pacman.zig");
-const shadowbox = @import("shadowbox.zig");
+const daybreak = @import("daybreak.zig");
 const tetris = @import("tetris.zig");
 const Engine = pixel_effects.Engine;
 const Scene = pixel_effects.Scene;
@@ -132,7 +132,7 @@ test "the wire budget stretches the ship interval for heavy frames" {
     try std.testing.expectEqual(@as(u8, 1), engine.effectiveEvery()); // nothing shipped yet: the base rate
     engine.last_frame_bytes = 20_000; // Pac-Man-sized: 0.6 MB/s at 30 fps, untouched
     try std.testing.expectEqual(@as(u8, 1), engine.effectiveEvery());
-    engine.last_frame_bytes = 480_000; // the old shadow-box: 14 MB/s wanted → every 8th tick
+    engine.last_frame_bytes = 480_000; // the old daybreak: 14 MB/s wanted → every 8th tick
     try std.testing.expectEqual(@as(u8, 8), engine.effectiveEvery());
     engine.transmit_every = 3;
     engine.last_frame_bytes = 100_000; // 3 MB/s wanted → every 2nd, but the base is 3
@@ -232,16 +232,16 @@ test "tetris fills the viewport with a compressed arcade cabinet and advances it
         engine.tetris_game.pieces > 0);
 }
 
-test "shadowbox stays inside the 720×405 envelope and ships compressed frames at a tenth of the ticks or slower" {
+test "daybreak stays inside the 720×405 envelope and ships compressed frames at a tenth of the ticks or slower" {
     const gpa = std.testing.allocator;
     // 80×24 cells at 8×16 px: the window's own 640×384 fits the envelope.
-    const dims = framebufferSize(80, 24, 8, 16, .shadowbox);
+    const dims = framebufferSize(80, 24, 8, 16, .daybreak);
     try std.testing.expectEqual(@as(u16, 640), dims.width);
     try std.testing.expectEqual(@as(u16, 384), dims.height);
-    const retina = framebufferSize(200, 60, 18, 38, .shadowbox); // 3600×2280: capped, aspect kept
+    const retina = framebufferSize(200, 60, 18, 38, .daybreak); // 3600×2280: capped, aspect kept
     try std.testing.expectEqual(@as(u16, 405), retina.height);
     try std.testing.expect(retina.width <= 720 and retina.width >= 600);
-    const tall = framebufferSize(60, 60, 8, 16, .shadowbox); // 480×960: height-capped
+    const tall = framebufferSize(60, 60, 8, 16, .daybreak); // 480×960: height-capped
     try std.testing.expectEqual(@as(u16, 405), tall.height);
 
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -255,10 +255,10 @@ test "shadowbox stays inside the 720×405 envelope and ships compressed frames a
     vx.caps.kitty_graphics = true;
     try vx.resize(gpa, &out.writer, .{ .rows = 24, .cols = 80, .x_pixel = 640, .y_pixel = 384 });
 
-    var engine = Engine.init(gpa, .shadowbox, 3);
+    var engine = Engine.init(gpa, .daybreak, 3);
     defer engine.deinit();
     engine.setCellPixels(8, 16);
-    engine.setSky(shadowbox.Sky.forHour(19.5));
+    engine.setSky(daybreak.Sky.forHour(19.5));
     try engine.reset(80, 24, 3);
     try std.testing.expectEqual(@as(u8, 3), engine.transmit_every);
     out.clearRetainingCapacity();

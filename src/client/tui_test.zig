@@ -608,10 +608,18 @@ test "composer suggestions include commands, council actions, and council names"
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
-    try std.testing.expectEqual(@as(usize, 3), suggestions.len); // strings, stars, shadowbox
+    try std.testing.expectEqual(@as(usize, 2), suggestions.len); // strings, stars
     try std.testing.expectEqualStrings("/animate strings", suggestions[0].label);
     try std.testing.expectEqualStrings("/animate stars", suggestions[1].label);
-    try std.testing.expectEqualStrings("/animate shadowbox", suggestions[2].label);
+
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/animate d");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 2), suggestions.len); // demo, daybreak
+    try std.testing.expectEqualStrings("/animate demo", suggestions[0].label);
+    try std.testing.expectEqualStrings("/animate daybreak", suggestions[1].label);
 
     app.view.editor.clear();
     app.view.editor.insertSlice("/screensaver p");
@@ -4455,7 +4463,7 @@ test "transcript spacing invariant: every section breathes, nothing doubles" {
     }
 }
 
-test "/screensaver shadowbox takes an hour or cycle; other effects refuse the word; a bare start clears it" {
+test "/screensaver daybreak takes an hour or cycle; other effects refuse the word; a bare start clears it" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -4472,30 +4480,30 @@ test "/screensaver shadowbox takes an hour or cycle; other effects refuse the wo
     };
     defer app.deinit();
 
-    app.runCommand("/screensaver shadowbox cycle");
+    app.runCommand("/screensaver daybreak cycle");
     try std.testing.expect(app.screensaver_active);
     try std.testing.expect(app.sky_override != null and app.sky_override.? == .cycle);
     _ = app.dismissScreensaver();
 
-    app.runCommand("/screensaver shadowbox 18.5");
+    app.runCommand("/screensaver daybreak 18.5");
     try std.testing.expect(app.screensaver_active);
     try std.testing.expectEqual(@as(f32, 18.5), app.sky_override.?.hour);
     _ = app.dismissScreensaver();
 
-    app.runCommand("/screensaver shadowbox");
+    app.runCommand("/screensaver daybreak");
     try std.testing.expect(app.screensaver_active);
     try std.testing.expect(app.sky_override == null);
     _ = app.dismissScreensaver();
 
-    app.runCommand("/screensaver shadowbox 25");
+    app.runCommand("/screensaver daybreak 25");
     try std.testing.expect(!app.screensaver_active);
-    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "usage: /screensaver shadowbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "usage: /screensaver daybreak") != null);
 
     app.runCommand("/screensaver matrix cycle");
     try std.testing.expect(!app.screensaver_active);
     try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "takes no hour") != null);
 
-    app.runCommand("/animate shadowbox cycle");
+    app.runCommand("/animate daybreak cycle");
     try std.testing.expect(app.ui_animation != null);
     try std.testing.expect(app.sky_override != null);
 }

@@ -1,29 +1,29 @@
-//! Unit tests for shadowbox.zig. Tests live beside the module they cover
-//! (docs/TESTING.md); anything they reach into is `pub` in shadowbox.zig.
+//! Unit tests for daybreak.zig. Tests live beside the module they cover
+//! (docs/TESTING.md); anything they reach into is `pub` in daybreak.zig.
 
 const std = @import("std");
 
-const shadowbox = @import("shadowbox.zig");
-const Observer = shadowbox.Observer;
-const Raster = shadowbox.Raster;
-const Sky = shadowbox.Sky;
-const areaLatitude = shadowbox.areaLatitude;
-const black = shadowbox.black;
-const horizon_y = shadowbox.horizon_y;
-const lightForSky = shadowbox.lightForSky;
-const localClock = shadowbox.localClock;
-const observerFromSystem = shadowbox.observerFromSystem;
-const parseIso6709 = shadowbox.parseIso6709;
-const parseLatLon = shadowbox.parseLatLon;
-const parseZoneTable = shadowbox.parseZoneTable;
-const render = shadowbox.render;
-const scene_w = shadowbox.scene_w;
-const skyAt = shadowbox.skyAt;
-const skyFor = shadowbox.skyFor;
-const sunPosition = shadowbox.sunPosition;
+const daybreak = @import("daybreak.zig");
+const Observer = daybreak.Observer;
+const Raster = daybreak.Raster;
+const Sky = daybreak.Sky;
+const areaLatitude = daybreak.areaLatitude;
+const black = daybreak.black;
+const horizon_y = daybreak.horizon_y;
+const lightForSky = daybreak.lightForSky;
+const localClock = daybreak.localClock;
+const observerFromSystem = daybreak.observerFromSystem;
+const parseIso6709 = daybreak.parseIso6709;
+const parseLatLon = daybreak.parseLatLon;
+const parseZoneTable = daybreak.parseZoneTable;
+const render = daybreak.render;
+const scene_w = daybreak.scene_w;
+const skyAt = daybreak.skyAt;
+const skyFor = daybreak.skyFor;
+const sunPosition = daybreak.sunPosition;
 
 test {
-    std.testing.refAllDecls(shadowbox);
+    std.testing.refAllDecls(daybreak);
 }
 
 fn pixel(rgb: []const u8, width: u16, x: usize, y: usize) [3]u8 {

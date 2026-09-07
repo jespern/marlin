@@ -1,8 +1,8 @@
-//! "ShadowBoX" — after Jani Ylikangas' 1029-byte js1k 2019 entry
-//! (https://js1k.com/2019-x/demo/4146), a paper-cutout landscape in layers,
-//! reworked to follow the real sun over the user's machine. The original had
-//! two static moods (a sunset that snaps to a snowy night) plus a bat and a
-//! lightning bolt; this one derives everything from the sun's true altitude
+//! Daybreak — a paper-cutout landscape in layers that follows the real sun
+//! over the user's machine. It began as a port of Jani Ylikangas' 1029-byte
+//! js1k 2019 entry "ShadowBoX" (https://js1k.com/2019-x/demo/4146), which
+//! had two static moods (a sunset that snaps to a snowy night) plus a bat
+//! and a lightning bolt; this one derives everything from the sun's true altitude
 //! and azimuth for the current instant, so the sky, the light on the water,
 //! the mist, the stars and the clouds move through a whole day without a
 //! seam — and days are long in summer, short in winter, endless past the
@@ -12,7 +12,7 @@
 //! the `/etc/localtime` link, or `/etc/timezone`; its coordinates from the
 //! zone database's own `zone1970.tab`/`zone.tab`. Failing that, the zone's
 //! area (Europe/…, Australia/…) gives a latitude and the UTC offset a
-//! longitude. `MARLIN_SHADOWBOX_LATLON=lat,lon` overrides all of it. The sun
+//! longitude. `MARLIN_DAYBREAK_LATLON=lat,lon` overrides all of it. The sun
 //! is placed with the NOAA solar position algorithm (declination, equation
 //! of time, hour angle → altitude and azimuth); the moon is the anti-sun.
 //!
@@ -316,7 +316,7 @@ pub fn observerFromSystem(gpa: std.mem.Allocator, io: std.Io, environ: ?*const s
         .source = .utc_offset,
     };
     if (environ) |env| {
-        if (env.get("MARLIN_SHADOWBOX_LATLON")) |value| {
+        if (env.get("MARLIN_DAYBREAK_LATLON")) |value| {
             if (parseLatLon(value)) |ll| {
                 observer.lat = ll[0];
                 observer.lon = ll[1];

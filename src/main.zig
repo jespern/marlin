@@ -123,13 +123,13 @@ test {
     _ = @import("client/effect.zig");
     _ = @import("client/effects_test.zig");
     _ = @import("client/pixel_effects_test.zig");
-    _ = @import("client/shadowbox_test.zig");
+    _ = @import("client/daybreak_test.zig");
     _ = @import("client/media_test.zig");
     _ = @import("client/matrix_test.zig");
     _ = @import("client/pacman_test.zig");
     _ = @import("client/tetris_test.zig");
     _ = @import("client/pixel_effects.zig");
-    _ = @import("client/shadowbox.zig");
+    _ = @import("client/daybreak.zig");
     _ = @import("client/plasma_test.zig");
     _ = @import("client/starfield_test.zig");
     _ = @import("client/strings_test.zig");

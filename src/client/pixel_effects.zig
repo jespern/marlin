@@ -25,7 +25,7 @@ const effect = @import("effect.zig");
 const visual_effect = @import("../core/visual_effect.zig");
 const pacman = @import("pacman.zig");
 const tetris = @import("tetris.zig");
-const shadowbox = @import("shadowbox.zig");
+const daybreak = @import("daybreak.zig");
 const wipeout_effect = @import("wipeout_effect.zig");
 
 pub const Scene = enum { plasma, tunnel, metaballs, horizon };
@@ -68,9 +68,9 @@ pub const Engine = struct {
     /// Ship every Nth tick; very large boards use 2 so deflate stays cheap.
     transmit_every: u8 = 1,
     seed: u64 = 1,
-    /// Where the sun and moon stand; the shadow-box follows it. Set by the
+    /// Where the sun and moon stand; daybreak follows it. Set by the
     /// TUI before each transmit.
-    sky: shadowbox.Sky = shadowbox.Sky.noon,
+    sky: daybreak.Sky = daybreak.Sky.noon,
     /// Board state for the pacman kind (unused otherwise), its cached
     /// background (per maze generation), zlib output, and the compressor's
     /// window.
@@ -113,7 +113,7 @@ pub const Engine = struct {
         self.window = &.{};
     }
 
-    pub fn setSky(self: *Engine, sky: shadowbox.Sky) void {
+    pub fn setSky(self: *Engine, sky: daybreak.Sky) void {
         self.sky = sky;
     }
 
@@ -180,11 +180,11 @@ pub const Engine = struct {
         self.last_frame_bytes = 0;
     }
 
-    /// Base ticks per shipped frame, before the wire budget. The shadow-box
+    /// Base ticks per shipped frame, before the wire budget. Daybreak
     /// moves slowly and its frames are the heaviest, so 10 fps; very large
     /// boards halve to keep deflate off the critical path.
     fn shipEvery(kind: visual_effect.Kind, pixels: usize) u8 {
-        if (kind == .shadowbox) return 3;
+        if (kind == .daybreak) return 3;
         if (kind == .wipeout) return 1;
         return if (pixels > 700_000) 2 else 1;
     }
@@ -231,7 +231,7 @@ pub const Engine = struct {
             .tunnel => renderScene(.tunnel, self.rgb, self.width, self.height, frame),
             .metaballs => renderScene(.metaballs, self.rgb, self.width, self.height, frame),
             .horizon => renderScene(.horizon, self.rgb, self.width, self.height, frame),
-            .shadowbox => shadowbox.render(self.rgb, self.width, self.height, self.frame, self.seed, self.sky),
+            .daybreak => daybreak.render(self.rgb, self.width, self.height, self.frame, self.seed, self.sky),
             .tetris => tetris.renderPixels(&self.tetris_game, self.rgb, self.width, self.height),
             .wipeout => if (self.wipeout_game) |g| g.render(self.rgb, self.width, self.height) else @memset(self.rgb, 0),
             .pacman => {
@@ -330,7 +330,7 @@ fn freeImage(tty: *std.Io.Writer, id: u32) void {
     tty.print("\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{id}) catch {};
 }
 
-/// Deflate effort. Measured on the shadow-box (gradients) and Pac-Man (flat
+/// Deflate effort. Measured on daybreak (gradients) and Pac-Man (flat
 /// art): level 4 shrinks frames 7% and 23% over level 1 at the same cost;
 /// level 6 buys a little more for a third more CPU per frame.
 pub const deflate_options: std.compress.flate.Compress.Options = .level_4;
@@ -347,7 +347,7 @@ fn deflate(dst: []u8, window: []u8, src: []const u8) ?[]u8 {
 /// The animation thread's tick rate; ship intervals are counted in ticks.
 pub const ticks_per_second: usize = 30;
 /// What any one effect may put on the wire. Pac-Man uses a third of it at
-/// 30 fps; the shadow-box lands near 10 fps; a noisy raw scene is throttled
+/// 30 fps; daybreak lands near 10 fps; a noisy raw scene is throttled
 /// rather than allowed to flood the terminal.
 pub const wire_budget_bytes_per_second: usize = 2_000_000;
 
@@ -388,7 +388,7 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
     const r: u32 = @max(rows, 1);
     const win_w = c * cell_px_w;
     const win_h = r * cell_px_h;
-    if (kind == .shadowbox) {
+    if (kind == .daybreak) {
         // A 1900×900 canvas stretched to the viewport in the original: render
         // near the window's own pixel size, inside the envelope Pac-Man has
         // proven (720×405 is ~0.8 of its pixels) since these frames compress

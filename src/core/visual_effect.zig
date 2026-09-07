@@ -18,7 +18,7 @@ pub const Kind = enum {
     metaballs,
     horizon,
     demo,
-    shadowbox,
+    daybreak,
     /// wipEout: a playable game, not a screensaver. Manual only.
     wipeout,
 
@@ -26,6 +26,8 @@ pub const Kind = enum {
         inline for (std.meta.fields(Kind)) |field| {
             if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
         }
+        // daybreak's first name (2026-09-04), kept so a saved config still loads.
+        if (std.ascii.eqlIgnoreCase(value, "shadowbox")) return .daybreak;
         return null;
     }
 
@@ -45,7 +47,7 @@ pub const Kind = enum {
             .metaballs => "pixel metaballs (Kitty graphics)",
             .horizon => "synthwave horizon (Kitty graphics)",
             .demo => "24-second pixel demoscene sequence (Kitty graphics)",
-            .shadowbox => "shadow-box landscape that follows your clock (after Jani Ylikangas' js1k entry; Kitty graphics)",
+            .daybreak => "a landscape that follows the real sun over your machine (Kitty graphics)",
             .wipeout => "wipEout, playable (Kitty graphics; start with !wipeout)",
         };
     }
@@ -54,7 +56,7 @@ pub const Kind = enum {
     pub fn backend(self: Kind) Backend {
         return switch (self) {
             .matrix, .strings, .stars, .plasma => .cell,
-            .tetris, .pacman, .tunnel, .metaballs, .horizon, .demo, .shadowbox, .wipeout => .pixel,
+            .tetris, .pacman, .tunnel, .metaballs, .horizon, .demo, .daybreak, .wipeout => .pixel,
         };
     }
 
@@ -89,7 +91,7 @@ pub const Kind = enum {
         return switch (self) {
             .tunnel, .demo => .plasma,
             .metaballs => .plasma,
-            .horizon, .shadowbox, .wipeout => .stars,
+            .horizon, .daybreak, .wipeout => .stars,
             else => self,
         };
     }

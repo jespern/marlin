@@ -17,6 +17,7 @@ test "visual effect names parse case-insensitively" {
     try std.testing.expectEqual(Kind.strings, Kind.parse("STRINGS").?);
     try std.testing.expectEqual(Kind.stars, Kind.parse("stars").?);
     try std.testing.expectEqual(Kind.tunnel, Kind.parse("Tunnel").?);
+    try std.testing.expectEqual(Kind.daybreak, Kind.parse("shadowbox").?); // the effect's first name
     try std.testing.expect(Kind.parse("nope") == null);
 }
 
@@ -34,12 +35,12 @@ test "backends, fallbacks, and the generated usage list" {
     try std.testing.expect(!Kind.matrix.fullScreenOnly());
     try std.testing.expectEqual(Kind.plasma, Kind.tunnel.fallback());
     try std.testing.expectEqual(Kind.stars, Kind.horizon.fallback());
-    try std.testing.expectEqual(Kind.stars, Kind.shadowbox.fallback());
+    try std.testing.expectEqual(Kind.stars, Kind.daybreak.fallback());
     try std.testing.expectEqual(Kind.matrix, Kind.matrix.fallback());
     try std.testing.expectEqual(Backend.pixel, Kind.wipeout.backend());
     try std.testing.expect(!Kind.wipeout.configurable() and Kind.wipeout.fullScreenOnly() and !Kind.wipeout.cellCapable());
     try std.testing.expectEqual(Kind.stars, Kind.wipeout.fallback());
     try std.testing.expect(Kind.wipeout.playable() and !Kind.tetris.playable());
-    try std.testing.expectEqualStrings("matrix|strings|stars|plasma|tetris|pacman|tunnel|metaballs|horizon|demo|shadowbox", usage_list);
-    try std.testing.expectEqualStrings("matrix|strings|stars|plasma|pacman|tunnel|metaballs|horizon|demo|shadowbox", configurable_usage_list);
+    try std.testing.expectEqualStrings("matrix|strings|stars|plasma|tetris|pacman|tunnel|metaballs|horizon|demo|daybreak", usage_list);
+    try std.testing.expectEqualStrings("matrix|strings|stars|plasma|pacman|tunnel|metaballs|horizon|demo|daybreak", configurable_usage_list);
 }

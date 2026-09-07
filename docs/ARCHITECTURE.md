@@ -1200,7 +1200,7 @@ A split pane identifies its session with a compact pane label.
   and roughness, then visibly executes rotations, shifts, descents, and late
   slides beneath overhangs;
   tunnel, metaballs, horizon, a 24-second `demo` sequence,
-  a `shadowbox` landscape (`client/shadowbox.zig`, after Jani Ylikangas'
+  a `daybreak` landscape (`client/daybreak.zig`, after Jani Ylikangas'
   js1k 2019 entry: composed in the original's 1900×900 canvas units and
   scaled per axis, rasterized with coverage anti-aliasing — the original's
   faint ranges are sub-pixel fillRect widths, which coverage reproduces.
@@ -1208,10 +1208,10 @@ A split pane identifies its session with a compact pane label.
   TUI locates the machine from its time zone — zone name from `TZ`, the
   `/etc/localtime` link or `/etc/timezone`; coordinates from the zone
   database's own `zone1970.tab`/`zone.tab`, else an area latitude plus a
-  longitude from the UTC offset; `MARLIN_SHADOWBOX_LATLON` overrides — and
+  longitude from the UTC offset; `MARLIN_DAYBREAK_LATLON` overrides — and
   feeds the scene a `Sky` from the NOAA solar position algorithm for the
-  current instant (a trailing hour or `cycle` on `/screensaver shadowbox`,
-  or `MARLIN_SHADOWBOX_HOUR`, pins or sweeps today's hours instead).
+  current instant (a trailing hour or `cycle` on `/screensaver daybreak`,
+  or `MARLIN_DAYBREAK_HOUR`, pins or sweeps today's hours instead).
   The scene keys everything on the sine of the sun's altitude: a sky
   palette of seven keyframes, the sun placed by azimuth (the viewer faces
   the equator; a tanh keeps the path in frame) and the moon as the
@@ -1246,14 +1246,14 @@ A split pane identifies its session with a compact pane label.
   loop calls `transmit` before `draw`; each engine owns one image id from
   vaxis' counter and every shipped tick retransmits under it (`a=t`, 4 KiB
   chunks, `q=2` so the terminal stays quiet, `o=z` zlib when smaller — the
-  flat maze compresses ~50×, the shadow-box a few times), so the terminal
+  flat maze compresses ~50×, daybreak a few times), so the terminal
   holds one image and never runs a delete per frame. Terminals differ on
   whether a replaced image keeps its placements, so the transmit opens a
   synchronized update (DEC 2026) that vaxis' render() closes after
   re-emitting the `a=p` placement from the cell grid: the swap is atomic.
   A wire budget of 2 MB/s (`pixel_effects.wire_budget_bytes_per_second`)
   stretches each effect's base ship interval from the size of its last
-  frame: Pac-Man stays at 30 fps, the shadow-box (720×405 at most, base
+  frame: Pac-Man stays at 30 fps, daybreak (720×405 at most, base
   10 fps) and the demoscene scenes (320 px wide) settle where their bytes
   allow, and a noisy scene is throttled rather than allowed to flood the
   terminal — the load that took Ghostty 1.3.1 down on 2026-09-04 was ~7 MB/s.

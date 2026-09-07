@@ -14,15 +14,15 @@ const strings = @import("strings.zig");
 const tetris = @import("tetris.zig");
 const pacman = @import("pacman.zig");
 const pixel_effects = @import("pixel_effects.zig");
-const shadowbox = @import("shadowbox.zig");
+const daybreak = @import("daybreak.zig");
 
 pub const Kind = visual_effect.Kind;
 pub const Backend = visual_effect.Backend;
 pub const kinds = visual_effect.kinds;
 pub const usage_list = visual_effect.usage_list;
 pub const configurable_usage_list = visual_effect.configurable_usage_list;
-/// The sky model the shadow-box follows; the TUI resolves it from the clock.
-pub const Sky = shadowbox.Sky;
+/// The sky model daybreak follows; the TUI resolves it from the clock.
+pub const Sky = daybreak.Sky;
 
 pub const Engine = union(enum) {
     matrix: matrix.Engine,
@@ -46,7 +46,7 @@ pub const Engine = union(enum) {
             .tetris => .{ .tetris = tetris.Engine.init(gpa, seed) },
             .pacman => .{ .pacman = pacman.Engine.init(gpa, seed) },
             // fallback() never names the pixel-only kinds; plasma is the safe cell default.
-            .plasma, .tunnel, .metaballs, .horizon, .demo, .shadowbox, .wipeout => .{ .plasma = plasma.Engine.init(gpa, seed) },
+            .plasma, .tunnel, .metaballs, .horizon, .demo, .daybreak, .wipeout => .{ .plasma = plasma.Engine.init(gpa, seed) },
         };
     }
 
@@ -72,7 +72,7 @@ pub const Engine = union(enum) {
         }
     }
 
-    /// Where the sun and moon stand, for effects that follow them (the shadow-box).
+    /// Where the sun and moon stand, for effects that follow them (daybreak).
     pub fn setSky(self: *Engine, sky: Sky) void {
         switch (self.*) {
             .pixel => |*engine| engine.setSky(sky),

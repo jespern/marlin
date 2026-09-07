@@ -16,15 +16,15 @@ Terminal-native effects share one finite-animation/full-screen-saver surface.
   that turn the ghosts blue and edible, bonus fruit, arcade scoring under a
   "1UP" / "HIGH SCORE" header, three lives, "READY!" and "GAME OVER"; a new
   maze every board), a spinning `tunnel`, `metaballs`, a synthwave `horizon`, `demo`, a
-  24-second sequence of those three, and `shadowbox`, a paper-cutout
+  24-second sequence of those three, and `daybreak`, a paper-cutout
   landscape after Jani Ylikangas' js1k entry that follows the real sun over
   your machine: it locates you from your time zone and computes the sun's
   true altitude and azimuth, so days run long in summer and short in
   winter, sunrise lands where and when it should, and a Nordic midsummer
-  night keeps its twilight. `/screensaver shadowbox cycle` runs today's
-  whole day every two minutes and `/screensaver shadowbox 18.5` pins an
-  hour (`MARLIN_SHADOWBOX_HOUR` does the same from the environment);
-  `MARLIN_SHADOWBOX_LATLON=lat,lon` overrides the place. Without graphics,
+  night keeps its twilight. `/screensaver daybreak cycle` runs today's
+  whole day every two minutes and `/screensaver daybreak 18.5` pins an
+  hour (`MARLIN_DAYBREAK_HOUR` does the same from the environment);
+  `MARLIN_DAYBREAK_LATLON=lat,lon` overrides the place. Without graphics,
   Tetris and Pac-Man draw cell fallbacks and the other pixel effects start as a
   cell sibling; either way the
   status line says so. Run `/animate <effect>` over gaps in the current UI
