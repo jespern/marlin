@@ -60,10 +60,10 @@ already implemented as Zig constants remain in source.
 
 Run from the branch worktree. Keep generated files outside the repository:
 
-```sh
-zig build mk64-probe -- '/Users/jespern/Downloads/Mario Kart 64 (USA).z64' /tmp/mk64-asset-audit.json 0 asset-audit
-python3 scripts/mk64_asset_audit.py /tmp/mk64-asset-audit.json /tmp/luigi.mkassets
-```
+The audit tooling (`mk64-probe … asset-audit` and `scripts/mk64_asset_audit.py`)
+was removed on 2026-09-08 along with the other probe binaries; the numbers
+below were produced with it and stand as recorded. The shipping importer is
+`zig build mk64-import`.
 
 The JSON audit is a temporary decoded interchange file. Python is measurement
 and format-experiment tooling only; the production importer should be pure Zig.

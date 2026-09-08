@@ -7,11 +7,9 @@ const std = @import("std");
 ///                    the ONLY artifact the default install produces
 ///   marlin-fakeprov  scripted OpenAI-compat server for e2e tests
 ///   e2e-runner       orchestrates fakeprov + marlin per scenario
-///   *-probe          offline renderers for the games/effects (dev tools)
 ///
 /// Steps:
 ///   zig build            install marlin (and nothing else)
-///   zig build tools      also install the probes and marlin-fakeprov
 ///   zig build test       unit + fixture tests
 ///   zig build e2e        end-to-end: real binary vs fake provider
 ///   zig build fake-model run local/testing's deterministic fake server
@@ -135,19 +133,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| asset_run.addArgs(args);
     asset_run.has_side_effects = true;
     b.step("mk64-import", "Regenerate the versioned MK64 asset bundle from the USA ROM").dependOn(&asset_run.step);
-    const mk64_probe = b.addExecutable(.{
-        .name = "mk64-probe",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/testing/mk64_probe.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "mk64", .module = mk64_module }},
-        }),
-    });
-    const mk64_run = b.addRunArtifact(mk64_probe);
-    if (b.args) |args| mk64_run.addArgs(args);
-    mk64_run.has_side_effects = true;
-    b.step("mk64-probe", "Render Luigi Raceway from a US ROM to PPM").dependOn(&mk64_run.step);
     const mk64_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/mk64/root.zig"),
         .target = target,
@@ -156,31 +141,7 @@ pub fn build(b: *std.Build) void {
     mk64_tests.root_module.addImport("asset_store", asset_store);
     b.step("mk64-test", "Test the pure-Zig MK64 port").dependOn(&b.addRunArtifact(mk64_tests).step);
 
-    // ---- wipEout port probe ----
-    const wipeout_module = b.createModule(.{
-        .root_source_file = b.path("src/wipeout/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    wipeout_module.addImport("asset_store", asset_store);
-    const wipeout_probe = b.addExecutable(.{
-        .name = "wipeout-probe",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/testing/wipeout_probe.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "wipeout", .module = wipeout_module },
-                .{ .name = "vaxis", .module = vaxis.module("vaxis") },
-            },
-        }),
-    });
-    const wipeout_probe_cmd = b.addRunArtifact(wipeout_probe);
-    if (b.args) |args| wipeout_probe_cmd.addArgs(args);
-    wipeout_probe_cmd.has_side_effects = true;
-    const wipeout_probe_step = b.step("wipeout-probe", "Run the wipEout track renderer probe");
-    wipeout_probe_step.dependOn(&wipeout_probe_cmd.step);
-
+    // ---- wipEout port tests ----
     const wipeout_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wipeout/root.zig"),
@@ -191,27 +152,6 @@ pub fn build(b: *std.Build) void {
     wipeout_tests.root_module.addImport("asset_store", asset_store);
     const wipeout_test_step = b.step("wipeout-test", "Run wipEout port unit tests");
     wipeout_test_step.dependOn(&b.addRunArtifact(wipeout_tests).step);
-
-    // ---- orb probe: offline frames of the orb screensaver ----
-    const orb_module = b.createModule(.{
-        .root_source_file = b.path("src/client/orb.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "vaxis", .module = vaxis.module("vaxis") }},
-    });
-    const orb_probe = b.addExecutable(.{
-        .name = "orb-probe",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/testing/orb_probe.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "orb", .module = orb_module }},
-        }),
-    });
-    const orb_probe_cmd = b.addRunArtifact(orb_probe);
-    if (b.args) |args| orb_probe_cmd.addArgs(args);
-    orb_probe_cmd.has_side_effects = true;
-    b.step("orb-probe", "Render orb screensaver frames to PPM").dependOn(&orb_probe_cmd.step);
 
     // ---- unit tests ----
     // Dedicated Debug module: safety checks stay on and test compiles stay
@@ -253,17 +193,6 @@ pub fn build(b: *std.Build) void {
         fake_model_cmd.addFileArg(b.path("src/testing/fixtures/local_testing.json"));
     fake_model_cmd.has_side_effects = true;
     const fake_model_step = b.step("fake-model", "Run the scripted local/testing model on 127.0.0.1:5757");
-
-    // ---- dev tools ----
-    // `zig build` installs marlin and nothing else: a release must never
-    // depend on a dev tool compiling for every target (the x86-64 release
-    // once failed on a 128-bit atomic in wipeout-probe). The probes and the
-    // fake provider are still one step away when wanted.
-    const tools_step = b.step("tools", "Install dev tools into zig-out/bin: wipeout-probe, mk64-probe, orb-probe, marlin-fakeprov");
-    tools_step.dependOn(&b.addInstallArtifact(wipeout_probe, .{}).step);
-    tools_step.dependOn(&b.addInstallArtifact(mk64_probe, .{}).step);
-    tools_step.dependOn(&b.addInstallArtifact(orb_probe, .{}).step);
-    tools_step.dependOn(&b.addInstallArtifact(fakeprov, .{}).step);
     fake_model_step.dependOn(&fake_model_cmd.step);
 
     const mobile_tests = b.addSystemCommand(&.{ "node", "--test" });

@@ -95,7 +95,7 @@ bend mini-turbo sequence is enabled at 100cc within its tested entry-speed
 window, with Luigi attempting it every second lap and Yoshi every third lap.
 Other CPUs/classes currently path-follow without scripted mini-turbos.
 There is no rubber-banding or original opponent AI.
-The full-race probe requires at least a ten-second CPU finishing spread and
+The full-race test scenario required at least a ten-second CPU finishing spread and
 a top-four finish for the baseline path-following player, as well as all eight
 finishing with valid laps. All racers currently use
 Mario's class tuning; character-specific weight and acceleration remain pending.
@@ -218,7 +218,7 @@ are unchanged.
 | `src/mk64/kart.zig` | 15 CI8 Mario angles, four wheel-palette phases, ROM drift textures, projected/depth-tested kart and particles |
 | `src/mk64/presentation.zig` | Persistent chase camera, wheel clock, and drift particle simulation |
 | `src/mk64/handling.zig`, `handling_tables.zig` | Grounded Mario/100cc controller equations and original steering tables at 60 Hz |
-| `src/mk64/autopilot.zig` | Path-following driver and fixed drift demonstration shared by terminal and probes |
+| `src/mk64/autopilot.zig` | Path-following driver and fixed drift demonstration used by the terminal game |
 | `src/mk64/drift.zig` | Hop impulse, drift charge and mini-turbo state; floor-relative vertical adapter |
 | `src/mk64/game.zig` | One simulation step per 60-Hz frame, floor/wall contact adapter, directional lap progress |
 | `src/mk64/items.zig`, `item_positions.zig` | Shared box respawns, mushroom inventory and original course spawn positions |
@@ -292,18 +292,11 @@ All presentation clocks pause and reset with the race.
 
 ## Validation
 
+The `mk64-probe` renderer and its scripted scenarios (drift-test, trial-test, item-view, race-test, lap-test, class checks) were removed on 2026-09-08 with the other probe binaries; the descriptions below record what they verified. The remaining checks:
+
 ```sh
 zig build mk64-test
 zig build test
-
-# ROM-backed image and 73-view renderer timing sweep:
-zig build mk64-probe -- "$MARLIN_MK64_ROM" /tmp/luigi.ppm 0
-
-# Drive straight for 300 ticks, then capture Mario and the chase camera:
-zig build mk64-probe -- "$MARLIN_MK64_ROM" /tmp/drive.ppm 0 300
-
-# Fixed left/right drift sequences must charge, boost, stay off grass and keep moving:
-zig build mk64-probe -- "$MARLIN_MK64_ROM" /tmp/drift-ready.ppm 0 drift-test
 
 # Real TUI command handoff and same-session return, with an isolated daemon:
 python3 scripts/mk64_tui_smoke.py zig-out/bin/marlin "$MARLIN_MK64_ROM"
@@ -313,22 +306,6 @@ python3 scripts/mk64_terminal_smoke.py zig-out/bin/marlin "$MARLIN_MK64_ROM"
 
 # Independently compile original C routines for local-force/yaw/charge/steering fixtures:
 python3 scripts/mk64_drift_reference.py ~/Work/mk64
-
-# Trial countdown, three splits and exact ghost save/reload (writes beside image):
-zig build mk64-probe -- "$MARLIN_MK64_ROM" /tmp/trial.ppm 0 trial-test
-
-# Item-row and inventory HUD preview:
-zig build mk64-probe -- "$MARLIN_MK64_ROM" /tmp/items.ppm 0 item-view
-
-# Eight-kart completion, grid order, pause, contact, item use and CPU turbo checks:
-zig build mk64-probe -- "$MARLIN_MK64_ROM" /tmp/race.ppm 0 race-test cc100
-
-# Class probes also check three laps and ghost round trips:
-zig build mk64-probe -- "$MARLIN_MK64_ROM" /tmp/200cc.ppm 0 trial-test cc200
-# Substitute cc50 or cc150 to check those classes.
-
-# Test driver must complete three laps on the actual collision mesh:
-zig build mk64-probe -- "$MARLIN_MK64_ROM" /tmp/lap.ppm 0 lap-test
 ```
 
 Acceleration tests include exact float-bit fixtures from the original normal
@@ -338,7 +315,7 @@ check road/grass terminal speed and braking. Hop/drift tests cover landing,
 held-key rearming, charge cancellation, turbo duration and full keyboard-driven
 left/right slides through boost release. The ROM-backed lap test checks three complete laps at the 60-Hz tick rate.
 
-The drift probe uses rolling entries at path 460 (left) and 380 (right), with
+The drift test scenario used rolling entries at path 460 (left) and 380 (right), with
 fixed 20/25/10/25/10-tick inward/outward key phases and then ordinary path
 following. It never reads charge state to choose drift inputs. Both sequences
 show ready and boost, keep all tyre samples off grass, and gain over 0.5 world
@@ -357,7 +334,7 @@ camera entry/recovery angle traces and wheel timing also have regression coverag
 This validates those routines independently of the race adapter. It does not
 compare complete rendered gameplay against an N64/emulator recording.
 
-The lap probe also checks that the projected kart stays in view throughout
+The lap test scenario also checked that the projected kart stays in view throughout
 all three laps with the new camera.
 
 The lap test has a bounded runtime and fails if the controller gets stuck. It

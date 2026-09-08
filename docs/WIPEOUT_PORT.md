@@ -64,16 +64,10 @@ the start countdown that the original beeps is written on screen instead
 | `src/wipeout/parzlib.zig` | Banded multi-threaded zlib encoder producing one valid stream |
 | `src/wipeout/root.zig` | Module root, camera angle helpers |
 | `src/client/wipeout_effect.zig` | The game inside marlin: a session plus the terminal key mapping |
-| `src/testing/wipeout_probe.zig` | Fly-through probe: Kitty output, dry-run metrics, PPM snapshots, scripted whole-game runs |
 | `scripts/wipeout_pack.py` | Builds `assets/wo.pak` from an extracted data tree |
 | `assets/wo.pak` | The bundle the client downloads on first run (3.4 MB) |
 
-Build steps: `zig build wipeout-test` (unit tests) and `zig build tools`, which
-installs `zig-out/bin/wipeout-probe` (the plain `zig build` installs only
-`marlin`; dev tools never sit in the release path).
-
-Run the installed binary directly rather than through `zig build
-wipeout-probe`, so the build runner is not competing for the CPU.
+Build steps: `zig build wipeout-test` (unit tests). The standalone probe binaries (`wipeout-probe`, `mk64-probe`, `orb-probe`) were removed on 2026-09-08: the only binary the build produces is `marlin`. The workflows below that used them are kept for the record; the tools live in git history before that date.
 
 Frames alternate between two Kitty image ids: each frame is placed as a
 new image and the previous id is deleted afterwards in the same flush, so
@@ -99,12 +93,6 @@ it); with the pipeline any stall shorter than the ~25 ms of slack per 30 fps
 frame never reaches the screen. Requesting user-interactive thread QoS was
 tried and made stalls worse under load, so it is not used. The report
 prints the worst frame and the number of frames over 20 ms.
-
-```
-zig build
-./zig-out/bin/wipeout-probe --track 1 --seconds 15
-./zig-out/bin/wipeout-probe --width 640 --height 480
-```
 
 ## Assets
 
@@ -178,11 +166,10 @@ The discards are texels whose PSX colour is 0x0000, which the format
 defines as transparent; the original shader drops them identically. Render
 cost is unchanged.
 
-Diagnostics for this live in the probe: `--scan-cracks DIR` flies a lap
-headless and dumps the frames with the most uncovered pixels together with
-their coordinates and the mesh ids on either side; `--probe-pixel X,Y` with
-`--snapshot` prints every triangle touching one pixel with its edge
-distances and depth-test outcome. Boost pads are tinted blue by the game
+Diagnostics for this lived in the removed probe (`--scan-cracks DIR` dumped
+the frames with the most uncovered pixels and the mesh ids on either side;
+`--probe-pixel X,Y` printed every triangle touching one pixel with its edge
+distances and depth-test outcome). Boost pads are tinted blue by the game
 data itself and are not holes.
 
 Not yet ported: the CRT post effect, 2D HUD text, additive-blend particles
@@ -196,8 +183,7 @@ Not yet ported: the CRT post effect, 2D HUD text, additive-blend particles
 | 640x480 | 11.6 ms | 6.4 ms | 6.4 MiB/s |
 
 Both fit a 33 ms frame with room for game logic. 480p transport has not been
-verified against a live terminal yet; run `zig build wipeout-probe --
---width 640 --height 480` in Kitty or Ghostty and watch for dropped frames.
+verified against a live terminal yet.
 
 ## Probe camera
 
@@ -211,11 +197,7 @@ boundary.
 
 ## Driving
 
-```
-./zig-out/bin/wipeout-probe --drive --fps 60
-./zig-out/bin/wipeout-probe --drive --fps 60 --pilot 6 --rapier --track 3
-./zig-out/bin/wipeout-probe --autopilot --fps 60      # hands-off lap
-```
+In the client, `!wipeout` (see "Inside marlin" below).
 
 Arrow keys steer and pitch, `x` or space is thrust, `z` and `c` are the
 left and right airbrakes, `v` toggles the cockpit view, Tab toggles the
@@ -262,12 +244,9 @@ sources, because it is C:
 A run records the autopilot's decisions from the Zig side and replays them
 into both implementations, then diffs the ship per frame:
 
-```
-./zig-out/bin/wipeout-probe --autopilot --intro --dry-run --fps 60 --seconds 60 \
-    --record-input /tmp/input.txt --ship-log /tmp/zig.csv
-~/Work/wipeout-rewrite/harness/parity ~/Work/wipeout-rewrite/ /tmp/input.txt /tmp/ref.csv 3600 0 0 2
-scripts/wipeout_parity.py /tmp/zig.csv /tmp/ref.csv
-```
+The recording and diffing tools (the probe's `--record-input`/`--ship-log`
+and `scripts/wipeout_parity.py`) were removed with the probe on 2026-09-08;
+the parity results below stand as recorded.
 
 The last three harness arguments are pilot, race class and circuit index
 (2 is Terramax, whose Venom layout is track01). The countdown is kept on
@@ -304,7 +283,7 @@ the composer lists the seven circuits, then pilots and flags, and Enter
 launches. `trackN` (1-14) and `pilotN` (0-7) keep the raw PSX numbering
 for the parity tooling. A refused line says which words would have worked. While it is up the client is in
 game mode: every key press and release goes to the ship (the same driving
-bindings as the probe, plus `p` for the CRT pass). Backspace returns a race
+bindings described above, plus `p` for the CRT pass). Backspace returns a race
 to the main menu; Escape or Ctrl-C pauses the game and hands the terminal
 back. Losing terminal focus clears held controls so a missed release cannot
 leave steering, thrust, or fire stuck. `!wipeout` again resumes the same
@@ -313,8 +292,7 @@ engine, so running another screensaver in between does not lose it, and
 the effect engine keeps state alive when hidden as marlin's other pixel
 effects already do. Frames ship every 60 Hz tick as one Kitty `a=T` under
 a fixed image id and placement id (see ARCHITECTURE.md, Transport; the
-bytes come from `src/wipeout/kitty_transport.zig`, which the probe's
-`--client-transport` shares). Ghostty 1.3.1 died
+bytes come from `src/wipeout/kitty_transport.zig`). Ghostty 1.3.1 died
 twice under the earlier scheme, which let vaxis delete and re-place the
 image on every redraw; bandwidth was cleared by stress runs of 14 MiB/s.
 
@@ -457,15 +435,8 @@ Rapier class or the bonus circuit and shows the congratulations scroller.
 `!wipeout <track> [pilot] [rapier] [trial] ...` still skips the menus and
 starts that race directly.
 
-The probe drives all of this headless:
-
-```
-./zig-out/bin/wipeout-probe --game "10:menu_start,50:menu_select,90:shot" --shots /tmp/wg
-```
-
-where entries are `frame:action` (any `input.Action` name), `+name` and
-`-name` to hold and release, `shot` to write a PPM, and `hall` to open
-the hall of fame entry as a test hook.
+The removed probe drove all of this headless with a `frame:action` script;
+the game-level unit tests in `src/wipeout/` cover the state machine directly.
 
 ## Save and resume
 
@@ -483,12 +454,9 @@ why the design insisted on that from the first commit.
 
 ## Snapshots
 
-```
-./zig-out/bin/wipeout-probe --snapshot /tmp/frame.ppm --frame 200
-```
-
-writes one 320x240 PPM without touching the terminal, which is how the
-renderer was verified without a live session.
+The probe's `--snapshot /tmp/frame.ppm --frame N` wrote one 320x240 PPM without
+touching the terminal; it went with the probe on 2026-09-08. The wipEout unit
+tests render frames into memory for their checks instead.
 
 ## Next slices
 
