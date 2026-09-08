@@ -182,8 +182,10 @@ views: nothing lives in a client but a render cache and a draft input box.
 
 **Discovery (LAN).** The daemon advertises `_marlin._tcp` over Bonjour
 through the system responder (mDNSResponder via dns_sd on macOS; Avahi is
-the Linux follow-up): instance = the machine's Bonjour name, target = its
-`.local` host, TXT = marlin version, ssh user, live session count (rewritten
+the Linux follow-up): instance = `user@host` (one marlind per user, and
+mDNSResponder keeps a second identical registration from the same host off
+the wire, so two users' daemons must differ by name), target = its `.local`
+host, TXT = marlin version, ssh user, live session count (rewritten
 in place as sessions come and go). `marlin discover [--wait S]` browses for
 up to two seconds, resolves each instance and prints the
 `--remote user@host.local` target; attaching is still ssh, so discovery is

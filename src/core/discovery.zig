@@ -2,9 +2,11 @@
 //!
 //! The daemon advertises `_marlin._tcp` through the system responder
 //! (mDNSResponder via dns_sd on macOS; Avahi is the Linux follow-up): the
-//! instance is the machine's name, the target its `.local` host, and the TXT
-//! record carries the marlin version, the user to ssh as, and the live
-//! session count. `marlin discover` browses for a moment, resolves each
+//! instance is `user@host` (one marlind per user, so two users' daemons on
+//! one machine must stay distinct — mDNSResponder keeps a second identical
+//! registration from the same host off the wire until the first goes away),
+//! the target its `.local` host, and the TXT record carries the marlin
+//! version, the user to ssh as, and the live session count. `marlin discover` browses for a moment, resolves each
 //! instance and prints a `--remote user@host.local` target. Attaching stays
 //! ssh, so discovery is visibility, not access.
 //!
@@ -69,6 +71,15 @@ pub const Peer = struct {
     /// Advertised session count, as text (whatever the daemon said).
     sessions: []const u8,
 };
+
+/// The advertised instance name: `user@host`, host without its domain.
+pub fn instanceName(buf: []u8, user: []const u8, hostname: []const u8) ![:0]const u8 {
+    const host = hostname[0 .. std.mem.indexOfScalar(u8, hostname, '.') orelse hostname.len];
+    if (user.len == 0) return std.fmt.bufPrintZ(buf, "{s}", .{host});
+    return std.fmt.bufPrintZ(buf, "{s}@{s}", .{ user, host });
+}
+
+extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
 
 pub fn stripTrailingDot(host: []const u8) []const u8 {
     return if (host.len > 0 and host[host.len - 1] == '.') host[0 .. host.len - 1] else host;
@@ -158,6 +169,7 @@ pub const Advertiser = if (supported) struct {
     user: []const u8 = "",
     sessions: usize = 0,
     txt_buf: [512]u8 = undefined,
+    name_buf: [256]u8 = undefined,
 
     pub fn start(self: *Advertiser, io: Io, version: []const u8, user: []const u8, sessions: usize) !void {
         self.io = io;
@@ -166,8 +178,12 @@ pub const Advertiser = if (supported) struct {
         self.sessions = sessions;
         const txt = try self.record();
         var ref: ?*dnssd.Ref = null;
-        // name=null: the machine's own Bonjour name; host=null: this host.
-        const err = dnssd.DNSServiceRegister(&ref, 0, 0, null, service_type, null, null, std.mem.nativeToBig(u16, ssh_port), @intCast(txt.len), txt.ptr, registerReply, self);
+        // Instance `user@host`; if the hostname is unavailable, null lets the
+        // responder use the machine's own Bonjour name. host=null: this host.
+        var host_buf: [256]u8 = undefined;
+        const hostname: []const u8 = if (gethostname(&host_buf, host_buf.len) == 0) std.mem.sliceTo(&host_buf, 0) else "";
+        const name: ?[:0]const u8 = if (hostname.len > 0) (instanceName(&self.name_buf, user, hostname) catch null) else null;
+        const err = dnssd.DNSServiceRegister(&ref, 0, 0, if (name) |n| n.ptr else null, service_type, null, null, std.mem.nativeToBig(u16, ssh_port), @intCast(txt.len), txt.ptr, registerReply, self);
         if (err != dnssd.ok) {
             std.log.warn("discovery: DNSServiceRegister failed ({d})", .{err});
             return error.RegisterFailed;

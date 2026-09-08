@@ -53,3 +53,12 @@ test "the table sorts by name, widens to content, and ends each row with the --r
     try std.testing.expectEqualStrings("", lines.next().?);
     try std.testing.expect(lines.next() == null);
 }
+
+test "instance names are user@host with the domain dropped; no user means the bare host" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("jespern@victory", try discovery.instanceName(&buf, "jespern", "victory.local"));
+    try std.testing.expectEqualStrings("jespern@victory", try discovery.instanceName(&buf, "jespern", "victory"));
+    try std.testing.expectEqualStrings("victory", try discovery.instanceName(&buf, "", "victory.lan"));
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, discovery.instanceName(&tiny, "jespern", "victory"));
+}
