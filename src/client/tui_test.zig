@@ -114,6 +114,7 @@ const layoutLines = tui.layoutLines;
 const layoutTabBar = tui.layoutTabBar;
 const nextRootTabSid = tui.nextRootTabSid;
 const optionTabNavigationDirection = tui.optionTabNavigationDirection;
+const optionArrowSwitchesTabs = tui.optionArrowSwitchesTabs;
 const parseOtelCommand = tui.parseOtelCommand;
 const pickerModelLine = tui.pickerModelLine;
 const planDisplayRange = tui.planDisplayRange;
@@ -3080,9 +3081,17 @@ test "tab navigation follows chronological roots and wraps" {
     try std.testing.expectEqual(@as(?u64, 40), nextRootTabSid(app.sessions.items, 10, -1));
     try std.testing.expectEqual(@as(?u64, 10), nextRootTabSid(app.sessions.items, 40, 1));
 
-    // Option-arrows use visible tab order in insert mode without moving the
-    // composer cursor. Switching from a child starts relative to its root.
-    app.view.editor.insertSlice("draft");
+    // With a draft in insert mode, Option-arrows are the composer's word
+    // motions and never leave the session.
+    app.view.editor.insertSlice("draft here");
+    app.view.editor.cursor = 2;
+    try handleKey(&app, .{ .codepoint = vaxis.Key.right, .mods = .{ .alt = true } });
+    try std.testing.expectEqual(@as(u64, 30), app.view.sid);
+    try std.testing.expect(app.view.editor.cursor > 2);
+    // In normal mode the same keys cycle the visible tab order, draft or
+    // not, without touching the composer cursor. Switching from a child
+    // starts relative to its root.
+    app.mode = .normal;
     app.view.editor.cursor = 2;
     try handleKey(&app, .{ .codepoint = vaxis.Key.right, .mods = .{ .alt = true } });
     try std.testing.expectEqual(@as(u64, 40), app.view.sid);
@@ -3091,6 +3100,7 @@ test "tab navigation follows chronological roots and wraps" {
     try handleKey(&app, .{ .codepoint = vaxis.Key.left, .mods = .{ .alt = true } });
     try std.testing.expectEqual(@as(u64, 10), app.view.sid);
     try std.testing.expectEqual(@as(usize, 2), app.saved_views.get(30).?.editor.cursor);
+    app.mode = .insert;
 
     // With one visible root, every shortcut is a no-op and never repurposes
     // Left/Right as composer movement in normal mode.
@@ -4694,4 +4704,31 @@ test "web output links retain their full destination in a narrow terminal" {
     try std.testing.expectEqualStrings(uri, linkAtMouse(win, .{ .row = 1, .col = 12, .button = .left, .mods = .{ .ctrl = true }, .type = .press }, false).?);
     try std.testing.expectEqualStrings(uri, win.readCell(23, 1).?.link.uri);
     try std.testing.expectEqualStrings("", win.readCell(0, 1).?.link.uri);
+}
+
+test "option-arrows switch tabs only while the composer is idle" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{ .sid = 1, .editor = Editor.init(gpa) },
+    };
+    defer app.deinit();
+    const right = vaxis.Key{ .codepoint = vaxis.Key.right, .mods = .{ .alt = true } };
+
+    // Empty composer in insert mode: tabs.
+    try std.testing.expectEqual(@as(?i8, 1), optionArrowSwitchesTabs(&app, right));
+    // A draft in insert mode: the key is a word motion again.
+    app.view.editor.insertSlice("foo bar");
+    try std.testing.expectEqual(@as(?i8, null), optionArrowSwitchesTabs(&app, right));
+    app.view.editor.cursor = 0;
+    try handleKey(&app, right);
+    try std.testing.expect(app.view.editor.cursor > 0);
+    try std.testing.expectEqualStrings("foo bar", app.view.editor.text.items);
+    // Normal mode has no draft to move through: tabs, draft or not.
+    app.mode = .normal;
+    try std.testing.expectEqual(@as(?i8, 1), optionArrowSwitchesTabs(&app, right));
 }

@@ -323,9 +323,11 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    // Option/Alt+Left/Right cycles tabs from either mode. Ghostty's default
-    // bindings encode these as Esc-b/Esc-f, so handle them before editing.
-    if (optionTabNavigationDirection(key)) |direction| {
+    // Option/Alt+Left/Right cycles tabs, except while a draft is being
+    // edited: then the same keys are the composer's word motions (Ghostty
+    // encodes them as readline's Esc-b/Esc-f), which they were before tabs
+    // claimed them. Normal mode and an empty composer still switch tabs.
+    if (optionArrowSwitchesTabs(app, key)) |direction| {
         app.cycleTab(direction);
         return;
     }
@@ -948,6 +950,15 @@ pub fn planProposalAction(key: vaxis.Key) PlanProposalAction {
 pub fn optionTabNavigationDirection(key: vaxis.Key) ?i8 {
     if (key.matchExact(vaxis.Key.right, .{ .alt = true }) or key.matches('f', .{ .alt = true })) return 1;
     if (key.matchExact(vaxis.Key.left, .{ .alt = true }) or key.matches('b', .{ .alt = true })) return -1;
+    return null;
+}
+
+/// Option/Alt+arrow means "switch tab" only when there is no draft to move
+/// through: in normal mode, or with an empty composer. With text under the
+/// cursor in insert mode it falls through to the word motions.
+pub fn optionArrowSwitchesTabs(app: *const App, key: vaxis.Key) ?i8 {
+    const direction = optionTabNavigationDirection(key) orelse return null;
+    if (app.mode == .normal or app.view.editor.isEmpty()) return direction;
     return null;
 }
 

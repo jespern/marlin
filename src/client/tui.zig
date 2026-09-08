@@ -21,7 +21,8 @@
 //!   global:  Ctrl+N creates a session; Ctrl+D/Ctrl+W archive when input is empty;
 //!            Ctrl+L clears/redraws and returns to bottom;
 //!            Ctrl+T toggles the expanded tool transcript;
-//!            Alt/Option+Left/Right cycles tabs; Alt/Option+1..9 jumps to a tab
+//!            Alt/Option+Left/Right cycles tabs (moves by word while a draft is
+//!            being edited); Alt/Option+1..9 jumps to a tab
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /cwd <path>, /search <query>, /animate <effect>,
 //!             /screensaver [effect], /new, /compact, /archive, /reboot [--build], /help,
@@ -4485,6 +4486,7 @@ pub const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "␣text", .description = "leading space sends a /… or !… message verbatim" },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
+    .{ .key = "Opt+←/→", .description = "switch tabs; moves by word while the composer has text" },
     .{ .key = "Ctrl+Backspace", .description = "start the orb screensaver" },
     .{ .key = "Ctrl+C", .description = "interrupt the active turn" },
 };
@@ -6695,6 +6697,7 @@ const VoiceRt = struct {
 pub const planProposalAction = keys.planProposalAction;
 
 pub const optionTabNavigationDirection = keys.optionTabNavigationDirection;
+pub const optionArrowSwitchesTabs = keys.optionArrowSwitchesTabs;
 
 pub const tabNavigationDirection = keys.tabNavigationDirection;
 

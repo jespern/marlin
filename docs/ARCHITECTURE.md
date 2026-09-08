@@ -1125,7 +1125,9 @@ Clean exit restores the attach process cwd and clears title/progress state.
 tab in a one-row strip that remains visible even when only one session exists.
 Tabs are clickable and begin with their dimmed 1-based position, matching
 Alt/Option+1..9 navigation. Alt/Option+Left/Right moves through the visible tab
-order in either mode; normal-mode `>`/`<` and Right/Left do the same. `gt`/`gT`
+order from normal mode or an empty composer; in insert mode with a draft the
+same keys are the composer's word motions, as they were before tabs claimed
+them. Normal-mode `>`/`<` and Right/Left cycle tabs too. `gt`/`gT`
 (with optional count) retains MRU session navigation. The terminal tab/window title
 tracks the focused session's cwd basename and adds the working spinner while that
 session is running, so both status and project follow in-app tab switches. A root
