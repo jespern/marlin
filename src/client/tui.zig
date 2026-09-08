@@ -5658,6 +5658,11 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     else if (app.shortcut_help and app.picker == null)
         try drawShortcutHelp(app, win, arena);
 
+    // The whole normal UI is in the window right now and the effect overlay
+    // is about to cover it: the moment a live backdrop can be captured.
+    if (app.screensaver_active) {
+        if (app.effect_engine) |*engine| engine.refreshBackdrop(win);
+    }
     drawUiAnimation(app, win);
 }
 

@@ -1,7 +1,8 @@
-//! Thinking-orb pixel effect. The first frame rasterizes Marlin's cell grid
-//! into a softened backdrop; later frames keep that snapshot still while a
-//! globe of scattered nodes turns above it and pulses fire along edges
-//! between neighbouring nodes, sporadically, like a brain lighting up.
+//! Thinking-orb pixel effect. Marlin's live cell grid is rasterized into a
+//! softened backdrop (re-captured a few times a second, so streaming output
+//! stays visible through the blur) while a globe of scattered nodes turns
+//! above it and pulses fire along edges between neighbouring nodes,
+//! sporadically, like a brain lighting up.
 
 const std = @import("std");
 const vaxis = @import("vaxis");

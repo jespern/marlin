@@ -234,6 +234,18 @@ pub const Engine = struct {
         return @intCast(@min(@max(@as(usize, self.transmit_every), needed), rate));
     }
 
+    /// Re-rasterize the live cell grid into the orb's blurred backdrop so it
+    /// follows the transcript instead of freezing at screensaver start. Runs
+    /// from draw() while the real UI is still in the window — by transmit
+    /// time the cells are already blacked out under the image. A blur needs
+    /// no 60 fps: every 20th tick (~3/s) keeps the capture+blur cost noise.
+    pub fn refreshBackdrop(self: *Engine, win: vaxis.Window) void {
+        if (self.kind != .orb or self.background.len == 0) return;
+        if (self.background_generation != 0 and self.frame % 20 != 0) return;
+        orb.capture(self.background, self.scratch, self.width, self.height, win, self.orb_fg, self.orb_bg);
+        self.background_generation = 1;
+    }
+
     pub fn tick(self: *Engine) void {
         self.frame +%= 1;
         if (self.kind == .pacman) self.game.tick();

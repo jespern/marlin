@@ -148,6 +148,15 @@ pub const Engine = union(enum) {
         };
     }
 
+    /// Effects that rasterize the cell grid into a backdrop (orb) re-capture
+    /// it here, from draw() while the live UI is still beneath the overlay.
+    pub fn refreshBackdrop(self: *Engine, win: vaxis.Window) void {
+        switch (self.*) {
+            .pixel => |*engine| engine.refreshBackdrop(win),
+            else => {},
+        }
+    }
+
     pub fn draw(self: *const Engine, win: vaxis.Window, mode: effect.DrawMode, opacity: u8) void {
         switch (self.*) {
             inline else => |*engine| engine.draw(win, mode, opacity),
