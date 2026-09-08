@@ -588,10 +588,10 @@ pub const Daemon = struct {
 
         var companion = web_service_mod.Service{ .gpa = gpa, .io = io, .environ = environ, .exe = self.marlin_exe orelse "", .port = cfg.web_port };
         defer companion.stop();
+        // Registered even while disabled so /web enable can start it later.
+        if (self.marlin_exe != null) self.web_service = &companion;
         if (cfg.web_enabled and self.marlin_exe != null) {
-            self.web_service = &companion;
             companion.start() catch |err| {
-                self.web_service = null;
                 std.log.warn("cannot start companion: {t}", .{err});
             };
         }
@@ -1156,11 +1156,31 @@ pub const Daemon = struct {
             .web_status => {
                 var arena: std.heap.ArenaAllocator = .init(self.gpa);
                 defer arena.deinit();
-                const status: proto.WebStatus = if (self.web_service) |service| try service.snapshot(arena.allocator()) else .{
+                var status: proto.WebStatus = if (self.web_service) |service| try service.snapshot(arena.allocator()) else .{
                     .enabled = self.cfg.web_enabled,
                     .state = if (self.cfg.web_enabled) "failed" else "disabled",
                 };
+                if (self.web_service != null) status.enabled = self.cfg.web_enabled;
                 self.sendTo(client, .{ .web_status_result = status });
+            },
+            .web_control => |wc| {
+                // The client has already persisted [web] enabled; this applies
+                // it to the running daemon without a restart.
+                self.cfg.web_enabled = wc.enabled;
+                const service = self.web_service orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "web", .msg = "companion unavailable in this daemon" } });
+                    return;
+                };
+                if (wc.enabled) {
+                    service.start() catch |err| {
+                        std.log.warn("cannot start companion: {t}", .{err});
+                        self.sendTo(client, .{ .err = .{ .code = "web", .msg = "could not start the web companion" } });
+                        return;
+                    };
+                } else {
+                    service.stop();
+                }
+                self.sendTo(client, .{ .ok = .{} });
             },
             .presence => |p| {
                 const accepted = self.presence.update(

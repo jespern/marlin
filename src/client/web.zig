@@ -23,8 +23,12 @@
 //! themselves in headers: DNS rebinding arrives under a foreign Host,
 //! cross-site POSTs carry a foreign Origin. Both are rejected; curl and the
 //! PWA never notice. A hostile local user is explicitly out of scope
-//! (loopback is machine-wide — do not enable [web] on a multi-user box).
-//! Serving still requires the `[web] enabled = true` opt-in (or MARLIN_WEB=1).
+//! (loopback is machine-wide — /web disable on a multi-user box).
+//! Serving honors `[web] enabled` (on by default; /web enable|disable
+//! persists the switch, MARLIN_WEB=1 overrides for one-offs).
+//!
+//! Requests log one Common Log Format line each to stderr — the daemon's
+//! companion ring captures them, so the /web tab reads like an access.log.
 
 const std = @import("std");
 const Io = std.Io;
@@ -116,9 +120,8 @@ pub fn serve(
     self_exe: []const u8,
     args: []const [:0]const u8,
 ) !u8 {
-    // Deliberately opt-in: this surface can drive every daemon capability.
-    // Refuse to start unless the user has said so in durable configuration
-    // (or the env override for one-offs).
+    // Enabled by default; disabled is an explicit user choice (/web disable
+    // or `[web] enabled = false`), so honor it and say the way back.
     var port: u16 = default_port;
     var want_tailscale = false;
     var want_push = false;
@@ -130,11 +133,7 @@ pub fn serve(
         defer loaded.deinit();
         if (!loaded.value.web_enabled) {
             std.log.err(
-                "the web ui is disabled (it is a full control surface for the daemon).\n" ++
-                    "  enable it deliberately: add\n" ++
-                    "    [web]\n" ++
-                    "    enabled = true\n" ++
-                    "  to ~/.config/marlin/config.toml, or run once with MARLIN_WEB=1.",
+                "the web ui is disabled — run /web enable in marlin (or set [web] enabled = true; MARLIN_WEB=1 for a one-off).",
                 .{},
             );
             return 2;
@@ -225,17 +224,61 @@ fn connMain(ctx: *ConnCtx) void {
     }
 }
 
+/// What one finished request logs: the response status and body bytes.
+const Access = struct { status: std.http.Status = .ok, bytes: u64 = 0 };
+
+/// respond() plus access accounting — every terminal reply goes through here
+/// so the log line carries the real status and size.
+fn reply(req: *std.http.Server.Request, access: *Access, body: []const u8, options: std.http.Server.Request.RespondOptions) !void {
+    access.* = .{ .status = options.status, .bytes = body.len };
+    try req.respond(body, options);
+}
+
+const clf_months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+/// Common Log Format timestamp: `08/Sep/2026:14:12:33 +0000` (UTC — marlin
+/// logs carry no local timezone database).
+pub fn clfTime(buf: []u8, epoch_seconds: i64) []const u8 {
+    const secs = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(epoch_seconds, 0)) };
+    const year_day = secs.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = secs.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>2}/{s}/{d}:{d:0>2}:{d:0>2}:{d:0>2} +0000", .{
+        month_day.day_index + 1,
+        clf_months[month_day.month.numeric() - 1],
+        year_day.year,
+        day_secs.getHoursIntoDay(),
+        day_secs.getMinutesIntoHour(),
+        day_secs.getSecondsIntoMinute(),
+    }) catch buf[0..0];
+}
+
+/// One access.log line per finished request, written directly to stderr
+/// (NOT std.log: no `info:` prefix) so the companion ring and the /web tab
+/// show plain Common Log Format. Streams log at completion with their total
+/// body bytes, the way nginx does. The bridge binds loopback only, so the
+/// peer is always 127.0.0.1.
+fn logAccess(ctx: *ConnCtx, req: *const std.http.Server.Request, access: Access) void {
+    var when_buf: [40]u8 = undefined;
+    const when = clfTime(&when_buf, Io.Timestamp.now(ctx.io, .real).toSeconds());
+    var buffer: [1024]u8 = undefined;
+    var writer = Io.File.stderr().writer(ctx.io, &buffer);
+    writer.interface.print("127.0.0.1 - - [{s}] \"{s} {s} {s}\" {d} {d}\n", .{
+        when,
+        @tagName(req.head.method),
+        req.head.target,
+        @tagName(req.head.version),
+        @intFromEnum(access.status),
+        access.bytes,
+    }) catch return;
+    writer.interface.flush() catch {};
+}
+
 fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     const target = req.head.target;
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
-
-    const route = if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/send") or
-        std.mem.eql(u8, path, "/events") or std.mem.eql(u8, path, "/history") or
-        std.mem.eql(u8, path, "/connection") or std.mem.startsWith(u8, path, "/push/"))
-        if (std.mem.startsWith(u8, path, "/push/")) "/push/*" else path
-    else
-        "asset/unknown";
-    std.log.info("web access {d} {s} {s}", .{ Io.Timestamp.now(ctx.io, .real).toSeconds(), @tagName(req.head.method), route });
+    var access = Access{};
+    defer logAccess(ctx, req, access);
 
     // Transport is the trust boundary (loopback / tailnet); these header
     // checks close the two ways a BROWSER can be steered across it. DNS
@@ -243,56 +286,56 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     // carries the attacker's Origin. Same-origin requests, curl, and the
     // installed PWA pass untouched — nothing here ever needs re-auth.
     if (!hostAllowed(ctx.tailnet_host, headerValue(req, "host"))) {
-        try req.respond("forbidden: unrecognized Host\n", .{ .status = .forbidden });
+        try reply(req, &access, "forbidden: unrecognized Host\n", .{ .status = .forbidden });
         return;
     }
     if (req.head.method == .POST and !originAllowed(ctx.tailnet_host, headerValue(req, "origin"))) {
-        try req.respond("forbidden: cross-origin request\n", .{ .status = .forbidden });
+        try reply(req, &access, "forbidden: cross-origin request\n", .{ .status = .forbidden });
         return;
     }
 
     if (std.mem.eql(u8, target, "/connection")) {
         const body = try std.json.Stringify.valueAlloc(ctx.gpa, .{ .tailnet_host = ctx.tailnet_host, .push_enabled = ctx.push_enabled }, .{});
         defer ctx.gpa.free(body);
-        try req.respond(body, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" } } });
+        try reply(req, &access, body, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" } } });
     } else if (std.mem.eql(u8, target, "/sw.js")) {
-        try req.respond(service_worker, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "text/javascript" }, .{ .name = "cache-control", .value = "no-cache" } } });
+        try reply(req, &access, service_worker, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "text/javascript" }, .{ .name = "cache-control", .value = "no-cache" } } });
     } else if (std.mem.startsWith(u8, path, "/push/")) {
-        try servePush(ctx, req, path);
+        try servePush(ctx, req, path, &access);
     } else if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
-        try req.respond(html, .{ .extra_headers = &.{
+        try reply(req, &access, html, .{ .extra_headers = &.{
             .{ .name = "content-type", .value = "text/html; charset=utf-8" },
         } });
     } else if (std.mem.eql(u8, target, "/manifest.webmanifest")) {
-        try req.respond(manifest, .{ .extra_headers = &.{
+        try reply(req, &access, manifest, .{ .extra_headers = &.{
             .{ .name = "content-type", .value = "application/manifest+json" },
         } });
     } else if (std.mem.eql(u8, target, "/icon-180.png")) {
-        try req.respond(icon_180, .{ .extra_headers = &.{
+        try reply(req, &access, icon_180, .{ .extra_headers = &.{
             .{ .name = "content-type", .value = "image/png" },
         } });
     } else if (std.mem.eql(u8, target, "/icon-512.png")) {
-        try req.respond(icon_512, .{ .extra_headers = &.{
+        try reply(req, &access, icon_512, .{ .extra_headers = &.{
             .{ .name = "content-type", .value = "image/png" },
         } });
     } else if (std.mem.startsWith(u8, target, "/events")) {
-        try serveEvents(ctx, req);
+        try serveEvents(ctx, req, &access);
     } else if (std.mem.startsWith(u8, target, "/history")) {
-        try serveHistory(ctx, req);
+        try serveHistory(ctx, req, &access);
     } else if (std.mem.eql(u8, target, "/send") and req.head.method == .POST) {
-        try serveSend(ctx, req);
+        try serveSend(ctx, req, &access);
     } else {
-        try req.respond("not found\n", .{ .status = .not_found });
+        try reply(req, &access, "not found\n", .{ .status = .not_found });
     }
 }
 
-fn servePush(ctx: *ConnCtx, req: *std.http.Server.Request, path: []const u8) !void {
+fn servePush(ctx: *ConnCtx, req: *std.http.Server.Request, path: []const u8, access: *Access) !void {
     if (!ctx.push_enabled) {
-        try req.respond("phone push is disabled", .{ .status = .not_found });
+        try reply(req, access, "phone push is disabled", .{ .status = .not_found });
         return;
     }
     const action: []const u8 = if (std.mem.eql(u8, path, "/push/info") and req.head.method == .GET) "info" else if (std.mem.eql(u8, path, "/push/subscribe") and req.head.method == .POST) "subscribe" else if (std.mem.eql(u8, path, "/push/unsubscribe") and req.head.method == .POST) "unsubscribe" else {
-        try req.respond("not found", .{ .status = .not_found });
+        try reply(req, access, "not found", .{ .status = .not_found });
         return;
     };
     var input: []const u8 = "";
@@ -301,20 +344,20 @@ fn servePush(ctx: *ConnCtx, req: *std.http.Server.Request, path: []const u8) !vo
         var buf: [8192]u8 = undefined;
         const reader = try req.readerExpectContinue(&buf);
         input = reader.allocRemaining(ctx.gpa, .limited(buf.len)) catch {
-            try req.respond("subscription too large", .{ .status = .payload_too_large });
+            try reply(req, access, "subscription too large", .{ .status = .payload_too_large });
             return;
         };
     }
     const result = mobile_push.run(ctx.gpa, ctx.io, ctx.environ, action, input) catch {
-        try req.respond("phone push unavailable; check Node.js and the subscription", .{ .status = .service_unavailable });
+        try reply(req, access, "phone push unavailable; check Node.js and the subscription", .{ .status = .service_unavailable });
         return;
     };
     defer ctx.gpa.free(result);
-    try req.respond(result, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" } } });
+    try reply(req, access, result, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" } } });
 }
 
 /// Forward one client message and return the daemon's first reply line.
-fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
+fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !void {
     const json_header = [_]std.http.Header{
         .{ .name = "content-type", .value = "application/json" },
     };
@@ -322,7 +365,7 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     var body_buf: [64 * 1024]u8 = undefined;
     const body_reader = try req.readerExpectContinue(&body_buf);
     const line = body_reader.allocRemaining(ctx.gpa, .limited(body_buf.len)) catch {
-        try req.respond("body too large\n", .{ .status = .payload_too_large });
+        try reply(req, access, "body too large\n", .{ .status = .payload_too_large });
         return;
     };
     defer ctx.gpa.free(line);
@@ -334,7 +377,7 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
         defer arena_state.deinit();
         _ = proto.decode(proto.ClientMsg, arena_state.allocator(), trimmed) catch {
-            try req.respond(
+            try reply(req, access,
                 \\{"err":{"code":"bad_msg","msg":"not a valid client message"}}
             , .{ .status = .bad_request, .extra_headers = &json_header });
             return;
@@ -342,7 +385,7 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     }
 
     const conn = attach.connect(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe) catch {
-        try req.respond(
+        try reply(req, access,
             \\{"err":{"code":"daemon","msg":"cannot reach daemon"}}
         , .{ .status = .bad_gateway, .extra_headers = &json_header });
         return;
@@ -352,25 +395,25 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     try conn.writer.writeAll(trimmed);
     try conn.writer.writeAll("\n");
     try conn.writer.flush();
-    const reply = conn.readLine() catch {
-        try req.respond(
+    const daemon_reply = conn.readLine() catch {
+        try reply(req, access,
             \\{"err":{"code":"daemon","msg":"daemon closed the connection"}}
         , .{ .status = .bad_gateway, .extra_headers = &json_header });
         return;
     };
-    defer ctx.gpa.free(reply);
-    try req.respond(reply, .{ .extra_headers = &json_header });
+    defer ctx.gpa.free(daemon_reply);
+    try reply(req, access, daemon_reply, .{ .extra_headers = &json_header });
 }
 
 /// Dedicated daemon connection per SSE stream; ends when either side closes.
-fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
+fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !void {
     const sid = sidFromQuery(req.head.target) orelse {
-        try req.respond("missing or bad sid\n", .{ .status = .bad_request });
+        try reply(req, access, "missing or bad sid\n", .{ .status = .bad_request });
         return;
     };
 
     const conn = attach.connect(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe) catch {
-        try req.respond("cannot reach daemon\n", .{ .status = .bad_gateway });
+        try reply(req, access, "cannot reach daemon\n", .{ .status = .bad_gateway });
         return;
     };
     defer conn.deinit();
@@ -394,6 +437,7 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         },
     } });
 
+    access.* = .{ .status = .ok, .bytes = 0 };
     while (true) {
         const line = conn.readLine() catch break;
         defer ctx.gpa.free(line);
@@ -407,22 +451,23 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         // it does NOT drain the body buffer itself (see endUnflushed).
         response.writer.flush() catch break;
         response.flush() catch break;
+        access.bytes += body.len + 8; // "data: " + "\n\n"
     }
 }
 
 /// One bounded older-history page as SSE. Unlike /events this stream ends at
 /// replay_done; the browser opens it only when the user asks for more.
-fn serveHistory(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
+fn serveHistory(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !void {
     const sid = queryU64(req.head.target, "sid") orelse {
-        try req.respond("missing or bad sid\n", .{ .status = .bad_request });
+        try reply(req, access, "missing or bad sid\n", .{ .status = .bad_request });
         return;
     };
     const before = queryU64(req.head.target, "before") orelse {
-        try req.respond("missing or bad before seq\n", .{ .status = .bad_request });
+        try reply(req, access, "missing or bad before seq\n", .{ .status = .bad_request });
         return;
     };
     const conn = attach.connect(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe) catch {
-        try req.respond("cannot reach daemon\n", .{ .status = .bad_gateway });
+        try reply(req, access, "cannot reach daemon\n", .{ .status = .bad_gateway });
         return;
     };
     defer conn.deinit();
@@ -444,6 +489,7 @@ fn serveHistory(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
             .{ .name = "cache-control", .value = "no-cache" },
         },
     } });
+    access.* = .{ .status = .ok, .bytes = 0 };
     while (true) {
         const line = conn.readLine() catch break;
         defer ctx.gpa.free(line);
@@ -453,6 +499,7 @@ fn serveHistory(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         response.writer.writeAll("\n\n") catch break;
         response.writer.flush() catch break;
         response.flush() catch break;
+        access.bytes += body.len + 8; // "data: " + "\n\n"
         if (std.mem.startsWith(u8, body, "{\"replay_done\":")) break;
     }
 }

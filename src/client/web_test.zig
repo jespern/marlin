@@ -73,3 +73,12 @@ test "Tailscale subprocess forces CLI mode and preserves argument boundaries" {
     try std.testing.expectEqualStrings("serve --bg|8377", result.stdout);
     try std.testing.expectEqualStrings("0", env.get("TAILSCALE_BE_CLI").?);
 }
+
+test "access log timestamps are Common Log Format in UTC" {
+    var buf: [40]u8 = undefined;
+    // 2026-09-08 13:07:05 UTC
+    try std.testing.expectEqualStrings("08/Sep/2026:13:07:05 +0000", web.clfTime(&buf, 1788872825));
+    // Epoch zero and negative inputs stay well-formed.
+    try std.testing.expectEqualStrings("01/Jan/1970:00:00:00 +0000", web.clfTime(&buf, 0));
+    try std.testing.expectEqualStrings("01/Jan/1970:00:00:00 +0000", web.clfTime(&buf, -5));
+}

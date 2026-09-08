@@ -12,7 +12,7 @@ pub const Service = struct {
     pid: ?std.process.Child.Id = null,
     stopping: bool = false,
     thread: ?std.Thread = null,
-    state: []const u8 = "starting",
+    state: []const u8 = "stopped",
     logs: [128][384]u8 = undefined,
     lengths: [128]usize = @splat(0),
     count: usize = 0,
@@ -21,7 +21,14 @@ pub const Service = struct {
     url_len: usize = 0,
     port: u16,
 
+    /// Idempotent, and restartable after stop(): /web disable then enable
+    /// cycles the same Service. Thread handle is dispatcher-owned.
     pub fn start(self: *Service) !void {
+        if (self.thread != null) return;
+        self.mutex.lockUncancelable(self.io);
+        self.stopping = false;
+        self.state = "starting";
+        self.mutex.unlock(self.io);
         self.thread = try std.Thread.spawn(.{}, work, .{self});
     }
     pub fn stop(self: *Service) void {

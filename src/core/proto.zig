@@ -205,6 +205,9 @@ pub const WebStatus = struct { enabled: bool = false, state: []const u8 = "disab
 
 pub const ClientMsg = union(enum) {
     web_status: struct {},
+    /// /web enable|disable: start or stop the companion now. Durability is
+    /// the client's job (it writes `[web] enabled` to config.toml itself).
+    web_control: struct { enabled: bool },
     /// Terminal leases belong to this connection. Phone leases use a per-page id
     /// because HTTP requests use fresh daemon connections. No transcript data.
     presence: struct { kind: enum { terminal, phone }, active: bool, sid: u64 = 0, page_id: u64 = 0 },

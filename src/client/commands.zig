@@ -41,7 +41,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
     .{ .name = "/plan", .usage = " [task|off|clear]", .description = "enter Plan mode or manage its execution todo", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
-    .{ .name = "/web", .description = "open the companion status and access log tab" },
+    .{ .name = "/web", .usage = " [enable|disable]", .description = "companion status and access log; enable/disable persists to config", .accepts_args = true },
     .{ .name = "/top", .description = "live session overview and switcher" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
@@ -628,7 +628,30 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
     } else if (std.mem.eql(u8, head, "/sessions")) {
         self.openPicker(.session);
     } else if (std.mem.eql(u8, head, "/web")) {
-        self.openWeb();
+        const arg = std.mem.trim(u8, it.rest(), " \t");
+        if (arg.len == 0) {
+            self.openWeb();
+        } else if (std.mem.eql(u8, arg, "enable") or std.mem.eql(u8, arg, "disable")) {
+            const enabled = std.mem.eql(u8, arg, "enable");
+            // Durable first (config.toml), then live (the daemon starts or
+            // stops the companion now, no restart needed).
+            if (self.environ) |environ| {
+                config.setWebEnabled(self.gpa, self.io, environ, enabled) catch {
+                    self.setNotice("could not update config.toml", .{});
+                    return;
+                };
+            }
+            self.conn.send(.{ .web_control = .{ .enabled = enabled } }) catch {
+                self.setNotice("saved to config; daemon unreachable — applies on restart", .{});
+                return;
+            };
+            if (enabled)
+                self.setNotice("web companion enabled and saved — /web for status", .{})
+            else
+                self.setNotice("web companion disabled and saved", .{});
+        } else {
+            self.setNotice("usage: /web [enable|disable]", .{});
+        }
     } else if (std.mem.eql(u8, head, "/top")) {
         self.openTop();
     } else if (std.mem.eql(u8, head, "/new")) {

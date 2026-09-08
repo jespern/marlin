@@ -61,24 +61,24 @@ test "screensaver durations are strict and canonical" {
     try std.testing.expectError(error.InvalidScreensaverEffect, validateScreensaverEffect("disco"));
 }
 
-test "web ui stays off unless deliberately enabled" {
+test "web ui defaults on; config and env can switch it either way" {
     const gpa = std.testing.allocator;
     var environ = std.process.Environ.Map.init(gpa);
     defer environ.deinit();
 
-    try std.testing.expect(!defaults().web_enabled);
-    try std.testing.expect(!fromEnviron(&environ).web_enabled);
-    try environ.put("MARLIN_WEB", "1");
+    try std.testing.expect(defaults().web_enabled);
     try std.testing.expect(fromEnviron(&environ).web_enabled);
     try environ.put("MARLIN_WEB", "0");
     try std.testing.expect(!fromEnviron(&environ).web_enabled);
+    try environ.put("MARLIN_WEB", "1");
+    try std.testing.expect(fromEnviron(&environ).web_enabled);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const doc = try toml.parse(arena_state.allocator(), "[web]\nenabled = true\n");
+    const doc = try toml.parse(arena_state.allocator(), "[web]\nenabled = false\n");
     var cfg = defaults();
     applyDocument(&cfg, doc);
-    try std.testing.expect(cfg.web_enabled);
+    try std.testing.expect(!cfg.web_enabled);
 }
 
 test "defaults are sane" {

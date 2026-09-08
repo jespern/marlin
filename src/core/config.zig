@@ -96,11 +96,12 @@ pub const Config = struct {
     /// leases. Independent of permissions and OFF until M4.5 lands.
     workspace_enabled: bool = false,
 
-    /// Daemon-managed web companion. OFF by default and deliberately opt-in: the web
-    /// bridge is an unauthenticated localhost surface that can drive every
-    /// daemon capability (including shutdown). `[web] enabled = true` or
-    /// MARLIN_WEB=1 turns it on.
-    web_enabled: bool = false,
+    /// Daemon-managed web companion. ON by default: the bridge binds loopback
+    /// only, and Host/Origin checks close the browser-shaped holes. It remains
+    /// an unauthenticated local surface that can drive every daemon capability
+    /// (including shutdown) — `/web disable` or `[web] enabled = false` turns
+    /// it off; do not run it enabled on a multi-user box.
+    web_enabled: bool = true,
     web_port: u16 = 8377,
 
     /// `marlin web` attempts `tailscale serve` so the UI is reachable at a
@@ -315,6 +316,22 @@ pub fn setUiFlag(
     const current = try readRawAlloc(gpa, io, environ);
     defer gpa.free(current);
     const updated = try setScalarText(gpa, current, "ui", key, if (enabled) "true" else "false");
+    defer gpa.free(updated);
+    try replaceRaw(gpa, io, environ, updated);
+}
+
+/// Persist `[web] enabled` — the durable half of /web enable|disable. The
+/// same surgical single-key edit as setUiFlag: everything else in the user's
+/// config.toml stays byte-for-byte.
+pub fn setWebEnabled(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    enabled: bool,
+) !void {
+    const current = try readRawAlloc(gpa, io, environ);
+    defer gpa.free(current);
+    const updated = try setScalarText(gpa, current, "web", "enabled", if (enabled) "true" else "false");
     defer gpa.free(updated);
     try replaceRaw(gpa, io, environ, updated);
 }
