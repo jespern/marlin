@@ -186,7 +186,9 @@ pub const Engine = struct {
         const pixels = @as(usize, self.width) * self.height;
         self.rgb = try self.gpa.alloc(u8, pixels * 3);
         errdefer self.gpa.free(self.rgb);
-        self.scratch = try self.gpa.alloc(u8, pixels * 3);
+        // Two frames' worth: the orb keeps its sharp particle layer and its
+        // blurred bloom side by side while compositing.
+        self.scratch = try self.gpa.alloc(u8, pixels * 6);
         errdefer self.gpa.free(self.scratch);
         self.encoded = try self.gpa.alloc(u8, std.base64.standard.Encoder.calcSize(pixels * 3));
         errdefer self.gpa.free(self.encoded);
@@ -267,7 +269,7 @@ pub const Engine = struct {
                     orb.capture(self.background, self.scratch, self.width, self.height, vx.window(), self.orb_fg, self.orb_bg);
                     self.background_generation = 1;
                 }
-                orb.render(self.rgb, self.background, self.width, self.height, self.frame, self.seed);
+                orb.render(self.rgb, self.scratch, self.background, self.width, self.height, self.frame, self.seed);
             },
             .tetris => tetris.renderPixels(&self.tetris_game, self.rgb, self.width, self.height),
             .wipeout => if (self.wipeout_game) |g| g.render(self.rgb, self.width, self.height) else @memset(self.rgb, 0),

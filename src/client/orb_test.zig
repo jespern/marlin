@@ -43,7 +43,7 @@ test "capture preserves a softened trace of the cell grid" {
     try std.testing.expect(plain[2] > plain[0]);
 }
 
-test "orb is deterministic, animated, pixelated, and leaves corners unchanged" {
+test "orb is deterministic, animated, and leaves the backdrop untouched away from the sphere" {
     const gpa = std.testing.allocator;
     const width: u16 = 160;
     const height: u16 = 100;
@@ -51,6 +51,8 @@ test "orb is deterministic, animated, pixelated, and leaves corners unchanged" {
     const background = try gpa.alloc(u8, len);
     defer gpa.free(background);
     @memset(background, 12);
+    const scratch = try gpa.alloc(u8, len * 2);
+    defer gpa.free(scratch);
     const a = try gpa.alloc(u8, len);
     defer gpa.free(a);
     const b = try gpa.alloc(u8, len);
@@ -58,76 +60,32 @@ test "orb is deterministic, animated, pixelated, and leaves corners unchanged" {
     const later = try gpa.alloc(u8, len);
     defer gpa.free(later);
 
-    orb.render(a, background, width, height, 17, 9);
-    orb.render(b, background, width, height, 17, 9);
-    orb.render(later, background, width, height, 47, 9);
+    orb.render(a, scratch, background, width, height, 17, 9);
+    orb.render(b, scratch, background, width, height, 17, 9);
+    orb.render(later, scratch, background, width, height, 47, 9);
 
     try std.testing.expectEqualSlices(u8, a, b);
     try std.testing.expect(!std.mem.eql(u8, a, later));
     try std.testing.expectEqual([3]u8{ 12, 12, 12 }, pixel(a, width, 0, 0));
     try std.testing.expectEqual([3]u8{ 12, 12, 12 }, pixel(a, width, width - 1, height - 1));
 
-    // Everything the orb paints lands on the 3-px block grid at this size:
-    // inside a block every pixel matches its top-left. (The last row and
-    // column of a block may carry the grid's dark edge line, so skip them.)
-    var off_grid: usize = 0;
+    // A particle sphere: a compact footprint, blue-first everywhere, with a
+    // bright limb where the projection stacks particles.
+    var changed: usize = 0;
+    var blue_first: usize = 0;
+    var bright: usize = 0;
     var y: usize = 0;
     while (y < height) : (y += 1) {
         var x: usize = 0;
         while (x < width) : (x += 1) {
-            if (x % 3 == 2 or y % 3 == 2) continue;
             const color = pixel(a, width, x, y);
             if (std.mem.eql(u8, &color, &[3]u8{ 12, 12, 12 })) continue;
-            const origin = pixel(a, width, x / 3 * 3, y / 3 * 3);
-            if (!std.mem.eql(u8, &color, &origin)) off_grid += 1;
+            changed += 1;
+            if (color[2] >= color[0] and color[2] >= color[1]) blue_first += 1;
+            if (color[2] > 200 and color[1] > 120) bright += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 0), off_grid);
-}
-
-test "orb is a cool-toned globe of nodes with sporadic pulses, not a planet" {
-    const gpa = std.testing.allocator;
-    const width: u16 = 320;
-    const height: u16 = 200;
-    const len = @as(usize, width) * height * 3;
-    const background = try gpa.alloc(u8, len);
-    defer gpa.free(background);
-    @memset(background, 12);
-    const rgb = try gpa.alloc(u8, len);
-    defer gpa.free(rgb);
-
-    var warm_total: usize = 0;
-    var cool_total: usize = 0;
-    var bright_total: usize = 0;
-    var changed_min: usize = std.math.maxInt(usize);
-    var changed_max: usize = 0;
-    var flashes: usize = 0;
-    const frames = [_]u64{ 0, 90, 300, 777, 1500 };
-    for (frames) |frame| {
-        orb.render(rgb, background, width, height, frame, 9);
-        var changed: usize = 0;
-        var y: usize = 0;
-        while (y < height) : (y += 1) {
-            var x: usize = 0;
-            while (x < width) : (x += 1) {
-                const c = pixel(rgb, width, x, y);
-                if (std.mem.eql(u8, &c, &[3]u8{ 12, 12, 12 })) continue;
-                changed += 1;
-                if (c[2] >= c[0]) cool_total += 1 else warm_total += 1;
-                if (c[1] > 150 and c[2] > 200) bright_total += 1;
-                if (c[0] > 200 and c[1] > 180) flashes += 1;
-            }
-        }
-        changed_min = @min(changed_min, changed);
-        changed_max = @max(changed_max, changed);
-    }
-    // The body plus its glow stays a compact orb, roughly the same footprint
-    // every frame, and the palette is blue-first: red never dominates.
-    try std.testing.expect(changed_min > 6_000 and changed_max < 22_000);
-    try std.testing.expect(changed_max - changed_min < 4_000);
-    try std.testing.expect(cool_total > warm_total * 20);
-    // Bright node/pulse pixels exist every frame, and at least one pulse
-    // landed on a node somewhere in the sample (the warm-white flash).
-    try std.testing.expect(bright_total > 400);
-    try std.testing.expect(flashes > 0);
+    try std.testing.expect(changed > len / 3 / 20 and changed < len / 3 / 2);
+    try std.testing.expect(blue_first * 100 >= changed * 92);
+    try std.testing.expect(bright > 40);
 }

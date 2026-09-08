@@ -55,192 +55,182 @@ pub fn capture(background: []u8, scratch: []u8, width: u16, height: u16, win: va
     boxBlur(background, scratch, width, height, 5);
 }
 
-/// A thinking orb: a globe of scattered nodes turning slowly, with pulses
-/// firing along edges between neighbouring nodes now and then, like a brain
-/// lighting up. Stateless: every frame is a pure function of (frame, seed),
-/// so the engine can skip or replay frames freely.
-pub fn render(rgb: []u8, background: []const u8, width: u16, height: u16, frame: u64, seed: u64) void {
+/// A thinking orb: a sphere of a few thousand tiny particles turning slowly,
+/// dense and bright at the limb where the projection stacks them, dim and
+/// sparse across the face, breathing and shimmering, with a faint drifting
+/// halo and a slow low-frequency relief that gives the shell texture.
+/// Particles are additive with a soft bloom, so where they crowd they glow.
+/// Stateless: every frame is a pure function of (frame, seed). `scratch` is
+/// a working buffer at least as large as `rgb`.
+pub fn render(rgb: []u8, scratch: []u8, background: []const u8, width: u16, height: u16, frame: u64, seed: u64) void {
     @memcpy(rgb, background);
     if (width == 0 or height == 0) return;
+    const light = scratch[0..rgb.len];
+    @memset(light, 0);
 
     const w: f32 = @floatFromInt(width);
     const h: f32 = @floatFromInt(height);
-    const radius = @min(w, h) * 0.27;
     const time = seconds(frame);
-    const cx = w * 0.5 + @sin(time * 0.23 + seedPhase(seed)) * w * 0.018;
-    const cy = h * 0.47 + @sin(time * 0.41 + 1.7) * h * 0.012;
-    const pixel_size = pixelBlockSize(width, height);
+    const radius = @min(w, h) * 0.30 * (1.0 + 0.012 * @sin(time * 0.9));
+    const cx = w * 0.5 + @sin(time * 0.23 + seedPhase(seed)) * w * 0.015;
+    const cy = h * 0.48 + @sin(time * 0.41 + 1.7) * h * 0.010;
 
-    // Faint body: a barely-there navy disc and rim so the scatter reads as a
-    // sphere, not confetti. Blocks keep the retro grid.
-    var by: u16 = 0;
-    while (by < height) : (by += pixel_size) {
-        const yf: f32 = @floatFromInt(@min(by + pixel_size / 2, height - 1));
-        var bx: u16 = 0;
-        while (bx < width) : (bx += pixel_size) {
-            const xf: f32 = @floatFromInt(@min(bx + pixel_size / 2, width - 1));
-            const dx = (xf - cx) / radius;
-            const dy = (yf - cy) / radius;
-            const d2 = dx * dx + dy * dy;
-            if (d2 > 1.25) continue;
-            if (d2 > 1.0) {
-                const glow = (1.25 - d2) / 0.25;
-                blendBlock(rgb, width, height, bx, by, pixel_size, .{ 24, 90, 140 }, glow * glow * 0.10, false);
-                continue;
-            }
-            const depth = @sqrt(1.0 - d2);
-            const rim = std.math.pow(f32, 1.0 - depth, 3.0);
-            blendBlock(rgb, width, height, bx, by, pixel_size, .{ 6, 18, 38 }, 0.34, true);
-            blendBlock(rgb, width, height, bx, by, pixel_size, .{ 30, 110, 170 }, rim * 0.30, false);
-        }
-    }
+    const spin = time * 0.22 + seedPhase(seed);
+    const tilt: f32 = 0.38;
+    const rot = Rotation.init(spin, tilt);
 
-    // Nodes on a Fibonacci sphere, turning about a tilted axis.
-    var nodes: [node_count]Node = undefined;
-    const spin = time * 0.31 + seedPhase(seed);
-    const tilt: f32 = 0.42;
-    const ct = @cos(tilt);
-    const st = @sin(tilt);
-    const cs = @cos(spin);
-    const ss = @sin(spin);
-    for (&nodes, 0..) |*node, i| {
-        const fi: f32 = @floatFromInt(i);
-        const y0 = 1.0 - (fi + 0.5) * 2.0 / @as(f32, @floatFromInt(node_count));
-        const r0 = @sqrt(@max(0.0, 1.0 - y0 * y0));
-        const theta = fi * golden_angle;
-        const x0 = @cos(theta) * r0;
-        const z0 = @sin(theta) * r0;
-        // spin about Y, then tilt about X
-        const x1 = x0 * cs + z0 * ss;
-        const z1 = -x0 * ss + z0 * cs;
-        const y2 = y0 * ct - z1 * st;
-        const z2 = y0 * st + z1 * ct;
-        node.* = .{
-            .sx = cx + x1 * radius,
-            .sy = cy + y2 * radius,
-            .z = z2,
-            .flash = 0,
-        };
-    }
-
-    // Edges between near neighbours. Only some ever fire, and each on its own
-    // slow, hashed clock, so the lines are sporadic rather than a wireframe.
+    // Surface shell: Fibonacci-distributed, each particle jittered slightly
+    // off the sphere and shimmering along its normal so the surface looks
+    // alive rather than machined.
     var i: usize = 0;
-    while (i < node_count) : (i += 1) {
-        var j: usize = i + 1;
-        while (j < node_count) : (j += 1) {
-            const a = nodes[i];
-            const b = nodes[j];
-            const ddx = (a.sx - b.sx) / radius;
-            const ddy = (a.sy - b.sy) / radius;
-            const ddz = a.z - b.z;
-            const chord2 = ddx * ddx + ddy * ddy + ddz * ddz;
-            const key = hash(@intCast(i), @intCast(j), 0, seed);
-            // Near neighbours: about one pair in six is a synapse. Distant
-            // pairs: a rare long arc across the globe, an "insight".
-            const long_arc = chord2 > 1.1 and chord2 < 2.6 and key % 97 == 0;
-            if (!long_arc and (chord2 > 0.55 or key % 6 != 0)) continue;
-            const period = 2.5 + @as(f32, @floatFromInt((key >> 8) % 700)) / 100.0 + (if (long_arc) @as(f32, 6.0) else 0.0); // 2.5..15.5 s
-            const phase = @as(f32, @floatFromInt((key >> 20) % 1000)) / 1000.0 * period;
-            const t = @mod(time + phase, period);
-            const duration: f32 = if (long_arc) 2.2 else 1.3;
-            if (t > duration) continue;
-            const progress = t / duration;
-            // direction alternates per firing so pulses go both ways over time
-            const flip = (@as(u64, @intFromFloat((time + phase) / period)) + (key >> 40)) % 2 == 1;
-            const from = if (flip) b else a;
-            const to = if (flip) a else b;
-            const depth = (@max(from.z, to.z) + 1.0) * 0.5; // 0 back .. 1 front
-            const vis = 0.25 + 0.75 * depth;
-            drawPulse(rgb, width, height, pixel_size, from, to, progress, vis);
-            if (progress > 0.82) {
-                const target = if (flip) &nodes[i] else &nodes[j];
-                target.flash = @max(target.flash, (progress - 0.82) / 0.18);
-            }
-        }
+    while (i < shell_count) : (i += 1) {
+        const key = hash(@intCast(i & 0xffff), @intCast(i >> 16), 0, seed);
+        const dir = randomDirection(key);
+        // Relief: a slow, low-frequency terrain fixed to the globe lifts some
+        // regions a few percent and brightens their ridges, so the shell has
+        // texture instead of a uniform skin. It drifts very slowly.
+        const elev = relief(dir, time);
+        const jitter = 0.985 + 0.02 * unit(key) + elev + 0.008 * @sin(time * 1.3 + unit(key >> 16) * 6.283);
+        const p = rot.apply(dir.scale(jitter));
+        const depth = (p.z + 1.0) * 0.5;
+        const twinkle = 0.7 + 0.3 * @sin(time * (1.5 + unit(key >> 24) * 2.0) + unit(key >> 32) * 6.283);
+        // face dim, limb bright: |z| small means we look at the edge
+        const limb = 1.0 - @abs(p.z);
+        const ridge = 1.0 + 12.0 * elev; // ±0.03 relief -> roughly ±35% brightness
+        const intensity = (0.30 + 0.95 * depth * depth + 1.1 * limb * limb * limb) * twinkle * ridge;
+        splat(light, width, height, cx + p.x * radius, cy + p.y * radius, intensity, depth);
     }
 
-    // Nodes last so they sit on top of their edges. Back nodes are dim and
-    // small; front nodes bright, with a soft flash when a pulse arrives.
-    for (nodes, 0..) |node, k| {
-        const depth = (node.z + 1.0) * 0.5;
-        const twinkle = 0.85 + 0.15 * @sin(time * 1.7 + @as(f32, @floatFromInt(k)) * 0.61);
-        const base_alpha = (0.18 + 0.72 * depth * depth) * twinkle;
-        var color = [3]f32{ 90.0 + 60.0 * depth, 170.0 + 60.0 * depth, 230.0 + 25.0 * depth };
-        if (node.flash > 0) {
-            color[0] += 165.0 * node.flash;
-            color[1] += 85.0 * node.flash;
-            color[2] += 25.0 * node.flash;
-        }
-        const alpha = @min(1.0, base_alpha + node.flash * 0.6);
-        const size: u16 = if (depth > 0.72 or node.flash > 0.3) pixel_size * 2 else pixel_size;
-        const bx = snap(node.sx - @as(f32, @floatFromInt(size)) * 0.5, pixel_size);
-        const byy = snap(node.sy - @as(f32, @floatFromInt(size)) * 0.5, pixel_size);
-        if (bx >= width or byy >= height) continue;
-        blendBlock(rgb, width, height, bx, byy, size, .{ channel(color[0]), channel(color[1]), channel(color[2]) }, alpha, false);
-        if (node.flash > 0.2) {
-            // halo one block wide around a flashing node
-            const hx = bx -| pixel_size;
-            const hy = byy -| pixel_size;
-            blendBlock(rgb, width, height, hx, hy, size + pixel_size * 2, .{ 255, 200, 120 }, node.flash * 0.12, false);
-        }
+    // Sparse interior mist, dimmer, so the ball has volume without a solid body.
+    i = 0;
+    while (i < core_count) : (i += 1) {
+        const key = hash(@intCast(i & 0xffff), 7, 0, seed);
+        const dir = randomDirection(key >> 8);
+        const r = 0.2 + 0.75 * std.math.cbrt(unit(key));
+        const p = rot.apply(dir.scale(r));
+        const depth = (p.z + 1.0) * 0.5;
+        const twinkle = 0.6 + 0.4 * @sin(time * 0.9 + unit(key >> 20) * 6.283);
+        splat(light, width, height, cx + p.x * radius, cy + p.y * radius, (0.12 + 0.45 * depth) * twinkle, depth);
+    }
+
+    // Drifting halo: a thin scatter loosening off the sphere, slowly orbiting
+    // the other way, each grain fading as it drifts out and respawning.
+    i = 0;
+    while (i < halo_count) : (i += 1) {
+        const key = hash(@intCast(i), 11, 0, seed);
+        const life = @mod(time * (0.06 + 0.08 * unit(key >> 8)) + unit(key), 1.0);
+        const dir = randomDirection(key >> 4);
+        const r = 1.02 + 0.5 * life;
+        const p = Rotation.init(-spin * 0.6 + life * 0.8, tilt).apply(dir.scale(r));
+        const depth = (p.z + 1.0) * 0.5;
+        const fade = (1.0 - life) * (1.0 - life);
+        splat(light, width, height, cx + p.x * radius, cy + p.y * radius, 0.7 * fade * (0.4 + 0.6 * depth), depth);
+    }
+
+    // Bloom: the accumulated light, blurred once, glows around the sharp
+    // particles; both are added over the backdrop.
+    const glow = scratch[rgb.len .. rgb.len * 2];
+    @memcpy(glow, light);
+    boxBlur(glow, rgb, width, height, 3); // rgb is scratch space here; it is rewritten below
+    @memcpy(rgb, background);
+    var px: usize = 0;
+    while (px < rgb.len) : (px += 3) {
+        const l: f32 = @as(f32, @floatFromInt(light[px + 2])) / 255.0; // stored as intensity in blue channel
+        const g: f32 = @as(f32, @floatFromInt(glow[px + 2])) / 255.0;
+        const warm: f32 = @as(f32, @floatFromInt(light[px])) / 255.0; // arcs and near-white cores
+        const v = @min(1.0, l + g * 1.6);
+        if (v <= 0.002) continue;
+        // deep blue -> electric blue -> cyan-white as intensity rises
+        const r_add = 30.0 * v + 225.0 * v * v * v + 140.0 * warm;
+        const g_add = 110.0 * v + 145.0 * v * v + 70.0 * warm;
+        const b_add = 255.0 * v;
+        rgb[px] = channel(@as(f32, @floatFromInt(rgb[px])) + r_add);
+        rgb[px + 1] = channel(@as(f32, @floatFromInt(rgb[px + 1])) + g_add);
+        rgb[px + 2] = channel(@as(f32, @floatFromInt(rgb[px + 2])) + b_add);
     }
 }
 
-const node_count = 168;
+const shell_count = 3200;
+const core_count = 700;
+const halo_count = 420;
 const golden_angle: f32 = 2.39996323;
 
-const Node = struct { sx: f32, sy: f32, z: f32, flash: f32 };
-
-fn snap(value: f32, pixel_size: u16) u16 {
-    const v = @max(value, 0.0);
-    const block: u16 = @intFromFloat(@min(v / @as(f32, @floatFromInt(pixel_size)), 60000.0));
-    return block * pixel_size;
-}
-
-/// A pulse running from `from` to `to`: the whole edge faintly lit while the
-/// firing lasts, a bright head at `progress` with a short fading tail behind.
-fn drawPulse(rgb: []u8, width: u16, height: u16, pixel_size: u16, from: Node, to: Node, progress: f32, vis: f32) void {
-    const ex = to.sx - from.sx;
-    const ey = to.sy - from.sy;
-    const length = @max(@sqrt(ex * ex + ey * ey), 1.0);
-    const steps: usize = @intFromFloat(@min(length / @as(f32, @floatFromInt(pixel_size)) + 1.0, 400.0));
-    var k: usize = 0;
-    while (k <= steps) : (k += 1) {
-        const f = @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(@max(steps, 1)));
-        const px = from.sx + ex * f;
-        const py = from.sy + ey * f;
-        const bx = snap(px - @as(f32, @floatFromInt(pixel_size)) * 0.5, pixel_size);
-        const by = snap(py - @as(f32, @floatFromInt(pixel_size)) * 0.5, pixel_size);
-        if (bx >= width or by >= height) continue;
-        const behind = progress - f; // >0 means the head has passed this point
-        var alpha: f32 = 0.26 * vis;
-        var color = [3]u8{ 50, 150, 210 };
-        if (behind >= 0.0 and behind < 0.28) {
-            const tail = 1.0 - behind / 0.28;
-            alpha = (0.3 + 0.7 * tail * tail) * vis;
-            color = .{ channel(140.0 + 115.0 * tail), channel(210.0 + 45.0 * tail), 255 };
-        }
-        blendBlock(rgb, width, height, bx, by, pixel_size, color, alpha, false);
+const Vec = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    fn scale(v: Vec, s: f32) Vec {
+        return .{ .x = v.x * s, .y = v.y * s, .z = v.z * s };
     }
-}
+};
 
-fn pixelBlockSize(width: u16, height: u16) u16 {
-    return std.math.clamp(@min(width, height) / 72, 3, 8);
-}
-
-fn blendBlock(rgb: []u8, width: u16, height: u16, x: u16, y: u16, size: u16, color: [3]u8, alpha: f32, grid: bool) void {
-    const x_end = @min(x + size, width);
-    const y_end = @min(y + size, height);
-    var py = y;
-    while (py < y_end) : (py += 1) {
-        var px = x;
-        while (px < x_end) : (px += 1) {
-            blend(rgb, width, px, py, color, alpha);
-            if (grid and (px + 1 == x_end or py + 1 == y_end))
-                blend(rgb, width, px, py, .{ 0, 3, 5 }, 0.34);
-        }
+const Rotation = struct {
+    cs: f32,
+    ss: f32,
+    ct: f32,
+    st: f32,
+    fn init(spin: f32, tilt: f32) Rotation {
+        return .{ .cs = @cos(spin), .ss = @sin(spin), .ct = @cos(tilt), .st = @sin(tilt) };
     }
+    /// Spin about Y, then tilt about X. z > 0 faces the viewer.
+    fn apply(r: Rotation, v: Vec) Vec {
+        const x1 = v.x * r.cs + v.z * r.ss;
+        const z1 = -v.x * r.ss + v.z * r.cs;
+        return .{ .x = x1, .y = v.y * r.ct - z1 * r.st, .z = v.y * r.st + z1 * r.ct };
+    }
+};
+
+fn fibonacciDirection(i: usize, n: usize) Vec {
+    const fi: f32 = @floatFromInt(i);
+    const y = 1.0 - (fi + 0.5) * 2.0 / @as(f32, @floatFromInt(n));
+    const r = @sqrt(@max(0.0, 1.0 - y * y));
+    const theta = fi * golden_angle;
+    return .{ .x = @cos(theta) * r, .y = y, .z = @sin(theta) * r };
+}
+
+/// Uniform random unit vector from hash bits.
+fn randomDirection(bits: u64) Vec {
+    const z = 2.0 * unit(bits) - 1.0;
+    const phi = unit(bits >> 16) * 6.2831853;
+    const r = @sqrt(@max(0.0, 1.0 - z * z));
+    return .{ .x = @cos(phi) * r, .y = z, .z = @sin(phi) * r };
+}
+
+/// Low-frequency relief on the unit sphere, in radius units (about ±0.03):
+/// three crossed sine bands, so it reads as continents and ridges rather
+/// than noise. Body-fixed, with a very slow drift.
+fn relief(dir: Vec, time: f32) f32 {
+    const t = time * 0.05;
+    const a = @sin(3.1 * dir.x + 1.7 * dir.y + t) * @sin(2.3 * dir.z - 1.1 * dir.x - t * 0.7);
+    const b = @sin(5.3 * dir.y + 2.9 * dir.z + 0.6 * dir.x + t * 1.3);
+    return 0.022 * a + 0.011 * b;
+}
+
+fn unit(bits: u64) f32 {
+    return @as(f32, @floatFromInt(bits & 0xffff)) / 65535.0;
+}
+
+/// Add one soft particle to the light buffer: a bright centre with a dim
+/// cross around it. Intensity accumulates in the blue channel; `warmth`
+/// (0..1, from depth) goes to red so the compositor can tint arc heads and
+/// front-most cores toward white.
+fn splat(light: []u8, width: u16, height: u16, fx: f32, fy: f32, intensity: f32, warmth: f32) void {
+    if (fx < 1.0 or fy < 1.0 or fx >= @as(f32, @floatFromInt(width)) - 1.0 or fy >= @as(f32, @floatFromInt(height)) - 1.0) return;
+    const x: usize = @intFromFloat(fx);
+    const y: usize = @intFromFloat(fy);
+    const w: usize = width;
+    const centre = @min(1.0, intensity);
+    addLight(light, (y * w + x) * 3, centre, if (intensity > 0.9) warmth * 0.5 else 0.0);
+    const side = centre * 0.30;
+    addLight(light, (y * w + x - 1) * 3, side, 0.0);
+    addLight(light, (y * w + x + 1) * 3, side, 0.0);
+    addLight(light, ((y - 1) * w + x) * 3, side, 0.0);
+    addLight(light, ((y + 1) * w + x) * 3, side, 0.0);
+}
+
+fn addLight(light: []u8, i: usize, amount: f32, warm: f32) void {
+    light[i + 2] = channel(@as(f32, @floatFromInt(light[i + 2])) + amount * 255.0);
+    if (warm > 0.0) light[i] = channel(@as(f32, @floatFromInt(light[i])) + warm * 255.0);
 }
 
 fn hash(x: u16, y: u16, frame: u64, seed: u64) u64 {

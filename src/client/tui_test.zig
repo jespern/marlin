@@ -637,7 +637,7 @@ test "composer suggestions include commands, council actions, and council names"
     suggestions = try commandSuggestions(&app, arena_state.allocator());
     try std.testing.expectEqual(@as(usize, 1), suggestions.len);
     try std.testing.expectEqualStrings("/screensaver orb", suggestions[0].label);
-    try std.testing.expect(std.mem.indexOf(u8, suggestions[0].description, "pixelated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, suggestions[0].description, "particles") != null);
 
     app.view.editor.clear();
     app.view.editor.insertSlice("/screensaver tu");

@@ -49,7 +49,7 @@ pub const Kind = enum {
             .horizon => "synthwave horizon (Kitty graphics)",
             .demo => "24-second pixel demoscene sequence (Kitty graphics)",
             .daybreak => "a landscape that follows the real sun over your machine (Kitty graphics)",
-            .orb => "a pixelated thinking orb: a globe of nodes with pulses firing between them, over blurred Marlin (Kitty graphics)",
+            .orb => "a thinking orb: a glowing, slowly turning sphere of thousands of particles, over blurred Marlin (Kitty graphics)",
             .wipeout => "wipEout, playable (Kitty graphics; start with !wipeout)",
         };
     }

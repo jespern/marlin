@@ -1209,13 +1209,14 @@ A split pane identifies its session with a compact pane label.
   tunnel, metaballs, horizon, a 24-second `demo` sequence, a floating `orb`
   (`client/orb.zig`) whose first transmitted frame rasterizes the already-drawn
   Vaxis cell grid into a dimmed two-pass box-blurred backdrop and whose later
-  frames reuse that snapshot beneath a 60 FPS thinking orb: 168 nodes on a
-  Fibonacci sphere turning about a tilted axis, dim at the back and bright
-  at the front over a faint navy body, with pulses firing along edges between
-  neighbouring nodes on hashed clocks (about one pair in six is a synapse,
-  plus rare long arcs across the globe) and a warm flash where a pulse
-  lands; everything is drawn on a coarse block grid and each frame is a pure
-  function of (frame, seed), and a `daybreak` landscape (`client/daybreak.zig`, after Jani Ylikangas'
+  frames reuse that snapshot beneath a 60 FPS thinking orb: a sphere of a few
+  thousand tiny additive particles (a hashed random shell, a sparse interior
+  mist, and a drifting halo) turning about a tilted axis, dense and bright at
+  the limb where the projection stacks them, breathing and shimmering, with
+  a slow body-fixed relief (crossed sine bands, a few percent of radius)
+  that lifts and brightens some regions so the shell has texture; a box-blurred
+  bloom of the light layer is added back over the sharp particles, and each
+  frame is a pure function of (frame, seed), and a `daybreak` landscape (`client/daybreak.zig`, after Jani Ylikangas'
   js1k 2019 entry: composed in the original's 1900×900 canvas units and
   scaled per axis, rasterized with coverage anti-aliasing — the original's
   faint ranges are sub-pixel fillRect widths, which coverage reproduces.

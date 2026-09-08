@@ -37,13 +37,15 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(background);
     const rgb = try gpa.alloc(u8, len);
     defer gpa.free(rgb);
+    const scratch = try gpa.alloc(u8, len * 2);
+    defer gpa.free(scratch);
     syntheticBackdrop(background, width, height);
 
     try std.Io.Dir.cwd().createDirPath(io, out_dir);
     var dir = try std.Io.Dir.cwd().openDir(io, out_dir, .{});
     defer dir.close(io);
     for (frames.items) |frame| {
-        orb.render(rgb, background, width, height, frame, 9);
+        orb.render(rgb, scratch, background, width, height, frame, 9);
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "orb-{d:0>5}.ppm", .{frame});
         var file = try dir.createFile(io, name, .{});
