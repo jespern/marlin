@@ -880,14 +880,16 @@ const Race = struct {
 /// Uses the Kitty keyboard protocol so key releases are reported; without
 /// it a game needs auto-repeat hacks to know when a key is let go.
 const KeyReader = struct {
-    const legacy_hold_ns: i128 = 180 * std.time.ns_per_ms;
+    const legacy_hold_ns: i64 = 180 * std.time.ns_per_ms;
 
     gpa: std.mem.Allocator,
     io: Io,
     tty: vaxis.Tty,
     /// Legacy (non-Kitty) input has no key releases; a plain-byte press
     /// stays held until `legacy_hold_ns` pass without a repeat.
-    legacy_until: [wipeout.input.count]std.atomic.Value(i128) = undefined,
+    /// i64 nanoseconds, not the clock's i128: x86-64 baseline has no 128-bit
+    /// atomics, and the release build failed on exactly that.
+    legacy_until: [wipeout.input.count]std.atomic.Value(i64) = undefined,
     tty_buffer: [4096]u8 = undefined,
     thread: ?std.Thread = null,
     held: [wipeout.input.count]std.atomic.Value(bool) = undefined,
@@ -901,7 +903,7 @@ const KeyReader = struct {
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .io = io, .tty = undefined };
         for (&self.held) |*h| h.* = std.atomic.Value(bool).init(false);
-        for (&self.legacy_until) |*l| l.* = std.atomic.Value(i128).init(0);
+        for (&self.legacy_until) |*l| l.* = std.atomic.Value(i64).init(0);
         self.tty = try vaxis.Tty.init(io, &self.tty_buffer);
         self.thread = try std.Thread.spawn(.{}, readLoop, .{self});
         return self;
@@ -917,7 +919,7 @@ const KeyReader = struct {
 
     fn snapshot(self: *KeyReader) [wipeout.input.count]bool {
         var out: [wipeout.input.count]bool = undefined;
-        const t = now(self.io);
+        const t: i64 = @intCast(now(self.io));
         for (&out, 0..) |*o, i| {
             const until = self.legacy_until[i].load(.acquire);
             if (until != 0 and t > until) {
@@ -932,7 +934,7 @@ const KeyReader = struct {
     /// Plain-byte press with no release to come: hold briefly.
     fn legacyPress(self: *KeyReader, action: wipeout.input.Action) void {
         self.held[@intFromEnum(action)].store(true, .release);
-        self.legacy_until[@intFromEnum(action)].store(now(self.io) + legacy_hold_ns, .release);
+        self.legacy_until[@intFromEnum(action)].store(@as(i64, @intCast(now(self.io))) + legacy_hold_ns, .release);
     }
 
     fn wantsQuit(self: *const KeyReader) bool {
