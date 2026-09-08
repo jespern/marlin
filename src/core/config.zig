@@ -108,7 +108,7 @@ pub const Config = struct {
     /// fixed tailnet https URL (the tailnet is the trust boundary). Opt in
     /// with `[web] tailscale = true`; absent/unavailable CLI stays loopback-only.
     web_tailscale: bool = false,
-    /// Standards-based phone push via the bundled Node.js delivery helper.
+    /// Standards-based phone push via the bounded `marlin _push` helper.
     web_push: bool = false,
 
     /// Advertise this daemon on the LAN as `_marlin._tcp` (Bonjour, via the

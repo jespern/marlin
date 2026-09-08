@@ -566,7 +566,7 @@ pub const Daemon = struct {
             std.log.info("OTLP trace export enabled", .{});
         }
 
-        var phone_push = mobile_push.Worker.init(gpa, io, environ);
+        var phone_push = mobile_push.Worker.init(gpa, io, environ, self.marlin_exe orelse "");
         defer phone_push.deinit();
         if (cfg.web_push) {
             phone_push.presence = &self.presence;

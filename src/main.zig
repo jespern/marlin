@@ -118,6 +118,7 @@ test {
     _ = @import("wipeout/hud_test.zig");
     _ = @import("client/web_test.zig");
     _ = @import("mobile/presence_test.zig");
+    _ = @import("mobile/webpush_test.zig");
     _ = @import("daemon/web_service_test.zig");
     _ = @import("testing/fixture_tests.zig");
     _ = @import("client/render_test.zig");

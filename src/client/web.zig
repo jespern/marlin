@@ -348,8 +348,8 @@ fn servePush(ctx: *ConnCtx, req: *std.http.Server.Request, path: []const u8, acc
             return;
         };
     }
-    const result = mobile_push.run(ctx.gpa, ctx.io, ctx.environ, action, input) catch {
-        try reply(req, access, "phone push unavailable; check Node.js and the subscription", .{ .status = .service_unavailable });
+    const result = mobile_push.run(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe, action, input) catch {
+        try reply(req, access, "phone push unavailable; check the subscription", .{ .status = .service_unavailable });
         return;
     };
     defer ctx.gpa.free(result);

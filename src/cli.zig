@@ -46,6 +46,7 @@ pub const Command = enum {
     sandbox_probe,
     _pipe,
     _web,
+    _push,
     _rebuild,
 
     pub fn parse(word: []const u8) ?Command {
@@ -145,6 +146,9 @@ pub fn dispatch(
         .reboot => return headless.reboot(gpa, io, environ, self_exe, rest),
         .shutdown => return headless.shutdown(gpa, io, environ),
         ._web => return web.serve(gpa, io, environ, self_exe, rest),
+        // Web Push helper (daemon- and web-spawned): crypto + delivery in a
+        // bounded subprocess, formerly the Node.js script.
+        ._push => return @import("mobile/webpush.zig").run(gpa, io, environ, rest),
         .web => {
             if (rest.len != 0) {
                 try stderrPrint(io, "marlin web shows the managed companion status; configure [web] port instead of --port.\n", .{});
