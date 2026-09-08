@@ -15,7 +15,8 @@
 //!            Ctrl+R fuzzy-searches authored input history;
 //!            readline/macOS movement and deletion chords are supported;
 //!            Esc → normal (draft survives); Ctrl+C interrupts active work
-//!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom; gs screensaver;
+//!   normal:  ? shortcuts; Esc/i insert; j/k scroll; g/G top/bottom; gs screensaver
+//!            (Ctrl+Backspace: the orb, from any mode);
 //!            / searches this transcript; </> or Left/Right switch tabs; q quit
 //!   global:  Ctrl+N creates a session; Ctrl+D/Ctrl+W archive when input is empty;
 //!            Ctrl+L clears/redraws and returns to bottom;
@@ -4484,6 +4485,7 @@ pub const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "␣text", .description = "leading space sends a /… or !… message verbatim" },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
     .{ .key = "Ctrl+T", .description = "toggle tool transcript" },
+    .{ .key = "Ctrl+Backspace", .description = "start the orb screensaver" },
     .{ .key = "Ctrl+C", .description = "interrupt the active turn" },
 };
 

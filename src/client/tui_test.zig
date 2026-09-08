@@ -720,6 +720,17 @@ test "named animations and screensavers share the selected effect engine" {
     try std.testing.expect(!app.shell_requested);
     try std.testing.expectEqual(effects.Kind.strings, app.effect_engine.?.kind());
     try std.testing.expect(app.dismissScreensaver());
+
+    // Ctrl+Backspace starts the orb from any mode; plain Backspace does not.
+    app.mode = .normal;
+    try handleKey(&app, .{ .codepoint = vaxis.Key.backspace });
+    try std.testing.expect(!app.screensaver_active);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.backspace, .mods = .{ .ctrl = true } });
+    try std.testing.expect(app.screensaver_active);
+    // Without Kitty graphics the orb starts as its cell fallback.
+    try std.testing.expectEqual(effects.Kind.orb.fallback(), app.effect_engine.?.kind());
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expect(app.dismissScreensaver());
 }
 
 test "manual-only Tetris cannot become the automatic screensaver" {

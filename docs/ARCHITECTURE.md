@@ -1298,7 +1298,8 @@ A split pane identifies its session with a compact pane label.
   and config-file validation reject it. Bare `/screensaver`, automatic
   activation, and normal-mode `gs` use `[ui] screensaver_effect` (default
   `"matrix"`). `gs` switches to insert mode before
-  entering the saver. A key or paste dismisses it and is consumed; mouse events
+  entering the saver; `Ctrl+Backspace` starts the orb from any mode (it needs
+  the Kitty keyboard protocol to be told apart from Ctrl+H). A key or paste dismisses it and is consumed; mouse events
   are ignored and do not reset inactivity. `[ui] screensaver_after = "10m"`
   enables per-client inactivity activation; absent or `"off"` disables it.
   Daemon/provider activity does not count as user activity.

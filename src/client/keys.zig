@@ -106,6 +106,15 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
+    // Ctrl+Backspace: straight into the orb, from any mode. Needs a terminal
+    // that reports Backspace with its modifiers (Kitty keyboard protocol);
+    // legacy encodings fold it into Ctrl+H, which stays composer backspace.
+    if (key.matches(vaxis.Key.backspace, .{ .ctrl = true })) {
+        app.mode = .insert;
+        app.startScreensaver(.orb);
+        return;
+    }
+
     if (key.matches('v', .{ .ctrl = true })) {
         app.attachClipboard();
         return;
