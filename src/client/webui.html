@@ -144,7 +144,23 @@
   #status .state.awaiting_approval { color: var(--yellow); }
   #status .state.err { color: var(--red); }
   #status .notice { color: var(--yellow); }
+  #status .model { cursor: pointer; }
+  #status .model:hover { color: var(--fg); }
   #status .right { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+  #picker {
+    /* left/bottom are set on open, anchored to the clicked model name */
+    position: fixed; width: min(420px, calc(100vw - 24px));
+    max-height: 50vh; display: none; flex-direction: column; z-index: 30;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  }
+  #picker.show { display: flex; }
+  #picker input {
+    background: transparent; border: 0; outline: 0; color: var(--fg); font: inherit;
+    padding: 8px 12px; border-bottom: 1px solid var(--line);
+  }
+  #picker-list { overflow-y: auto; }
+  #picker-list div { padding: 5px 12px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #picker-list div:hover, #picker-list div.sel { background: var(--panel2); color: var(--accent); }
   #interrupt {
     display: none; padding: 1px 6px; min-width: 26px; align-items: center;
     justify-content: center; border-color: transparent; background: transparent;
@@ -235,8 +251,12 @@
     <input id="input" autocomplete="off" spellcheck="false" autocapitalize="off"
       autocorrect="off" enterkeyhint="send" placeholder="message marlin…">
   </div>
+  <div id="picker" role="listbox">
+    <input id="picker-filter" placeholder="filter models…" autocomplete="off">
+    <div id="picker-list"></div>
+  </div>
   <div id="status">
-    <span class="state">idle</span><span>·</span><span class="model"></span>
+    <span class="state">idle</span><span>·</span><span class="model" title="switch model"></span>
     <span class="notice"></span>
     <span class="right">
       <button id="sandbox-btn" class="act">⛨ sandbox</button>
@@ -519,9 +539,21 @@ function disarmInterrupt() {
   button.setAttribute('aria-label', 'interrupt running turn');
 }
 
+const spinFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+let spinTimer = null, spinIndex = 0;
 function setState(state) {
   const st = $('#status .state');
-  st.textContent = state;
+  if (spinTimer) { clearInterval(spinTimer); spinTimer = null; }
+  if (state === 'running') {
+    // The TUI's braille spinner; static "running" reads as stuck.
+    st.textContent = spinFrames[spinIndex] + ' running';
+    spinTimer = setInterval(() => {
+      spinIndex = (spinIndex + 1) % spinFrames.length;
+      st.textContent = spinFrames[spinIndex] + ' running';
+    }, 100);
+  } else {
+    st.textContent = state;
+  }
   st.className = 'state ' + state;
   $('#interrupt').classList.toggle('show', state === 'running' || state === 'awaiting_approval');
   if (state !== 'running' && state !== 'awaiting_approval') disarmInterrupt();
@@ -656,6 +688,7 @@ function renderSessions(list) {
       tabTitle(s);
       $('#sandbox-btn').classList.toggle('on', !!s.sandboxed);
       $('#sandbox-btn').textContent = s.sandboxed ? '⛨ sandboxed' : '⛨ sandbox off';
+      $('#sandbox-btn').title = s.sandboxed ? 'click to disable the shell sandbox' : 'click to enable the shell sandbox';
     }
   }
 }
@@ -708,6 +741,11 @@ $('#input').addEventListener('keydown', async e => {
   if (e.key !== 'Enter') return;
   const text = e.target.value.trim();
   if (!text || !sid) return;
+  if (text.startsWith('/')) {
+    e.target.value = '';
+    slashCommand(text).catch(() => notice('command failed'));
+    return;
+  }
   const targetSid = sid;
   const state = $('#status .state').textContent;
   const pending = addOptimisticInput(targetSid, text, state === 'running' || state === 'awaiting_approval');
@@ -766,6 +804,96 @@ $('#sandbox-btn').onclick = async () => {
   const r = await send('{"session_set_sandbox":{"sid":' + sid + ',"enabled":' + (!cur.sandboxed) + '}}');
   if (r.err) notice(r.err.msg); else loadSessions();
 };
+// ---- model picker and composer slash commands ----
+let pickerModels = [];
+function closePicker() { $('#picker').classList.remove('show'); }
+function renderPicker(filter) {
+  const list = $('#picker-list');
+  list.replaceChildren();
+  const f = filter.toLowerCase();
+  for (const m of pickerModels) {
+    if (f && !m.toLowerCase().includes(f)) continue;
+    const row = el('div', null, m);
+    if (cur && m === cur.model) row.classList.add('sel');
+    row.onclick = () => { closePicker(); setModel(m); };
+    list.appendChild(row);
+    if (list.children.length >= 400) break;
+  }
+}
+async function openModelPicker() {
+  if (!sid) return;
+  const r = await send('{"model_list":{}}');
+  pickerModels = ((r.model_list_result || {}).models || []);
+  if (!pickerModels.length && cur && cur.model) pickerModels = [cur.model];
+  $('#picker-filter').value = '';
+  renderPicker('');
+  const picker = $('#picker');
+  // Anchor above the model name, clamped so it never leaves the viewport.
+  // Show first: offsetWidth reads 0 while display is none.
+  picker.classList.add('show');
+  const anchor = $('#status .model').getBoundingClientRect();
+  picker.style.left = Math.max(12, Math.min(anchor.left, innerWidth - picker.offsetWidth - 12)) + 'px';
+  picker.style.bottom = (innerHeight - anchor.top + 6) + 'px';
+  $('#picker-filter').focus();
+}
+async function setModel(model) {
+  const r = await send('{"session_set_model":{"sid":' + sid + ',"model":' + JSON.stringify(model) + '}}');
+  if (r.err) { notice(r.err.msg); return; }
+  $('#status .model').textContent = model;
+  loadSessions();
+}
+$('#status .model').onclick = () => {
+  if ($('#picker').classList.contains('show')) closePicker();
+  else openModelPicker().catch(() => notice('could not load models'));
+};
+$('#picker-filter').addEventListener('input', e => renderPicker(e.target.value));
+$('#picker-filter').addEventListener('keydown', e => {
+  if (e.key === 'Escape') closePicker();
+  if (e.key === 'Enter') {
+    const first = $('#picker-list').firstChild;
+    if (first) { closePicker(); setModel(first.textContent); }
+  }
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePicker(); });
+
+// The composer accepts the session-scoped subset of slash commands; the rest
+// belong to the terminal (screensavers, reboot, voice…) and say so.
+async function slashCommand(raw) {
+  const space = raw.indexOf(' ');
+  const cmd = space < 0 ? raw : raw.slice(0, space);
+  const arg = space < 0 ? '' : raw.slice(space + 1).trim();
+  let r = null;
+  if (cmd === '/model') {
+    if (!arg) return openModelPicker();
+    r = await send('{"session_set_model":{"sid":' + sid + ',"model":' + JSON.stringify(arg) + '}}');
+    if (!r.err) $('#status .model').textContent = arg;
+  } else if (cmd === '/sandbox') {
+    const enable = arg === 'on' ? true : arg === 'off' ? false : !(cur && cur.sandboxed);
+    r = await send('{"session_set_sandbox":{"sid":' + sid + ',"enabled":' + enable + '}}');
+  } else if (cmd === '/permissions') {
+    const full = arg === 'full' ? true : arg === 'default' ? false : !(cur && cur.full_access);
+    r = await send('{"session_set_approvals":{"sid":' + sid + ',"approvals":"' + (full ? 'auto' : 'default') + '"}}');
+    if (!r.err) notice(full ? 'FULL ACCESS — nothing asks for approval' : 'default approvals restored');
+  } else if (cmd === '/compact') {
+    r = await send('{"session_compact":{"sid":' + sid + '}}');
+    if (!r.err) notice('compacting…');
+  } else if (cmd === '/rename') {
+    if (!arg) { notice('usage: /rename <title>'); return; }
+    r = await send('{"session_rename":{"sid":' + sid + ',"title":' + JSON.stringify(arg) + '}}');
+  } else if (cmd === '/archive') {
+    r = await send('{"session_archive":{"sid":' + sid + ',"archived":true}}');
+    if (!r.err) { sid = null; await loadSessions(); return; }
+  } else if (cmd === '/new') {
+    return $('#new-btn').onclick();
+  } else if (cmd === '/interrupt') {
+    r = await send('{"interrupt":{"sid":' + sid + ',"report":true}}');
+  } else {
+    notice(cmd + ' works in the terminal, not here');
+    return;
+  }
+  if (r && r.err) notice(r.err.msg);
+  else await loadSessions();
+}
 $('#topbar .title').onclick = () => { if (cur) renameSession(cur); };
 $('#menu-btn').onclick = () => drawer(!$('#side').classList.contains('open'));
 $('#backdrop').onclick = () => drawer(false);
