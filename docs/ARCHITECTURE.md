@@ -1211,8 +1211,8 @@ A split pane identifies its session with a compact pane label.
   Vaxis cell grid into a dimmed two-pass box-blurred backdrop and whose later
   frames reuse that snapshot beneath a 60 FPS thinking orb: a sphere of a few
   thousand tiny additive particles (a hashed random shell, a sparse interior
-  mist, and a drifting halo) turning about an axis that itself wanders (tilt
-  breathing between ~15° and ~60°, azimuth precessing over ~90 s), dense and bright at
+  mist, and a drifting halo) turning about the vertical so the surface
+  moves right, the pole nodding inside a ~15° cone on slow periods, dense and bright at
   the limb where the projection stacks them, breathing and shimmering, with
   a slow body-fixed relief (crossed sine bands, a few percent of radius)
   that lifts and brightens some regions so the shell has texture; a box-blurred

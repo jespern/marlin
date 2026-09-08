@@ -75,9 +75,9 @@ pub fn render(rgb: []u8, scratch: []u8, background: []const u8, width: u16, heig
     const cx = w * 0.5 + @sin(time * 0.23 + seedPhase(seed)) * w * 0.015;
     const cy = h * 0.48 + @sin(time * 0.41 + 1.7) * h * 0.010;
 
-    // The spin axis itself wanders: its tilt breathes between about 15° and
-    // 60° and its azimuth precesses once every ~90 s, so the globe tumbles
-    // through different orientations over time instead of turning on rails.
+    // Mostly a plain spin about the vertical, so the surface moves to the
+    // right, with the pole nodding within a ~15° cone on slow, incommensurate
+    // periods so the motion never quite repeats or turns on rails.
     const spin = time * 0.22 + seedPhase(seed);
     const axis = wanderingAxis(time, seed);
     const rot = Rotation.init(axis, spin);
@@ -188,13 +188,14 @@ const Rotation = struct {
     }
 };
 
-/// The spin axis as a unit vector: mostly upright, its tilt from vertical
-/// drifting between ~15° and ~60° and its azimuth precessing slowly. Both
-/// periods are long and incommensurate so the tumble does not repeat soon.
+/// The spin axis as a unit vector: vertical with a slow nod. The tilt from
+/// vertical breathes between ~2° and ~15° and its direction precesses
+/// slowly, so the pole wobbles inside a 15° cone.
 fn wanderingAxis(time: f32, seed: u64) Vec {
     const phase = seedPhase(seed);
-    const tilt = 0.65 + 0.40 * @sin(time * 0.047 + phase * 0.7);
-    const azimuth = time * 0.070 + phase;
+    const max_tilt: f32 = 0.262; // 15°
+    const tilt = max_tilt * (0.55 + 0.45 * @sin(time * 0.05 + phase * 0.7));
+    const azimuth = time * 0.07 + phase;
     const st = @sin(tilt);
     return .{ .x = st * @cos(azimuth), .y = @cos(tilt), .z = st * @sin(azimuth) };
 }
