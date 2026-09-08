@@ -75,9 +75,12 @@ pub fn render(rgb: []u8, scratch: []u8, background: []const u8, width: u16, heig
     const cx = w * 0.5 + @sin(time * 0.23 + seedPhase(seed)) * w * 0.015;
     const cy = h * 0.48 + @sin(time * 0.41 + 1.7) * h * 0.010;
 
+    // The spin axis itself wanders: its tilt breathes between about 15° and
+    // 60° and its azimuth precesses once every ~90 s, so the globe tumbles
+    // through different orientations over time instead of turning on rails.
     const spin = time * 0.22 + seedPhase(seed);
-    const tilt: f32 = 0.38;
-    const rot = Rotation.init(spin, tilt);
+    const axis = wanderingAxis(time, seed);
+    const rot = Rotation.init(axis, spin);
 
     // Surface shell: Fibonacci-distributed, each particle jittered slightly
     // off the sphere and shimmering along its normal so the surface looks
@@ -121,7 +124,7 @@ pub fn render(rgb: []u8, scratch: []u8, background: []const u8, width: u16, heig
         const life = @mod(time * (0.06 + 0.08 * unit(key >> 8)) + unit(key), 1.0);
         const dir = randomDirection(key >> 4);
         const r = 1.02 + 0.5 * life;
-        const p = Rotation.init(-spin * 0.6 + life * 0.8, tilt).apply(dir.scale(r));
+        const p = Rotation.init(axis, -spin * 0.6 + life * 0.8).apply(dir.scale(r));
         const depth = (p.z + 1.0) * 0.5;
         const fade = (1.0 - life) * (1.0 - life);
         splat(light, width, height, cx + p.x * radius, cy + p.y * radius, 0.7 * fade * (0.4 + 0.6 * depth), depth);
@@ -164,21 +167,37 @@ const Vec = struct {
     }
 };
 
+/// Rotation by `angle` about the unit vector `axis` (Rodrigues' formula).
 const Rotation = struct {
-    cs: f32,
-    ss: f32,
-    ct: f32,
-    st: f32,
-    fn init(spin: f32, tilt: f32) Rotation {
-        return .{ .cs = @cos(spin), .ss = @sin(spin), .ct = @cos(tilt), .st = @sin(tilt) };
+    u: Vec,
+    c: f32,
+    s: f32,
+    fn init(axis: Vec, angle: f32) Rotation {
+        return .{ .u = axis, .c = @cos(angle), .s = @sin(angle) };
     }
-    /// Spin about Y, then tilt about X. z > 0 faces the viewer.
+    /// z > 0 faces the viewer.
     fn apply(r: Rotation, v: Vec) Vec {
-        const x1 = v.x * r.cs + v.z * r.ss;
-        const z1 = -v.x * r.ss + v.z * r.cs;
-        return .{ .x = x1, .y = v.y * r.ct - z1 * r.st, .z = v.y * r.st + z1 * r.ct };
+        const u = r.u;
+        const dot = u.x * v.x + u.y * v.y + u.z * v.z;
+        const k = (1.0 - r.c) * dot;
+        return .{
+            .x = v.x * r.c + (u.y * v.z - u.z * v.y) * r.s + u.x * k,
+            .y = v.y * r.c + (u.z * v.x - u.x * v.z) * r.s + u.y * k,
+            .z = v.z * r.c + (u.x * v.y - u.y * v.x) * r.s + u.z * k,
+        };
     }
 };
+
+/// The spin axis as a unit vector: mostly upright, its tilt from vertical
+/// drifting between ~15° and ~60° and its azimuth precessing slowly. Both
+/// periods are long and incommensurate so the tumble does not repeat soon.
+fn wanderingAxis(time: f32, seed: u64) Vec {
+    const phase = seedPhase(seed);
+    const tilt = 0.65 + 0.40 * @sin(time * 0.047 + phase * 0.7);
+    const azimuth = time * 0.070 + phase;
+    const st = @sin(tilt);
+    return .{ .x = st * @cos(azimuth), .y = @cos(tilt), .z = st * @sin(azimuth) };
+}
 
 fn fibonacciDirection(i: usize, n: usize) Vec {
     const fi: f32 = @floatFromInt(i);
