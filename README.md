@@ -286,7 +286,9 @@ The install is sanity-checked and atomically replaces the resolved executable.
 That means an install.sh binary in `~/.local/bin` is replaced directly; a
 Homebrew entry keeps its public symlink and replaces the currently linked keg
 binary. Homebrew may overwrite that development build during a later upgrade or
-reinstall. For a development build that survives Homebrew upgrades, use an
+reinstall. If Homebrew's public path holds a regular file instead of its
+symlink (an old clobbered install), the installer refuses and prints the
+`rm … && brew link marlin` that repairs it. For a development build that survives Homebrew upgrades, use an
 explicit `~/.local/bin` target and keep that directory before Homebrew in
 `PATH`. To choose an explicit destination instead of the active `PATH` entry:
 

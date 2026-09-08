@@ -98,8 +98,32 @@ test_explicit_target_and_non_marlin_refusal() {
         fail "non-marlin refusal was not explained"
 }
 
+test_refuses_clobbered_homebrew_link() {
+    case_root=$TEST_ROOT/clobbered
+    candidate=$case_root/build/marlin
+    prefix=$case_root/homebrew
+    destination=$prefix/bin/marlin
+    make_marlin "$candidate" dev
+    make_marlin "$destination" old-dev
+    # A fake brew that reports our prefix.
+    mkdir -p "$case_root/tools"
+    {
+        printf '#!/bin/sh\n'
+        printf "printf '%%s\\\\n' '%s'\n" "$prefix"
+    } > "$case_root/tools/brew"
+    chmod 755 "$case_root/tools/brew"
+
+    if PATH="$prefix/bin:$case_root/tools:/usr/bin:/bin" \
+        "$ROOT/scripts/install-dev.sh" "$candidate" > "$case_root/output" 2>&1; then
+        fail "regular file in Homebrew's bin was replaced"
+    fi
+    assert_version "$destination" old-dev
+    grep -Fq "brew link marlin" "$case_root/output" || fail "clobbered-link refusal did not explain the fix"
+}
+
 test_installs_over_active_regular_binary
 test_preserves_homebrew_style_symlink
+test_refuses_clobbered_homebrew_link
 test_first_install_uses_local_bin
 test_explicit_target_and_non_marlin_refusal
 
