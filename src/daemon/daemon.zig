@@ -41,6 +41,7 @@ const Io = std.Io;
 
 const proto = @import("../core/proto.zig");
 const web_service_mod = @import("web_service.zig");
+const discovery = @import("../core/discovery.zig");
 const mobile_push = @import("../mobile/push.zig");
 const mobile_presence = @import("../mobile/presence.zig");
 const block = @import("../core/block.zig");
@@ -317,6 +318,8 @@ pub const Daemon = struct {
     cfg: config.Config,
     phone_push: ?*mobile_push.Worker = null,
     web_service: ?*web_service_mod.Service = null,
+    /// LAN discovery (Bonjour); set while advertising so session-count changes update the record.
+    advertiser: ?*discovery.Advertiser = null,
     presence: mobile_presence.Shared = .{},
     extensions: *extensions.Runtime,
     /// A successful `/mcp reload` owns the newly read config here because the
@@ -569,6 +572,18 @@ pub const Daemon = struct {
             phone_push.presence = &self.presence;
             try phone_push.start();
             self.phone_push = &phone_push;
+        }
+
+        // LAN discovery: advertise `_marlin._tcp` through the system responder
+        // so `marlin discover` elsewhere lists this daemon. Visibility only —
+        // attaching is still ssh. e2e daemons run with MARLIN_DISCOVERY=0.
+        var advertiser = discovery.Advertiser{};
+        defer advertiser.stop();
+        if (cfg.discovery_enabled and discovery.supported) {
+            const user = environ.get("USER") orelse "";
+            if (advertiser.start(io, build_options.version, user, self.sessions.count())) {
+                self.advertiser = &advertiser;
+            } else |err| std.log.warn("discovery: not advertising: {t}", .{err});
         }
 
         var companion = web_service_mod.Service{ .gpa = gpa, .io = io, .environ = environ, .exe = self.marlin_exe orelse "", .port = cfg.web_port };
@@ -3747,6 +3762,7 @@ pub const Daemon = struct {
     /// clients opt into catalog deltas, so ordinary mutations never scan or
     /// encode the complete durable session table.
     fn broadcastLegacySessionList(self: *Daemon) void {
+        if (self.advertiser) |a| a.setSessions(self.sessions.count());
         if (!self.hasLegacySessionWatcher()) return;
         const rows = self.store.listSessions(false) catch return;
         defer {
@@ -3767,6 +3783,7 @@ pub const Daemon = struct {
     }
 
     fn fanOutSessionDelta(self: *Daemon, line: []const u8) void {
+        if (self.advertiser) |a| a.setSessions(self.sessions.count());
         const ctx = struct { daemon: *Daemon, encoded: []const u8 }{ .daemon = self, .encoded = line };
         self.forEachClient(ctx, struct {
             fn send(value: @TypeOf(ctx), client: *Client) void {
@@ -4258,6 +4275,7 @@ pub const Daemon = struct {
 
     fn shutdownCleanup(self: *Daemon) void {
         if (self.web_service) |service| service.stop();
+        if (self.advertiser) |a| a.stop();
         self.sleep_assertion.sync(false);
         self.clients_mutex.lockUncancelable(self.io);
         self.accepting_clients = false;

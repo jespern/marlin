@@ -135,3 +135,14 @@ test "companion port accepts explicit ports and rejects zero or overflow" {
     try std.testing.expectError(error.InvalidValue, parse(arena.allocator(), "[web]\nport = 0\n"));
     try std.testing.expectError(error.ExpectedUnsigned, parse(arena.allocator(), "[web]\nport = 65536\n"));
 }
+
+test "[discovery] enabled parses; absent stays null so the default (on) applies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const off = try parse(arena.allocator(), "[discovery]\nenabled = false\n");
+    try std.testing.expect(!off.discovery_enabled.?);
+    const on = try parse(arena.allocator(), "[discovery]\nenabled = true\n");
+    try std.testing.expect(on.discovery_enabled.?);
+    const absent = try parse(arena.allocator(), "[web]\nport = 8378\n");
+    try std.testing.expect(absent.discovery_enabled == null);
+}

@@ -309,6 +309,8 @@ fn runScenario(
     // criterion). Capability permissions are pinned off; a scenario that
     // wants them sets MARLIN_PERMISSIONS=1 in its own "env" map below.
     try env.put("MARLIN_PERMISSIONS", "0");
+    // Test daemons stay off the LAN: no Bonjour advertisement.
+    try env.put("MARLIN_DISCOVERY", "0");
     // Production's generated starter config subscribes to a remote feed.
     // Fake-provider scenarios stay hermetic unless their own env opts in.
     try env.put("MARLIN_NETWORK_BLOCKLISTS", "");

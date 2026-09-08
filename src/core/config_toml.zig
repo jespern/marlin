@@ -72,6 +72,7 @@ pub const Document = struct {
     voice_stt_bin: ?[]const u8 = null,
     web_tailscale: ?bool = null,
     web_push: ?bool = null,
+    discovery_enabled: ?bool = null,
     ui_tab_bar: ?bool = null,
     ui_bell: ?bool = null,
     ui_screensaver_after_ms: ?u64 = null,
@@ -97,6 +98,7 @@ const Section = enum {
     permissions,
     workspace,
     web,
+    discovery,
     ui,
     voice,
     network,
@@ -225,6 +227,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
                 }
                 if (std.mem.eql(u8, key, "tailscale")) doc.web_tailscale = try boolean(value);
                 if (std.mem.eql(u8, key, "push")) doc.web_push = try boolean(value);
+            },
+            .discovery => if (std.mem.eql(u8, key, "enabled")) {
+                doc.discovery_enabled = try boolean(value);
             },
             .ui => {
                 if (std.mem.eql(u8, key, "tab_bar")) doc.ui_tab_bar = try boolean(value);
@@ -360,6 +365,7 @@ fn sectionFor(name: []const u8) Section {
         .{ "permissions", Section.permissions },
         .{ "workspace", Section.workspace },
         .{ "web", Section.web },
+        .{ "discovery", Section.discovery },
         .{ "voice", Section.voice },
         .{ "ui", Section.ui },
         .{ "network", Section.network },

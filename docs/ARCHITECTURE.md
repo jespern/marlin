@@ -180,6 +180,20 @@ daemons, mutually invisible. Autostart/flock logic stays inside the user's
 runtime dir, never system-wide. Clients — local or remote — are ephemeral
 views: nothing lives in a client but a render cache and a draft input box.
 
+**Discovery (LAN).** The daemon advertises `_marlin._tcp` over Bonjour
+through the system responder (mDNSResponder via dns_sd on macOS; Avahi is
+the Linux follow-up): instance = the machine's Bonjour name, target = its
+`.local` host, TXT = marlin version, ssh user, live session count (rewritten
+in place as sessions come and go). `marlin discover [--wait S]` browses for
+up to two seconds, resolves each instance and prints the
+`--remote user@host.local` target; attaching is still ssh, so discovery is
+visibility, not access. The system responder is deliberate: it shares port
+5353 with the OS, survives name conflicts and interface changes, and lets
+Bonjour Sleep Proxy keep a sleeping laptop's record alive and wake it on
+connect. `[discovery] enabled = false` or `MARLIN_DISCOVERY=0` turns
+advertising off; e2e daemons run with it off. Code: `core/discovery.zig`
+(TXT codec, table, dns_sd backend), `client/discover.zig`.
+
 **Mode B — protocol over ssh (SHIPPED; the primary remote path).**
 
 Decision (2026-08): Mode B is the herdr/tmux replacement. The end state is

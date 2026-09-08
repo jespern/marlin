@@ -65,7 +65,8 @@ marlin top                     # live session tree, including child work
 Inside the TUI, `/new` starts a session, `/model` selects its agent/model,
 `/cwd <path>` changes its working directory while idle, `Ctrl+S` opens the
 session switcher, and `/detach` closes the client while work
-continues. `marlin --remote <host>` attaches through SSH.
+continues. `marlin --remote <host>` attaches through SSH, and `marlin discover` lists
+the marlins on your LAN over Bonjour with the `--remote` target for each.
 
 ## What makes it useful
 

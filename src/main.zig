@@ -73,6 +73,7 @@ test {
     _ = @import("core/guest_test.zig");
     _ = @import("core/proto_test.zig");
     _ = @import("core/config_test.zig");
+    _ = @import("core/discovery_test.zig");
     _ = @import("core/jsonx_test.zig");
     _ = @import("core/ids_test.zig");
     _ = @import("core/session_handle_test.zig");

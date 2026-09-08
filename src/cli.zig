@@ -10,6 +10,7 @@ const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
 const pipe = @import("client/pipe.zig");
 const remote_rebuild = @import("client/remote_rebuild.zig");
+const discover = @import("client/discover.zig");
 const top = @import("client/top.zig");
 const landlock = @import("daemon/landlock.zig");
 const permissions = @import("daemon/permissions.zig");
@@ -22,6 +23,7 @@ pub const Command = enum {
     daemon,
     run,
     ls,
+    discover,
     top,
     mk64,
     search,
@@ -116,6 +118,7 @@ pub fn dispatch(
         ),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
         .ls => return headless.ls(gpa, io, environ, self_exe, rest),
+        .discover => return discover.run(gpa, io, environ, rest),
         .top => {
             if (rest.len != 0) {
                 try stdoutPrint(io, "usage: marlin top\n", .{});
@@ -376,6 +379,8 @@ const help_text =
     \\  marlin shutdown        stop the daemon
     \\  marlin web             show the daemon-managed companion status
     \\                         (127.0.0.1:8377; tailnet via tailscale serve)
+    \\  marlin discover [--wait S]  list the marlins on this network (Bonjour)
+    \\                         with a --remote target for each
     \\  marlin --remote <host> [command …]  run any of the above against
     \\                         <host>'s daemon over ssh (host is an ssh
     \\                         destination; ssh config names apply)

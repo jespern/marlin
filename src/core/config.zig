@@ -110,6 +110,13 @@ pub const Config = struct {
     /// Standards-based phone push via the bundled Node.js delivery helper.
     web_push: bool = false,
 
+    /// Advertise this daemon on the LAN as `_marlin._tcp` (Bonjour, via the
+    /// system responder) so `marlin discover` on another machine lists it:
+    /// name, `.local` host, version, ssh user, live session count. Visibility
+    /// only — attaching is still ssh. `[discovery] enabled = false` or
+    /// `MARLIN_DISCOVERY=0` turns it off.
+    discovery_enabled: bool = true,
+
     /// TUI chrome (`[ui]`): the top tab strip. Toggleable live via /config;
     /// the daemon serializes persistence through setUiTabBar.
     ui_tab_bar: bool = true,
@@ -154,6 +161,9 @@ fn applyEnviron(c: *Config, environ: *const std.process.Environ.Map) void {
     }
     if (environ.get("MARLIN_WEB")) |v| {
         c.web_enabled = std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
+    }
+    if (environ.get("MARLIN_DISCOVERY")) |v| {
+        c.discovery_enabled = std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
     }
     if (environ.get("MARLIN_NETWORK_BLOCKLISTS")) |value| c.network_blocklists = value;
     if (environ.get("MARLIN_NETWORK_ALLOW")) |value| c.network_allow = value;
@@ -767,6 +777,7 @@ pub fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.web_port) |value| cfg.web_port = value;
     if (doc.web_tailscale) |value| cfg.web_tailscale = value;
     if (doc.web_push) |value| cfg.web_push = value;
+    if (doc.discovery_enabled) |value| cfg.discovery_enabled = value;
     if (doc.ui_tab_bar) |value| cfg.ui_tab_bar = value;
     if (doc.ui_bell) |value| cfg.ui_bell = value;
     if (doc.ui_screensaver_after_ms) |value| cfg.ui_screensaver_after_ms = value;
