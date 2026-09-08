@@ -581,7 +581,7 @@ pub const Daemon = struct {
         defer advertiser.stop();
         if (cfg.discovery_enabled and discovery.supported) {
             const user = environ.get("USER") orelse "";
-            if (advertiser.start(io, build_options.version, user, self.sessions.count())) {
+            if (advertiser.start(io, build_options.version, user, self.advertisedSessionCount())) {
                 self.advertiser = &advertiser;
             } else |err| std.log.warn("discovery: not advertising: {t}", .{err});
         }
@@ -3781,8 +3781,15 @@ pub const Daemon = struct {
     /// Compatibility path for already-running protocol-v1 clients. Current
     /// clients opt into catalog deltas, so ordinary mutations never scan or
     /// encode the complete durable session table.
+    /// What the Bonjour record advertises: sessions as `marlin ls` counts them
+    /// (durable, non-archived). The in-memory map holds only hydrated ones and
+    /// is empty at boot, so it is the wrong measure.
+    fn advertisedSessionCount(self: *Daemon) usize {
+        return @intCast(self.store.countSessions(false) catch 0);
+    }
+
     fn broadcastLegacySessionList(self: *Daemon) void {
-        if (self.advertiser) |a| a.setSessions(self.sessions.count());
+        if (self.advertiser) |a| a.setSessions(self.advertisedSessionCount());
         if (!self.hasLegacySessionWatcher()) return;
         const rows = self.store.listSessions(false) catch return;
         defer {
@@ -3803,7 +3810,7 @@ pub const Daemon = struct {
     }
 
     fn fanOutSessionDelta(self: *Daemon, line: []const u8) void {
-        if (self.advertiser) |a| a.setSessions(self.sessions.count());
+        if (self.advertiser) |a| a.setSessions(self.advertisedSessionCount());
         const ctx = struct { daemon: *Daemon, encoded: []const u8 }{ .daemon = self, .encoded = line };
         self.forEachClient(ctx, struct {
             fn send(value: @TypeOf(ctx), client: *Client) void {
@@ -3843,6 +3850,7 @@ pub const Daemon = struct {
     }
 
     fn broadcastSessionTree(self: *Daemon, sid: u64, archived: bool) void {
+        if (self.advertiser) |a| a.setSessions(self.advertisedSessionCount());
         const rows = self.store.listSessionTree(sid) catch {
             self.broadcastLegacySessionList();
             return;

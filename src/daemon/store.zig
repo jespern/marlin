@@ -652,6 +652,16 @@ pub const Store = struct {
         try stepDone(stmt);
     }
 
+    /// Sessions as `marlin ls` counts them: durable rows, archived ones only
+    /// when asked. Cheap enough to run on every session-list fan-out.
+    pub fn countSessions(self: Store, include_archived: bool) Error!u64 {
+        const stmt = try self.prepare("SELECT COUNT(*) FROM sessions WHERE (? OR archived_at IS NULL)");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @intFromBool(include_archived));
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SqliteStep;
+        return @intCast(@max(c.sqlite3_column_int64(stmt, 0), 0));
+    }
+
     /// A process restart cannot resume an in-flight provider stream. Preserve
     /// the durable hierarchy but report those sessions as interrupted.
     pub fn recoverInterruptedSessions(self: Store) Error!void {

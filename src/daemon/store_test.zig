@@ -837,3 +837,18 @@ test "archiving a root hides its hierarchy and can be reversed" {
     try std.testing.expect(!restored[0].archived);
     try std.testing.expect(!restored[1].archived);
 }
+
+test "countSessions matches ls: non-archived by default, archived on request, zero when empty" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try std.testing.expectEqual(@as(u64, 0), try store.countSessions(false));
+    try store.createSession(1, 1700000000000, "/tmp", "openrouter/foo", .high);
+    try store.createSession(2, 1700000001000, "/tmp", "openrouter/foo", .high);
+    try std.testing.expectEqual(@as(u64, 2), try store.countSessions(false));
+    try store.setSessionTreeArchived(2, 1700000002000);
+    try std.testing.expectEqual(@as(u64, 1), try store.countSessions(false));
+    try std.testing.expectEqual(@as(u64, 2), try store.countSessions(true));
+    try store.setSessionTreeArchived(2, null);
+    try std.testing.expectEqual(@as(u64, 2), try store.countSessions(false));
+}
