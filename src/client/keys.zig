@@ -30,6 +30,22 @@ const commandQuery = commands.commandQuery;
 const isCommandInput = commands.isCommandInput;
 
 pub fn handleKey(app: *App, key: vaxis.Key) !void {
+    if (app.web_view) {
+        if (optionTabNavigationDirection(key)) |direction| {
+            app.web_view = false;
+            app.cycleTab(direction);
+            return;
+        }
+        if (key.mods.alt and !key.mods.ctrl and key.codepoint >= '1' and key.codepoint <= '9') {
+            app.web_view = false;
+            app.jumpToTab(@intCast(key.codepoint - '0'));
+            return;
+        }
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) app.web_view = false else if (key.matches(vaxis.Key.up, .{})) app.web_scroll +|= 1 else if (key.matches(vaxis.Key.down, .{})) app.web_scroll -|= 1 else if (key.matches('r', .{})) {
+            app.web_poll_ms = 0;
+        }
+        return;
+    }
     if (key.matches('s', .{ .ctrl = true })) {
         if (app.top_view != null) app.closeTop() else app.openTop();
         return;
@@ -686,6 +702,11 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
 /// row (the ⧉ copy affordance) copies the whole block instead.
 pub fn handleMouse(app: *App, m: vaxis.Mouse) void {
     if (app.top_view != null) return;
+    if (app.web_view and m.row >= app.tabBarRows()) {
+        if (m.button == .wheel_up) app.web_scroll +|= 3;
+        if (m.button == .wheel_down) app.web_scroll -|= 3;
+        return;
+    }
     // Some terminals report the release button as `none`, so complete an
     // active left-button drag based on event type before switching on button.
     if (m.type == .release and app.view.sel_dragging) {
@@ -716,6 +737,11 @@ pub fn handleMouse(app: *App, m: vaxis.Mouse) void {
                 // A tab flagged ! takes you TO the parked approval, not to
                 // the tree's root; keyboard jumps (alt+N, gt) stay literal.
                 .activate => {
+                    if (sid == 0) {
+                        app.openWeb();
+                        return;
+                    }
+                    app.web_view = false;
                     const target = app.awaitingSessionInTree(sid) orelse sid;
                     app.switchSession(target, true) catch app.setNotice("could not switch session", .{});
                 },

@@ -187,7 +187,7 @@ the remote-named invocation as the ONLY terminal tool in the daily drive —
 full mux (tabs, approvals, drafts), local clipboard and image paste,
 OSC 52 — with ssh as a dumb pipe underneath. No new transport protocol,
 ever. The web client is the companion for phones and terminal-less
-machines, exposed via automatic `tailscale serve` in front of the
+machines, exposed via opt-in `tailscale serve` in front of the
 localhost port (Host/Origin-checked, tokenless — the tailnet is the trust
 boundary) rather than marlin-grown TLS/auth machinery.
 
@@ -259,11 +259,13 @@ mosh box -- marlin      # roaming
 
 The daemon listens on a **unix socket** (`$XDG_RUNTIME_DIR/marlin/daemon.sock`,
 mode 0600) — that is the only listener; the TCP listener with token auth is
-(v2) design that does not exist. What DOES ship today is `marlin web`: a
-localhost-only HTTP/SSE bridge in front of the daemon socket (POC,
+(v2) design that does not exist. The daemon owns a companion child process: a
+localhost-only HTTP/SSE bridge in front of the daemon socket (
 `src/client/web.zig`). It binds 127.0.0.1, has **no authentication** — anything
 reaching the port can drive marlin, including reboot/shutdown — and therefore
 requires the explicit `[web] enabled = true` (or `MARLIN_WEB=1`) opt-in.
+The companion starts and stops with the daemon. `/web` opens its operational
+tab (bounded access log and address); `marlin web` prints its status.
 
 ### Self-hosting reboot (`/reboot`)
 

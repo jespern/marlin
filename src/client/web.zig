@@ -17,7 +17,7 @@
 //!
 //! Binds 127.0.0.1 only. The trust boundary is the TRANSPORT: loopback, or
 //! the tailnet when `tailscale serve` proxies the port to this node's fixed
-//! https URL (attempted automatically; `[web] tailscale = false` opts out).
+//! https URL (`[web] tailscale = true` opts in).
 //! No token, no login — a phone opens the same URL forever. What remains is
 //! what a BROWSER can be tricked into sending, and both vectors identify
 //! themselves in headers: DNS rebinding arrives under a foreign Host,
@@ -34,6 +34,8 @@ const proto = @import("../core/proto.zig");
 const attach = @import("attach.zig");
 
 const html = @embedFile("webui.html");
+const mobile_push = @import("../mobile/push.zig");
+const service_worker = @embedFile("webui-sw.js");
 const icon_180 = @embedFile("webui-icon-180.png");
 const icon_512 = @embedFile("webui-icon-512.png");
 const manifest =
@@ -44,20 +46,42 @@ const manifest =
 ;
 const default_port: u16 = 8377;
 
+/// macOS app installs bundle the CLI without adding a PATH executable.
+/// Explicit CLI mode prevents background launches from opening a GUI.
+pub fn runTailscale(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const []const u8) !std.process.RunResult {
+    return runTailscaleCommand(gpa, io, environ, "tailscale", args) catch |err| {
+        if (err != error.FileNotFound or @import("builtin").os.tag != .macos) return err;
+        return runTailscaleCommand(gpa, io, environ, "/Applications/Tailscale.app/Contents/MacOS/Tailscale", args);
+    };
+}
+
+pub fn runTailscaleCommand(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, executable: []const u8, args: []const []const u8) !std.process.RunResult {
+    if (args.len > 7) return error.TooManyArguments;
+    var env = try environ.clone(gpa);
+    defer env.deinit();
+    try env.put("TAILSCALE_BE_CLI", "1");
+    var argv: [8][]const u8 = undefined;
+    argv[0] = executable;
+    @memcpy(argv[1 .. args.len + 1], args);
+    return std.process.run(gpa, io, .{
+        .argv = argv[0 .. args.len + 1],
+        .environ_map = &env,
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } },
+    });
+}
+
 /// Best-effort `tailscale serve --bg <port>`: expose the loopback port at
 /// this node's fixed tailnet https URL. Returns the gpa-owned tailnet host
 /// name when serving, null (with a log line) when tailscale is absent,
 /// logged out, or the CLI shape is unrecognized — the UI stays usable on
 /// loopback either way.
-fn setupTailscale(gpa: std.mem.Allocator, io: Io, port: u16) ?[]u8 {
+fn setupTailscale(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, port: u16) ?[]u8 {
     var port_buf: [8]u8 = undefined;
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
 
-    const serve_result = std.process.run(gpa, io, .{
-        .argv = &.{ "tailscale", "serve", "--bg", port_str },
-        .stdout_limit = .limited(16 * 1024),
-        .stderr_limit = .limited(16 * 1024),
-    }) catch |err| {
+    const serve_result = runTailscale(gpa, io, environ, &.{ "serve", "--bg", port_str }) catch |err| {
         std.log.info("tailscale serve unavailable ({t}); web ui is loopback-only", .{err});
         return null;
     };
@@ -69,11 +93,7 @@ fn setupTailscale(gpa: std.mem.Allocator, io: Io, port: u16) ?[]u8 {
         return null;
     }
 
-    const status = std.process.run(gpa, io, .{
-        .argv = &.{ "tailscale", "status", "--json" },
-        .stdout_limit = .limited(4 * 1024 * 1024),
-        .stderr_limit = .limited(16 * 1024),
-    }) catch return null;
+    const status = runTailscale(gpa, io, environ, &.{ "status", "--json" }) catch return null;
     defer gpa.free(status.stdout);
     defer gpa.free(status.stderr);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -99,7 +119,9 @@ pub fn serve(
     // Deliberately opt-in: this surface can drive every daemon capability.
     // Refuse to start unless the user has said so in durable configuration
     // (or the env override for one-offs).
-    var want_tailscale = true;
+    var port: u16 = default_port;
+    var want_tailscale = false;
+    var want_push = false;
     {
         var loaded = config.load(gpa, io, environ) catch |e| {
             std.log.err("cannot load config: {t}", .{e});
@@ -117,10 +139,11 @@ pub fn serve(
             );
             return 2;
         }
+        port = loaded.value.web_port;
         want_tailscale = loaded.value.web_tailscale;
+        want_push = loaded.value.web_push and environ.get("MARLIN_REMOTE") == null;
     }
 
-    var port: u16 = default_port;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
@@ -147,7 +170,7 @@ pub fn serve(
     };
     defer server.deinit(io);
 
-    const tailnet_host: ?[]const u8 = if (want_tailscale) setupTailscale(gpa, io, port) else null;
+    const tailnet_host: ?[]const u8 = if (want_tailscale) setupTailscale(gpa, io, environ, port) else null;
     defer if (tailnet_host) |h| gpa.free(@constCast(h));
     std.log.info("marlin web ui on http://127.0.0.1:{d}/", .{port});
     if (tailnet_host) |host| {
@@ -161,7 +184,7 @@ pub fn serve(
             s.close(io);
             continue;
         };
-        ctx.* = .{ .gpa = gpa, .io = io, .environ = environ, .self_exe = self_exe, .stream = stream, .tailnet_host = tailnet_host };
+        ctx.* = .{ .gpa = gpa, .io = io, .environ = environ, .self_exe = self_exe, .stream = stream, .tailnet_host = tailnet_host, .push_enabled = want_push };
         const thread = std.Thread.spawn(.{}, connMain, .{ctx}) catch {
             var s = stream;
             s.close(io);
@@ -182,6 +205,7 @@ const ConnCtx = struct {
     /// Non-null when tailscale serve fronts this port; its DNS name is then
     /// an allowed Host/Origin alongside loopback.
     tailnet_host: ?[]const u8,
+    push_enabled: bool = false,
 };
 
 fn connMain(ctx: *ConnCtx) void {
@@ -205,6 +229,14 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     const target = req.head.target;
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 
+    const route = if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/send") or
+        std.mem.eql(u8, path, "/events") or std.mem.eql(u8, path, "/history") or
+        std.mem.eql(u8, path, "/connection") or std.mem.startsWith(u8, path, "/push/"))
+        if (std.mem.startsWith(u8, path, "/push/")) "/push/*" else path
+    else
+        "asset/unknown";
+    std.log.info("web access {d} {s} {s}", .{ Io.Timestamp.now(ctx.io, .real).toSeconds(), @tagName(req.head.method), route });
+
     // Transport is the trust boundary (loopback / tailnet); these header
     // checks close the two ways a BROWSER can be steered across it. DNS
     // rebinding reaches us under the attacker's Host; a cross-site POST
@@ -219,7 +251,15 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         return;
     }
 
-    if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
+    if (std.mem.eql(u8, target, "/connection")) {
+        const body = try std.json.Stringify.valueAlloc(ctx.gpa, .{ .tailnet_host = ctx.tailnet_host, .push_enabled = ctx.push_enabled }, .{});
+        defer ctx.gpa.free(body);
+        try req.respond(body, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" } } });
+    } else if (std.mem.eql(u8, target, "/sw.js")) {
+        try req.respond(service_worker, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "text/javascript" }, .{ .name = "cache-control", .value = "no-cache" } } });
+    } else if (std.mem.startsWith(u8, path, "/push/")) {
+        try servePush(ctx, req, path);
+    } else if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
         try req.respond(html, .{ .extra_headers = &.{
             .{ .name = "content-type", .value = "text/html; charset=utf-8" },
         } });
@@ -244,6 +284,33 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     } else {
         try req.respond("not found\n", .{ .status = .not_found });
     }
+}
+
+fn servePush(ctx: *ConnCtx, req: *std.http.Server.Request, path: []const u8) !void {
+    if (!ctx.push_enabled) {
+        try req.respond("phone push is disabled", .{ .status = .not_found });
+        return;
+    }
+    const action: []const u8 = if (std.mem.eql(u8, path, "/push/info") and req.head.method == .GET) "info" else if (std.mem.eql(u8, path, "/push/subscribe") and req.head.method == .POST) "subscribe" else if (std.mem.eql(u8, path, "/push/unsubscribe") and req.head.method == .POST) "unsubscribe" else {
+        try req.respond("not found", .{ .status = .not_found });
+        return;
+    };
+    var input: []const u8 = "";
+    defer if (input.len != 0) ctx.gpa.free(input);
+    if (req.head.method == .POST) {
+        var buf: [8192]u8 = undefined;
+        const reader = try req.readerExpectContinue(&buf);
+        input = reader.allocRemaining(ctx.gpa, .limited(buf.len)) catch {
+            try req.respond("subscription too large", .{ .status = .payload_too_large });
+            return;
+        };
+    }
+    const result = mobile_push.run(ctx.gpa, ctx.io, ctx.environ, action, input) catch {
+        try req.respond("phone push unavailable; check Node.js and the subscription", .{ .status = .service_unavailable });
+        return;
+    };
+    defer ctx.gpa.free(result);
+    try req.respond(result, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" } } });
 }
 
 /// Forward one client message and return the daemon's first reply line.

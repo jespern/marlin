@@ -41,6 +41,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
     .{ .name = "/plan", .usage = " [task|off|clear]", .description = "enter Plan mode or manage its execution todo", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
+    .{ .name = "/web", .description = "open the companion status and access log tab" },
     .{ .name = "/top", .description = "live session overview and switcher" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
@@ -626,6 +627,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         }
     } else if (std.mem.eql(u8, head, "/sessions")) {
         self.openPicker(.session);
+    } else if (std.mem.eql(u8, head, "/web")) {
+        self.openWeb();
     } else if (std.mem.eql(u8, head, "/top")) {
         self.openTop();
     } else if (std.mem.eql(u8, head, "/new")) {

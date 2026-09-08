@@ -43,6 +43,7 @@ pub const Command = enum {
     landlock_exec,
     sandbox_probe,
     _pipe,
+    _web,
     _rebuild,
 
     pub fn parse(word: []const u8) ?Command {
@@ -140,7 +141,21 @@ pub fn dispatch(
         .gc => return headless.gc(gpa, io, environ, self_exe, rest),
         .reboot => return headless.reboot(gpa, io, environ, self_exe, rest),
         .shutdown => return headless.shutdown(gpa, io, environ),
-        .web => return web.serve(gpa, io, environ, self_exe, rest),
+        ._web => return web.serve(gpa, io, environ, self_exe, rest),
+        .web => {
+            if (rest.len != 0) {
+                try stderrPrint(io, "marlin web shows the managed companion status; configure [web] port instead of --port.\n", .{});
+                return 2;
+            }
+            const conn = try attach.connect(gpa, io, environ, self_exe);
+            defer conn.deinit();
+            try conn.send(.{ .web_status = .{} });
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const status = try conn.recvUntil(arena.allocator(), .web_status_result);
+            try stdoutPrint(io, "Web companion: {s}\n{s}\nOpen /web inside Marlin for the live access log.\n", .{ status.state, status.url });
+            return 0;
+        },
         .attach => {
             const options = parseAttachArgs(rest) catch {
                 try stdoutPrint(io, "usage: marlin attach [session-handle] [--session-file <path>]\n", .{});
@@ -359,7 +374,7 @@ const help_text =
     \\  marlin reboot [--build|--build-client|--build-both] [--force]
     \\                         rebuild scoped source binaries, then reattach
     \\  marlin shutdown        stop the daemon
-    \\  marlin web [--port N]  local web UI — opt-in via [web] enabled = true
+    \\  marlin web             show the daemon-managed companion status
     \\                         (127.0.0.1:8377; tailnet via tailscale serve)
     \\  marlin --remote <host> [command …]  run any of the above against
     \\                         <host>'s daemon over ssh (host is an ssh

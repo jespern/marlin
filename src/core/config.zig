@@ -96,17 +96,19 @@ pub const Config = struct {
     /// leases. Independent of permissions and OFF until M4.5 lands.
     workspace_enabled: bool = false,
 
-    /// `marlin web` gate. OFF by default and deliberately opt-in: the web
+    /// Daemon-managed web companion. OFF by default and deliberately opt-in: the web
     /// bridge is an unauthenticated localhost surface that can drive every
     /// daemon capability (including shutdown). `[web] enabled = true` or
     /// MARLIN_WEB=1 turns it on.
     web_enabled: bool = false,
+    web_port: u16 = 8377,
 
     /// `marlin web` attempts `tailscale serve` so the UI is reachable at a
-    /// fixed tailnet https URL (the tailnet is the trust boundary). On by
-    /// default; degrades silently to localhost-only when tailscale is absent
-    /// or logged out. `[web] tailscale = false` opts out.
-    web_tailscale: bool = true,
+    /// fixed tailnet https URL (the tailnet is the trust boundary). Opt in
+    /// with `[web] tailscale = true`; absent/unavailable CLI stays loopback-only.
+    web_tailscale: bool = false,
+    /// Standards-based phone push via the bundled Node.js delivery helper.
+    web_push: bool = false,
 
     /// TUI chrome (`[ui]`): the top tab strip. Toggleable live via /config;
     /// the daemon serializes persistence through setUiTabBar.
@@ -762,7 +764,9 @@ pub fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.permissions_enabled) |value| cfg.permissions_enabled = value;
     if (doc.workspace_enabled) |value| cfg.workspace_enabled = value;
     if (doc.web_enabled) |value| cfg.web_enabled = value;
+    if (doc.web_port) |value| cfg.web_port = value;
     if (doc.web_tailscale) |value| cfg.web_tailscale = value;
+    if (doc.web_push) |value| cfg.web_push = value;
     if (doc.ui_tab_bar) |value| cfg.ui_tab_bar = value;
     if (doc.ui_bell) |value| cfg.ui_bell = value;
     if (doc.ui_screensaver_after_ms) |value| cfg.ui_screensaver_after_ms = value;

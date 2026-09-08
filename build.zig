@@ -234,6 +234,10 @@ pub fn build(b: *std.Build) void {
     const fake_model_step = b.step("fake-model", "Run the scripted local/testing model on 127.0.0.1:5757");
     fake_model_step.dependOn(&fake_model_cmd.step);
 
+    const mobile_tests = b.addSystemCommand(&.{ "node", "--test" });
+    mobile_tests.addFileArg(b.path("src/mobile/push_test.cjs"));
+    b.step("mobile-test", "Test optional phone push helper (Node.js 22+)").dependOn(&mobile_tests.step);
+
     // ---- e2e ----
     const process_io_module = b.createModule(.{
         .root_source_file = b.path("src/daemon/process_io.zig"),

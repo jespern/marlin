@@ -55,3 +55,21 @@ test "origin gate: absent or same-host origins pass, cross-site does not" {
     try std.testing.expect(!originAllowed(tail, "file://x"));
     try std.testing.expect(!originAllowed(null, "https://box.tail1234.ts.net"));
 }
+
+test "Tailscale subprocess forces CLI mode and preserves argument boundaries" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("TAILSCALE_BE_CLI", "0");
+    const result = try web.runTailscaleCommand(gpa, threaded.io(), &env, "/bin/sh", &.{
+        "-c", "test \"$TAILSCALE_BE_CLI\" = 1 || exit 7; printf '%s|%s' \"$1\" \"$2\"", "peer", "serve --bg", "8377",
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("serve --bg|8377", result.stdout);
+    try std.testing.expectEqualStrings("0", env.get("TAILSCALE_BE_CLI").?);
+}

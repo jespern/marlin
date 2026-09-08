@@ -64,12 +64,14 @@ pub const Document = struct {
     permissions_enabled: ?bool = null,
     workspace_enabled: ?bool = null,
     web_enabled: ?bool = null,
+    web_port: ?u16 = null,
     voice_enabled: ?bool = null,
     voice_engine: ?[]const u8 = null,
     voice_mode: ?[]const u8 = null,
     voice_model: ?[]const u8 = null,
     voice_stt_bin: ?[]const u8 = null,
     web_tailscale: ?bool = null,
+    web_push: ?bool = null,
     ui_tab_bar: ?bool = null,
     ui_bell: ?bool = null,
     ui_screensaver_after_ms: ?u64 = null,
@@ -216,7 +218,13 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             },
             .web => {
                 if (std.mem.eql(u8, key, "enabled")) doc.web_enabled = try boolean(value);
+                if (std.mem.eql(u8, key, "port")) {
+                    const port = try unsigned(u16, value);
+                    if (port == 0) return error.InvalidValue;
+                    doc.web_port = port;
+                }
                 if (std.mem.eql(u8, key, "tailscale")) doc.web_tailscale = try boolean(value);
+                if (std.mem.eql(u8, key, "push")) doc.web_push = try boolean(value);
             },
             .ui => {
                 if (std.mem.eql(u8, key, "tab_bar")) doc.ui_tab_bar = try boolean(value);

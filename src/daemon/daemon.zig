@@ -40,6 +40,9 @@ const build_options = @import("build_options");
 const Io = std.Io;
 
 const proto = @import("../core/proto.zig");
+const web_service_mod = @import("web_service.zig");
+const mobile_push = @import("../mobile/push.zig");
+const mobile_presence = @import("../mobile/presence.zig");
 const block = @import("../core/block.zig");
 const ids = @import("../core/ids.zig");
 const config = @import("../core/config.zig");
@@ -312,6 +315,9 @@ pub const Daemon = struct {
     environ: *std.process.Environ.Map,
     store: store_mod.Store,
     cfg: config.Config,
+    phone_push: ?*mobile_push.Worker = null,
+    web_service: ?*web_service_mod.Service = null,
+    presence: mobile_presence.Shared = .{},
     extensions: *extensions.Runtime,
     /// A successful `/mcp reload` owns the newly read config here because the
     /// replacement extension registry references its strings. The startup
@@ -555,6 +561,24 @@ pub const Daemon = struct {
         if (self.otel_exporter) |exporter| {
             exporter.activate();
             std.log.info("OTLP trace export enabled", .{});
+        }
+
+        var phone_push = mobile_push.Worker.init(gpa, io, environ);
+        defer phone_push.deinit();
+        if (cfg.web_push) {
+            phone_push.presence = &self.presence;
+            try phone_push.start();
+            self.phone_push = &phone_push;
+        }
+
+        var companion = web_service_mod.Service{ .gpa = gpa, .io = io, .environ = environ, .exe = self.marlin_exe orelse "", .port = cfg.web_port };
+        defer companion.stop();
+        if (cfg.web_enabled and self.marlin_exe != null) {
+            self.web_service = &companion;
+            companion.start() catch |err| {
+                self.web_service = null;
+                std.log.warn("cannot start companion: {t}", .{err});
+            };
         }
 
         // Dispatcher thread: consumes events, owns all state.
@@ -879,6 +903,7 @@ pub const Daemon = struct {
                 };
             },
             .client_gone => |cg| {
+                _ = self.presence.update(self.io, .terminal, cg.client_id, 0, false, nowMs(self.io));
                 // A reboot request belongs to its waiting client. If that
                 // client times out or exits before the daemon can acknowledge
                 // quiescence, cancel the pending reboot instead of surprising
@@ -917,6 +942,7 @@ pub const Daemon = struct {
                     self.refusePendingRebootForApproval();
                     self.fanOutActionableLine(ta.sid, ta.line);
                     self.broadcastStatus(ta.sid, .awaiting_approval);
+                    self.notifyPhone(ta.sid, true, false);
                 } else {
                     self.gpa.free(ta.line);
                 }
@@ -1032,6 +1058,7 @@ pub const Daemon = struct {
                     if (!continued) self.extensions.fireHook(.on_session_done, json);
                     if (terminal_error != null) self.extensions.fireHook(.on_error, json);
                 }
+                if (!continued and !td.interrupted) self.notifyPhone(td.sid, false, terminal_error != null);
                 // A child is an ordinary durable session plus this one-shot
                 // rendezvous back to the parent tool call.
                 if (session.task_waiter) |future| {
@@ -1100,12 +1127,37 @@ pub const Daemon = struct {
         }
     }
 
+    fn notifyPhone(self: *Daemon, sid: u64, needs_input: bool, failed: bool) void {
+        if (self.presence.suppress(self.io, sid, nowMs(self.io))) return;
+        if (self.phone_push) |worker| worker.notify(sid, needs_input, failed);
+    }
+
     fn handleClientMsg(self: *Daemon, client: *Client, msg: proto.ClientMsg) !void {
         if (!client.said_hello and msg != .hello) {
             self.sendTo(client, .{ .err = .{ .code = "no_hello", .msg = "hello required first" } });
             return;
         }
         switch (msg) {
+            .web_status => {
+                var arena: std.heap.ArenaAllocator = .init(self.gpa);
+                defer arena.deinit();
+                const status: proto.WebStatus = if (self.web_service) |service| try service.snapshot(arena.allocator()) else .{
+                    .enabled = self.cfg.web_enabled,
+                    .state = if (self.cfg.web_enabled) "failed" else "disabled",
+                };
+                self.sendTo(client, .{ .web_status_result = status });
+            },
+            .presence => |p| {
+                const accepted = self.presence.update(
+                    self.io,
+                    if (p.kind == .terminal) .terminal else .phone,
+                    if (p.kind == .terminal) client.id else p.page_id,
+                    p.sid,
+                    p.active,
+                    nowMs(self.io),
+                );
+                if (accepted) self.sendTo(client, .{ .ok = .{} }) else self.sendTo(client, .{ .err = .{ .code = "presence", .msg = "invalid or full presence lease table" } });
+            },
             .hello => |h| {
                 if (h.proto_version != proto.proto_version) {
                     self.sendTo(client, .{ .err = .{ .code = "version", .msg = "protocol version mismatch" } });
@@ -1835,6 +1887,7 @@ pub const Daemon = struct {
                 self.refusePendingRebootForApproval();
                 self.fanOutActionableLine(ca.sid, line);
                 self.broadcastStatus(ca.sid, .awaiting_approval);
+                self.notifyPhone(ca.sid, true, false);
                 // Deliberately no reply yet: cc_approval_result is sent when
                 // a client answers (or the bridge/turn goes away).
             },
@@ -4204,6 +4257,7 @@ pub const Daemon = struct {
     }
 
     fn shutdownCleanup(self: *Daemon) void {
+        if (self.web_service) |service| service.stop();
         self.sleep_assertion.sync(false);
         self.clients_mutex.lockUncancelable(self.io);
         self.accepting_clients = false;
@@ -4897,6 +4951,7 @@ test "a dying bridge client unparks its session's parked cc approval" {
     defer daemon.store.close();
     daemon.clients = .empty;
     daemon.clients_mutex = .init;
+    daemon.presence = .{};
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -4942,6 +4997,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     daemon.network = .{ .gpa = gpa };
     daemon.clients = .empty;
     daemon.clients_mutex = .init;
+    daemon.presence = .{};
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -4986,6 +5042,7 @@ test "a disconnected requester cannot leave a delayed reboot armed" {
     daemon.io = threaded.io();
     daemon.clients = .empty;
     daemon.clients_mutex = .init;
+    daemon.presence = .{};
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);

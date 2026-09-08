@@ -509,6 +509,14 @@ pub const App = struct {
     terminal_restore_cwd: std.ArrayList(u8) = .empty,
     terminal_progress: ?terminal_osc.Progress = null,
     terminal_focused: bool = true,
+    presence_last_sent_ms: i64 = 0,
+    presence_last_activity_ms: i64 = 0,
+    presence_reported_active: bool = false,
+    web_view: bool = false,
+    web_available: bool = false,
+    web_text: std.ArrayList(u8) = .empty,
+    web_scroll: usize = 0,
+    web_poll_ms: i64 = 0,
     terminal_theme: terminal_osc.Theme = .{},
     notification_sid: u64 = 0,
     notification_title: std.ArrayList(u8) = .empty,
@@ -651,6 +659,7 @@ pub const App = struct {
         if (self.wipeout_download) |progress| self.gpa.destroy(progress);
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
+        self.web_text.deinit(self.gpa);
         self.terminal_title.deinit(self.gpa);
         self.terminal_cwd.deinit(self.gpa);
         self.terminal_restore_cwd.deinit(self.gpa);
@@ -862,6 +871,14 @@ pub const App = struct {
     /// everything else for free.
     pub fn tabBarRows(self: *const App) usize {
         return if (self.show_tab_bar) tab_bar_height else 0;
+    }
+
+    pub fn openWeb(self: *App) void {
+        self.web_view = true;
+        self.top_view = null;
+        self.web_scroll = 0;
+        self.web_poll_ms = 0;
+        self.conn.send(.{ .web_status = .{} }) catch self.setNotice("cannot read companion status", .{});
     }
 
     pub fn tabAtColumn(self: *const App, col: usize) ?u64 {
@@ -1809,6 +1826,13 @@ pub const App = struct {
                 }
                 self.setNotice("daemon error {s}: {s}", .{ e.code, e.msg });
             },
+            .web_status_result => |status| {
+                self.web_available = status.enabled;
+                self.web_text.clearRetainingCapacity();
+                self.web_text.print(self.gpa, "Web companion · {s}\n{s}\nEsc: return · ↑↓: scroll · r: refresh · Ctrl/Cmd-click: open link\n\n", .{ status.state, status.url }) catch {};
+                if (!status.enabled) self.web_text.appendSlice(self.gpa, "Enable [web] enabled = true in the daemon config and restart Marlin.\n") catch {};
+                for (status.logs) |entry| self.web_text.print(self.gpa, "{s}\n", .{entry}) catch {};
+            },
             .ok => |ok| self.acknowledgeInput(ok.request_id),
             else => {},
         }
@@ -2405,11 +2429,24 @@ pub const App = struct {
 
     pub fn recordUserActivity(self: *App) void {
         const now = nowWallMs(self.io);
+        self.presence_last_activity_ms = now;
         const deadline = if (self.screensaver_timeout_ms == 0)
             0
         else
             now +| @as(i64, @intCast(self.screensaver_timeout_ms));
         self.screensaver_deadline_ms.store(deadline, .release);
+    }
+
+    fn sendPresence(self: *App, force: bool) void {
+        const now = nowWallMs(self.io);
+        const active = self.terminal_focused and now - self.presence_last_activity_ms < 120_000;
+        if (!force and active == self.presence_reported_active and now - self.presence_last_sent_ms < 10_000) return;
+        self.conn.send(.{ .presence = .{
+            .kind = .terminal,
+            .active = active,
+        } }) catch return;
+        self.presence_last_sent_ms = now;
+        self.presence_reported_active = active;
     }
 
     pub fn maybeStartScreensaver(self: *App) void {
@@ -4643,20 +4680,25 @@ fn drawTabBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
     bar.fill(.{ .style = Palette.tab_bar });
     app.tab_hits.clearRetainingCapacity();
 
-    const layout = try layoutTabBar(arena, app, win.width);
+    const available_width = win.width -| @as(u16, if (app.web_available) 7 else 0);
+    const layout = try layoutTabBar(arena, app, available_width);
+    if (app.web_available and win.width >= 7) {
+        _ = bar.printSegment(.{ .text = " web ", .style = if (app.web_view) Palette.tab_active else Palette.tab_inactive }, .{ .col_offset = available_width, .wrap = .none });
+        try app.tab_hits.append(app.gpa, .{ .start_col = available_width, .end_col = win.width, .sid = 0 });
+    }
     if (layout.hidden_left) {
         _ = bar.printSegment(.{ .text = "‹ ", .style = Palette.tab_overflow }, .{ .wrap = .none });
     }
-    if (layout.hidden_right and win.width >= 2) {
+    if (layout.hidden_right and available_width >= 2) {
         _ = bar.printSegment(.{ .text = " ›", .style = Palette.tab_overflow }, .{
-            .col_offset = win.width - 2,
+            .col_offset = available_width - 2,
             .wrap = .none,
         });
     }
 
     for (layout.items) |item| {
         if (item.width == 0) continue;
-        const style = if (item.active) Palette.tab_active else Palette.tab_inactive;
+        const style = if (item.active and !app.web_view) Palette.tab_active else Palette.tab_inactive;
         const tab = bar.child(.{
             .x_off = @intCast(item.x),
             .width = @intCast(item.width),
@@ -4897,6 +4939,18 @@ fn drawTop(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
     if (app.top_view) |*view| view.scroll_top = scroll_top;
 }
 
+/// Use the transcript's OSC 8 renderer so operational output has the same
+/// terminal hyperlinks and mouse activation as ordinary session output.
+pub fn drawWebLine(win: vaxis.Window, arena: std.mem.Allocator, text: []const u8, row: u16) !void {
+    _ = win.printSegment(.{ .text = text, .style = Palette.tab_inactive }, .{ .row_offset = row, .wrap = .none });
+    render.applyLineLinks(win, row, .{
+        .text = text,
+        .style = Palette.tab_inactive,
+        .links = try render.findLinkSpans(arena, text),
+        .links_resolved = true,
+    });
+}
+
 pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const win = vx.window();
     win.clear();
@@ -4908,6 +4962,26 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     if (app.show_tab_bar) try drawTabBar(app, win, arena);
     const top_rows = app.tabBarRows();
+    if (app.web_view) {
+        win.hideCursor();
+        const rows = h -| top_rows;
+        var lines: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, app.web_text.items, '\n');
+        while (it.next()) |line| try lines.append(arena, line);
+        const pinned = @min(@as(usize, 3), @min(rows, lines.items.len));
+        for (lines.items[0..pinned], 0..) |line, row| {
+            try drawWebLine(win, arena, line, @intCast(row + top_rows));
+        }
+        const log_rows = rows - pinned;
+        const max_scroll = (lines.items.len - pinned) -| log_rows;
+        app.web_scroll = @min(app.web_scroll, max_scroll);
+        const first = pinned + max_scroll - app.web_scroll;
+        for (lines.items[first..], 0..) |line, row| {
+            if (row >= log_rows) break;
+            try drawWebLine(win, arena, line, @intCast(row + top_rows + pinned));
+        }
+        return;
+    }
 
     // The composer is a three-row panel for a one-line prompt (padding,
     // content, padding) and grows with multiline input.
@@ -5802,9 +5876,9 @@ pub fn dispatchEvent(
             if (key.codepoint == vaxis.Key.left_super or key.codepoint == vaxis.Key.right_super)
                 app.link_super_held = true;
             if (key.isModifier()) return;
+            app.recordUserActivity();
             if (app.gameKey(key, true)) return;
             if (app.dismissScreensaver()) return;
-            app.recordUserActivity();
             try handleKey(app, key);
         },
         .key_release => |key| {
@@ -5818,6 +5892,7 @@ pub fn dispatchEvent(
         .voice => |vev| app.handleVoiceEvent(vev),
         .wipeout => |wev| app.handleWipeoutEvent(wev),
         .mouse => |m| {
+            app.presence_last_activity_ms = nowWallMs(app.io);
             if (app.screensaver_active) return;
             vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null) .pointer else .default);
             if (linkAtMouse(vx.window(), m, app.link_super_held)) |uri| {
@@ -5827,7 +5902,10 @@ pub fn dispatchEvent(
             handleMouse(app, m);
         },
         .mouse_leave => vx.setMouseShape(.default),
-        .focus_in => app.terminal_focused = true,
+        .focus_in => {
+            app.terminal_focused = true;
+            app.presence_last_activity_ms = nowWallMs(app.io);
+        },
         .focus_out => {
             app.terminal_focused = false;
             if (app.game_mode) if (app.wipeout_game) |game| game.releaseKeys();
@@ -5867,6 +5945,7 @@ pub fn dispatchEvent(
 }
 
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
+    var next_presence_tick: i64 = 0;
     while (!app.animation_stop.load(.acquire)) {
         if (app.game_active.load(.acquire)) {
             // A playable game steps on wall time; ticks just need to be
@@ -5881,8 +5960,12 @@ fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
             app.io.sleep(.fromMilliseconds(90), .awake) catch {};
         } else {
             app.io.sleep(.fromMilliseconds(200), .awake) catch {};
-            // An idle TUI posts no ticks; pending deadlines need one.
             const now = nowWallMs(app.io);
+            if (now >= next_presence_tick) {
+                loop.postEvent(.tick) catch return;
+                next_presence_tick = now + 1000;
+            }
+            // Pending deadlines need one.
             const notice_deadline = app.notice_deadline_ms.load(.acquire);
             const saver_deadline = app.screensaver_deadline_ms.load(.acquire);
             if ((notice_deadline != 0 and now >= notice_deadline) or
@@ -6188,6 +6271,9 @@ pub fn run(
         defer animation_thread.join();
         defer app.animation_stop.store(true, .release);
 
+        app.sendPresence(true);
+        app.conn.send(.{ .web_status = .{} }) catch {};
+
         // First frame before any event arrives.
         {
             var frame_arena = std.heap.ArenaAllocator.init(gpa);
@@ -6257,6 +6343,15 @@ pub fn run(
                 if (!restored) {
                     daemon_disconnect_reason = "reconnect failed";
                     app.should_quit = true;
+                }
+            }
+
+            if (reconnect_thread == null and !app.should_quit) {
+                app.sendPresence(reconnect_verdict != null);
+                const now = nowWallMs(app.io);
+                if ((app.web_view and now - app.web_poll_ms >= 1000) or reconnect_verdict != null) {
+                    app.conn.send(.{ .web_status = .{} }) catch {};
+                    app.web_poll_ms = now;
                 }
             }
 

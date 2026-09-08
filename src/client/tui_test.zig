@@ -4636,3 +4636,33 @@ test "typing `!wipeout ` in the composer lists the circuits by name, then pilots
     try std.testing.expectEqualStrings("!wipeout terramax rapier", suggestions[0].replacement);
     try std.testing.expectEqualStrings("!wipeout terramax race", suggestions[1].replacement);
 }
+
+test "web status view preserves the session draft and Escape returns to it" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 7, .editor = Editor.init(gpa) }, .web_view = true };
+    defer app.deinit();
+    app.view.editor.insertSlice("unfinished draft");
+    const line = try proto.encode(gpa, proto.DaemonMsg{ .web_status_result = .{ .enabled = true, .state = "running", .url = "https://phone.example/", .logs = &.{"GET /events"} } });
+    app.handleDaemonLine(line);
+    try std.testing.expect(app.web_available);
+    try std.testing.expect(std.mem.indexOf(u8, app.web_text.items, "https://phone.example/") != null);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(!app.web_view);
+    try std.testing.expectEqualStrings("unfinished draft", app.view.editor.text.items);
+}
+
+test "web output links retain their full destination in a narrow terminal" {
+    const gpa = std.testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .rows = 2, .cols = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 24, .height = 2, .screen = &screen };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const uri = "https://accordion.tail526a9.ts.net/";
+    try tui.drawWebLine(win, arena.allocator(), "tailnet: " ++ uri, 1);
+    try std.testing.expectEqualStrings(uri, linkAtMouse(win, .{ .row = 1, .col = 12, .button = .left, .mods = .{ .ctrl = true }, .type = .press }, false).?);
+    try std.testing.expectEqualStrings(uri, win.readCell(23, 1).?.link.uri);
+    try std.testing.expectEqualStrings("", win.readCell(0, 1).?.link.uri);
+}

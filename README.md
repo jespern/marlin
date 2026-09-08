@@ -203,11 +203,12 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
 ## What v1 deliberately does NOT do
 
 - No messaging gateway (Telegram/Discord/...) — hook scripts cover notification.
-- No hosted or multi-user web product. `marlin web` is an opt-in,
+- No hosted or multi-user web product. the daemon-managed web companion is an opt-in,
   localhost-only client on the same protocol, fronted by `tailscale serve`
   and Host/Origin-checked (no token; the tailnet is the gate) — install it to a
   phone home screen to watch sessions and answer parked approvals over your
-  own tailnet. It is one embedded HTML file, and it is not a deploy surface.
+  own tailnet. See [mobile companion setup](docs/MOBILE.md) for the stable phone address
+  and optional presence-aware notifications.
 - No voice *stack*: no realtime voice models, wake words, or audio in the
   protocol — ever. What exists is deliberately smaller: `/voice setup` (TUI)
   configures local, offline push-to-talk dictation into the composer —

@@ -201,7 +201,13 @@ pub const AttachmentUpload = struct {
 };
 
 /// Client → daemon.
+pub const WebStatus = struct { enabled: bool = false, state: []const u8 = "disabled", url: []const u8 = "", logs: []const []const u8 = &.{} };
+
 pub const ClientMsg = union(enum) {
+    web_status: struct {},
+    /// Terminal leases belong to this connection. Phone leases use a per-page id
+    /// because HTTP requests use fresh daemon connections. No transcript data.
+    presence: struct { kind: enum { terminal, phone }, active: bool, sid: u64 = 0, page_id: u64 = 0 },
     hello: struct { proto_version: u32, client_kind: []const u8 = "generic", lifecycle_events: bool = false },
     session_create: struct {
         cwd: []const u8,
@@ -386,6 +392,7 @@ pub const ApprovalAnswer = enum { granted, denied };
 
 /// Daemon → client.
 pub const DaemonMsg = union(enum) {
+    web_status_result: WebStatus,
     /// Opt-in via hello.lifecycle_events; deliberate shutdown must not autostart.
     daemon_stopping: struct {},
     hello_ok: struct {

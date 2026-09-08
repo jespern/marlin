@@ -83,6 +83,7 @@ test "web tailscale and ui tab_bar flags parse" {
         \\[web]
         \\enabled = true
         \\tailscale = false
+        \\push = true
         \\[ui]
         \\tab_bar = false
         \\bell = false
@@ -93,6 +94,7 @@ test "web tailscale and ui tab_bar flags parse" {
     );
     try std.testing.expect(doc.web_enabled.?);
     try std.testing.expect(!doc.web_tailscale.?);
+    try std.testing.expect(doc.web_push.?);
     try std.testing.expect(!doc.ui_tab_bar.?);
     try std.testing.expect(!doc.ui_bell.?);
     try std.testing.expectEqual(@as(u64, 600_000), doc.ui_screensaver_after_ms.?);
@@ -123,4 +125,13 @@ test "council tables parse name and roster" {
         arena_state.allocator(),
         "[[council]]\nname = \"empty\"\n",
     ));
+}
+
+test "companion port accepts explicit ports and rejects zero or overflow" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const doc = try parse(arena.allocator(), "[web]\nport = 8378\n");
+    try std.testing.expectEqual(@as(?u16, 8378), doc.web_port);
+    try std.testing.expectError(error.InvalidValue, parse(arena.allocator(), "[web]\nport = 0\n"));
+    try std.testing.expectError(error.ExpectedUnsigned, parse(arena.allocator(), "[web]\nport = 65536\n"));
 }

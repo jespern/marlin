@@ -43,6 +43,8 @@ policy that failed open. Both default false when decoding an older daemon.
 | message | payload | reply |
 |---|---|---|
 | hello | proto_version, client_kind, lifecycle_events? | hello_ok or err |
+| web_status | — | web_status_result{enabled,state,url,logs}; bounded companion operational log |
+| presence | kind: terminal/phone, active, sid?, page_id? | ok or err |
 | session_create | cwd, model, effort?, title?, approvals?, request_id? | session_created{sid, request_id}; request_failed echoes request_id |
 | session_list | include_archived? | session_list_result{sessions}; archived omitted by default |
 | input_history | sid?, limit? | input_history_result{entries}; authored user/steer text across sessions, current sid first then newest, capped at 1024 |
@@ -301,3 +303,19 @@ SIGTERM, only to opted-in clients. The TUI exits instead of entering its
 crash-reconnect/autostart path. Reboot does not send this notice: other attached
 TUIs should reconnect to the replacement. Old clients receive no unknown tag
 and may still autostart after shutdown; upgrade/detach them before stopping.
+
+## Companion presence
+
+`presence` is additive in protocol 6. Terminal leases use the socket client id
+and are removed on disconnect; phone leases use a per-page nonzero `page_id`
+because HTTP commands have short-lived daemon connections. Active leases last
+30 seconds and clients renew every 10 seconds. `active:false` releases the
+lease immediately. The table holds at most 128 leases; exhausted capacity
+returns `err{presence}` rather than displacing live leases.
+
+Any active terminal suppresses phone pushes globally. A visible phone session
+suppresses pushes for that session. The TUI reports activity while focused and
+within two minutes of interaction (including focus-in); quiet reading past
+that threshold counts as idle. The dispatcher filters completion/failure and
+approval events; the optional worker checks presence again before delivery.
+Suppressed events are not queued for later. See [MOBILE.md](MOBILE.md).

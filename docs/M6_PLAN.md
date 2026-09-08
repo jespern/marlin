@@ -129,8 +129,8 @@ The trust boundary decision, recorded:
 - Terminals: SSH-carried NDJSON (`marlin --remote <host> …` → `ssh <host>
   marlin _pipe`). SSH configuration is the entire naming and auth story;
   marlin keeps no host registry and adds no credentials.
-- Phone/PWA: the tailnet. `marlin web` runs `tailscale serve` automatically
-  (opt-out via `[web] tailscale = false`), giving a fixed tokenless https
+- Phone/PWA: the tailnet. The daemon-managed companion runs `tailscale serve` when configured
+  (opt-in via `[web] tailscale = true`), giving a fixed tokenless https
   URL; the web layer validates Host and Origin to stop DNS rebinding and
   cross-site POSTs, and that is ALL it does — device identity and transport
   encryption belong to the tailnet.
