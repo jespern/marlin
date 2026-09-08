@@ -57,6 +57,7 @@ main() {
         printf '\n'
         configure_path
     fi
+    report_other_marlins
 
     printf '\nNext: export OPENROUTER_API_KEY=... && marlin run "hello fish"\n'
 }
@@ -127,6 +128,29 @@ verify_checksum() {
 installed_marlin_is_active() {
     active=$(command -v marlin 2>/dev/null || true)
     [ "$active" = "$INSTALL_DIR/marlin" ]
+}
+
+# Other marlin executables on PATH keep answering `marlin` in shells that
+# already hashed them (zsh does, until `rehash`), and an earlier PATH entry
+# wins outright. Name them, with versions, so "marlin version" still saying
+# something old is not a mystery.
+report_other_marlins() {
+    others=""
+    old_ifs=$IFS
+    IFS=:
+    for dir in ${PATH:-}; do
+        IFS=$old_ifs
+        [ -n "$dir" ] || continue
+        [ "$dir" = "$INSTALL_DIR" ] && continue
+        [ -x "$dir/marlin" ] && [ ! -d "$dir/marlin" ] || continue
+        other_version=$("$dir/marlin" version 2>/dev/null || printf 'unknown version')
+        others="$others  $dir/marlin ($other_version)\n"
+    done
+    IFS=$old_ifs
+    [ -n "$others" ] || return 0
+    printf '\nOther marlin executables on your PATH:\n%b' "$others"
+    printf 'Your shell may keep running one of those until you open a new shell or run: hash -r (zsh: rehash)\n'
+    printf 'Remove the ones you no longer want so `marlin` means one thing.\n'
 }
 
 configure_path() {

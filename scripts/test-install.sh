@@ -155,8 +155,40 @@ test_rejects_unsupported_platform() {
     assert_contains "$case_root/output" 'unsupported OS: plan9'
 }
 
+test_names_other_marlins_on_path() {
+    case_root="$TEST_ROOT/others"
+    home="$case_root/home"
+    release="$case_root/release"
+    mocks="$case_root/mocks"
+    stale="$case_root/stale-bin"
+    mkdir -p "$home" "$stale"
+    make_release "$release" marlin-aarch64-darwin 1.2.3
+    make_curl_mock "$mocks"
+    # A stale marlin earlier on PATH, like a clobbered Homebrew link.
+    sed "s/@VERSION@/0.0.0-dev/" "$ROOT/scripts/testdata/installer/fake-marlin.sh" > "$stale/marlin"
+    chmod 755 "$stale/marlin"
+
+    HOME="$home" \
+    SHELL=/bin/zsh \
+    PATH="$stale:$mocks:/usr/bin:/bin" \
+    MARLIN_OS=darwin \
+    MARLIN_ARCH=aarch64 \
+    MARLIN_RELEASE_BASE=https://example.test/releases/latest/download \
+    MARLIN_MOCK_RELEASE_DIR="$release" \
+    MARLIN_ADD_TO_PATH=0 \
+        sh "$ROOT/site/install.sh" > "$case_root/output"
+
+    assert_contains "$case_root/output" 'Installed marlin 1.2.3'
+    assert_contains "$case_root/output" "$stale/marlin (marlin 0.0.0-dev)"
+    assert_contains "$case_root/output" 'hash -r (zsh: rehash)'
+    # No stray marlin: the section is absent.
+    ! grep -Fq 'Other marlin executables' "$TEST_ROOT/install/output" || \
+        fail "clean install listed other marlins"
+}
+
 test_installs_and_configures_zsh
 test_checksum_failure_preserves_existing_binary
+test_names_other_marlins_on_path
 test_installs_pinned_release_assets
 test_rejects_unsupported_platform
 
