@@ -3,12 +3,15 @@ const std = @import("std");
 /// marlin build graph.
 ///
 /// Artifacts:
-///   marlin           the agent harness (daemon | attach | run | ls | ...)
+///   marlin           the agent harness (daemon | attach | run | ls | ...);
+///                    the ONLY artifact the default install produces
 ///   marlin-fakeprov  scripted OpenAI-compat server for e2e tests
 ///   e2e-runner       orchestrates fakeprov + marlin per scenario
+///   *-probe          offline renderers for the games/effects (dev tools)
 ///
 /// Steps:
-///   zig build            install marlin
+///   zig build            install marlin (and nothing else)
+///   zig build tools      also install the probes and marlin-fakeprov
 ///   zig build test       unit + fixture tests
 ///   zig build e2e        end-to-end: real binary vs fake provider
 ///   zig build fake-model run local/testing's deterministic fake server
@@ -172,7 +175,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(wipeout_probe);
     const wipeout_probe_cmd = b.addRunArtifact(wipeout_probe);
     if (b.args) |args| wipeout_probe_cmd.addArgs(args);
     wipeout_probe_cmd.has_side_effects = true;
@@ -242,8 +244,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    // Installed too: handy for driving the TUI manually against a script.
-    b.installArtifact(fakeprov);
 
     const fake_model_cmd = b.addRunArtifact(fakeprov);
     fake_model_cmd.addArgs(&.{ "--port", "5757", "--repeat-last" });
@@ -253,6 +253,17 @@ pub fn build(b: *std.Build) void {
         fake_model_cmd.addFileArg(b.path("src/testing/fixtures/local_testing.json"));
     fake_model_cmd.has_side_effects = true;
     const fake_model_step = b.step("fake-model", "Run the scripted local/testing model on 127.0.0.1:5757");
+
+    // ---- dev tools ----
+    // `zig build` installs marlin and nothing else: a release must never
+    // depend on a dev tool compiling for every target (the x86-64 release
+    // once failed on a 128-bit atomic in wipeout-probe). The probes and the
+    // fake provider are still one step away when wanted.
+    const tools_step = b.step("tools", "Install dev tools into zig-out/bin: wipeout-probe, mk64-probe, orb-probe, marlin-fakeprov");
+    tools_step.dependOn(&b.addInstallArtifact(wipeout_probe, .{}).step);
+    tools_step.dependOn(&b.addInstallArtifact(mk64_probe, .{}).step);
+    tools_step.dependOn(&b.addInstallArtifact(orb_probe, .{}).step);
+    tools_step.dependOn(&b.addInstallArtifact(fakeprov, .{}).step);
     fake_model_step.dependOn(&fake_model_cmd.step);
 
     const mobile_tests = b.addSystemCommand(&.{ "node", "--test" });

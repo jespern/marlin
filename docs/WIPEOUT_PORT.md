@@ -68,8 +68,9 @@ the start countdown that the original beeps is written on screen instead
 | `scripts/wipeout_pack.py` | Builds `assets/wo.pak` from an extracted data tree |
 | `assets/wo.pak` | The bundle the client downloads on first run (3.4 MB) |
 
-Build steps: `zig build wipeout-test` (unit tests) and `zig build`, which
-installs `zig-out/bin/wipeout-probe`.
+Build steps: `zig build wipeout-test` (unit tests) and `zig build tools`, which
+installs `zig-out/bin/wipeout-probe` (the plain `zig build` installs only
+`marlin`; dev tools never sit in the release path).
 
 Run the installed binary directly rather than through `zig build
 wipeout-probe`, so the build runner is not competing for the CPU.
