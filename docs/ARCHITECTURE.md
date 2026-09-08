@@ -1209,10 +1209,13 @@ A split pane identifies its session with a compact pane label.
   tunnel, metaballs, horizon, a 24-second `demo` sequence, a floating `orb`
   (`client/orb.zig`) whose first transmitted frame rasterizes the already-drawn
   Vaxis cell grid into a dimmed two-pass box-blurred backdrop and whose later
-  frames reuse that snapshot beneath a 60 FPS procedural sphere shaded as red
-  and gold armor with cyan-white reactor seams, then sampled through a coarse
-  virtual framebuffer with palette quantization, pixel-cell borders, scanlines,
-  and low-rate digital noise, and a `daybreak` landscape (`client/daybreak.zig`, after Jani Ylikangas'
+  frames reuse that snapshot beneath a 60 FPS thinking orb: 168 nodes on a
+  Fibonacci sphere turning about a tilted axis, dim at the back and bright
+  at the front over a faint navy body, with pulses firing along edges between
+  neighbouring nodes on hashed clocks (about one pair in six is a synapse,
+  plus rare long arcs across the globe) and a warm flash where a pulse
+  lands; everything is drawn on a coarse block grid and each frame is a pure
+  function of (frame, seed), and a `daybreak` landscape (`client/daybreak.zig`, after Jani Ylikangas'
   js1k 2019 entry: composed in the original's 1900×900 canvas units and
   scaled per axis, rasterized with coverage anti-aliasing — the original's
   faint ranges are sub-pixel fillRect widths, which coverage reproduces.

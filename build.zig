@@ -190,6 +190,27 @@ pub fn build(b: *std.Build) void {
     const wipeout_test_step = b.step("wipeout-test", "Run wipEout port unit tests");
     wipeout_test_step.dependOn(&b.addRunArtifact(wipeout_tests).step);
 
+    // ---- orb probe: offline frames of the orb screensaver ----
+    const orb_module = b.createModule(.{
+        .root_source_file = b.path("src/client/orb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "vaxis", .module = vaxis.module("vaxis") }},
+    });
+    const orb_probe = b.addExecutable(.{
+        .name = "orb-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/orb_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "orb", .module = orb_module }},
+        }),
+    });
+    const orb_probe_cmd = b.addRunArtifact(orb_probe);
+    if (b.args) |args| orb_probe_cmd.addArgs(args);
+    orb_probe_cmd.has_side_effects = true;
+    b.step("orb-probe", "Render orb screensaver frames to PPM").dependOn(&orb_probe_cmd.step);
+
     // ---- unit tests ----
     // Dedicated Debug module: safety checks stay on and test compiles stay
     // fast regardless of the install optimize mode.
