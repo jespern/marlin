@@ -109,7 +109,10 @@ pub const Config = struct {
     /// with `[web] tailscale = true`; absent/unavailable CLI stays loopback-only.
     web_tailscale: bool = false,
     /// Standards-based phone push via the bounded `marlin _push` helper.
-    web_push: bool = false,
+    /// On by default: it is inert until a phone actually subscribes, and the
+    /// subscribe surface is the web UI, which the user already reached.
+    /// `[web] push = false` turns it off.
+    web_push: bool = true,
 
     /// Advertise this daemon on the LAN as `_marlin._tcp` (Bonjour, via the
     /// system responder) so `marlin discover` on another machine lists it:

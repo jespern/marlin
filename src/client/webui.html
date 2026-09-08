@@ -14,9 +14,13 @@
 <title>marlin</title>
 <style>
   :root {
+    /* Mirrors the TUI palette (client/render.zig): headings #89ddff, code
+       soft-blue #8aa6bf on #2d3035, shell blue #82aaff, prompt bg #42454b.
+       Yellow is reserved for approval/warning surfaces, like the terminal. */
     --bg: #17191d; --panel: #1e2126; --panel2: #24282e; --line: #2c313a;
-    --fg: #e8eaee; --dim: #8b93a1; --accent: #5cc8e8; --green: #73d091;
-    --yellow: #e8c765; --red: #f07178; --blue: #829aff;
+    --fg: #e8eaee; --dim: #8b93a1; --accent: #89ddff; --green: #73d091;
+    --yellow: #e8c765; --red: #f07178; --blue: #82aaff;
+    --code: #8aa6bf; --code-bg: #2d3035; --prompt-bg: #42454b;
     --add-bg: #1f3729; --del-bg: #3b2429;
   }
   * { box-sizing: border-box; margin: 0; }
@@ -58,16 +62,16 @@
   #topbar, #approval, #composer, #status { flex-shrink: 0; }
   #connection { padding: 10px 16px; border-top: 1px solid var(--line); font-size: 12px; overflow-wrap: anywhere; }
   #connection a { color: var(--accent); }
-  #connection-state { color: var(--yellow); }
+  #connection-state { color: var(--dim); }
   #push-toggle { margin-top: 10px; }
   #connection-badge { font-size: 11px; color: var(--yellow); }
   #connection-help, #push-help { color: var(--dim); margin-top: 6px; }
   #transcript { order: 1; flex: 1; min-height: 0; overflow-y: auto; padding: 18px 22px; }
   #history-more { display: none; margin: 0 auto 14px; }
   #history-more.show { display: block; }
-  .block { margin: 0 0 10px; max-width: 100ch; }
+  .block { margin: 0 0 10px; }
   .user {
-    background: var(--panel2); border-left: 3px solid var(--accent);
+    background: var(--prompt-bg); border-left: 3px solid var(--accent);
     padding: 8px 12px; border-radius: 4px; white-space: pre-wrap;
     color: #fff; font-weight: 600;
   }
@@ -82,7 +86,7 @@
   .reasoning { color: var(--dim); padding: 0 12px; }
   .reasoning::before { content: "· "; color: var(--accent); font-weight: bold; }
   .tool summary { color: var(--dim); cursor: pointer; }
-  .tool summary .name { color: var(--yellow); }
+  .tool summary .name { color: var(--blue); }
   .tool summary .prev { color: var(--dim); }
   .tool pre, .md pre {
     background: var(--panel); margin: 4px 0; padding: 8px 12px;
@@ -95,7 +99,7 @@
   .md p, .md ul, .md ol, .md blockquote, .md table, .md h1, .md h2, .md h3, .md h4 { margin: 0 0 8px; }
   .md h1, .md h2 { font-size: 16px; color: var(--accent); }
   .md h3, .md h4 { font-size: 14px; color: var(--accent); }
-  .md code { background: var(--panel2); padding: 0 4px; border-radius: 3px; color: var(--yellow); }
+  .md code { background: var(--code-bg); padding: 0 4px; border-radius: 3px; color: var(--code); }
   .md pre code { background: none; padding: 0; color: var(--fg); }
   .md ul, .md ol { padding-left: 24px; }
   .md blockquote { border-left: 3px solid var(--line); padding-left: 10px; color: var(--dim); font-style: italic; }
@@ -184,7 +188,6 @@
     #side h1 { padding: 16px 16px 12px; }
     #side h1 button { padding: 4px 10px; }
     #transcript { padding: 12px; }
-    .block { max-width: none; }
     #input { font-size: 16px; } /* <16px makes iOS zoom the page on focus */
     #composer .prompt { padding-top: 13px; }
     button.act { padding: 8px 14px; }
@@ -814,15 +817,17 @@ async function setupCompanion() {
     const response = await fetch('/connection');
     if (!response.ok) throw Error('connection settings unavailable');
     const settings = await response.json();
-    const url = settings.tailnet_host ? 'https://' + settings.tailnet_host + '/' : location.origin + '/';
-    $('#canonical-url').href = url;
-    $('#canonical-url').textContent = url;
-    $('#connection-help').textContent = settings.tailnet_host
-      ? 'Use this address for the Home Screen app. The laptop must be awake and connected to Tailscale.'
-      : 'Phone address unavailable. Enable Tailscale in Marlin’s web settings and check Tailscale Serve.';
-    if (!settings.push_enabled) { $('#push-help').textContent = 'Phone notifications are disabled in Marlin’s configuration.'; return; }
+    // Loopback needs no address advertisement (you are already here) and no
+    // Tailscale lecture; the footer stays quiet unless something is actionable.
+    if (settings.tailnet_host) {
+      const url = 'https://' + settings.tailnet_host + '/';
+      $('#canonical-url').href = url;
+      $('#canonical-url').textContent = url;
+      $('#connection-help').textContent = 'Add to Home Screen from this address.';
+    }
+    if (!settings.push_enabled) return;
     if (!isSecureContext || !('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
-      $('#push-help').textContent = 'For iPhone notifications, open the HTTPS address as a Home Screen app on iOS 16.4 or later.';
+      $('#push-help').textContent = 'Notifications need the Home Screen app (iOS 16.4+).';
       return;
     }
     await navigator.serviceWorker.register('/sw.js');
