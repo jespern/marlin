@@ -209,7 +209,8 @@ pub const Advertiser = if (supported) struct {
         if (self.ref == null or n == self.sessions) return;
         self.sessions = n;
         const t = self.record() catch return;
-        _ = dnssd.DNSServiceUpdateRecord(self.ref, null, 0, @intCast(t.len), t.ptr, 0);
+        const err = dnssd.DNSServiceUpdateRecord(self.ref, null, 0, @intCast(t.len), t.ptr, 0);
+        if (err != dnssd.ok) std.log.warn("discovery: TXT update failed ({d})", .{err}) else std.log.debug("discovery: sessions={d}", .{n});
     }
 
     pub fn stop(self: *Advertiser) void {
