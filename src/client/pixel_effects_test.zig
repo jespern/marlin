@@ -174,6 +174,7 @@ test "the wire budget stretches the ship interval for heavy frames" {
     var game = Engine.init(std.testing.allocator, .wipeout, 1);
     defer game.deinit();
     try std.testing.expectEqual(@as(usize, 60), pixel_effects.tickRate(.wipeout));
+    try std.testing.expectEqual(@as(usize, 60), pixel_effects.tickRate(.orb));
     game.last_frame_bytes = 62_000;
     try std.testing.expectEqual(@as(u8, 1), game.effectiveEvery());
     game.last_frame_bytes = 150_000;
@@ -276,6 +277,50 @@ test "tetris fills the viewport with a compressed arcade cabinet and advances it
         after.y != before.y or
         after.route_index != before.route_index or
         engine.tetris_game.pieces > 0);
+}
+
+test "orb captures the cell grid once and animates over the frozen backdrop" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var vx = try vaxis.Vaxis.init(threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &out.writer);
+    vx.caps.kitty_graphics = true;
+    try vx.resize(gpa, &out.writer, .{ .rows = 25, .cols = 90, .x_pixel = 720, .y_pixel = 400 });
+    const win = vx.window();
+    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 6, 12, 24 } } } });
+    win.writeCell(12, 5, .{
+        .char = .{ .grapheme = "M", .width = 1 },
+        .style = .{ .fg = .{ .rgb = .{ 240, 180, 120 } }, .bg = .{ .rgb = .{ 6, 12, 24 } } },
+    });
+
+    var engine = Engine.init(gpa, .orb, 7);
+    defer engine.deinit();
+    engine.setCellPixels(8, 16);
+    engine.setGraphics(true);
+    try engine.reset(90, 25, 7);
+    try std.testing.expectEqual(@as(u8, 1), engine.transmit_every);
+    try std.testing.expectEqual(@as(u64, 0), engine.background_generation);
+    out.clearRetainingCapacity();
+    try engine.transmit(&vx, &out.writer);
+    try std.testing.expectEqual(@as(u64, 1), engine.background_generation);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b_Ga=T,f=24,s=720,v=400,i=") != null);
+    try std.testing.expectEqual(@as(u8, 1), engine.effectiveEvery());
+    try std.testing.expect(engine.last_frame_bytes * 60 <= pixel_effects.wire_budget_bytes_per_second);
+
+    const captured = try gpa.dupe(u8, engine.background);
+    defer gpa.free(captured);
+    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 220, 20, 20 } } } });
+    engine.tick();
+    engine.tick();
+    out.clearRetainingCapacity();
+    try engine.transmit(&vx, &out.writer);
+    try std.testing.expectEqualSlices(u8, captured, engine.background);
+    try std.testing.expect(!std.mem.eql(u8, captured, engine.rgb));
 }
 
 test "daybreak stays inside the 720×405 envelope and ships compressed frames at a tenth of the ticks or slower" {

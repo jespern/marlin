@@ -631,6 +631,15 @@ test "composer suggestions include commands, council actions, and council names"
     try std.testing.expectEqualStrings("/screensaver pacman", suggestions[1].label);
 
     app.view.editor.clear();
+    app.view.editor.insertSlice("/screensaver o");
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(gpa);
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/screensaver orb", suggestions[0].label);
+    try std.testing.expect(std.mem.indexOf(u8, suggestions[0].description, "pixelated") != null);
+
+    app.view.editor.clear();
     app.view.editor.insertSlice("/screensaver tu");
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -687,6 +696,15 @@ test "named animations and screensavers share the selected effect engine" {
     try std.testing.expectEqual(effects.Kind.tetris, app.effect_engine.?.kind());
     try std.testing.expectEqual(effects.Kind.matrix, app.screensaver_kind);
     try std.testing.expect(app.dismissScreensaver());
+
+    app.kitty_graphics = true;
+    app.runCommand("/screensaver orb");
+    try std.testing.expect(app.screensaver_active);
+    try std.testing.expectEqual(effects.Kind.orb, app.effect_engine.?.kind());
+    try std.testing.expect(app.fast_effect_active.load(.acquire));
+    try std.testing.expect(app.dismissScreensaver());
+    try std.testing.expect(!app.fast_effect_active.load(.acquire));
+    app.kitty_graphics = false;
 
     app.runCommand("/screensaver stars");
     try std.testing.expect(app.screensaver_active);

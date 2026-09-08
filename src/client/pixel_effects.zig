@@ -29,6 +29,7 @@ const visual_effect = @import("../core/visual_effect.zig");
 const pacman = @import("pacman.zig");
 const tetris = @import("tetris.zig");
 const daybreak = @import("daybreak.zig");
+const orb = @import("orb.zig");
 const wipeout_effect = @import("wipeout_effect.zig");
 const kitty = @import("../wipeout/kitty_transport.zig");
 
@@ -76,6 +77,8 @@ pub const Engine = struct {
     /// Where the sun and moon stand; daybreak follows it. Set by the
     /// TUI before each transmit.
     sky: daybreak.Sky = daybreak.Sky.noon,
+    orb_fg: [3]u8 = orb.default_fg,
+    orb_bg: [3]u8 = orb.default_bg,
     /// Board state for the pacman kind (unused otherwise), its cached
     /// background (per maze generation), zlib output, and the compressor's
     /// window.
@@ -139,6 +142,11 @@ pub const Engine = struct {
         self.sky = sky;
     }
 
+    pub fn setOrbColors(self: *Engine, foreground: ?[3]u8, background_color: ?[3]u8) void {
+        self.orb_fg = foreground orelse orb.default_fg;
+        self.orb_bg = background_color orelse orb.default_bg;
+    }
+
     pub fn setCellPixels(self: *Engine, w: u32, h: u32) void {
         if (w > 0 and h > 0) {
             self.cell_px_w = w;
@@ -182,7 +190,7 @@ pub const Engine = struct {
         errdefer self.gpa.free(self.scratch);
         self.encoded = try self.gpa.alloc(u8, std.base64.standard.Encoder.calcSize(pixels * 3));
         errdefer self.gpa.free(self.encoded);
-        if (self.kind == .pacman) {
+        if (self.kind == .pacman or self.kind == .orb) {
             self.background = try self.gpa.alloc(u8, pixels * 3);
             errdefer self.gpa.free(self.background);
             self.background_generation = 0;
@@ -203,11 +211,11 @@ pub const Engine = struct {
     }
 
     /// Base ticks per shipped frame, before the wire budget. Daybreak moves
-    /// slowly and its frames are the heaviest, so 10 fps; very large boards
-    /// halve to keep deflate off the critical path; wipEout ships every
-    /// 60 Hz tick.
+    /// slowly and ships at 10 fps; the orb and wipEout ship every 60 Hz tick;
+    /// very large boards halve to keep deflate off the critical path.
     fn shipEvery(kind: visual_effect.Kind, pixels: usize) u8 {
         if (kind == .daybreak) return 3;
+        if (kind == .orb) return 1;
         if (kind == .wipeout) return 1;
         return if (pixels > 700_000) 2 else 1;
     }
@@ -238,7 +246,6 @@ pub const Engine = struct {
     /// a daemon event) reuse the image already in the terminal. The caller
     /// handles NoGraphicsCapability by falling back to a cell effect.
     pub fn transmit(self: *Engine, vx: *vaxis.Vaxis, tty: *std.Io.Writer) !void {
-        _ = vx;
         if (!self.graphics) return error.NoGraphicsCapability;
         if (self.rgb.len == 0) try self.resize(self.cols, self.rows);
         if (self.kind == .wipeout) {
@@ -255,6 +262,13 @@ pub const Engine = struct {
             .metaballs => renderScene(.metaballs, self.rgb, self.width, self.height, frame),
             .horizon => renderScene(.horizon, self.rgb, self.width, self.height, frame),
             .daybreak => daybreak.render(self.rgb, self.width, self.height, self.frame, self.seed, self.sky),
+            .orb => {
+                if (self.background_generation == 0) {
+                    orb.capture(self.background, self.scratch, self.width, self.height, vx.window(), self.orb_fg, self.orb_bg);
+                    self.background_generation = 1;
+                }
+                orb.render(self.rgb, self.background, self.width, self.height, self.frame, self.seed);
+            },
             .tetris => tetris.renderPixels(&self.tetris_game, self.rgb, self.width, self.height),
             .wipeout => if (self.wipeout_game) |g| g.render(self.rgb, self.width, self.height) else @memset(self.rgb, 0),
             .pacman => {
@@ -346,7 +360,7 @@ pub const game_ticks_per_second: usize = 60;
 
 /// Ticks per second an engine of this kind is driven at.
 pub fn tickRate(kind: visual_effect.Kind) usize {
-    return if (kind == .wipeout) game_ticks_per_second else ticks_per_second;
+    return if (kind == .wipeout or kind == .orb) game_ticks_per_second else ticks_per_second;
 }
 /// What any one effect may put on the wire — a courtesy cap, not a crash
 /// guard: Ghostty 1.3.1 took 14 MiB/s of raw frames for 40 s and 2 min of
@@ -397,11 +411,11 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
     const r: u32 = @max(rows, 1);
     const win_w = c * cell_px_w;
     const win_h = r * cell_px_h;
-    if (kind == .daybreak) {
-        // A 1900×900 canvas stretched to the viewport in the original: render
-        // near the window's own pixel size, inside the envelope Pac-Man has
-        // proven (720×405 is ~0.8 of its pixels) since these frames compress
-        // only a few times.
+    if (kind == .daybreak or kind == .orb) {
+        // Detailed, slowly shipped scenes render near the window's own pixel
+        // size inside the 720×405 envelope Pac-Man has already proven. Both
+        // daybreak's stretched 1900×900 canvas and the orb's captured text
+        // benefit from more resolution than the small demoscene framebuffers.
         var width: u32 = std.math.clamp(win_w, 480, 720);
         var height: u32 = @max(width * win_h / @max(win_w, 1), 32);
         if (height > 405) {

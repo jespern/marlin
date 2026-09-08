@@ -48,7 +48,7 @@ pub const Engine = union(enum) {
             .tetris => .{ .tetris = tetris.Engine.init(gpa, seed) },
             .pacman => .{ .pacman = pacman.Engine.init(gpa, seed) },
             // fallback() never names the pixel-only kinds; plasma is the safe cell default.
-            .plasma, .tunnel, .metaballs, .horizon, .demo, .daybreak, .wipeout => .{ .plasma = plasma.Engine.init(gpa, seed) },
+            .plasma, .tunnel, .metaballs, .horizon, .demo, .daybreak, .orb, .wipeout => .{ .plasma = plasma.Engine.init(gpa, seed) },
         };
     }
 
@@ -86,6 +86,13 @@ pub const Engine = union(enum) {
     pub fn setSky(self: *Engine, sky: Sky) void {
         switch (self.*) {
             .pixel => |*engine| engine.setSky(sky),
+            else => {},
+        }
+    }
+
+    pub fn setOrbColors(self: *Engine, foreground: ?[3]u8, background: ?[3]u8) void {
+        switch (self.*) {
+            .pixel => |*engine| engine.setOrbColors(foreground, background),
             else => {},
         }
     }

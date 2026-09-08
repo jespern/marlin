@@ -159,6 +159,7 @@ pub const VoiceEvent = union(enum) {
 pub const Mode = enum { insert, normal };
 
 pub const transient_animation_frames: usize = 180;
+const fast_transient_animation_frames: usize = transient_animation_frames * 2;
 
 const TopView = struct {
     selected_sid: ?u64 = null,
@@ -559,6 +560,8 @@ pub const App = struct {
     game_mode: bool = false,
     /// Ticker hint: the game wants ~60 Hz ticks, not the 30 Hz effect tier.
     game_active: std.atomic.Value(bool) = .init(false),
+    /// The orb also uses the 60 Hz presentation tier without entering game mode.
+    fast_effect_active: std.atomic.Value(bool) = .init(false),
     /// Terminal capability from queryTerminal; pixel effects need it and
     /// otherwise start as their cell fallback.
     kitty_graphics: bool = false,
@@ -2208,6 +2211,7 @@ pub const App = struct {
         }
         self.effect_engine.?.setCellPixels(self.cell_px_w, self.cell_px_h);
         self.effect_engine.?.setGraphics(self.kitty_graphics);
+        self.effect_engine.?.setOrbColors(self.terminal_theme.foreground, self.terminal_theme.background);
         self.effect_engine.?.reset(
             @intCast(@min(self.term_cols, std.math.maxInt(u16))),
             self.term_rows,
@@ -2227,6 +2231,7 @@ pub const App = struct {
         self.ui_animation = kind;
         self.ui_animation_frame = 0;
         self.ui_animation_active.store(true, .release);
+        self.fast_effect_active.store(self.effect_engine.?.kind() == .orb, .release);
         self.syncAnimationTicker();
     }
 
@@ -2236,6 +2241,7 @@ pub const App = struct {
         self.ui_animation_frame = 0;
         self.screensaver_active = true;
         self.ui_animation_active.store(true, .release);
+        self.fast_effect_active.store(self.effect_engine.?.kind() == .orb, .release);
         self.clearPending();
         self.syncAnimationTicker();
     }
@@ -2244,6 +2250,7 @@ pub const App = struct {
         if (!self.screensaver_active) return false;
         self.screensaver_active = false;
         self.ui_animation_active.store(false, .release);
+        self.fast_effect_active.store(false, .release);
         self.recordUserActivity();
         self.refresh_requested = true;
         self.syncAnimationTicker();
@@ -2461,10 +2468,12 @@ pub const App = struct {
         if (self.effect_engine) |*engine| engine.tick();
         if (self.screensaver_active) return;
         self.ui_animation_frame += 1;
-        if (self.ui_animation_frame >= transient_animation_frames) {
+        const frame_limit = if (self.fast_effect_active.load(.acquire)) fast_transient_animation_frames else transient_animation_frames;
+        if (self.ui_animation_frame >= frame_limit) {
             self.ui_animation = null;
             self.ui_animation_frame = 0;
             self.ui_animation_active.store(false, .release);
+            self.fast_effect_active.store(false, .release);
             self.refresh_requested = true;
             self.syncAnimationTicker();
         }
@@ -5648,10 +5657,11 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     drawUiAnimation(app, win);
 }
 
-fn transientAnimationOpacity(frame: usize) u8 {
-    const fade_frames: usize = 18;
+fn transientAnimationOpacity(frame: usize, fast: bool) u8 {
+    const fade_frames: usize = if (fast) 36 else 18;
     if (frame < fade_frames) return @intCast(frame * 255 / fade_frames);
-    const remaining = (transient_animation_frames - 1) -| frame;
+    const frame_limit = if (fast) fast_transient_animation_frames else transient_animation_frames;
+    const remaining = (frame_limit - 1) -| frame;
     if (remaining < fade_frames) return @intCast(remaining * 255 / fade_frames);
     return 255;
 }
@@ -5670,7 +5680,7 @@ pub fn drawUiAnimation(app: *const App, win: vaxis.Window) void {
             engine.draw(win, .full_screen, 255);
             win.hideCursor();
         } else {
-            engine.draw(win, .interleaved, transientAnimationOpacity(app.ui_animation_frame));
+            engine.draw(win, .interleaved, transientAnimationOpacity(app.ui_animation_frame, app.fast_effect_active.load(.acquire)));
         }
     }
 }
@@ -5947,9 +5957,8 @@ pub fn dispatchEvent(
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     var next_presence_tick: i64 = 0;
     while (!app.animation_stop.load(.acquire)) {
-        if (app.game_active.load(.acquire)) {
-            // A playable game steps on wall time; ticks just need to be
-            // frequent enough for 60 fps presentation.
+        if (app.game_active.load(.acquire) or app.fast_effect_active.load(.acquire)) {
+            // Games and high-motion effects use the 60 fps presentation tier.
             loop.postEvent(.tick) catch return;
             app.io.sleep(.fromMilliseconds(16), .awake) catch {};
         } else if (app.ui_animation_active.load(.acquire)) {

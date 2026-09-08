@@ -16,7 +16,10 @@ Terminal-native effects share one finite-animation/full-screen-saver surface.
   that turn the ghosts blue and edible, bonus fruit, arcade scoring under a
   "1UP" / "HIGH SCORE" header, three lives, "READY!" and "GAME OVER"; a new
   maze every board), a spinning `tunnel`, `metaballs`, a synthwave `horizon`, `demo`, a
-  24-second sequence of those three, and `daybreak`, a paper-cutout
+  24-second sequence of those three, `orb`, a 60 FPS rotating red-and-gold armor
+  sphere rendered as chunky, palette-quantized pixels with cyan-white reactor
+  seams, scanlines, and light digital noise over a dimmed, blurred snapshot of
+  the current Marlin screen, and `daybreak`, a paper-cutout
   landscape after Jani Ylikangas' js1k entry that follows the real sun over
   your machine: it locates you from your time zone and computes the sun's
   true altitude and azimuth, so days run long in summer and short in
@@ -27,7 +30,9 @@ Terminal-native effects share one finite-animation/full-screen-saver surface.
   `MARLIN_DAYBREAK_LATLON=lat,lon` overrides the place. Without graphics,
   Tetris and Pac-Man draw cell fallbacks and the other pixel effects start as a
   cell sibling; either way the
-  status line says so. Run `/animate <effect>` over gaps in the current UI
+  status line says so. Start the floating orb with `/screensaver orb`; it
+  captures the visible Marlin cell grid once, softens that raster, and keeps the
+  backdrop still while the sphere turns. Run `/animate <effect>` over gaps in the current UI
   (opaque for the pixel kinds), or `/screensaver [effect]` for the
   continuous form. Tetris is deliberately manual-only: start it with
   `/screensaver tetris` (or `/animate tetris`); it cannot be selected for idle

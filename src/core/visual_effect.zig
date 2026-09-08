@@ -19,6 +19,7 @@ pub const Kind = enum {
     horizon,
     demo,
     daybreak,
+    orb,
     /// wipEout: a playable game, not a screensaver. Manual only.
     wipeout,
 
@@ -48,6 +49,7 @@ pub const Kind = enum {
             .horizon => "synthwave horizon (Kitty graphics)",
             .demo => "24-second pixel demoscene sequence (Kitty graphics)",
             .daybreak => "a landscape that follows the real sun over your machine (Kitty graphics)",
+            .orb => "a pixelated red-gold reactor orb over blurred Marlin (Kitty graphics)",
             .wipeout => "wipEout, playable (Kitty graphics; start with !wipeout)",
         };
     }
@@ -56,7 +58,7 @@ pub const Kind = enum {
     pub fn backend(self: Kind) Backend {
         return switch (self) {
             .matrix, .strings, .stars, .plasma => .cell,
-            .tetris, .pacman, .tunnel, .metaballs, .horizon, .demo, .daybreak, .wipeout => .pixel,
+            .tetris, .pacman, .tunnel, .metaballs, .horizon, .demo, .daybreak, .orb, .wipeout => .pixel,
         };
     }
 
@@ -91,7 +93,7 @@ pub const Kind = enum {
         return switch (self) {
             .tunnel, .demo => .plasma,
             .metaballs => .plasma,
-            .horizon, .daybreak, .wipeout => .stars,
+            .horizon, .daybreak, .orb, .wipeout => .stars,
             else => self,
         };
     }

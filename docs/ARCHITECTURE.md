@@ -1206,8 +1206,13 @@ A split pane identifies its session with a compact pane label.
   reachable movement graph, scores reachable landings by lines, height, holes,
   and roughness, then visibly executes rotations, shifts, descents, and late
   slides beneath overhangs;
-  tunnel, metaballs, horizon, a 24-second `demo` sequence,
-  a `daybreak` landscape (`client/daybreak.zig`, after Jani Ylikangas'
+  tunnel, metaballs, horizon, a 24-second `demo` sequence, a floating `orb`
+  (`client/orb.zig`) whose first transmitted frame rasterizes the already-drawn
+  Vaxis cell grid into a dimmed two-pass box-blurred backdrop and whose later
+  frames reuse that snapshot beneath a 60 FPS procedural sphere shaded as red
+  and gold armor with cyan-white reactor seams, then sampled through a coarse
+  virtual framebuffer with palette quantization, pixel-cell borders, scanlines,
+  and low-rate digital noise, and a `daybreak` landscape (`client/daybreak.zig`, after Jani Ylikangas'
   js1k 2019 entry: composed in the original's 1900×900 canvas units and
   scaled per axis, rasterized with coverage anti-aliasing — the original's
   faint ranges are sub-pixel fillRect widths, which coverage reproduces.
@@ -1269,8 +1274,9 @@ A split pane identifies its session with a compact pane label.
   stress run both left the terminal flat. A wire budget of 10 MB/s
   (`pixel_effects.wire_budget_bytes_per_second`; `MARLIN_WIRE_BUDGET`
   overrides it, 0 for none) is a courtesy cap that lets every effect ship at
-  its base rate — Pac-Man 30 fps, daybreak (720×405 at most) 10 fps, the
-  demoscene scenes (320 px wide) 30, wipEout every 60 Hz tick — and still
+  its base rate — Pac-Man 30 fps, daybreak (720×405 at most) 10 fps, orb
+  (the same envelope) and wipEout every 60 Hz tick, and the demoscene scenes
+  (320 px wide) at 30 fps — and still
   reins in a runaway scene.
   Placements use the default z-index (above text) because terminals disagree
   on where negative z sits relative to an explicit cell background.
