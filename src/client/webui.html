@@ -161,6 +161,17 @@
   #picker-list { overflow-y: auto; }
   #picker-list div { padding: 5px 12px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #picker-list div:hover, #picker-list div.sel { background: var(--panel2); color: var(--accent); }
+  #slashmenu {
+    position: fixed; width: min(480px, calc(100vw - 24px)); max-height: 40vh;
+    display: none; flex-direction: column; overflow-y: auto; z-index: 30;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    font-size: 13px;
+  }
+  #slashmenu.show { display: flex; }
+  #slashmenu div { padding: 5px 12px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #slashmenu div:hover, #slashmenu div.sel { background: var(--panel2); }
+  #slashmenu .cmd { color: var(--accent); }
+  #slashmenu .desc { color: var(--dim); margin-left: 10px; }
   #interrupt {
     display: none; padding: 1px 6px; min-width: 26px; align-items: center;
     justify-content: center; border-color: transparent; background: transparent;
@@ -255,6 +266,7 @@
     <input id="picker-filter" placeholder="filter models…" autocomplete="off">
     <div id="picker-list"></div>
   </div>
+  <div id="slashmenu" role="listbox"></div>
   <div id="status">
     <span class="state">idle</span><span>·</span><span class="model" title="switch model"></span>
     <span class="notice"></span>
@@ -737,12 +749,90 @@ async function loadSessions() {
   }
 }
 
+// The composer's slash-command menu: shown while the first token is being
+// typed, filtered by prefix. Enter runs the selection (or completes /rename,
+// which needs its argument); Tab completes; Escape clears the composer —
+// the web UI has no vim modes, so erase is what Escape means here.
+const slash_commands = [
+  { name: '/model', usage: ' [name]', desc: 'switch model or open the picker' },
+  { name: '/sandbox', usage: ' [on|off]', desc: 'toggle the shell sandbox' },
+  { name: '/permissions', usage: ' [full|default]', desc: 'full access or default approvals' },
+  { name: '/compact', usage: '', desc: 'compact the current context' },
+  { name: '/rename', usage: ' <title>', desc: 'rename this session' },
+  { name: '/archive', usage: '', desc: 'archive this session' },
+  { name: '/new', usage: '', desc: 'start a new session' },
+  { name: '/interrupt', usage: '', desc: 'interrupt the running turn' },
+];
+let slashSel = 0;
+function slashMatches(value) {
+  return value.startsWith('/') && !value.includes(' ')
+    ? slash_commands.filter(c => c.name.startsWith(value))
+    : [];
+}
+function hideSlashMenu() { $('#slashmenu').classList.remove('show'); }
+function renderSlashMenu() {
+  const menu = $('#slashmenu');
+  const matches = slashMatches($('#input').value);
+  if (!matches.length) { hideSlashMenu(); return; }
+  slashSel = Math.min(slashSel, matches.length - 1);
+  menu.replaceChildren();
+  matches.forEach((c, i) => {
+    const row = el('div', i === slashSel ? 'sel' : null);
+    row.appendChild(el('span', 'cmd', c.name + c.usage));
+    row.appendChild(el('span', 'desc', c.desc));
+    row.onclick = () => acceptSlash(c);
+    menu.appendChild(row);
+  });
+  menu.classList.add('show');
+  const anchor = $('#input').getBoundingClientRect();
+  menu.style.left = Math.max(12, Math.min(anchor.left, innerWidth - menu.offsetWidth - 12)) + 'px';
+  menu.style.bottom = (innerHeight - anchor.top + 6) + 'px';
+}
+function acceptSlash(c) {
+  hideSlashMenu();
+  if (c.usage.startsWith(' <')) { // required argument: complete, keep typing
+    $('#input').value = c.name + ' ';
+    $('#input').focus();
+    return;
+  }
+  $('#input').value = '';
+  slashCommand(c.name).catch(() => notice('command failed'));
+}
+$('#input').addEventListener('input', () => { slashSel = 0; renderSlashMenu(); });
+$('#input').addEventListener('blur', () => setTimeout(hideSlashMenu, 150));
 $('#input').addEventListener('keydown', async e => {
+  const menu_open = $('#slashmenu').classList.contains('show');
+  if (e.key === 'Escape') {
+    e.target.value = '';
+    hideSlashMenu();
+    return;
+  }
+  if (menu_open) {
+    const matches = slashMatches(e.target.value);
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      slashSel = (slashSel + (e.key === 'ArrowDown' ? 1 : matches.length - 1)) % matches.length;
+      renderSlashMenu();
+      return;
+    }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      if (matches[slashSel]) $('#input').value = matches[slashSel].name + (matches[slashSel].usage ? ' ' : '');
+      renderSlashMenu();
+      return;
+    }
+    if (e.key === 'Enter' && matches[slashSel]) {
+      e.preventDefault();
+      acceptSlash(matches[slashSel]);
+      return;
+    }
+  }
   if (e.key !== 'Enter') return;
   const text = e.target.value.trim();
   if (!text || !sid) return;
   if (text.startsWith('/')) {
     e.target.value = '';
+    hideSlashMenu();
     slashCommand(text).catch(() => notice('command failed'));
     return;
   }
@@ -855,6 +945,16 @@ $('#picker-filter').addEventListener('keydown', e => {
   }
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePicker(); });
+// Type anywhere: a printable key with focus outside any field lands in the
+// composer (or the open picker's filter), like typing at the terminal.
+// Focusing during keydown is enough — the default action then inserts the
+// character into the newly focused input. Shortcuts (⌘/Ctrl/Alt) pass by.
+document.addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey || e.key.length !== 1) return;
+  const t = e.target;
+  if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || (t && t.isContentEditable)) return;
+  ($('#picker').classList.contains('show') ? $('#picker-filter') : $('#input')).focus();
+});
 
 // The composer accepts the session-scoped subset of slash commands; the rest
 // belong to the terminal (screensavers, reboot, voice…) and say so.
