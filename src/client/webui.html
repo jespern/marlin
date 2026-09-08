@@ -83,8 +83,11 @@
   .user.optimistic.unconfirmed::after { content: " · delivery?"; color: var(--yellow); }
   .user.rejected { border-left-color: var(--red); color: var(--red); opacity: .85; }
   .user.rejected::after { content: " · not sent"; color: var(--red); font-size: 12px; }
-  .reasoning { color: var(--dim); padding: 0 12px; }
-  .reasoning::before { content: "· "; color: var(--accent); font-weight: bold; }
+  /* The marker is absolutely positioned so it aligns with the first line of
+     the markdown body (whose leading <p> is block-level); as inline ::before
+     content it stranded the dot alone on its own line above the text. */
+  .reasoning { color: var(--dim); padding: 0 12px 0 24px; position: relative; }
+  .reasoning::before { content: "·"; color: var(--accent); font-weight: bold; position: absolute; left: 12px; top: 0; }
   .tool summary { color: var(--dim); cursor: pointer; }
   .tool summary .name { color: var(--blue); }
   .tool summary .prev { color: var(--dim); }

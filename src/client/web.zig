@@ -113,6 +113,19 @@ fn setupTailscale(gpa: std.mem.Allocator, io: Io, environ: *const std.process.En
     return gpa.dupe(u8, host) catch null;
 }
 
+/// Block on the daemon-held stdin pipe; its EOF means the daemon exited (any
+/// cause), so exit too. Runs on a detached thread — the process dying is the
+/// point, so there is nothing to join.
+fn parentDeathWatch(io: Io) void {
+    const in = Io.File.stdin();
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = in.readStreaming(io, &.{&buf}) catch break;
+        if (n == 0) break;
+    }
+    std.process.exit(0);
+}
+
 pub fn serve(
     gpa: std.mem.Allocator,
     io: Io,
@@ -161,6 +174,16 @@ pub fn serve(
         return 1;
     };
     probe.deinit();
+
+    // Exit when the spawning daemon goes away. Without this an orphaned
+    // companion outlives its daemon and keeps the port (see web_service.zig).
+    // reuse_address stays on so /reboot can rebind through TIME_WAIT; the
+    // watchdog is what actually prevents two live listeners coexisting, since
+    // it reaps the old companion before the new one binds.
+    if (!(Io.File.stdin().isTty(io) catch true)) {
+        const watch = std.Thread.spawn(.{}, parentDeathWatch, .{io}) catch null;
+        if (watch) |t| t.detach();
+    }
 
     var addr = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
     var server = addr.listen(io, .{ .reuse_address = true }) catch |e| {

@@ -80,10 +80,16 @@ pub const Service = struct {
         self.state = if (self.stopping) "stopped" else "failed";
     }
     fn run(self: *Service) !void {
+        // stdin is a pipe the daemon holds open for the companion's lifetime
+        // but never writes to. Its only purpose is death detection: when the
+        // daemon exits — cleanly OR by crash/SIGKILL — the OS closes this
+        // write end, the companion reads EOF and exits, so a companion can
+        // never outlive its daemon and squat the port (the orphaned-web-ui
+        // bug). Clean shutdown still kills it directly via stop().
         var child = try std.process.spawn(self.io, .{
             .argv = &.{ self.exe, "_web" },
             .environ_map = self.environ,
-            .stdin = .ignore,
+            .stdin = .pipe,
             .stdout = .ignore,
             .stderr = .pipe,
         });
