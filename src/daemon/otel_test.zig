@@ -110,7 +110,10 @@ test "OTLP request follows GenAI inference and execute-tool structure without co
     try std.testing.expect(spanAttribute(root.*, "gen_ai.conversation.id") != null);
     try std.testing.expect(spanAttribute(root.*, "gen_ai.usage.input_tokens") != null);
     try std.testing.expect(spanAttribute(root.*, "gen_ai.usage.output_tokens") != null);
-    try std.testing.expect(spanAttribute(root.*, "gen_ai.provider.name") == null);
+    // The root carries model + provider so guest turns (no native rounds)
+    // are still attributable and priceable.
+    try expectStringAttribute(root.*, "gen_ai.request.model", "openrouter/test/model");
+    try expectStringAttribute(root.*, "gen_ai.provider.name", "openrouter");
 
     const inference = spanNamed(spans, "chat test/model");
     try std.testing.expectEqual(@as(i64, 3), inference.object.get("kind").?.integer);

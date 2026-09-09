@@ -185,9 +185,12 @@ pub const Event = union(enum) {
         /// Joined `errors` array (e.g. "No conversation found with session
         /// ID: …"); empty on success.
         error_text: []const u8,
+        /// Billed input for the whole invocation: fresh + cache reads +
+        /// cache writes (each priced differently — the splits are below).
         tokens_in: u64,
         tokens_out: u64,
         cached_tokens: u64,
+        cache_write_tokens: u64,
     },
 };
 
@@ -292,10 +295,12 @@ pub fn decodeLine(
         var tokens_in: u64 = 0;
         var tokens_out: u64 = 0;
         var cached: u64 = 0;
+        var cache_write: u64 = 0;
         if (root.get("usage")) |u| if (u == .object) {
             tokens_in = uintField(u.object, "input_tokens") orelse 0;
             tokens_out = uintField(u.object, "output_tokens") orelse 0;
             cached = uintField(u.object, "cache_read_input_tokens") orelse 0;
+            cache_write = uintField(u.object, "cache_creation_input_tokens") orelse 0;
         };
         const subtype = strField(root, "subtype") orelse "";
         var error_text: std.ArrayList(u8) = .empty;
@@ -314,9 +319,10 @@ pub fn decodeLine(
                 .is_error = !std.mem.eql(u8, subtype, "success") or
                     (boolField(root, "is_error") orelse false),
                 .error_text = error_text.items,
-                .tokens_in = tokens_in + cached,
+                .tokens_in = tokens_in + cached + cache_write,
                 .tokens_out = tokens_out,
                 .cached_tokens = cached,
+                .cache_write_tokens = cache_write,
             },
         });
         return;

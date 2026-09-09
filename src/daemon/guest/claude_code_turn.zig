@@ -68,6 +68,8 @@ const CcOutcome = struct {
     exit_code: i64 = -1,
     tokens_in: u64 = 0,
     tokens_out: u64 = 0,
+    cached_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
     /// gpa-owned final text (may be empty).
     final_text: std.ArrayList(u8) = .empty,
     stderr_tail: [4096]u8 = undefined,
@@ -126,6 +128,7 @@ fn ccInvoke(
     usage_credits: *bool,
     prompt: []const u8,
     fresh: bool,
+    round: u32,
 ) !CcOutcome {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -259,6 +262,21 @@ fn ccInvoke(
     var pending_text: std.ArrayList(u8) = .empty;
     defer pending_text.deinit(gpa);
 
+    // Telemetry: one round row per invocation, one tool row per completed
+    // tool call — the same tables the native loop fills, so guest turns get
+    // real chat/execute_tool child spans instead of an empty aggregate.
+    const invoke_started_ms = nowMs(io);
+    var first_event_at_ms: i64 = 0;
+    const PendingTool = struct { call_id: []u8, name: []u8, started_at_ms: i64 };
+    var pending_tools: std.ArrayList(PendingTool) = .empty;
+    defer {
+        for (pending_tools.items) |tool| {
+            gpa.free(tool.call_id);
+            gpa.free(tool.name);
+        }
+        pending_tools.deinit(gpa);
+    }
+
     {
         const line_buf = try gpa.alloc(u8, 512 * 1024);
         defer gpa.free(line_buf);
@@ -280,6 +298,7 @@ fn ccInvoke(
             const line_arena = line_arena_state.allocator();
             var events: std.ArrayList(claude_code.Event) = .empty;
             claude_code.decodeLine(line_arena, line, &events) catch continue;
+            if (first_event_at_ms == 0 and events.items.len > 0) first_event_at_ms = nowMs(io);
             for (events.items) |ev| switch (ev) {
                 .init => outcome.got_init = true,
                 .text_delta => |text| {
@@ -305,6 +324,19 @@ fn ccInvoke(
                         .name = tu.name,
                         .args_json = tu.input_json,
                     } });
+                    if (ap.turn_id != 0) track: {
+                        // Event payloads are line-arena-owned; copy what the
+                        // telemetry row will need at tool_result time.
+                        const call_id = gpa.dupe(u8, tu.id) catch break :track;
+                        const name = gpa.dupe(u8, tu.name) catch {
+                            gpa.free(call_id);
+                            break :track;
+                        };
+                        pending_tools.append(gpa, .{ .call_id = call_id, .name = name, .started_at_ms = nowMs(io) }) catch {
+                            gpa.free(call_id);
+                            gpa.free(name);
+                        };
+                    }
                     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, tu.name, .start);
                 },
                 .tool_result => |tr| {
@@ -321,6 +353,24 @@ fn ccInvoke(
                         .inline_body = body[0..@min(body.len, cap)],
                         .full_body_ref = null,
                     } });
+                    if (ap.turn_id != 0) for (pending_tools.items, 0..) |tool, i| {
+                        if (!std.mem.eql(u8, tool.call_id, tr.tool_use_id)) continue;
+                        const span = telemetry_ids.spanId(ids.next(io));
+                        ap.store.telemetryRecordTool(opts.session_id, ap.turn_id, .{
+                            .round = round,
+                            .call_id = tool.call_id,
+                            .span_id = &span,
+                            .name = tool.name,
+                            .description = "",
+                            .started_at_ms = tool.started_at_ms,
+                            .ended_at_ms = nowMs(io),
+                            .status = if (tr.is_error) "err" else "ok",
+                        }) catch |err| std.log.warn("could not persist guest tool telemetry: {t}", .{err});
+                        const removed = pending_tools.swapRemove(i);
+                        gpa.free(removed.call_id);
+                        gpa.free(removed.name);
+                        break;
+                    };
                     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, "claude", .done);
                 },
                 .usage_credits => |active| {
@@ -337,6 +387,8 @@ fn ccInvoke(
                     @memcpy(outcome.result_error[0..outcome.result_error_len], r.error_text[0..outcome.result_error_len]);
                     outcome.tokens_in = r.tokens_in;
                     outcome.tokens_out = r.tokens_out;
+                    outcome.cached_tokens = r.cached_tokens;
+                    outcome.cache_write_tokens = r.cache_write_tokens;
                     outcome.final_text.clearRetainingCapacity();
                     try outcome.final_text.appendSlice(gpa, if (r.text.len > 0) r.text else pending_text.items);
                     pending_text.clearRetainingCapacity();
@@ -357,6 +409,40 @@ fn ccInvoke(
     };
     @memcpy(outcome.stderr_tail[0..drain.len], drain.tail[0..drain.len]);
     outcome.stderr_len = drain.len;
+
+    // One model-call row per completed invocation. Claude Code's result
+    // usage is the billed sum for this run (fresh + cache read + cache
+    // write, split out), which is exactly what a chat span should carry.
+    if (ap.turn_id != 0 and outcome.got_result) {
+        const span = telemetry_ids.spanId(ids.next(io));
+        ap.store.telemetryRecordRound(opts.session_id, ap.turn_id, .{
+            .round = round,
+            .span_id = &span,
+            .started_at_ms = invoke_started_ms,
+            .first_byte_at_ms = first_event_at_ms,
+            .first_visible_at_ms = first_event_at_ms,
+            .ended_at_ms = nowMs(io),
+            .status = if (outcome.result_is_error) "err" else "ok",
+            .http_status = 0,
+            .response_bytes = 0,
+            .provider = "claudecode",
+            .provider_name = "anthropic",
+            .request_model = opts.endpoint.model,
+            .response_model = "",
+            .server_address = "",
+            .server_port = 0,
+            .finish_reason = "",
+            .reasoning_level = "",
+            .max_tokens = 0,
+            .generation_id = "",
+            .usage_available = true,
+            .tokens_in = outcome.tokens_in,
+            .tokens_out = outcome.tokens_out,
+            .cached_tokens = outcome.cached_tokens,
+            .cache_write_tokens = outcome.cache_write_tokens,
+            .reasoning_tokens = 0,
+        }) catch |err| std.log.warn("could not persist guest round telemetry: {t}", .{err});
+    }
     return outcome;
 }
 
@@ -407,7 +493,7 @@ pub fn runClaudeCodeTurn(
 
     while (true) {
         rounds += 1;
-        var outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh);
+        var outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh, rounds);
         // Session-identity mismatch: an invocation that never INITIALIZED
         // didn't run at all — `--resume` of an id Claude Code has never seen
         // exits 0 with an is_error result and no init event (observed live),
@@ -416,7 +502,7 @@ pub fn runClaudeCodeTurn(
         if (!outcome.got_init and !outcome.cancelled and !outcome.timed_out) {
             outcome.final_text.deinit(gpa);
             fresh = !fresh;
-            outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh);
+            outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh, rounds);
         }
         defer outcome.final_text.deinit(gpa);
 

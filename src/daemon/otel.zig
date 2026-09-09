@@ -442,6 +442,15 @@ pub fn buildTraceRequest(allocator: std.mem.Allocator, trace: TelemetryTrace, co
     try root_attributes.append(allocator, stringKeyValue("gen_ai.conversation.id", conversation_id));
     try root_attributes.append(allocator, stringKeyValue("marlin.session.kind", trace.session_kind));
     try root_attributes.append(allocator, stringKeyValue("marlin.turn.outcome", trace.outcome));
+    // Model and provider on the ROOT span, not only on child rounds: cost
+    // attribution needs a model on every turn shape, including guest turns
+    // whose rounds may be sparse. Registry form ("provider/rest"); the
+    // provider is the first segment.
+    if (trace.model.len > 0) {
+        try root_attributes.append(allocator, stringKeyValue("gen_ai.request.model", trace.model));
+        const provider = trace.model[0 .. std.mem.indexOfScalar(u8, trace.model, '/') orelse trace.model.len];
+        try root_attributes.append(allocator, stringKeyValue("gen_ai.provider.name", provider));
+    }
     try root_attributes.append(allocator, stringKeyValue("mirador.trace.tags", "marlin"));
     try root_attributes.append(allocator, stringKeyValue("mirador.trace.attribute.session_id", conversation_id));
     // Turn-level rollups live on the root so turns whose work happens outside
