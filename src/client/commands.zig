@@ -48,7 +48,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/animate", .usage = " <" ++ effects.usage_list ++ ">", .description = "play a transient screen effect", .accepts_args = true },
     .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "]", .description = "start a continuous full-screen effect", .accepts_args = true },
     .{ .name = "/mk64", .hidden = true, .description = "play Mario Kart (pure Zig)", .accepts_args = true },
-    .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure live OTLP export", .accepts_args = true },
+    .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure OTLP export (persists across restarts)", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/cwd", .usage = " <path>", .description = "change this session's working directory", .accepts_args = true },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },

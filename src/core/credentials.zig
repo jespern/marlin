@@ -15,6 +15,11 @@ pub const cred_keys = [_][]const u8{
     "LITELLM_API_KEY",
     "MARLIN_LOCAL_BASE_URL",
     "MARLIN_LOCAL_API_KEY",
+    // /otel set persists here (the headers carry a bearer token; the
+    // endpoint just keeps it company) so a daemon restart resumes exporting.
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
 };
 
 /// Credentials may name custom-provider secrets, but the file must never
@@ -119,6 +124,39 @@ pub fn store(
     }
     if (!replaced) try out.print(gpa, "{s}={s}\n", .{ key, value });
 
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    chmod600(path);
+}
+
+/// Delete `key` from the credentials file. Missing file or key is a no-op;
+/// everything else in the file stays byte-for-byte.
+pub fn remove(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    key: []const u8,
+) !void {
+    const path = try credentialsPath(gpa, environ);
+    defer gpa.free(path);
+    const existing = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch return;
+    defer gpa.free(existing);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var removed = false;
+    var it = std.mem.splitScalar(u8, existing, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r");
+        if (line.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=');
+        const line_key = if (eq) |e| std.mem.trim(u8, line[0..e], " \t") else "";
+        if (eq != null and std.mem.eql(u8, line_key, key)) {
+            removed = true;
+            continue;
+        }
+        try out.print(gpa, "{s}\n", .{line});
+    }
+    if (!removed) return;
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
     chmod600(path);
 }

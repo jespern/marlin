@@ -1321,6 +1321,13 @@ pub const Daemon = struct {
                 if (previous) |exporter| exporter.deinit();
                 self.otel_exporter = replacement;
                 if (replacement) |exporter| exporter.activate();
+                // Durable through restarts: the same env keys startup reads
+                // go to the 0600 credentials file (the headers are a bearer
+                // token; the endpoint keeps them company). /otel off arrives
+                // as an all-empty configure and clears the entries. Content
+                // capture is deliberately NOT persisted — turning it on stays
+                // a per-daemon-lifetime decision.
+                self.persistOtelConfig(request.endpoint, request.traces_endpoint, request.headers);
                 self.sendOtelStatus(client);
             },
             .otel_status => self.sendOtelStatus(client),
@@ -4254,6 +4261,25 @@ pub const Daemon = struct {
             .enabled = self.otel_exporter != null,
             .content = if (self.otel_exporter) |exporter| exporter.capturesContent() else false,
         } });
+    }
+
+    /// Mirror a live /otel configuration into the credentials file so the
+    /// next daemon starts exporting again. Empty values delete their entry
+    /// (an all-empty call is /otel off). Best-effort: the live exporter is
+    /// already switched, so a persistence failure only costs durability.
+    fn persistOtelConfig(self: *Daemon, endpoint: []const u8, traces_endpoint: []const u8, headers: []const u8) void {
+        const entries = [_]struct { key: []const u8, value: []const u8 }{
+            .{ .key = "OTEL_EXPORTER_OTLP_ENDPOINT", .value = endpoint },
+            .{ .key = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", .value = traces_endpoint },
+            .{ .key = "OTEL_EXPORTER_OTLP_HEADERS", .value = headers },
+        };
+        for (entries) |entry| {
+            const result = if (entry.value.len == 0)
+                credentials.remove(self.gpa, self.io, self.environ, entry.key)
+            else
+                credentials.store(self.gpa, self.io, self.environ, entry.key, entry.value);
+            result catch |err| std.log.warn("could not persist {s}: {t}", .{ entry.key, err });
+        }
     }
 
     fn sendMcpStatus(self: *Daemon, client: *Client) void {
