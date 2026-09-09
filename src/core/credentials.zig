@@ -15,11 +15,14 @@ pub const cred_keys = [_][]const u8{
     "LITELLM_API_KEY",
     "MARLIN_LOCAL_BASE_URL",
     "MARLIN_LOCAL_API_KEY",
-    // /otel set persists here (the headers carry a bearer token; the
-    // endpoint just keeps it company) so a daemon restart resumes exporting.
+    // /otel persists here (the headers carry a bearer token; the rest keep
+    // them company) so a daemon restart resumes exporting. /otel off writes
+    // OTEL_SDK_DISABLED instead of deleting the endpoint — a durable pause.
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_SDK_DISABLED",
+    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
 };
 
 /// Credentials may name custom-provider secrets, but the file must never

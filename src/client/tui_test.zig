@@ -1282,7 +1282,9 @@ test "/effort opens the shared selector vocabulary" {
 test "OTEL command parsing is vendor-neutral and strict" {
     try std.testing.expect(parseOtelCommand(null, "").? == .status);
     try std.testing.expect(parseOtelCommand("status", "").? == .status);
+    try std.testing.expect(parseOtelCommand("on", "").? == .on);
     try std.testing.expect(parseOtelCommand("off", "").? == .off);
+    try std.testing.expect(parseOtelCommand("on", "extra") == null);
     const set = parseOtelCommand("set", " https://otel.example ").?;
     try std.testing.expectEqualStrings("https://otel.example", set.set);
     try std.testing.expect(parseOtelCommand("set", "") == null);

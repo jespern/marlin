@@ -242,6 +242,9 @@ pub const ClientMsg = union(enum) {
         headers: []const u8 = "",
     },
     otel_status: struct {},
+    /// /otel on: resume export from the saved endpoint/headers after an
+    /// /otel off pause (clears the persisted OTEL_SDK_DISABLED).
+    otel_enable: struct {},
     /// Toggle opt-in GenAI content capture (prompts, replies, tool
     /// args/results on exported spans). Requires an active exporter; the
     /// flag applies to everything still in the durable outbox.

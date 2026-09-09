@@ -38,13 +38,16 @@ pub const Exporter = struct {
     thread: std.Thread,
 
     /// Standard OTEL environment variables make export opt-in without putting
-    /// collector credentials in Marlin's config file.
+    /// collector credentials in Marlin's config file. OTEL_SDK_DISABLED is
+    /// the spec's kill switch: /otel off persists it so a pause survives
+    /// restarts while the saved endpoint and headers stay in place.
     pub fn start(
         gpa: std.mem.Allocator,
         io: Io,
         store: *Store,
         environ: *const std.process.Environ.Map,
     ) !?*Exporter {
+        if (contentCaptureRequested(environ.get("OTEL_SDK_DISABLED") orelse "")) return null;
         return startConfigured(gpa, io, store, environ, .{
             .endpoint = environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") orelse "",
             .traces_endpoint = environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") orelse "",

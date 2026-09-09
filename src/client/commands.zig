@@ -48,7 +48,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/animate", .usage = " <" ++ effects.usage_list ++ ">", .description = "play a transient screen effect", .accepts_args = true },
     .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "]", .description = "start a continuous full-screen effect", .accepts_args = true },
     .{ .name = "/mk64", .hidden = true, .description = "play Mario Kart (pure Zig)", .accepts_args = true },
-    .{ .name = "/otel", .usage = " [set <endpoint>|status|off]", .description = "configure OTLP export (persists across restarts)", .accepts_args = true },
+    .{ .name = "/otel", .usage = " [set <endpoint>|status|on|off]", .description = "configure OTLP export (persists across restarts)", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/cwd", .usage = " <path>", .description = "change this session's working directory", .accepts_args = true },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
@@ -79,6 +79,7 @@ pub const CommandSuggestion = struct {
 
 pub const OtelCommand = union(enum) {
     status,
+    on,
     off,
     set: []const u8,
     content: bool,
@@ -88,6 +89,7 @@ pub fn parseOtelCommand(action_arg: ?[]const u8, rest_arg: []const u8) ?OtelComm
     const action = action_arg orelse "status";
     const rest = std.mem.trim(u8, rest_arg, " \t\r\n");
     if (std.mem.eql(u8, action, "status") and rest.len == 0) return .status;
+    if (std.mem.eql(u8, action, "on") and rest.len == 0) return .on;
     if (std.mem.eql(u8, action, "off") and rest.len == 0) return .off;
     if (std.mem.eql(u8, action, "set") and rest.len > 0 and
         std.mem.indexOfAny(u8, rest, " \t\r\n") == null)
@@ -182,9 +184,10 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
     {
         const rest = std.mem.trimStart(u8, query["/otel".len..], " \t");
         const actions = [_]struct { name: []const u8, description: []const u8, submit: bool }{
-            .{ .name = "set", .description = "set endpoint, then enter masked headers", .submit = false },
+            .{ .name = "set", .description = "set endpoint, then enter masked headers (persisted)", .submit = false },
             .{ .name = "status", .description = "show live OTLP exporter state", .submit = true },
-            .{ .name = "off", .description = "disable live OTLP export", .submit = true },
+            .{ .name = "on", .description = "resume export from the saved endpoint", .submit = true },
+            .{ .name = "off", .description = "pause export (endpoint and headers stay saved)", .submit = true },
         };
         for (actions) |action| {
             if (rest.len <= action.name.len and std.ascii.eqlIgnoreCase(rest, action.name[0..rest.len])) {
@@ -946,15 +949,18 @@ pub fn showMcpStatus(self: *App, servers: []const proto.McpServerInfo) void {
 
 pub fn otelCommand(self: *App, action_arg: ?[]const u8, rest_arg: []const u8) void {
     const parsed = parseOtelCommand(action_arg, rest_arg) orelse {
-        self.setNotice("usage: /otel [status|off|set <endpoint>|content on|content off]", .{});
+        self.setNotice("usage: /otel [status|on|off|set <endpoint>|content on|content off]", .{});
         return;
     };
     switch (parsed) {
         .status => self.conn.send(.{ .otel_status = .{} }) catch {
             self.setNotice("could not request OTLP status", .{});
         },
+        .on => self.conn.send(.{ .otel_enable = .{} }) catch {
+            self.setNotice("could not resume OTLP export", .{});
+        },
         .off => self.conn.send(.{ .otel_configure = .{} }) catch {
-            self.setNotice("could not disable OTLP export", .{});
+            self.setNotice("could not pause OTLP export", .{});
         },
         .content => |enabled| self.conn.send(.{ .otel_content = .{ .enabled = enabled } }) catch {
             self.setNotice("could not toggle OTLP content capture", .{});

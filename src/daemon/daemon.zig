@@ -333,6 +333,16 @@ pub const Daemon = struct {
     /// Optional OTLP worker. It drains durable telemetry with a separate
     /// persistent HTTP pool and is stopped before the store closes.
     otel_exporter: ?*otel.Exporter = null,
+    /// Last /otel set (or startup env) endpoint/headers, gpa-owned: what
+    /// /otel on resumes from after an /otel off pause in the same daemon
+    /// lifetime. The credentials file is the durable copy; this mirror
+    /// exists because self.environ must not be mutated while turn threads
+    /// read it for spawns.
+    otel_saved: struct {
+        endpoint: []u8 = &.{},
+        traces_endpoint: []u8 = &.{},
+        headers: []u8 = &.{},
+    } = .{},
     sandbox_backend: sandbox.Backend = .unavailable,
     /// Non-null exactly when sandbox_backend is .seatbelt: the profile's
     /// protected-read denials are parameterized on these roots.
@@ -557,6 +567,11 @@ pub const Daemon = struct {
             std.log.warn("OTLP exporter disabled: {t}", .{err});
             break :blk null;
         };
+        self.saveOtelConfig(
+            environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") orelse "",
+            environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") orelse "",
+            environ.get("OTEL_EXPORTER_OTLP_HEADERS") orelse "",
+        );
         errdefer if (self.otel_exporter) |exporter| {
             exporter.deinit();
             self.otel_exporter = null;
@@ -1298,6 +1313,20 @@ pub const Daemon = struct {
                     } });
                     return;
                 }
+                const turning_off = request.endpoint.len == 0 and
+                    request.traces_endpoint.len == 0 and request.headers.len == 0;
+                if (turning_off) {
+                    // /otel off is a durable PAUSE: the exporter stops and
+                    // OTEL_SDK_DISABLED=true is persisted, but the saved
+                    // endpoint and token stay for /otel on to resume from.
+                    const previous = self.otel_exporter;
+                    self.otel_exporter = null;
+                    if (previous) |exporter| exporter.deinit();
+                    self.persistCredential("OTEL_SDK_DISABLED", "true");
+                    self.sendOtelStatus(client);
+                    return;
+                }
+                const capture_content = if (self.otel_exporter) |exporter| exporter.capturesContent() else false;
                 const replacement = otel.Exporter.startConfigured(
                     self.gpa,
                     self.io,
@@ -1307,6 +1336,7 @@ pub const Daemon = struct {
                         .endpoint = request.endpoint,
                         .traces_endpoint = request.traces_endpoint,
                         .headers = request.headers,
+                        .capture_content = capture_content,
                     },
                 ) catch |err| {
                     std.log.warn("OTLP live configuration rejected: {t}", .{err});
@@ -1323,11 +1353,44 @@ pub const Daemon = struct {
                 if (replacement) |exporter| exporter.activate();
                 // Durable through restarts: the same env keys startup reads
                 // go to the 0600 credentials file (the headers are a bearer
-                // token; the endpoint keeps them company). /otel off arrives
-                // as an all-empty configure and clears the entries. Content
-                // capture is deliberately NOT persisted — turning it on stays
-                // a per-daemon-lifetime decision.
-                self.persistOtelConfig(request.endpoint, request.traces_endpoint, request.headers);
+                // token; the rest keep them company), and any lingering
+                // pause is lifted.
+                self.saveOtelConfig(request.endpoint, request.traces_endpoint, request.headers);
+                self.persistCredential("OTEL_EXPORTER_OTLP_ENDPOINT", request.endpoint);
+                self.persistCredential("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", request.traces_endpoint);
+                self.persistCredential("OTEL_EXPORTER_OTLP_HEADERS", request.headers);
+                self.persistCredential("OTEL_SDK_DISABLED", "");
+                self.sendOtelStatus(client);
+            },
+            .otel_enable => {
+                if (self.otel_exporter != null) {
+                    self.persistCredential("OTEL_SDK_DISABLED", "");
+                    self.sendOtelStatus(client);
+                    return;
+                }
+                const saved = self.otel_saved;
+                if (saved.endpoint.len == 0 and saved.traces_endpoint.len == 0) {
+                    self.sendTo(client, .{ .err = .{
+                        .code = "otel_config",
+                        .msg = "no saved OTLP endpoint — /otel set <endpoint> first",
+                    } });
+                    return;
+                }
+                const replacement = otel.Exporter.startConfigured(self.gpa, self.io, &self.store, self.environ, .{
+                    .endpoint = saved.endpoint,
+                    .traces_endpoint = saved.traces_endpoint,
+                    .headers = saved.headers,
+                    .capture_content = otel.contentCaptureRequested(
+                        self.environ.get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT") orelse "",
+                    ),
+                }) catch |err| {
+                    std.log.warn("OTLP resume rejected: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{ .code = "otel_config", .msg = "saved OTLP configuration no longer works — /otel set again" } });
+                    return;
+                };
+                self.otel_exporter = replacement;
+                if (replacement) |exporter| exporter.activate();
+                self.persistCredential("OTEL_SDK_DISABLED", "");
                 self.sendOtelStatus(client);
             },
             .otel_status => self.sendOtelStatus(client),
@@ -1340,6 +1403,12 @@ pub const Daemon = struct {
                     return;
                 };
                 exporter.setCaptureContent(request.enabled);
+                // Persisted like the endpoint: whoever owns the collector
+                // decided; a restart should not silently flip it back.
+                self.persistCredential(
+                    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+                    if (request.enabled) "true" else "",
+                );
                 self.sendOtelStatus(client);
             },
             .session_watch => |sw| {
@@ -4263,22 +4332,32 @@ pub const Daemon = struct {
         } });
     }
 
-    /// Mirror a live /otel configuration into the credentials file so the
-    /// next daemon starts exporting again. Empty values delete their entry
-    /// (an all-empty call is /otel off). Best-effort: the live exporter is
-    /// already switched, so a persistence failure only costs durability.
-    fn persistOtelConfig(self: *Daemon, endpoint: []const u8, traces_endpoint: []const u8, headers: []const u8) void {
-        const entries = [_]struct { key: []const u8, value: []const u8 }{
-            .{ .key = "OTEL_EXPORTER_OTLP_ENDPOINT", .value = endpoint },
-            .{ .key = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", .value = traces_endpoint },
-            .{ .key = "OTEL_EXPORTER_OTLP_HEADERS", .value = headers },
+    /// Store (or, for an empty value, delete) one credentials-file entry.
+    /// Best-effort: the live change already happened, so a persistence
+    /// failure only costs durability, and says so in the log.
+    fn persistCredential(self: *Daemon, key: []const u8, value: []const u8) void {
+        const result = if (value.len == 0)
+            credentials.remove(self.gpa, self.io, self.environ, key)
+        else
+            credentials.store(self.gpa, self.io, self.environ, key, value);
+        result catch |err| std.log.warn("could not persist {s}: {t}", .{ key, err });
+    }
+
+    /// Refresh the in-memory /otel mirror (what /otel on resumes from).
+    fn saveOtelConfig(self: *Daemon, endpoint: []const u8, traces_endpoint: []const u8, headers: []const u8) void {
+        const saved = &self.otel_saved;
+        const fields = [_]struct { dst: *[]u8, src: []const u8 }{
+            .{ .dst = &saved.endpoint, .src = endpoint },
+            .{ .dst = &saved.traces_endpoint, .src = traces_endpoint },
+            .{ .dst = &saved.headers, .src = headers },
         };
-        for (entries) |entry| {
-            const result = if (entry.value.len == 0)
-                credentials.remove(self.gpa, self.io, self.environ, entry.key)
-            else
-                credentials.store(self.gpa, self.io, self.environ, entry.key, entry.value);
-            result catch |err| std.log.warn("could not persist {s}: {t}", .{ entry.key, err });
+        for (fields) |field| {
+            const copy = self.gpa.dupe(u8, field.src) catch return;
+            if (field.dst.len > 0) {
+                @memset(field.dst.*, 0);
+                self.gpa.free(field.dst.*);
+            }
+            field.dst.* = copy;
         }
     }
 
@@ -4374,6 +4453,14 @@ pub const Daemon = struct {
         while (sit.next()) |sp| self.destroySession(sp.*);
         self.sessions.deinit(self.gpa);
         self.retained_approvals.deinit(self.gpa);
+        // The saved /otel mirror may hold a bearer token; zero, then free.
+        inline for (.{ &self.otel_saved.endpoint, &self.otel_saved.traces_endpoint, &self.otel_saved.headers }) |slice| {
+            if (slice.*.len > 0) {
+                @memset(slice.*, 0);
+                self.gpa.free(slice.*);
+                slice.* = &.{};
+            }
+        }
         self.http_pool.deinit();
 
         // A reboot client waits for ACK plus EOF. Open the replacement gate
