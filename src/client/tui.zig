@@ -3305,6 +3305,18 @@ pub const App = struct {
         };
     }
 
+    /// A model id typed into the picker that matches nothing listed: Enter
+    /// applies it as-is, so a guest can run a model newer than any list
+    /// (a `provider/model` shape is required; no spaces).
+    pub fn typedModelFallback(self: *const App, matches: usize) ?[]const u8 {
+        if (self.picker_kind != .model or matches != 0) return null;
+        const q = self.picker_filter.items;
+        if (std.mem.indexOfScalar(u8, q, ' ') != null) return null;
+        const slash = std.mem.indexOfScalar(u8, q, '/') orelse return null;
+        if (slash == 0 or slash + 1 == q.len) return null;
+        return q;
+    }
+
     /// Filtered picker items (arena-allocated indices into pickerSource).
     /// Filter: case-insensitive substring; multiple space-separated words
     /// must ALL match ("son 4.5" → claude-sonnet-4.5).
@@ -5594,6 +5606,8 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         // Filter line (acts as a mini prompt).
         const src_note: []const u8 = if ((app.picker_kind == .model or app.picker_kind == .council) and app.catalog.items.len == 0)
             " (favorites — catalog loading…)"
+        else if (app.typedModelFallback(items.len) != null)
+            " (not listed — Enter uses it as typed)"
         else
             "";
         const fline = try std.fmt.allocPrint(arena, " {s} · filter: {s}▏{s}", .{

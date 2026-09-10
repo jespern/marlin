@@ -255,6 +255,12 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
                     app.applyPickerItem(pick);
                     app.picker_filter.clearRetainingCapacity();
                 }
+            } else if (app.typedModelFallback(n)) |typed| {
+                // Nothing listed matches, but the text is a model id: a
+                // guest may accept a model no catalog knows yet.
+                app.picker = null;
+                app.applyPickerItem(typed);
+                app.picker_filter.clearRetainingCapacity();
             }
         } else if (isArchivePickerKey(app.picker_kind, key)) {
             if (n > 0) app.archivePickerSession(items[@min(sel, n - 1)]);

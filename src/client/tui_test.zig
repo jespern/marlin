@@ -4734,3 +4734,22 @@ test "option-arrows switch tabs only while the composer is idle" {
     app.mode = .normal;
     try std.testing.expectEqual(@as(?i8, 1), optionArrowSwitchesTabs(&app, right));
 }
+
+test "a typed provider/model that matches nothing is offered as-is, but only well-formed and only in the model picker" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) }, .picker_kind = .model, .picker = 0 };
+    defer app.deinit();
+    try app.picker_filter.appendSlice(gpa, "codex/gpt-6-astra");
+    try std.testing.expectEqualStrings("codex/gpt-6-astra", app.typedModelFallback(0).?);
+    try std.testing.expect(app.typedModelFallback(3) == null); // something matched: pick from the list
+    app.picker_kind = .council;
+    try std.testing.expect(app.typedModelFallback(0) == null);
+    app.picker_kind = .model;
+    for ([_][]const u8{ "astra", "codex/", "/gpt-6", "codex/gpt 6", "" }) |bad| {
+        app.picker_filter.clearRetainingCapacity();
+        try app.picker_filter.appendSlice(gpa, bad);
+        try std.testing.expect(app.typedModelFallback(0) == null);
+    }
+}

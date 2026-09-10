@@ -62,6 +62,7 @@ const extensions = @import("extensions.zig");
 const registry = @import("provider/registry.zig");
 const claude_code = @import("provider/claude_code.zig");
 const codex = @import("provider/codex.zig");
+const guest_models = @import("guest_models.zig");
 const http = @import("provider/http.zig");
 const process_io = @import("process_io.zig");
 const task_tool = @import("tools/task.zig");
@@ -3972,8 +3973,11 @@ pub const Daemon = struct {
             self.appendNativeAnthropicIds(arena, &local_list, "claudecode/") catch return;
         }
         if (self.codexAvailable()) {
-            // `default` delegates model selection to the user's Codex config.
+            // `default` delegates model selection to the user's Codex config;
+            // concrete ids come from Codex's own model cache and the
+            // catalog's openai/gpt-* slugs (guest_models.zig).
             local_list.append(arena, "codex/default") catch return;
+            self.appendCodexIds(arena, &local_list) catch return;
         }
         if (self.environ.get("ANTHROPIC_API_KEY")) |key| if (key.len > 0) {
             self.appendNativeAnthropicIds(arena, &local_list, "anthropic/") catch return;
@@ -4042,6 +4046,20 @@ pub const Daemon = struct {
             const entry = try std.fmt.allocPrint(arena, prefix ++ "{s}", .{slug});
             std.mem.replaceScalar(u8, entry[prefix.len..], '.', '-');
             try list.append(arena, entry);
+        }
+    }
+
+    /// Concrete Codex model ids: what Codex itself lists, then whatever the
+    /// OpenRouter catalog knows under openai/gpt-* that the cache does not.
+    fn appendCodexIds(self: *Daemon, arena: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (guest_models.codexCachePath(&path_buf, self.environ)) |path| {
+            if (Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(4 * 1024 * 1024))) |json| {
+                try guest_models.appendFromCodexCache(arena, list, json);
+            } else |_| {}
+        }
+        for (self.catalog.items) |m| {
+            if (try guest_models.fromCatalogId(arena, m.id)) |id| try guest_models.appendUnique(arena, list, id);
         }
     }
 
