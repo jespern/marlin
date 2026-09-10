@@ -25,6 +25,7 @@ const commands = @import("commands.zig");
 const keys = @import("keys.zig");
 const setup_mod = @import("setup.zig");
 const search_mod = @import("search.zig");
+const temp_dir = @import("../testing/temp_dir.zig");
 const LayoutCache = layout_mod.LayoutCache;
 const TailLayoutCache = layout_mod.TailLayoutCache;
 const StreamLayoutCache = layout_mod.StreamLayoutCache;
@@ -3114,18 +3115,22 @@ test "tab navigation follows chronological roots and wraps" {
     try handleKey(&app, .{ .codepoint = vaxis.Key.right, .mods = .{ .alt = true } });
     try std.testing.expectEqual(@as(u64, 30), app.view.sid);
     try std.testing.expect(app.view.editor.cursor > 2);
-    // In normal mode the same keys cycle the visible tab order, draft or
-    // not, without touching the composer cursor. Switching from a child
-    // starts relative to its root.
+    // A draft parked in normal mode (Escape) is still a draft: word motion,
+    // same session.
     app.mode = .normal;
     app.view.editor.cursor = 2;
+    try handleKey(&app, .{ .codepoint = vaxis.Key.right, .mods = .{ .alt = true } });
+    try std.testing.expectEqual(@as(u64, 30), app.view.sid);
+    try std.testing.expect(app.view.editor.cursor > 2);
+    // An empty composer cycles the visible tab order from either mode.
+    // Switching from a child starts relative to its root.
+    app.view.editor.clear();
     try handleKey(&app, .{ .codepoint = vaxis.Key.right, .mods = .{ .alt = true } });
     try std.testing.expectEqual(@as(u64, 40), app.view.sid);
     try handleKey(&app, .{ .codepoint = vaxis.Key.left, .mods = .{ .alt = true } });
     try std.testing.expectEqual(@as(u64, 20), app.view.sid);
     try handleKey(&app, .{ .codepoint = vaxis.Key.left, .mods = .{ .alt = true } });
     try std.testing.expectEqual(@as(u64, 10), app.view.sid);
-    try std.testing.expectEqual(@as(usize, 2), app.saved_views.get(30).?.editor.cursor);
     app.mode = .insert;
 
     // With one visible root, every shortcut is a no-op and never repurposes
@@ -4732,7 +4737,7 @@ test "web output links retain their full destination in a narrow terminal" {
     try std.testing.expectEqualStrings("", win.readCell(0, 1).?.link.uri);
 }
 
-test "option-arrows switch tabs only while the composer is idle" {
+test "option-arrows switch tabs only while the composer is empty" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -4754,9 +4759,53 @@ test "option-arrows switch tabs only while the composer is idle" {
     try handleKey(&app, right);
     try std.testing.expect(app.view.editor.cursor > 0);
     try std.testing.expectEqualStrings("foo bar", app.view.editor.text.items);
-    // Normal mode has no draft to move through: tabs, draft or not.
+    // Escape parked the draft in normal mode: still a word motion, not a tab.
     app.mode = .normal;
+    try std.testing.expectEqual(@as(?i8, null), optionArrowSwitchesTabs(&app, right));
+    app.view.editor.cursor = 0;
+    try handleKey(&app, right);
+    try std.testing.expect(app.view.editor.cursor > 0);
+    try std.testing.expectEqualStrings("foo bar", app.view.editor.text.items);
+    // Empty composer in normal mode: tabs.
+    app.view.editor.clear();
     try std.testing.expectEqual(@as(?i8, 1), optionArrowSwitchesTabs(&app, right));
+}
+
+test "/cwd suggests directories under the session cwd, one segment at a time, never submitting" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "cwd-suggest");
+    defer tmp.deinit();
+    var root = try Io.Dir.cwd().openDir(io, tmp.path, .{});
+    defer root.close(io);
+    try root.createDirPath(io, "projects/marlin");
+    try root.createDirPath(io, "notes");
+
+    var app = App{ .gpa = gpa, .io = io, .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr(tmp.path);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    app.view.editor.insertSlice("/cwd ");
+    var suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 2), suggestions.len);
+    try std.testing.expectEqualStrings("/cwd notes/", suggestions[0].label);
+    try std.testing.expectEqualStrings("/cwd projects/", suggestions[1].replacement);
+    try std.testing.expect(!suggestions[1].submit_on_enter);
+
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/cwd projects/m");
+    suggestions = try commandSuggestions(&app, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    try std.testing.expectEqualStrings("/cwd projects/marlin/", suggestions[0].replacement);
+
+    // A path with a space is not completed (one-argument rule), and no HOME means ~ offers nothing.
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/cwd ~/");
+    try std.testing.expectEqual(@as(usize, 0), (try commandSuggestions(&app, arena_state.allocator())).len);
 }
 
 test "a typed provider/model that matches nothing is offered as-is, but only well-formed and only in the model picker" {

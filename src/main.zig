@@ -76,6 +76,7 @@ test {
     _ = @import("core/config_test.zig");
     _ = @import("core/discovery_test.zig");
     _ = @import("client/initial_session_test.zig");
+    _ = @import("client/path_complete_test.zig");
     _ = @import("core/jsonx_test.zig");
     _ = @import("core/ids_test.zig");
     _ = @import("core/session_handle_test.zig");

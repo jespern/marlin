@@ -8,6 +8,7 @@ const proto = @import("../core/proto.zig");
 const config = @import("../core/config.zig");
 const effects = @import("effects.zig");
 const wipeout_effect = @import("wipeout_effect.zig");
+const path_complete = @import("path_complete.zig");
 const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const tui = @import("tui.zig");
@@ -113,6 +114,7 @@ pub fn commandQuery(editor: *const Editor) ?[]const u8 {
             !std.mem.eql(u8, head, "/animate") and
             !std.mem.eql(u8, head, "/screensaver") and
             !std.mem.eql(u8, head, "/otel") and
+            !std.mem.eql(u8, head, "/cwd") and
             !std.mem.eql(u8, head, "!rb") and
             !std.mem.eql(u8, head, "!wipeout")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
@@ -199,6 +201,26 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
                     .submit_on_enter = action.submit,
                 });
             }
+        }
+        return out.items;
+    }
+    if (query.len > "/cwd".len and
+        std.mem.eql(u8, query[0.."/cwd".len], "/cwd") and
+        (query["/cwd".len] == ' ' or query["/cwd".len] == '\t'))
+    {
+        // Directories matching the path typed so far, relative to the
+        // session's cwd (or ~, or absolute); Tab descends one segment,
+        // Enter with a complete path is the user's call.
+        const typed = std.mem.trimStart(u8, query["/cwd".len..], " \t");
+        const home: ?[]const u8 = if (app.environ) |env| env.get("HOME") else null;
+        for (try path_complete.directories(arena, app.io, app.view.cwd.items, home, typed)) |c| {
+            const replacement = try std.fmt.allocPrint(arena, "/cwd {s}", .{c.arg});
+            try out.append(arena, .{
+                .label = replacement,
+                .description = "directory",
+                .replacement = replacement,
+                .submit_on_enter = false,
+            });
         }
         return out.items;
     }
