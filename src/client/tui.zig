@@ -3398,11 +3398,9 @@ pub const App = struct {
         }
         const current_guest = proto.guestBackend(self.view.model.items);
         const requested_guest = proto.guestBackend(m);
-        if (current_guest != null and requested_guest != null and current_guest.? != requested_guest.?) {
-            self.setNotice("switch through a native model first so Marlin can hand over between guest agents", .{});
-            return;
-        }
-        const starts_handover = !proto.isGuestModel(self.view.model.items) and proto.isGuestModel(m);
+        // Native → guest, and guest → another guest (the daemon has a
+        // native model write the briefing first), both hand over.
+        const starts_handover = requested_guest != null and (current_guest == null or current_guest.? != requested_guest.?);
         self.conn.send(.{ .session_set_model = .{ .sid = self.view.sid, .model = m } }) catch return;
         self.setModelStr(m);
         if (starts_handover) {

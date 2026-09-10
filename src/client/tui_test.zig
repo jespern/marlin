@@ -468,6 +468,30 @@ test "native to guest model selection updates status model before handover finis
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"session_set_model\"") != null);
 }
 
+test "guest to guest model selection is sent and announced as a handover, not refused" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setModelStr("claudecode/fable");
+
+    app.applyModel("codex/gpt-6-astra");
+
+    try std.testing.expectEqualStrings("codex/gpt-6-astra", app.view.model.items);
+    try std.testing.expectEqualStrings("switching to codex/gpt-6-astra — generating handover summary…", app.notice.items);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "codex/gpt-6-astra") != null);
+
+    // Same guest, different model: a plain switch.
+    app.applyModel("codex/gpt-5.5");
+    try std.testing.expectEqualStrings("model → codex/gpt-5.5", app.notice.items);
+}
+
 test "cwd command waits for daemon canonical path and applies session upsert" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

@@ -31,18 +31,6 @@ test "a malformed or empty cache contributes nothing and is not an error" {
     try std.testing.expectEqual(@as(usize, 0), list.items.len);
 }
 
-test "catalog openai/gpt-* slugs become codex ids; batch variants and other vendors do not" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try std.testing.expectEqualStrings("codex/gpt-6-astra", (try guest_models.fromCatalogId(arena, "openrouter/openai/gpt-6-astra")).?);
-    try std.testing.expectEqualStrings("codex/gpt-6-astra-pro", (try guest_models.fromCatalogId(arena, "openrouter/openai/gpt-6-astra-pro")).?);
-    try std.testing.expect((try guest_models.fromCatalogId(arena, "openrouter/openai/gpt-6-astra:batch")) == null);
-    try std.testing.expect((try guest_models.fromCatalogId(arena, "openrouter/openai/o3")) == null);
-    try std.testing.expect((try guest_models.fromCatalogId(arena, "openrouter/anthropic/claude-opus-4.8")) == null);
-    try std.testing.expect((try guest_models.fromCatalogId(arena, "openai/gpt-6-astra")) == null);
-}
-
 test "the cache path honours CODEX_HOME, then HOME/.codex" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();

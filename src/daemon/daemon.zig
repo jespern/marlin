@@ -1503,11 +1503,24 @@ pub const Daemon = struct {
                 const current_guest = proto.guestBackend(session.model);
                 const requested_guest = proto.guestBackend(sm.model);
                 if (current_guest != null and requested_guest != null and current_guest.? != requested_guest.?) {
-                    self.sendTo(client, .{ .err = .{
-                        .code = "guest_switch",
-                        .msg = "switch through a native model before changing guest backends so Marlin can create a handover",
-                    } });
-                    return;
+                    // Guest → guest: a native model authors the handover
+                    // briefing from the durable transcript, then turn_done
+                    // applies the new guest — the native → guest path, with
+                    // the author put in place first. The old guest's own
+                    // context never carries over (it can't); the briefing is
+                    // what does.
+                    const author = self.handoverAuthorModel() orelse {
+                        self.sendTo(client, .{ .err = .{
+                            .code = "guest_switch",
+                            .msg = "no native model is configured to write the handover between guest agents; set [model] default to a native model",
+                        } });
+                        return;
+                    };
+                    const author_model = try self.gpa.dupe(u8, author);
+                    errdefer self.gpa.free(author_model);
+                    try self.store.setSessionModel(sm.sid, author);
+                    self.gpa.free(session.model);
+                    session.model = author_model;
                 }
                 const new_model = try self.gpa.dupe(u8, sm.model);
                 errdefer self.gpa.free(new_model);
@@ -3352,6 +3365,15 @@ pub const Daemon = struct {
         self.finishTurn(job.sid, false, false, null, null, 0, 0);
     }
 
+    /// The native model that writes a handover briefing when one guest hands
+    /// to another: the configured default when native, else the first native
+    /// favorite. Null when everything configured is a guest.
+    fn handoverAuthorModel(self: *const Daemon) ?[]const u8 {
+        if (!proto.isGuestModel(self.cfg.model_default)) return self.cfg.model_default;
+        for (self.cfg.model_favorites) |favorite| if (!proto.isGuestModel(favorite)) return favorite;
+        return null;
+    }
+
     /// Native model writes a visible handover, then turn_done applies
     /// pending_guest_model. Failures still switch: the briefing is best-effort.
     fn handoverMain(job: *TurnJob) void {
@@ -4049,17 +4071,26 @@ pub const Daemon = struct {
         }
     }
 
-    /// Concrete Codex model ids: what Codex itself lists, then whatever the
-    /// OpenRouter catalog knows under openai/gpt-* that the cache does not.
+    /// Concrete Codex model ids from Codex's own model cache, for the picker
+    /// when the account fetch has not (yet) supplied them via the catalog.
     fn appendCodexIds(self: *Daemon, arena: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (guest_models.codexCachePath(&path_buf, self.environ)) |path| {
             if (Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(4 * 1024 * 1024))) |json| {
-                try guest_models.appendFromCodexCache(arena, list, json);
-            } else |_| {}
-        }
-        for (self.catalog.items) |m| {
-            if (try guest_models.fromCatalogId(arena, m.id)) |id| try guest_models.appendUnique(arena, list, id);
+                // The account fetch (codex.fetchModels) already put the live
+                // list in the catalog; the cache only fills in what it lacks
+                // (offline, or before the first fetch lands).
+                var cached: std.ArrayList([]const u8) = .empty;
+                try guest_models.appendFromCodexCache(arena, &cached, json);
+                for (cached.items) |id| {
+                    var in_catalog = false;
+                    for (self.catalog.items) |m| if (std.mem.eql(u8, m.id, id)) {
+                        in_catalog = true;
+                        break;
+                    };
+                    if (!in_catalog) try guest_models.appendUnique(arena, list, id);
+                }
+            } else |err| std.log.debug("codex model cache unreadable at {s}: {t}", .{ path, err });
         }
     }
 
