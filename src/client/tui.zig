@@ -45,6 +45,7 @@ const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const session_file = @import("session_file.zig");
+const initial_session = @import("initial_session.zig");
 const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
@@ -6076,12 +6077,13 @@ pub fn run(
                 }
             }
         } else {
-            for (list.sessions, 0..) |session, i| {
-                if (session.archived) continue;
-                sid = session.sid;
-                selected = i;
-                break;
-            }
+            // No handle: the shell's directory is the intent. Land in the
+            // newest live root session rooted here, or fall through and
+            // create one here. Remote clients keep the newest live session.
+            var here_buf: [4096]u8 = undefined;
+            const here = here_buf[0..try std.process.currentPath(io, &here_buf)];
+            selected = initial_session.pick(list.sessions, here, environ.get(attach.remote_env) != null);
+            if (selected) |i| sid = list.sessions[i].sid;
         }
 
         if (selected) |i| {

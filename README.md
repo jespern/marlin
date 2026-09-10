@@ -56,6 +56,7 @@ guest backends involves a context handover; see
 ```sh
 marlin                         # open the TUI; setup runs on first use
 marlin ls                      # list durable sessions and short handles
+marlin                          # the session rooted in this directory, or a new one here
 marlin attach 63df              # reattach using a unique handle prefix
 marlin attach --session-file .marlin-session  # publish the selected full handle
 marlin inspect 63df --json      # inspect state, recent blocks, and diagnostics

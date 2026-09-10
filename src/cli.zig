@@ -358,7 +358,8 @@ const help_text =
     \\marlin — a fast, simple AI agent harness
     \\
     \\usage:
-    \\  marlin                 attach to the daemon (TUI, newest session)
+    \\  marlin                 attach: the session rooted in this directory,
+    \\                         or a new one here (over --remote: the newest)
     \\  marlin attach [handle] [--session-file <path>]
     \\                         attach TUI and atomically publish its full handle
     \\  marlin run [--continue] [--model <m>] [--image <path>] [--quiet] [--ask] "task"
