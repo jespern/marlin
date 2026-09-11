@@ -1732,13 +1732,18 @@ pub const App = struct {
                 defer self.gpa.free(rendered);
                 self.pushBlock(.system_note, rendered, "diagnostics", .ok);
             },
-            .otel_status_result => |status| self.setNotice(
-                "OTLP {s}{s}",
-                .{
-                    if (status.enabled) @as([]const u8, "enabled") else "disabled",
-                    if (status.content) @as([]const u8, " · content capture ON") else "",
-                },
-            ),
+            .otel_status_result => |status| {
+                self.conn.otel_enabled = status.enabled;
+                self.conn.otel_content = status.content;
+                self.refresh_requested = true;
+                self.setNotice(
+                    "OTLP {s}{s}",
+                    .{
+                        if (status.enabled) @as([]const u8, "enabled") else "disabled",
+                        if (status.content) @as([]const u8, " · content capture ON") else "",
+                    },
+                );
+            },
             .session_upsert => |su| self.upsertSessionSummary(su.session),
             .session_remove => |sr| self.removeSessionSummary(sr.sid),
             .interrupt_result => |result| {
@@ -5513,16 +5518,28 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             voice_style = Palette.status_running;
         },
     };
+    // OTLP export indicator: one quiet glyph, green while spans flow, the
+    // approval yellow when conversation CONTENT is being shipped too — the
+    // one telemetry state worth a louder color. Absent when off.
+    const otel_on = app.conn.otel_enabled;
+    const otel_style = if (app.conn.otel_content) Palette.status_approval else Palette.status_running;
     var right_w: u16 = sandbox_cols + 1 + @as(u16, @intCast(dns_txt.len)) + 3;
     if (mode_txt.len > 0) right_w += @intCast(mode_txt.len + 3);
     if (voice_txt.len > 0) right_w += voice_cols + 3;
+    if (otel_on) right_w += 1 + 3;
     if (status_win.width > right_w) {
         const right_win = status_win.child(.{
             .x_off = @intCast(status_win.width - right_w),
             .width = right_w,
         });
-        var right_segments: [8]vaxis.Segment = undefined;
+        var right_segments: [10]vaxis.Segment = undefined;
         var right_n: usize = 0;
+        if (otel_on) {
+            right_segments[right_n] = .{ .text = "∿", .style = otel_style };
+            right_n += 1;
+            right_segments[right_n] = .{ .text = " · ", .style = Palette.status_sep };
+            right_n += 1;
+        }
         if (voice_txt.len > 0) {
             right_segments[right_n] = .{ .text = voice_txt, .style = voice_style };
             right_n += 1;

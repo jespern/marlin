@@ -1222,6 +1222,8 @@ pub const Daemon = struct {
                     .sandbox_available = self.sandbox_backend != .unavailable,
                     .network_filtering = self.network.isActive(),
                     .network_configured = config.networkPolicyConfigured(self.cfg),
+                    .otel_enabled = self.otel_exporter != null,
+                    .otel_content = if (self.otel_exporter) |exporter| exporter.capturesContent() else false,
                     .network_feed_count = self.network.feedCount(),
                     .network_rule_count = self.network.ruleCount(),
                     .daemon_exe_mtime_ms = self.exe_mtime_ms,

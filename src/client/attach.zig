@@ -59,6 +59,9 @@ pub const Conn = struct {
     sandbox_available: bool = false,
     network_filtering: bool = false,
     network_configured: bool = false,
+    /// OTLP exporter state at handshake; the /otel status reply refreshes it.
+    otel_enabled: bool = false,
+    otel_content: bool = false,
     network_feed_count: u64 = 0,
     network_rule_count: u64 = 0,
     /// Daemon build identity from hello_ok, for stale-daemon detection:
@@ -341,6 +344,8 @@ pub fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !v
     conn.sandbox_available = hello.sandbox_available;
     conn.network_filtering = hello.network_filtering;
     conn.network_configured = hello.network_configured;
+    conn.otel_enabled = hello.otel_enabled;
+    conn.otel_content = hello.otel_content;
     conn.network_feed_count = hello.network_feed_count;
     conn.network_rule_count = hello.network_rule_count;
     conn.daemon_version_len = @min(hello.daemon_version.len, conn.daemon_version_buf.len);

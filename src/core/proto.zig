@@ -413,6 +413,10 @@ pub const DaemonMsg = union(enum) {
         /// A blocklist or explicit-deny policy was requested in configuration.
         /// False distinguishes opt-out from a configured policy that failed.
         network_configured: bool = false,
+        /// OTLP exporter live (status-bar indicator); content = conversation
+        /// content capture is also on, which the indicator colors louder.
+        otel_enabled: bool = false,
+        otel_content: bool = false,
         network_feed_count: u64 = 0,
         network_rule_count: u64 = 0,
         /// Modification time (ms) of the daemon's own executable, captured at
