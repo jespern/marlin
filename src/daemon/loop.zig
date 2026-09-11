@@ -427,6 +427,62 @@ fn appendEphemeralUserMessage(
     return out;
 }
 
+/// Guests cannot take image content in their prompt argv, but they all have
+/// file tools — and Claude Code's Read renders an image file to the model.
+/// So materialize each attachment blob as a content-addressed file under the
+/// temp root and hand the guest the paths instead of an apology. Writes are
+/// idempotent (hash-named, exclusive create); the OS owns tmp cleanup.
+pub fn materializeGuestAttachments(
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *Store,
+    environ: ?*const std.process.Environ.Map,
+    user_text: []const u8,
+    attachments: []const block.MediaRef,
+) ![]u8 {
+    const tmp_root = if (environ) |env| env.get("TMPDIR") orelse "/tmp" else "/tmp";
+    var dir_buf: [512]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/marlin-attachments", .{std.mem.trimEnd(u8, tmp_root, "/")}) catch return error.NameTooLong;
+    try Io.Dir.cwd().createDirPath(io, dir);
+
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+    try text.print(gpa, "{s}\n\n[The user attached {d} image(s); Marlin saved them as files. View them with your file-reading tool:", .{ user_text, attachments.len });
+    for (attachments) |attachment| {
+        const bytes = try store.getBlobAlloc(gpa, attachment.hash);
+        defer gpa.free(bytes);
+        var path_buf: [768]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.{s}", .{ dir, attachment.hash, extensionForMime(attachment.mime) }) catch return error.NameTooLong;
+        writeFileIfAbsent(io, path, bytes) catch |err| {
+            std.log.warn("could not write attachment {s}: {t}", .{ attachment.hash, err });
+            return err;
+        };
+        try text.print(gpa, "\n  {s}", .{path});
+        if (attachment.name.len > 0) try text.print(gpa, " ({s})", .{attachment.name});
+    }
+    try text.appendSlice(gpa, "]");
+    return text.toOwnedSlice(gpa);
+}
+
+fn extensionForMime(mime: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(mime, "image/png")) return "png";
+    if (std.ascii.eqlIgnoreCase(mime, "image/jpeg")) return "jpg";
+    if (std.ascii.eqlIgnoreCase(mime, "image/gif")) return "gif";
+    if (std.ascii.eqlIgnoreCase(mime, "image/webp")) return "webp";
+    return "img";
+}
+
+/// Content-addressed write: an existing file with this name IS the payload.
+fn writeFileIfAbsent(io: Io, path: []const u8, bytes: []const u8) !void {
+    const file = Io.Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        else => return err,
+    };
+    errdefer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+    file.close(io);
+}
+
 /// Run one full agent turn: user text in → tool roundtrips → final text out.
 /// All blocks are persisted as they happen; a crash mid-turn leaves a
 /// consistent log.
@@ -455,8 +511,11 @@ pub fn runTurn(
             .synthetic = opts.synthetic_input,
         } });
         for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
-        const delegated_prompt = if (attachments.len > 0)
-            try std.fmt.allocPrint(gpa, "{s}\n\n[{d} image attachment(s) are stored in Marlin but unavailable to this guest agent]", .{ user_text, attachments.len })
+        const delegated_prompt: ?[]u8 = if (attachments.len > 0)
+            materializeGuestAttachments(gpa, io, store, opts.tool_environ, user_text, attachments) catch |err| blk: {
+                std.log.warn("could not materialize guest attachments: {t}", .{err});
+                break :blk try std.fmt.allocPrint(gpa, "{s}\n\n[{d} image attachment(s) are stored in Marlin but could not be shared with this guest agent]", .{ user_text, attachments.len });
+            }
         else
             null;
         defer if (delegated_prompt) |prompt| gpa.free(prompt);

@@ -903,3 +903,47 @@ test "task_batch runs bounded children concurrently and preserves result order" 
     const third = std.mem.indexOf(u8, result.output, "third").?;
     try std.testing.expect(first < second and second < third);
 }
+
+test "guest attachments materialize as content-addressed files the prompt points at" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-guest-attach-test");
+    defer temp.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("TMPDIR", temp.path);
+
+    const payload = "\x89PNG fake image bytes";
+    const hash = try store.putBlob(payload, 1_000);
+    defer gpa.free(@constCast(hash));
+
+    const refs = [_]block.MediaRef{.{ .hash = hash, .mime = "image/png", .name = "screenshot.png", .byte_len = payload.len }};
+    const prompt = try loop.materializeGuestAttachments(gpa, io, &store, &env, "look at this", &refs);
+    defer gpa.free(prompt);
+
+    // The prompt keeps the user text and points at the materialized file.
+    try std.testing.expect(std.mem.startsWith(u8, prompt, "look at this"));
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "screenshot.png") != null);
+    const marker = std.mem.indexOf(u8, prompt, "/marlin-attachments/").?;
+    const path_start = std.mem.lastIndexOfScalar(u8, prompt[0..marker], ' ').? + 1;
+    var path_end = marker;
+    while (path_end < prompt.len and prompt[path_end] != ' ' and prompt[path_end] != '\n') path_end += 1;
+    const path = prompt[path_start..path_end];
+    try std.testing.expect(std.mem.endsWith(u8, path, ".png"));
+
+    const written = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024));
+    defer gpa.free(written);
+    try std.testing.expectEqualStrings(payload, written);
+
+    // Content-addressed: a second materialization reuses the file quietly.
+    const again = try loop.materializeGuestAttachments(gpa, io, &store, &env, "look again", &refs);
+    defer gpa.free(again);
+    try std.testing.expect(std.mem.indexOf(u8, again, path) != null);
+
+    Io.Dir.cwd().deleteFile(io, path) catch {};
+}
