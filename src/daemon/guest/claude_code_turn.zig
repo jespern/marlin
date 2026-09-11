@@ -76,7 +76,7 @@ const CcOutcome = struct {
     stderr_len: usize = 0,
 };
 
-fn compactDiagnostic(allocator: std.mem.Allocator, text: []const u8, max: usize) ![]u8 {
+pub fn compactDiagnostic(allocator: std.mem.Allocator, text: []const u8, max: usize) ![]u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     const clipped = trimmed[0..@min(trimmed.len, max)];
     const compact = try allocator.dupe(u8, clipped);

@@ -38,6 +38,7 @@ const resolveGuestApproval = loop.resolveGuestApproval;
 const tryCloseSteering = loop.tryCloseSteering;
 
 const shared = @import("shared.zig");
+const compactDiagnostic = @import("claude_code_turn.zig").compactDiagnostic;
 const setDelegateError = shared.setDelegateError;
 const lastDelegateErrorNote = shared.lastDelegateErrorNote;
 const putEnvDefault = shared.putEnvDefault;
@@ -53,6 +54,48 @@ fn codexWriteLine(writer: *Io.Writer, line: []const u8) !void {
     try writer.flush();
 }
 
+/// Idempotent child teardown: the happy-path defer and the error-path
+/// diagnostics (which must join the stderr drain BEFORE reading its tail)
+/// share one implementation. The app-server is per turn; reap the whole
+/// owned group immediately so background descendants cannot outlive the
+/// Marlin turn or add half a second of teardown latency.
+const CodexTeardown = struct {
+    io: Io,
+    watcher: *CcWatcher,
+    watcher_thread: std.Thread,
+    drain_thread: ?std.Thread,
+    child: *std.process.Child,
+    group: std.process.Child.Id,
+    done: bool = false,
+
+    fn run(self: *CodexTeardown) void {
+        if (self.done) return;
+        self.done = true;
+        self.watcher.done.store(true, .release);
+        self.watcher_thread.join();
+        process_io.terminateProcessGroup(self.io, self.group, 0);
+        if (self.drain_thread) |thread| thread.join();
+        _ = self.child.wait(self.io) catch {};
+    }
+};
+
+/// The app-server died mid-conversation: say so durably, with its last
+/// stderr — the only evidence there is.
+fn noteCodexServerExit(gpa: std.mem.Allocator, ap: *Appender, stderr_tail: []const u8) void {
+    var note_buf: [768]u8 = undefined;
+    var note: []const u8 = "codex app-server exited mid-turn with no stderr output";
+    if (compactDiagnostic(gpa, stderr_tail, 512)) |compact| {
+        defer gpa.free(compact);
+        if (compact.len > 0)
+            note = std.fmt.bufPrint(&note_buf, "codex app-server exited mid-turn (stderr: {s})", .{compact}) catch note;
+        setDelegateError(note);
+        _ = ap.append(.{ .system_note = .{ .text = note } }) catch {};
+        return;
+    } else |_| {}
+    setDelegateError(note);
+    _ = ap.append(.{ .system_note = .{ .text = note } }) catch {};
+}
+
 fn codexWriteValue(arena: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
     const encoded = try std.json.Stringify.valueAlloc(arena, value, .{});
     try codexWriteLine(writer, encoded);
@@ -63,8 +106,22 @@ fn codexWaitResponse(
     reader: *Io.Reader,
     request_id: i64,
 ) !codex.Response {
+    // Response lines routinely exceed the reader's fixed buffer:
+    // thread/resume echoes the whole thread, and one real session crossed
+    // 4 MiB after a long turn, failing every subsequent turn (observed
+    // live). Accumulate like the event loop does, with the same 64 MiB
+    // ceiling; only a line beyond THAT is reported as too long — and
+    // distinctly from the process dying, since the two need opposite
+    // investigations.
+    // Arena-owned, deliberately not deinited: the decoded Response may
+    // reference these bytes, which therefore live until the turn arena does.
+    var acc: std.ArrayList(u8) = .empty;
     while (true) {
-        const line = reader.takeDelimiterInclusive('\n') catch return error.CodexAppServerExited;
+        const line = shared.takeEventLine(reader, arena, &acc, shared.max_event_line_bytes) catch |err| switch (err) {
+            error.LineTooLong => return error.CodexEventLineTooLong,
+            error.ReadFailed => return error.CodexAppServerExited,
+            error.OutOfMemory => return error.OutOfMemory,
+        } orelse return error.CodexAppServerExited;
         const inbound = codex.decodeLine(arena, line) catch continue;
         switch (inbound) {
             .response => |response| if (response.id == request_id) return response,
@@ -335,16 +392,25 @@ pub fn runCodexTurn(
     const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
     var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
     const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
-    defer {
-        watcher.done.store(true, .release);
-        watcher_thread.join();
-        // The app-server is per turn. Its foreground work has completed; reap
-        // the whole owned group immediately so background descendants cannot
-        // outlive the Marlin turn or add half a second of teardown latency.
-        process_io.terminateProcessGroup(io, child.id.?, 0);
-        if (drain_thread) |thread| thread.join();
-        _ = child.wait(io) catch {};
-    }
+    var teardown = CodexTeardown{
+        .io = io,
+        .watcher = &watcher,
+        .watcher_thread = watcher_thread,
+        .drain_thread = drain_thread,
+        .child = &child,
+        .group = child.id.?,
+    };
+    defer teardown.run();
+    // A dead app-server used to fail as a bare CodexAppServerExited with the
+    // stderr tail captured and thrown away (observed live: two ~1s failures
+    // with no trace anywhere). Tear down FIRST so the drain is complete, then
+    // put the tail where the user can see it.
+    errdefer |err| if (err == error.CodexAppServerExited and
+        !watcher.cancelled.load(.acquire) and !watcher.timed_out.load(.acquire))
+    {
+        teardown.run();
+        noteCodexServerExit(gpa, ap, drain.tail[0..drain.len]);
+    };
 
     var writer_buffer: [64 * 1024]u8 = undefined;
     var writer_file = child.stdin.?.writer(io, &writer_buffer);
