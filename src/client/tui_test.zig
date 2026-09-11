@@ -4826,3 +4826,35 @@ test "a typed provider/model that matches nothing is offered as-is, but only wel
         try std.testing.expect(app.typedModelFallback(0) == null);
     }
 }
+
+test "cwd Tab completes but Enter submits the typed directory instead of its children" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "cwd-enter");
+    defer tmp.deinit();
+    var root = try Io.Dir.cwd().openDir(io, tmp.path, .{});
+    defer root.close(io);
+    try root.createDirPath(io, "projects/marlin/src");
+    try root.createDirPath(io, "projects/other");
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = io, .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr(tmp.path);
+    app.view.editor.insertSlice("/cwd proj");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cwd projects/", app.view.editor.text.items);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cwd projects/", app.view.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"projects/\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "marlin") == null);
+    try std.testing.expectEqual(@as(usize, 0), app.view.editor.text.items.len);
+}

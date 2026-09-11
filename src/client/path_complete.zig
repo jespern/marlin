@@ -16,6 +16,26 @@ pub const max_candidates = 12;
 /// Matching directories for `typed`. Unknown directories and unreadable
 /// entries yield nothing rather than an error: this runs on every keystroke.
 pub fn directories(arena: std.mem.Allocator, io: Io, session_cwd: []const u8, home: ?[]const u8, typed: []const u8) ![]Candidate {
+    return matchingDirectories(arena, io, session_cwd, home, typed, max_candidates);
+}
+
+/// Complete against every match, including entries beyond the visible menu.
+/// Never choose an arbitrary child when more than one directory matches.
+pub fn complete(arena: std.mem.Allocator, io: Io, session_cwd: []const u8, home: ?[]const u8, typed: []const u8) ![]const u8 {
+    const matches = try matchingDirectories(arena, io, session_cwd, home, typed, std.math.maxInt(usize));
+    if (matches.len == 0) return typed;
+    var prefix = matches[0].arg;
+    for (matches[1..]) |candidate| {
+        var n: usize = 0;
+        while (n < prefix.len and n < candidate.arg.len and prefix[n] == candidate.arg[n]) : (n += 1) {}
+        // A byte prefix may end inside a multibyte filename character.
+        while (n > 0 and n < prefix.len and prefix[n] & 0xc0 == 0x80) n -= 1;
+        prefix = prefix[0..n];
+    }
+    return if (prefix.len > typed.len) prefix else typed;
+}
+
+fn matchingDirectories(arena: std.mem.Allocator, io: Io, session_cwd: []const u8, home: ?[]const u8, typed: []const u8, limit: usize) ![]Candidate {
     var out: std.ArrayList(Candidate) = .empty;
     if (std.mem.eql(u8, typed, "~")) {
         if (home != null) try out.append(arena, .{ .arg = "~/", .name = "~" });
@@ -39,7 +59,7 @@ pub fn directories(arena: std.mem.Allocator, io: Io, session_cwd: []const u8, ho
     while (it.next(io) catch null) |entry| {
         if (entry.name.len == 0) continue;
         if (entry.name[0] == '.' and (base.len == 0 or base[0] != '.')) continue;
-        if (entry.name.len < base.len or !std.ascii.eqlIgnoreCase(entry.name[0..base.len], base)) continue;
+        if (entry.name.len < base.len or !std.mem.eql(u8, entry.name[0..base.len], base)) continue;
         const is_dir = switch (entry.kind) {
             .directory => true,
             .sym_link => blk: {
@@ -53,7 +73,7 @@ pub fn directories(arena: std.mem.Allocator, io: Io, session_cwd: []const u8, ho
         try names.append(arena, try arena.dupe(u8, entry.name));
     }
     std.mem.sort([]const u8, names.items, {}, lessThan);
-    for (names.items[0..@min(names.items.len, max_candidates)]) |name| {
+    for (names.items[0..@min(names.items.len, limit)]) |name| {
         try out.append(arena, .{
             .arg = try std.fmt.allocPrint(arena, "{s}{s}/", .{ prefix, name }),
             .name = name,

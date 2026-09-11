@@ -405,7 +405,24 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
             // A recalled /command still looks like an autocomplete query.
             // While walking history, Up/Down must keep walking history rather
             // than being captured by the command menu.
-            if (suggestions.len > 0 and !ed.isWalkingHistory()) {
+            // Path completion follows shell keys: Tab expands, Enter executes
+            // the typed path even when the menu offers child directories.
+            const query = commandQuery(ed) orelse "";
+            const cwd_argument = std.mem.startsWith(u8, query, "/cwd ") or std.mem.startsWith(u8, query, "/cwd\t");
+            if (cwd_argument and key.matches(vaxis.Key.tab, .{})) {
+                const typed = std.mem.trimStart(u8, query[4..], " \t");
+                const home = if (app.environ) |env| env.get("HOME") else null;
+                const completed = try @import("path_complete.zig").complete(command_arena.allocator(), app.io, app.view.cwd.items, home, typed);
+                if (!std.mem.eql(u8, typed, completed)) {
+                    const replacement = try std.fmt.allocPrint(command_arena.allocator(), "/cwd {s}", .{completed});
+                    ed.clear();
+                    ed.insertSlice(replacement);
+                }
+                app.command_selection = 0;
+                return;
+            }
+            const submit_cwd = isEnterKey(key) and cwd_argument;
+            if (suggestions.len > 0 and !ed.isWalkingHistory() and !submit_cwd) {
                 app.command_selection = @min(app.command_selection, suggestions.len - 1);
                 if (isNextInputRowKey(key)) {
                     app.command_selection = if (app.command_selection + 1 < suggestions.len)

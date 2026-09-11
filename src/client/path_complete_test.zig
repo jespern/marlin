@@ -29,7 +29,7 @@ test "directories under the session cwd, hidden and files excluded, sorted, type
     const all = try path_complete.directories(arena, io, tmp.path, null, "");
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "alpha/", "beta/" }), names(all, &buf));
 
-    const al = try path_complete.directories(arena, io, tmp.path, null, "AL");
+    const al = try path_complete.directories(arena, io, tmp.path, null, "al");
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{"alpha/"}), names(al, &buf));
     try std.testing.expectEqualStrings("alpha", al[0].name);
 
@@ -74,4 +74,31 @@ test "~ expands against HOME for lookup but stays ~ in the suggestion; absolute 
     try std.testing.expectEqual(@as(usize, 1), absolute.len);
     try std.testing.expect(std.mem.startsWith(u8, absolute[0].arg, tmp.path));
     try std.testing.expect(std.mem.endsWith(u8, absolute[0].arg, "/Work/"));
+}
+
+test "shell completion uses all matches and stops at an ambiguous prefix" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "cwd-shell");
+    defer tmp.deinit();
+    var root = try std.Io.Dir.cwd().openDir(io, tmp.path, .{});
+    defer root.close(io);
+    try root.createDirPath(io, "projects/marlin");
+    try root.createDirPath(io, "projects/mobile");
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("projects/", try path_complete.complete(arena, io, tmp.path, null, "proj"));
+    try std.testing.expectEqualStrings("projects/m", try path_complete.complete(arena, io, tmp.path, null, "projects/"));
+    try std.testing.expectEqualStrings("projects/m", try path_complete.complete(arena, io, tmp.path, null, "projects/m"));
+    try std.testing.expectEqualStrings("projects/marlin/", try path_complete.complete(arena, io, tmp.path, null, "projects/ma"));
+    try std.testing.expectEqualStrings("PROJ", try path_complete.complete(arena, io, tmp.path, null, "PROJ"));
+    for (0..13) |i| try root.createDirPath(io, try std.fmt.allocPrint(arena, "many/shared{d}", .{i}));
+    try root.createDirPath(io, "many/zebra");
+    try std.testing.expectEqualStrings("many/", try path_complete.complete(arena, io, tmp.path, null, "many/"));
+    try root.createDirPath(io, "unicode/é");
+    try root.createDirPath(io, "unicode/ê");
+    try std.testing.expectEqualStrings("unicode/", try path_complete.complete(arena, io, tmp.path, null, "unicode/"));
 }
