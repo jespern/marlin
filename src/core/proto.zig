@@ -316,6 +316,13 @@ pub const ClientMsg = union(enum) {
         attachments: []const AttachmentUpload = &.{},
     },
     approve: struct { sid: u64, approval_id: []const u8, decision: ApprovalAnswer },
+    /// Answer to a parked question_request: the chosen option's text, or the
+    /// user's own words. First answer wins; stale answers are ignored.
+    question_answer: struct { sid: u64, question_id: []const u8, answer: []const u8 },
+    /// The `mcp__marlin__ask_user` tool of a delegated Claude Code session,
+    /// forwarded by the bridge. The daemon replies cc_question_result after a
+    /// human answers the parked question_request (arbitrarily delayed).
+    cc_question: struct { sid: u64, question: []const u8, options_json: []const u8 },
     /// One Claude Code permission prompt forwarded by the `marlin cc_approve`
     /// bridge subprocess of a delegated session. The daemon replies
     /// cc_approval_result — immediately when policy auto-allows the call,
@@ -486,6 +493,15 @@ pub const DaemonMsg = union(enum) {
         /// Raw JSON args — clients render their own preview.
         args_json: []const u8,
     },
+    /// The agent asked the user to choose: clients render the options as an
+    /// interactive picker and reply question_answer. Parked exactly like an
+    /// approval (state awaiting_approval, replayed to reconnecting clients).
+    question_request: struct {
+        sid: u64,
+        question_id: []const u8,
+        question: []const u8,
+        options: []const []const u8,
+    },
     session_meta: struct {
         sid: u64,
         tokens_in: u64,
@@ -520,6 +536,8 @@ pub const DaemonMsg = union(enum) {
     /// ignore it) becomes the deny text Claude Code shows its model, so a
     /// policy denial reads as policy, not as a human saying no.
     cc_approval_result: struct { sid: u64, decision: ApprovalAnswer, message: ?[]const u8 = null },
+    /// Reply to cc_question: the user's answer, or null when dismissed.
+    cc_question_result: struct { sid: u64, answer: ?[]const u8 = null },
     /// Terminal reply to gc.
     gc_result: struct { bytes_reclaimed: u64, orphan_blobs: u64, expired_blobs: u64 },
     /// Reply to council_set/council_remove/council_list: the full current

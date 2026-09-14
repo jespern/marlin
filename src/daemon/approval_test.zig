@@ -97,3 +97,37 @@ test "gate: cancel unparks with denied" {
     try std.testing.expect(!gate.arm(io, 1, &cancel));
     try std.testing.expectEqual(@as(?u64, null), gate.isPending(io));
 }
+
+test "question gate: answer-before-wait resolves; dismiss unparks with null; stale answers refused" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const QuestionGate = @import("approval.zig").QuestionGate;
+
+    var gate = QuestionGate{};
+    // Nothing armed: an answer has no home and stays caller-owned.
+    const stray = try gpa.dupe(u8, "stray");
+    defer gpa.free(stray);
+    try std.testing.expect(!gate.resolve(io, 1, stray));
+
+    // Armed, answered by the dispatcher, then waited on by the turn thread —
+    // wait returns immediately with the owned answer.
+    try std.testing.expect(gate.arm(io, 2, null));
+    try std.testing.expectEqual(@as(?u64, 2), gate.isPending(io));
+    const answer = try gpa.dupe(u8, "Always show the last year");
+    try std.testing.expect(gate.resolve(io, 2, answer));
+    const received = gate.wait(io, 2).?;
+    defer gpa.free(received);
+    try std.testing.expectEqualStrings("Always show the last year", received);
+    try std.testing.expectEqual(@as(?u64, null), gate.isPending(io));
+
+    // Dismissal (interrupt) unparks with no answer.
+    try std.testing.expect(gate.arm(io, 3, null));
+    gate.dismissPending(io);
+    try std.testing.expect(gate.wait(io, 3) == null);
+
+    // A pre-cancelled turn never parks.
+    var cancel = std.atomic.Value(bool).init(true);
+    try std.testing.expect(!gate.arm(io, 4, &cancel));
+}

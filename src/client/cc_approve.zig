@@ -42,10 +42,32 @@ pub const Decision = struct {
     }
 };
 
+/// A forwarded ask_user answer. Fixed buffer like Decision; unanswered means
+/// the question was dismissed (interrupt) or the daemon was unreachable.
+pub const QuestionAnswer = struct {
+    answer_buf: [8192]u8 = undefined,
+    answer_len: usize = 0,
+    answered: bool = false,
+
+    pub fn init(text: ?[]const u8) QuestionAnswer {
+        var self = QuestionAnswer{};
+        if (text) |value| {
+            self.answered = true;
+            self.answer_len = @min(value.len, self.answer_buf.len);
+            @memcpy(self.answer_buf[0..self.answer_len], value[0..self.answer_len]);
+        }
+        return self;
+    }
+    pub fn answer(self: *const QuestionAnswer) ?[]const u8 {
+        return if (self.answered) self.answer_buf[0..self.answer_len] else null;
+    }
+};
+
 /// Answers one forwarded prompt; injectable so tests need no daemon.
 pub const Decider = struct {
     ctx: ?*anyopaque = null,
     decide: *const fn (ctx: ?*anyopaque, tool_name: []const u8, input_json: []const u8) Decision,
+    ask_question: ?*const fn (ctx: ?*anyopaque, question: []const u8, options_json: []const u8) QuestionAnswer = null,
 };
 
 pub fn run(
@@ -75,7 +97,11 @@ pub fn run(
         .self_exe = self_exe,
         .sid = session_id,
     };
-    const decider = Decider{ .ctx = &daemon_decider, .decide = DaemonDecider.decide };
+    const decider = Decider{
+        .ctx = &daemon_decider,
+        .decide = DaemonDecider.decide,
+        .ask_question = DaemonDecider.askQuestion,
+    };
 
     var in_buf: [64 * 1024]u8 = undefined;
     var reader = Io.File.stdin().reader(io, &in_buf);
@@ -122,6 +148,25 @@ const DaemonDecider = struct {
         const result = try conn.recvUntil(arena_state.allocator(), .cc_approval_result);
         return Decision.init(result.decision, result.message);
     }
+
+    fn askQuestion(ctx: ?*anyopaque, question: []const u8, options_json: []const u8) QuestionAnswer {
+        const self: *DaemonDecider = @ptrCast(@alignCast(ctx.?));
+        return self.forwardQuestion(question, options_json) catch QuestionAnswer.init(null);
+    }
+
+    fn forwardQuestion(self: *DaemonDecider, question: []const u8, options_json: []const u8) !QuestionAnswer {
+        const conn = try attach.connect(self.gpa, self.io, self.environ, self.self_exe);
+        defer conn.deinit();
+        try conn.send(.{ .cc_question = .{
+            .sid = self.sid,
+            .question = question,
+            .options_json = options_json,
+        } });
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const result = try conn.recvUntil(arena_state.allocator(), .cc_question_result);
+        return QuestionAnswer.init(result.answer);
+    }
 };
 
 /// Handle one JSON-RPC line; null means no reply (notifications, garbage).
@@ -154,7 +199,7 @@ pub fn handleLine(gpa: std.mem.Allocator, line: []const u8, decider: Decider) ?[
     if (std.mem.eql(u8, rpc.method, "ping")) return rpcResult(gpa, id, "{}");
     if (std.mem.eql(u8, rpc.method, "tools/list")) {
         return rpcResult(gpa, id,
-            \\{"tools":[{"name":"approve","description":"Forward one Claude Code permission prompt to the marlin approval gate.","inputSchema":{"type":"object","properties":{"tool_name":{"type":"string"},"input":{"type":"object"}},"required":["tool_name","input"]}}]}
+            \\{"tools":[{"name":"approve","description":"Forward one Claude Code permission prompt to the marlin approval gate.","inputSchema":{"type":"object","properties":{"tool_name":{"type":"string"},"input":{"type":"object"}},"required":["tool_name","input"]}},{"name":"ask_user","description":"Ask the user a multiple-choice question, rendered as an interactive picker in their Marlin terminal. Use this whenever you would otherwise list options in prose and ask them to reply. The turn pauses until they answer; the result is the chosen option's exact text, or the user's own typed words.","inputSchema":{"type":"object","properties":{"question":{"type":"string","description":"The complete question, ending in a question mark"},"options":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":9,"description":"Distinct, mutually exclusive choices. No 'Other' option; the user can always type their own answer instead."}},"required":["question","options"]}}]}
         );
     }
     if (std.mem.eql(u8, rpc.method, "tools/call")) {
@@ -169,7 +214,10 @@ fn handleToolCall(gpa: std.mem.Allocator, id: std.json.Value, params: ?std.json.
     const p = params orelse return rpcError(gpa, id, -32602, "missing params");
     if (p != .object) return rpcError(gpa, id, -32602, "params must be an object");
     const name = p.object.get("name") orelse return rpcError(gpa, id, -32602, "missing tool name");
-    if (name != .string or !std.mem.eql(u8, name.string, "approve"))
+    if (name != .string) return rpcError(gpa, id, -32602, "unknown tool");
+    if (std.mem.eql(u8, name.string, "ask_user"))
+        return handleAskUser(gpa, id, p, decider);
+    if (!std.mem.eql(u8, name.string, "approve"))
         return rpcError(gpa, id, -32602, "unknown tool");
 
     // Anything malformed decides as a deny, not a protocol error: Claude
@@ -211,6 +259,40 @@ fn handleToolCall(gpa: std.mem.Allocator, id: std.json.Value, params: ?std.json.
 
     // The permission payload travels as the text of one MCP content block.
     const escaped = std.json.Stringify.valueAlloc(gpa, payload, .{}) catch return null;
+    defer gpa.free(escaped);
+    const result = std.fmt.allocPrint(gpa,
+        \\{{"content":[{{"type":"text","text":{s}}}]}}
+    , .{escaped}) catch return null;
+    defer gpa.free(result);
+    return rpcResult(gpa, id, result);
+}
+
+/// ask_user: forward the question to the daemon's picker and return the
+/// user's answer as the tool result text. A dismissed question (interrupt)
+/// reports itself as such — a fact for the model, never a protocol error.
+fn handleAskUser(gpa: std.mem.Allocator, id: std.json.Value, p: std.json.Value, decider: Decider) ?[]u8 {
+    const forward = decider.ask_question orelse
+        return rpcError(gpa, id, -32602, "ask_user unavailable");
+    var question: []const u8 = "";
+    var options_owned: ?[]u8 = null;
+    defer if (options_owned) |owned| gpa.free(owned);
+    if (p.object.get("arguments")) |arguments| {
+        if (arguments == .object) {
+            if (arguments.object.get("question")) |q| {
+                if (q == .string) question = q.string;
+            }
+            if (arguments.object.get("options")) |options| {
+                options_owned = std.json.Stringify.valueAlloc(gpa, options, .{}) catch null;
+            }
+        }
+    }
+    const answer: QuestionAnswer = if (question.len == 0 or options_owned == null)
+        QuestionAnswer.init(null)
+    else
+        forward(decider.ctx, question, options_owned.?);
+
+    const text = answer.answer() orelse "The user dismissed the question without answering; proceed with your best judgment.";
+    const escaped = std.json.Stringify.valueAlloc(gpa, text, .{}) catch return null;
     defer gpa.free(escaped);
     const result = std.fmt.allocPrint(gpa,
         \\{{"content":[{{"type":"text","text":{s}}}]}}

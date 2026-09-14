@@ -366,6 +366,19 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
+    // Question hotkeys: digits pick an option in both modes while the
+    // composer is empty; typing anything else falls through to the composer,
+    // whose submit becomes the free-text answer.
+    if (app.view.question != null and app.view.editor.isEmpty() and
+        key.codepoint >= '1' and key.codepoint <= '9')
+    {
+        const index: usize = @intCast(key.codepoint - '1');
+        const q = app.view.question.?;
+        if (index < q.options_count) {
+            app.answerQuestion(q.option(index));
+            return;
+        }
+    }
     // Approval hotkeys work in both modes when the input is empty.
     if (app.view.pending != null and app.view.editor.isEmpty()) {
         if (key.matches('y', .{})) {

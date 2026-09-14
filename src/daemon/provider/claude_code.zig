@@ -89,23 +89,36 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
     } else {
         try argv.appendSlice(arena, &.{ "--resume", opts.session_uuid });
     }
+    // The marlin MCP server rides along whenever there is a bridge target:
+    // beyond permission prompts it carries ask_user, the interactive
+    // multiple-choice picker — wanted in EVERY permission mode, bypass
+    // included. The system-prompt note is what makes the model reach for it.
+    if (opts.bridge) |bridge| {
+        const mcp_config = try std.json.Stringify.valueAlloc(arena, .{
+            .mcpServers = .{ .marlin = .{
+                .type = "stdio",
+                .command = bridge.marlin_exe,
+                .args = .{ "cc_approve", "--sid", try std.fmt.allocPrint(arena, "{d}", .{bridge.sid}) },
+            } },
+        }, .{});
+        try argv.appendSlice(arena, &.{
+            "--mcp-config",           mcp_config,
+            "--append-system-prompt",
+            "When you need the user to choose between options, call mcp__marlin__ask_user — it renders " ++
+                "an interactive picker in their terminal and pauses for the pick. Never list choices as " ++
+                "prose and ask them to reply; that is what ask_user replaces. Skip it when one option is " ++
+                "the obvious default: state your choice and proceed.",
+        });
+    }
     switch (opts.permissions) {
         .accept_edits => {
-            if (opts.bridge) |bridge| {
+            if (opts.bridge != null) {
                 // Bridge mode: default permissions, with every prompt routed
                 // to marlin over MCP. acceptEdits would silently skip the
                 // bridge for edits, losing outside-workspace protection.
-                const mcp_config = try std.json.Stringify.valueAlloc(arena, .{
-                    .mcpServers = .{ .marlin = .{
-                        .type = "stdio",
-                        .command = bridge.marlin_exe,
-                        .args = .{ "cc_approve", "--sid", try std.fmt.allocPrint(arena, "{d}", .{bridge.sid}) },
-                    } },
-                }, .{});
                 try argv.appendSlice(arena, &.{
                     "--permission-mode",        "default",
                     "--permission-prompt-tool", "mcp__marlin__approve",
-                    "--mcp-config",             mcp_config,
                 });
             } else {
                 try argv.appendSlice(arena, &.{ "--permission-mode", "acceptEdits" });

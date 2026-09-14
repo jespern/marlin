@@ -18,6 +18,7 @@ const files = @import("files.zig");
 const search = @import("search.zig");
 const fetch_tool = @import("fetch.zig");
 const task = @import("task.zig");
+const ask_user = @import("ask_user.zig");
 const plan = @import("plan.zig");
 
 pub const Spec = struct {
@@ -62,6 +63,8 @@ pub const specs = [_]Spec{
     // generic dispatch intentionally has no session/store access.
     .{ .name = task.spec_name, .description = task.spec_description, .schema_json = task.spec_schema, .parallel_safe = false, .mutating = false },
     .{ .name = task.batch_spec_name, .description = task.batch_spec_description, .schema_json = task.batch_spec_schema, .parallel_safe = false, .mutating = false },
+    // Parks on the session's question gate; executed in loop.zig like task.
+    .{ .name = ask_user.spec_name, .description = ask_user.spec_description, .schema_json = ask_user.spec_schema, .parallel_safe = false, .mutating = false },
 };
 
 pub fn find(name: []const u8) ?*const Spec {

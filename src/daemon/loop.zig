@@ -28,6 +28,7 @@ const http = @import("provider/http.zig");
 const sse = @import("provider/sse.zig");
 const tools_registry = @import("tools/registry.zig");
 const task_tool = @import("tools/task.zig");
+const ask_user_tool = @import("tools/ask_user.zig");
 const bash_tool = @import("tools/bash.zig");
 const files_tool = @import("tools/files.zig");
 const Effort = @import("../core/effort.zig").Effort;
@@ -156,6 +157,11 @@ pub const RunOpts = struct {
     /// Daemon-owned durable-child primitive. It receives the already-persisted
     /// parent tool_call block id and parks this turn until the child completes.
     on_task: ?*const fn (ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut = null,
+    /// ask_user: park here until a client answers (or an interrupt dismisses).
+    question_gate: ?*approval.QuestionGate = null,
+    /// Publish a question_request to clients; false = nobody will ever answer.
+    on_question: ?*const fn (ctx: ?*anyopaque, id: u64, question: []const u8, options: []const []const u8) bool = null,
+    on_question_done: ?*const fn (ctx: ?*anyopaque, id: u64) void = null,
     /// Read-only children omit mutating tools and recursive task. Plan mode is
     /// stricter: no bash, no mutations, no plan_update, but read-only tasks
     /// remain available for investigation.
@@ -1482,6 +1488,10 @@ pub fn toolAllowed(opts: RunOpts, spec: *const tools_registry.Spec) bool {
     const is_task = std.mem.eql(u8, spec.name, task_tool.spec_name) or
         std.mem.eql(u8, spec.name, task_tool.batch_spec_name);
     if (is_task) return opts.on_task != null and opts.tool_profile != .read_only;
+    // Asking needs a human on the other end: a headless or child session has
+    // no question channel and the tool is withheld from the spec list.
+    if (std.mem.eql(u8, spec.name, ask_user_tool.spec_name))
+        return opts.question_gate != null and opts.on_question != null;
     if (opts.tool_profile == .plan) {
         if (std.mem.eql(u8, spec.name, "bash") or std.mem.eql(u8, spec.name, "plan_update")) return false;
         return !spec.mutating;
@@ -1564,6 +1574,50 @@ fn buildProviderBody(
     };
 }
 
+/// ask_user: validate, publish a question_request, and park on the question
+/// gate until a client answers or an interrupt dismisses. The answer arrives
+/// gpa-owned and becomes the tool result verbatim — the model sees exactly
+/// what the user picked or typed.
+fn runAskUser(gpa: std.mem.Allocator, io: Io, opts: RunOpts, args_json: []const u8) tools_registry.ExecOut {
+    const gate = opts.question_gate orelse
+        return .{ .output = gpa.dupe(u8, "error: ask_user is unavailable in this session") catch @panic("oom"), .status = .denied };
+    const publish = opts.on_question orelse
+        return .{ .output = gpa.dupe(u8, "error: ask_user is unavailable in this session") catch @panic("oom"), .status = .denied };
+
+    const Args = struct { question: []const u8, options: []const []const u8 };
+    const parsed = std.json.parseFromSlice(Args, gpa, args_json, .{ .ignore_unknown_fields = true }) catch {
+        return .{ .output = gpa.dupe(u8, "error: ask_user needs {question, options: [2..9 strings]}") catch @panic("oom"), .status = .err };
+    };
+    defer parsed.deinit();
+    const question = std.mem.trim(u8, parsed.value.question, " \t\r\n");
+    const options = parsed.value.options;
+    if (question.len == 0 or options.len < 2 or options.len > 9) {
+        return .{ .output = gpa.dupe(u8, "error: ask_user needs a question and 2..9 options") catch @panic("oom"), .status = .err };
+    }
+    for (options) |option| if (std.mem.trim(u8, option, " \t\r\n").len == 0) {
+        return .{ .output = gpa.dupe(u8, "error: ask_user options must be non-empty") catch @panic("oom"), .status = .err };
+    };
+
+    const id = ids.next(io);
+    if (!gate.arm(io, id, opts.cancel)) {
+        return .{ .output = gpa.dupe(u8, "the question was not asked (turn interrupted)") catch @panic("oom"), .status = .err };
+    }
+    if (!publish(opts.on_delta_ctx, id, question, options)) {
+        // Nobody will ever answer; unpark by dismiss+wait so the gate resets.
+        gate.dismissPending(io);
+        _ = gate.wait(io, id);
+        return .{ .output = gpa.dupe(u8, "error: the question could not reach any client") catch @panic("oom"), .status = .err };
+    }
+    publishPhase(opts, .approval);
+    defer publishPhase(opts, .tool);
+    const answer = gate.wait(io, id);
+    if (opts.on_question_done) |cb| cb(opts.on_delta_ctx, id);
+    if (answer) |text| {
+        return .{ .output = text, .status = .ok };
+    }
+    return .{ .output = gpa.dupe(u8, "the user dismissed the question without answering") catch @panic("oom"), .status = .err };
+}
+
 fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, name: []const u8, args_json: []const u8) tools_registry.ExecOut {
     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .start);
     defer if (opts.on_tool) |cb| cb(opts.on_delta_ctx, name, .done);
@@ -1582,6 +1636,7 @@ fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, 
             .status = .denied,
         };
     }
+    if (std.mem.eql(u8, name, ask_user_tool.spec_name)) return runAskUser(gpa, io, opts, args_json);
     if (opts.extensions) |ext| {
         if (ext.dispatch(name, args_json, opts.cwd, opts.cancel)) |result| return result;
     }

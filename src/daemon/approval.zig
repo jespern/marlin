@@ -131,4 +131,78 @@ pub const Gate = struct {
     }
 };
 
+/// Gate for ask_user questions: the same park-and-resolve shape as `Gate`,
+/// but the resolution carries the user's answer text instead of a verdict.
+/// The answer is gpa-owned; `wait` hands ownership to the turn thread, and
+/// an unresolved answer left behind by an interrupt is freed on `deinit`.
+pub const QuestionGate = struct {
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
+    pending_id: ?u64 = null,
+    /// null = unanswered; empty slice = dismissed without an answer.
+    answer: ?[]u8 = null,
+    dismissed: bool = false,
+
+    pub fn arm(self: *QuestionGate, io: Io, id: u64, cancel: ?*std.atomic.Value(bool)) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (cancel) |f| {
+            if (f.load(.acquire)) return false;
+        }
+        if (self.pending_id != null) return false;
+        self.pending_id = id;
+        self.answer = null;
+        self.dismissed = false;
+        return true;
+    }
+
+    /// TURN thread. Returns the gpa-owned answer, or null when the question
+    /// was dismissed (interrupt); the tool then reports "no answer".
+    pub fn wait(self: *QuestionGate, io: Io, id: u64) ?[]u8 {
+        self.mutex.lockUncancelable(io);
+        if (self.pending_id == null or self.pending_id.? != id) {
+            self.mutex.unlock(io);
+            return null;
+        }
+        while (self.answer == null and !self.dismissed) {
+            self.cond.waitUncancelable(io, &self.mutex);
+        }
+        const result = self.answer;
+        self.pending_id = null;
+        self.answer = null;
+        self.dismissed = false;
+        self.mutex.unlock(io);
+        return result;
+    }
+
+    /// DISPATCHER thread. Takes ownership of `answer` when it returns true;
+    /// a stale/duplicate answer returns false and the caller keeps it.
+    pub fn resolve(self: *QuestionGate, io: Io, id: u64, answer: []u8) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const pending = self.pending_id orelse return false;
+        if (pending != id) return false;
+        if (self.answer != null or self.dismissed) return false;
+        self.answer = answer;
+        self.cond.signal(io);
+        return true;
+    }
+
+    pub fn isPending(self: *QuestionGate, io: Io) ?u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.pending_id;
+    }
+
+    /// Interrupt/shutdown: wake the turn thread with no answer. No-op idle.
+    pub fn dismissPending(self: *QuestionGate, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.pending_id == null) return;
+        if (self.answer != null or self.dismissed) return;
+        self.dismissed = true;
+        self.cond.signal(io);
+    }
+};
+
 // ---------------------------------------------------------------- tests --

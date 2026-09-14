@@ -32,6 +32,30 @@ pub const PendingApproval = struct {
     }
 };
 
+/// A parked ask_user question: fixed buffers like PendingApproval, so view
+/// switches copy it by value with no ownership to manage. Overlong questions
+/// and options are clipped for display; the ANSWER sent back is the option's
+/// clipped text or the user's own words, which the daemon relays verbatim.
+pub const PendingQuestion = struct {
+    id_buf: [32]u8 = undefined,
+    id_len: usize = 0,
+    question_buf: [512]u8 = undefined,
+    question_len: usize = 0,
+    options_buf: [9][160]u8 = undefined,
+    option_lens: [9]usize = @splat(0),
+    options_count: usize = 0,
+
+    pub fn id(self: *const PendingQuestion) []const u8 {
+        return self.id_buf[0..self.id_len];
+    }
+    pub fn question(self: *const PendingQuestion) []const u8 {
+        return self.question_buf[0..self.question_len];
+    }
+    pub fn option(self: *const PendingQuestion, i: usize) []const u8 {
+        return self.options_buf[i][0..self.option_lens[i]];
+    }
+};
+
 pub const PlanItemOwned = struct {
     step: []u8,
     status: block.PlanStatus,
@@ -109,6 +133,8 @@ pub const SessionView = struct {
     last_body_first: usize = 0,
     last_body_rows: usize = 0,
     pending: ?PendingApproval = null,
+    /// A parked ask_user question (rendered as a numbered picker card).
+    question: ?PendingQuestion = null,
     /// Character-precise mouse selection over the session view. Lines are
     /// absolute layout indices; columns are terminal cells within the line.
     sel_anchor: ?SelectionPoint = null,

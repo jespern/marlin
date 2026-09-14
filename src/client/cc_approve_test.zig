@@ -92,3 +92,37 @@ test "tools/call forwards the prompt and wraps the verdict for Claude Code" {
     defer gpa.free(unknown);
     try std.testing.expect(std.mem.indexOf(u8, unknown, "-32601") != null);
 }
+
+test "bridge ask_user: listed, forwards to the picker, and reports dismissal" {
+    const gpa = std.testing.allocator;
+    const AskStub = struct {
+        fn decide(_: ?*anyopaque, _: []const u8, _: []const u8) cc_approve.Decision {
+            return cc_approve.Decision.init(.denied, null);
+        }
+        fn answered(_: ?*anyopaque, question: []const u8, options_json: []const u8) cc_approve.QuestionAnswer {
+            std.testing.expectEqualStrings("Tabs or spaces?", question) catch unreachable;
+            std.testing.expect(std.mem.indexOf(u8, options_json, "Tabs") != null) catch unreachable;
+            return cc_approve.QuestionAnswer.init("Spaces");
+        }
+        fn dismissed(_: ?*anyopaque, _: []const u8, _: []const u8) cc_approve.QuestionAnswer {
+            return cc_approve.QuestionAnswer.init(null);
+        }
+    };
+
+    const list_reply = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    , .{ .decide = AskStub.decide, .ask_question = AskStub.answered }).?;
+    defer gpa.free(list_reply);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply, "\"ask_user\"") != null);
+
+    const call =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"Tabs or spaces?","options":["Tabs","Spaces"]}}}
+    ;
+    const answered = handleLine(gpa, call, .{ .decide = AskStub.decide, .ask_question = AskStub.answered }).?;
+    defer gpa.free(answered);
+    try std.testing.expect(std.mem.indexOf(u8, answered, "Spaces") != null);
+
+    const dismissed = handleLine(gpa, call, .{ .decide = AskStub.decide, .ask_question = AskStub.dismissed }).?;
+    defer gpa.free(dismissed);
+    try std.testing.expect(std.mem.indexOf(u8, dismissed, "dismissed the question") != null);
+}

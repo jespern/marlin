@@ -142,7 +142,11 @@ fn ccInvoke(
     // never let a yolo parent's approval mode strip the bridge from a child.
     const read_only_child = opts.tool_profile == .read_only;
     if (read_only_child and opts.marlin_exe == null) return error.GuestBridgeUnavailable;
-    const bridge: ?claude_code.Bridge = if (opts.marlin_exe != null and (opts.approval_mode != .auto or read_only_child))
+    // The bridge attaches whenever marlin is resolvable — even in bypass
+    // mode, where it routes no permission prompts, it still carries the
+    // ask_user picker tool. Permission ROUTING stays mode-dependent in
+    // buildArgv.
+    const bridge: ?claude_code.Bridge = if (opts.marlin_exe != null)
         .{ .marlin_exe = opts.marlin_exe.?, .sid = opts.session_id }
     else
         null;

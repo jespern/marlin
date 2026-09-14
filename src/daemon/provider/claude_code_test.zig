@@ -106,15 +106,19 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
         .bridge = .{ .marlin_exe = "/opt/marlin", .sid = 42 },
         .max_turns = 8,
     });
-    try std.testing.expectEqualStrings("--permission-mode", bridged[9]);
-    try std.testing.expectEqualStrings("default", bridged[10]);
-    try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[11]);
-    try std.testing.expectEqualStrings("mcp__marlin__approve", bridged[12]);
-    try std.testing.expectEqualStrings("--mcp-config", bridged[13]);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[14], "\"command\":\"/opt/marlin\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[14], "\"--sid\",\"42\"") != null);
+    // The MCP server (approve + ask_user) leads, then permission routing.
+    try std.testing.expectEqualStrings("--mcp-config", bridged[9]);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[10], "\"command\":\"/opt/marlin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[10], "\"--sid\",\"42\"") != null);
+    try std.testing.expectEqualStrings("--append-system-prompt", bridged[11]);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[12], "mcp__marlin__ask_user") != null);
+    try std.testing.expectEqualStrings("--permission-mode", bridged[13]);
+    try std.testing.expectEqualStrings("default", bridged[14]);
+    try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[15]);
+    try std.testing.expectEqualStrings("mcp__marlin__approve", bridged[16]);
 
-    // Bridge wiring never overrides an explicit bypass.
+    // Bridge wiring never overrides an explicit bypass: no prompt routing,
+    // but the MCP server (and its ask_user picker) still rides along.
     const yolo = try buildArgv(arena, .{
         .binary = "claude",
         .prompt = "hi",
@@ -126,6 +130,14 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
         .max_turns = 8,
     });
     for (yolo) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--permission-prompt-tool"));
+    var saw_mcp = false;
+    var saw_bypass = false;
+    for (yolo) |arg| {
+        if (std.mem.eql(u8, arg, "--mcp-config")) saw_mcp = true;
+        if (std.mem.eql(u8, arg, "--dangerously-skip-permissions")) saw_bypass = true;
+    }
+    try std.testing.expect(saw_mcp);
+    try std.testing.expect(saw_bypass);
 }
 
 test "decode: init, assistant blocks, tool_result shapes, result usage" {

@@ -274,6 +274,10 @@ const Session = struct {
     usage_credits: std.atomic.Value(bool) = .init(false),
     /// Gate the turn thread parks on for `ask` decisions.
     gate: approval.Gate = .{},
+    /// Gate the turn thread parks on for ask_user questions.
+    question_gate: approval.QuestionGate = .{},
+    /// One parked bridge ask_user question (cc_question), mirroring cc_pending.
+    cc_question_pending: ?CcPending = null,
     /// Complete encoded approval_request retained while the gate is armed.
     /// Dispatcher-owned; reconnecting subscribers/watchers receive this exact
     /// actionable state instead of only an unexplained awaiting status.
@@ -1957,6 +1961,75 @@ pub const Daemon = struct {
                     self.resolveCcPending(session, id, verdict);
                 self.sendTo(client, .{ .ok = .{} });
             },
+            .question_answer => |qa| {
+                const session = self.sessions.get(qa.sid) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                const id = std.fmt.parseInt(u64, qa.question_id, 10) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "bad_question", .msg = "bad question id" } });
+                    return;
+                };
+                const answer = std.mem.trim(u8, qa.answer, " \t\r\n");
+                if (answer.len == 0 or answer.len > 8192) {
+                    self.sendTo(client, .{ .err = .{ .code = "bad_question", .msg = "answers are 1..8192 bytes" } });
+                    return;
+                }
+                // Native gate first; an unknown id may be a parked bridge
+                // question — same picker, different waiter. First answer wins.
+                const copy = try self.gpa.dupe(u8, answer);
+                if (session.question_gate.resolve(self.io, id, copy)) {
+                    // The turn thread resumes and pushes turn_resumed itself.
+                } else {
+                    self.gpa.free(copy);
+                    self.resolveCcQuestion(session, id, answer);
+                }
+                self.sendTo(client, .{ .ok = .{} });
+            },
+            .cc_question => |cq| {
+                const session = self.sessions.get(cq.sid) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                // Background children have nobody to ask; refuse rather than
+                // park a prompt no one will see.
+                if (session.kind != .root) {
+                    self.sendTo(client, .{ .cc_question_result = .{ .sid = cq.sid, .answer = null } });
+                    return;
+                }
+                if (session.cc_question_pending != null or cq.question.len == 0 or cq.question.len > 4096) {
+                    self.sendTo(client, .{ .cc_question_result = .{ .sid = cq.sid, .answer = null } });
+                    return;
+                }
+                var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena_state.deinit();
+                const options = parseQuestionOptions(arena_state.allocator(), cq.options_json) orelse {
+                    self.sendTo(client, .{ .cc_question_result = .{ .sid = cq.sid, .answer = null } });
+                    return;
+                };
+                const question_id = ids.next(self.io);
+                var id_buf: [24]u8 = undefined;
+                const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{question_id}) catch unreachable;
+                const line = try proto.encode(self.gpa, proto.DaemonMsg{ .question_request = .{
+                    .sid = cq.sid,
+                    .question_id = id_str,
+                    .question = cq.question,
+                    .options = options,
+                } });
+                session.cc_question_pending = .{ .approval_id = question_id, .client_id = client.id };
+                if (session.pending_approval_line) |old| self.gpa.free(old);
+                session.pending_approval_line = line;
+                session.phase_started_at_ms.store(nowMs(self.io), .release);
+                session.phase.store(@intFromEnum(proto.TurnPhase.approval), .release);
+                session.state = .awaiting_approval;
+                self.store.setSessionStatus(cq.sid, "awaiting_approval") catch {};
+                self.refusePendingRebootForApproval();
+                self.fanOutActionableLine(cq.sid, line);
+                self.broadcastStatus(cq.sid, .awaiting_approval);
+                self.notifyPhone(cq.sid, true, false);
+                // No reply yet: cc_question_result is sent when a client
+                // answers (or the bridge/turn goes away).
+            },
             .cc_approval => |ca| {
                 const session = self.sessions.get(ca.sid) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
@@ -2523,8 +2596,11 @@ pub const Daemon = struct {
                         if (session.state == .running or session.state == .awaiting_approval) {
                             session.cancel.store(true, .release);
                             session.gate.denyPending(self.io);
+                            session.question_gate.dismissPending(self.io);
                             if (session.cc_pending) |pending|
                                 self.resolveCcPending(session, pending.approval_id, .denied);
+                            if (session.cc_question_pending) |pending|
+                                self.resolveCcQuestion(session, pending.approval_id, null);
                         }
                     }
                 }
@@ -2795,6 +2871,9 @@ pub const Daemon = struct {
     fn destroySession(self: *Daemon, session: *Session) void {
         if (session.turn_thread) |thread| thread.join();
         self.clearPendingApproval(session);
+        // An answer resolved after the turn stopped waiting would leak.
+        if (session.question_gate.answer) |answer| self.gpa.free(answer);
+        session.question_gate.answer = null;
         session.steer_mutex.lockUncancelable(self.io);
         for (session.steer_queue.items) |steer| self.gpa.free(steer);
         session.steer_queue.deinit(self.gpa);
@@ -3242,6 +3321,9 @@ pub const Daemon = struct {
             .gate = &job.session.gate,
             .on_approval_needed = TurnHooks.onApprovalNeeded,
             .on_approval_done = TurnHooks.onApprovalDone,
+            .question_gate = &job.session.question_gate,
+            .on_question = TurnHooks.onQuestionNeeded,
+            .on_question_done = TurnHooks.onQuestionDone,
             .on_delta = TurnHooks.onDelta,
             .on_reasoning_delta = TurnHooks.onReasoningDelta,
             .on_stream_status = TurnHooks.onStreamStatus,
@@ -3634,6 +3716,33 @@ pub const Daemon = struct {
             const self = job.daemon;
             self.events.push(self.io, .{ .turn_resumed = .{ .sid = job.sid } }) catch {};
         }
+
+        /// ask_user publication: same turn_awaiting machinery as approvals —
+        /// pending-line replay, awaiting state, phone nudge — different wire.
+        fn onQuestionNeeded(ctx: ?*anyopaque, id: u64, question: []const u8, options: []const []const u8) bool {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            var id_buf: [24]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch return false;
+            const line = proto.encode(self.gpa, proto.DaemonMsg{ .question_request = .{
+                .sid = job.sid,
+                .question_id = id_str,
+                .question = question,
+                .options = options,
+            } }) catch return false;
+            self.events.push(self.io, .{ .turn_awaiting = .{ .sid = job.sid, .line = line } }) catch {
+                self.gpa.free(line);
+                return false;
+            };
+            return true;
+        }
+
+        fn onQuestionDone(ctx: ?*anyopaque, id: u64) void {
+            _ = id;
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            self.events.push(self.io, .{ .turn_resumed = .{ .sid = job.sid } }) catch {};
+        }
     };
 
     // ----------------------------------------------------------- fan-out --
@@ -3704,15 +3813,53 @@ pub const Daemon = struct {
         }
     }
 
-    /// A dying bridge client takes its parked prompt with it: without this,
-    /// the session would sit in awaiting_approval answering to nobody.
+    /// cc_question options arrive as a raw JSON array of strings from the
+    /// bridge; anything else is a malformed ask and is refused.
+    fn parseQuestionOptions(arena: std.mem.Allocator, options_json: []const u8) ?[]const []const u8 {
+        const parsed = std.json.parseFromSliceLeaky([]const []const u8, arena, options_json, .{}) catch return null;
+        if (parsed.len < 2 or parsed.len > 9) return null;
+        for (parsed) |option| {
+            const trimmed = std.mem.trim(u8, option, " \t\r\n");
+            if (trimmed.len == 0 or option.len > 1024) return null;
+        }
+        return parsed;
+    }
+
+    /// Answer a parked bridge ask_user question (no-op for unknown ids).
+    fn resolveCcQuestion(self: *Daemon, session: *Session, question_id: u64, answer: ?[]const u8) void {
+        const pending = session.cc_question_pending orelse return;
+        if (pending.approval_id != question_id) return;
+        session.cc_question_pending = null;
+        if (self.lookupClient(pending.client_id)) |bridge| {
+            self.sendTo(bridge, .{ .cc_question_result = .{ .sid = session.id, .answer = answer } });
+        }
+        self.clearPendingApproval(session);
+        if (session.state == .awaiting_approval) {
+            session.phase_started_at_ms.store(nowMs(self.io), .release);
+            session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+            session.state = .running;
+            self.store.setSessionStatus(session.id, "running") catch {};
+            self.broadcastStatus(session.id, .running);
+        }
+    }
+
+    /// A dying bridge client takes its parked prompt with it — approval or
+    /// question alike: without this, the session would sit in
+    /// awaiting_approval answering to nobody.
     fn dropCcPendingForClient(self: *Daemon, client_id: u64) void {
         var it = self.sessions.valueIterator();
         while (it.next()) |session_ptr| {
             const session = session_ptr.*;
-            const pending = session.cc_pending orelse continue;
-            if (pending.client_id != client_id) continue;
-            session.cc_pending = null;
+            var dropped = false;
+            if (session.cc_question_pending) |pending| if (pending.client_id == client_id) {
+                session.cc_question_pending = null;
+                dropped = true;
+            };
+            if (session.cc_pending) |pending| if (pending.client_id == client_id) {
+                session.cc_pending = null;
+                dropped = true;
+            };
+            if (!dropped) continue;
             self.clearPendingApproval(session);
             if (session.state == .awaiting_approval) {
                 const phase_started = nowMs(self.io);
@@ -4780,8 +4927,11 @@ fn cancelActiveSession(self: *Daemon, session: *Session) void {
     if (session.state != .running and session.state != .awaiting_approval) return;
     session.cancel.store(true, .release);
     session.gate.denyPending(self.io);
+    session.question_gate.dismissPending(self.io);
     if (session.cc_pending) |pending|
         self.resolveCcPending(session, pending.approval_id, .denied);
+    if (session.cc_question_pending) |pending|
+        self.resolveCcQuestion(session, pending.approval_id, null);
 }
 
 fn taskError(gpa: std.mem.Allocator, message: []const u8) tools_registry.ExecOut {

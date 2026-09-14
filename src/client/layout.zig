@@ -1099,6 +1099,14 @@ pub const ApprovalView = struct {
     args: []const u8,
 };
 
+/// A parked ask_user question for the picker card. Option slices point into
+/// the view's fixed buffers, valid for the frame like ApprovalView's.
+pub const QuestionView = struct {
+    question: []const u8,
+    options: [9][]const u8 = undefined,
+    count: usize = 0,
+};
+
 /// App-free input to transcript layout. The TUI owns the mutable caches and
 /// supplies only the slices and scalar state needed for one frame.
 pub const Transcript = struct {
@@ -1128,6 +1136,7 @@ pub const Transcript = struct {
     guest: bool = false,
     cwd: []const u8 = "",
     approval: ?ApprovalView,
+    question: ?QuestionView = null,
     layout_cache: *LayoutCache,
     tail_layout_cache: *TailLayoutCache,
     stream_layout_cache: *StreamLayoutCache,
@@ -1689,6 +1698,19 @@ pub fn layoutLines(
             arg,
         });
         try wrapPrefixed(arena, &lines, "", card, Palette.approval_card, w);
+    }
+
+    // Question card: the agent asked the user to choose. Numbered options
+    // answer on their digit; the composer answers in the user's own words.
+    if (transcript.question) |question| {
+        try blankLine(arena, &lines);
+        const head = try std.fmt.allocPrint(arena, "? {s}", .{question.question});
+        try wrapPrefixed(arena, &lines, "", head, Palette.approval_card, w);
+        for (question.options[0..question.count], 1..) |option, n| {
+            const row = try std.fmt.allocPrint(arena, "[{d}] {s}", .{ n, option });
+            try wrapPrefixed(arena, &lines, "  ", row, .{}, w);
+        }
+        try wrapPrefixed(arena, &lines, "  ", "1-9 picks · or type your own answer and press Enter", Palette.tool_out, w);
     }
     try resolveLineLinks(arena, lines.items);
     return lines;

@@ -1682,13 +1682,36 @@ pub const App = struct {
                 view.state = s.state;
                 if (s.usage_credits) |active| view.usage_credits = active;
                 self.syncAnimationTicker();
-                if (s.state != .awaiting_approval) view.pending = null;
+                if (s.state != .awaiting_approval) {
+                    view.pending = null;
+                    view.question = null;
+                }
                 if (s.state == .idle or s.state == .err or s.state == .done)
                     self.releaseStreamingBuffers();
                 // An error state never arrives bare: show its reason in the
                 // notice slot (the transcript note holds the durable copy).
                 if (s.state == .err) if (s.err_text) |text| if (text.len > 0)
                     self.setNotice("{s}", .{text});
+            },
+            .question_request => |qr| {
+                // Backgrounded sessions need no stash: focusing one replays
+                // its pending line and this handler runs again.
+                const view = self.liveView(qr.sid) orelse return;
+                var q = session_view.PendingQuestion{};
+                q.id_len = @min(qr.question_id.len, q.id_buf.len);
+                @memcpy(q.id_buf[0..q.id_len], qr.question_id[0..q.id_len]);
+                q.question_len = @min(qr.question.len, q.question_buf.len);
+                @memcpy(q.question_buf[0..q.question_len], qr.question[0..q.question_len]);
+                q.options_count = @min(qr.options.len, q.options_buf.len);
+                for (qr.options[0..q.options_count], 0..) |option, i| {
+                    q.option_lens[i] = @min(option.len, q.options_buf[i].len);
+                    @memcpy(q.options_buf[i][0..q.option_lens[i]], option[0..q.option_lens[i]]);
+                }
+                view.question = q;
+                view.pending = null;
+                if (!self.terminal_focused)
+                    self.queueTerminalNotification(qr.sid, "Question waiting");
+                self.refresh_requested = true;
             },
             .approval_request => |ar| {
                 var p = PendingApproval{};
@@ -2029,6 +2052,16 @@ pub const App = struct {
             // Up then Enter can repeat them during this client lifetime.
             self.view.editor.pushHistory(trimmed);
             self.runCommand(trimmed);
+            return;
+        }
+        // A parked question owns the composer: the turn cannot take input
+        // until it is answered, so typed text IS the answer (in the user's
+        // own words instead of a numbered pick).
+        if (self.view.question != null and trimmed.len > 0) {
+            self.view.editor.pushHistory(trimmed);
+            // Send before clearing: `trimmed` may alias the editor's buffer.
+            self.answerQuestion(trimmed);
+            self.view.editor.clear();
             return;
         }
         const was_busy = self.view.state == .running or self.view.state == .awaiting_approval;
@@ -3777,6 +3810,23 @@ pub const App = struct {
         self.setNotice("interrupt requested", .{});
     }
 
+    /// Answer the parked ask_user question — a picked option's text or the
+    /// user's own words. First answer wins daemon-side; the card clears
+    /// optimistically and would be replayed if the send were lost.
+    pub fn answerQuestion(self: *App, answer: []const u8) void {
+        const q = self.view.question orelse return;
+        self.conn.send(.{ .question_answer = .{
+            .sid = self.view.sid,
+            .question_id = q.id(),
+            .answer = answer,
+        } }) catch {
+            self.setNotice("could not send the answer", .{});
+            return;
+        };
+        self.view.question = null;
+        self.refresh_requested = true;
+    }
+
     pub fn clearView(self: *App) void {
         self.view.scroll_up = 0;
         self.view.sel_anchor = null;
@@ -3948,6 +3998,12 @@ fn transcriptView(app: *App) Transcript {
         .approval = if (app.view.pending) |*pending| .{
             .tool = pending.tool(),
             .args = pending.args(),
+        } else null,
+        .question = if (app.view.question) |*question| blk: {
+            var qv = layout_mod.QuestionView{ .question = question.question() };
+            qv.count = question.options_count;
+            for (0..question.options_count) |i| qv.options[i] = question.option(i);
+            break :blk qv;
         } else null,
         .layout_cache = &app.view.layout_cache,
         .tail_layout_cache = &app.view.tail_layout_cache,
