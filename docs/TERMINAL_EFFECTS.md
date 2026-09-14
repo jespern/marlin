@@ -44,3 +44,22 @@ Terminal-native effects share one finite-animation/full-screen-saver surface.
   and `screensaver_effect`.
 
 Return to the [README](../README.md).
+
+
+## Rocket launch
+
+Run `/screensaver rocket` for a looping 40-second moon-rocket launch, or
+`/animate rocket` for one complete launch. Any normal screensaver dismissal
+key returns to the session. The idle screensaver configuration also accepts
+`rocket`; it is never enabled automatically.
+
+The scene has a low perspective camera, ten-second countdown, orange core and
+white boosters, service tower, ignition glow, exhaust and rolling smoke. The
+camera follows the climb before fading into the next countdown. It renders
+procedurally at 30 Hz inside a 720×405 envelope and uses the existing compressed
+Kitty transport, fixed placement, and wire budget. Without Kitty graphics it
+uses the starfield fallback. No downloads or sound are required.
+
+Visual reference: [NASA Kennedy's slow-motion Artemis I liftoff](https://www.youtube.com/watch?v=aWCCNYJV3Zw)
+and [NASA's Artemis I media resources](https://www.nasa.gov/general/artemis-i-media-resources/).
+This is a stylized animation, not a flight simulation.

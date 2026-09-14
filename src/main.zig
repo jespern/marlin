@@ -134,6 +134,7 @@ test {
     _ = @import("wipeout/kitty_transport_test.zig");
     _ = @import("client/daybreak_test.zig");
     _ = @import("client/orb_test.zig");
+    _ = @import("client/rocket_test.zig");
     _ = @import("client/media_test.zig");
     _ = @import("client/matrix_test.zig");
     _ = @import("client/pacman_test.zig");

@@ -371,3 +371,52 @@ test "daybreak stays inside the 720×405 envelope and ships compressed frames at
     try std.testing.expectEqual(@as(usize, every), ticks);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), ",q=2,o=z,m=1,c=80,r=24,C=1;") != null);
 }
+
+test "rocket ships bounded compressed Kitty frames and respects the wire budget" {
+    const gpa = std.testing.allocator;
+    // 80×24 cells at 8×16 px: the window's own 640×384 fits the envelope.
+    const dims = framebufferSize(80, 24, 8, 16, .rocket);
+    try std.testing.expectEqual(@as(u16, 640), dims.width);
+    try std.testing.expectEqual(@as(u16, 384), dims.height);
+    const retina = framebufferSize(200, 60, 18, 38, .rocket); // 3600×2280: capped, aspect kept
+    try std.testing.expectEqual(@as(u16, 405), retina.height);
+    try std.testing.expect(retina.width <= 720 and retina.width >= 600);
+    const tall = framebufferSize(60, 60, 8, 16, .rocket); // 480×960: height-capped
+    try std.testing.expectEqual(@as(u16, 405), tall.height);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var vx = try vaxis.Vaxis.init(threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &out.writer);
+    vx.caps.kitty_graphics = true;
+    try vx.resize(gpa, &out.writer, .{ .rows = 24, .cols = 80, .x_pixel = 640, .y_pixel = 384 });
+
+    var engine = Engine.init(gpa, .rocket, 3);
+    defer engine.deinit();
+    engine.setCellPixels(8, 16);
+    engine.setGraphics(true);
+    try engine.reset(80, 24, 3);
+    try std.testing.expectEqual(@as(u8, 1), engine.transmit_every);
+    out.clearRetainingCapacity();
+    engine.frame = 360;
+    try engine.transmit(&vx, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b_Ga=T,f=24,s=640,v=384,i=") != null);
+    try std.testing.expect(out.written().len < engine.rgb.len);
+    // The budget never lets it exceed 2 MB/s.
+    const every = engine.effectiveEvery();
+    try std.testing.expect(every >= 1);
+    try std.testing.expect(engine.last_frame_bytes * 30 / every <= pixel_effects.wire_budget_bytes_per_second);
+    // Ticks between shipped frames match, and the same id is replaced.
+    out.clearRetainingCapacity();
+    var ticks: usize = 0;
+    while (out.written().len == 0 and ticks < 30) : (ticks += 1) {
+        engine.tick();
+        try engine.transmit(&vx, &out.writer);
+    }
+    try std.testing.expectEqual(@as(usize, every), ticks);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), ",q=2,o=z,m=1,c=80,r=24,C=1;") != null);
+}

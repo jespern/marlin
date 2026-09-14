@@ -2471,7 +2471,7 @@ pub const App = struct {
         if (self.effect_engine) |*engine| engine.tick();
         if (self.screensaver_active) return;
         self.ui_animation_frame += 1;
-        const frame_limit = if (self.fast_effect_active.load(.acquire)) fast_transient_animation_frames else transient_animation_frames;
+        const frame_limit = if (self.effect_engine != null and self.effect_engine.?.kind() == .rocket) @import("rocket.zig").loop_frames else if (self.fast_effect_active.load(.acquire)) fast_transient_animation_frames else transient_animation_frames;
         if (self.ui_animation_frame >= frame_limit) {
             self.ui_animation = null;
             self.ui_animation_frame = 0;

@@ -29,6 +29,7 @@ const visual_effect = @import("../core/visual_effect.zig");
 const pacman = @import("pacman.zig");
 const tetris = @import("tetris.zig");
 const daybreak = @import("daybreak.zig");
+const rocket = @import("rocket.zig");
 const orb = @import("orb.zig");
 const wipeout_effect = @import("wipeout_effect.zig");
 const kitty = @import("../wipeout/kitty_transport.zig");
@@ -275,6 +276,7 @@ pub const Engine = struct {
             .tunnel => renderScene(.tunnel, self.rgb, self.width, self.height, frame),
             .metaballs => renderScene(.metaballs, self.rgb, self.width, self.height, frame),
             .horizon => renderScene(.horizon, self.rgb, self.width, self.height, frame),
+            .rocket => rocket.render(self.rgb, self.width, self.height, self.frame, self.seed),
             .daybreak => daybreak.render(self.rgb, self.width, self.height, self.frame, self.seed, self.sky),
             .orb => {
                 if (self.background_generation == 0) {
@@ -425,7 +427,7 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
     const r: u32 = @max(rows, 1);
     const win_w = c * cell_px_w;
     const win_h = r * cell_px_h;
-    if (kind == .daybreak or kind == .orb) {
+    if (kind == .daybreak or kind == .orb or kind == .rocket) {
         // Detailed, slowly shipped scenes render near the window's own pixel
         // size inside the 720×405 envelope Pac-Man has already proven. Both
         // daybreak's stretched 1900×900 canvas and the orb's captured text
