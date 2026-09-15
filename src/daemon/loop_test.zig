@@ -612,7 +612,7 @@ test "codex guest persists app-server items and resumes its durable thread" {
     defer temp.deinit();
     const script =
         \\#!/bin/sh
-        \\case "$*" in "app-server --listen stdio://") ;; *) exit 9 ;; esac
+        \\case "$*" in "-c sandbox_workspace_write.network_access=true app-server --listen stdio://") ;; *) exit 9 ;; esac
         \\[ -z "$OPENAI_API_KEY" ] || exit 7
         \\while IFS= read -r line; do
         \\  case "$line" in

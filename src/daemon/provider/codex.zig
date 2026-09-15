@@ -37,6 +37,12 @@ pub fn buildArgv(
 ) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(arena, binaryPath(environ));
+    // Codex's workspace-write sandbox defaults to NO network, which breaks
+    // ordinary dev work — binding a localhost test receiver was the first
+    // observed casualty. Marlin's own kernel sandbox scopes WRITES and leaves
+    // networking open, so align the guest with that posture. Ignored by the
+    // read-only mode marlin gives child sessions.
+    try argv.appendSlice(arena, &.{ "-c", "sandbox_workspace_write.network_access=true" });
     if (otel) |cfg| try appendOtelOverrides(arena, &argv, cfg);
     try argv.appendSlice(arena, &.{ "app-server", "--listen", "stdio://" });
     return argv.items;

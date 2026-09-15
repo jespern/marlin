@@ -19,19 +19,23 @@ test "otel overrides compose per-signal URLs and gate the content-bearing log ex
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // argv[1..2] is always the workspace-write network grant (loopback test
+    // servers are ordinary dev work); overrides follow, app-server closes.
     const plain = try buildArgv(arena, null, null);
-    try std.testing.expectEqual(@as(usize, 4), plain.len);
-    try std.testing.expectEqualStrings("app-server", plain[1]);
+    try std.testing.expectEqual(@as(usize, 6), plain.len);
+    try std.testing.expectEqualStrings("-c", plain[1]);
+    try std.testing.expectEqualStrings("sandbox_workspace_write.network_access=true", plain[2]);
+    try std.testing.expectEqualStrings("app-server", plain[3]);
 
     const structural = try buildArgv(arena, null, .{
         .base_endpoint = "https://otel.example/",
         .headers = "Authorization=Bearer%20secret",
     });
-    try std.testing.expectEqual(@as(usize, 6), structural.len);
-    try std.testing.expectEqualStrings("-c", structural[1]);
+    try std.testing.expectEqual(@as(usize, 8), structural.len);
+    try std.testing.expectEqualStrings("-c", structural[3]);
     try std.testing.expectEqualStrings(
         "otel.trace_exporter={ otlp-http = { endpoint = \"https://otel.example/v1/traces\", protocol = \"json\", headers = { \"Authorization\" = \"Bearer secret\" } } }",
-        structural[2],
+        structural[4],
     );
     for (structural) |arg| try std.testing.expect(std.mem.indexOf(u8, arg, "log_user_prompt") == null);
 
@@ -39,12 +43,12 @@ test "otel overrides compose per-signal URLs and gate the content-bearing log ex
         .base_endpoint = "https://otel.example",
         .capture_content = true,
     });
-    try std.testing.expectEqual(@as(usize, 10), content.len);
+    try std.testing.expectEqual(@as(usize, 12), content.len);
     try std.testing.expectEqualStrings(
         "otel.exporter={ otlp-http = { endpoint = \"https://otel.example/v1/logs\", protocol = \"json\" } }",
-        content[4],
+        content[6],
     );
-    try std.testing.expectEqualStrings("otel.log_user_prompt=true", content[6]);
+    try std.testing.expectEqualStrings("otel.log_user_prompt=true", content[8]);
 
     // A traces-only collector cannot compose the logs URL: structural spans
     // still flow, the content-bearing log exporter stays off even when the
@@ -53,8 +57,8 @@ test "otel overrides compose per-signal URLs and gate the content-bearing log ex
         .traces_endpoint = "https://otel.example/custom/traces",
         .capture_content = true,
     });
-    try std.testing.expectEqual(@as(usize, 6), traces_only.len);
-    try std.testing.expect(std.mem.indexOf(u8, traces_only[2], "custom/traces") != null);
+    try std.testing.expectEqual(@as(usize, 8), traces_only.len);
+    try std.testing.expect(std.mem.indexOf(u8, traces_only[4], "custom/traces") != null);
 }
 
 test "app-server records distinguish responses, requests, and notifications" {
@@ -117,7 +121,7 @@ test "Codex catalog query uses app-server model list" {
     defer temp.deinit();
     const script =
         \\#!/bin/sh
-        \\case "$*" in "app-server --listen stdio://") ;; *) exit 9 ;; esac
+        \\case "$*" in "-c sandbox_workspace_write.network_access=true app-server --listen stdio://") ;; *) exit 9 ;; esac
         \\[ -z "$OPENAI_API_KEY" ] || exit 7
         \\initialized=0
         \\while IFS= read -r line; do
