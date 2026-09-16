@@ -884,11 +884,16 @@ pub fn runTurn(
                 .args_json = persisted_args,
             } });
 
-            const spec = tools_registry.find(pc.name.items) orelse
+            const builtin_spec = tools_registry.find(pc.name.items);
+            const spec = builtin_spec orelse
                 if (opts.extensions) |ext| ext.find(pc.name.items) else null;
             prepared[i] = .{
                 .call_id = pc.call_id.items,
-                .name = pc.name.items,
+                // Builtins execute under their canonical name whatever the
+                // model typed ("Bash", "Read" — registry.find normalizes);
+                // extension tools stay verbatim, their casing is theirs. The
+                // persisted tool_call block keeps the model's own spelling.
+                .name = if (builtin_spec) |s| s.name else pc.name.items,
                 .args_json = args_owned,
                 .tool_call_block_id = tool_call_block_id,
                 .spec = spec,

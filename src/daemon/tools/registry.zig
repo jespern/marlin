@@ -68,8 +68,22 @@ pub const specs = [_]Spec{
 };
 
 pub fn find(name: []const u8) ?*const Spec {
+    // Case-insensitive: models with Claude-flavored training call `Bash` and
+    // `Grep` despite the advertised lowercase names (observed live with
+    // deepseek — two dead rounds of "unknown tool 'Bash'"). The caller
+    // executes under the returned spec's canonical name.
     for (&specs) |*s| {
-        if (std.mem.eql(u8, s.name, name)) return s;
+        if (std.ascii.eqlIgnoreCase(s.name, name)) return s;
+    }
+    // The same trained instinct reaches for Claude's names where marlin's
+    // differ; map the classics rather than fail a round to spelling.
+    const aliases = [_]struct { alias: []const u8, canonical: []const u8 }{
+        .{ .alias = "read", .canonical = files.read_spec_name },
+        .{ .alias = "write", .canonical = files.write_spec_name },
+        .{ .alias = "webfetch", .canonical = fetch_tool.spec_name },
+    };
+    for (aliases) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.alias, name)) return find(entry.canonical);
     }
     return null;
 }

@@ -220,3 +220,15 @@ test "dispatch: cancelled subprocess and walker tools are reported as interrupte
     try std.testing.expectEqual(block.ToolStatus.interrupted, globbed.status);
     try std.testing.expectEqualStrings("tool interrupted by user", globbed.output);
 }
+
+test "tool lookup forgives Claude-flavored spellings; execution is canonical" {
+    // Case: deepseek called `Bash` and lost two rounds to 'unknown tool'.
+    try std.testing.expectEqualStrings("bash", registry.find("Bash").?.name);
+    try std.testing.expectEqualStrings("grep", registry.find("Grep").?.name);
+    // Name aliases where marlin's canonical name differs from Claude's.
+    try std.testing.expectEqualStrings("read_file", registry.find("Read").?.name);
+    try std.testing.expectEqualStrings("write_file", registry.find("Write").?.name);
+    try std.testing.expectEqualStrings("fetch", registry.find("WebFetch").?.name);
+    // Genuinely unknown names still fail; extension tools are not aliased.
+    try std.testing.expect(registry.find("Teleport") == null);
+}
