@@ -1549,6 +1549,18 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .ok = .{} });
                     return;
                 }
+                // A durable scrollback note before the swap: it survives
+                // replay, shows on every client, and tells the next model what
+                // changed under it. Guest handovers write their own briefing;
+                // this is the ordinary same-lane switch.
+                if (!std.mem.eql(u8, session.model, sm.model)) {
+                    var note_buf: [256]u8 = undefined;
+                    const note = std.fmt.bufPrint(&note_buf, "≡ model switched: {s} → {s}", .{
+                        modelDisplayName(session.model),
+                        modelDisplayName(sm.model),
+                    }) catch "≡ model switched";
+                    self.appendSessionNote(sm.sid, note);
+                }
                 try self.store.setSessionModel(sm.sid, sm.model);
                 self.gpa.free(session.model);
                 session.model = new_model;
@@ -3149,6 +3161,14 @@ pub const Daemon = struct {
         };
         self.store.appendBlock(b) catch return;
         TurnHooks.onBlock(job, b);
+    }
+
+    /// The human-facing tail of a registry model id for scrollback notes:
+    /// "openrouter/anthropic/claude-sonnet-4.5" → "claude-sonnet-4.5",
+    /// "claudecode/fable" → "fable". The full id stays the source of truth.
+    fn modelDisplayName(model: []const u8) []const u8 {
+        const slash = std.mem.lastIndexOfScalar(u8, model, '/') orelse return model;
+        return model[slash + 1 ..];
     }
 
     /// Append and publish a daemon-side lifecycle note when no TurnJob exists
@@ -5413,4 +5433,14 @@ test "a disconnected requester cannot leave a delayed reboot armed" {
 
     try daemon.handleEvent(.{ .client_gone = .{ .client_id = 41 } });
     try std.testing.expectEqual(@as(?u64, null), daemon.pending_reboot);
+}
+
+test "model display names for scrollback notes take the id's last segment" {
+    try std.testing.expectEqualStrings(
+        "claude-sonnet-4.5",
+        Daemon.modelDisplayName("openrouter/anthropic/claude-sonnet-4.5"),
+    );
+    try std.testing.expectEqualStrings("fable", Daemon.modelDisplayName("claudecode/fable"));
+    // No slash: the whole id is the name.
+    try std.testing.expectEqualStrings("local", Daemon.modelDisplayName("local"));
 }
