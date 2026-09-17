@@ -4471,6 +4471,8 @@ fn drawCommandMenu(
     const suggestions = try commandSuggestions(app, arena);
     if (suggestions.len == 0) return;
 
+    const query = commandQuery(&app.view.editor).?;
+    const directory_menu = std.mem.startsWith(u8, query, "/cwd ") or std.mem.startsWith(u8, query, "/cwd\t");
     const shown: u16 = @intCast(@min(suggestions.len, composer_commands.len));
     const menu_h = shown + 1;
     if (input_top < menu_h) return;
@@ -4488,7 +4490,7 @@ fn drawCommandMenu(
     var row: usize = 0;
     while (row < shown) : (row += 1) {
         const suggestion = suggestions[row];
-        const selected = row == app.command_selection;
+        const selected = !directory_menu and row == app.command_selection;
         const row_style = if (selected) Palette.command_selected else Palette.command_menu;
         const name_style = if (selected) Palette.command_selected_name else Palette.command_name;
         const description_style = if (selected) Palette.command_selected_description else Palette.command_description;
@@ -4507,7 +4509,7 @@ fn drawCommandMenu(
 
     const hint = menu.child(.{ .y_off = @intCast(shown), .height = 1, .width = menu.width });
     _ = hint.printSegment(.{
-        .text = " ↑↓ select · Tab complete · Enter choose",
+        .text = if (directory_menu) " Tab complete · Enter use typed path" else " ↑↓ select · Tab complete · Enter choose",
         .style = Palette.command_description,
     }, .{ .wrap = .none });
 }

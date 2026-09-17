@@ -4858,3 +4858,36 @@ test "cwd Tab completes but Enter submits the typed directory instead of its chi
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "marlin") == null);
     try std.testing.expectEqual(@as(usize, 0), app.view.editor.text.items.len);
 }
+
+test "cwd Enter encodings submit the typed path despite a highlighted child" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "cwd-enter-keys");
+    defer tmp.deinit();
+    var root = try Io.Dir.cwd().openDir(io, tmp.path, .{});
+    defer root.close(io);
+    try root.createDirPath(io, "parent/first");
+    try root.createDirPath(io, "parent/second");
+    const enter_keys = [_]vaxis.Key{
+        .{ .codepoint = vaxis.Key.enter },
+        .{ .codepoint = vaxis.Key.kp_enter },
+        .{ .codepoint = '\n' },
+        .{ .codepoint = 0, .text = "\r" },
+    };
+    for (enter_keys) |key| {
+        var output: Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        var conn: attach.Conn = undefined;
+        conn.gpa = gpa;
+        conn.writer = &output.writer;
+        var app = App{ .gpa = gpa, .io = io, .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) }, .command_selection = 1 };
+        defer app.deinit();
+        app.setCwdStr(tmp.path);
+        app.view.editor.insertSlice("/cwd parent/");
+        try handleKey(&app, key);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"parent/\"") != null);
+        try std.testing.expectEqual(@as(usize, 0), app.view.editor.text.items.len);
+    }
+}

@@ -15,6 +15,10 @@ test {
     std.testing.refAllDecls(attach);
 }
 
+test "child transport inherits the foreground process group for ssh prompts" {
+    try std.testing.expectEqual(@as(?std.posix.pid_t, null), attach.child_pgid);
+}
+
 const FlakyHelloServer = struct {
     io: Io,
     server: *Io.net.Server,

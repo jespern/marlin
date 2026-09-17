@@ -22,6 +22,9 @@ const proto = @import("../core/proto.zig");
 pub const remote_env = "MARLIN_REMOTE";
 pub const rebuild_ready_marker = "MARLIN_REBUILD_READY";
 pub const rebuild_started_marker = "MARLIN_REBUILD_STARTED";
+/// SSH may read authentication prompts from /dev/tty, so it must stay in the
+/// client's foreground process group rather than creating a background group.
+pub const child_pgid: ?std.posix.pid_t = null;
 
 pub const Transport = union(enum) {
     socket: Socket,
@@ -527,7 +530,7 @@ pub fn spawnChildConn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) 
         // scribble on the alternate screen; the next frame repaints, and a
         // visible scribble beats an invisible prompt.
         .stderr = .inherit,
-        .pgid = 0,
+        .pgid = child_pgid,
     });
     errdefer child.kill(io);
     const stdin_file = child.stdin.?;

@@ -222,9 +222,10 @@ Transport is `ssh <host> sh -lc 'exec marlin _pipe'`: an internal
 stdio↔daemon.sock bridge on the remote (readiness-probed, with daemon
 autostart), spawned per connection as a child of the local client. The
 login shell is deliberate — non-interactive ssh shells miss ~/.local/bin
-and homebrew on most setups — and ssh's stderr is inherited, so
-first-connect host-key prompts, passphrase prompts, and 'command not
-found' reach the terminal instead of dying invisibly into a timeout. Dispatch puts the host in
+and homebrew on most setups. SSH inherits stderr and the client's foreground
+process group, so first-connect host-key prompts and passphrase prompts can
+read `/dev/tty`, while failures such as `command not found` remain visible.
+Dispatch puts the host in
 MARLIN_REMOTE, which `attach.connect` reads — so the TUI, its reconnects,
 headless commands, and the web bridge all inherit remote support from the
 one connect path. Marlin keeps NO host registry: `<host>` goes to ssh

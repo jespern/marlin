@@ -470,7 +470,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
                 app.view.sel_anchor = null;
             } else if (isNewlineKey(key)) {
                 ed.insertNewline();
-            } else if (key.matches(vaxis.Key.enter, .{})) {
+            } else if (isEnterKey(key)) {
                 const text = try ed.takeExpandedWithImages(app.attachments.items.len);
                 defer app.gpa.free(text);
                 app.submitInput(text);
