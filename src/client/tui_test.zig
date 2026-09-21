@@ -4891,3 +4891,56 @@ test "cwd Enter encodings submit the typed path despite a highlighted child" {
         try std.testing.expectEqual(@as(usize, 0), app.view.editor.text.items.len);
     }
 }
+
+test "long pinned prompts cap at ten rows and retain full scrollback" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var vx = try vaxis.init(threaded.io(), gpa, &environ, .{});
+    defer vx.deinit(gpa, &output.writer);
+    try vx.resize(gpa, &output.writer, .{ .rows = 40, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+
+    var conn: attach.Conn = undefined;
+    conn.sandbox_available = false;
+    conn.network_filtering = false;
+    conn.network_configured = false;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.view.state = .running;
+    const prompt = "a long request with details\n" ** 80;
+    try app.view.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 1, .text = try gpa.dupe(u8, prompt), .label = try gpa.dupe(u8, "") });
+    try app.view.blocks.append(gpa, .{ .kind = .assistant_msg, .turn_id = 1, .text = try gpa.dupe(u8, "visible answer"), .label = try gpa.dupe(u8, "") });
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expectEqual(@as(usize, 10), app.view.last_pinned_rows);
+    try std.testing.expect(app.view.last_body_rows > 0);
+    try std.testing.expectEqualStrings(prompt, app.view.blocks.items[0].text);
+    try std.testing.expect(app.visibleLineAtRow(8) == null);
+    const marker = vx.window().readCell(1, @intCast(app.tabBarRows() + 8)).?;
+    try std.testing.expectEqualStrings("…", marker.char.grapheme);
+    // Resizing the same terminal recalculates the budget. Tiny terminals
+    // omit the pin instead of letting its minimum chrome exceed one quarter.
+    for ([_]struct { height: u16, pinned: usize }{
+        .{ .height = 24, .pinned = 6 },
+        .{ .height = 12, .pinned = 0 },
+        .{ .height = 48, .pinned = 10 },
+    }) |size| {
+        try vx.resize(gpa, &output.writer, .{ .rows = size.height, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+        frame.deinit();
+        frame = std.heap.ArenaAllocator.init(gpa);
+        try draw(&app, &vx, frame.allocator());
+        try std.testing.expectEqual(size.pinned, app.view.last_pinned_rows);
+        try std.testing.expect(app.view.last_pinned_rows <= size.height / 4);
+    }
+    app.view.scroll_up = 1;
+    frame.deinit();
+    frame = std.heap.ArenaAllocator.init(gpa);
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expectEqual(@as(usize, 0), app.view.last_pinned_rows);
+    try std.testing.expect(app.visibleLineAtRow(0) != null);
+}

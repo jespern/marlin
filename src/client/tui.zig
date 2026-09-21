@@ -5159,11 +5159,18 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     var visible: std.ArrayList(DisplayLine) = .empty;
     const prompt_range = layout_mod.activePromptLineRange(&transcript);
     const ordinary_first = total -| view_h;
+    // Include truncation and the separator in the budget. Recompute from
+    // the live terminal height on every draw, including after a resize.
+    // Also leave room for the answer when an expanded composer reduces view_h.
+    const pinned_budget = @min(@as(usize, 10), @min(h / 4, view_h / 2));
     const pin_prompt = app.view.scroll_up == 0 and prompt_range != null and
-        prompt_range.?.len + 2 <= view_h and ordinary_first >= prompt_range.?.start;
+        pinned_budget >= 4 and ordinary_first >= prompt_range.?.start;
     if (pin_prompt) {
         const sticky_prompt = prompt_range.?;
-        for (lines.items[sticky_prompt.start..][0..sticky_prompt.len], sticky_prompt.start..) |ln, abs_line| {
+        const displayed_len = @min(sticky_prompt.len, pinned_budget - 1);
+        const truncated = displayed_len < sticky_prompt.len;
+        const copied_len = displayed_len - @intFromBool(truncated);
+        for (lines.items[sticky_prompt.start..][0..copied_len], sticky_prompt.start..) |ln, abs_line| {
             var pinned_line = ln;
             // The sticky copy is navigation chrome rather than an editable
             // composer. Give its first content row a distinct anchored mark;
@@ -5174,6 +5181,11 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             }
             try visible.append(arena, .{ .line = pinned_line, .abs_line = abs_line, .selectable = false });
         }
+        if (truncated) try visible.append(arena, .{
+            .line = .{ .text = " … scroll up for the full prompt", .style = Palette.prompt_text, .fill_style = Palette.prompt_panel },
+            .abs_line = sticky_prompt.start + copied_len,
+            .selectable = false,
+        });
         // One blank, non-selectable row keeps the pinned surface visually
         // separate from the live scrollback immediately below it.
         try visible.append(arena, .{
@@ -5181,7 +5193,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             .abs_line = sticky_prompt.start + sticky_prompt.len,
             .selectable = false,
         });
-        const pinned_rows = sticky_prompt.len + 1;
+        const pinned_rows = displayed_len + 1;
         const body_capacity = view_h - pinned_rows;
         const body_floor = sticky_prompt.start + sticky_prompt.len;
         const body_first = @max(body_floor, total -| body_capacity);
