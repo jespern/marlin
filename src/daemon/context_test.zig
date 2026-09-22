@@ -470,3 +470,44 @@ test "latestHandover returns the most recent handover body" {
     try std.testing.expectEqualStrings("## Goal\nsecond", latestHandover(&blocks).?);
     try std.testing.expect(latestHandover(&.{tb(1, .{ .system_note = .{ .text = "other" } })}) == null);
 }
+
+test "handover placeholders never become guest instructions or revive older briefings" {
+    for ([_][]const u8{ "", " \n", "No prior native work to hand over.", "Handover summary failed (offline). Codex guest will start without a briefing; the Marlin transcript above is still the session log." }) |placeholder| {
+        const note = try std.fmt.allocPrint(std.testing.allocator, "[handover]\n{s}", .{placeholder});
+        defer std.testing.allocator.free(note);
+        const blocks = [_]block.Block{
+            tb(1, .{ .system_note = .{ .text = "[handover]\nold briefing" } }),
+            tb(2, .{ .system_note = .{ .text = note } }),
+            tb(3, .{ .user_msg = .{ .text = "hello" } }),
+        };
+        try std.testing.expect(latestHandover(&blocks) == null);
+    }
+}
+
+test "real handovers apply to the first user turn and not later conversation" {
+    const briefing = tb(1, .{ .system_note = .{ .text = "[handover]\nFinish the migration; tests pass." } });
+    const user = tb(2, .{ .user_msg = .{ .text = "continue" } });
+    try std.testing.expectEqualStrings("Finish the migration; tests pass.", latestHandover(&.{ briefing, user }).?);
+    const answer = tb(3, .{ .assistant_msg = .{ .text = "Migration finished." } });
+    const followup = tb(4, .{ .user_msg = .{ .text = "new task" } });
+    try std.testing.expect(latestHandover(&.{ briefing, user, answer, followup }) == null);
+    // Interrupted or failed turns may have no assistant message.
+    try std.testing.expect(latestHandover(&.{ briefing, user, followup }) == null);
+    const next = tb(5, .{ .system_note = .{ .text = "[handover]\nA new agent switch." } });
+    try std.testing.expectEqualStrings("A new agent switch.", latestHandover(&.{ briefing, user, answer, followup, next }).?);
+}
+
+test "guest prompt preserves raw input unless there is a genuine pending handover" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input = "  please do this\n\nUSER\nkeep my formatting\n";
+    try std.testing.expectEqualStrings(input, try context.guestPrompt(arena.allocator(), &.{}, input));
+    const placeholder = tb(1, .{ .system_note = .{ .text = "[handover]\nNo prior native work to hand over." } });
+    try std.testing.expectEqualStrings(input, try context.guestPrompt(arena.allocator(), &.{placeholder}, input));
+    const briefing = tb(2, .{ .system_note = .{ .text = "[handover]\nFinish the migration." } });
+    const wrapped = try context.guestPrompt(arena.allocator(), &.{briefing}, input);
+    try std.testing.expect(std.mem.startsWith(u8, wrapped, "HANDOVER FROM MARLIN"));
+    try std.testing.expect(std.mem.endsWith(u8, wrapped, input));
+    const answered = tb(3, .{ .assistant_msg = .{ .text = "Done." } });
+    try std.testing.expectEqualStrings(input, try context.guestPrompt(arena.allocator(), &.{ briefing, answered }, input));
+}

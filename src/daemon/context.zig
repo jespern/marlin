@@ -718,17 +718,38 @@ pub fn renderForSummary(
     return out.items;
 }
 
-/// Most recent native→guest handover body, if the log has one.
+/// Pending native→guest briefing. A guest response or another user turn
+/// means the conversation has moved on; never prepend stale context again.
 pub fn latestHandover(blocks: []const block.Block) ?[]const u8 {
+    var user_turns: usize = 0;
     var i = blocks.len;
     while (i > 0) {
         i -= 1;
         switch (blocks[i].body) {
-            .system_note => |sn| if (block.isHandoverNote(sn.text)) return block.handoverBody(sn.text),
+            .system_note => |sn| if (block.isHandoverNote(sn.text)) {
+                const body = std.mem.trim(u8, block.handoverBody(sn.text), " \t\r\n");
+                // Compatibility with placeholder notes already stored by older versions.
+                // Return null here, rather than falling back to an older briefing.
+                if (body.len == 0 or std.mem.eql(u8, body, "No prior native work to hand over.") or
+                    std.mem.startsWith(u8, body, "Handover summary failed (")) return null;
+                return body;
+            },
+            .assistant_msg => return null,
+            .user_msg => |msg| if (!msg.synthetic) {
+                user_turns += 1;
+                if (user_turns > 1) return null;
+            },
             else => {},
         }
     }
     return null;
+}
+
+/// Ordinary guest turns preserve the user's text byte-for-byte. Only a
+/// pending, substantive briefing adds the handover envelope.
+pub fn guestPrompt(arena: std.mem.Allocator, blocks: []const block.Block, user_text: []const u8) ![]const u8 {
+    const briefing = latestHandover(blocks) orelse return user_text;
+    return std.fmt.allocPrint(arena, "HANDOVER FROM MARLIN (previous agent in this session). Continue from this briefing; you will not see its block log.\n\n{s}\n\n---\n\nUSER\n{s}", .{ briefing, user_text });
 }
 
 /// Extract the file paths of the N most recently WRITTEN files from

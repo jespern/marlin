@@ -1429,6 +1429,7 @@ pub fn writeHandover(
     const arena = arena_state.allocator();
     var history: std.ArrayList(block.Block) = .empty;
     try store.loadContextBlocksInto(arena, &history, opts.session_id, 1_000_000);
+    if (history.items.len == 0) return;
 
     var ap = Appender{
         .store = store,
@@ -1449,16 +1450,6 @@ pub fn writeHandover(
     );
     _ = try ap.append(.{ .system_note = .{ .text = announce } });
     publishPhase(opts, .provider);
-
-    if (history.items.len == 0) {
-        const empty_note = try std.fmt.allocPrint(
-            arena,
-            "{s}No prior native work to hand over.",
-            .{block.handover_prefix},
-        );
-        _ = try ap.append(.{ .system_note = .{ .text = empty_note } });
-        return;
-    }
 
     var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
     defer http_client.deinit();

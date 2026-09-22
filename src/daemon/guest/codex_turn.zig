@@ -523,10 +523,8 @@ pub fn runCodexTurn(
         var history_arena_state = std.heap.ArenaAllocator.init(gpa);
         defer history_arena_state.deinit();
         store.loadContextBlocksInto(history_arena_state.allocator(), &history, opts.session_id, 1_000_000) catch {};
-        if (context.latestHandover(history.items)) |briefing| {
-            prompt.clearRetainingCapacity();
-            try prompt.print(gpa, "HANDOVER FROM MARLIN (previous agent in this session). Continue from this briefing; you will not see its block log.\n\n{s}\n\n---\n\nUSER\n{s}", .{ briefing, first_text });
-        }
+        prompt.clearRetainingCapacity();
+        try prompt.appendSlice(gpa, try context.guestPrompt(history_arena_state.allocator(), history.items, first_text));
     }
 
     var active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, prompt.items);
