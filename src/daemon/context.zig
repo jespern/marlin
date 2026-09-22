@@ -26,6 +26,7 @@
 const std = @import("std");
 const config = @import("../core/config.zig");
 const block = @import("../core/block.zig");
+const dsml = @import("provider/dsml.zig");
 const provider = @import("provider/provider.zig");
 
 /// Estimate tokens for text not yet measured by the provider.
@@ -594,12 +595,15 @@ pub const compaction_prompt =
 /// shown to the user and given to the guest as its first-turn briefing.
 /// It must not assume Marlin tool names — the guest has its own tools.
 pub const handover_prompt =
-    \\Write a handover briefing for another coding agent that will continue
-    \\this work in the same repository. The next agent owns its own tools and
-    \\will not see Marlin's block log. Be concrete enough
-    \\that it can resume without re-discovering the repo.
+    \\You are writing a DOCUMENT, not doing work. Do not run tools, do not
+    \\call functions, do not inspect anything. Your whole reply is the text of
+    \\a handover briefing that another coding agent will read before it
+    \\continues this work in the same repository. That agent owns its own
+    \\tools and will not see Marlin's block log. Be concrete enough that it
+    \\can resume without re-discovering the repo.
     \\
-    \\Structure the briefing as:
+    \\Start your reply with the line "## Goal" and use exactly these six
+    \\sections, in this order:
     \\
     \\## Goal
     \\(what the user asked for, in their terms)
@@ -612,10 +616,11 @@ pub const handover_prompt =
     \\## Constraints
     \\(durable user decisions)
     \\## Next
-    \\(the immediate next action)
+    \\(the immediate next action, as a sentence for the next agent, not a
+    \\command for you to run)
     \\
-    \\Omit routine reads, raw logs, and Marlin-internal commands. Do not
-    \\continue the work yourself.
+    \\Omit routine reads, raw logs, and Marlin-internal commands. Plain
+    \\Markdown only: no tool-call markup of any kind.
 ;
 
 /// Don't compact sessions smaller than this many blocks.
@@ -742,6 +747,31 @@ pub fn latestHandover(blocks: []const block.Block) ?[]const u8 {
             else => {},
         }
     }
+    return null;
+}
+
+/// Why a summarizer reply cannot be stored as a handover briefing.
+pub const HandoverDefect = enum {
+    /// Inline tool-call markup: the model tried to keep working instead of
+    /// writing the document.
+    tool_markup,
+    /// None of the required section headings; the reply is prose or noise.
+    missing_sections,
+    /// Too short to carry a briefing.
+    too_short,
+};
+
+/// A briefing is acceptable when it carries no tool-call markup and at least
+/// the Goal and Next sections the prompt demands. Anything else is a model
+/// that answered the wrong question; storing it would hand the guest garbage.
+pub fn handoverDefect(text: []const u8) ?HandoverDefect {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (t.len < 40) return .too_short;
+    if (dsml.containsMarkup(t)) return .tool_markup;
+    if (std.mem.indexOf(u8, t, "<function_calls>") != null or std.mem.indexOf(u8, t, "<tool_call>") != null) return .tool_markup;
+    const has_goal = std.mem.indexOf(u8, t, "## Goal") != null;
+    const has_next = std.mem.indexOf(u8, t, "## Next") != null;
+    if (!has_goal or !has_next) return .missing_sections;
     return null;
 }
 

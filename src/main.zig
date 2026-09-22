@@ -104,6 +104,7 @@ test {
     _ = @import("daemon/tools/mcp_test.zig");
     _ = @import("daemon/provider/provider_test.zig");
     _ = @import("daemon/provider/openai_compat_test.zig");
+    _ = @import("daemon/provider/dsml_test.zig");
     _ = @import("daemon/provider/anthropic_test.zig");
     _ = @import("daemon/provider/sse_test.zig");
     _ = @import("daemon/provider/http_test.zig");

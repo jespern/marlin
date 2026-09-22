@@ -815,6 +815,9 @@ pub fn runTurn(
             _ = try ap.append(.{ .reasoning = .{ .text = acc.reasoning.items } });
         }
 
+        // Inline tool-call markup in the text (DeepSeek) becomes real calls
+        // here, before the "no calls → final answer" decision below.
+        try acc.recoverInlineToolCalls(arena);
         const response_text = try acc.textWithCitationLinks(arena);
 
         // -- no tool calls → final answer, unless the user steered --
@@ -1456,28 +1459,63 @@ pub fn writeHandover(
     const from_seq = history.items[0].seq;
     const to_seq = history.items[history.items.len - 1].seq;
     const transcript = try context.renderForSummary(arena, history.items, from_seq, to_seq, 400_000);
-    const summary = summarize(
-        gpa,
-        arena,
-        &http_client,
-        opts.endpoint,
-        transcript,
-        opts.cancel,
-        try providerRequestOptions(arena, opts, opts.endpoint),
-        context.handover_prompt,
-        &opts,
-    ) catch |e| {
-        const failure = try http.failureText(arena, e);
-        const msg = try std.fmt.allocPrint(
+    const request_opts = try providerRequestOptions(arena, opts, opts.endpoint);
+    // Some models (deepseek-v4.1-flash, observed) answer the briefing request
+    // by trying to continue the work: inline tool-call markup, no sections.
+    // Validate; retry once with the defect named; never store a bad one.
+    var attempt: usize = 0;
+    var last_defect: ?context.HandoverDefect = null;
+    while (attempt < 2) : (attempt += 1) {
+        const prompt = if (attempt == 0)
+            context.handover_prompt
+        else
+            try std.fmt.allocPrint(arena, "{s}\n\nYour previous reply was rejected: {s}. Reply with the briefing document only.", .{
+                context.handover_prompt,
+                switch (last_defect.?) {
+                    .tool_markup => "it contained tool-call markup instead of a briefing",
+                    .missing_sections => "it lacked the required ## Goal and ## Next sections",
+                    .too_short => "it was too short to be a briefing",
+                },
+            });
+        const summary = summarize(
+            gpa,
             arena,
-            "{s}Handover summary failed ({s}). {s} will start without a briefing; the Marlin transcript above is still the session log.",
-            .{ block.handover_prefix, failure, guest_label },
-        );
-        _ = try ap.append(.{ .system_note = .{ .text = msg } });
+            &http_client,
+            opts.endpoint,
+            transcript,
+            opts.cancel,
+            request_opts,
+            prompt,
+            &opts,
+        ) catch |e| {
+            const failure = try http.failureText(arena, e);
+            const msg = try std.fmt.allocPrint(
+                arena,
+                "{s}Handover summary failed ({s}). {s} will start without a briefing; the Marlin transcript above is still the session log.",
+                .{ block.handover_prefix, failure, guest_label },
+            );
+            _ = try ap.append(.{ .system_note = .{ .text = msg } });
+            return;
+        };
+        if (context.handoverDefect(summary)) |defect| {
+            last_defect = defect;
+            continue;
+        }
+        const note = try std.fmt.allocPrint(arena, "{s}{s}", .{ block.handover_prefix, summary });
+        _ = try ap.append(.{ .system_note = .{ .text = note } });
         return;
+    }
+    const why: []const u8 = switch (last_defect.?) {
+        .tool_markup => "the model answered with tool calls instead of a briefing",
+        .missing_sections => "the model did not produce the briefing sections",
+        .too_short => "the model produced no usable briefing",
     };
-    const note = try std.fmt.allocPrint(arena, "{s}{s}", .{ block.handover_prefix, summary });
-    _ = try ap.append(.{ .system_note = .{ .text = note } });
+    const msg = try std.fmt.allocPrint(
+        arena,
+        "{s}Handover summary failed ({s}, twice). {s} will start without a briefing; the Marlin transcript above is still the session log.",
+        .{ block.handover_prefix, why, guest_label },
+    );
+    _ = try ap.append(.{ .system_note = .{ .text = msg } });
 }
 
 pub fn toolAllowed(opts: RunOpts, spec: *const tools_registry.Spec) bool {

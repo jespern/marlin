@@ -12,6 +12,7 @@
 const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
+const dsml = @import("dsml.zig");
 const Effort = @import("../../core/effort.zig").Effort;
 
 // ------------------------------------------------------------- request --
@@ -245,6 +246,8 @@ pub const StreamAccum = struct {
     /// HTTP consumer observes this and closes the stream immediately.
     response_too_large: bool = false,
     tool_bytes: usize = 0,
+    /// Tool calls lifted out of DSML text markup by recoverInlineToolCalls.
+    recovered_inline_calls: usize = 0,
     citation_bytes: usize = 0,
 
     /// Immediate delta sink for UI liveness; may be null in headless tests.
@@ -264,6 +267,31 @@ pub const StreamAccum = struct {
     const max_citation_bytes: usize = 256 * 1024;
 
     pub const FinishReason = enum { stop, tool_calls, length, content_filter, other };
+
+    /// DeepSeek sometimes emits its tool calls as text markup instead of the
+    /// API's `tool_calls` field (see dsml.zig). Once the stream has ended,
+    /// lift any complete inline calls into real PartialCalls and strip the
+    /// markup from the text, so the turn executes them like any other call
+    /// instead of showing the leak as prose. Only applies when the provider
+    /// sent no structured calls; a mixed response keeps the structured ones.
+    pub fn recoverInlineToolCalls(self: *StreamAccum, arena: std.mem.Allocator) !void {
+        if (self.calls.items.len > 0) return;
+        if (!dsml.containsMarkup(self.text.items)) return;
+        const extracted = try dsml.extractCalls(arena, self.text.items);
+        for (extracted.calls, 0..) |call, i| {
+            const pc = try self.callAt(@intCast(i));
+            var id_buf: [32]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buf, "dsml_{d}", .{i});
+            try self.appendToolFragment(&pc.call_id, id);
+            try self.appendToolFragment(&pc.name, call.name);
+            try self.appendToolFragment(&pc.args, call.args_json);
+        }
+        self.text.clearRetainingCapacity();
+        try self.text.appendSlice(self.gpa, extracted.prose);
+        self.text_forwarded = @min(self.text_forwarded, self.text.items.len);
+        if (extracted.calls.len > 0) self.finish_reason = .tool_calls;
+        self.recovered_inline_calls = extracted.calls.len;
+    }
 
     pub fn finishReason(self: *const StreamAccum) []const u8 {
         return if (self.finish_reason) |reason| @tagName(reason) else "";
@@ -443,7 +471,7 @@ pub const StreamAccum = struct {
         };
     }
 
-    fn callAt(self: *StreamAccum, index: u32) !*PartialCall {
+    pub fn callAt(self: *StreamAccum, index: u32) !*PartialCall {
         for (self.calls.items) |*pc| {
             if (pc.index == index) return pc;
         }

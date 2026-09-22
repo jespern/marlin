@@ -106,7 +106,16 @@ The real hazard is **context continuity**, not mixing logs:
   "switching to a guest model, generating handover summary…". On
   completion (or failure — the switch is not blocked) the session
   becomes guest; the guest's first prompt is that briefing plus the
-  user's next message. Empty native logs skip the LLM.
+  user's next message. Empty native logs skip the LLM. The briefing is
+  validated before it is stored (`context.handoverDefect`): tool-call
+  markup, missing `## Goal`/`## Next` sections, or a stub means the model
+  tried to keep working instead of writing the document (deepseek-v4.1-flash
+  did exactly this, emitting its inline `｜DSML｜` tool markup). One retry
+  names the defect; a second miss stores the "started without a briefing"
+  note so the guest gets the user's text clean. Separately, the OpenRouter
+  stream accumulator lifts complete inline DSML invokes into real tool
+  calls (`provider/dsml.zig`) so a native turn executes them instead of
+  showing the leak as prose.
 - **guest→different guest:** refused directly. Switch through a native model
   so the native handover turn can bridge the two private context stores.
 
