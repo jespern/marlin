@@ -224,3 +224,62 @@ test "returned process group sweeps a daemonized descendant after parent exit" {
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     } else return error.DaemonizedDescendantSurvivedCleanup;
 }
+
+test "a closed stdin alone ends a stdio child that flushes on the way out" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try TestScratch.init(gpa, io, "marlin-process-io-stdin-eof");
+    defer temp.deinit();
+    const out_path = try std.fs.path.join(gpa, &.{ temp.path, "flushed" });
+    defer gpa.free(out_path);
+
+    // Stands in for a guest that batches work and only ships it on the clean
+    // exit path: signalling it loses the file, closing stdin produces it.
+    const script =
+        \\while IFS= read -r line; do :; done
+        \\printf flushed > "$1"
+    ;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", script, "--", out_path },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const group: std.posix.pid_t = child.id.?;
+    defer terminateProcessGroup(io, group, 0);
+
+    try std.testing.expect(process_io.closeStdinAndReap(&child, io, 2_000));
+    process_io.releaseReapedChild(&child, io);
+
+    const flushed = try Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .limited(64));
+    defer gpa.free(flushed);
+    try std.testing.expectEqualStrings("flushed", flushed);
+}
+
+test "a child that ignores the closed stdin is left for the caller to signal" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "trap '' TERM; while :; do sleep 1; done" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const group: std.posix.pid_t = child.id.?;
+
+    try std.testing.expect(!process_io.closeStdinAndReap(&child, io, 150));
+    try std.testing.expect(child.stdin == null);
+
+    terminateProcessGroup(io, group, 0);
+    _ = child.wait(io) catch {};
+}

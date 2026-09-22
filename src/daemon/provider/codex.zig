@@ -19,6 +19,62 @@ pub fn binaryPath(environ: ?*const std.process.Environ.Map) []const u8 {
     return if (override.len == 0) default_binary else override;
 }
 
+/// Codex's config file: `$CODEX_HOME/config.toml`, else `$HOME/.codex/config.toml`.
+fn configPath(buf: []u8, environ: *const std.process.Environ.Map) ?[]const u8 {
+    if (environ.get("CODEX_HOME")) |home| if (home.len > 0)
+        return std.fmt.bufPrint(buf, "{s}/config.toml", .{home}) catch null;
+    const home = environ.get("HOME") orelse return null;
+    if (home.len == 0) return null;
+    return std.fmt.bufPrint(buf, "{s}/.codex/config.toml", .{home}) catch null;
+}
+
+/// Whether the operator's own Codex config already names an OTLP collector.
+///
+/// Codex merges `-c key=value` overrides into that file per key, not per
+/// table: an override that sets only `endpoint` keeps the file's `headers`, so
+/// Marlin's endpoint would travel under the operator's Authorization token
+/// (live-observed as a 403 `invalid OTLP API key`). Deferring to an exporter
+/// the operator configured keeps the endpoint/auth pairing they set up.
+///
+/// Deliberately a scan rather than a parse: this answers one yes/no question
+/// about Codex's config surface, which is not Marlin's to model. Only keys
+/// under `[otel]`, dotted `otel.*`, and the inline `otel = { ... }` form
+/// count; a malformed or unreadable file reads as "not configured".
+pub fn configNamesCollector(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+) bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = configPath(&path_buf, environ) orelse return false;
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024)) catch return false;
+    defer gpa.free(bytes);
+
+    var in_otel = false;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '[') {
+            const name = std.mem.trim(u8, line, "[] \t");
+            in_otel = std.mem.eql(u8, name, "otel") or std.mem.startsWith(u8, name, "otel.");
+            continue;
+        }
+        const equal = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..equal], " \t");
+        if (in_otel) {
+            if (std.mem.eql(u8, key, "trace_exporter") or std.mem.eql(u8, key, "exporter")) return true;
+        } else if (std.mem.eql(u8, key, "otel")) {
+            if (std.mem.indexOf(u8, line, "trace_exporter") != null or
+                std.mem.indexOf(u8, line, "exporter") != null) return true;
+        } else if (std.mem.startsWith(u8, key, "otel.")) {
+            const leaf = key["otel.".len..];
+            if (std.mem.eql(u8, leaf, "trace_exporter") or std.mem.eql(u8, leaf, "exporter")) return true;
+        }
+    }
+    return false;
+}
+
 /// Collector settings for codex's own [otel] config, passed as `-c` root
 /// overrides. Codex has no OTEL_* environment interface, and its otlp-http
 /// endpoint is used verbatim, so full per-signal URLs are composed here.
@@ -46,6 +102,19 @@ pub fn buildArgv(
     if (otel) |cfg| try appendOtelOverrides(arena, &argv, cfg);
     try argv.appendSlice(arena, &.{ "app-server", "--listen", "stdio://" });
     return argv.items;
+}
+
+/// W3C trace context for one app-server request. The app-server honors this
+/// JSON-RPC `trace` field and nests its spans under the given parent; the
+/// `TRACEPARENT` environment variable it also sees is ignored for its own
+/// spans (observed live: env-only runs produced parentless spans in unrelated
+/// trace ids, the field produced children of Marlin's turn span).
+pub const Trace = struct {
+    traceparent: []const u8,
+};
+
+pub fn traceFor(traceparent: ?[]const u8) ?Trace {
+    return if (traceparent) |value| .{ .traceparent = value } else null;
 }
 
 pub const CatalogModel = struct {

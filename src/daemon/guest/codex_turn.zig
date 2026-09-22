@@ -30,6 +30,7 @@ const loop = @import("../loop.zig");
 const Appender = loop.Appender;
 const RunOpts = loop.RunOpts;
 const TurnResult = loop.TurnResult;
+const OtelGuest = loop.OtelGuest;
 const cancelled = loop.cancelled;
 const effectiveApprovalMode = loop.effectiveApprovalMode;
 const nowMs = loop.nowMs;
@@ -54,11 +55,34 @@ fn codexWriteLine(writer: *Io.Writer, line: []const u8) !void {
     try writer.flush();
 }
 
+/// How long a closed stdin gets to end the app-server on its own before the
+/// process group is signalled. Codex exits in tens of milliseconds once its
+/// stdio closes; the margin only covers a slow flush.
+const codex_shutdown_grace_ms: u32 = 1000;
+
+/// The `-c otel.*` overrides for this turn, or null to leave Codex's own
+/// `[otel]` configuration alone — which is what happens whenever the operator
+/// already named a collector there. Marlin's override merges with (not
+/// replaces) that config per key, so retargeting the endpoint would send the
+/// operator's Authorization header to Marlin's collector instead.
+pub fn otelOverrides(guest: ?OtelGuest, codex_config_names_collector: bool) ?codex.Otel {
+    if (guest == null or codex_config_names_collector) return null;
+    return .{
+        .base_endpoint = guest.?.base_endpoint,
+        .traces_endpoint = guest.?.traces_endpoint,
+        .headers = guest.?.headers,
+        .capture_content = guest.?.capture_content,
+    };
+}
+
 /// Idempotent child teardown: the happy-path defer and the error-path
 /// diagnostics (which must join the stderr drain BEFORE reading its tail)
-/// share one implementation. The app-server is per turn; reap the whole
-/// owned group immediately so background descendants cannot outlive the
-/// Marlin turn or add half a second of teardown latency.
+/// share one implementation. The app-server is per turn, so teardown closes
+/// its stdin first and waits briefly: Codex flushes its OTEL batch processors
+/// on the clean exit path, and a signal — which is what this used to send
+/// immediately — throws those spans away (observed live: an entire session of
+/// guest telemetry lost to SIGTERM, nothing reaching the collector). Only a
+/// server that ignores the closed stdin gets the group kill.
 const CodexTeardown = struct {
     io: Io,
     watcher: *CcWatcher,
@@ -73,9 +97,17 @@ const CodexTeardown = struct {
         self.done = true;
         self.watcher.done.store(true, .release);
         self.watcher_thread.join();
-        process_io.terminateProcessGroup(self.io, self.group, 0);
-        if (self.drain_thread) |thread| thread.join();
-        _ = self.child.wait(self.io) catch {};
+        if (process_io.closeStdinAndReap(self.child, self.io, codex_shutdown_grace_ms)) {
+            if (self.drain_thread) |thread| thread.join();
+            process_io.releaseReapedChild(self.child, self.io);
+        } else {
+            // Still running (or not ours to wait on): owned descendants must
+            // not outlive the turn, so reap the whole group now. `wait` also
+            // releases the pipes, so the drain joins before it runs.
+            process_io.terminateProcessGroup(self.io, self.group, 0);
+            _ = self.child.wait(self.io) catch {};
+            if (self.drain_thread) |thread| thread.join();
+        }
     }
 };
 
@@ -99,6 +131,33 @@ fn noteCodexServerExit(gpa: std.mem.Allocator, ap: *Appender, stderr_tail: []con
 fn codexWriteValue(arena: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
     const encoded = try std.json.Stringify.valueAlloc(arena, value, .{});
     try codexWriteLine(writer, encoded);
+}
+
+/// One app-server request. The W3C context is omitted entirely when Marlin is
+/// not exporting, so an untraced turn puts exactly the old bytes on the wire.
+/// `pub` so the sibling test can pin both wire shapes.
+pub fn codexRequest(
+    arena: std.mem.Allocator,
+    writer: *Io.Writer,
+    comptime method: []const u8,
+    id: i64,
+    trace: ?codex.Trace,
+    params: anytype,
+) !void {
+    if (trace) |wire_trace| {
+        try codexWriteValue(arena, writer, .{
+            .method = method,
+            .id = id,
+            .trace = wire_trace,
+            .params = params,
+        });
+    } else {
+        try codexWriteValue(arena, writer, .{
+            .method = method,
+            .id = id,
+            .params = params,
+        });
+    }
 }
 
 fn codexWaitResponse(
@@ -269,20 +328,17 @@ fn codexSendTurnStart(
     request_id: i64,
     thread_id: []const u8,
     opts: RunOpts,
+    trace: ?codex.Trace,
     text: []const u8,
 ) ![]const u8 {
-    try codexWriteValue(arena, writer, .{
-        .method = "turn/start",
-        .id = request_id,
-        .params = .{
-            .threadId = thread_id,
-            .input = .{.{ .type = "text", .text = text }},
-            .cwd = opts.cwd,
-            .model = codexModel(opts),
-            .effort = opts.effort.providerValue(),
-            .approvalPolicy = codexApprovalPolicy(opts),
-            .approvalsReviewer = "user",
-        },
+    try codexRequest(arena, writer, "turn/start", request_id, trace, .{
+        .threadId = thread_id,
+        .input = .{.{ .type = "text", .text = text }},
+        .cwd = opts.cwd,
+        .model = codexModel(opts),
+        .effort = opts.effort.providerValue(),
+        .approvalPolicy = codexApprovalPolicy(opts),
+        .approvalsReviewer = "user",
     });
     const response = try codexWaitResponse(arena, reader, request_id);
     if (codexRpcError(arena, response)) |message| {
@@ -302,6 +358,7 @@ fn sendCodexSteers(
     ap: *Appender,
     thread_id: []const u8,
     turn_id: []const u8,
+    trace: ?codex.Trace,
     next_request_id: *i64,
 ) !usize {
     const poll = opts.poll_steer orelse return 0;
@@ -309,14 +366,10 @@ fn sendCodexSteers(
     while (poll(opts.on_delta_ctx, gpa)) |text| {
         defer gpa.free(text);
         _ = try ap.append(.{ .steer = .{ .text = text } });
-        try codexWriteValue(arena, writer, .{
-            .method = "turn/steer",
-            .id = next_request_id.*,
-            .params = .{
-                .threadId = thread_id,
-                .expectedTurnId = turn_id,
-                .input = .{.{ .type = "text", .text = text }},
-            },
+        try codexRequest(arena, writer, "turn/steer", next_request_id.*, trace, .{
+            .threadId = thread_id,
+            .expectedTurnId = turn_id,
+            .input = .{.{ .type = "text", .text = text }},
         });
         next_request_id.* += 1;
         count += 1;
@@ -338,33 +391,35 @@ pub fn runCodexTurn(
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const argv = try codex.buildArgv(arena, opts.tool_environ, if (opts.otel_guest) |guest| .{
-        .base_endpoint = guest.base_endpoint,
-        .traces_endpoint = guest.traces_endpoint,
-        .headers = guest.headers,
-        .capture_content = guest.capture_content,
-    } else null);
+    // Defer to a collector the operator already told Codex about: Marlin's
+    // `-c` override merges with (not replaces) that config, so it would retarget
+    // the endpoint while the operator's Authorization header stayed in place.
+    const otel_overrides: ?codex.Otel = if (opts.tool_environ) |environ|
+        otelOverrides(opts.otel_guest, codex.configNamesCollector(gpa, io, environ))
+    else
+        otelOverrides(opts.otel_guest, false);
+    const argv = try codex.buildArgv(arena, opts.tool_environ, otel_overrides);
     var guest_environ: ?std.process.Environ.Map = if (opts.tool_environ) |source|
         try permissions.toolEnvironment(gpa, source)
     else
         null;
     defer if (guest_environ) |*map| map.deinit();
-    // Codex reads its collector from config overrides above; TRACEPARENT
-    // still travels via the environment so subprocesses it spawns (and any
-    // future inbound-context support) can nest under Marlin's turn trace.
-    var codex_traceparent_buf: [64]u8 = undefined;
-    if (opts.otel_guest != null) {
-        if (guest_environ) |*map| {
-            const trace_id = telemetry_ids.traceId(opts.session_id, ap.turn_id);
-            const root_span = telemetry_ids.spanId(ap.turn_id);
-            const traceparent = std.fmt.bufPrint(
-                &codex_traceparent_buf,
-                "00-{s}-{s}-01",
-                .{ trace_id[0..], root_span[0..] },
-            ) catch unreachable;
-            _ = putEnvDefault(map, "TRACEPARENT", traceparent);
-        }
-    }
+    // The app-server nests its own spans under the W3C context on each
+    // request (`codex.Trace`); the environment variable alone only reaches
+    // subprocesses it spawns.
+    var traceparent_buf: [64]u8 = undefined;
+    const traceparent: ?[]const u8 = if (opts.otel_guest != null) blk: {
+        const trace_id = telemetry_ids.traceId(opts.session_id, ap.turn_id);
+        const root_span = telemetry_ids.spanId(ap.turn_id);
+        const value = std.fmt.bufPrint(
+            &traceparent_buf,
+            "00-{s}-{s}-01",
+            .{ trace_id[0..], root_span[0..] },
+        ) catch unreachable;
+        if (guest_environ) |*map| _ = putEnvDefault(map, "TRACEPARENT", value);
+        break :blk value;
+    } else null;
+    const trace = codex.traceFor(traceparent);
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = opts.cwd },
@@ -420,15 +475,11 @@ pub fn runCodexTurn(
     var reader_file = child.stdout.?.reader(io, line_buffer);
     const reader = &reader_file.interface;
 
-    try codexWriteValue(arena, writer, .{
-        .method = "initialize",
-        .id = 1,
-        .params = .{ .clientInfo = .{
-            .name = "marlin",
-            .title = "Marlin",
-            .version = build_options.version,
-        } },
-    });
+    try codexRequest(arena, writer, "initialize", 1, trace, .{ .clientInfo = .{
+        .name = "marlin",
+        .title = "Marlin",
+        .version = build_options.version,
+    } });
     const initialized = try codexWaitResponse(arena, reader, 1);
     if (codexRpcError(arena, initialized)) |message| {
         setDelegateError(message);
@@ -439,11 +490,7 @@ pub fn runCodexTurn(
 
     // Fail early with a useful login instruction instead of letting a null
     // account decay into an opaque failed turn.
-    try codexWriteValue(arena, writer, .{
-        .method = "account/read",
-        .id = 2,
-        .params = .{ .refreshToken = true },
-    });
+    try codexRequest(arena, writer, "account/read", 2, trace, .{ .refreshToken = true });
     const account_response = try codexWaitResponse(arena, reader, 2);
     if (codexRpcError(arena, account_response)) |message| {
         setDelegateError(message);
@@ -462,17 +509,13 @@ pub fn runCodexTurn(
     const saved_thread_id = try store.getCodexThreadId(opts.session_id);
     defer if (saved_thread_id) |saved| gpa.free(saved);
     if (saved_thread_id) |saved| {
-        try codexWriteValue(arena, writer, .{
-            .method = "thread/resume",
-            .id = next_request_id,
-            .params = .{
-                .threadId = saved,
-                .cwd = opts.cwd,
-                .model = codexModel(opts),
-                .approvalPolicy = codexApprovalPolicy(opts),
-                .approvalsReviewer = "user",
-                .sandbox = codexSandbox(opts),
-            },
+        try codexRequest(arena, writer, "thread/resume", next_request_id, trace, .{
+            .threadId = saved,
+            .cwd = opts.cwd,
+            .model = codexModel(opts),
+            .approvalPolicy = codexApprovalPolicy(opts),
+            .approvalsReviewer = "user",
+            .sandbox = codexSandbox(opts),
         });
         const resumed = try codexWaitResponse(arena, reader, next_request_id);
         next_request_id += 1;
@@ -490,17 +533,13 @@ pub fn runCodexTurn(
         thread_id = "";
     }
     if (thread_id.len == 0) {
-        try codexWriteValue(arena, writer, .{
-            .method = "thread/start",
-            .id = next_request_id,
-            .params = .{
-                .cwd = opts.cwd,
-                .model = codexModel(opts),
-                .approvalPolicy = codexApprovalPolicy(opts),
-                .approvalsReviewer = "user",
-                .sandbox = codexSandbox(opts),
-                .ephemeral = false,
-            },
+        try codexRequest(arena, writer, "thread/start", next_request_id, trace, .{
+            .cwd = opts.cwd,
+            .model = codexModel(opts),
+            .approvalPolicy = codexApprovalPolicy(opts),
+            .approvalsReviewer = "user",
+            .sandbox = codexSandbox(opts),
+            .ephemeral = false,
         });
         const started = try codexWaitResponse(arena, reader, next_request_id);
         next_request_id += 1;
@@ -529,7 +568,7 @@ pub fn runCodexTurn(
         }
     }
 
-    var active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, prompt.items);
+    var active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, prompt.items);
     next_request_id += 1;
     var rounds: u32 = 1;
     var tokens_in: u64 = 0;
@@ -653,7 +692,7 @@ pub fn runCodexTurn(
                         defer gpa.free(text);
                         _ = try ap.append(.{ .steer = .{ .text = text } });
                         final_text.clearRetainingCapacity();
-                        active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, text);
+                        active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, text);
                         next_request_id += 1;
                         rounds += 1;
                     } else {
@@ -664,7 +703,7 @@ pub fn runCodexTurn(
             },
         }
         if (!done)
-            _ = try sendCodexSteers(gpa, line_arena, writer, opts, ap, thread_id, active_turn_id, &next_request_id);
+            _ = try sendCodexSteers(gpa, line_arena, writer, opts, ap, thread_id, active_turn_id, trace, &next_request_id);
     }
 
     // A killed/interrupted rollout can publish usage without reaching its
