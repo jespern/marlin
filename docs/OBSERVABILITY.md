@@ -196,7 +196,27 @@ environment always win.
   previews with no redaction switch of their own, so the content-bearing log
   exporter and `otel.log_user_prompt` are enabled only under Marlin's content
   opt-in; structural trace spans flow regardless. `TRACEPARENT` is exported to
-  the process environment as well.
+  the process environment as well, but it reaches only subprocesses the
+  app-server spawns: the app-server ignores it for its own spans and instead
+  reads the W3C context from the JSON-RPC `trace` field, which Marlin sets on
+  every request it sends. Verified live — env-only runs produced parentless
+  spans in unrelated trace ids, while the request field produced spans whose
+  parent is Marlin's turn root span.
+  Two Codex-specific caveats:
+  - **An operator-configured collector wins.** Codex merges `-c key=value`
+    per key, not per table, so overriding only the endpoint would send
+    Marlin's collector under the operator's own `Authorization` header
+    (observed live as a `403 invalid OTLP API key`). When `~/.codex/config.toml`
+    already names an exporter under `[otel]`, Marlin passes no overrides at all
+    and the operator's endpoint/auth pairing stays intact; `TRACEPARENT` and
+    the request `trace` field are unaffected, and the spans still nest under
+    Marlin's turn.
+  - **Shutdown is a stdin close, not a signal.** The app-server buffers spans
+    in a `BatchSpanProcessor` and flushes only on a clean exit; SIGTERM
+    followed immediately by SIGKILL yielded zero exported bytes at every turn
+    length, while closing stdin exported the full batch. Marlin closes the
+    app-server's stdin and gives it a short grace period before falling back to
+    signalling the process group.
 
 ## OpenRouter correlation
 

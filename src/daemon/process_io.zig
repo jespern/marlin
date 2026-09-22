@@ -202,6 +202,65 @@ pub fn terminateProcessTree(child: *std.process.Child, io: Io, grace_ms: u32) vo
     };
 }
 
+fn awakeMs(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+/// Close the child's stdin — the shutdown signal a stdio line protocol already
+/// understands — and poll for it to exit on its own for up to `grace_ms`.
+///
+/// Signals are a last resort, not a first one: a SIGTERM'd guest that buffers
+/// work (Codex's OTLP batch processor, for one) discards it, while a closed
+/// stdin lets it flush and exit cleanly. On success the child is reaped and
+/// `stdin` released, but `stdout`/`stderr`/`id` are left for
+/// `releaseReapedChild`; on timeout the child is untouched and still running,
+/// so the caller escalates to the group kill.
+pub fn closeStdinAndReap(child: *std.process.Child, io: Io, grace_ms: u32) bool {
+    if (builtin.os.tag == .windows) return false;
+    const pid = child.id orelse return true;
+    if (child.stdin) |stdin| {
+        stdin.close(io);
+        child.stdin = null;
+    }
+    const Status = if (builtin.link_libc) c_int else u32;
+    const WaitOptions = if (builtin.link_libc) c_int else u32;
+    const nohang: WaitOptions = std.posix.W.NOHANG;
+    const deadline = awakeMs(io) + @as(i64, grace_ms);
+    while (true) {
+        var status: Status = undefined;
+        const rc = std.posix.system.waitpid(pid, &status, nohang);
+        if (rc == pid) return true;
+        // A child that is merely still running is the expected case, and it is
+        // reported as 0 — not as an errno, so it must not be read as success.
+        if (rc == 0) {
+            if (awakeMs(io) >= deadline) return false;
+            io.sleep(.fromMilliseconds(10), .awake) catch return false;
+            continue;
+        }
+        switch (std.posix.errno(rc)) {
+            .INTR => continue,
+            // ECHILD: already reaped by someone else. Not ours to wait on.
+            else => return false,
+        }
+    }
+}
+
+/// Release the pipes of a child whose exit `closeStdinAndReap` already
+/// observed. `Child.wait` would normally do this, but it also waits — which
+/// the caller must not do twice.
+pub fn releaseReapedChild(child: *std.process.Child, io: Io) void {
+    if (child.stdout) |stdout| {
+        stdout.close(io);
+        child.stdout = null;
+    }
+    if (child.stderr) |stderr| {
+        stderr.close(io);
+        child.stderr = null;
+    }
+    child.id = null;
+}
+
 /// Terminate any processes still belonging to a group previously returned by
 /// `run`. There is no direct child to reap at this point; this is a supervisor
 /// cleanup primitive for intentionally daemonizing descendants.

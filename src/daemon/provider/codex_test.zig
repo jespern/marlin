@@ -153,3 +153,42 @@ test "Codex catalog query uses app-server model list" {
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqualStrings("codex/test-codex-model", models[0].id);
 }
+
+test "operator-configured Codex collectors are recognized so Marlin defers to them" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-codex-otel-config");
+    defer temp.deinit();
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("CODEX_HOME", temp.path);
+
+    // No config file at all: nothing to defer to.
+    try std.testing.expect(!codex.configNamesCollector(gpa, io, &env));
+
+    const config_path = try std.fs.path.join(gpa, &.{ temp.path, "config.toml" });
+    defer gpa.free(config_path);
+    const Case = struct { name: []const u8, body: []const u8, expected: bool };
+    const cases = [_]Case{
+        .{ .name = "termalike", .expected = true, .body = "[otel]\ntrace_exporter = { otlp-http = { endpoint = \"https://otel-dev.example/v1/traces\" } }\n" },
+        .{ .name = "logs-only", .body = "[otel]\nexporter = { otlp-http = { endpoint = \"https://otel.example/v1/logs\" } }\n", .expected = true },
+        .{ .name = "dotted", .body = "otel.trace_exporter = { otlp-http = { endpoint = \"https://otel.example/v1/traces\" } }\n", .expected = true },
+        .{ .name = "inline", .body = "otel = { trace_exporter = { otlp-http = { endpoint = \"https://otel.example/v1/traces\" } } }\n", .expected = true },
+        .{ .name = "other-sections", .body = "model = \"gpt-5.3-codex\"\n[history]\npersistence = \"none\"\n", .expected = false },
+        .{ .name = "commented-out", .body = "# [otel]\n# trace_exporter = {}\n", .expected = false },
+        // Only `[otel]`'s own keys count: a same-named key elsewhere is not
+        // an exporter, and reading it as one would silently drop Marlin's.
+        .{ .name = "decoy-section", .body = "[tui]\nexporter = \"theme\"\n", .expected = false },
+    };
+    for (cases) |case| {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = case.body });
+        if (codex.configNamesCollector(gpa, io, &env) != case.expected) {
+            std.debug.print("case {s} misread\n", .{case.name});
+            return error.CollectorDetectionMismatch;
+        }
+    }
+}
