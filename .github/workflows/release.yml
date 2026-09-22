@@ -1,6 +1,12 @@
 name: release
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Candidate version (e.g. v0.1.5); builds assets without publishing"
+        required: true
+        type: string
   push:
     tags:
       - "v*"
@@ -24,10 +30,13 @@ jobs:
           version: 0.16.0
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev sqlite3
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev sqlite3 lsof procps
       - run: zig build fmt-check
+      - run: sh scripts/test-install.sh
       - run: zig build test
       - run: zig build e2e
+      - run: zig build converge
+        if: runner.os == 'Linux'
 
   build:
     needs: verify
@@ -58,9 +67,10 @@ jobs:
 
       - name: Build release binary
         env:
-          MARLIN_VERSION: ${{ github.ref_name }}
+          MARLIN_VERSION: ${{ inputs.version || github.ref_name }}
           MARLIN_TARGET: ${{ matrix.target }}
         run: |
+          printf '%s\n' "$MARLIN_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
           set --
           if [ "$RUNNER_OS" = macOS ]; then
             set -- --sysroot "$(xcrun --sdk macosx --show-sdk-path)"
@@ -70,7 +80,7 @@ jobs:
       - name: Package release assets
         env:
           ARTIFACT: ${{ matrix.artifact }}
-          MARLIN_VERSION: ${{ github.ref_name }}
+          MARLIN_VERSION: ${{ inputs.version || github.ref_name }}
         run: |
           mkdir -p dist/package
           cp zig-out/bin/marlin "dist/$ARTIFACT"
@@ -98,6 +108,7 @@ jobs:
           path: dist/
 
   publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
     permissions:

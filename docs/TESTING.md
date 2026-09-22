@@ -156,6 +156,15 @@ CI runs it nightly and on manual dispatch, never on PRs. Without the
 `OPENROUTER_API_KEY` repository secret the job skips with a visible warning
 rather than failing; set the secret to arm it.
 
+## Release preflight
+
+Before tagging, dispatch `release.yml` on the candidate commit with the
+`version` input (for example `v0.1.5`). It runs the macOS/Linux checks and
+builds, executes, and packages all four release binaries. Manual runs upload
+artifacts but cannot publish a release or update Homebrew. After CI and this
+preflight pass, tag that same commit and push the tag to publish the release,
+verify the public installer, and update the Homebrew tap.
+
 ## CI
 
 `.github/workflows/ci.yml`: `zig build fmt-check` + unit/fixture + e2e on macOS and Linux
