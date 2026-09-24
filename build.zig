@@ -59,7 +59,7 @@ fn configureYaml(module: *std.Build.Module, b: *std.Build) void {
     module.addCSourceFiles(.{
         .root = b.path("vendor/libyaml"),
         .files = &.{ "api.c", "reader.c", "scanner.c", "parser.c", "loader.c" },
-        .flags = &.{ "-std=c99", "-DYAML_DECLARE_STATIC", "-DYAML_VERSION_STRING=\"0.2.5\"", "-DYAML_VERSION_MAJOR=0", "-DYAML_VERSION_MINOR=2", "-DYAML_VERSION_PATCH=5" },
+        .flags = &.{ "-std=c99", "-D_POSIX_C_SOURCE=200809L", "-DYAML_DECLARE_STATIC", "-DYAML_VERSION_STRING=\"0.2.5\"", "-DYAML_VERSION_MAJOR=0", "-DYAML_VERSION_MINOR=2", "-DYAML_VERSION_PATCH=5" },
     });
 }
 
