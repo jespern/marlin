@@ -47,8 +47,12 @@ permission matrix. Their official binary has its own tools and permissions.
 The Marlin approval bar parks guest prompts as multiplexer UX — a session
 needs a human — rather than dispatching a Marlin tool. Claude Code uses the
 `cc_approval` bridge and its deliberately coarse `ccAutoAllow` heuristic.
-Codex app-server requests flow directly through the shared gate; root threads
-use its workspace-write sandbox, while plan/child threads are started
+Codex app-server requests flow directly through the shared gate. Root threads
+use `workspace-write` with `on-request` approvals in default mode; Full
+Permissions (`auto`) uses `danger-full-access` with `never` approvals so Git
+metadata writes are not trapped behind a sandbox that cannot ask for access.
+These settings are applied on both thread start and resume; a running guest
+adopts sandbox changes on its next Marlin turn. Plan/child threads always stay
 read-only with approvals disabled. The Codex subprocess also receives the
 scrubbed tool environment, so daemon-held provider keys cannot become agent
 shell environment. None of these are native `read_file` policy.

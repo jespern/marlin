@@ -27,6 +27,77 @@ test {
     std.testing.refAllDecls(codex_turn);
 }
 
+test "codex permission modes reach new and resumed threads" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const loop = @import("../loop.zig");
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-codex-permissions");
+    defer temp.deinit();
+    const script =
+        \\#!/bin/sh
+        \\read -r sandbox approval method < expected
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*) echo '{"id":1,"result":{}}' ;;
+        \\    *'"method":"account/read"'*) echo '{"id":2,"result":{"account":{"type":"chatgpt"}}}' ;;
+        \\    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+        \\      case "$line" in *\"method\":\"$method\"*) ;; *) exit 10 ;; esac
+        \\      case "$line" in *\"sandbox\":\"$sandbox\"*) ;; *) exit 11 ;; esac
+        \\      case "$line" in *\"approvalPolicy\":\"$approval\"*) ;; *) exit 12 ;; esac
+        \\      echo '{"id":3,"result":{"thread":{"id":"permissions-thread"}}}' ;;
+        \\    *'"method":"turn/start"'*)
+        \\      case "$line" in *\"approvalPolicy\":\"$approval\"*) ;; *) exit 13 ;; esac
+        \\      echo '{"id":4,"result":{"turn":{"id":"permissions-turn"}}}'
+        \\      echo '{"method":"item/completed","params":{"item":{"id":"reply","type":"agentMessage","text":"OK","phase":"final_answer"}}}'
+        \\      echo '{"method":"turn/completed","params":{"turn":{"id":"permissions-turn","status":"completed"}}}' ;;
+        \\  esac
+        \\done
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-codex" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+    const expected_path = try std.fs.path.join(gpa, &.{ temp.path, "expected" });
+    defer gpa.free(expected_path);
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(codex.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    // Exercise both fresh threads and permission changes on existing threads.
+    for ([_]loop.ToolProfile{ .full, .read_only, .plan }, 1..) |profile, session_id| {
+        try store.createSession(session_id, 0, temp.path, "codex/default", .auto);
+        var live = std.atomic.Value(u8).init(@intFromEnum(approval.Mode.auto));
+        const opts: loop.RunOpts = .{
+            .session_id = session_id,
+            .cwd = temp.path,
+            .endpoint = .{ .url = "", .bearer = null, .model = "default", .backend = .{ .guest = .codex } },
+            .cfg = config.defaults(),
+            .tool_environ = &env,
+            .tool_profile = profile,
+            .approval_mode = .default,
+            .approval_mode_live = &live,
+        };
+        for ([_]approval.Mode{ .auto, .default, .auto }, 0..) |mode, turn| {
+            live.store(@intFromEnum(mode), .release);
+            const expected = try std.fmt.allocPrint(gpa, "{s} {s} {s}\n", .{
+                if (profile != .full) "read-only" else if (mode == .auto) "danger-full-access" else "workspace-write",
+                if (profile != .full or mode == .auto) "never" else "on-request",
+                if (turn == 0) "thread/start" else "thread/resume",
+            });
+            defer gpa.free(expected);
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = expected });
+            const result = try loop.runTurn(gpa, io, &store, opts, "check permissions", &.{});
+            defer gpa.free(result.text);
+            try std.testing.expectEqualStrings("OK", result.text);
+        }
+    }
+}
+
 test "codex otel overrides stand down for an operator-configured collector" {
     const OtelGuest = @import("../loop.zig").OtelGuest;
     const guest: OtelGuest = .{

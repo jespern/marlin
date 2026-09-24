@@ -305,7 +305,11 @@ fn codexApprovalPolicy(opts: RunOpts) []const u8 {
 }
 
 fn codexSandbox(opts: RunOpts) []const u8 {
-    return if (opts.tool_profile == .full) "workspace-write" else "read-only";
+    // Full Permissions must lift both approval and filesystem restrictions:
+    // workspace-write protects .git even when approvals are set to never.
+    // Child/reviewer profiles stay read-only regardless of the session mode.
+    if (opts.tool_profile != .full) return "read-only";
+    return if (effectiveApprovalMode(opts) == .auto) "danger-full-access" else "workspace-write";
 }
 
 fn codexModel(opts: RunOpts) ?[]const u8 {
