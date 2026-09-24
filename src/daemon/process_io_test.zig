@@ -122,8 +122,16 @@ test "fixture cleanup removes an escaped process group after an early test failu
     try std.testing.expect(pid > 1);
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
+        // EPERM also means gone. Darwin refuses to signal a group it cannot
+        // signal in full, and a member that has been killed but not yet reaped
+        // has already released its credentials, so the group answers EPERM for
+        // as long as the orphaned fixture waits on launchd to reap it. That
+        // window is invisible on an idle machine and wide open under a loaded
+        // one, which is why this only ever failed in CI. A fixture that really
+        // survived is our own live process: it answers the probe, and the loop
+        // runs out of attempts below.
         std.posix.kill(-pid, .CONT) catch |err| switch (err) {
-            error.ProcessNotFound => return,
+            error.ProcessNotFound, error.PermissionDenied => return,
             else => return err,
         };
         try io.sleep(.fromMilliseconds(10), .awake);
