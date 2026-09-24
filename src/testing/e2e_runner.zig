@@ -145,6 +145,10 @@ const Check = struct {
     mcp_script: ?[]const u8 = null,
     hook_output_contains: ?[]const u8 = null,
     session_handle_flow: bool = false,
+    recap_contains: ?[]const u8 = null,
+    git_status_flow: bool = false,
+    skill_invocation_flow: bool = false,
+    plugin_flow: bool = false,
     /// Direct socket regression: approval publication, reconnect replay,
     /// steering while parked, and reboot refusal are one state-machine flow.
     approval_reconnect_flow: bool = false,
@@ -260,6 +264,24 @@ fn runScenario(
     if (sf.check.image_fixture) {
         const image_path = try std.fs.path.join(arena, &.{ state_dir, "tiny.gif" });
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "GIF89aMARLIN" });
+    }
+
+    if (sf.check.skill_invocation_flow) {
+        const skill_dir = try std.fs.path.join(arena, &.{ state_dir, ".marlin", "skills", "review" });
+        try Io.Dir.cwd().createDirPath(io, skill_dir);
+        const skill_path = try std.fs.path.join(arena, &.{ skill_dir, "SKILL.md" });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = skill_path, .data = "---\nname: review\ndescription: >-\n  Review a target\n  with project conventions.\nmetadata:\n  name: nested-name-is-not-a-skill\n---\nSKILL_BODY_MARKER: inspect $ARGUMENTS[0] with $1.\nRead references/guide.md for details.\n" });
+        const reference_dir = try std.fs.path.join(arena, &.{ skill_dir, "references" });
+        try Io.Dir.cwd().createDirPath(io, reference_dir);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ reference_dir, "guide.md" }), .data = "BUNDLED_REFERENCE_MARKER: keep checks focused." });
+        const user_skill_dir = try std.fs.path.join(arena, &.{ state_dir, ".config", "marlin", "skills", "review" });
+        try Io.Dir.cwd().createDirPath(io, user_skill_dir);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ user_skill_dir, "SKILL.md" }), .data = "---\nname: review\ndescription: SHADOWED_USER_DESCRIPTION\n---\nSHADOWED_USER_BODY\n" });
+        const shared_dir = try std.fs.path.join(arena, &.{ state_dir, ".agents", "skills", "shared" });
+        try Io.Dir.cwd().createDirPath(io, shared_dir);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ shared_dir, "SKILL.md" }), .data = "---\nname: shared\ndescription: SHARED_SKILL_DESCRIPTION\n---\nUNLOADED_SHARED_BODY\n" });
+        const agent_path = try std.fs.path.join(arena, &.{ state_dir, "AGENT.md" });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = agent_path, .data = "AGENT_STARTUP_MARKER: follow project conventions." });
     }
 
     // 1. Spawn the fake provider; read PORT line.
@@ -464,6 +486,11 @@ fn runScenario(
             return error.HookOutputMissing;
         }
     }
+
+    if (sf.check.recap_contains) |expected| try checkRecap(gpa, io, &env, expected);
+    if (sf.check.git_status_flow) try checkGitStatus(gpa, io, &env, state_dir);
+    if (sf.check.skill_invocation_flow) try checkSkillInvocation(gpa, io, &env, state_dir);
+    if (sf.check.plugin_flow) try checkPlugins(gpa, io, &env, state_dir, marlin_bin);
 
     // 4. Fake provider must have consumed all steps and validated them.
     const prov_term = waitProvider(io, &prov) catch |err| {
@@ -1059,6 +1086,277 @@ fn checkApprovalReconnectFlow(
             return error.WrongDaemonError;
         if (uintField(daemon_err, "request_id") != 103) return error.InputAckMismatch;
         break;
+    }
+}
+
+fn checkSkillInvocation(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {
+    const conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try conn.send(.{ .session_list = .{ .include_archived = false } });
+    const listing = try recvTagBounded(conn, arena, "session_list_result");
+    const sessions = listing.get("sessions") orelse return error.SessionIdMissing;
+    if (sessions != .array or sessions.array.items.len != 1) return error.SessionIdMissing;
+    const sid = uintField(sessions.array.items[0].object, "sid") orelse return error.SessionIdMissing;
+    try conn.send(.{ .input = .{
+        .sid = sid,
+        .text = "/missing",
+        .skill = .{ .name = "missing" },
+        .request_id = 201,
+    } });
+    const rejected = try recvTagBounded(conn, arena, "err");
+    if (uintField(rejected, "request_id") != 201 or
+        !std.mem.eql(u8, stringField(rejected, "code") orelse "", "skill")) return error.SkillRejectionMismatch;
+
+    try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+    _ = try recvTagBounded(conn, arena, "status");
+    const invocation = "/review 'parser module' tests";
+    try conn.send(.{ .input = .{
+        .sid = sid,
+        .text = invocation,
+        .skill = .{ .name = "review", .arguments = "'parser module' tests" },
+        .request_id = 202,
+    } });
+    var saw_skill = false;
+    var saw_ack = false;
+    var completed = false;
+    while (!completed or !saw_ack) {
+        const msg = try recvBounded(conn, arena);
+        if (tagObject(msg, "err")) |daemon_err| {
+            reportDaemonError(io, daemon_err);
+            return error.UnexpectedDaemonError;
+        }
+        if (tagObject(msg, "ok")) |ok| {
+            if (uintField(ok, "request_id") == 202) saw_ack = true;
+        }
+        if (tagObject(msg, "blk")) |outer| {
+            const b = objectField(outer, "b") orelse return error.BlockMissing;
+            const body = objectField(b, "body") orelse return error.BlockMissing;
+            if (objectField(body, "user_msg")) |user| {
+                if (std.mem.eql(u8, stringField(user, "display_text") orelse "", invocation)) {
+                    const text = stringField(user, "text") orelse return error.SkillBodyMissing;
+                    if (std.mem.indexOf(u8, text, "SKILL_BODY_MARKER: inspect parser module with tests.") == null or
+                        std.mem.indexOf(u8, text, "Base directory for relative skill resources:") == null) return error.SkillBodyMissing;
+                    saw_skill = true;
+                }
+            }
+        }
+        if (tagObject(msg, "status")) |status| {
+            const state = stringField(status, "state") orelse "";
+            if (std.mem.eql(u8, state, "err")) return error.SkillTurnFailed;
+            if (std.mem.eql(u8, state, "idle")) completed = true;
+        }
+    }
+    if (!saw_skill) return error.SkillBodyMissing;
+    // Instructions are re-read for the next turn; the earlier rendered
+    // skill remains in context even when this input is ordinary prose.
+    const agent_path = try std.fs.path.join(arena, &.{ cwd, "AGENT.md" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = agent_path, .data = "AGENT_EDIT_MARKER: updated project conventions." });
+    try conn.send(.{ .input = .{ .sid = sid, .text = "follow up with the loaded skill", .request_id = 203 } });
+    _ = try recvTagBounded(conn, arena, "ok");
+    while (true) {
+        const status = try recvTagBounded(conn, arena, "status");
+        const state = stringField(status, "state") orelse "";
+        if (std.mem.eql(u8, state, "err")) return error.SkillTurnFailed;
+        if (std.mem.eql(u8, state, "idle")) break;
+    }
+}
+
+fn checkPlugins(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, marlin_bin: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const repo = try std.fs.path.join(arena, &.{ cwd, "marketplace" });
+    const files = .{
+        .{ ".claude-plugin/marketplace.json", "{\"name\":\"fixture-market\",\"plugins\":[{\"name\":\"demo\",\"source\":\"./plugins/demo\"},{\"name\":\"unsupported\",\"source\":\"./plugins/unsupported\"}]}" },
+        .{ "plugins/demo/.claude-plugin/plugin.json", "{\"name\":\"demo\",\"version\":\"1.0.0\"}" },
+        .{ "plugins/demo/skills/review/SKILL.md", "---\nname: review\ndescription: Review a target with the plugin\n---\nPLUGIN_COMMAND_BODY: $ARGUMENTS.\n" },
+        .{ "plugins/unsupported/.claude-plugin/plugin.json", "{\"name\":\"unsupported\",\"hooks\":{}}" },
+    };
+    inline for (files) |file| {
+        const path = try std.fs.path.join(arena, &.{ repo, file[0] });
+        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = file[1] });
+    }
+    const git_commands = [_][]const []const u8{
+        &.{ "git", "init" },                                                                                                                                                           &.{ "git", "add", "." },
+        &.{ "git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-m", "fixture" },
+    };
+    for (git_commands) |argv| {
+        const result = try process_io.run(gpa, io, .{ .argv = argv, .cwd = .{ .path = repo }, .environ_map = env, .timeout_ms = helper_timeout_ms });
+        defer result.deinit(gpa);
+        if (result.term != .exited or result.term.exited != 0) return error.GitFixtureFailed;
+    }
+    const commands = [_]struct { args: []const []const u8, ok: bool = true, contains: []const u8 }{
+        .{ .args = &.{ "marketplace", "add", "./marketplace" }, .contains = "Added marketplace fixture-market" },
+        .{ .args = &.{ "install", "unsupported@fixture-market" }, .ok = false, .contains = "Only skill-only plugins" },
+        .{ .args = &.{ "install", "demo@fixture-market" }, .contains = "Installed demo@fixture-market" },
+        .{ .args = &.{"list"}, .contains = "demo@fixture-market" },
+    };
+    for (commands) |command| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ marlin_bin, "plugin" });
+        try argv.appendSlice(arena, command.args);
+        const result = try process_io.run(gpa, io, .{ .argv = argv.items, .cwd = .{ .path = cwd }, .environ_map = env, .timeout_ms = helper_timeout_ms });
+        defer result.deinit(gpa);
+        if (result.term != .exited or (result.term.exited == 0) != command.ok or
+            std.mem.indexOf(u8, if (command.ok) result.stdout else result.stderr, command.contains) == null)
+        {
+            print(io, "plugin CLI failed: {s} {s}\n", .{ result.stdout, result.stderr });
+            return error.PluginCommandFailed;
+        }
+    }
+    const conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    try conn.send(.{ .session_list = .{ .include_archived = false } });
+    const listing = try recvTagBounded(conn, arena, "session_list_result");
+    const sessions = listing.get("sessions") orelse return error.SessionIdMissing;
+    if (sessions != .array or sessions.array.items.len != 1) return error.SessionIdMissing;
+    const sid = uintField(sessions.array.items[0].object, "sid") orelse return error.SessionIdMissing;
+    try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+    const legacy_status = try recvBounded(conn, arena);
+    if (tagObject(legacy_status, "status") == null) return error.UnexpectedSkillCatalog;
+    try conn.send(.{ .sub = .{ .sid = sid, .skill_catalog = true } });
+    const catalog = try recvTagBounded(conn, arena, "session_skills");
+    try expectSkillCatalog(catalog, sid, &.{"demo:review"});
+    _ = try recvTagBounded(conn, arena, "status");
+    try conn.send(.{ .input = .{ .sid = sid, .text = "/demo:review the parser", .skill = .{ .name = "demo:review", .arguments = "the parser" }, .request_id = 301 } });
+    var saw_input = false;
+    while (true) {
+        const msg = try recvBounded(conn, arena);
+        if (tagObject(msg, "err")) |_| return error.PluginInvocationFailed;
+        if (tagObject(msg, "blk")) |outer| {
+            const body = objectField(objectField(outer, "b") orelse continue, "body") orelse continue;
+            if (objectField(body, "user_msg")) |user| {
+                if (std.mem.eql(u8, stringField(user, "display_text") orelse "", "/demo:review the parser") and
+                    std.mem.indexOf(u8, stringField(user, "text") orelse "", "PLUGIN_COMMAND_BODY: the parser.") != null) saw_input = true;
+            }
+        }
+        if (tagObject(msg, "status")) |status| {
+            const state = stringField(status, "state") orelse "";
+            if (std.mem.eql(u8, state, "err")) return error.PluginInvocationFailed;
+            if (std.mem.eql(u8, state, "idle")) break;
+        }
+    }
+    if (!saw_input) return error.PluginInvocationFailed;
+    try conn.send(.{ .plugin = .{ .sid = sid, .command = .{ .action = .uninstall, .argument = "demo@fixture-market" } } });
+    const removed = try recvTagBounded(conn, arena, "plugin_result");
+    if (removed.get("ok") == null or removed.get("ok").? != .bool or !removed.get("ok").?.bool) return error.PluginCommandFailed;
+    const empty_catalog = try recvTagBounded(conn, arena, "session_skills");
+    try expectSkillCatalog(empty_catalog, sid, &.{});
+    try conn.send(.{ .input = .{ .sid = sid, .text = "/demo:review", .skill = .{ .name = "demo:review" }, .request_id = 302 } });
+    const rejected = try recvTagBounded(conn, arena, "err");
+    if (uintField(rejected, "request_id") != 302) return error.PluginInvocationFailed;
+    const reinstalled = try process_io.run(gpa, io, .{
+        .argv = &.{ marlin_bin, "plugin", "install", "demo@fixture-market" },
+        .cwd = .{ .path = cwd },
+        .environ_map = env,
+        .timeout_ms = helper_timeout_ms,
+    });
+    defer reinstalled.deinit(gpa);
+    if (reinstalled.term != .exited or reinstalled.term.exited != 0) return error.PluginCommandFailed;
+    try expectSkillCatalog(try recvTagBounded(conn, arena, "session_skills"), sid, &.{"demo:review"});
+    const project = try std.fs.path.join(arena, &.{ cwd, "completion-project" });
+    const skill_dir = try std.fs.path.join(arena, &.{ project, ".agents", "skills", "local-review" });
+    try Io.Dir.cwd().createDirPath(io, skill_dir);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ skill_dir, "SKILL.md" }),
+        .data = "---\nname: local-review\ndescription: Project review\n---\nReview locally.\n",
+    });
+    try conn.send(.{ .session_set_cwd = .{ .sid = sid, .cwd = project } });
+    const project_catalog = try recvTagBounded(conn, arena, "session_skills");
+    try expectSkillCatalog(project_catalog, sid, &.{ "demo:review", "local-review" });
+    const canonical_project = try Io.Dir.cwd().realPathFileAlloc(io, project, arena);
+    if (!std.mem.eql(u8, stringField(project_catalog, "cwd") orelse "", canonical_project)) return error.SkillCatalogWrongCwd;
+}
+
+fn expectSkillCatalog(catalog: std.json.ObjectMap, sid: u64, expected: []const []const u8) !void {
+    if (uintField(catalog, "sid") != sid) return error.SkillCatalogWrongSession;
+    const skills = catalog.get("skills") orelse return error.SkillCatalogMissing;
+    if (skills != .array or skills.array.items.len != expected.len) return error.SkillCatalogMismatch;
+    for (expected) |name| {
+        var found = false;
+        for (skills.array.items) |entry| {
+            if (entry != .object) return error.SkillCatalogMismatch;
+            if (std.mem.eql(u8, stringField(entry.object, "name") orelse "", name)) {
+                found = true;
+                const description: []const u8 = stringField(entry.object, "description") orelse "";
+                if (description.len == 0) return error.SkillCatalogMissingDescription;
+                if (entry.object.get("content") != null or entry.object.get("path") != null) return error.SkillCatalogLeakedContent;
+            }
+        }
+        if (!found) return error.SkillCatalogMismatch;
+    }
+}
+
+fn checkGitStatus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {
+    const conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try conn.send(.{ .session_list = .{ .include_archived = false } });
+    const listing = try recvTagBounded(conn, arena, "session_list_result");
+    const sessions = listing.get("sessions") orelse return error.SessionIdMissing;
+    if (sessions != .array or sessions.array.items.len != 1) return error.SessionIdMissing;
+    const sid = uintField(sessions.array.items[0].object, "sid") orelse return error.SessionIdMissing;
+    try conn.send(.{ .session_git_status = .{ .sid = sid } });
+    const absent = try recvTagBounded(conn, arena, "session_git_status");
+    const absent_branch: []const u8 = stringField(absent, "branch") orelse return error.GitBranchMissing;
+    if (absent_branch.len != 0) return error.UnexpectedGitBranch;
+    const commands = [_][]const []const u8{
+        &.{ "git", "init", "--initial-branch=status-test" },
+        &.{ "git", "-c", "user.name=Status Test", "-c", "user.email=status@example.test", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "base" },
+        &.{ "git", "update-ref", "refs/remotes/origin/status-test", "HEAD" },
+    };
+    for (commands) |argv| {
+        const result = try process_io.run(gpa, io, .{ .argv = argv, .cwd = .{ .path = cwd }, .environ_map = env, .timeout_ms = helper_timeout_ms });
+        defer result.deinit(gpa);
+        if (result.term != .exited or result.term.exited != 0) return error.GitFixtureFailed;
+    }
+    // Negative cache expires too: initializing a repo in the same cwd appears.
+    try io.sleep(.fromMilliseconds(5_100), .awake);
+    for (0..3) |attempt| {
+        // Exercise both the TTL cache and the metadata cache after TTL expiry.
+        if (attempt == 2) try io.sleep(.fromMilliseconds(5_100), .awake);
+        try conn.send(.{ .session_git_status = .{ .sid = sid } });
+        const result = try recvTagBounded(conn, arena, "session_git_status");
+        if (!std.mem.eql(u8, stringField(result, "branch") orelse "", "status-test")) return error.GitBranchMissing;
+        if (uintField(result, "sid") != sid) return error.SessionIdMissing;
+        const counts = result.get("counts") orelse return error.GitCountsMissing;
+        if (counts != .object or uintField(counts.object, "ahead") != 0 or uintField(counts.object, "behind") != 0) return error.GitCountsMissing;
+    }
+}
+
+fn checkRecap(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, expected: []const u8) !void {
+    const conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try conn.send(.{ .session_list = .{ .include_archived = false } });
+    const listing = try recvTagBounded(conn, arena, "session_list_result");
+    const sessions = listing.get("sessions") orelse return error.SessionIdMissing;
+    if (sessions != .array or sessions.array.items.len != 1) return error.SessionIdMissing;
+    const sid = uintField(sessions.array.items[0].object, "sid") orelse return error.SessionIdMissing;
+    try conn.send(.{ .sub = .{ .sid = sid, .tail_limit = 1 } });
+    const replay = try recvTagBounded(conn, arena, "replay_done");
+    const seq = uintField(replay, "newest_seq") orelse return error.TailReplayMarkerMissing;
+    try conn.send(.{ .session_recap = .{ .sid = sid, .seq = seq - 1 } });
+    const stale = try recvTagBounded(conn, arena, "session_recap");
+    const stale_text: []const u8 = stringField(stale, "text") orelse "";
+    if (stale_text.len != 0) return error.StaleRecapAccepted;
+    // Only the first request may contact the provider. The second reads the
+    // cache even though the scripted provider has already consumed its steps.
+    for (0..2) |_| {
+        try conn.send(.{ .session_recap = .{ .sid = sid, .seq = seq } });
+        const result = try recvTagBounded(conn, arena, "session_recap");
+        const text = stringField(result, "text") orelse return error.RecapMissing;
+        if (std.mem.indexOf(u8, text, expected) == null) return error.RecapMissing;
+        const generated = result.get("generated") orelse return error.RecapMissing;
+        if (generated != .bool or !generated.bool) return error.RecapNotGenerated;
     }
 }
 

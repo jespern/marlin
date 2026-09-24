@@ -319,8 +319,8 @@ Sequence:
    exits there would be nobody left to answer it. `/reboot --force` interrupts
    instead: finalized blocks are truth, partial delta
    buffers are discardable; interrupted sessions get a `system_note`
-   ("interrupted by reboot") and resume with `--continue`. Running
-   background bash tasks are listed for confirmation (they get orphaned).
+   ("interrupted by reboot") and resume with `--continue`. Native bash has
+   no managed background jobs to carry across a reboot.
 3. **Daemon exit.** Persist, stop accepting clients, unlink the public socket,
    then ACK and exit. Removing the socket before the ACK makes the client-side
    exec a clean handoff rather than a race with a dying listener. For a local
@@ -659,6 +659,13 @@ loop:
   a Result, not an error: everything captured before the deadline reaches
   the model with a note naming the limit, so a timed-out build is
   debuggable instead of a blank failure.
+- **Foreground shell execution**: native bash has no background-job API,
+  persistent shell sessions, or later completion notifications. The system
+  prompt and tool description direct models to one-shot commands or bounded
+  foreground polling, and prohibit persistent watchers and detached work.
+  Persistent dev servers/watchers belong in a user-managed terminal. This is
+  model guidance, not a shell-syntax enforcement layer; guest agents use their
+  vendor harness's tools and instructions.
 - **Graceful SIGTERM/SIGINT**: a self-pipe watcher thread turns the signal
   into the ordinary `.shutdown` dispatcher event — socket removed, store
   closed — the same path `/quit` and reboot use. (SIGHUP stays ignored so
@@ -841,7 +848,7 @@ to configured favorites when neither source is available.
 Context for each request is **derived** from the block log at turn start:
 
 ```
-[system prompt]  (stable per session: base + skills index + pinned context)
+[system prompt]  (base + turn-local skills catalog + pinned context)
 [compaction summaries, oldest first]      // from compaction blocks
 [stable blocks before this turn]
 [current environment]                     // volatile; inserted late
@@ -1035,10 +1042,82 @@ secret IMMORTAL):
   → run script with JSON event on stdin. This is the notification story
   (ntfy/Telegram/say) without a gateway in the core.
 
-**Skills** (v1, because it's cheap and high-value): markdown files with YAML
-frontmatter in `~/.config/marlin/skills/`; index (name + one-line description)
-injected into the system prompt; `skill` tool loads full content on demand.
-Compatible with the emerging cross-tool skills convention.
+**Skills** use the [Agent Skills format](https://agentskills.io/specification).
+The daemon indexes configured user roots (default: `$XDG_CONFIG_HOME/marlin/skills`
+or `~/.config/marlin/skills`, then `~/.agents/skills`). Native turns build an
+immutable catalog for their session cwd: `.marlin/skills` first, then
+`.agents/skills`, then user skills and namespaced installed plugin skills. The first occurrence of a name wins;
+collisions are logged. Project discovery runs per turn, so cwd changes and
+project edits cannot contaminate another session's catalog. User catalogs are
+refreshed with the extension runtime (`/mcp reload`). No ancestor walk occurs.
+
+Discovery follows symlinked directories, deduplicates canonical directory
+paths, skips `.git`/`node_modules`/`__pycache__`, and is bounded by six nested
+levels, 2,000 directories, and 10,000 directory entries. A directory containing
+`SKILL.md` is a bundle boundary: its resource files are not scanned for skills.
+Legacy flat Markdown skills are accepted only directly in a configured/root
+skills directory (excluding `README.md`). Files are capped at 1 MiB and YAML
+frontmatter at 64 KiB. Vendored LibYAML parses scalars and nested mappings;
+no constructors are executed. Unusable metadata is skipped with a diagnostic;
+name/directory mismatches are tolerated with a warning for interoperability.
+
+The native system prompt includes only names/descriptions. A read-only `skill`
+tool, registered only when the turn has skills, accepts a name enum from that
+catalog and returns the instructions, original metadata, source path, and base
+directory. Optional fields are retained, including experimental `allowed-tools`,
+which does not modify approval policy. Bundled resources are accessed on demand
+through normal file/shell tools. The catalog tells the model to reactivate a
+skill if its instructions have been removed by compaction.
+
+Explicit `/name [arguments]` sends structured skill metadata on `input`; the
+daemon resolves it with the same cwd/user precedence before starting a turn or
+accepting a steer. Unknown names produce correlated input errors without a
+provider call. `$ARGUMENTS`, `$ARGUMENTS[N]`, and `$N` are substituted once
+(zero-based positional arguments, with quoting); otherwise arguments are
+appended. Model-driven activation leaves body variables intact. No template
+shell commands are executed. Full rendered text is persisted as model input;
+optional `display_text` retains the original slash invocation for TUI rendering
+and history, including after replay. Guest adapters receive explicitly invoked
+skills through their normal input path; guest automatic discovery remains the
+guest harness's responsibility. Client-specific execution frontmatter is not
+interpreted.
+
+The TUI opts into `session_skills` snapshots on subscription. The daemon uses
+that session's same project/user/plugin catalog and sends only names and
+descriptions. Attach, cwd changes, successful plugin operations, and extension
+reload refresh subscribed clients. The per-view cache powers slash-prefix
+completion without filesystem or network work on keystrokes. Built-ins retain
+precedence; skill selection inserts the name plus a space for arguments and
+requires a subsequent Enter to invoke. Cached entries only apply to their
+reported cwd, including when switching sessions or attaching over SSH.
+
+**Skill-only plugins** (`daemon/plugins.zig`) import Claude marketplace catalogs
+using `.claude-plugin/marketplace.json`. Only relative in-repository plugin
+sources and the default `skills/` layout are accepted. Semantic manifest fields
+for unsupported components, conventional hooks/agents/commands/MCP/LSP files,
+and paths or symlinks escaping the plugin boundary are rejected. No plugin
+installation scripts run. Git operations use existing credentials, disable
+terminal prompting and hooks, and have a 60-second cancellation-aware timeout.
+
+`/plugin` and `marlin plugin` send the same daemon request. A single worker
+serializes commands without blocking the dispatcher; shutdown cancels and joins
+it before draining events. The worker alone writes `plugins/registry.json`,
+using atomic replacement after validating the prospective snapshot. Marketplace
+updates clone to a new snapshot and validate every installed plugin before
+publishing any change. Failed operations preserve the previous registry.
+
+Each native turn or slash invocation reads the committed installed-plugin list
+while building its private skill index. Installed names are prefixed with the
+plugin name; a second marketplace cannot install that same namespace. The
+extension runtime itself is not mutated and MCP processes are not restarted.
+Old snapshots remain on disk across update/uninstall so active turns and stored
+resource references stay valid. Cache garbage collection and background update
+polling are deliberately absent. Guest activation is explicit through Marlin's
+slash-command path; automatic guest catalogs remain owned by the guest harness.
+
+Native turns load the first nonempty readable `MARLIN.md`, `AGENTS.md`, or
+`AGENT.md` in the session cwd before provider context assembly. Files are read
+each turn so edits and working-directory changes apply to the next request.
 
 ## 8. TUI client
 
@@ -1356,6 +1435,21 @@ A split pane identifies its session with a compact pane label.
 - Tool blocks render collapsed by default (name + one-line summary + status),
   expand on demand. Approvals render as inline prompt cards.
 
+### Idle session recaps
+
+Idle recaps: the TUI requests a recap after three minutes without transcript
+changes or user input following turn completion. A bounded daemon worker makes
+one tool-free summarization request, using the compaction model or a native
+session/default model. Recaps are cached by session and transcript sequence
+(up to 64 entries per daemon lifetime), kept outside the block log and model
+context, and discarded if work resumes before the result arrives. Provider
+failure or unavailable native credentials falls back to a labeled last-exchange
+excerpt. Recaps appear as local transcript notes and remain in scrollback when
+the next turn starts. Escape retains its normal Vim behavior. Old daemons
+do not advertise the `session_recaps` handshake capability, so new clients do
+not request recaps from them. Background sessions are checked when focused;
+closed clients do not schedule recap requests.
+
 ### Image / asset paste
 
 **Status: image input shipped.** Bracketed paste is text-only, so complex
@@ -1461,7 +1555,7 @@ readonly_tools = ["snapshot"]  # exact remote tool-name overrides
 mutating_tools = ["click"]     # wins over annotation/default
 
 [skills]
-directories = ["~/.config/marlin/skills"]
+directories = ["~/.config/marlin/skills", "~/.agents/skills"]
 
 [hooks]
 on_approval_needed = "~/.config/marlin/hooks/notify.sh"

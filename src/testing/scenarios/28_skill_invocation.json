@@ -1,0 +1,103 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "bootstrap skill invocation",
+        "AGENT_STARTUP_MARKER",
+        "review: Review a target with project conventions.",
+        "shared: SHARED_SKILL_DESCRIPTION",
+        "\"name\":\"skill\""
+      ],
+      "expect_not_contains": [
+        "SKILL_BODY_MARKER",
+        "SHADOWED_USER_DESCRIPTION",
+        "SHADOWED_USER_BODY",
+        "UNLOADED_SHARED_BODY",
+        "BUNDLED_REFERENCE_MARKER"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"activate_review\", \"function\": {\"name\": \"skill\", \"arguments\": \"{\\\"name\\\": \\\"review\\\"}\"}}]}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 30, \"completion_tokens\": 5}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "SKILL_BODY_MARKER: inspect $ARGUMENTS[0] with $1.",
+        "Base directory for relative skill resources:",
+        ".marlin/skills/review",
+        "Read references/guide.md"
+      ],
+      "expect_not_contains": [
+        "BUNDLED_REFERENCE_MARKER",
+        "SHADOWED_USER_BODY"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"read_reference\", \"function\": {\"name\": \"read_file\", \"arguments\": \"{\\\"path\\\": \\\".marlin/skills/review/references/guide.md\\\"}\"}}]}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 30, \"completion_tokens\": 5}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "bootstrap skill invocation",
+        "AGENT_STARTUP_MARKER",
+        "BUNDLED_REFERENCE_MARKER"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"content\": \"ready\"}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 30, \"completion_tokens\": 4}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "SKILL_BODY_MARKER: inspect parser module with tests.",
+        "AGENT_STARTUP_MARKER",
+        "Base directory for relative skill resources:"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"content\": \"skill completed\"}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 30, \"completion_tokens\": 4}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "follow up with the loaded skill",
+        "SKILL_BODY_MARKER: inspect parser module with tests.",
+        "AGENT_EDIT_MARKER"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"content\": \"followup completed\"}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 30, \"completion_tokens\": 4}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": [
+      "run",
+      "--quiet",
+      "--model",
+      "local/testing",
+      "bootstrap skill invocation"
+    ],
+    "stdout_contains": [
+      "ready"
+    ],
+    "skill_invocation_flow": true,
+    "db_kinds": [
+      "user_msg",
+      "tool_call",
+      "tool_result",
+      "tool_call",
+      "tool_result",
+      "assistant_msg",
+      "user_msg",
+      "assistant_msg",
+      "user_msg",
+      "assistant_msg"
+    ]
+  }
+}

@@ -53,6 +53,8 @@ const store_mod = @import("store.zig");
 const power = @import("power.zig");
 const loop = @import("loop.zig");
 const context = @import("context.zig");
+const recap = @import("recap.zig");
+const recap_limits = @import("../core/recap.zig");
 const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
 const sandbox = @import("sandbox.zig");
@@ -65,6 +67,7 @@ const codex = @import("provider/codex.zig");
 const guest_models = @import("guest_models.zig");
 const http = @import("provider/http.zig");
 const process_io = @import("process_io.zig");
+const plugins = @import("plugins.zig");
 const task_tool = @import("tools/task.zig");
 const tools_registry = @import("tools/registry.zig");
 
@@ -118,6 +121,27 @@ const CatalogModel = struct {
     tiered: bool = false,
 };
 
+const git_status = @import("git_status.zig");
+const GitResult = struct { client_id: u64, sid: u64, cwd: []u8, snapshot: git_status.Snapshot, at_ms: i64 };
+
+const PluginJob = struct {
+    daemon: *Daemon,
+    client_id: u64,
+    command: plugins.Command,
+    cwd: []u8,
+    result: plugins.Result = undefined,
+
+    fn deinit(self: *PluginJob) void {
+        const gpa = self.daemon.gpa;
+        gpa.free(self.command.argument);
+        gpa.free(self.cwd);
+        gpa.free(self.result.message);
+        gpa.destroy(self);
+    }
+};
+
+const RecapResult = struct { client_id: u64, sid: u64, seq: u64, text: []u8, generated: bool };
+
 /// Everything that flows into the dispatcher.
 const Event = union(enum) {
     client_msg: struct { client_id: u64, msg_line: []u8 }, // raw NDJSON from client
@@ -134,6 +158,9 @@ const Event = union(enum) {
     /// Model catalog fetched by a worker thread (registry-form ids plus
     /// normalized pricing; id allocations are dispatcher-owned on receipt).
     catalog_ready: struct { client_id: u64, models: []CatalogModel, err: ?anyerror = null },
+    recap_ready: RecapResult,
+    git_ready: *GitResult,
+    plugin_ready: *PluginJob,
     /// Turn thread → dispatcher completion. final_text and err_text are
     /// separately owned because child task results serialize both fields.
     turn_done: struct { sid: u64, interrupted: bool, round_budget_reached: bool, err_text: ?[]u8, final_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
@@ -160,6 +187,7 @@ const Client = struct {
     subs: std.ArrayList(u64) = .empty, // subscribed session ids
     said_hello: bool = false,
     lifecycle_events: bool = false,
+    skill_catalog: bool = false,
     /// Receives refreshed session-list snapshots without subscribing to every
     /// session's block stream (M4 multiplexer/background activity contract).
     watches_sessions: bool = false,
@@ -296,7 +324,7 @@ const Session = struct {
     /// Last estimated assembled context size (tokens), for status display.
     context_used: std.atomic.Value(u64) = .init(0),
     /// Queued mid-turn steer texts (gpa-owned), drained by poll_steer.
-    steer_queue: std.ArrayList([]u8) = .empty,
+    steer_queue: std.ArrayList(block.Input) = .empty,
     /// Guarded by steer_mutex. A turn closes this atomically with observing
     /// an empty queue, so dispatcher input can never be acknowledged into the
     /// final-poll/turn-done gap. Compact and handover operations leave it off.
@@ -406,6 +434,14 @@ pub const Daemon = struct {
     catalog_fetching: bool = false,
     catalog_cancel: std.atomic.Value(bool) = .init(false),
     catalog_thread: ?std.Thread = null,
+    plugin_thread: ?std.Thread = null,
+    plugin_cancel: std.atomic.Value(bool) = .init(false),
+    git_thread: ?std.Thread = null,
+    git_cancel: std.atomic.Value(bool) = .init(false),
+    git_cache: std.ArrayList(GitResult) = .empty,
+    recap_thread: ?std.Thread = null,
+    recap_cancel: std.atomic.Value(bool) = .init(false),
+    recap_cache: std.ArrayList(RecapResult) = .empty,
 
     const catalog_ttl_ms: i64 = 60 * 60 * 1000; // 1h
 
@@ -1011,6 +1047,56 @@ pub const Daemon = struct {
                     self.sendCatalog(client);
                 }
             },
+            .plugin_ready => |job| {
+                if (self.plugin_thread) |thread| thread.join();
+                self.plugin_thread = null;
+                defer job.deinit();
+                if (self.lookupClient(job.client_id)) |client|
+                    self.sendTo(client, .{ .plugin_result = .{ .ok = job.result.ok, .message = job.result.message } });
+                if (job.result.ok) self.refreshSkillCatalogs();
+            },
+            .git_ready => |result| {
+                defer self.gpa.destroy(result);
+                if (self.git_thread) |thread| thread.join();
+                self.git_thread = null;
+                if (self.lookupClient(result.client_id)) |client| self.sendGitStatus(client, result.sid, result.*);
+                for (self.git_cache.items, 0..) |cached, i| {
+                    if (std.mem.eql(u8, cached.cwd, result.cwd)) {
+                        self.gpa.free(self.git_cache.swapRemove(i).cwd);
+                        break;
+                    }
+                }
+                if (self.git_cache.items.len >= 32) self.gpa.free(self.git_cache.orderedRemove(0).cwd);
+                self.git_cache.append(self.gpa, result.*) catch self.gpa.free(result.cwd);
+            },
+            .recap_ready => |result| {
+                if (self.recap_thread) |thread| thread.join();
+                self.recap_thread = null;
+                const session = self.sessions.get(result.sid);
+                const current = (self.store.lastSeq(result.sid) catch 0) == result.seq and
+                    (session == null or (session.?.state != .running and session.?.state != .awaiting_approval and !session.?.archived));
+                if (!current) {
+                    self.gpa.free(result.text);
+                    if (self.lookupClient(result.client_id)) |client| self.sendTo(client, .{ .session_recap = .{ .sid = result.sid, .seq = result.seq } });
+                    return;
+                }
+                if (self.lookupClient(result.client_id)) |client| self.sendTo(client, .{ .session_recap = .{
+                    .sid = result.sid,
+                    .seq = result.seq,
+                    .text = result.text,
+                    .generated = result.generated,
+                } });
+                // Bounded daemon-lifetime cache, keyed by transcript frontier.
+                // It is UI metadata and never becomes conversation context.
+                var i: usize = 0;
+                while (i < self.recap_cache.items.len) {
+                    if (self.recap_cache.items[i].sid == result.sid) {
+                        self.gpa.free(self.recap_cache.swapRemove(i).text);
+                    } else i += 1;
+                }
+                if (self.recap_cache.items.len >= 64) self.gpa.free(self.recap_cache.orderedRemove(0).text);
+                self.recap_cache.append(self.gpa, result) catch self.gpa.free(result.text);
+            },
             .turn_done => |td| {
                 defer if (td.err_text) |t| self.gpa.free(t);
                 defer if (td.final_text) |t| self.gpa.free(t);
@@ -1224,6 +1310,8 @@ pub const Daemon = struct {
                     .proto_version = proto.proto_version,
                     .daemon_version = daemon_version,
                     .sandbox_available = self.sandbox_backend != .unavailable,
+                    .session_recaps = true,
+                    .git_status = true,
                     .network_filtering = self.network.isActive(),
                     .network_configured = config.networkPolicyConfigured(self.cfg),
                     .otel_enabled = self.otel_exporter != null,
@@ -1418,6 +1506,8 @@ pub const Daemon = struct {
                 );
                 self.sendOtelStatus(client);
             },
+            .session_git_status => |request| try self.requestGitStatus(client, request.sid),
+            .session_recap => |request| try self.requestRecap(client, request.sid, request.seq),
             .session_watch => |sw| {
                 client.watches_sessions = true;
                 client.watches_session_deltas = sw.incremental;
@@ -1495,6 +1585,7 @@ pub const Daemon = struct {
                 session.cwd = new_cwd;
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sc.sid);
+                self.publishSkillCatalog(sc.sid, null);
             },
             .session_set_model => |sm| {
                 const session = (try self.getOrLoadSession(sm.sid)) orelse {
@@ -1839,7 +1930,11 @@ pub const Daemon = struct {
                     }
                     return;
                 }
-                if (!client.subscribed(s.sid)) try client.subs.append(self.gpa, s.sid);
+                const new_subscription = !client.subscribed(s.sid);
+                const new_skill_catalog = s.skill_catalog and !client.skill_catalog;
+                if (s.skill_catalog) client.skill_catalog = true;
+                if (new_subscription) try client.subs.append(self.gpa, s.sid);
+                if (client.skill_catalog and (new_subscription or new_skill_catalog)) self.publishSkillCatalog(s.sid, client);
                 const session = self.sessions.get(s.sid);
                 const state: proto.SessionState = if (session) |ses| blk: {
                     // A subscriber returned: the release-when-unwatched
@@ -1896,6 +1991,28 @@ pub const Daemon = struct {
                     );
                     return;
                 }
+                var invocation_index = if (inp.skill != null)
+                    self.extensions.skill_index.forProject(self.io, session.cwd) catch {
+                        self.sendInputError(client, inp.request_id, "skill", "could not discover skills for this working directory");
+                        return;
+                    }
+                else
+                    null;
+                defer if (invocation_index) |*index| index.deinit();
+                const expanded = if (inp.skill) |skill|
+                    invocation_index.?.renderInvocation(self.gpa, skill.name, skill.arguments) catch |err| {
+                        const skill_error = switch (err) {
+                            error.UnknownSkill => "unknown skill; install it in .agents/skills or a configured skills directory (reload user skills with /mcp reload)",
+                            else => "could not render skill instructions",
+                        };
+                        self.sendInputError(client, inp.request_id, "skill", skill_error);
+                        return;
+                    }
+                else
+                    null;
+                defer if (expanded) |text| self.gpa.free(text);
+                const input_text = expanded orelse inp.text;
+                const display_text: ?[]const u8 = if (expanded != null) inp.text else null;
                 if (session.state == .running or session.state == .awaiting_approval) {
                     if (inp.attachments.len > 0) {
                         self.sendInputError(client, inp.request_id, "busy", "image attachments require a new turn");
@@ -1903,14 +2020,20 @@ pub const Daemon = struct {
                     }
                     // Approval is a parked phase of the same turn. Input stays
                     // a steer for that turn; it must never create a competitor.
-                    const owned = self.gpa.dupe(u8, inp.text) catch {
+                    const owned_text = self.gpa.dupe(u8, input_text) catch {
                         self.sendInputError(client, inp.request_id, "internal", "could not queue input");
                         return;
                     };
+                    const owned_display = if (display_text) |value| self.gpa.dupe(u8, value) catch {
+                        self.gpa.free(owned_text);
+                        self.sendInputError(client, inp.request_id, "internal", "could not queue input");
+                        return;
+                    } else null;
+                    const owned = block.Input{ .text = owned_text, .display_text = owned_display };
                     session.steer_mutex.lockUncancelable(self.io);
                     if (!session.steer_accepting) {
                         session.steer_mutex.unlock(self.io);
-                        self.gpa.free(owned);
+                        owned.deinit(self.gpa);
                         self.sendInputError(
                             client,
                             inp.request_id,
@@ -1921,7 +2044,7 @@ pub const Daemon = struct {
                     }
                     session.steer_queue.append(self.gpa, owned) catch {
                         session.steer_mutex.unlock(self.io);
-                        self.gpa.free(owned);
+                        owned.deinit(self.gpa);
                         self.sendInputError(client, inp.request_id, "internal", "could not queue input");
                         return;
                     };
@@ -1934,7 +2057,7 @@ pub const Daemon = struct {
                     return;
                 };
                 defer freeMediaRefs(self.gpa, attachments);
-                self.startTurn(session, inp.text, attachments) catch |err| {
+                self.startInputTurn(session, input_text, attachments, false, display_text) catch |err| {
                     if (err == error.SessionBusy) {
                         self.sendInputError(client, inp.request_id, "busy", "session already has an active turn");
                         return;
@@ -2383,6 +2506,27 @@ pub const Daemon = struct {
                     return err;
                 };
                 self.sendTo(client, .{ .ok = .{ .request_id = request.request_id } });
+            },
+            .plugin => |request| {
+                if (self.plugin_thread != null) {
+                    self.sendTo(client, .{ .plugin_result = .{ .ok = false, .message = "Another plugin command is still running." } });
+                    return;
+                }
+                const cwd = if (request.sid) |sid| blk: {
+                    const session = (try self.getOrLoadSession(sid)) orelse {
+                        self.sendTo(client, .{ .plugin_result = .{ .ok = false, .message = "Unknown session." } });
+                        return;
+                    };
+                    break :blk session.cwd;
+                } else request.cwd;
+                const job = try self.gpa.create(PluginJob);
+                errdefer self.gpa.destroy(job);
+                const argument = try self.gpa.dupe(u8, request.command.argument);
+                errdefer self.gpa.free(argument);
+                const owned_cwd = try self.gpa.dupe(u8, cwd);
+                errdefer self.gpa.free(owned_cwd);
+                job.* = .{ .daemon = self, .client_id = client.id, .command = .{ .action = request.command.action, .argument = argument }, .cwd = owned_cwd };
+                self.plugin_thread = try std.Thread.spawn(.{}, pluginMain, .{job});
             },
             .mcp_restart => |request| {
                 if (self.anySessionBusy()) {
@@ -2887,7 +3031,7 @@ pub const Daemon = struct {
         if (session.question_gate.answer) |answer| self.gpa.free(answer);
         session.question_gate.answer = null;
         session.steer_mutex.lockUncancelable(self.io);
-        for (session.steer_queue.items) |steer| self.gpa.free(steer);
+        for (session.steer_queue.items) |steer| steer.deinit(self.gpa);
         session.steer_queue.deinit(self.gpa);
         session.steer_mutex.unlock(self.io);
         self.gpa.free(session.model);
@@ -2971,6 +3115,7 @@ pub const Daemon = struct {
         model: []u8,
         effort: proto.ReasoningEffort,
         text: []u8,
+        display_text: ?[]u8 = null,
         attachments: []const block.MediaRef,
         sandbox_enabled: bool,
         network_filtering_enabled: bool,
@@ -3003,6 +3148,17 @@ pub const Daemon = struct {
         attachments: []const block.MediaRef,
         synthetic_input: bool,
     ) !void {
+        return self.startInputTurn(session, text, attachments, synthetic_input, null);
+    }
+
+    fn startInputTurn(
+        self: *Daemon,
+        session: *Session,
+        text: []const u8,
+        attachments: []const block.MediaRef,
+        synthetic_input: bool,
+        display_text: ?[]const u8,
+    ) !void {
         if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
             return error.SessionBusy;
         const job = try self.gpa.create(TurnJob);
@@ -3013,6 +3169,8 @@ pub const Daemon = struct {
         errdefer self.gpa.free(model);
         const owned_text = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(owned_text);
+        const owned_display = if (display_text) |value| try self.gpa.dupe(u8, value) else null;
+        errdefer if (owned_display) |value| self.gpa.free(value);
         const owned_attachments = try dupeMediaRefs(self.gpa, attachments);
         errdefer freeMediaRefs(self.gpa, owned_attachments);
         const otel_base: []u8 = if (self.otel_exporter) |e| try self.gpa.dupe(u8, e.raw_base_endpoint) else try self.gpa.dupe(u8, "");
@@ -3035,6 +3193,7 @@ pub const Daemon = struct {
             .model = model,
             .effort = session.effort,
             .text = owned_text,
+            .display_text = owned_display,
             .attachments = owned_attachments,
             .sandbox_enabled = session.sandbox_enabled,
             .network_filtering_enabled = session.network_filtering_enabled,
@@ -3126,7 +3285,7 @@ pub const Daemon = struct {
         const turn_id = if (job.turn_id != 0) job.turn_id else ids.next(self.io);
         var seq = self.store.lastSeq(job.sid) catch return;
         const bodies = [_]block.Body{
-            .{ .user_msg = .{ .text = job.text, .attachments = job.attachments } },
+            .{ .user_msg = .{ .text = job.text, .display_text = job.display_text, .attachments = job.attachments } },
             .{ .system_note = .{ .text = note } },
         };
         for (bodies) |body| {
@@ -3202,12 +3361,12 @@ pub const Daemon = struct {
         if (pending.items.len == 0) return;
 
         var seq = self.store.lastSeq(session.id) catch {
-            for (pending.items) |text| self.gpa.free(text);
+            for (pending.items) |text| text.deinit(self.gpa);
             return;
         };
         const turn_id = ids.next(self.io);
         for (pending.items) |text| {
-            defer self.gpa.free(text);
+            defer text.deinit(self.gpa);
             seq += 1;
             const b = block.Block{
                 .id = ids.next(self.io),
@@ -3215,7 +3374,7 @@ pub const Daemon = struct {
                 .turn_id = turn_id,
                 .seq = seq,
                 .ts = nowMs(self.io),
-                .body = .{ .steer = .{ .text = text } },
+                .body = .{ .steer = text },
             };
             self.store.appendBlock(b) catch continue;
             const line = proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = session.id, .b = b } }) catch continue;
@@ -3244,6 +3403,7 @@ pub const Daemon = struct {
             self.gpa.free(job.cwd);
             self.gpa.free(job.model);
             self.gpa.free(job.text);
+            if (job.display_text) |value| self.gpa.free(value);
             self.gpa.free(job.otel_base);
             self.gpa.free(job.otel_traces);
             @memset(job.otel_headers, 0);
@@ -3355,6 +3515,7 @@ pub const Daemon = struct {
             .on_task = if (job.kind == .root) TurnHooks.onTask else null,
             .tool_profile = if (job.kind != .root) .read_only else if (job.plan_mode) .plan else .full,
             .synthetic_input = job.synthetic_input,
+            .input_display_text = job.display_text,
             .auto_continue_round_budget = job.kind == .root,
             .cancel = job.cancel,
             .poll_steer = TurnHooks.pollSteer,
@@ -3427,6 +3588,7 @@ pub const Daemon = struct {
             self.gpa.free(job.cwd);
             self.gpa.free(job.model);
             self.gpa.free(job.text);
+            if (job.display_text) |value| self.gpa.free(value);
             freeMediaRefs(self.gpa, job.attachments);
             self.gpa.destroy(job);
         }
@@ -3469,8 +3631,134 @@ pub const Daemon = struct {
         self.finishTurn(job.sid, false, false, null, null, 0, 0);
     }
 
-    /// The native model that writes a handover briefing when one guest hands
-    /// to another: the configured default when native, else the first native
+    fn sendGitStatus(self: *Daemon, client: *Client, sid: u64, result: GitResult) void {
+        self.sendTo(client, .{ .session_git_status = .{
+            .sid = sid,
+            .cwd = result.cwd,
+            .branch = result.snapshot.branch(),
+            .counts = if (result.snapshot.counts) |c| .{ .ahead = c.ahead, .behind = c.behind } else null,
+        } });
+    }
+
+    fn pluginMain(job: *PluginJob) void {
+        const self = job.daemon;
+        job.result = pluginExecute(job) catch |err| .{
+            .ok = false,
+            .message = std.fmt.allocPrint(self.gpa, "Plugin command failed: {t}", .{err}) catch @panic("oom"),
+        };
+        self.events.push(self.io, .{ .plugin_ready = job }) catch job.deinit();
+    }
+
+    fn pluginExecute(job: *PluginJob) !plugins.Result {
+        const self = job.daemon;
+        const root = try plugins.rootPath(self.gpa, self.environ);
+        defer self.gpa.free(root);
+        return plugins.run(self.gpa, self.io, self.environ, root, job.cwd, job.command, &self.plugin_cancel);
+    }
+
+    fn requestGitStatus(self: *Daemon, client: *Client, sid: u64) !void {
+        const session = (try self.getOrLoadSession(sid)) orelse return;
+        var previous: ?git_status.Snapshot = null;
+        for (self.git_cache.items) |cached| {
+            if (!std.mem.eql(u8, cached.cwd, session.cwd)) continue;
+            if (nowMs(self.io) - cached.at_ms < git_status.ttl_ms) {
+                self.sendGitStatus(client, sid, cached);
+                return;
+            }
+            previous = cached.snapshot;
+        }
+        // One bounded worker for all clients; busy callers retry on their next tick.
+        if (self.git_thread != null) return;
+        const cwd = try self.gpa.dupe(u8, session.cwd);
+        errdefer self.gpa.free(cwd);
+        const result = try self.gpa.create(GitResult);
+        errdefer self.gpa.destroy(result);
+        result.* = .{ .client_id = client.id, .sid = sid, .cwd = cwd, .snapshot = .{}, .at_ms = 0 };
+        self.git_thread = try std.Thread.spawn(.{}, gitStatusMain, .{ self, result, previous });
+    }
+
+    fn gitStatusMain(self: *Daemon, result: *GitResult, previous: ?git_status.Snapshot) void {
+        result.snapshot = git_status.probe(self.gpa, self.io, result.cwd, self.environ, &self.git_cancel, previous);
+        result.at_ms = nowMs(self.io);
+        self.events.push(self.io, .{ .git_ready = result }) catch {
+            self.gpa.free(result.cwd);
+            self.gpa.destroy(result);
+        };
+    }
+
+    fn requestRecap(self: *Daemon, client: *Client, sid: u64, seq: u64) !void {
+        const session = (try self.getOrLoadSession(sid)) orelse return;
+        if (session.archived or session.kind != .root or session.state == .running or
+            session.state == .awaiting_approval or seq == 0 or try self.store.lastSeq(sid) != seq)
+        {
+            self.sendTo(client, .{ .session_recap = .{ .sid = sid, .seq = seq } });
+            return;
+        }
+        for (self.recap_cache.items) |cached| {
+            if (cached.sid == sid and cached.seq == seq) {
+                self.sendTo(client, .{ .session_recap = .{ .sid = sid, .seq = seq, .text = cached.text, .generated = cached.generated } });
+                return;
+            }
+        }
+        if (self.recap_thread != null) {
+            self.sendTo(client, .{ .session_recap = .{ .sid = sid, .seq = seq, .retry = true } });
+            return;
+        }
+        // Resolve and own the endpoint before the worker starts; no mutable
+        // session or configuration pointer crosses the thread boundary.
+        const model = self.cfg.model_compaction orelse
+            (if (!proto.isGuestModel(session.model)) session.model else self.handoverAuthorModel() orelse "");
+        const endpoint: ?registry.Endpoint = if (model.len > 0 and !proto.isGuestModel(model))
+            registry.resolve(self.gpa, self.environ, self.cfg, model) catch null
+        else
+            null;
+        errdefer if (endpoint) |ep| ep.deinit(self.gpa);
+        self.recap_cancel.store(false, .release);
+        self.recap_thread = try std.Thread.spawn(.{}, recapMain, .{ self, client.id, sid, seq, endpoint });
+    }
+
+    fn recapMain(self: *Daemon, client_id: u64, sid: u64, seq: u64, endpoint: ?registry.Endpoint) void {
+        defer if (endpoint) |ep| ep.deinit(self.gpa);
+        var result = self.generateRecap(sid, endpoint) catch RecapResult{
+            .client_id = client_id,
+            .sid = sid,
+            .seq = seq,
+            .text = &.{},
+            .generated = false,
+        };
+        result.client_id = client_id;
+        result.sid = sid;
+        result.seq = seq;
+        self.events.push(self.io, .{ .recap_ready = result }) catch self.gpa.free(result.text);
+    }
+
+    fn generateRecap(self: *Daemon, sid: u64, endpoint: ?registry.Endpoint) !RecapResult {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        var blocks: std.ArrayList(block.Block) = .empty;
+        try self.store.loadTailInto(arena.allocator(), &blocks, sid, 128);
+        const snapshot = try recap.snapshot(arena.allocator(), blocks.items);
+        var text = snapshot.fallback;
+        var generated = false;
+        if (endpoint) |ep| {
+            var client = try self.http_pool.acquire();
+            defer client.deinit();
+            const summary = loop.summarizeBounded(self.gpa, arena.allocator(), &client, .{
+                .url = ep.url,
+                .bearer = ep.bearer,
+                .model = ep.model,
+                .provider_name = ep.provider_name,
+                .backend = ep.backend,
+            }, snapshot.transcript, &self.recap_cancel, .{}, recap.prompt, null, 512) catch null;
+            if (summary) |value| {
+                text = value;
+                generated = true;
+            }
+        }
+        return .{ .client_id = 0, .sid = sid, .seq = 0, .text = try recap_limits.plainText(self.gpa, text), .generated = generated };
+    }
+
+    /// Native summary model for guest sessions: default, then first native
     /// favorite. Null when everything configured is a guest.
     fn handoverAuthorModel(self: *const Daemon) ?[]const u8 {
         if (!proto.isGuestModel(self.cfg.model_default)) return self.cfg.model_default;
@@ -3487,6 +3775,7 @@ pub const Daemon = struct {
             self.gpa.free(job.cwd);
             self.gpa.free(job.model);
             self.gpa.free(job.text);
+            if (job.display_text) |value| self.gpa.free(value);
             freeMediaRefs(self.gpa, job.attachments);
             self.gpa.destroy(job);
         }
@@ -3676,7 +3965,7 @@ pub const Daemon = struct {
             return future.wait(self.io);
         }
 
-        fn pollSteer(ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 {
+        fn pollSteer(ctx: ?*anyopaque, gpa: std.mem.Allocator) ?block.Input {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
             job.session.steer_mutex.lockUncancelable(self.io);
@@ -4486,6 +4775,49 @@ pub const Daemon = struct {
         loaded_transferred = true;
         previous.deinit();
         if (previous_config) |*old| old.deinit();
+        self.refreshSkillCatalogs();
+    }
+
+    fn refreshSkillCatalogs(self: *Daemon) void {
+        var it = self.sessions.keyIterator();
+        while (it.next()) |sid| self.publishSkillCatalog(sid.*, null);
+    }
+
+    fn publishSkillCatalog(self: *Daemon, sid: u64, target: ?*Client) void {
+        if (target == null) {
+            self.clients_mutex.lockUncancelable(self.io);
+            var it = self.clients.valueIterator();
+            var interested = false;
+            while (it.next()) |client| {
+                if (client.*.skill_catalog and client.*.subscribed(sid)) {
+                    interested = true;
+                    break;
+                }
+            }
+            self.clients_mutex.unlock(self.io);
+            if (!interested) return;
+        }
+        self.sendSkillCatalog(sid, target) catch |err| std.log.warn("cannot refresh skill completions for {d}: {t}", .{ sid, err });
+    }
+
+    fn sendSkillCatalog(self: *Daemon, sid: u64, target: ?*Client) !void {
+        const session = (try self.getOrLoadSession(sid)) orelse return;
+        var index = try self.extensions.skill_index.forProject(self.io, session.cwd);
+        defer index.deinit();
+        const items = try self.gpa.alloc(proto.SkillInfo, index.items.items.len);
+        defer self.gpa.free(items);
+        for (index.items.items, items) |skill, *item| item.* = .{ .name = skill.name, .description = skill.description };
+        const msg: proto.DaemonMsg = .{ .session_skills = .{ .sid = sid, .cwd = session.cwd, .skills = items } };
+        if (target) |client| {
+            self.sendTo(client, msg);
+        } else {
+            const Ctx = struct { daemon: *Daemon, sid: u64, msg: proto.DaemonMsg };
+            self.forEachClient(Ctx{ .daemon = self, .sid = sid, .msg = msg }, struct {
+                fn send(ctx: Ctx, client: *Client) void {
+                    if (client.said_hello and client.skill_catalog and client.subscribed(ctx.sid)) ctx.daemon.sendTo(client, ctx.msg);
+                }
+            }.send);
+        }
     }
 
     fn sendSetupStatus(self: *Daemon, client: *Client, probe_guests: bool) void {
@@ -4632,12 +4964,25 @@ pub const Daemon = struct {
         self.accepting_clients = false;
         self.clients_mutex.unlock(self.io);
 
-        // Stop the one non-turn worker before draining its completion event;
-        // it owns the daemon HTTP/config pointers until joined.
+        // Join background workers before draining their completion events
+        // and releasing the shared HTTP pool and configuration.
         self.catalog_cancel.store(true, .release);
         if (self.catalog_thread) |thread| thread.join();
         self.catalog_thread = null;
         self.catalog_fetching = false;
+        self.plugin_cancel.store(true, .release);
+        if (self.plugin_thread) |thread| thread.join();
+        self.plugin_thread = null;
+        self.git_cancel.store(true, .release);
+        if (self.git_thread) |thread| thread.join();
+        self.git_thread = null;
+        for (self.git_cache.items) |cached| self.gpa.free(cached.cwd);
+        self.git_cache.deinit(self.gpa);
+        self.recap_cancel.store(true, .release);
+        if (self.recap_thread) |thread| thread.join();
+        self.recap_thread = null;
+        for (self.recap_cache.items) |cached| self.gpa.free(cached.text);
+        self.recap_cache.deinit(self.gpa);
         if (self.otel_exporter) |exporter| {
             self.otel_exporter = null;
             exporter.deinit();
@@ -4720,6 +5065,12 @@ pub const Daemon = struct {
             .catalog_ready => |value| {
                 for (value.models) |model| self.gpa.free(model.id);
                 self.gpa.free(value.models);
+            },
+            .recap_ready => |value| self.gpa.free(value.text),
+            .plugin_ready => |job| job.deinit(),
+            .git_ready => |value| {
+                self.gpa.free(value.cwd);
+                self.gpa.destroy(value);
             },
             .turn_done => |value| {
                 if (value.err_text) |text| self.gpa.free(text);

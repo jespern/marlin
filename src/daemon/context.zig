@@ -73,6 +73,18 @@ pub const system_prompt_base =
     \\  jq is unavailable.
     \\- Reserve bash for what it is uniquely good at: builds, tests, git, and
     \\  running programs.
+    \\- Marlin's bash tool is foreground-only: it returns when the command
+    \\  finishes or times out. There is no background-job API, persistent
+    \\  shell session, or completion notification to collect later. Do not
+    \\  invent run_in_background, yield, or job-status tool arguments.
+    \\- Do not launch persistent watchers or detach commands with `&`,
+    \\  `nohup`, `disown`, or `setsid` to continue after a tool call. Use
+    \\  one-shot builds/tests and status queries. When waiting is necessary,
+    \\  use bounded foreground polling with an explicit deadline and
+    \\  timeout_seconds; report a timeout as incomplete, not success. For a
+    \\  persistent dev server or watcher, give the user the command to run
+    \\  in a separate terminal. Never claim a watcher is running or promise
+    \\  a later notification after the turn ends.
     \\- When you need the user to choose between options, call ask_user — it
     \\  renders an interactive picker in their terminal and pauses for the
     \\  pick. Never list choices as prose and ask them to reply; that is what
@@ -221,7 +233,7 @@ pub const AssembleOpts = struct {
     /// the base system prompt. Full skill bodies stay out of context until
     /// the model explicitly loads one with the skill tool.
     system_prompt_suffix: []const u8 = "",
-    /// Repo-local instructions (MARLIN.md / AGENTS.md at the session root),
+    /// Repo-local instructions (MARLIN.md / AGENTS.md / AGENT.md at the session root),
     /// injected verbatim under a PROJECT INSTRUCTIONS header. Empty = none.
     project_instructions: []const u8 = "",
     /// Per-turn dynamic facts (cwd, platform, date, git, sandbox, network),

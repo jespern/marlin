@@ -135,6 +135,8 @@ pub const Palette = struct {
     pub const status_context_warn: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 3 } };
     pub const status_context_hot: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 1 } };
     pub const status_cwd: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 2 } };
+    pub const status_git_ahead: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 2 } };
+    pub const status_git_behind: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 1 } };
     pub const status_notice: vaxis.Style = .{ .bg = status_bg, .fg = soft_blue };
     pub const approval_card: vaxis.Style = .{ .fg = .{ .index = 3 }, .bold = true };
     pub const delta_style: vaxis.Style = .{};

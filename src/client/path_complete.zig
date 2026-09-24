@@ -11,12 +11,13 @@ pub const Candidate = struct {
     name: []const u8,
 };
 
+/// Maximum visible rows; all matches remain reachable through menu scrolling.
 pub const max_candidates = 12;
 
 /// Matching directories for `typed`. Unknown directories and unreadable
 /// entries yield nothing rather than an error: this runs on every keystroke.
 pub fn directories(arena: std.mem.Allocator, io: Io, session_cwd: []const u8, home: ?[]const u8, typed: []const u8) ![]Candidate {
-    return matchingDirectories(arena, io, session_cwd, home, typed, max_candidates);
+    return matchingDirectories(arena, io, session_cwd, home, typed, std.math.maxInt(usize));
 }
 
 /// Complete against every match, including entries beyond the visible menu.

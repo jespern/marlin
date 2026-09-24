@@ -307,6 +307,45 @@ test "environment block reports cwd, git absence, and inactive regimes" {
     try std.testing.expectEqualStrings("Use spaces, not tabs.", instructions.?);
 }
 
+test "project instructions load AGENT.md before a turn and refresh after edits or cwd changes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-agent-instructions");
+    defer temp.deinit();
+    var dir = try Io.Dir.cwd().openDir(io, temp.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "AGENT.md", .data = "singular instructions" });
+    {
+        const text = projectInstructions(gpa, io, temp.path).?;
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("singular instructions", text);
+    }
+    try dir.writeFile(io, .{ .sub_path = "AGENT.md", .data = "edited instructions" });
+    {
+        const text = projectInstructions(gpa, io, temp.path).?;
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("edited instructions", text);
+    }
+    try dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "conventional instructions" });
+    {
+        const text = projectInstructions(gpa, io, temp.path).?;
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("conventional instructions", text);
+    }
+    try dir.writeFile(io, .{ .sub_path = "MARLIN.md", .data = "Marlin instructions" });
+    {
+        const text = projectInstructions(gpa, io, temp.path).?;
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("Marlin instructions", text);
+    }
+    try dir.createDirPath(io, "next");
+    const next = try std.fs.path.join(gpa, &.{ temp.path, "next" });
+    defer gpa.free(next);
+    try std.testing.expect(projectInstructions(gpa, io, next) == null);
+}
+
 test "root round budget becomes an automatic continuation checkpoint" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -488,11 +527,16 @@ test "delegated claude code turn consumes a steer racing finalization" {
         pending: bool = false,
         closes: usize = 0,
 
-        fn poll(ctx: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+        fn poll(ctx: ?*anyopaque, allocator: std.mem.Allocator) ?block.Input {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             if (!self.pending) return null;
             self.pending = false;
-            return allocator.dupe(u8, "guest steer") catch null;
+            const text = allocator.dupe(u8, "guest steer") catch return null;
+            const display = allocator.dupe(u8, "/guest-skill") catch {
+                allocator.free(text);
+                return null;
+            };
+            return .{ .text = text, .display_text = display };
         }
 
         fn tryClose(ctx: ?*anyopaque) bool {
@@ -514,6 +558,7 @@ test "delegated claude code turn consumes a steer racing finalization" {
         .tool_environ = &env,
         .approval_mode = .auto,
         .on_delta_ctx = &probe,
+        .input_display_text = "/initial-skill",
         .poll_steer = Probe.poll,
         .try_close_steer = Probe.tryClose,
     }, "start", &.{});
@@ -528,6 +573,9 @@ test "delegated claude code turn consumes a steer racing finalization" {
     }
     const expected = [_]block.BlockKind{ .user_msg, .assistant_msg, .steer, .assistant_msg };
     try std.testing.expectEqual(expected.len, loaded.len);
+    try std.testing.expectEqualStrings("/initial-skill", loaded[0].blk.body.user_msg.display_text.?);
+    try std.testing.expectEqualStrings("guest steer", loaded[2].blk.body.steer.text);
+    try std.testing.expectEqualStrings("/guest-skill", loaded[2].blk.body.steer.display_text.?);
     for (expected, loaded) |kind, lb| try std.testing.expectEqual(kind, std.meta.activeTag(lb.blk.body));
 }
 
@@ -716,14 +764,20 @@ test "tool-free responses consume steering and close the final-poll race" {
         close_calls: usize = 0,
         raced_pending: bool = false,
 
-        fn poll(ctx: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+        fn poll(ctx: ?*anyopaque, allocator: std.mem.Allocator) ?block.Input {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.polls += 1;
-            if (self.polls == 2)
-                return allocator.dupe(u8, "steer after first response") catch null;
+            if (self.polls == 2) {
+                const text = allocator.dupe(u8, "steer after first response") catch return null;
+                const display = allocator.dupe(u8, "/steer-skill") catch {
+                    allocator.free(text);
+                    return null;
+                };
+                return .{ .text = text, .display_text = display };
+            }
             if (self.raced_pending) {
                 self.raced_pending = false;
-                return allocator.dupe(u8, "steer from close race") catch null;
+                return .{ .text = allocator.dupe(u8, "steer from close race") catch return null };
             }
             return null;
         }
@@ -746,6 +800,7 @@ test "tool-free responses consume steering and close the final-poll race" {
         .cfg = config.defaults(),
         .approval_mode = .auto,
         .on_delta_ctx = &probe,
+        .input_display_text = "/initial-skill",
         .poll_steer = SteerProbe.poll,
         .try_close_steer = SteerProbe.tryClose,
     }, "initial request", &.{});
@@ -772,6 +827,8 @@ test "tool-free responses consume steering and close the final-poll race" {
         .assistant_msg,
     };
     try std.testing.expectEqual(expected.len, loaded.len);
+    try std.testing.expectEqualStrings("/initial-skill", loaded[0].blk.body.user_msg.display_text.?);
+    try std.testing.expectEqualStrings("/steer-skill", loaded[2].blk.body.steer.display_text.?);
     for (expected, loaded) |kind, lb| try std.testing.expectEqual(kind, std.meta.activeTag(lb.blk.body));
 }
 

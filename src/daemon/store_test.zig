@@ -852,3 +852,38 @@ test "countSessions matches ls: non-archived by default, archived on request, ze
     try store.setSessionTreeArchived(2, null);
     try std.testing.expectEqual(@as(u64, 2), try store.countSessions(false));
 }
+
+test "skill search and recalled inputs use the slash command while blocks retain instructions" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 1, "/one", "m", .auto);
+    try store.appendBlock(.{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 10,
+        .body = .{ .user_msg = .{ .text = "hidden skill instructions", .display_text = "/review banana" } },
+    });
+    try store.appendBlock(.{
+        .id = 2,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 2,
+        .ts = 11,
+        .body = .{ .steer = .{ .text = "other hidden instructions", .display_text = "/review citrus" } },
+    });
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqual(@as(usize, 2), (try store.search(arena, "review", 1, 20)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try store.search(arena, "hidden", 1, 20)).len);
+    const loaded = try store.getBlocks(1, 1, 10);
+    defer {
+        for (loaded) |*lb| lb.deinit();
+        gpa.free(loaded);
+    }
+    try std.testing.expectEqualStrings("hidden skill instructions", loaded[0].blk.body.user_msg.text);
+    try std.testing.expectEqualStrings("/review banana", loaded[0].blk.body.user_msg.display_text.?);
+}

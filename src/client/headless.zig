@@ -263,6 +263,33 @@ fn seconds(ms: u64) f64 {
     return @as(f64, @floatFromInt(ms)) / 1000.0;
 }
 
+pub fn plugin(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    const parser = @import("../core/plugin_command.zig");
+    const words = try gpa.alloc([]const u8, args.len);
+    defer gpa.free(words);
+    for (args, words) |arg, *word| word.* = arg;
+    const command = parser.parse(words) orelse {
+        try eprint(io, "usage: marlin {s}\n", .{parser.usage[1..]});
+        return 2;
+    };
+    const conn = try attach.connect(gpa, io, environ, self_exe);
+    defer conn.deinit();
+    const cwd = try Io.Dir.cwd().realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(cwd);
+    try conn.send(.{ .plugin = .{ .command = command, .cwd = cwd } });
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const result = try conn.recvUntil(arena_state.allocator(), .plugin_result);
+    if (result.ok) try print(io, "{s}\n", .{result.message}) else try eprint(io, "{s}\n", .{result.message});
+    return if (result.ok) 0 else 1;
+}
+
 pub fn mcp(
     gpa: std.mem.Allocator,
     io: Io,

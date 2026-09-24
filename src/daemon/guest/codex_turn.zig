@@ -364,12 +364,12 @@ fn sendCodexSteers(
     const poll = opts.poll_steer orelse return 0;
     var count: usize = 0;
     while (poll(opts.on_delta_ctx, gpa)) |text| {
-        defer gpa.free(text);
-        _ = try ap.append(.{ .steer = .{ .text = text } });
+        defer text.deinit(gpa);
+        _ = try ap.append(.{ .steer = text });
         try codexRequest(arena, writer, "turn/steer", next_request_id.*, trace, .{
             .threadId = thread_id,
             .expectedTurnId = turn_id,
-            .input = .{.{ .type = "text", .text = text }},
+            .input = .{.{ .type = "text", .text = text.text }},
         });
         next_request_id.* += 1;
         count += 1;
@@ -682,19 +682,19 @@ pub fn runCodexTurn(
                         }
                     }
 
-                    var follow_up: ?[]u8 = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
+                    var follow_up: ?block.Input = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
                     if (follow_up == null and !tryCloseSteering(opts))
                         follow_up = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
                     if (!interrupted and !failed and follow_up != null) {
                         const text = follow_up.?;
-                        defer gpa.free(text);
-                        _ = try ap.append(.{ .steer = .{ .text = text } });
+                        defer text.deinit(gpa);
+                        _ = try ap.append(.{ .steer = text });
                         final_text.clearRetainingCapacity();
-                        active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, text);
+                        active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, text.text);
                         next_request_id += 1;
                         rounds += 1;
                     } else {
-                        if (follow_up) |text| gpa.free(text);
+                        if (follow_up) |text| text.deinit(gpa);
                         done = true;
                     }
                 }

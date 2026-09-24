@@ -19,6 +19,7 @@ const permissions = @import("permissions.zig");
 const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const extensions = @import("extensions.zig");
+const skills = @import("skills.zig");
 const provider = @import("provider/provider.zig");
 const openai = @import("provider/openai_compat.zig");
 const anthropic = @import("provider/anthropic.zig");
@@ -110,6 +111,8 @@ pub const RunOpts = struct {
     network_policy: ?*const network_policy.Policy = null,
     /// Daemon-owned M5 extension registry (exec, MCP, skills, hooks).
     extensions: ?*extensions.Runtime = null,
+    /// Immutable catalog owned by the native turn, including cwd skills.
+    skill_index: ?*const skills.Index = null,
     /// Compaction endpoint (usually same as endpoint but cheap model);
     /// null → use `endpoint` for summarization too.
     compaction_endpoint: ?Endpoint = null,
@@ -169,6 +172,7 @@ pub const RunOpts = struct {
     /// Internal continuation prompts remain model-visible without appearing as
     /// authored user input or entering composer history.
     synthetic_input: bool = false,
+    input_display_text: ?[]const u8 = null,
     /// Root sessions checkpoint a very long agent loop at max_rounds and let
     /// the daemon immediately resume it as a fresh internal turn. Children
     /// keep max_rounds as a hard parent-facing completion boundary.
@@ -182,7 +186,7 @@ pub const RunOpts = struct {
     /// Steer poll: return queued mid-turn user text (caller allocs w/ gpa;
     /// loop frees). Checked between rounds and after a tool-free response;
     /// accepted text is injected as a steer block before the turn may finish.
-    poll_steer: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 = null,
+    poll_steer: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator) ?block.Input = null,
     /// Atomically close this turn to new steering only when its queue is
     /// empty. False means a steer raced the final poll and the loop must
     /// continue. Null is appropriate for single-threaded tests.
@@ -255,6 +259,7 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
     return switch (body) {
         .user_msg => |value| .{ .user_msg = .{
             .text = try arena.dupe(u8, value.text),
+            .display_text = if (value.display_text) |text| try arena.dupe(u8, text) else null,
             .attachments = try cloneMediaRefs(arena, value.attachments),
             .synthetic = value.synthetic,
         } },
@@ -279,7 +284,10 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .decision = value.decision,
             .decided_by = if (value.decided_by) |client| try arena.dupe(u8, client) else null,
         } },
-        .steer => |value| .{ .steer = .{ .text = try arena.dupe(u8, value.text) } },
+        .steer => |value| .{ .steer = .{
+            .text = try arena.dupe(u8, value.text),
+            .display_text = if (value.display_text) |text| try arena.dupe(u8, text) else null,
+        } },
         .plan => |value| blk: {
             const items = try arena.alloc(block.PlanItem, value.items.len);
             for (value.items, items) |item, *copy| copy.* = .{
@@ -496,10 +504,11 @@ pub fn runTurn(
     gpa: std.mem.Allocator,
     io: Io,
     store: *Store,
-    opts: RunOpts,
+    supplied_opts: RunOpts,
     user_text: []const u8,
     attachments: []const block.MediaRef,
 ) !TurnResult {
+    var opts = supplied_opts;
     // Delegated sessions own the agent loop; no context assembly, provider
     // HTTP, or Marlin tool dispatch happens here.
     if (guestBackend(opts.endpoint)) |guest| {
@@ -515,6 +524,7 @@ pub fn runTurn(
             .text = user_text,
             .attachments = attachments,
             .synthetic = opts.synthetic_input,
+            .display_text = opts.input_display_text,
         } });
         for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
         const delegated_prompt: ?[]u8 = if (attachments.len > 0)
@@ -530,6 +540,26 @@ pub fn runTurn(
             .codex => runCodexTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text),
         };
     }
+
+    var turn_skills = if (opts.extensions) |ext|
+        try ext.skill_index.forProject(io, opts.cwd)
+    else
+        null;
+    defer if (turn_skills) |*index| index.deinit();
+    if (turn_skills) |*index| opts.skill_index = index;
+    const skill_spec: ?tools_registry.Spec = if (opts.skill_index) |index|
+        if (index.items.items.len > 0) index.spec() else null
+    else
+        null;
+    var extension_specs_list: std.ArrayList(tools_registry.Spec) = .empty;
+    defer extension_specs_list.deinit(gpa);
+    if (opts.extensions) |ext| {
+        for (ext.specs()) |spec| {
+            if (!std.mem.eql(u8, spec.name, skills.spec_name)) try extension_specs_list.append(gpa, spec);
+        }
+    }
+    if (skill_spec) |spec| try extension_specs_list.append(gpa, spec);
+    const extension_specs = extension_specs_list.items;
 
     var history_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer history_arena_state.deinit();
@@ -555,6 +585,7 @@ pub fn runTurn(
         .text = user_text,
         .attachments = attachments,
         .synthetic = opts.synthetic_input,
+        .display_text = opts.input_display_text,
     } });
     for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
 
@@ -593,7 +624,7 @@ pub fn runTurn(
         var blocks = history.items;
 
         const frontier: u64 = if (opts.prune_frontier) |pf| pf.* else 0;
-        const extension_prompt_suffix = if (opts.extensions) |ext| ext.systemPromptSuffix() else "";
+        const extension_prompt_suffix = if (opts.skill_index) |index| index.prompt else "";
         var prompt_parts: std.ArrayList([]const u8) = .empty;
         if (extension_prompt_suffix.len > 0) try prompt_parts.append(arena, extension_prompt_suffix);
         if (web_search_available) try prompt_parts.append(arena, openrouter_web_search_prompt);
@@ -654,7 +685,6 @@ pub fn runTurn(
         if (opts.context_used_out) |cu| cu.store(est_used, .release);
         const assemble_ms: u64 = @intCast(@max(0, nowAwakeMs(io) - assemble_started_ms));
 
-        const extension_specs = if (opts.extensions) |ext| ext.specs() else &.{};
         var tool_count: usize = 0;
         for (&tools_registry.specs) |*s| if (toolAllowed(opts, s)) {
             tool_count += 1;
@@ -888,8 +918,12 @@ pub fn runTurn(
             } });
 
             const builtin_spec = tools_registry.find(pc.name.items);
-            const spec = builtin_spec orelse
-                if (opts.extensions) |ext| ext.find(pc.name.items) else null;
+            const spec = builtin_spec orelse blk: {
+                for (extension_specs) |*candidate| {
+                    if (std.mem.eql(u8, candidate.name, pc.name.items)) break :blk candidate;
+                }
+                break :blk null;
+            };
             prepared[i] = .{
                 .call_id = pc.call_id.items,
                 // Builtins execute under their canonical name whatever the
@@ -1167,8 +1201,8 @@ fn drainSteers(gpa: std.mem.Allocator, opts: RunOpts, ap: *Appender) !usize {
     const poll = opts.poll_steer orelse return 0;
     var count: usize = 0;
     while (poll(opts.on_delta_ctx, gpa)) |steer_text| {
-        defer gpa.free(steer_text);
-        _ = try ap.append(.{ .steer = .{ .text = steer_text } });
+        defer steer_text.deinit(gpa);
+        _ = try ap.append(.{ .steer = steer_text });
         count += 1;
     }
     return count;
@@ -1343,11 +1377,26 @@ pub fn summarize(
     system_prompt: []const u8,
     stream_opts: ?*const RunOpts,
 ) ![]const u8 {
+    return summarizeBounded(gpa, arena, http_client, ep, transcript, cancel, request_opts, system_prompt, stream_opts, summary_max_tokens);
+}
+
+pub fn summarizeBounded(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    http_client: *http.Client,
+    ep: Endpoint,
+    transcript: []const u8,
+    cancel: ?*std.atomic.Value(bool),
+    request_opts: openai.RequestOptions,
+    system_prompt: []const u8,
+    stream_opts: ?*const RunOpts,
+    max_tokens: u64,
+) ![]const u8 {
     var msgs = [_]provider.Message{
         .{ .role = .system, .payload = .{ .text = system_prompt } },
         .{ .role = .user, .payload = .{ .text = transcript } },
     };
-    const body = try buildProviderBody(arena, ep, .auto, &msgs, &.{}, request_opts, summary_max_tokens);
+    const body = try buildProviderBody(arena, ep, .auto, &msgs, &.{}, request_opts, max_tokens);
 
     var acc = openai.StreamAccum.init(gpa);
     defer acc.deinit();
@@ -1671,6 +1720,13 @@ fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, 
         };
     }
     if (std.mem.eql(u8, name, ask_user_tool.spec_name)) return runAskUser(gpa, io, opts, args_json);
+    if (std.mem.eql(u8, name, skills.spec_name)) {
+        if (opts.skill_index) |index| {
+            const output = index.loadContent(gpa, args_json) catch |err|
+                std.fmt.allocPrint(gpa, "error: skill load failed: {t}", .{err}) catch @panic("oom");
+            return .{ .output = output, .status = if (std.mem.startsWith(u8, output, "error:")) .err else .ok };
+        }
+    }
     if (opts.extensions) |ext| {
         if (ext.dispatch(name, args_json, opts.cwd, opts.cancel)) |result| return result;
     }
@@ -1892,11 +1948,11 @@ fn resolvedTurnId(opts: RunOpts, io: Io) u64 {
     return if (opts.turn_id != 0) opts.turn_id else ids.next(io);
 }
 
-/// Repo-local agent instructions: MARLIN.md, falling back to AGENTS.md, at
+/// Repo-local agent instructions: MARLIN.md, AGENTS.md, or AGENT.md, at
 /// the session root. Read fresh each turn so edits apply immediately.
 /// Missing, empty, or oversized files yield null.
 pub fn projectInstructions(gpa: std.mem.Allocator, io: Io, cwd: []const u8) ?[]u8 {
-    const names = [_][]const u8{ "MARLIN.md", "AGENTS.md" };
+    const names = [_][]const u8{ "MARLIN.md", "AGENTS.md", "AGENT.md" };
     for (names) |name| {
         const path = std.fs.path.join(gpa, &.{ cwd, name }) catch return null;
         defer gpa.free(path);

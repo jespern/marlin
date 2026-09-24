@@ -67,7 +67,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_set_plan_mode | sid, enabled | ok, or err{busy} mid-turn; persists collaboration mode with the session |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on guest sessions |
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded, err{guest} on guest sessions |
-| sub | sid, from_seq, tail_limit?, before_seq?, around_seq?, replay_limit?, replay_done? | replayed blk×N, optional replay_done marker, then status once live |
+| sub | sid, from_seq, tail_limit?, before_seq?, around_seq?, replay_limit?, replay_done?, skill_catalog? | replayed blk×N, optional replay_done marker, then status once live; skill_catalog opts the connection into session_skills snapshots for subscribed sessions |
 | unsub | sid | ok |
 | blob_get | hash | blob_result{hash, bytes}; the uncapped tool output behind a truncated inline body (`!c`) |
 | input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer while an agent turn is accepting them (running/awaiting approval); newly started root turns update the session title from the prompt's normalized first line, except generic follow-ups such as `commit it` preserve an existing title; steers and child turns do not retitle; compact, handover, and the atomic finishing edge return `err{not_steerable}` |
@@ -76,6 +76,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | council_remove | name | council_list_result after atomically removing the table; err{council} when unknown |
 | plan_clear | sid, request_id? | plan_clear_result{sid,cleared,request_id}; idempotently completes the latest unfinished durable execution plan |
 | plan_accept | sid, request_id? | ok/err; leaves Plan mode and starts a synthetic implementation turn from the latest proposal |
+| plugin | command{action, argument}, optional sid/cwd | plugin_result{ok, message}; async daemon worker; actions list, marketplace_add/update/remove, install, uninstall; sid resolves the session cwd, otherwise cwd resolves relative local Git sources |
 | mcp_list | — | mcp_list_result with per-server readiness, tool count, and discovery error |
 | mcp_add | name, cmd[] | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
 | mcp_remove | name | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
@@ -191,6 +192,7 @@ flag is read at export time, so it covers everything still in the outbox.
 | diagnostics_result | reply to diagnostics; aggregate provider/TTFT, measured local-preparation, and legacy pre-provider percentiles/outliers; latest provider/tool waterfall includes setup, context-load/SQLite-wait rows/bytes/VM steps, assembly, and body serialization; contains no prompt or tool content |
 | otel_status_result {enabled,content} | reply to `otel_status`, `otel_configure`, or `otel_content`; never includes endpoint headers |
 | session_upsert {session} | one added/restored/changed catalog row for an incremental session watcher |
+| session_skills {sid,cwd,skills:[{name,description}]} | completion catalog on subscription, cwd changes, successful plugin operations, and extension reload; only for clients opting in via sub.skill_catalog |
 | session_remove {sid} | one archived catalog row removed from an incremental session watcher |
 | blk {sid, b} | a block was persisted (replay AND live fan-out) |
 | delta {sid, turn_id, text} | streaming assistant text (ephemeral) |

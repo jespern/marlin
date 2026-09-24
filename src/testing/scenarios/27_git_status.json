@@ -1,0 +1,38 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "\"model\":\"testing\"",
+        "say hello",
+        "\"stream\":true"
+      ],
+      "expect_not_contains": [
+        "openrouter:web_search",
+        "Web search is available for discovering sources"
+      ],
+      "sse": [
+        "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello \"}}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"from fake\"}}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": [
+      "run",
+      "--quiet",
+      "--model",
+      "local/testing",
+      "say hello"
+    ],
+    "exit_code": 0,
+    "stdout_equals": "hello from fake\n",
+    "db_kinds": [
+      "user_msg",
+      "assistant_msg"
+    ],
+    "session_handle_flow": true,
+    "git_status_flow": true
+  }
+}

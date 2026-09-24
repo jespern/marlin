@@ -50,11 +50,25 @@ pub const MediaRef = struct {
     byte_len: u64,
 };
 
+/// Model text and optional compact user-facing invocation. Queued inputs
+/// own both strings; persisted block payloads borrow them.
+pub const Input = struct {
+    text: []const u8,
+    display_text: ?[]const u8 = null,
+
+    pub fn deinit(self: Input, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+        if (self.display_text) |text| gpa.free(text);
+    }
+};
+
 /// Kind-specific payloads. Serialized as JSON into blocks.body_json;
 /// unknown fields are ignored on read (forward compat, see MILESTONES open Q3).
 pub const Body = union(BlockKind) {
     user_msg: struct {
         text: []const u8,
+        /// Original slash invocation; text contains the model-visible skill.
+        display_text: ?[]const u8 = null,
         attachments: []const MediaRef = &.{},
         /// Internal context injected after compaction. It remains model-visible
         /// but clients must not present it as authored user input or history.
@@ -97,7 +111,7 @@ pub const Body = union(BlockKind) {
         decision: ?ApprovalDecision, // null while pending
         decided_by: ?[]const u8, // client id
     },
-    steer: struct { text: []const u8 },
+    steer: Input,
     /// One immutable plan revision. The newest revision is the current plan;
     /// completed revisions remain in the log as execution history.
     plan: struct { items: []const PlanItem },
