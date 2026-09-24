@@ -47,6 +47,103 @@ const TestScratch = struct {
     }
 };
 
+// Longer than every timeout/assertion in these tests, but finite even when
+// the test runner itself is killed and its defers cannot execute.
+inline fn stubbornLoop(comptime seconds: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        "remaining={d}; while [ \"$remaining\" -gt 0 ]; do sleep 1; remaining=$((remaining - 1)); done",
+        .{seconds},
+    );
+}
+
+/// Register before spawning, not after reading the PID or asserting success.
+/// This is independent of the process-tree cleanup under test, and only runs
+/// after assertions have had a chance to detect a surviving fixture.
+const FixtureCleanup = struct {
+    io: Io,
+    pid_path: []const u8,
+    owns_group: bool = false,
+
+    fn deinit(self: FixtureCleanup) void {
+        const gpa = std.heap.page_allocator;
+        const bytes = Io.Dir.cwd().readFileAlloc(self.io, self.pid_path, gpa, .limited(64)) catch return;
+        defer gpa.free(bytes);
+        const pid = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \t\r\n"), 10) catch return;
+        if (pid <= 1) return;
+        std.posix.kill(if (self.owns_group) -pid else pid, .KILL) catch {};
+    }
+};
+
+fn readFixturePid(gpa: std.mem.Allocator, io: Io, path: []const u8) !std.posix.pid_t {
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64));
+    defer gpa.free(bytes);
+    const pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \t\r\n"), 10);
+    if (pid <= 1) return error.InvalidFixturePid;
+    return pid;
+}
+
+test "fixture cleanup removes an escaped process group after an early test failure" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try TestScratch.init(gpa, io, "marlin-process-io-guard");
+    defer temp.deinit();
+    const pid_path = try std.fs.path.join(gpa, &.{ temp.path, "escapee.pid" });
+    defer gpa.free(pid_path);
+
+    const Exercise = struct {
+        fn fail(allocator: std.mem.Allocator, test_io: Io, path: []const u8, pid_out: *std.posix.pid_t) !void {
+            defer (FixtureCleanup{ .io = test_io, .pid_path = path, .owns_group = true }).deinit();
+            var child = try std.process.spawn(test_io, .{
+                .argv = &.{ "bash", "-c", "set -m\n(trap '' TERM; " ++ stubbornLoop(30) ++ ") &\nprintf '%s' \"$!\" > \"$1\"\nwait", "--", path },
+                .stdout = .ignore,
+                .stderr = .ignore,
+                .pgid = 0,
+            });
+            // Deliberately only kill the direct child. The independent guard
+            // must remove the escaped group without process_io or ps.
+            defer child.kill(test_io);
+            var attempts: usize = 0;
+            while (attempts < 100) : (attempts += 1) {
+                const pid = readFixturePid(allocator, test_io, path) catch {
+                    try test_io.sleep(.fromMilliseconds(10), .awake);
+                    continue;
+                };
+                pid_out.* = pid;
+                return error.DeliberateTestFailure;
+            }
+            return error.FixtureDidNotStart;
+        }
+    };
+    var pid: std.posix.pid_t = 0;
+    try std.testing.expectError(error.DeliberateTestFailure, Exercise.fail(gpa, io, pid_path, &pid));
+    try std.testing.expect(pid > 1);
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        std.posix.kill(-pid, .CONT) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.FixtureSurvivedTestFailure;
+}
+
+test "stubborn fixtures expire even without supervisor cleanup" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const result = try run(gpa, threaded.io(), .{
+        .argv = &.{ "sh", "-c", "trap '' TERM; " ++ stubbornLoop(2) },
+        .timeout_ms = 5_000,
+    });
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+}
+
 test "run writes stdin and collects both output streams" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -92,20 +189,33 @@ test "forced kill sweeps descendants that escaped the process group" {
     defer threaded.deinit();
     const io = threaded.io();
 
+    // The production escapee sweep needs a process-table snapshot. Some
+    // sandboxes deny ps entirely; do not spawn an escapee when that part of
+    // the contract cannot be exercised. The independent guard test above
+    // still runs in those environments.
+    const probe = std.process.run(gpa, io, .{
+        .argv = &.{ "ps", "-axo", "pid=,ppid=,pgid=" },
+        .stdout_limit = .limited(1 << 20),
+        .stderr_limit = .limited(4096),
+    }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied, error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer gpa.free(probe.stdout);
+    defer gpa.free(probe.stderr);
+    if (probe.term != .exited or probe.term.exited != 0) return error.SkipZigTest;
+
     var temp = try TestScratch.init(gpa, io, "marlin-process-io-escapee");
     defer temp.deinit();
     const pid_path = try std.fs.path.join(gpa, &.{ temp.path, "escapee.pid" });
     defer gpa.free(pid_path);
+    defer (FixtureCleanup{ .io = io, .pid_path = pid_path, .owns_group = true }).deinit();
 
     // set -m gives the background job its own process group (what timeout(1)
     // does via setpgid), so a group-only kill would miss it; the TERM trap
     // additionally forces the sweep's KILL escalation to be what lands.
-    const script =
-        \\set -m
-        \\(trap '' TERM; while :; do sleep 1; done) &
-        \\printf '%s' "$!" > "$1"
-        \\wait
-    ;
+    const script = "set -m\n(trap '' TERM; " ++ stubbornLoop(30) ++ ") &\n" ++
+        "printf '%s' \"$!\" > \"$1\"\nwait";
     const result = try run(gpa, io, .{
         .argv = &.{ "bash", "-c", script, "--", pid_path },
         .timeout_ms = 500,
@@ -138,6 +248,7 @@ test "cancellation terminates and reaps the complete process tree" {
     defer temp.deinit();
     const pid_path = try std.fs.path.join(gpa, &.{ temp.path, "descendant.pid" });
     defer gpa.free(pid_path);
+    defer (FixtureCleanup{ .io = io, .pid_path = pid_path }).deinit();
 
     var cancel = std.atomic.Value(bool).init(false);
     const CancelJob = struct {
@@ -151,12 +262,8 @@ test "cancellation terminates and reaps the complete process tree" {
     const cancel_thread = try std.Thread.spawn(.{}, CancelJob.fire, .{CancelJob{ .flag = &cancel, .io = io }});
     defer cancel_thread.join();
 
-    const script =
-        \\(trap '' TERM; while :; do sleep 1; done) &
-        \\descendant=$!
-        \\printf '%s' "$descendant" > "$1"
-        \\wait
-    ;
+    const script = "(trap '' TERM; " ++ stubbornLoop(30) ++ ") &\n" ++
+        "descendant=$!\nprintf '%s' \"$descendant\" > \"$1\"\nwait";
     const started = Io.Timestamp.now(io, .awake).nanoseconds;
     try std.testing.expectError(error.Cancelled, run(gpa, io, .{
         .argv = &.{ "sh", "-c", script, "--", pid_path },
@@ -194,12 +301,10 @@ test "returned process group sweeps a daemonized descendant after parent exit" {
     defer temp.deinit();
     const pid_path = try std.fs.path.join(gpa, &.{ temp.path, "daemon.pid" });
     defer gpa.free(pid_path);
+    defer (FixtureCleanup{ .io = io, .pid_path = pid_path }).deinit();
 
-    const script =
-        \\(trap '' HUP TERM; while :; do sleep 1; done) >/dev/null 2>&1 &
-        \\printf '%s' "$!" > "$1"
-        \\exit 0
-    ;
+    const script = "(trap '' HUP TERM; " ++ stubbornLoop(30) ++ ") >/dev/null 2>&1 &\n" ++
+        "printf '%s' \"$!\" > \"$1\"\nexit 0";
     const result = try run(gpa, io, .{
         .argv = &.{ "sh", "-c", script, "--", pid_path },
         .timeout_ms = 2_000,
@@ -251,7 +356,10 @@ test "a closed stdin alone ends a stdio child that flushes on the way out" {
         .pgid = 0,
     });
     const group: std.posix.pid_t = child.id.?;
-    defer terminateProcessGroup(io, group, 0);
+    defer {
+        terminateProcessGroup(io, group, 0);
+        child.kill(io);
+    }
 
     try std.testing.expect(process_io.closeStdinAndReap(&child, io, 2_000));
     process_io.releaseReapedChild(&child, io);
@@ -269,13 +377,17 @@ test "a child that ignores the closed stdin is left for the caller to signal" {
     const io = threaded.io();
 
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "sh", "-c", "trap '' TERM; while :; do sleep 1; done" },
+        .argv = &.{ "sh", "-c", "trap '' TERM; " ++ stubbornLoop(30) },
         .stdin = .pipe,
         .stdout = .ignore,
         .stderr = .ignore,
         .pgid = 0,
     });
     const group: std.posix.pid_t = child.id.?;
+    defer {
+        terminateProcessGroup(io, group, 0);
+        child.kill(io);
+    }
 
     try std.testing.expect(!process_io.closeStdinAndReap(&child, io, 150));
     try std.testing.expect(child.stdin == null);

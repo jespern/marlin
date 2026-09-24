@@ -1652,6 +1652,7 @@ test "correlated session creation replies clear only the matching pending reques
         },
         .awaiting_new_session = true,
         .pending_new_session_request_id = 77,
+        .reset_after_new_session = true,
     };
     defer app.deinit();
     try app.pending_new_cwd.appendSlice(gpa, "/work");
@@ -1663,6 +1664,7 @@ test "correlated session creation replies clear only the matching pending reques
     } });
     app.handleDaemonLine(unrelated);
     try std.testing.expect(app.awaiting_new_session);
+    try std.testing.expect(app.reset_after_new_session);
     try std.testing.expectEqual(@as(u64, 77), app.pending_new_session_request_id);
 
     const matching = try proto.encode(gpa, proto.DaemonMsg{ .err = .{
@@ -1672,8 +1674,185 @@ test "correlated session creation replies clear only the matching pending reques
     } });
     app.handleDaemonLine(matching);
     try std.testing.expect(!app.awaiting_new_session);
+    try std.testing.expect(!app.reset_after_new_session);
     try std.testing.expectEqual(@as(u64, 0), app.pending_new_session_request_id);
     try std.testing.expectEqual(@as(usize, 0), app.pending_new_cwd.items.len);
+}
+
+test "reset opens a blank session before archiving idle trees and preserves active work" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    for ([_]bool{ false, true }) |has_active| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var output: Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        var conn: attach.Conn = undefined;
+        conn.gpa = gpa;
+        conn.writer = &output.writer;
+        const original_sid: u64 = if (has_active) 30 else 10;
+        var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = original_sid, .editor = Editor.init(gpa) } };
+        defer app.deinit();
+        app.replaceSessionSummaries(&.{
+            .{ .sid = 10, .title = "old", .model = "m", .status = "idle", .created_at = 10, .running = false },
+            .{ .sid = 11, .parent_sid = 10, .kind = .task_child, .title = "finished", .model = "m", .status = "done", .state = .done, .created_at = 11, .running = false },
+            .{ .sid = 20, .title = "parent", .model = "m", .status = "idle", .created_at = 20, .running = false },
+            .{ .sid = 21, .parent_sid = 20, .kind = .task_child, .title = "approval", .model = "m", .status = "idle", .state = if (has_active) .awaiting_approval else .idle, .created_at = 21, .running = false },
+            .{ .sid = 22, .parent_sid = 20, .kind = .task_child, .title = "failed", .model = "m", .status = "err", .state = .err, .created_at = 22, .running = false },
+            .{ .sid = 30, .title = "working", .model = "m", .status = "idle", .state = if (has_active) .running else .idle, .created_at = 30, .running = has_active },
+        });
+        app.pushBlock(.assistant_msg, "old transcript", "", .ok);
+        app.view.editor.insertSlice("/res");
+        const suggestions = try commandSuggestions(&app, arena.allocator());
+        try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+        try std.testing.expectEqualStrings("/reset", suggestions[0].replacement);
+        app.view.editor.clear();
+        app.runCommand("/reset");
+        try std.testing.expect(app.reset_after_new_session);
+        try std.testing.expect(app.awaiting_new_session);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "session_create") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "session_archive") == null);
+        const request_id = app.pending_new_session_request_id;
+        const before_repeat = output.written().len;
+        app.runCommand("/reset");
+        try std.testing.expectEqual(before_repeat, output.written().len);
+        app.handleSessionCreated(99, request_id + 1);
+        try std.testing.expectEqual(original_sid, app.view.sid);
+        app.handleSessionCreated(99, request_id);
+        try std.testing.expectEqual(@as(u64, 99), app.view.sid);
+        try std.testing.expect(!app.reset_after_new_session);
+        try std.testing.expectEqual(@as(usize, 0), app.view.blocks.items.len);
+        try std.testing.expectEqual(@as(usize, 0), app.view.editor.text.items.len);
+        try std.testing.expectEqual(Mode.insert, app.mode);
+
+        var archived: std.ArrayList(u64) = .empty;
+        defer archived.deinit(gpa);
+        var lines = std.mem.tokenizeScalar(u8, output.written(), '\n');
+        while (lines.next()) |line| {
+            const msg = try proto.decode(proto.ClientMsg, arena.allocator(), line);
+            switch (msg) {
+                .session_archive => |a| try archived.append(gpa, a.sid),
+                .session_kill, .interrupt => return error.ResetInterruptedWork,
+                else => {},
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (has_active) 2 else 3), archived.items.len);
+        for (archived.items) |sid| {
+            try std.testing.expect(sid == 10 or (if (has_active) sid == 22 else sid == 20 or sid == 30));
+        }
+        // Deliver the daemon's archive deltas and empty replay. Only a fresh
+        // session remains when everything was idle; active trees survive.
+        for ([_]u64{ 10, 11, 20, 21, 22, 30 }) |sid| {
+            if (has_active and (sid == 20 or sid == 21 or sid == 30)) continue;
+            app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_remove = .{ .sid = sid } }));
+        }
+        app.upsertSessionSummary(.{ .sid = 99, .title = "", .model = "m", .status = "idle", .created_at = 99, .running = false });
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{ .sid = 99, .oldest_seq = 0, .newest_seq = 0, .has_older = false } }));
+        try std.testing.expectEqual(@as(usize, if (has_active) 4 else 1), app.sessions.items.len);
+        try std.testing.expect(!app.view.history_loading);
+        try std.testing.expectEqual(proto.SessionState.idle, app.view.state);
+        try std.testing.expectEqual(@as(usize, if (has_active) 1 else 0), app.saved_views.count());
+        if (has_active) {
+            const saved = app.saved_views.get(30).?;
+            try std.testing.expectEqual(proto.SessionState.running, saved.state);
+            try std.testing.expectEqualStrings("old transcript", saved.blocks.items[0].text);
+        }
+    }
+}
+
+test "reset does not hijack a pending new session or accept arguments" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) }, .awaiting_new_session = true };
+    defer app.deinit();
+    app.runCommand("/reset");
+    try std.testing.expect(!app.reset_after_new_session);
+    try std.testing.expectEqualStrings("new session already being created", app.notice.items);
+    app.awaiting_new_session = false;
+    app.runCommand("/reset force");
+    try std.testing.expect(!app.reset_after_new_session);
+    try std.testing.expectEqualStrings("usage: /reset", app.notice.items);
+}
+
+test "idle recap stays in scrollback across Escape and the next turn" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .recaps_supported = true, .view = .{ .sid = 1, .editor = Editor.init(gpa), .last_seq = 3 } };
+    defer app.deinit();
+    app.view.recap.changed(1000);
+    app.maybeRequestRecap(180_999);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    app.view.editor.insertSlice("draft");
+    app.maybeRequestRecap(181_000);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    app.view.editor.clear();
+    app.maybeRequestRecap(181_000);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "session_recap") != null);
+    const sent = output.written().len;
+    app.maybeRequestRecap(190_000);
+    try std.testing.expectEqual(sent, output.written().len);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_recap = .{ .sid = 1, .seq = 2, .text = "stale" } }));
+    try std.testing.expectEqual(@as(usize, 0), app.view.blocks.items.len);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_recap = .{ .sid = 1, .seq = 3, .text = "Login fixed; deploy next.", .generated = true } }));
+    try std.testing.expectEqualStrings("Login fixed; deploy next.", app.view.blocks.items[0].text);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    app.maybeRequestRecap(999_000);
+    try std.testing.expectEqual(sent, output.written().len);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 1, .state = .running } }));
+    try std.testing.expectEqualStrings("Login fixed; deploy next.", app.view.blocks.items[0].text);
+    app.maybeRequestRecap(std.math.maxInt(i64));
+    try std.testing.expectEqual(sent, output.written().len);
+}
+
+test "recap renders in the transcript while drafting without reserving composer space" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var vx = try vaxis.init(threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &output.writer);
+    try vx.resize(gpa, &output.writer, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    var conn: attach.Conn = undefined;
+    conn.sandbox_available = false;
+    conn.network_filtering = false;
+    conn.network_configured = false;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.pushBlock(.assistant_msg, "Work complete.", "", .ok);
+    try app.view.appendRecap(gpa, 3, "Login fixed. Deployment is pending.", true);
+    try app.view.appendRecap(gpa, 3, "duplicate", true);
+    try std.testing.expectEqual(@as(usize, 2), app.view.blocks.items.len);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    try draw(&app, &vx, arena.allocator());
+    const with_recap = app.view.last_view_h;
+    var recap_row: ?u16 = null;
+    for (0..app.view.last_view_h) |row| {
+        if (vx.window().readCell(2, @intCast(row + app.tabBarRows()))) |cell| {
+            if (std.mem.eql(u8, cell.char.grapheme, "R")) recap_row = @intCast(row + app.tabBarRows());
+        }
+    }
+    try std.testing.expect(recap_row != null);
+    app.view.editor.insertSlice("draft");
+    try draw(&app, &vx, arena.allocator());
+    try std.testing.expectEqual(with_recap, app.view.last_view_h);
+    try std.testing.expectEqualStrings("R", vx.window().readCell(2, recap_row.?).?.char.grapheme);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try std.testing.expectEqualStrings("Login fixed. Deployment is pending.", app.view.blocks.items[1].text);
 }
 
 test "session picker reserves archive chords without stealing filter text" {
@@ -4802,7 +4981,7 @@ test "/cwd suggests directories under the session cwd, one segment at a time, ne
     try std.testing.expectEqual(@as(usize, 1), suggestions.len);
     try std.testing.expectEqualStrings("/cwd projects/marlin/", suggestions[0].replacement);
 
-    // A path with a space is not completed (one-argument rule), and no HOME means ~ offers nothing.
+    // No HOME means ~ offers nothing.
     app.view.editor.clear();
     app.view.editor.insertSlice("/cwd ~/");
     try std.testing.expectEqual(@as(usize, 0), (try commandSuggestions(&app, arena_state.allocator())).len);
@@ -4849,9 +5028,7 @@ test "cwd Tab completes but Enter submits the typed directory instead of its chi
     app.view.editor.insertSlice("/cwd proj");
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cwd projects/", app.view.editor.text.items);
-    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
-    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
-    try std.testing.expectEqualStrings("/cwd projects/", app.view.editor.text.items);
+    // No explicit menu selection: Enter keeps the directory just completed.
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
     try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"projects/\"") != null);
@@ -4943,4 +5120,371 @@ test "long pinned prompts cap at ten rows and retain full scrollback" {
     try draw(&app, &vx, frame.allocator());
     try std.testing.expectEqual(@as(usize, 0), app.view.last_pinned_rows);
     try std.testing.expect(app.visibleLineAtRow(0) != null);
+}
+
+test "git status polling is throttled, capability gated and rejects stale cwd replies" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr("/repo");
+    app.maybeRequestGitStatus(1000);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    app.git_supported = true;
+    app.maybeRequestGitStatus(1000);
+    const request_len = output.written().len;
+    try std.testing.expect(request_len > 0);
+    app.maybeRequestGitStatus(5999);
+    try std.testing.expectEqual(request_len, output.written().len);
+    app.maybeRequestGitStatus(6000);
+    try std.testing.expectEqual(request_len * 2, output.written().len);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_git_status = .{ .sid = 42, .cwd = "/repo", .branch = "main", .counts = .{ .ahead = 2, .behind = 3 } } }));
+    try std.testing.expectEqualStrings("main ↑2 ↓3", app.git_label.items);
+    app.setCwdStr("/elsewhere");
+    app.maybeRequestGitStatus(6001);
+    try std.testing.expectEqualStrings("", app.git_label.items);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_git_status = .{ .sid = 42, .cwd = "/repo", .branch = "stale" } }));
+    try std.testing.expectEqualStrings("", app.git_label.items);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_git_status = .{ .sid = 43, .cwd = "/elsewhere", .branch = "wrong-session" } }));
+    try std.testing.expectEqualStrings("", app.git_label.items);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_git_status = .{ .sid = 42, .cwd = "/elsewhere", .branch = "topic" } }));
+    try std.testing.expectEqualStrings("topic", app.git_label.items);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_git_status = .{ .sid = 42, .cwd = "/elsewhere" } }));
+    try std.testing.expectEqualStrings("", app.git_label.items);
+}
+
+test "cwd Tab and arrows accept directory selections and descend without submitting" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "cwd-menu");
+    defer tmp.deinit();
+    var root = try Io.Dir.cwd().openDir(io, tmp.path, .{});
+    defer root.close(io);
+    try root.createDirPath(io, "projects/marlin/src");
+    try root.createDirPath(io, "projects/other/deep");
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = io, .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr(tmp.path);
+    app.view.editor.insertSlice("/cwd proj");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cwd projects/", app.view.editor.text.items);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expect(app.cwdMenuSelected());
+    try std.testing.expectEqual(@as(usize, 0), app.command_selection);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.down });
+    try std.testing.expectEqual(@as(usize, 1), app.command_selection);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.up });
+    try std.testing.expectEqual(@as(usize, 0), app.command_selection);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab, .mods = .{ .shift = true } });
+    try std.testing.expectEqual(@as(usize, 1), app.command_selection);
+    try std.testing.expect(!app.view.plan_mode);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cwd projects/other/", app.view.editor.text.items);
+    try std.testing.expect(!app.cwdMenuSelected());
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cwd projects/other/deep/", app.view.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"projects/other/deep/\"") != null);
+}
+
+test "cwd selection handles spaces and Enter accepts an explicitly chosen directory" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "cwd-spaces");
+    defer tmp.deinit();
+    var root = try Io.Dir.cwd().openDir(io, tmp.path, .{});
+    defer root.close(io);
+    try root.createDirPath(io, "team alpha");
+    try root.createDirPath(io, "team beta/src dir");
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = io, .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr(tmp.path);
+    app.view.editor.insertSlice("/cwd team ");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.up });
+    try std.testing.expectEqual(@as(usize, 1), app.command_selection);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cwd team beta/", app.view.editor.text.items);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.down });
+    try handleKey(&app, .{ .codepoint = vaxis.Key.kp_enter });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"team beta/src dir/\"") != null);
+}
+
+test "cwd editing and Escape cancel menu selection while history retains arrow keys" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "cwd-edit-menu");
+    defer tmp.deinit();
+    var root = try Io.Dir.cwd().openDir(io, tmp.path, .{});
+    defer root.close(io);
+    try root.createDirPath(io, "alpha");
+    try root.createDirPath(io, "beta");
+    var app = App{ .gpa = gpa, .io = io, .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr(tmp.path);
+    app.view.editor.insertSlice("/cwd ");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.down });
+    try std.testing.expect(app.cwdMenuSelected());
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(!app.cwdMenuSelected());
+    try std.testing.expectEqual(tui.Mode.insert, app.mode);
+    try std.testing.expectEqualStrings("/cwd ", app.view.editor.text.items);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.down });
+    try handleKey(&app, .{ .codepoint = vaxis.Key.left });
+    try std.testing.expect(!app.cwdMenuSelected());
+    try handleKey(&app, .{ .codepoint = vaxis.Key.right });
+    try handleKey(&app, .{ .codepoint = 'b', .text = "b" });
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cwd beta/", app.view.editor.text.items);
+    app.view.editor.clear();
+    app.view.editor.pushHistory("older");
+    app.view.editor.pushHistory("/cwd ");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.up });
+    try std.testing.expectEqualStrings("/cwd ", app.view.editor.text.items);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.up });
+    try std.testing.expectEqualStrings("older", app.view.editor.text.items);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.down });
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expect(!app.view.editor.isWalkingHistory());
+    try std.testing.expect(app.cwdMenuSelected());
+}
+
+test "cwd menu scrolls to and visibly highlights matches beyond the first twelve" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "cwd-menu-scroll");
+    defer tmp.deinit();
+    var root = try Io.Dir.cwd().openDir(io, tmp.path, .{});
+    defer root.close(io);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (0..15) |i| try root.createDirPath(io, try std.fmt.allocPrint(arena, "dir{d:0>2}", .{i}));
+    var app = App{ .gpa = gpa, .io = io, .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr(tmp.path);
+    app.view.editor.insertSlice("/cwd ");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.up });
+    try std.testing.expectEqual(@as(usize, 14), app.command_selection);
+    var screen = try vaxis.Screen.init(gpa, .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 80, .height = 8, .screen = &screen };
+    try tui.drawCommandMenu(&app, win, arena, 7, 80);
+    try std.testing.expectEqualStrings("/", win.readCell(2, 5).?.char.grapheme);
+    try std.testing.expectEqualDeep(Palette.command_selected_name, win.readCell(2, 5).?.style);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cwd dir14/", app.view.editor.text.items);
+}
+
+test "cd aliases cwd through command completion, directory selection and submission" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "cd-alias");
+    defer tmp.deinit();
+    var root = try Io.Dir.cwd().openDir(io, tmp.path, .{});
+    defer root.close(io);
+    try root.createDirPath(io, "project one/nested");
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = io, .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr(tmp.path);
+    app.view.editor.insertSlice("/cd");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cd ", app.view.editor.text.items);
+    app.view.editor.insertSlice("pro");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cd project one/", app.view.editor.text.items);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab, .mods = .{ .shift = true } });
+    try std.testing.expect(app.cwdMenuSelected());
+    try std.testing.expect(!app.view.plan_mode);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cd project one/nested/", app.view.editor.text.items);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"project one/nested/\"") != null);
+    app.runCommand("/cd");
+    try std.testing.expectEqualStrings("usage: /cd <path>", app.notice.items);
+    app.runCommand("/cd\t..");
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"..\"") != null);
+}
+
+test "skill invocation preserves namespaced names and arguments without capturing paths or builtins" {
+    const invocation = commands.skillInvocation("/plugin:some-skill\tfirst line\nsecond line").?;
+    try std.testing.expectEqualStrings("plugin:some-skill", invocation.name);
+    try std.testing.expectEqualStrings("first line\nsecond line", invocation.arguments);
+    for ([_][]const u8{ "/", "/tmp/file", "/../private", "/$variable", "/q", "/cd x", "/cwd x", "/help", "/plugin install demo@fixture-market", " /some-skill" }) |text| {
+        try std.testing.expect(commands.skillInvocation(text) == null);
+    }
+}
+
+test "slash skills send structured invocations as input or steering and the verbatim escape remains" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    for ([_]proto.SessionState{ .idle, .running }) |state| {
+        var output: Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        var conn: attach.Conn = undefined;
+        conn.gpa = gpa;
+        conn.writer = &output.writer;
+        var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .state = state, .editor = Editor.init(gpa) } };
+        defer app.deinit();
+        app.view.editor.insertSlice("/some-skill check this change");
+        try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const sent = try proto.decode(proto.ClientMsg, arena.allocator(), output.written());
+        try std.testing.expectEqualStrings("/some-skill check this change", sent.input.text);
+        try std.testing.expectEqualStrings("some-skill", sent.input.skill.?.name);
+        try std.testing.expectEqualStrings("check this change", sent.input.skill.?.arguments);
+        try std.testing.expectEqual(@as(u64, 42), sent.input.sid);
+        try std.testing.expectEqual(if (state == .running) block.BlockKind.steer else block.BlockKind.user_msg, app.view.blocks.items[0].kind);
+        try std.testing.expectEqualStrings("/some-skill check this change", app.view.editor.history.items[0]);
+        const expanded = "Skill: some-skill\nSource: /skills/some-skill/SKILL.md\n\nReal instructions";
+        const durable = block.Block{
+            .id = 3,
+            .session_id = 42,
+            .turn_id = 7,
+            .seq = 1,
+            .ts = 0,
+            .body = if (state == .running)
+                .{ .steer = .{ .text = expanded, .display_text = sent.input.text } }
+            else
+                .{ .user_msg = .{ .text = expanded, .display_text = sent.input.text } },
+        };
+        app.applyBlock(durable);
+        var replayed = (try allocDurableRenderBlock(gpa, durable)).?;
+        defer replayed.deinit(gpa);
+        try std.testing.expectEqualStrings(sent.input.text, replayed.text);
+        try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+        try std.testing.expectEqualStrings(sent.input.text, app.view.blocks.items[0].text);
+        try std.testing.expect(!app.view.blocks.items[0].pending_echo);
+        const before_escape = output.written().len;
+        app.submitInput(" /some-skill leave this literal");
+        const escaped = try proto.decode(proto.ClientMsg, arena.allocator(), output.written()[before_escape..]);
+        try std.testing.expectEqualStrings("/some-skill leave this literal", escaped.input.text);
+        try std.testing.expect(escaped.input.skill == null);
+        const before_builtin = output.written().len;
+        app.submitInput("/help");
+        try std.testing.expect(app.shortcut_help);
+        try std.testing.expectEqual(before_builtin, output.written().len);
+    }
+}
+
+test "plugin slash commands go to the installer rather than the model" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const cases = .{
+        .{ "/plugin marketplace add miradorlabs/agent-plugins", @import("../core/plugin_command.zig").Action.marketplace_add, "miradorlabs/agent-plugins" },
+        .{ "/plugin install mirador@miradorlabs", @import("../core/plugin_command.zig").Action.install, "mirador@miradorlabs" },
+    };
+    inline for (cases) |case| {
+        var output: Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        var conn: attach.Conn = undefined;
+        conn.gpa = gpa;
+        conn.writer = &output.writer;
+        var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+        defer app.deinit();
+        app.view.editor.insertSlice(case[0]);
+        try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const sent = try proto.decode(proto.ClientMsg, arena.allocator(), output.written());
+        try std.testing.expect(sent == .plugin);
+        try std.testing.expectEqual(case[1], sent.plugin.command.action);
+        try std.testing.expectEqualStrings(case[2], sent.plugin.command.argument);
+        try std.testing.expectEqual(@as(?u64, 42), sent.plugin.sid);
+        try std.testing.expectEqual(@as(usize, 0), app.view.blocks.items.len);
+    }
+}
+
+test "plugin skill completion owns catalog data, navigates names and preserves arguments" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr("/remote/repo");
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_skills = .{
+        .sid = 42,
+        .cwd = "/remote/repo",
+        .skills = &.{
+            .{ .name = "help", .description = "Must not shadow builtins" },
+            .{ .name = "q", .description = "Must not shadow aliases" },
+            .{ .name = "mirador:council", .description = "Consult\nthe council" },
+            .{ .name = "mirador:submit-pr", .description = "Submit a PR" },
+        },
+    } }));
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    app.view.editor.insertSlice("/mi");
+    const matches = try commandSuggestions(&app, arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqualStrings("Consult the council", matches[0].description);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.down });
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/mirador:submit-pr ", app.view.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    app.view.editor.insertSlice("fix the parser");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    const sent = try proto.decode(proto.ClientMsg, arena.allocator(), output.written());
+    try std.testing.expectEqualStrings("mirador:submit-pr", sent.input.skill.?.name);
+    try std.testing.expectEqualStrings("fix the parser", sent.input.skill.?.arguments);
+
+    app.view.editor.insertSlice("/mirador:cou");
+    const before = output.written().len;
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("/mirador:council ", app.view.editor.text.items);
+    try std.testing.expectEqual(before, output.written().len);
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/he");
+    const help = try commandSuggestions(&app, arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), help.len);
+    try std.testing.expectEqualStrings("/help", help[0].label);
+
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/mirador:");
+    app.setCwdStr("/other");
+    try std.testing.expectEqual(@as(usize, 0), (try commandSuggestions(&app, arena.allocator())).len);
+    app.setCwdStr("/remote/repo");
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_skills = .{ .sid = 99, .cwd = "/remote/repo", .skills = &.{} } }));
+    try std.testing.expectEqual(@as(usize, 2), (try commandSuggestions(&app, arena.allocator())).len);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_skills = .{ .sid = 42, .cwd = "/remote/repo", .skills = &.{} } }));
+    try std.testing.expectEqual(@as(usize, 0), (try commandSuggestions(&app, arena.allocator())).len);
 }

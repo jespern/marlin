@@ -1,0 +1,46 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "fix login"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"content\": \"Fixed login and tested it. Deployment is pending.\"}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 20, \"completion_tokens\": 12}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "brief recap",
+        "LATEST REQUEST: fix login",
+        "Deployment is pending."
+      ],
+      "expect_not_contains": [
+        "\"tools\""
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"content\": \"Login is fixed and tested; deployment is still pending.\"}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 20, \"completion_tokens\": 12}}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": [
+      "run",
+      "--quiet",
+      "--model",
+      "local/testing",
+      "fix login"
+    ],
+    "stdout_contains": [
+      "Fixed login"
+    ],
+    "recap_contains": "deployment is still pending",
+    "db_kinds": [
+      "user_msg",
+      "assistant_msg"
+    ]
+  }
+}

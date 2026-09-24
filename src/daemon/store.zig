@@ -2393,12 +2393,12 @@ fn searchTextAlloc(allocator: std.mem.Allocator, blk: block.Block) !?[]const u8 
     switch (blk.body) {
         .user_msg => |user| {
             if (user.synthetic) return null;
-            try appendSearchPart(&out, allocator, user.text);
+            try appendSearchPart(&out, allocator, user.display_text orelse user.text);
             for (user.attachments) |attachment| try appendSearchPart(&out, allocator, attachment.name);
         },
         .assistant_msg => |assistant| try appendSearchPart(&out, allocator, assistant.text),
         .reasoning => |reasoning| try appendSearchPart(&out, allocator, reasoning.text),
-        .steer => |steer| try appendSearchPart(&out, allocator, steer.text),
+        .steer => |steer| try appendSearchPart(&out, allocator, steer.display_text orelse steer.text),
         .tool_call => |call| {
             try appendSearchPart(&out, allocator, call.name);
             try appendSearchPart(&out, allocator, call.args_json);

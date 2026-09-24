@@ -111,11 +111,16 @@ pub const Runtime = struct {
 
         const arena = arena_state.allocator();
         const directories = try expandPaths(arena, cfg.skill_directories, environ.get("HOME"));
-        const skill_index = try skills.Index.load(gpa, io, directories);
+        var skill_index = try skills.Index.load(gpa, io, directories);
         var skill_transferred = false;
         errdefer if (!skill_transferred) {
             var owned = skill_index;
             owned.deinit();
+        };
+
+        skill_index.plugin_root = @import("plugins.zig").rootPath(gpa, environ) catch |err| switch (err) {
+            error.NoHome => null,
+            else => return err,
         };
 
         self.* = .{
@@ -281,13 +286,7 @@ pub const Runtime = struct {
                 .mutating = entry.toolMutating(tool),
             });
         }
-        if (self.skill_index.items.items.len > 0) try self.appendSpec(.{
-            .name = skills.spec_name,
-            .description = skills.spec_description,
-            .schema_json = skills.spec_schema,
-            .parallel_safe = true,
-            .mutating = false,
-        });
+        if (self.skill_index.items.items.len > 0) try self.appendSpec(self.skill_index.spec());
     }
 
     fn appendSpec(self: *Runtime, spec: Spec) !void {

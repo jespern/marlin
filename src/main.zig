@@ -94,6 +94,7 @@ test {
     _ = @import("daemon/extensions_test.zig");
     _ = @import("daemon/hooks_test.zig");
     _ = @import("daemon/skills_test.zig");
+    _ = @import("daemon/plugins_test.zig");
     _ = @import("daemon/tools/registry_test.zig");
     _ = @import("daemon/tools/bash_test.zig");
     _ = @import("daemon/tools/files_test.zig");
@@ -104,6 +105,7 @@ test {
     _ = @import("daemon/tools/mcp_test.zig");
     _ = @import("daemon/provider/provider_test.zig");
     _ = @import("daemon/provider/openai_compat_test.zig");
+    _ = @import("daemon/provider/dsml_test.zig");
     _ = @import("daemon/provider/anthropic_test.zig");
     _ = @import("daemon/provider/sse_test.zig");
     _ = @import("daemon/provider/http_test.zig");
@@ -145,7 +147,10 @@ test {
     _ = @import("client/starfield_test.zig");
     _ = @import("client/strings_test.zig");
     _ = @import("client/tui_test.zig");
+    _ = @import("daemon/git_status_test.zig");
     _ = @import("client/session_view_test.zig");
+    _ = @import("client/recap_test.zig");
+    _ = @import("daemon/recap_test.zig");
     _ = @import("client/commands.zig");
     _ = @import("client/keys.zig");
     _ = @import("client/setup.zig");

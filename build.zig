@@ -51,6 +51,18 @@ fn configureSqlite(module: *std.Build.Module, b: *std.Build, embedded: bool) voi
     }
 }
 
+// A real YAML parser for portable Agent Skills frontmatter. Vendored so
+// release builds and cross compilation do not depend on a system libyaml.
+fn configureYaml(module: *std.Build.Module, b: *std.Build) void {
+    module.link_libc = true;
+    module.addIncludePath(b.path("vendor/libyaml"));
+    module.addCSourceFiles(.{
+        .root = b.path("vendor/libyaml"),
+        .files = &.{ "api.c", "reader.c", "scanner.c", "parser.c", "loader.c" },
+        .flags = &.{ "-std=c99", "-DYAML_DECLARE_STATIC", "-DYAML_VERSION_STRING=\"0.2.5\"", "-DYAML_VERSION_MAJOR=0", "-DYAML_VERSION_MINOR=2", "-DYAML_VERSION_PATCH=5" },
+    });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // The installed binary is the daily driver: default it to ReleaseFast so
@@ -101,6 +113,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("asset_store", asset_store);
     configureSqlite(exe.root_module, b, embedded_sqlite);
+    configureYaml(exe.root_module, b);
     configurePower(exe.root_module, b, target);
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
@@ -167,6 +180,7 @@ pub fn build(b: *std.Build) void {
     });
     test_module.addImport("asset_store", asset_store);
     configureSqlite(test_module, b, embedded_sqlite);
+    configureYaml(test_module, b);
     configurePower(test_module, b, target);
     test_module.addOptions("build_options", build_options);
     const exe_tests = b.addTest(.{ .root_module = test_module });

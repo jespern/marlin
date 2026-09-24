@@ -36,6 +36,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
     .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
+    .{ .name = "/plugin", .usage = " [list|marketplace|install|uninstall]", .description = "manage skill-only plugins and marketplaces", .accepts_args = true },
     .{ .name = "/mcp", .usage = " [add|remove|restart|reload]", .description = "inspect and manage MCP servers", .accepts_args = true },
     .{ .name = "/council", .usage = " [<name>|new <name>|edit <name>|remove <name>]", .description = "list, inspect, or edit review councils", .accepts_args = true },
     .{ .name = "/voice", .usage = " [setup|mode|off]", .description = "dictate into the composer (local STT; setup on first use)", .accepts_args = true },
@@ -51,7 +52,9 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/mk64", .hidden = true, .description = "play Mario Kart (pure Zig)", .accepts_args = true },
     .{ .name = "/otel", .usage = " [set <endpoint>|status|on|off]", .description = "configure OTLP export (persists across restarts)", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
+    .{ .name = "/reset", .description = "archive idle sessions and open a fresh startup screen" },
     .{ .name = "/cwd", .usage = " <path>", .description = "change this session's working directory", .accepts_args = true },
+    .{ .name = "/cd", .usage = " <path>", .description = "change working directory (alias for /cwd)", .accepts_args = true },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
@@ -114,15 +117,34 @@ pub fn commandQuery(editor: *const Editor) ?[]const u8 {
             !std.mem.eql(u8, head, "/animate") and
             !std.mem.eql(u8, head, "/screensaver") and
             !std.mem.eql(u8, head, "/otel") and
-            !std.mem.eql(u8, head, "/cwd") and
+            !isCwdCommand(head) and
             !std.mem.eql(u8, head, "!rb") and
             !std.mem.eql(u8, head, "!wipeout")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
+        // /cwd consumes the whole tail, including spaces in directory names.
+        // Keep cursor motion as editing; completion operates at the path's end.
+        if (isCwdCommand(head)) return if (editor.cursor == text.len) text else null;
         // One argument is the rule; `!wipeout` stacks words (circuit, pilot,
         // class, flags) and offers the next one at each step.
         if (!std.mem.eql(u8, head, "!wipeout") and std.mem.indexOfAny(u8, rest, " \t") != null) return null;
     }
     return text;
+}
+
+pub fn isCwdCommand(head: []const u8) bool {
+    return std.mem.eql(u8, head, "/cwd") or std.mem.eql(u8, head, "/cd");
+}
+
+pub fn cwdCommand(editor: *const Editor) ?[]const u8 {
+    const query = commandQuery(editor) orelse return null;
+    const space = std.mem.indexOfAny(u8, query, " \t") orelse return null;
+    const head = query[0..space];
+    return if (isCwdCommand(head)) head else null;
+}
+
+pub fn cwdArgument(editor: *const Editor) ?[]const u8 {
+    const head = cwdCommand(editor) orelse return null;
+    return std.mem.trimStart(u8, editor.text.items[head.len..], " \t");
 }
 
 pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const CommandSuggestion {
@@ -204,17 +226,11 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
         }
         return out.items;
     }
-    if (query.len > "/cwd".len and
-        std.mem.eql(u8, query[0.."/cwd".len], "/cwd") and
-        (query["/cwd".len] == ' ' or query["/cwd".len] == '\t'))
-    {
-        // Directories matching the path typed so far, relative to the
-        // session's cwd (or ~, or absolute); Tab descends one segment,
-        // Enter with a complete path is the user's call.
-        const typed = std.mem.trimStart(u8, query["/cwd".len..], " \t");
+    if (cwdArgument(&app.view.editor)) |typed| {
+        const head = cwdCommand(&app.view.editor).?;
         const home: ?[]const u8 = if (app.environ) |env| env.get("HOME") else null;
         for (try path_complete.directories(arena, app.io, app.view.cwd.items, home, typed)) |c| {
-            const replacement = try std.fmt.allocPrint(arena, "/cwd {s}", .{c.arg});
+            const replacement = try std.fmt.allocPrint(arena, "{s} {s}", .{ head, c.arg });
             try out.append(arena, .{
                 .label = replacement,
                 .description = "directory",
@@ -355,6 +371,23 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
             });
         }
     }
+    if (query[0] == '/' and std.mem.eql(u8, app.view.cwd.items, app.view.skills_cwd)) {
+        for (app.view.skills) |skill| {
+            const name = try std.fmt.allocPrint(arena, "/{s}", .{skill.name});
+            if (skillInvocation(name) == null) continue;
+            if (query.len > name.len or !std.ascii.eqlIgnoreCase(query, name[0..query.len])) continue;
+            const description = try arena.dupe(u8, skill.description);
+            for (description) |*c| if (std.ascii.isWhitespace(c.*)) {
+                c.* = ' ';
+            };
+            try out.append(arena, .{
+                .label = name,
+                .description = description,
+                .replacement = try std.fmt.allocPrint(arena, "{s} ", .{name}),
+                .submit_on_enter = false,
+            });
+        }
+    }
     return out.items;
 }
 
@@ -409,8 +442,24 @@ pub fn isCommandInput(text: []const u8) bool {
     return trimmed.len > 0 and (trimmed[0] == '/' or trimmed[0] == '!');
 }
 
+pub const SkillInvocation = struct { name: []const u8, arguments: []const u8 };
+
+/// An unclaimed slash name is an explicit request to the active agent.
+/// Built-ins win collisions; paths and punctuation are not skill names.
+pub fn skillInvocation(text: []const u8) ?SkillInvocation {
+    if (text.len < 2 or text[0] != '/') return null;
+    var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const head = words.next() orelse return null;
+    if (std.mem.eql(u8, head, "/q")) return null;
+    for (composer_commands) |command| if (std.mem.eql(u8, head, command.name)) return null;
+    const name = head[1..];
+    if (name.len == 0 or !std.ascii.isAlphanumeric(name[0])) return null;
+    for (name) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != ':' and c != '.') return null;
+    return .{ .name = name, .arguments = std.mem.trimStart(u8, words.rest(), " \t\r\n") };
+}
+
 pub fn runCommand(self: *App, cmd: []const u8) void {
-    var it = std.mem.tokenizeScalar(u8, cmd, ' ');
+    var it = std.mem.tokenizeAny(u8, cmd, " \t\r\n");
     const head = it.next() orelse return;
 
     if (std.mem.eql(u8, head, "/quit") or std.mem.eql(u8, head, "/q") or
@@ -516,6 +565,27 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         } else {
             self.setNotice("usage: /mcp [add <name> <command> [args...]|remove <name>|restart <name>|reload]", .{});
         }
+    } else if (std.mem.eql(u8, head, "/plugin")) {
+        const plugin_command = @import("../core/plugin_command.zig");
+        var args: [3][]const u8 = undefined;
+        var count: usize = 0;
+        while (it.next()) |arg| {
+            if (count == args.len) {
+                self.setNotice("usage: {s}", .{plugin_command.usage});
+                return;
+            }
+            args[count] = arg;
+            count += 1;
+        }
+        const command = plugin_command.parse(args[0..count]) orelse {
+            self.setNotice("usage: {s}", .{plugin_command.usage});
+            return;
+        };
+        self.conn.send(.{ .plugin = .{ .sid = self.view.sid, .command = command } }) catch {
+            self.setNotice("could not send plugin command", .{});
+            return;
+        };
+        self.setNotice("working on plugin command…", .{});
     } else if (std.mem.eql(u8, head, "/council")) {
         const action = it.next();
         if (action == null or std.mem.eql(u8, action.?, "list")) {
@@ -683,10 +753,16 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.newSession() catch {
             self.setNotice("could not create session", .{});
         };
-    } else if (std.mem.eql(u8, head, "/cwd")) {
+    } else if (std.mem.eql(u8, head, "/reset")) {
+        if (it.next() != null) {
+            self.setNotice("usage: /reset", .{});
+            return;
+        }
+        self.resetSessions();
+    } else if (isCwdCommand(head)) {
         const cwd = std.mem.trim(u8, it.rest(), " \t");
         if (cwd.len == 0) {
-            self.setNotice("usage: /cwd <path>", .{});
+            self.setNotice("usage: {s} <path>", .{head});
             return;
         }
         self.applyCwd(cwd);
@@ -845,6 +921,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         // `!ls -la` — every shell and vim accept the bang glued to the
         // command. The exact `!c`/`!rb`/`!rbc` shortcuts matched above.
         self.shellEscape(cmd[1..]);
+    } else if (skillInvocation(cmd) != null) {
+        self.submitInput(cmd);
     } else {
         self.setNotice("unknown command {s} (try /help)", .{head});
     }

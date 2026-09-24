@@ -202,6 +202,7 @@ pub const AttachmentUpload = struct {
 
 /// Client → daemon.
 pub const WebStatus = struct { enabled: bool = false, state: []const u8 = "disabled", url: []const u8 = "", logs: []const []const u8 = &.{} };
+pub const SkillInfo = struct { name: []const u8, description: []const u8 };
 
 pub const ClientMsg = union(enum) {
     web_status: struct {},
@@ -233,6 +234,8 @@ pub const ClientMsg = union(enum) {
     /// Operational timings/outcomes for one session. `turn_limit` bounds the
     /// percentile sample; the latest turn's waterfall is always included.
     diagnostics: struct { sid: u64, turn_limit: u32 = 50 },
+    session_recap: struct { sid: u64, seq: u64 },
+    session_git_status: struct { sid: u64 },
     /// Replace or disable the daemon's process-local OTLP exporter without a
     /// restart. Credentials travel only over the local socket or SSH pipe and
     /// are never persisted. Empty endpoint fields select disabled state.
@@ -294,6 +297,8 @@ pub const ClientMsg = union(enum) {
     /// union tag they cannot decode. These fields are additive for older peers.
     sub: struct {
         sid: u64,
+        /// Opt into session_skills snapshots on attach and catalog changes.
+        skill_catalog: bool = false,
         from_seq: u64 = 0,
         tail_limit: u32 = 0,
         before_seq: u64 = 0,
@@ -312,6 +317,9 @@ pub const ClientMsg = union(enum) {
     input: struct {
         sid: u64,
         text: []const u8,
+        /// Explicit slash invocation. The daemon resolves and renders the
+        /// installed skill before accepting input; text remains the command.
+        skill: ?struct { name: []const u8, arguments: []const u8 = "" } = null,
         request_id: u64 = 0,
         attachments: []const AttachmentUpload = &.{},
     },
@@ -356,6 +364,7 @@ pub const ClientMsg = union(enum) {
     },
     /// MCP is daemon-owned. Listing and lifecycle actions therefore work from
     /// any thin client without assuming a shared process or filesystem.
+    plugin: struct { sid: ?u64 = null, cwd: []const u8 = ".", command: @import("plugin_command.zig").Command },
     mcp_list: struct {},
     mcp_restart: struct { name: []const u8 },
     /// Persist a stdio server in config.toml, then rebuild the live registry.
@@ -414,6 +423,8 @@ pub const DaemonMsg = union(enum) {
         /// The daemon's kernel shell sandbox passed its startup canary;
         /// sessions may enable prompt-free sandboxed shell execution.
         sandbox_available: bool = false,
+        session_recaps: bool = false,
+        git_status: bool = false,
         /// A DNS blocklist / explicit-deny network policy is loaded for
         /// Marlin-owned network tools and may be enabled per session.
         network_filtering: bool = false,
@@ -445,6 +456,9 @@ pub const DaemonMsg = union(enum) {
     /// Sent only to session watchers that explicitly opted in: older tagged
     /// union decoders reject message types they do not know.
     session_upsert: struct { session: SessionInfo },
+    session_git_status: struct { sid: u64, cwd: []const u8, branch: []const u8 = "", counts: ?struct { ahead: u64, behind: u64 } = null },
+    session_skills: struct { sid: u64, cwd: []const u8, skills: []const SkillInfo },
+    session_recap: struct { sid: u64, seq: u64, text: []const u8 = "", generated: bool = false, retry: bool = false },
     session_remove: struct { sid: u64 },
     blk: struct { sid: u64, b: block.Block },
     delta: struct { sid: u64, turn_id: u64, text: []const u8 },
@@ -521,6 +535,7 @@ pub const DaemonMsg = union(enum) {
     },
     setup_status_result: SetupStatus,
     setup_result: struct { model: []const u8, session_updated: bool = false },
+    plugin_result: struct { ok: bool, message: []const u8 },
     mcp_list_result: struct { servers: []const McpServerInfo },
     /// Terminal reply after a UI preference is durable.
     ui_config_result: struct {

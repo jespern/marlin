@@ -26,7 +26,6 @@ const prevWordCol = render.prevWordCol;
 const commands = @import("commands.zig");
 const commandSuggestions = commands.commandSuggestions;
 const completeSuggestion = commands.completeSuggestion;
-const commandQuery = commands.commandQuery;
 const isCommandInput = commands.isCommandInput;
 
 pub fn handleKey(app: *App, key: vaxis.Key) !void {
@@ -287,7 +286,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
 
-    if (isPlanToggleKey(key)) {
+    if (isPlanToggleKey(key) and !(app.mode == .insert and !app.view.editor.isWalkingHistory() and commands.cwdArgument(&app.view.editor) != null)) {
         app.togglePlanMode();
         return;
     }
@@ -418,36 +417,62 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
             // A recalled /command still looks like an autocomplete query.
             // While walking history, Up/Down must keep walking history rather
             // than being captured by the command menu.
-            // Path completion follows shell keys: Tab expands, Enter executes
-            // the typed path even when the menu offers child directories.
-            const query = commandQuery(ed) orelse "";
-            const cwd_argument = std.mem.startsWith(u8, query, "/cwd ") or std.mem.startsWith(u8, query, "/cwd\t");
-            if (cwd_argument and key.matches(vaxis.Key.tab, .{})) {
-                const typed = std.mem.trimStart(u8, query[4..], " \t");
-                const home = if (app.environ) |env| env.get("HOME") else null;
-                const completed = try @import("path_complete.zig").complete(command_arena.allocator(), app.io, app.view.cwd.items, home, typed);
-                if (!std.mem.eql(u8, typed, completed)) {
-                    const replacement = try std.fmt.allocPrint(command_arena.allocator(), "/cwd {s}", .{completed});
-                    ed.clear();
-                    ed.insertSlice(replacement);
+            // Complete the common prefix first. An ambiguous Tab or arrow
+            // opens an explicit selection; the next Tab accepts that directory.
+            const typed_cwd = commands.cwdArgument(ed);
+            const cwd_argument = typed_cwd != null;
+            if (!cwd_argument) app.cwd_menu_selection = null;
+            if (typed_cwd) |typed| {
+                if (key.matches(vaxis.Key.tab, .{})) {
+                    if (app.cwdMenuSelected() and suggestions.len > 0) {
+                        completeSuggestion(ed, suggestions[@min(app.command_selection, suggestions.len - 1)], true);
+                        app.cwd_menu_selection = null;
+                    } else {
+                        const home = if (app.environ) |env| env.get("HOME") else null;
+                        const completed = try @import("path_complete.zig").complete(command_arena.allocator(), app.io, app.view.cwd.items, home, typed);
+                        if (!std.mem.eql(u8, typed, completed)) {
+                            const replacement = try std.fmt.allocPrint(command_arena.allocator(), "{s} {s}", .{ commands.cwdCommand(ed).?, completed });
+                            ed.clear();
+                            ed.insertSlice(replacement);
+                            app.cwd_menu_selection = null;
+                        } else if (suggestions.len > 0) {
+                            // Explicit completion ends a recalled history walk.
+                            ed.insertSlice("");
+                            app.cwd_menu_selection = app.cwdMenuKey();
+                        }
+                    }
+                    app.command_selection = 0;
+                    return;
                 }
-                app.command_selection = 0;
-                return;
+                if (key.matches(vaxis.Key.escape, .{}) and app.cwdMenuSelected()) {
+                    app.cwd_menu_selection = null;
+                    app.command_selection = 0;
+                    return;
+                }
+                if (isEnterKey(key) and app.cwdMenuSelected() and suggestions.len > 0 and !ed.isWalkingHistory()) {
+                    completeSuggestion(ed, suggestions[@min(app.command_selection, suggestions.len - 1)], false);
+                }
             }
             const submit_cwd = isEnterKey(key) and cwd_argument;
             if (suggestions.len > 0 and !ed.isWalkingHistory() and !submit_cwd) {
                 app.command_selection = @min(app.command_selection, suggestions.len - 1);
                 if (isNextInputRowKey(key)) {
-                    app.command_selection = if (app.command_selection + 1 < suggestions.len)
+                    app.command_selection = if (cwd_argument and !app.cwdMenuSelected())
+                        0
+                    else if (app.command_selection + 1 < suggestions.len)
                         app.command_selection + 1
                     else
                         0;
+                    if (cwd_argument) app.cwd_menu_selection = app.cwdMenuKey();
                     return;
                 } else if (isPreviousInputRowKey(key) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
-                    app.command_selection = if (app.command_selection > 0)
+                    app.command_selection = if (cwd_argument and !app.cwdMenuSelected())
+                        suggestions.len - 1
+                    else if (app.command_selection > 0)
                         app.command_selection - 1
                     else
                         suggestions.len - 1;
+                    if (cwd_argument) app.cwd_menu_selection = app.cwdMenuKey();
                     return;
                 } else if (key.matches(vaxis.Key.tab, .{})) {
                     completeSuggestion(ed, suggestions[app.command_selection], true);
@@ -465,6 +490,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
                     return;
                 }
             }
+            app.cwd_menu_selection = null;
             if (key.matches(vaxis.Key.escape, .{})) {
                 app.mode = .normal; // draft survives: editor state untouched
                 app.view.sel_anchor = null;

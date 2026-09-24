@@ -399,14 +399,14 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
                 generated_text = try rehydrationLabel(gpa, u.text);
                 text = generated_text.?;
             } else {
-                text = u.text;
+                text = u.display_text orelse u.text;
                 if (u.attachments.len > 0) {
                     generated_label = try mediaLabel(gpa, u.attachments);
                     label = generated_label.?;
                 }
             }
         },
-        .steer => |s| text = s.text,
+        .steer => |s| text = s.display_text orelse s.text,
         .assistant_msg => |a| text = a.text,
         .reasoning => |r| text = r.text,
         .tool_call => |tc| {
@@ -1488,7 +1488,12 @@ pub fn layoutBlockRange(
                 }
             },
             .system_note => {
-                if (std.mem.eql(u8, rb.label, "diagnostics")) {
+                if (std.mem.eql(u8, rb.label, "Recap") or std.mem.eql(u8, rb.label, "Last exchange")) {
+                    try flushRanSummary(alloc, lines, &pending_ran);
+                    try blankLine(alloc, lines);
+                    try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.note, w);
+                    try wrapPrefixed(alloc, lines, "  ", rb.text, Palette.note, w);
+                } else if (std.mem.eql(u8, rb.label, "diagnostics")) {
                     try flushRanSummary(alloc, lines, &pending_ran);
                     try blankLine(alloc, lines);
                     try wrapPrefixed(alloc, lines, "  ", "diagnostics", Palette.note, w);

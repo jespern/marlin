@@ -1,0 +1,62 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "bootstrap plugins"
+      ],
+      "expect_not_contains": [
+        "demo:review"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"content\": \"ready\"}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "demo:review: Review a target with the plugin",
+        "Skill: demo:review",
+        "PLUGIN_COMMAND_BODY: the parser."
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"load_plugin\", \"function\": {\"name\": \"skill\", \"arguments\": \"{\\\"name\\\": \\\"demo:review\\\"}\"}}]}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "\"tool_call_id\":\"load_plugin\"",
+        "PLUGIN_COMMAND_BODY: $ARGUMENTS.",
+        "Base directory for relative skill resources:"
+      ],
+      "sse": [
+        "{\"choices\": [{\"delta\": {\"content\": \"plugin complete\"}}]}",
+        "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\"}]}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": [
+      "run",
+      "--quiet",
+      "--model",
+      "local/testing",
+      "bootstrap plugins"
+    ],
+    "stdout_contains": [
+      "ready"
+    ],
+    "plugin_flow": true,
+    "db_kinds": [
+      "user_msg",
+      "assistant_msg",
+      "user_msg",
+      "tool_call",
+      "tool_result",
+      "assistant_msg"
+    ]
+  }
+}

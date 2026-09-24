@@ -273,3 +273,32 @@ test "request body maps tool images to OpenAI content parts" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\",\"content\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "data:image/png;base64,iVBORw0KGgo=") != null);
 }
+
+test "inline DSML tool calls are recovered as real calls and stripped from the text" {
+    const gpa = std.testing.allocator;
+    var acc = StreamAccum.init(gpa);
+    defer acc.deinit();
+    const text = "Checking.\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">git status</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    try acc.text.appendSlice(gpa, text);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try acc.recoverInlineToolCalls(arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), acc.calls.items.len);
+    try std.testing.expectEqualStrings("bash", acc.calls.items[0].name.items);
+    try std.testing.expectEqualStrings("{\"command\":\"git status\"}", acc.calls.items[0].args.items);
+    try std.testing.expectEqualStrings("dsml_0", acc.calls.items[0].call_id.items);
+    try std.testing.expectEqualStrings("Checking.", acc.text.items);
+    try std.testing.expectEqual(StreamAccum.FinishReason.tool_calls, acc.finish_reason.?);
+    try std.testing.expectEqual(@as(usize, 1), acc.recovered_inline_calls);
+
+    // Structured calls present: the text is left alone.
+    var acc2 = StreamAccum.init(gpa);
+    defer acc2.deinit();
+    try acc2.text.appendSlice(gpa, text);
+    const pc = try acc2.callAt(0);
+    try acc2.appendToolFragment(&pc.name, "read_file");
+    try acc2.recoverInlineToolCalls(arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), acc2.calls.items.len);
+    try std.testing.expectEqualStrings("read_file", acc2.calls.items[0].name.items);
+    try std.testing.expectEqualStrings(text, acc2.text.items);
+}

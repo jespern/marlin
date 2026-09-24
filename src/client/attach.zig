@@ -60,6 +60,8 @@ pub const Conn = struct {
     wbuf: []u8,
     /// Daemon capabilities from hello_ok; populated by connect().
     sandbox_available: bool = false,
+    session_recaps: bool = false,
+    git_status: bool = false,
     network_filtering: bool = false,
     network_configured: bool = false,
     /// OTLP exporter state at handshake; the /otel status reply refreshes it.
@@ -345,6 +347,8 @@ pub fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !v
     if (deadline.canceled.load(.acquire)) return error.ConnectCanceled;
     if (deadline.fired.load(.acquire)) return error.DaemonHandshakeTimedOut;
     conn.sandbox_available = hello.sandbox_available;
+    conn.session_recaps = hello.session_recaps;
+    conn.git_status = hello.git_status;
     conn.network_filtering = hello.network_filtering;
     conn.network_configured = hello.network_configured;
     conn.otel_enabled = hello.otel_enabled;

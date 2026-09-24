@@ -137,6 +137,19 @@ before attempting daemon shutdown. Unit coverage deliberately cancels a shell
 whose grandchild ignores SIGTERM and proves the grandchild is gone, preventing
 a failed test from keeping `tee` (or an agent turn) alive indefinitely.
 
+Destructive process fixtures register independent PID-file cleanup before
+spawning, so assertion failures and early returns still remove their children.
+Their termination-resistant loops also expire after 30 seconds if the test
+runner is killed before its defers can run. The escaped-process-group test
+requires `ps` access and skips before spawning when a sandbox denies it; the
+independent failure-cleanup regression still runs without that access.
+
+To inspect leftovers from older versions of that fixture, run
+`python3 scripts/cleanup_process_tests.py` in a terminal with process access.
+Add `--apply` to remove them. The script accepts only orphaned, same-user
+process-group leaders with the exact old fixture command, revalidates their
+start time and group membership before signaling, and checks for survivors.
+
 Compaction regressions live at the lowest expressive layers: context unit
 tests prove range edges cannot bisect a calls-first parallel turn and legacy
 orphan results are omitted; TUI tests prove summaries/file contents never enter
@@ -221,3 +234,19 @@ enshrined as another e2e.
    `delay_ms_between_events` exists precisely to freeze races into scenarios.
 4. Unit-test time stays under ~5s and e2e under ~30s locally. When they
    outgrow that, split steps — never skip them.
+
+Agent Skills coverage lives in `src/daemon/skills_test.zig` (YAML scalar forms,
+metadata isolation, malformed input, symlink cycles, bundle boundaries, project
+precedence and cwd isolation). Scenario `28_skill_invocation.json` exercises the
+native catalog, model-driven activation, a bundled reference read, project-over-user
+precedence, explicit slash activation, and persisted instructions across turns.
+
+Skill-only marketplace coverage is in `src/daemon/plugins_test.zig`: real Git
+fixtures exercise clone/install, namespaced lookup, atomic updates, rollback,
+uninstall, and path/symlink/component rejection. `29_plugins.json` exercises the
+CLI and daemon worker, then namespaced slash and model-driven activation through
+a real provider roundtrip. TUI tests assert `/plugin` is routed to the installer
+instead of becoming a user prompt. Completion coverage checks namespaced skill
+selection, argument preservation, built-in precedence, and stale cwd isolation.
+The plugin scenario also verifies opt-in catalog delivery, uninstall/reinstall
+updates to an already attached client, and project skills after a cwd change.

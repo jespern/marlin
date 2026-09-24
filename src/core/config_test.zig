@@ -439,3 +439,32 @@ test "voice section: parse, whole-section replace, removal helper" {
     defer gpa.free(untouched);
     try std.testing.expectEqualStrings("[web]\nenabled = true\n", untouched);
 }
+
+test "default user skill roots include shared skills and can be overridden" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-skills-config");
+    defer temp.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("HOME", temp.path);
+    try environ.put("XDG_CONFIG_HOME", temp.path);
+    var loaded = try load(gpa, io, &environ);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.value.skill_directories.len);
+    const native = try std.fs.path.join(gpa, &.{ temp.path, "marlin", "skills" });
+    defer gpa.free(native);
+    const shared = try std.fs.path.join(gpa, &.{ temp.path, ".agents", "skills" });
+    defer gpa.free(shared);
+    try std.testing.expectEqualStrings(native, loaded.value.skill_directories[0]);
+    try std.testing.expectEqualStrings(shared, loaded.value.skill_directories[1]);
+    const config_path = try std.fs.path.join(gpa, &.{ temp.path, "marlin", "config.toml" });
+    defer gpa.free(config_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "[skills]\ndirectories = [\"/custom/skills\"]\n" });
+    var custom = try load(gpa, io, &environ);
+    defer custom.deinit();
+    try std.testing.expectEqual(@as(usize, 1), custom.value.skill_directories.len);
+    try std.testing.expectEqualStrings("/custom/skills", custom.value.skill_directories[0]);
+}

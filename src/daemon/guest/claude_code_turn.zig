@@ -571,7 +571,7 @@ pub fn runClaudeCodeTurn(
         // Steers queued while the subprocess ran become follow-up rounds.
         // `try_close_steer` closes the same last-poll race as the native
         // provider loop; false guarantees another poll can take the winner.
-        var steer_text: ?[]u8 = if (opts.poll_steer) |poll|
+        var steer_text: ?block.Input = if (opts.poll_steer) |poll|
             poll(opts.on_delta_ctx, gpa)
         else
             null;
@@ -579,10 +579,10 @@ pub fn runClaudeCodeTurn(
             steer_text = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
         }
         if (steer_text) |text| {
-            defer gpa.free(text);
-            _ = try ap.append(.{ .steer = .{ .text = text } });
+            defer text.deinit(gpa);
+            _ = try ap.append(.{ .steer = text });
             prompt.clearRetainingCapacity();
-            try prompt.appendSlice(gpa, text);
+            try prompt.appendSlice(gpa, text.text);
             continue;
         }
         break;

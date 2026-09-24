@@ -25,7 +25,7 @@
 //!            being edited); Alt/Option+1..9 jumps to a tab
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /cwd <path>, /search <query>, /animate <effect>,
-//!             /screensaver [effect], /new, /compact, /archive, /reboot [--build], /help,
+//!             /screensaver [effect], /new, /reset, /compact, /archive, /reboot [--build], /help,
 //!             /quit (alias /detach — sessions keep running in the daemon)
 //!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
 //!              !c (copy last full tool output), !rb [client|both] / !rbc (scoped rebuild),
@@ -432,6 +432,11 @@ pub const App = struct {
     term_rows: u16 = 24,
     /// Used only to render cwd with a compact ~/ prefix.
     home: std.ArrayList(u8) = .empty,
+    git_cwd: std.ArrayList(u8) = .empty,
+    git_label: std.ArrayList(u8) = .empty,
+    git_supported: bool = false,
+    git_sid: u64 = 0,
+    git_next_poll_ms: i64 = 0,
     /// Selector overlay: null = closed; value = highlighted index into the
     /// filtered model or effort list (see pickerItems).
     picker: ?usize = null,
@@ -446,6 +451,8 @@ pub const App = struct {
     /// Highlighted row in the command/shortcut autocomplete menu. The menu
     /// itself is derived from editor text and therefore needs no open flag.
     command_selection: usize = 0,
+    /// Explicit directory selection, tied to this exact draft/session/cursor.
+    cwd_menu_selection: ?u64 = null,
     /// Type-to-filter query while the picker is open.
     picker_filter: std.ArrayList(u8) = .empty,
     /// Provider onboarding draft; see setup.zig.
@@ -515,6 +522,7 @@ pub const App = struct {
     terminal_focused: bool = true,
     presence_last_sent_ms: i64 = 0,
     presence_last_activity_ms: i64 = 0,
+    recaps_supported: bool = false,
     presence_reported_active: bool = false,
     web_view: bool = false,
     web_available: bool = false,
@@ -604,6 +612,7 @@ pub const App = struct {
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
     awaiting_new_session: bool = false,
+    reset_after_new_session: bool = false,
     pending_new_session_request_id: u64 = 0,
     pending_new_cwd: std.ArrayList(u8) = .empty,
     /// Set by /reboot or !rb: after clean TUI teardown, run() returns this
@@ -677,6 +686,8 @@ pub const App = struct {
         self.clipboard_pending.deinit(self.gpa);
         self.clipboard_desc.deinit(self.gpa);
         self.home.deinit(self.gpa);
+        self.git_cwd.deinit(self.gpa);
+        self.git_label.deinit(self.gpa);
         self.notice.deinit(self.gpa);
         if (self.otel_header_prompt) self.view.editor.clearSensitive();
         self.view.deinit(self.gpa);
@@ -767,6 +778,15 @@ pub const App = struct {
     pub fn setModelStr(self: *App, m: []const u8) void {
         self.view.model.clearRetainingCapacity();
         self.view.model.appendSlice(self.gpa, m) catch {};
+    }
+
+    pub fn cwdMenuKey(self: *const App) u64 {
+        const seed = std.hash.Wyhash.hash(self.view.sid ^ @as(u64, @intCast(self.view.editor.cursor)), self.view.cwd.items);
+        return std.hash.Wyhash.hash(seed, self.view.editor.text.items);
+    }
+
+    pub fn cwdMenuSelected(self: *const App) bool {
+        return self.cwd_menu_selection == self.cwdMenuKey();
     }
 
     pub fn setCwdStr(self: *App, cwd: []const u8) void {
@@ -1058,12 +1078,14 @@ pub const App = struct {
             self.view.history_loading = true;
             self.view.history_before_seq = 0;
             self.conn.send(.{ .sub = .{
+                .skill_catalog = true,
                 .sid = sid,
                 .from_seq = 1,
                 .tail_limit = initial_replay_blocks,
             } }) catch {};
         } else {
             self.conn.send(.{ .sub = .{
+                .skill_catalog = true,
                 .sid = sid,
                 .from_seq = self.view.last_seq +| 1,
                 .replay_limit = initial_replay_blocks,
@@ -1534,6 +1556,7 @@ pub const App = struct {
                     }
                 }
                 view.last_seq = b.b.seq;
+                view.recap.changed(b.b.ts);
                 self.applyBlock(b.b);
             },
             .replay_done => |replay| {
@@ -1549,6 +1572,7 @@ pub const App = struct {
                     if (replay.oldest_seq > 0) view.oldest_seq = replay.oldest_seq;
                     view.history_complete = !replay.has_older;
                     self.conn.send(.{ .sub = .{
+                        .skill_catalog = true,
                         .sid = view.sid,
                         .from_seq = replay.newest_seq +| 1,
                         .replay_limit = initial_replay_blocks,
@@ -1558,6 +1582,7 @@ pub const App = struct {
                 if (replay.forward) {
                     if (replay.has_newer and replay.newest_seq > 0) {
                         self.conn.send(.{ .sub = .{
+                            .skill_catalog = true,
                             .sid = view.sid,
                             .from_seq = replay.newest_seq +| 1,
                             .replay_limit = initial_replay_blocks,
@@ -1599,6 +1624,11 @@ pub const App = struct {
                     view.state
                 else
                     null;
+                if (self.liveView(s.sid) orelse self.saved_views.get(s.sid)) |recap_view| {
+                    if (s.state == .running or s.state == .awaiting_approval or
+                        prior_state == .running or prior_state == .awaiting_approval)
+                        recap_view.recap.changed(status_now);
+                }
                 self.updateSessionSummaryState(s.sid, s.state);
                 if (prior_state == .running and s.state != .running and
                     (s.sid != self.view.sid or !self.terminal_focused))
@@ -1767,6 +1797,28 @@ pub const App = struct {
                     },
                 );
             },
+            .session_skills => |result| {
+                const view = self.liveView(result.sid) orelse self.saved_views.get(result.sid) orelse return;
+                view.replaceSkills(self.gpa, result.cwd, result.skills) catch return;
+                if (result.sid == self.view.sid) self.command_selection = 0;
+                self.refresh_requested = true;
+            },
+            .session_git_status => |result| {
+                if (result.sid != self.view.sid or !std.mem.eql(u8, result.cwd, self.view.cwd.items)) return;
+                self.git_next_poll_ms = nowWallMs(self.io) + 5_000;
+                self.git_label.clearRetainingCapacity();
+                if (result.branch.len > 0) {
+                    self.git_label.appendSlice(self.gpa, result.branch) catch {};
+                    if (result.counts) |counts| self.git_label.print(self.gpa, " ↑{d} ↓{d}", .{ counts.ahead, counts.behind }) catch {};
+                }
+                self.refresh_requested = true;
+            },
+            .session_recap => |result| {
+                const view = self.liveView(result.sid) orelse self.saved_views.get(result.sid) orelse return;
+                if (view.state == .running or view.state == .awaiting_approval) return;
+                if (view.recap.accept(view.last_seq, result.seq, result.retry, nowWallMs(self.io)))
+                    view.appendRecap(self.gpa, result.seq, result.text, result.generated) catch {};
+            },
             .session_upsert => |su| self.upsertSessionSummary(su.session),
             .session_remove => |sr| self.removeSessionSummary(sr.sid),
             .interrupt_result => |result| {
@@ -1807,6 +1859,10 @@ pub const App = struct {
             },
             .setup_status_result => |status| self.applySetupStatus(status),
             .setup_result => |result| self.applySetupResult(result),
+            .plugin_result => |result| {
+                self.pushBlock(.system_note, result.message, "plugins", if (result.ok) .ok else .err);
+                self.setNotice("{s}", .{if (result.ok) "plugin command completed" else "plugin command failed — see transcript"});
+            },
             .mcp_list_result => |result| self.showMcpStatus(result.servers),
             .ui_config_result => |result| {
                 self.show_tab_bar = result.tab_bar;
@@ -1849,6 +1905,7 @@ pub const App = struct {
                 }
                 if (self.awaiting_new_session and e.request_id != 0 and e.request_id == self.pending_new_session_request_id) {
                     self.awaiting_new_session = false;
+                    self.reset_after_new_session = false;
                     self.pending_new_session_request_id = 0;
                     self.pending_new_cwd.clearRetainingCapacity();
                 }
@@ -1889,8 +1946,8 @@ pub const App = struct {
                     else
                         null;
                     defer if (label) |owned| self.gpa.free(owned);
-                    if (!reconcilePendingEcho(self.view.blocks.items, .user_msg, u.text, b.seq, b.turn_id)) {
-                        self.pushDurableBlock(b, .user_msg, u.text, label orelse "", .ok);
+                    if (!reconcilePendingEcho(self.view.blocks.items, .user_msg, u.display_text orelse u.text, b.seq, b.turn_id)) {
+                        self.pushDurableBlock(b, .user_msg, u.display_text orelse u.text, label orelse "", .ok);
                     } else if (label) |owned| {
                         for (self.view.blocks.items) |*rendered| {
                             if (rendered.seq != b.seq) continue;
@@ -1902,13 +1959,13 @@ pub const App = struct {
                     }
                     // Seed input history from the log (replay covers pre-reboot
                     // messages; live blocks cover this session's submits).
-                    self.view.editor.pushHistory(u.text);
+                    self.view.editor.pushHistory(u.display_text orelse u.text);
                 }
             },
             .steer => |s| {
-                if (!reconcilePendingEcho(self.view.blocks.items, .steer, s.text, b.seq, b.turn_id))
-                    self.pushDurableBlock(b, .steer, s.text, "", .ok);
-                self.view.editor.pushHistory(s.text);
+                if (!reconcilePendingEcho(self.view.blocks.items, .steer, s.display_text orelse s.text, b.seq, b.turn_id))
+                    self.pushDurableBlock(b, .steer, s.display_text orelse s.text, "", .ok);
+                self.view.editor.pushHistory(s.display_text orelse s.text);
             },
             .assistant_msg => |a| {
                 // Finalized text replaces the streaming delta.
@@ -2046,7 +2103,8 @@ pub const App = struct {
             self.setNotice("choose a backend before sending the first prompt", .{});
             return;
         }
-        if (is_command) {
+        const invocation = if (is_command) commands.skillInvocation(trimmed) else null;
+        if (is_command and invocation == null) {
             // Commands are client actions rather than durable user_msg
             // blocks, but they still belong in the local editor history so
             // Up then Enter can repeat them during this client lifetime.
@@ -2057,6 +2115,10 @@ pub const App = struct {
         // A parked question owns the composer: the turn cannot take input
         // until it is answered, so typed text IS the answer (in the user's
         // own words instead of a numbered pick).
+        if (self.view.question != null and invocation != null) {
+            self.setNotice("answer the pending question before invoking a skill", .{});
+            return;
+        }
         if (self.view.question != null and trimmed.len > 0) {
             self.view.editor.pushHistory(trimmed);
             // Send before clearing: `trimmed` may alias the editor's buffer.
@@ -2084,6 +2146,7 @@ pub const App = struct {
         self.conn.send(.{ .input = .{
             .sid = self.view.sid,
             .text = trimmed,
+            .skill = if (invocation) |skill| .{ .name = skill.name, .arguments = skill.arguments } else null,
             .request_id = request_id,
             .attachments = uploads,
         } }) catch |err| {
@@ -2094,6 +2157,7 @@ pub const App = struct {
             return;
         };
         self.clearAttachments();
+        if (invocation != null) self.view.editor.pushHistory(trimmed);
         if (was_busy) {
             self.pushInputEcho(.steer, trimmed, request_id, null);
             self.setNotice("queued as steer for active turn", .{});
@@ -2477,12 +2541,22 @@ pub const App = struct {
 
     pub fn recordUserActivity(self: *App) void {
         const now = nowWallMs(self.io);
+        self.view.recap.last_activity_ms = now;
         self.presence_last_activity_ms = now;
         const deadline = if (self.screensaver_timeout_ms == 0)
             0
         else
             now +| @as(i64, @intCast(self.screensaver_timeout_ms));
         self.screensaver_deadline_ms.store(deadline, .release);
+    }
+
+    pub fn maybeRequestRecap(self: *App, now: i64) void {
+        if (!self.recaps_supported or self.view.history_loading or !self.view.editor.isEmpty()) return;
+        if (self.sessionSummary(self.view.sid)) |summary| if (summary.parent_sid != null) return;
+        if (!self.view.recap.due(self.view.state, self.view.last_seq, now)) return;
+        self.conn.send(.{ .session_recap = .{ .sid = self.view.sid, .seq = self.view.last_seq } }) catch return;
+        self.view.recap.pending_seq = self.view.last_seq;
+        self.view.recap.attempted_seq = self.view.last_seq;
     }
 
     fn sendPresence(self: *App, force: bool) void {
@@ -2501,6 +2575,20 @@ pub const App = struct {
         if (self.screensaver_active or self.screensaver_timeout_ms == 0) return;
         const deadline = self.screensaver_deadline_ms.load(.acquire);
         if (deadline != 0 and nowWallMs(self.io) >= deadline) self.startScreensaver(self.screensaver_kind);
+    }
+
+    pub fn maybeRequestGitStatus(self: *App, now: i64) void {
+        if (!self.git_supported) return;
+        const changed = self.git_sid != self.view.sid or !std.mem.eql(u8, self.git_cwd.items, self.view.cwd.items);
+        if (changed) {
+            self.git_label.clearRetainingCapacity();
+            self.git_cwd.clearRetainingCapacity();
+            self.git_cwd.appendSlice(self.gpa, self.view.cwd.items) catch return;
+            self.git_sid = self.view.sid;
+        }
+        if (!changed and now < self.git_next_poll_ms) return;
+        self.git_next_poll_ms = now + 5_000;
+        self.conn.send(.{ .session_git_status = .{ .sid = self.view.sid } }) catch {};
     }
 
     pub fn tickUiAnimation(self: *App) void {
@@ -3693,6 +3781,51 @@ pub const App = struct {
         self.pending_new_session_request_id = request_id;
     }
 
+    pub fn resetSessions(self: *App) void {
+        // Never turn an unrelated, already-pending /new into a reset.
+        if (self.awaiting_new_session or self.setup.required) {
+            self.newSession() catch {};
+            return;
+        }
+        self.newSession() catch {
+            self.setNotice("could not create session; existing sessions kept", .{});
+            return;
+        };
+        self.reset_after_new_session = true;
+    }
+
+    fn resetCanArchiveTree(self: *const App, sid: u64) bool {
+        if (self.sessionBelongsToTree(self.view.sid, sid)) return false;
+        for (self.sessions.items) |session| {
+            if ((session.state == .running or session.state == .awaiting_approval) and
+                self.sessionBelongsToTree(session.sid, sid)) return false;
+        }
+        return true;
+    }
+
+    fn finishSessionReset(self: *App) void {
+        // Archive whole idle branches once, including finished children of
+        // active parents. Keep ancestors of active work. The daemon checks
+        // tree activity again before archiving, covering stale client state.
+        for (self.sessions.items) |session| {
+            if (!self.resetCanArchiveTree(session.sid)) continue;
+            if (session.parent_sid) |parent| {
+                if (self.sessionSummary(parent) != null and self.resetCanArchiveTree(parent)) continue;
+            }
+            self.conn.send(.{ .session_archive = .{ .sid = session.sid } }) catch {
+                self.setNotice("fresh session opened; could not finish archiving idle sessions", .{});
+                return;
+            };
+        }
+        self.picker = null;
+        self.picker_filter.clearRetainingCapacity();
+        self.closeTop();
+        self.closeCouncilDetail();
+        self.clearAttachments();
+        self.mode = .insert;
+        self.setNotice("fresh session · archiving idle sessions; active work stays open", .{});
+    }
+
     pub fn sessionBelongsToTree(self: *const App, candidate_sid: u64, root_sid: u64) bool {
         var cursor: ?u64 = candidate_sid;
         while (cursor) |sid| {
@@ -3775,6 +3908,8 @@ pub const App = struct {
         if (request_id != 0 and request_id != self.pending_new_session_request_id) return;
         self.awaiting_new_session = false;
         self.pending_new_session_request_id = 0;
+        const reset = self.reset_after_new_session;
+        self.reset_after_new_session = false;
         self.rememberSession(sid);
         const model = self.gpa.dupe(u8, self.view.model.items) catch return;
         defer self.gpa.free(model);
@@ -3790,6 +3925,7 @@ pub const App = struct {
         self.shortcut_help = false;
         var handle_buf: session_handle.Full = undefined;
         self.setNotice("new session {s}", .{self.displaySessionHandle(&handle_buf, sid)});
+        if (reset) self.finishSessionReset();
     }
 
     pub fn approveReply(self: *App, granted: bool) void {
@@ -3851,6 +3987,7 @@ pub const App = struct {
         self.view.history_before_seq = self.view.oldest_seq;
         self.view.history_page_failed = false;
         self.conn.send(.{ .sub = .{
+            .skill_catalog = true,
             .sid = self.view.sid,
             .tail_limit = initial_replay_blocks,
             .before_seq = self.view.history_before_seq,
@@ -4460,7 +4597,7 @@ pub fn inputPanelHeight(content_height: usize) usize {
     return content_height + 2; // one blank row above and below the editor
 }
 
-fn drawCommandMenu(
+pub fn drawCommandMenu(
     app: *App,
     win: vaxis.Window,
     arena: std.mem.Allocator,
@@ -4471,12 +4608,14 @@ fn drawCommandMenu(
     const suggestions = try commandSuggestions(app, arena);
     if (suggestions.len == 0) return;
 
-    const query = commandQuery(&app.view.editor).?;
-    const directory_menu = std.mem.startsWith(u8, query, "/cwd ") or std.mem.startsWith(u8, query, "/cwd\t");
-    const shown: u16 = @intCast(@min(suggestions.len, composer_commands.len));
+    const directory_menu = commands.cwdArgument(&app.view.editor) != null;
+    const limit = if (directory_menu) @import("path_complete.zig").max_candidates else composer_commands.len;
+    const shown: u16 = @intCast(@min(suggestions.len, limit, input_top -| 1));
+    if (shown == 0) return;
     const menu_h = shown + 1;
-    if (input_top < menu_h) return;
     app.command_selection = @min(app.command_selection, suggestions.len - 1);
+    const selection_active = !directory_menu or app.cwdMenuSelected();
+    const start = if (selection_active) app.command_selection + 1 -| shown else 0;
 
     const menu = win.child(.{
         .x_off = 1,
@@ -4489,8 +4628,9 @@ fn drawCommandMenu(
     const pad = "                        ";
     var row: usize = 0;
     while (row < shown) : (row += 1) {
-        const suggestion = suggestions[row];
-        const selected = !directory_menu and row == app.command_selection;
+        const index = start + row;
+        const suggestion = suggestions[index];
+        const selected = selection_active and index == app.command_selection;
         const row_style = if (selected) Palette.command_selected else Palette.command_menu;
         const name_style = if (selected) Palette.command_selected_name else Palette.command_name;
         const description_style = if (selected) Palette.command_selected_description else Palette.command_description;
@@ -4509,7 +4649,7 @@ fn drawCommandMenu(
 
     const hint = menu.child(.{ .y_off = @intCast(shown), .height = 1, .width = menu.width });
     _ = hint.printSegment(.{
-        .text = if (directory_menu) " Tab complete · Enter use typed path" else " ↑↓ select · Tab complete · Enter choose",
+        .text = if (directory_menu and !selection_active) " ↑↓ select · Tab complete · Enter use typed path" else " ↑↓ select · Tab complete · Enter choose",
         .style = Palette.command_description,
     }, .{ .wrap = .none });
 }
@@ -5455,7 +5595,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     // Stable public session handle, shared with `marlin ls` and accepted by
     // attach/archive/kill/compact as any unique prefix of four or more chars.
-    var status_segments: [27]vaxis.Segment = undefined;
+    var status_segments: [33]vaxis.Segment = undefined;
     var status_n: usize = 0;
     status_segments[status_n] = .{ .text = " ", .style = Palette.status_bar };
     status_n += 1;
@@ -5482,6 +5622,26 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     status_n += 1;
     status_segments[status_n] = .{ .text = cwd_txt, .style = Palette.status_cwd };
     status_n += 1;
+    if (app.git_supported and app.git_sid == app.view.sid and std.mem.eql(u8, app.git_cwd.items, app.view.cwd.items) and app.git_label.items.len > 0) {
+        status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+        status_n += 1;
+        const git_label = app.git_label.items;
+        const counts_at = std.mem.indexOf(u8, git_label, " ↑") orelse git_label.len;
+        status_segments[status_n] = .{ .text = git_label[0..counts_at], .style = Palette.status_cwd };
+        status_n += 1;
+        var git_parts = std.mem.tokenizeScalar(u8, git_label[counts_at..], ' ');
+        while (git_parts.next()) |part| {
+            const ahead = std.mem.startsWith(u8, part, "↑");
+            if (!ahead and !std.mem.startsWith(u8, part, "↓")) continue;
+            status_segments[status_n] = .{
+                .text = if (ahead) " ↑" else " ↓",
+                .style = if (ahead) Palette.status_git_ahead else Palette.status_git_behind,
+            };
+            status_n += 1;
+            status_segments[status_n] = .{ .text = part["↑".len..], .style = Palette.status_bar };
+            status_n += 1;
+        }
+    }
     if (app.view.scroll_up > 0) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
@@ -5874,6 +6034,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     new_conn.send(.{ .council_list = .{} }) catch {};
     if (app.view.last_seq == 0) {
         new_conn.send(.{ .sub = .{
+            .skill_catalog = true,
             .sid = app.view.sid,
             .from_seq = 1,
             .tail_limit = initial_replay_blocks,
@@ -5883,6 +6044,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
         };
     } else {
         new_conn.send(.{ .sub = .{
+            .skill_catalog = true,
             .sid = app.view.sid,
             .from_seq = app.view.last_seq +| 1,
             .replay_limit = initial_replay_blocks,
@@ -5902,14 +6064,22 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     rt.join();
     const old = app.conn;
     app.conn = new_conn;
+    app.git_supported = new_conn.git_status;
+    app.git_next_poll_ms = 0;
+    app.git_label.clearRetainingCapacity();
+    app.recaps_supported = new_conn.session_recaps;
+    app.view.recap.pending_seq = 0;
+    app.view.recap.attempted_seq = 0;
     rt.* = new_rt;
     old.deinit();
     app.cacheWelcomeFacts();
     if (app.awaiting_new_session) {
+        const command: []const u8 = if (app.reset_after_new_session) "/reset" else "/new";
         app.awaiting_new_session = false;
+        app.reset_after_new_session = false;
         app.pending_new_session_request_id = 0;
         app.pending_new_cwd.clearRetainingCapacity();
-        app.setNotice("reconnected · retry /new if the session was not created", .{});
+        app.setNotice("reconnected · retry {s} if it did not finish", .{command});
     } else {
         app.setNotice("reconnected", .{});
     }
@@ -6031,6 +6201,8 @@ pub fn dispatchEvent(
         },
         .color_report => |report| app.terminal_theme.applyReport(report),
         .tick => {
+            app.maybeRequestGitStatus(nowWallMs(app.io));
+            app.maybeRequestRecap(nowWallMs(app.io));
             app.view.spinner_frame +%= 1;
             app.voiceTick();
             app.wipeoutDownloadTick();
@@ -6228,6 +6400,7 @@ pub fn run(
         // Fast initial attach: the newest bounded window. The TUI backfills
         // the durable log if the user actually reaches this window's top.
         try conn.send(.{ .sub = .{
+            .skill_catalog = true,
             .sid = sid,
             .from_seq = 1,
             .tail_limit = initial_replay_blocks,
@@ -6238,6 +6411,8 @@ pub fn run(
         .gpa = gpa,
         .io = io,
         .conn = conn,
+        .git_supported = conn.git_status,
+        .recaps_supported = conn.session_recaps,
         .view = .{
             .sid = sid,
             .editor = Editor.init(gpa),
@@ -6262,6 +6437,7 @@ pub fn run(
     app.screensaver_timeout_ms = cfg.ui_screensaver_after_ms;
     app.screensaver_kind = effects.Kind.parse(cfg.ui_screensaver_effect) orelse .matrix;
     app.recordUserActivity();
+    app.view.recap.last_activity_ms = 0;
     app.syncAnimationTicker();
     app.view.effort = effort_at_start;
     app.setCwdStr(cwd_at_start);

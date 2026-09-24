@@ -511,3 +511,13 @@ test "guest prompt preserves raw input unless there is a genuine pending handove
     const answered = tb(3, .{ .assistant_msg = .{ .text = "Done." } });
     try std.testing.expectEqualStrings(input, try context.guestPrompt(arena.allocator(), &.{ briefing, answered }, input));
 }
+
+test "handoverDefect rejects tool markup, missing sections, and stubs; accepts a real briefing" {
+    const leak = "I'll pick up where the checkpoint left off.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">git status</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    try std.testing.expectEqual(@as(?context.HandoverDefect, .tool_markup), context.handoverDefect(leak));
+    try std.testing.expectEqual(@as(?context.HandoverDefect, .tool_markup), context.handoverDefect("## Goal\nx\n<function_calls>\n<invoke name=\"bash\">…\n## Next\ny"));
+    try std.testing.expectEqual(@as(?context.HandoverDefect, .missing_sections), context.handoverDefect("Sure! Here is a summary of the work so far: the codex trace-context wiring is mostly done and the docs need a paragraph."));
+    try std.testing.expectEqual(@as(?context.HandoverDefect, .too_short), context.handoverDefect("## Goal\n## Next"));
+    const good = "## Goal\nWire codex trace context.\n## Accomplished\nSpans nest under the turn.\n## In progress\nDocs paragraph.\n## Files\nsrc/daemon/guest/codex_turn.zig\n## Constraints\nNo env var interface for Codex.\n## Next\nFinish docs/OBSERVABILITY.md and run zig build test.";
+    try std.testing.expectEqual(@as(?context.HandoverDefect, null), context.handoverDefect(good));
+}

@@ -215,8 +215,10 @@ pub fn load(
     var cfg = defaults();
     const config_dir = try credentials.configDir(arena, environ);
     const default_skills = try std.fs.path.join(arena, &.{ config_dir, "skills" });
-    const skill_dirs = try arena.alloc([]const u8, 1);
+    const skill_dirs = try arena.alloc([]const u8, if (environ.get("HOME") != null) 2 else 1);
     skill_dirs[0] = default_skills;
+    if (environ.get("HOME")) |home_dir|
+        skill_dirs[1] = try std.fs.path.join(arena, &.{ home_dir, ".agents", "skills" });
     cfg.skill_directories = skill_dirs;
 
     const path = try std.fs.path.join(arena, &.{ config_dir, "config.toml" });

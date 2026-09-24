@@ -26,6 +26,7 @@
 const std = @import("std");
 const config = @import("../core/config.zig");
 const block = @import("../core/block.zig");
+const dsml = @import("provider/dsml.zig");
 const provider = @import("provider/provider.zig");
 
 /// Estimate tokens for text not yet measured by the provider.
@@ -72,6 +73,18 @@ pub const system_prompt_base =
     \\  jq is unavailable.
     \\- Reserve bash for what it is uniquely good at: builds, tests, git, and
     \\  running programs.
+    \\- Marlin's bash tool is foreground-only: it returns when the command
+    \\  finishes or times out. There is no background-job API, persistent
+    \\  shell session, or completion notification to collect later. Do not
+    \\  invent run_in_background, yield, or job-status tool arguments.
+    \\- Do not launch persistent watchers or detach commands with `&`,
+    \\  `nohup`, `disown`, or `setsid` to continue after a tool call. Use
+    \\  one-shot builds/tests and status queries. When waiting is necessary,
+    \\  use bounded foreground polling with an explicit deadline and
+    \\  timeout_seconds; report a timeout as incomplete, not success. For a
+    \\  persistent dev server or watcher, give the user the command to run
+    \\  in a separate terminal. Never claim a watcher is running or promise
+    \\  a later notification after the turn ends.
     \\- When you need the user to choose between options, call ask_user — it
     \\  renders an interactive picker in their terminal and pauses for the
     \\  pick. Never list choices as prose and ask them to reply; that is what
@@ -220,7 +233,7 @@ pub const AssembleOpts = struct {
     /// the base system prompt. Full skill bodies stay out of context until
     /// the model explicitly loads one with the skill tool.
     system_prompt_suffix: []const u8 = "",
-    /// Repo-local instructions (MARLIN.md / AGENTS.md at the session root),
+    /// Repo-local instructions (MARLIN.md / AGENTS.md / AGENT.md at the session root),
     /// injected verbatim under a PROJECT INSTRUCTIONS header. Empty = none.
     project_instructions: []const u8 = "",
     /// Per-turn dynamic facts (cwd, platform, date, git, sandbox, network),
@@ -594,12 +607,15 @@ pub const compaction_prompt =
 /// shown to the user and given to the guest as its first-turn briefing.
 /// It must not assume Marlin tool names — the guest has its own tools.
 pub const handover_prompt =
-    \\Write a handover briefing for another coding agent that will continue
-    \\this work in the same repository. The next agent owns its own tools and
-    \\will not see Marlin's block log. Be concrete enough
-    \\that it can resume without re-discovering the repo.
+    \\You are writing a DOCUMENT, not doing work. Do not run tools, do not
+    \\call functions, do not inspect anything. Your whole reply is the text of
+    \\a handover briefing that another coding agent will read before it
+    \\continues this work in the same repository. That agent owns its own
+    \\tools and will not see Marlin's block log. Be concrete enough that it
+    \\can resume without re-discovering the repo.
     \\
-    \\Structure the briefing as:
+    \\Start your reply with the line "## Goal" and use exactly these six
+    \\sections, in this order:
     \\
     \\## Goal
     \\(what the user asked for, in their terms)
@@ -612,10 +628,11 @@ pub const handover_prompt =
     \\## Constraints
     \\(durable user decisions)
     \\## Next
-    \\(the immediate next action)
+    \\(the immediate next action, as a sentence for the next agent, not a
+    \\command for you to run)
     \\
-    \\Omit routine reads, raw logs, and Marlin-internal commands. Do not
-    \\continue the work yourself.
+    \\Omit routine reads, raw logs, and Marlin-internal commands. Plain
+    \\Markdown only: no tool-call markup of any kind.
 ;
 
 /// Don't compact sessions smaller than this many blocks.
@@ -742,6 +759,31 @@ pub fn latestHandover(blocks: []const block.Block) ?[]const u8 {
             else => {},
         }
     }
+    return null;
+}
+
+/// Why a summarizer reply cannot be stored as a handover briefing.
+pub const HandoverDefect = enum {
+    /// Inline tool-call markup: the model tried to keep working instead of
+    /// writing the document.
+    tool_markup,
+    /// None of the required section headings; the reply is prose or noise.
+    missing_sections,
+    /// Too short to carry a briefing.
+    too_short,
+};
+
+/// A briefing is acceptable when it carries no tool-call markup and at least
+/// the Goal and Next sections the prompt demands. Anything else is a model
+/// that answered the wrong question; storing it would hand the guest garbage.
+pub fn handoverDefect(text: []const u8) ?HandoverDefect {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (t.len < 40) return .too_short;
+    if (dsml.containsMarkup(t)) return .tool_markup;
+    if (std.mem.indexOf(u8, t, "<function_calls>") != null or std.mem.indexOf(u8, t, "<tool_call>") != null) return .tool_markup;
+    const has_goal = std.mem.indexOf(u8, t, "## Goal") != null;
+    const has_next = std.mem.indexOf(u8, t, "## Next") != null;
+    if (!has_goal or !has_next) return .missing_sections;
     return null;
 }
 

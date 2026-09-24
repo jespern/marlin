@@ -16,7 +16,9 @@ const process_io = @import("../process_io.zig");
 
 pub const spec_name = "bash";
 pub const spec_description =
-    "Run a shell command with bash -c. Returns interleaved stdout/stderr and the exit code. " ++
+    "Run a foreground shell command with bash -c. Returns stdout/stderr and the exit code when finished. " ++
+    "No background jobs, persistent shell sessions, or later completion notifications are supported. " ++
+    "Do not detach commands or start persistent watchers; use one-shot commands or bounded foreground polling. " ++
     "The working directory is the session's cwd. When network filtering is enabled, " ++
     "literal destinations used by common network commands are screened before execution. " ++
     "Commands are killed after timeout_seconds (default 600, max 3600); raise it for long builds.";

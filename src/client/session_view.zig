@@ -89,11 +89,15 @@ pub const SessionView = struct {
     /// composer. Its terminal completed revision lives only in transcript.
     plan: std.ArrayList(PlanItemOwned) = .empty,
     state: proto.SessionState = .idle,
+    recap: @import("recap.zig").State = .{},
     model: std.ArrayList(u8) = .empty,
     effort: proto.ReasoningEffort = .auto,
     /// Session working directory from daemon metadata, not necessarily the
     /// attach process's current directory.
     cwd: std.ArrayList(u8) = .empty,
+    skills: []const proto.SkillInfo = &.{},
+    skills_cwd: []const u8 = "",
+    skills_arena: ?std.heap.ArenaAllocator = null,
     tokens_in: u64 = 0,
     tokens_out: u64 = 0,
     context_used: u64 = 0,
@@ -191,9 +195,40 @@ pub const SessionView = struct {
         deinitPlan(gpa, &self.plan);
         self.model.deinit(gpa);
         self.cwd.deinit(gpa);
+        if (self.skills_arena) |*arena| arena.deinit();
         self.layout_cache.reset(gpa);
         self.tail_layout_cache.reset(gpa);
         self.stream_layout_cache.reset(gpa);
+    }
+
+    pub fn replaceSkills(self: *SessionView, gpa: std.mem.Allocator, cwd: []const u8, skills: []const proto.SkillInfo) !void {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const owned_cwd = try a.dupe(u8, cwd);
+        const owned = try a.alloc(proto.SkillInfo, skills.len);
+        for (skills, owned) |skill, *item| {
+            item.* = .{ .name = try a.dupe(u8, skill.name), .description = try a.dupe(u8, skill.description) };
+        }
+        if (self.skills_arena) |*old| old.deinit();
+        self.skills_arena = arena;
+        self.skills_cwd = owned_cwd;
+        self.skills = owned;
+    }
+
+    pub fn appendRecap(self: *SessionView, gpa: std.mem.Allocator, seq: u64, text: []const u8, generated: bool) !void {
+        if (text.len == 0 or self.recap.shown_seq == seq) return;
+        const owned_text = try gpa.dupe(u8, @import("../core/recap.zig").clipped(text, @import("../core/recap.zig").max_text_bytes));
+        errdefer gpa.free(owned_text);
+        const label = try gpa.dupe(u8, if (generated) "Recap" else "Last exchange");
+        errdefer gpa.free(label);
+        try self.blocks.append(gpa, .{
+            .kind = .system_note,
+            .text = owned_text,
+            .label = label,
+            .turn_id = if (self.blocks.getLastOrNull()) |last| last.turn_id else 0,
+        });
+        self.recap.shown_seq = seq;
     }
 
     /// Drop provisional streaming text once a turn settles so an idle view,
