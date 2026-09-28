@@ -621,6 +621,8 @@ fn isSpace(c: u8) bool {
 
 /// Vertical movement within the text. Returns false when the cursor is
 /// already on the first/last display row — the caller then walks history.
+/// Down on the last row first jumps to the end of the text, so history is
+/// only walked from there.
 pub fn moveUp(self: *Editor, width: usize) bool {
     const rows = self.layoutRows(width);
     const pos = self.cursorRowCol(rows, width);
@@ -632,7 +634,12 @@ pub fn moveUp(self: *Editor, width: usize) bool {
 pub fn moveDown(self: *Editor, width: usize) bool {
     const rows = self.layoutRows(width);
     const pos = self.cursorRowCol(rows, width);
-    if (pos.row + 1 >= rows.len) return false;
+    if (pos.row + 1 >= rows.len) {
+        if (self.cursor == self.text.items.len) return false;
+        self.cursor = self.text.items.len;
+        self.goal_col = null;
+        return true;
+    }
     self.placeCursor(rows, pos.row + 1, self.takeGoal(pos.col), width);
     return true;
 }

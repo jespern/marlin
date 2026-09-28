@@ -201,6 +201,18 @@ test "vertical movement and edge detection" {
     try testing.expect(!ed.moveDown(40)); // at bottom
 }
 
+test "down on the last row jumps to the end before walking history" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.pushHistory("older");
+    ed.insertSlice("one\ntwo");
+    ed.cursor = 5; // mid "two"
+    try testing.expect(ed.moveDown(40));
+    try testing.expectEqual(ed.text.items.len, ed.cursor);
+    try testing.expect(!ed.moveDown(40)); // now at end: history's turn
+    try testing.expectEqualStrings("one\ntwo", ed.text.items);
+}
+
 test "soft wrap heights" {
     var ed = Editor.init(testing.allocator);
     defer ed.deinit();
