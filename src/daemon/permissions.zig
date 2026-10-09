@@ -144,6 +144,9 @@ pub fn ccAutoAllow(
     const read_only = [_][]const u8{
         "Read",     "Glob",      "Grep", "LS",           "NotebookRead",
         "WebFetch", "WebSearch", "Task", "ExitPlanMode", "TodoWrite",
+        // marlin's own bridge picker: the call IS a question to the user,
+        // so approving it first would just ask twice.
+        "mcp__marlin__ask_user",
     };
     for (read_only) |name| if (std.mem.eql(u8, tool_name, name)) return true;
 

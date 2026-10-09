@@ -164,6 +164,9 @@ test "cc bridge policy: reads auto, edits containment-checked, unknown asks" {
 
     // Unknown tools (MCP and future ones) always ask.
     try std.testing.expect(!ccAutoAllow(gpa, io, "/work/api", "mcp__x__y", "{}"));
+    // Except marlin's own picker, which is itself a question to the user.
+    try std.testing.expect(ccAutoAllow(gpa, io, "/work/api", "mcp__marlin__ask_user", "{\"question\":\"?\"}"));
+    try std.testing.expect(!ccAutoAllow(gpa, io, "/work/api", "mcp__marlin__approve", "{}"));
 }
 
 test "cc bridge policy: workspace edits allowed on a real tree" {
