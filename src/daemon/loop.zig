@@ -917,13 +917,18 @@ pub fn runTurn(
                 .args_json = persisted_args,
             } });
 
-            const builtin_spec = tools_registry.find(pc.name.items);
-            const spec = builtin_spec orelse blk: {
+            const extension_spec: ?*const tools_registry.Spec = blk: {
                 for (extension_specs) |*candidate| {
                     if (std.mem.eql(u8, candidate.name, pc.name.items)) break :blk candidate;
                 }
                 break :blk null;
             };
+            // Builtin names never collide with extension names (extensions.zig
+            // rejects them), so trying extensions first only matters for
+            // repair: a real MCP tool must win over a mangled builtin guess.
+            const builtin_spec = tools_registry.find(pc.name.items) orelse
+                if (extension_spec == null) tools_registry.repair(pc.name.items) else null;
+            const spec = builtin_spec orelse extension_spec;
             prepared[i] = .{
                 .call_id = pc.call_id.items,
                 // Builtins execute under their canonical name whatever the

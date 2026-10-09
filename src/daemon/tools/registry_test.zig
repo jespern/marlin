@@ -232,3 +232,17 @@ test "tool lookup forgives Claude-flavored spellings; execution is canonical" {
     // Genuinely unknown names still fail; extension tools are not aliased.
     try std.testing.expect(registry.find("Teleport") == null);
 }
+
+test "repair recovers builtins from leaked template markup and invented MCP prefixes" {
+    // Case: glm-5.3 called `mcp__tools__task_batch` and `...</arg_value>`.
+    try std.testing.expectEqualStrings("task_batch", registry.repair("mcp__tools__task_batch").?.name);
+    try std.testing.expectEqualStrings("bash", registry.repair("bash</arg_value>").?.name);
+    try std.testing.expectEqualStrings("read_file", registry.repair(" \"Read\" ").?.name);
+    try std.testing.expectEqualStrings("grep", registry.repair("mcp__x__grep</tool_call>").?.name);
+    // Garbage stays unknown rather than guessed at.
+    try std.testing.expect(registry.repair("mcp__tools__task_batch__sNet__tool_search_A7k32Q</arg_value>") == null);
+    try std.testing.expect(registry.repair("mcp__tools__teleport") == null);
+    try std.testing.expect(registry.repair("mcp__") == null);
+    // `find` itself stays exact so real MCP tools never shadow-match builtins.
+    try std.testing.expect(registry.find("mcp__fs__read_file") == null);
+}

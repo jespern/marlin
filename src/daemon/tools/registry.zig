@@ -88,6 +88,25 @@ pub fn find(name: []const u8) ?*const Spec {
     return null;
 }
 
+/// Last-resort lookup for a name that matched no builtin or extension tool.
+/// Models with their own chat templates leak markup into the name (GLM:
+/// `task_batch</arg_value>`) or invent an MCP namespace for a builtin
+/// (`mcp__tools__task_batch`, observed live with glm-5.3). Not part of
+/// `find`: extension registration uses `find` to reject real collisions,
+/// and a real `mcp__fs__read_file` must stay distinct from `read_file`.
+pub fn repair(name: []const u8) ?*const Spec {
+    var clean = name;
+    if (std.mem.indexOfScalar(u8, clean, '<')) |i| clean = clean[0..i];
+    clean = std.mem.trim(u8, clean, " \t\r\n\"'`");
+    if (find(clean)) |s| return s;
+    if (std.mem.startsWith(u8, clean, "mcp__")) {
+        const rest = clean["mcp__".len..];
+        const sep = std.mem.indexOf(u8, rest, "__") orelse return null;
+        return find(rest[sep + 2 ..]);
+    }
+    return null;
+}
+
 pub const ExecOut = struct {
     output: []u8,
     status: block.ToolStatus,
