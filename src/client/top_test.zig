@@ -76,3 +76,32 @@ test "top orders oldest roots first while keeping descendants together" {
         ordered[4].sid,
     });
 }
+
+test "top applies status updates so killed or finished task children stop reading running" {
+    // Case: `x` on a running tree stopped the children in the daemon, but
+    // top only listened for upserts, and untitled task children never get
+    // one after creation — the rows stayed `running` indefinitely.
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var view = top.Top{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .now_ms = 0 };
+    defer view.deinit();
+    const child = proto.SessionInfo{
+        .sid = 7,
+        .parent_sid = 1,
+        .kind = .task_child,
+        .title = "child",
+        .model = "m",
+        .status = "running",
+        .state = .running,
+        .created_at = 0,
+        .running = true,
+    };
+    view.handleLine(try proto.encode(gpa, proto.DaemonMsg{ .session_upsert = .{ .session = child } }));
+    try std.testing.expectEqual(proto.SessionState.running, view.rows.items[0].state);
+    view.handleLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 7, .state = .idle } }));
+    try std.testing.expectEqual(proto.SessionState.idle, view.rows.items[0].state);
+    // Unknown sids are ignored rather than inventing rows.
+    view.handleLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 99, .state = .running } }));
+    try std.testing.expectEqual(@as(usize, 1), view.rows.items.len);
+}

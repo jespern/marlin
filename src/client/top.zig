@@ -327,7 +327,7 @@ const OwnedRow = struct {
 
 const PendingAction = enum { archive, unarchive, kill };
 
-const Top = struct {
+pub const Top = struct {
     gpa: std.mem.Allocator,
     io: Io,
     conn: *attach.Conn,
@@ -343,7 +343,7 @@ const Top = struct {
     should_quit: bool = false,
     attach_sid: ?u64 = null,
 
-    fn deinit(self: *Top) void {
+    pub fn deinit(self: *Top) void {
         for (self.rows.items) |*row| row.deinit(self.gpa);
         self.rows.deinit(self.gpa);
         self.notice.deinit(self.gpa);
@@ -445,7 +445,7 @@ const Top = struct {
         self.normalizeSelection();
     }
 
-    fn handleLine(self: *Top, line: []u8) void {
+    pub fn handleLine(self: *Top, line: []u8) void {
         defer self.gpa.free(line);
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -453,6 +453,15 @@ const Top = struct {
         switch (msg) {
             .session_list_result => |result| self.replace(result.sessions),
             .session_upsert => |update| self.upsert(update.session),
+            // Upserts carry structural changes only (create, rename); turn
+            // state moves on the compact status path. Task children never
+            // get a title upsert, so without this they read running forever.
+            .status => |s| for (self.rows.items) |*row| {
+                if (row.sid == s.sid) {
+                    row.state = s.state;
+                    break;
+                }
+            },
             .session_remove => |removed| {
                 self.remove(removed.sid);
                 if (self.show_archived) self.conn.send(.{ .session_list = .{ .include_archived = true } }) catch {};
