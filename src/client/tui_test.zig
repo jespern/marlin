@@ -3193,6 +3193,44 @@ test "top overlay kill requires confirmation before sending" {
     try std.testing.expect(app.top_view.?.confirm_kill == null);
 }
 
+test "top overlay kills the selected running child, not its tree" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = &conn,
+        .view = .{
+            .sid = 20,
+            .editor = Editor.init(gpa),
+        },
+    };
+    defer app.deinit();
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 20, .title = "root", .model = "m", .status = "running", .state = .running, .created_at = 20, .running = true },
+        .{ .sid = 21, .parent_sid = 20, .kind = .task_child, .title = "a", .model = "m", .status = "running", .state = .running, .created_at = 21, .running = true },
+        .{ .sid = 22, .parent_sid = 20, .kind = .task_child, .title = "b", .model = "m", .status = "running", .state = .running, .created_at = 22, .running = true },
+    });
+    app.runCommand("/top");
+    try handleKey(&app, .{ .codepoint = 'j' });
+    try handleKey(&app, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(?u64, 22), app.top_view.?.selected_sid);
+    try handleKey(&app, .{ .codepoint = 'x' });
+    try handleKey(&app, .{ .codepoint = 'y' });
+    try std.testing.expectEqualStrings("{\"session_kill\":{\"sid\":22}}\n", output.written());
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .ok = .{} }));
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 22, .state = .idle } }));
+    try std.testing.expectEqual(proto.SessionState.idle, app.sessionSummary(22).?.state);
+    try std.testing.expectEqual(proto.SessionState.running, app.sessionSummary(21).?.state);
+    try std.testing.expect(app.top_view != null);
+}
+
 test "inactive session view cache evicts least recently used transcripts" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
