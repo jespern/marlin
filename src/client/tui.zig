@@ -1355,14 +1355,20 @@ pub const App = struct {
     }
 
     pub fn removeSessionSummary(self: *App, sid: u64) void {
+        // The overlay's fallback is a DISPLAY position (tree order), not the
+        // storage index: keep the cursor where the removed row was so the
+        // next sibling slides under it and archives can cascade with `a`.
+        const display_index = self.topDisplayIndex(sid);
         for (self.sessions.items, 0..) |*summary, i| {
             if (summary.sid != sid) continue;
             summary.deinit(self.gpa);
             _ = self.sessions.orderedRemove(i);
             _ = self.session_labels.orderedRemove(i);
             if (self.top_view) |*view| {
-                if (view.selected_sid == sid) view.selected_sid = null;
-                view.selected_fallback = @min(i, self.sessions.items.len -| 1);
+                if (view.selected_sid == sid) {
+                    view.selected_sid = null;
+                    if (display_index) |at| view.selected_fallback = at;
+                }
             }
             break;
         }
@@ -3303,6 +3309,16 @@ pub const App = struct {
             if (session.sid == sid) return i;
         };
         return @min(view.selected_fallback, self.sessions.items.len - 1);
+    }
+
+    fn topDisplayIndex(self: *const App, sid: u64) ?usize {
+        if (self.top_view == null) return null;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const rows = self.topRows(arena_state.allocator()) catch return null;
+        const ordered = top_view.orderedRows(arena_state.allocator(), rows) catch return null;
+        for (ordered, 0..) |row, i| if (row.sid == sid) return i;
+        return null;
     }
 
     pub fn normalizeTopSelection(self: *App) void {

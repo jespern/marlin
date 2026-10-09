@@ -3193,6 +3193,47 @@ test "top overlay kill requires confirmation before sending" {
     try std.testing.expect(app.top_view.?.confirm_kill == null);
 }
 
+test "top overlay keeps the cursor in place so archives cascade across siblings" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
+    };
+    defer app.deinit();
+    // Storage order deliberately differs from the overlay's tree order
+    // (oldest roots first, descendants under their parent).
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 1, .title = "newest root", .model = "m", .status = "idle", .created_at = 50, .running = false },
+        .{ .sid = 23, .parent_sid = 20, .kind = .task_child, .title = "c", .model = "m", .status = "idle", .created_at = 23, .running = false },
+        .{ .sid = 20, .title = "parent", .model = "m", .status = "idle", .created_at = 20, .running = false },
+        .{ .sid = 10, .title = "oldest root", .model = "m", .status = "idle", .created_at = 10, .running = false },
+        .{ .sid = 21, .parent_sid = 20, .kind = .task_child, .title = "a", .model = "m", .status = "idle", .created_at = 21, .running = false },
+        .{ .sid = 22, .parent_sid = 20, .kind = .task_child, .title = "b", .model = "m", .status = "idle", .created_at = 22, .running = false },
+    });
+    app.openTop();
+    app.top_view.?.selected_sid = 21;
+    app.normalizeTopSelection();
+
+    // Each archive removes the focused row; the next sibling takes its place.
+    app.removeSessionSummary(21);
+    try std.testing.expectEqual(@as(?u64, 22), app.top_view.?.selected_sid);
+    app.removeSessionSummary(22);
+    try std.testing.expectEqual(@as(?u64, 23), app.top_view.?.selected_sid);
+    // Past the last child the cursor moves on to the next row, not upwards.
+    app.removeSessionSummary(23);
+    try std.testing.expectEqual(@as(?u64, 1), app.top_view.?.selected_sid);
+    // Removing a row that is not focused leaves the cursor alone.
+    app.removeSessionSummary(10);
+    try std.testing.expectEqual(@as(?u64, 1), app.top_view.?.selected_sid);
+}
+
 test "top overlay kills the selected running child, not its tree" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
