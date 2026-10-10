@@ -103,6 +103,8 @@ pub const SessionView = struct {
     context_used: u64 = 0,
     context_limit: u64 = 0,
     usage_credits: bool = false,
+    guest_activity: []const proto.GuestActivity = &.{},
+    guest_activity_arena: ?std.heap.ArenaAllocator = null,
     /// Persistent daemon-owned collaboration mode for the session.
     plan_mode: bool = false,
     /// An idle final answer from a Plan-mode turn can be implemented or
@@ -196,6 +198,7 @@ pub const SessionView = struct {
         self.model.deinit(gpa);
         self.cwd.deinit(gpa);
         if (self.skills_arena) |*arena| arena.deinit();
+        if (self.guest_activity_arena) |*arena| arena.deinit();
         self.layout_cache.reset(gpa);
         self.tail_layout_cache.reset(gpa);
         self.stream_layout_cache.reset(gpa);
@@ -214,6 +217,24 @@ pub const SessionView = struct {
         self.skills_arena = arena;
         self.skills_cwd = owned_cwd;
         self.skills = owned;
+    }
+
+    pub fn replaceGuestActivity(self: *SessionView, gpa: std.mem.Allocator, items: []const proto.GuestActivity) !void {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const owned = try a.alloc(proto.GuestActivity, items.len);
+        for (items, owned) |item, *copy| copy.* = .{
+            .id = try a.dupe(u8, item.id),
+            .parent_id = try a.dupe(u8, item.parent_id),
+            .kind = item.kind,
+            .name = try a.dupe(u8, item.name),
+            .detail = try a.dupe(u8, item.detail),
+            .started_at_ms = item.started_at_ms,
+        };
+        if (self.guest_activity_arena) |*old| old.deinit();
+        self.guest_activity_arena = arena;
+        self.guest_activity = owned;
     }
 
     pub fn appendRecap(self: *SessionView, gpa: std.mem.Allocator, seq: u64, text: []const u8, generated: bool) !void {

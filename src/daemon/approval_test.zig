@@ -131,3 +131,21 @@ test "question gate: answer-before-wait resolves; dismiss unparks with null; sta
     var cancel = std.atomic.Value(bool).init(true);
     try std.testing.expect(!gate.arm(io, 4, &cancel));
 }
+
+test "park clock counts nested and overlapping parks once and includes an open park" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var clock: approval.ParkClock = .{};
+    try std.testing.expectEqual(@as(i64, 0), clock.parkedMs(1_000));
+    clock.begin(io, 1_000);
+    try std.testing.expectEqual(@as(i64, 500), clock.parkedMs(1_500)); // still open
+    clock.begin(io, 1_200); // an approval while a question is up
+    clock.end(io, 1_700);
+    try std.testing.expectEqual(@as(i64, 800), clock.parkedMs(1_800)); // outer still open
+    clock.end(io, 2_000);
+    try std.testing.expectEqual(@as(i64, 1_000), clock.parkedMs(9_000)); // closed: frozen
+    clock.end(io, 9_000); // unmatched end is ignored
+    try std.testing.expectEqual(@as(i64, 1_000), clock.parkedMs(9_500));
+}

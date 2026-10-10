@@ -1622,6 +1622,10 @@ pub const App = struct {
                 view.stream_quiet_ms = ss.quiet_ms;
                 view.stream_status_at_ms = nowWallMs(self.io);
             },
+            .guest_activity => |activity| {
+                const view = self.liveView(activity.sid) orelse return;
+                view.replaceGuestActivity(self.gpa, activity.items) catch {};
+            },
             .status => |s| {
                 const status_now = nowWallMs(self.io);
                 const prior_state = if (self.sessionSummary(s.sid)) |summary|
@@ -1671,6 +1675,7 @@ pub const App = struct {
                             saved.stream_bytes = 0;
                             saved.stream_quiet_ms = 0;
                             saved.stream_status_at_ms = 0;
+                            saved.replaceGuestActivity(self.gpa, &.{}) catch {};
                             saved.releaseStreamingBuffers(self.gpa);
                         }
                     }
@@ -1714,6 +1719,7 @@ pub const App = struct {
                     view.stream_status_at_ms = 0;
                     view.turn_phase = .idle;
                     view.phase_started_ms = 0;
+                    view.replaceGuestActivity(self.gpa, &.{}) catch {};
                 }
                 view.state = s.state;
                 if (s.usage_credits) |active| view.usage_credits = active;
@@ -4148,6 +4154,7 @@ fn transcriptView(app: *App) Transcript {
         .show_working_ticker = !hasUnfinishedPlan(app.view.plan.items),
         .cwd = app.view.cwd.items,
         .guest = proto.isGuestModel(app.view.model.items),
+        .guest_activity = app.view.guest_activity,
         .approval = if (app.view.pending) |*pending| .{
             .tool = pending.tool(),
             .args = pending.args(),

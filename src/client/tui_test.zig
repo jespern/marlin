@@ -5238,6 +5238,30 @@ test "git status polling is throttled, capability gated and rejects stale cwd re
     try std.testing.expectEqualStrings("", app.git_label.items);
 }
 
+test "guest activity snapshots are owned and clear when the turn settles" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 42, .editor = Editor.init(gpa), .state = .running } };
+    defer app.deinit();
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{
+        .sid = 42,
+        .items = &.{.{
+            .id = "agent-1",
+            .kind = .agent,
+            .name = "Scout",
+            .detail = "inspect tests",
+        }},
+    } }));
+    try std.testing.expectEqual(@as(usize, 1), app.view.guest_activity.len);
+    try std.testing.expectEqualStrings("Scout", app.view.guest_activity[0].name);
+    try std.testing.expectEqualStrings("inspect tests", app.view.guest_activity[0].detail);
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 42, .state = .idle } }));
+    try std.testing.expectEqual(@as(usize, 0), app.view.guest_activity.len);
+}
+
 test "cwd Tab and arrows accept directory selections and descend without submitting" {
     const gpa = std.testing.allocator;
     var threaded: Io.Threaded = .init(gpa, .{});

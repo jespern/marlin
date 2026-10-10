@@ -56,6 +56,42 @@ pub fn policyFor(cfg: config.Config, mode: Mode, mutating: bool, sandboxed: bool
 
 /// One-shot blocking gate: turn thread arms then waits, dispatcher resolves.
 /// Reused across calls within a session.
+/// Time a turn spends parked on the user (approval or ask_user). Guest run
+/// ceilings exist to reap wedged subprocesses, not to bound how long a human
+/// takes to answer, so the watcher excludes parked time from its clock.
+/// begin/end may be called from the dispatcher or the turn thread; nested or
+/// overlapping parks count once (depth-counted), the watcher reads lock-free.
+pub const ParkClock = struct {
+    mutex: Io.Mutex = .init,
+    depth: u32 = 0,
+    since_ms: std.atomic.Value(i64) = .init(0),
+    total_ms: std.atomic.Value(i64) = .init(0),
+
+    pub fn begin(self: *ParkClock, io: Io, now_ms: i64) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.depth == 0) self.since_ms.store(now_ms, .release);
+        self.depth += 1;
+    }
+
+    pub fn end(self: *ParkClock, io: Io, now_ms: i64) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.depth == 0) return;
+        self.depth -= 1;
+        if (self.depth > 0) return;
+        const since = self.since_ms.swap(0, .acq_rel);
+        if (since > 0 and now_ms > since) _ = self.total_ms.fetchAdd(now_ms - since, .acq_rel);
+    }
+
+    /// Parked milliseconds so far, including a park still in progress.
+    pub fn parkedMs(self: *const ParkClock, now_ms: i64) i64 {
+        const since = self.since_ms.load(.acquire);
+        const open: i64 = if (since > 0 and now_ms > since) now_ms - since else 0;
+        return self.total_ms.load(.acquire) + open;
+    }
+};
+
 pub const Gate = struct {
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,

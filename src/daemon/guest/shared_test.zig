@@ -65,3 +65,28 @@ test "stderr drain retains the latest bytes" {
     try std.testing.expect(std.mem.endsWith(u8, drain.tail[0..drain.len], "latest"));
     try std.testing.expect(std.mem.indexOf(u8, drain.tail[0..drain.len], "old") == null);
 }
+
+test "guest deadline excludes only time parked on the user during this run" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const approval = @import("../approval.zig");
+    var clock: approval.ParkClock = .{};
+    // Parking from an earlier run must not extend this one.
+    clock.begin(io, 1);
+    clock.end(io, 1 + 30 * 60 * 1000);
+    var watcher = shared.CcWatcher.init(io, null, 0, &clock);
+    const start = watcher.deadline_at - shared.guest_deadline_ms;
+    try std.testing.expect(!watcher.deadlineHit(watcher.deadline_at - 1));
+    try std.testing.expect(watcher.deadlineHit(watcher.deadline_at));
+    // An hour on an ask_user question pushes the deadline out by an hour.
+    clock.begin(io, start + 10);
+    clock.end(io, start + 10 + 60 * 60 * 1000);
+    try std.testing.expect(!watcher.deadlineHit(watcher.deadline_at));
+    try std.testing.expect(watcher.deadlineHit(watcher.deadline_at + 60 * 60 * 1000));
+    // Without a clock the ceiling is plain wall time.
+    const bare = shared.CcWatcher.init(io, null, 0, null);
+    try std.testing.expect(bare.deadlineHit(bare.deadline_at));
+    try std.testing.expect(shared.guest_deadline_ms >= 4 * 60 * 60 * 1000);
+}

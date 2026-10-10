@@ -300,6 +300,11 @@ const Session = struct {
     /// Claude Code's latest structured overage signal. Ephemeral: the guest
     /// reports it again when rate-limit state changes.
     usage_credits: std.atomic.Value(bool) = .init(false),
+    /// Latest complete delegated-guest activity snapshot. The turn thread
+    /// replaces it under the mutex; subscribers read it for reconnects.
+    guest_activity_mutex: Io.Mutex = .init,
+    guest_activity_arena: ?std.heap.ArenaAllocator = null,
+    guest_activity: []const proto.GuestActivity = &.{},
     /// Gate the turn thread parks on for `ask` decisions.
     gate: approval.Gate = .{},
     /// Gate the turn thread parks on for ask_user questions.
@@ -315,6 +320,9 @@ const Session = struct {
     /// serializes prompts, so one slot per session is an invariant, not a
     /// queue that can overflow.
     cc_pending: ?CcPending = null,
+    /// Time parked on the user (bridge prompts here, native guest approvals
+    /// in loop.resolveGuestApproval); guest run ceilings exclude it.
+    park_clock: approval.ParkClock = .{},
     /// L1 prune frontier (context.zig): tool_results with seq < this are
     /// stubbed at assembly. Advanced by the turn thread, read by it only —
     /// but stored here so it survives across turns. In-memory only: after a
@@ -1943,6 +1951,12 @@ pub const Daemon = struct {
                     // eviction stays (those sessions are archived).
                     if (!ses.archived) ses.evict_when_idle = false;
                     if (ses.pending_approval_line) |line| self.sendLine(client, line);
+                    ses.guest_activity_mutex.lockUncancelable(self.io);
+                    if (ses.guest_activity.len > 0) self.sendTo(client, .{ .guest_activity = .{
+                        .sid = s.sid,
+                        .items = ses.guest_activity,
+                    } });
+                    ses.guest_activity_mutex.unlock(self.io);
                     break :blk ses.state;
                 } else .idle;
                 const status_now = nowMs(self.io);
@@ -2151,6 +2165,7 @@ pub const Daemon = struct {
                     .question = cq.question,
                     .options = options,
                 } });
+                if (session.cc_question_pending == null) session.park_clock.begin(self.io, nowMs(self.io));
                 session.cc_question_pending = .{ .approval_id = question_id, .client_id = client.id };
                 if (session.pending_approval_line) |old| self.gpa.free(old);
                 session.pending_approval_line = line;
@@ -2212,6 +2227,7 @@ pub const Daemon = struct {
                     .tool = ca.tool,
                     .args_json = ca.args_json,
                 } });
+                if (session.cc_pending == null) session.park_clock.begin(self.io, nowMs(self.io));
                 session.cc_pending = .{ .approval_id = approval_id, .client_id = client.id };
                 if (session.pending_approval_line) |old| self.gpa.free(old);
                 session.pending_approval_line = line;
@@ -3034,6 +3050,11 @@ pub const Daemon = struct {
         for (session.steer_queue.items) |steer| steer.deinit(self.gpa);
         session.steer_queue.deinit(self.gpa);
         session.steer_mutex.unlock(self.io);
+        session.guest_activity_mutex.lockUncancelable(self.io);
+        if (session.guest_activity_arena) |*arena| arena.deinit();
+        session.guest_activity_arena = null;
+        session.guest_activity = &.{};
+        session.guest_activity_mutex.unlock(self.io);
         self.gpa.free(session.model);
         self.gpa.free(session.cwd);
         if (session.pending_guest_model) |guest| self.gpa.free(guest);
@@ -3508,6 +3529,7 @@ pub const Daemon = struct {
             .on_reasoning_delta = TurnHooks.onReasoningDelta,
             .on_stream_status = TurnHooks.onStreamStatus,
             .on_phase = TurnHooks.onPhase,
+            .on_guest_activity = TurnHooks.onGuestActivity,
             .usage_credits_live = &job.session.usage_credits,
             .on_usage_credits = TurnHooks.onUsageCredits,
             .on_delta_ctx = job,
@@ -3518,6 +3540,7 @@ pub const Daemon = struct {
             .input_display_text = job.display_text,
             .auto_continue_round_budget = job.kind == .root,
             .cancel = job.cancel,
+            .park_clock = &job.session.park_clock,
             .poll_steer = TurnHooks.pollSteer,
             .try_close_steer = TurnHooks.tryCloseSteer,
             .max_rounds = job.max_rounds,
@@ -3620,6 +3643,7 @@ pub const Daemon = struct {
             .on_phase = TurnHooks.onPhase,
             .on_delta_ctx = job,
             .cancel = job.cancel,
+            .park_clock = &job.session.park_clock,
         }) catch |e| {
             const t = http.failureNote(self.gpa, "compaction", e) catch null;
             self.persistTurnNote(job, t orelse "compaction failed");
@@ -3803,6 +3827,7 @@ pub const Daemon = struct {
             .on_phase = TurnHooks.onPhase,
             .on_delta_ctx = job,
             .cancel = job.cancel,
+            .park_clock = &job.session.park_clock,
         }, job.text) catch |e| {
             const t = http.failureNote(self.gpa, "handover", e) catch null;
             self.persistTurnNote(job, t orelse "handover failed");
@@ -3882,6 +3907,36 @@ pub const Daemon = struct {
                 0,
                 job.session.usage_credits.load(.acquire),
             ) catch return;
+            self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+        }
+
+        fn onGuestActivity(ctx: ?*anyopaque, items: []const proto.GuestActivity) void {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            const a = arena.allocator();
+            const owned = a.alloc(proto.GuestActivity, items.len) catch {
+                arena.deinit();
+                return;
+            };
+            for (items, owned) |item, *copy| copy.* = .{
+                .id = a.dupe(u8, item.id) catch return arena.deinit(),
+                .parent_id = a.dupe(u8, item.parent_id) catch return arena.deinit(),
+                .kind = item.kind,
+                .name = a.dupe(u8, item.name) catch return arena.deinit(),
+                .detail = a.dupe(u8, item.detail) catch return arena.deinit(),
+                .started_at_ms = item.started_at_ms,
+            };
+            job.session.guest_activity_mutex.lockUncancelable(self.io);
+            if (job.session.guest_activity_arena) |*old| old.deinit();
+            job.session.guest_activity_arena = arena;
+            job.session.guest_activity = owned;
+            job.session.guest_activity_mutex.unlock(self.io);
+
+            const line = proto.encode(self.gpa, proto.DaemonMsg{ .guest_activity = .{
+                .sid = job.sid,
+                .items = items,
+            } }) catch return;
             self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
         }
 
@@ -4102,6 +4157,7 @@ pub const Daemon = struct {
         const pending = session.cc_pending orelse return;
         if (pending.approval_id != approval_id) return;
         session.cc_pending = null;
+        session.park_clock.end(self.io, nowMs(self.io));
         if (self.lookupClient(pending.client_id)) |bridge| {
             self.sendTo(bridge, .{ .cc_approval_result = .{
                 .sid = session.id,
@@ -4139,6 +4195,7 @@ pub const Daemon = struct {
         const pending = session.cc_question_pending orelse return;
         if (pending.approval_id != question_id) return;
         session.cc_question_pending = null;
+        session.park_clock.end(self.io, nowMs(self.io));
         if (self.lookupClient(pending.client_id)) |bridge| {
             self.sendTo(bridge, .{ .cc_question_result = .{ .sid = session.id, .answer = answer } });
         }
@@ -4162,10 +4219,12 @@ pub const Daemon = struct {
             var dropped = false;
             if (session.cc_question_pending) |pending| if (pending.client_id == client_id) {
                 session.cc_question_pending = null;
+                session.park_clock.end(self.io, nowMs(self.io));
                 dropped = true;
             };
             if (session.cc_pending) |pending| if (pending.client_id == client_id) {
                 session.cc_pending = null;
+                session.park_clock.end(self.io, nowMs(self.io));
                 dropped = true;
             };
             if (!dropped) continue;

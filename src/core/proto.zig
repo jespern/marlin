@@ -29,7 +29,24 @@ pub const SessionState = enum { idle, running, awaiting_approval, err, done };
 /// Coarse, lock-free turn phase used for cancellation diagnostics. This is
 /// deliberately operational rather than provider-specific: clients can say
 /// what is being cancelled without coupling themselves to loop internals.
-pub const TurnPhase = enum { idle, starting, context, provider, approval, tool, child, compaction, finishing };
+/// `background`: a guest finished replying but stays alive waiting on its own
+/// background jobs (Claude Code run_in_background); nothing is being asked
+/// of the model until one completes.
+pub const TurnPhase = enum { idle, starting, context, provider, approval, tool, child, compaction, finishing, background };
+
+/// Live work owned by a delegated guest. These nodes are operational state,
+/// not Marlin child sessions: ids and parent ids come from the guest's own
+/// stream and disappear when the delegated invocation ends.
+pub const GuestActivityKind = enum { agent, tool, process };
+
+pub const GuestActivity = struct {
+    id: []const u8,
+    parent_id: []const u8 = "",
+    kind: GuestActivityKind,
+    name: []const u8,
+    detail: []const u8 = "",
+    started_at_ms: i64 = 0,
+};
 
 pub const InterruptResult = struct {
     sid: u64,
@@ -467,6 +484,10 @@ pub const DaemonMsg = union(enum) {
     /// provider: cumulative body bytes this round and ms since the last
     /// visible (text/reasoning) delta. Emitted at most ~1/s.
     stream_status: struct { sid: u64, bytes: u64, quiet_ms: u64 },
+    /// Complete ephemeral activity snapshot for one running guest turn.
+    /// An empty list clears the tree. Full snapshots make dropped/coalesced
+    /// intermediate updates harmless and let reconnects restore the view.
+    guest_activity: struct { sid: u64, items: []const GuestActivity },
     replay_done: struct {
         sid: u64,
         oldest_seq: u64 = 0,

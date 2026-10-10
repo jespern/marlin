@@ -151,6 +151,8 @@ pub const RunOpts = struct {
     /// Coarse phase transitions for cancellation diagnostics. The callback
     /// must be non-blocking; the daemon publishes it through atomics.
     on_phase: ?*const fn (ctx: ?*anyopaque, phase: proto.TurnPhase) void = null,
+    /// Complete live activity tree for a delegated guest invocation.
+    on_guest_activity: ?*const fn (ctx: ?*anyopaque, items: []const proto.GuestActivity) void = null,
     /// Guest billing state shared with the daemon and transition notification.
     usage_credits_live: ?*std.atomic.Value(bool) = null,
     on_usage_credits: ?*const fn (ctx: ?*anyopaque, active: bool) void = null,
@@ -162,6 +164,9 @@ pub const RunOpts = struct {
     on_task: ?*const fn (ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut = null,
     /// ask_user: park here until a client answers (or an interrupt dismisses).
     question_gate: ?*approval.QuestionGate = null,
+    /// Session-owned record of time parked on the user. Guest run ceilings
+    /// exclude it so a slow human answer never kills the subprocess.
+    park_clock: ?*approval.ParkClock = null,
     /// Publish a question_request to clients; false = nobody will ever answer.
     on_question: ?*const fn (ctx: ?*anyopaque, id: u64, question: []const u8, options: []const []const u8) bool = null,
     on_question_done: ?*const fn (ctx: ?*anyopaque, id: u64) void = null,
@@ -1181,6 +1186,8 @@ pub fn resolveGuestApproval(
         else
             false;
         if (!published) _ = gate.resolve(io, approval_id, .denied);
+        if (opts.park_clock) |clock| clock.begin(io, nowMs(io));
+        defer if (opts.park_clock) |clock| clock.end(io, nowMs(io));
         break :blk gate.wait(io, approval_id);
     } else .approved;
 

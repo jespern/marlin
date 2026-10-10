@@ -40,21 +40,34 @@ const resolveGuestApproval = loop.resolveGuestApproval;
 const tryCloseSteering = loop.tryCloseSteering;
 
 const shared = @import("shared.zig");
+const guest_activity = @import("activity.zig");
 const setDelegateError = shared.setDelegateError;
 const lastDelegateErrorNote = shared.lastDelegateErrorNote;
 const putEnvDefault = shared.putEnvDefault;
 const CcWatcher = shared.CcWatcher;
 const CcStderrDrain = shared.CcStderrDrain;
 
-/// Wall-clock ceiling for one delegated invocation; Claude Code has its own
-/// internal turn management, this only prevents an unkillable zombie run.
-const claude_code_deadline_ms: i64 = 60 * 60 * 1000;
-
 pub fn usageCreditsTransitionNote(active: bool) []const u8 {
     return if (active)
         "Claude Code is now using API credits"
     else
         "Claude Code returned to subscription usage";
+}
+
+/// Claude Code owns execution of guest tools, so Marlin cannot observe the
+/// child process directly. Keep the visible phase on `tool` while any tool
+/// call reported by the stream is still awaiting its matching result.
+pub fn guestToolPhase(open_tools: usize) proto.TurnPhase {
+    return if (open_tools == 0) .provider else .tool;
+}
+
+fn activityDetail(arena: std.mem.Allocator, input_json: []const u8) []const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, input_json, .{}) catch return "";
+    if (parsed != .object) return "";
+    inline for (.{ "description", "command", "prompt", "file_path", "pattern", "query" }) |key| {
+        if (parsed.object.get(key)) |value| if (value == .string) return value.string;
+    }
+    return "";
 }
 
 const CcOutcome = struct {
@@ -72,9 +85,27 @@ const CcOutcome = struct {
     cache_write_tokens: u64 = 0,
     /// gpa-owned final text (may be empty).
     final_text: std.ArrayList(u8) = .empty,
+    /// The last successful result's text is already an assistant_msg block.
+    /// A run with background tasks emits several results; each reply is
+    /// persisted as it lands so a later kill cannot lose it.
+    final_persisted: bool = false,
     stderr_tail: [4096]u8 = undefined,
     stderr_len: usize = 0,
 };
+
+/// The reply landed but the run stays alive for its background tasks: say so
+/// in the transcript and the phase, or "running" looks like a hang.
+fn noteBackgroundWait(gpa: std.mem.Allocator, opts: RunOpts, ap: *Appender, open: usize, description: []const u8) !void {
+    const note = if (description.len > 0 and open == 1)
+        try std.fmt.allocPrint(gpa, "waiting on background task: {s}", .{description})
+    else if (description.len > 0)
+        try std.fmt.allocPrint(gpa, "waiting on {d} background tasks: {s}, …", .{ open, description })
+    else
+        try std.fmt.allocPrint(gpa, "waiting on {d} background task{s}", .{ open, if (open == 1) "" else "s" });
+    defer gpa.free(note);
+    _ = try ap.append(.{ .system_note = .{ .text = note } });
+    publishPhase(opts, .background);
+}
 
 pub fn compactDiagnostic(allocator: std.mem.Allocator, text: []const u8, max: usize) ![]u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -251,12 +282,7 @@ fn ccInvoke(
     var outcome = CcOutcome{};
     errdefer outcome.final_text.deinit(gpa);
 
-    var watcher = CcWatcher{
-        .io = io,
-        .cancel = opts.cancel,
-        .group = child.id.?,
-        .deadline_at = nowMs(io) + claude_code_deadline_ms,
-    };
+    var watcher = CcWatcher.init(io, opts.cancel, child.id.?, opts.park_clock);
     const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
     var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
     const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
@@ -265,6 +291,12 @@ fn ccInvoke(
     // the final prose is never double-persisted next to the assistant_msg.
     var pending_text: std.ArrayList(u8) = .empty;
     defer pending_text.deinit(gpa);
+    // Open run_in_background tasks, per Claude Code's own task list.
+    var background_open: usize = 0;
+    // Between a reply (`result`) and the next sub-turn: the model is idle.
+    var replied = false;
+    var background_description: std.ArrayList(u8) = .empty;
+    defer background_description.deinit(gpa);
 
     // Telemetry: one round row per invocation, one tool row per completed
     // tool call — the same tables the native loop fills, so guest turns get
@@ -280,6 +312,9 @@ fn ccInvoke(
         }
         pending_tools.deinit(gpa);
     }
+    var open_tools: usize = 0;
+    var activity = guest_activity.Tracker.init(gpa, opts.on_guest_activity, opts.on_delta_ctx);
+    defer activity.deinit();
 
     {
         const line_buf = try gpa.alloc(u8, 512 * 1024);
@@ -319,6 +354,19 @@ fn ccInvoke(
                     _ = try ap.append(.{ .reasoning = .{ .text = text } });
                 },
                 .tool_use => |tu| {
+                    const kind: proto.GuestActivityKind = if (std.mem.eql(u8, tu.name, "Agent")) .agent else .tool;
+                    try activity.start(
+                        tu.id,
+                        tu.parent_tool_use_id,
+                        kind,
+                        tu.name,
+                        activityDetail(line_arena, tu.input_json),
+                        nowMs(io),
+                    );
+                    // Forwarded subagent tools exist to drive the live tree;
+                    // persisting them would flatten child internals into the
+                    // parent's transcript and duplicate the Agent result.
+                    if (tu.parent_tool_use_id.len > 0) continue;
                     if (pending_text.items.len > 0) {
                         _ = try ap.append(.{ .reasoning = .{ .text = pending_text.items, .commentary = true } });
                         pending_text.clearRetainingCapacity();
@@ -341,9 +389,14 @@ fn ccInvoke(
                             gpa.free(name);
                         };
                     }
+                    open_tools += 1;
+                    if (open_tools == 1) publishPhase(opts, guestToolPhase(open_tools));
                     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, tu.name, .start);
                 },
                 .tool_result => |tr| {
+                    const nested = tr.parent_tool_use_id.len > 0 or activity.isNested(tr.tool_use_id);
+                    activity.finish(tr.tool_use_id);
+                    if (nested) continue;
                     const cap = opts.cfg.inline_tool_cap_bytes;
                     // Same capture-time redaction as native tool results:
                     // the delegated binary can read a file containing a key
@@ -375,6 +428,8 @@ fn ccInvoke(
                         gpa.free(removed.name);
                         break;
                     };
+                    if (open_tools > 0) open_tools -= 1;
+                    if (open_tools == 0) publishPhase(opts, guestToolPhase(open_tools));
                     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, "claude", .done);
                 },
                 .usage_credits => |active| {
@@ -389,13 +444,47 @@ fn ccInvoke(
                     outcome.result_is_error = r.is_error;
                     outcome.result_error_len = @min(r.error_text.len, outcome.result_error.len);
                     @memcpy(outcome.result_error[0..outcome.result_error_len], r.error_text[0..outcome.result_error_len]);
-                    outcome.tokens_in = r.tokens_in;
-                    outcome.tokens_out = r.tokens_out;
-                    outcome.cached_tokens = r.cached_tokens;
-                    outcome.cache_write_tokens = r.cache_write_tokens;
+                    // Usage is per sub-turn; a run that resumes after its
+                    // background tasks reports one result per sub-turn.
+                    outcome.tokens_in += r.tokens_in;
+                    outcome.tokens_out += r.tokens_out;
+                    outcome.cached_tokens += r.cached_tokens;
+                    outcome.cache_write_tokens += r.cache_write_tokens;
                     outcome.final_text.clearRetainingCapacity();
                     try outcome.final_text.appendSlice(gpa, if (r.text.len > 0) r.text else pending_text.items);
                     pending_text.clearRetainingCapacity();
+                    outcome.final_persisted = false;
+                    if (!r.is_error) {
+                        _ = try ap.append(.{ .assistant_msg = .{ .text = outcome.final_text.items } });
+                        outcome.final_persisted = true;
+                    }
+                    replied = true;
+                    if (background_open > 0) try noteBackgroundWait(gpa, opts, ap, background_open, background_description.items);
+                },
+                .background_tasks => |bg| {
+                    const was_open = background_open;
+                    background_open = bg.len;
+                    background_description.clearRetainingCapacity();
+                    if (bg.len > 0) try background_description.appendSlice(gpa, bg[0].description);
+                    activity.clearKind(.process);
+                    for (bg) |task| try activity.start(
+                        task.task_id,
+                        "",
+                        .process,
+                        if (std.mem.eql(u8, task.task_type, "local_bash")) "Bash" else task.task_type,
+                        task.description,
+                        nowMs(io),
+                    );
+                    // Launched after the reply landed (rare): park visibly too.
+                    if (was_open == 0 and bg.len > 0 and replied)
+                        try noteBackgroundWait(gpa, opts, ap, background_open, background_description.items);
+                },
+                .task_notification => |notification| {
+                    replied = false;
+                    activity.finish(notification.task_id);
+                    _ = try ap.append(.{ .system_note = .{ .text = notification.summary } });
+                    // The run resumes on its own: the model now reads the result.
+                    publishPhase(opts, .provider);
                 },
             };
         }
@@ -509,7 +598,7 @@ pub fn runClaudeCodeTurn(
             return .{ .text = try gpa.dupe(u8, ""), .rounds = rounds, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
         }
         if (outcome.timed_out) {
-            const note = "claude code run exceeded the 60-minute ceiling and was terminated";
+            const note = "claude code run " ++ shared.guest_deadline_note_suffix;
             setDelegateError(note);
             _ = try ap.append(.{ .system_note = .{ .text = note } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
@@ -558,7 +647,7 @@ pub fn runClaudeCodeTurn(
         }
 
         fresh = false;
-        _ = try ap.append(.{ .assistant_msg = .{ .text = outcome.final_text.items } });
+        if (!outcome.final_persisted) _ = try ap.append(.{ .assistant_msg = .{ .text = outcome.final_text.items } });
         final_text.clearRetainingCapacity();
         try final_text.appendSlice(gpa, outcome.final_text.items);
 

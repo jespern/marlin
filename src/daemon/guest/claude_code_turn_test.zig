@@ -76,3 +76,9 @@ test "usage credit notifications describe both transitions" {
         claude_code_turn.usageCreditsTransitionNote(false),
     );
 }
+
+test "guest tool phase remains tool until every parallel call finishes" {
+    try std.testing.expectEqual(proto.TurnPhase.provider, claude_code_turn.guestToolPhase(0));
+    try std.testing.expectEqual(proto.TurnPhase.tool, claude_code_turn.guestToolPhase(1));
+    try std.testing.expectEqual(proto.TurnPhase.tool, claude_code_turn.guestToolPhase(3));
+}

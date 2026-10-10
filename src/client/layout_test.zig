@@ -740,6 +740,67 @@ test "working activity names each operational phase" {
     try std.testing.expect(std.mem.indexOf(u8, detail.text, "streaming ↑ 4.0KiB") != null);
 }
 
+test "guest activity renders a nested agent and process tree" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    const activity = [_]proto.GuestActivity{
+        .{ .id = "agent-1", .kind = .agent, .name = "Scout", .detail = "inspect tests" },
+        .{ .id = "bash-1", .parent_id = "agent-1", .kind = .process, .name = "Bash", .detail = "zig build test" },
+    };
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &.{},
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .guest = true,
+        .guest_activity = &activity,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const lines = try layoutLines(arena, gpa, &transcript, 100);
+
+    var agent_line: ?usize = null;
+    var process_line: ?usize = null;
+    for (lines.items, 0..) |line, i| {
+        const rendered = try lineText(arena, line);
+        if (std.mem.indexOf(u8, rendered, "◇ Scout · inspect tests") != null) agent_line = i;
+        if (std.mem.indexOf(u8, rendered, "   └─ Bash · zig build test") != null) process_line = i;
+    }
+    try std.testing.expect(agent_line != null);
+    try std.testing.expect(process_line != null);
+    try std.testing.expect(agent_line.? < process_line.?);
+
+    transcript.reasoning_delta = "still reasoning";
+    _ = arena_state.reset(.retain_capacity);
+    const reasoning_lines = try layoutLines(arena, gpa, &transcript, 100);
+    for (reasoning_lines.items) |line| {
+        const rendered = try lineText(arena, line);
+        if (std.mem.indexOf(u8, rendered, "◇ Scout") != null) return;
+    }
+    return error.TestExpectedEqual;
+}
+
 test "running Bash activity syntax-highlights the displayed command" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

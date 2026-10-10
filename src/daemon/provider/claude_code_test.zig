@@ -45,11 +45,12 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
         .max_turns = 32,
     });
     try std.testing.expectEqualStrings("--include-partial-messages", fresh[6]);
-    try std.testing.expectEqualStrings("--model", fresh[7]);
-    try std.testing.expectEqualStrings("fable-5", fresh[8]);
-    try std.testing.expectEqualStrings("--session-id", fresh[9]);
-    try std.testing.expectEqualStrings("--permission-mode", fresh[11]);
-    try std.testing.expectEqualStrings("acceptEdits", fresh[12]);
+    try std.testing.expectEqualStrings("--forward-subagent-text", fresh[7]);
+    try std.testing.expectEqualStrings("--model", fresh[8]);
+    try std.testing.expectEqualStrings("fable-5", fresh[9]);
+    try std.testing.expectEqualStrings("--session-id", fresh[10]);
+    try std.testing.expectEqualStrings("--permission-mode", fresh[12]);
+    try std.testing.expectEqualStrings("acceptEdits", fresh[13]);
     for (fresh) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--effort"));
 
     const high = try buildArgv(arena, .{
@@ -80,8 +81,9 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     // "default" model omits --model entirely.
     for (resumed) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--model"));
     try std.testing.expectEqualStrings("--include-partial-messages", resumed[6]);
-    try std.testing.expectEqualStrings("--resume", resumed[7]);
-    try std.testing.expectEqualStrings("--dangerously-skip-permissions", resumed[9]);
+    try std.testing.expectEqualStrings("--forward-subagent-text", resumed[7]);
+    try std.testing.expectEqualStrings("--resume", resumed[8]);
+    try std.testing.expectEqualStrings("--dangerously-skip-permissions", resumed[10]);
 
     const planned = try buildArgv(arena, .{
         .binary = "claude",
@@ -92,8 +94,8 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
         .permissions = .plan,
         .max_turns = 8,
     });
-    try std.testing.expectEqualStrings("--permission-mode", planned[9]);
-    try std.testing.expectEqualStrings("plan", planned[10]);
+    try std.testing.expectEqualStrings("--permission-mode", planned[10]);
+    try std.testing.expectEqualStrings("plan", planned[11]);
     for (planned) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--dangerously-skip-permissions"));
 
     const bridged = try buildArgv(arena, .{
@@ -107,15 +109,15 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
         .max_turns = 8,
     });
     // The MCP server (approve + ask_user) leads, then permission routing.
-    try std.testing.expectEqualStrings("--mcp-config", bridged[9]);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[10], "\"command\":\"/opt/marlin\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[10], "\"--sid\",\"42\"") != null);
-    try std.testing.expectEqualStrings("--append-system-prompt", bridged[11]);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[12], "mcp__marlin__ask_user") != null);
-    try std.testing.expectEqualStrings("--permission-mode", bridged[13]);
-    try std.testing.expectEqualStrings("default", bridged[14]);
-    try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[15]);
-    try std.testing.expectEqualStrings("mcp__marlin__approve", bridged[16]);
+    try std.testing.expectEqualStrings("--mcp-config", bridged[10]);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[11], "\"command\":\"/opt/marlin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[11], "\"--sid\",\"42\"") != null);
+    try std.testing.expectEqualStrings("--append-system-prompt", bridged[12]);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[13], "mcp__marlin__ask_user") != null);
+    try std.testing.expectEqualStrings("--permission-mode", bridged[14]);
+    try std.testing.expectEqualStrings("default", bridged[15]);
+    try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[16]);
+    try std.testing.expectEqualStrings("mcp__marlin__approve", bridged[17]);
 
     // Bridge wiring never overrides an explicit bypass: no prompt routing,
     // but the MCP server (and its ask_user picker) still rides along.
@@ -180,6 +182,31 @@ test "decode: init, assistant blocks, tool_result shapes, result usage" {
     try std.testing.expectEqual(@as(u64, 5), result.tokens_out);
     try std.testing.expectEqual(@as(u64, 90), result.cached_tokens);
     try std.testing.expect(!result.is_error);
+}
+
+test "decode: forwarded subagent prose stays nested while its tools remain visible" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+
+    try decodeLine(arena,
+        \\{"type":"assistant","parent_tool_use_id":"agent-1","message":{"content":[{"type":"thinking","thinking":"child thought"},{"type":"text","text":"child prose"},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"zig build test"}}]}}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("tool-1", events.items[0].tool_use.id);
+    try std.testing.expectEqualStrings("agent-1", events.items[0].tool_use.parent_tool_use_id);
+
+    try decodeLine(arena,
+        \\{"type":"stream_event","parent_tool_use_id":"agent-1","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ignored child delta"}}}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+
+    try decodeLine(arena,
+        \\{"type":"user","parent_tool_use_id":"agent-1","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expectEqualStrings("agent-1", events.items[1].tool_result.parent_tool_use_id);
 }
 
 test "decode: rate limit event reports usage credit state" {
@@ -292,4 +319,32 @@ test "decode: tool_result adopts the structuredPatch diff when present" {
         "edited 1 hunk in /tmp/a.zig\n@@ -3,3 +3,3 @@ pub fn greet() void {\n pub fn greet() void {\n-    old();\n+    new();\n }",
         events.items[8].tool_result.text,
     );
+}
+
+test "decode: background task lifecycle (captured from claude -p 2.1.x)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b0y87bkk9","run_id":"r","task_type":"local_bash","description":"Sleep 8 seconds then echo done-bg"}],"uuid":"u","session_id":"s"}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"task_started","task_id":"b0y87bkk9","is_backgrounded":true,"task_type":"local_bash","uuid":"u","session_id":"s"}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"task_notification","task_id":"b0y87bkk9","status":"completed","summary":"Background command \"Sleep 8 seconds then echo done-bg\" completed (exit code 0)","uuid":"u","session_id":"s"}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"u","session_id":"s"}
+    , &events);
+
+    try std.testing.expectEqual(@as(usize, 3), events.items.len); // task_started is not surfaced
+    try std.testing.expectEqual(@as(usize, 1), events.items[0].background_tasks.len);
+    try std.testing.expectEqualStrings("b0y87bkk9", events.items[0].background_tasks[0].task_id);
+    try std.testing.expectEqualStrings("Sleep 8 seconds then echo done-bg", events.items[0].background_tasks[0].description);
+    try std.testing.expectEqualStrings("b0y87bkk9", events.items[1].task_notification.task_id);
+    try std.testing.expectEqualStrings("Background command \"Sleep 8 seconds then echo done-bg\" completed (exit code 0)", events.items[1].task_notification.summary);
+    try std.testing.expectEqual(@as(usize, 0), events.items[2].background_tasks.len);
 }

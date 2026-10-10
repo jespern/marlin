@@ -39,6 +39,7 @@ const resolveGuestApproval = loop.resolveGuestApproval;
 const tryCloseSteering = loop.tryCloseSteering;
 
 const shared = @import("shared.zig");
+const guest_activity = @import("activity.zig");
 const compactDiagnostic = @import("claude_code_turn.zig").compactDiagnostic;
 const setDelegateError = shared.setDelegateError;
 const lastDelegateErrorNote = shared.lastDelegateErrorNote;
@@ -46,7 +47,6 @@ const putEnvDefault = shared.putEnvDefault;
 const CcWatcher = shared.CcWatcher;
 const CcStderrDrain = shared.CcStderrDrain;
 
-const codex_deadline_ms: i64 = 60 * 60 * 1000;
 const codex_line_bytes: usize = 4 * 1024 * 1024;
 
 fn codexWriteLine(writer: *Io.Writer, line: []const u8) !void {
@@ -242,6 +242,79 @@ fn codexToolBody(arena: std.mem.Allocator, item: std.json.Value) ![]const u8 {
 fn codexStatus(item: std.json.Value) block.ToolStatus {
     const status = codex.strField(item, "status") orelse return .ok;
     return if (std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "declined")) .err else .ok;
+}
+
+fn codexActivityKind(item: std.json.Value) proto.GuestActivityKind {
+    const kind = codex.strField(item, "type") orelse "";
+    if (std.mem.eql(u8, kind, "commandExecution") or std.mem.eql(u8, kind, "sleep")) return .process;
+    return .tool;
+}
+
+fn codexActivityDetail(arena: std.mem.Allocator, item: std.json.Value) ![]const u8 {
+    inline for (.{ "description", "prompt", "query", "path", "cwd" }) |key| {
+        if (codex.strField(item, key)) |value| if (value.len > 0) return value;
+    }
+    if (codex.field(item, "command")) |command| return codex.stringify(arena, command);
+    if (codex.field(item, "arguments")) |args| return codex.stringify(arena, args);
+    return "";
+}
+
+fn codexActivityParent(item: std.json.Value) []const u8 {
+    return codex.strField(item, "parentId") orelse
+        codex.strField(item, "parentItemId") orelse
+        codex.strField(item, "parent_item_id") orelse "";
+}
+
+fn isPrimaryCodexThread(params: std.json.Value, thread_id: []const u8) bool {
+    const event_thread = codex.strField(params, "threadId") orelse return true;
+    return std.mem.eql(u8, event_thread, thread_id);
+}
+
+fn codexSubagentEvent(
+    activity: *guest_activity.Tracker,
+    item: std.json.Value,
+    started_at_ms: i64,
+) !bool {
+    const item_type = codex.strField(item, "type") orelse return false;
+    if (!std.mem.eql(u8, item_type, "subAgentActivity")) return false;
+    const agent_id = codex.strField(item, "agentThreadId") orelse return true;
+    const kind = codex.strField(item, "kind") orelse "";
+    if (std.mem.eql(u8, kind, "completed") or std.mem.eql(u8, kind, "interrupted")) {
+        activity.finish(agent_id);
+        return true;
+    }
+    if (activity.contains(agent_id)) return true;
+    try activity.start(
+        agent_id,
+        "",
+        .agent,
+        "Agent",
+        codex.strField(item, "agentPath") orelse "",
+        started_at_ms,
+    );
+    return true;
+}
+
+fn codexThreadStarted(
+    activity: *guest_activity.Tracker,
+    params: std.json.Value,
+    root_thread_id: []const u8,
+    started_at_ms: i64,
+) !void {
+    const thread = codex.field(params, "thread") orelse return;
+    const id = codex.strField(thread, "id") orelse return;
+    const raw_parent = codex.strField(thread, "parentThreadId") orelse return;
+    const parent = if (std.mem.eql(u8, raw_parent, root_thread_id)) "" else raw_parent;
+    const name = codex.strField(thread, "agentNickname") orelse
+        codex.strField(thread, "agentRole") orelse "Agent";
+    try activity.start(
+        id,
+        parent,
+        .agent,
+        name,
+        codex.strField(thread, "preview") orelse "",
+        started_at_ms,
+    );
 }
 
 fn appendCodexItemStarted(
@@ -442,12 +515,7 @@ pub fn runCodexTurn(
         return error.DelegateSpawnFailed;
     };
 
-    var watcher = CcWatcher{
-        .io = io,
-        .cancel = opts.cancel,
-        .group = child.id.?,
-        .deadline_at = nowMs(io) + codex_deadline_ms,
-    };
+    var watcher = CcWatcher.init(io, opts.cancel, child.id.?, opts.park_clock);
     const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
     var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
     const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
@@ -583,6 +651,8 @@ pub fn runCodexTurn(
     var interrupted = false;
     var failed = false;
     var failure_text: []const u8 = "codex turn failed";
+    var activity = guest_activity.Tracker.init(gpa, opts.on_guest_activity, opts.on_delta_ctx);
+    defer activity.deinit();
 
     var line_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer line_arena_state.deinit();
@@ -626,16 +696,45 @@ pub fn runCodexTurn(
             },
             .notification => |notification| {
                 const params = notification.params;
-                if (std.mem.eql(u8, notification.method, "item/agentMessage/delta")) {
+                const primary_thread = isPrimaryCodexThread(params, thread_id);
+                if (std.mem.eql(u8, notification.method, "thread/started")) {
+                    try codexThreadStarted(&activity, params, thread_id, nowMs(io));
+                } else if (std.mem.eql(u8, notification.method, "item/agentMessage/delta")) {
+                    if (!primary_thread) continue;
                     if (codex.strField(params, "delta")) |delta|
                         if (opts.on_delta) |callback| callback(opts.on_delta_ctx, delta);
                 } else if (std.mem.eql(u8, notification.method, "item/reasoning/summaryTextDelta")) {
+                    if (!primary_thread) continue;
                     if (codex.strField(params, "delta")) |delta|
                         if (opts.on_reasoning_delta) |callback| callback(opts.on_delta_ctx, delta);
                 } else if (std.mem.eql(u8, notification.method, "item/started")) {
-                    if (codex.field(params, "item")) |item| try appendCodexItemStarted(line_arena, ap, opts, item);
+                    if (codex.field(params, "item")) |item| {
+                        if (try codexSubagentEvent(&activity, item, nowMs(io))) continue;
+                        if (try codexToolName(line_arena, item)) |name| {
+                            const item_parent = codexActivityParent(item);
+                            const parent = if (item_parent.len > 0)
+                                item_parent
+                            else if (!primary_thread)
+                                codex.strField(params, "threadId") orelse ""
+                            else
+                                "";
+                            try activity.start(
+                                codex.strField(item, "id") orelse "",
+                                parent,
+                                codexActivityKind(item),
+                                name,
+                                try codexActivityDetail(line_arena, item),
+                                nowMs(io),
+                            );
+                        }
+                        if (!primary_thread) continue;
+                        try appendCodexItemStarted(line_arena, ap, opts, item);
+                    }
                 } else if (std.mem.eql(u8, notification.method, "item/completed")) {
                     if (codex.field(params, "item")) |item| {
+                        if (try codexSubagentEvent(&activity, item, nowMs(io))) continue;
+                        activity.finish(codex.strField(item, "id") orelse "");
+                        if (!primary_thread) continue;
                         const kind = codex.strField(item, "type") orelse "";
                         if (std.mem.eql(u8, kind, "agentMessage")) {
                             const text = codex.strField(item, "text") orelse "";
@@ -725,7 +824,7 @@ pub fn runCodexTurn(
         };
     }
     if (watcher.timed_out.load(.acquire)) {
-        const note = "codex run exceeded the 60-minute ceiling and was terminated";
+        const note = "codex run " ++ shared.guest_deadline_note_suffix;
         setDelegateError(note);
         _ = try ap.append(.{ .system_note = .{ .text = note } });
         return error.DelegateTimeout;
@@ -746,4 +845,49 @@ pub fn runCodexTurn(
         .tokens_in = tokens_in,
         .tokens_out = tokens_out,
     };
+}
+
+test "codex subagent lifecycle builds an agent node" {
+    const Seen = struct {
+        count: usize = 0,
+        id: [32]u8 = undefined,
+        id_len: usize = 0,
+
+        fn publish(ctx: ?*anyopaque, items: []const proto.GuestActivity) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.count = items.len;
+            if (items.len == 0) return;
+            self.id_len = @min(items[0].id.len, self.id.len);
+            @memcpy(self.id[0..self.id_len], items[0].id[0..self.id_len]);
+        }
+    };
+    var seen = Seen{};
+    var tracker = guest_activity.Tracker.init(std.testing.allocator, Seen.publish, &seen);
+    defer tracker.deinit();
+
+    var started = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"subAgentActivity","agentThreadId":"child-1","agentPath":"worker","kind":"started"}
+    , .{});
+    defer started.deinit();
+    try std.testing.expect(try codexSubagentEvent(&tracker, started.value, 10));
+    try std.testing.expectEqual(@as(usize, 1), seen.count);
+    try std.testing.expectEqualStrings("child-1", seen.id[0..seen.id_len]);
+
+    var completed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"subAgentActivity","agentThreadId":"child-1","agentPath":"worker","kind":"completed"}
+    , .{});
+    defer completed.deinit();
+    try std.testing.expect(try codexSubagentEvent(&tracker, completed.value, 20));
+    try std.testing.expectEqual(@as(usize, 0), seen.count);
+}
+
+test "codex thread events retain nested subagent parentage" {
+    var tracker = guest_activity.Tracker.init(std.testing.allocator, null, null);
+    defer tracker.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"thread":{"id":"grandchild","parentThreadId":"child","agentNickname":"Scout","preview":"inspect tests"}}
+    , .{});
+    defer parsed.deinit();
+    try codexThreadStarted(&tracker, parsed.value, "root", 10);
+    try std.testing.expect(tracker.isNested("grandchild"));
 }

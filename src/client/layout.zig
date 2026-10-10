@@ -1134,6 +1134,7 @@ pub const Transcript = struct {
     /// rendered as ordinary assistant text, and their tool calls show as a
     /// compact one-line trail instead of folding into "Ran N commands".
     guest: bool = false,
+    guest_activity: []const proto.GuestActivity = &.{},
     cwd: []const u8 = "",
     approval: ?ApprovalView,
     question: ?QuestionView = null,
@@ -1197,6 +1198,7 @@ pub fn workingLabel(transcript: *const Transcript, now_ms: i64) []const u8 {
         .approval => "Waiting for approval…",
         .tool => "Running tool…",
         .child => "Waiting for child agent…",
+        .background => "Waiting on background task…",
         .compaction => "Compacting context…",
         .finishing => "Finalizing response…",
     };
@@ -1265,6 +1267,52 @@ pub fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) !W
         };
     }
     return detail;
+}
+
+fn activityHasParent(items: []const proto.GuestActivity, parent_id: []const u8) bool {
+    for (items) |item| if (std.mem.eql(u8, item.id, parent_id)) return true;
+    return false;
+}
+
+fn activityIsLastChild(items: []const proto.GuestActivity, index: usize, parent_id: []const u8) bool {
+    for (items[index + 1 ..]) |item| {
+        const effective_parent = if (activityHasParent(items, item.parent_id)) item.parent_id else "";
+        if (std.mem.eql(u8, effective_parent, parent_id)) return false;
+    }
+    return true;
+}
+
+fn appendGuestActivityChildren(
+    arena: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    items: []const proto.GuestActivity,
+    parent_id: []const u8,
+    depth: usize,
+    now_ms: i64,
+) !void {
+    for (items, 0..) |item, item_index| {
+        const effective_parent = if (activityHasParent(items, item.parent_id)) item.parent_id else "";
+        if (!std.mem.eql(u8, effective_parent, parent_id)) continue;
+        const indent = try arena.alloc(u8, depth * 3);
+        @memset(indent, ' ');
+        const icon: []const u8 = if (depth == 0)
+            (if (item.kind == .agent) "◇" else "•")
+        else if (activityIsLastChild(items, item_index, effective_parent))
+            "└─"
+        else
+            "├─";
+        const elapsed_s: i64 = if (item.started_at_ms > 0) @max(0, @divTrunc(now_ms - item.started_at_ms, 1000)) else 0;
+        const detail = if (item.detail.len > 0) try std.fmt.allocPrint(arena, " · {s}", .{item.detail}) else "";
+        try lines.append(arena, .{
+            .text = "  ",
+            .style = Palette.working,
+            .text2 = try std.fmt.allocPrint(arena, "{s}{s} {s}{s}", .{ indent, icon, item.name, detail }),
+            .style2 = if (item.kind == .agent) Palette.status_model else Palette.collapse_hint,
+            .text3 = try std.fmt.allocPrint(arena, " · {d}s", .{elapsed_s}),
+            .style3 = Palette.collapse_hint,
+        });
+        try appendGuestActivityChildren(arena, lines, items, item.id, depth + 1, now_ms);
+    }
 }
 
 /// SECTION DISCIPLINE (the transcript's one spacing rule, pinned by the
@@ -1655,42 +1703,49 @@ pub fn layoutLines(
         try blankLine(arena, &lines);
         try transcript.stream_layout_cache.update(gpa, transcript.delta, w);
         try transcript.stream_layout_cache.appendTo(arena, &lines);
-    } else if (transcript.reasoning_delta.len == 0 and transcript.state == .running and transcript.show_working_ticker) {
+    } else if (transcript.state == .running and transcript.show_working_ticker and
+        (transcript.reasoning_delta.len == 0 or transcript.guest_activity.len > 0))
+    {
         try blankLine(arena, &lines);
-        const head = try std.fmt.allocPrint(arena, "{s} ", .{
-            spinner_frames[transcript.spinner_frame % spinner_frames.len],
-        });
-        const now_ms = nowWallMs(transcript.io);
-        const word = workingLabel(transcript, now_ms);
-        const detail = try workingDetail(arena, transcript);
-        var syntax: std.ArrayList(SyntaxSpan) = .empty;
-        if (streamTraffic(transcript, now_ms)) |traffic| {
-            const arrow = if (traffic == .up) "↑" else "↓";
-            if (std.mem.indexOf(u8, detail.text, arrow)) |arrow_at| {
-                try syntax.append(arena, .{
-                    .start = head.len + word.len + arrow_at,
-                    .end = head.len + word.len + arrow_at + arrow.len,
-                    .style = if (traffic == .up) Palette.stream_up else Palette.stream_down,
-                });
+        if (transcript.guest_activity.len > 0) {
+            try appendGuestActivityChildren(arena, &lines, transcript.guest_activity, "", 0, nowWallMs(transcript.io));
+        }
+        if (transcript.reasoning_delta.len == 0) {
+            const head = try std.fmt.allocPrint(arena, "{s} ", .{
+                spinner_frames[transcript.spinner_frame % spinner_frames.len],
+            });
+            const now_ms = nowWallMs(transcript.io);
+            const word = workingLabel(transcript, now_ms);
+            const detail = try workingDetail(arena, transcript);
+            var syntax: std.ArrayList(SyntaxSpan) = .empty;
+            if (streamTraffic(transcript, now_ms)) |traffic| {
+                const arrow = if (traffic == .up) "↑" else "↓";
+                if (std.mem.indexOf(u8, detail.text, arrow)) |arrow_at| {
+                    try syntax.append(arena, .{
+                        .start = head.len + word.len + arrow_at,
+                        .end = head.len + word.len + arrow_at + arrow.len,
+                        .style = if (traffic == .up) Palette.stream_up else Palette.stream_down,
+                    });
+                }
             }
+            try syntax.appendSlice(arena, try shimmerSpans(arena, word, head.len, transcript.spinner_frame, transcript.shimmer_shades));
+            if (detail.shell_command) |command| {
+                try syntax.appendSlice(arena, try shellCommandSpans(
+                    arena,
+                    command,
+                    head.len + word.len + detail.shell_offset,
+                ));
+            }
+            try lines.append(arena, .{
+                .text = head,
+                .style = Palette.working,
+                .text2 = word,
+                .style2 = Palette.working,
+                .text3 = detail.text,
+                .style3 = Palette.collapse_hint,
+                .syntax = syntax.items,
+            });
         }
-        try syntax.appendSlice(arena, try shimmerSpans(arena, word, head.len, transcript.spinner_frame, transcript.shimmer_shades));
-        if (detail.shell_command) |command| {
-            try syntax.appendSlice(arena, try shellCommandSpans(
-                arena,
-                command,
-                head.len + word.len + detail.shell_offset,
-            ));
-        }
-        try lines.append(arena, .{
-            .text = head,
-            .style = Palette.working,
-            .text2 = word,
-            .style2 = Palette.working,
-            .text3 = detail.text,
-            .style3 = Palette.collapse_hint,
-            .syntax = syntax.items,
-        });
     }
 
     // Approval card.

@@ -80,6 +80,10 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        // Preserve Claude's own subagent hierarchy in stream-json. The
+        // adapter consumes parent_tool_use_id for live activity; forwarded
+        // child prose is never flattened into the parent's answer.
+        "--forward-subagent-text",
     });
     if (!std.mem.eql(u8, opts.model, "default")) {
         try argv.appendSlice(arena, &.{ "--model", opts.model });
@@ -180,17 +184,25 @@ pub const Event = union(enum) {
     tool_use: struct {
         id: []const u8,
         name: []const u8,
+        parent_tool_use_id: []const u8 = "",
         /// Re-stringified input object (arena-owned).
         input_json: []const u8,
     },
     /// Tool result echoed back to the model (flattened to text).
     tool_result: struct {
         tool_use_id: []const u8,
+        parent_tool_use_id: []const u8 = "",
         text: []const u8,
         is_error: bool,
     },
     /// Claude Code's structured signal that paid usage credits are active.
     usage_credits: bool,
+    /// system/background_tasks_changed: the authoritative open-task list.
+    /// After a `result`, a non-empty list means the run is parked waiting
+    /// for these to finish (it emits another result when they do).
+    background_tasks: []const BackgroundTask,
+    /// system/task_notification: a background task finished.
+    task_notification: struct { task_id: []const u8, summary: []const u8 },
     /// Terminal event: the turn's outcome and usage.
     result: struct {
         text: []const u8,
@@ -205,6 +217,13 @@ pub const Event = union(enum) {
         cached_tokens: u64,
         cache_write_tokens: u64,
     },
+};
+
+pub const BackgroundTask = struct {
+    task_id: []const u8,
+    run_id: []const u8 = "",
+    task_type: []const u8 = "",
+    description: []const u8 = "",
 };
 
 /// Decode one stream-json line into zero or more events (an assistant
@@ -225,19 +244,42 @@ pub fn decodeLine(
     const t = strField(root, "type") orelse return error.BadLine;
 
     if (std.mem.eql(u8, t, "system")) {
-        if (strField(root, "subtype")) |st| if (std.mem.eql(u8, st, "init"))
+        const st = strField(root, "subtype") orelse return;
+        if (std.mem.eql(u8, st, "init")) {
             try out.append(arena, .init);
+        } else if (std.mem.eql(u8, st, "background_tasks_changed")) {
+            const tasks: []const std.json.Value = if (root.get("tasks")) |v| switch (v) {
+                .array => |a| a.items,
+                else => &.{},
+            } else &.{};
+            const decoded = try arena.alloc(BackgroundTask, tasks.len);
+            for (tasks, decoded) |task, *copy| copy.* = if (task == .object) .{
+                .task_id = strField(task.object, "task_id") orelse "",
+                .run_id = strField(task.object, "run_id") orelse "",
+                .task_type = strField(task.object, "task_type") orelse "",
+                .description = strField(task.object, "description") orelse "",
+            } else .{ .task_id = "" };
+            try out.append(arena, .{ .background_tasks = decoded });
+        } else if (std.mem.eql(u8, st, "task_notification")) {
+            try out.append(arena, .{ .task_notification = .{
+                .task_id = strField(root, "task_id") orelse "",
+                .summary = strField(root, "summary") orelse "background task finished",
+            } });
+        }
         return;
     }
     if (std.mem.eql(u8, t, "assistant")) {
+        const parent_tool_use_id = strField(root, "parent_tool_use_id") orelse "";
         const content = messageContent(root) orelse return;
         for (content) |item| {
             if (item != .object) continue;
             const bt = strField(item.object, "type") orelse continue;
             if (std.mem.eql(u8, bt, "text")) {
+                if (parent_tool_use_id.len > 0) continue;
                 const text = strField(item.object, "text") orelse continue;
                 if (text.len > 0) try out.append(arena, .{ .text = text });
             } else if (std.mem.eql(u8, bt, "thinking")) {
+                if (parent_tool_use_id.len > 0) continue;
                 const text = strField(item.object, "thinking") orelse continue;
                 if (text.len > 0) try out.append(arena, .{ .reasoning = text });
             } else if (std.mem.eql(u8, bt, "tool_use")) {
@@ -245,6 +287,7 @@ pub fn decodeLine(
                 try out.append(arena, .{ .tool_use = .{
                     .id = strField(item.object, "id") orelse "",
                     .name = strField(item.object, "name") orelse "",
+                    .parent_tool_use_id = parent_tool_use_id,
                     .input_json = try stringifyValue(arena, input),
                 } });
             }
@@ -252,6 +295,8 @@ pub fn decodeLine(
         return;
     }
     if (std.mem.eql(u8, t, "stream_event")) {
+        const parent_tool_use_id: []const u8 = strField(root, "parent_tool_use_id") orelse "";
+        if (parent_tool_use_id.len > 0) return;
         const event = root.get("event") orelse return;
         if (event != .object) return;
         if (!std.mem.eql(u8, strField(event.object, "type") orelse "", "content_block_delta")) return;
@@ -268,6 +313,7 @@ pub fn decodeLine(
         return;
     }
     if (std.mem.eql(u8, t, "user")) {
+        const parent_tool_use_id = strField(root, "parent_tool_use_id") orelse "";
         const content = messageContent(root) orelse return;
         var first_result: ?usize = null;
         var result_count: usize = 0;
@@ -277,6 +323,7 @@ pub fn decodeLine(
             if (!std.mem.eql(u8, bt, "tool_result")) continue;
             try out.append(arena, .{ .tool_result = .{
                 .tool_use_id = strField(item.object, "tool_use_id") orelse "",
+                .parent_tool_use_id = parent_tool_use_id,
                 .text = try flattenContent(arena, item.object.get("content")),
                 .is_error = boolField(item.object, "is_error") orelse false,
             } });
