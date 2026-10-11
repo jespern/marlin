@@ -209,7 +209,7 @@ const max_client_outbox_bytes: usize = 2 * proto.max_line_bytes;
 /// Replay is bounded by bytes as well as rows. One exceptional record may
 /// exceed this budget (up to the protocol line limit), but the page then ends
 /// immediately so a few large pastes cannot overflow a healthy client outbox.
-const max_replay_page_bytes: usize = 16 * 1024 * 1024;
+const max_replay_page_bytes: usize = 4 * 1024 * 1024;
 /// A persisted user/steer block has more JSON envelope than its input
 /// command. Keep a fixed wrapper margin so every accepted input is guaranteed
 /// to remain replayable under the same protocol record limit.
@@ -1584,6 +1584,12 @@ pub const Daemon = struct {
                         return;
                     },
                 };
+                const changed = !std.mem.eql(u8, session.cwd, new_cwd);
+                const cwd_note = if (changed)
+                    try std.fmt.allocPrint(self.gpa, "{s}{s} → {s}", .{ block.cwd_switch_prefix, session.cwd, new_cwd })
+                else
+                    null;
+                defer if (cwd_note) |note| self.gpa.free(note);
                 self.store.setSessionCwd(sc.sid, new_cwd) catch {
                     self.gpa.free(new_cwd);
                     self.sendTo(client, .{ .err = .{ .code = "store", .msg = "could not update working directory" } });
@@ -1591,6 +1597,7 @@ pub const Daemon = struct {
                 };
                 self.gpa.free(session.cwd);
                 session.cwd = new_cwd;
+                if (cwd_note) |note| self.appendSessionNote(sc.sid, note);
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sc.sid);
                 self.publishSkillCatalog(sc.sid, null);
@@ -1607,7 +1614,12 @@ pub const Daemon = struct {
                 }
                 const current_guest = proto.guestBackend(session.model);
                 const requested_guest = proto.guestBackend(sm.model);
-                if (current_guest != null and requested_guest != null and current_guest.? != requested_guest.?) {
+                const needs_handover = if (requested_guest != null and
+                    (current_guest == null or current_guest.? != requested_guest.?))
+                    try self.sessionNeedsHandover(sm.sid)
+                else
+                    false;
+                if (needs_handover and current_guest != null and requested_guest != null and current_guest.? != requested_guest.?) {
                     // Guest → guest: a native model authors the handover
                     // briefing from the durable transcript, then turn_done
                     // applies the new guest — the native → guest path, with
@@ -1629,7 +1641,7 @@ pub const Daemon = struct {
                 }
                 const new_model = try self.gpa.dupe(u8, sm.model);
                 errdefer self.gpa.free(new_model);
-                if (!proto.isGuestModel(session.model) and proto.isGuestModel(sm.model)) {
+                if (needs_handover and !proto.isGuestModel(session.model) and proto.isGuestModel(sm.model)) {
                     // Keep the native model on the session until the handover
                     // turn finishes; the dispatcher applies pending_guest_model
                     // on turn_done. The native model writes a visible briefing.
@@ -3788,6 +3800,16 @@ pub const Daemon = struct {
         if (!proto.isGuestModel(self.cfg.model_default)) return self.cfg.model_default;
         for (self.cfg.model_favorites) |favorite| if (!proto.isGuestModel(favorite)) return favorite;
         return null;
+    }
+
+    /// Cwd markers divide one session's durable log into project epochs.
+    /// Only work in the current epoch may justify a guest handover.
+    fn sessionNeedsHandover(self: *Daemon, sid: u64) !bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        var history: std.ArrayList(block.Block) = .empty;
+        try self.store.loadBlocksInto(arena_state.allocator(), &history, sid, 1, 1_000_000);
+        return context.handoverSource(history.items).len > 0;
     }
 
     /// Native model writes a visible handover, then turn_done applies

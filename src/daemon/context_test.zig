@@ -10,6 +10,8 @@ const context = @import("context.zig");
 const assemble = context.assemble;
 const capInline = context.capInline;
 const latestHandover = context.latestHandover;
+const handoverSource = context.handoverSource;
+const latestCwdSwitchSeq = context.latestCwdSwitchSeq;
 const legacy_rehydration_prefix = context.legacy_rehydration_prefix;
 const needsCompaction = context.needsCompaction;
 const planCompaction = context.planCompaction;
@@ -469,6 +471,50 @@ test "latestHandover returns the most recent handover body" {
     };
     try std.testing.expectEqualStrings("## Goal\nsecond", latestHandover(&blocks).?);
     try std.testing.expect(latestHandover(&.{tb(1, .{ .system_note = .{ .text = "other" } })}) == null);
+}
+
+test "handover source never crosses a cwd switch" {
+    const blocks = [_]block.Block{
+        tb(1, .{ .user_msg = .{ .text = "work in old repo" } }),
+        tb(2, .{ .assistant_msg = .{ .text = "old result" } }),
+        tb(3, .{ .system_note = .{ .text = "≡ working directory switched: /old → /new" } }),
+    };
+    try std.testing.expectEqual(@as(usize, 0), handoverSource(&blocks).len);
+    try std.testing.expectEqual(@as(?u64, 3), latestCwdSwitchSeq(&blocks));
+    const contaminated_compaction = [_]block.Block{
+        blocks[0],
+        blocks[1],
+        blocks[2],
+        tb(4, .{ .compaction = .{ .summary = "old repo summary", .covers_from_seq = 1, .covers_to_seq = 3 } }),
+    };
+    try std.testing.expectEqual(@as(usize, 0), handoverSource(&contaminated_compaction).len);
+
+    const with_new_work = [_]block.Block{
+        blocks[0],
+        blocks[1],
+        blocks[2],
+        tb(4, .{ .user_msg = .{ .text = "work in new repo" } }),
+        tb(5, .{ .assistant_msg = .{ .text = "new result" } }),
+    };
+    const source = handoverSource(&with_new_work);
+    try std.testing.expectEqual(@as(usize, 2), source.len);
+    try std.testing.expectEqual(@as(u64, 4), source[0].seq);
+    try std.testing.expectEqual(@as(u64, 5), source[1].seq);
+    try std.testing.expect(latestCwdSwitchSeq(&.{ blocks[0], blocks[1] }) == null);
+}
+
+test "post-cwd handover rendering ignores cross-project compactions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const blocks = [_]block.Block{
+        tb(4, .{ .user_msg = .{ .text = "new project request" } }),
+        tb(5, .{ .compaction = .{ .summary = "old project secret", .covers_from_seq = 1, .covers_to_seq = 4 } }),
+        tb(6, .{ .assistant_msg = .{ .text = "new project answer" } }),
+    };
+    const rendered = try context.renderForSummary(arena_state.allocator(), &blocks, 4, 6, 400_000, false);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "new project request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "new project answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "old project secret") == null);
 }
 
 test "handover placeholders never become guest instructions or revive older briefings" {

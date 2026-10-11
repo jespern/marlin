@@ -130,6 +130,7 @@ pub const Body = union(BlockKind) {
 /// first `claude -p` prompt.
 pub const handover_prefix = "[handover]\n";
 pub const handover_announce_prefix = "Switching to ";
+pub const cwd_switch_prefix = "≡ working directory switched: ";
 
 pub fn isHandoverNote(text: []const u8) bool {
     return std.mem.startsWith(u8, text, handover_prefix);
@@ -137,6 +138,10 @@ pub fn isHandoverNote(text: []const u8) bool {
 
 pub fn isHandoverAnnounce(text: []const u8) bool {
     return std.mem.startsWith(u8, text, handover_announce_prefix);
+}
+
+pub fn isCwdSwitchNote(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, cwd_switch_prefix);
 }
 
 pub fn handoverBody(text: []const u8) []const u8 {

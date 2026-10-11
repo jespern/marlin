@@ -1314,7 +1314,7 @@ fn maybeCompact(
     publishPhase(opts, .compaction);
     defer publishPhase(opts, .context);
 
-    const transcript = try context.renderForSummary(arena, blocks, plan.from_seq, plan.to_seq, 400_000);
+    const transcript = try context.renderForSummary(arena, blocks, plan.from_seq, plan.to_seq, 400_000, true);
     const ep = opts.compaction_endpoint orelse opts.endpoint;
 
     const summary = summarize(
@@ -1491,9 +1491,22 @@ pub fn writeHandover(
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var history: std.ArrayList(block.Block) = .empty;
-    try store.loadContextBlocksInto(arena, &history, opts.session_id, 1_000_000);
-    if (history.items.len == 0) return;
+    // Cwd markers live in the immutable log even after compaction advances
+    // the context frontier past them. Consult that log first; when a marker
+    // exists, raw post-boundary blocks are safer than any compaction that may
+    // have covered both projects. Sessions without a cwd switch retain the
+    // compact context-loading path.
+    var durable: std.ArrayList(block.Block) = .empty;
+    try store.loadBlocksInto(arena, &durable, opts.session_id, 1, 1_000_000);
+    var compact_context: std.ArrayList(block.Block) = .empty;
+    const after_cwd_switch = context.latestCwdSwitchSeq(durable.items) != null;
+    const source = if (after_cwd_switch)
+        context.handoverSource(durable.items)
+    else blk: {
+        try store.loadContextBlocksInto(arena, &compact_context, opts.session_id, 1_000_000);
+        break :blk context.handoverSource(compact_context.items);
+    };
+    if (source.len == 0) return;
 
     var ap = Appender{
         .store = store,
@@ -1517,9 +1530,9 @@ pub fn writeHandover(
 
     var http_client = if (opts.http_pool) |pool| try pool.acquire() else try http.Client.init(gpa, io);
     defer http_client.deinit();
-    const from_seq = history.items[0].seq;
-    const to_seq = history.items[history.items.len - 1].seq;
-    const transcript = try context.renderForSummary(arena, history.items, from_seq, to_seq, 400_000);
+    const from_seq = source[0].seq;
+    const to_seq = source[source.len - 1].seq;
+    const transcript = try context.renderForSummary(arena, source, from_seq, to_seq, 400_000, !after_cwd_switch);
     const request_opts = try providerRequestOptions(arena, opts, opts.endpoint);
     // Some models (deepseek-v4.1-flash, observed) answer the briefing request
     // by trying to continue the work: inline tool-call markup, no sections.

@@ -86,6 +86,7 @@ const SetupPrompt = tui.SetupPrompt;
 const TabActivity = tui.TabActivity;
 const TabMouseAction = tui.TabMouseAction;
 const TransportVerdicts = tui.TransportVerdicts;
+const history_window_blocks = tui.history_window_blocks;
 const buildReviewPrompt = tui.buildReviewPrompt;
 const commandQuery = tui.commandQuery;
 const commandSuggestions = tui.commandSuggestions;
@@ -212,6 +213,8 @@ test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do n
     try std.testing.expectEqual(@as(usize, 5), app.vim.pending_count);
     try handleKey(&app, .{ .codepoint = 'G' });
     try std.testing.expectEqual(@as(usize, 0), app.vim.pending_count);
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    app.mode = .normal;
 
     // `:` on an empty composer opens the command menu.
     try handleKey(&app, .{ .codepoint = ':' });
@@ -2751,6 +2754,38 @@ test "older replay page is prepended atomically in transcript order" {
     try std.testing.expectEqual(@as(usize, 3), app.view.editor.history.items.len);
 }
 
+test "live blocks remain live while an older page is loading" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+            .last_seq = 20,
+            .oldest_seq = 10,
+            .history_loading = true,
+            .history_before_seq = 10,
+        },
+    };
+    defer app.deinit();
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = .{
+        .id = 21,
+        .session_id = 7,
+        .turn_id = 3,
+        .seq = 21,
+        .ts = 0,
+        .body = .{ .assistant_msg = .{ .text = "live" } },
+    } } }));
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    try std.testing.expectEqual(@as(u64, 21), app.view.blocks.items[0].seq);
+    try std.testing.expectEqual(@as(usize, 0), app.view.history_backfill.items.len);
+}
+
 test "failed replay request releases buffered page and can be retried" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -2784,6 +2819,115 @@ test "failed replay request releases buffered page and can be retried" {
     try std.testing.expectEqual(@as(u64, 0), app.view.history_before_seq);
     try std.testing.expectEqual(@as(usize, 0), app.view.history_backfill.items.len);
     try std.testing.expect(!app.view.history_complete);
+}
+
+test "live transcript storage stays inside the sliding block window" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+
+    for (1..history_window_blocks + 33) |seq| {
+        const durable_seq: u64 = @intCast(seq);
+        app.applyBlock(.{
+            .id = durable_seq,
+            .session_id = 7,
+            .turn_id = durable_seq,
+            .seq = durable_seq,
+            .ts = 0,
+            .body = .{ .user_msg = .{ .text = "bounded" } },
+        });
+    }
+    try std.testing.expectEqual(history_window_blocks, app.view.blocks.items.len);
+    try std.testing.expectEqual(@as(u64, 33), app.view.blocks.items[0].seq);
+    try std.testing.expect(!app.view.history_complete);
+}
+
+test "centered replay replaces the window without catching up to the tail" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .history_loading = true,
+        .history_tail_reload = true,
+    } };
+    defer app.deinit();
+    app.search.target_seq = 50;
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = .{
+        .id = 50,
+        .session_id = 7,
+        .turn_id = 1,
+        .seq = 50,
+        .ts = 0,
+        .body = .{ .assistant_msg = .{ .text = "match" } },
+    } } }));
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{
+        .sid = 7,
+        .oldest_seq = 40,
+        .newest_seq = 60,
+        .has_older = true,
+        .has_newer = true,
+    } }));
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    try std.testing.expect(app.view.history_has_newer);
+    try std.testing.expect(!app.view.history_loading);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+}
+
+test "newer replay accepts blocks below the known durable frontier" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .last_seq = 20,
+        .oldest_seq = 10,
+        .history_has_newer = true,
+    } };
+    defer app.deinit();
+    try app.view.blocks.append(gpa, .{
+        .kind = .assistant_msg,
+        .seq = 10,
+        .text = try gpa.dupe(u8, "ten"),
+        .label = try gpa.dupe(u8, ""),
+    });
+
+    app.requestNewerHistory();
+    try std.testing.expect(app.view.history_loading);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = .{
+        .id = 11,
+        .session_id = 7,
+        .turn_id = 2,
+        .seq = 11,
+        .ts = 0,
+        .body = .{ .assistant_msg = .{ .text = "eleven" } },
+    } } }));
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{
+        .sid = 7,
+        .oldest_seq = 11,
+        .newest_seq = 11,
+        .has_newer = true,
+        .forward = true,
+    } }));
+    try std.testing.expectEqual(@as(usize, 2), app.view.blocks.items.len);
+    try std.testing.expectEqual(@as(u64, 11), app.view.blocks.items[1].seq);
+    try std.testing.expectEqual(@as(u64, 10), app.view.history_target_seq);
+    try std.testing.expect(app.view.history_has_newer);
 }
 
 test "diagnostics render in scrollback with the full latest-turn waterfall" {
@@ -3331,6 +3475,31 @@ test "tab bar is permanent, root-only, chronological, and rolls up child activit
     try std.testing.expectEqual(@as(u64, 99), fallback.items[0].sid);
 }
 
+test "background completion is unread until its root tab is focused" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 10, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 10, .title = "active", .model = "m", .status = "idle", .state = .idle, .created_at = 10, .running = false },
+        .{ .sid = 20, .title = "background", .model = "m", .status = "idle", .state = .idle, .created_at = 20, .running = false },
+        .{ .sid = 21, .parent_sid = 20, .kind = .task_child, .title = "worker", .model = "m", .status = "running", .state = .running, .created_at = 21, .running = true },
+    });
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 21, .state = .done } }));
+    try std.testing.expectEqual(TabActivity.done, app.tabActivity(20));
+    try std.testing.expectEqual(TabActivity.idle, app.tabActivity(10));
+
+    try app.focusSession(20, true);
+    try std.testing.expectEqual(TabActivity.idle, app.tabActivity(20));
+}
+
 test "tab navigation follows chronological roots and wraps" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -3452,6 +3621,29 @@ test "tab overflow retains the active tab and tab hit testing is button-extensib
     app.view.last_view_h = 5;
     handleMouse(&app, .{ .row = 1, .col = 7, .button = .left, .mods = .{}, .type = .press });
     try std.testing.expectEqual(@as(usize, 40), app.view.sel_anchor.?.line); // row 0 is the tab strip
+}
+
+test "mouse scroll changes composer mode and G returns to insert at the live tail" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    handleMouse(&app, .{ .row = 2, .col = 2, .button = .wheel_up, .mods = .{}, .type = .press });
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try std.testing.expectEqual(@as(usize, 3), app.view.scroll_up);
+
+    handleMouse(&app, .{ .row = 2, .col = 2, .button = .wheel_down, .mods = .{}, .type = .press });
+    try std.testing.expectEqual(@as(usize, 0), app.view.scroll_up);
+    try std.testing.expectEqual(Mode.insert, app.mode);
+
+    app.mode = .normal;
+    app.view.scroll_up = 12;
+    try handleKey(&app, .{ .codepoint = 'G', .mods = .{ .shift = true } });
+    try std.testing.expectEqual(@as(usize, 0), app.view.scroll_up);
+    try std.testing.expectEqual(Mode.insert, app.mode);
 }
 
 test "active prompt scrolls normally before sticking at the top" {

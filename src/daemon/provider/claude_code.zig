@@ -51,7 +51,9 @@ pub const ArgvOpts = struct {
     /// of the headless default (auto-deny). Ignored under .bypass, which
     /// never prompts at all.
     bridge: ?Bridge = null,
-    max_turns: u32,
+    /// Child tasks use their parent-facing round budget. Root sessions omit
+    /// the flag and rely on Marlin's wall-clock/cancel supervision instead.
+    max_turns: ?u32 = null,
     /// Marlin effort; `auto` omits `--effort`. Claude Code accepts
     /// low/medium/high/xhigh/max (`claude --help`).
     effort: Effort = .auto,
@@ -131,10 +133,12 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
         .bypass => try argv.append(arena, "--dangerously-skip-permissions"),
         .plan => try argv.appendSlice(arena, &.{ "--permission-mode", "plan" }),
     }
-    try argv.appendSlice(arena, &.{
-        "--max-turns",
-        try std.fmt.allocPrint(arena, "{d}", .{opts.max_turns}),
-    });
+    if (opts.max_turns) |limit| {
+        try argv.appendSlice(arena, &.{
+            "--max-turns",
+            try std.fmt.allocPrint(arena, "{d}", .{limit}),
+        });
+    }
     if (effortFlag(opts.effort)) |level| {
         try argv.appendSlice(arena, &.{ "--effort", level });
     }

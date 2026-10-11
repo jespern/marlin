@@ -714,6 +714,7 @@ pub fn renderForSummary(
     from_seq: u64,
     to_seq: u64,
     byte_budget: usize,
+    include_compactions: bool,
 ) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (blocks) |b| {
@@ -724,7 +725,8 @@ pub fn renderForSummary(
             .assistant_msg => |a| try out.print(arena, "ASSISTANT: {s}\n\n", .{a.text}),
             .tool_call => |tc| try out.print(arena, "TOOL CALL {s}: {s}\n", .{ tc.name, tc.args_json[0..@min(tc.args_json.len, 500)] }),
             .tool_result => |tr| try out.print(arena, "RESULT ({t}): {s}\n\n", .{ tr.status, tr.inline_body[0..@min(tr.inline_body.len, 1500)] }),
-            .compaction => |cp| try out.print(arena, "[EARLIER SUMMARY]\n{s}\n\n", .{cp.summary}),
+            .compaction => |cp| if (include_compactions)
+                try out.print(arena, "[EARLIER SUMMARY]\n{s}\n\n", .{cp.summary}),
             .reasoning, .approval, .plan, .system_note => {},
         }
         if (out.items.len > byte_budget) {
@@ -733,6 +735,42 @@ pub fn renderForSummary(
         }
     }
     return out.items;
+}
+
+/// The transcript range safe to pass to a native→guest handover. A cwd
+/// switch is a project boundary: older work must never be summarized into
+/// instructions for an agent launched in the new directory. If no actual
+/// conversation happened after the boundary, there is nothing to hand over.
+pub fn handoverSource(blocks: []const block.Block) []const block.Block {
+    var start: usize = 0;
+    for (blocks, 0..) |b, i| switch (b.body) {
+        .system_note => |note| if (block.isCwdSwitchNote(note.text)) {
+            start = i + 1;
+        },
+        else => {},
+    };
+    const candidate = blocks[start..];
+    for (candidate) |b| switch (b.body) {
+        .user_msg, .assistant_msg, .tool_call, .tool_result, .steer, .reasoning => return candidate,
+        // After a cwd marker, durable raw blocks are still available and are
+        // the only trustworthy evidence of work in the new project. A later
+        // compaction may have summarized across the marker.
+        .compaction => if (start == 0) return candidate,
+        .approval, .plan, .system_note => {},
+    };
+    return &.{};
+}
+
+pub fn latestCwdSwitchSeq(blocks: []const block.Block) ?u64 {
+    var i = blocks.len;
+    while (i > 0) {
+        i -= 1;
+        switch (blocks[i].body) {
+            .system_note => |note| if (block.isCwdSwitchNote(note.text)) return blocks[i].seq,
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Pending native→guest briefing. A guest response or another user turn

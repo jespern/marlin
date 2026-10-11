@@ -25,6 +25,7 @@ const SyntaxLanguage = render.SyntaxLanguage;
 const diffLanguage = render.diffLanguage;
 const syntaxSpans = render.syntaxSpans;
 const shellCommandSpans = render.shellCommandSpans;
+const shellDisplayCommand = render.shellDisplayCommand;
 const gitLogSpans = render.gitLogSpans;
 const findLinkSpans = render.findLinkSpans;
 const linksForChunk = render.linksForChunk;
@@ -671,10 +672,14 @@ pub fn appendToolCallLine(
     /// Dim annotation after the argument (e.g. "96 bytes" distilled from an
     /// authored diff's intro line, which is not rendered as a body line).
     note: ?[]const u8,
+    /// A paired completed result can carry fields omitted from the started
+    /// event. Codex WebSearch, for example, reports an empty query at start
+    /// and the actual query only on completion.
+    completed_result: ?RenderBlock,
 ) !void {
     // Keep the machinery subdued. Bash commands receive semantic shell
     // roles; for file tools the emphasized value is a path.
-    const hi = toolDisplayArg(rb.label, rb.text, cwd);
+    const hi = try completedToolDisplayArg(alloc, rb, completed_result, cwd);
     const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{toolDisplayName(rb.label)});
     const note_text: []const u8 = if (note) |n|
         try std.fmt.allocPrint(alloc, " · {s}", .{n})
@@ -719,7 +724,7 @@ pub fn appendNetworkSuccessLine(
     else
         "Fetched";
     const head = try std.fmt.allocPrint(alloc, "  ✓ {s} ", .{action});
-    const arg = toolDisplayArg(rb.label, rb.text, cwd) orelse toolDisplayName(rb.label);
+    const arg = (try completedToolDisplayArg(alloc, rb, result, cwd)) orelse toolDisplayName(rb.label);
     const capped = arg[0..utf8Floor(arg, @min(arg.len, w -| (head.len + 2)))];
     const payload_bytes: u64 = result.payload_bytes orelse @intCast(result.text.len);
     const detail = try std.fmt.allocPrint(alloc, "{s} · {Bi:.1}", .{
@@ -897,6 +902,38 @@ pub const ExpandPair = struct {
     result: usize,
     show_result: bool = true,
 };
+
+/// Locate the result paired positionally with a call in one provider batch.
+/// Calls are emitted first and results follow in the same order, with only
+/// metadata blocks allowed between them.
+fn pairedToolResult(blocks: []const RenderBlock, call_idx: usize) ?RenderBlock {
+    if (call_idx >= blocks.len or blocks[call_idx].kind != .tool_call) return null;
+    const turn_id = blocks[call_idx].turn_id;
+    var calls_start = call_idx;
+    while (calls_start > 0 and blocks[calls_start - 1].kind == .tool_call and
+        blocks[calls_start - 1].turn_id == turn_id) : (calls_start -= 1)
+    {}
+    const ordinal = call_idx - calls_start;
+
+    var calls_end = call_idx + 1;
+    while (calls_end < blocks.len and blocks[calls_end].kind == .tool_call and
+        blocks[calls_end].turn_id == turn_id) : (calls_end += 1)
+    {}
+
+    var result_ordinal: usize = 0;
+    var i = calls_end;
+    while (i < blocks.len and blocks[i].turn_id == turn_id) : (i += 1) {
+        switch (blocks[i].kind) {
+            .approval, .reasoning, .system_note, .plan => {},
+            .tool_result => {
+                if (result_ordinal == ordinal) return blocks[i];
+                result_ordinal += 1;
+            },
+            else => break,
+        }
+    }
+    return null;
+}
 
 /// Scan the batch starting at `start`; pairs that must stay visible (failed
 /// results, or author-diffs from the edit/write tools whose truncation would
@@ -1246,7 +1283,7 @@ pub fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) !W
         }
     }
     if (currentInflightCall(transcript.blocks)) |cur| {
-        const arg_full = toolDisplayArg(cur.rb.label, cur.rb.text, transcript.cwd) orelse "";
+        const arg_full = (try toolDisplayArgDecoded(arena, cur.rb.label, cur.rb.text, transcript.cwd)) orelse "";
         const arg = arg_full[0..utf8Floor(arg_full, @min(arg_full.len, 60))];
         const call_s: i64 = if (transcript.call_started_ms > 0)
             @max(0, @divTrunc(nowWallMs(transcript.io) - transcript.call_started_ms, 1000))
@@ -1302,14 +1339,24 @@ fn appendGuestActivityChildren(
         else
             "├─";
         const elapsed_s: i64 = if (item.started_at_ms > 0) @max(0, @divTrunc(now_ms - item.started_at_ms, 1000)) else 0;
-        const detail = if (item.detail.len > 0) try std.fmt.allocPrint(arena, " · {s}", .{item.detail}) else "";
+        const item_detail = if (std.ascii.eqlIgnoreCase(item.name, "bash"))
+            shellDisplayCommand(item.detail)
+        else
+            item.detail;
+        const activity_head = try std.fmt.allocPrint(arena, "{s}{s} {s}", .{ indent, icon, item.name });
+        const detail = if (item_detail.len > 0) try std.fmt.allocPrint(arena, " · {s}", .{item_detail}) else "";
+        const activity_text = try std.fmt.allocPrint(arena, "{s}{s}", .{ activity_head, detail });
         try lines.append(arena, .{
             .text = "  ",
             .style = Palette.working,
-            .text2 = try std.fmt.allocPrint(arena, "{s}{s} {s}{s}", .{ indent, icon, item.name, detail }),
+            .text2 = activity_text,
             .style2 = if (item.kind == .agent) Palette.status_model else Palette.collapse_hint,
             .text3 = try std.fmt.allocPrint(arena, " · {d}s", .{elapsed_s}),
             .style3 = Palette.collapse_hint,
+            .syntax = if (std.ascii.eqlIgnoreCase(item.name, "bash") and item_detail.len > 0)
+                try shellCommandSpans(arena, item_detail, 2 + activity_head.len + " · ".len)
+            else
+                &.{},
         });
         try appendGuestActivityChildren(arena, lines, items, item.id, depth + 1, now_ms);
     }
@@ -1427,7 +1474,7 @@ pub fn layoutBlockRange(
                 var hint: []const u8 = " · ctrl+t to view transcript";
                 if (running_count == 1) {
                     const call = blocks_all[running_call_idx];
-                    const hi = toolDisplayArg(call.label, call.text, transcript.cwd) orelse "";
+                    const hi = (try toolDisplayArgDecoded(alloc, call.label, call.text, transcript.cwd)) orelse "";
                     const capped = hi[0..@min(hi.len, 60)];
                     hint = try std.fmt.allocPrint(alloc, " · {s} {s}{s}", .{
                         toolDisplayName(call.label),
@@ -1456,7 +1503,7 @@ pub fn layoutBlockRange(
                     const result = blocks_all[pair.result];
                     if (pair.show_result) {
                         const note = if (result.status == .ok) try diffSummaryNote(alloc, result.text) else null;
-                        try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note);
+                        try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note, result);
                         try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
                     } else {
                         try appendNetworkSuccessLine(alloc, lines, blocks_all[pair.call], result, transcript.cwd, w);
@@ -1510,7 +1557,15 @@ pub fn layoutBlockRange(
                 try flushRanSummary(alloc, lines, &pending_ran);
                 if (!last_dense) try blankLine(alloc, lines);
                 last_tool_label.* = rb.label;
-                try appendToolCallLine(alloc, lines, rb, transcript.cwd, w, null);
+                try appendToolCallLine(
+                    alloc,
+                    lines,
+                    rb,
+                    transcript.cwd,
+                    w,
+                    null,
+                    pairedToolResult(transcript.blocks, block_idx),
+                );
             },
             .tool_result => {
                 // Guest trail: the call line is the progress signal; a
@@ -1751,7 +1806,7 @@ pub fn layoutLines(
     // Approval card.
     if (transcript.approval) |approval| {
         try blankLine(arena, &lines);
-        const arg = toolDisplayArg(approval.tool, approval.args, transcript.cwd) orelse "";
+        const arg = (try toolDisplayArgDecoded(arena, approval.tool, approval.args, transcript.cwd)) orelse "";
         const card = try std.fmt.allocPrint(arena, "⚠ approve {s}{s}{s} ?  [y]es / [n]o", .{
             toolDisplayName(approval.tool),
             if (arg.len > 0) " " else "",
@@ -1781,7 +1836,10 @@ pub fn extractHighlightArg(tool_name: []const u8, args_json: []const u8) ?[]cons
         return extractJsonStringRaw(args_json, "path") orelse
             extractJsonStringRaw(args_json, "file_path");
     if (std.ascii.eqlIgnoreCase(tool_name, "bash"))
-        return extractJsonStringRaw(args_json, "command");
+        return if (extractJsonStringRaw(args_json, "command")) |command|
+            shellDisplayCommand(command)
+        else
+            null;
     if (std.ascii.eqlIgnoreCase(tool_name, "grep") or std.ascii.eqlIgnoreCase(tool_name, "glob"))
         return extractJsonStringRaw(args_json, "pattern");
     if (std.ascii.eqlIgnoreCase(tool_name, "fetch") or std.ascii.eqlIgnoreCase(tool_name, "webfetch"))
@@ -1836,7 +1894,112 @@ pub fn toolDisplayArg(tool_name: []const u8, args_json: []const u8, cwd: []const
     const is_path = isFileTool(tool_name) or
         (generic_path != null and generic_path.?.ptr == arg.ptr and generic_path.?.len == arg.len);
     if (!is_path or !std.fs.path.isAbsolute(arg)) return arg;
+    return shortenDisplayPath(arg, cwd);
+}
 
+const DisplayArg = struct {
+    value: []const u8,
+    is_path: bool = false,
+};
+
+const DisplayArgsJson = struct {
+    path: ?[]const u8 = null,
+    file_path: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    pattern: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    query: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    prompt: ?[]const u8 = null,
+    explanation: ?[]const u8 = null,
+};
+
+/// Extract a display argument from parsed JSON so consumers such as the shell
+/// highlighter receive the actual string value, not JSON escape syntax. The
+/// parser projects only display-relevant fields, so a large Write/Edit body
+/// is skipped rather than copied into the frame arena. The raw extractor
+/// remains as a best-effort fallback for non-shell malformed payloads and for
+/// callers that cannot provide scratch allocation.
+pub fn toolDisplayArgDecoded(
+    arena: std.mem.Allocator,
+    tool_name: []const u8,
+    args_json: []const u8,
+    cwd: []const u8,
+) !?[]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(DisplayArgsJson, arena, args_json, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return malformedDisplayArg(tool_name, args_json, cwd),
+    };
+
+    const arg = decodedDisplayArg(tool_name, parsed) orelse return null;
+    if (!arg.is_path or !std.fs.path.isAbsolute(arg.value)) return arg.value;
+    return shortenDisplayPath(arg.value, cwd);
+}
+
+fn completedToolDisplayArg(
+    arena: std.mem.Allocator,
+    call: RenderBlock,
+    result: ?RenderBlock,
+    cwd: []const u8,
+) !?[]const u8 {
+    const started = try toolDisplayArgDecoded(arena, call.label, call.text, cwd);
+    if (started) |value| if (value.len > 0) return value;
+    if (!isNetworkReadTool(call.label)) return started;
+    const completed = result orelse return started;
+    const enriched = try toolDisplayArgDecoded(arena, call.label, completed.text, cwd);
+    if (enriched) |value| if (value.len > 0) return value;
+    return started;
+}
+
+fn malformedDisplayArg(tool_name: []const u8, args_json: []const u8, cwd: []const u8) ?[]const u8 {
+    // JSON escape syntax is not shell syntax. Suppressing one malformed Bash
+    // preview is preferable to handing it to the shell lexer and coloring an
+    // arbitrary suffix as a quoted string.
+    if (std.ascii.eqlIgnoreCase(tool_name, "bash")) return null;
+    return toolDisplayArg(tool_name, args_json, cwd);
+}
+
+fn decodedDisplayArg(tool_name: []const u8, root: DisplayArgsJson) ?DisplayArg {
+    if (isFileTool(tool_name)) {
+        if (root.path) |value| return .{ .value = value, .is_path = true };
+        if (root.file_path) |value| return .{ .value = value, .is_path = true };
+        return null;
+    }
+    if (std.ascii.eqlIgnoreCase(tool_name, "bash"))
+        return if (root.command) |value| .{ .value = shellDisplayCommand(value) } else null;
+    if (std.ascii.eqlIgnoreCase(tool_name, "grep") or std.ascii.eqlIgnoreCase(tool_name, "glob"))
+        return if (root.pattern) |value| .{ .value = value } else null;
+    if (std.ascii.eqlIgnoreCase(tool_name, "fetch") or std.ascii.eqlIgnoreCase(tool_name, "webfetch"))
+        return if (root.url) |value| .{ .value = value } else null;
+    if (std.ascii.eqlIgnoreCase(tool_name, "websearch"))
+        return if (root.query) |value| .{ .value = value } else null;
+    if (std.ascii.eqlIgnoreCase(tool_name, "task")) {
+        if (root.description) |value| return .{ .value = value };
+        if (root.prompt) |value| return .{ .value = value };
+        return null;
+    }
+    if (std.mem.eql(u8, tool_name, "plan_update"))
+        return if (root.explanation) |value| .{ .value = value } else null;
+
+    for ([_]struct { ?[]const u8, bool }{
+        .{ root.path, true },
+        .{ root.file_path, true },
+        .{ root.command, false },
+        .{ root.pattern, false },
+        .{ root.url, false },
+        .{ root.query, false },
+        .{ root.description, false },
+        .{ root.prompt, false },
+    }) |candidate| {
+        if (candidate[0]) |value|
+            return .{ .value = value, .is_path = candidate[1] };
+    }
+    return null;
+}
+
+fn shortenDisplayPath(arg: []const u8, cwd: []const u8) []const u8 {
     const root = if (std.mem.eql(u8, cwd, "/")) cwd else std.mem.trimEnd(u8, cwd, "/");
     if (root.len > 0 and std.mem.startsWith(u8, arg, root)) {
         if (arg.len == root.len) return ".";

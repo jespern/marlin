@@ -112,9 +112,10 @@ const spaces = render.spaces;
 const spinner_frames = render.spinner_frames;
 const terminal_osc = @import("terminal_osc.zig");
 
-/// Keep startup and first session-switch latency independent of transcript
-/// length. Reaching the top explicitly backfills the complete durable log.
-pub const initial_replay_blocks: u32 = 256;
+/// SQLite remains the scrollback owner. The TUI holds only a bounded window,
+/// paging in either direction as the viewport reaches an edge.
+pub const initial_replay_blocks: u32 = 96;
+pub const history_window_blocks: usize = 384;
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -499,6 +500,9 @@ pub const App = struct {
     saved_views: std.AutoHashMapUnmanaged(u64, *SessionView) = .empty,
     saved_view_clock: u64 = 0,
     background_approvals: std.AutoHashMapUnmanaged(u64, PendingApproval) = .empty,
+    /// Root tabs whose most recent turn completed while they were not
+    /// focused. The green check is an unread affordance, not durable state.
+    unread_completions: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Council cache from the daemon (durable config); refreshed by every
     /// council_list_result. Names and models are gpa-owned.
     councils: std.ArrayList(OwnedCouncil) = .empty,
@@ -663,6 +667,7 @@ pub const App = struct {
         }
         self.saved_views.deinit(self.gpa);
         self.background_approvals.deinit(self.gpa);
+        self.unread_completions.deinit(self.gpa);
         self.clearCouncils();
         self.councils.deinit(self.gpa);
         self.voice_rt.deinit(self.gpa);
@@ -759,6 +764,67 @@ pub const App = struct {
     pub fn clearHistoryBackfill(self: *App) void {
         for (self.view.history_backfill.items) |*rendered| rendered.deinit(self.gpa);
         self.view.history_backfill.clearRetainingCapacity();
+    }
+
+    fn rebuildWindowHistory(self: *App) void {
+        self.view.editor.clearHistory();
+        for (self.view.blocks.items) |rendered| {
+            if (rendered.kind == .user_msg) self.view.editor.pushHistory(rendered.text);
+        }
+    }
+
+    fn resetWindowLayout(self: *App) void {
+        self.copy_cursor = null;
+        self.view.sel_anchor = null;
+        self.view.sel_dragging = false;
+        self.view.layout_epoch +%= 1;
+        self.view.layout_cache.reset(self.gpa);
+        self.view.tail_layout_cache.reset(self.gpa);
+        self.view.stream_layout_cache.reset(self.gpa);
+        self.view.last_total_lines = 0;
+    }
+
+    fn firstWindowSeq(self: *const App) u64 {
+        for (self.view.blocks.items) |rendered| if (rendered.seq > 0) return rendered.seq;
+        return 0;
+    }
+
+    fn lastWindowSeq(self: *const App) u64 {
+        var i = self.view.blocks.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.view.blocks.items[i].seq > 0) return self.view.blocks.items[i].seq;
+        }
+        return 0;
+    }
+
+    fn dropWindowPrefix(self: *App, count: usize) void {
+        const n = @min(count, self.view.blocks.items.len);
+        for (self.view.blocks.items[0..n]) |*rendered| rendered.deinit(self.gpa);
+        std.mem.copyForwards(
+            RenderBlock,
+            self.view.blocks.items[0 .. self.view.blocks.items.len - n],
+            self.view.blocks.items[n..],
+        );
+        self.view.blocks.items.len -= n;
+        self.view.history_complete = false;
+    }
+
+    fn dropWindowSuffix(self: *App, count: usize) void {
+        const n = @min(count, self.view.blocks.items.len);
+        const start = self.view.blocks.items.len - n;
+        for (self.view.blocks.items[start..]) |*rendered| rendered.deinit(self.gpa);
+        self.view.blocks.items.len = start;
+        self.view.history_has_newer = true;
+    }
+
+    fn trimHistoryWindow(self: *App, keep_newest: bool) void {
+        const excess = self.view.blocks.items.len -| history_window_blocks;
+        if (excess == 0) return;
+        if (keep_newest) self.dropWindowPrefix(excess) else self.dropWindowSuffix(excess);
+        self.view.oldest_seq = self.firstWindowSeq();
+        self.rebuildWindowHistory();
+        self.resetWindowLayout();
     }
 
     pub fn releaseStreamingBuffers(self: *App) void {
@@ -883,13 +949,27 @@ pub const App = struct {
     }
 
     pub fn tabActivity(self: *const App, root_sid: u64) TabActivity {
-        var activity: TabActivity = .idle;
+        var activity: TabActivity = if (self.unread_completions.contains(root_sid)) .done else .idle;
         for (self.sessions.items) |session| {
             if (!self.sessionBelongsToTree(session.sid, root_sid)) continue;
             const candidate = tabActivityForState(session.state);
             if (tabActivityRank(candidate) > tabActivityRank(activity)) activity = candidate;
         }
         return activity;
+    }
+
+    fn updateCompletionUnread(self: *App, sid: u64, prior: ?proto.SessionState, next: proto.SessionState) void {
+        const root_sid = self.rootSessionId(sid);
+        if (next == .running) {
+            _ = self.unread_completions.remove(root_sid);
+            return;
+        }
+        if ((prior == .running or prior == .awaiting_approval) and
+            (next == .idle or next == .done) and
+            (root_sid != self.rootSessionId(self.view.sid) or !self.terminal_focused))
+        {
+            self.unread_completions.put(self.gpa, root_sid, {}) catch {};
+        }
     }
 
     /// Rows the tab strip occupies at the top of the screen; every layout
@@ -970,6 +1050,7 @@ pub const App = struct {
         // A half-buffered older page and baked layout are cheap to redo and
         // would otherwise keep every cached transcript's layout alive.
         self.clearHistoryBackfill();
+        self.trimHistoryWindow(!self.view.history_has_newer);
         self.view.layout_cache.reset(self.gpa);
         self.view.tail_layout_cache.reset(self.gpa);
         self.view.stream_layout_cache.reset(self.gpa);
@@ -1017,6 +1098,8 @@ pub const App = struct {
         // Any page that was in flight when the view was parked is stale.
         self.view.history_loading = false;
         self.view.history_before_seq = 0;
+        self.view.history_after_seq = 0;
+        self.view.history_tail_reload = false;
         self.view.history_page_failed = false;
         self.view.sel_clear_after_copy = false;
         self.view.last_used = 0;
@@ -1040,6 +1123,7 @@ pub const App = struct {
     /// which knows what replay shape it wants. Every focus change goes
     /// through here; two hand-rolled copies once drifted apart.
     pub fn focusSession(self: *App, sid: u64, touch_recent: bool) !void {
+        const focused_root_sid = self.rootSessionId(sid);
         const old_sid = self.view.sid;
         try self.saveActiveView();
         self.conn.send(.{ .unsub = .{ .sid = old_sid } }) catch {};
@@ -1065,6 +1149,7 @@ pub const App = struct {
         // follow the App across tabs (a full A, default B switch used to
         // keep the badge lit).
         self.view.permissions_full = if (self.sessionSummary(sid)) |summary| summary.full_access else false;
+        _ = self.unread_completions.remove(focused_root_sid);
 
         if (touch_recent) self.touchRecentSession(sid);
         self.syncAnimationTicker();
@@ -1084,12 +1169,18 @@ pub const App = struct {
                 .tail_limit = initial_replay_blocks,
             } }) catch {};
         } else {
+            self.view.history_loading = true;
+            self.view.history_tail_reload = true;
+            self.view.history_before_seq = 0;
+            self.view.history_after_seq = 0;
             self.conn.send(.{ .sub = .{
                 .skill_catalog = true,
                 .sid = sid,
-                .from_seq = self.view.last_seq +| 1,
-                .replay_limit = initial_replay_blocks,
-            } }) catch {};
+                .tail_limit = initial_replay_blocks,
+            } }) catch {
+                self.view.history_loading = false;
+                self.view.history_tail_reload = false;
+            };
         }
         self.rememberSession(sid);
         var handle_buf: session_handle.Full = undefined;
@@ -1146,6 +1237,13 @@ pub const App = struct {
 
     pub fn replaceSessionSummaries(self: *App, incoming: []const proto.SessionInfo) void {
         for (incoming) |info| self.rememberSession(info.sid);
+        // A catalog refresh can race the direct status event. Observe its
+        // transitions before replacing the old summaries so completion
+        // unread state cannot depend on message ordering.
+        for (incoming) |info| {
+            const prior = if (self.sessionSummary(info.sid)) |summary| summary.state else null;
+            self.updateCompletionUnread(info.sid, prior, info.state);
+        }
         for (self.sessions.items) |*session| session.deinit(self.gpa);
         self.sessions.clearRetainingCapacity();
         self.session_labels.clearRetainingCapacity();
@@ -1546,8 +1644,17 @@ pub const App = struct {
             },
             .blk => |b| {
                 const view = self.liveView(b.sid) orelse return;
-                if (view.history_loading and view.history_before_seq > 0 and b.b.seq < view.history_before_seq) {
+                const is_older_page_block = view.history_before_seq > 0 and b.b.seq < view.history_before_seq;
+                const is_replacement_or_newer_page_block = view.history_after_seq > 0 or view.history_tail_reload;
+                if (view.history_loading and (is_older_page_block or is_replacement_or_newer_page_block)) {
                     self.bufferOlderBlock(b.b);
+                    return;
+                }
+                // While an old window is visible, live durable blocks advance
+                // the known frontier without being spliced across the gap.
+                if (view.history_has_newer and b.b.seq > view.last_seq) {
+                    view.last_seq = b.b.seq;
+                    view.recap.changed(b.b.ts);
                     return;
                 }
                 if (b.b.seq <= view.last_seq) return;
@@ -1573,6 +1680,21 @@ pub const App = struct {
                     } else {
                         deinitPlan(self.gpa, &view.plan);
                     }
+                }
+                if (view.history_tail_reload) {
+                    self.finishReplacementHistoryPage(
+                        replay.oldest_seq,
+                        replay.newest_seq,
+                        replay.has_older,
+                        replay.has_newer,
+                        self.search.target_seq,
+                    );
+                    return;
+                }
+                if (view.history_after_seq > 0 and replay.forward) {
+                    const anchor = view.history_after_seq -| 1;
+                    self.finishNewerHistoryPage(replay.oldest_seq, replay.newest_seq, replay.has_newer, anchor);
+                    return;
                 }
                 if (!replay.forward and replay.has_newer and replay.newest_seq > 0) {
                     if (replay.oldest_seq > 0) view.oldest_seq = replay.oldest_seq;
@@ -1606,6 +1728,9 @@ pub const App = struct {
                 view.history_complete = !replay.has_older;
                 view.history_loading = false;
                 view.history_before_seq = 0;
+                view.history_after_seq = 0;
+                view.history_tail_reload = false;
+                view.history_has_newer = replay.has_newer;
                 if (view.scroll_up > 0) view.scroll_up = std.math.maxInt(usize);
             },
             .delta => |d| {
@@ -1634,6 +1759,7 @@ pub const App = struct {
                     view.state
                 else
                     null;
+                self.updateCompletionUnread(s.sid, prior_state, s.state);
                 if (self.liveView(s.sid) orelse self.saved_views.get(s.sid)) |recap_view| {
                     if (s.state == .running or s.state == .awaiting_approval or
                         prior_state == .running or prior_state == .awaiting_approval)
@@ -1925,6 +2051,8 @@ pub const App = struct {
                     self.clearHistoryBackfill();
                     self.view.history_loading = false;
                     self.view.history_before_seq = 0;
+                    self.view.history_after_seq = 0;
+                    self.view.history_tail_reload = false;
                     self.view.history_page_failed = false;
                 }
                 self.setNotice("daemon error {s}: {s}", .{ e.code, e.msg });
@@ -2042,6 +2170,8 @@ pub const App = struct {
         }
         // New content: keep pinned to bottom unless the user scrolled up.
         if (self.view.scroll_up > 0) self.view.scroll_up +|= 0; // stay where they are
+        if (!self.view.history_loading and !self.view.history_has_newer)
+            self.trimHistoryWindow(true);
     }
 
     pub fn bufferOlderBlock(self: *App, b: block.Block) void {
@@ -2062,9 +2192,11 @@ pub const App = struct {
     }
 
     pub fn finishOlderHistoryPage(self: *App, oldest_seq: u64, has_older: bool) void {
+        const anchor = self.view.history_before_seq;
         defer {
             self.view.history_loading = false;
             self.view.history_before_seq = 0;
+            self.view.history_after_seq = 0;
             self.view.history_page_failed = false;
         }
         if (self.view.history_page_failed) {
@@ -2084,20 +2216,75 @@ pub const App = struct {
         if (oldest_seq > 0) self.view.oldest_seq = oldest_seq;
         self.view.history_complete = !has_older;
 
-        // History is bounded by Editor; rebuilding restores chronological
-        // order now that older user messages were prepended.
-        self.view.editor.clearHistory();
-        for (self.view.blocks.items) |rendered| {
-            if (rendered.kind == .user_msg) self.view.editor.pushHistory(rendered.text);
-        }
-        self.copy_cursor = null;
-        self.view.sel_anchor = null;
-        self.view.sel_dragging = false;
-        self.view.layout_epoch +%= 1;
-        self.view.layout_cache.reset(self.gpa);
-        self.view.tail_layout_cache.reset(self.gpa);
-        if (self.view.scroll_up > 0) self.view.scroll_up = std.math.maxInt(usize);
+        self.trimHistoryWindow(false);
+        self.view.history_target_seq = anchor;
+        self.rebuildWindowHistory();
+        self.resetWindowLayout();
         self.setNotice("loaded {d} older blocks", .{loaded});
+    }
+
+    pub fn finishNewerHistoryPage(
+        self: *App,
+        oldest_seq: u64,
+        newest_seq: u64,
+        has_newer: bool,
+        anchor: u64,
+    ) void {
+        defer {
+            self.view.history_loading = false;
+            self.view.history_after_seq = 0;
+            self.view.history_page_failed = false;
+        }
+        if (self.view.history_page_failed) {
+            self.clearHistoryBackfill();
+            self.setNotice("could not load newer history", .{});
+            return;
+        }
+        const loaded = self.view.history_backfill.items.len;
+        self.view.blocks.appendSlice(self.gpa, self.view.history_backfill.items) catch {
+            self.clearHistoryBackfill();
+            self.setNotice("could not load newer history", .{});
+            return;
+        };
+        self.view.history_backfill.items.len = 0;
+        _ = oldest_seq;
+        if (newest_seq > self.view.last_seq) self.view.last_seq = newest_seq;
+        self.view.history_has_newer = has_newer;
+        self.trimHistoryWindow(true);
+        self.view.oldest_seq = self.firstWindowSeq();
+        self.view.history_target_seq = anchor;
+        self.rebuildWindowHistory();
+        self.resetWindowLayout();
+        self.setNotice("loaded {d} newer blocks", .{loaded});
+    }
+
+    pub fn finishReplacementHistoryPage(
+        self: *App,
+        oldest_seq: u64,
+        newest_seq: u64,
+        has_older: bool,
+        has_newer: bool,
+        anchor: u64,
+    ) void {
+        defer {
+            self.view.history_loading = false;
+            self.view.history_tail_reload = false;
+            self.view.history_page_failed = false;
+        }
+        if (self.view.history_page_failed) {
+            self.clearHistoryBackfill();
+            self.setNotice("could not load transcript window", .{});
+            return;
+        }
+        std.mem.swap(std.ArrayList(RenderBlock), &self.view.blocks, &self.view.history_backfill);
+        self.clearHistoryBackfill();
+        self.view.oldest_seq = oldest_seq;
+        if (newest_seq > self.view.last_seq) self.view.last_seq = newest_seq;
+        self.view.history_complete = !has_older;
+        self.view.history_has_newer = has_newer;
+        self.view.history_target_seq = anchor;
+        self.rebuildWindowHistory();
+        self.resetWindowLayout();
     }
 
     // -------------------------------------------------------- user input --
@@ -4007,6 +4194,7 @@ pub const App = struct {
         self.clearHistoryBackfill();
         self.view.history_loading = true;
         self.view.history_before_seq = self.view.oldest_seq;
+        self.view.history_after_seq = 0;
         self.view.history_page_failed = false;
         self.conn.send(.{ .sub = .{
             .skill_catalog = true,
@@ -4026,6 +4214,55 @@ pub const App = struct {
         if (self.view.history_complete or self.view.history_loading) return;
         const max_scroll = self.view.last_total_lines -| self.view.last_view_h;
         if (self.view.scroll_up >= max_scroll) self.requestOlderHistory();
+    }
+
+    pub fn requestNewerHistory(self: *App) void {
+        if (!self.view.history_has_newer or self.view.history_loading) return;
+        const newest = self.lastWindowSeq();
+        if (newest == 0) return;
+        self.copy_cursor = null;
+        self.view.sel_anchor = null;
+        self.view.sel_dragging = false;
+        self.clearHistoryBackfill();
+        self.view.history_loading = true;
+        self.view.history_before_seq = 0;
+        self.view.history_after_seq = newest +| 1;
+        self.view.history_page_failed = false;
+        self.conn.send(.{ .sub = .{
+            .skill_catalog = true,
+            .sid = self.view.sid,
+            .from_seq = self.view.history_after_seq,
+            .replay_limit = initial_replay_blocks,
+        } }) catch {
+            self.view.history_loading = false;
+            self.view.history_after_seq = 0;
+            self.setNotice("could not load newer history", .{});
+            return;
+        };
+        self.setNotice("loading newer history…", .{});
+    }
+
+    pub fn requestLiveTail(self: *App) void {
+        if (!self.view.history_has_newer or self.view.history_loading) return;
+        self.clearHistoryBackfill();
+        self.view.history_loading = true;
+        self.view.history_before_seq = 0;
+        self.view.history_after_seq = 0;
+        self.view.history_tail_reload = true;
+        self.view.history_page_failed = false;
+        self.conn.send(.{ .sub = .{
+            .skill_catalog = true,
+            .sid = self.view.sid,
+            .tail_limit = initial_replay_blocks,
+        } }) catch {
+            self.view.history_loading = false;
+            self.view.history_tail_reload = false;
+            self.setNotice("could not load latest history", .{});
+        };
+    }
+
+    pub fn maybeRequestHistoryAtBottom(self: *App) void {
+        if (self.view.scroll_up == 0) self.requestNewerHistory();
     }
 
     // Implemented in commands.zig; exposed here so call sites keep method syntax.
@@ -4333,7 +4570,9 @@ pub const buildReviewPrompt = commands.buildReviewPrompt;
 fn tabActivityForState(state: proto.SessionState) TabActivity {
     return switch (state) {
         .idle => .idle,
-        .done => .done,
+        // Completion is rendered only from App.unread_completions. A durable
+        // done state must not leave every old tab permanently checked.
+        .done => .idle,
         .running => .running,
         .err => .err,
         .awaiting_approval => .approval,
@@ -4543,7 +4782,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
         try candidates.append(arena, .{
             .sid = app.view.sid,
             .label = tabLabel(app, null),
-            .activity = tabActivityForState(app.view.state),
+            .activity = if (app.unread_completions.contains(app.view.sid)) .done else tabActivityForState(app.view.state),
             .active = true,
             .created_at = 0,
         });
@@ -5304,6 +5543,26 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         }
         app.search.target_seq = 0;
     }
+    if (app.view.history_target_seq > 0 and !app.view.history_loading) {
+        var target_index: ?usize = null;
+        for (app.view.blocks.items, 0..) |rendered, index| {
+            if (rendered.seq == app.view.history_target_seq) {
+                target_index = index;
+                break;
+            }
+        }
+        if (target_index) |index| {
+            var prefix_lines: std.ArrayList(Line) = .empty;
+            var last_tool_label: []const u8 = "";
+            try layoutBlockRange(arena, &transcript, &prefix_lines, 0, index + 1, w, &last_tool_label, true);
+            const target_line = prefix_lines.items.len -| 1;
+            const max_scroll = total -| view_h;
+            const desired_first = target_line -| (@as(usize, view_h) / 3);
+            app.view.scroll_up = max_scroll -| @min(desired_first, max_scroll);
+            app.view.last_total_lines = total;
+        }
+        app.view.history_target_seq = 0;
+    }
     // Anchor while reading: scroll_up counts from the BOTTOM, so content
     // arriving while scrolled up would slide the view. Compensate by the
     // growth delta; pinned (scroll_up == 0) stays pinned.
@@ -5537,7 +5796,13 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const cwd_txt = try statusCwd(arena, app.view.cwd.items, app.home.items);
     var session_handle_buf: session_handle.Full = undefined;
     const session_txt = try std.fmt.allocPrint(arena, "{s}", .{app.displaySessionHandle(&session_handle_buf, app.view.sid)});
-    const scroll_txt = try std.fmt.allocPrint(arena, "↕ {d} (G: bottom)", .{app.view.scroll_up});
+    const scroll_txt = if (app.view.history_has_newer)
+        if (app.view.scroll_up > 0)
+            try std.fmt.allocPrint(arena, "↕ {d} (G: latest)", .{app.view.scroll_up})
+        else
+            "older history (G: latest)"
+    else
+        try std.fmt.allocPrint(arena, "↕ {d} (G: bottom)", .{app.view.scroll_up});
     const focused_parent_sid = if (app.sessionSummary(app.view.sid)) |summary| summary.parent_sid else null;
     var child_count: usize = 0;
     var child_running: usize = 0;
@@ -5665,7 +5930,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             status_n += 1;
         }
     }
-    if (app.view.scroll_up > 0) {
+    if (app.view.scroll_up > 0 or app.view.history_has_newer) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
         status_segments[status_n] = .{ .text = scroll_txt, .style = Palette.status_bar };
@@ -6066,12 +6331,17 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
             return false;
         };
     } else {
+        app.view.history_loading = true;
+        app.view.history_tail_reload = true;
+        app.view.history_before_seq = 0;
+        app.view.history_after_seq = 0;
         new_conn.send(.{ .sub = .{
             .skill_catalog = true,
             .sid = app.view.sid,
-            .from_seq = app.view.last_seq +| 1,
-            .replay_limit = initial_replay_blocks,
+            .tail_limit = initial_replay_blocks,
         } }) catch {
+            app.view.history_loading = false;
+            app.view.history_tail_reload = false;
             new_conn.deinit();
             return false;
         };
@@ -6216,6 +6486,7 @@ pub fn dispatchEvent(
         .mouse_leave => vx.setMouseShape(.default),
         .focus_in => {
             app.terminal_focused = true;
+            _ = app.unread_completions.remove(app.rootSessionId(app.view.sid));
             app.presence_last_activity_ms = nowWallMs(app.io);
         },
         .focus_out => {

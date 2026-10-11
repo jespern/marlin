@@ -632,17 +632,21 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
                 }
             } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
                 app.view.scroll_up -|= app.takeCount();
+                app.maybeRequestHistoryAtBottom();
             } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
                 app.view.scroll_up +|= app.takeCount();
                 app.maybeRequestHistoryAtTop();
             } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
                 app.view.scroll_up -|= 20 * app.takeCount();
+                app.maybeRequestHistoryAtBottom();
             } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
                 app.view.scroll_up +|= 20 * app.takeCount();
                 app.maybeRequestHistoryAtTop();
             } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
                 _ = app.takeCount(); // no line addressing in a transcript; consume, don't leak
                 app.view.scroll_up = 0;
+                app.requestLiveTail();
+                app.mode = .insert;
             } else if (key.matches('g', .{})) {
                 app.vim.pending_g = true;
             } else if (key.matches('v', .{}) or key.matches('V', .{ .shift = true }) or key.matches('V', .{})) {
@@ -836,9 +840,15 @@ pub fn handleMouse(app: *App, m: vaxis.Mouse) void {
     switch (m.button) {
         .wheel_up => {
             app.view.scroll_up +|= 3;
+            app.mode = .normal;
             app.maybeRequestHistoryAtTop();
         },
-        .wheel_down => app.view.scroll_up -|= 3,
+        .wheel_down => {
+            app.view.scroll_up -|= 3;
+            app.maybeRequestHistoryAtBottom();
+            if (app.copy_cursor == null and app.view.scroll_up == 0 and !app.view.history_has_newer)
+                app.mode = .insert;
+        },
         .left => {
             const row = terminal_row - app.tabBarRows();
             // Only selectable body rows inside the session view participate;
@@ -1297,6 +1307,7 @@ pub fn copyModeKey(self: *App, key: vaxis.Key) void {
         cursor.line -|= 20;
     } else if (key.matches(vaxis.Key.down, .{})) {
         self.view.scroll_up -|= 1;
+        self.maybeRequestHistoryAtBottom();
         self.clampCopyCursorToView();
         return;
     } else if (key.matches(vaxis.Key.up, .{})) {

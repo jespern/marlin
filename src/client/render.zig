@@ -562,6 +562,57 @@ pub fn isShellPath(word: []const u8) bool {
         std.mem.indexOfScalar(u8, word, '/') != null;
 }
 
+fn shellWord(command: []const u8, at: *usize) ?[]const u8 {
+    while (at.* < command.len and (command[at.*] == ' ' or command[at.*] == '\t')) at.* += 1;
+    if (at.* >= command.len) return null;
+    const start = at.*;
+    while (at.* < command.len and command[at.*] != ' ' and command[at.*] != '\t') at.* += 1;
+    return command[start..at.*];
+}
+
+fn isShellLauncher(word: []const u8) bool {
+    const name = std.fs.path.basename(word);
+    return wordIn(name, "sh bash zsh dash ksh fish");
+}
+
+fn isShellCommandFlag(word: []const u8) bool {
+    if (std.mem.eql(u8, word, "--command")) return true;
+    return word.len > 1 and word[0] == '-' and word[1] != '-' and
+        std.mem.indexOfScalar(u8, word[1..], 'c') != null;
+}
+
+/// Remove a redundant `zsh -lc "…"`-style launcher from a command PREVIEW.
+/// This is intentionally strict: only a wholly quoted payload is unwrapped,
+/// so arguments after the script (which become $0/$1) are never hidden. The
+/// durable tool input and the command Claude/Codex executed remain untouched.
+pub fn shellDisplayCommand(command: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, command, " \t");
+    var at: usize = 0;
+    const launcher = shellWord(trimmed, &at) orelse return command;
+    if (!isShellLauncher(launcher)) return command;
+
+    while (shellWord(trimmed, &at)) |arg| {
+        if (!isShellCommandFlag(arg)) {
+            if (arg.len == 0 or arg[0] != '-') return command;
+            continue;
+        }
+        const payload = std.mem.trim(u8, trimmed[at..], " \t");
+        if (payload.len >= 2 and
+            ((payload[0] == '"' and payload[payload.len - 1] == '"') or
+                (payload[0] == '\'' and payload[payload.len - 1] == '\'')))
+            return payload[1 .. payload.len - 1];
+        // The allocation-free fallback used outside transcript layout still
+        // reads raw JSON, where an outer double quote appears as \" at both
+        // ends.
+        if (payload.len >= 4 and
+            ((std.mem.startsWith(u8, payload, "\\\"") and std.mem.endsWith(u8, payload, "\\\"")) or
+                (std.mem.startsWith(u8, payload, "\\'") and std.mem.endsWith(u8, payload, "\\'"))))
+            return payload[2 .. payload.len - 2];
+        return command;
+    }
+    return command;
+}
+
 /// Shell-aware styling for bash tool previews. This is deliberately lexical:
 /// it separates the landmarks people scan for (programs, flags, operators,
 /// strings, paths, and variables) without trying to execute or fully parse

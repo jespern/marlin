@@ -65,6 +65,7 @@ const max_layout_lines = layout.max_layout_lines;
 const scanToolBatch = layout.scanToolBatch;
 const streamTraffic = layout.streamTraffic;
 const toolDisplayArg = layout.toolDisplayArg;
+const toolDisplayArgDecoded = layout.toolDisplayArgDecoded;
 const toolDisplayName = layout.toolDisplayName;
 const workingDetail = layout.workingDetail;
 const workingLabel = layout.workingLabel;
@@ -116,12 +117,25 @@ test "tool calls render semantic arguments instead of raw JSON" {
     try std.testing.expectEqualStrings("zig build test", toolDisplayArg("Bash",
         \\{"command":"zig build test","description":"verify"}
     , cwd).?);
+    try std.testing.expectEqualStrings("sed -n '1,20p' src/main.zig", toolDisplayArg("Bash",
+        \\{"command":"/bin/zsh -lc \"sed -n '1,20p' src/main.zig\""}
+    , cwd).?);
     try std.testing.expectEqualStrings("src/main.zig", toolDisplayArg("mcp_read_source",
         \\{"path":"/Users/example/Work/marlin/src/main.zig"}
     , cwd).?);
     try std.testing.expectEqualStrings("secrets.txt", toolDisplayArg("Read",
         \\{"file_path":"/outside/private/secrets.txt"}
     , cwd).?);
+
+    var decoded_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer decoded_arena_state.deinit();
+    const decoded_arena = decoded_arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "grep -n -i \"cosign\" crates/src/main.rs | head -20",
+        (try toolDisplayArgDecoded(decoded_arena, "Bash",
+            \\{"command":"grep -n -i \"cosign\" crates/src/main.rs | head -20"}
+        , cwd)).?,
+    );
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -131,7 +145,7 @@ test "tool calls render semantic arguments instead of raw JSON" {
         .kind = .tool_call,
         .text = try arena.dupe(u8, args),
         .label = try arena.dupe(u8, "Read"),
-    }, cwd, 100, null);
+    }, cwd, 100, null, null);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     try std.testing.expectEqualStrings("  ⚙ Read ", lines.items[0].text);
     try std.testing.expectEqualStrings("src/client/layout.zig", lines.items[0].text2);
@@ -140,9 +154,20 @@ test "tool calls render semantic arguments instead of raw JSON" {
     lines.clearRetainingCapacity();
     try appendToolCallLine(arena, &lines, .{
         .kind = .tool_call,
+        .text = try arena.dupe(u8,
+            \\{"command":"grep -n -i \"cosign\" crates/src/main.rs | head -20"}
+        ),
+        .label = try arena.dupe(u8, "Bash"),
+    }, cwd, 100, null, null);
+    try std.testing.expectEqualStrings("grep -n -i \"cosign\" crates/src/main.rs | head -20", lines.items[0].text2);
+    try std.testing.expect(lines.items[0].syntax.len >= 5);
+
+    lines.clearRetainingCapacity();
+    try appendToolCallLine(arena, &lines, .{
+        .kind = .tool_call,
         .text = try arena.dupe(u8, "{malformed}"),
         .label = try arena.dupe(u8, "Read"),
-    }, cwd, 100, null);
+    }, cwd, 100, null, null);
     try std.testing.expectEqualStrings("", lines.items[0].text2);
 
     lines.clearRetainingCapacity();
@@ -150,7 +175,7 @@ test "tool calls render semantic arguments instead of raw JSON" {
         .kind = .tool_call,
         .text = try arena.dupe(u8, "{\"anything\":\"still private\"}"),
         .label = try arena.dupe(u8, "custom_tool"),
-    }, cwd, 100, null);
+    }, cwd, 100, null, null);
     try std.testing.expectEqualStrings("  ⚙ custom_tool ", lines.items[0].text);
     try std.testing.expectEqualStrings("", lines.items[0].text2);
 
@@ -168,6 +193,72 @@ test "tool calls render semantic arguments instead of raw JSON" {
     try std.testing.expectEqualStrings("  ✓ Fetched ", lines.items[0].text);
     try std.testing.expectEqualStrings("https://example.com/spec", lines.items[0].text2);
     try std.testing.expectEqualStrings(" · 42.2KiB", lines.items[0].text3);
+
+    lines.clearRetainingCapacity();
+    try appendNetworkSuccessLine(arena, &lines, .{
+        .kind = .tool_call,
+        .text = try arena.dupe(u8, "{\"type\":\"webSearch\",\"query\":\"\"}"),
+        .label = try arena.dupe(u8, "WebSearch"),
+    }, .{
+        .kind = .tool_result,
+        .text = try arena.dupe(u8, "{\"type\":\"webSearch\",\"query\":\"tree-sitter bash grammar\",\"results\":[]}"),
+        .label = try arena.dupe(u8, ""),
+    }, cwd, 100);
+    try std.testing.expectEqualStrings("  ✓ Searched ", lines.items[0].text);
+    try std.testing.expectEqualStrings("tree-sitter bash grammar", lines.items[0].text2);
+}
+
+test "expanded batched searches use queries from their paired results" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{
+        .{ .kind = .tool_call, .turn_id = 7, .text = @constCast("{\"type\":\"webSearch\",\"query\":\"\"}"), .label = @constCast("WebSearch") },
+        .{ .kind = .tool_call, .turn_id = 7, .text = @constCast("{\"type\":\"webSearch\",\"query\":\"\"}"), .label = @constCast("WebSearch") },
+        .{ .kind = .tool_result, .turn_id = 7, .text = @constCast("{\"query\":\"first query\",\"results\":[]}"), .label = @constCast("") },
+        .{ .kind = .tool_result, .turn_id = 7, .text = @constCast("{\"query\":\"second query\",\"results\":[]}"), .label = @constCast("") },
+    };
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = true,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var lines: std.ArrayList(Line) = .empty;
+    var last_tool_label: []const u8 = "";
+    try layoutBlockRange(arena_state.allocator(), &transcript, &lines, 0, blocks.len, 120, &last_tool_label, false);
+
+    var queries: [2][]const u8 = undefined;
+    var found: usize = 0;
+    for (lines.items) |line| {
+        if (!std.mem.eql(u8, line.text, "  ⚙ Search ")) continue;
+        queries[found] = line.text2;
+        found += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), found);
+    try std.testing.expectEqualStrings("first query", queries[0]);
+    try std.testing.expectEqualStrings("second query", queries[1]);
 }
 
 test "diff intro notes distill to counts for the tool line" {
@@ -207,7 +298,7 @@ test "authored diff notes include exact colored diffstats" {
         .kind = .tool_call,
         .text = try arena.dupe(u8, "{\"path\":\"src/x.zig\"}"),
         .label = try arena.dupe(u8, "edit"),
-    }, "/repo", 100, "1 occurrence(s) · +18 -5");
+    }, "/repo", 100, "1 occurrence(s) · +18 -5", null);
     try std.testing.expectEqual(@as(usize, 2), lines.items[0].syntax.len);
     try std.testing.expect(vaxis.Color.eql(Palette.diff_add.fg, lines.items[0].syntax[0].style.fg));
     try std.testing.expect(vaxis.Color.eql(Palette.diff_del.fg, lines.items[0].syntax[1].style.fg));

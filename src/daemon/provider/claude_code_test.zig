@@ -53,6 +53,16 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     try std.testing.expectEqualStrings("acceptEdits", fresh[13]);
     for (fresh) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--effort"));
 
+    const root = try buildArgv(arena, .{
+        .binary = "claude",
+        .prompt = "long autonomous task",
+        .model = "fable-5",
+        .session_uuid = "u-u-i-d",
+        .fresh = true,
+        .permissions = .bypass,
+    });
+    for (root) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--max-turns"));
+
     const high = try buildArgv(arena, .{
         .binary = "claude",
         .prompt = "hi",

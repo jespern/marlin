@@ -123,6 +123,15 @@ pub const SessionView = struct {
     /// Zero identifies the initial tail replay; non-zero is the exclusive
     /// upper bound of an older page currently being buffered.
     history_before_seq: u64 = 0,
+    /// Inclusive start of a newer page currently being buffered. Non-zero
+    /// means the visible window is behind the durable tail.
+    history_after_seq: u64 = 0,
+    /// A tail reload replaces an old scrollback window atomically.
+    history_tail_reload: bool = false,
+    /// The loaded window has durable blocks below it.
+    history_has_newer: bool = false,
+    /// Reposition this durable block after a sliding-window page swap.
+    history_target_seq: u64 = 0,
     history_backfill: std.ArrayList(RenderBlock) = .empty,
     history_page_failed: bool = false,
     /// 0 = pinned to bottom; N = scrolled up N lines.

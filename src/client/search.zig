@@ -82,6 +82,9 @@ pub fn clearTranscriptForSearch(self: *App) void {
     self.view.history_complete = false;
     self.view.history_loading = true;
     self.view.history_before_seq = 0;
+    self.view.history_after_seq = 0;
+    self.view.history_tail_reload = true;
+    self.view.history_has_newer = false;
     self.view.history_page_failed = false;
     self.view.scroll_up = 0;
     self.view.last_total_lines = 0;

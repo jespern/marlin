@@ -9,6 +9,7 @@ const BlockKind = block.BlockKind;
 const Body = block.Body;
 const PlanItem = block.PlanItem;
 const handoverBody = block.handoverBody;
+const isCwdSwitchNote = block.isCwdSwitchNote;
 const isHandoverAnnounce = block.isHandoverAnnounce;
 const isHandoverNote = block.isHandoverNote;
 
@@ -79,4 +80,9 @@ test "handover note prefix splits body from marker" {
     try std.testing.expect(!isHandoverNote("Switching to Claude Code (claudecode/fable)."));
     try std.testing.expect(isHandoverAnnounce("Switching to Claude Code (claudecode/fable). Generating a handover summary…"));
     try std.testing.expectEqualStrings("## Goal\nship it", handoverBody("[handover]\n## Goal\nship it"));
+}
+
+test "cwd switch notes have a durable project-boundary marker" {
+    try std.testing.expect(isCwdSwitchNote("≡ working directory switched: /old → /new"));
+    try std.testing.expect(!isCwdSwitchNote("working directory → /new"));
 }

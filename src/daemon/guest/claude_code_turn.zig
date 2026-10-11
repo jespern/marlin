@@ -194,7 +194,11 @@ fn ccInvoke(
         else
             .accept_edits,
         .bridge = bridge,
-        .max_turns = opts.max_rounds,
+        // A root's max_rounds is Marlin's native-loop checkpoint size, not a
+        // reason to kill one long Claude Code invocation. Root guests are
+        // already bounded by the supervised four-hour ceiling; child guests
+        // preserve their explicit parent-facing tool budget.
+        .max_turns = if (opts.auto_continue_round_budget) null else opts.max_rounds,
         .effort = opts.effort,
     });
 
