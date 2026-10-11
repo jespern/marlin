@@ -7,8 +7,9 @@ that is intended, not accidental.
 
 Run `scripts/install-git-hooks.sh` once after cloning. The repo-owned
 pre-commit hook checks the complete staged snapshot with Zig's canonical
-formatter, the same formatting gate as CI. Use `zig build fmt` during
-implementation to format all Zig source and `build.zig`.
+formatter, and the pre-push hook runs the same whole-tree `fmt-check` gate as
+CI. Use `zig build fmt` during implementation to format all Zig source and
+`build.zig`.
 
 ## The pyramid
 

@@ -56,7 +56,8 @@
       "user_msg",
       "tool_call",
       "tool_result",
-      "assistant_msg"
+      "assistant_msg",
+      "system_note"
     ]
   }
 }

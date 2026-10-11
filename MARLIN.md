@@ -22,8 +22,9 @@ answer is no. Standing walls: README Principles, and ARCHITECTURE
 - `zig build fmt` — format all Zig source and `build.zig`. Run this while
   editing, before tests and handoff; do not leave formatting for CI.
 - `zig build fmt-check` — verify formatting without changing files. The
-  repo-owned pre-commit hook checks the equivalent staged snapshot, and CI
-  runs this step against the checked-out commit.
+  repo-owned pre-commit hook checks the equivalent staged snapshot, the
+  pre-push hook checks the whole working tree, and CI checks the pushed
+  commit. Install both hooks once with `scripts/install-git-hooks.sh`.
 - `zig build` — build AND install `zig-out/bin/marlin`, defaulting to
   ReleaseFast for source installs. Official release artifacts are built
   ReleaseSafe (safety checks stay on in a long-running daemon); the
