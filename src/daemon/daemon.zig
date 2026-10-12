@@ -149,6 +149,9 @@ const Event = union(enum) {
     // From turn threads (loop.zig callbacks). All payloads gpa-owned.
     turn_block: struct { sid: u64, line: []u8 }, // pre-encoded proto.DaemonMsg.blk
     turn_delta: struct { sid: u64, line: []u8 },
+    /// Live work trees are useful outside the focused transcript: session
+    /// watchers (Ctrl+S / `marlin top`) receive them for every live session.
+    turn_activity: struct { sid: u64, line: []u8 },
     turn_usage_credits: struct { sid: u64, active: bool },
     /// A tool call needs a client decision; fan out approval_request and
     /// flip session status to awaiting_approval. Line pre-encoded.
@@ -1005,6 +1008,10 @@ pub const Daemon = struct {
                 defer self.gpa.free(td.line);
                 self.fanOutLine(td.sid, td.line);
             },
+            .turn_activity => |activity| {
+                defer self.gpa.free(activity.line);
+                self.fanOutActivityLine(activity.sid, activity.line);
+            },
             .turn_usage_credits => |usage| {
                 const session = self.sessions.get(usage.sid) orelse return;
                 self.broadcastUsageCredits(usage.sid, session.state, usage.active);
@@ -1521,6 +1528,17 @@ pub const Daemon = struct {
                 client.watches_session_deltas = sw.incremental;
                 try self.sendSessionList(client, false);
                 self.sendPendingApprovals(client);
+                var sessions = self.sessions.valueIterator();
+                while (sessions.next()) |session| {
+                    session.*.guest_activity_mutex.lockUncancelable(self.io);
+                    if (session.*.guest_activity.len > 0) {
+                        self.sendTo(client, .{ .guest_activity = .{
+                            .sid = session.*.id,
+                            .items = session.*.guest_activity,
+                        } });
+                    }
+                    session.*.guest_activity_mutex.unlock(self.io);
+                }
             },
             .session_kill => |sk| {
                 _ = self.cancelSessionTree(sk.sid);
@@ -3959,7 +3977,7 @@ pub const Daemon = struct {
                 .sid = job.sid,
                 .items = items,
             } }) catch return;
-            self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+            self.events.push(self.io, .{ .turn_activity = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
         }
 
         fn onUsageCredits(ctx: ?*anyopaque, active: bool) void {
@@ -4143,6 +4161,16 @@ pub const Daemon = struct {
     fn fanOne(ctx: FanCtx, client: *Client) void {
         if (!client.said_hello or !client.subscribed(ctx.sid)) return;
         ctx.self.sendLine(client, ctx.line);
+    }
+
+    fn fanOutActivityLine(self: *Daemon, sid: u64, line: []const u8) void {
+        const ctx = FanCtx{ .self = self, .sid = sid, .line = line };
+        self.forEachClient(ctx, struct {
+            fn send(c: FanCtx, client: *Client) void {
+                if (!client.said_hello or (!client.subscribed(c.sid) and !client.watches_sessions)) return;
+                c.self.sendLine(client, c.line);
+            }
+        }.send);
     }
 
     /// Approval requests are actionable multiplexer state, not transcript
@@ -5142,6 +5170,7 @@ pub const Daemon = struct {
             .client_gone, .turn_resumed, .turn_usage_credits, .shutdown => {},
             .turn_block => |value| self.gpa.free(value.line),
             .turn_delta => |value| self.gpa.free(value.line),
+            .turn_activity => |value| self.gpa.free(value.line),
             .turn_awaiting => |value| self.gpa.free(value.line),
             .catalog_ready => |value| {
                 for (value.models) |model| self.gpa.free(model.id);

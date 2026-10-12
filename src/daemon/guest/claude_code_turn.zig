@@ -73,6 +73,10 @@ fn activityDetail(arena: std.mem.Allocator, input_json: []const u8) []const u8 {
 const CcOutcome = struct {
     got_init: bool = false,
     got_result: bool = false,
+    result_count: u32 = 0,
+    input_count: u32 = 1,
+    steering_finalized: bool = false,
+    input_write_failed: bool = false,
     result_is_error: bool = false,
     result_error: [512]u8 = undefined,
     result_error_len: usize = 0,
@@ -92,6 +96,132 @@ const CcOutcome = struct {
     stderr_tail: [4096]u8 = undefined,
     stderr_len: usize = 0,
 };
+
+fn writeCcUserInput(allocator: std.mem.Allocator, writer: *Io.Writer, text: []const u8) !void {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, .{
+        .type = "user",
+        .message = .{ .role = "user", .content = .{.{ .type = "text", .text = text }} },
+        .parent_tool_use_id = @as(?[]const u8, null),
+        .session_id = "",
+    }, .{});
+    defer allocator.free(encoded);
+    try writer.writeAll(encoded);
+    try writer.writeByte('\n');
+    try writer.flush();
+}
+
+/// Owns Claude Code's stdin while stdout is decoded on the turn thread.
+/// Polling must be independent of stdout: a foreground shell command can
+/// produce no events for minutes, which is exactly when steering matters.
+const CcInputPump = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    opts: *const RunOpts,
+    file: Io.File,
+    writer: *Io.Writer,
+    max_inputs: u32,
+    mutex: Io.Mutex = .init,
+    done: bool = false,
+    finalized: bool = false,
+    sent_total: u32 = 1,
+    replayed_total: u32 = 0,
+    pending_replays: std.ArrayList(block.Input) = .empty,
+    write_failed: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *CcInputPump) void {
+        defer self.file.close(self.io);
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            if (self.done) {
+                self.mutex.unlock(self.io);
+                return;
+            }
+            var next: ?block.Input = null;
+            if (self.sent_total < self.max_inputs) {
+                if (self.opts.poll_steer) |poll| next = poll(self.opts.on_delta_ctx, self.gpa);
+            }
+            if (next) |input| {
+                self.pending_replays.append(self.gpa, input) catch {
+                    input.deinit(self.gpa);
+                    self.mutex.unlock(self.io);
+                    self.write_failed.store(true, .release);
+                    return;
+                };
+                self.sent_total += 1;
+                self.mutex.unlock(self.io);
+                writeCcUserInput(self.gpa, self.writer, input.text) catch {
+                    self.write_failed.store(true, .release);
+                    return;
+                };
+                continue;
+            }
+            self.mutex.unlock(self.io);
+            self.io.sleep(.fromMilliseconds(25), .awake) catch return;
+        }
+    }
+
+    /// Called for each result. Close stdin only after Claude has replayed
+    /// (accepted) every message already handed to it and no background task is
+    /// still keeping that result provisional. Claude may fold a steer into the
+    /// current turn or emit a separate result for it, so result counts are not
+    /// message counts. Holding this mutex across the daemon's atomic queue
+    /// close prevents a poll/close race.
+    fn result(self: *CcInputPump, background_open: usize) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (background_open > 0 or self.replayed_total < self.sent_total) return;
+        if (self.sent_total >= self.max_inputs or tryCloseSteering(self.opts.*)) {
+            self.finalized = true;
+            self.done = true;
+        }
+    }
+
+    fn replayed(self: *CcInputPump) void {
+        self.mutex.lockUncancelable(self.io);
+        self.replayed_total += 1;
+        self.mutex.unlock(self.io);
+    }
+
+    fn takeReplay(self: *CcInputPump) ?block.Input {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.pending_replays.items.len == 0) return null;
+        return self.pending_replays.orderedRemove(0);
+    }
+
+    fn stop(self: *CcInputPump) void {
+        self.mutex.lockUncancelable(self.io);
+        self.done = true;
+        self.mutex.unlock(self.io);
+    }
+
+    fn inputCount(self: *CcInputPump) u32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.sent_total;
+    }
+
+    fn isFinalized(self: *CcInputPump) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.finalized;
+    }
+
+    fn deinit(self: *CcInputPump) void {
+        for (self.pending_replays.items) |input| input.deinit(self.gpa);
+        self.pending_replays.deinit(self.gpa);
+    }
+};
+
+pub fn backgroundActivityKind(task_type: []const u8) proto.GuestActivityKind {
+    return if (std.mem.eql(u8, task_type, "local_agent")) .agent else .process;
+}
+
+pub fn toolActivityKind(name: []const u8) proto.GuestActivityKind {
+    if (std.mem.eql(u8, name, "Agent")) return .agent;
+    if (std.mem.eql(u8, name, "Bash") or std.mem.eql(u8, name, "Shell")) return .process;
+    return .tool;
+}
 
 /// The reply landed but the run stays alive for its background tasks: say so
 /// in the transcript and the phase, or "running" looks like a hang.
@@ -183,7 +313,6 @@ fn ccInvoke(
         null;
     const argv = try claude_code.buildArgv(arena, .{
         .binary = claude_code.binaryPath(opts.tool_environ),
-        .prompt = prompt,
         .model = opts.endpoint.model,
         .session_uuid = claude_code.sessionUuid(&uuid_buf, opts.session_id),
         .fresh = fresh,
@@ -269,7 +398,7 @@ fn ccInvoke(
         .argv = argv,
         .cwd = .{ .path = opts.cwd },
         .environ_map = if (child_environ) |*map| map else opts.tool_environ,
-        .stdin = .ignore,
+        .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
         .pgid = 0,
@@ -290,6 +419,30 @@ fn ccInvoke(
     const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
     var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
     const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
+
+    // Stream-json input keeps this exact Claude process alive while a steer
+    // arrives. The first message is synchronous; a pump owns the pipe after
+    // that so a silent long-running tool cannot starve steering.
+    var stdin_file = child.stdin.?;
+    child.stdin = null;
+    var stdin_buffer: [64 * 1024]u8 = undefined;
+    var stdin_writer_file = stdin_file.writer(io, &stdin_buffer);
+    try writeCcUserInput(gpa, &stdin_writer_file.interface, prompt);
+    var input_pump = CcInputPump{
+        .gpa = gpa,
+        .io = io,
+        .opts = &opts,
+        .file = stdin_file,
+        .writer = &stdin_writer_file.interface,
+        .max_inputs = if (opts.max_rounds >= round) opts.max_rounds - round + 1 else 1,
+    };
+    defer input_pump.deinit();
+    const input_thread = try std.Thread.spawn(.{}, CcInputPump.run, .{&input_pump});
+    var input_joined = false;
+    defer if (!input_joined) {
+        input_pump.stop();
+        input_thread.join();
+    };
 
     // Commentary between tool rounds; flushed when the next tool begins so
     // the final prose is never double-persisted next to the assistant_msg.
@@ -319,6 +472,16 @@ fn ccInvoke(
     var open_tools: usize = 0;
     var activity = guest_activity.Tracker.init(gpa, opts.on_guest_activity, opts.on_delta_ctx);
     defer activity.deinit();
+    const BackgroundLink = struct { task_id: []u8, tool_use_id: []u8 };
+    var background_links: std.ArrayList(BackgroundLink) = .empty;
+    defer {
+        for (background_links.items) |link| {
+            gpa.free(link.task_id);
+            gpa.free(link.tool_use_id);
+        }
+        background_links.deinit(gpa);
+    }
+    var replayed_users: usize = 0;
 
     {
         const line_buf = try gpa.alloc(u8, 512 * 1024);
@@ -328,7 +491,7 @@ fn ccInvoke(
         defer line_arena_state.deinit();
         var line_acc: std.ArrayList(u8) = .empty;
         defer line_acc.deinit(gpa);
-        while (true) {
+        read_events: while (true) {
             const line = shared.takeEventLine(&reader.interface, gpa, &line_acc, shared.max_event_line_bytes) catch |err| switch (err) {
                 error.LineTooLong => {
                     _ = try ap.append(.{ .system_note = .{ .text = "claude code: one event line exceeded 64 MiB and was dropped" } });
@@ -358,11 +521,10 @@ fn ccInvoke(
                     _ = try ap.append(.{ .reasoning = .{ .text = text } });
                 },
                 .tool_use => |tu| {
-                    const kind: proto.GuestActivityKind = if (std.mem.eql(u8, tu.name, "Agent")) .agent else .tool;
                     try activity.start(
                         tu.id,
                         tu.parent_tool_use_id,
-                        kind,
+                        toolActivityKind(tu.name),
                         tu.name,
                         activityDetail(line_arena, tu.input_json),
                         nowMs(io),
@@ -399,7 +561,12 @@ fn ccInvoke(
                 },
                 .tool_result => |tr| {
                     const nested = tr.parent_tool_use_id.len > 0 or activity.isNested(tr.tool_use_id);
-                    activity.finish(tr.tool_use_id);
+                    var stays_open = false;
+                    for (background_links.items) |link| if (std.mem.eql(u8, link.tool_use_id, tr.tool_use_id)) {
+                        stays_open = true;
+                        break;
+                    };
+                    if (!stays_open) activity.finish(tr.tool_use_id);
                     if (nested) continue;
                     const cap = opts.cfg.inline_tool_cap_bytes;
                     // Same capture-time redaction as native tool results:
@@ -445,6 +612,7 @@ fn ccInvoke(
                 },
                 .result => |r| {
                     outcome.got_result = true;
+                    outcome.result_count += 1;
                     outcome.result_is_error = r.is_error;
                     outcome.result_error_len = @min(r.error_text.len, outcome.result_error.len);
                     @memcpy(outcome.result_error[0..outcome.result_error_len], r.error_text[0..outcome.result_error_len]);
@@ -464,6 +632,7 @@ fn ccInvoke(
                     }
                     replied = true;
                     if (background_open > 0) try noteBackgroundWait(gpa, opts, ap, background_open, background_description.items);
+                    input_pump.result(background_open);
                 },
                 .background_tasks => |bg| {
                     const was_open = background_open;
@@ -474,7 +643,7 @@ fn ccInvoke(
                     for (bg) |task| try activity.start(
                         task.task_id,
                         "",
-                        .process,
+                        backgroundActivityKind(task.task_type),
                         if (std.mem.eql(u8, task.task_type, "local_bash")) "Bash" else task.task_type,
                         task.description,
                         nowMs(io),
@@ -483,16 +652,87 @@ fn ccInvoke(
                     if (was_open == 0 and bg.len > 0 and replied)
                         try noteBackgroundWait(gpa, opts, ap, background_open, background_description.items);
                 },
+                .task_started => |task| {
+                    if (!task.is_backgrounded or task.tool_use_id.len == 0) continue;
+                    // background_tasks_changed arrives first and uses task_id;
+                    // replace that provisional node with the tool-use id that
+                    // forwarded child events name as their parent.
+                    activity.finish(task.task_id);
+                    var parent_tool_use_id: []const u8 = "";
+                    for (background_links.items) |link| {
+                        if (!std.mem.eql(u8, link.task_id, task.parent_task_id)) continue;
+                        parent_tool_use_id = link.tool_use_id;
+                        break;
+                    }
+                    try activity.start(
+                        task.tool_use_id,
+                        parent_tool_use_id,
+                        backgroundActivityKind(task.task_type),
+                        if (std.mem.eql(u8, task.task_type, "local_bash")) "Bash" else "Agent",
+                        task.description,
+                        nowMs(io),
+                    );
+                    var known = false;
+                    for (background_links.items) |link| if (std.mem.eql(u8, link.tool_use_id, task.tool_use_id)) {
+                        known = true;
+                        break;
+                    };
+                    if (!known) {
+                        const owned_task = try gpa.dupe(u8, task.task_id);
+                        const owned_tool = gpa.dupe(u8, task.tool_use_id) catch |err| {
+                            gpa.free(owned_task);
+                            return err;
+                        };
+                        background_links.append(gpa, .{ .task_id = owned_task, .tool_use_id = owned_tool }) catch |err| {
+                            gpa.free(owned_task);
+                            gpa.free(owned_tool);
+                            return err;
+                        };
+                    }
+                },
                 .task_notification => |notification| {
                     replied = false;
-                    activity.finish(notification.task_id);
+                    const activity_id = if (notification.tool_use_id.len > 0) notification.tool_use_id else notification.task_id;
+                    activity.finish(activity_id);
+                    for (background_links.items, 0..) |link, i| {
+                        if (!std.mem.eql(u8, link.tool_use_id, activity_id)) continue;
+                        const removed = background_links.swapRemove(i);
+                        gpa.free(removed.task_id);
+                        gpa.free(removed.tool_use_id);
+                        break;
+                    }
                     _ = try ap.append(.{ .system_note = .{ .text = notification.summary } });
                     // The run resumes on its own: the model now reads the result.
                     publishPhase(opts, .provider);
                 },
+                .replayed_user => |text| {
+                    input_pump.replayed();
+                    replayed_users += 1;
+                    if (replayed_users == 1) continue; // initial prompt
+                    if (input_pump.takeReplay()) |input| {
+                        defer input.deinit(gpa);
+                        _ = try ap.append(.{ .steer = input });
+                    } else {
+                        _ = try ap.append(.{ .steer = .{ .text = text } });
+                    }
+                },
             };
+            // Claude's SDK stream can remain resident waiting for more input
+            // even after stdin is closed after a multi-message run. Once the
+            // terminal result atomically closed steering, no later stdout is
+            // part of this Marlin turn.
+            if (input_pump.isFinalized()) break :read_events;
         }
     }
+
+    input_pump.stop();
+    input_thread.join();
+    input_joined = true;
+    outcome.input_count = input_pump.inputCount();
+    outcome.steering_finalized = input_pump.isFinalized();
+    outcome.input_write_failed = input_pump.write_failed.load(.acquire);
+    if (outcome.steering_finalized)
+        process_io.terminateProcessGroup(io, child.id.?, 50);
 
     watcher.done.store(true, .release);
     watcher_thread.join();
@@ -593,6 +833,10 @@ pub fn runClaudeCodeTurn(
         }
         defer outcome.final_text.deinit(gpa);
 
+        // One long-lived stream-json process can now consume several user
+        // messages; preserve the old round accounting/budget semantics.
+        if (outcome.input_count > 1) rounds += outcome.input_count - 1;
+
         total_in += outcome.tokens_in;
         total_out += outcome.tokens_out;
 
@@ -607,6 +851,13 @@ pub fn runClaudeCodeTurn(
             _ = try ap.append(.{ .system_note = .{ .text = note } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);
             return error.DelegateTimeout;
+        }
+        if (outcome.input_write_failed) {
+            const note = "claude code closed its input before a steering message could be delivered";
+            setDelegateError(note);
+            _ = try ap.append(.{ .system_note = .{ .text = note } });
+            try store.updateSessionUsage(opts.session_id, total_in, total_out);
+            return error.DelegateFailed;
         }
         if (!outcome.got_result) {
             const stderr = try compactDiagnostic(
@@ -654,6 +905,10 @@ pub fn runClaudeCodeTurn(
         if (!outcome.final_persisted) _ = try ap.append(.{ .assistant_msg = .{ .text = outcome.final_text.items } });
         final_text.clearRetainingCapacity();
         try final_text.appendSlice(gpa, outcome.final_text.items);
+
+        // The live stdin pump already performed the atomic final queue close;
+        // do not repeat it in the legacy multi-invocation fallback below.
+        if (outcome.steering_finalized) break;
 
         // Round budget. `--max-turns` bounds the subprocess, not this loop;
         // without a ceiling here a steady stream of steers runs forever. The

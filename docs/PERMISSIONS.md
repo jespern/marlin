@@ -241,9 +241,9 @@ generated entry, changing it, or removing it is the user's explicit policy.
 
 The daemon loads and refreshes configured feeds at startup. The TUI handshake
 reports whether policy was configured separately from whether rules loaded,
-shows `dnsblock on`, `dnsblock off`, or `dnsblock err` beside the sandbox
-indicator, and emits a short startup notice. A load failure is fail-open and is
-reported differently from an unconfigured policy.
+shows compact DNS-block (`⊘`) and sandbox (`⛨`) status glyphs whose colors
+carry their state, and emits a short startup notice. A load failure is fail-open
+and is reported differently from an unconfigured policy.
 
 Runtime controls are session-scoped and in-memory:
 

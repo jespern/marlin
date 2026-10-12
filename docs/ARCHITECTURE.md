@@ -76,9 +76,16 @@ a guest tab feels like a native tab. The guest boundary is frozen at:
    in Edit results), so the reader assembles oversized lines rather than
    mistaking them for end of stream; only a line over 64 MiB is dropped,
    with a visible system note (`guest/shared.zig` `takeEventLine`)
-3. interrupt / reboot / resume
+3. interrupt / reboot / resume / mid-turn steering. Claude Code uses
+   bidirectional stream-json input, so steering reaches the live process and
+   queues behind an executing vendor tool rather than waiting for `claude -p`
+   to exit
 4. permission requests onto the existing approval bar (mux UX, not harness UX)
-5. session status (running / awaiting_approval / idle)
+5. session status (running / background / awaiting_approval / idle) and a
+   shared ephemeral Agent/tool/process hierarchy. Claude's task-start event
+   links a background task id to the tool-use id forwarded child events name;
+   Codex thread/subagent events and native tool batches project into the same
+   node shape
 6. account-scoped model discovery for the shared `/model` picker
 
 Nothing else. Semantic rendering of unknown tools is a TUI fact, not a
@@ -140,9 +147,9 @@ then the wall is how Marlin stays small.
 - Picker and status name the regime: guest models keep their place in
   the list, prefixed `(guest)`. Status switches to the selected target as soon
   as `/model` is accepted, including while a native→guest handover is still
-  running. Guest status shows `(guest) {name}` and dims
-  ctx/sandbox/dnsblock as `n/a` (unavailable, not off — Marlin does not
-  own the guest's context window). When Claude Code's structured rate-limit
+  running. Guest status shows `(guest) {name}` and dims the context and the
+  sandbox/DNS glyphs (unavailable, not off — Marlin does not own the guest's
+  context window). When Claude Code's structured rate-limit
   event reports overage use, the context slot instead shows `(using api credits)`
   and each transition is recorded as a system note through the active turn's
   ordered block appender. Native remains the `/new` default.
@@ -1233,6 +1240,19 @@ through the daemon, and Esc discards the draft. The status bar
 reports background sessions only when actionable (`2 running · 1 approval`).
 A split pane identifies its session with a compact pane label.
 
+**Ctrl+S is one work tree, not a session picker plus a process inspector.**
+Session-watch clients receive complete live activity snapshots for every
+session, including ones whose transcript is not subscribed. Durable sessions,
+native task children, guest agents, tools, and processes share one flattened
+parent-before-child surface and one j/k cursor. Selecting live work keeps the
+whole tree visible and opens its kind, age, stable harness id, parent id, and
+unabridged task/command detail below it. Orphans and malformed cycles stay
+visible rather than falling out of the tree. Standalone `marlin top` renders
+and navigates the same model. Enter on ephemeral work switches to its owning
+session; archive and kill remain session operations. Claude/Codex-owned
+children are operational nodes because the guest harness owns their transcript
+lifecycle.
+
 ```
 ┌ 1 api-fix ● │ 2 crypto-review ! ────────────────────┐
 ├─ main: api-fix ● ───────────────────────────────────┤
@@ -1343,8 +1363,9 @@ A split pane identifies its session with a compact pane label.
   drifting soft clouds tinted from the horizon color, tree grays darkening
   at night, and the sky mirrored and dimmed below the waterline as water),
   and a self-playing Pac-Man (`client/pacman.zig`, rules and wall-bounce
-  ghosts after feiss' js1k 2019 entry, a BFS eat-or-flee driver replacing
-  the cursor keys; added over the original, after the arcade: four corner
+  ghosts after feiss' js1k 2019 entry, with a score-valued objective planner
+  and maze-distance danger fields replacing the cursor keys; added over the
+  original, after the arcade: four corner
   energizers that frighten the ghosts for thirty steps — Pac-Man hunts them,
   an eaten ghost walks home as eyes and comes back out — arcade scoring with
   the 200/400/800/1600 ghost run and the level's fruit appearing twice a

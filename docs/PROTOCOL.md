@@ -260,6 +260,10 @@ trade readability for a second identity or a storage migration.
 - An acknowledged steer is polled both between rounds and after a tool-free
   provider response. The turn atomically closes steering only while the queue
   is empty, so input cannot disappear into the final-poll/turn-done edge.
+- `guest_activity` is a complete ephemeral work-tree snapshot despite its
+  compatibility name. It fans to both the focused subscriber and global
+  `session_watch` clients; an empty snapshot clears that session. A new
+  watcher receives the current non-empty snapshots after its session list.
 - Replay (`sub` with from_seq ≥ 1 or tail_limit > 0) and its requested marker
   complete before any live message for that session reaches the client. A
   partial forward page is not subscribed at all; the final page and live

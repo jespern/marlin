@@ -15,8 +15,11 @@ const RowView = top.RowView;
 const computeColumns = top.computeColumns;
 const formatAge = top.formatAge;
 const orderedRows = top.orderedRows;
+const orderedActivityIndices = top.orderedActivityIndices;
 const rowDepth = top.rowDepth;
+const selectedWorkIndex = top.selectedWorkIndex;
 const truncateLeft = top.truncateLeft;
+const workRows = top.workRows;
 
 test {
     std.testing.refAllDecls(top);
@@ -77,6 +80,65 @@ test "top orders oldest roots first while keeping descendants together" {
     });
 }
 
+test "activity tree orders descendants and retains orphans and cycles" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const items = [_]proto.GuestActivity{
+        .{ .id = "nested", .parent_id = "agent", .kind = .process, .name = "Bash" },
+        .{ .id = "orphan", .parent_id = "missing", .kind = .tool, .name = "Read" },
+        .{ .id = "agent", .kind = .agent, .name = "Scout" },
+        .{ .id = "cycle-a", .parent_id = "cycle-b", .kind = .agent, .name = "A" },
+        .{ .id = "cycle-b", .parent_id = "cycle-a", .kind = .agent, .name = "B" },
+    };
+    const order = try orderedActivityIndices(arena_state.allocator(), &items);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 0, 3, 4 }, order);
+}
+
+test "top row exposes live work counts in its title" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const segments = try top.rowSegments(arena_state.allocator(), .{
+        .sid = 1,
+        .parent_sid = null,
+        .kind = .root,
+        .state = .running,
+        .created_at = 1,
+        .title = "root",
+        .cwd = "/",
+        .model = "claudecode/sonnet",
+        .activity_count = 3,
+        .agent_count = 2,
+        .process_count = 1,
+    }, &.{1}, .{ .title = 60 }, 1000, false);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    for (segments) |segment| try text.appendSlice(std.testing.allocator, segment.text);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "2 agents, 1 proc") != null);
+}
+
+test "work tree flattens sessions and their activity into one navigable order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const rows = [_]RowView{
+        .{ .sid = 20, .parent_sid = null, .kind = .root, .state = .running, .created_at = 20, .title = "root", .cwd = "/", .model = "m" },
+        .{ .sid = 30, .parent_sid = null, .kind = .root, .state = .idle, .created_at = 30, .title = "next", .cwd = "/", .model = "m" },
+    };
+    const activity = [_]proto.GuestActivity{
+        .{ .id = "shell", .parent_id = "agent", .kind = .process, .name = "Bash", .detail = "sleep 20" },
+        .{ .id = "agent", .kind = .agent, .name = "Scout" },
+    };
+    const work = try workRows(arena_state.allocator(), &rows, &.{.{ .sid = 20, .items = &activity }});
+    try std.testing.expectEqual(@as(usize, 4), work.len);
+    try std.testing.expectEqual(@as(?usize, 0), selectedWorkIndex(work, 20, null));
+    try std.testing.expectEqual(@as(?usize, 1), selectedWorkIndex(work, 20, 0));
+    try std.testing.expectEqual(@as(?usize, 2), selectedWorkIndex(work, 20, 1));
+    try std.testing.expectEqual(@as(?usize, 3), selectedWorkIndex(work, 30, null));
+    try std.testing.expectEqual(@as(usize, 1), work[1].activity.depth);
+    try std.testing.expectEqual(@as(usize, 2), work[2].activity.depth);
+    try std.testing.expectEqualStrings("agent", work[1].activity.item.id);
+    try std.testing.expectEqualStrings("shell", work[2].activity.item.id);
+}
+
 test "top applies status updates so killed or finished task children stop reading running" {
     // Case: `x` on a running tree stopped the children in the daemon, but
     // top only listened for upserts, and untitled task children never get
@@ -104,4 +166,20 @@ test "top applies status updates so killed or finished task children stop readin
     // Unknown sids are ignored rather than inventing rows.
     view.handleLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 99, .state = .running } }));
     try std.testing.expectEqual(@as(usize, 1), view.rows.items.len);
+}
+
+test "standalone top owns global activity snapshots and clears them" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var view = top.Top{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .now_ms = 0 };
+    defer view.deinit();
+    view.handleLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{
+        .sid = 7,
+        .items = &.{.{ .id = "proc", .kind = .process, .name = "Bash", .detail = "sleep 20" }},
+    } }));
+    try std.testing.expectEqual(@as(usize, 1), view.activity(7).len);
+    try std.testing.expectEqualStrings("sleep 20", view.activity(7)[0].detail);
+    view.handleLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{ .sid = 7, .items = &.{} } }));
+    try std.testing.expectEqual(@as(usize, 0), view.activity(7).len);
 }

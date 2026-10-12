@@ -53,6 +53,20 @@ test {
     std.testing.refAllDecls(loop);
 }
 
+test "native activity classifies processes and extracts useful detail" {
+    try std.testing.expectEqual(proto.GuestActivityKind.process, loop.nativeActivityKind("bash"));
+    try std.testing.expectEqual(proto.GuestActivityKind.agent, loop.nativeActivityKind("task"));
+    try std.testing.expectEqual(proto.GuestActivityKind.agent, loop.nativeActivityKind("task_batch"));
+    try std.testing.expectEqual(proto.GuestActivityKind.tool, loop.nativeActivityKind("read_file"));
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("zig build test", loop.nativeActivityDetail(arena, "{\"command\":\"zig build test\"}"));
+    try std.testing.expectEqualStrings("src/main.zig", loop.nativeActivityDetail(arena, "{\"path\":\"src/main.zig\"}"));
+    try std.testing.expectEqualStrings("not json", loop.nativeActivityDetail(arena, "not json"));
+}
+
 const codexAccountError = codex_turn.codexAccountError;
 
 fn serveSteeringCompletions(io: Io, server: *Io.net.Server, checks: *SteeringWireChecks) void {
@@ -404,6 +418,14 @@ test "delegated claude code turn persists rate-limit transitions through its ord
         \\echo '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"streaming live prose"}}}'
         \\echo '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"checked repo"},{"type":"text","text":"scanning repo"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}'
         \\echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"file.txt"}]}}'
+        \\echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"agent-tool","name":"Agent","input":{"description":"inspect tests","run_in_background":true}}]}}'
+        \\echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"agent-task","task_type":"local_agent","description":"inspect tests"}]}'
+        \\echo '{"type":"system","subtype":"task_started","task_id":"agent-task","tool_use_id":"agent-tool","task_type":"local_agent","description":"inspect tests","is_backgrounded":true}'
+        \\echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"agent-tool","content":"agent launched"}]}}'
+        \\echo '{"type":"assistant","parent_tool_use_id":"agent-tool","message":{"content":[{"type":"tool_use","id":"child-tool","name":"Bash","input":{"command":"zig build test"}}]}}'
+        \\echo '{"type":"user","parent_tool_use_id":"agent-tool","message":{"content":[{"type":"tool_result","tool_use_id":"child-tool","content":"ok"}]}}'
+        \\echo '{"type":"system","subtype":"task_notification","task_id":"agent-task","tool_use_id":"agent-tool","status":"completed","summary":"Agent finished"}'
+        \\echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
         \\echo '{"type":"rate_limit_event","rate_limit_info":{"isUsingOverage":false}}'
         \\echo '{"type":"result","subtype":"success","result":"DELEGATE-OK","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":90}}'
         \\
@@ -425,6 +447,7 @@ test "delegated claude code turn persists rate-limit transitions through its ord
     const DeltaProbe = struct {
         text: std.ArrayList(u8) = .empty,
         reasoning: std.ArrayList(u8) = .empty,
+        saw_agent_child: bool = false,
 
         fn onText(ctx: ?*anyopaque, text: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
@@ -434,6 +457,17 @@ test "delegated claude code turn persists rate-limit transitions through its ord
         fn onReasoning(ctx: ?*anyopaque, text: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.reasoning.appendSlice(std.testing.allocator, text) catch @panic("oom");
+        }
+
+        fn onActivity(ctx: ?*anyopaque, items: []const proto.GuestActivity) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            var saw_agent = false;
+            var saw_child = false;
+            for (items) |item| {
+                if (item.kind == .agent and std.mem.eql(u8, item.id, "agent-tool")) saw_agent = true;
+                if (std.mem.eql(u8, item.id, "child-tool") and std.mem.eql(u8, item.parent_id, "agent-tool")) saw_child = true;
+            }
+            self.saw_agent_child = self.saw_agent_child or (saw_agent and saw_child);
         }
     };
     var probe = DeltaProbe{};
@@ -450,6 +484,7 @@ test "delegated claude code turn persists rate-limit transitions through its ord
         .usage_credits_live = &usage_credits,
         .on_delta = DeltaProbe.onText,
         .on_reasoning_delta = DeltaProbe.onReasoning,
+        .on_guest_activity = DeltaProbe.onActivity,
         .on_delta_ctx = &probe,
     }, "do the thing", &.{});
     defer gpa.free(result.text);
@@ -457,6 +492,7 @@ test "delegated claude code turn persists rate-limit transitions through its ord
     try std.testing.expectEqualStrings("DELEGATE-OK", result.text);
     try std.testing.expectEqualStrings("streaming live prose", probe.text.items);
     try std.testing.expectEqualStrings("checking live reasoning", probe.reasoning.items);
+    try std.testing.expect(probe.saw_agent_child);
     try std.testing.expectEqual(@as(u64, 100), result.tokens_in);
     try std.testing.expectEqual(@as(u64, 5), result.tokens_out);
 
@@ -472,6 +508,9 @@ test "delegated claude code turn persists rate-limit transitions through its ord
         "reasoning",
         "tool_call",
         "tool_result",
+        "tool_call",
+        "tool_result",
+        "system_note",
         "system_note",
         "assistant_msg",
     };
@@ -487,7 +526,9 @@ test "delegated claude code turn persists rate-limit transitions through its ord
     try std.testing.expectEqualStrings("scanning repo", loaded[3].blk.body.reasoning.text);
     try std.testing.expectEqualStrings("Bash", loaded[4].blk.body.tool_call.name);
     try std.testing.expectEqualStrings("file.txt", loaded[5].blk.body.tool_result.inline_body);
-    try std.testing.expectEqualStrings("Claude Code returned to subscription usage", loaded[6].blk.body.system_note.text);
+    try std.testing.expectEqualStrings("Agent", loaded[6].blk.body.tool_call.name);
+    try std.testing.expectEqualStrings("Agent finished", loaded[8].blk.body.system_note.text);
+    try std.testing.expectEqualStrings("Claude Code returned to subscription usage", loaded[9].blk.body.system_note.text);
     try std.testing.expect(!usage_credits.load(.acquire));
 }
 
@@ -502,12 +543,13 @@ test "delegated claude code turn consumes a steer racing finalization" {
     defer temp.deinit();
     const script =
         \\#!/bin/sh
+        \\IFS= read -r initial
         \\echo '{"type":"system","subtype":"init","session_id":"x"}'
-        \\case "$*" in
-        \\  *"guest steer"*) result=STEERED ;;
-        \\  *) result=FIRST ;;
-        \\esac
-        \\printf '{"type":"result","subtype":"success","result":"%s","usage":{"input_tokens":1,"output_tokens":1}}\n' "$result"
+        \\echo '{"type":"user","isReplay":true,"message":{"content":[{"type":"text","text":"start"}]}}'
+        \\echo '{"type":"result","subtype":"success","result":"FIRST","usage":{"input_tokens":1,"output_tokens":1}}'
+        \\IFS= read -r steer
+        \\echo '{"type":"user","isReplay":true,"message":{"content":[{"type":"text","text":"guest steer"}]}}'
+        \\echo '{"type":"result","subtype":"success","result":"STEERED","usage":{"input_tokens":1,"output_tokens":1}}'
         \\
     ;
     const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-claude" });
@@ -680,6 +722,10 @@ test "codex guest persists app-server items and resumes its durable thread" {
         \\      IFS= read -r approval
         \\      case "$approval" in *'"decision":"accept"'*) ;; *) exit 8 ;; esac
         \\      echo '{"method":"item/completed","params":{"threadId":"thread_marlin_test","turnId":"turn_test","completedAtMs":3,"item":{"id":"cmd_1","type":"commandExecution","command":"pwd","commandActions":[],"cwd":"/tmp","status":"completed","aggregatedOutput":"/tmp\\n","exitCode":0}}}'
+        \\      echo '{"method":"item/started","params":{"threadId":"thread_marlin_test","turnId":"turn_test","item":{"id":"spawn_1","type":"subAgentActivity","kind":"started","agentThreadId":"child_thread","agentPath":"/root/scout"}}}'
+        \\      echo '{"method":"item/started","params":{"threadId":"child_thread","turnId":"child_turn","item":{"id":"child_cmd","type":"commandExecution","command":"sleep 1","cwd":"/tmp","status":"inProgress"}}}'
+        \\      echo '{"method":"turn/completed","params":{"threadId":"child_thread","turn":{"id":"child_turn","rootTurnId":"turn_test","status":"completed"}}}'
+        \\      echo '{"method":"item/started","params":{"threadId":"thread_marlin_test","turnId":"turn_test","item":{"id":"child_done","type":"subAgentActivity","kind":"completed","agentThreadId":"child_thread","agentPath":"/root/scout"}}}'
         \\      echo '{"method":"item/agentMessage/delta","params":{"threadId":"thread_marlin_test","turnId":"turn_test","itemId":"msg_1","delta":"CODEX-OK"}}'
         \\      echo '{"method":"item/completed","params":{"threadId":"thread_marlin_test","turnId":"turn_test","completedAtMs":4,"item":{"id":"msg_1","type":"agentMessage","text":"CODEX-OK","phase":"final_answer"}}}'
         \\      echo '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread_marlin_test","turnId":"turn_test","tokenUsage":{"last":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":4,"reasoningOutputTokens":1,"totalTokens":16},"total":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":4,"reasoningOutputTokens":1,"totalTokens":16},"modelContextWindow":200000}}}'
@@ -702,6 +748,25 @@ test "codex guest persists app-server items and resumes its durable thread" {
     defer store.close();
     try store.createSession(1, 0, temp.path, "codex/default", .auto);
 
+    const ActivityProbe = struct {
+        saw_nested_process: bool = false,
+        saw_command_detail: bool = false,
+
+        fn publish(ctx: ?*anyopaque, items: []const proto.GuestActivity) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            var agent = false;
+            var process = false;
+            for (items) |item| {
+                if (item.kind == .agent and std.mem.eql(u8, item.id, "child_thread")) agent = true;
+                if (item.kind == .process and std.mem.eql(u8, item.parent_id, "child_thread")) {
+                    process = true;
+                    if (std.mem.indexOf(u8, item.detail, "sleep 1") != null) self.saw_command_detail = true;
+                }
+            }
+            self.saw_nested_process = self.saw_nested_process or (agent and process);
+        }
+    };
+    var activity_probe = ActivityProbe{};
     const opts = RunOpts{
         .session_id = 1,
         .cwd = temp.path,
@@ -709,10 +774,14 @@ test "codex guest persists app-server items and resumes its durable thread" {
         .cfg = config.defaults(),
         .tool_environ = &env,
         .approval_mode = .default,
+        .on_guest_activity = ActivityProbe.publish,
+        .on_delta_ctx = &activity_probe,
     };
     const first = try runTurn(gpa, io, &store, opts, "inspect", &.{});
     defer gpa.free(first.text);
     try std.testing.expectEqualStrings("CODEX-OK", first.text);
+    try std.testing.expect(activity_probe.saw_nested_process);
+    try std.testing.expect(activity_probe.saw_command_detail);
     try std.testing.expectEqual(@as(u64, 12), first.tokens_in);
     try std.testing.expectEqual(@as(u64, 4), first.tokens_out);
     const thread_id = (try store.getCodexThreadId(1)).?;

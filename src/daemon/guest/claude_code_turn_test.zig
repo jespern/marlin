@@ -82,3 +82,11 @@ test "guest tool phase remains tool until every parallel call finishes" {
     try std.testing.expectEqual(proto.TurnPhase.tool, claude_code_turn.guestToolPhase(1));
     try std.testing.expectEqual(proto.TurnPhase.tool, claude_code_turn.guestToolPhase(3));
 }
+
+test "background Claude agents remain agents, not generic processes" {
+    try std.testing.expectEqual(proto.GuestActivityKind.agent, claude_code_turn.backgroundActivityKind("local_agent"));
+    try std.testing.expectEqual(proto.GuestActivityKind.process, claude_code_turn.backgroundActivityKind("local_bash"));
+    try std.testing.expectEqual(proto.GuestActivityKind.agent, claude_code_turn.toolActivityKind("Agent"));
+    try std.testing.expectEqual(proto.GuestActivityKind.process, claude_code_turn.toolActivityKind("Bash"));
+    try std.testing.expectEqual(proto.GuestActivityKind.tool, claude_code_turn.toolActivityKind("Read"));
+}

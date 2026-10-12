@@ -167,9 +167,21 @@ const fast_transient_animation_frames: usize = transient_animation_frames * 2;
 
 const TopView = struct {
     selected_sid: ?u64 = null,
+    /// Null selects the session row; otherwise selects this position in the
+    /// session's parent-before-child live activity order.
+    selected_activity: ?usize = null,
     selected_fallback: usize = 0,
     scroll_top: usize = 0,
     confirm_kill: ?u64 = null,
+};
+
+const ActivitySnapshot = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []const proto.GuestActivity,
+
+    fn deinit(self: *ActivitySnapshot) void {
+        self.arena.deinit();
+    }
 };
 
 pub const RebuildScope = enum { none, attached, client, both };
@@ -498,6 +510,9 @@ pub const App = struct {
     /// subscribed to their block streams. Moving a view in and out of App is
     /// allocation-free after the first visit.
     saved_views: std.AutoHashMapUnmanaged(u64, *SessionView) = .empty,
+    /// Catalog-level guest work. Unlike cached transcripts, this contains
+    /// every watched session so Ctrl+S can inspect background activity.
+    guest_activities: std.AutoHashMapUnmanaged(u64, ActivitySnapshot) = .empty,
     saved_view_clock: u64 = 0,
     background_approvals: std.AutoHashMapUnmanaged(u64, PendingApproval) = .empty,
     /// Root tabs whose most recent turn completed while they were not
@@ -666,6 +681,9 @@ pub const App = struct {
             self.gpa.destroy(saved.*);
         }
         self.saved_views.deinit(self.gpa);
+        var activity_it = self.guest_activities.valueIterator();
+        while (activity_it.next()) |snapshot| snapshot.deinit();
+        self.guest_activities.deinit(self.gpa);
         self.background_approvals.deinit(self.gpa);
         self.unread_completions.deinit(self.gpa);
         self.clearCouncils();
@@ -740,7 +758,7 @@ pub const App = struct {
 
     /// Notices are transient by construction: they self-clear after a few
     /// seconds instead of squatting on the status bar until something else
-    /// overwrites them ("session → 3f2a" used to live there for hours).
+    /// overwrites them.
     pub const notice_ttl_ms: i64 = 8_000;
 
     pub fn setNotice(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -1183,8 +1201,6 @@ pub const App = struct {
             };
         }
         self.rememberSession(sid);
-        var handle_buf: session_handle.Full = undefined;
-        self.setNotice("session → {s}", .{self.displaySessionHandle(&handle_buf, sid)});
     }
 
     pub fn cycleSession(self: *App, direction: i8) void {
@@ -1630,6 +1646,46 @@ pub const App = struct {
         return if (sid == self.view.sid) &self.view else null;
     }
 
+    pub fn guestActivity(self: *const App, sid: u64) []const proto.GuestActivity {
+        return if (self.guest_activities.get(sid)) |snapshot| snapshot.items else &.{};
+    }
+
+    fn replaceCatalogGuestActivity(self: *App, sid: u64, items: []const proto.GuestActivity) !void {
+        if (items.len == 0) {
+            if (self.guest_activities.fetchRemove(sid)) |removed| {
+                var snapshot = removed.value;
+                snapshot.deinit();
+            }
+            if (self.top_view) |*top| {
+                if (top.selected_sid == sid) top.selected_activity = null;
+            }
+            return;
+        }
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const owned = try a.alloc(proto.GuestActivity, items.len);
+        for (items, owned) |item, *copy| copy.* = .{
+            .id = try a.dupe(u8, item.id),
+            .parent_id = try a.dupe(u8, item.parent_id),
+            .kind = item.kind,
+            .name = try a.dupe(u8, item.name),
+            .detail = try a.dupe(u8, item.detail),
+            .started_at_ms = item.started_at_ms,
+        };
+        const previous = try self.guest_activities.fetchPut(self.gpa, sid, .{
+            .arena = arena,
+            .items = owned,
+        });
+        if (previous) |old| {
+            var snapshot = old.value;
+            snapshot.deinit();
+        }
+        if (self.top_view) |*top| if (top.selected_sid == sid) if (top.selected_activity) |position| {
+            top.selected_activity = @min(position, owned.len - 1);
+        };
+    }
+
     pub fn handleDaemonLine(self: *App, line: []u8) void {
         defer self.gpa.free(line);
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
@@ -1748,8 +1804,9 @@ pub const App = struct {
                 view.stream_status_at_ms = nowWallMs(self.io);
             },
             .guest_activity => |activity| {
-                const view = self.liveView(activity.sid) orelse return;
-                view.replaceGuestActivity(self.gpa, activity.items) catch {};
+                self.replaceCatalogGuestActivity(activity.sid, activity.items) catch {};
+                if (self.liveView(activity.sid)) |view|
+                    view.replaceGuestActivity(self.gpa, activity.items) catch {};
             },
             .status => |s| {
                 const status_now = nowWallMs(self.io);
@@ -1958,7 +2015,10 @@ pub const App = struct {
                     view.appendRecap(self.gpa, result.seq, result.text, result.generated) catch {};
             },
             .session_upsert => |su| self.upsertSessionSummary(su.session),
-            .session_remove => |sr| self.removeSessionSummary(sr.sid),
+            .session_remove => |sr| {
+                self.replaceCatalogGuestActivity(sr.sid, &.{}) catch {};
+                self.removeSessionSummary(sr.sid);
+            },
             .interrupt_result => |result| {
                 if (self.liveView(result.sid) == null) return;
                 if (!result.active) {
@@ -3482,17 +3542,56 @@ pub const App = struct {
 
     pub fn topRows(self: *const App, arena: std.mem.Allocator) ![]const top_view.RowView {
         const rows = try arena.alloc(top_view.RowView, self.sessions.items.len);
-        for (self.sessions.items, 0..) |session, i| rows[i] = .{
-            .sid = session.sid,
-            .parent_sid = session.parent_sid,
-            .kind = session.kind,
-            .state = session.state,
-            .created_at = session.created_at,
-            .title = session.title,
-            .cwd = session.cwd,
-            .model = session.model,
-        };
+        for (self.sessions.items, 0..) |session, i| {
+            const activity = self.guestActivity(session.sid);
+            var agents: usize = 0;
+            var processes: usize = 0;
+            for (activity) |item| switch (item.kind) {
+                .agent => agents += 1,
+                .process => processes += 1,
+                .tool => {},
+            };
+            rows[i] = .{
+                .sid = session.sid,
+                .parent_sid = session.parent_sid,
+                .kind = session.kind,
+                .state = session.state,
+                .created_at = session.created_at,
+                .title = session.title,
+                .cwd = session.cwd,
+                .model = session.model,
+                .activity_count = activity.len,
+                .agent_count = agents,
+                .process_count = processes,
+            };
+        }
         return rows;
+    }
+
+    fn topActivityGroups(self: *const App, arena: std.mem.Allocator) ![]const top_view.ActivityGroup {
+        const groups = try arena.alloc(top_view.ActivityGroup, self.sessions.items.len);
+        for (self.sessions.items, 0..) |session, i| groups[i] = .{ .sid = session.sid, .items = self.guestActivity(session.sid) };
+        return groups;
+    }
+
+    fn topWorkRows(self: *const App, arena: std.mem.Allocator) ![]const top_view.WorkRow {
+        return top_view.workRows(arena, try self.topRows(arena), try self.topActivityGroups(arena));
+    }
+
+    fn selectTopWorkRow(self: *App, row: top_view.WorkRow, fallback: usize) void {
+        const view = if (self.top_view) |*top| top else return;
+        view.selected_fallback = fallback;
+        switch (row) {
+            .session => |session| {
+                view.selected_sid = session.sid;
+                view.selected_activity = null;
+            },
+            .activity => |activity| {
+                view.selected_sid = activity.sid;
+                view.selected_activity = activity.position;
+            },
+        }
+        view.confirm_kill = null;
     }
 
     pub fn topSelectedIndex(self: *const App) ?usize {
@@ -3508,9 +3607,11 @@ pub const App = struct {
         if (self.top_view == null) return null;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
-        const rows = self.topRows(arena_state.allocator()) catch return null;
-        const ordered = top_view.orderedRows(arena_state.allocator(), rows) catch return null;
-        for (ordered, 0..) |row, i| if (row.sid == sid) return i;
+        const rows = self.topWorkRows(arena_state.allocator()) catch return null;
+        for (rows, 0..) |row, i| switch (row) {
+            .session => |session| if (session.sid == sid) return i,
+            .activity => {},
+        };
         return null;
     }
 
@@ -3518,55 +3619,42 @@ pub const App = struct {
         if (self.top_view == null) return;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
-        const rows = self.topRows(arena_state.allocator()) catch return;
-        const ordered = top_view.orderedRows(arena_state.allocator(), rows) catch return;
-        if (ordered.len == 0) {
+        const rows = self.topWorkRows(arena_state.allocator()) catch return;
+        if (rows.len == 0) {
             self.top_view.?.selected_sid = null;
+            self.top_view.?.selected_activity = null;
             return;
         }
-        if (self.top_view.?.selected_sid) |sid| for (ordered, 0..) |row, i| {
-            if (row.sid == sid) {
-                self.top_view.?.selected_fallback = i;
-                return;
-            }
-        };
-        const i = @min(self.top_view.?.selected_fallback, ordered.len - 1);
-        self.top_view.?.selected_sid = ordered[i].sid;
+        if (top_view.selectedWorkIndex(rows, self.top_view.?.selected_sid, self.top_view.?.selected_activity)) |i| {
+            self.top_view.?.selected_fallback = i;
+            return;
+        }
+        const i = @min(self.top_view.?.selected_fallback, rows.len - 1);
+        self.selectTopWorkRow(rows[i], i);
     }
 
     pub fn moveTopSelection(self: *App, delta: isize) void {
         if (self.top_view == null) return;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
-        const rows = self.topRows(arena_state.allocator()) catch return;
-        const ordered = top_view.orderedRows(arena_state.allocator(), rows) catch return;
-        if (ordered.len == 0) return;
-        var current = @min(self.top_view.?.selected_fallback, ordered.len - 1);
-        if (self.top_view.?.selected_sid) |sid| for (ordered, 0..) |row, i| {
-            if (row.sid == sid) {
-                current = i;
-                break;
-            }
-        };
+        const rows = self.topWorkRows(arena_state.allocator()) catch return;
+        if (rows.len == 0) return;
+        const current = top_view.selectedWorkIndex(rows, self.top_view.?.selected_sid, self.top_view.?.selected_activity) orelse @min(self.top_view.?.selected_fallback, rows.len - 1);
         const next: usize = if (delta < 0)
             current -| @as(usize, @intCast(-delta))
         else
-            @min(current + @as(usize, @intCast(delta)), ordered.len - 1);
-        self.top_view.?.selected_fallback = next;
-        self.top_view.?.selected_sid = ordered[next].sid;
-        self.top_view.?.confirm_kill = null;
+            @min(current + @as(usize, @intCast(delta)), rows.len - 1);
+        self.selectTopWorkRow(rows[next], next);
     }
 
     pub fn setTopEdgeSelection(self: *App, last: bool) void {
         if (self.top_view == null) return;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
-        const rows = self.topRows(arena_state.allocator()) catch return;
-        const ordered = top_view.orderedRows(arena_state.allocator(), rows) catch return;
-        if (ordered.len == 0) return;
-        const i = if (last) ordered.len - 1 else 0;
-        self.top_view.?.selected_fallback = i;
-        self.top_view.?.selected_sid = ordered[i].sid;
+        const rows = self.topWorkRows(arena_state.allocator()) catch return;
+        if (rows.len == 0) return;
+        const i = if (last) rows.len - 1 else 0;
+        self.selectTopWorkRow(rows[i], i);
     }
 
     pub fn archiveTopSession(self: *App, sid: u64) void {
@@ -4957,7 +5045,7 @@ pub const shortcut_help_rows = [_]ShortcutHelpRow{
     .{ .key = "Ctrl+R (insert)", .description = "fuzzy-search authored input history" },
     .{ .key = "Enter while working", .description = "steer the active turn" },
     .{ .key = "Ctrl+N", .description = "create a new session" },
-    .{ .key = "Ctrl+S", .description = "open the live session overview" },
+    .{ .key = "Ctrl+S", .description = "open the live session and process tree" },
     .{ .key = "Ctrl+W (empty)", .description = "archive the current session" },
     .{ .key = "␣text", .description = "leading space sends a /… or !… message verbatim" },
     .{ .key = "Ctrl+L", .description = "redraw and return to bottom" },
@@ -5411,13 +5499,16 @@ fn drawPlan(
 
 fn drawTop(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
     const rows = try top_view.orderedRows(arena, try app.topRows(arena));
+    const groups = try app.topActivityGroups(arena);
     var scroll_top: usize = if (app.top_view) |view| view.scroll_top else 0;
     try top_view.drawCatalog(
         win,
         arena,
         rows,
+        groups,
         app.known_session_ids.items,
         if (app.top_view) |view| view.selected_sid else null,
+        if (app.top_view) |view| view.selected_activity else null,
         &scroll_top,
         nowWallMs(app.io),
         false,
@@ -5794,8 +5885,6 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     else
         Palette.status_context;
     const cwd_txt = try statusCwd(arena, app.view.cwd.items, app.home.items);
-    var session_handle_buf: session_handle.Full = undefined;
-    const session_txt = try std.fmt.allocPrint(arena, "{s}", .{app.displaySessionHandle(&session_handle_buf, app.view.sid)});
     const scroll_txt = if (app.view.history_has_newer)
         if (app.view.scroll_up > 0)
             try std.fmt.allocPrint(arena, "↕ {d} (G: latest)", .{app.view.scroll_up})
@@ -5818,10 +5907,9 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             else => {},
         }
     }
-    const child_txt: []const u8 = if (focused_parent_sid) |parent_sid| child: {
-        var parent_handle_buf: session_handle.Full = undefined;
-        break :child try std.fmt.allocPrint(arena, "child of {s}", .{app.displaySessionHandle(&parent_handle_buf, parent_sid)});
-    } else if (child_count > 0)
+    const child_txt: []const u8 = if (focused_parent_sid != null)
+        "child session"
+    else if (child_count > 0)
         if (child_approvals > 0)
             try std.fmt.allocPrint(arena, "{d} child{s} · {d} approval{s}", .{
                 child_count,
@@ -5857,6 +5945,26 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         Palette.status_running
     else
         Palette.status_child;
+    var work_agents: usize = 0;
+    var work_processes: usize = 0;
+    for (app.view.guest_activity) |item| switch (item.kind) {
+        .agent => work_agents += 1,
+        .process => work_processes += 1,
+        .tool => {},
+    };
+    const work_txt: []const u8 = if (work_agents > 0 and work_processes > 0)
+        try std.fmt.allocPrint(arena, "{d} agent{s} · {d} proc{s} · Ctrl+S →", .{
+            work_agents,
+            if (work_agents == 1) "" else "s",
+            work_processes,
+            if (work_processes == 1) "" else "s",
+        })
+    else if (work_agents > 0)
+        try std.fmt.allocPrint(arena, "{d} agent{s} · Ctrl+S →", .{ work_agents, if (work_agents == 1) "" else "s" })
+    else if (work_processes > 0)
+        try std.fmt.allocPrint(arena, "{d} proc{s} · Ctrl+S →", .{ work_processes, if (work_processes == 1) "" else "s" })
+    else
+        "";
     var background_running: usize = 0;
     var background_approvals: usize = 0;
     for (app.sessions.items) |session| {
@@ -5881,9 +5989,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     else
         "";
 
-    // Stable public session handle, shared with `marlin ls` and accepted by
-    // attach/archive/kill/compact as any unique prefix of four or more chars.
-    var status_segments: [33]vaxis.Segment = undefined;
+    var status_segments: [39]vaxis.Segment = undefined;
     var status_n: usize = 0;
     status_segments[status_n] = .{ .text = " ", .style = Palette.status_bar };
     status_n += 1;
@@ -5936,14 +6042,16 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         status_segments[status_n] = .{ .text = scroll_txt, .style = Palette.status_bar };
         status_n += 1;
     }
-    status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
-    status_n += 1;
-    status_segments[status_n] = .{ .text = session_txt, .style = Palette.status_sep };
-    status_n += 1;
     if (child_txt.len > 0) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
         status_segments[status_n] = .{ .text = child_txt, .style = child_style };
+        status_n += 1;
+    }
+    if (work_txt.len > 0) {
+        status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+        status_n += 1;
+        status_segments[status_n] = .{ .text = work_txt, .style = Palette.status_running };
         status_n += 1;
     }
     if (background_txt.len > 0) {
@@ -5964,18 +6072,11 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     _ = status_win.print(status_segments[0..status_n], .{ .wrap = .none });
 
     // Far-right indicators: shell sandbox state and DNS blocklist filtering.
-    // Drawn after the left segments so they win on narrow terminals.
-    // Guest sessions cannot use Marlin's sandbox or dnsblock — show the
-    // slots muted so they read as unavailable, not toggled off.
+    // Their colors carry state; keeping them to one glyph apiece leaves room
+    // for the session-specific status. Guest sessions cannot use either, so
+    // both glyphs are muted rather than reading as toggled off.
     const sandboxed_now = app.currentSandboxed();
-    const sandbox_txt: []const u8 = if (guest)
-        "⛨ sandbox n/a"
-    else if (sandboxed_now)
-        "⛨ sandboxed"
-    else if (app.conn.sandbox_available)
-        "⛨ sandbox off"
-    else
-        "⛨ no sandbox";
+    const sandbox_txt = "⛨";
     const sandbox_style = if (guest)
         Palette.status_muted
     else if (sandboxed_now)
@@ -5984,21 +6085,10 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         Palette.status_context_warn
     else
         Palette.status_sep;
-    // The shield is 3 UTF-8 bytes but renders as one cell; every variant
-    // above carries exactly one, so columns = bytes - 2.
-    const sandbox_cols: u16 = @intCast(sandbox_txt.len - "⛨".len + 1);
+    const sandbox_cols: u16 = @intCast(displayWidth(sandbox_txt));
     const dns_available = app.conn.network_filtering;
     const dns_on = app.currentNetworkFiltering();
-    const dns_txt: []const u8 = if (guest)
-        "dnsblock n/a"
-    else if (dns_on)
-        "dnsblock on"
-    else if (dns_available)
-        "dnsblock off"
-    else if (app.conn.network_configured)
-        "dnsblock err"
-    else
-        "dnsblock off";
+    const dns_txt = "⊘";
     const dns_style = if (guest)
         Palette.status_muted
     else if (dns_on)
@@ -6007,6 +6097,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         Palette.status_context_warn
     else
         Palette.status_sep;
+    const dns_cols: u16 = @intCast(displayWidth(dns_txt));
     const mode_txt: []const u8 = if (app.view.plan_mode) "PLAN" else if (app.view.permissions_full) "FULL ACCESS" else "";
     // Voice dictation state. Invisible until /voice setup enables it —
     // dormant means dormant — then a quiet armed hint that turns loud
@@ -6041,7 +6132,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // one telemetry state worth a louder color. Absent when off.
     const otel_on = app.conn.otel_enabled;
     const otel_style = if (app.conn.otel_content) Palette.status_approval else Palette.status_running;
-    var right_w: u16 = sandbox_cols + 1 + @as(u16, @intCast(dns_txt.len)) + 3;
+    var right_w: u16 = sandbox_cols + 1 + dns_cols + 3;
     if (mode_txt.len > 0) right_w += @intCast(mode_txt.len + 3);
     if (voice_txt.len > 0) right_w += voice_cols + 3;
     if (otel_on) right_w += 1 + 3;

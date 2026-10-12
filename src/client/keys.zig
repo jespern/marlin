@@ -182,9 +182,13 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
             app.moveTopSelection(-10);
         } else if (key.matches('a', .{})) {
-            if (app.topSelectedIndex()) |i| app.archiveTopSession(app.sessions.items[i].sid);
+            if (app.top_view.?.selected_activity == null) {
+                if (app.topSelectedIndex()) |i| app.archiveTopSession(app.sessions.items[i].sid);
+            } else app.setNotice("select a session to archive", .{});
         } else if (key.matches('x', .{}) or key.matches('K', .{ .shift = true })) {
-            if (app.topSelectedIndex()) |i| app.top_view.?.confirm_kill = app.sessions.items[i].sid;
+            if (app.top_view.?.selected_activity == null) {
+                if (app.topSelectedIndex()) |i| app.top_view.?.confirm_kill = app.sessions.items[i].sid;
+            } else app.setNotice("select a session to kill", .{});
         } else if (isEnterKey(key)) {
             if (app.topSelectedIndex()) |i| {
                 const sid = app.sessions.items[i].sid;

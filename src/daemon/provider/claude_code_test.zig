@@ -37,25 +37,26 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
 
     const fresh = try buildArgv(arena, .{
         .binary = "claude",
-        .prompt = "hi",
         .model = "fable-5",
         .session_uuid = "u-u-i-d",
         .fresh = true,
         .permissions = .accept_edits,
         .max_turns = 32,
     });
-    try std.testing.expectEqualStrings("--include-partial-messages", fresh[6]);
-    try std.testing.expectEqualStrings("--forward-subagent-text", fresh[7]);
-    try std.testing.expectEqualStrings("--model", fresh[8]);
-    try std.testing.expectEqualStrings("fable-5", fresh[9]);
-    try std.testing.expectEqualStrings("--session-id", fresh[10]);
-    try std.testing.expectEqualStrings("--permission-mode", fresh[12]);
-    try std.testing.expectEqualStrings("acceptEdits", fresh[13]);
+    try std.testing.expectEqualStrings("--input-format", fresh[2]);
+    try std.testing.expectEqualStrings("stream-json", fresh[3]);
+    try std.testing.expectEqualStrings("--replay-user-messages", fresh[6]);
+    try std.testing.expectEqualStrings("--include-partial-messages", fresh[8]);
+    try std.testing.expectEqualStrings("--forward-subagent-text", fresh[9]);
+    try std.testing.expectEqualStrings("--model", fresh[10]);
+    try std.testing.expectEqualStrings("fable-5", fresh[11]);
+    try std.testing.expectEqualStrings("--session-id", fresh[12]);
+    try std.testing.expectEqualStrings("--permission-mode", fresh[14]);
+    try std.testing.expectEqualStrings("acceptEdits", fresh[15]);
     for (fresh) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--effort"));
 
     const root = try buildArgv(arena, .{
         .binary = "claude",
-        .prompt = "long autonomous task",
         .model = "fable-5",
         .session_uuid = "u-u-i-d",
         .fresh = true,
@@ -65,7 +66,6 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
 
     const high = try buildArgv(arena, .{
         .binary = "claude",
-        .prompt = "hi",
         .model = "fable-5",
         .session_uuid = "u-u-i-d",
         .fresh = true,
@@ -81,7 +81,6 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
 
     const resumed = try buildArgv(arena, .{
         .binary = "claude",
-        .prompt = "hi",
         .model = "default",
         .session_uuid = "u-u-i-d",
         .fresh = false,
@@ -90,27 +89,25 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     });
     // "default" model omits --model entirely.
     for (resumed) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--model"));
-    try std.testing.expectEqualStrings("--include-partial-messages", resumed[6]);
-    try std.testing.expectEqualStrings("--forward-subagent-text", resumed[7]);
-    try std.testing.expectEqualStrings("--resume", resumed[8]);
-    try std.testing.expectEqualStrings("--dangerously-skip-permissions", resumed[10]);
+    try std.testing.expectEqualStrings("--include-partial-messages", resumed[8]);
+    try std.testing.expectEqualStrings("--forward-subagent-text", resumed[9]);
+    try std.testing.expectEqualStrings("--resume", resumed[10]);
+    try std.testing.expectEqualStrings("--dangerously-skip-permissions", resumed[12]);
 
     const planned = try buildArgv(arena, .{
         .binary = "claude",
-        .prompt = "design it",
         .model = "default",
         .session_uuid = "u-u-i-d",
         .fresh = false,
         .permissions = .plan,
         .max_turns = 8,
     });
-    try std.testing.expectEqualStrings("--permission-mode", planned[10]);
-    try std.testing.expectEqualStrings("plan", planned[11]);
+    try std.testing.expectEqualStrings("--permission-mode", planned[12]);
+    try std.testing.expectEqualStrings("plan", planned[13]);
     for (planned) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--dangerously-skip-permissions"));
 
     const bridged = try buildArgv(arena, .{
         .binary = "claude",
-        .prompt = "hi",
         .model = "default",
         .session_uuid = "u-u-i-d",
         .fresh = true,
@@ -119,21 +116,20 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
         .max_turns = 8,
     });
     // The MCP server (approve + ask_user) leads, then permission routing.
-    try std.testing.expectEqualStrings("--mcp-config", bridged[10]);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[11], "\"command\":\"/opt/marlin\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[11], "\"--sid\",\"42\"") != null);
-    try std.testing.expectEqualStrings("--append-system-prompt", bridged[12]);
-    try std.testing.expect(std.mem.indexOf(u8, bridged[13], "mcp__marlin__ask_user") != null);
-    try std.testing.expectEqualStrings("--permission-mode", bridged[14]);
-    try std.testing.expectEqualStrings("default", bridged[15]);
-    try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[16]);
-    try std.testing.expectEqualStrings("mcp__marlin__approve", bridged[17]);
+    try std.testing.expectEqualStrings("--mcp-config", bridged[12]);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"command\":\"/opt/marlin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"--sid\",\"42\"") != null);
+    try std.testing.expectEqualStrings("--append-system-prompt", bridged[14]);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[15], "mcp__marlin__ask_user") != null);
+    try std.testing.expectEqualStrings("--permission-mode", bridged[16]);
+    try std.testing.expectEqualStrings("default", bridged[17]);
+    try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[18]);
+    try std.testing.expectEqualStrings("mcp__marlin__approve", bridged[19]);
 
     // Bridge wiring never overrides an explicit bypass: no prompt routing,
     // but the MCP server (and its ask_user picker) still rides along.
     const yolo = try buildArgv(arena, .{
         .binary = "claude",
-        .prompt = "hi",
         .model = "default",
         .session_uuid = "u-u-i-d",
         .fresh = true,
@@ -350,11 +346,46 @@ test "decode: background task lifecycle (captured from claude -p 2.1.x)" {
         \\{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"u","session_id":"s"}
     , &events);
 
-    try std.testing.expectEqual(@as(usize, 3), events.items.len); // task_started is not surfaced
+    try std.testing.expectEqual(@as(usize, 4), events.items.len);
     try std.testing.expectEqual(@as(usize, 1), events.items[0].background_tasks.len);
     try std.testing.expectEqualStrings("b0y87bkk9", events.items[0].background_tasks[0].task_id);
     try std.testing.expectEqualStrings("Sleep 8 seconds then echo done-bg", events.items[0].background_tasks[0].description);
-    try std.testing.expectEqualStrings("b0y87bkk9", events.items[1].task_notification.task_id);
-    try std.testing.expectEqualStrings("Background command \"Sleep 8 seconds then echo done-bg\" completed (exit code 0)", events.items[1].task_notification.summary);
-    try std.testing.expectEqual(@as(usize, 0), events.items[2].background_tasks.len);
+    try std.testing.expect(events.items[1].task_started.is_backgrounded);
+    try std.testing.expectEqualStrings("local_bash", events.items[1].task_started.task_type);
+    try std.testing.expectEqualStrings("b0y87bkk9", events.items[2].task_notification.task_id);
+    try std.testing.expectEqualStrings("Background command \"Sleep 8 seconds then echo done-bg\" completed (exit code 0)", events.items[2].task_notification.summary);
+    try std.testing.expectEqual(@as(usize, 0), events.items[3].background_tasks.len);
+}
+
+test "decode: background agent links task and tool-use ids" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"agent-task","run_id":"run","task_type":"local_agent","subagent_type":"general-purpose","description":"Inspect tests"}]}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"task_started","task_id":"agent-task","tool_use_id":"toolu_agent","description":"Inspect tests","is_backgrounded":true,"task_type":"local_agent"}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"task_notification","task_id":"agent-task","tool_use_id":"toolu_agent","status":"completed","summary":"Agent finished"}
+    , &events);
+
+    try std.testing.expectEqual(@as(usize, 3), events.items.len);
+    try std.testing.expectEqualStrings("local_agent", events.items[0].background_tasks[0].task_type);
+    try std.testing.expectEqualStrings("toolu_agent", events.items[1].task_started.tool_use_id);
+    try std.testing.expectEqualStrings("toolu_agent", events.items[2].task_notification.tool_use_id);
+}
+
+test "decode: stream-json stdin replay is surfaced as user input" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var events: std.ArrayList(Event) = .empty;
+    try decodeLine(arena_state.allocator(),
+        \\{"type":"user","message":{"role":"user","content":[{"type":"text","text":"change direction"}]},"parent_tool_use_id":null,"isReplay":true}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("change direction", events.items[0].replayed_user);
 }

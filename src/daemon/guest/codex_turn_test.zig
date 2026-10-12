@@ -27,6 +27,20 @@ test {
     std.testing.refAllDecls(codex_turn);
 }
 
+test "child turn completion is not the root turn boundary" {
+    var child = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"threadId":"child-thread","turn":{"rootTurnId":"root-turn","status":"completed"}}
+    , .{});
+    defer child.deinit();
+    try std.testing.expect(!codex_turn.isPrimaryCodexThread(child.value, "root-thread"));
+
+    var root = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"threadId":"root-thread","turn":{"status":"completed"}}
+    , .{});
+    defer root.deinit();
+    try std.testing.expect(codex_turn.isPrimaryCodexThread(root.value, "root-thread"));
+}
+
 test "codex permission modes reach new and resumed threads" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const loop = @import("../loop.zig");

@@ -1,4 +1,4 @@
-//! Live top(1)-style session catalog, shared with the attached TUI overlay.
+//! Live session/agent/process work tree shared by `marlin top` and Ctrl+S.
 
 const std = @import("std");
 const Io = std.Io;
@@ -26,6 +26,9 @@ pub const RowView = struct {
     title: []const u8,
     cwd: []const u8,
     model: []const u8,
+    activity_count: usize = 0,
+    agent_count: usize = 0,
+    process_count: usize = 0,
 };
 
 pub const Columns = struct {
@@ -205,6 +208,233 @@ pub fn orderedRows(arena: std.mem.Allocator, rows: []const RowView) ![]const Row
     return result;
 }
 
+fn activityIndex(items: []const proto.GuestActivity, id: []const u8) ?usize {
+    for (items, 0..) |item, i| if (std.mem.eql(u8, item.id, id)) return i;
+    return null;
+}
+
+fn appendActivityTree(
+    arena: std.mem.Allocator,
+    items: []const proto.GuestActivity,
+    parent_id: []const u8,
+    emitted: []bool,
+    out: *std.ArrayList(usize),
+) !void {
+    for (items, 0..) |item, i| {
+        if (emitted[i] or !std.mem.eql(u8, item.parent_id, parent_id)) continue;
+        emitted[i] = true;
+        try out.append(arena, i);
+        try appendActivityTree(arena, items, item.id, emitted, out);
+    }
+}
+
+/// Stable parent-before-child order for provider-owned work ids. Orphans and
+/// malformed cycles remain visible at the end instead of disappearing.
+pub fn orderedActivityIndices(arena: std.mem.Allocator, items: []const proto.GuestActivity) ![]const usize {
+    const emitted = try arena.alloc(bool, items.len);
+    @memset(emitted, false);
+    var out: std.ArrayList(usize) = .empty;
+    for (items, 0..) |item, i| {
+        if (item.parent_id.len > 0 and activityIndex(items, item.parent_id) != null) continue;
+        emitted[i] = true;
+        try out.append(arena, i);
+        try appendActivityTree(arena, items, item.id, emitted, &out);
+    }
+    for (items, 0..) |_, i| if (!emitted[i]) try out.append(arena, i);
+    return out.toOwnedSlice(arena);
+}
+
+pub fn activityDepth(items: []const proto.GuestActivity, item: proto.GuestActivity) usize {
+    var depth: usize = 0;
+    var parent = item.parent_id;
+    while (parent.len > 0 and depth < items.len) : (depth += 1) {
+        const i = activityIndex(items, parent) orelse break;
+        parent = items[i].parent_id;
+    }
+    return depth;
+}
+
+pub const ActivityGroup = struct {
+    sid: u64,
+    items: []const proto.GuestActivity,
+};
+
+pub const ActivityRow = struct {
+    sid: u64,
+    item: proto.GuestActivity,
+    depth: usize,
+    /// Position in this session's parent-before-child activity order.
+    position: usize,
+};
+
+pub const WorkRow = union(enum) {
+    session: RowView,
+    activity: ActivityRow,
+
+    pub fn sid(self: WorkRow) u64 {
+        return switch (self) {
+            .session => |row| row.sid,
+            .activity => |row| row.sid,
+        };
+    }
+};
+
+fn activityFor(groups: []const ActivityGroup, sid: u64) []const proto.GuestActivity {
+    for (groups) |group| if (group.sid == sid) return group.items;
+    return &.{};
+}
+
+/// One flattened operational tree: durable sessions are roots/branches and
+/// provider-owned agents, tools, and processes appear directly beneath the
+/// session that owns them. This is the shared model for Ctrl+S and `marlin top`.
+pub fn workRows(arena: std.mem.Allocator, rows: []const RowView, groups: []const ActivityGroup) ![]const WorkRow {
+    const sessions = try orderedRows(arena, rows);
+    var result: std.ArrayList(WorkRow) = .empty;
+    for (sessions) |row| {
+        var display = row;
+        display.depth = rowDepth(sessions, row);
+        try result.append(arena, .{ .session = display });
+        const items = activityFor(groups, row.sid);
+        const order = try orderedActivityIndices(arena, items);
+        for (order, 0..) |source, position| try result.append(arena, .{ .activity = .{
+            .sid = row.sid,
+            .item = items[source],
+            .depth = display.depth + 1 + activityDepth(items, items[source]),
+            .position = position,
+        } });
+    }
+    return result.toOwnedSlice(arena);
+}
+
+pub fn selectedWorkIndex(rows: []const WorkRow, sid: ?u64, activity_position: ?usize) ?usize {
+    const selected_sid = sid orelse return null;
+    for (rows, 0..) |row, i| switch (row) {
+        .session => |session| if (session.sid == selected_sid and activity_position == null) return i,
+        .activity => |activity| if (activity_position) |position| {
+            if (activity.sid == selected_sid and activity.position == position) return i;
+        },
+    };
+    return null;
+}
+
+fn activityIcon(kind: proto.GuestActivityKind) []const u8 {
+    return switch (kind) {
+        .agent => "◆",
+        .tool => "◇",
+        .process => "▸",
+    };
+}
+
+fn activityKindLabel(kind: proto.GuestActivityKind) []const u8 {
+    return switch (kind) {
+        .agent => "agent",
+        .tool => "tool",
+        .process => "process",
+    };
+}
+
+pub fn drawActivityInspector(
+    win: vaxis.Window,
+    arena: std.mem.Allocator,
+    handle: []const u8,
+    model: []const u8,
+    items: []const proto.GuestActivity,
+    selected: *usize,
+    scroll_top: *usize,
+    now_ms: i64,
+) !void {
+    win.clear();
+    if (win.width < 20 or win.height < 6) return;
+    const order = try orderedActivityIndices(arena, items);
+    if (order.len == 0) {
+        _ = win.printSegment(.{ .text = " process tree — work finished", .style = .{ .fg = Palette.soft_blue, .bold = true } }, .{ .wrap = .none });
+        _ = win.printSegment(.{ .text = " no live child work remains · ←/Esc back", .style = .{ .fg = .{ .index = 8 }, .dim = true } }, .{ .row_offset = 2, .wrap = .none });
+        selected.* = 0;
+        scroll_top.* = 0;
+        return;
+    }
+    selected.* = @min(selected.*, order.len - 1);
+    var agent_count: usize = 0;
+    var process_count: usize = 0;
+    for (items) |item| switch (item.kind) {
+        .agent => agent_count += 1,
+        .process => process_count += 1,
+        .tool => {},
+    };
+    const header = try std.fmt.allocPrint(arena, " process tree — {s} · {s} · {d} live · {d} agent{s} · {d} proc{s}", .{
+        handle,
+        modelName(model),
+        items.len,
+        agent_count,
+        if (agent_count == 1) "" else "s",
+        process_count,
+        if (process_count == 1) "" else "s",
+    });
+    _ = win.printSegment(.{ .text = header, .style = .{ .fg = Palette.soft_blue, .bold = true } }, .{ .wrap = .none });
+    _ = win.printSegment(.{ .text = " STATE     AGE   KIND      WORK", .style = .{ .fg = .{ .index = 8 }, .bold = true } }, .{ .row_offset = 2, .wrap = .none });
+
+    const detail_rows: usize = @min(6, @max(1, win.height / 4));
+    const body_height: usize = win.height -| (4 + detail_rows);
+    if (selected.* < scroll_top.*) scroll_top.* = selected.*;
+    if (selected.* >= scroll_top.* + body_height) scroll_top.* = selected.* - body_height + 1;
+    scroll_top.* = @min(scroll_top.*, order.len -| body_height);
+    const end = @min(order.len, scroll_top.* + body_height);
+    for (order[scroll_top.*..end], 0..) |source, offset| {
+        const item = items[source];
+        const is_selected = scroll_top.* + offset == selected.*;
+        const base = rowStyle(is_selected, false);
+        const row_win = win.child(.{ .y_off = @intCast(offset + 3), .height = 1, .width = win.width });
+        row_win.fill(.{ .style = base });
+        var age_buf: [32]u8 = undefined;
+        const age = formatAge(&age_buf, item.started_at_ms, now_ms);
+        const indent = try render.spaces(arena, activityDepth(items, item) * 2);
+        const prefix = try std.fmt.allocPrint(arena, "{s}{s} {s}", .{ indent, activityIcon(item.kind), item.name });
+        const display_detail = if (item.kind == .process) render.shellDisplayCommand(item.detail) else item.detail;
+        const detail = if (display_detail.len > 0) try std.fmt.allocPrint(arena, " · {s}", .{display_detail}) else "";
+        const line = try std.fmt.allocPrint(arena, " active    {s: >4}  {s: <8}  {s}{s}", .{
+            age,
+            activityKindLabel(item.kind),
+            prefix,
+            detail,
+        });
+        _ = row_win.printSegment(.{ .text = truncateRight(line, win.width -| 1), .style = base }, .{ .col_offset = 1, .wrap = .none });
+        if (item.kind == .process and display_detail.len > 0) {
+            const syntax_line = try std.fmt.allocPrint(arena, " {s}", .{line});
+            render.applyLineSyntax(row_win, 0, .{
+                .text = syntax_line,
+                .style = base,
+                .syntax = try render.shellCommandSpans(arena, display_detail, syntax_line.len - display_detail.len),
+            });
+        }
+    }
+
+    const chosen = items[order[selected.*]];
+    const detail_top = win.height - detail_rows - 1;
+    const detail_win = win.child(.{ .y_off = @intCast(detail_top), .height = @intCast(detail_rows), .width = win.width });
+    detail_win.fill(.{ .style = Palette.prompt_panel });
+    const identity = try std.fmt.allocPrint(arena, " {s} {s}  id {s}", .{ activityIcon(chosen.kind), activityKindLabel(chosen.kind), chosen.id });
+    _ = detail_win.printSegment(.{ .text = truncateRight(identity, win.width -| 1), .style = .{ .fg = Palette.soft_blue, .bold = true } }, .{ .wrap = .none });
+    if (detail_rows > 1 and chosen.parent_id.len > 0) {
+        const parent = try std.fmt.allocPrint(arena, " parent {s}", .{chosen.parent_id});
+        _ = detail_win.printSegment(.{ .text = truncateRight(parent, win.width -| 1), .style = Palette.command_description }, .{ .row_offset = 1, .wrap = .none });
+    }
+    if (detail_rows > 2 and chosen.detail.len > 0) {
+        const display_detail = if (chosen.kind == .process) render.shellDisplayCommand(chosen.detail) else chosen.detail;
+        _ = detail_win.printSegment(.{ .text = " command / task", .style = .{ .fg = .{ .index = 8 }, .bold = true } }, .{ .row_offset = 2, .wrap = .none });
+        if (detail_rows > 3) {
+            _ = detail_win.printSegment(.{ .text = display_detail, .style = Palette.command_description }, .{ .row_offset = 3, .col_offset = 1, .wrap = .word });
+            if (chosen.kind == .process) render.applyLineSyntax(detail_win, 3, .{
+                .text = try std.fmt.allocPrint(arena, " {s}", .{display_detail}),
+                .style = Palette.command_description,
+                .syntax = try render.shellCommandSpans(arena, display_detail, 1),
+            });
+        }
+    }
+    const footer_win = win.child(.{ .y_off = win.height - 1, .height = 1, .width = win.width });
+    footer_win.fill(.{ .style = Palette.command_menu });
+    _ = footer_win.printSegment(.{ .text = " j/k move · ←/Esc back · Ctrl+S close", .style = Palette.command_description }, .{ .wrap = .none });
+}
+
 pub fn rowSegments(
     arena: std.mem.Allocator,
     row: RowView,
@@ -220,13 +450,29 @@ pub fn rowSegments(
     const base = rowStyle(selected, row.archived);
     const state_style = stateStyle(row.state, selected, row.archived);
     const title = if (row.title.len > 0) row.title else "(untitled)";
+    const activity_badge: []const u8 = if (row.activity_count == 0)
+        ""
+    else if (row.agent_count > 0 and row.process_count > 0)
+        try std.fmt.allocPrint(arena, " · {d} agent{s}, {d} proc{s}", .{
+            row.agent_count,
+            if (row.agent_count == 1) "" else "s",
+            row.process_count,
+            if (row.process_count == 1) "" else "s",
+        })
+    else if (row.agent_count > 0)
+        try std.fmt.allocPrint(arena, " · {d} agent{s}", .{ row.agent_count, if (row.agent_count == 1) "" else "s" })
+    else if (row.process_count > 0)
+        try std.fmt.allocPrint(arena, " · {d} proc{s}", .{ row.process_count, if (row.process_count == 1) "" else "s" })
+    else
+        try std.fmt.allocPrint(arena, " · {d} tool{s}", .{ row.activity_count, if (row.activity_count == 1) "" else "s" });
     const indent = try render.spaces(arena, row.depth * 2);
     const title_prefix = if (row.parent_sid != null)
         try std.fmt.allocPrint(arena, "{s}↳ ", .{indent})
     else
         "";
     const title_room = columns.title -| render.displayWidth(title_prefix);
-    const short_title = truncateRight(title, title_room);
+    const decorated_title = try std.fmt.allocPrint(arena, "{s}{s}", .{ title, activity_badge });
+    const short_title = truncateRight(decorated_title, title_room);
 
     var out = try arena.alloc(vaxis.Segment, 11);
     var n: usize = 0;
@@ -257,6 +503,71 @@ pub fn rowSegments(
     out[n] = .{ .text = try std.fmt.allocPrint(arena, "{s}{s}", .{ title_prefix, short_title }), .style = base };
     n += 1;
     return out[0..n];
+}
+
+fn activitySegments(
+    arena: std.mem.Allocator,
+    row: ActivityRow,
+    columns: Columns,
+    now_ms: i64,
+    selected: bool,
+) ![]const vaxis.Segment {
+    const base = rowStyle(selected, false);
+    var age_buf: [32]u8 = undefined;
+    const age = formatAge(&age_buf, row.item.started_at_ms, now_ms);
+    const display_detail = if (row.item.kind == .process) render.shellDisplayCommand(row.item.detail) else row.item.detail;
+    const indent = try render.spaces(arena, row.depth * 2);
+    const detail = if (display_detail.len > 0) try std.fmt.allocPrint(arena, " · {s}", .{display_detail}) else "";
+    const title = try std.fmt.allocPrint(arena, "{s}{s} {s}{s}", .{ indent, activityIcon(row.item.kind), row.item.name, detail });
+
+    var out = try arena.alloc(vaxis.Segment, 11);
+    var n: usize = 0;
+    out[n] = .{ .text = try padded(arena, "", columns.handle, false), .style = base };
+    n += 1;
+    out[n] = .{ .text = "  ", .style = base };
+    n += 1;
+    out[n] = .{ .text = try padded(arena, "active", columns.state, false), .style = .{ .fg = Palette.soft_blue, .bg = base.bg } };
+    n += 1;
+    out[n] = .{ .text = "  ", .style = base };
+    n += 1;
+    out[n] = .{ .text = try padded(arena, age, columns.age, true), .style = base };
+    n += 1;
+    if (columns.model > 0) {
+        out[n] = .{ .text = "  ", .style = base };
+        n += 1;
+        out[n] = .{ .text = try padded(arena, activityKindLabel(row.item.kind), columns.model, false), .style = base };
+        n += 1;
+    }
+    if (columns.cwd > 0) {
+        out[n] = .{ .text = "  ", .style = base };
+        n += 1;
+        out[n] = .{ .text = try padded(arena, "", columns.cwd, false), .style = base };
+        n += 1;
+    }
+    out[n] = .{ .text = "  ", .style = base };
+    n += 1;
+    out[n] = .{ .text = truncateRight(title, columns.title), .style = base };
+    n += 1;
+    return out[0..n];
+}
+
+fn drawActivityDetail(win: vaxis.Window, arena: std.mem.Allocator, row: ActivityRow) !void {
+    win.fill(.{ .style = Palette.prompt_panel });
+    const identity = try std.fmt.allocPrint(arena, " {s} {s} · id {s}", .{ activityIcon(row.item.kind), activityKindLabel(row.item.kind), row.item.id });
+    _ = win.printSegment(.{ .text = truncateRight(identity, win.width -| 1), .style = .{ .fg = Palette.soft_blue, .bold = true } }, .{ .wrap = .none });
+    if (win.height > 1 and row.item.parent_id.len > 0) {
+        const parent = try std.fmt.allocPrint(arena, " parent {s}", .{row.item.parent_id});
+        _ = win.printSegment(.{ .text = truncateRight(parent, win.width -| 1), .style = Palette.command_description }, .{ .row_offset = 1, .wrap = .none });
+    }
+    if (win.height > 2 and row.item.detail.len > 0) {
+        const detail = if (row.item.kind == .process) render.shellDisplayCommand(row.item.detail) else row.item.detail;
+        _ = win.printSegment(.{ .text = detail, .style = Palette.command_description }, .{ .row_offset = 2, .col_offset = 1, .wrap = .word });
+        if (row.item.kind == .process) render.applyLineSyntax(win, 2, .{
+            .text = try std.fmt.allocPrint(arena, " {s}", .{detail}),
+            .style = Palette.command_description,
+            .syntax = try render.shellCommandSpans(arena, detail, 1),
+        });
+    }
 }
 
 pub fn headerText(arena: std.mem.Allocator, columns: Columns) ![]const u8 {
@@ -327,12 +638,23 @@ const OwnedRow = struct {
 
 const PendingAction = enum { archive, unarchive, kill };
 
+const OwnedActivitySnapshot = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []const proto.GuestActivity,
+
+    fn deinit(self: *OwnedActivitySnapshot) void {
+        self.arena.deinit();
+    }
+};
+
 pub const Top = struct {
     gpa: std.mem.Allocator,
     io: Io,
     conn: *attach.Conn,
     rows: std.ArrayList(OwnedRow) = .empty,
+    activities: std.AutoHashMapUnmanaged(u64, OwnedActivitySnapshot) = .empty,
     selected_sid: ?u64 = null,
+    selected_activity: ?usize = null,
     selected_fallback: usize = 0,
     scroll_top: usize = 0,
     show_archived: bool = false,
@@ -346,7 +668,47 @@ pub const Top = struct {
     pub fn deinit(self: *Top) void {
         for (self.rows.items) |*row| row.deinit(self.gpa);
         self.rows.deinit(self.gpa);
+        var activity_it = self.activities.valueIterator();
+        while (activity_it.next()) |snapshot| snapshot.deinit();
+        self.activities.deinit(self.gpa);
         self.notice.deinit(self.gpa);
+    }
+
+    pub fn activity(self: *const Top, sid: u64) []const proto.GuestActivity {
+        return if (self.activities.get(sid)) |snapshot| snapshot.items else &.{};
+    }
+
+    fn replaceActivity(self: *Top, sid: u64, items: []const proto.GuestActivity) void {
+        if (items.len == 0) {
+            if (self.activities.fetchRemove(sid)) |removed| {
+                var snapshot = removed.value;
+                snapshot.deinit();
+            }
+            if (self.selected_sid == sid) self.selected_activity = null;
+            return;
+        }
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        const a = arena.allocator();
+        const owned = a.alloc(proto.GuestActivity, items.len) catch return arena.deinit();
+        for (items, owned) |item, *copy| copy.* = .{
+            .id = a.dupe(u8, item.id) catch return arena.deinit(),
+            .parent_id = a.dupe(u8, item.parent_id) catch return arena.deinit(),
+            .kind = item.kind,
+            .name = a.dupe(u8, item.name) catch return arena.deinit(),
+            .detail = a.dupe(u8, item.detail) catch return arena.deinit(),
+            .started_at_ms = item.started_at_ms,
+        };
+        const previous = self.activities.fetchPut(self.gpa, sid, .{ .arena = arena, .items = owned }) catch {
+            arena.deinit();
+            return;
+        };
+        if (previous) |old| {
+            var snapshot = old.value;
+            snapshot.deinit();
+        }
+        if (self.selected_sid == sid) if (self.selected_activity) |position| {
+            self.selected_activity = @min(position, owned.len - 1);
+        };
     }
 
     fn setNotice(self: *Top, comptime fmt: []const u8, args: anytype) void {
@@ -370,22 +732,76 @@ pub const Top = struct {
         return @min(self.selected_fallback, self.rows.items.len - 1);
     }
 
+    fn work(self: *const Top, arena: std.mem.Allocator) ![]const WorkRow {
+        const views = try arena.alloc(RowView, self.rows.items.len);
+        const groups = try arena.alloc(ActivityGroup, self.rows.items.len);
+        for (self.rows.items, 0..) |*row, i| {
+            views[i] = row.view();
+            const items = self.activity(row.sid);
+            views[i].activity_count = items.len;
+            for (items) |item| switch (item.kind) {
+                .agent => views[i].agent_count += 1,
+                .process => views[i].process_count += 1,
+                .tool => {},
+            };
+            groups[i] = .{ .sid = row.sid, .items = items };
+        }
+        return workRows(arena, views, groups);
+    }
+
     fn normalizeSelection(self: *Top) void {
-        if (self.selectedIndex()) |i| {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const rows = self.work(arena_state.allocator()) catch return;
+        if (rows.len == 0) {
+            self.selected_sid = null;
+            self.selected_activity = null;
+            return;
+        }
+        if (selectedWorkIndex(rows, self.selected_sid, self.selected_activity)) |i| {
             self.selected_fallback = i;
-            self.selected_sid = self.rows.items[i].sid;
-        } else self.selected_sid = null;
+            return;
+        }
+        const i = @min(self.selected_fallback, rows.len - 1);
+        self.selectWorkRow(rows[i], i);
     }
 
     fn move(self: *Top, delta: isize) void {
-        const current = self.selectedIndex() orelse return;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const rows = self.work(arena_state.allocator()) catch return;
+        if (rows.len == 0) return;
+        const current = selectedWorkIndex(rows, self.selected_sid, self.selected_activity) orelse @min(self.selected_fallback, rows.len - 1);
         const next: usize = if (delta < 0)
             current -| @as(usize, @intCast(-delta))
         else
-            @min(current + @as(usize, @intCast(delta)), self.rows.items.len - 1);
-        self.selected_fallback = next;
-        self.selected_sid = self.rows.items[next].sid;
+            @min(current + @as(usize, @intCast(delta)), rows.len - 1);
+        self.selectWorkRow(rows[next], next);
         self.confirm_kill = null;
+    }
+
+    fn moveEdge(self: *Top, last: bool) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const rows = self.work(arena_state.allocator()) catch return;
+        if (rows.len == 0) return;
+        const i = if (last) rows.len - 1 else 0;
+        self.selectWorkRow(rows[i], i);
+        self.confirm_kill = null;
+    }
+
+    fn selectWorkRow(self: *Top, row: WorkRow, fallback: usize) void {
+        self.selected_fallback = fallback;
+        switch (row) {
+            .session => |session| {
+                self.selected_sid = session.sid;
+                self.selected_activity = null;
+            },
+            .activity => |work_activity| {
+                self.selected_sid = work_activity.sid;
+                self.selected_activity = work_activity.position;
+            },
+        }
     }
 
     fn sortRows(self: *Top) void {
@@ -462,7 +878,9 @@ pub const Top = struct {
                     break;
                 }
             },
+            .guest_activity => |snapshot| self.replaceActivity(snapshot.sid, snapshot.items),
             .session_remove => |removed| {
+                self.replaceActivity(removed.sid, &.{});
                 self.remove(removed.sid);
                 if (self.show_archived) self.conn.send(.{ .session_list = .{ .include_archived = true } }) catch {};
             },
@@ -545,23 +963,19 @@ fn handleKey(app: *Top, key: vaxis.Key) void {
     } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
         app.move(-1);
     } else if (key.matches('g', .{})) {
-        if (app.rows.items.len > 0) {
-            app.selected_fallback = 0;
-            app.selected_sid = app.rows.items[0].sid;
-        }
+        app.moveEdge(false);
     } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
-        if (app.rows.items.len > 0) {
-            app.selected_fallback = app.rows.items.len - 1;
-            app.selected_sid = app.rows.items[app.rows.items.len - 1].sid;
-        }
+        app.moveEdge(true);
     } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
         app.move(10);
     } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
         app.move(-10);
     } else if (key.matches('a', .{})) {
-        app.requestArchive();
+        if (app.selected_activity == null) app.requestArchive() else app.setNotice("select a session to archive", .{});
     } else if (key.matches('x', .{}) or key.matches('K', .{ .shift = true })) {
-        if (app.selectedIndex()) |i| app.confirm_kill = app.rows.items[i].sid;
+        if (app.selected_activity == null) {
+            if (app.selectedIndex()) |i| app.confirm_kill = app.rows.items[i].sid;
+        } else app.setNotice("select a session to kill", .{});
     } else if (key.matches('A', .{ .shift = true })) {
         app.show_archived = !app.show_archived;
         if (app.show_archived) {
@@ -603,8 +1017,10 @@ pub fn drawCatalog(
     win: vaxis.Window,
     arena: std.mem.Allocator,
     rows: []const RowView,
+    activity_groups: []const ActivityGroup,
     known_ids: []const u64,
     selected_sid: ?u64,
+    selected_activity: ?usize,
     scroll_top: *usize,
     now_ms: i64,
     show_archived: bool,
@@ -614,14 +1030,15 @@ pub fn drawCatalog(
 ) !void {
     win.clear();
     if (win.width < 20 or win.height < 4) return;
+    const work = try workRows(arena, rows, activity_groups);
 
     var running: usize = 0;
     var approvals: usize = 0;
     var errors: usize = 0;
     var archived: usize = 0;
-    var selected_index: usize = 0;
-    for (rows, 0..) |row, i| {
-        if (row.sid == selected_sid) selected_index = i;
+    var live_work: usize = 0;
+    const selected_index = selectedWorkIndex(work, selected_sid, selected_activity) orelse 0;
+    for (rows) |row| {
         switch (row.state) {
             .running => running += 1,
             .awaiting_approval => approvals += 1,
@@ -629,11 +1046,13 @@ pub fn drawCatalog(
             else => {},
         }
         if (row.archived) archived += 1;
+        live_work += row.activity_count;
     }
 
-    const summary = try std.fmt.allocPrint(arena, " marlin top — {d} sessions · {d} running · {d} approval · {d} error{s}{s}", .{
+    const summary = try std.fmt.allocPrint(arena, " marlin work tree — {d} sessions · {d} running · {d} live work · {d} approval · {d} error{s}{s}", .{
         rows.len,
         running,
+        live_work,
         approvals,
         errors,
         if (show_archived) @as([]const u8, " · ") else " · archived hidden",
@@ -644,23 +1063,44 @@ pub fn drawCatalog(
     const columns = computeColumns(win.width -| 1);
     _ = win.printSegment(.{ .text = try headerText(arena, columns), .style = .{ .fg = .{ .index = 8 }, .bold = true } }, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
 
-    const body_height: usize = win.height -| 4;
+    const selected_is_activity = work.len > 0 and switch (work[selected_index]) {
+        .activity => true,
+        .session => false,
+    };
+    const detail_rows: usize = if (selected_is_activity and win.height >= 8) @min(5, @max(3, win.height / 4)) else 0;
+    const body_height: usize = win.height -| (4 + detail_rows);
     if (rows.len == 0) {
         _ = win.printSegment(.{ .text = " no sessions — marlin run \"task\" to start one", .style = .{ .fg = .{ .index = 8 }, .dim = true } }, .{ .row_offset = 3, .wrap = .none });
     } else {
         if (selected_index < scroll_top.*) scroll_top.* = selected_index;
         if (selected_index >= scroll_top.* + body_height) scroll_top.* = selected_index - body_height + 1;
-        scroll_top.* = @min(scroll_top.*, rows.len -| body_height);
-        const end = @min(rows.len, scroll_top.* + body_height);
-        for (rows[scroll_top.*..end], 0..) |row, offset| {
-            const selected = row.sid == selected_sid;
-            var display_row = row;
-            display_row.depth = rowDepth(rows, row);
+        scroll_top.* = @min(scroll_top.*, work.len -| body_height);
+        const end = @min(work.len, scroll_top.* + body_height);
+        for (work[scroll_top.*..end], 0..) |row, offset| {
+            const selected = scroll_top.* + offset == selected_index;
             const row_win = win.child(.{ .y_off = @intCast(offset + 3), .height = 1, .width = win.width });
-            row_win.fill(.{ .style = rowStyle(selected, row.archived) });
-            _ = row_win.print(try rowSegments(arena, display_row, known_ids, columns, now_ms, selected), .{ .col_offset = 1, .wrap = .none });
+            switch (row) {
+                .session => |session| {
+                    row_win.fill(.{ .style = rowStyle(selected, session.archived) });
+                    _ = row_win.print(try rowSegments(arena, session, known_ids, columns, now_ms, selected), .{ .col_offset = 1, .wrap = .none });
+                },
+                .activity => |activity| {
+                    row_win.fill(.{ .style = rowStyle(selected, false) });
+                    const segments = try activitySegments(arena, activity, columns, now_ms, selected);
+                    _ = row_win.print(segments, .{ .col_offset = 1, .wrap = .none });
+                },
+            }
         }
     }
+
+    if (detail_rows > 0) switch (work[selected_index]) {
+        .activity => |activity| try drawActivityDetail(win.child(.{
+            .y_off = @intCast(win.height - detail_rows - 1),
+            .height = @intCast(detail_rows),
+            .width = win.width,
+        }), arena, activity),
+        .session => {},
+    };
 
     const footer: []const u8 = if (confirm_kill)
         " kill session tree? y confirm · any other key cancel"
@@ -677,13 +1117,26 @@ pub fn drawCatalog(
 
 fn draw(app: *Top, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const views = try arena.alloc(RowView, app.rows.items.len);
-    for (app.rows.items, 0..) |*row, i| views[i] = row.view();
+    const groups = try arena.alloc(ActivityGroup, app.rows.items.len);
+    for (app.rows.items, 0..) |*row, i| {
+        views[i] = row.view();
+        const activity = app.activity(row.sid);
+        groups[i] = .{ .sid = row.sid, .items = activity };
+        views[i].activity_count = activity.len;
+        for (activity) |item| switch (item.kind) {
+            .agent => views[i].agent_count += 1,
+            .process => views[i].process_count += 1,
+            .tool => {},
+        };
+    }
     try drawCatalog(
         vx.window(),
         arena,
         views,
+        groups,
         try app.knownIds(arena),
         app.selected_sid,
+        app.selected_activity,
         &app.scroll_top,
         app.now_ms,
         app.show_archived,

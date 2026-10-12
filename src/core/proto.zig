@@ -34,9 +34,9 @@ pub const SessionState = enum { idle, running, awaiting_approval, err, done };
 /// of the model until one completes.
 pub const TurnPhase = enum { idle, starting, context, provider, approval, tool, child, compaction, finishing, background };
 
-/// Live work owned by a delegated guest. These nodes are operational state,
-/// not Marlin child sessions: ids and parent ids come from the guest's own
-/// stream and disappear when the delegated invocation ends.
+/// Live operational work owned by a turn. Guest ids/parents come from the
+/// harness stream; native ids are tool call ids. These are not durable child
+/// sessions and disappear when the work finishes.
 pub const GuestActivityKind = enum { agent, tool, process };
 
 pub const GuestActivity = struct {
@@ -484,9 +484,9 @@ pub const DaemonMsg = union(enum) {
     /// provider: cumulative body bytes this round and ms since the last
     /// visible (text/reasoning) delta. Emitted at most ~1/s.
     stream_status: struct { sid: u64, bytes: u64, quiet_ms: u64 },
-    /// Complete ephemeral activity snapshot for one running guest turn.
-    /// An empty list clears the tree. Full snapshots make dropped/coalesced
-    /// intermediate updates harmless and let reconnects restore the view.
+    /// Complete ephemeral work snapshot for one running turn. An empty list
+    /// clears the tree. Subscribers and session watchers receive it, so the
+    /// focused transcript, Ctrl+S, and `marlin top` share one process model.
     guest_activity: struct { sid: u64, items: []const GuestActivity },
     replay_done: struct {
         sid: u64,

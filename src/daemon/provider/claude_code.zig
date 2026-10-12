@@ -40,7 +40,6 @@ pub const Bridge = struct { marlin_exe: []const u8, sid: u64 };
 
 pub const ArgvOpts = struct {
     binary: []const u8,
-    prompt: []const u8,
     /// Model string after "claudecode/"; "default" omits --model.
     model: []const u8,
     session_uuid: []const u8,
@@ -77,9 +76,13 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
     try argv.appendSlice(arena, &.{
         opts.binary,
         "-p",
-        opts.prompt,
+        "--input-format",
+        "stream-json",
         "--output-format",
         "stream-json",
+        // Echo stdin messages so the turn driver can persist a steer only
+        // after Claude Code has accepted it onto the live session.
+        "--replay-user-messages",
         "--verbose",
         "--include-partial-messages",
         // Preserve Claude's own subagent hierarchy in stream-json. The
@@ -206,7 +209,23 @@ pub const Event = union(enum) {
     /// for these to finish (it emits another result when they do).
     background_tasks: []const BackgroundTask,
     /// system/task_notification: a background task finished.
-    task_notification: struct { task_id: []const u8, summary: []const u8 },
+    task_notification: struct {
+        task_id: []const u8,
+        tool_use_id: []const u8,
+        summary: []const u8,
+    },
+    /// system/task_started: links Claude's durable background-task id to the
+    /// tool-use id used by forwarded subagent events.
+    task_started: struct {
+        task_id: []const u8,
+        tool_use_id: []const u8,
+        parent_task_id: []const u8,
+        task_type: []const u8,
+        description: []const u8,
+        is_backgrounded: bool,
+    },
+    /// A root user message replayed from stream-json stdin.
+    replayed_user: []const u8,
     /// Terminal event: the turn's outcome and usage.
     result: struct {
         text: []const u8,
@@ -267,7 +286,17 @@ pub fn decodeLine(
         } else if (std.mem.eql(u8, st, "task_notification")) {
             try out.append(arena, .{ .task_notification = .{
                 .task_id = strField(root, "task_id") orelse "",
+                .tool_use_id = strField(root, "tool_use_id") orelse "",
                 .summary = strField(root, "summary") orelse "background task finished",
+            } });
+        } else if (std.mem.eql(u8, st, "task_started")) {
+            try out.append(arena, .{ .task_started = .{
+                .task_id = strField(root, "task_id") orelse "",
+                .tool_use_id = strField(root, "tool_use_id") orelse "",
+                .parent_task_id = strField(root, "parent_task_id") orelse "",
+                .task_type = strField(root, "task_type") orelse "",
+                .description = strField(root, "description") orelse "",
+                .is_backgrounded = boolField(root, "is_backgrounded") orelse false,
             } });
         }
         return;
@@ -319,6 +348,13 @@ pub fn decodeLine(
     if (std.mem.eql(u8, t, "user")) {
         const parent_tool_use_id = strField(root, "parent_tool_use_id") orelse "";
         const content = messageContent(root) orelse return;
+        if (parent_tool_use_id.len == 0 and (boolField(root, "isReplay") orelse false)) {
+            for (content) |item| {
+                if (item != .object) continue;
+                if (!std.mem.eql(u8, strField(item.object, "type") orelse "", "text")) continue;
+                if (strField(item.object, "text")) |text| try out.append(arena, .{ .replayed_user = text });
+            }
+        }
         var first_result: ?usize = null;
         var result_count: usize = 0;
         for (content) |item| {

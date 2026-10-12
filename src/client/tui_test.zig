@@ -252,9 +252,9 @@ test "manners: notices expire, the plan offer is not a modal, a background appro
     defer app.deinit();
 
     // Notice TTL: a fresh notice stays; a past deadline clears it on tick.
-    app.setNotice("session → 3f2a", .{});
+    app.setNotice("settings updated", .{});
     app.expireNotice();
-    try std.testing.expectEqualStrings("session → 3f2a", app.notice.items);
+    try std.testing.expectEqualStrings("settings updated", app.notice.items);
     app.notice_deadline_ms.store(1, .release);
     app.expireNotice();
     try std.testing.expectEqual(@as(usize, 0), app.notice.items.len);
@@ -3314,6 +3314,42 @@ test "top overlay opens from command and Ctrl+S, tracks selection, and closes" {
     try std.testing.expect(app.top_view == null);
 }
 
+test "top overlay uses one cursor across sessions agents and processes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{ .sid = 20, .editor = Editor.init(gpa) },
+    };
+    defer app.deinit();
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 20, .title = "root", .model = "m", .status = "running", .state = .running, .created_at = 20, .running = true },
+        .{ .sid = 30, .title = "next", .model = "m", .status = "idle", .created_at = 30, .running = false },
+    });
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{
+        .sid = 20,
+        .items = &.{
+            .{ .id = "agent", .kind = .agent, .name = "Scout" },
+            .{ .id = "shell", .parent_id = "agent", .kind = .process, .name = "Bash", .detail = "sleep 20" },
+        },
+    } }));
+    app.openTop();
+    try handleKey(&app, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(?u64, 20), app.top_view.?.selected_sid);
+    try std.testing.expectEqual(@as(?usize, 0), app.top_view.?.selected_activity);
+    try handleKey(&app, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(?usize, 1), app.top_view.?.selected_activity);
+    try handleKey(&app, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(?u64, 30), app.top_view.?.selected_sid);
+    try std.testing.expect(app.top_view.?.selected_activity == null);
+    try handleKey(&app, .{ .codepoint = 'k' });
+    try std.testing.expectEqual(@as(?u64, 20), app.top_view.?.selected_sid);
+    try std.testing.expectEqual(@as(?usize, 1), app.top_view.?.selected_activity);
+}
+
 test "top overlay kill requires confirmation before sending" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -3742,6 +3778,20 @@ test "draw permanently reserves and paints the clickable tab row" {
     const title_cell = vx.window().readCell(3, 0).?;
     try std.testing.expectEqualStrings("m", title_cell.char.grapheme);
     try std.testing.expect(title_cell.style.bold);
+
+    var status_line: std.ArrayList(u8) = .empty;
+    defer status_line.deinit(gpa);
+    var col: u16 = 0;
+    while (col < 80) : (col += 1) {
+        const cell = vx.window().readCell(col, 11) orelse continue;
+        try status_line.appendSlice(gpa, cell.char.grapheme);
+    }
+    var handle_buf: session_handle.Full = undefined;
+    const handle = session_handle.display(&handle_buf, app.view.sid, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, status_line.items, handle) == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_line.items, "sandbox") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_line.items, "dnsblock") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_line.items, "⊘ · ⛨") != null);
 }
 
 test "empty session draws the welcome card; content reclaims it" {
@@ -5447,11 +5497,39 @@ test "guest activity snapshots are owned and clear when the turn settles" {
         }},
     } }));
     try std.testing.expectEqual(@as(usize, 1), app.view.guest_activity.len);
+    try std.testing.expectEqual(@as(usize, 1), app.guestActivity(42).len);
     try std.testing.expectEqualStrings("Scout", app.view.guest_activity[0].name);
     try std.testing.expectEqualStrings("inspect tests", app.view.guest_activity[0].detail);
 
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 42, .state = .idle } }));
     try std.testing.expectEqual(@as(usize, 0), app.view.guest_activity.len);
+    // The adapter's terminal empty snapshot owns catalog cleanup. Status may
+    // race ahead of it, so the unified work tree remains accurate meanwhile.
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{ .sid = 42, .items = &.{} } }));
+    try std.testing.expectEqual(@as(usize, 0), app.guestActivity(42).len);
+}
+
+test "background guest activity is retained without a transcript subscription" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{
+        .sid = 99,
+        .items = &.{
+            .{ .id = "agent", .kind = .agent, .name = "Scout", .detail = "inspect" },
+            .{ .id = "shell", .parent_id = "agent", .kind = .process, .name = "Bash", .detail = "sleep 20" },
+        },
+    } }));
+    try std.testing.expectEqual(@as(usize, 2), app.guestActivity(99).len);
+    try std.testing.expectEqualStrings("sleep 20", app.guestActivity(99)[1].detail);
+    // Background snapshots must not leak into the focused transcript.
+    try std.testing.expectEqual(@as(usize, 0), app.view.guest_activity.len);
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{ .sid = 99, .items = &.{} } }));
+    try std.testing.expectEqual(@as(usize, 0), app.guestActivity(99).len);
 }
 
 test "cwd Tab and arrows accept directory selections and descend without submitting" {

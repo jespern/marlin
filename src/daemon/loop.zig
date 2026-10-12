@@ -151,7 +151,7 @@ pub const RunOpts = struct {
     /// Coarse phase transitions for cancellation diagnostics. The callback
     /// must be non-blocking; the daemon publishes it through atomics.
     on_phase: ?*const fn (ctx: ?*anyopaque, phase: proto.TurnPhase) void = null,
-    /// Complete live activity tree for a delegated guest invocation.
+    /// Complete live Agent/tool/process tree for native or guest work.
     on_guest_activity: ?*const fn (ctx: ?*anyopaque, items: []const proto.GuestActivity) void = null,
     /// Guest billing state shared with the daemon and transition notification.
     usage_credits_live: ?*std.atomic.Value(bool) = null,
@@ -1903,6 +1903,43 @@ const ToolWorker = struct {
     }
 };
 
+pub fn nativeActivityKind(name: []const u8) proto.GuestActivityKind {
+    if (std.mem.eql(u8, name, bash_tool.spec_name)) return .process;
+    if (std.mem.eql(u8, name, task_tool.spec_name) or std.mem.eql(u8, name, task_tool.batch_spec_name)) return .agent;
+    return .tool;
+}
+
+pub fn nativeActivityDetail(arena: std.mem.Allocator, args_json: []const u8) []const u8 {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return args_json;
+    if (value != .object) return args_json;
+    const fields = [_][]const u8{ "command", "cmd", "prompt", "path", "query" };
+    for (fields) |field| if (value.object.get(field)) |candidate| {
+        if (candidate == .string and candidate.string.len > 0) return candidate.string;
+    };
+    return args_json;
+}
+
+fn publishNativeActivity(gpa: std.mem.Allocator, io: Io, opts: RunOpts, calls: []const PreparedCall) void {
+    const callback = opts.on_guest_activity orelse return;
+    if (calls.len == 0) {
+        callback(opts.on_delta_ctx, &.{});
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const items = arena.alloc(proto.GuestActivity, calls.len) catch return;
+    const started_at = nowMs(io);
+    for (calls, items) |call, *item| item.* = .{
+        .id = call.call_id,
+        .kind = nativeActivityKind(call.name),
+        .name = call.name,
+        .detail = nativeActivityDetail(arena, call.args_json),
+        .started_at_ms = started_at,
+    };
+    callback(opts.on_delta_ctx, items);
+}
+
 pub const max_parallel_tool_workers: usize = 8;
 
 pub fn parallelChunkEnd(start: usize, group_end: usize) usize {
@@ -1920,7 +1957,9 @@ fn executePrepared(gpa: std.mem.Allocator, io: Io, opts: RunOpts, calls: []Prepa
             continue;
         }
         if (!calls[i].parallelSafe()) {
+            publishNativeActivity(gpa, io, opts, calls[i .. i + 1]);
             ToolWorker.run(gpa, io, opts, &calls[i]);
+            publishNativeActivity(gpa, io, opts, &.{});
             i += 1;
             continue;
         }
@@ -1928,7 +1967,9 @@ fn executePrepared(gpa: std.mem.Allocator, io: Io, opts: RunOpts, calls: []Prepa
         var end = i + 1;
         while (end < calls.len and calls[end].exec == null and calls[end].parallelSafe()) : (end += 1) {}
         if (end - i == 1) {
+            publishNativeActivity(gpa, io, opts, calls[i..end]);
             ToolWorker.run(gpa, io, opts, &calls[i]);
+            publishNativeActivity(gpa, io, opts, &.{});
             i = end;
             continue;
         }
@@ -1940,17 +1981,24 @@ fn executePrepared(gpa: std.mem.Allocator, io: Io, opts: RunOpts, calls: []Prepa
         while (chunk_start < end) {
             threads.clearRetainingCapacity();
             const chunk_end = parallelChunkEnd(chunk_start, end);
+            publishNativeActivity(gpa, io, opts, calls[chunk_start..chunk_end]);
             var at = chunk_start;
             while (at < chunk_end) : (at += 1) {
                 const thread = std.Thread.spawn(.{}, ToolWorker.run, .{ gpa, io, opts, &calls[at] }) catch break;
                 threads.appendAssumeCapacity(thread);
             }
             for (threads.items) |thread| thread.join();
+            publishNativeActivity(gpa, io, opts, &.{});
 
             if (at < chunk_end) {
                 // A partial chunk is joined before serial fallback; no worker
                 // remains live while the rest of this safe group executes.
-                for (calls[at..end]) |*call| ToolWorker.run(gpa, io, opts, call);
+                var serial = at;
+                while (serial < end) : (serial += 1) {
+                    publishNativeActivity(gpa, io, opts, calls[serial .. serial + 1]);
+                    ToolWorker.run(gpa, io, opts, &calls[serial]);
+                    publishNativeActivity(gpa, io, opts, &.{});
+                }
                 break;
             }
             chunk_start = chunk_end;

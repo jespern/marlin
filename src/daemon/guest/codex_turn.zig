@@ -251,11 +251,13 @@ fn codexActivityKind(item: std.json.Value) proto.GuestActivityKind {
 }
 
 fn codexActivityDetail(arena: std.mem.Allocator, item: std.json.Value) ![]const u8 {
-    inline for (.{ "description", "prompt", "query", "path", "cwd" }) |key| {
+    inline for (.{ "description", "prompt", "query", "path" }) |key| {
         if (codex.strField(item, key)) |value| if (value.len > 0) return value;
     }
-    if (codex.field(item, "command")) |command| return codex.stringify(arena, command);
+    if (codex.field(item, "command")) |command|
+        return if (command == .string) command.string else codex.stringify(arena, command);
     if (codex.field(item, "arguments")) |args| return codex.stringify(arena, args);
+    if (codex.strField(item, "cwd")) |cwd| return cwd;
     return "";
 }
 
@@ -265,7 +267,7 @@ fn codexActivityParent(item: std.json.Value) []const u8 {
         codex.strField(item, "parent_item_id") orelse "";
 }
 
-fn isPrimaryCodexThread(params: std.json.Value, thread_id: []const u8) bool {
+pub fn isPrimaryCodexThread(params: std.json.Value, thread_id: []const u8) bool {
     const event_thread = codex.strField(params, "threadId") orelse return true;
     return std.mem.eql(u8, event_thread, thread_id);
 }
@@ -768,6 +770,10 @@ pub fn runCodexTurn(
                         }
                     }
                 } else if (std.mem.eql(u8, notification.method, "turn/completed")) {
+                    // App-server multiplexes child-agent turns over this same
+                    // stream. A child finishing is activity, not the terminal
+                    // boundary of the root turn we were asked to drive.
+                    if (!primary_thread) continue;
                     tokens_in += current_tokens_in;
                     tokens_out += current_tokens_out;
                     current_tokens_in = 0;
