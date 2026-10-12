@@ -5,8 +5,9 @@
 //! of the arcade original: left-right symmetric, one-tile corridors between
 //! chunky wall pieces, no dead ends, a ghost house in the middle with a door
 //! only ghosts may pass, and side tunnels that wrap around. Where the
-//! original read the cursor keys, this drives Pac-Man itself: breadth-first
-//! toward the nearest dot, steering away when a ghost is close.
+//! original read the cursor keys, this drives Pac-Man itself: a score-valued
+//! objective planner routes toward dots, fruit, energizers, and edible ghosts
+//! while a maze-distance danger field keeps each first step survivable.
 //!
 //! Added over the original, after the arcade: four energizers near the
 //! corners that turn the ghosts outside the house blue and reverse them —
@@ -132,18 +133,14 @@ pub const step_ticks: u64 = 6;
 const mouth_ticks: u64 = 4;
 /// Pause after a catch or a cleared board before everything resets.
 pub const freeze_ticks: u16 = 30;
-/// Ghosts this close (BFS steps) make Pac-Man run instead of eat.
-const danger_distance: u16 = 3;
+/// Ghosts this close (maze steps) make Pac-Man run instead of eat.
+const danger_distance: u16 = 4;
 /// Board steps an energizer keeps the ghosts frightened (~6 s), and how many
 /// of the last ones they flash.
 pub const fright_steps: u16 = 30;
 pub const fright_flash_steps: u16 = 8;
-/// A frightened ghost this close is worth chasing.
-const chase_distance: u16 = 6;
 /// Cornered, Pac-Man dashes for an energizer this close instead of fleeing.
 const energizer_dash: u16 = 5;
-/// Bonus fruit this close beats the nearest dot.
-const fruit_dash: u16 = 10;
 
 /// HUD rows around the board: "1UP" / "HIGH SCORE" and their values above,
 /// spare lives and the level's fruit below. Renderers reserve them.
@@ -996,33 +993,32 @@ pub const Game = struct {
         return options[self.random() % count];
     }
 
-    /// Chase a frightened ghost that is close; otherwise eat the nearest dot
-    /// unless a dangerous ghost is close, then dash for a nearby energizer
-    /// or, failing that, flee.
-    fn choosePacDir(self: *Game) ?Dir {
+    const DangerFields = [4][max_tiles]u16;
+
+    /// Pick the move with the best score outlook. Survival is the first
+    /// multiplier: dangerous ghosts create maze-distance fields, not the
+    /// Manhattan approximation that can mistake the other side of a wall for
+    /// safety. Outside immediate danger, real point values and expiry timers
+    /// choose among fruit, catchable frightened ghosts, useful energizers,
+    /// and ordinary dots. Planning is repeated every step, so moving targets
+    /// and newly dangerous corridors are handled before committing further.
+    pub fn choosePacDir(self: *Game) ?Dir {
         var dist: [max_tiles]u16 = undefined;
         var parent: [max_tiles]u16 = undefined;
         self.bfs(self.pac.x, self.pac.y, .pac, &dist, &parent);
         const here = self.index(self.pac.x, self.pac.y);
 
+        var danger_fields: DangerFields = undefined;
+        const danger_count = self.buildDangerFields(&danger_fields);
         var nearest_threat: u16 = std.math.maxInt(u16);
-        var prey: ?usize = null;
-        var prey_dist: u16 = std.math.maxInt(u16);
         for (self.ghosts) |g| {
             const gi = self.index(g.actor.x, g.actor.y);
             if (g.dangerous()) nearest_threat = @min(nearest_threat, dist[gi]);
-            if (g.edible() and dist[gi] < prey_dist) {
-                prey_dist = dist[gi];
-                prey = gi;
-            }
-        }
-
-        if (prey != null and prey_dist <= chase_distance and prey.? != here) {
-            return self.firstStep(here, prey.?, &parent);
         }
 
         if (nearest_threat <= danger_distance) {
-            // An energizer within reach turns the tables.
+            // A reachable energizer is both the safest exit and the start of
+            // the board's most valuable scoring run.
             var pellet: ?usize = null;
             var pellet_dist: u16 = energizer_dash + 1;
             for (self.energizerSpots()) |spot| {
@@ -1033,48 +1029,174 @@ pub const Game = struct {
                     pellet = pi;
                 }
             }
-            if (pellet) |p| return self.firstStep(here, p, &parent);
-
-            // Flee: the passable neighbor farthest (Manhattan) from the closest ghost.
-            var best: ?Dir = null;
-            var best_score: i32 = -1;
-            for (all_dirs) |d| {
-                const next = self.neighbor(self.pac.x, self.pac.y, d) orelse continue;
-                if (!self.passable(next[0], next[1], .pac)) continue;
-                var score: i32 = std.math.maxInt(i32);
-                for (self.ghosts) |g| {
-                    if (!g.dangerous()) continue;
-                    const m = @as(i32, @intCast(@abs(next[0] - g.actor.x))) + @as(i32, @intCast(@abs(next[1] - g.actor.y)));
-                    score = @min(score, m);
-                }
-                if (score > best_score) {
-                    best_score = score;
-                    best = d;
-                }
-            }
-            return best;
+            if (pellet) |p| return self.safeStepToward(p, &danger_fields, danger_count) orelse self.fleeStep(&danger_fields, danger_count);
+            return self.fleeStep(&danger_fields, danger_count);
         }
 
-        // Fruit within reach is worth more than any dot.
+        var target: ?usize = null;
+        var best_utility: u64 = 0;
+
+        // Never walk away from fifty guaranteed points already under Pac-Man's
+        // nose. Longer approaches still require danger or combo potential so
+        // the other power pellets remain available for profitable runs.
+        for (self.energizerSpots()) |spot| {
+            if (!self.energizers[@intCast(spot[1])][@intCast(spot[0])]) continue;
+            const pi = self.index(spot[0], spot[1]);
+            if (dist[pi] != 1) continue;
+            best_utility = objectiveUtility(energizer_points, 1, 1);
+            target = pi;
+            break;
+        }
+
+        // A frightened ghost is only an objective when Pac-Man can plausibly
+        // close the distance before the timer ends. Since blue ghosts move at
+        // half speed, two fright steps per tile is a conservative catch budget.
+        const ghost_reward = ghost_points << @intCast(@min(self.ghost_combo, 3));
+        for (self.ghosts) |g| {
+            if (!g.edible()) continue;
+            const gi = self.index(g.actor.x, g.actor.y);
+            const d = dist[gi];
+            if (d == 0 or d == std.math.maxInt(u16) or @as(u32, d) * 2 > @as(u32, self.fright) + 2) continue;
+            const utility = objectiveUtility(ghost_reward, d, 4);
+            if (utility > best_utility) {
+                best_utility = utility;
+                target = gi;
+            }
+        }
+
+        // Fruit is pure bonus: dots on its route still score, so use a strong
+        // expiry premium and pursue it from anywhere it can be reached in time.
         if (self.fruit) |f| {
             const fi = self.index(f.x, f.y);
-            if (dist[fi] <= fruit_dash) return self.firstStep(here, fi, &parent);
+            const d = dist[fi];
+            if (d != 0 and d != std.math.maxInt(u16) and d <= f.steps) {
+                const utility = objectiveUtility(f.kind.points(), d, 4);
+                if (utility > best_utility) {
+                    best_utility = utility;
+                    target = fi;
+                }
+            }
         }
 
-        // Nearest dot by BFS distance, then the first step toward it.
-        var target: ?usize = null;
-        var target_dist: u16 = std.math.maxInt(u16);
+        // Energizers are scarce. Spend one when ghosts are close enough to
+        // convert it into a scoring run; otherwise leave it until the ordinary
+        // dots are gone or it is needed as an escape hatch.
+        if (self.fright == 0 and danger_count > 0) {
+            for (self.energizerSpots()) |spot| {
+                if (!self.energizers[@intCast(spot[1])][@intCast(spot[0])]) continue;
+                const pi = self.index(spot[0], spot[1]);
+                const d = dist[pi];
+                if (d == 0 or d == std.math.maxInt(u16) or d > 10) continue;
+                var nearby: u8 = 0;
+                for (danger_fields[0..danger_count]) |field| {
+                    if (field[pi] <= 8) nearby += 1;
+                }
+                if (nearby == 0) continue;
+                var value: u32 = energizer_points;
+                var combo = self.ghost_combo;
+                var n = nearby;
+                while (n > 0) : (n -= 1) {
+                    value +|= ghost_points << @intCast(@min(combo, 3));
+                    combo +|= 1;
+                }
+                const utility = objectiveUtility(value, d, 2);
+                if (utility > best_utility) {
+                    best_utility = utility;
+                    target = pi;
+                }
+            }
+        }
+
+        // Ordinary dots are the steady fallback. Energizer dots are excluded
+        // while any regular dot remains so the power pellets are not wasted.
+        var regular_dots: u32 = 0;
         const total: usize = @as(usize, self.cols) * self.rows;
         var i: usize = 0;
         while (i < total) : (i += 1) {
             if (dist[i] == std.math.maxInt(u16) or i == here) continue;
-            if (self.dots[i / self.cols][i % self.cols] and dist[i] < target_dist) {
-                target_dist = dist[i];
+            if (self.dots[i / self.cols][i % self.cols] and !self.energizers[i / self.cols][i % self.cols]) regular_dots += 1;
+        }
+        i = 0;
+        while (i < total) : (i += 1) {
+            if (dist[i] == std.math.maxInt(u16) or i == here or !self.dots[i / self.cols][i % self.cols]) continue;
+            if (regular_dots > 0 and self.energizers[i / self.cols][i % self.cols]) continue;
+            const utility = objectiveUtility(if (self.energizers[i / self.cols][i % self.cols]) energizer_points else dot_points, dist[i], 1);
+            if (utility > best_utility) {
+                best_utility = utility;
                 target = i;
             }
         }
         const t = target orelse return self.randomTurn(&self.pac, .pac, true);
-        return self.firstStep(here, t, &parent);
+        return self.safeStepToward(t, &danger_fields, danger_count) orelse self.fleeStep(&danger_fields, danger_count);
+    }
+
+    fn buildDangerFields(self: *const Game, fields: *DangerFields) usize {
+        var count: usize = 0;
+        var scratch_parent: [max_tiles]u16 = undefined;
+        for (self.ghosts) |g| {
+            if (!g.dangerous()) continue;
+            self.bfs(g.actor.x, g.actor.y, .pac, &fields[count], &scratch_parent);
+            count += 1;
+        }
+        return count;
+    }
+
+    fn dangerAt(fields: *const DangerFields, count: usize, index_: usize) u16 {
+        var nearest: u16 = std.math.maxInt(u16);
+        for (fields[0..count]) |field| nearest = @min(nearest, field[index_]);
+        return nearest;
+    }
+
+    /// Take a shortest-ish step toward the objective, allowing a small detour
+    /// when it buys meaningful separation from a dangerous ghost.
+    fn safeStepToward(self: *const Game, target: usize, fields: *const DangerFields, danger_count: usize) ?Dir {
+        const tx: i32 = @intCast(target % self.cols);
+        const ty: i32 = @intCast(target / self.cols);
+        var goal_dist: [max_tiles]u16 = undefined;
+        var parent: [max_tiles]u16 = undefined;
+        self.bfs(tx, ty, .pac, &goal_dist, &parent);
+
+        var best: ?Dir = null;
+        var best_score: i32 = std.math.minInt(i32);
+        for (all_dirs) |d| {
+            const next = self.neighbor(self.pac.x, self.pac.y, d) orelse continue;
+            if (!self.passable(next[0], next[1], .pac)) continue;
+            const ni = self.index(next[0], next[1]);
+            const remaining = goal_dist[ni];
+            if (remaining == std.math.maxInt(u16)) continue;
+            const safety = dangerAt(fields, danger_count, ni);
+            if (safety == 0) continue;
+            var score = -@as(i32, remaining) * 64 + safetyScore(safety);
+            if (self.dots[@intCast(next[1])][@intCast(next[0])]) score += 12;
+            if (d == self.pac.dir) score += 2;
+            if (score > best_score) {
+                best_score = score;
+                best = d;
+            }
+        }
+        return best;
+    }
+
+    /// Maximize actual corridor distance from the nearest dangerous ghost.
+    /// A dot is only a tie-breaker; surviving preserves every future point.
+    fn fleeStep(self: *const Game, fields: *const DangerFields, danger_count: usize) ?Dir {
+        var best: ?Dir = null;
+        var best_score: i32 = std.math.minInt(i32);
+        for (all_dirs) |d| {
+            const next = self.neighbor(self.pac.x, self.pac.y, d) orelse continue;
+            if (!self.passable(next[0], next[1], .pac)) continue;
+            const ni = self.index(next[0], next[1]);
+            const safety = dangerAt(fields, danger_count, ni);
+            if (safety == 0) continue;
+            var score = safetyScore(safety) + @as(i32, self.openNeighbors(next[0], next[1], .pac)) * 4;
+            if (self.dots[@intCast(next[1])][@intCast(next[0])]) score += 2;
+            if (d == self.pac.dir) score += 1;
+            if (score > best_score) {
+                best_score = score;
+                best = d;
+            }
+        }
+        return best;
     }
 
     /// The direction of the first step from `here` toward `target`, reading
@@ -1108,6 +1230,21 @@ pub const Game = struct {
         return self.firstStep(self.index(x, y), target, &parent);
     }
 };
+
+fn objectiveUtility(points: u32, distance: u16, urgency: u8) u64 {
+    return @as(u64, points) * 1024 * urgency / (@as(u64, distance) + 4);
+}
+
+fn safetyScore(distance: u16) i32 {
+    if (distance == std.math.maxInt(u16)) return 512;
+    return switch (distance) {
+        0 => std.math.minInt(i32),
+        1 => -12_000,
+        2 => -1_500,
+        3 => -240,
+        else => @as(i32, @min(distance, 16)) * 16,
+    };
+}
 
 fn seedOrDefault(seed: u64) u64 {
     return if (seed == 0) 0x243f6a8885a308d3 else seed;

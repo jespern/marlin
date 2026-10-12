@@ -13,9 +13,11 @@ Terminal-native effects share one finite-animation/full-screen-saver surface.
   descent routes—including late slides beneath overhangs; `pacman`, a self-playing take on feiss' 1024-byte js1k entry on a maze
   generated to fit your window with the arcade's rules (mirrored, no dead
   ends, a ghost house in the middle, wrap-around tunnels, four energizers
-  that turn the ghosts blue and edible, bonus fruit, arcade scoring under a
-  "1UP" / "HIGH SCORE" header, three lives, "READY!" and "GAME OVER"; a new
-  maze every board), a spinning `tunnel`, `metaballs`, a synthwave `horizon`, `demo`, a
+  that turn the ghosts blue and edible, bonus fruit, and a score-maximizing
+  bot that values expiring prizes and ghost combos while routing around danger;
+  arcade scoring appears under a "1UP" / "HIGH SCORE" header, with three lives,
+  "READY!" and "GAME OVER", and a new maze every board), a spinning `tunnel`,
+  `metaballs`, a synthwave `horizon`, `demo`, a
   24-second sequence of those three, `orb`, a 60 FPS rotating red-and-gold armor
   sphere rendered as chunky, palette-quantized pixels with cyan-white reactor
   seams, scanlines, and light digital noise over a dimmed, blurred snapshot of

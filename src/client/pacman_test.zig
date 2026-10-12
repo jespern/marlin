@@ -58,6 +58,59 @@ fn expectSoundMaze(game: *const Game) !void {
     try std.testing.expectEqual(Tile.path, game.tile(start[0], start[1]));
 }
 
+fn plannerBoard() Game {
+    var game = Game.init(1);
+    game.cols = 9;
+    game.rows = 7;
+    game.tunnel_row = null;
+    for (&game.map) |*row| @memset(row, .wall);
+    for (&game.dots) |*row| @memset(row, false);
+    for (&game.energizers) |*row| @memset(row, false);
+    var y: usize = 1;
+    while (y < 6) : (y += 1) {
+        var x: usize = 1;
+        while (x < 8) : (x += 1) game.map[y][x] = .path;
+    }
+    game.pac = Actor.at(1, 1, .right);
+    for (&game.ghosts) |*ghost| ghost.* = .{ .actor = Actor.at(4, 3, .up), .inside = true, .wait = 200 };
+    game.ready = 0;
+    game.freeze = 0;
+    game.fright = 0;
+    game.fruit = null;
+    game.dots_left = 0;
+    game.dots_total = 0;
+    return game;
+}
+
+test "score planner crosses the board for expiring fruit instead of taking the nearest dot" {
+    var game = plannerBoard();
+    game.dots[2][1] = true;
+    game.dots_left = 1;
+    game.dots_total = 1;
+    game.fruit = .{ .kind = .cherry, .x = 7, .y = 1, .steps = 7 };
+
+    try std.testing.expectEqual(pacman.Dir.right, game.choosePacDir().?);
+}
+
+test "score planner abandons a frightened ghost it cannot catch before expiry" {
+    var game = plannerBoard();
+    game.dots[2][1] = true;
+    game.dots_left = 1;
+    game.dots_total = 1;
+    game.ghosts[0] = .{ .actor = Actor.at(3, 1, .left), .inside = false, .wait = 0, .frightened = true };
+    game.fright = 1;
+
+    try std.testing.expectEqual(pacman.Dir.down, game.choosePacDir().?);
+}
+
+test "score planner gives survival priority over a prize behind a dangerous ghost" {
+    var game = plannerBoard();
+    game.fruit = .{ .kind = .key, .x = 7, .y = 1, .steps = 20 };
+    game.ghosts[0] = .{ .actor = Actor.at(2, 1, .left), .inside = false, .wait = 0 };
+
+    try std.testing.expectEqual(pacman.Dir.down, game.choosePacDir().?);
+}
+
 test "generated mazes are symmetric, connected, dead-end free, and fit their budget" {
     const sizes = [_][2]u16{ .{ 28, 31 }, .{ 45, 27 }, .{ 15, 15 }, .{ 75, 48 }, .{ 40, 20 } };
     for (sizes, 0..) |size, n| {
