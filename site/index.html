@@ -329,7 +329,7 @@
     <img class="fish" src="assets/marlin.gif" alt="a marlin leaping out of the ocean, majestically, at 64 colors">
     <h1><span class="tilde">~*~</span> marlin <span class="tilde">~*~</span></h1>
     <p class="tagline">fast, durable terminal agents that <b>SWIM</b> between clients &nbsp;🐟&nbsp; built in Zig</p>
-    <p class="release-line">current release: <a href="https://github.com/jespern/marlin/releases/tag/v0.1.5">v0.1.5</a></p>
+    <p class="release-line">current release: <a href="https://github.com/jespern/marlin/releases/tag/v0.1.6">v0.1.6</a></p>
   </header>
 
   <div class="install">
@@ -342,7 +342,7 @@
   </div>
 
   <marquee scrollamount="6">
-    ★★★ WELCOME to marlin.wtf ★★★ native agent ★ Claude Code + Codex guests ★ daemon-owned sessions ★ scriptable CLI ★ durable plans ★ SSH remote ★ MCP + hooks + skills ★ written in ZIG ★★★
+    ★★★ WELCOME to marlin.wtf ★★★ native agent ★ Claude Code + Codex guests ★ daemon-owned sessions ★ live work tree ★ scriptable CLI ★ durable plans ★ SSH remote ★ MCP + hooks + skills + plugins ★ written in ZIG ★★★
   </marquee>
 
   <div class="panel">
@@ -398,12 +398,14 @@
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">☷</span>Durable execution plans</b>The active step stays pinned in a timed two-column table with live progress and child activity. Completed plans close into scrollback; revisions survive reboot and compaction.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">▣</span>Real multiplexer</b>Durable concurrent sessions, a clickable configurable tab strip, short stable handles, <code class="inline">/sessions</code>, per-session view state, and rolled-up child activity.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">!</span>Actionable state</b>Running, approval, error, and child status are typed protocol events, not guesses scraped from a terminal. <code class="inline">!c</code> copies the last complete tool result.</div>
-      <div class="feature"><b><span class="feature-icon" aria-hidden="true">⇄</span>Remote without reinvention</b><code class="inline">marlin --remote host</code> carries the structured protocol over SSH. <code class="inline">marlin web</code> is an opt-in loopback UI exposed to your phone through Tailscale Serve.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">⇄</span>Remote without reinvention</b><code class="inline">marlin --remote host</code> carries the structured protocol over SSH. <code class="inline">marlin web</code> is a daemon-managed loopback UI, on by default (<code class="inline">/web disable</code> turns it off), that you can expose to your phone through Tailscale Serve.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">∞</span>Context that admits reality</b>Inline output caps, full content-addressed blobs, pruning, compaction, usage accounting, and durable reconnect replay.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">↻</span>Self-hosting loop</b>Headless runs, steering, approvals, interruption, automatic client reconnect, and coordinated <code class="inline">/reboot --build</code> while developing Marlin inside Marlin.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">⌥</span>Live work tree</b><code class="inline">Ctrl+S</code> or <code class="inline">marlin top</code> shows every session with its live work underneath: children, guest subagents, running commands, and background jobs. Enter opens a job's live output; <code class="inline">x</code> kills, <code class="inline">a</code> archives down a list.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">⚙</span>MCP as a product</b>Isolated health, daemon-owned add/remove/restart/reload, per-tool policy, durable image results, and one schema + approval path.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">⛨</span>Permissions that enforce</b>Scrubbed tool environments, protected-path read refusals, capture-time secret redaction, managed network filtering, and canary-verified kernel shell sandboxing on macOS (Seatbelt) and Linux (Landlock) with safe fallback.</div>
-      <div class="feature"><b><span class="feature-icon" aria-hidden="true">◇</span>Claude Code + Codex guests</b>Run the official <code class="inline">claude</code> binary or stable <code class="inline">codex app-server</code> protocol as first-class multiplexed sessions using existing subscription logins. Guest permission prompts share marlin's approval bar.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">◇</span>Claude Code + Codex guests</b>Run the official <code class="inline">claude</code> binary or stable <code class="inline">codex app-server</code> protocol as first-class multiplexed sessions using their existing logins. Guest permission prompts and questions share marlin's approval bar, background jobs and subagents show up in the work tree, and switching a session between native, Claude Code, and Codex models carries a validated handover briefing.</div>
+      <div class="feature"><b><span class="feature-icon" aria-hidden="true">✚</span>Skills + plugins</b>Agent Skills bundles are discovered from project <code class="inline">.marlin/skills</code> and <code class="inline">.agents/skills</code> plus your user skill directories, and invoked as slash commands. <code class="inline">marlin plugin marketplace add</code> and <code class="inline">install</code> import skill-only Claude Code plugin marketplaces.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">$</span>Scriptable by design</b><code class="inline">marlin run</code> works headlessly; <code class="inline">ls</code>, <code class="inline">search</code>, and <code class="inline">inspect --json</code> expose daemon-owned state for shell scripts without screen scraping or SQLite queries.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">⋈</span>Children + review councils</b><code class="inline">task</code> and <code class="inline">task_batch</code> create up to eight durable, attachable, read-only children. Named councils fan questions across models for parent synthesis.</div>
       <div class="feature"><b><span class="feature-icon" aria-hidden="true">▧</span>Image-aware sessions</b>Ctrl+V or <code class="inline">/attach</code> uploads signed image data through the client boundary, stores it by content hash, and maps it to native provider vision blocks.</div>
@@ -467,11 +469,11 @@ $ marlin run --model codex/default "review this patch"
   <div class="panel">
     <h2>&gt;&gt; edges we're still sharpening (honesty zone)</h2>
     <ul class="starlist">
-      <li><b>subprocess cancellation</b>: built-in shell and extension processes still need one consistent deadline, TERM, grace, and KILL primitive</li>
+      <li><b>subprocess cancellation</b>: the built-in shell and Claude Code guests get TERM, a grace period, then KILL across the whole process tree; MCP and extension servers are still killed outright</li>
       <li><b>extension burn-in</b>: MCP and hooks work today; real-world dogfood and exact field-level TOML diagnostics are still active work</li>
       <li><b>child hardening</b>: durable batches and cancellation cascade are shipped; disconnect/reconnect and cancellation edges are still being tightened</li>
       <li><b>MCP streamable HTTP</b>: stdio is managed and supported today; remote HTTP transport remains later</li>
-      <li><b>hosted or multi-user web</b>: <code class="inline">marlin web</code> is an opt-in, tokenless loopback client exposed through Tailscale Serve; your tailnet is the trust boundary, and it is not a public deploy surface</li>
+      <li><b>hosted or multi-user web</b>: <code class="inline">marlin web</code> is on by default but loopback-only and tokenless, so it can drive anything the daemon can; expose it through Tailscale Serve (your tailnet is the trust boundary), turn it off on multi-user machines, and never treat it as a public deploy surface</li>
       <li><b>workspace undo/isolation</b>: snapshots, leases, worktrees, <code class="inline">/land</code>, and <code class="inline">/discard</code> remain one deliberately later track</li>
       <li><b>kitchen sink surfaces</b>: no messaging gateway, realtime voice models, wake words, audio protocol, embedded terminal emulator, or dashboard empire; optional local push-to-talk dictation stays entirely at the client edge</li>
     </ul>
