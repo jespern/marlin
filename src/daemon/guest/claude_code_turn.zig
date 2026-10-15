@@ -522,6 +522,9 @@ fn ccInvoke(
                     if (pending_text.items.len > 0) try pending_text.append(gpa, '\n');
                     try pending_text.appendSlice(gpa, text);
                 },
+                .child_output => |nested_output| {
+                    try activity.appendOutput(nested_output.parent_tool_use_id, nested_output.text);
+                },
                 .reasoning => |text| {
                     _ = try ap.append(.{ .reasoning = .{ .text = text } });
                 },
@@ -566,6 +569,7 @@ fn ccInvoke(
                 },
                 .tool_result => |tr| {
                     const nested = tr.parent_tool_use_id.len > 0 or activity.isNested(tr.tool_use_id);
+                    try activity.appendOutput(tr.tool_use_id, tr.text);
                     var stays_open = false;
                     for (background_links.items) |link| if (std.mem.eql(u8, link.tool_use_id, tr.tool_use_id)) {
                         stays_open = true;

@@ -185,6 +185,11 @@ pub const Event = union(enum) {
     reasoning_delta: []const u8,
     /// Completed assistant text content block (progress commentary or final prose).
     text: []const u8,
+    /// Completed prose emitted by a forwarded Claude subagent.
+    child_output: struct {
+        parent_tool_use_id: []const u8,
+        text: []const u8,
+    },
     /// Completed assistant thinking content block.
     reasoning: []const u8,
     /// Assistant tool_use content block.
@@ -308,9 +313,15 @@ pub fn decodeLine(
             if (item != .object) continue;
             const bt = strField(item.object, "type") orelse continue;
             if (std.mem.eql(u8, bt, "text")) {
-                if (parent_tool_use_id.len > 0) continue;
                 const text = strField(item.object, "text") orelse continue;
-                if (text.len > 0) try out.append(arena, .{ .text = text });
+                if (text.len == 0) continue;
+                if (parent_tool_use_id.len > 0)
+                    try out.append(arena, .{ .child_output = .{
+                        .parent_tool_use_id = parent_tool_use_id,
+                        .text = text,
+                    } })
+                else
+                    try out.append(arena, .{ .text = text });
             } else if (std.mem.eql(u8, bt, "thinking")) {
                 if (parent_tool_use_id.len > 0) continue;
                 const text = strField(item.object, "thinking") orelse continue;

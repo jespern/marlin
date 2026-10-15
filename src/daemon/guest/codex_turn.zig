@@ -709,6 +709,10 @@ pub fn runCodexTurn(
                     if (!primary_thread) continue;
                     if (codex.strField(params, "delta")) |delta|
                         if (opts.on_reasoning_delta) |callback| callback(opts.on_delta_ctx, delta);
+                } else if (std.mem.eql(u8, notification.method, "item/commandExecution/outputDelta")) {
+                    const item_id = codex.strField(params, "itemId") orelse continue;
+                    const delta = codex.strField(params, "delta") orelse continue;
+                    try activity.appendOutput(item_id, delta);
                 } else if (std.mem.eql(u8, notification.method, "item/started")) {
                     if (codex.field(params, "item")) |item| {
                         if (try codexSubagentEvent(&activity, item, nowMs(io))) continue;

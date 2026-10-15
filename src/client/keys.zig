@@ -162,6 +162,22 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
     }
 
     if (app.top_view != null) {
+        if (app.top_view.?.inspecting_activity) {
+            if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+                app.top_view.?.inspecting_activity = false;
+            } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+                app.top_view.?.activity_output_scroll +|= 1;
+            } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+                app.top_view.?.activity_output_scroll -|= 1;
+            } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
+                app.top_view.?.activity_output_scroll +|= 10;
+            } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
+                app.top_view.?.activity_output_scroll -|= 10;
+            } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+                app.top_view.?.activity_output_scroll = 0;
+            }
+            return;
+        }
         if (app.top_view.?.confirm_kill) |sid| {
             if (key.matches('y', .{})) app.killTopSession(sid);
             if (app.top_view) |*view| view.confirm_kill = null;
@@ -190,7 +206,10 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
                 if (app.topSelectedIndex()) |i| app.top_view.?.confirm_kill = app.sessions.items[i].sid;
             } else app.setNotice("select a session to kill", .{});
         } else if (isEnterKey(key)) {
-            if (app.topSelectedIndex()) |i| {
+            if (app.top_view.?.selected_activity != null) {
+                app.top_view.?.inspecting_activity = true;
+                app.top_view.?.activity_output_scroll = 0;
+            } else if (app.topSelectedIndex()) |i| {
                 const sid = app.sessions.items[i].sid;
                 app.closeTop();
                 app.switchSession(sid, true) catch app.setNotice("could not switch session", .{});

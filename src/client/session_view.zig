@@ -239,6 +239,7 @@ pub const SessionView = struct {
             .kind = item.kind,
             .name = try a.dupe(u8, item.name),
             .detail = try a.dupe(u8, item.detail),
+            .output = try a.dupe(u8, item.output),
             .started_at_ms = item.started_at_ms,
         };
         if (self.guest_activity_arena) |*old| old.deinit();

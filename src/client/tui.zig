@@ -172,6 +172,9 @@ const TopView = struct {
     selected_activity: ?usize = null,
     selected_fallback: usize = 0,
     scroll_top: usize = 0,
+    inspecting_activity: bool = false,
+    /// Number of output lines scrolled back from the live bottom.
+    activity_output_scroll: usize = 0,
     confirm_kill: ?u64 = null,
 };
 
@@ -1657,7 +1660,10 @@ pub const App = struct {
                 snapshot.deinit();
             }
             if (self.top_view) |*top| {
-                if (top.selected_sid == sid) top.selected_activity = null;
+                if (top.selected_sid == sid) {
+                    top.selected_activity = null;
+                    top.inspecting_activity = false;
+                }
             }
             return;
         }
@@ -1671,6 +1677,7 @@ pub const App = struct {
             .kind = item.kind,
             .name = try a.dupe(u8, item.name),
             .detail = try a.dupe(u8, item.detail),
+            .output = try a.dupe(u8, item.output),
             .started_at_ms = item.started_at_ms,
         };
         const previous = try self.guest_activities.fetchPut(self.gpa, sid, .{
@@ -5515,6 +5522,8 @@ fn drawTop(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
         app.notice.items,
         if (app.top_view) |view| view.confirm_kill != null else false,
         true,
+        if (app.top_view) |view| view.inspecting_activity else false,
+        if (app.top_view) |*view| &view.activity_output_scroll else unreachable,
     );
     if (app.top_view) |*view| view.scroll_top = scroll_top;
 }

@@ -30,6 +30,18 @@ test "session uuid is stable, v4-shaped, and sid-distinct" {
     try std.testing.expect(ua[8] == '-' and ua[13] == '-' and ua[18] == '-' and ua[23] == '-');
 }
 
+test "forwarded subagent prose retains its activity parent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var events: std.ArrayList(Event) = .empty;
+    try decodeLine(arena_state.allocator(),
+        \\{"type":"assistant","parent_tool_use_id":"agent-1","message":{"content":[{"type":"text","text":"inspecting tests"}]}}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("agent-1", events.items[0].child_output.parent_tool_use_id);
+    try std.testing.expectEqualStrings("inspecting tests", events.items[0].child_output.text);
+}
+
 test "argv: fresh vs resume, model passthrough, permission mapping" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -199,20 +211,22 @@ test "decode: forwarded subagent prose stays nested while its tools remain visib
     try decodeLine(arena,
         \\{"type":"assistant","parent_tool_use_id":"agent-1","message":{"content":[{"type":"thinking","thinking":"child thought"},{"type":"text","text":"child prose"},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"zig build test"}}]}}
     , &events);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expectEqualStrings("tool-1", events.items[0].tool_use.id);
-    try std.testing.expectEqualStrings("agent-1", events.items[0].tool_use.parent_tool_use_id);
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expectEqualStrings("agent-1", events.items[0].child_output.parent_tool_use_id);
+    try std.testing.expectEqualStrings("child prose", events.items[0].child_output.text);
+    try std.testing.expectEqualStrings("tool-1", events.items[1].tool_use.id);
+    try std.testing.expectEqualStrings("agent-1", events.items[1].tool_use.parent_tool_use_id);
 
     try decodeLine(arena,
         \\{"type":"stream_event","parent_tool_use_id":"agent-1","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ignored child delta"}}}
     , &events);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
 
     try decodeLine(arena,
         \\{"type":"user","parent_tool_use_id":"agent-1","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}}
     , &events);
-    try std.testing.expectEqual(@as(usize, 2), events.items.len);
-    try std.testing.expectEqualStrings("agent-1", events.items[1].tool_result.parent_tool_use_id);
+    try std.testing.expectEqual(@as(usize, 3), events.items.len);
+    try std.testing.expectEqualStrings("agent-1", events.items[2].tool_result.parent_tool_use_id);
 }
 
 test "decode: rate limit event reports usage credit state" {

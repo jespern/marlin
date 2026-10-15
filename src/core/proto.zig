@@ -45,6 +45,8 @@ pub const GuestActivity = struct {
     kind: GuestActivityKind,
     name: []const u8,
     detail: []const u8 = "",
+    /// Bounded, best-effort live output exposed by the guest harness.
+    output: []const u8 = "",
     started_at_ms: i64 = 0,
 };
 

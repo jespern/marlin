@@ -3965,6 +3965,7 @@ pub const Daemon = struct {
                 .kind = item.kind,
                 .name = a.dupe(u8, item.name) catch return arena.deinit(),
                 .detail = a.dupe(u8, item.detail) catch return arena.deinit(),
+                .output = a.dupe(u8, item.output) catch return arena.deinit(),
                 .started_at_ms = item.started_at_ms,
             };
             job.session.guest_activity_mutex.lockUncancelable(self.io);

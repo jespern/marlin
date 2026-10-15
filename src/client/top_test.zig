@@ -139,6 +139,17 @@ test "work tree flattens sessions and their activity into one navigable order" {
     try std.testing.expectEqualStrings("shell", work[2].activity.item.id);
 }
 
+test "activity output preserves blank lines for the scrollable viewer" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const lines = try top.outputLines(arena_state.allocator(), "one\n\nthree\n");
+    try std.testing.expectEqual(@as(usize, 4), lines.len);
+    try std.testing.expectEqualStrings("one", lines[0]);
+    try std.testing.expectEqualStrings("", lines[1]);
+    try std.testing.expectEqualStrings("three", lines[2]);
+    try std.testing.expectEqualStrings("", lines[3]);
+}
+
 test "top applies status updates so killed or finished task children stop reading running" {
     // Case: `x` on a running tree stopped the children in the daemon, but
     // top only listened for upserts, and untitled task children never get

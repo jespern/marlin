@@ -3,6 +3,8 @@
 const std = @import("std");
 const proto = @import("../../core/proto.zig");
 
+pub const max_output_bytes: usize = 64 * 1024;
+
 pub const PublishFn = *const fn (?*anyopaque, []const proto.GuestActivity) void;
 
 const Owned = struct {
@@ -11,6 +13,7 @@ const Owned = struct {
     kind: proto.GuestActivityKind,
     name: []u8,
     detail: []u8,
+    output: []u8,
     started_at_ms: i64,
 
     fn deinit(self: Owned, gpa: std.mem.Allocator) void {
@@ -18,6 +21,7 @@ const Owned = struct {
         gpa.free(self.parent_id);
         gpa.free(self.name);
         gpa.free(self.detail);
+        gpa.free(self.output);
     }
 };
 
@@ -73,16 +77,39 @@ pub const Tracker = struct {
         errdefer self.gpa.free(owned_name);
         const owned_detail = try self.gpa.dupe(u8, detail);
         errdefer self.gpa.free(owned_detail);
+        const owned_output = try self.gpa.dupe(u8, "");
+        errdefer self.gpa.free(owned_output);
         const owned = Owned{
             .id = owned_id,
             .parent_id = owned_parent,
             .kind = kind,
             .name = owned_name,
             .detail = owned_detail,
+            .output = owned_output,
             .started_at_ms = started_at_ms,
         };
         try self.items.append(self.gpa, owned);
         self.publish();
+    }
+
+    /// Append output to an active node while keeping activity snapshots
+    /// bounded. When the cap is crossed, retain the newest bytes.
+    pub fn appendOutput(self: *Tracker, id: []const u8, bytes: []const u8) !void {
+        if (id.len == 0 or bytes.len == 0) return;
+        for (self.items.items) |*item| {
+            if (!std.mem.eql(u8, item.id, id)) continue;
+            const keep_old = @min(item.output.len, max_output_bytes -| @min(bytes.len, max_output_bytes));
+            const keep_new = @min(bytes.len, max_output_bytes);
+            const replacement = try self.gpa.alloc(u8, keep_old + keep_new);
+            if (keep_old > 0)
+                @memcpy(replacement[0..keep_old], item.output[item.output.len - keep_old ..]);
+            if (keep_new > 0)
+                @memcpy(replacement[keep_old..], bytes[bytes.len - keep_new ..]);
+            self.gpa.free(item.output);
+            item.output = replacement;
+            self.publish();
+            return;
+        }
     }
 
     pub fn isNested(self: *const Tracker, id: []const u8) bool {
@@ -140,6 +167,7 @@ pub const Tracker = struct {
             .kind = item.kind,
             .name = item.name,
             .detail = item.detail,
+            .output = item.output,
             .started_at_ms = item.started_at_ms,
         });
         callback(self.ctx, snapshot.items);
@@ -176,4 +204,32 @@ test "finishing an agent removes its active descendants" {
     try std.testing.expectEqual(@as(usize, 2), seen);
     tracker.finish("agent");
     try std.testing.expectEqual(@as(usize, 0), seen);
+}
+
+test "activity output is appended and bounded to its newest bytes" {
+    var last: [16]u8 = undefined;
+    var last_len: usize = 0;
+    const Sink = struct {
+        fn publish(ctx: ?*anyopaque, items: []const proto.GuestActivity) void {
+            const state: *struct { buf: *[16]u8, len: *usize } = @ptrCast(@alignCast(ctx.?));
+            if (items.len == 0) return;
+            state.len.* = @min(state.buf.len, items[0].output.len);
+            @memcpy(state.buf[0..state.len.*], items[0].output[items[0].output.len - state.len.* ..]);
+        }
+    };
+    var state = .{ .buf = &last, .len = &last_len };
+    var tracker = Tracker.init(std.testing.allocator, Sink.publish, &state);
+    defer tracker.deinit();
+    try tracker.start("p", "", .process, "Bash", "echo", 1);
+    try tracker.appendOutput("p", "hello ");
+    try tracker.appendOutput("p", "world");
+    try std.testing.expectEqualStrings("hello world", last[0..last_len]);
+
+    const oversized = try std.testing.allocator.alloc(u8, max_output_bytes + 8);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+    @memcpy(oversized[oversized.len - 4 ..], "tail");
+    try tracker.appendOutput("p", oversized);
+    try std.testing.expectEqualStrings("xxxxxxxxxxxx", last[0..12]);
+    try std.testing.expectEqualStrings("tail", last[12..16]);
 }

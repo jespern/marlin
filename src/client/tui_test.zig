@@ -3348,6 +3348,14 @@ test "top overlay uses one cursor across sessions agents and processes" {
     try handleKey(&app, .{ .codepoint = 'k' });
     try std.testing.expectEqual(@as(?u64, 20), app.top_view.?.selected_sid);
     try std.testing.expectEqual(@as(?usize, 1), app.top_view.?.selected_activity);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(app.top_view.?.inspecting_activity);
+    try std.testing.expectEqual(@as(u64, 20), app.view.sid);
+    try handleKey(&app, .{ .codepoint = 'k' });
+    try std.testing.expectEqual(@as(usize, 1), app.top_view.?.activity_output_scroll);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(!app.top_view.?.inspecting_activity);
+    try std.testing.expectEqual(@as(?usize, 1), app.top_view.?.selected_activity);
 }
 
 test "top overlay kill requires confirmation before sending" {

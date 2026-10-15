@@ -570,6 +570,85 @@ fn drawActivityDetail(win: vaxis.Window, arena: std.mem.Allocator, row: Activity
     }
 }
 
+pub fn outputLines(arena: std.mem.Allocator, output: []const u8) ![]const []const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var start: usize = 0;
+    for (output, 0..) |byte, i| {
+        if (byte != '\n') continue;
+        const end = if (i > start and output[i - 1] == '\r') i - 1 else i;
+        try lines.append(arena, output[start..end]);
+        start = i + 1;
+    }
+    if (start < output.len)
+        try lines.append(arena, if (output[output.len - 1] == '\r') output[start .. output.len - 1] else output[start..])
+    else if (output.len > 0 and output[output.len - 1] == '\n')
+        try lines.append(arena, "");
+    return lines.toOwnedSlice(arena);
+}
+
+fn wrappedOutputLines(arena: std.mem.Allocator, output: []const u8, width: usize) ![]const []const u8 {
+    const logical = try outputLines(arena, output);
+    var wrapped: std.ArrayList([]const u8) = .empty;
+    for (logical) |line| {
+        if (line.len == 0) {
+            try wrapped.append(arena, "");
+            continue;
+        }
+        var start: usize = 0;
+        while (start < line.len) {
+            var end = render.wordBreak(line, start, width);
+            if (end == start) end = render.hardCellBreak(line, start, width);
+            if (end == start) break;
+            try wrapped.append(arena, line[start..end]);
+            start = end;
+            while (start < line.len and line[start] == ' ') start += 1;
+        }
+    }
+    return wrapped.toOwnedSlice(arena);
+}
+
+pub fn drawActivityOutput(
+    win: vaxis.Window,
+    arena: std.mem.Allocator,
+    row: ActivityRow,
+    output_scroll: *usize,
+) !void {
+    win.clear();
+    if (win.width < 20 or win.height < 4) return;
+    const title = try std.fmt.allocPrint(arena, " output — {s} {s}", .{ activityIcon(row.item.kind), row.item.name });
+    _ = win.printSegment(.{ .text = truncateRight(title, win.width -| 1), .style = .{ .fg = Palette.soft_blue, .bold = true } }, .{ .wrap = .none });
+    if (row.item.detail.len > 0) {
+        const detail = if (row.item.kind == .process) render.shellDisplayCommand(row.item.detail) else row.item.detail;
+        _ = win.printSegment(.{ .text = truncateRight(try std.fmt.allocPrint(arena, " {s}", .{detail}), win.width -| 1), .style = Palette.command_description }, .{ .row_offset = 1, .wrap = .none });
+    }
+
+    const body_top: usize = 3;
+    const body_height = win.height -| (body_top + 1);
+    const lines = try wrappedOutputLines(arena, row.item.output, @max(1, win.width -| 2));
+    if (lines.len == 0) {
+        output_scroll.* = 0;
+        _ = win.printSegment(.{
+            .text = " No output has been emitted by this harness yet.",
+            .style = .{ .fg = .{ .index = 8 }, .dim = true },
+        }, .{ .row_offset = @intCast(body_top), .wrap = .none });
+    } else if (body_height > 0) {
+        const max_scroll = lines.len -| body_height;
+        output_scroll.* = @min(output_scroll.*, max_scroll);
+        const end = lines.len - output_scroll.*;
+        const begin = end -| body_height;
+        for (lines[begin..end], 0..) |line, i| {
+            _ = win.printSegment(.{ .text = line, .style = Palette.tab_inactive }, .{
+                .row_offset = @intCast(body_top + i),
+                .col_offset = 1,
+                .wrap = .none,
+            });
+        }
+    }
+    const footer_win = win.child(.{ .y_off = win.height - 1, .height = 1, .width = win.width });
+    footer_win.fill(.{ .style = Palette.command_menu });
+    _ = footer_win.printSegment(.{ .text = " j/k scroll · G follow bottom · Esc back · Ctrl+S close", .style = Palette.command_description }, .{ .wrap = .none });
+}
+
 pub fn headerText(arena: std.mem.Allocator, columns: Columns) ![]const u8 {
     const handle = try padded(arena, "HANDLE", columns.handle, false);
     const state = try padded(arena, "STATE", columns.state, false);
@@ -657,6 +736,8 @@ pub const Top = struct {
     selected_activity: ?usize = null,
     selected_fallback: usize = 0,
     scroll_top: usize = 0,
+    inspecting_activity: bool = false,
+    activity_output_scroll: usize = 0,
     show_archived: bool = false,
     confirm_kill: ?u64 = null,
     pending_action: ?PendingAction = null,
@@ -684,7 +765,10 @@ pub const Top = struct {
                 var snapshot = removed.value;
                 snapshot.deinit();
             }
-            if (self.selected_sid == sid) self.selected_activity = null;
+            if (self.selected_sid == sid) {
+                self.selected_activity = null;
+                self.inspecting_activity = false;
+            }
             return;
         }
         var arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -696,6 +780,7 @@ pub const Top = struct {
             .kind = item.kind,
             .name = a.dupe(u8, item.name) catch return arena.deinit(),
             .detail = a.dupe(u8, item.detail) catch return arena.deinit(),
+            .output = a.dupe(u8, item.output) catch return arena.deinit(),
             .started_at_ms = item.started_at_ms,
         };
         const previous = self.activities.fetchPut(self.gpa, sid, .{ .arena = arena, .items = owned }) catch {
@@ -951,6 +1036,24 @@ fn tickThread(io: Io, stop: *std.atomic.Value(bool), loop: *vaxis.Loop(Event)) v
 }
 
 fn handleKey(app: *Top, key: vaxis.Key) void {
+    if (app.inspecting_activity) {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            app.inspecting_activity = false;
+        } else if (key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) {
+            app.should_quit = true;
+        } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+            app.activity_output_scroll +|= 1;
+        } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+            app.activity_output_scroll -|= 1;
+        } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
+            app.activity_output_scroll +|= 10;
+        } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
+            app.activity_output_scroll -|= 10;
+        } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+            app.activity_output_scroll = 0;
+        }
+        return;
+    }
     if (app.confirm_kill) |sid| {
         if (key.matches('y', .{})) app.requestKill(sid);
         app.confirm_kill = null;
@@ -988,7 +1091,10 @@ fn handleKey(app: *Top, key: vaxis.Key) void {
             }
         }
     } else if (key.matches(vaxis.Key.enter, .{})) {
-        if (app.selectedIndex()) |i| {
+        if (app.selected_activity != null) {
+            app.inspecting_activity = true;
+            app.activity_output_scroll = 0;
+        } else if (app.selectedIndex()) |i| {
             app.attach_sid = app.rows.items[i].sid;
             app.should_quit = true;
         }
@@ -1027,6 +1133,8 @@ pub fn drawCatalog(
     notice: []const u8,
     confirm_kill: bool,
     embedded: bool,
+    inspecting_activity: bool,
+    output_scroll: *usize,
 ) !void {
     win.clear();
     if (win.width < 20 or win.height < 4) return;
@@ -1049,6 +1157,11 @@ pub fn drawCatalog(
         live_work += row.activity_count;
     }
 
+    if (inspecting_activity and work.len > 0) switch (work[selected_index]) {
+        .activity => |activity| return drawActivityOutput(win, arena, activity, output_scroll),
+        .session => {},
+    };
+
     const summary = try std.fmt.allocPrint(arena, " marlin work tree — {d} sessions · {d} running · {d} live work · {d} approval · {d} error{s}{s}", .{
         rows.len,
         running,
@@ -1063,12 +1176,7 @@ pub fn drawCatalog(
     const columns = computeColumns(win.width -| 1);
     _ = win.printSegment(.{ .text = try headerText(arena, columns), .style = .{ .fg = .{ .index = 8 }, .bold = true } }, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
 
-    const selected_is_activity = work.len > 0 and switch (work[selected_index]) {
-        .activity => true,
-        .session => false,
-    };
-    const detail_rows: usize = if (selected_is_activity and win.height >= 8) @min(5, @max(3, win.height / 4)) else 0;
-    const body_height: usize = win.height -| (4 + detail_rows);
+    const body_height: usize = win.height -| 4;
     if (rows.len == 0) {
         _ = win.printSegment(.{ .text = " no sessions — marlin run \"task\" to start one", .style = .{ .fg = .{ .index = 8 }, .dim = true } }, .{ .row_offset = 3, .wrap = .none });
     } else {
@@ -1093,23 +1201,14 @@ pub fn drawCatalog(
         }
     }
 
-    if (detail_rows > 0) switch (work[selected_index]) {
-        .activity => |activity| try drawActivityDetail(win.child(.{
-            .y_off = @intCast(win.height - detail_rows - 1),
-            .height = @intCast(detail_rows),
-            .width = win.width,
-        }), arena, activity),
-        .session => {},
-    };
-
     const footer: []const u8 = if (confirm_kill)
         " kill session tree? y confirm · any other key cancel"
     else if (notice.len > 0)
         notice
     else if (embedded)
-        " j/k move · Enter switch · a archive · x kill · Ctrl+S/Esc close"
+        " j/k move · Enter open/switch · a archive · x kill · Ctrl+S/Esc close"
     else
-        " j/k move · Enter attach · a archive · x kill · A archived · q quit";
+        " j/k move · Enter open/attach · a archive · x kill · A archived · q quit";
     const footer_win = win.child(.{ .y_off = win.height - 1, .height = 1, .width = win.width });
     footer_win.fill(.{ .style = Palette.command_menu });
     _ = footer_win.printSegment(.{ .text = footer, .style = Palette.command_description }, .{ .wrap = .none });
@@ -1143,6 +1242,8 @@ fn draw(app: *Top, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         app.notice.items,
         app.confirm_kill != null,
         false,
+        app.inspecting_activity,
+        &app.activity_output_scroll,
     );
 }
 
