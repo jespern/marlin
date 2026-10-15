@@ -424,6 +424,17 @@ fn ccInvoke(
     const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
     var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
     const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
+    // Both threads point into this frame. Any error return from here on must
+    // stop them and reap the child before the frame unwinds; the success path
+    // tears down the same way and clears this guard first.
+    var threads_live = true;
+    errdefer if (threads_live) {
+        watcher.done.store(true, .release);
+        watcher_thread.join();
+        process_io.terminateProcessGroup(io, child.id.?, 0);
+        if (drain_thread) |t| t.join();
+        _ = child.wait(io) catch {};
+    };
 
     // Stream-json input keeps this exact Claude process alive while a steer
     // arrives. The first message is synchronous; a pump owns the pipe after
@@ -432,8 +443,21 @@ fn ccInvoke(
     child.stdin = null;
     var stdin_buffer: [64 * 1024]u8 = undefined;
     var stdin_writer_file = stdin_file.writer(io, &stdin_buffer);
-    try writeCcUserInput(gpa, &stdin_writer_file.interface, prompt);
+    // A claude that exits before reading its prompt (an immediate error
+    // result, e.g. an unknown --resume id) has already said why on stdout;
+    // the broken pipe is not the outcome. Read that stdout as usual.
+    const prompt_written = if (writeCcUserInput(gpa, &stdin_writer_file.interface, prompt)) |_|
+        true
+    else |err| switch (err) {
+        error.OutOfMemory => {
+            stdin_file.close(io);
+            return error.OutOfMemory;
+        },
+        else => false,
+    };
     var input_pump = CcInputPump{
+        // An unwritable stdin gets no steering: the pump closes it and exits.
+        .done = !prompt_written,
         .gpa = gpa,
         .io = io,
         .opts = &opts,
@@ -743,6 +767,7 @@ fn ccInvoke(
 
     // The watcher signals the group by id, so it stops before anything here
     // can reap the child and free that id for reuse.
+    threads_live = false;
     watcher.done.store(true, .release);
     watcher_thread.join();
     // A finalized Claude can stay resident on a closed stdin, so it is

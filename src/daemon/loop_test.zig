@@ -677,6 +677,55 @@ test "delegated turn recovers when claude has never seen the derived session" {
     try std.testing.expectEqualStrings("RECOVERED-OK", second.text);
 }
 
+test "delegated turn reads the outcome of a claude that exits before reading its prompt" {
+    // Case: on fast Linux runners the fake claude above exited before marlin
+    // wrote the prompt. The broken pipe aborted the turn, and the stderr and
+    // deadline threads it had started outlived their frame and crashed a
+    // later test. A prompt larger than any pipe buffer makes the race certain.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-cc-early-exit-test");
+    defer temp.deinit();
+    const script =
+        \\#!/bin/sh
+        \\echo '{"type":"system","subtype":"init","session_id":"x"}'
+        \\echo '{"type":"result","subtype":"success","result":"EARLY-EXIT-OK","usage":{"input_tokens":1,"output_tokens":1}}'
+        \\exec 0<&-
+        \\
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-claude" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(claude_code.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, temp.path, "claudecode/claude-fable-5", .auto);
+
+    const huge_prompt = try gpa.alloc(u8, 256 * 1024);
+    defer gpa.free(huge_prompt);
+    @memset(huge_prompt, 'x');
+    const result = try runTurn(gpa, io, &store, .{
+        .session_id = 1,
+        .cwd = temp.path,
+        .endpoint = .{ .url = "", .bearer = null, .model = "claude-fable-5", .backend = .{ .guest = .claude_code } },
+        .cfg = .{},
+        .tool_environ = &env,
+        .approval_mode = .auto,
+    }, huge_prompt, &.{});
+    defer gpa.free(result.text);
+    try std.testing.expectEqualStrings("EARLY-EXIT-OK", result.text);
+}
+
 test "codex guest never silently falls back to API-key billing" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
