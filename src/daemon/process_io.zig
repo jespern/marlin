@@ -223,6 +223,30 @@ pub fn closeStdinAndReap(child: *std.process.Child, io: Io, grace_ms: u32) bool 
         stdin.close(io);
         child.stdin = null;
     }
+    return reapWithin(pid, io, grace_ms);
+}
+
+/// SIGTERM the child's process group, poll for the child to exit on its own
+/// for up to `grace_ms`, then SIGKILL whatever is left of the group.
+///
+/// For a guest that ignores a closed stdin but flushes on SIGTERM (Claude
+/// Code ships its final OTLP logs in its SIGTERM handler): a fixed sleep
+/// before the kill would either cut that flush short or delay every turn by
+/// the whole grace. Returns true when the child was reaped, with the same
+/// contract as `closeStdinAndReap`: `releaseReapedChild` next, never `wait`.
+/// On false the child has been SIGKILLed but not reaped, so `wait` it.
+pub fn terminateProcessGroupAndReap(child: *std.process.Child, io: Io, grace_ms: u32) bool {
+    if (builtin.os.tag == .windows) return false;
+    const pid = child.id orelse return true;
+    std.posix.kill(-pid, .TERM) catch {};
+    const reaped = reapWithin(pid, io, grace_ms);
+    // Even a reaped leader can leave descendants behind; they must not
+    // outlive the turn.
+    std.posix.kill(-pid, .KILL) catch {};
+    return reaped;
+}
+
+fn reapWithin(pid: std.posix.pid_t, io: Io, grace_ms: u32) bool {
     const Status = if (builtin.link_libc) c_int else u32;
     const WaitOptions = if (builtin.link_libc) c_int else u32;
     const nohang: WaitOptions = std.posix.W.NOHANG;
@@ -246,10 +270,14 @@ pub fn closeStdinAndReap(child: *std.process.Child, io: Io, grace_ms: u32) bool 
     }
 }
 
-/// Release the pipes of a child whose exit `closeStdinAndReap` already
-/// observed. `Child.wait` would normally do this, but it also waits — which
-/// the caller must not do twice.
+/// Release the pipes of a child whose exit `closeStdinAndReap` or
+/// `terminateProcessGroupAndReap` already observed. `Child.wait` would
+/// normally do this, but it also waits — which the caller must not do twice.
 pub fn releaseReapedChild(child: *std.process.Child, io: Io) void {
+    if (child.stdin) |stdin| {
+        stdin.close(io);
+        child.stdin = null;
+    }
     if (child.stdout) |stdout| {
         stdout.close(io);
         child.stdout = null;

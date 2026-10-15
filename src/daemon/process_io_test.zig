@@ -377,6 +377,92 @@ test "a closed stdin alone ends a stdio child that flushes on the way out" {
     try std.testing.expectEqualStrings("flushed", flushed);
 }
 
+/// Wait for a child script to signal readiness by creating `path`: a signal
+/// sent before its `trap` runs would meet the default action instead.
+fn awaitFile(io: Io, path: []const u8, timeout_ms: u32) !void {
+    var waited: u32 = 0;
+    while (true) : (waited += 10) {
+        if (Io.Dir.cwd().access(io, path, .{})) |_| return else |_| {}
+        if (waited >= timeout_ms) return error.Timeout;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
+test "a group SIGTERM gives a child that flushes on the signal time to finish" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try TestScratch.init(gpa, io, "marlin-process-io-term-flush");
+    defer temp.deinit();
+    const ready_path = try std.fs.path.join(gpa, &.{ temp.path, "ready" });
+    defer gpa.free(ready_path);
+    const out_path = try std.fs.path.join(gpa, &.{ temp.path, "flushed" });
+    defer gpa.free(out_path);
+
+    // Stands in for Claude Code: resident regardless of stdin, it ships its
+    // batched work from its SIGTERM handler, which a prompt SIGKILL cuts off.
+    const script =
+        \\trap 'sleep 0.2; printf flushed > "$2"; exit 0' TERM
+        \\: > "$1"
+        \\sleep 30 &
+        \\wait $!
+    ;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", script, "--", ready_path, out_path },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const group: std.posix.pid_t = child.id.?;
+    defer {
+        terminateProcessGroup(io, group, 0);
+        child.kill(io);
+    }
+    try awaitFile(io, ready_path, 5_000);
+
+    try std.testing.expect(process_io.terminateProcessGroupAndReap(&child, io, 2_000));
+    process_io.releaseReapedChild(&child, io);
+
+    const flushed = try Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .limited(64));
+    defer gpa.free(flushed);
+    try std.testing.expectEqualStrings("flushed", flushed);
+}
+
+test "a group SIGTERM the child ignores ends in a SIGKILL after the grace" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var temp = try TestScratch.init(gpa, io, "marlin-process-io-term-ignored");
+    defer temp.deinit();
+    const ready_path = try std.fs.path.join(gpa, &.{ temp.path, "ready" });
+    defer gpa.free(ready_path);
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "trap '' TERM; : > \"$1\"; " ++ stubbornLoop(30), "--", ready_path },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const group: std.posix.pid_t = child.id.?;
+    defer {
+        terminateProcessGroup(io, group, 0);
+        child.kill(io);
+    }
+    try awaitFile(io, ready_path, 5_000);
+
+    try std.testing.expect(!process_io.terminateProcessGroupAndReap(&child, io, 150));
+    const term = try child.wait(io);
+    try std.testing.expect(term == .signal);
+}
+
 test "a child that ignores the closed stdin is left for the caller to signal" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;

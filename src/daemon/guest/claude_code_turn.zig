@@ -47,6 +47,11 @@ const putEnvDefault = shared.putEnvDefault;
 const CcWatcher = shared.CcWatcher;
 const CcStderrDrain = shared.CcStderrDrain;
 
+/// How long a finalized Claude Code gets between SIGTERM and SIGKILL. Its
+/// SIGTERM handler flushes OTLP for at most CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS
+/// (2 s by default); the margin covers process exit after it.
+const cc_shutdown_grace_ms: u32 = 2500;
+
 pub fn usageCreditsTransitionNote(active: bool) []const u8 {
     return if (active)
         "Claude Code is now using API credits"
@@ -731,19 +736,30 @@ fn ccInvoke(
     outcome.input_count = input_pump.inputCount();
     outcome.steering_finalized = input_pump.isFinalized();
     outcome.input_write_failed = input_pump.write_failed.load(.acquire);
-    if (outcome.steering_finalized)
-        process_io.terminateProcessGroup(io, child.id.?, 50);
 
+    // The watcher signals the group by id, so it stops before anything here
+    // can reap the child and free that id for reuse.
     watcher.done.store(true, .release);
     watcher_thread.join();
+    // A finalized Claude can stay resident on a closed stdin, so it is
+    // signalled, but given time to exit: its SIGTERM handler ships the turn's
+    // last OTLP logs (the final api_request and the assistant_response), and
+    // a kill 50 ms later used to throw exactly those away.
+    const reaped = outcome.steering_finalized and
+        process_io.terminateProcessGroupAndReap(&child, io, cc_shutdown_grace_ms);
     if (drain_thread) |t| t.join();
     outcome.cancelled = watcher.cancelled.load(.acquire);
     outcome.timed_out = watcher.timed_out.load(.acquire);
-    const term: std.process.Child.Term = child.wait(io) catch .{ .exited = 255 };
-    outcome.exit_code = switch (term) {
-        .exited => |code| code,
-        else => -1,
-    };
+    if (reaped) {
+        // A finalized run has its result, so its exit code is never read.
+        process_io.releaseReapedChild(&child, io);
+    } else {
+        const term: std.process.Child.Term = child.wait(io) catch .{ .exited = 255 };
+        outcome.exit_code = switch (term) {
+            .exited => |code| code,
+            else => -1,
+        };
+    }
     @memcpy(outcome.stderr_tail[0..drain.len], drain.tail[0..drain.len]);
     outcome.stderr_len = drain.len;
 
