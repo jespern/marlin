@@ -1,5 +1,7 @@
 # marlin
 
+[![shadybin](https://img.shields.io/endpoint?url=https://shadybin.dev/registry/github.com/jespern/marlin/badge.json)](https://shadybin.dev/registry/github.com/jespern/marlin/)
+
 **A durable session multiplexer for AI agents, written in Zig.**
 
 One static binary. A daemon that owns your agent sessions and keeps them running;
