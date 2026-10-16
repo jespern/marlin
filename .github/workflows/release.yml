@@ -182,3 +182,21 @@ jobs:
             git -C homebrew-tap commit -m "marlin $version"
             git -C homebrew-tap push
           fi
+
+  # shadybin rebuilds the release from its tag, on the same kinds of runners as build,
+  # checks the binaries are the ones just published, has Claude review the code that goes
+  # into them, and attaches its statement and report to the release. It runs on this
+  # repository's Actions minutes and Claude API key (the ANTHROPIC_API_KEY secret); the
+  # badge at shadybin.dev then shows the release's verdict.
+  shadybin:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: shadybin/shadybin/.github/workflows/certify.yml@5362b451327a344e6e10aca225ab33135715ea64 # main
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

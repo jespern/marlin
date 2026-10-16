@@ -74,6 +74,11 @@ pub fn build(b: *std.Build) void {
     // module below for safety checks and fast compile iteration.
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
     const version = b.option([]const u8, "version", "Marlin version embedded in the binary") orelse "0.0.0-dev";
+    // Release binaries carry no debug info: it held build-cache paths whose hashes depend
+    // on the build machine's CPU (a dependency builds a code generator for the host), so
+    // two builds of the same tag on different x86 runners differed in those paths alone.
+    // Stripped, a release rebuilds byte for byte, and is smaller.
+    const strip = b.option(bool, "strip", "Omit debug info (default: on unless Debug)") orelse (optimize != .Debug);
     const embedded_sqlite = b.option(
         bool,
         "embedded-sqlite",
@@ -105,6 +110,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis.module("vaxis") },
                 .{ .name = "regex", .module = regex.module("regex") },
