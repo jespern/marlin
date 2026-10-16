@@ -230,3 +230,44 @@ test "assistant inline Markdown supports emphasis and strikethrough" {
     try std.testing.expect(rendered.styles[0].style.italic);
     try std.testing.expect(rendered.styles[1].style.strikethrough);
 }
+
+fn selectRows(arena: std.mem.Allocator, lines: []const Line, first: usize, last: usize) ![]const u8 {
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{ .rows = 4, .cols = 200, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(std.testing.allocator);
+    const win = vaxis.Window{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 200, .height = 4, .screen = &screen };
+    return render.selectedText(arena, win, lines, render.Selection.init(.{ .line = first, .col = 0 }, .{ .line = last, .col = 199 }));
+}
+
+test "selecting a soft-wrapped code line copies the source line, not the screen" {
+    // Case: a long markdown badge line wrapped at …/te | rma-cli… in its code
+    // panel; dragging over it copied a newline at the wrap and panel chrome.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source = "[![shadybin](https://img.shields.io/endpoint?url=https://shadybin.dev/registry/github.com/miradorlabs/terma-cli/badge.json)](https://shadybin.dev/registry/github.com/miradorlabs/terma-cli/)";
+    var lines: std.ArrayList(Line) = .empty;
+    try wrapMarkdown(arena, &lines, "```markdown\n" ++ source ++ "\nsecond line\n```", 80);
+    var first_code: ?usize = null;
+    var last_code: usize = 0;
+    for (lines.items, 0..) |line, i| {
+        if (line.copy.content_end_col == null) continue;
+        if (first_code == null) first_code = i;
+        last_code = i;
+    }
+    try std.testing.expect(last_code > first_code.? + 1); // the long line really wrapped
+    const copied = try selectRows(arena, lines.items, first_code.?, last_code);
+    try std.testing.expectEqualStrings(source ++ "\nsecond line", copied);
+}
+
+test "selecting word-wrapped prose restores the consumed spaces and drops the hanging indent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sentence = "It will read v0.2.7 not certified until there is a certified release, which needs credits and an API key secret first.";
+    var lines: std.ArrayList(Line) = .empty;
+    try wrapMarkdown(arena, &lines, "- " ++ sentence, 40);
+    try std.testing.expect(lines.items.len >= 3);
+    const copied = try selectRows(arena, lines.items, 0, lines.items.len - 1);
+    try std.testing.expect(std.mem.indexOfScalar(u8, copied, '\n') == null);
+    try std.testing.expect(std.mem.endsWith(u8, copied, sentence));
+}

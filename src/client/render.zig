@@ -187,6 +187,9 @@ pub const Line = struct {
     /// the clipboard when the row is clicked. Owned by the layout arena or
     /// cache like every other Line slice.
     copy_payload: ?[]const u8 = null,
+    /// How selection copy treats this row: whether it continues the row
+    /// above (a soft wrap) and which display columns hold copyable content.
+    copy: CopyRow = .{},
 };
 
 pub const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
@@ -984,6 +987,38 @@ pub fn appendColumns(
     }
 }
 
+/// Selection-copy metadata for one rendered row. Wrapping is a display
+/// artifact: copying across a wrap must reproduce the source text, not the
+/// screen, and chrome (hanging indents, line numbers, panel borders, padding)
+/// is never part of the content.
+pub const CopyRow = struct {
+    /// How this row joins the previous one when both are copied.
+    join: Join = .newline,
+    /// Copyable display columns `[content_col, content_end_col)`; null bounds
+    /// mean the row edge.
+    content_col: ?u16 = null,
+    content_end_col: ?u16 = null,
+
+    pub const Join = enum {
+        /// A new source line.
+        newline,
+        /// A hard break inside a word or code line: nothing was consumed.
+        direct,
+        /// A word wrap that consumed the separating whitespace.
+        space,
+    };
+};
+
+fn clampCol(width: usize) ?u16 {
+    return @intCast(@min(width, std.math.maxInt(u16)));
+}
+
+/// Copy metadata for a soft-wrapped continuation row whose content starts
+/// after `prefix_width` columns of hanging indent or chrome.
+pub fn continuationCopy(prefix_width: usize, consumed_space: bool) CopyRow {
+    return .{ .join = if (consumed_space) .space else .direct, .content_col = clampCol(prefix_width) };
+}
+
 pub fn selectedText(
     arena: std.mem.Allocator,
     win: vaxis.Window,
@@ -995,11 +1030,19 @@ pub fn selectedText(
     const last = @min(selection.hi.line, lines.len - 1);
     var line_idx = selection.lo.line;
     while (line_idx <= last) : (line_idx += 1) {
-        if (line_idx > selection.lo.line) try out.append(arena, '\n');
         const line = lines[line_idx];
+        if (line_idx > selection.lo.line) switch (line.copy.join) {
+            .newline => try out.append(arena, '\n'),
+            .direct => {},
+            .space => try out.append(arena, ' '),
+        };
         const text = try lineText(arena, line);
         const cols = selection.columns(line_idx, lineWidth(win, line)) orelse continue;
-        try appendColumns(arena, &out, win, text, cols.start, cols.end);
+        var start = cols.start;
+        var end = cols.end;
+        if (line.copy.content_col) |col| start = @max(start, col);
+        if (line.copy.content_end_col) |col| end = @min(end, col);
+        if (start < end) try appendColumns(arena, &out, win, text, start, end);
     }
     return out.items;
 }
@@ -1048,6 +1091,7 @@ pub fn wrapPrefixed(
             continue;
         }
         var start: usize = 0;
+        var consumed_space = false;
         while (start < raw_line.len) {
             const line_prefix = if (first) prefix else continuation;
             const body_width = width -| displayWidth(line_prefix);
@@ -1071,10 +1115,15 @@ pub fn wrapPrefixed(
                 .style = style,
                 .links = links,
                 .links_resolved = true,
+                .copy = if (start > 0) continuationCopy(displayWidth(line_prefix), consumed_space) else .{},
             });
             first = false;
             start = end;
-            while (start < raw_line.len and (raw_line[start] == ' ' or raw_line[start] == '\t')) start += 1;
+            consumed_space = false;
+            while (start < raw_line.len and (raw_line[start] == ' ' or raw_line[start] == '\t')) {
+                start += 1;
+                consumed_space = true;
+            }
         }
     }
 }

@@ -223,6 +223,7 @@ pub fn appendMarkdownLine(
 
     var start: usize = 0;
     var first = true;
+    var consumed_space = false;
     while (start < rendered.text.len) {
         const line_prefix = if (first) first_prefix else continuation_prefix;
         const body_width = width -| displayWidth(line_prefix);
@@ -240,10 +241,15 @@ pub fn appendMarkdownLine(
             .links = try linksForChunk(arena, rendered.links, start, end, line_prefix.len),
             .syntax = try stylesForChunk(arena, rendered.styles, start, end, line_prefix.len),
             .links_resolved = true,
+            .copy = if (first) .{} else render.continuationCopy(displayWidth(line_prefix), consumed_space),
         });
         first = false;
         start = end;
-        while (start < rendered.text.len and (rendered.text[start] == ' ' or rendered.text[start] == '\t')) start += 1;
+        consumed_space = false;
+        while (start < rendered.text.len and (rendered.text[start] == ' ' or rendered.text[start] == '\t')) {
+            start += 1;
+            consumed_space = true;
+        }
     }
 }
 
@@ -615,6 +621,9 @@ pub fn appendCodeBlock(
                 .end = gutter.len + panel.items.len,
                 .style = Palette.md_code_border,
             });
+            // Copy only the code: the line number column, borders, and
+            // padding are chrome, and a hard-wrapped code line rejoins as-is.
+            const content_col = displayWidth(gutter) + displayWidth(panel.items[0 .. code_offset - gutter.len]);
             try lines.append(arena, .{
                 .text = gutter,
                 .style = .{},
@@ -622,6 +631,11 @@ pub fn appendCodeBlock(
                 .style2 = Palette.md_code_panel,
                 .syntax = styles.items,
                 .links_resolved = true,
+                .copy = .{
+                    .join = if (first) .newline else .direct,
+                    .content_col = @intCast(@min(content_col, std.math.maxInt(u16))),
+                    .content_end_col = @intCast(@min(content_col + used, std.math.maxInt(u16))),
+                },
             });
             first = false;
             start = end;
