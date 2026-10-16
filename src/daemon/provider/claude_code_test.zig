@@ -131,6 +131,9 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     try std.testing.expectEqualStrings("--mcp-config", bridged[12]);
     try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"command\":\"/opt/marlin\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"--sid\",\"42\"") != null);
+    // Approvals and questions wait on a human: lift Claude Code's 30-minute
+    // silent-call abort for this server only.
+    try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"timeout\":604800000") != null);
     try std.testing.expectEqualStrings("--append-system-prompt", bridged[14]);
     try std.testing.expect(std.mem.indexOf(u8, bridged[15], "mcp__marlin__ask_user") != null);
     try std.testing.expectEqualStrings("--permission-mode", bridged[16]);

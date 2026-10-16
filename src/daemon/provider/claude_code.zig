@@ -24,6 +24,14 @@ const Effort = @import("../../core/effort.zig").Effort;
 pub const binary_env = "MARLIN_CLAUDE_CODE_BIN";
 pub const default_binary = "claude";
 
+/// Per-server MCP tool timeout for marlin's own bridge. Claude Code aborts any
+/// MCP call that is silent for 30 minutes and sends no progress token to keep
+/// one alive, but approve and ask_user are silent precisely while the human
+/// thinks. A week is "until answered" in practice, yet still finite should the
+/// bridge ever wedge; it is scoped to this server, so the user's other MCP
+/// servers keep Claude's default guard. (Verified against claude 2.1.300.)
+pub const bridge_tool_timeout_ms: u64 = 7 * 24 * 60 * 60 * 1000;
+
 pub fn binaryPath(environ: ?*const std.process.Environ.Map) []const u8 {
     const env = environ orelse return default_binary;
     const override = env.get(binary_env) orelse return default_binary;
@@ -108,6 +116,7 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
                 .type = "stdio",
                 .command = bridge.marlin_exe,
                 .args = .{ "cc_approve", "--sid", try std.fmt.allocPrint(arena, "{d}", .{bridge.sid}) },
+                .timeout = bridge_tool_timeout_ms,
             } },
         }, .{});
         try argv.appendSlice(arena, &.{
