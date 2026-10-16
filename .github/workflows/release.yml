@@ -195,7 +195,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: shadybin/shadybin/.github/workflows/certify.yml@5362b451327a344e6e10aca225ab33135715ea64 # main
+    uses: shadybin/shadybin/.github/workflows/certify.yml@7b883fdc66a7beb429d67bc45529ff5d8f0f9d1f # main; builds the tool from its own commit
     with:
       tag: ${{ github.ref_name }}
     secrets:
