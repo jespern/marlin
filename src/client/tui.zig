@@ -5964,16 +5964,16 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         .tool => {},
     };
     const work_txt: []const u8 = if (work_agents > 0 and work_processes > 0)
-        try std.fmt.allocPrint(arena, "{d} agent{s} · {d} proc{s} · Ctrl+S →", .{
+        try std.fmt.allocPrint(arena, "{d} agent{s} · {d} proc{s}", .{
             work_agents,
             if (work_agents == 1) "" else "s",
             work_processes,
             if (work_processes == 1) "" else "s",
         })
     else if (work_agents > 0)
-        try std.fmt.allocPrint(arena, "{d} agent{s} · Ctrl+S →", .{ work_agents, if (work_agents == 1) "" else "s" })
+        try std.fmt.allocPrint(arena, "{d} agent{s}", .{ work_agents, if (work_agents == 1) "" else "s" })
     else if (work_processes > 0)
-        try std.fmt.allocPrint(arena, "{d} proc{s} · Ctrl+S →", .{ work_processes, if (work_processes == 1) "" else "s" })
+        try std.fmt.allocPrint(arena, "{d} proc{s}", .{ work_processes, if (work_processes == 1) "" else "s" })
     else
         "";
     var background_running: usize = 0;
