@@ -506,7 +506,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
                     completeSuggestion(ed, suggestion, false);
                     app.command_selection = 0;
                     if (suggestion.submit_on_enter) {
-                        const text = try ed.takeExpandedWithImages(app.attachments.items.len);
+                        const text = try ed.takeExpandedWithImages(app.view.attachments.items.len);
                         defer app.gpa.free(text);
                         app.submitInput(text);
                     }
@@ -520,7 +520,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (isNewlineKey(key)) {
                 ed.insertNewline();
             } else if (isEnterKey(key)) {
-                const text = try ed.takeExpandedWithImages(app.attachments.items.len);
+                const text = try ed.takeExpandedWithImages(app.view.attachments.items.len);
                 defer app.gpa.free(text);
                 app.submitInput(text);
             } else if (isPreviousInputRowKey(key)) {
@@ -1025,7 +1025,7 @@ pub fn isNewSessionKey(key: vaxis.Key) bool {
 /// the session you were reading is the wrong surprise.
 pub fn isArchiveCurrentKey(app: *const App, key: vaxis.Key) bool {
     return key.matches('w', .{ .ctrl = true }) and
-        app.view.editor.isEmpty() and app.attachments.items.len == 0 and
+        app.view.editor.isEmpty() and app.view.attachments.items.len == 0 and
         app.copy_cursor == null;
 }
 

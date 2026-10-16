@@ -1928,7 +1928,7 @@ test "staging images inserts numbered prompt placeholders" {
     });
 
     try std.testing.expectEqualStrings("compare [image #1] [image #2] ", app.view.editor.text.items);
-    try std.testing.expectEqual(@as(usize, 2), app.attachments.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.view.attachments.items.len);
 }
 
 test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D never does" {
@@ -1958,7 +1958,7 @@ test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D neve
     try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_w));
     app.view.editor.clear();
 
-    try app.attachments.append(gpa, .{
+    try app.view.attachments.append(gpa, .{
         .name = try gpa.dupe(u8, "image.png"),
         .mime = try gpa.dupe(u8, "image/png"),
         .data_base64 = try gpa.dupe(u8, "AA=="),
@@ -3617,6 +3617,46 @@ test "tab navigation follows chronological roots and wraps" {
     try handleKey(&one, .{ .codepoint = '<' });
     try handleKey(&one, .{ .codepoint = vaxis.Key.right });
     try std.testing.expectEqual(@as(usize, 2), one.view.editor.cursor);
+}
+
+test "a staged image stays with its own tab's draft instead of following tab switches" {
+    // Case: an image pasted in one tab "for later", then a new tab opened —
+    // the image went out with the new tab's message, and the original tab
+    // was left with a bare [image #N] placeholder.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 10, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 10, .title = "first", .model = "m", .status = "idle", .created_at = 10, .running = false },
+        .{ .sid = 20, .title = "second", .model = "m", .status = "idle", .created_at = 20, .running = false },
+    });
+
+    app.view.editor.insertSlice("for later ");
+    app.addAttachment(.{
+        .name = try gpa.dupe(u8, "shot.png"),
+        .mime = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, "QUFBQQ=="),
+    });
+    try std.testing.expectEqual(@as(usize, 1), app.view.attachments.items.len);
+
+    try app.switchSession(20, false);
+    try std.testing.expectEqual(@as(u64, 20), app.view.sid);
+    try std.testing.expectEqual(@as(usize, 0), app.view.attachments.items.len);
+    output.clearRetainingCapacity();
+    app.submitInput("hello from the other tab");
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "hello from the other tab") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "QUFBQQ==") == null);
+
+    try app.switchSession(10, false);
+    try std.testing.expectEqual(@as(usize, 1), app.view.attachments.items.len);
+    try std.testing.expectEqualStrings("for later [image #1] ", app.view.editor.text.items);
 }
 
 test "tab overflow retains the active tab and tab hit testing is button-extensible" {

@@ -439,7 +439,6 @@ pub const App = struct {
     /// per-session lives there so a switch (or, later, a second pane) moves
     /// one value instead of a field list.
     view: SessionView,
-    attachments: std.ArrayList(media.Pending) = .empty,
 
     mode: Mode = .insert,
     /// Terminal size (updated on every winsize event); columns drive editor
@@ -650,8 +649,6 @@ pub const App = struct {
     next_input_request_id: u64 = 1,
 
     pub fn deinit(self: *App) void {
-        self.clearAttachments();
-        self.attachments.deinit(self.gpa);
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
         self.picker_filter.deinit(self.gpa);
@@ -720,26 +717,26 @@ pub const App = struct {
     }
 
     pub fn clearAttachments(self: *App) void {
-        for (self.attachments.items) |*attachment| attachment.deinit(self.gpa);
-        self.attachments.clearRetainingCapacity();
+        for (self.view.attachments.items) |*attachment| attachment.deinit(self.gpa);
+        self.view.attachments.clearRetainingCapacity();
     }
 
     pub fn addAttachment(self: *App, pending_value: media.Pending) void {
         var pending = pending_value;
-        if (self.attachments.items.len >= 4) {
+        if (self.view.attachments.items.len >= 4) {
             pending.deinit(self.gpa);
             self.setNotice("at most four images may be attached to one message", .{});
             return;
         }
-        self.attachments.append(self.gpa, pending) catch {
+        self.view.attachments.append(self.gpa, pending) catch {
             pending.deinit(self.gpa);
             self.setNotice("could not stage image", .{});
             return;
         };
-        self.view.editor.insertImagePlaceholder(self.attachments.items.len);
+        self.view.editor.insertImagePlaceholder(self.view.attachments.items.len);
         self.setNotice("attached {s} · {d}/4 · Ctrl+V or /attach adds another", .{
-            self.attachments.items[self.attachments.items.len - 1].name,
-            self.attachments.items.len,
+            self.view.attachments.items[self.view.attachments.items.len - 1].name,
+            self.view.attachments.items.len,
         });
     }
 
@@ -2360,7 +2357,7 @@ pub const App = struct {
 
     pub fn submitInput(self: *App, text: []const u8) void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
-        if (trimmed.len == 0 and self.attachments.items.len == 0) return;
+        if (trimmed.len == 0 and self.view.attachments.items.len == 0) return;
         const is_command = isCommandInput(text);
         const allowed_during_setup = std.mem.eql(u8, trimmed, "/quit") or
             std.mem.eql(u8, trimmed, "/q") or
@@ -2395,18 +2392,18 @@ pub const App = struct {
             return;
         }
         const was_busy = self.view.state == .running or self.view.state == .awaiting_approval;
-        if (was_busy and self.attachments.items.len > 0) {
+        if (was_busy and self.view.attachments.items.len > 0) {
             self.setNotice("images attach to a new turn; interrupt or wait before sending", .{});
             return;
         }
         var uploads_buf: [4]proto.AttachmentUpload = undefined;
-        for (self.attachments.items, 0..) |attachment, i| uploads_buf[i] = .{
+        for (self.view.attachments.items, 0..) |attachment, i| uploads_buf[i] = .{
             .name = attachment.name,
             .mime = attachment.mime,
             .data_base64 = attachment.data_base64,
         };
-        const uploads = uploads_buf[0..self.attachments.items.len];
-        const attachment_label = pendingMediaLabel(self.gpa, self.attachments.items) catch null;
+        const uploads = uploads_buf[0..self.view.attachments.items.len];
+        const attachment_label = pendingMediaLabel(self.gpa, self.view.attachments.items) catch null;
         defer if (attachment_label) |label| self.gpa.free(label);
         const request_id = self.next_input_request_id;
         self.next_input_request_id +%= 1;

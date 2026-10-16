@@ -6,6 +6,7 @@ const std = @import("std");
 const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const Editor = @import("editor.zig");
+const media = @import("media.zig");
 const layout = @import("layout.zig");
 const RenderBlock = layout.RenderBlock;
 const LayoutCache = layout.LayoutCache;
@@ -82,6 +83,9 @@ pub fn deinitPlan(gpa: std.mem.Allocator, items: *std.ArrayList(PlanItemOwned)) 
 pub const SessionView = struct {
     sid: u64,
     editor: Editor,
+    /// Images staged for this session's draft. They belong to the draft, not
+    /// the client: switching tabs must not carry them into another session.
+    attachments: std.ArrayList(media.Pending) = .empty,
     blocks: std.ArrayList(RenderBlock) = .empty,
     delta: std.ArrayList(u8) = .empty,
     reasoning_delta: std.ArrayList(u8) = .empty,
@@ -197,6 +201,8 @@ pub const SessionView = struct {
 
     pub fn deinit(self: *SessionView, gpa: std.mem.Allocator) void {
         self.editor.deinit();
+        for (self.attachments.items) |*attachment| attachment.deinit(gpa);
+        self.attachments.deinit(gpa);
         for (self.blocks.items) |*rb| rb.deinit(gpa);
         self.blocks.deinit(gpa);
         for (self.history_backfill.items) |*rb| rb.deinit(gpa);
