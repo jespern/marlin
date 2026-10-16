@@ -1,0 +1,36 @@
+name: certify
+
+# shadybin certification of a published release: rebuilds it, checks the binaries match,
+# has Claude review the code that goes in (on the ANTHROPIC_API_KEY secret), attests the
+# statement and report, and keeps them for the registry. release.yml calls this after
+# publishing; run it by hand to re-certify an existing release, e.g. one published before
+# a certify fix. The pin is the only place marlin names a shadybin commit.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to certify (e.g. v0.1.7)"
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  shadybin:
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: shadybin/shadybin/.github/workflows/certify.yml@1fe75d080b9682fe51bf6bac950821cc95b756d2 # main; certifies immutable releases
+    with:
+      tag: ${{ inputs.tag }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
