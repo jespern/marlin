@@ -892,6 +892,68 @@ test "guest activity renders a nested agent and process tree" {
     return error.TestExpectedEqual;
 }
 
+test "elapsed times share one shape: seconds, then minutes and seconds, then hours" {
+    var buf: [layout.duration_buf_len]u8 = undefined;
+    try std.testing.expectEqualStrings("0s", layout.formatSeconds(&buf, 0));
+    try std.testing.expectEqualStrings("59s", layout.formatSeconds(&buf, 59));
+    try std.testing.expectEqualStrings("1m 0s", layout.formatSeconds(&buf, 60));
+    try std.testing.expectEqualStrings("8m 12s", layout.formatSeconds(&buf, 492));
+    try std.testing.expectEqualStrings("59m 59s", layout.formatSeconds(&buf, 3599));
+    try std.testing.expectEqualStrings("1h 0m", layout.formatSeconds(&buf, 3600));
+    try std.testing.expectEqualStrings("26h 3m", layout.formatSeconds(&buf, 26 * 3600 + 3 * 60 + 9));
+}
+
+test "live guest work shows elapsed time as minutes and seconds, not raw seconds" {
+    // Case: "◇ Agent · Research OpenCode 2 plugin API · 492s" beside a ticker
+    // reading "53m 6s total".
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    const started = nowWallMs(threaded.io()) - 492_400;
+    const activity = [_]proto.GuestActivity{
+        .{ .id = "agent-1", .kind = .agent, .name = "Agent", .detail = "Research OpenCode 2 plugin API", .started_at_ms = started },
+    };
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &.{},
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .guest = true,
+        .guest_activity = &activity,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const lines = try layoutLines(arena, gpa, &transcript, 120);
+    for (lines.items) |line| {
+        const rendered = try lineText(arena, line);
+        if (std.mem.indexOf(u8, rendered, "◇ Agent · Research OpenCode 2 plugin API") == null) continue;
+        try std.testing.expect(std.mem.indexOf(u8, rendered, " · 8m 12s") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "492s") == null);
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
 test "running Bash activity syntax-highlights the displayed command" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

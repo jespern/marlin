@@ -2031,14 +2031,16 @@ pub const App = struct {
                 if (!result.active) {
                     self.setNotice("nothing to interrupt", .{});
                 } else if (result.already_requested) {
-                    self.setNotice("still cancelling · {s} · {d}s", .{
+                    var since_buf: [layout_mod.duration_buf_len]u8 = undefined;
+                    self.setNotice("still cancelling · {s} · {s}", .{
                         @tagName(result.phase),
-                        result.pending_ms / 1000,
+                        layout_mod.formatSeconds(&since_buf, result.pending_ms / 1000),
                     });
                 } else {
-                    self.setNotice("cancelling · {s} for {d}s", .{
+                    var phase_buf: [layout_mod.duration_buf_len]u8 = undefined;
+                    self.setNotice("cancelling · {s} for {s}", .{
                         @tagName(result.phase),
-                        result.phase_ms / 1000,
+                        layout_mod.formatSeconds(&phase_buf, result.phase_ms / 1000),
                     });
                 }
             },

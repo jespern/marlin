@@ -1013,12 +1013,25 @@ pub fn planTableWidths(total: usize) PlanTableWidths {
 pub fn formatPlanDuration(alloc: std.mem.Allocator, duration_ms: u64) ![]const u8 {
     if (duration_ms == 0) return "";
     if (duration_ms < 1_000) return "<1s";
-    const seconds = (duration_ms +| 500) / 1_000;
-    if (seconds < 60) return std.fmt.allocPrint(alloc, "{d}s", .{seconds});
+    var buf: [duration_buf_len]u8 = undefined;
+    return alloc.dupe(u8, formatSeconds(&buf, (duration_ms +| 500) / 1_000));
+}
+
+pub const duration_buf_len = 32;
+
+/// The one human elapsed-time shape in the TUI: `45s`, `8m 12s`, `1h 3m`.
+/// Plans, the working ticker, live guest work, and notices all use it, so a
+/// glance never has to convert 492s in its head.
+pub fn formatSeconds(buf: []u8, seconds: u64) []const u8 {
+    if (seconds < 60) return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "?";
     const minutes = seconds / 60;
-    if (minutes < 60)
-        return std.fmt.allocPrint(alloc, "{d}m {d}s", .{ minutes, seconds % 60 });
-    return std.fmt.allocPrint(alloc, "{d}h {d}m", .{ minutes / 60, minutes % 60 });
+    if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m {d}s", .{ minutes, seconds % 60 }) catch "?";
+    return std.fmt.bufPrint(buf, "{d}h {d}m", .{ minutes / 60, minutes % 60 }) catch "?";
+}
+
+fn secondsAlloc(alloc: std.mem.Allocator, seconds: i64) ![]const u8 {
+    var buf: [duration_buf_len]u8 = undefined;
+    return alloc.dupe(u8, formatSeconds(&buf, @intCast(@max(seconds, 0))));
 }
 
 fn planBorder(
@@ -1259,22 +1272,22 @@ pub fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) !W
         @max(0, @divTrunc(now_ms - transcript.phase_started_ms, 1000))
     else
         0;
-    const elapsed = if (elapsed_s >= 60)
-        try std.fmt.allocPrint(arena, " · {d}m {d}s total · {d}s here", .{ @divTrunc(elapsed_s, 60), @mod(elapsed_s, 60), phase_s })
-    else
-        try std.fmt.allocPrint(arena, " · {d}s total · {d}s here", .{ elapsed_s, phase_s });
+    const elapsed = try std.fmt.allocPrint(arena, " · {s} total · {s} here", .{
+        try secondsAlloc(arena, elapsed_s),
+        try secondsAlloc(arena, phase_s),
+    });
 
     var detail = WorkingDetail{ .text = elapsed };
     const stream_fresh = streamStatusFresh(transcript, now_ms);
     if (stream_fresh and currentInflightCall(transcript.blocks) == null) {
         const quiet_s = transcript.stream_quiet_ms / 1000;
         if (transcript.stream_bytes == 0) {
-            detail.text = try std.fmt.allocPrint(arena, "{s} · waiting for provider · {d}s", .{
-                elapsed, quiet_s,
+            detail.text = try std.fmt.allocPrint(arena, "{s} · waiting for provider · {s}", .{
+                elapsed, try secondsAlloc(arena, @intCast(quiet_s)),
             });
         } else if (quiet_s >= 3) {
-            detail.text = try std.fmt.allocPrint(arena, "{s} · streaming ↓ {Bi:.1} · last token {d}s ago", .{
-                elapsed, transcript.stream_bytes, quiet_s,
+            detail.text = try std.fmt.allocPrint(arena, "{s} · streaming ↓ {Bi:.1} · last token {s} ago", .{
+                elapsed, transcript.stream_bytes, try secondsAlloc(arena, @intCast(quiet_s)),
             });
         } else {
             detail.text = try std.fmt.allocPrint(arena, "{s} · streaming ↑ {Bi:.1}", .{
@@ -1351,7 +1364,7 @@ fn appendGuestActivityChildren(
             .style = Palette.working,
             .text2 = activity_text,
             .style2 = if (item.kind == .agent) Palette.status_model else Palette.collapse_hint,
-            .text3 = try std.fmt.allocPrint(arena, " · {d}s", .{elapsed_s}),
+            .text3 = try std.fmt.allocPrint(arena, " · {s}", .{try secondsAlloc(arena, elapsed_s)}),
             .style3 = Palette.collapse_hint,
             .syntax = if (std.ascii.eqlIgnoreCase(item.name, "bash") and item_detail.len > 0)
                 try shellCommandSpans(arena, item_detail, 2 + activity_head.len + " · ".len)
