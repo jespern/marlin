@@ -167,6 +167,7 @@ pub const RunOpts = struct {
     /// Session-owned record of time parked on the user. Guest run ceilings
     /// exclude it so a slow human answer never kills the subprocess.
     park_clock: ?*approval.ParkClock = null,
+    guest_max_runtime_live: ?*const std.atomic.Value(u64) = null,
     /// Publish a question_request to clients; false = nobody will ever answer.
     on_question: ?*const fn (ctx: ?*anyopaque, id: u64, question: []const u8, options: []const []const u8) bool = null,
     on_question_done: ?*const fn (ctx: ?*anyopaque, id: u64) void = null,

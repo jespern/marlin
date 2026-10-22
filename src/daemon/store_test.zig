@@ -530,15 +530,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v13 with performance telemetry and scaling indexes" {
+test "schema is v14 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 13), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 14), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 13), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 14), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
@@ -886,4 +886,29 @@ test "skill search and recalled inputs use the slash command while blocks retain
     }
     try std.testing.expectEqualStrings("hidden skill instructions", loaded[0].blk.body.user_msg.text);
     try std.testing.expectEqualStrings("/review banana", loaded[0].blk.body.user_msg.display_text.?);
+}
+
+test "v13 session runtime migration preserves defaults and independent overrides" {
+    var store = try Store.open(std.testing.allocator, null);
+    defer store.close();
+    inline for ([_][:0]const u8{
+        "ALTER TABLE sessions DROP COLUMN guest_max_runtime_ms",
+        "UPDATE kv SET value='13' WHERE key='schema_version'",
+    }) |sql| {
+        const stmt = try store.prepare(sql);
+        defer finalize(stmt);
+        try std.testing.expectEqual(c.SQLITE_DONE, c.sqlite3_step(stmt));
+    }
+    try store.createSession(1, 0, "/", "claudecode/default", .auto);
+    try store.createSession(2, 0, "/", "codex/default", .auto);
+    try store.migrate();
+    try std.testing.expectEqual(@as(?u64, null), try store.getSessionGuestRuntime(1));
+    try store.setSessionGuestRuntime(1, 43_200_000);
+    try std.testing.expectEqual(@as(?u64, 43_200_000), try store.getSessionGuestRuntime(1));
+    try std.testing.expectEqual(@as(?u64, null), try store.getSessionGuestRuntime(2));
+    try store.setSessionGuestRuntime(1, 0);
+    try std.testing.expectEqual(@as(?u64, 0), try store.getSessionGuestRuntime(1));
+    try store.setSessionGuestRuntime(1, null);
+    try std.testing.expectEqual(@as(?u64, null), try store.getSessionGuestRuntime(1));
+    try store.migrate();
 }

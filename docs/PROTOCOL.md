@@ -64,6 +64,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_set_cwd | sid, cwd | ok, or err{busy} mid-turn / err{bad_cwd}; relative paths resolve against the current session cwd, and the canonical existing directory is persisted and broadcast as session_upsert |
 | session_rename | sid, title | ok; title normalized like auto-titles (first line, trimmed, capped) and broadcast as session_upsert |
 | session_set_approvals | sid, approvals ("default" \| "auto") | ok; applies to the RUNNING turn too — granting full access resolves a parked prompt immediately |
+| session_runtime | sid, value? (duration, "off", or "default") | session_runtime_result{sid,max_runtime_ms,uses_default}; omit value to query; persists per session and updates running guest deadlines |
 | session_set_plan_mode | sid, enabled | ok, or err{busy} mid-turn; persists collaboration mode with the session |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on guest sessions |
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded, err{guest} on guest sessions |

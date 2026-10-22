@@ -507,7 +507,8 @@ live edge without a subscription gap, positions the viewport, and highlights
 the matching block. Normal-mode `n`/`N` advances through the retained result
 set without re-running the query.
 
-Schema v13 adds content-free local preparation telemetry, a materialized
+Schema v14 adds a nullable per-session `guest_max_runtime_ms` override (null
+inherits config, zero disables the deadline). Schema v13 adds content-free local preparation telemetry, a materialized
 compaction frontier column, and the indexes that keep recent-input, hierarchy,
 turn-specific, context-metadata, and diagnostics reads bounded as durable
 history grows. Schema v8 persists per-session Plan mode. Schema v7 projects
@@ -673,6 +674,12 @@ loop:
   Persistent dev servers/watchers belong in a user-managed terminal. This is
   model guidance, not a shell-syntax enforcement layer; guest agents use their
   vendor harness's tools and instructions.
+- **Guest runtime limit**: `[guest] max_runtime` defaults to `"4h"` and accepts
+  `s`/`m`/`h` durations or `"off"`. `/runtime [duration|off|default]` queries or
+  persists a session override and atomically updates the running Claude Code or
+  Codex watcher. It measures elapsed time from invocation start minus user waits;
+  changing the allowance does not reset the clock. Disabled deadlines retain
+  cancellation and process-group cleanup. Native provider/bash limits are separate.
 - **Graceful SIGTERM/SIGINT**: a self-pipe watcher thread turns the signal
   into the ordinary `.shutdown` dispatcher event — socket removed, store
   closed — the same path `/quit` and reboot use. (SIGHUP stays ignored so

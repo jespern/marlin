@@ -22,6 +22,8 @@ pub const Config = struct {
     /// absent value deliberately stays false so a genuinely fresh install
     /// enters setup, while clients with existing sessions are grandfathered.
     setup_completed: bool = false,
+    /// Shared guest invocation ceiling; zero disables the deadline.
+    guest_max_runtime_ms: u64 = 4 * 60 * 60 * 1000,
     model_default: []const u8 = "openrouter/anthropic/claude-sonnet-4.5",
     model_compaction: ?[]const u8 = null, // null → use model_default
     /// `.auto` omits the request parameter and preserves the model default.
@@ -783,6 +785,7 @@ fn hasCsvEntry(value: ?[]const u8) bool {
 
 pub fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.setup_completed) |value| cfg.setup_completed = value;
+    if (doc.guest_max_runtime_ms) |value| cfg.guest_max_runtime_ms = value;
     if (doc.model_default) |value| cfg.model_default = value;
     if (doc.model_compaction) |value| cfg.model_compaction = value;
     if (doc.model_favorites) |value| cfg.model_favorites = value;

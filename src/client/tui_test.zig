@@ -5909,3 +5909,33 @@ test "plugin skill completion owns catalog data, navigates names and preserves a
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_skills = .{ .sid = 42, .cwd = "/remote/repo", .skills = &.{} } }));
     try std.testing.expectEqual(@as(usize, 0), (try commandSuggestions(&app, arena.allocator())).len);
 }
+
+test "runtime command is local control even while a guest is running" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .state = .running, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    for ([_][]const u8{ "12h", "off", "default", "" }) |value| {
+        const start = output.written().len;
+        const command = try std.fmt.allocPrint(arena.allocator(), "/runtime {s}", .{value});
+        app.submitInput(command);
+        const sent = try proto.decode(proto.ClientMsg, arena.allocator(), output.written()[start..]);
+        try std.testing.expectEqual(@as(u64, 42), sent.session_runtime.sid);
+        if (value.len == 0) try std.testing.expect(sent.session_runtime.value == null) else try std.testing.expectEqualStrings(value, sent.session_runtime.value.?);
+    }
+    const before = output.written().len;
+    app.submitInput("/runtime -5h");
+    try std.testing.expectEqual(before, output.written().len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.blocks.items.len);
+    app.view.editor.insertSlice("/runtime o");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/runtime off", app.view.editor.text.items);
+}

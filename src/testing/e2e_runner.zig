@@ -149,6 +149,7 @@ const Check = struct {
     git_status_flow: bool = false,
     skill_invocation_flow: bool = false,
     plugin_flow: bool = false,
+    runtime_flow: bool = false,
     /// Direct socket regression: approval publication, reconnect replay,
     /// steering while parked, and reboot refusal are one state-machine flow.
     approval_reconnect_flow: bool = false,
@@ -490,6 +491,7 @@ fn runScenario(
     if (sf.check.recap_contains) |expected| try checkRecap(gpa, io, &env, expected);
     if (sf.check.git_status_flow) try checkGitStatus(gpa, io, &env, state_dir);
     if (sf.check.skill_invocation_flow) try checkSkillInvocation(gpa, io, &env, state_dir);
+    if (sf.check.runtime_flow) try checkRuntime(gpa, io, &env);
     if (sf.check.plugin_flow) try checkPlugins(gpa, io, &env, state_dir, marlin_bin);
 
     // 4. Fake provider must have consumed all steps and validated them.
@@ -1328,6 +1330,40 @@ fn checkGitStatus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
         const counts = result.get("counts") orelse return error.GitCountsMissing;
         if (counts != .object or uintField(counts.object, "ahead") != 0 or uintField(counts.object, "behind") != 0) return error.GitCountsMissing;
     }
+}
+
+fn checkRuntime(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    var ids: [2]u64 = undefined;
+    for (&ids, [_][]const u8{ "claudecode/default", "codex/default" }) |*sid, model| {
+        try conn.send(.{ .session_create = .{ .cwd = "/tmp", .model = model } });
+        sid.* = uintField(try recvTagBounded(conn, a, "session_created"), "sid") orelse return error.SessionIdMissing;
+    }
+    for ([_]struct { value: ?[]const u8, expected: u64, uses_default: bool }{
+        .{ .value = null, .expected = 14_400_000, .uses_default = true },
+        .{ .value = "12h", .expected = 43_200_000, .uses_default = false },
+        .{ .value = "off", .expected = 0, .uses_default = false },
+        .{ .value = null, .expected = 0, .uses_default = false },
+        .{ .value = "default", .expected = 14_400_000, .uses_default = true },
+    }) |case| {
+        try conn.send(.{ .session_runtime = .{ .sid = ids[0], .value = case.value } });
+        const result = try recvTagBounded(conn, a, "session_runtime_result");
+        if (uintField(result, "sid") != ids[0] or uintField(result, "max_runtime_ms") != case.expected) return error.RuntimeMismatch;
+        const uses_default = result.get("uses_default") orelse return error.RuntimeMismatch;
+        if (uses_default != .bool or uses_default.bool != case.uses_default) return error.RuntimeMismatch;
+        // Releasing the session forces the next command to restore it from SQLite.
+        try conn.send(.{ .unsub = .{ .sid = ids[0] } });
+        _ = try recvTagBounded(conn, a, "ok");
+    }
+    try conn.send(.{ .session_runtime = .{ .sid = ids[0], .value = "nonsense" } });
+    _ = try recvTagBounded(conn, a, "err");
+    try conn.send(.{ .session_runtime = .{ .sid = ids[1] } });
+    const untouched = try recvTagBounded(conn, a, "session_runtime_result");
+    if (uintField(untouched, "max_runtime_ms") != 14_400_000) return error.RuntimeLeakedAcrossSessions;
 }
 
 fn checkRecap(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, expected: []const u8) !void {

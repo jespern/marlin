@@ -57,6 +57,7 @@ const schema_sql =
     \\  max_rounds INTEGER,
     \\  archived_at INTEGER,
     \\  plan_mode INTEGER NOT NULL DEFAULT 0,
+    \\  guest_max_runtime_ms INTEGER,
     \\  codex_thread_id TEXT
     \\);
     \\CREATE TABLE IF NOT EXISTS blocks(
@@ -169,7 +170,7 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','13');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','14');
 ;
 
 pub const SessionRow = struct {
@@ -457,6 +458,12 @@ pub const Store = struct {
                 \\CREATE INDEX IF NOT EXISTS search_docs_recent_inputs_session ON search_docs(session_id, ts DESC, block_id DESC) WHERE kind IN ('user_msg','steer');
                 \\CREATE INDEX IF NOT EXISTS search_docs_recent_inputs_global ON search_docs(ts DESC, block_id DESC) WHERE kind IN ('user_msg','steer');
                 \\UPDATE kv SET value='13' WHERE key='schema_version';
+            );
+        }
+        if (ver < 14) {
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN guest_max_runtime_ms INTEGER;
+                \\UPDATE kv SET value='14' WHERE key='schema_version';
             );
         }
     }
@@ -1239,6 +1246,25 @@ pub const Store = struct {
         bindText(stmt, 1, @tagName(effort));
         bindInt(stmt, 2, @bitCast(id));
         try stepDone(stmt);
+    }
+
+    pub fn setSessionGuestRuntime(self: Store, id: u64, runtime_ms: ?u64) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET guest_max_runtime_ms=? WHERE id=?");
+        defer finalize(stmt);
+        bindOptionalInt(stmt, 1, runtime_ms);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
+    pub fn getSessionGuestRuntime(self: Store, id: u64) Error!?u64 {
+        const stmt = try self.prepare("SELECT guest_max_runtime_ms FROM sessions WHERE id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return error.NotFound;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+        return @intCast(c.sqlite3_column_int64(stmt, 0));
     }
 
     pub fn setSessionPlanMode(self: Store, id: u64, enabled: bool) Error!void {

@@ -22,7 +22,7 @@
 //!     TurnJob before setting state=running and spawning; every protocol
 //!     mutation of these fields is rejected with err{busy} while a turn runs.
 //!   - Fields a RUNNING turn may touch, each with its own discipline:
-//!       cancel, approval_mode_live, context_used,
+//!       cancel, approval_mode_live, guest_max_runtime_live, context_used,
 //!       phase, phase_started_at_ms                 atomics
 //!       gate                                       internally synchronized
 //!       steer_queue                                under steer_mutex
@@ -292,6 +292,8 @@ const Session = struct {
     /// Atomic mirror of approval_mode for the RUNNING turn thread; updated
     /// together with it so /permissions applies mid-turn.
     approval_mode_live: std.atomic.Value(u8) = .init(@intFromEnum(approval.Mode.default)),
+    /// maxInt inherits the turn’s configured default; zero disables its deadline.
+    guest_max_runtime_live: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     /// Kernel shell sandbox + prompt-free shell execution (/sandbox).
     /// Seeded from cfg.permissions_enabled; effective only with a verified
     /// backend. In-memory like approval_mode: a daemon restart returns the
@@ -1712,6 +1714,28 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(se.sid);
             },
+            .session_runtime => |request| {
+                const session = (try self.getOrLoadSession(request.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (request.value) |value| {
+                    if (self.rejectArchivedSession(client, session)) return;
+                    const runtime: ?u64 = if (std.mem.eql(u8, value, "default")) null else config.parseDurationMs(value) catch {
+                        self.sendTo(client, .{ .err = .{ .code = "runtime", .msg = "usage: /runtime [12h|off|default] (durations use s, m, or h)" } });
+                        return;
+                    };
+                    try self.store.setSessionGuestRuntime(request.sid, runtime);
+                    session.guest_max_runtime_live.store(runtime orelse std.math.maxInt(u64), .release);
+                }
+                const value = session.guest_max_runtime_live.load(.acquire);
+                const uses_default = value == std.math.maxInt(u64);
+                self.sendTo(client, .{ .session_runtime_result = .{
+                    .sid = request.sid,
+                    .max_runtime_ms = if (uses_default) self.cfg.guest_max_runtime_ms else value,
+                    .uses_default = uses_default,
+                } });
+            },
             .session_set_plan_mode => |sp| {
                 const session = (try self.getOrLoadSession(sp.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
@@ -2871,6 +2895,7 @@ pub const Daemon = struct {
             .sandbox_enabled = self.cfg.permissions_enabled,
             .network_filtering_enabled = self.network.isActive(),
         };
+        session.guest_max_runtime_live.store((try self.store.getSessionGuestRuntime(sid)) orelse std.math.maxInt(u64), .release);
         if (self.retained_approvals.get(sid)) |mode| {
             session.approval_mode = mode;
             session.approval_mode_live.store(@intFromEnum(mode), .release);
@@ -3571,6 +3596,7 @@ pub const Daemon = struct {
             .auto_continue_round_budget = job.kind == .root,
             .cancel = job.cancel,
             .park_clock = &job.session.park_clock,
+            .guest_max_runtime_live = &job.session.guest_max_runtime_live,
             .poll_steer = TurnHooks.pollSteer,
             .try_close_steer = TurnHooks.tryCloseSteer,
             .max_rounds = job.max_rounds,

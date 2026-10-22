@@ -468,3 +468,24 @@ test "default user skill roots include shared skills and can be overridden" {
     try std.testing.expectEqual(@as(usize, 1), custom.value.skill_directories.len);
     try std.testing.expectEqualStrings("/custom/skills", custom.value.skill_directories[0]);
 }
+
+test "guest runtime supports durations and off without changing the default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(u64, 14_400_000), defaults().guest_max_runtime_ms);
+    for ([_]struct { value: []const u8, ms: u64 }{
+        .{ .value = "12h", .ms = 43_200_000 },
+        .{ .value = "90m", .ms = 5_400_000 },
+        .{ .value = "30s", .ms = 30_000 },
+        .{ .value = "off", .ms = 0 },
+    }) |case| {
+        const text = try std.fmt.allocPrint(arena.allocator(), "[guest]\nmax_runtime = \"{s}\"\n", .{case.value});
+        var cfg = defaults();
+        applyDocument(&cfg, try toml.parse(arena.allocator(), text));
+        try std.testing.expectEqual(case.ms, cfg.guest_max_runtime_ms);
+    }
+    for ([_][]const u8{ "0", "false", "\"0h\"", "\"-1h\"", "\"forever\"", "\"999999999999999h\"" }) |value| {
+        const text = try std.fmt.allocPrint(arena.allocator(), "[guest]\nmax_runtime = {s}\n", .{value});
+        try std.testing.expectError(error.ExpectedDuration, toml.parse(arena.allocator(), text));
+    }
+}

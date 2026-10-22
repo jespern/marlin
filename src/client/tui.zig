@@ -1962,6 +1962,12 @@ pub const App = struct {
                     self.queueTerminalNotification(ar.sid, "Approval needed");
                 }
             },
+            .session_runtime_result => |result| {
+                if (result.sid != self.view.sid) return;
+                var duration_buf: [32]u8 = undefined;
+                const duration = config.formatDuration(&duration_buf, result.max_runtime_ms) catch return;
+                self.setNotice("guest runtime: {s} ({s}) — measured from invocation start, excluding user waits", .{ duration, if (result.uses_default) @as([]const u8, "default") else "session override" });
+            },
             .session_created => |sc| self.handleSessionCreated(sc.sid, sc.request_id),
             .session_list_result => |sl| self.replaceSessionSummaries(sl.sessions),
             .input_history_result => |history| {

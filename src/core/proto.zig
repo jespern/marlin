@@ -294,6 +294,7 @@ pub const ClientMsg = union(enum) {
     session_set_effort: struct { sid: u64, effort: ReasoningEffort },
     /// Persist the session collaboration mode. Plan mode is daemon-enforced
     /// read-only and survives client reconnects and daemon restarts.
+    session_runtime: struct { sid: u64, value: ?[]const u8 = null },
     session_set_plan_mode: struct { sid: u64, enabled: bool },
     /// Toggle the kernel shell sandbox (and its prompt-free shell execution)
     /// for one session. Enabling requires the daemon's verified backend
@@ -466,6 +467,7 @@ pub const DaemonMsg = union(enum) {
         daemon_exe: []const u8 = "",
         daemon_started_at_ms: i64 = 0,
     },
+    session_runtime_result: struct { sid: u64, max_runtime_ms: u64, uses_default: bool },
     session_created: struct { sid: u64, request_id: u64 = 0 },
     session_list_result: struct { sessions: []const SessionInfo },
     input_history_result: struct { entries: []const InputHistoryEntry },

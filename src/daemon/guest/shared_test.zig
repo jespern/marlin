@@ -76,17 +76,53 @@ test "guest deadline excludes only time parked on the user during this run" {
     // Parking from an earlier run must not extend this one.
     clock.begin(io, 1);
     clock.end(io, 1 + 30 * 60 * 1000);
-    var watcher = shared.CcWatcher.init(io, null, 0, &clock);
-    const start = watcher.deadline_at - shared.guest_deadline_ms;
-    try std.testing.expect(!watcher.deadlineHit(watcher.deadline_at - 1));
-    try std.testing.expect(watcher.deadlineHit(watcher.deadline_at));
+    const runtime: u64 = 12 * 60 * 60 * 1000;
+    var watcher = shared.CcWatcher.init(io, null, 0, &clock, runtime);
+    const start = watcher.started_at;
+    const deadline = start + @as(i64, @intCast(runtime));
+    try std.testing.expect(!watcher.deadlineHit(deadline - 1));
+    try std.testing.expect(watcher.deadlineHit(deadline));
     // An hour on an ask_user question pushes the deadline out by an hour.
     clock.begin(io, start + 10);
     clock.end(io, start + 10 + 60 * 60 * 1000);
-    try std.testing.expect(!watcher.deadlineHit(watcher.deadline_at));
-    try std.testing.expect(watcher.deadlineHit(watcher.deadline_at + 60 * 60 * 1000));
+    try std.testing.expect(!watcher.deadlineHit(deadline));
+    try std.testing.expect(watcher.deadlineHit(deadline + 60 * 60 * 1000));
     // Without a clock the ceiling is plain wall time.
-    const bare = shared.CcWatcher.init(io, null, 0, null);
-    try std.testing.expect(bare.deadlineHit(bare.deadline_at));
-    try std.testing.expect(shared.guest_deadline_ms >= 4 * 60 * 60 * 1000);
+    const bare = shared.CcWatcher.init(io, null, 0, null, runtime);
+    try std.testing.expect(bare.deadlineHit(bare.started_at + @as(i64, @intCast(runtime))));
+}
+
+test "guest runtime changes live and default restores the original allowance" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var live = std.atomic.Value(u64).init(shared.default_runtime);
+    var watcher = shared.CcWatcher.init(threaded.io(), null, 0, null, 1000);
+    watcher.max_runtime_live = &live;
+    const later = watcher.started_at + 2000;
+    try std.testing.expect(watcher.deadlineHit(later));
+    live.store(12 * 60 * 60 * 1000, .release);
+    try std.testing.expect(!watcher.deadlineHit(later));
+    live.store(0, .release);
+    try std.testing.expect(!watcher.deadlineHit(std.math.maxInt(i64)));
+    live.store(shared.default_runtime, .release);
+    try std.testing.expect(watcher.deadlineHit(later));
+    const note = try shared.deadlineNote(std.testing.allocator, "claude code", 43_200_000);
+    defer std.testing.allocator.free(note);
+    try std.testing.expect(std.mem.indexOf(u8, note, "12h") != null);
+}
+
+test "disabled guest deadline still cancels its subprocess" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var child = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "5" }, .pgid = 0 });
+    defer child.kill(io);
+    var cancel = std.atomic.Value(bool).init(true);
+    var watcher = shared.CcWatcher.init(io, &cancel, child.id.?, null, 0);
+    shared.CcWatcher.run(&watcher);
+    const term = try child.wait(io);
+    try std.testing.expect(term == .signal);
+    try std.testing.expect(watcher.cancelled.load(.acquire));
+    try std.testing.expect(!watcher.timed_out.load(.acquire));
 }

@@ -87,6 +87,7 @@ const CcOutcome = struct {
     result_error_len: usize = 0,
     cancelled: bool = false,
     timed_out: bool = false,
+    timed_out_runtime_ms: u64 = 0,
     exit_code: i64 = -1,
     tokens_in: u64 = 0,
     tokens_out: u64 = 0,
@@ -420,7 +421,8 @@ fn ccInvoke(
     var outcome = CcOutcome{};
     errdefer outcome.final_text.deinit(gpa);
 
-    var watcher = CcWatcher.init(io, opts.cancel, child.id.?, opts.park_clock);
+    var watcher = CcWatcher.init(io, opts.cancel, child.id.?, opts.park_clock, opts.cfg.guest_max_runtime_ms);
+    watcher.max_runtime_live = opts.guest_max_runtime_live;
     const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
     var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
     const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
@@ -779,6 +781,7 @@ fn ccInvoke(
     if (drain_thread) |t| t.join();
     outcome.cancelled = watcher.cancelled.load(.acquire);
     outcome.timed_out = watcher.timed_out.load(.acquire);
+    outcome.timed_out_runtime_ms = watcher.timed_out_runtime_ms;
     if (reaped) {
         // A finalized run has its result, so its exit code is never read.
         process_io.releaseReapedChild(&child, io);
@@ -891,7 +894,8 @@ pub fn runClaudeCodeTurn(
             return .{ .text = try gpa.dupe(u8, ""), .rounds = rounds, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
         }
         if (outcome.timed_out) {
-            const note = "claude code run " ++ shared.guest_deadline_note_suffix;
+            const note = try shared.deadlineNote(gpa, "claude code", outcome.timed_out_runtime_ms);
+            defer gpa.free(note);
             setDelegateError(note);
             _ = try ap.append(.{ .system_note = .{ .text = note } });
             try store.updateSessionUsage(opts.session_id, total_in, total_out);

@@ -50,6 +50,7 @@ pub const Provider = struct {
 };
 
 pub const Document = struct {
+    guest_max_runtime_ms: ?u64 = null,
     setup_completed: ?bool = null,
     model_default: ?[]const u8 = null,
     model_compaction: ?[]const u8 = null,
@@ -93,6 +94,7 @@ const Section = enum {
     unknown,
     setup,
     model,
+    guest,
     context,
     approval,
     permissions,
@@ -195,6 +197,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
         switch (section) {
             .setup => if (std.mem.eql(u8, key, "completed")) {
                 doc.setup_completed = try boolean(value);
+            },
+            .guest => if (std.mem.eql(u8, key, "max_runtime")) {
+                doc.guest_max_runtime_ms = try durationMs(value);
             },
             .model => {
                 if (std.mem.eql(u8, key, "default")) doc.model_default = try string(arena, value);
@@ -360,6 +365,7 @@ fn sectionFor(name: []const u8) Section {
     if (std.mem.eql(u8, name, "setup")) return .setup;
     const entries = .{
         .{ "model", Section.model },
+        .{ "guest", Section.guest },
         .{ "context", Section.context },
         .{ "approval", Section.approval },
         .{ "permissions", Section.permissions },

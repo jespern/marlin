@@ -251,3 +251,8 @@ instead of becoming a user prompt. Completion coverage checks namespaced skill
 selection, argument preservation, built-in precedence, and stale cwd isolation.
 The plugin scenario also verifies opt-in catalog delivery, uninstall/reinstall
 updates to an already attached client, and project skills after a cwd change.
+
+Guest runtime limits are covered by config duration parsing, v13→v14 storage
+migration, live watcher allowance changes and cancellation with the deadline off.
+`30_guest_runtime.json` exercises query/set/reset and session isolation over the
+real daemon protocol, including restoration after unloading a session.

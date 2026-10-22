@@ -299,6 +299,27 @@ available in the model picker alongside the fetched OpenRouter catalog. Key
 variable names must end in `_API_KEY`, `_TOKEN`, or `_SECRET` so Marlin's tool
 boundary strips and redacts them automatically.
 
+## Guest runtime limits
+
+Use `/runtime 12h` in a session to allow an overnight Claude Code or Codex run,
+or `/runtime off` to disable its deadline. `/runtime` shows the current setting;
+`/runtime default` restores the configured default. Tab completes common values.
+The override persists with that session and applies immediately to a running guest.
+
+Durations use `s`, `m`, or `h`. The allowance is measured from the current guest
+invocation's start, excluding time waiting for your approval or answer; changing
+it does not restart the clock. Lowering it below elapsed runtime ends the run.
+Interrupt and daemon shutdown still stop the guest when the deadline is off.
+This setting covers guest execution, not native model requests or bash timeouts.
+
+The default is four hours. Set a different default in
+`~/.config/marlin/config.toml` on the daemon host, then restart the daemon:
+
+```toml
+[guest]
+max_runtime = "12h" # or "off"; omitted defaults to "4h"
+```
+
 ## Context management today
 
 Marlin implements a three-stage structural cascade:

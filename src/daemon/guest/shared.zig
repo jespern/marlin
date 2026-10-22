@@ -9,12 +9,13 @@ const process_io = @import("../process_io.zig");
 const nowMs = @import("../loop.zig").nowMs;
 const approval = @import("../approval.zig");
 
-/// Hard wall-clock ceiling for one delegated guest invocation (claude -p,
-/// codex app-server turn). A zombie guard only: a user can always interrupt,
-/// and guests legitimately wait on long background jobs. Time parked on the
-/// user (approvals, ask_user) is excluded via `CcWatcher.park`.
-pub const guest_deadline_ms: i64 = 4 * 60 * 60 * 1000;
-pub const guest_deadline_note_suffix = "exceeded the 4-hour ceiling and was terminated";
+pub const default_runtime = std.math.maxInt(u64);
+
+pub fn deadlineNote(gpa: Allocator, agent: []const u8, max_runtime_ms: u64) ![]u8 {
+    var duration_buf: [32]u8 = undefined;
+    const duration = try @import("../../core/config.zig").formatDuration(&duration_buf, max_runtime_ms);
+    return std.fmt.allocPrint(gpa, "{s} run exceeded the guest runtime limit ({s}) and was terminated", .{ agent, duration });
+}
 
 /// Failure detail for the most recent Delegate* error on THIS thread,
 /// mirroring http.lastTransportCause: Zig errors carry no payload, and a
@@ -50,7 +51,10 @@ pub const CcWatcher = struct {
     io: Io,
     cancel: ?*const std.atomic.Value(bool),
     group: std.posix.pid_t,
-    deadline_at: i64,
+    started_at: i64,
+    max_runtime_ms: u64,
+    max_runtime_live: ?*const std.atomic.Value(u64) = null,
+    timed_out_runtime_ms: u64 = 0,
     /// Parked-on-user time pushes the deadline out by the same amount.
     park: ?*const approval.ParkClock = null,
     /// The clock is session-lifetime; only parking during this run counts.
@@ -62,10 +66,14 @@ pub const CcWatcher = struct {
     pub fn run(w: *CcWatcher) void {
         while (!w.done.load(.acquire)) {
             const cancel_hit = if (w.cancel) |c| c.load(.acquire) else false;
-            const deadline_hit = w.deadlineHit(nowMs(w.io));
+            const runtime = w.runtimeMs();
+            const deadline_hit = w.deadlineHitWithLimit(nowMs(w.io), runtime);
             if (cancel_hit or deadline_hit) {
                 if (cancel_hit) w.cancelled.store(true, .release);
-                if (deadline_hit) w.timed_out.store(true, .release);
+                if (deadline_hit) {
+                    w.timed_out_runtime_ms = runtime;
+                    w.timed_out.store(true, .release);
+                }
                 process_io.terminateProcessGroup(w.io, w.group, 500);
                 return;
             }
@@ -78,21 +86,33 @@ pub const CcWatcher = struct {
         cancel: ?*const std.atomic.Value(bool),
         group: std.posix.pid_t,
         park: ?*const approval.ParkClock,
+        max_runtime_ms: u64,
     ) CcWatcher {
         const now = nowMs(io);
         return .{
             .io = io,
             .cancel = cancel,
             .group = group,
-            .deadline_at = now + guest_deadline_ms,
+            .started_at = now,
+            .max_runtime_ms = max_runtime_ms,
             .park = park,
             .park_base = if (park) |clock| clock.parkedMs(now) else 0,
         };
     }
 
+    pub fn runtimeMs(w: *const CcWatcher) u64 {
+        const live = if (w.max_runtime_live) |value| value.load(.acquire) else default_runtime;
+        return if (live == default_runtime) w.max_runtime_ms else live;
+    }
+
     pub fn deadlineHit(w: *const CcWatcher, now_ms: i64) bool {
+        return w.deadlineHitWithLimit(now_ms, w.runtimeMs());
+    }
+
+    fn deadlineHitWithLimit(w: *const CcWatcher, now_ms: i64, runtime: u64) bool {
+        if (runtime == 0) return false;
         const parked: i64 = if (w.park) |clock| clock.parkedMs(now_ms) - w.park_base else 0;
-        return now_ms - parked >= w.deadline_at;
+        return @as(i128, now_ms) - w.started_at - parked >= runtime;
     }
 };
 

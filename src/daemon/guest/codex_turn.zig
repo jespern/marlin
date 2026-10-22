@@ -517,7 +517,8 @@ pub fn runCodexTurn(
         return error.DelegateSpawnFailed;
     };
 
-    var watcher = CcWatcher.init(io, opts.cancel, child.id.?, opts.park_clock);
+    var watcher = CcWatcher.init(io, opts.cancel, child.id.?, opts.park_clock, opts.cfg.guest_max_runtime_ms);
+    watcher.max_runtime_live = opts.guest_max_runtime_live;
     const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
     var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
     const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
@@ -834,7 +835,8 @@ pub fn runCodexTurn(
         };
     }
     if (watcher.timed_out.load(.acquire)) {
-        const note = "codex run " ++ shared.guest_deadline_note_suffix;
+        const note = try shared.deadlineNote(gpa, "codex", watcher.timed_out_runtime_ms);
+        defer gpa.free(note);
         setDelegateError(note);
         _ = try ap.append(.{ .system_note = .{ .text = note } });
         return error.DelegateTimeout;
