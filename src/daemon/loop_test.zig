@@ -279,6 +279,65 @@ test "plan tool profile permits investigation and denies execution mutations" {
     try std.testing.expect(!toolAllowed(opts, tools_registry.find("plan_update").?));
 }
 
+test "ask_user publishes its phase before the question and returns the full option" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Probe = struct {
+        io: Io,
+        gate: *approval.QuestionGate,
+        events: [4]u8 = undefined,
+        len: usize = 0,
+
+        fn phase(ctx: ?*anyopaque, p: proto.TurnPhase) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.events[self.len] = switch (p) {
+                .approval => 'a',
+                .tool => 't',
+                else => '?',
+            };
+            self.len += 1;
+        }
+        fn question(ctx: ?*anyopaque, id: u64, _: []const u8, options: []const []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.events[self.len] = 'q';
+            self.len += 1;
+            // The client picks option 1; the answer lands before wait().
+            return self.gate.resolve(self.io, id, std.testing.allocator.dupe(u8, options[0]) catch return false);
+        }
+    };
+    var gate: approval.QuestionGate = .{};
+    var probe: Probe = .{ .io = io, .gate = &gate };
+    const opts = RunOpts{
+        .session_id = 1,
+        .cwd = "/tmp",
+        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .backend = .{ .native = .openai_compatible } },
+        .cfg = config.defaults(),
+        .question_gate = &gate,
+        .on_question = Probe.question,
+        .on_phase = Probe.phase,
+        .on_delta_ctx = &probe,
+    };
+
+    // A phase update is a `running` status: sent after the question it would
+    // knock the client out of awaiting_approval and clear the picker card.
+    const long_option = "Run the private server under Wine on this Mac (headless server + plugin with Debug=3, connect a client, capture) — this is the only way to get a real byte-exact transcript locally";
+    const args = "{\"question\":\"Which route?\",\"options\":[\"" ++ long_option ++ "\",\"Skip\"]}";
+    const out = loop.runAskUser(gpa, io, opts, args);
+    defer gpa.free(out.output);
+    try std.testing.expectEqual(block.ToolStatus.ok, out.status);
+    try std.testing.expectEqualStrings(long_option, out.output);
+    try std.testing.expectEqualStrings("aqt", probe.events[0..probe.len]);
+
+    const too_long = "{\"question\":\"?\",\"options\":[\"" ++ ("x" ** 1025) ++ "\",\"y\"]}";
+    const rejected = loop.runAskUser(gpa, io, opts, too_long);
+    defer gpa.free(rejected.output);
+    try std.testing.expectEqual(block.ToolStatus.err, rejected.status);
+    try std.testing.expectEqual(@as(usize, 3), probe.len);
+}
+
 test "OpenRouter web search requires visible progress" {
     try std.testing.expect(std.mem.indexOf(u8, openrouter_web_search_prompt, "user-visible progress note") != null);
     try std.testing.expect(std.mem.indexOf(u8, openrouter_web_search_prompt, "Never search silently") != null);

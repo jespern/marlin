@@ -1686,7 +1686,7 @@ fn buildProviderBody(
 /// gate until a client answers or an interrupt dismisses. The answer arrives
 /// gpa-owned and becomes the tool result verbatim — the model sees exactly
 /// what the user picked or typed.
-fn runAskUser(gpa: std.mem.Allocator, io: Io, opts: RunOpts, args_json: []const u8) tools_registry.ExecOut {
+pub fn runAskUser(gpa: std.mem.Allocator, io: Io, opts: RunOpts, args_json: []const u8) tools_registry.ExecOut {
     const gate = opts.question_gate orelse
         return .{ .output = gpa.dupe(u8, "error: ask_user is unavailable in this session") catch @panic("oom"), .status = .denied };
     const publish = opts.on_question orelse
@@ -1702,22 +1702,33 @@ fn runAskUser(gpa: std.mem.Allocator, io: Io, opts: RunOpts, args_json: []const 
     if (question.len == 0 or options.len < 2 or options.len > 9) {
         return .{ .output = gpa.dupe(u8, "error: ask_user needs a question and 2..9 options") catch @panic("oom"), .status = .err };
     }
-    for (options) |option| if (std.mem.trim(u8, option, " \t\r\n").len == 0) {
-        return .{ .output = gpa.dupe(u8, "error: ask_user options must be non-empty") catch @panic("oom"), .status = .err };
-    };
+    // Same caps as the Claude Code bridge (parseQuestionOptions); the client's
+    // picker buffers are sized to them so a picked option comes back whole.
+    if (question.len > 4096) {
+        return .{ .output = gpa.dupe(u8, "error: ask_user question must be at most 4096 bytes") catch @panic("oom"), .status = .err };
+    }
+    for (options) |option| {
+        if (std.mem.trim(u8, option, " \t\r\n").len == 0)
+            return .{ .output = gpa.dupe(u8, "error: ask_user options must be non-empty") catch @panic("oom"), .status = .err };
+        if (option.len > 1024)
+            return .{ .output = gpa.dupe(u8, "error: ask_user options must be at most 1024 bytes each") catch @panic("oom"), .status = .err };
+    }
 
     const id = ids.next(io);
     if (!gate.arm(io, id, opts.cancel)) {
         return .{ .output = gpa.dupe(u8, "the question was not asked (turn interrupted)") catch @panic("oom"), .status = .err };
     }
+    // Phase BEFORE publish, as the approval path does: a phase update is a
+    // `running` status line, and arriving after the awaiting status it would
+    // flip clients back to running and clear the picker card they just got.
+    publishPhase(opts, .approval);
+    defer publishPhase(opts, .tool);
     if (!publish(opts.on_delta_ctx, id, question, options)) {
         // Nobody will ever answer; unpark by dismiss+wait so the gate resets.
         gate.dismissPending(io);
         _ = gate.wait(io, id);
         return .{ .output = gpa.dupe(u8, "error: the question could not reach any client") catch @panic("oom"), .status = .err };
     }
-    publishPhase(opts, .approval);
-    defer publishPhase(opts, .tool);
     const answer = gate.wait(io, id);
     if (opts.on_question_done) |cb| cb(opts.on_delta_ctx, id);
     if (answer) |text| {

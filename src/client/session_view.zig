@@ -34,15 +34,16 @@ pub const PendingApproval = struct {
 };
 
 /// A parked ask_user question: fixed buffers like PendingApproval, so view
-/// switches copy it by value with no ownership to manage. Overlong questions
-/// and options are clipped for display; the ANSWER sent back is the option's
-/// clipped text or the user's own words, which the daemon relays verbatim.
+/// switches copy it by value with no ownership to manage. Sized to the
+/// daemon's caps (question 4096, option 1024 bytes) so nothing is clipped:
+/// the ANSWER sent back is the picked option's text, which the daemon relays
+/// verbatim to the model — a clipped option would hand it a truncated answer.
 pub const PendingQuestion = struct {
     id_buf: [32]u8 = undefined,
     id_len: usize = 0,
-    question_buf: [512]u8 = undefined,
+    question_buf: [4096]u8 = undefined,
     question_len: usize = 0,
-    options_buf: [9][160]u8 = undefined,
+    options_buf: [9][1024]u8 = undefined,
     option_lens: [9]usize = @splat(0),
     options_count: usize = 0,
 
