@@ -229,3 +229,20 @@ test "raster primitives: sub-pixel rects are faint, soft ellipses fade to their 
     try std.testing.expectEqual(@as(u8, 255), pixel(rgb, w, 30, 2)[0]);
     try std.testing.expect(pixel(rgb, w, 33, 10)[0] > pixel(rgb, w, 30, 10)[0]);
 }
+
+test "hover time is exactly HH:mm:ss with unsigned zero-padded fields" {
+    var buf: [8]u8 = undefined;
+    for (0..24) |hour| {
+        const timestamp = 1792713605000 + @as(i64, @intCast(hour)) * 3_600_000;
+        const text = daybreak.formatLocalTimestamp(&buf, timestamp) orelse return error.TimestampMissing;
+        try std.testing.expectEqual(@as(usize, 8), text.len);
+        try std.testing.expectEqual(@as(u8, ':'), text[2]);
+        try std.testing.expectEqual(@as(u8, ':'), text[5]);
+        for ([_]usize{ 0, 1, 3, 4, 6, 7 }) |i| try std.testing.expect(std.ascii.isDigit(text[i]));
+        try std.testing.expectEqualStrings("05", text[6..8]);
+        try std.testing.expect((try std.fmt.parseInt(u8, text[0..2], 10)) < 24);
+        try std.testing.expect((try std.fmt.parseInt(u8, text[3..5], 10)) < 60);
+    }
+    var short: [7]u8 = undefined;
+    try std.testing.expect(daybreak.formatLocalTimestamp(&short, 1792713605000) == null);
+}

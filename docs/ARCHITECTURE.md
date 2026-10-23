@@ -1294,15 +1294,15 @@ lifecycle.
   restores ordinary contiguous scrollback. The pinned card is a display
   duplicate, so selection and copy continue to address the
   durable transcript rows. Hovering transcript output—including tool calls,
-  results, folded summaries, and status messages—shows a dim local timestamp
-  to the right of its first text row (or first visible row when scrolled).
-  A ten-column margin keeps the time clear of output; date and timezone are
-  included when space allows. Cached rows retain their source timestamp and
-  offset to the first text row, including pinned prompt copies. Folded
-  summaries use the latest completion time; live rows use their operation or
-  phase start, and local notes use their creation time. Mouse leave, keyboard
-  input, and dragging dismiss the timestamp. Selection is ours (mouse mode on): drag selects
-  logical text within/across blocks; double-click = word, triple = block.
+  results, folded summaries, and status messages—shows local `HH:mm:ss` in a
+  dim badge at the bottom-right above the composer or plan. The badge has an
+  opaque background and one cell of horizontal padding, and is painted last
+  so menus or other content cannot obscure it. The transcript uses its full
+  width. Cached rows retain their source timestamp, including pinned prompt
+  copies. Folded summaries use the latest completion time; live rows use
+  their operation or phase start, and local notes use their creation time.
+  Mouse leave, keyboard input, and dragging dismiss the timestamp. Selection
+  is ours (mouse mode on): drag selects logical text within/across blocks; double-click = word, triple = block.
   Copy → OSC 52 (works through ssh/mosh); shift+drag falls through to the
   terminal for native selection as escape hatch. The active turn's durable
   layout is cached until blocks/state/width change. During a running turn the

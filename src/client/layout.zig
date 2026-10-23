@@ -1388,18 +1388,17 @@ fn appendGuestActivityChildren(
 
 fn stampOutputLines(lines: []Line, timestamp_ms: ?i64) void {
     const timestamp = timestamp_ms orelse return;
-    var first: ?usize = null;
-    for (lines, 0..) |*line, i| {
+    var started = false;
+    for (lines) |*line| {
         if (line.timestamp_ms != null) {
-            first = null;
+            started = false;
             continue;
         }
-        if (first == null) {
+        if (!started) {
             if (std.mem.trim(u8, line.text, " ").len == 0 and line.text2.len == 0 and line.text3.len == 0) continue;
-            first = i;
+            started = true;
         }
         line.timestamp_ms = timestamp;
-        line.timestamp_offset = i - first.?;
     }
 }
 

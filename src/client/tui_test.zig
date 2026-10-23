@@ -5941,7 +5941,7 @@ test "runtime command is local control even while a guest is running" {
     try std.testing.expectEqualStrings("/runtime off", app.view.editor.text.items);
 }
 
-test "hover timestamps sit beside the first output row, including tools and status" {
+test "hover timestamps overlay the bottom right for all transcript output" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -5975,7 +5975,7 @@ test "hover timestamps sit beside the first output row, including tools and stat
     defer frame.deinit();
     var verdicts = TransportVerdicts{};
     var timestamp_buf: [80]u8 = undefined;
-    const expected = @import("daybreak.zig").formatLocalTimestamp(&timestamp_buf, timestamp).?[11..19];
+    const expected = @import("daybreak.zig").formatLocalTimestamp(&timestamp_buf, timestamp).?;
     // Repeated draws exercise the cached layout as well as initial layout.
     for ([_]i16{ 1, 2, 3 }) |row| {
         try dispatchEvent(&app, &vx, undefined, gpa, .{ .mouse = .{
@@ -5986,12 +5986,8 @@ test "hover timestamps sit beside the first output row, including tools and stat
             .type = .motion,
         } }, &verdicts);
         try draw(&app, &vx, frame.allocator());
-        const col = timestampColumn(vx.window(), 1, expected) orelse return error.TimestampMissing;
-        const rendered_lines = try tui.layoutLines(frame.allocator(), &app, 80);
-        try std.testing.expect(col > lineWidth(vx.window(), rendered_lines.items[0]));
-        try std.testing.expect(vx.window().readCell(col, 1).?.style.dim);
-        try std.testing.expect(timestampColumn(vx.window(), 2, expected) == null);
-        try std.testing.expect(timestampColumn(vx.window(), 3, expected) == null);
+        try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
+        try std.testing.expect(timestampColumn(vx.window(), @intCast(row), expected) == null);
     }
     for ([_]tui.Event{
         .{ .mouse = .{ .row = 23, .col = 10, .button = .none, .mods = .{}, .type = .motion } },
@@ -6020,7 +6016,6 @@ test "hover timestamps sit beside the first output row, including tools and stat
             if (line.timestamp_ms == null) continue;
             if (first == null) first = i;
             try std.testing.expectEqual(@as(?i64, timestamp), line.timestamp_ms);
-            try std.testing.expectEqual(i - first.?, line.timestamp_offset);
             try dispatchEvent(&app, &vx, undefined, gpa, .{ .mouse = .{
                 .row = @intCast(app.tabBarRows() + i),
                 .col = 10,
@@ -6029,9 +6024,7 @@ test "hover timestamps sit beside the first output row, including tools and stat
                 .type = .motion,
             } }, &verdicts);
             try draw(&app, &vx, frame.allocator());
-            const anchor_row: u16 = @intCast(app.tabBarRows() + first.?);
-            const col = timestampColumn(vx.window(), anchor_row, expected) orelse return error.TimestampMissing;
-            try std.testing.expect(vx.window().readCell(col, anchor_row).?.style.dim);
+            try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
         }
         try std.testing.expect(first != null);
     }
@@ -6050,7 +6043,7 @@ test "hover timestamps sit beside the first output row, including tools and stat
     } }, &verdicts);
     try draw(&app, &vx, frame.allocator());
     try std.testing.expect(app.view.last_first_visible > 0);
-    try std.testing.expect(timestampColumn(vx.window(), 1, expected) != null);
+    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
 
     for (app.view.blocks.items) |*rb| rb.deinit(gpa);
     app.view.blocks.clearRetainingCapacity();
@@ -6069,8 +6062,46 @@ test "hover timestamps sit beside the first output row, including tools and stat
         .type = .motion,
     } }, &verdicts);
     try draw(&app, &vx, frame.allocator());
-    try std.testing.expect(timestampColumn(vx.window(), 2, expected) != null);
+    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
     try std.testing.expect(timestampColumn(vx.window(), 1, expected) == null);
+    app.view.editor.insertSlice("/");
+    try draw(&app, &vx, frame.allocator());
+    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
+
+    // Long tool output gets the full terminal width and never competes with the badge.
+    app.view.editor.clear();
+    app.view.delta.clearRetainingCapacity();
+    app.view.state = .idle;
+    for (app.view.blocks.items) |*rb| rb.deinit(gpa);
+    app.view.blocks.clearRetainingCapacity();
+    app.view.layout_epoch +%= 1;
+    app.pushDurableBlock(message, .tool_result, "x" ** 120, "", .ok);
+    app.hover_mouse = .{ .row = 1, .col = 10, .button = .none, .mods = .{}, .type = .motion };
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expectEqualStrings("x", vx.window().readCell(79, 1).?.char.grapheme);
+    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
+
+    // An occupied destination is cleared, including its old hyperlink and padding.
+    for ([_]u16{ 20, 80 }) |width| {
+        try vx.resize(gpa, &output.writer, .{ .rows = 24, .cols = width, .x_pixel = 0, .y_pixel = 0 });
+        vx.window().fill(.{ .char = .{ .grapheme = "X" }, .link = .{ .uri = "https://example.com" }, .style = .{ .reverse = true } });
+        try tui.drawTimestampOverlay(vx.window(), frame.allocator(), 19, timestamp);
+        try expectTimestampBadge(vx.window(), 19, expected);
+        try std.testing.expectEqualStrings("X", vx.window().readCell(width - 11, 19).?.char.grapheme);
+    }
+}
+
+fn expectTimestampBadge(win: vaxis.Window, row: u16, expected: []const u8) !void {
+    try std.testing.expectEqual(@as(usize, 8), expected.len);
+    try std.testing.expectEqual(@as(?u16, win.width - 9), timestampColumn(win, row, expected));
+    for (win.width - 10..win.width) |col| {
+        const cell = win.readCell(@intCast(col), row).?;
+        try std.testing.expect(cell.style.dim);
+        try std.testing.expectEqual(Palette.timestamp.bg, cell.style.bg);
+        try std.testing.expectEqualStrings("", cell.link.uri);
+        if (col == win.width - 10 or col == win.width - 1)
+            try std.testing.expectEqualStrings(" ", cell.char.grapheme);
+    }
 }
 
 fn timestampColumn(win: vaxis.Window, row: u16, timestamp: []const u8) ?u16 {
