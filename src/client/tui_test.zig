@@ -2558,11 +2558,12 @@ test "durable user block reconciles optimistic local echo" {
     }};
     defer rendered[0].deinit(gpa);
 
-    try std.testing.expect(reconcilePendingEcho(&rendered, .user_msg, "hello", 9, 3));
+    try std.testing.expect(reconcilePendingEcho(&rendered, .user_msg, "hello", 9, 3, 123456));
     try std.testing.expect(!rendered[0].pending_echo);
     try std.testing.expectEqual(@as(u64, 9), rendered[0].seq);
     try std.testing.expectEqual(@as(u64, 3), rendered[0].turn_id);
-    try std.testing.expect(!reconcilePendingEcho(&rendered, .user_msg, "hello", 9, 3));
+    try std.testing.expectEqual(@as(?i64, 123456), rendered[0].timestamp_ms);
+    try std.testing.expect(!reconcilePendingEcho(&rendered, .user_msg, "hello", 9, 3, 123456));
 }
 
 test "correlated daemon error removes only its optimistic input and restores state" {
@@ -5938,4 +5939,71 @@ test "runtime command is local control even while a guest is running" {
     app.view.editor.insertSlice("/runtime o");
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/runtime off", app.view.editor.text.items);
+}
+
+test "hover timestamps follow durable wrapped rows and disappear outside messages" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var vx = try vaxis.init(threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &output.writer);
+    try vx.resize(gpa, &output.writer, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    var conn: attach.Conn = undefined;
+    conn.sandbox_available = false;
+    conn.network_filtering = false;
+    conn.network_configured = false;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    const timestamp: i64 = 1792744496000;
+    const message: block.Block = .{
+        .id = 1,
+        .session_id = 1,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = timestamp,
+        .body = .{ .assistant_msg = .{ .text = "This saved message wraps onto several rows so hovering its continuation should show the same timestamp as hovering its first line. Here is some more text." } },
+    };
+    app.applyBlock(message);
+    var replayed = (try allocDurableRenderBlock(gpa, message)).?;
+    defer replayed.deinit(gpa);
+    try std.testing.expectEqual(@as(?i64, timestamp), replayed.timestamp_ms);
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    var verdicts = TransportVerdicts{};
+    var timestamp_buf: [80]u8 = undefined;
+    const expected = @import("daybreak.zig").formatLocalTimestamp(&timestamp_buf, timestamp).?;
+    // Repeated draws exercise the cached layout as well as initial layout.
+    for ([_]i16{ 1, 2, 3 }) |row| {
+        try dispatchEvent(&app, &vx, undefined, gpa, .{ .mouse = .{
+            .row = row,
+            .col = 10,
+            .button = .none,
+            .mods = .{},
+            .type = .motion,
+        } }, &verdicts);
+        try draw(&app, &vx, frame.allocator());
+        const gap: u16 = @intCast(app.tabBarRows() + app.view.last_view_h);
+        const col: u16 = @intCast(80 - expected.len - 1);
+        for (expected, 0..) |char, i| {
+            const cell = vx.window().readCell(col + @as(u16, @intCast(i)), gap).?;
+            try std.testing.expectEqualSlices(u8, &.{char}, cell.char.grapheme);
+        }
+    }
+    for ([_]tui.Event{
+        .{ .mouse = .{ .row = 23, .col = 10, .button = .none, .mods = .{}, .type = .motion } },
+        .mouse_leave,
+        .focus_out,
+    }) |event| {
+        try dispatchEvent(&app, &vx, undefined, gpa, event, &verdicts);
+        try draw(&app, &vx, frame.allocator());
+        const gap: u16 = @intCast(app.tabBarRows() + app.view.last_view_h);
+        for (0..80) |col| {
+            const cell = vx.window().readCell(@intCast(col), gap).?;
+            try std.testing.expect(cell.char.grapheme.len == 0 or std.mem.eql(u8, cell.char.grapheme, " "));
+        }
+    }
 }

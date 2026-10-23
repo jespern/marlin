@@ -161,6 +161,7 @@ pub const SyntaxSpan = struct {
 /// independently; the line is the wrap unit). Slices point into the App's
 /// block storage or the frame arena (valid for the frame).
 pub const Line = struct {
+    timestamp_ms: ?i64 = null,
     text: []const u8,
     style: vaxis.Style,
     /// When set, paint the complete terminal row before printing segments.

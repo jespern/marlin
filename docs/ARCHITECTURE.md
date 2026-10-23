@@ -1293,7 +1293,11 @@ lifecycle.
   reaches the top, then stays there above the growing live tail. Scrolling up
   restores ordinary contiguous scrollback. The pinned card is a display
   duplicate, so selection and copy continue to address the
-  durable transcript rows. Selection is ours (mouse mode on): drag selects
+  durable transcript rows. Hovering a saved message (including its pinned
+  prompt copy) shows its local date, time, and timezone in the gap above
+  the composer or plan. Timestamps travel with cached layout rows; live
+  streaming text has no timestamp until saved. Mouse leave, keyboard input,
+  and dragging dismiss the timestamp. Selection is ours (mouse mode on): drag selects
   logical text within/across blocks; double-click = word, triple = block.
   Copy → OSC 52 (works through ssh/mosh); shift+drag falls through to the
   terminal for native selection as escape hatch. The active turn's durable

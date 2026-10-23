@@ -713,6 +713,17 @@ const Tm = extern struct {
 };
 extern "c" fn localtime_r(t: *const std.c.time_t, result: *Tm) ?*Tm;
 
+/// Format a durable event in the client's local timezone, including its zone.
+pub fn formatLocalTimestamp(buf: []u8, unix_ms: i64) ?[]const u8 {
+    const t: std.c.time_t = std.math.cast(std.c.time_t, @divFloor(unix_ms, 1000)) orelse return null;
+    var tm: Tm = undefined;
+    _ = localtime_r(&t, &tm) orelse return null;
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}", .{
+        @as(i64, tm.year) + 1900,                            tm.mon + 1, tm.mday, tm.hour, tm.min, tm.sec,
+        if (tm.zone) |zone| std.mem.span(zone) else "local",
+    }) catch null;
+}
+
 pub const LocalClock = struct {
     /// UTC seconds and milliseconds since the epoch.
     unix: i64,

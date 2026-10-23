@@ -227,6 +227,7 @@ pub const StreamLayoutCache = struct {
 
 /// A block reduced to what the renderer needs (owned copies).
 pub const RenderBlock = struct {
+    timestamp_ms: ?i64 = null,
     kind: block.BlockKind,
     /// Durable identity from the block log. Zero marks an optimistic local
     /// echo that will be reconciled when the daemon block arrives.
@@ -451,6 +452,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     return .{
         .kind = kind,
         .seq = b.seq,
+        .timestamp_ms = b.ts,
         .turn_id = b.turn_id,
         .text = owned_text,
         .label = owned_label,
@@ -1375,6 +1377,10 @@ fn appendGuestActivityChildren(
     }
 }
 
+fn stampMessageLines(lines: []Line, timestamp_ms: ?i64) void {
+    for (lines) |*line| line.timestamp_ms = timestamp_ms;
+}
+
 /// SECTION DISCIPLINE (the transcript's one spacing rule, pinned by the
 /// "transcript spacing invariant" test): every section — prompt card,
 /// assistant prose, reasoning line, Ran-N summary, expanded diff pair,
@@ -1535,6 +1541,8 @@ pub fn layoutBlockRange(
             .user_msg => {
                 try flushRanSummary(alloc, lines, &pending_ran);
                 try blankLine(alloc, lines);
+                const message_start = lines.items.len;
+                defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                 try wrapPromptCard(alloc, lines, rb.text, w);
                 if (rb.label.len > 0)
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
@@ -1542,6 +1550,8 @@ pub fn layoutBlockRange(
             .assistant_msg => {
                 try flushRanSummary(alloc, lines, &pending_ran);
                 try blankLine(alloc, lines);
+                const message_start = lines.items.len;
+                defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                 try wrapMarkdown(alloc, lines, rb.text, w);
             },
             .reasoning => {
@@ -1557,12 +1567,16 @@ pub fn layoutBlockRange(
                     if (transcript.show_tool_transcript or !commentarySuperseded(transcript.blocks, block_idx)) {
                         try flushRanSummary(alloc, lines, &pending_ran);
                         try blankLine(alloc, lines);
+                        const message_start = lines.items.len;
+                        defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                         try wrapMarkdown(alloc, lines, rb.text, w);
                     }
                 } else if (transcript.show_tool_transcript or
                     (rb.commentary and !commentarySuperseded(transcript.blocks, block_idx)))
                 {
                     try blankLine(alloc, lines);
+                    const message_start = lines.items.len;
+                    defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                     try wrapReasoningCard(alloc, lines, try clipText(alloc, rb.text, 280), w);
                 }
             },
@@ -1595,6 +1609,8 @@ pub fn layoutBlockRange(
             .steer => {
                 try flushRanSummary(alloc, lines, &pending_ran);
                 try blankLine(alloc, lines);
+                const message_start = lines.items.len;
+                defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                 try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w);
             },
             .plan => {
@@ -1613,6 +1629,8 @@ pub fn layoutBlockRange(
                     try flushRanSummary(alloc, lines, &pending_ran);
                     try blankLine(alloc, lines);
                     try wrapPrefixed(alloc, lines, "  ", "diagnostics", Palette.note, w);
+                    const message_start = lines.items.len;
+                    defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                     try wrapMarkdown(alloc, lines, rb.text, w);
                 } else if (block.isHandoverNote(rb.text)) {
                     try flushRanSummary(alloc, lines, &pending_ran);

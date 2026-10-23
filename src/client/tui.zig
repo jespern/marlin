@@ -117,7 +117,7 @@ const terminal_osc = @import("terminal_osc.zig");
 pub const initial_replay_blocks: u32 = 96;
 pub const history_window_blocks: usize = 384;
 
-const Event = union(enum) {
+pub const Event = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
     mouse_leave,
@@ -224,6 +224,7 @@ pub fn reconcilePendingEcho(
     text: []const u8,
     seq: u64,
     turn_id: u64,
+    timestamp_ms: i64,
 ) bool {
     for (blocks) |*rendered| {
         if (rendered.pending_echo and rendered.kind == kind and std.mem.eql(u8, rendered.text, text)) {
@@ -232,6 +233,7 @@ pub fn reconcilePendingEcho(
             rendered.pending_prior_state = null;
             rendered.seq = seq;
             rendered.turn_id = turn_id;
+            rendered.timestamp_ms = timestamp_ms;
             return true;
         }
     }
@@ -424,6 +426,7 @@ pub const SearchState = struct {
 };
 
 pub const App = struct {
+    hover_mouse: ?vaxis.Mouse = null,
     gpa: std.mem.Allocator,
     io: Io,
     conn: *attach.Conn,
@@ -1141,6 +1144,7 @@ pub const App = struct {
     /// which knows what replay shape it wants. Every focus change goes
     /// through here; two hand-rolled copies once drifted apart.
     pub fn focusSession(self: *App, sid: u64, touch_recent: bool) !void {
+        self.hover_mouse = null;
         const focused_root_sid = self.rootSessionId(sid);
         const old_sid = self.view.sid;
         try self.saveActiveView();
@@ -1525,6 +1529,7 @@ pub const App = struct {
             const rendered = &self.view.blocks.items[self.view.blocks.items.len - 1];
             rendered.seq = b.seq;
             rendered.turn_id = b.turn_id;
+            rendered.timestamp_ms = b.ts;
         }
     }
 
@@ -2158,7 +2163,9 @@ pub const App = struct {
                     else
                         null;
                     defer if (label) |owned| self.gpa.free(owned);
-                    if (!reconcilePendingEcho(self.view.blocks.items, .user_msg, u.display_text orelse u.text, b.seq, b.turn_id)) {
+                    const reconciled = reconcilePendingEcho(self.view.blocks.items, .user_msg, u.display_text orelse u.text, b.seq, b.turn_id, b.ts);
+                    if (reconciled) self.view.layout_epoch +%= 1;
+                    if (!reconciled) {
                         self.pushDurableBlock(b, .user_msg, u.display_text orelse u.text, label orelse "", .ok);
                     } else if (label) |owned| {
                         for (self.view.blocks.items) |*rendered| {
@@ -2175,7 +2182,9 @@ pub const App = struct {
                 }
             },
             .steer => |s| {
-                if (!reconcilePendingEcho(self.view.blocks.items, .steer, s.display_text orelse s.text, b.seq, b.turn_id))
+                const reconciled = reconcilePendingEcho(self.view.blocks.items, .steer, s.display_text orelse s.text, b.seq, b.turn_id, b.ts);
+                if (reconciled) self.view.layout_epoch +%= 1;
+                if (!reconciled)
                     self.pushDurableBlock(b, .steer, s.display_text orelse s.text, "", .ok);
                 self.view.editor.pushHistory(s.display_text orelse s.text);
             },
@@ -5754,9 +5763,15 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     if (total == 0 and !app.view.history_loading and app.view.state == .idle)
         try drawWelcome(app, win, top_rows, view_h, arena);
 
+    var hovered_timestamp: ?i64 = null;
     for (visible.items, 0..) |display, row| {
         const ln = display.line;
         const abs_line = display.abs_line;
+        if (app.hover_mouse) |mouse| {
+            if (mouse.row == top_rows + row and mouse.col >= 0 and mouse.col < w and
+                !app.view.sel_dragging and app.picker == null and !app.shortcut_help)
+                hovered_timestamp = ln.timestamp_ms;
+        }
         if (ln.fill_style) |fill_style| {
             const fill_start = @min(ln.fill_start, w);
             const fill_width = @min(ln.fill_width orelse (w -| fill_start), w -| fill_start);
@@ -5838,6 +5853,16 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const input_top = h - 1 - input_h;
     const plan_top = input_top -| plan_h;
     try drawPlan(app, win, arena, plan_top, plan_h);
+    if (hovered_timestamp) |timestamp| {
+        var timestamp_buf: [80]u8 = undefined;
+        if (daybreak.formatLocalTimestamp(&timestamp_buf, timestamp)) |label| {
+            _ = win.printSegment(.{ .text = try arena.dupe(u8, label), .style = Palette.note }, .{
+                .row_offset = @intCast(top_rows + view_h),
+                .col_offset = @intCast(w -| (displayWidth(label) + 1)),
+                .wrap = .none,
+            });
+        }
+    }
 
     // ---- input box ----
     const input_panel = win.child(.{ .y_off = input_top, .height = input_h, .width = w });
@@ -6563,6 +6588,7 @@ pub fn dispatchEvent(
             if (key.codepoint == vaxis.Key.left_super or key.codepoint == vaxis.Key.right_super)
                 app.link_super_held = true;
             if (key.isModifier()) return;
+            app.hover_mouse = null;
             app.recordUserActivity();
             if (app.gameKey(key, true)) return;
             if (app.dismissScreensaver()) return;
@@ -6581,6 +6607,7 @@ pub fn dispatchEvent(
         .mouse => |m| {
             app.presence_last_activity_ms = nowWallMs(app.io);
             if (app.screensaver_active) return;
+            app.hover_mouse = if (m.type == .motion and m.button == .none) m else null;
             vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null) .pointer else .default);
             if (linkAtMouse(vx.window(), m, app.link_super_held)) |uri| {
                 openExternalLink(app, uri);
@@ -6588,13 +6615,17 @@ pub fn dispatchEvent(
             }
             handleMouse(app, m);
         },
-        .mouse_leave => vx.setMouseShape(.default),
+        .mouse_leave => {
+            app.hover_mouse = null;
+            vx.setMouseShape(.default);
+        },
         .focus_in => {
             app.terminal_focused = true;
             _ = app.unread_completions.remove(app.rootSessionId(app.view.sid));
             app.presence_last_activity_ms = nowWallMs(app.io);
         },
         .focus_out => {
+            app.hover_mouse = null;
             app.terminal_focused = false;
             if (app.game_mode) if (app.wipeout_game) |game| game.releaseKeys();
         },
@@ -6609,6 +6640,7 @@ pub fn dispatchEvent(
             app.expireNotice();
         },
         .winsize => |ws| {
+            app.hover_mouse = null;
             app.term_cols = ws.cols;
             app.term_rows = ws.rows;
             app.recordCellPixels(ws);
@@ -6619,6 +6651,7 @@ pub fn dispatchEvent(
             try vx.resize(gpa, tty.writer(), ws);
         },
         .paste => |text| {
+            app.hover_mouse = null;
             if (app.dismissScreensaver()) {
                 gpa.free(@constCast(text));
                 return;
