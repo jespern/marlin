@@ -29,6 +29,7 @@ const completeSuggestion = commands.completeSuggestion;
 const isCommandInput = commands.isCommandInput;
 
 pub fn handleKey(app: *App, key: vaxis.Key) !void {
+    app.cwd_completion_waiting_key = null;
     if (app.web_view) {
         if (optionTabNavigationDirection(key)) |direction| {
             app.web_view = false;
@@ -436,6 +437,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
             const edit_w: usize = app.term_cols -| 2;
             var command_arena = std.heap.ArenaAllocator.init(app.gpa);
             defer command_arena.deinit();
+            app.requestCwdCompletion();
             const suggestions = commandSuggestions(app, command_arena.allocator()) catch &.{};
             // A recalled /command still looks like an autocomplete query.
             // While walking history, Up/Down must keep walking history rather
@@ -446,13 +448,18 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
             const cwd_argument = typed_cwd != null;
             if (!cwd_argument) app.cwd_menu_selection = null;
             if (typed_cwd) |typed| {
+                if (!app.cwd_completion_ready and (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true }) or
+                    (!ed.isWalkingHistory() and (isNextInputRowKey(key) or isPreviousInputRowKey(key)))))
+                {
+                    app.cwd_completion_waiting_key = .{ .codepoint = key.codepoint, .mods = key.mods };
+                    return;
+                }
                 if (key.matches(vaxis.Key.tab, .{})) {
                     if (app.cwdMenuSelected() and suggestions.len > 0) {
                         completeSuggestion(ed, suggestions[@min(app.command_selection, suggestions.len - 1)], true);
                         app.cwd_menu_selection = null;
                     } else {
-                        const home = if (app.environ) |env| env.get("HOME") else null;
-                        const completed = try @import("path_complete.zig").complete(command_arena.allocator(), app.io, app.view.cwd.items, home, typed);
+                        const completed = @import("../core/path_complete.zig").commonPrefix(app.cwdCompletionMatches(), typed);
                         if (!std.mem.eql(u8, typed, completed)) {
                             const replacement = try std.fmt.allocPrint(command_arena.allocator(), "{s} {s}", .{ commands.cwdCommand(ed).?, completed });
                             ed.clear();

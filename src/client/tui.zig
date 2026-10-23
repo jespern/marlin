@@ -471,6 +471,12 @@ pub const App = struct {
     command_selection: usize = 0,
     /// Explicit directory selection, tied to this exact draft/session/cursor.
     cwd_menu_selection: ?u64 = null,
+    cwd_completion_key: ?u64 = null,
+    cwd_completion_request: u64 = 0,
+    cwd_completion_ready: bool = false,
+    cwd_completion_arena: ?std.heap.ArenaAllocator = null,
+    cwd_completion_matches: []const []const u8 = &.{},
+    cwd_completion_waiting_key: ?vaxis.Key = null,
     /// Type-to-filter query while the picker is open.
     picker_filter: std.ArrayList(u8) = .empty,
     /// Provider onboarding draft; see setup.zig.
@@ -652,6 +658,7 @@ pub const App = struct {
     next_input_request_id: u64 = 1,
 
     pub fn deinit(self: *App) void {
+        if (self.cwd_completion_arena) |*arena| arena.deinit();
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
         self.picker_filter.deinit(self.gpa);
@@ -870,6 +877,34 @@ pub const App = struct {
     pub fn cwdMenuKey(self: *const App) u64 {
         const seed = std.hash.Wyhash.hash(self.view.sid ^ @as(u64, @intCast(self.view.editor.cursor)), self.view.cwd.items);
         return std.hash.Wyhash.hash(seed, self.view.editor.text.items);
+    }
+
+    pub fn cwdCompletionMatches(self: *const App) []const []const u8 {
+        if (!self.cwd_completion_ready or self.cwd_completion_key != self.cwdMenuKey()) return &.{};
+        return self.cwd_completion_matches;
+    }
+
+    pub fn requestCwdCompletion(self: *App) void {
+        const typed = commands.cwdArgument(&self.view.editor) orelse {
+            self.cwd_completion_key = null;
+            self.cwd_completion_waiting_key = null;
+            return;
+        };
+        const key = self.cwdMenuKey();
+        if (self.cwd_completion_key == key) return;
+        self.cwd_completion_key = key;
+        self.cwd_completion_ready = false;
+        self.cwd_completion_waiting_key = null;
+        self.cwd_menu_selection = null;
+        self.command_selection = 0;
+        self.cwd_completion_request +%= 1;
+        self.conn.send(.{ .session_complete_cwd = .{
+            .sid = self.view.sid,
+            .typed = typed,
+            .request_id = self.cwd_completion_request,
+        } }) catch {
+            self.cwd_completion_key = null;
+        };
     }
 
     pub fn cwdMenuSelected(self: *const App) bool {
@@ -1145,6 +1180,8 @@ pub const App = struct {
     /// through here; two hand-rolled copies once drifted apart.
     pub fn focusSession(self: *App, sid: u64, touch_recent: bool) !void {
         self.hover_mouse = null;
+        self.cwd_completion_key = null;
+        self.cwd_completion_waiting_key = null;
         const focused_root_sid = self.rootSessionId(sid);
         const old_sid = self.view.sid;
         try self.saveActiveView();
@@ -2013,6 +2050,21 @@ pub const App = struct {
                 view.replaceSkills(self.gpa, result.cwd, result.skills) catch return;
                 if (result.sid == self.view.sid) self.command_selection = 0;
                 self.refresh_requested = true;
+            },
+            .session_cwd_completions => |result| {
+                if (result.request_id != self.cwd_completion_request or result.sid != self.view.sid or
+                    !std.mem.eql(u8, result.cwd, self.view.cwd.items) or
+                    self.cwd_completion_key != self.cwdMenuKey() or
+                    !std.mem.eql(u8, result.typed, commands.cwdArgument(&self.view.editor) orelse return)) return;
+                if (self.cwd_completion_arena) |*arena| arena.deinit();
+                self.cwd_completion_arena = .init(self.gpa);
+                self.cwd_completion_matches = &.{};
+                const owned = proto.decode(proto.DaemonMsg, self.cwd_completion_arena.?.allocator(), line) catch return;
+                self.cwd_completion_matches = owned.session_cwd_completions.matches;
+                self.cwd_completion_ready = true;
+                const waiting_key = self.cwd_completion_waiting_key;
+                self.cwd_completion_waiting_key = null;
+                if (waiting_key) |key| handleKey(self, key) catch {};
             },
             .session_git_status => |result| {
                 if (result.sid != self.view.sid or !std.mem.eql(u8, result.cwd, self.view.cwd.items)) return;
@@ -4977,11 +5029,12 @@ pub fn drawCommandMenu(
     width: u16,
 ) !void {
     if (app.mode != .insert or app.picker != null or app.view.editor.isWalkingHistory() or commandQuery(&app.view.editor) == null) return;
+    app.requestCwdCompletion();
     const suggestions = try commandSuggestions(app, arena);
     if (suggestions.len == 0) return;
 
     const directory_menu = commands.cwdArgument(&app.view.editor) != null;
-    const limit = if (directory_menu) @import("path_complete.zig").max_candidates else composer_commands.len;
+    const limit = if (directory_menu) @import("../core/path_complete.zig").max_candidates else composer_commands.len;
     const shown: u16 = @intCast(@min(suggestions.len, limit, input_top -| 1));
     if (shown == 0) return;
     const menu_h = shown + 1;
@@ -6678,7 +6731,11 @@ pub fn dispatchEvent(
         },
         .daemon_line => |line| app.handleDaemonLine(line),
         .daemon_gone => |reason| verdicts.conn_lost = reason,
-        .reconnected => |maybe| verdicts.reconnect = maybe,
+        .reconnected => |maybe| {
+            app.cwd_completion_key = null;
+            app.cwd_completion_waiting_key = null;
+            verdicts.reconnect = maybe;
+        },
     }
 }
 

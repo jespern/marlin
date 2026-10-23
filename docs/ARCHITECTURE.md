@@ -1448,6 +1448,11 @@ lifecycle.
   are ignored and do not reset inactivity. `[ui] screensaver_after = "10m"`
   enables per-client inactivity activation; absent or `"off"` disables it.
   Daemon/provider activity does not count as user activity.
+  Directory suggestions for `/cwd` and `/cd` are requested from the daemon,
+  using the session cwd and the daemon's HOME. The TUI never scans its local
+  filesystem for these completions. Replies are cached for the current input;
+  Tab and arrow navigation can wait for a reply, while edits, session changes,
+  and cwd changes invalidate stale replies. This works across remote transports.
   `/cwd <path>` changes the focused session's durable working directory while
   idle. `~` and `~/…` resolve against the daemon user's home; other relative
   paths resolve against the session's current cwd. The daemon requires an

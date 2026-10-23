@@ -290,6 +290,7 @@ pub const ClientMsg = union(enum) {
     /// Change the working directory used by subsequent turns. Relative paths
     /// resolve against the session's current working directory.
     session_set_cwd: struct { sid: u64, cwd: []const u8 },
+    session_complete_cwd: struct { sid: u64, typed: []const u8, request_id: u64 },
     session_set_model: struct { sid: u64, model: []const u8 },
     session_set_effort: struct { sid: u64, effort: ReasoningEffort },
     /// Persist the session collaboration mode. Plan mode is daemon-enforced
@@ -478,6 +479,7 @@ pub const DaemonMsg = union(enum) {
     /// union decoders reject message types they do not know.
     session_upsert: struct { session: SessionInfo },
     session_git_status: struct { sid: u64, cwd: []const u8, branch: []const u8 = "", counts: ?struct { ahead: u64, behind: u64 } = null },
+    session_cwd_completions: struct { sid: u64, cwd: []const u8, typed: []const u8, request_id: u64, matches: []const []const u8 },
     session_skills: struct { sid: u64, cwd: []const u8, skills: []const SkillInfo },
     session_recap: struct { sid: u64, seq: u64, text: []const u8 = "", generated: bool = false, retry: bool = false },
     session_remove: struct { sid: u64 },

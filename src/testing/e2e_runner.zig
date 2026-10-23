@@ -150,6 +150,7 @@ const Check = struct {
     skill_invocation_flow: bool = false,
     plugin_flow: bool = false,
     runtime_flow: bool = false,
+    cwd_completion_flow: bool = false,
     /// Direct socket regression: approval publication, reconnect replay,
     /// steering while parked, and reboot refusal are one state-machine flow.
     approval_reconnect_flow: bool = false,
@@ -492,6 +493,7 @@ fn runScenario(
     if (sf.check.git_status_flow) try checkGitStatus(gpa, io, &env, state_dir);
     if (sf.check.skill_invocation_flow) try checkSkillInvocation(gpa, io, &env, state_dir);
     if (sf.check.runtime_flow) try checkRuntime(gpa, io, &env);
+    if (sf.check.cwd_completion_flow) try checkCwdCompletion(gpa, io, &env, state_dir);
     if (sf.check.plugin_flow) try checkPlugins(gpa, io, &env, state_dir, marlin_bin);
 
     // 4. Fake provider must have consumed all steps and validated them.
@@ -1565,4 +1567,47 @@ fn print(io: Io, comptime fmt: []const u8, args: anytype) void {
     var w: Io.File.Writer = .init(.stdout(), io, &buf);
     w.interface.print(fmt, args) catch return;
     w.interface.flush() catch return;
+}
+
+fn checkCwdCompletion(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, daemon_home: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.fs.path.join(a, &.{ daemon_home, "server-project" });
+    const repo = try std.fs.path.join(a, &.{ cwd, "repo-on-host" });
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ repo, "sub directory" }));
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ daemon_home, "home-only" }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ cwd, "repo-file" }), .data = "not a directory" });
+    const conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    try conn.send(.{ .session_create = .{ .cwd = cwd, .model = "local/testing" } });
+    const sid = uintField(try recvTagBounded(conn, a, "session_created"), "sid") orelse return error.SessionIdMissing;
+    const absolute = try std.fmt.allocPrint(a, "{s}/repo", .{cwd});
+    for ([_]struct { typed: []const u8, expected: ?[]const u8 }{
+        .{ .typed = "repo", .expected = "repo-on-host/" },
+        .{ .typed = "~/home-", .expected = "~/home-only/" },
+        .{ .typed = absolute, .expected = try std.fmt.allocPrint(a, "{s}/", .{repo}) },
+        .{ .typed = "missing/path/", .expected = null },
+    }, 1..) |case, request_id| {
+        try conn.send(.{ .session_complete_cwd = .{ .sid = sid, .typed = case.typed, .request_id = request_id } });
+        const result = try recvTagBounded(conn, a, "session_cwd_completions");
+        if (uintField(result, "request_id") != request_id or uintField(result, "sid") != sid) return error.CwdCompletionIdentity;
+        if (!std.mem.eql(u8, stringField(result, "cwd") orelse "", cwd) or
+            !std.mem.eql(u8, stringField(result, "typed") orelse "", case.typed)) return error.CwdCompletionIdentity;
+        const matches = result.get("matches") orelse return error.CwdCompletionMissing;
+        if (matches != .array) return error.CwdCompletionMissing;
+        if (case.expected) |expected| {
+            if (matches.array.items.len != 1 or matches.array.items[0] != .string or
+                !std.mem.eql(u8, matches.array.items[0].string, expected)) return error.CwdCompletionMismatch;
+        } else if (matches.array.items.len != 0) return error.CwdCompletionMismatch;
+    }
+    try conn.send(.{ .session_set_cwd = .{ .sid = sid, .cwd = "repo-on-host" } });
+    _ = try recvTagBounded(conn, a, "ok");
+    try conn.send(.{ .session_complete_cwd = .{ .sid = sid, .typed = "sub", .request_id = 5 } });
+    const result = try recvTagBounded(conn, a, "session_cwd_completions");
+    const canonical = try Io.Dir.cwd().realPathFileAlloc(io, repo, a);
+    if (!std.mem.eql(u8, stringField(result, "cwd") orelse "", canonical)) return error.CwdCompletionIdentity;
+    const matches = result.get("matches") orelse return error.CwdCompletionMissing;
+    if (matches != .array or matches.array.items.len != 1 or matches.array.items[0] != .string or
+        !std.mem.eql(u8, matches.array.items[0].string, "sub directory/")) return error.CwdCompletionMismatch;
 }

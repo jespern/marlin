@@ -24,12 +24,17 @@ pub fn directories(arena: std.mem.Allocator, io: Io, session_cwd: []const u8, ho
 /// Never choose an arbitrary child when more than one directory matches.
 pub fn complete(arena: std.mem.Allocator, io: Io, session_cwd: []const u8, home: ?[]const u8, typed: []const u8) ![]const u8 {
     const matches = try matchingDirectories(arena, io, session_cwd, home, typed, std.math.maxInt(usize));
+    const args = try arena.alloc([]const u8, matches.len);
+    for (matches, args) |match, *arg| arg.* = match.arg;
+    return commonPrefix(args, typed);
+}
+
+pub fn commonPrefix(matches: []const []const u8, typed: []const u8) []const u8 {
     if (matches.len == 0) return typed;
-    var prefix = matches[0].arg;
+    var prefix = matches[0];
     for (matches[1..]) |candidate| {
         var n: usize = 0;
-        while (n < prefix.len and n < candidate.arg.len and prefix[n] == candidate.arg[n]) : (n += 1) {}
-        // A byte prefix may end inside a multibyte filename character.
+        while (n < prefix.len and n < candidate.len and prefix[n] == candidate[n]) : (n += 1) {}
         while (n > 0 and n < prefix.len and prefix[n] & 0xc0 == 0x80) n -= 1;
         prefix = prefix[0..n];
     }

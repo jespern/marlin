@@ -256,3 +256,8 @@ Guest runtime limits are covered by config duration parsing, v13→v14 storage
 migration, live watcher allowance changes and cancellation with the deadline off.
 `30_guest_runtime.json` exercises query/set/reset and session isolation over the
 real daemon protocol, including restoration after unloading a session.
+
+Directory completion is covered by scenario `31_cwd_completion.json`: relative
+and absolute paths, the daemon's isolated HOME, non-directory filtering, missing
+paths, request correlation, and cwd changes. TUI tests exercise delayed replies,
+stale query/session/cwd rejection, and Tab/arrow navigation over protocol results.

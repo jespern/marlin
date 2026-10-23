@@ -1523,6 +1523,22 @@ pub const Daemon = struct {
                 );
                 self.sendOtelStatus(client);
             },
+            .session_complete_cwd => |request| {
+                const session = (try self.getOrLoadSession(request.sid)) orelse return;
+                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena.deinit();
+                const a = arena.allocator();
+                const directories = try @import("../core/path_complete.zig").directories(a, self.io, session.cwd, self.environ.get("HOME"), request.typed);
+                const matches = try a.alloc([]const u8, directories.len);
+                for (directories, matches) |directory, *arg| arg.* = directory.arg;
+                self.sendTo(client, .{ .session_cwd_completions = .{
+                    .sid = request.sid,
+                    .cwd = session.cwd,
+                    .typed = request.typed,
+                    .request_id = request.request_id,
+                    .matches = matches,
+                } });
+            },
             .session_git_status => |request| try self.requestGitStatus(client, request.sid),
             .session_recap => |request| try self.requestRecap(client, request.sid, request.seq),
             .session_watch => |sw| {

@@ -61,6 +61,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
 | session_set_model | sid, model | ok, or err{busy} mid-turn. Native→guest (`claudecode/` or `codex/`) starts a native handover turn. Guest→other guest does the same after the daemon puts a native author on the session (the configured default, else the first native favorite); err{guest_switch} only when nothing native is configured. |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
+| session_complete_cwd | sid, typed, request_id | session_cwd_completions{sid, cwd, typed, request_id, matches}; directory arguments resolved on the daemon host, including its HOME; replies are requested only |
 | session_set_cwd | sid, cwd | ok, or err{busy} mid-turn / err{bad_cwd}; relative paths resolve against the current session cwd, and the canonical existing directory is persisted and broadcast as session_upsert |
 | session_rename | sid, title | ok; title normalized like auto-titles (first line, trimmed, capped) and broadcast as session_upsert |
 | session_set_approvals | sid, approvals ("default" \| "auto") | ok; applies to the RUNNING turn too — granting full access resolves a parked prompt immediately |

@@ -8,7 +8,6 @@ const proto = @import("../core/proto.zig");
 const config = @import("../core/config.zig");
 const effects = @import("effects.zig");
 const wipeout_effect = @import("wipeout_effect.zig");
-const path_complete = @import("path_complete.zig");
 const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const tui = @import("tui.zig");
@@ -243,11 +242,10 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
         }
         return out.items;
     }
-    if (cwdArgument(&app.view.editor)) |typed| {
+    if (cwdArgument(&app.view.editor) != null) {
         const head = cwdCommand(&app.view.editor).?;
-        const home: ?[]const u8 = if (app.environ) |env| env.get("HOME") else null;
-        for (try path_complete.directories(arena, app.io, app.view.cwd.items, home, typed)) |c| {
-            const replacement = try std.fmt.allocPrint(arena, "{s} {s}", .{ head, c.arg });
+        for (app.cwdCompletionMatches()) |arg| {
+            const replacement = try std.fmt.allocPrint(arena, "{s} {s}", .{ head, arg });
             try out.append(arena, .{
                 .label = replacement,
                 .description = "directory",

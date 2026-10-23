@@ -5339,6 +5339,7 @@ test "/cwd suggests directories under the session cwd, one segment at a time, ne
     defer arena_state.deinit();
 
     app.view.editor.insertSlice("/cwd ");
+    try serveCwdCompletions(&app);
     var suggestions = try commandSuggestions(&app, arena_state.allocator());
     try std.testing.expectEqual(@as(usize, 2), suggestions.len);
     try std.testing.expectEqualStrings("/cwd notes/", suggestions[0].label);
@@ -5347,6 +5348,7 @@ test "/cwd suggests directories under the session cwd, one segment at a time, ne
 
     app.view.editor.clear();
     app.view.editor.insertSlice("/cwd projects/m");
+    try serveCwdCompletions(&app);
     suggestions = try commandSuggestions(&app, arena_state.allocator());
     try std.testing.expectEqual(@as(usize, 1), suggestions.len);
     try std.testing.expectEqualStrings("/cwd projects/marlin/", suggestions[0].replacement);
@@ -5396,10 +5398,12 @@ test "cwd Tab completes but Enter submits the typed directory instead of its chi
     defer app.deinit();
     app.setCwdStr(tmp.path);
     app.view.editor.insertSlice("/cwd proj");
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cwd projects/", app.view.editor.text.items);
     // No explicit menu selection: Enter keeps the directory just completed.
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"projects/\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "marlin") == null);
@@ -5433,6 +5437,7 @@ test "cwd Enter encodings submit the typed path despite a highlighted child" {
         defer app.deinit();
         app.setCwdStr(tmp.path);
         app.view.editor.insertSlice("/cwd parent/");
+        try serveCwdCompletions(&app);
         try handleKey(&app, key);
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"parent/\"") != null);
         try std.testing.expectEqual(@as(usize, 0), app.view.editor.text.items.len);
@@ -5601,24 +5606,32 @@ test "cwd Tab and arrows accept directory selections and descend without submitt
     defer app.deinit();
     app.setCwdStr(tmp.path);
     app.view.editor.insertSlice("/cwd proj");
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cwd projects/", app.view.editor.text.items);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expect(app.cwdMenuSelected());
     try std.testing.expectEqual(@as(usize, 0), app.command_selection);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.down });
     try std.testing.expectEqual(@as(usize, 1), app.command_selection);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.up });
     try std.testing.expectEqual(@as(usize, 0), app.command_selection);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab, .mods = .{ .shift = true } });
     try std.testing.expectEqual(@as(usize, 1), app.command_selection);
     try std.testing.expect(!app.view.plan_mode);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cwd projects/other/", app.view.editor.text.items);
     try std.testing.expect(!app.cwdMenuSelected());
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cwd projects/other/deep/", app.view.editor.text.items);
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"projects/other/deep/\"") != null);
 }
@@ -5643,11 +5656,15 @@ test "cwd selection handles spaces and Enter accepts an explicitly chosen direct
     defer app.deinit();
     app.setCwdStr(tmp.path);
     app.view.editor.insertSlice("/cwd team ");
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.up });
     try std.testing.expectEqual(@as(usize, 1), app.command_selection);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cwd team beta/", app.view.editor.text.items);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.down });
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.kp_enter });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"team beta/src dir/\"") != null);
 }
@@ -5667,27 +5684,38 @@ test "cwd editing and Escape cancel menu selection while history retains arrow k
     defer app.deinit();
     app.setCwdStr(tmp.path);
     app.view.editor.insertSlice("/cwd ");
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.down });
     try std.testing.expect(app.cwdMenuSelected());
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
     try std.testing.expect(!app.cwdMenuSelected());
     try std.testing.expectEqual(tui.Mode.insert, app.mode);
     try std.testing.expectEqualStrings("/cwd ", app.view.editor.text.items);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.down });
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.left });
     try std.testing.expect(!app.cwdMenuSelected());
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.right });
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = 'b', .text = "b" });
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cwd beta/", app.view.editor.text.items);
     app.view.editor.clear();
     app.view.editor.pushHistory("older");
     app.view.editor.pushHistory("/cwd ");
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.up });
     try std.testing.expectEqualStrings("/cwd ", app.view.editor.text.items);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.up });
     try std.testing.expectEqualStrings("older", app.view.editor.text.items);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.down });
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expect(!app.view.editor.isWalkingHistory());
     try std.testing.expect(app.cwdMenuSelected());
@@ -5710,6 +5738,7 @@ test "cwd menu scrolls to and visibly highlights matches beyond the first twelve
     defer app.deinit();
     app.setCwdStr(tmp.path);
     app.view.editor.insertSlice("/cwd ");
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.up });
     try std.testing.expectEqual(@as(usize, 14), app.command_selection);
     var screen = try vaxis.Screen.init(gpa, .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
@@ -5718,6 +5747,7 @@ test "cwd menu scrolls to and visibly highlights matches beyond the first twelve
     try tui.drawCommandMenu(&app, win, arena, 7, 80);
     try std.testing.expectEqualStrings("/", win.readCell(2, 5).?.char.grapheme);
     try std.testing.expectEqualDeep(Palette.command_selected_name, win.readCell(2, 5).?.style);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cwd dir14/", app.view.editor.text.items);
 }
@@ -5741,16 +5771,21 @@ test "cd aliases cwd through command completion, directory selection and submiss
     defer app.deinit();
     app.setCwdStr(tmp.path);
     app.view.editor.insertSlice("/cd");
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cd ", app.view.editor.text.items);
     app.view.editor.insertSlice("pro");
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cd project one/", app.view.editor.text.items);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab, .mods = .{ .shift = true } });
     try std.testing.expect(app.cwdMenuSelected());
     try std.testing.expect(!app.view.plan_mode);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("/cd project one/nested/", app.view.editor.text.items);
+    try serveCwdCompletions(&app);
     try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"project one/nested/\"") != null);
     app.runCommand("/cd");
@@ -6157,4 +6192,86 @@ test "folded tool summaries retain completion time and live rows use phase start
     try std.testing.expectEqual(@as(?i64, 4000), lines.items[lines.items.len - 1].timestamp_ms);
     app.pushBlock(.system_note, "client status", "", .ok);
     try std.testing.expect(app.view.blocks.items[app.view.blocks.items.len - 1].timestamp_ms != null);
+}
+
+// External completion peer for navigation tests; the client sees only protocol replies.
+fn serveCwdCompletions(app: *App) !void {
+    const typed = commands.cwdArgument(&app.view.editor) orelse return;
+    var output: Io.Writer.Allocating = .init(app.gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = app.gpa;
+    conn.writer = &output.writer;
+    const original = app.conn;
+    app.conn = &conn;
+    defer app.conn = original;
+    app.requestCwdCompletion();
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const candidates = try @import("../core/path_complete.zig").directories(arena.allocator(), app.io, app.view.cwd.items, null, typed);
+    const matches = try arena.allocator().alloc([]const u8, candidates.len);
+    for (candidates, matches) |candidate, *arg| arg.* = candidate.arg;
+    app.handleDaemonLine(try proto.encode(app.gpa, proto.DaemonMsg{ .session_cwd_completions = .{
+        .sid = app.view.sid,
+        .cwd = app.view.cwd.items,
+        .typed = typed,
+        .request_id = app.cwd_completion_request,
+        .matches = matches,
+    } }));
+}
+
+test "cwd completion uses daemon replies and rejects stale paths and sessions" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa) }, .remote_transport = true };
+    defer app.deinit();
+    app.setCwdStr("/only-on-daemon");
+    app.view.editor.insertSlice("/cwd ~/pro");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("/cwd ~/pro", app.view.editor.text.items);
+    try std.testing.expect(app.cwd_completion_waiting_key != null);
+    const request_id = app.cwd_completion_request;
+    const sent_len = output.written().len;
+    app.requestCwdCompletion();
+    try std.testing.expectEqual(sent_len, output.written().len);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "session_complete_cwd") != null);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_cwd_completions = .{
+        .sid = 42,
+        .cwd = "/only-on-daemon",
+        .typed = "~/pro",
+        .request_id = request_id,
+        .matches = &.{"~/project-on-server/"},
+    } }));
+    try std.testing.expectEqualStrings("/cwd ~/project-on-server/", app.view.editor.text.items);
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/cd /old");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.tab });
+    const old_id = app.cwd_completion_request;
+    try handleKey(&app, .{ .codepoint = 'x', .text = "x" });
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_cwd_completions = .{
+        .sid = 42,
+        .cwd = "/only-on-daemon",
+        .typed = "/old",
+        .request_id = old_id,
+        .matches = &.{"/old-wrong/"},
+    } }));
+    try std.testing.expectEqualStrings("/cd /oldx", app.view.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 0), app.cwdCompletionMatches().len);
+    app.requestCwdCompletion();
+    for ([_]u64{ 43, 42 }) |sid| {
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_cwd_completions = .{
+            .sid = sid,
+            .cwd = if (sid == 42) "/different-cwd" else "/only-on-daemon",
+            .typed = "/oldx",
+            .request_id = app.cwd_completion_request,
+            .matches = &.{"/wrong/"},
+        } }));
+        try std.testing.expectEqual(@as(usize, 0), app.cwdCompletionMatches().len);
+    }
 }
