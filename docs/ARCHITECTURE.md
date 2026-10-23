@@ -1294,10 +1294,12 @@ lifecycle.
   restores ordinary contiguous scrollback. The pinned card is a display
   duplicate, so selection and copy continue to address the
   durable transcript rows. Hovering transcript output—including tool calls,
-  results, folded summaries, and status messages—shows local `HH:mm:ss` in a
-  dim badge at the bottom-right above the composer or plan. The badge has an
-  opaque background and one cell of horizontal padding, and is painted last
-  so menus or other content cannot obscure it. The transcript uses its full
+  results, folded summaries, and status messages—shows local
+  `YYYY-MM-DD HH:mm:ss TZ` at the far right of the composer’s first text row.
+  Narrow terminals omit the date first, then the timezone if necessary. The
+  badge has an opaque background matching the composer and one cell of
+  horizontal padding, and is painted last so menus or other content cannot
+  obscure it. The transcript uses its full
   width. Cached rows retain their source timestamp, including pinned prompt
   copies. Folded summaries use the latest completion time; live rows use
   their operation or phase start, and local notes use their creation time.

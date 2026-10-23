@@ -713,13 +713,19 @@ const Tm = extern struct {
 };
 extern "c" fn localtime_r(t: *const std.c.time_t, result: *Tm) ?*Tm;
 
-/// Fixed-width HH:mm:ss in the client's local timezone.
+/// Local date, time, and timezone; unsigned fields avoid numeric sign prefixes.
 pub fn formatLocalTimestamp(buf: []u8, unix_ms: i64) ?[]const u8 {
     const t: std.c.time_t = std.math.cast(std.c.time_t, @divFloor(unix_ms, 1000)) orelse return null;
     var tm: Tm = undefined;
     _ = localtime_r(&t, &tm) orelse return null;
-    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{
-        @as(u8, @intCast(tm.hour)), @as(u8, @intCast(tm.min)), @as(u8, @intCast(tm.sec)),
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}", .{
+        std.math.cast(u32, @as(i64, tm.year) + 1900) orelse return null,
+        @as(u8, @intCast(tm.mon + 1)),
+        @as(u8, @intCast(tm.mday)),
+        @as(u8, @intCast(tm.hour)),
+        @as(u8, @intCast(tm.min)),
+        @as(u8, @intCast(tm.sec)),
+        if (tm.zone) |zone| std.mem.span(zone) else "local",
     }) catch null;
 }
 

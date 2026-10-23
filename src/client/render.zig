@@ -84,7 +84,7 @@ pub const Palette = struct {
     pub const shell_path: vaxis.Style = .{ .fg = soft_blue };
     pub const shell_variable: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xf7, 0x8c, 0x6c } } };
     pub const tool_out: vaxis.Style = .{ .fg = .{ .index = 8 }, .dim = true };
-    pub const timestamp: vaxis.Style = .{ .fg = .{ .index = 7 }, .bg = command_bg, .dim = true };
+    pub const timestamp: vaxis.Style = .{ .fg = .{ .index = 7 }, .bg = prompt_bg, .dim = true };
     /// Secondary text on collapse-summary and Working lines. Deliberately
     /// NOT tool_out: index-8+dim is near-invisible on dark themes, and these
     /// lines are the only live signal while a turn runs.

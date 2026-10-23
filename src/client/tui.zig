@@ -6340,19 +6340,21 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     drawUiAnimation(app, win);
     if (!app.screensaver_active) {
         if (hovered_timestamp) |timestamp|
-            try drawTimestampOverlay(win, arena, @intCast(top_rows + view_h), timestamp);
+            try drawTimestampOverlay(win, arena, input_top + 1, timestamp);
     }
 }
 
 pub fn drawTimestampOverlay(win: vaxis.Window, arena: std.mem.Allocator, row: u16, timestamp: i64) !void {
-    const width = 10; // HH:mm:ss with one cell of padding on each side.
-    if (win.width < width or row >= win.height) return;
-    var buf: [8]u8 = undefined;
-    const time = daybreak.formatLocalTimestamp(&buf, timestamp) orelse return;
+    if (win.width < 10 or row >= win.height) return;
+    var buf: [80]u8 = undefined;
+    const full = daybreak.formatLocalTimestamp(&buf, timestamp) orelse return;
+    const capacity = win.width - 2;
+    const label = if (displayWidth(full) <= capacity) full else if (displayWidth(full[11..]) <= capacity) full[11..] else full[11..19];
+    const width: u16 = @intCast(displayWidth(label) + 2);
     const badge = win.child(.{ .x_off = win.width - width, .y_off = row, .width = width, .height = 1 });
     badge.fill(.{ .style = Palette.timestamp });
     _ = badge.printSegment(.{
-        .text = try std.fmt.allocPrint(arena, " {s} ", .{time}),
+        .text = try std.fmt.allocPrint(arena, " {s} ", .{label}),
         .style = Palette.timestamp,
     }, .{ .wrap = .none });
 }

@@ -5941,7 +5941,7 @@ test "runtime command is local control even while a guest is running" {
     try std.testing.expectEqualStrings("/runtime off", app.view.editor.text.items);
 }
 
-test "hover timestamps overlay the bottom right for all transcript output" {
+test "hover timestamps overlay the right of the composer for all transcript output" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -5986,7 +5986,7 @@ test "hover timestamps overlay the bottom right for all transcript output" {
             .type = .motion,
         } }, &verdicts);
         try draw(&app, &vx, frame.allocator());
-        try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
+        try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h + 2), expected);
         try std.testing.expect(timestampColumn(vx.window(), @intCast(row), expected) == null);
     }
     for ([_]tui.Event{
@@ -5996,7 +5996,7 @@ test "hover timestamps overlay the bottom right for all transcript output" {
     }) |event| {
         try dispatchEvent(&app, &vx, undefined, gpa, event, &verdicts);
         try draw(&app, &vx, frame.allocator());
-        try std.testing.expect(timestampColumn(vx.window(), 1, expected) == null);
+        try std.testing.expect(timestampColumn(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h + 2), expected) == null);
         const gap: u16 = @intCast(app.tabBarRows() + app.view.last_view_h);
         for (0..80) |col| {
             const cell = vx.window().readCell(@intCast(col), gap).?;
@@ -6024,7 +6024,7 @@ test "hover timestamps overlay the bottom right for all transcript output" {
                 .type = .motion,
             } }, &verdicts);
             try draw(&app, &vx, frame.allocator());
-            try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
+            try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h + 2), expected);
         }
         try std.testing.expect(first != null);
     }
@@ -6043,7 +6043,7 @@ test "hover timestamps overlay the bottom right for all transcript output" {
     } }, &verdicts);
     try draw(&app, &vx, frame.allocator());
     try std.testing.expect(app.view.last_first_visible > 0);
-    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
+    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h + 2), expected);
 
     for (app.view.blocks.items) |*rb| rb.deinit(gpa);
     app.view.blocks.clearRetainingCapacity();
@@ -6062,11 +6062,11 @@ test "hover timestamps overlay the bottom right for all transcript output" {
         .type = .motion,
     } }, &verdicts);
     try draw(&app, &vx, frame.allocator());
-    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
+    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h + 2), expected);
     try std.testing.expect(timestampColumn(vx.window(), 1, expected) == null);
     app.view.editor.insertSlice("/");
     try draw(&app, &vx, frame.allocator());
-    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
+    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h + 2), expected);
 
     // Long tool output gets the full terminal width and never competes with the badge.
     app.view.editor.clear();
@@ -6079,27 +6079,40 @@ test "hover timestamps overlay the bottom right for all transcript output" {
     app.hover_mouse = .{ .row = 1, .col = 10, .button = .none, .mods = .{}, .type = .motion };
     try draw(&app, &vx, frame.allocator());
     try std.testing.expectEqualStrings("x", vx.window().readCell(79, 1).?.char.grapheme);
-    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h), expected);
+    try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h + 2), expected);
+
+    // The overlay stays on the first input row as a long draft grows the composer.
+    app.view.editor.insertSlice("draft text " ** 30);
+    try draw(&app, &vx, frame.allocator());
+    const input_row: u16 = @intCast(app.tabBarRows() + app.view.last_view_h + 2);
+    try expectTimestampBadge(vx.window(), input_row, expected);
+    try std.testing.expect(input_row < 21);
+    try std.testing.expectEqualStrings("draft text " ** 30, app.view.editor.text.items);
+    try dispatchEvent(&app, &vx, undefined, gpa, .mouse_leave, &verdicts);
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expect(timestampColumn(vx.window(), input_row, expected) == null);
+    try std.testing.expectEqualStrings("draft text " ** 30, app.view.editor.text.items);
 
     // An occupied destination is cleared, including its old hyperlink and padding.
     for ([_]u16{ 20, 80 }) |width| {
         try vx.resize(gpa, &output.writer, .{ .rows = 24, .cols = width, .x_pixel = 0, .y_pixel = 0 });
         vx.window().fill(.{ .char = .{ .grapheme = "X" }, .link = .{ .uri = "https://example.com" }, .style = .{ .reverse = true } });
         try tui.drawTimestampOverlay(vx.window(), frame.allocator(), 19, timestamp);
-        try expectTimestampBadge(vx.window(), 19, expected);
-        try std.testing.expectEqualStrings("X", vx.window().readCell(width - 11, 19).?.char.grapheme);
+        const label = if (width == 20) expected[11..] else expected;
+        try expectTimestampBadge(vx.window(), 19, label);
+        try std.testing.expectEqualStrings("X", vx.window().readCell(width - @as(u16, @intCast(label.len)) - 3, 19).?.char.grapheme);
     }
 }
 
 fn expectTimestampBadge(win: vaxis.Window, row: u16, expected: []const u8) !void {
-    try std.testing.expectEqual(@as(usize, 8), expected.len);
-    try std.testing.expectEqual(@as(?u16, win.width - 9), timestampColumn(win, row, expected));
-    for (win.width - 10..win.width) |col| {
+    const width: u16 = @intCast(expected.len + 2);
+    try std.testing.expectEqual(@as(?u16, win.width - width + 1), timestampColumn(win, row, expected));
+    for (win.width - width..win.width) |col| {
         const cell = win.readCell(@intCast(col), row).?;
         try std.testing.expect(cell.style.dim);
         try std.testing.expectEqual(Palette.timestamp.bg, cell.style.bg);
         try std.testing.expectEqualStrings("", cell.link.uri);
-        if (col == win.width - 10 or col == win.width - 1)
+        if (col == win.width - width or col == win.width - 1)
             try std.testing.expectEqualStrings(" ", cell.char.grapheme);
     }
 }

@@ -230,18 +230,21 @@ test "raster primitives: sub-pixel rects are faint, soft ellipses fade to their 
     try std.testing.expect(pixel(rgb, w, 33, 10)[0] > pixel(rgb, w, 30, 10)[0]);
 }
 
-test "hover time is exactly HH:mm:ss with unsigned zero-padded fields" {
-    var buf: [8]u8 = undefined;
+test "hover timestamp includes date and timezone without numeric sign prefixes" {
+    var buf: [80]u8 = undefined;
     for (0..24) |hour| {
         const timestamp = 1792713605000 + @as(i64, @intCast(hour)) * 3_600_000;
         const text = daybreak.formatLocalTimestamp(&buf, timestamp) orelse return error.TimestampMissing;
-        try std.testing.expectEqual(@as(usize, 8), text.len);
-        try std.testing.expectEqual(@as(u8, ':'), text[2]);
-        try std.testing.expectEqual(@as(u8, ':'), text[5]);
-        for ([_]usize{ 0, 1, 3, 4, 6, 7 }) |i| try std.testing.expect(std.ascii.isDigit(text[i]));
-        try std.testing.expectEqualStrings("05", text[6..8]);
-        try std.testing.expect((try std.fmt.parseInt(u8, text[0..2], 10)) < 24);
-        try std.testing.expect((try std.fmt.parseInt(u8, text[3..5], 10)) < 60);
+        try std.testing.expect(text.len > 20);
+        try std.testing.expectEqualStrings("2026-10-", text[0..8]);
+        try std.testing.expectEqual(@as(u8, ' '), text[10]);
+        try std.testing.expectEqual(@as(u8, ':'), text[13]);
+        try std.testing.expectEqual(@as(u8, ':'), text[16]);
+        try std.testing.expectEqual(@as(u8, ' '), text[19]);
+        for ([_]usize{ 0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18 }) |i| try std.testing.expect(std.ascii.isDigit(text[i]));
+        try std.testing.expectEqualStrings("05", text[17..19]);
+        try std.testing.expect((try std.fmt.parseInt(u8, text[11..13], 10)) < 24);
+        try std.testing.expect((try std.fmt.parseInt(u8, text[14..16], 10)) < 60);
     }
     var short: [7]u8 = undefined;
     try std.testing.expect(daybreak.formatLocalTimestamp(&short, 1792713605000) == null);
