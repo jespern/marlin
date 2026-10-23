@@ -5941,7 +5941,7 @@ test "runtime command is local control even while a guest is running" {
     try std.testing.expectEqualStrings("/runtime off", app.view.editor.text.items);
 }
 
-test "hover timestamps follow durable wrapped rows and disappear outside messages" {
+test "hover timestamps sit beside the first output row, including tools and status" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -5975,7 +5975,7 @@ test "hover timestamps follow durable wrapped rows and disappear outside message
     defer frame.deinit();
     var verdicts = TransportVerdicts{};
     var timestamp_buf: [80]u8 = undefined;
-    const expected = @import("daybreak.zig").formatLocalTimestamp(&timestamp_buf, timestamp).?;
+    const expected = @import("daybreak.zig").formatLocalTimestamp(&timestamp_buf, timestamp).?[11..19];
     // Repeated draws exercise the cached layout as well as initial layout.
     for ([_]i16{ 1, 2, 3 }) |row| {
         try dispatchEvent(&app, &vx, undefined, gpa, .{ .mouse = .{
@@ -5986,12 +5986,12 @@ test "hover timestamps follow durable wrapped rows and disappear outside message
             .type = .motion,
         } }, &verdicts);
         try draw(&app, &vx, frame.allocator());
-        const gap: u16 = @intCast(app.tabBarRows() + app.view.last_view_h);
-        const col: u16 = @intCast(80 - expected.len - 1);
-        for (expected, 0..) |char, i| {
-            const cell = vx.window().readCell(col + @as(u16, @intCast(i)), gap).?;
-            try std.testing.expectEqualSlices(u8, &.{char}, cell.char.grapheme);
-        }
+        const col = timestampColumn(vx.window(), 1, expected) orelse return error.TimestampMissing;
+        const rendered_lines = try tui.layoutLines(frame.allocator(), &app, 80);
+        try std.testing.expect(col > lineWidth(vx.window(), rendered_lines.items[0]));
+        try std.testing.expect(vx.window().readCell(col, 1).?.style.dim);
+        try std.testing.expect(timestampColumn(vx.window(), 2, expected) == null);
+        try std.testing.expect(timestampColumn(vx.window(), 3, expected) == null);
     }
     for ([_]tui.Event{
         .{ .mouse = .{ .row = 23, .col = 10, .button = .none, .mods = .{}, .type = .motion } },
@@ -6000,10 +6000,117 @@ test "hover timestamps follow durable wrapped rows and disappear outside message
     }) |event| {
         try dispatchEvent(&app, &vx, undefined, gpa, event, &verdicts);
         try draw(&app, &vx, frame.allocator());
+        try std.testing.expect(timestampColumn(vx.window(), 1, expected) == null);
         const gap: u16 = @intCast(app.tabBarRows() + app.view.last_view_h);
         for (0..80) |col| {
             const cell = vx.window().readCell(@intCast(col), gap).?;
             try std.testing.expect(cell.char.grapheme.len == 0 or std.mem.eql(u8, cell.char.grapheme, " "));
         }
     }
+    app.view.show_tool_transcript = true;
+    for ([_]block.BlockKind{ .user_msg, .reasoning, .tool_call, .tool_result, .system_note, .steer, .compaction }) |kind| {
+        for (app.view.blocks.items) |*rb| rb.deinit(gpa);
+        app.view.blocks.clearRetainingCapacity();
+        app.view.layout_epoch +%= 1;
+        app.pushDurableBlock(message, kind, if (kind == .tool_call) "{\"command\":\"echo hello\"}" else "first line\nsecond line", if (kind == .tool_call) "bash" else "", .ok);
+        try draw(&app, &vx, frame.allocator());
+        const lines = try tui.layoutLines(frame.allocator(), &app, 80);
+        var first: ?usize = null;
+        for (lines.items, 0..) |line, i| {
+            if (line.timestamp_ms == null) continue;
+            if (first == null) first = i;
+            try std.testing.expectEqual(@as(?i64, timestamp), line.timestamp_ms);
+            try std.testing.expectEqual(i - first.?, line.timestamp_offset);
+            try dispatchEvent(&app, &vx, undefined, gpa, .{ .mouse = .{
+                .row = @intCast(app.tabBarRows() + i),
+                .col = 10,
+                .button = .none,
+                .mods = .{},
+                .type = .motion,
+            } }, &verdicts);
+            try draw(&app, &vx, frame.allocator());
+            const anchor_row: u16 = @intCast(app.tabBarRows() + first.?);
+            const col = timestampColumn(vx.window(), anchor_row, expected) orelse return error.TimestampMissing;
+            try std.testing.expect(vx.window().readCell(col, anchor_row).?.style.dim);
+        }
+        try std.testing.expect(first != null);
+    }
+    for (app.view.blocks.items) |*rb| rb.deinit(gpa);
+    app.view.blocks.clearRetainingCapacity();
+    app.view.layout_epoch +%= 1;
+    app.pushDurableBlock(message, .assistant_msg, "output row\n" ** 40, "", .ok);
+    try draw(&app, &vx, frame.allocator());
+    app.view.scroll_up = 3;
+    try dispatchEvent(&app, &vx, undefined, gpa, .{ .mouse = .{
+        .row = 3,
+        .col = 10,
+        .button = .none,
+        .mods = .{},
+        .type = .motion,
+    } }, &verdicts);
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expect(app.view.last_first_visible > 0);
+    try std.testing.expect(timestampColumn(vx.window(), 1, expected) != null);
+
+    for (app.view.blocks.items) |*rb| rb.deinit(gpa);
+    app.view.blocks.clearRetainingCapacity();
+    app.view.layout_epoch +%= 1;
+    app.view.scroll_up = 0;
+    app.view.state = .running;
+    app.pushDurableBlock(message, .user_msg, "pinned request", "", .ok);
+    try app.view.delta.appendSlice(gpa, "live output\n" ** 40);
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expect(app.view.last_pinned_rows > 0);
+    try dispatchEvent(&app, &vx, undefined, gpa, .{ .mouse = .{
+        .row = 2,
+        .col = 10,
+        .button = .none,
+        .mods = .{},
+        .type = .motion,
+    } }, &verdicts);
+    try draw(&app, &vx, frame.allocator());
+    try std.testing.expect(timestampColumn(vx.window(), 2, expected) != null);
+    try std.testing.expect(timestampColumn(vx.window(), 1, expected) == null);
+}
+
+fn timestampColumn(win: vaxis.Window, row: u16, timestamp: []const u8) ?u16 {
+    outer: for (0..win.width) |col| {
+        for (timestamp, 0..) |char, i| {
+            if (col + i >= win.width) continue :outer;
+            const cell = win.readCell(@intCast(col + i), row) orelse continue :outer;
+            if (!std.mem.eql(u8, cell.char.grapheme, &.{char})) continue :outer;
+        }
+        return @intCast(col);
+    }
+    return null;
+}
+
+test "folded tool summaries retain completion time and live rows use phase start" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    const call: block.Block = .{ .id = 1, .session_id = 1, .turn_id = 1, .seq = 1, .ts = 1000, .body = .{ .tool_call = .{ .call_id = "one", .name = "bash", .args_json = "{\"command\":\"echo hello\"}" } } };
+    const result: block.Block = .{ .id = 2, .session_id = 1, .turn_id = 1, .seq = 2, .ts = 2000, .body = .{ .tool_result = .{ .call_id = "one", .status = .ok, .inline_body = "hello", .full_body_ref = null } } };
+    app.applyBlock(call);
+    app.applyBlock(result);
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    for (0..2) |_| {
+        const lines = try tui.layoutLines(frame.allocator(), &app, 80);
+        try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+        try std.testing.expectEqualStrings("Ran 1 command", lines.items[0].text2);
+        try std.testing.expectEqual(@as(?i64, 2000), lines.items[0].timestamp_ms);
+    }
+    app.view.state = .running;
+    app.view.turn_started_ms = 3000;
+    app.view.phase_started_ms = 4000;
+    var lines = try tui.layoutLines(frame.allocator(), &app, 80);
+    try std.testing.expectEqual(@as(?i64, 4000), lines.items[lines.items.len - 1].timestamp_ms);
+    try app.view.delta.appendSlice(gpa, "streaming reply");
+    lines = try tui.layoutLines(frame.allocator(), &app, 80);
+    try std.testing.expectEqual(@as(?i64, 4000), lines.items[lines.items.len - 1].timestamp_ms);
+    app.pushBlock(.system_note, "client status", "", .ok);
+    try std.testing.expect(app.view.blocks.items[app.view.blocks.items.len - 1].timestamp_ms != null);
 }

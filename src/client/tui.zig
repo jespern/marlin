@@ -1568,6 +1568,7 @@ pub const App = struct {
             .label = l,
             .status = status,
             .pending_echo = pending_echo,
+            .timestamp_ms = nowWallMs(self.io),
         }) catch {
             self.gpa.free(t);
             self.gpa.free(l);
@@ -4517,9 +4518,13 @@ fn transcriptView(app: *App) Transcript {
     };
 }
 
+pub fn transcriptWidth(width: u16) u16 {
+    return width -| 10;
+}
+
 pub fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(Line) {
     var transcript = transcriptView(app);
-    return layout_mod.layoutLines(arena, app.gpa, &transcript, width);
+    return layout_mod.layoutLines(arena, app.gpa, &transcript, transcriptWidth(width));
 }
 
 fn formatDiagnostics(gpa: std.mem.Allocator, report: proto.Diagnostics) ![]u8 {
@@ -5624,7 +5629,9 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // On very short terminals the TODO panel may not fit; keep the ordinary
     // ticker in that case so liveness never disappears with the panel.
     transcript.show_working_ticker = plan_h == 0;
-    var lines = try layout_mod.layoutLines(arena, app.gpa, &transcript, w);
+    const content_w = transcriptWidth(w);
+    const transcript_win = win.child(.{ .width = content_w });
+    var lines = try layout_mod.layoutLines(arena, app.gpa, &transcript, content_w);
     const total = lines.items.len;
     if (app.search.target_seq > 0 and !app.view.history_loading) {
         var target_index: ?usize = null;
@@ -5643,7 +5650,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
                 &prefix_lines,
                 0,
                 index + 1,
-                w,
+                content_w,
                 &last_tool_label,
                 true,
             );
@@ -5668,7 +5675,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         if (target_index) |index| {
             var prefix_lines: std.ArrayList(Line) = .empty;
             var last_tool_label: []const u8 = "";
-            try layoutBlockRange(arena, &transcript, &prefix_lines, 0, index + 1, w, &last_tool_label, true);
+            try layoutBlockRange(arena, &transcript, &prefix_lines, 0, index + 1, content_w, &last_tool_label, true);
             const target_line = prefix_lines.items.len -| 1;
             const max_scroll = total -| view_h;
             const desired_first = target_line -| (@as(usize, view_h) / 3);
@@ -5718,7 +5725,13 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             try visible.append(arena, .{ .line = pinned_line, .abs_line = abs_line, .selectable = false });
         }
         if (truncated) try visible.append(arena, .{
-            .line = .{ .text = " … scroll up for the full prompt", .style = Palette.prompt_text, .fill_style = Palette.prompt_panel },
+            .line = .{
+                .text = " … scroll up for the full prompt",
+                .style = Palette.prompt_text,
+                .fill_style = Palette.prompt_panel,
+                .timestamp_ms = lines.items[sticky_prompt.start + copied_len].timestamp_ms,
+                .timestamp_offset = lines.items[sticky_prompt.start + copied_len].timestamp_offset,
+            },
             .abs_line = sticky_prompt.start + copied_len,
             .selectable = false,
         });
@@ -5763,19 +5776,19 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     if (total == 0 and !app.view.history_loading and app.view.state == .idle)
         try drawWelcome(app, win, top_rows, view_h, arena);
 
-    var hovered_timestamp: ?i64 = null;
+    var hovered_row: ?usize = null;
     for (visible.items, 0..) |display, row| {
         const ln = display.line;
         const abs_line = display.abs_line;
         if (app.hover_mouse) |mouse| {
             if (mouse.row == top_rows + row and mouse.col >= 0 and mouse.col < w and
-                !app.view.sel_dragging and app.picker == null and !app.shortcut_help)
-                hovered_timestamp = ln.timestamp_ms;
+                !app.view.sel_dragging and app.picker == null and !app.shortcut_help and ln.timestamp_ms != null)
+                hovered_row = row;
         }
         if (ln.fill_style) |fill_style| {
             const fill_start = @min(ln.fill_start, w);
             const fill_width = @min(ln.fill_width orelse (w -| fill_start), w -| fill_start);
-            const row_win = win.child(.{
+            const row_win = transcript_win.child(.{
                 .x_off = @intCast(fill_start),
                 .y_off = @intCast(top_rows + row),
                 .height = 1,
@@ -5795,12 +5808,12 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             segs_buf[n] = .{ .text = ln.text3, .style = ln.style3 };
             n += 1;
         }
-        _ = win.print(segs_buf[0..n], .{
+        _ = transcript_win.print(segs_buf[0..n], .{
             .row_offset = @intCast(top_rows + row),
             .wrap = .none,
         });
-        applyLineSyntax(win, @intCast(top_rows + row), ln);
-        applyLineLinks(win, @intCast(top_rows + row), ln);
+        applyLineSyntax(transcript_win, @intCast(top_rows + row), ln);
+        applyLineLinks(transcript_win, @intCast(top_rows + row), ln);
         if (display.selectable and app.search.highlight_line == abs_line) {
             var col: usize = 0;
             const width = @min(lineWidth(win, ln), @as(usize, w));
@@ -5853,12 +5866,21 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const input_top = h - 1 - input_h;
     const plan_top = input_top -| plan_h;
     try drawPlan(app, win, arena, plan_top, plan_h);
-    if (hovered_timestamp) |timestamp| {
+    if (hovered_row) |hover| {
+        const source = visible.items[hover];
+        const anchor = source.abs_line -| source.line.timestamp_offset;
+        var row = hover;
+        while (row > 0 and visible.items[row - 1].abs_line >= anchor and
+            visible.items[row - 1].line.timestamp_ms == source.line.timestamp_ms) : (row -= 1)
+        {}
+        const text_width = @min(lineWidth(transcript_win, visible.items[row].line), content_w);
         var timestamp_buf: [80]u8 = undefined;
-        if (daybreak.formatLocalTimestamp(&timestamp_buf, timestamp)) |label| {
-            _ = win.printSegment(.{ .text = try arena.dupe(u8, label), .style = Palette.note }, .{
-                .row_offset = @intCast(top_rows + view_h),
-                .col_offset = @intCast(w -| (displayWidth(label) + 1)),
+        if (daybreak.formatLocalTimestamp(&timestamp_buf, source.line.timestamp_ms.?)) |full| {
+            const col = @min(text_width + 2, w -| 8);
+            const label = if (displayWidth(full) <= w - col) full else full[11..19];
+            _ = win.printSegment(.{ .text = try arena.dupe(u8, label), .style = Palette.timestamp }, .{
+                .row_offset = @intCast(top_rows + row),
+                .col_offset = @intCast(col),
                 .wrap = .none,
             });
         }

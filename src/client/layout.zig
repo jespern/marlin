@@ -679,6 +679,8 @@ pub fn appendToolCallLine(
     /// and the actual query only on completion.
     completed_result: ?RenderBlock,
 ) !void {
+    const output_start = lines.items.len;
+    defer stampOutputLines(lines.items[output_start..], rb.timestamp_ms);
     // Keep the machinery subdued. Bash commands receive semantic shell
     // roles; for file tools the emphasized value is a path.
     const hi = try completedToolDisplayArg(alloc, rb, completed_result, cwd);
@@ -721,6 +723,8 @@ pub fn appendNetworkSuccessLine(
     cwd: []const u8,
     w: usize,
 ) !void {
+    const output_start = lines.items.len;
+    defer stampOutputLines(lines.items[output_start..], result.timestamp_ms);
     const action: []const u8 = if (std.ascii.indexOfIgnoreCase(rb.label, "search") != null)
         "Searched"
     else
@@ -821,6 +825,8 @@ pub fn diffSummaryNote(alloc: std.mem.Allocator, text: []const u8) !?[]const u8 
 }
 
 pub fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, tool_label: []const u8) !void {
+    const output_start = lines.items.len;
+    defer stampOutputLines(lines.items[output_start..], rb.timestamp_ms);
     // Collapsed: show at most 8 lines — but a diff the agent
     // AUTHORED (edit/write tools) shows whole (up to 24) because
     // a truncated diff misleads. Diffs merely read via bash keep
@@ -987,7 +993,7 @@ pub fn scanToolBatch(
 /// Emit and reset the accumulated "Ran N commands" summary. Deferred so
 /// consecutive tool stretches merge across interleaved commentary cards
 /// instead of stacking one summary line per provider round.
-pub fn flushRanSummary(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), pending: *usize) !void {
+pub fn flushRanSummary(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), pending: *usize, timestamp_ms: ?i64) !void {
     if (pending.* == 0) return;
     try blankLine(alloc, lines);
     const summary = try std.fmt.allocPrint(alloc, "Ran {d} {s}", .{
@@ -995,6 +1001,7 @@ pub fn flushRanSummary(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), pe
         if (pending.* == 1) "command" else "commands",
     });
     try lines.append(alloc, .{
+        .timestamp_ms = timestamp_ms,
         .text = "  • ",
         .style = Palette.note,
         .text2 = summary,
@@ -1341,6 +1348,7 @@ fn appendGuestActivityChildren(
     parent_id: []const u8,
     depth: usize,
     now_ms: i64,
+    fallback_timestamp: ?i64,
 ) !void {
     for (items, 0..) |item, item_index| {
         const effective_parent = if (activityHasParent(items, item.parent_id)) item.parent_id else "";
@@ -1362,6 +1370,7 @@ fn appendGuestActivityChildren(
         const detail = if (item_detail.len > 0) try std.fmt.allocPrint(arena, " · {s}", .{item_detail}) else "";
         const activity_text = try std.fmt.allocPrint(arena, "{s}{s}", .{ activity_head, detail });
         try lines.append(arena, .{
+            .timestamp_ms = if (item.started_at_ms > 0) item.started_at_ms else fallback_timestamp,
             .text = "  ",
             .style = Palette.working,
             .text2 = activity_text,
@@ -1373,12 +1382,25 @@ fn appendGuestActivityChildren(
             else
                 &.{},
         });
-        try appendGuestActivityChildren(arena, lines, items, item.id, depth + 1, now_ms);
+        try appendGuestActivityChildren(arena, lines, items, item.id, depth + 1, now_ms, fallback_timestamp);
     }
 }
 
-fn stampMessageLines(lines: []Line, timestamp_ms: ?i64) void {
-    for (lines) |*line| line.timestamp_ms = timestamp_ms;
+fn stampOutputLines(lines: []Line, timestamp_ms: ?i64) void {
+    const timestamp = timestamp_ms orelse return;
+    var first: ?usize = null;
+    for (lines, 0..) |*line, i| {
+        if (line.timestamp_ms != null) {
+            first = null;
+            continue;
+        }
+        if (first == null) {
+            if (std.mem.trim(u8, line.text, " ").len == 0 and line.text2.len == 0 and line.text3.len == 0) continue;
+            first = i;
+        }
+        line.timestamp_ms = timestamp;
+        line.timestamp_offset = i - first.?;
+    }
 }
 
 /// SECTION DISCIPLINE (the transcript's one spacing rule, pinned by the
@@ -1402,6 +1424,7 @@ pub fn layoutBlockRange(
     // visible truncation, never an unbounded allocation loop in the TUI.
     const max_layout_steps = (end - start) *| 2 +| 1_024;
     var pending_ran: usize = 0;
+    var pending_timestamp: ?i64 = null;
     // Dense tool rows stack flush within a group; the group START gets one
     // blank like any other section. Tracks whether the last emitted row was
     // dense machinery (tool call/result/approval) or prose.
@@ -1411,6 +1434,7 @@ pub fn layoutBlockRange(
     while (block_idx < end) : (block_idx += 1) {
         if (layout_steps >= max_layout_steps or lines.items.len >= max_layout_lines) {
             try lines.append(alloc, .{
+                .timestamp_ms = transcript.blocks[block_idx].timestamp_ms,
                 .text = "  [transcript rendering truncated at safety limit]",
                 .style = Palette.tool_err,
             });
@@ -1418,6 +1442,8 @@ pub fn layoutBlockRange(
         }
         layout_steps += 1;
         const rb = transcript.blocks[block_idx];
+        const block_start = lines.items.len;
+        defer stampOutputLines(lines.items[block_start..], rb.timestamp_ms);
         if (!transcript.show_tool_transcript and !transcript.guest and rb.kind == .tool_call) {
             const blocks_all = transcript.blocks;
             // Fold completed batches into one summary, merging consecutive
@@ -1468,6 +1494,7 @@ pub fn layoutBlockRange(
 
             if (expand.items.len == 0 and running_count == 0 and folded > 0) {
                 pending_ran += folded;
+                pending_timestamp = blocks_all[scan_end - 1].timestamp_ms;
                 if (scan_end > block_idx) {
                     block_idx = scan_end - 1;
                     continue;
@@ -1506,6 +1533,7 @@ pub fn layoutBlockRange(
                 if (total_ran > 0 or running_count > 0) {
                     try blankLine(alloc, lines);
                     try lines.append(alloc, .{
+                        .timestamp_ms = if (scan_end > block_idx) blocks_all[scan_end - 1].timestamp_ms else pending_timestamp orelse rb.timestamp_ms,
                         .text = "  • ",
                         .style = Palette.note,
                         .text2 = summary,
@@ -1539,19 +1567,15 @@ pub fn layoutBlockRange(
         }
         switch (rb.kind) {
             .user_msg => {
-                try flushRanSummary(alloc, lines, &pending_ran);
+                try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 try blankLine(alloc, lines);
-                const message_start = lines.items.len;
-                defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                 try wrapPromptCard(alloc, lines, rb.text, w);
                 if (rb.label.len > 0)
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
             },
             .assistant_msg => {
-                try flushRanSummary(alloc, lines, &pending_ran);
+                try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 try blankLine(alloc, lines);
-                const message_start = lines.items.len;
-                defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                 try wrapMarkdown(alloc, lines, rb.text, w);
             },
             .reasoning => {
@@ -1565,23 +1589,19 @@ pub fn layoutBlockRange(
                     // A guest's only narration: full text, assistant styling.
                     // Still superseded by a later message saying the same.
                     if (transcript.show_tool_transcript or !commentarySuperseded(transcript.blocks, block_idx)) {
-                        try flushRanSummary(alloc, lines, &pending_ran);
+                        try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                         try blankLine(alloc, lines);
-                        const message_start = lines.items.len;
-                        defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                         try wrapMarkdown(alloc, lines, rb.text, w);
                     }
                 } else if (transcript.show_tool_transcript or
                     (rb.commentary and !commentarySuperseded(transcript.blocks, block_idx)))
                 {
                     try blankLine(alloc, lines);
-                    const message_start = lines.items.len;
-                    defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                     try wrapReasoningCard(alloc, lines, try clipText(alloc, rb.text, 280), w);
                 }
             },
             .tool_call => {
-                try flushRanSummary(alloc, lines, &pending_ran);
+                try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 if (!last_dense) try blankLine(alloc, lines);
                 last_tool_label.* = rb.label;
                 try appendToolCallLine(
@@ -1607,33 +1627,29 @@ pub fn layoutBlockRange(
                 try wrapInto(alloc, lines, txt, .{ .text = txt, .style = Palette.note });
             },
             .steer => {
-                try flushRanSummary(alloc, lines, &pending_ran);
+                try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 try blankLine(alloc, lines);
-                const message_start = lines.items.len;
-                defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                 try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w);
             },
             .plan => {
                 if (visibleCompletedPlan(transcript.blocks, block_idx)) {
-                    try flushRanSummary(alloc, lines, &pending_ran);
+                    try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                     try appendArchivedPlanTable(alloc, lines, rb.plan_items, w);
                 }
             },
             .system_note => {
                 if (std.mem.eql(u8, rb.label, "Recap") or std.mem.eql(u8, rb.label, "Last exchange")) {
-                    try flushRanSummary(alloc, lines, &pending_ran);
+                    try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                     try blankLine(alloc, lines);
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.note, w);
                     try wrapPrefixed(alloc, lines, "  ", rb.text, Palette.note, w);
                 } else if (std.mem.eql(u8, rb.label, "diagnostics")) {
-                    try flushRanSummary(alloc, lines, &pending_ran);
+                    try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                     try blankLine(alloc, lines);
                     try wrapPrefixed(alloc, lines, "  ", "diagnostics", Palette.note, w);
-                    const message_start = lines.items.len;
-                    defer stampMessageLines(lines.items[message_start..], rb.timestamp_ms);
                     try wrapMarkdown(alloc, lines, rb.text, w);
                 } else if (block.isHandoverNote(rb.text)) {
-                    try flushRanSummary(alloc, lines, &pending_ran);
+                    try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                     try blankLine(alloc, lines);
                     try wrapPrefixed(alloc, lines, "  ", "handover to guest", Palette.note, w);
                     try wrapMarkdown(alloc, lines, block.handoverBody(rb.text), w);
@@ -1644,13 +1660,13 @@ pub fn layoutBlockRange(
                 }
             },
             .compaction => {
-                try flushRanSummary(alloc, lines, &pending_ran);
+                try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 try blankLine(alloc, lines);
                 try wrapPrefixed(alloc, lines, "  ≋ ", "context compacted", Palette.note, w);
             },
         }
     }
-    try flushRanSummary(alloc, lines, &pending_ran);
+    try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
 }
 
 fn handoverInProgress(blocks: []const RenderBlock) bool {
@@ -1771,11 +1787,14 @@ pub fn layoutLines(
         try lines.append(arena, .{ .text = "", .style = .{} });
     try lines.appendSlice(arena, tail_cache.lines.items);
 
+    const live_timestamp: ?i64 = if (transcript.phase_started_ms > 0) transcript.phase_started_ms else if (transcript.turn_started_ms > 0) transcript.turn_started_ms else if (transcript.blocks.len > 0) transcript.blocks[transcript.blocks.len - 1].timestamp_ms else null;
     // Streaming region: provider reasoning summaries are verbose by nature
     // (first-person deliberation), so the live view is a one-line ticker
     // showing only the freshest thought — not a growing wall. The durable
     // card at round end is clipped separately below.
     if (transcript.reasoning_delta.len > 0) {
+        const first = lines.items.len;
+        defer stampOutputLines(lines.items[first..], live_timestamp);
         const tail = lastNonEmptyLine(transcript.reasoning_delta);
         const cap = @min(tail.len, w -| 8);
         try lines.append(arena, .{
@@ -1786,6 +1805,8 @@ pub fn layoutLines(
         });
     }
     if (transcript.delta.len > 0) {
+        const first = lines.items.len;
+        defer stampOutputLines(lines.items[first..], live_timestamp);
         try blankLine(arena, &lines);
         try transcript.stream_layout_cache.update(gpa, transcript.delta, w);
         try transcript.stream_layout_cache.appendTo(arena, &lines);
@@ -1794,7 +1815,7 @@ pub fn layoutLines(
     {
         try blankLine(arena, &lines);
         if (transcript.guest_activity.len > 0) {
-            try appendGuestActivityChildren(arena, &lines, transcript.guest_activity, "", 0, nowWallMs(transcript.io));
+            try appendGuestActivityChildren(arena, &lines, transcript.guest_activity, "", 0, nowWallMs(transcript.io), live_timestamp);
         }
         if (transcript.reasoning_delta.len == 0) {
             const head = try std.fmt.allocPrint(arena, "{s} ", .{
@@ -1823,6 +1844,7 @@ pub fn layoutLines(
                 ));
             }
             try lines.append(arena, .{
+                .timestamp_ms = live_timestamp,
                 .text = head,
                 .style = Palette.working,
                 .text2 = word,
@@ -1836,6 +1858,8 @@ pub fn layoutLines(
 
     // Approval card.
     if (transcript.approval) |approval| {
+        const first = lines.items.len;
+        defer stampOutputLines(lines.items[first..], live_timestamp);
         try blankLine(arena, &lines);
         const arg = (try toolDisplayArgDecoded(arena, approval.tool, approval.args, transcript.cwd)) orelse "";
         const card = try std.fmt.allocPrint(arena, "⚠ approve {s}{s}{s} ?  [y]es / [n]o", .{
@@ -1849,6 +1873,8 @@ pub fn layoutLines(
     // Question card: the agent asked the user to choose. Numbered options
     // answer on their digit; the composer answers in the user's own words.
     if (transcript.question) |question| {
+        const first = lines.items.len;
+        defer stampOutputLines(lines.items[first..], live_timestamp);
         try blankLine(arena, &lines);
         const head = try std.fmt.allocPrint(arena, "? {s}", .{question.question});
         try wrapPrefixed(arena, &lines, "", head, Palette.approval_card, w);
