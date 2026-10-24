@@ -94,6 +94,19 @@ cleanup cannot coexist with an autostarted replacement.
 Older plain `ConnectFailed` notes cannot retrospectively recover details that
 were never persisted.
 
+Codex guest failures retain the vendor's error category, HTTP status, and
+additional detail when supplied. JSON-wrapped error messages are rendered as
+text; a bare backend `Bad Request` is explicitly labeled as lacking an explanation.
+After a confirmed failed vendor turn, Marlin can continue the same saved thread
+automatically, at most twice per Marlin turn, with one- and two-second pauses.
+This covers transport/server failures and the observed opaque `other` / `Bad
+Request` response. Explicit invalid-request, authentication, quota, and policy
+errors stop immediately. Process loss and rejected RPCs do not trigger recovery.
+Each attempt is visible in the transcript, keeps the original runtime deadline,
+and can be interrupted. Continuation asks the vendor to inspect saved progress
+and verify uncertain outcomes; Marlin does not replay the original request or
+tool calls. Repeated failure stops with the attempt count and resume guidance.
+
 ## OTLP/HTTP export (Mirador included)
 
 Export uses the standard OpenTelemetry variables and is off unless an endpoint

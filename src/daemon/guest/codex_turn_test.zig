@@ -181,3 +181,155 @@ test "codex app-server requests carry the turn's W3C trace context" {
     defer untraced.deinit();
     try std.testing.expect(untraced.value.object.get("trace") == null);
 }
+
+test "Codex failure classification keeps permanent errors terminal and preserves details" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]struct { json: []const u8, recoverable: bool, text: []const u8 }{
+        .{ .json = "{\"message\":\"{\\\"detail\\\":\\\"Bad Request\\\"}\",\"codexErrorInfo\":\"other\"}", .recoverable = true, .text = "Bad Request (the backend supplied no further explanation)" },
+        .{ .json = "{\"message\":\"connection lost\",\"codexErrorInfo\":{\"responseStreamDisconnected\":{\"httpStatusCode\":503}},\"additionalDetails\":\"request id abc\"}", .recoverable = true, .text = "connection lost (Codex: responseStreamDisconnected) (HTTP 503): request id abc" },
+        .{ .json = "{\"message\":\"Unauthorized\",\"codexErrorInfo\":{\"httpConnectionFailed\":{\"httpStatusCode\":401}}}", .recoverable = false, .text = "Unauthorized (Codex: httpConnectionFailed) (HTTP 401)" },
+    }) |case| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, case.json, .{});
+        const failure = try codex_turn.turnFailure(arena, value);
+        try std.testing.expectEqual(case.recoverable, failure.recoverable);
+        try std.testing.expectEqualStrings(case.text, failure.text);
+    }
+    for ([_][]const u8{ "unauthorized", "badRequest", "contextWindowExceeded", "usageLimitExceeded", "rateLimitExceeded", "cyberPolicy", "misalignmentPolicyViolation", "sandboxError" }) |kind| {
+        const raw = try std.fmt.allocPrint(arena, "{{\"message\":\"Bad Request\",\"codexErrorInfo\":\"{s}\"}}", .{kind});
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{});
+        try std.testing.expect(!(try codex_turn.turnFailure(arena, value)).recoverable);
+    }
+}
+
+test "Codex terminal failure continues the same thread with bounded attempts and cancellation" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const loop = @import("../loop.zig");
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-codex-recovery");
+    defer temp.deinit();
+    const script =
+        \\#!/bin/sh
+        \\read -r mode < mode
+        \\n=0
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*) echo '{"id":1,"result":{}}' ;;
+        \\    *'"method":"account/read"'*) echo '{"id":2,"result":{"account":{"type":"chatgpt"}}}' ;;
+        \\    *'"method":"thread/start"'*) echo '{"id":3,"result":{"thread":{"id":"saved-thread"}}}' ;;
+        \\    *'"method":"turn/start"'*)
+        \\      n=$((n+1))
+        \\      echo "$n" > attempts
+        \\      case "$line" in *'"threadId":"saved-thread"'*) ;; *) exit 10 ;; esac
+        \\      if [ "$n" -gt 1 ]; then
+        \\        case "$line" in *'Continue the interrupted task from the current saved state.'*) ;; *) exit 11 ;; esac
+        \\        case "$line" in *ORIGINAL_REQUEST*) exit 12 ;; esac
+        \\      fi
+        \\      id=$((n+3))
+        \\      if [ "$mode" = rpc ] && [ "$n" -gt 1 ]; then
+        \\        echo '{"id":5,"error":{"code":-32602,"message":"invalid continuation"}}'
+        \\        continue
+        \\      fi
+        \\      echo "{\"id\":$id,\"result\":{\"turn\":{\"id\":\"turn-$n\"}}}"
+        \\      if [ "$n" -eq 1 ]; then
+        \\        echo '{"method":"item/started","params":{"threadId":"saved-thread","item":{"type":"commandExecution","id":"only-once","command":"completed action"}}}'
+        \\        echo '{"method":"item/completed","params":{"threadId":"saved-thread","item":{"type":"commandExecution","id":"only-once","status":"completed","aggregatedOutput":"done"}}}'
+        \\      fi
+        \\      echo '{"method":"thread/tokenUsage/updated","params":{"threadId":"saved-thread","tokenUsage":{"last":{"inputTokens":12,"outputTokens":4}}}}'
+        \\      if [ "$mode" = vendor ] || { [ "$mode" = recover ] && [ "$n" -gt 1 ]; }; then
+        \\        echo '{"method":"error","params":{"threadId":"child","turnId":"child-turn","willRetry":false,"error":{"message":"child failure"}}}'
+        \\        echo '{"method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"failed","error":{"message":"child failure"}}}}'
+        \\        echo '{"method":"turn/completed","params":{"threadId":"saved-thread","turn":{"id":"stale-turn","status":"failed","error":{"message":"stale failure"}}}}'
+        \\        echo '{"method":"error","params":{"threadId":"saved-thread","willRetry":true,"error":{"message":"vendor is retrying","codexErrorInfo":"internalServerError"}}}'
+        \\        echo '{"method":"item/completed","params":{"threadId":"saved-thread","item":{"type":"agentMessage","id":"reply","text":"RECOVERED","phase":"final_answer"}}}'
+        \\        echo "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"saved-thread\",\"turn\":{\"id\":\"turn-$n\",\"status\":\"completed\"}}}"
+        \\      else
+        \\        kind=other
+        \\        [ "$mode" != permanent ] || kind=unauthorized
+        \\        echo "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"saved-thread\",\"turn\":{\"id\":\"turn-$n\",\"status\":\"failed\",\"error\":{\"message\":\"{\\\"detail\\\":\\\"Bad Request\\\"}\",\"codexErrorInfo\":\"$kind\"}}}}"
+        \\      fi ;;
+        \\  esac
+        \\done
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-codex" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+    const mode_path = try std.fs.path.join(gpa, &.{ temp.path, "mode" });
+    defer gpa.free(mode_path);
+    const attempts_path = try std.fs.path.join(gpa, &.{ temp.path, "attempts" });
+    defer gpa.free(attempts_path);
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(codex.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+    const Probe = struct {
+        cancel: std.atomic.Value(bool) = .init(false),
+        cancel_recovery: bool,
+        recovery_notes: usize = 0,
+
+        fn onBlock(ctx: ?*anyopaque, b: block.Block) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (b.body != .system_note) return;
+            if (std.mem.indexOf(u8, b.body.system_note.text, "Continuing the existing thread automatically") == null) return;
+            self.recovery_notes += 1;
+            if (self.cancel_recovery) self.cancel.store(true, .release);
+        }
+    };
+    for ([_][]const u8{ "recover", "repeat", "permanent", "cancel", "deadline", "vendor", "rpc" }) |mode| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = mode_path, .data = mode });
+        var store = try Store.open(gpa, null);
+        defer store.close();
+        try store.createSession(1, 0, temp.path, "codex/default", .auto);
+        var probe = Probe{ .cancel_recovery = std.mem.eql(u8, mode, "cancel") };
+        var cfg = config.defaults();
+        const deadline = std.mem.eql(u8, mode, "deadline");
+        cfg.guest_max_runtime_ms = if (deadline) 2_000 else 10_000;
+        const opts: loop.RunOpts = .{
+            .session_id = 1,
+            .cwd = temp.path,
+            .endpoint = .{ .url = "", .bearer = null, .model = "default", .backend = .{ .guest = .codex } },
+            .cfg = cfg,
+            .tool_environ = &env,
+            .cancel = &probe.cancel,
+            .on_block = Probe.onBlock,
+            .on_delta_ctx = &probe,
+        };
+        const expected_attempts: usize = if (std.mem.eql(u8, mode, "repeat")) 3 else if (std.mem.eql(u8, mode, "recover") or std.mem.eql(u8, mode, "rpc") or deadline) 2 else 1;
+        if (std.mem.eql(u8, mode, "recover") or std.mem.eql(u8, mode, "vendor") or std.mem.eql(u8, mode, "cancel")) {
+            const result = try loop.runTurn(gpa, io, &store, opts, "ORIGINAL_REQUEST", &.{});
+            defer gpa.free(result.text);
+            try std.testing.expectEqual(probe.cancel_recovery, result.interrupted);
+            if (!probe.cancel_recovery) try std.testing.expectEqualStrings("RECOVERED", result.text);
+            try std.testing.expectEqual(@as(u64, expected_attempts * 12), result.tokens_in);
+            try std.testing.expectEqual(@as(u64, expected_attempts * 4), result.tokens_out);
+        } else if (deadline) {
+            try std.testing.expectError(error.DelegateTimeout, loop.runTurn(gpa, io, &store, opts, "ORIGINAL_REQUEST", &.{}));
+        } else {
+            try std.testing.expectError(error.DelegateFailed, loop.runTurn(gpa, io, &store, opts, "ORIGINAL_REQUEST", &.{}));
+            const detail = @import("shared.zig").lastDelegateErrorNote().?;
+            try std.testing.expect(std.mem.indexOf(u8, detail, if (std.mem.eql(u8, mode, "repeat")) "Stopped after 2" else if (std.mem.eql(u8, mode, "rpc")) "invalid continuation" else "unauthorized") != null);
+        }
+        const attempts = try Io.Dir.cwd().readFileAlloc(io, attempts_path, gpa, .limited(100));
+        defer gpa.free(attempts);
+        try std.testing.expectEqual(expected_attempts, try std.fmt.parseInt(usize, std.mem.trim(u8, attempts, "\n"), 10));
+        try std.testing.expectEqual(if (probe.cancel_recovery or deadline) expected_attempts else expected_attempts - 1, probe.recovery_notes);
+        const blocks = try store.getBlocks(1, 1, 100);
+        defer {
+            for (blocks) |*b| b.deinit();
+            gpa.free(blocks);
+        }
+        var calls: usize = 0;
+        var results: usize = 0;
+        for (blocks) |b| {
+            if (b.blk.body == .tool_call) calls += 1;
+            if (b.blk.body == .tool_result) results += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), calls);
+        try std.testing.expectEqual(@as(usize, 1), results);
+    }
+}

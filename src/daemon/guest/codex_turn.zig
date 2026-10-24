@@ -48,6 +48,52 @@ const CcWatcher = shared.CcWatcher;
 const CcStderrDrain = shared.CcStderrDrain;
 
 const codex_line_bytes: usize = 4 * 1024 * 1024;
+const max_recovery_attempts: u32 = 2;
+const recovery_prompt = "Continue the interrupted task from the current saved state. Check what has already completed and do not repeat completed actions. If an action's outcome is uncertain, verify it before trying it again.";
+
+pub const TurnFailure = struct {
+    text: []const u8,
+    recoverable: bool,
+};
+
+/// Only terminal vendor failures permit continuation. An RPC rejection or a
+/// lost process does not establish whether its turn is still executing.
+pub fn turnFailure(arena: std.mem.Allocator, value: std.json.Value) !TurnFailure {
+    var message = codex.strField(value, "message") orelse "Codex turn failed without an explanation";
+    if (std.json.parseFromSliceLeaky(std.json.Value, arena, message, .{})) |decoded| {
+        message = codex.strField(decoded, "detail") orelse codex.strField(decoded, "message") orelse message;
+    } else |_| {}
+    const info = codex.field(value, "codexErrorInfo");
+    var kind: []const u8 = "other";
+    var status: ?i64 = null;
+    if (info) |entry| switch (entry) {
+        .string => |name| kind = name,
+        .object => |object| {
+            if (object.count() == 1) {
+                kind = object.keys()[0];
+                status = codex.intField(object.values()[0], "httpStatusCode");
+            }
+        },
+        else => {},
+    };
+    var recoverable = std.mem.eql(u8, kind, "serverOverloaded") or std.mem.eql(u8, kind, "internalServerError");
+    for ([_][]const u8{ "httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts" }) |name| {
+        if (std.mem.eql(u8, kind, name)) recoverable = if (status) |code| code == 408 or (code >= 500 and code <= 599) else true;
+    }
+    // Observed backend failure: Codex labels this opaque rejection "other";
+    // continuing the same thread succeeds. Explicit badRequest/auth/policy
+    // errors remain terminal, even if their prose happens to look similar.
+    if (std.mem.eql(u8, kind, "other") and std.mem.eql(u8, message, "Bad Request")) recoverable = true;
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(arena, message);
+    if (!std.mem.eql(u8, kind, "other")) try text.print(arena, " (Codex: {s})", .{kind});
+    if (status) |code| try text.print(arena, " (HTTP {d})", .{code});
+    const details = codex.strField(value, "additionalDetails") orelse "";
+    if (details.len > 0 and !std.mem.eql(u8, details, message)) try text.print(arena, ": {s}", .{details});
+    if (details.len == 0 and std.mem.eql(u8, kind, "other") and std.mem.eql(u8, message, "Bad Request"))
+        try text.appendSlice(arena, " (the backend supplied no further explanation)");
+    return .{ .text = text.items, .recoverable = recoverable };
+}
 
 fn codexWriteLine(writer: *Io.Writer, line: []const u8) !void {
     try writer.writeAll(line);
@@ -654,6 +700,8 @@ pub fn runCodexTurn(
     var interrupted = false;
     var failed = false;
     var failure_text: []const u8 = "codex turn failed";
+    var failure_recoverable = false;
+    var recovery_attempts: u32 = 0;
     var activity = guest_activity.Tracker.init(gpa, opts.on_guest_activity, opts.on_delta_ctx);
     defer activity.deinit();
 
@@ -661,7 +709,7 @@ pub fn runCodexTurn(
     defer line_arena_state.deinit();
     var line_acc: std.ArrayList(u8) = .empty;
     defer line_acc.deinit(gpa);
-    while (!done) {
+    events: while (!done) {
         const line = shared.takeEventLine(reader, gpa, &line_acc, shared.max_event_line_bytes) catch |err| switch (err) {
             error.LineTooLong => {
                 _ = try ap.append(.{ .system_note = .{ .text = "codex: one event line exceeded 64 MiB and was dropped" } });
@@ -760,18 +808,20 @@ pub fn runCodexTurn(
                         }
                     }
                 } else if (std.mem.eql(u8, notification.method, "thread/tokenUsage/updated")) {
+                    if (!primary_thread) continue;
                     if (codex.field(params, "tokenUsage")) |usage|
                         if (codex.field(usage, "last")) |last| {
                             current_tokens_in = @intCast(@max(0, codex.intField(last, "inputTokens") orelse 0));
                             current_tokens_out = @intCast(@max(0, codex.intField(last, "outputTokens") orelse 0));
                         };
                 } else if (std.mem.eql(u8, notification.method, "error")) {
+                    if (!primary_thread) continue;
+                    if (codex.strField(params, "turnId")) |id| if (!std.mem.eql(u8, id, active_turn_id)) continue;
                     if (!(codex.boolField(params, "willRetry") orelse false)) {
                         if (codex.field(params, "error")) |err_value| {
-                            if (codex.strField(err_value, "message")) |message| {
-                                setDelegateError(message);
-                                failure_text = lastDelegateErrorNote().?;
-                            }
+                            const failure = try turnFailure(arena, err_value);
+                            failure_text = failure.text;
+                            failure_recoverable = failure.recoverable;
                         }
                     }
                 } else if (std.mem.eql(u8, notification.method, "turn/completed")) {
@@ -779,21 +829,49 @@ pub fn runCodexTurn(
                     // stream. A child finishing is activity, not the terminal
                     // boundary of the root turn we were asked to drive.
                     if (!primary_thread) continue;
+                    const turn = codex.field(params, "turn") orelse continue;
+                    if (codex.strField(turn, "id")) |id| if (!std.mem.eql(u8, id, active_turn_id)) continue;
                     tokens_in += current_tokens_in;
                     tokens_out += current_tokens_out;
                     current_tokens_in = 0;
                     current_tokens_out = 0;
-                    const turn = codex.field(params, "turn") orelse continue;
                     const status = codex.strField(turn, "status") orelse "failed";
                     interrupted = std.mem.eql(u8, status, "interrupted");
                     failed = std.mem.eql(u8, status, "failed");
                     if (codex.field(turn, "error")) |err_value| {
                         if (err_value != .null) {
-                            if (codex.strField(err_value, "message")) |message| {
-                                setDelegateError(message);
-                                failure_text = lastDelegateErrorNote().?;
-                            }
+                            const failure = try turnFailure(arena, err_value);
+                            failure_text = failure.text;
+                            failure_recoverable = failure.recoverable;
                         }
+                    }
+
+                    if (failed and failure_recoverable and recovery_attempts < max_recovery_attempts and
+                        !cancelled(opts.cancel) and !watcher.cancelled.load(.acquire) and !watcher.timed_out.load(.acquire))
+                    {
+                        recovery_attempts += 1;
+                        const note = try std.fmt.allocPrint(arena, "Codex request failed: {s}. Continuing the existing thread automatically ({d}/{d}).", .{ failure_text, recovery_attempts, max_recovery_attempts });
+                        _ = try ap.append(.{ .system_note = .{ .text = note } });
+                        // Keep the original runtime deadline and let interrupt
+                        // cancel the pause as well as the next vendor turn.
+                        for (0..recovery_attempts * 10) |_| {
+                            if (cancelled(opts.cancel) or watcher.cancelled.load(.acquire) or watcher.timed_out.load(.acquire)) break :events;
+                            try io.sleep(.fromMilliseconds(100), .awake);
+                        }
+                        if (cancelled(opts.cancel) or watcher.cancelled.load(.acquire) or watcher.timed_out.load(.acquire)) break :events;
+                        active_turn_id = codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, recovery_prompt) catch |err| {
+                            if (err != error.DelegateFailed) return @as(anyerror!TurnResult, err);
+                            failure_text = lastDelegateErrorNote() orelse "Codex rejected automatic continuation";
+                            break :events;
+                        };
+                        next_request_id += 1;
+                        rounds += 1;
+                        failed = false;
+                        failure_recoverable = false;
+                        failure_text = "codex turn failed";
+                        shared.clearDelegateError();
+                        final_text.clearRetainingCapacity();
+                        continue :events;
                     }
 
                     var follow_up: ?block.Input = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
@@ -807,6 +885,8 @@ pub fn runCodexTurn(
                         active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, text.text);
                         next_request_id += 1;
                         rounds += 1;
+                        failure_recoverable = false;
+                        failure_text = "codex turn failed";
                     } else {
                         if (follow_up) |text| text.deinit(gpa);
                         done = true;
@@ -842,7 +922,10 @@ pub fn runCodexTurn(
         return error.DelegateTimeout;
     }
     if (!done or failed) {
-        const note = try std.fmt.allocPrint(gpa, "codex error: {s}", .{failure_text});
+        const note = if (recovery_attempts > 0)
+            try std.fmt.allocPrint(gpa, "Codex request failed: {s}. Stopped after {d} automatic continuation attempt(s); your saved thread is available to resume.", .{ failure_text, recovery_attempts })
+        else
+            try std.fmt.allocPrint(gpa, "Codex request failed: {s}. Your saved thread is available to resume.", .{failure_text});
         defer gpa.free(note);
         setDelegateError(note);
         _ = try ap.append(.{ .system_note = .{ .text = note } });
