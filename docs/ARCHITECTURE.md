@@ -1213,11 +1213,19 @@ get these right; Hermes is the counter-example):
   effect), not spinner characters and not log lines. Cheap in a cell grid:
   cycle fg color across the word per frame.
 - **Optimism must reconcile.** Submitted messages/steers render immediately,
-  but each has a wire request id. A matching daemon error removes precisely
+  with a wire request id. Steering uses a prompt card marked `↪`, distinct
+  from a new turn's `❯`, and a `Queued` label until the durable delivery
+  arrives. Pending entries survive transcript replacement on tab switches
+  and reconnects, history trimming, and view-cache eviction. Delivery
+  reconciles one matching input after its submission frontier, removes the
+  queue label, and places it in durable transcript order. A matching daemon error removes precisely
   that echo and restores the pre-submit state; generic errors cannot strand a
-  false running indicator. If the socket dies, the TUI restores the terminal
-  first and then prints the read failure at the shell, where alt-screen teardown
-  cannot erase it.
+  false running indicator. Remote transport failures use the reconnect flow
+  described above.
+- **Git status** shows the branch beside cwd when available. Ahead/behind
+  counts are hidden by `show_git_divergence` in `src/client/tui.zig`; their
+  existing computation and colored rendering remain available for restoring
+  the display with that switch.
 - **Diffs render like a diff tool, not like raw patch output.** Gutter
   `+`/`-`, restrained full-row green/red surfaces, and language-aware syntax
   foregrounds keep the change shape obvious without washing out the code.
@@ -1366,6 +1374,8 @@ lifecycle.
   read from its `changes` list; the adapter retains per-file headers and turns
   add/delete contents into unified diff rows. Tool-call IDs pair parallel
   results with their correct calls in both live and replayed transcripts.
+  Sleep rows show their requested duration without expanding the transcript
+  (for example `250ms`, `1.5s`, `45s`, `1m`, or `1m30s`).
   Provider byte/quiet telemetry and exact persisted tool calls
   refine the phase without adding durable transcript chatter. Active provider
   traffic shows a green up arrow; three quiet seconds change it to a red down

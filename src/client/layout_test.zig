@@ -1394,3 +1394,36 @@ test "guest tool calls show as a one-line trail instead of folding into Ran N co
     }
     try std.testing.expect(ran_summary);
 }
+
+test "Sleep rows show compact requested durations without expanding the transcript" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]struct { ms: u64, display: []const u8 }{
+        .{ .ms = 0, .display = "0s" },
+        .{ .ms = 250, .display = "250ms" },
+        .{ .ms = 1_000, .display = "1s" },
+        .{ .ms = 1_500, .display = "1.5s" },
+        .{ .ms = 1_025, .display = "1.025s" },
+        .{ .ms = 45_000, .display = "45s" },
+        .{ .ms = 60_000, .display = "1m" },
+        .{ .ms = 90_000, .display = "1m30s" },
+        .{ .ms = 3_600_000, .display = "1h" },
+        .{ .ms = 3_661_500, .display = "1h1m1.5s" },
+    }) |case| {
+        const args = try std.fmt.allocPrint(arena, "{{\"type\":\"sleep\",\"id\":\"call_sleep\",\"durationMs\":{d}}}", .{case.ms});
+        var lines: std.ArrayList(Line) = .empty;
+        try appendToolCallLine(arena, &lines, .{
+            .kind = .tool_call,
+            .text = try arena.dupe(u8, args),
+            .label = try arena.dupe(u8, "Sleep"),
+        }, "", 80, null, null);
+        try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+        try std.testing.expectEqualStrings("  ⚙ Sleep ", lines.items[0].text);
+        try std.testing.expectEqualStrings(case.display, lines.items[0].text2);
+    }
+    try std.testing.expectEqualStrings("1.5s", (try toolDisplayArgDecoded(arena, "sleep", "{\"duration_ms\":1500}", "")).?);
+    for ([_][]const u8{ "{}", "{\"durationMs\":-1}", "{\"durationMs\":\"bad\"}", "{" }) |args| {
+        try std.testing.expectEqual(@as(?[]const u8, null), try toolDisplayArgDecoded(arena, "Sleep", args, ""));
+    }
+}

@@ -116,6 +116,8 @@ const terminal_osc = @import("terminal_osc.zig");
 /// paging in either direction as the viewport reaches an edge.
 pub const initial_replay_blocks: u32 = 96;
 pub const history_window_blocks: usize = 384;
+// Keep the divergence plumbing available while showing only the branch.
+pub const show_git_divergence = false;
 
 pub const Event = union(enum) {
     key_press: vaxis.Key,
@@ -226,14 +228,23 @@ pub fn reconcilePendingEcho(
     turn_id: u64,
     timestamp_ms: i64,
 ) bool {
-    for (blocks) |*rendered| {
-        if (rendered.pending_echo and rendered.kind == kind and std.mem.eql(u8, rendered.text, text)) {
+    for (blocks, 0..) |*rendered, index| {
+        if (rendered.pending_echo and (rendered.kind == .user_msg or rendered.kind == .steer) and
+            (kind == .user_msg or kind == .steer) and seq > rendered.pending_after_seq and
+            std.mem.eql(u8, rendered.text, text))
+        {
             rendered.pending_echo = false;
+            rendered.kind = kind;
             rendered.pending_request_id = 0;
             rendered.pending_prior_state = null;
             rendered.seq = seq;
             rendered.turn_id = turn_id;
             rendered.timestamp_ms = timestamp_ms;
+            // Delivery can follow intervening tool output. Keep durable
+            // order identical to replay, rather than freezing submit order.
+            const delivered = rendered.*;
+            std.mem.copyForwards(RenderBlock, blocks[index .. blocks.len - 1], blocks[index + 1 ..]);
+            blocks[blocks.len - 1] = delivered;
             return true;
         }
     }
@@ -247,6 +258,11 @@ fn acknowledgeInputInBlocks(blocks: []RenderBlock, request_id: u64) bool {
         rendered.pending_prior_state = null;
         return true;
     }
+    return false;
+}
+
+fn hasPendingInput(blocks: []const RenderBlock) bool {
+    for (blocks) |rendered| if (rendered.pending_echo) return true;
     return false;
 }
 
@@ -832,13 +848,19 @@ pub const App = struct {
 
     fn dropWindowPrefix(self: *App, count: usize) void {
         const n = @min(count, self.view.blocks.items.len);
-        for (self.view.blocks.items[0..n]) |*rendered| rendered.deinit(self.gpa);
+        var retained: usize = 0;
+        for (self.view.blocks.items[0..n]) |*rendered| {
+            if (rendered.pending_echo) {
+                self.view.blocks.items[retained] = rendered.*;
+                retained += 1;
+            } else rendered.deinit(self.gpa);
+        }
         std.mem.copyForwards(
             RenderBlock,
-            self.view.blocks.items[0 .. self.view.blocks.items.len - n],
+            self.view.blocks.items[retained .. retained + self.view.blocks.items.len - n],
             self.view.blocks.items[n..],
         );
-        self.view.blocks.items.len -= n;
+        self.view.blocks.items.len -= n - retained;
         self.view.history_complete = false;
     }
 
@@ -1137,6 +1159,7 @@ pub const App = struct {
             var oldest_tick: u64 = std.math.maxInt(u64);
             var it = self.saved_views.iterator();
             while (it.next()) |entry| {
+                if (hasPendingInput(entry.value_ptr.*.blocks.items)) continue;
                 if (entry.value_ptr.*.last_used < oldest_tick) {
                     oldest_tick = entry.value_ptr.*.last_used;
                     oldest_sid = entry.key_ptr.*;
@@ -1236,6 +1259,18 @@ pub const App = struct {
                 .from_seq = 1,
                 .tail_limit = initial_replay_blocks,
             } }) catch {};
+        } else if (hasPendingInput(self.view.blocks.items)) {
+            // Read every missed delivery, even if it has fallen outside
+            // the latest snapshot while this tab was in the background.
+            self.view.history_loading = true;
+            self.conn.send(.{ .sub = .{
+                .skill_catalog = true,
+                .sid = sid,
+                .from_seq = self.view.last_seq +| 1,
+                .replay_limit = initial_replay_blocks,
+            } }) catch {
+                self.view.history_loading = false;
+            };
         } else {
             self.view.history_loading = true;
             self.view.history_tail_reload = true;
@@ -1651,6 +1686,7 @@ pub const App = struct {
         if (self.view.blocks.items.len == before) return;
         const rendered = &self.view.blocks.items[self.view.blocks.items.len - 1];
         rendered.pending_request_id = request_id;
+        rendered.pending_after_seq = self.view.last_seq;
         rendered.pending_prior_state = prior_state;
     }
 
@@ -1827,6 +1863,7 @@ pub const App = struct {
                     return;
                 }
                 if (replay.forward) {
+                    if (!view.history_has_newer) self.trimHistoryWindow(true);
                     if (replay.has_newer and replay.newest_seq > 0) {
                         self.conn.send(.{ .sub = .{
                             .skill_catalog = true,
@@ -2088,7 +2125,9 @@ pub const App = struct {
                 self.git_label.clearRetainingCapacity();
                 if (result.branch.len > 0) {
                     self.git_label.appendSlice(self.gpa, result.branch) catch {};
-                    if (result.counts) |counts| self.git_label.print(self.gpa, " ↑{d} ↓{d}", .{ counts.ahead, counts.behind }) catch {};
+                    if (show_git_divergence) {
+                        if (result.counts) |counts| self.git_label.print(self.gpa, " ↑{d} ↓{d}", .{ counts.ahead, counts.behind }) catch {};
+                    }
                 }
                 self.refresh_requested = true;
             },
@@ -2425,6 +2464,25 @@ pub const App = struct {
             self.clearHistoryBackfill();
             self.setNotice("could not load transcript window", .{});
             return;
+        }
+        // A snapshot contains delivered messages, but not the daemon's
+        // pending steer queue. Reconcile deliveries and carry the rest over.
+        self.view.history_backfill.ensureUnusedCapacity(self.gpa, self.view.blocks.items.len) catch {
+            self.clearHistoryBackfill();
+            self.setNotice("could not load transcript window", .{});
+            return;
+        };
+        for (self.view.history_backfill.items) |incoming| {
+            if (incoming.kind == .user_msg or incoming.kind == .steer)
+                _ = reconcilePendingEcho(self.view.blocks.items, incoming.kind, incoming.text, incoming.seq, incoming.turn_id, incoming.timestamp_ms orelse 0);
+        }
+        var i: usize = 0;
+        while (i < self.view.blocks.items.len) {
+            if (self.view.blocks.items[i].pending_echo) {
+                self.view.history_backfill.appendAssumeCapacity(self.view.blocks.orderedRemove(i));
+            } else {
+                i += 1;
+            }
         }
         std.mem.swap(std.ArrayList(RenderBlock), &self.view.blocks, &self.view.history_backfill);
         self.clearHistoryBackfill();
@@ -6564,6 +6622,18 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
             .from_seq = 1,
             .tail_limit = initial_replay_blocks,
         } }) catch {
+            new_conn.deinit();
+            return false;
+        };
+    } else if (hasPendingInput(app.view.blocks.items)) {
+        app.view.history_loading = true;
+        new_conn.send(.{ .sub = .{
+            .skill_catalog = true,
+            .sid = app.view.sid,
+            .from_seq = app.view.last_seq +| 1,
+            .replay_limit = initial_replay_blocks,
+        } }) catch {
+            app.view.history_loading = false;
             new_conn.deinit();
             return false;
         };

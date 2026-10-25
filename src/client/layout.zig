@@ -255,6 +255,8 @@ pub const RenderBlock = struct {
     pending_echo: bool = false,
     /// Identity of the input awaiting its daemon ok/err. Zero after ack.
     pending_request_id: u64 = 0,
+    /// Durable frontier at submission, so replay cannot match an older repeat.
+    pending_after_seq: u64 = 0,
     /// Non-null only for a new-turn echo whose optimistic running state must
     /// be restored if the daemon rejects that exact request.
     pending_prior_state: ?proto.SessionState = null,
@@ -488,13 +490,24 @@ pub fn wrapPromptCard(
     text: []const u8,
     width: usize,
 ) !void {
-    const first_prefix = " ❯ ";
+    return wrapInputCard(arena, lines, text, width, false, false);
+}
+
+fn wrapInputCard(
+    arena: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    text: []const u8,
+    width: usize,
+    steer: bool,
+    queued: bool,
+) !void {
+    const first_prefix = if (steer) " ↪ " else " ❯ ";
     const continuation = "   ";
     const prefix_cells: usize = 3;
     const body_width = width -| (prefix_cells + 1); // keep right padding
     if (body_width < 8) return;
 
-    try lines.append(arena, .{ .text = "", .style = Palette.prompt_text, .fill_style = Palette.prompt_panel });
+    try lines.append(arena, .{ .text = if (queued) "   Queued" else "", .style = Palette.collapse_hint, .fill_style = Palette.prompt_panel });
     var first = true;
     var logical = std.mem.splitScalar(u8, text, '\n');
     while (logical.next()) |raw_line| {
@@ -513,7 +526,7 @@ pub fn wrapPromptCard(
             );
             try lines.append(arena, .{
                 .text = prefix,
-                .style = if (first) Palette.prompt_mark else Palette.prompt_text,
+                .style = if (!first) Palette.prompt_text else if (steer) Palette.steer else Palette.prompt_mark,
                 .text2 = rest[0..take],
                 .style2 = Palette.prompt_text,
                 .fill_style = Palette.prompt_panel,
@@ -1717,7 +1730,7 @@ pub fn layoutBlockRange(
             .steer => {
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 try blankLine(alloc, lines);
-                try wrapPrefixed(alloc, lines, "  ↪ ", rb.text, Palette.steer, w);
+                try wrapInputCard(alloc, lines, rb.text, w, true, rb.pending_echo);
             },
             .plan => {
                 if (visibleCompletedPlan(transcript.blocks, block_idx)) {
@@ -1779,9 +1792,14 @@ pub fn stableBlockCount(transcript: *const Transcript) usize {
         for (items) |item| has_pending = has_pending or item.pending_echo;
         if (!has_pending) return items.len;
     }
-    const last_turn = items[items.len - 1].turn_id;
     var i = items.len;
-    while (i > 0 and items[i - 1].turn_id == last_turn) i -= 1;
+    while (i > 0 and items[i - 1].pending_echo) i -= 1;
+    if (i == 0) return 0;
+    const last_turn = items[i - 1].turn_id;
+    while (i > 0 and (items[i - 1].pending_echo or items[i - 1].turn_id == last_turn)) i -= 1;
+    for (items[0..i], 0..) |item, index| {
+        if (item.pending_echo) return index;
+    }
     return i;
 }
 
@@ -2011,6 +2029,7 @@ fn isFileTool(tool_name: []const u8) bool {
 }
 
 pub fn toolDisplayName(tool_name: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(tool_name, "sleep")) return "Sleep";
     if (isReadTool(tool_name)) return "Read";
     if (std.ascii.eqlIgnoreCase(tool_name, "write") or std.mem.eql(u8, tool_name, "write_file")) return "Write";
     if (std.ascii.eqlIgnoreCase(tool_name, "edit")) return "Edit";
@@ -2070,6 +2089,16 @@ pub fn toolDisplayArgDecoded(
     args_json: []const u8,
     cwd: []const u8,
 ) !?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(tool_name, "sleep")) {
+        const duration = std.json.parseFromSliceLeaky(struct {
+            durationMs: ?u64 = null,
+            duration_ms: ?u64 = null,
+        }, arena, args_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        return try formatSleepDuration(arena, duration.durationMs orelse duration.duration_ms orelse return null);
+    }
     const parsed = std.json.parseFromSliceLeaky(DisplayArgsJson, arena, args_json, .{
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
@@ -2091,6 +2120,30 @@ pub fn toolDisplayArgDecoded(
     const arg = decodedDisplayArg(tool_name, parsed) orelse return null;
     if (!arg.is_path or !std.fs.path.isAbsolute(arg.value)) return arg.value;
     return shortenDisplayPath(arg.value, cwd);
+}
+
+fn formatSleepDuration(arena: std.mem.Allocator, duration_ms: u64) ![]const u8 {
+    if (duration_ms == 0) return "0s";
+    if (duration_ms < std.time.ms_per_s) return std.fmt.allocPrint(arena, "{d}ms", .{duration_ms});
+    var out: std.ArrayList(u8) = .empty;
+    var remaining = duration_ms;
+    for ([_]struct { u64, []const u8 }{
+        .{ std.time.ms_per_hour, "h" },
+        .{ std.time.ms_per_min, "m" },
+    }) |unit| {
+        if (remaining >= unit[0]) try out.print(arena, "{d}{s}", .{ remaining / unit[0], unit[1] });
+        remaining %= unit[0];
+    }
+    if (remaining > 0) {
+        try out.print(arena, "{d}", .{remaining / std.time.ms_per_s});
+        if (remaining % std.time.ms_per_s != 0) {
+            var fraction: [3]u8 = undefined;
+            const digits = try std.fmt.bufPrint(&fraction, "{d:0>3}", .{remaining % std.time.ms_per_s});
+            try out.print(arena, ".{s}", .{std.mem.trimEnd(u8, digits, "0")});
+        }
+        try out.append(arena, 's');
+    }
+    return out.items;
 }
 
 fn completedToolDisplayArg(

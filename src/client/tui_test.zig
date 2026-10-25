@@ -5581,7 +5581,7 @@ test "git status polling is throttled, capability gated and rejects stale cwd re
     app.maybeRequestGitStatus(6000);
     try std.testing.expectEqual(request_len * 2, output.written().len);
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .session_git_status = .{ .sid = 42, .cwd = "/repo", .branch = "main", .counts = .{ .ahead = 2, .behind = 3 } } }));
-    try std.testing.expectEqualStrings("main ↑2 ↓3", app.git_label.items);
+    try std.testing.expectEqualStrings("main", app.git_label.items);
     app.setCwdStr("/elsewhere");
     app.maybeRequestGitStatus(6001);
     try std.testing.expectEqualStrings("", app.git_label.items);
@@ -6409,4 +6409,170 @@ test "offline Enter preserves the draft and quit still works" {
     app.view.editor.insertSlice("/quit");
     try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
     try std.testing.expect(app.should_quit);
+}
+
+test "queued steering cards survive replay and reconcile each repeated delivery once" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .state = .running,
+        .last_seq = 10,
+    } };
+    defer app.deinit();
+    app.pushInputEcho(.steer, "also check the docs", 1, null);
+    app.pushInputEcho(.steer, "also check the docs", 2, null);
+    app.acknowledgeInput(1);
+    app.acknowledgeInput(2);
+
+    // A tab switch/reconnect snapshot can contain an older identical message.
+    // It must neither consume the new queue entries nor discard them.
+    const old = block.Block{
+        .id = 5,
+        .session_id = 7,
+        .turn_id = 1,
+        .seq = 5,
+        .ts = 100,
+        .body = .{ .steer = .{ .text = "also check the docs" } },
+    };
+    try app.view.history_backfill.append(gpa, (try allocDurableRenderBlock(gpa, old)).?);
+    app.finishReplacementHistoryPage(5, 10, false, false, 0);
+    try std.testing.expectEqual(@as(usize, 3), app.view.blocks.items.len);
+    try std.testing.expect(!app.view.blocks.items[0].pending_echo);
+    try std.testing.expect(app.view.blocks.items[1].pending_echo);
+    try std.testing.expect(app.view.blocks.items[2].pending_echo);
+
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    for ([_]bool{ false, true }) |guest| {
+        // Exercise both guest and native layouts, folded and expanded.
+        app.setModelStr(if (guest) "codex/gpt-5" else "openrouter/test/model");
+        for ([_]bool{ false, true }) |expanded| {
+            app.view.show_tool_transcript = expanded;
+            app.view.layout_epoch +%= 1;
+            const lines = try layoutLines(frame.allocator(), &app, 80);
+            var cards: usize = 0;
+            var queued: usize = 0;
+            for (lines.items) |line| {
+                if (std.mem.eql(u8, line.text, " ↪ ")) {
+                    cards += 1;
+                    try std.testing.expect(line.fill_style != null);
+                    try std.testing.expectEqualStrings("also check the docs", line.text2);
+                }
+                if (std.mem.eql(u8, line.text, "   Queued")) queued += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 3), cards);
+            try std.testing.expectEqual(@as(usize, 2), queued);
+        }
+    }
+
+    // One delivery was persisted while the view was away: one pending copy
+    // remains. Historical repeats are still not mistaken for new delivery.
+    try app.view.history_backfill.append(gpa, (try allocDurableRenderBlock(gpa, old)).?);
+    var delivered = old;
+    delivered.id = 11;
+    delivered.seq = 11;
+    delivered.turn_id = 2;
+    try app.view.history_backfill.append(gpa, (try allocDurableRenderBlock(gpa, delivered)).?);
+    app.finishReplacementHistoryPage(5, 11, false, false, 0);
+    try std.testing.expectEqual(@as(usize, 3), app.view.blocks.items.len);
+    try std.testing.expect(!app.view.blocks.items[1].pending_echo);
+    try std.testing.expect(app.view.blocks.items[2].pending_echo);
+
+    // Intervening output must precede the second delivered input, as on replay.
+    app.applyBlock(.{ .id = 12, .session_id = 7, .turn_id = 2, .seq = 12, .ts = 200, .body = .{ .reasoning = .{ .text = "Checking the docs now.", .commentary = true } } });
+    delivered.id = 13;
+    delivered.seq = 13;
+    app.applyBlock(delivered);
+    try std.testing.expectEqual(@as(usize, 4), app.view.blocks.items.len);
+    try std.testing.expectEqual(@as(u64, 12), app.view.blocks.items[2].seq);
+    try std.testing.expectEqual(@as(u64, 13), app.view.blocks.items[3].seq);
+    for (app.view.blocks.items) |entry| try std.testing.expect(!entry.pending_echo);
+    const lines = try layoutLines(frame.allocator(), &app, 80);
+    var cards: usize = 0;
+    for (lines.items) |line| {
+        if (std.mem.eql(u8, line.text, " ↪ ")) cards += 1;
+        try std.testing.expect(!std.mem.eql(u8, line.text, "   Queued"));
+    }
+    try std.testing.expectEqual(@as(usize, 3), cards);
+}
+
+test "pending input does not freeze active tool layout and survives history trimming" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .state = .running,
+    } };
+    defer app.deinit();
+    app.applyBlock(.{ .id = 1, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 0, .body = .{ .tool_call = .{ .call_id = "call", .name = "bash", .args_json = "{}" } } });
+    app.pushInputEcho(.steer, "remember this", 1, null);
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    _ = try layoutLines(frame.allocator(), &app, 80);
+    try std.testing.expectEqual(@as(usize, 0), app.view.layout_cache.covered);
+    for (2..history_window_blocks + 10) |seq| {
+        app.applyBlock(.{ .id = seq, .session_id = 7, .turn_id = 1, .seq = seq, .ts = 0, .body = .{ .system_note = .{ .text = "progress" } } });
+    }
+    var pending: usize = 0;
+    for (app.view.blocks.items) |entry| {
+        if (entry.pending_echo) {
+            pending += 1;
+            try std.testing.expectEqualStrings("remember this", entry.text);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), pending);
+}
+
+test "returning to a tab with pending input replays missed deliveries and retains its cache" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{
+        .sid = 1,
+        .editor = Editor.init(gpa),
+        .state = .running,
+        .last_seq = 10,
+    } };
+    defer app.deinit();
+    app.pushInputEcho(.steer, "check the docs", 1, null);
+    for (2..App.max_saved_views + 5) |sid| try app.focusSession(sid, true);
+    try std.testing.expect(app.saved_views.contains(1));
+    const before = output.written().len;
+    try app.switchSession(1, true);
+    var requests = std.mem.splitScalar(u8, output.written()[before..], '\n');
+    var saw_replay = false;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    while (requests.next()) |line| {
+        if (line.len == 0) continue;
+        const request = try proto.decode(proto.ClientMsg, arena.allocator(), line);
+        if (request == .sub) {
+            try std.testing.expectEqual(@as(u64, 11), request.sub.from_seq);
+            try std.testing.expectEqual(@as(u32, 0), request.sub.tail_limit);
+            try std.testing.expectEqual(tui.initial_replay_blocks, request.sub.replay_limit);
+            saw_replay = true;
+        }
+    }
+    try std.testing.expect(saw_replay);
+    try std.testing.expect(app.view.blocks.items[0].pending_echo);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 1, .b = .{
+        .id = 11,
+        .session_id = 1,
+        .seq = 11,
+        .turn_id = 2,
+        .ts = 1,
+        .body = .{ .steer = .{ .text = "check the docs" } },
+    } } }));
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    try std.testing.expect(!app.view.blocks.items[0].pending_echo);
 }
