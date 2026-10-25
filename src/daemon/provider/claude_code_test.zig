@@ -65,6 +65,8 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     try std.testing.expectEqualStrings("--session-id", fresh[12]);
     try std.testing.expectEqualStrings("--permission-mode", fresh[14]);
     try std.testing.expectEqualStrings("acceptEdits", fresh[15]);
+    try std.testing.expectEqualStrings("--append-system-prompt", fresh[fresh.len - 2]);
+    try std.testing.expectEqualStrings(@import("../../core/guest.zig").progress_instructions, fresh[fresh.len - 1]);
     for (fresh) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--effort"));
 
     const root = try buildArgv(arena, .{
@@ -136,6 +138,7 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     try std.testing.expect(std.mem.indexOf(u8, bridged[13], "\"timeout\":604800000") != null);
     try std.testing.expectEqualStrings("--append-system-prompt", bridged[14]);
     try std.testing.expect(std.mem.indexOf(u8, bridged[15], "mcp__marlin__ask_user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bridged[15], @import("../../core/guest.zig").progress_instructions) != null);
     try std.testing.expectEqualStrings("--permission-mode", bridged[16]);
     try std.testing.expectEqualStrings("default", bridged[17]);
     try std.testing.expectEqualStrings("--permission-prompt-tool", bridged[18]);

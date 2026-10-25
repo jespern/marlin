@@ -269,6 +269,29 @@ test "diff intro notes distill to counts for the tool line" {
     try std.testing.expect(diffIntroNote("The file has been updated successfully.") == null);
 }
 
+test "Codex nested paths and bare unified diffs render filenames and counts" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("src/a file.zig, src/b.zig", (try toolDisplayArgDecoded(arena, "Edit",
+        \\{"type":"fileChange","changes":[{"path":"/w/src/a file.zig","kind":{"type":"update"},"diff":"ignored"},{"path":"/w/src/b.zig"}]}
+    , "/w")).?);
+    try std.testing.expectEqualStrings("notes.ipynb", (try toolDisplayArgDecoded(arena, "NotebookEdit", "{\"notebook_path\":\"/w/notes.ipynb\"}", "/w")).?);
+    const diff = "@@ -1,2 +1,2 @@\n-old\n---old code\n+new\n+++new code";
+    try std.testing.expectEqualStrings("+2 -2", (try diffSummaryNote(arena, diff)).?);
+    try std.testing.expect((try diffSummaryNote(arena, "updated successfully")) == null);
+
+    var lines: std.ArrayList(Line) = .empty;
+    const call = RenderBlock{ .kind = .tool_call, .label = @constCast("Edit"), .text = @constCast("{\"changes\":[]}") };
+    const result = RenderBlock{ .kind = .tool_result, .label = @constCast(""), .text = @constCast("--- src/a.zig\n+++ src/a.zig\n@@ -1 +1 @@\n-old\n+new") };
+    try layout.appendToolCallLine(arena, &lines, call, "/w", 80, try diffSummaryNote(arena, result.text), result);
+    try std.testing.expectEqualStrings("src/a.zig", lines.items[0].text2);
+    try std.testing.expectEqualStrings(" · +1 -1", lines.items[0].text3);
+    try std.testing.expectEqual(@as(usize, 2), lines.items[0].syntax.len);
+    try std.testing.expectEqual(Palette.diff_add.fg, lines.items[0].syntax[0].style.fg);
+    try std.testing.expectEqual(Palette.diff_del.fg, lines.items[0].syntax[1].style.fg);
+}
+
 test "authored diff notes include exact colored diffstats" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -742,6 +765,71 @@ test "live reasoning uses assistant-priority text" {
     try std.testing.expectEqualStrings("  · ", reasoning.text);
     try std.testing.expectEqualStrings("checking the implementation", reasoning.text2);
     try std.testing.expectEqual(Palette.assistant, reasoning.style2);
+
+    transcript.reasoning_delta = "Earlier context and investigation details. " ** 200 ++ "Latest finding: the server is healthy.";
+    const compact = try layoutLines(arena_state.allocator(), gpa, &transcript, 60);
+    try std.testing.expectEqual(@as(usize, 3), compact.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, compact.items[2].text2, "healthy.") != null);
+    transcript.show_tool_transcript = true;
+    const expanded = try layoutLines(arena_state.allocator(), gpa, &transcript, 60);
+    try std.testing.expect(expanded.items.len > 3);
+    try std.testing.expect(std.mem.startsWith(u8, expanded.items[0].text2, "Earlier context"));
+
+    const saved = [_]RenderBlock{.{ .kind = .reasoning, .text = @constCast(transcript.reasoning_delta), .label = @constCast("") }};
+    transcript.blocks = &saved;
+    transcript.reasoning_delta = "";
+    transcript.guest = true;
+    transcript.state = .done;
+    transcript.show_tool_transcript = false;
+    transcript.layout_epoch += 1;
+    const saved_preview = try layoutLines(arena_state.allocator(), gpa, &transcript, 60);
+    try std.testing.expectEqual(@as(usize, 3), saved_preview.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, saved_preview.items[0].text2, "Earlier context"));
+    try std.testing.expectEqualStrings(" …", saved_preview.items[2].text3);
+    transcript.show_tool_transcript = true;
+    const saved_full = try layoutLines(arena_state.allocator(), gpa, &transcript, 60);
+    try std.testing.expect(saved_full.items.len > 3);
+    try std.testing.expect(std.mem.indexOf(u8, saved_full.items[saved_full.items.len - 1].text2, "healthy.") != null);
+}
+
+test "submitted prompt cards wrap whole words and preserve Unicode and source text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+    try wrapPromptCard(arena, &lines, "hello marlin", 14);
+    try std.testing.expectEqualStrings("hello ", lines.items[1].text2);
+    try std.testing.expectEqualStrings("marlin", lines.items[2].text2);
+
+    for ([_][]const u8{ "hello world next", "你好世界你好 🌍 café", "👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻", "one\ttwo three", "abcdefghijklmnopqrstuv" }) |source| {
+        lines.clearRetainingCapacity();
+        try wrapPromptCard(arena, &lines, source, 14);
+        var joined: std.ArrayList(u8) = .empty;
+        for (lines.items) |line| {
+            try std.testing.expect(std.unicode.utf8ValidateSlice(line.text2));
+            try std.testing.expect(render.displayWidth(line.text2) <= 10);
+            try joined.appendSlice(arena, line.text2);
+        }
+        try std.testing.expectEqualStrings(source, joined.items);
+    }
+}
+
+test "latest reasoning preview keeps link offsets after its continuation marker" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+    try layout.wrapReasoningPreview(arena, &lines, "**check** [docs](https://example.com) " ** 50, 30, true);
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("  … ", lines.items[0].text);
+    try std.testing.expect(lines.items[0].links.len > 0);
+    for (lines.items) |line| {
+        const text = try lineText(arena, line);
+        for (line.links) |link| {
+            try std.testing.expectEqualStrings("docs", text[link.start..link.end]);
+            try std.testing.expectEqualStrings("https://example.com", link.uri);
+        }
+    }
 }
 
 test "working activity names each operational phase" {
@@ -1152,7 +1240,7 @@ test "guest commentary renders as full assistant prose instead of a clipped reas
     defer threaded.deinit();
     const long = "Starting the extraction now: moving the field declarations into the new struct, then the mechanical rename across about a thousand access sites, then the test literals, then a compile to find whatever the regex missed, and finally the fold-in of the saved view type so the two copy functions can go away for good.";
     try std.testing.expect(long.len > 280);
-    const blocks = [_]RenderBlock{
+    var blocks = [_]RenderBlock{
         .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("go"), .label = @constCast("") },
         .{ .kind = .reasoning, .turn_id = 1, .text = @constCast(long), .label = @constCast(""), .commentary = true },
         .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{\"command\":\"zig build test\"}"), .label = @constCast("Bash") },
@@ -1212,6 +1300,26 @@ test "guest commentary renders as full assistant prose instead of a clipped reas
     }
     try std.testing.expectEqual(@as(usize, 1), card_marks);
     try std.testing.expect(clipped);
+
+    // Expansion must expose both raw reasoning and commentary in either cache.
+    transcript.show_tool_transcript = true;
+    for ([_]bool{ false, true }) |guest| {
+        transcript.guest = guest;
+        for ([_]bool{ false, true }) |commentary| {
+            blocks[1].commentary = commentary;
+            transcript.layout_epoch += 1;
+            for ([_]proto.SessionState{ .running, .done }) |state| {
+                transcript.state = state;
+                const expanded = try layoutLines(arena, gpa, &transcript, 120);
+                joined.clearRetainingCapacity();
+                for (expanded.items) |line| {
+                    try joined.appendSlice(arena, try lineText(arena, line));
+                    try joined.append(arena, ' ');
+                }
+                try std.testing.expect(std.mem.indexOf(u8, joined.items, "can go away for good.") != null);
+            }
+        }
+    }
 }
 
 test "guest tool calls show as a one-line trail instead of folding into Ran N commands" {

@@ -125,7 +125,8 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
             "When you need the user to choose between options, call mcp__marlin__ask_user — it renders " ++
                 "an interactive picker in their terminal and pauses for the pick. Never list choices as " ++
                 "prose and ask them to reply; that is what ask_user replaces. Skip it when one option is " ++
-                "the obvious default: state your choice and proceed.",
+                "the obvious default: state your choice and proceed.\n\n" ++
+                @import("../../core/guest.zig").progress_instructions,
         });
     }
     switch (opts.permissions) {
@@ -151,6 +152,9 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
             try std.fmt.allocPrint(arena, "{d}", .{limit}),
         });
     }
+    if (opts.bridge == null) try argv.appendSlice(arena, &.{
+        "--append-system-prompt", @import("../../core/guest.zig").progress_instructions,
+    });
     if (effortFlag(opts.effort)) |level| {
         try argv.appendSlice(arena, &.{ "--effort", level });
     }

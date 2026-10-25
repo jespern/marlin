@@ -263,7 +263,7 @@ fn codexToolName(arena: std.mem.Allocator, item: std.json.Value) !?[]const u8 {
     return null;
 }
 
-fn codexToolBody(arena: std.mem.Allocator, item: std.json.Value) ![]const u8 {
+pub fn codexToolBody(arena: std.mem.Allocator, item: std.json.Value) ![]const u8 {
     const kind = codex.strField(item, "type") orelse return codex.stringify(arena, item);
     if (std.mem.eql(u8, kind, "commandExecution"))
         return codex.strField(item, "aggregatedOutput") orelse "";
@@ -273,8 +273,35 @@ fn codexToolBody(arena: std.mem.Allocator, item: std.json.Value) ![]const u8 {
         var joined: std.ArrayList(u8) = .empty;
         for (changes.array.items) |change| {
             const diff = codex.strField(change, "diff") orelse continue;
+            const path = codex.strField(change, "path") orelse "unknown file";
+            const change_kind = codex.field(change, "kind") orelse .null;
+            const action = codex.strField(change_kind, "type") orelse "update";
+            const added = std.mem.eql(u8, action, "add");
+            const deleted = std.mem.eql(u8, action, "delete");
+            const destination = codex.strField(change_kind, "move_path") orelse path;
             if (joined.items.len > 0) try joined.append(arena, '\n');
-            try joined.appendSlice(arena, diff);
+            try joined.print(arena, "--- {s}\n+++ {s}\n", .{
+                if (added) "/dev/null" else path,
+                if (deleted) "/dev/null" else destination,
+            });
+            // Add/delete events contain file contents, not unified diffs.
+            if (added or deleted) {
+                const count = if (diff.len == 0) 0 else std.mem.count(u8, diff, "\n") + @intFromBool(!std.mem.endsWith(u8, diff, "\n"));
+                try joined.print(arena, "@@ -{d},{d} +{d},{d} @@\n", .{
+                    @as(usize, if (deleted and count > 0) 1 else 0),
+                    if (deleted) count else 0,
+                    @as(usize, if (added and count > 0) 1 else 0),
+                    if (added) count else 0,
+                });
+                var it = std.mem.splitScalar(u8, diff, '\n');
+                while (it.next()) |line| {
+                    if (line.len == 0 and it.index == null) break;
+                    try joined.print(arena, "{c}{s}\n", .{ @as(u8, if (added) '+' else '-'), line });
+                }
+            } else {
+                try joined.appendSlice(arena, diff);
+                if (!std.mem.endsWith(u8, diff, "\n")) try joined.append(arena, '\n');
+            }
         }
         return if (joined.items.len > 0) joined.items else "file change completed";
     }
@@ -632,6 +659,7 @@ pub fn runCodexTurn(
     if (saved_thread_id) |saved| {
         try codexRequest(arena, writer, "thread/resume", next_request_id, trace, .{
             .threadId = saved,
+            .developerInstructions = @import("../../core/guest.zig").progress_instructions,
             .cwd = opts.cwd,
             .model = codexModel(opts),
             .approvalPolicy = codexApprovalPolicy(opts),
@@ -655,6 +683,7 @@ pub fn runCodexTurn(
     }
     if (thread_id.len == 0) {
         try codexRequest(arena, writer, "thread/start", next_request_id, trace, .{
+            .developerInstructions = @import("../../core/guest.zig").progress_instructions,
             .cwd = opts.cwd,
             .model = codexModel(opts),
             .approvalPolicy = codexApprovalPolicy(opts),

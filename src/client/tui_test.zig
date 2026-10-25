@@ -1931,7 +1931,7 @@ test "staging images inserts numbered prompt placeholders" {
     try std.testing.expectEqual(@as(usize, 2), app.view.attachments.items.len);
 }
 
-test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D never does" {
+test "Ctrl+D aliases Ctrl+W at an empty input prompt but keeps normal-mode scrolling" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -1948,8 +1948,12 @@ test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D neve
     const ctrl_d = vaxis.Key{ .codepoint = 'd', .mods = .{ .ctrl = true } };
     const ctrl_w = vaxis.Key{ .codepoint = 'w', .mods = .{ .ctrl = true } };
 
-    try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d)); // page-down while reading, never archive
+    try std.testing.expect(isArchiveCurrentKey(&app, ctrl_d));
     try std.testing.expect(isArchiveCurrentKey(&app, ctrl_w));
+    app.mode = .normal;
+    try std.testing.expect(!isArchiveCurrentKey(&app, ctrl_d));
+    try std.testing.expect(isArchiveCurrentKey(&app, ctrl_w));
+    app.mode = .insert;
     try std.testing.expect(!isArchiveCurrentKey(&app, .{ .codepoint = 'd' }));
     try std.testing.expect(!isArchiveCurrentKey(&app, .{ .codepoint = 'w' }));
 
@@ -1975,6 +1979,9 @@ test "Ctrl+W archives only a truly empty composer outside copy mode; Ctrl+D neve
     // The shared /archive path retains its running-session guard.
     app.view.state = .running;
     try handleKey(&app, ctrl_w);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "interrupt it first") != null);
+    app.notice.clearRetainingCapacity();
+    try handleKey(&app, ctrl_d);
     try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "interrupt it first") != null);
 }
 
@@ -4198,6 +4205,60 @@ test "raw provider reasoning folds; commentary narration stays visible" {
     try std.testing.expect(saw_raw);
 }
 
+test "parallel guest Edit results retain filenames diffstats and colored rows live and on replay" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const args = "{\"changes\":[{\"path\":\"/w/src/a.zig\"}]}";
+    const diff = "@@ -1 +1 @@\n-old\n+new";
+    const bodies = [_]block.Body{
+        .{ .tool_call = .{ .call_id = "edit-1", .name = "Edit", .args_json = args } },
+        .{ .tool_call = .{ .call_id = "bash-1", .name = "Bash", .args_json = "{\"command\":\"true\"}" } },
+        .{ .tool_result = .{ .call_id = "bash-1", .status = .ok, .inline_body = "shell output", .full_body_ref = null } },
+        .{ .tool_result = .{ .call_id = "edit-1", .status = .ok, .inline_body = diff, .full_body_ref = null } },
+    };
+    for ([_]bool{ false, true }) |replay| {
+        var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+        defer app.deinit();
+        try app.view.model.appendSlice(gpa, "codex/default");
+        try app.view.cwd.appendSlice(gpa, "/w");
+        for (bodies, 1..) |body, seq| {
+            const b = block.Block{ .id = seq, .session_id = 1, .turn_id = 1, .seq = seq, .ts = 0, .body = body };
+            if (replay) {
+                try app.view.blocks.append(gpa, (try allocDurableRenderBlock(gpa, b)).?);
+            } else switch (body) {
+                .tool_call => |call| app.pushDurableBlock(b, .tool_call, call.args_json, call.name, .ok),
+                .tool_result => |result| app.pushDurableToolResult(b, result.inline_body, result.status, null, ""),
+                else => unreachable,
+            }
+        }
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const lines = try layoutLines(arena_state.allocator(), &app, 80);
+        var saw_edit = false;
+        var added: usize = 0;
+        var removed: usize = 0;
+        for (lines.items) |line| {
+            if (std.mem.indexOf(u8, line.text, "⚙ Edit") != null) {
+                saw_edit = true;
+                try std.testing.expectEqualStrings("src/a.zig", line.text2);
+                try std.testing.expectEqualStrings(" · +1 -1", line.text3);
+            }
+            if (std.mem.eql(u8, line.text2, "new")) {
+                added += 1;
+                try std.testing.expectEqual(Palette.diff_add_code, line.fill_style.?);
+            }
+            if (std.mem.eql(u8, line.text2, "old")) {
+                removed += 1;
+                try std.testing.expectEqual(Palette.diff_del_code, line.fill_style.?);
+            }
+        }
+        try std.testing.expect(saw_edit);
+        try std.testing.expectEqual(@as(usize, 1), added);
+        try std.testing.expectEqual(@as(usize, 1), removed);
+    }
+}
+
 test "a failing sibling expands alone; healthy batch members stay folded" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -6274,4 +6335,78 @@ test "cwd completion uses daemon replies and rejects stale paths and sessions" {
         } }));
         try std.testing.expectEqual(@as(usize, 0), app.cwdCompletionMatches().len);
     }
+}
+
+test "transcript expansion stays per session after tab cache eviction" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    try handleKey(&app, .{ .codepoint = 't', .mods = .{ .ctrl = true } });
+    try app.focusSession(2, true);
+    try std.testing.expect(!app.view.show_tool_transcript);
+    try app.focusSession(1, true);
+    try std.testing.expect(app.view.show_tool_transcript);
+
+    for (3..App.max_saved_views + 5) |sid| try app.focusSession(sid, true);
+    try std.testing.expect(app.saved_views.get(1) == null);
+    try std.testing.expect(app.saved_views.get(2) == null);
+    try app.focusSession(1, true);
+    try std.testing.expect(app.view.show_tool_transcript);
+    try app.focusSession(2, true);
+    try std.testing.expect(!app.view.show_tool_transcript);
+
+    try app.focusSession(1, true);
+    try handleKey(&app, .{ .codepoint = 't', .mods = .{ .ctrl = true } });
+    for (3..App.max_saved_views + 5) |sid| try app.focusSession(sid, true);
+    try std.testing.expect(app.saved_views.get(1) == null);
+    try app.focusSession(1, true);
+    try std.testing.expect(!app.view.show_tool_transcript);
+    try std.testing.expect(!app.expanded_transcripts.contains(1));
+}
+
+test "remote reconnects survive prolonged outages with bounded backoff" {
+    var remote = tui.ReconnectSchedule{ .remote = true };
+    try std.testing.expectEqual(@as(?u32, 0), remote.nextDelayMs());
+    for (0..1000) |_| {
+        const delay = remote.nextDelayMs() orelse return error.StoppedRetrying;
+        try std.testing.expect(delay > 0 and delay <= 10_000);
+    }
+    remote.attempts = std.math.maxInt(u32);
+    try std.testing.expectEqual(@as(?u32, 10_000), remote.nextDelayMs());
+    try std.testing.expectEqual(@as(?u32, 10_000), remote.nextDelayMs());
+    var local = tui.ReconnectSchedule{ .remote = false };
+    for (0..3) |_| try std.testing.expect(local.nextDelayMs() != null);
+    try std.testing.expectEqual(@as(?u32, null), local.nextDelayMs());
+}
+
+test "offline Enter preserves the draft and quit still works" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .reconnecting = true, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    for ([_][]const u8{ "a draft to send later", "/runtime 0", "/some-skill work" }) |draft| {
+        app.view.editor.clear();
+        app.view.editor.insertSlice(draft);
+        try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+        try std.testing.expectEqualStrings(draft, app.view.editor.text.items);
+        try std.testing.expectEqual(@as(usize, 0), output.written().len);
+        try std.testing.expect(!app.should_quit);
+    }
+    app.view.editor.clear();
+    app.view.editor.insertSlice("/quit");
+    try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(app.should_quit);
 }

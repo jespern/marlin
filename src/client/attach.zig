@@ -228,6 +228,13 @@ fn isTransientHandshakeError(err: anyerror) bool {
     };
 }
 
+pub fn isRetryableReconnectError(err: anyerror) bool {
+    return isTransientHandshakeError(err) or switch (err) {
+        error.DaemonHandshakeTimedOut, error.ReadFailed, error.WriteFailed => true,
+        else => false,
+    };
+}
+
 const handshake_timeout_ms: u32 = 2_000;
 /// Remote handshakes cover ssh session setup, remote daemon autostart, and
 /// possibly an interactive ssh auth prompt on /dev/tty; a local-socket
@@ -384,9 +391,30 @@ pub fn connectCancelable(
     self_exe: []const u8,
     cancel: ?*const ConnectCancel,
 ) !*Conn {
+    return connectWithMode(gpa, io, environ, self_exe, cancel, false);
+}
+
+pub fn reconnectCancelable(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    cancel: *const ConnectCancel,
+) !*Conn {
+    return connectWithMode(gpa, io, environ, self_exe, cancel, true);
+}
+
+fn connectWithMode(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    cancel: ?*const ConnectCancel,
+    reconnecting: bool,
+) !*Conn {
     if (connectCancelled(cancel)) return error.ConnectCanceled;
     if (environ.get(remote_env)) |host| {
-        if (host.len > 0) return connectRemote(gpa, io, host, cancel);
+        if (host.len > 0) return connectRemote(gpa, io, host, cancel, reconnecting);
     }
     var spawned = false;
     var ready_pipe: ?Io.File = null;
@@ -482,11 +510,24 @@ pub fn spawnRemoteRebuild(gpa: std.mem.Allocator, io: Io, host: []const u8) !*Co
     return spawnChildConn(gpa, io, &.{ "ssh", host, "sh -lc 'exec marlin _rebuild'" });
 }
 
+/// A dedicated connection makes the liveness settings effective even when
+/// ssh config normally reuses a master. Reconnects must not steal TUI input
+/// for an authentication prompt; initial connects remain interactive.
+pub fn remoteArgv(host: []const u8, reconnecting: bool) [15][]const u8 {
+    return .{
+        "ssh", "-T",                    "-S",                         "none",
+        "-o",  "ServerAliveInterval=5", "-o",                         "ServerAliveCountMax=3",
+        "-o",  "ConnectTimeout=10",     "-o",                         if (reconnecting) "BatchMode=yes" else "BatchMode=no",
+        "--",  host,                    "sh -lc 'exec marlin _pipe'",
+    };
+}
+
 fn connectRemote(
     gpa: std.mem.Allocator,
     io: Io,
     host: []const u8,
     cancel: ?*const ConnectCancel,
+    reconnecting: bool,
 ) !*Conn {
     // One transient retry, not the local loop's hundred: each attempt pays
     // full ssh session setup, and the case worth absorbing is a remote
@@ -499,15 +540,16 @@ fn connectRemote(
         // `ssh host marlin _pipe` runs a non-interactive shell whose PATH
         // usually misses ~/.local/bin and homebrew. ssh config owns naming,
         // keys, agent, and jump hosts; marlin keeps no host registry.
-        const conn = try spawnChildConn(gpa, io, &.{ "ssh", host, "sh -lc 'exec marlin _pipe'" });
+        const argv = remoteArgv(host, reconnecting);
+        const conn = try spawnChildConnWithStderr(gpa, io, &argv, !reconnecting);
         handshake(conn, remote_handshake_timeout_ms, cancel) catch |err| {
             conn.deinit();
             if (err == error.ConnectCanceled) return err;
-            if (attempt < 1 and isTransientHandshakeError(err)) {
+            if (!reconnecting and attempt < 1 and isTransientHandshakeError(err)) {
                 io.sleep(.fromMilliseconds(250), .awake) catch {};
                 continue;
             }
-            std.log.err(
+            if (!reconnecting) std.log.err(
                 "could not reach `ssh {s} sh -lc 'exec marlin _pipe'`: {t}\n" ++
                     "  ssh's own messages (host-key prompts, auth errors, 'command\n" ++
                     "  not found') appear above this line. Most common cause: marlin\n" ++
@@ -522,6 +564,10 @@ fn connectRemote(
 }
 
 pub fn spawnChildConn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) !*Conn {
+    return spawnChildConnWithStderr(gpa, io, argv, true);
+}
+
+fn spawnChildConnWithStderr(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, inherit_stderr: bool) !*Conn {
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .pipe,
@@ -530,10 +576,9 @@ pub fn spawnChildConn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) 
         // host key confirmation, key passphrases) and its failure text all
         // arrive on stderr. Swallowing them turned "unknown host key" into
         // a silent 30s hang — the prompt was waiting on /dev/tty while its
-        // question went nowhere. During a mid-TUI reconnect this may
-        // scribble on the alternate screen; the next frame repaints, and a
-        // visible scribble beats an invisible prompt.
-        .stderr = .inherit,
+        // question went nowhere. Background retries are noninteractive and
+        // report their state in the TUI instead of writing over its screen.
+        .stderr = if (inherit_stderr) .inherit else .ignore,
         .pgid = child_pgid,
     });
     errdefer child.kill(io);

@@ -13,7 +13,6 @@ const SyntaxSpan = render.SyntaxSpan;
 const Line = render.Line;
 const spinner_frames = render.spinner_frames;
 const shimmerSpans = render.shimmerSpans;
-const lastNonEmptyLine = render.lastNonEmptyLine;
 const utf8Floor = render.utf8Floor;
 const clipText = render.clipText;
 const isLegacyRehydration = render.isLegacyRehydration;
@@ -237,6 +236,7 @@ pub const RenderBlock = struct {
     text: []u8,
     /// tool_call: "name" — used for the collapsed header line.
     label: []u8,
+    call_id: []u8 = &.{},
     /// Terminal completed plan revision. Intermediate revisions stay in the
     /// pinned App plan only; retaining all of them would waste memory and
     /// render duplicate historical tables.
@@ -262,6 +262,7 @@ pub const RenderBlock = struct {
     pub fn deinit(self: *RenderBlock, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
         gpa.free(self.label);
+        if (self.call_id.len > 0) gpa.free(self.call_id);
         for (self.plan_items) |item| gpa.free(item.step);
         if (self.plan_items.len > 0) gpa.free(self.plan_items);
         if (self.full_body_ref) |ref| gpa.free(ref);
@@ -448,6 +449,13 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     } else try gpa.dupe(u8, label);
     errdefer gpa.free(owned_label);
     const owned_ref = if (full_body_ref) |ref| try gpa.dupe(u8, ref) else null;
+    errdefer if (owned_ref) |ref| gpa.free(ref);
+    const call_id = switch (b.body) {
+        .tool_call => |call| call.call_id,
+        .tool_result => |result| result.call_id,
+        else => "",
+    };
+    const owned_call_id: []u8 = if (call_id.len > 0) try gpa.dupe(u8, call_id) else &.{};
 
     return .{
         .kind = kind,
@@ -456,6 +464,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .turn_id = b.turn_id,
         .text = owned_text,
         .label = owned_label,
+        .call_id = owned_call_id,
         .plan_items = plan_items,
         .status = status,
         .full_body_ref = owned_ref,
@@ -492,7 +501,7 @@ pub fn wrapPromptCard(
         const source_links = try findLinkSpans(arena, raw_line);
         var rest = raw_line;
         while (true) {
-            const take = @min(rest.len, body_width);
+            const take = render.promptRowEnd(rest, 0, body_width);
             const chunk_start = raw_line.len - rest.len;
             const prefix = if (first) first_prefix else continuation;
             const links = try linksForChunk(
@@ -564,6 +573,50 @@ pub fn wrapReasoningCard(
     }
 }
 
+/// Keep the normal view readable while Ctrl+T retains the complete text.
+/// Bound the source window as well as the rows: live thinking can be large.
+pub fn wrapReasoningPreview(
+    arena: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    text: []const u8,
+    width: usize,
+    latest: bool,
+) !void {
+    const budget = @min(@max(width, 8) * 3 * 4, 4096);
+    const start = if (latest and text.len > budget) render.nextCpEndFor(text, text.len - budget) else 0;
+    const end = if (latest) text.len else utf8Floor(text, @min(text.len, budget));
+    var preview: std.ArrayList(Line) = .empty;
+    try wrapReasoningCard(arena, &preview, text[start..end], width -| 2);
+    const count = @min(preview.items.len, 3);
+    const first = if (latest) preview.items.len - count else 0;
+    const output_start = lines.items.len;
+    try lines.appendSlice(arena, preview.items[first..][0..count]);
+    if (count == 0) return;
+    const head = &lines.items[output_start];
+    const marker = if (first > 0 or start > 0) "  … " else "  · ";
+    const shift = marker.len - head.text.len;
+    if (shift > 0) {
+        const syntax = try arena.dupe(SyntaxSpan, head.syntax);
+        for (syntax) |*span| {
+            span.start += shift;
+            span.end += shift;
+        }
+        head.syntax = syntax;
+        const links = try arena.dupe(LinkSpan, head.links);
+        for (links) |*span| {
+            span.start += shift;
+            span.end += shift;
+        }
+        head.links = links;
+    }
+    head.text = marker;
+    head.style = Palette.reasoning_mark;
+    if (!latest and (preview.items.len > count or end < text.len)) {
+        lines.items[lines.items.len - 1].text3 = " …";
+        lines.items[lines.items.len - 1].style3 = Palette.collapse_hint;
+    }
+}
+
 pub const CollapsedToolRun = struct {
     count: usize,
     /// First block after the run.
@@ -577,8 +630,8 @@ pub fn isDiffOutput(text: []const u8) bool {
 /// Tools whose diff output is a change the agent MADE. Only these stop the
 /// collapse run below; a diff the agent merely read (`bash git diff …`) is
 /// ordinary command output and collapses like any other success. Covers both
-/// vocabularies: native (edit/write_file) and Claude Code guest sessions
-/// (Edit/Write/…), whose bridge emits diffs in the same dialect.
+/// vocabularies: native (edit/write_file) and guest sessions (Edit/Write/…),
+/// whose adapters emit unified diffs.
 pub fn isFileEditTool(label: []const u8) bool {
     const authored = [_][]const u8{ "edit", "write_file", "Edit", "Write", "MultiEdit", "NotebookEdit" };
     for (authored) |name| {
@@ -690,7 +743,8 @@ pub fn appendToolCallLine(
     else
         "";
     if (hi) |h| {
-        const hi_capped = h[0..@min(h.len, w -| (head.len + 2))];
+        const available = w -| (displayWidth(head) + displayWidth(note_text) + 2);
+        const hi_capped = h[0..hardCellBreak(h, 0, available)];
         const is_bash = std.ascii.eqlIgnoreCase(rb.label, "bash");
         try lines.append(alloc, .{
             .text = head,
@@ -803,11 +857,14 @@ const DiffStats = struct {
 /// carry their omitted-line count explicitly, so their diffstat remains exact.
 fn diffStats(text: []const u8) DiffStats {
     var stats: DiffStats = .{};
+    var in_hunk = false;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
-        if (std.mem.startsWith(u8, line, "+") and !std.mem.startsWith(u8, line, "+++")) {
+        if (std.mem.startsWith(u8, line, "@@ ")) in_hunk = true;
+        if (line.len == 0) in_hunk = false;
+        if (std.mem.startsWith(u8, line, "+") and (in_hunk or !std.mem.startsWith(u8, line, "+++"))) {
             stats.added += 1;
-        } else if (std.mem.startsWith(u8, line, "-") and !std.mem.startsWith(u8, line, "---")) {
+        } else if (std.mem.startsWith(u8, line, "-") and (in_hunk or !std.mem.startsWith(u8, line, "---"))) {
             stats.removed += 1;
         } else if (std.mem.startsWith(u8, line, "… ") and std.mem.endsWith(u8, line, " more new lines")) {
             const count = line["… ".len .. line.len - " more new lines".len];
@@ -818,10 +875,14 @@ fn diffStats(text: []const u8) DiffStats {
 }
 
 pub fn diffSummaryNote(alloc: std.mem.Allocator, text: []const u8) !?[]const u8 {
-    const intro = diffIntroNote(text) orelse return null;
+    const intro = diffIntroNote(text);
+    if (intro == null and !isDiffOutput(text)) return null;
     const stats = diffStats(text);
-    if (stats.added == 0 and stats.removed == 0) return intro;
-    return try std.fmt.allocPrint(alloc, "{s} · +{d} -{d}", .{ intro, stats.added, stats.removed });
+    if (intro) |note| {
+        if (stats.added == 0 and stats.removed == 0) return note;
+        return try std.fmt.allocPrint(alloc, "{s} · +{d} -{d}", .{ note, stats.added, stats.removed });
+    }
+    return try std.fmt.allocPrint(alloc, "+{d} -{d}", .{ stats.added, stats.removed });
 }
 
 pub fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, tool_label: []const u8) !void {
@@ -834,7 +895,7 @@ pub fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Lin
     const is_diff = isDiffOutput(rb.text);
     const authored = is_diff and isFileEditTool(tool_label);
     const max_shown: usize = if (authored) 24 else 8;
-    const language = if (is_diff) diffLanguage(rb.text) else SyntaxLanguage.generic;
+    var language = if (is_diff) diffLanguage(rb.text) else SyntaxLanguage.generic;
     var shown: usize = 0;
     var total: usize = 0;
     var diff_nums: DiffLineNumbers = .{};
@@ -842,9 +903,12 @@ pub fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Lin
     var it = std.mem.splitScalar(u8, rb.text, '\n');
     while (it.next()) |l| {
         defer first = false;
+        if (l.len == 0) diff_nums.active = false;
+        if (!diff_nums.active and (std.mem.startsWith(u8, l, "--- ") or std.mem.startsWith(u8, l, "+++ ")) and
+            !std.mem.eql(u8, l[4..], "/dev/null")) language = render.languageForPath(l[4..]);
         // An authored diff's intro line ("created x (96 bytes)") is rendered
         // as a dim note on the ⚙ line instead; the hunks speak for themselves.
-        if (first and authored and rb.status == .ok and !std.mem.startsWith(u8, l, "@@ ")) continue;
+        if (first and authored and rb.status == .ok and diffIntroNote(rb.text) != null) continue;
         total += 1;
         if (shown < max_shown) {
             if (rb.status == .ok and is_diff) {
@@ -911,12 +975,18 @@ pub const ExpandPair = struct {
     show_result: bool = true,
 };
 
-/// Locate the result paired positionally with a call in one provider batch.
-/// Calls are emitted first and results follow in the same order, with only
-/// metadata blocks allowed between them.
+/// Prefer durable call IDs; when IDs are unavailable, fall back to a
+/// calls-first batch with results in the same order.
 fn pairedToolResult(blocks: []const RenderBlock, call_idx: usize) ?RenderBlock {
     if (call_idx >= blocks.len or blocks[call_idx].kind != .tool_call) return null;
     const turn_id = blocks[call_idx].turn_id;
+    if (blocks[call_idx].call_id.len > 0) {
+        for (blocks[call_idx + 1 ..]) |candidate| {
+            if (candidate.turn_id != turn_id) break;
+            if (candidate.kind == .tool_result and std.mem.eql(u8, candidate.call_id, blocks[call_idx].call_id)) return candidate;
+        }
+        return null;
+    }
     var calls_start = call_idx;
     while (calls_start > 0 and blocks[calls_start - 1].kind == .tool_call and
         blocks[calls_start - 1].turn_id == turn_id) : (calls_start -= 1)
@@ -939,6 +1009,18 @@ fn pairedToolResult(blocks: []const RenderBlock, call_idx: usize) ?RenderBlock {
             },
             else => break,
         }
+    }
+    return null;
+}
+
+fn pairedToolCallIndex(blocks: []const RenderBlock, result_idx: usize) ?usize {
+    const result = blocks[result_idx];
+    if (result.call_id.len == 0) return null;
+    var i = result_idx;
+    while (i > 0) {
+        i -= 1;
+        if (blocks[i].turn_id != result.turn_id) break;
+        if (blocks[i].kind == .tool_call and std.mem.eql(u8, blocks[i].call_id, result.call_id)) return i;
     }
     return null;
 }
@@ -968,7 +1050,7 @@ pub fn scanToolBatch(
         switch (blocks[i].kind) {
             .approval, .reasoning, .system_note, .plan => {},
             .tool_result => {
-                const call_idx = start + matched;
+                const call_idx = pairedToolCallIndex(blocks, i) orelse start + matched;
                 const failed = blocks[i].status != .ok;
                 const author_diff = isDiffOutput(blocks[i].text) and
                     isFileEditTool(blocks[call_idx].label);
@@ -1188,10 +1270,8 @@ pub const Transcript = struct {
     /// The TUI's TODO table supplies its own spinner and active-step timer;
     /// suppress this competing live-status row while that table is visible.
     show_working_ticker: bool = true,
-    /// The session runs a guest agent (Claude Code, Codex). Guests emit no
-    /// thinking, so their between-tool prose is the whole narration and is
-    /// rendered as ordinary assistant text, and their tool calls show as a
-    /// compact one-line trail instead of folding into "Ran N commands".
+    /// Guest prose renders as assistant text, exposed thinking gets a compact
+    /// preview, and tools use a one-line trail instead of "Ran N commands".
     guest: bool = false,
     guest_activity: []const proto.GuestActivity = &.{},
     cwd: []const u8 = "",
@@ -1578,48 +1658,57 @@ pub fn layoutBlockRange(
                 try wrapMarkdown(alloc, lines, rb.text, w);
             },
             .reasoning => {
-                // Raw provider reasoning folds out of the default view: some
-                // models (grok) fill it with drafted replies and summarizer
-                // fragments, which reads as two narrators fighting. The
-                // model's deliberate one-line narration (commentary=true)
-                // stays unless a later commentary/final answer says the same
-                // thing. ctrl+t reveals the complete durable transcript.
+                // Guest summaries get a compact preview; native raw thinking
+                // stays folded because it can contain drafted replies.
                 if (transcript.guest and rb.commentary) {
-                    // A guest's only narration: full text, assistant styling.
+                    // Deliberate progress updates: full text, assistant styling.
                     // Still superseded by a later message saying the same.
                     if (transcript.show_tool_transcript or !commentarySuperseded(transcript.blocks, block_idx)) {
                         try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                         try blankLine(alloc, lines);
                         try wrapMarkdown(alloc, lines, rb.text, w);
                     }
+                } else if (transcript.guest and !transcript.show_tool_transcript) {
+                    try blankLine(alloc, lines);
+                    try wrapReasoningPreview(alloc, lines, rb.text, w, false);
                 } else if (transcript.show_tool_transcript or
                     (rb.commentary and !commentarySuperseded(transcript.blocks, block_idx)))
                 {
                     try blankLine(alloc, lines);
-                    try wrapReasoningCard(alloc, lines, try clipText(alloc, rb.text, 280), w);
+                    const text = if (transcript.show_tool_transcript) rb.text else try clipText(alloc, rb.text, 280);
+                    try wrapReasoningCard(alloc, lines, text, w);
                 }
             },
             .tool_call => {
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 if (!last_dense) try blankLine(alloc, lines);
                 last_tool_label.* = rb.label;
+                const result = pairedToolResult(transcript.blocks, block_idx);
+                const note = if (result != null and result.?.status == .ok and isFileEditTool(rb.label))
+                    try diffSummaryNote(alloc, result.?.text)
+                else
+                    null;
                 try appendToolCallLine(
                     alloc,
                     lines,
                     rb,
                     transcript.cwd,
                     w,
-                    null,
-                    pairedToolResult(transcript.blocks, block_idx),
+                    note,
+                    result,
                 );
             },
             .tool_result => {
+                const tool_label = if (pairedToolCallIndex(transcript.blocks, block_idx)) |call_idx|
+                    transcript.blocks[call_idx].label
+                else
+                    last_tool_label.*;
                 // Guest trail: the call line is the progress signal; a
                 // successful result body is machinery unless it is an
                 // authored diff. Failures always show.
                 if (transcript.guest and !transcript.show_tool_transcript and rb.status == .ok and
-                    !(isFileEditTool(last_tool_label.*) and isDiffOutput(rb.text))) continue;
-                try appendToolResultLines(alloc, lines, rb, last_tool_label.*);
+                    !(isFileEditTool(tool_label) and isDiffOutput(rb.text))) continue;
+                try appendToolResultLines(alloc, lines, rb, tool_label);
             },
             .approval => {
                 const txt = try std.fmt.allocPrint(alloc, "    [approval: {s}]", .{rb.text});
@@ -1787,21 +1876,16 @@ pub fn layoutLines(
     try lines.appendSlice(arena, tail_cache.lines.items);
 
     const live_timestamp: ?i64 = if (transcript.phase_started_ms > 0) transcript.phase_started_ms else if (transcript.turn_started_ms > 0) transcript.turn_started_ms else if (transcript.blocks.len > 0) transcript.blocks[transcript.blocks.len - 1].timestamp_ms else null;
-    // Streaming region: provider reasoning summaries are verbose by nature
-    // (first-person deliberation), so the live view is a one-line ticker
-    // showing only the freshest thought — not a growing wall. The durable
-    // card at round end is clipped separately below.
+    // Live thinking follows the latest few wrapped lines. Expanded transcripts
+    // expose the full stream, just as they do for completed reasoning.
     if (transcript.reasoning_delta.len > 0) {
+        try blankLine(arena, &lines);
         const first = lines.items.len;
         defer stampOutputLines(lines.items[first..], live_timestamp);
-        const tail = lastNonEmptyLine(transcript.reasoning_delta);
-        const cap = @min(tail.len, w -| 8);
-        try lines.append(arena, .{
-            .text = "  · ",
-            .style = Palette.reasoning_mark,
-            .text2 = tail[0..utf8Floor(tail, cap)],
-            .style2 = Palette.reasoning,
-        });
+        if (transcript.show_tool_transcript)
+            try wrapReasoningCard(arena, &lines, transcript.reasoning_delta, w)
+        else
+            try wrapReasoningPreview(arena, &lines, transcript.reasoning_delta, w, true);
     }
     if (transcript.delta.len > 0) {
         const first = lines.items.len;
@@ -1817,6 +1901,7 @@ pub fn layoutLines(
             try appendGuestActivityChildren(arena, &lines, transcript.guest_activity, "", 0, nowWallMs(transcript.io), live_timestamp);
         }
         if (transcript.reasoning_delta.len == 0) {
+            try blankLine(arena, &lines);
             const head = try std.fmt.allocPrint(arena, "{s} ", .{
                 spinner_frames[transcript.spinner_frame % spinner_frames.len],
             });
@@ -1961,6 +2046,9 @@ const DisplayArg = struct {
 const DisplayArgsJson = struct {
     path: ?[]const u8 = null,
     file_path: ?[]const u8 = null,
+    filePath: ?[]const u8 = null,
+    notebook_path: ?[]const u8 = null,
+    changes: ?[]const struct { path: []const u8 = "" } = null,
     command: ?[]const u8 = null,
     pattern: ?[]const u8 = null,
     url: ?[]const u8 = null,
@@ -1989,6 +2077,17 @@ pub fn toolDisplayArgDecoded(
         else => return malformedDisplayArg(tool_name, args_json, cwd),
     };
 
+    if (isFileEditTool(tool_name)) {
+        if (parsed.changes) |changes| {
+            var paths: std.ArrayList(u8) = .empty;
+            for (changes) |change| {
+                if (change.path.len == 0) continue;
+                if (paths.items.len > 0) try paths.appendSlice(arena, ", ");
+                try paths.appendSlice(arena, if (std.fs.path.isAbsolute(change.path)) shortenDisplayPath(change.path, cwd) else change.path);
+            }
+            if (paths.items.len > 0) return paths.items;
+        }
+    }
     const arg = decodedDisplayArg(tool_name, parsed) orelse return null;
     if (!arg.is_path or !std.fs.path.isAbsolute(arg.value)) return arg.value;
     return shortenDisplayPath(arg.value, cwd);
@@ -2002,6 +2101,21 @@ fn completedToolDisplayArg(
 ) !?[]const u8 {
     const started = try toolDisplayArgDecoded(arena, call.label, call.text, cwd);
     if (started) |value| if (value.len > 0) return value;
+    if (isFileEditTool(call.label)) {
+        const completed = result orelse return started;
+        var path: ?[]const u8 = null;
+        var lines = std.mem.splitScalar(u8, completed.text, '\n');
+        while (lines.next()) |line| {
+            if ((std.mem.startsWith(u8, line, "+++ ") or std.mem.startsWith(u8, line, "--- ")) and
+                !std.mem.eql(u8, line[4..], "/dev/null"))
+            {
+                path = line[4..];
+                if (std.mem.startsWith(u8, line, "+++ ")) break;
+            }
+            if (std.mem.startsWith(u8, line, "@@ ")) break;
+        }
+        if (path) |value| return if (std.fs.path.isAbsolute(value)) shortenDisplayPath(value, cwd) else value;
+    }
     if (!isNetworkReadTool(call.label)) return started;
     const completed = result orelse return started;
     const enriched = try toolDisplayArgDecoded(arena, call.label, completed.text, cwd);
@@ -2018,9 +2132,11 @@ fn malformedDisplayArg(tool_name: []const u8, args_json: []const u8, cwd: []cons
 }
 
 fn decodedDisplayArg(tool_name: []const u8, root: DisplayArgsJson) ?DisplayArg {
-    if (isFileTool(tool_name)) {
+    if (isFileTool(tool_name) or isFileEditTool(tool_name)) {
         if (root.path) |value| return .{ .value = value, .is_path = true };
         if (root.file_path) |value| return .{ .value = value, .is_path = true };
+        if (root.filePath) |value| return .{ .value = value, .is_path = true };
+        if (root.notebook_path) |value| return .{ .value = value, .is_path = true };
         return null;
     }
     if (std.ascii.eqlIgnoreCase(tool_name, "bash"))
@@ -2148,8 +2264,8 @@ pub fn appendDiffLine(
         return true;
     }
 
-    const is_add = std.mem.startsWith(u8, line, "+") and !std.mem.startsWith(u8, line, "+++");
-    const is_del = std.mem.startsWith(u8, line, "-") and !std.mem.startsWith(u8, line, "---");
+    const is_add = std.mem.startsWith(u8, line, "+") and (nums.active or !std.mem.startsWith(u8, line, "+++"));
+    const is_del = std.mem.startsWith(u8, line, "-") and (nums.active or !std.mem.startsWith(u8, line, "---"));
     const is_context = std.mem.startsWith(u8, line, " ");
     if (is_add or is_del or is_context) {
         var number: usize = 0;

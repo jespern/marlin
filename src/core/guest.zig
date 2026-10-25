@@ -5,6 +5,17 @@
 
 const std = @import("std");
 
+/// User-facing narration supplements the structured tool/activity stream.
+pub const progress_instructions =
+    "Keep the user informed with brief progress updates in ordinary assistant text. " ++
+    "Before substantial work, say what you are checking and why. During longer work, " ++
+    "share a concise update when you learn something useful, change direction, or begin " ++
+    "a long operation: what you found, what it means, and what comes next. " ++
+    "Use one or two short sentences, with occasional updates between tool batches. " ++
+    "Tool descriptions alone are not progress updates. Avoid narrating every tool call, " ++
+    "repeating unchanged status, or exposing private chain-of-thought; give findings " ++
+    "and brief decision summaries instead. Follow the user's preferences for verbosity.";
+
 pub const Backend = enum {
     claude_code,
     codex,

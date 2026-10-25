@@ -19,6 +19,36 @@ test "child transport inherits the foreground process group for ssh prompts" {
     try std.testing.expectEqual(@as(?std.posix.pid_t, null), attach.child_pgid);
 }
 
+test "SSH resolves pipe liveness and reconnect authentication options" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    for ([_]bool{ false, true }) |reconnecting| {
+        const pipe_argv = attach.remoteArgv("marlin-fixture.invalid", reconnecting);
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        // -G evaluates the real SSH configuration without making a connection.
+        try argv.appendSlice(gpa, &.{ "ssh", "-G", "-F", "/dev/null" });
+        try argv.appendSlice(gpa, pipe_argv[1..]);
+        const result = std.process.run(gpa, threaded.io(), .{ .argv = argv.items }) catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            else => return err,
+        };
+        defer gpa.free(result.stdout);
+        defer gpa.free(result.stderr);
+        try std.testing.expect(result.term == .exited and result.term.exited == 0);
+        for ([_][]const u8{ "serveraliveinterval 5\n", "serveralivecountmax 3\n", "connecttimeout 10\n", "requesttty false\n" }) |setting|
+            try std.testing.expect(std.mem.indexOf(u8, result.stdout, setting) != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, if (reconnecting) "batchmode yes\n" else "batchmode no\n") != null);
+    }
+    try std.testing.expect(attach.isRetryableReconnectError(error.EndOfStream));
+    try std.testing.expect(attach.isRetryableReconnectError(error.DaemonHandshakeTimedOut));
+    try std.testing.expect(attach.isRetryableReconnectError(error.ReadFailed));
+    try std.testing.expect(attach.isRetryableReconnectError(error.WriteFailed));
+    try std.testing.expect(!attach.isRetryableReconnectError(error.DaemonError));
+    try std.testing.expect(!attach.isRetryableReconnectError(error.ConnectCanceled));
+}
+
 const FlakyHelloServer = struct {
     io: Io,
     server: *Io.net.Server,

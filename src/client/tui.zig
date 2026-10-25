@@ -521,6 +521,8 @@ pub const App = struct {
     /// subscribed to their block streams. Moving a view in and out of App is
     /// allocation-free after the first visit.
     saved_views: std.AutoHashMapUnmanaged(u64, *SessionView) = .empty,
+    /// Small per-session preference survives eviction of the transcript cache.
+    expanded_transcripts: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Catalog-level guest work. Unlike cached transcripts, this contains
     /// every watched session so Ctrl+S can inspect background activity.
     guest_activities: std.AutoHashMapUnmanaged(u64, ActivitySnapshot) = .empty,
@@ -655,6 +657,7 @@ pub const App = struct {
     mk64_rom: ?[]u8 = null,
     mk64_autopilot: bool = false,
     remote_transport: bool = false,
+    reconnecting: bool = false,
     next_input_request_id: u64 = 1,
 
     pub fn deinit(self: *App) void {
@@ -691,6 +694,7 @@ pub const App = struct {
             self.gpa.destroy(saved.*);
         }
         self.saved_views.deinit(self.gpa);
+        self.expanded_transcripts.deinit(self.gpa);
         var activity_it = self.guest_activities.valueIterator();
         while (activity_it.next()) |snapshot| snapshot.deinit();
         self.guest_activities.deinit(self.gpa);
@@ -1100,6 +1104,10 @@ pub const App = struct {
     /// Park the focused view in the MRU cache and leave a fresh, empty view
     /// (same sid until the caller reassigns it) in its place.
     pub fn saveActiveView(self: *App) !void {
+        if (self.view.show_tool_transcript)
+            try self.expanded_transcripts.put(self.gpa, self.view.sid, {})
+        else
+            _ = self.expanded_transcripts.remove(self.view.sid);
         const saved = try self.gpa.create(SessionView);
         errdefer self.gpa.destroy(saved);
         self.saved_view_clock +%= 1;
@@ -1200,6 +1208,7 @@ pub const App = struct {
             self.view.plan_mode = summary.plan_mode;
             self.view.usage_credits = summary.usage_credits;
         }
+        self.view.show_tool_transcript = self.expanded_transcripts.contains(sid);
         if (self.background_approvals.get(sid)) |pending| {
             self.view.pending = pending;
             _ = self.background_approvals.remove(sid);
@@ -1542,6 +1551,7 @@ pub const App = struct {
             self.gpa.destroy(saved);
         }
         _ = self.background_approvals.remove(sid);
+        _ = self.expanded_transcripts.remove(sid);
     }
 
     pub fn currentInflightCall(self: *const App) ?InflightCall {
@@ -1567,6 +1577,12 @@ pub const App = struct {
             rendered.seq = b.seq;
             rendered.turn_id = b.turn_id;
             rendered.timestamp_ms = b.ts;
+            const call_id = switch (b.body) {
+                .tool_call => |call| call.call_id,
+                .tool_result => |result| result.call_id,
+                else => "",
+            };
+            if (call_id.len > 0) rendered.call_id = self.gpa.dupe(u8, call_id) catch &.{};
         }
     }
 
@@ -2423,7 +2439,17 @@ pub const App = struct {
 
     // -------------------------------------------------------- user input --
 
+    pub fn inputBlockedDuringReconnect(self: *App, text: []const u8) bool {
+        if (!self.reconnecting) return false;
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, "/quit") or std.mem.eql(u8, trimmed, "/q") or
+            std.mem.eql(u8, trimmed, "/detach")) return false;
+        self.setNotice("offline — reconnecting; draft kept, submit when connected", .{});
+        return true;
+    }
+
     pub fn submitInput(self: *App, text: []const u8) void {
+        if (self.inputBlockedDuringReconnect(text)) return;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.view.attachments.items.len == 0) return;
         const is_command = isCommandInput(text);
@@ -6151,10 +6177,10 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         };
         status_n += 1;
     }
-    if (app.notice.items.len > 0) {
+    if (app.reconnecting or app.notice.items.len > 0) {
         status_segments[status_n] = .{ .text = "  ", .style = Palette.status_bar };
         status_n += 1;
-        status_segments[status_n] = .{ .text = app.notice.items, .style = Palette.status_notice };
+        status_segments[status_n] = .{ .text = if (app.reconnecting) "offline — reconnecting…" else app.notice.items, .style = Palette.status_notice };
         status_n += 1;
     }
     _ = status_win.print(status_segments[0..status_n], .{ .wrap = .none });
@@ -6462,6 +6488,19 @@ fn readerThread(gpa: std.mem.Allocator, conn: *attach.Conn, loop: *vaxis.Loop(Ev
 /// resubscribe (from_seq replay), so a dropped local socket (daemon restart)
 /// or ssh child (laptop sleep, network hop) just needs a new transport under
 /// the same view — the mosh-like behavior, with state instead of pixels.
+pub const ReconnectSchedule = struct {
+    remote: bool,
+    attempts: u32 = 0,
+
+    pub fn nextDelayMs(self: *ReconnectSchedule) ?u32 {
+        if (!self.remote and self.attempts >= 3) return null;
+        const delays = [_]u32{ 0, 1_500, 3_000, 6_000, 10_000 };
+        const delay = delays[@min(self.attempts, delays.len - 1)];
+        self.attempts +|= 1;
+        return delay;
+    }
+};
+
 const ReconnectJob = struct {
     app: *App,
     loop: *vaxis.Loop(Event),
@@ -6472,25 +6511,25 @@ const ReconnectJob = struct {
         self.cancel.cancel();
     }
 
-    fn waitBetweenAttempts(self: *ReconnectJob) bool {
+    fn waitBetweenAttempts(self: *ReconnectJob, delay_ms: u32) bool {
         var elapsed_ms: u32 = 0;
-        while (elapsed_ms < 1_500) : (elapsed_ms += 50) {
+        while (elapsed_ms < delay_ms) : (elapsed_ms += 50) {
             if (self.cancel.isCancelled()) return false;
             self.app.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
         return !self.cancel.isCancelled();
     }
 
-    /// Bounded retries remain interruptible: quitting cancels an in-flight
-    /// local/SSH handshake and the spacing sleep, so teardown does not wait on
-    /// remote handshake deadlines.
+    /// Remote outages have no retry limit. Both the handshake and backoff
+    /// remain cancellable so quitting never waits for the network to return.
     fn run(job: *ReconnectJob) void {
-        var attempt: u32 = 0;
-        while (attempt < 3) : (attempt += 1) {
-            if (attempt > 0 and !job.waitBetweenAttempts()) return;
+        var schedule = ReconnectSchedule{ .remote = job.app.remote_transport };
+        while (schedule.nextDelayMs()) |delay_ms| {
+            if (!job.waitBetweenAttempts(delay_ms)) return;
             const environ = job.app.environ orelse break;
-            const conn = attach.connectCancelable(job.app.gpa, job.app.io, environ, job.self_exe, &job.cancel) catch |err| {
+            const conn = attach.reconnectCancelable(job.app.gpa, job.app.io, environ, job.self_exe, &job.cancel) catch |err| {
                 if (err == error.ConnectCanceled) return;
+                if (schedule.remote and !attach.isRetryableReconnectError(err)) break;
                 continue;
             };
             if (job.cancel.isCancelled()) {
@@ -6555,6 +6594,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     rt.join();
     const old = app.conn;
     app.conn = new_conn;
+    app.reconnecting = false;
     app.git_supported = new_conn.git_status;
     app.git_next_poll_ms = 0;
     app.git_label.clearRetainingCapacity();
@@ -7121,6 +7161,7 @@ pub fn run(
                     daemon_disconnect_reason = reason;
                     app.should_quit = true;
                 } else {
+                    app.reconnecting = true;
                     app.setNotice("connection lost — reconnecting…", .{});
                     reconnect_job = .{ .app = &app, .loop = &loop, .self_exe = self_exe };
                     reconnect_thread = std.Thread.spawn(.{}, ReconnectJob.run, .{&reconnect_job}) catch blk: {
@@ -7139,7 +7180,16 @@ pub fn run(
                     adoptReconnectedConn(&app, &loop, &rt, new_conn)
                 else
                     false;
-                if (!restored) {
+                if (!restored and maybe_conn != null and app.remote_transport and !app.should_quit) {
+                    // The network can disappear again between hello and the
+                    // subscription writes. Keep the old view and try again.
+                    reconnect_job = .{ .app = &app, .loop = &loop, .self_exe = self_exe };
+                    reconnect_thread = std.Thread.spawn(.{}, ReconnectJob.run, .{&reconnect_job}) catch blk: {
+                        daemon_disconnect_reason = "could not restart reconnect worker";
+                        app.should_quit = true;
+                        break :blk null;
+                    };
+                } else if (!restored) {
                     daemon_disconnect_reason = "reconnect failed";
                     app.should_quit = true;
                 }

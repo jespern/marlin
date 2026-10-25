@@ -1160,6 +1160,18 @@ pub fn wordBreak(text: []const u8, start: usize, capacity: usize) usize {
     return hard_end;
 }
 
+/// Word wrapping for editable/submitted prompts: retain every source byte,
+/// including whitespace, and only split a word when it cannot fit a row.
+pub fn promptRowEnd(text: []const u8, start: usize, capacity: usize) usize {
+    const end = hardCellBreak(text, start, capacity);
+    if (end >= text.len or text[end] == ' ' or text[end] == '\t') return end;
+    var at = end;
+    while (at > start) : (at -= 1) {
+        if (text[at - 1] == ' ' or text[at - 1] == '\t') return at;
+    }
+    return end;
+}
+
 pub fn spaces(arena: std.mem.Allocator, count: usize) ![]const u8 {
     const out = try arena.alloc(u8, count);
     @memset(out, ' ');

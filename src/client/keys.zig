@@ -509,6 +509,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
                     app.command_selection = 0;
                     return;
                 } else if (isEnterKey(key)) {
+                    if (app.inputBlockedDuringReconnect(ed.text.items)) return;
                     const suggestion = suggestions[app.command_selection];
                     completeSuggestion(ed, suggestion, false);
                     app.command_selection = 0;
@@ -527,6 +528,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (isNewlineKey(key)) {
                 ed.insertNewline();
             } else if (isEnterKey(key)) {
+                if (app.inputBlockedDuringReconnect(ed.text.items)) return;
                 const text = try ed.takeExpandedWithImages(app.view.attachments.items.len);
                 defer app.gpa.free(text);
                 app.submitInput(text);
@@ -1026,12 +1028,11 @@ pub fn isNewSessionKey(key: vaxis.Key) bool {
     return key.matches('n', .{ .ctrl = true });
 }
 
-/// Ctrl+W on an empty composer archives (close-pane muscle memory). Ctrl+D
-/// deliberately does NOT: an empty composer is the normal state while
-/// reading a transcript, and Ctrl+D there is vim/less page-down — archiving
-/// the session you were reading is the wrong surprise.
+/// Ctrl+D aliases Ctrl+W at an empty input prompt. In normal/copy mode it
+/// remains page-down so reading a transcript cannot accidentally archive it.
 pub fn isArchiveCurrentKey(app: *const App, key: vaxis.Key) bool {
-    return key.matches('w', .{ .ctrl = true }) and
+    return (key.matches('w', .{ .ctrl = true }) or
+        (app.mode == .insert and key.matches('d', .{ .ctrl = true }))) and
         app.view.editor.isEmpty() and app.view.attachments.items.len == 0 and
         app.copy_cursor == null;
 }

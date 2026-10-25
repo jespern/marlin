@@ -21,6 +21,20 @@ const codex = @import("../provider/codex.zig");
 const http = @import("../provider/http.zig");
 const build_options = @import("build_options");
 
+test "Codex file changes retain paths and normalize added and deleted contents" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const item = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"type":"fileChange","changes":[{"path":"/w/new.zig","kind":{"type":"add"},"diff":"const x = 1;\n\n"},{"path":"/w/old.py","kind":{"type":"delete"},"diff":"print('old')"},{"path":"/w/from.zig","kind":{"type":"update","move_path":"/w/to.zig"},"diff":"@@ -1 +1 @@\n-old\n+new"},{"path":"/w/empty.txt","kind":{"type":"add"},"diff":""}]}
+    , .{});
+    const body = try @import("codex_turn.zig").codexToolBody(arena, item);
+    try std.testing.expect(std.mem.indexOf(u8, body, "--- /dev/null\n+++ /w/new.zig\n@@ -0,0 +1,2 @@\n+const x = 1;\n+\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "--- /w/old.py\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-print('old')\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "--- /w/from.zig\n+++ /w/to.zig\n@@ -1 +1 @@\n-old\n+new") != null);
+    try std.testing.expect(std.mem.endsWith(u8, body, "+++ /w/empty.txt\n@@ -0,0 +0,0 @@\n"));
+}
+
 const codex_turn = @import("codex_turn.zig");
 
 test {
@@ -61,6 +75,7 @@ test "codex permission modes reach new and resumed threads" {
         \\      case "$line" in *\"method\":\"$method\"*) ;; *) exit 10 ;; esac
         \\      case "$line" in *\"sandbox\":\"$sandbox\"*) ;; *) exit 11 ;; esac
         \\      case "$line" in *\"approvalPolicy\":\"$approval\"*) ;; *) exit 12 ;; esac
+        \\      case "$line" in *'"developerInstructions":"Keep the user informed'*) ;; *) exit 14 ;; esac
         \\      echo '{"id":3,"result":{"thread":{"id":"permissions-thread"}}}' ;;
         \\    *'"method":"turn/start"'*)
         \\      case "$line" in *\"approvalPolicy\":\"$approval\"*) ;; *) exit 13 ;; esac

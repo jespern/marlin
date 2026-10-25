@@ -88,6 +88,14 @@ a guest tab feels like a native tab. The guest boundary is frozen at:
    node shape
 6. account-scoped model discovery for the shared `/model` picker
 
+Marlin also supplies a small communication instruction through Claude's
+`--append-system-prompt` and Codex's `developerInstructions` on thread start
+and resume. It requests occasional one- or two-sentence updates about findings,
+decisions, and next steps, without narrating each tool call or repeating idle
+status. Native sessions follow the same communication style. The vendor still
+owns the agent loop and decides what thinking/summary text it exposes; Marlin
+does not generate substitute reasoning when none is provided.
+
 Nothing else. Semantic rendering of unknown tools is a TUI fact, not a
 guest-tool catalogue. Images stay durable in Marlin and are not smuggled
 into the binary. `/compact`, `/sandbox`, session `/network`, and Marlin
@@ -238,7 +246,7 @@ Transport is `ssh <host> sh -lc 'exec marlin _pipe'`: an internal
 stdio↔daemon.sock bridge on the remote (readiness-probed, with daemon
 autostart), spawned per connection as a child of the local client. The
 login shell is deliberate — non-interactive ssh shells miss ~/.local/bin
-and homebrew on most setups. SSH inherits stderr and the client's foreground
+and homebrew on most setups. Initial SSH connections inherit stderr and the client's foreground
 process group, so first-connect host-key prompts and passphrase prompts can
 read `/dev/tty`, while failures such as `command not found` remain visible.
 Dispatch puts the host in
@@ -248,6 +256,25 @@ one connect path. Marlin keeps NO host registry: `<host>` goes to ssh
 verbatim, and ssh config owns naming, keys, agent, and jump hosts. A shell
 alias covers the daily case (`alias mw='marlin --remote work'`). mosh
 remains a Mode A transport only — it carries terminal frames, not stdio.
+
+The pipe uses a dedicated SSH connection (`-T -S none`), with
+`ServerAliveInterval=5`, `ServerAliveCountMax=3`, and `ConnectTimeout=10`.
+These command-line settings override SSH config so a stalled connection is
+normally detected in about 15 seconds, including when SSH config otherwise
+reuses a master connection. The TUI retries remote transport failures without
+an attempt limit, spacing attempts by 1.5, 3, 6, then at most 10 seconds.
+Quitting cancels the handshake or backoff. Local daemon recovery retains its
+three-attempt limit; protocol/daemon errors do not retry indefinitely.
+
+While disconnected, a persistent status says `offline — reconnecting…`;
+Enter preserves the draft rather than sending it. Background reconnects use
+`BatchMode=yes` and suppress SSH stderr to avoid prompts and errors overwriting
+the TUI. They require noninteractive authentication (a usable key/agent or
+equivalent); password-only users must reconnect manually. Initial connections
+still allow prompts. SSH cannot migrate an existing TCP connection across an
+address change: recovery opens a fresh pipe and reloads durable session state.
+This does not improve packet-loss latency on a live TCP connection, and an
+unacknowledged command is not automatically resent.
 
 `marlin` must be installed on the remote and findable by a login shell (the
 connect error says how to test). Source-built installations get scoped
@@ -259,9 +286,8 @@ Homebrew binaries refuse with package-manager guidance rather than guessing an
 update mechanism. A remote client needs no local provider key — providers live
 with the daemon — so first-run onboarding is skipped when MARLIN_REMOTE is set.
 
-Why primary: from_seq replay resynchronizes STATE, not a screen — a
-dropped connection reconnects with zero lost blocks (better than mosh for
-this app, and mosh only ever repaired pixels). Typing/scroll/selection are
+Why primary: replay resynchronizes durable session state after a
+dropped connection. Typing/scroll/selection are
 local-latency; only submits and steers cross the wire. The client runs
 where the clipboard lives, so image paste works (the ssh-clipboard
 limitation in §image/asset paste applies only to Mode A) and kitty
@@ -275,7 +301,7 @@ binary down (or the client's up): single static binary makes the fix a
 one-liner. Path semantics: tool output paths are daemon-side; any "open
 file" gesture must know it's remote (scp-on-demand or just don't).
 
-**Mode A — ssh as terminal transport (SHIPPED; the only mode today).**
+**Mode A — ssh as terminal transport (SHIPPED; alternative remote path).**
 `ssh -t box marlin` /
 `mosh box -- marlin`: the TUI runs next to the daemon, the local terminal
 just displays cells. Zero setup, works from machines that don't have
@@ -1279,8 +1305,9 @@ lifecycle.
   (with a count/operator pending it cancels that instead and stays),
   `:` opens the command menu,
   Ctrl+W on an empty composer or
-  `/archive [children]` for explicit lifecycle changes (Ctrl+D stays
-  page-down: an empty composer is the normal state while reading), `/sessions` for
+  `/archive [children]` for explicit lifecycle changes (Ctrl+D aliases Ctrl+W
+  at an empty insert-mode prompt with no attachments; in normal/copy mode it
+  stays page-down), `/sessions` for
   arbitrary attach, v visual-select,
   y yank).
 - **Splits (not yet implemented)**: binary-tree layout, each pane = a
@@ -1288,6 +1315,10 @@ lifecycle.
   already fans blocks out to every session a client has subscribed, so splits
   are a client-only change; the prerequisite `SessionView` extraction and the
   rest of the plan are in `docs/PANES_PLAN.md`.
+- **Prompt wrapping**: editable input and submitted prompt cards share
+  word-aware, display-cell-aware wrapping. Explicit newlines and source
+  whitespace are preserved; only words wider than a row are split, at
+  grapheme boundaries. Up/Down navigation follows the same display rows.
 - **Scrollback**: virtual list over the block log. While following the bottom
   of a running turn, the initiating user prompt scrolls normally until it
   reaches the top, then stays there above the growing live tail. Scrolling up
@@ -1312,16 +1343,30 @@ lifecycle.
   `provider`, `tool`, `child`, `compaction`, `finishing`) as ephemeral additive
   status metadata;
   the live activity row names that work and shows total plus current-phase
-  elapsed time. Live and completed reasoning commentary uses the same foreground
+  elapsed time. A blank line separates live thinking/activity indicators from
+  the preceding output, including guest tool activity rows.
+  Live reasoning shows the latest three word-wrapped lines in the default
+  view; Ctrl+T shows the full stream. Completed guest thinking/summaries have
+  a three-line preview, with full text in the expanded transcript. Native raw
+  thinking stays folded; deliberate progress commentary remains visible.
+  Live and completed reasoning commentary uses the same foreground
   priority as final assistant prose; its dot rail, not grey text, distinguishes it.
   In the default view, later commentary or the final answer suppresses earlier
   same-turn narration that repeats substantially the same words; Ctrl+T retains
-  the complete durable transcript. Guest sessions (`Transcript.guest`) render
-  differently because headless Claude Code and Codex emit no thinking: their
-  between-tool prose is the whole narration, so it is laid out as ordinary
+  the complete durable transcript, including full saved reasoning without the
+  collapsed view's 280-byte preview cap. Expansion is remembered per session
+  for the life of the client, independently of the eight-view transcript cache.
+  Guest sessions (`Transcript.guest`) render
+  between-tool prose as ordinary
   assistant text (full length, no dot rail), and their tool calls show as a
   one-line `⚙` trail instead of folding into "Ran N commands"; successful
-  result bodies stay hidden except authored diffs, failures always show. Provider byte/quiet telemetry and exact persisted tool calls
+  result bodies stay hidden except authored diffs, failures always show.
+  Edit rows include available filenames and green/red `+added -removed`
+  counts, including guest diffs without a native intro line. Codex paths are
+  read from its `changes` list; the adapter retains per-file headers and turns
+  add/delete contents into unified diff rows. Tool-call IDs pair parallel
+  results with their correct calls in both live and replayed transcripts.
+  Provider byte/quiet telemetry and exact persisted tool calls
   refine the phase without adding durable transcript chatter. Active provider
   traffic shows a green up arrow; three quiet seconds change it to a red down
   arrow. When the active call is Bash, its command preview uses the same

@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const vaxis = @import("vaxis");
+const render = @import("render.zig");
 
 pub const Editor = @This();
 
@@ -665,74 +666,27 @@ pub const Row = struct { start: usize, end: usize };
 
 var row_buf: [256]Row = undefined;
 
-/// Soft-wrap layout. Wrap unit is the codepoint (display-width aware).
-/// Returns rows in a static buffer (single-threaded TUI; capacity is far
-/// beyond max_rows * any sane width because long pastes are chips).
+/// Word-wrap layout shared with submitted prompt cards. Explicit newlines
+/// stay hard boundaries; oversized words split on display-cell boundaries.
+/// Returns rows in a static buffer (single-threaded TUI).
 pub fn layoutRows(self: *const Editor, width: usize) []Row {
-    const t = self.text.items;
-    const w = if (width < 4) 4 else width;
+    const w = @max(width, 4);
     var n: usize = 0;
-    var start: usize = 0;
-    var col: usize = 0;
-    var i: usize = 0;
-    while (i < t.len) {
-        if (t[i] == '\n') {
-            if (n < row_buf.len) row_buf[n] = .{ .start = start, .end = i };
+    var offset: usize = 0;
+    var logical = std.mem.splitScalar(u8, self.text.items, '\n');
+    while (logical.next()) |line| {
+        var start: usize = 0;
+        while (true) {
+            const end = render.promptRowEnd(line, start, w);
+            if (n == row_buf.len) return &row_buf;
+            row_buf[n] = .{ .start = offset + start, .end = offset + end };
             n += 1;
-            i += 1;
-            start = i;
-            col = 0;
-            continue;
+            if (end == line.len) break;
+            start = end;
         }
-        const end = nextCpEnd(t, i);
-        const cpw = cpDisplayWidth(t[i..end]);
-        if (col + cpw > w) {
-            // Word-aware: when the overflow lands mid-word, break after the
-            // row's last space so the whole word moves down; a word longer
-            // than the row still hard-splits.
-            var break_pos = i;
-            var scan = i;
-            while (scan > start) : (scan -= 1) {
-                if (t[scan - 1] == ' ') {
-                    break_pos = scan;
-                    break;
-                }
-            }
-            if (n < row_buf.len) row_buf[n] = .{ .start = start, .end = break_pos };
-            n += 1;
-            start = break_pos;
-            col = 0;
-            var carried = break_pos;
-            while (carried < i) {
-                const ce = nextCpEnd(t, carried);
-                col += cpDisplayWidth(t[carried..ce]);
-                carried = ce;
-            }
-        }
-        col += cpw;
-        i = end;
+        offset += line.len + 1;
     }
-    if (n < row_buf.len) row_buf[n] = .{ .start = start, .end = t.len };
-    n += 1;
-    return row_buf[0..@min(n, row_buf.len)];
-}
-
-/// Approximate display width of one codepoint: wide for CJK/emoji ranges,
-/// 1 otherwise. (Grapheme clusters beyond a single codepoint render wider
-/// than we predict; cursor stays consistent because layout and cursor
-/// mapping share this function.)
-fn cpDisplayWidth(bytes: []const u8) usize {
-    const cp = std.unicode.utf8Decode(bytes) catch return 1;
-    if (cp >= 0x1100 and (cp <= 0x115F or
-        (cp >= 0x2E80 and cp <= 0xA4CF) or
-        (cp >= 0xAC00 and cp <= 0xD7A3) or
-        (cp >= 0xF900 and cp <= 0xFAFF) or
-        (cp >= 0xFE30 and cp <= 0xFE4F) or
-        (cp >= 0xFF00 and cp <= 0xFF60) or
-        (cp >= 0xFFE0 and cp <= 0xFFE6) or
-        (cp >= 0x1F300 and cp <= 0x1FAFF) or
-        (cp >= 0x20000 and cp <= 0x2FFFD))) return 2;
-    return 1;
+    return row_buf[0..n];
 }
 
 pub const RowCol = struct { row: usize, col: usize };
@@ -752,14 +706,7 @@ pub fn cursorRowCol(self: *const Editor, rows: []const Row, width: usize) RowCol
             if (!is_last and self.cursor == r.end and
                 (r.end >= t.len or t[r.end] != '\n'))
                 continue;
-            var col: usize = 0;
-            var i = r.start;
-            while (i < self.cursor) {
-                const end = nextCpEnd(t, i);
-                col += cpDisplayWidth(t[i..end]);
-                i = end;
-            }
-            return .{ .row = ri, .col = col };
+            return .{ .row = ri, .col = render.displayWidth(t[r.start..self.cursor]) };
         }
     }
     return .{ .row = if (rows.len == 0) 0 else rows.len - 1, .col = 0 };
@@ -771,12 +718,21 @@ fn placeCursor(self: *Editor, rows: []const Row, row: usize, goal: usize, width:
     const r = rows[row];
     var col: usize = 0;
     var i = r.start;
-    while (i < r.end and col < goal) {
-        const end = nextCpEnd(t, i);
-        col += cpDisplayWidth(t[i..end]);
-        i = end;
+    var previous = i;
+    var graphemes = vaxis.unicode.graphemeIterator(t[r.start..r.end]);
+    while (col < goal) {
+        const grapheme = graphemes.next() orelse break;
+        const bytes = grapheme.bytes(t[r.start..r.end]);
+        previous = i;
+        col += render.displayWidth(bytes);
+        i += bytes.len;
     }
-    self.cursor = i;
+    // A soft-wrap boundary belongs to the following row. Stay on the target
+    // row when its word-wrapped line is shorter than the desired column.
+    self.cursor = if (i == r.end and row + 1 < rows.len and rows[row + 1].start == r.end and i > r.start)
+        previous
+    else
+        i;
 }
 
 /// How many rows the input box needs at `width` (1..max_rows).
@@ -856,15 +812,15 @@ fn drawImpl(
             });
             if (masked) {
                 var col: usize = 0;
-                var at: usize = 0;
-                while (at < seg.len and col < body_w) {
-                    const end = nextCpEnd(seg, at);
+                var graphemes = vaxis.unicode.graphemeIterator(seg);
+                while (col < body_w) {
+                    const grapheme = graphemes.next() orelse break;
+                    const bytes = grapheme.bytes(seg);
                     _ = child.printSegment(.{ .text = "•", .style = text_style }, .{
                         .col_offset = @intCast(col),
                         .wrap = .none,
                     });
-                    col += cpDisplayWidth(seg[at..end]);
-                    at = end;
+                    col += render.displayWidth(bytes);
                 }
             } else {
                 _ = child.printSegment(.{ .text = seg, .style = text_style }, .{ .wrap = .none });

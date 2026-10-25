@@ -237,6 +237,46 @@ test "soft wrap moves whole words to the next row" {
     try testing.expectEqual(@as(usize, 2), long.layoutRows(10).len);
 }
 
+test "word wrapping keeps exact-fit words and navigation reaches shorter rows" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("hello world next");
+    var rows = ed.layoutRows(11);
+    try testing.expectEqualStrings("hello world", ed.text.items[rows[0].start..rows[0].end]);
+    try testing.expectEqualStrings(" next", ed.text.items[rows[1].start..rows[1].end]);
+
+    ed.clear();
+    ed.insertSlice("hi wonderful");
+    try testing.expect(ed.moveUp(10));
+    rows = ed.layoutRows(10);
+    try testing.expectEqual(@as(usize, 0), ed.cursorRowCol(rows, 10).row);
+    try testing.expect(ed.moveDown(10));
+    rows = ed.layoutRows(10);
+    try testing.expectEqual(@as(usize, 1), ed.cursorRowCol(rows, 10).row);
+    try testing.expectEqual(ed.text.items.len, ed.cursor);
+}
+
+test "word wrapping preserves unicode tabs and explicit newlines" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    ed.insertSlice("hi\tmarlins\n你好世界你好\n");
+    const rows = ed.layoutRows(8);
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    const expected = [_][]const u8{ "hi\t", "marlins", "你好世界", "你好", "" };
+    for (rows, expected) |row, text| try testing.expectEqualStrings(text, ed.text.items[row.start..row.end]);
+
+    ed.clear();
+    ed.insertSlice("👩‍💻👩‍💻👩‍💻 hello");
+    const emoji_rows = ed.layoutRows(8);
+    try testing.expectEqual(@as(usize, 2), emoji_rows.len);
+    try testing.expect(ed.moveUp(8));
+    try testing.expectEqual(@as(usize, 0), ed.cursorRowCol(ed.layoutRows(8), 8).row);
+    try testing.expect(ed.moveDown(8));
+    const position = ed.cursorRowCol(ed.layoutRows(8), 8);
+    try testing.expectEqual(@as(usize, 1), position.row);
+    try testing.expectEqual(@as(usize, 5), position.col);
+}
+
 test "delete word and line ops" {
     var ed = Editor.init(testing.allocator);
     defer ed.deinit();
