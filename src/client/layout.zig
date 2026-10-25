@@ -503,11 +503,12 @@ fn wrapInputCard(
 ) !void {
     const first_prefix = if (steer) " ↪ " else " ❯ ";
     const continuation = "   ";
+    const text_style = if (steer) Palette.steer_text else Palette.prompt_text;
     const prefix_cells: usize = 3;
     const body_width = width -| (prefix_cells + 1); // keep right padding
     if (body_width < 8) return;
 
-    try lines.append(arena, .{ .text = if (queued) "   Queued" else "", .style = Palette.collapse_hint, .fill_style = Palette.prompt_panel });
+    try lines.append(arena, .{ .text = if (queued) "   Queued" else "", .style = Palette.prompt_hint, .fill_style = Palette.prompt_panel });
     var first = true;
     var logical = std.mem.splitScalar(u8, text, '\n');
     while (logical.next()) |raw_line| {
@@ -526,9 +527,9 @@ fn wrapInputCard(
             );
             try lines.append(arena, .{
                 .text = prefix,
-                .style = if (!first) Palette.prompt_text else if (steer) Palette.steer else Palette.prompt_mark,
+                .style = if (!first) text_style else if (steer) Palette.steer else Palette.prompt_mark,
                 .text2 = rest[0..take],
-                .style2 = Palette.prompt_text,
+                .style2 = text_style,
                 .fill_style = Palette.prompt_panel,
                 .links = links,
                 .links_resolved = true,

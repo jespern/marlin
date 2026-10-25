@@ -1214,8 +1214,8 @@ get these right; Hermes is the counter-example):
   cycle fg color across the word per frame.
 - **Optimism must reconcile.** Submitted messages/steers render immediately,
   with a wire request id. Steering uses a prompt card marked `↪`, distinct
-  from a new turn's `❯`, and a `Queued` label until the durable delivery
-  arrives. Pending entries survive transcript replacement on tab switches
+  from a new turn's `❯`, italic regular-weight text, and a `Queued` label
+  until the durable delivery arrives. Pending entries survive transcript replacement on tab switches
   and reconnects, history trimming, and view-cache eviction. Delivery
   reconciles one matching input after its submission frontier, removes the
   queue label, and places it in durable transcript order. A matching daemon error removes precisely

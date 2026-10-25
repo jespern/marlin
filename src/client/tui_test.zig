@@ -6576,3 +6576,60 @@ test "returning to a tab with pending input replays missed deliveries and retain
     try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
     try std.testing.expect(!app.view.blocks.items[0].pending_echo);
 }
+
+test "steering cards keep a uniform background and italic text across wrapped lines" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .state = .running,
+    } };
+    defer app.deinit();
+    app.pushInputEcho(.steer, "how is it looking here? Please check the next campaign too.", 1, null);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var screen = try vaxis.Screen.init(gpa, .{ .rows = 1, .cols = 32, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 32,
+        .height = 1,
+        .screen = &screen,
+    };
+    for ([_]bool{ true, false }) |pending| {
+        app.view.blocks.items[0].pending_echo = pending;
+        app.view.layout_epoch +%= 1;
+        const lines = try layoutLines(arena.allocator(), &app, 32);
+        var text_rows: usize = 0;
+        var saw_queued = false;
+        for (lines.items) |line| {
+            const fill = line.fill_style orelse continue;
+            win.fill(.{ .style = fill });
+            _ = win.print(&.{
+                .{ .text = line.text, .style = line.style },
+                .{ .text = line.text2, .style = line.style2 },
+            }, .{ .wrap = .none });
+            for (0..32) |col| {
+                try std.testing.expect(vaxis.Color.eql(win.readCell(@intCast(col), 0).?.style.bg, Palette.prompt_bg));
+            }
+            if (line.text2.len > 0) {
+                text_rows += 1;
+                const cell = win.readCell(3, 0).?;
+                try std.testing.expect(cell.style.italic);
+                try std.testing.expect(!cell.style.bold);
+                if (text_rows == 1) {
+                    try std.testing.expectEqualStrings(" ↪ ", line.text);
+                    try std.testing.expect(vaxis.Color.eql(win.readCell(1, 0).?.style.fg, Palette.steer.fg));
+                }
+            }
+            if (std.mem.eql(u8, line.text, "   Queued")) saw_queued = true;
+        }
+        try std.testing.expect(text_rows > 1);
+        try std.testing.expectEqual(pending, saw_queued);
+    }
+}

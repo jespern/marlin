@@ -20,6 +20,8 @@ pub const Palette = struct {
     /// foreground is grey. (This emphasis used to sit on reasoning cards;
     /// prompts are the anchors a transcript is scanned by.)
     pub const prompt_text: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } }, .bg = prompt_bg, .bold = true };
+    pub const steer_text: vaxis.Style = .{ .fg = prompt_text.fg, .bg = prompt_bg, .italic = true };
+    pub const prompt_hint: vaxis.Style = .{ .fg = .{ .index = 7 }, .bg = prompt_bg };
     pub const prompt_mark: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .index = 6 }, .bold = true };
     pub const pinned_prompt_mark: vaxis.Style = .{ .bg = prompt_bg, .fg = .{ .rgb = .{ 0xc7, 0x92, 0xea } }, .bold = true };
     pub const command_bg: vaxis.Color = .{ .rgb = .{ 0x2d, 0x30, 0x35 } };
@@ -114,7 +116,7 @@ pub const Palette = struct {
     pub const syntax_function: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x82, 0xaa, 0xff } } };
     pub const syntax_constant: vaxis.Style = .{ .fg = soft_blue };
     pub const note: vaxis.Style = .{ .fg = soft_blue };
-    pub const steer: vaxis.Style = .{ .fg = .{ .index = 5 } }; // magenta
+    pub const steer: vaxis.Style = .{ .fg = .{ .index = 5 }, .bg = prompt_bg }; // magenta
     pub const status_bg: vaxis.Color = .{ .index = 0 };
     pub const status_bar: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 7 } };
     pub const status_sep: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 8 }, .dim = true };
