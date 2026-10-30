@@ -415,11 +415,13 @@ header, which is where it must be kept current:
   mutations of them are rejected with `err{busy}` while a turn runs, which
   is what makes the snapshot sound.
 - **A running turn may touch exactly the listed shared fields**, each with a
-  stated discipline: atomics (`cancel`, `approval_mode_live`, `context_used`,
-  `phase`, `phase_started_at_ms`), the internally-synchronized approval `gate`, the
+  stated discipline: atomics (`cancel`, `approval_mode_live`, `guest_max_runtime_live`,
+  `context_used`), the internally-synchronized approval `gate`, the
   `steer_queue` plus `steer_accepting` under `steer_mutex`, and `prune_frontier` (turn-thread
   exclusive while running). `TurnJob.session` is a live pointer, not a copy;
   a new turn-visible field must be added to that list with its discipline.
+  Phase callbacks enqueue updates; the dispatcher owns phase changes and
+  prevents progress from overriding a parked question or approval.
 
 ## 2. Data model: the block log
 
@@ -1349,8 +1351,11 @@ lifecycle.
   layout is cached until blocks/state/width change. During a running turn the
   daemon publishes its coarse operational phase (`starting`, `context`,
   `provider`, `tool`, `child`, `compaction`, `finishing`) as ephemeral additive
-  status metadata;
-  the live activity row names that work and shows total plus current-phase
+  status metadata. The dispatcher applies phase updates only while a session
+  is running. Guest progress arriving after an approval or question parks
+  the session cannot emit a spurious running status and dismiss its selector;
+  answering or cancelling the request controls that lifecycle transition.
+  The live activity row names that work and shows total plus current-phase
   elapsed time. A blank line separates live thinking/activity indicators from
   the preceding output, including guest tool activity rows.
   Live reasoning shows the latest three word-wrapped lines in the default
@@ -1562,13 +1567,16 @@ assets are grabbed out-of-band:
   future remote transport.
 - **Wire + store.** An input carries bounded base64 upload records. The daemon
   verifies MIME signatures and writes bytes to the existing content-addressed
-  blob store; `user_msg.attachments` carries only metadata and blob hashes.
+  blob store; `user_msg.attachments` and `steer.attachments` carry only metadata and blob hashes.
   Replay therefore never inflates with base64.
+  Images can accompany mid-turn steering, including while an approval is
+  parked. Sending moves the image into the queue and frees the composer for
+  further input. Steering blocks retain blob references atomically on persistence.
 - **Context assembly.** OpenAI/OpenRouter and Anthropic requests map active
   attachments to native image content blocks. L1 removes old image bodies
   from active provider context while the durable blob remains available. The
-  delegated Claude Code route records an explicit unsupported note rather
-  than silently dropping media.
+  Claude Code and Codex routes materialize images as files on the daemon host
+  and include their paths in the guest input, for new turns and live steering.
 - **Rendering.** User cards show a durable `▣ name · mime · size` attachment
   row. Inline terminal thumbnails remain optional polish over the same media
   reference; they are not required for provider vision or replay correctness.

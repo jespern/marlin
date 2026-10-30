@@ -363,6 +363,17 @@ test "assemble resolves durable image refs only for active provider context" {
     });
     try std.testing.expect(pruned[1].payload == .text);
     try std.testing.expect(std.mem.indexOf(u8, pruned[1].payload.text, "elided") != null);
+    const steered = [_]block.Block{tb(1, .{ .steer = .{
+        .text = "inspect while working",
+        .attachments = blocks[0].body.user_msg.attachments,
+    } })};
+    const steer_msgs = try assemble(arena, &steered, .{ .media_loader = Loader.load, .media_loader_ctx = &marker });
+    try std.testing.expect(steer_msgs[1].payload == .user_content);
+    try std.testing.expectEqualStrings("inspect while working", steer_msgs[1].payload.user_content.text);
+    try std.testing.expectEqual(@as(usize, 1), steer_msgs[1].payload.user_content.media.len);
+    const steer_pruned = try assemble(arena, &steered, .{ .prune_before_seq = 2, .media_loader = Loader.load, .media_loader_ctx = &marker });
+    try std.testing.expect(steer_pruned[1].payload == .text);
+    try std.testing.expect(std.mem.indexOf(u8, steer_pruned[1].payload.text, "elided") != null);
 }
 
 test "planPrune: protects recent output, hysteresis on small reclaim" {

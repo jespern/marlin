@@ -22,8 +22,8 @@
 //!     TurnJob before setting state=running and spawning; every protocol
 //!     mutation of these fields is rejected with err{busy} while a turn runs.
 //!   - Fields a RUNNING turn may touch, each with its own discipline:
-//!       cancel, approval_mode_live, guest_max_runtime_live, context_used,
-//!       phase, phase_started_at_ms                 atomics
+//!       cancel, approval_mode_live, guest_max_runtime_live, context_used
+//!                                                  atomics
 //!       gate                                       internally synchronized
 //!       steer_queue                                under steer_mutex
 //!       prune_frontier                             turn-thread exclusive
@@ -31,6 +31,8 @@
 //!                                                  only between turns
 //!     Adding a turn-visible field means adding it to THIS list with a
 //!     stated discipline — TurnJob.session is a live pointer, not a copy.
+//!   - Phase updates are queued for the dispatcher, which preserves parked
+//!     approvals/questions against concurrent guest progress callbacks.
 //!   - Client outboxes are Mpsc(owned OutboundLine); the client thread writes
 //!     them to the socket, publishes the last flushed sequence, and frees.
 
@@ -153,6 +155,7 @@ const Event = union(enum) {
     /// watchers (Ctrl+S / `marlin top`) receive them for every live session.
     turn_activity: struct { sid: u64, line: []u8 },
     turn_usage_credits: struct { sid: u64, active: bool },
+    turn_phase: struct { sid: u64, phase: proto.TurnPhase, started_at_ms: i64 },
     /// A tool call needs a client decision; fan out approval_request and
     /// flip session status to awaiting_approval. Line pre-encoded.
     turn_awaiting: struct { sid: u64, line: []u8 },
@@ -178,7 +181,7 @@ const OutboundLine = struct {
     seq: u64,
 };
 
-const Client = struct {
+pub const Client = struct {
     id: u64,
     stream: Io.net.Stream,
     outbox: queue.Mpsc(OutboundLine),
@@ -263,7 +266,7 @@ fn shouldAutoContinueRoundBudget(
     return kind == .root and round_budget_reached and !interrupted and err_text == null and !reboot_pending;
 }
 
-const Session = struct {
+pub const Session = struct {
     id: u64,
     parent_sid: ?u64 = null,
     kind: proto.SessionKind = .root,
@@ -278,9 +281,7 @@ const Session = struct {
     state: proto.SessionState = .idle,
     turn_thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = .init(false),
-    /// Turn-thread phase is atomically published for dispatcher-side
-    /// cancellation diagnostics. Cancellation request bookkeeping itself is
-    /// dispatcher-owned.
+    /// Dispatcher-owned phase, including cancellation diagnostics.
     phase: std.atomic.Value(u8) = .init(@intFromEnum(proto.TurnPhase.idle)),
     turn_started_at_ms: std.atomic.Value(i64) = .init(0),
     phase_started_at_ms: std.atomic.Value(i64) = .init(0),
@@ -937,7 +938,7 @@ pub const Daemon = struct {
         return false;
     }
 
-    fn handleEvent(self: *Daemon, ev: Event) !void {
+    pub fn handleEvent(self: *Daemon, ev: Event) !void {
         switch (ev) {
             .client_msg => |cm| {
                 const sensitive = std.mem.indexOf(u8, cm.msg_line, "\"otel_configure\"") != null or
@@ -1017,6 +1018,25 @@ pub const Daemon = struct {
             .turn_usage_credits => |usage| {
                 const session = self.sessions.get(usage.sid) orelse return;
                 self.broadcastUsageCredits(usage.sid, session.state, usage.active);
+            },
+            .turn_phase => |update| {
+                const session = self.sessions.get(update.sid) orelse return;
+                // Progress is not a lifecycle transition. A bridge question
+                // can park the session while other guest tools keep running.
+                if (session.state != .running) return;
+                session.phase_started_at_ms.store(update.started_at_ms, .release);
+                session.phase.store(@intFromEnum(update.phase), .release);
+                const now = nowMs(self.io);
+                const line = try encodeTurnPhaseStatus(
+                    self.gpa,
+                    update.sid,
+                    update.phase,
+                    elapsedSince(session.turn_started_at_ms.load(.acquire), now),
+                    elapsedSince(update.started_at_ms, now),
+                    session.usage_credits.load(.acquire),
+                );
+                defer self.gpa.free(line);
+                self.fanOutLine(update.sid, line);
             },
             .turn_awaiting => |ta| {
                 if (self.sessions.get(ta.sid)) |session| {
@@ -2098,22 +2118,12 @@ pub const Daemon = struct {
                 const input_text = expanded orelse inp.text;
                 const display_text: ?[]const u8 = if (expanded != null) inp.text else null;
                 if (session.state == .running or session.state == .awaiting_approval) {
-                    if (inp.attachments.len > 0) {
-                        self.sendInputError(client, inp.request_id, "busy", "image attachments require a new turn");
-                        return;
-                    }
                     // Approval is a parked phase of the same turn. Input stays
                     // a steer for that turn; it must never create a competitor.
-                    const owned_text = self.gpa.dupe(u8, input_text) catch {
-                        self.sendInputError(client, inp.request_id, "internal", "could not queue input");
+                    const owned = self.prepareSteerInput(session.model, input_text, display_text, inp.attachments) catch |err| {
+                        self.sendInputError(client, inp.request_id, "attachment", attachmentErrorMessage(err));
                         return;
                     };
-                    const owned_display = if (display_text) |value| self.gpa.dupe(u8, value) catch {
-                        self.gpa.free(owned_text);
-                        self.sendInputError(client, inp.request_id, "internal", "could not queue input");
-                        return;
-                    } else null;
-                    const owned = block.Input{ .text = owned_text, .display_text = owned_display };
                     session.steer_mutex.lockUncancelable(self.io);
                     if (!session.steer_accepting) {
                         session.steer_mutex.unlock(self.io);
@@ -2941,6 +2951,23 @@ pub const Daemon = struct {
             .msg = msg,
             .request_id = request_id,
         } });
+    }
+
+    pub fn prepareSteerInput(self: *Daemon, model: []const u8, text: []const u8, display_text: ?[]const u8, uploads: []const proto.AttachmentUpload) !block.Input {
+        const attachments = try self.prepareAttachments(uploads);
+        errdefer freeMediaRefs(self.gpa, attachments);
+        const guest_images = proto.isGuestModel(model) and attachments.len > 0;
+        const owned_text = if (guest_images)
+            try loop.materializeGuestAttachments(self.gpa, self.io, &self.store, self.environ, text, attachments)
+        else
+            try self.gpa.dupe(u8, text);
+        errdefer self.gpa.free(owned_text);
+        const shown = display_text orelse if (guest_images) text else null;
+        return .{
+            .text = owned_text,
+            .display_text = if (shown) |value| try self.gpa.dupe(u8, value) else null,
+            .attachments = attachments,
+        };
     }
 
     fn prepareAttachments(self: *Daemon, uploads: []const proto.AttachmentUpload) ![]block.MediaRef {
@@ -3979,17 +4006,11 @@ pub const Daemon = struct {
         fn onPhase(ctx: ?*anyopaque, phase: proto.TurnPhase) void {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
-            job.session.phase_started_at_ms.store(nowMs(self.io), .release);
-            job.session.phase.store(@intFromEnum(phase), .release);
-            const line = encodeTurnPhaseStatus(
-                self.gpa,
-                job.sid,
-                phase,
-                elapsedSince(job.session.turn_started_at_ms.load(.acquire), nowMs(self.io)),
-                0,
-                job.session.usage_credits.load(.acquire),
-            ) catch return;
-            self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+            self.events.push(self.io, .{ .turn_phase = .{
+                .sid = job.sid,
+                .phase = phase,
+                .started_at_ms = nowMs(self.io),
+            } }) catch {};
         }
 
         fn onGuestActivity(ctx: ?*anyopaque, items: []const proto.GuestActivity) void {
@@ -5210,7 +5231,7 @@ pub const Daemon = struct {
     fn discardShutdownEvent(self: *Daemon, event: Event) void {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
-            .client_gone, .turn_resumed, .turn_usage_credits, .shutdown => {},
+            .client_gone, .turn_resumed, .turn_usage_credits, .turn_phase, .shutdown => {},
             .turn_block => |value| self.gpa.free(value.line),
             .turn_delta => |value| self.gpa.free(value.line),
             .turn_activity => |value| self.gpa.free(value.line),

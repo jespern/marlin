@@ -1533,6 +1533,9 @@ pub const Store = struct {
         bindOptionalInt(stmt, 8, compactionCoversToSeq(blk.body));
         try stepDone(stmt);
         try self.insertSearchDocLocked(blk, search_text);
+        if (blk.body == .steer) {
+            for (blk.body.steer.attachments) |attachment| try self.addBlobRef(attachment.hash, blk.id);
+        }
         try self.execAll("COMMIT;");
         committed = true;
     }
@@ -2424,7 +2427,10 @@ fn searchTextAlloc(allocator: std.mem.Allocator, blk: block.Block) !?[]const u8 
         },
         .assistant_msg => |assistant| try appendSearchPart(&out, allocator, assistant.text),
         .reasoning => |reasoning| try appendSearchPart(&out, allocator, reasoning.text),
-        .steer => |steer| try appendSearchPart(&out, allocator, steer.display_text orelse steer.text),
+        .steer => |steer| {
+            try appendSearchPart(&out, allocator, steer.display_text orelse steer.text);
+            for (steer.attachments) |attachment| try appendSearchPart(&out, allocator, attachment.name);
+        },
         .tool_call => |call| {
             try appendSearchPart(&out, allocator, call.name);
             try appendSearchPart(&out, allocator, call.args_json);

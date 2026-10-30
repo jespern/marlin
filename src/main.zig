@@ -148,6 +148,7 @@ test {
     _ = @import("client/strings_test.zig");
     _ = @import("client/tui_test.zig");
     _ = @import("daemon/git_status_test.zig");
+    _ = @import("daemon/daemon_test.zig");
     _ = @import("client/session_view_test.zig");
     _ = @import("client/recap_test.zig");
     _ = @import("daemon/recap_test.zig");

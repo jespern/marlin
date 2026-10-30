@@ -51,14 +51,21 @@ pub const MediaRef = struct {
 };
 
 /// Model text and optional compact user-facing invocation. Queued inputs
-/// own both strings; persisted block payloads borrow them.
+/// own the strings and attachment metadata; persisted block payloads borrow them.
 pub const Input = struct {
     text: []const u8,
     display_text: ?[]const u8 = null,
+    attachments: []const MediaRef = &.{},
 
     pub fn deinit(self: Input, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
         if (self.display_text) |text| gpa.free(text);
+        for (self.attachments) |attachment| {
+            gpa.free(attachment.hash);
+            gpa.free(attachment.mime);
+            gpa.free(attachment.name);
+        }
+        if (self.attachments.len > 0) gpa.free(self.attachments);
     }
 };
 

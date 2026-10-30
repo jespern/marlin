@@ -2290,10 +2290,12 @@ pub const App = struct {
                 }
             },
             .steer => |s| {
+                const label = if (s.attachments.len > 0) layout_mod.mediaLabel(self.gpa, s.attachments) catch null else null;
+                defer if (label) |owned| self.gpa.free(owned);
                 const reconciled = reconcilePendingEcho(self.view.blocks.items, .steer, s.display_text orelse s.text, b.seq, b.turn_id, b.ts);
                 if (reconciled) self.view.layout_epoch +%= 1;
                 if (!reconciled)
-                    self.pushDurableBlock(b, .steer, s.display_text orelse s.text, "", .ok);
+                    self.pushDurableBlock(b, .steer, s.display_text orelse s.text, label orelse "", .ok);
                 self.view.editor.pushHistory(s.display_text orelse s.text);
             },
             .assistant_msg => |a| {
@@ -2544,10 +2546,6 @@ pub const App = struct {
             return;
         }
         const was_busy = self.view.state == .running or self.view.state == .awaiting_approval;
-        if (was_busy and self.view.attachments.items.len > 0) {
-            self.setNotice("images attach to a new turn; interrupt or wait before sending", .{});
-            return;
-        }
         var uploads_buf: [4]proto.AttachmentUpload = undefined;
         for (self.view.attachments.items, 0..) |attachment, i| uploads_buf[i] = .{
             .name = attachment.name,
@@ -2576,7 +2574,7 @@ pub const App = struct {
         self.clearAttachments();
         if (invocation != null) self.view.editor.pushHistory(trimmed);
         if (was_busy) {
-            self.pushInputEcho(.steer, trimmed, request_id, null);
+            self.pushInputEchoLabel(.steer, trimmed, attachment_label orelse "", request_id, null);
             self.setNotice("queued as steer for active turn", .{});
         } else {
             // The composer becomes a scrollback card immediately. The turn

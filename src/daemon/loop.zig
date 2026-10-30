@@ -293,6 +293,7 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
         .steer => |value| .{ .steer = .{
             .text = try arena.dupe(u8, value.text),
             .display_text = if (value.display_text) |text| try arena.dupe(u8, text) else null,
+            .attachments = try cloneMediaRefs(arena, value.attachments),
         } },
         .plan => |value| blk: {
             const items = try arena.alloc(block.PlanItem, value.items.len);

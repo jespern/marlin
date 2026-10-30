@@ -6633,3 +6633,41 @@ test "steering cards keep a uniform background and italic text across wrapped li
         try std.testing.expectEqual(pending, saw_queued);
     }
 }
+
+test "sending a screenshot during a turn frees the composer for more steering" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    for ([_]proto.SessionState{ .running, .awaiting_approval }) |state| {
+        var output: Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        var conn: attach.Conn = undefined;
+        conn.gpa = gpa;
+        conn.writer = &output.writer;
+        var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{
+            .sid = 7,
+            .editor = Editor.init(gpa),
+            .state = state,
+        } };
+        defer app.deinit();
+        app.view.editor.insertSlice("look here");
+        app.addAttachment(.{ .name = try gpa.dupe(u8, "shot.png"), .mime = try gpa.dupe(u8, "image/png"), .data_base64 = try gpa.dupe(u8, "iVBORw0KGgo=") });
+        try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+        try std.testing.expect(app.view.editor.isEmpty());
+        try std.testing.expectEqual(@as(usize, 0), app.view.attachments.items.len);
+        try std.testing.expectEqual(block.BlockKind.steer, app.view.blocks.items[0].kind);
+        try std.testing.expect(std.mem.indexOf(u8, app.view.blocks.items[0].label, "shot.png") != null);
+        app.view.editor.insertSlice("also check the logs");
+        try handleKey(&app, .{ .codepoint = vaxis.Key.enter });
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var requests = std.mem.splitScalar(u8, output.written(), '\n');
+        const first = try proto.decode(proto.ClientMsg, arena.allocator(), requests.next().?);
+        const second = try proto.decode(proto.ClientMsg, arena.allocator(), requests.next().?);
+        try std.testing.expectEqual(@as(usize, 1), first.input.attachments.len);
+        try std.testing.expectEqualStrings("look here", first.input.text);
+        try std.testing.expectEqualStrings("also check the logs", second.input.text);
+        try std.testing.expectEqual(@as(usize, 0), second.input.attachments.len);
+        try std.testing.expectEqual(@as(usize, 2), app.view.blocks.items.len);
+    }
+}

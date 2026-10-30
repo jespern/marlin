@@ -252,6 +252,26 @@ pub const MediaLoader = *const fn (
     hash: []const u8,
 ) anyerror![]const u8;
 
+fn appendUserContent(arena: std.mem.Allocator, msgs: *std.ArrayList(provider.Message), text: []const u8, attachments: []const block.MediaRef, seq: u64, opts: AssembleOpts) !void {
+    if (attachments.len == 0 or seq < opts.prune_before_seq or
+        opts.media_loader == null or opts.media_loader_ctx == null)
+    {
+        const content = if (attachments.len > 0 and seq < opts.prune_before_seq)
+            try std.fmt.allocPrint(arena, "{s}\n\n[{d} image attachment(s) elided from active context]", .{ text, attachments.len })
+        else
+            text;
+        try msgs.append(arena, .{ .role = .user, .payload = .{ .text = content } });
+    } else {
+        const media = try resolveMedia(arena, attachments, opts);
+        if (media.len == 0) {
+            const content = try std.fmt.allocPrint(arena, "{s}\n\n[image attachments unavailable]", .{text});
+            try msgs.append(arena, .{ .role = .user, .payload = .{ .text = content } });
+        } else try msgs.append(arena, .{ .role = .user, .payload = .{
+            .user_content = .{ .text = text, .media = media },
+        } });
+    }
+}
+
 fn resolveMedia(arena: std.mem.Allocator, refs: []const block.MediaRef, opts: AssembleOpts) ![]const provider.Media {
     const loader = opts.media_loader orelse return &.{};
     const loader_ctx = opts.media_loader_ctx orelse return &.{};
@@ -355,26 +375,8 @@ pub fn assemble(
             try msgs.append(arena, .{ .role = .system, .payload = .{ .text = opts.environment } });
         }
         switch (b.body) {
-            .user_msg => |u| {
-                if (u.attachments.len == 0 or b.seq < opts.prune_before_seq or
-                    opts.media_loader == null or opts.media_loader_ctx == null)
-                {
-                    const text = if (u.attachments.len > 0 and b.seq < opts.prune_before_seq)
-                        try std.fmt.allocPrint(arena, "{s}\n\n[{d} image attachment(s) elided from active context]", .{ u.text, u.attachments.len })
-                    else
-                        u.text;
-                    try msgs.append(arena, .{ .role = .user, .payload = .{ .text = text } });
-                } else {
-                    const media = try resolveMedia(arena, u.attachments, opts);
-                    if (media.len == 0) {
-                        const text = try std.fmt.allocPrint(arena, "{s}\n\n[image attachments unavailable]", .{u.text});
-                        try msgs.append(arena, .{ .role = .user, .payload = .{ .text = text } });
-                    } else try msgs.append(arena, .{ .role = .user, .payload = .{
-                        .user_content = .{ .text = u.text, .media = media },
-                    } });
-                }
-            },
-            .steer => |s| try msgs.append(arena, .{ .role = .user, .payload = .{ .text = s.text } }),
+            .user_msg => |u| try appendUserContent(arena, &msgs, u.text, u.attachments, b.seq, opts),
+            .steer => |input| try appendUserContent(arena, &msgs, input.text, input.attachments, b.seq, opts),
             .assistant_msg => |a| try msgs.append(arena, .{ .role = .assistant, .payload = .{ .text = a.text } }),
             .tool_call => {
                 // Collect consecutive tool_call blocks of this turn.

@@ -411,7 +411,13 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
                 }
             }
         },
-        .steer => |s| text = s.display_text orelse s.text,
+        .steer => |s| {
+            text = s.display_text orelse s.text;
+            if (s.attachments.len > 0) {
+                generated_label = try mediaLabel(gpa, s.attachments);
+                label = generated_label.?;
+            }
+        },
         .assistant_msg => |a| text = a.text,
         .reasoning => |r| text = r.text,
         .tool_call => |tc| {
@@ -1732,6 +1738,8 @@ pub fn layoutBlockRange(
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 try blankLine(alloc, lines);
                 try wrapInputCard(alloc, lines, rb.text, w, true, rb.pending_echo);
+                if (rb.label.len > 0)
+                    try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
             },
             .plan => {
                 if (visibleCompletedPlan(transcript.blocks, block_idx)) {
