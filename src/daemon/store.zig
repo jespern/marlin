@@ -60,6 +60,22 @@ const schema_sql =
     \\  guest_max_runtime_ms INTEGER,
     \\  codex_thread_id TEXT
     \\);
+    \\CREATE TABLE IF NOT EXISTS session_pauses(
+    \\  session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
+    \\  restart INTEGER NOT NULL DEFAULT 0,
+    \\  approval_mode TEXT NOT NULL DEFAULT 'default',
+    \\  queued_text TEXT NOT NULL DEFAULT ''
+    \\);
+    \\CREATE TABLE IF NOT EXISTS paused_inputs(
+    \\  id INTEGER PRIMARY KEY,
+    \\  session_id INTEGER NOT NULL REFERENCES session_pauses(session_id) ON DELETE CASCADE,
+    \\  body_json TEXT NOT NULL
+    \\);
+    \\CREATE TABLE IF NOT EXISTS pause_media_refs(
+    \\  hash TEXT NOT NULL REFERENCES blobs(hash),
+    \\  input_id INTEGER NOT NULL REFERENCES paused_inputs(id) ON DELETE CASCADE,
+    \\  PRIMARY KEY(hash,input_id)
+    \\);
     \\CREATE TABLE IF NOT EXISTS blocks(
     \\  id INTEGER PRIMARY KEY,
     \\  session_id INTEGER NOT NULL REFERENCES sessions(id),
@@ -672,7 +688,128 @@ pub const Store = struct {
     /// A process restart cannot resume an in-flight provider stream. Preserve
     /// the durable hierarchy but report those sessions as interrupted.
     pub fn recoverInterruptedSessions(self: Store) Error!void {
-        try self.execAll("UPDATE sessions SET status='err' WHERE status IN ('running','awaiting_approval');");
+        try self.execAll("UPDATE sessions SET status=CASE WHEN id IN (SELECT session_id FROM session_pauses) THEN 'idle' ELSE 'err' END WHERE status IN ('running','awaiting_approval');");
+    }
+
+    pub const Pause = struct {
+        restart: bool,
+        approval_mode: []const u8,
+        queued_text: []const u8,
+
+        pub fn deinit(self: Pause, gpa: std.mem.Allocator) void {
+            gpa.free(self.approval_mode);
+            gpa.free(self.queued_text);
+        }
+    };
+
+    pub fn setPause(self: Store, sid: u64, restart: bool, mode: []const u8) Error!void {
+        const stmt = try self.prepare("INSERT INTO session_pauses(session_id,restart,approval_mode) VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET restart=excluded.restart");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(sid));
+        bindInt(stmt, 2, @intFromBool(restart));
+        bindText(stmt, 3, mode);
+        try stepDone(stmt);
+    }
+
+    pub const PausedInput = struct { id: u64, input: block.Input };
+
+    pub fn checkpointPause(self: Store, sid: u64, restart: bool, mode: []const u8, inputs: []const PausedInput) Error!void {
+        const mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(mutex);
+        defer c.sqlite3_mutex_leave(mutex);
+        try self.execAll("BEGIN IMMEDIATE");
+        errdefer self.execAll("ROLLBACK") catch {};
+        try self.setPause(sid, restart, mode);
+        for (inputs) |input| {
+            const json = std.json.Stringify.valueAlloc(self.gpa, input.input, .{}) catch return error.OutOfMemory;
+            defer self.gpa.free(json);
+            const stmt = try self.prepare("INSERT INTO paused_inputs(id,session_id,body_json) VALUES(?,?,?)");
+            defer finalize(stmt);
+            bindInt(stmt, 1, @bitCast(input.id));
+            bindInt(stmt, 2, @bitCast(sid));
+            bindText(stmt, 3, json);
+            try stepDone(stmt);
+            for (input.input.attachments) |attachment| {
+                const ref = try self.prepare("INSERT INTO pause_media_refs(hash,input_id) VALUES(?,?)");
+                defer finalize(ref);
+                bindText(ref, 1, attachment.hash);
+                bindInt(ref, 2, @bitCast(input.id));
+                try stepDone(ref);
+            }
+        }
+        try self.execAll("COMMIT");
+    }
+
+    pub fn pausedInputs(self: Store, arena: std.mem.Allocator, sid: u64) Error![]PausedInput {
+        const stmt = try self.prepare("SELECT id,body_json FROM paused_inputs WHERE session_id=? ORDER BY id");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(sid));
+        var inputs: std.ArrayList(PausedInput) = .empty;
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            const input = std.json.parseFromSliceLeaky(block.Input, arena, columnText(stmt, 1), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch return error.SqliteStep;
+            try inputs.append(arena, .{ .id = @bitCast(c.sqlite3_column_int64(stmt, 0)), .input = input });
+        }
+        return inputs.toOwnedSlice(arena);
+    }
+
+    pub fn hasPausedInputs(self: Store, sid: u64) Error!bool {
+        const stmt = try self.prepare("SELECT 1 FROM paused_inputs WHERE session_id=? LIMIT 1");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(sid));
+        return switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => true,
+            c.SQLITE_DONE => false,
+            else => error.SqliteStep,
+        };
+    }
+
+    pub fn getPause(self: Store, sid: u64) Error!?Pause {
+        const stmt = try self.prepare("SELECT restart,approval_mode,queued_text FROM session_pauses WHERE session_id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(sid));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        const mode = try self.dupeCol(stmt, 1);
+        errdefer self.gpa.free(mode);
+        return .{ .restart = c.sqlite3_column_int(stmt, 0) != 0, .approval_mode = mode, .queued_text = try self.dupeCol(stmt, 2) };
+    }
+
+    pub fn clearPause(self: Store, sid: u64) Error!void {
+        const stmt = try self.prepare("DELETE FROM session_pauses WHERE session_id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(sid));
+        try stepDone(stmt);
+    }
+
+    pub fn appendPausedSteer(self: Store, sid: u64, text: []const u8) Error!void {
+        const stmt = try self.prepare("UPDATE session_pauses SET queued_text=queued_text || char(10) || ? WHERE session_id=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, text);
+        bindInt(stmt, 2, @bitCast(sid));
+        try stepDone(stmt);
+    }
+
+    pub fn disarmRestartPauses(self: Store) Error!void {
+        try self.execAll("UPDATE session_pauses SET restart=0 WHERE restart=1");
+    }
+
+    pub fn pausedSessions(self: Store, restart_only: bool) Error![]u64 {
+        const stmt = try self.prepare("SELECT p.session_id FROM session_pauses p JOIN sessions s ON s.id=p.session_id WHERE (?=0 OR p.restart=1) AND s.archived_at IS NULL ORDER BY s.created_at,s.id");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @intFromBool(restart_only));
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(self.gpa);
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            try out.append(self.gpa, @bitCast(c.sqlite3_column_int64(stmt, 0)));
+        }
+        return out.toOwnedSlice(self.gpa);
     }
 
     pub fn updateSessionUsage(self: Store, id: u64, tokens_in: u64, tokens_out: u64) Error!void {
@@ -1534,6 +1671,12 @@ pub const Store = struct {
         try stepDone(stmt);
         try self.insertSearchDocLocked(blk, search_text);
         if (blk.body == .steer) {
+            try self.appendPausedSteer(blk.session_id, blk.body.steer.text);
+            const pending = try self.prepare("DELETE FROM paused_inputs WHERE id=? AND session_id=?");
+            defer finalize(pending);
+            bindInt(pending, 1, @bitCast(blk.id));
+            bindInt(pending, 2, @bitCast(blk.session_id));
+            try stepDone(pending);
             for (blk.body.steer.attachments) |attachment| try self.addBlobRef(attachment.hash, blk.id);
         }
         try self.execAll("COMMIT;");
@@ -2300,24 +2443,24 @@ pub const Store = struct {
 
         const orphan = try self.blobStats(
             "SELECT count(*), COALESCE(sum(length(bytes)),0) FROM blobs " ++
-                "WHERE NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.hash=blobs.hash)",
+                "WHERE NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.hash=blobs.hash) AND NOT EXISTS (SELECT 1 FROM pause_media_refs p WHERE p.hash=blobs.hash)",
             null,
         );
         try self.execAll(
             "DELETE FROM blobs WHERE NOT EXISTS " ++
-                "(SELECT 1 FROM blob_refs r WHERE r.hash=blobs.hash);",
+                "(SELECT 1 FROM blob_refs r WHERE r.hash=blobs.hash) AND NOT EXISTS (SELECT 1 FROM pause_media_refs p WHERE p.hash=blobs.hash);",
         );
 
         var expired = BlobStats{};
         if (expire_before_ms) |cutoff| {
             const eligible =
-                "tombstone=0 AND created_at>0 AND created_at<?1 " ++
+                "tombstone=0 AND created_at>0 AND created_at<?1 AND NOT EXISTS (SELECT 1 FROM pause_media_refs p WHERE p.hash=blobs.hash) " ++
                 "AND EXISTS (SELECT 1 FROM blob_refs r WHERE r.hash=blobs.hash) " ++
                 "AND NOT EXISTS (SELECT 1 FROM blob_refs r " ++
                 "JOIN blocks b ON b.id=r.block_id " ++
                 "JOIN sessions s ON s.id=b.session_id " ++
                 "WHERE r.hash=blobs.hash AND " ++
-                "(b.ts>=?1 OR s.status IN ('running','awaiting_approval')))";
+                "(b.ts>=?1 OR s.status IN ('running','awaiting_approval') OR EXISTS (SELECT 1 FROM session_pauses p WHERE p.session_id=s.id)))";
             expired = try self.blobStats(
                 "SELECT count(*), COALESCE(sum(length(bytes)),0) FROM blobs WHERE " ++ eligible,
                 cutoff,

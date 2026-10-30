@@ -94,6 +94,8 @@ pub const SessionView = struct {
     /// composer. Its terminal completed revision lives only in transcript.
     plan: std.ArrayList(PlanItemOwned) = .empty,
     state: proto.SessionState = .idle,
+    pause: proto.PauseState = .none,
+    login_required: bool = false,
     recap: @import("recap.zig").State = .{},
     model: std.ArrayList(u8) = .empty,
     effort: proto.ReasoningEffort = .auto,
@@ -141,8 +143,8 @@ pub const SessionView = struct {
     history_page_failed: bool = false,
     /// 0 = pinned to bottom; N = scrolled up N lines.
     scroll_up: usize = 0,
-    /// Line count of the last rendered frame; used to keep the view
-    /// anchored (not sliding) when new lines arrive while scrolled up.
+    /// Together with last_view_h, preserves the reading position when live
+    /// output grows/shrinks or the composer/plan changes viewport height.
     last_total_lines: usize = 0,
     /// View geometry of the last frame. Once a running turn's prompt reaches
     /// the top, the viewport may become non-contiguous to keep it there.

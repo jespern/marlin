@@ -65,6 +65,15 @@ bar. Marlin tools, Seatbelt, network screening, MCP-as-agent-tools,
 `task`/`task_batch`, `plan_update`, and L0/L1/L2 **do not reach inside the
 subprocess.**
 
+Guest authentication errors are terminal and actionable: Claude result errors,
+explicit authentication envelopes, and stderr failures, plus Codex RPC and stream
+errors (including HTTP 401), produce a durable login-required note and an error
+status. The TUI shows `LOGIN REQUIRED`; the note names `claude auth login` or
+`codex login` and specifies the daemon host. These failures bypass automatic
+continuation and Claude's session-identity retry. Detection uses vendor failure
+signals, not local credential-file presence or assistant prose. It does not poll
+credentials or predict expiry while a session is idle.
+
 Guest is a session regime, not a model. Kitchen-sink is chasing parity so
 a guest tab feels like a native tab. The guest boundary is frozen at:
 
@@ -347,13 +356,40 @@ Sequence:
    `<checkout>/zig-out/bin/marlin` and the checkout markers `.git`, `build.zig`,
    `build.zig.zon`, and `src/main.zig`; package installations refuse. Every
    candidate is sanity-exec'd (`version`) before any daemon exits.
-2. **Quiesce.** Default: wait for running turns to reach a block boundary. A
-   parked approval refuses a plain reboot visibly: once the requesting TUI
-   exits there would be nobody left to answer it. `/reboot --force` interrupts
-   instead: finalized blocks are truth, partial delta
-   buffers are discardable; interrupted sessions get a `system_note`
-   ("interrupted by reboot") and resume with `--continue`. Native bash has
-   no managed background jobs to carry across a reboot.
+2. **Suspend.** Current clients negotiate `hello_ok.pause_resume` and request
+   `reboot{suspend_sessions:true}`. Active root sessions and their child work
+   pause; the daemon persists which roots should resume after startup. Native
+   turns finish the current model/tool round, then stop at the next round
+   boundary. Guests are interrupted and later resume their vendor conversation;
+   this does not freeze shell processes or preserve an in-flight network stream.
+   `--force` interrupts native tools too instead of waiting for the round.
+   Pending questions/approvals are dismissed without granting permission; the
+   continuation explicitly tells the agent to ask again. Sessions that naturally
+   finish before suspension do not start another turn after reboot.
+
+   `/pause [all] [--force]` and `/resume [all]` expose the same lifecycle without
+   rebooting. Manual pauses survive restart and are never promoted to automatic
+   resumes by a later reboot. New input is rejected while pausing/paused with its
+   draft preserved. `pausing`/`paused` appear in the status line and session list;
+   paused tabs use `‖`. A child is paused through its root; interrupted child
+   results release the parent's tool wait, and the parent resumes from its saved
+   transcript rather than resurrecting an in-memory child rendezvous.
+
+   Additive `session_pauses`, `paused_inputs`, and `pause_media_refs` tables hold
+   intent, queued input, and temporary attachment pins. The dispatcher snapshots
+   steering under its queue mutex in the same transaction as pause intent, before
+   setting the pause flag. After the worker stops, each saved input moves into a
+   durable steer block and loses its temporary pin in one transaction. Startup
+   performs the same drain, so crashes cannot duplicate queued messages or lose
+   screenshots; GC also preserves attachments referenced by paused sessions.
+   Automatic restart intent is consumed before spawning its continuation. Failed
+   starts remain manually resumable and do not form a restart retry loop.
+
+   Reboot still has a 120-second client deadline. If its requester disconnects
+   before quiescence, shutdown is cancelled and automatic-resume flags become
+   manual pauses. The sessions finish pausing and remain available for `/resume`.
+   Older clients retain the legacy protocol default: wait for whole turns, refuse
+   parked approvals, or interrupt with `force:true`, without automatic resume.
 3. **Daemon exit.** Persist, stop accepting clients, unlink the public socket,
    then ACK and exit. Removing the socket before the ACK makes the client-side
    exec a clean handoff rather than a race with a dying listener. For a local
@@ -1335,7 +1371,13 @@ lifecycle.
 - **Scrollback**: virtual list over the block log. While following the bottom
   of a running turn, the initiating user prompt scrolls normally until it
   reaches the top, then stays there above the growing live tail. Scrolling up
-  restores ordinary contiguous scrollback. The pinned card is a display
+  restores ordinary contiguous scrollback. While reading above the bottom,
+  the first visible row stays fixed as live output/activity rows grow or shrink,
+  including when composer or plan height changes the available viewport.
+  At the client history-window limit, new output stays in the daemon's log
+  instead of evicting text under the reader; scrolling down pages forward and
+  `G` reloads the latest tail.
+  The pinned card is a display
   duplicate, so selection and copy continue to address the
   durable transcript rows. Hovering transcript output—including tool calls,
   results, folded summaries, and status messages—shows local

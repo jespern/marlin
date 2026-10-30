@@ -1511,6 +1511,55 @@ test "plain reboot refuses a focused approval unless forced" {
     try std.testing.expect(app.should_quit);
 }
 
+test "pause commands preserve drafts and paused state survives tab metadata refresh" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .pause_supported = true, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.runCommand("/pause all --force");
+    app.runCommand("/resume all");
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"session_pause\":{\"sid\":7,\"all\":true,\"force\":true}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"session_resume\":{\"sid\":7,\"all\":true}") != null);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 7, .state = .idle, .pause = .paused } }));
+    app.view.editor.insertSlice("keep my draft");
+    const before = output.written().len;
+    app.submitInput(app.view.editor.text.items);
+    try std.testing.expectEqual(before, output.written().len);
+    try std.testing.expectEqualStrings("keep my draft", app.view.editor.text.items);
+    app.replaceSessionSummaries(&.{.{ .sid = 7, .model = "local/testing", .title = "paused", .state = .idle, .status = "idle", .pause = .paused, .created_at = 0, .running = false }});
+    try std.testing.expectEqual(proto.PauseState.paused, app.view.pause);
+    app.view.state = .awaiting_approval;
+    app.runCommand("!rb both");
+    try std.testing.expect(app.reboot_request.requested);
+    try std.testing.expect(app.should_quit);
+}
+
+test "guest login failures remain visible until the session is retried" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    const guests = @import("../core/guest.zig");
+    for ([_]guests.Backend{ .claude_code, .codex }) |which| {
+        const note = guests.loginRequiredNote(which);
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 7, .state = .err, .err_text = note } }));
+        try std.testing.expect(app.view.login_required);
+        try std.testing.expectEqualStrings(note, app.notice.items);
+        // Reattach can report the same error state without repeating its text.
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 7, .state = .err } }));
+        try std.testing.expect(app.view.login_required);
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 7, .state = .running } }));
+        try std.testing.expect(!app.view.login_required);
+    }
+}
+
 test "standard editor key bindings map to commands" {
     const Case = struct { key: vaxis.Key, command: EditCommand };
     const cases = [_]Case{
@@ -1706,7 +1755,7 @@ test "reset opens a blank session before archiving idle trees and preserves acti
             .{ .sid = 30, .title = "working", .model = "m", .status = "idle", .state = if (has_active) .running else .idle, .created_at = 30, .running = has_active },
         });
         app.pushBlock(.assistant_msg, "old transcript", "", .ok);
-        app.view.editor.insertSlice("/res");
+        app.view.editor.insertSlice("/rese");
         const suggestions = try commandSuggestions(&app, arena.allocator());
         try std.testing.expectEqual(@as(usize, 1), suggestions.len);
         try std.testing.expectEqualStrings("/reset", suggestions[0].replacement);
@@ -2859,6 +2908,53 @@ test "live transcript storage stays inside the sliding block window" {
     try std.testing.expectEqual(history_window_blocks, app.view.blocks.items.len);
     try std.testing.expectEqual(@as(u64, 33), app.view.blocks.items[0].seq);
     try std.testing.expect(!app.view.history_complete);
+}
+
+test "live output cannot evict a full scrollback window while reading" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    for (1..history_window_blocks + 1) |seq| {
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = .{
+            .id = seq,
+            .session_id = 7,
+            .turn_id = seq,
+            .seq = seq,
+            .ts = 0,
+            .body = .{ .assistant_msg = .{ .text = "Saved output" } },
+        } } }));
+    }
+    app.view.scroll_up = 20;
+    for (history_window_blocks + 1..history_window_blocks + 101) |seq| {
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = .{
+            .id = seq,
+            .session_id = 7,
+            .turn_id = seq,
+            .seq = seq,
+            .ts = 0,
+            .body = .{ .assistant_msg = .{ .text = "Later output" } },
+        } } }));
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .delta = .{ .sid = 7, .turn_id = seq, .text = "live output" } }));
+        app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .reasoning_delta = .{ .sid = 7, .turn_id = seq, .text = "live reasoning" } }));
+    }
+    try std.testing.expectEqual(history_window_blocks, app.view.blocks.items.len);
+    try std.testing.expectEqual(@as(u64, 1), app.view.blocks.items[0].seq);
+    try std.testing.expectEqual(@as(u64, history_window_blocks), app.view.blocks.items[history_window_blocks - 1].seq);
+    try std.testing.expectEqual(@as(u64, history_window_blocks + 100), app.view.last_seq);
+    try std.testing.expect(app.view.history_has_newer);
+    try std.testing.expectEqual(@as(usize, 0), app.view.delta.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.reasoning_delta.items.len);
+    app.view.scroll_up = 0;
+    app.maybeRequestHistoryAtBottom();
+    try std.testing.expectEqual(@as(u64, history_window_blocks + 1), app.view.history_after_seq);
+    try std.testing.expect(app.view.history_loading);
 }
 
 test "centered replay replaces the window without catching up to the tail" {
@@ -5512,6 +5608,82 @@ test "cwd Enter encodings submit the typed path despite a highlighted child" {
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"cwd\":\"parent/\"") != null);
         try std.testing.expectEqual(@as(usize, 0), app.view.editor.text.items.len);
     }
+}
+
+test "scrollback stays fixed through live activity shrinking, output and viewport changes" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var vx = try vaxis.init(threaded.io(), gpa, &environ, .{});
+    defer vx.deinit(gpa, &output.writer);
+    try vx.resize(gpa, &output.writer, .{ .rows = 32, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .editor = Editor.init(gpa), .state = .running } };
+    defer app.deinit();
+    for (0..60) |i| {
+        const text = try std.fmt.allocPrint(gpa, "Saved transcript line {d}", .{i});
+        defer gpa.free(text);
+        app.pushBlock(.system_note, text, "", .ok);
+    }
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    const arena = frame.allocator();
+    const Snapshot = struct {
+        fn text(alloc: std.mem.Allocator, win: vaxis.Window, top: usize) ![]const u8 {
+            var result: std.ArrayList(u8) = .empty;
+            for (top..top + 8) |row| {
+                for (0..80) |col| {
+                    const cell = win.readCell(@intCast(col), @intCast(row)).?;
+                    try result.appendSlice(alloc, cell.char.grapheme);
+                }
+                try result.append(alloc, '\n');
+            }
+            return result.items;
+        }
+    };
+    try draw(&app, &vx, arena);
+    app.view.scroll_up = 20;
+    try draw(&app, &vx, arena);
+    const first = app.view.last_first_visible;
+    const reading = try Snapshot.text(arena, vx.window(), app.tabBarRows());
+    for (0..3) |_| {
+        for (0..10) |step| {
+            switch (step) {
+                0 => app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{ .sid = 42, .items = &.{
+                    .{ .id = "scout", .kind = .agent, .name = "Scout", .detail = "Inspecting files" },
+                    .{ .id = "test", .kind = .process, .name = "Tests", .detail = "Running checks" },
+                } } })),
+                1 => app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{ .sid = 42, .items = &.{} } })),
+                2 => app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .delta = .{ .sid = 42, .turn_id = 1, .text = "New output\n\n" ** 10 } })),
+                3 => app.applyBlock(.{ .id = 1, .session_id = 42, .turn_id = 1, .seq = 1, .ts = 1, .body = .{ .assistant_msg = .{ .text = "Completed output" } } }),
+                4 => app.view.editor.insertSlice("draft line\n" ** 4),
+                5 => app.view.editor.clear(),
+                6 => app.setPlan(&.{.{ .step = "Checking the implementation", .status = .in_progress }}),
+                7 => app.setPlan(&.{}),
+                8 => app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 42, .state = .idle } })),
+                9 => app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .status = .{ .sid = 42, .state = .running } })),
+                else => unreachable,
+            }
+            try draw(&app, &vx, arena);
+            try std.testing.expectEqual(first, app.view.last_first_visible);
+            try std.testing.expectEqualStrings(reading, try Snapshot.text(arena, vx.window(), app.tabBarRows()));
+        }
+    }
+    // Explicit navigation still works, and returning to the bottom resumes following.
+    app.view.scroll_up += 3;
+    try draw(&app, &vx, arena);
+    try std.testing.expectEqual(first - 3, app.view.last_first_visible);
+    app.view.scroll_up = 0;
+    try app.view.delta.appendSlice(gpa, "Follow the new output\n\n" ** 10);
+    try draw(&app, &vx, arena);
+    try std.testing.expectEqual(@as(usize, 0), app.view.scroll_up);
+    try std.testing.expectEqual(app.view.last_total_lines - app.view.last_view_h, app.view.last_first_visible);
 }
 
 test "long pinned prompts cap at ten rows and retain full scrollback" {

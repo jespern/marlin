@@ -1,0 +1,54 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "pause stress task"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_pause\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 0.6; printf completed >> pause-effect\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "second restart task"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_pause\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 0.8; printf second\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "second restart task",
+        "Resume the task suspended by Marlin",
+        "reboot queued screenshot",
+        "iVBORw0KGgpwYXlsb2Fk"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"pause stress completed\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ],
+      "delay_ms_between_events": 0
+    },
+    {
+      "expect_contains": [
+        "queued before suspension",
+        "Resume the task suspended by Marlin"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"pause stress completed\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ],
+      "delay_ms_between_events": 0
+    }
+  ],
+  "check": {
+    "argv": [],
+    "pause_flow": "reboot"
+  }
+}

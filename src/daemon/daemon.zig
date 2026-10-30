@@ -22,7 +22,7 @@
 //!     TurnJob before setting state=running and spawning; every protocol
 //!     mutation of these fields is rejected with err{busy} while a turn runs.
 //!   - Fields a RUNNING turn may touch, each with its own discipline:
-//!       cancel, approval_mode_live, guest_max_runtime_live, context_used
+//!       cancel, pause_requested, approval_mode_live, guest_max_runtime_live, context_used
 //!                                                  atomics
 //!       gate                                       internally synchronized
 //!       steer_queue                                under steer_mutex
@@ -79,6 +79,8 @@ extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
 const plan_accept_prompt =
     \\Implement the plan you just proposed. First create a concise durable execution plan with plan_update, then carry it through completion. Do not re-plan unless implementation evidence requires a change.
 ;
+
+const resume_prompt = "Resume the task suspended by Marlin. Continue from the saved conversation and inspect the current state before repeating interrupted operations. Pending questions or approvals were not answered: ask again when needed. Inspect saved child-session results before restarting delegated work.";
 
 const round_checkpoint_prompt =
     \\Continue the current task from the durable transcript. An internal worker-round checkpoint was reached; this is not a user-requested stop. Resume the existing plan and work through completion, then give the user the final answer.
@@ -282,6 +284,7 @@ pub const Session = struct {
     state: proto.SessionState = .idle,
     turn_thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = .init(false),
+    pause_requested: std.atomic.Value(bool) = .init(false),
     /// Dispatcher-owned phase, including cancellation diagnostics.
     phase: std.atomic.Value(u8) = .init(@intFromEnum(proto.TurnPhase.idle)),
     turn_started_at_ms: std.atomic.Value(i64) = .init(0),
@@ -420,6 +423,7 @@ pub const Daemon = struct {
     /// /reboot in flight: client id awaiting the coordinated shutdown.
     /// The daemon quiesces (waits for turns to reach done) then acks + exits.
     pending_reboot: ?u64 = null,
+    reboot_suspend: bool = false,
     /// Set when reboot cleanup retires the listener before closing clients.
     /// The final cleanup tail must not unlink a replacement daemon's socket.
     socket_retired: bool = false,
@@ -919,6 +923,7 @@ pub const Daemon = struct {
     // --------------------------------------------------------- dispatcher --
 
     fn dispatchLoop(self: *Daemon) void {
+        self.resumePausedSessions(true) catch |err| std.log.err("could not resume suspended sessions: {t}", .{err});
         while (self.events.pop(self.io)) |ev| {
             self.handleEvent(ev) catch |e| {
                 std.log.warn("dispatch error: {t}", .{e});
@@ -994,7 +999,11 @@ pub const Daemon = struct {
                 // client times out or exits before the daemon can acknowledge
                 // quiescence, cancel the pending reboot instead of surprising
                 // the user with a delayed shutdown minutes later.
-                if (self.pending_reboot == cg.client_id) self.pending_reboot = null;
+                if (self.pending_reboot == cg.client_id) {
+                    self.pending_reboot = null;
+                    if (self.reboot_suspend) try self.store.disarmRestartPauses();
+                    self.reboot_suspend = false;
+                }
                 self.dropCcPendingForClient(cg.client_id);
                 if (self.removeClient(cg.client_id)) |client| {
                     // The registry no longer contains this client, so each
@@ -1024,7 +1033,7 @@ pub const Daemon = struct {
                 const session = self.sessions.get(update.sid) orelse return;
                 // Progress is not a lifecycle transition. A bridge question
                 // can park the session while other guest tools keep running.
-                if (session.state != .running) return;
+                if (session.state != .running or session.pause_requested.load(.acquire)) return;
                 session.phase_started_at_ms.store(update.started_at_ms, .release);
                 session.phase.store(@intFromEnum(update.phase), .release);
                 const now = nowMs(self.io);
@@ -1048,7 +1057,9 @@ pub const Daemon = struct {
                     // A turn can reach its first approval after a plain reboot
                     // has begun quiescing. Refuse that reboot now rather than
                     // strand an approval whose TUI already exited.
-                    self.refusePendingRebootForApproval();
+                    if (session.pause_requested.load(.acquire)) {
+                        cancelActiveSession(self, session);
+                    } else self.refusePendingRebootForApproval();
                     self.fanOutActionableLine(ta.sid, ta.line);
                     self.broadcastStatus(ta.sid, .awaiting_approval);
                     self.notifyPhone(ta.sid, true, false);
@@ -1143,7 +1154,21 @@ pub const Daemon = struct {
                     t.join();
                     session.turn_thread = null;
                 }
-                const auto_continue = shouldAutoContinueRoundBudget(
+                const pause_requested = session.pause_requested.load(.acquire);
+                var checkpoint_failed = false;
+                const pending_inputs = if (pause_requested) self.store.hasPausedInputs(td.sid) catch failed: {
+                    checkpoint_failed = true;
+                    break :failed true;
+                } else false;
+                var paused = pause_requested and (td.interrupted or td.err_text != null or td.round_budget_reached or pending_inputs);
+                if (pause_requested and !paused) {
+                    self.store.clearPause(td.sid) catch {
+                        checkpoint_failed = true;
+                        paused = true;
+                    };
+                    if (!paused) session.pause_requested.store(false, .release);
+                }
+                const auto_continue = !paused and shouldAutoContinueRoundBudget(
                     session.kind,
                     td.round_budget_reached,
                     td.interrupted,
@@ -1170,7 +1195,14 @@ pub const Daemon = struct {
                 session.turn_started_at_ms.store(0, .release);
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
                 session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
-                session.state = if (td.err_text != null) .err else .idle;
+                session.state = if (!paused and td.err_text != null) .err else .idle;
+                if (paused) self.restorePausedInputs(session) catch {
+                    checkpoint_failed = true;
+                };
+                if (checkpoint_failed) {
+                    self.refusePendingRebootForCheckpoint();
+                    session.state = .err;
+                }
                 var continuation_error: ?[]u8 = null;
                 defer if (continuation_error) |text| self.gpa.free(text);
                 var continuation_failed = false;
@@ -1192,8 +1224,9 @@ pub const Daemon = struct {
                 } else {
                     self.store.setSessionStatus(td.sid, @tagName(session.state)) catch {};
                 }
-                const terminal_error: ?[]const u8 = td.err_text orelse continuation_error orelse
+                const terminal_error: ?[]const u8 = if (checkpoint_failed) "could not save the pause checkpoint; session remains paused, retry /resume after fixing storage" else if (paused) null else td.err_text orelse continuation_error orelse
                     if (continuation_failed) "automatic continuation failed to start" else null;
+                if (paused) self.appendSessionNote(td.sid, "session paused; use /resume to continue");
                 // Meta BEFORE status: clients treat idle/err as end-of-turn
                 // and stop reading, so usage must already be on the wire.
                 self.broadcastMeta(td.sid, td.tokens_in, td.tokens_out);
@@ -1217,12 +1250,12 @@ pub const Daemon = struct {
                     if (!continued) self.extensions.fireHook(.on_session_done, json);
                     if (terminal_error != null) self.extensions.fireHook(.on_error, json);
                 }
-                if (!continued and !td.interrupted) self.notifyPhone(td.sid, false, terminal_error != null);
+                if (!paused and !continued and !td.interrupted) self.notifyPhone(td.sid, false, terminal_error != null);
                 // A child is an ordinary durable session plus this one-shot
                 // rendezvous back to the parent tool call.
                 if (session.task_waiter) |future| {
                     session.task_waiter = null;
-                    const outcome_status: block.ToolStatus = if (td.interrupted)
+                    const outcome_status: block.ToolStatus = if (paused or td.interrupted)
                         .interrupted
                     else if (td.err_text != null)
                         .err
@@ -1230,7 +1263,7 @@ pub const Daemon = struct {
                         .ok;
                     const result_json = std.json.Stringify.valueAlloc(self.gpa, .{
                         .child_sid = td.sid,
-                        .status = if (td.interrupted)
+                        .status = if (paused or td.interrupted)
                             @as([]const u8, "interrupted")
                         else if (td.err_text != null)
                             "error"
@@ -1241,7 +1274,7 @@ pub const Daemon = struct {
                     }, .{}) catch self.gpa.dupe(u8, "error: could not encode child result") catch @panic("oom");
                     const result_delivered = future.resolve(self.io, result_json, outcome_status);
                     if (!result_delivered) self.gpa.free(result_json);
-                    if (result_delivered and shouldAutoArchiveChild(session.kind, td.interrupted, td.err_text)) {
+                    if (result_delivered and !paused and shouldAutoArchiveChild(session.kind, td.interrupted, td.err_text)) {
                         if (self.store.setSessionTreeArchived(td.sid, nowMs(self.io))) |_| {
                             session.archived = true;
                             self.broadcastSessionTree(td.sid, true);
@@ -1350,6 +1383,7 @@ pub const Daemon = struct {
                     .proto_version = proto.proto_version,
                     .daemon_version = daemon_version,
                     .hostname = hostname,
+                    .pause_resume = true,
                     .sandbox_available = self.sandbox_backend != .unavailable,
                     .session_recaps = true,
                     .git_status = true,
@@ -2037,7 +2071,7 @@ pub const Daemon = struct {
                 if (s.skill_catalog) client.skill_catalog = true;
                 if (new_subscription) try client.subs.append(self.gpa, s.sid);
                 if (client.skill_catalog and (new_subscription or new_skill_catalog)) self.publishSkillCatalog(s.sid, client);
-                const session = self.sessions.get(s.sid);
+                const session = try self.getOrLoadSession(s.sid);
                 const state: proto.SessionState = if (session) |ses| blk: {
                     // A subscriber returned: the release-when-unwatched
                     // eviction reason is gone; do not tear this session down
@@ -2057,6 +2091,7 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .status = .{
                     .sid = s.sid,
                     .state = state,
+                    .pause = if (session) |ses| sessionPauseState(ses) else .none,
                     .phase = if (session) |ses| if (state == .running or state == .awaiting_approval)
                         @enumFromInt(ses.phase.load(.acquire))
                     else
@@ -2090,6 +2125,10 @@ pub const Daemon = struct {
                     self.sendInputError(client, inp.request_id, "no_session", "unknown session");
                     return;
                 };
+                if (session.pause_requested.load(.acquire) or self.pending_reboot != null) {
+                    self.sendInputError(client, inp.request_id, "paused", "session is pausing or paused; use /resume before sending input");
+                    return;
+                }
                 if (session.archived) {
                     self.sendInputError(
                         client,
@@ -2230,7 +2269,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .cc_question_result = .{ .sid = cq.sid, .answer = null } });
                     return;
                 }
-                if (session.cc_question_pending != null or cq.question.len == 0 or cq.question.len > 4096) {
+                if (session.pause_requested.load(.acquire) or session.cancel.load(.acquire) or session.cc_question_pending != null or cq.question.len == 0 or cq.question.len > 4096) {
                     self.sendTo(client, .{ .cc_question_result = .{ .sid = cq.sid, .answer = null } });
                     return;
                 }
@@ -2269,6 +2308,10 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                if (session.pause_requested.load(.acquire) or session.cancel.load(.acquire)) {
+                    self.sendTo(client, .{ .cc_approval_result = .{ .sid = ca.sid, .decision = .denied, .message = "session suspended; request approval again after resume" } });
+                    return;
+                }
                 // Guest CHILDREN (council reviewers) are read-only by bridge
                 // enforcement — checked before any mode, so neither yolo nor
                 // /permissions can hand a reviewer write access. Mutations
@@ -2347,6 +2390,7 @@ pub const Daemon = struct {
                     t.join();
                     session.turn_thread = null;
                 }
+                if (session.pause_requested.load(.acquire)) return error.SessionPaused;
                 const job = try self.gpa.create(TurnJob);
                 errdefer self.gpa.destroy(job);
                 const cwd = try self.gpa.dupe(u8, session.cwd);
@@ -2789,6 +2833,36 @@ pub const Daemon = struct {
                 };
                 self.sendMcpStatus(client);
             },
+            .session_pause => |request| {
+                if (request.all) {
+                    try self.pauseActiveSessions(false, request.force);
+                } else {
+                    const session = (try self.getOrLoadSession(request.sid)) orelse return error.NotFound;
+                    if (session.kind != .root) {
+                        self.sendTo(client, .{ .err = .{ .code = "child_session", .msg = "pause the parent session to suspend its child work" } });
+                        return;
+                    }
+                    try self.pauseSessionTree(session, false, request.force);
+                }
+                self.sendTo(client, .{ .ok = .{} });
+            },
+            .session_resume => |request| {
+                if (self.pending_reboot != null) {
+                    self.sendTo(client, .{ .err = .{ .code = "reboot_pending", .msg = "wait for reboot before resuming" } });
+                    return;
+                }
+                if (request.all) {
+                    try self.resumePausedSessions(false);
+                } else {
+                    const session = (try self.getOrLoadSession(request.sid)) orelse return error.NotFound;
+                    if (session.state == .running or session.state == .awaiting_approval) {
+                        self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "session is still pausing; wait for paused before resuming" } });
+                        return;
+                    }
+                    try self.resumeSession(session);
+                }
+                self.sendTo(client, .{ .ok = .{} });
+            },
             .interrupt => |i| {
                 const result = self.cancelSessionTree(i.sid);
                 if (i.report)
@@ -2837,7 +2911,7 @@ pub const Daemon = struct {
                     } });
                     return;
                 }
-                if (!r.force and self.hasPendingApproval()) {
+                if (!r.force and !r.suspend_sessions and self.hasPendingApproval()) {
                     self.sendTo(client, .{ .err = .{
                         .code = "approval_pending",
                         .msg = "cannot reboot while approval is pending; answer it, interrupt it, or use --force",
@@ -2845,7 +2919,15 @@ pub const Daemon = struct {
                     return;
                 }
                 self.pending_reboot = client.id;
-                if (r.force) {
+                self.reboot_suspend = r.suspend_sessions;
+                if (r.suspend_sessions) {
+                    self.pauseActiveSessions(true, r.force) catch |err| {
+                        self.pending_reboot = null;
+                        self.reboot_suspend = false;
+                        try self.store.disarmRestartPauses();
+                        return err;
+                    };
+                } else if (r.force) {
                     var sit = self.sessions.valueIterator();
                     while (sit.next()) |sp| {
                         const session = sp.*;
@@ -2922,14 +3004,22 @@ pub const Daemon = struct {
             .effort = row.effort,
             .cwd = cwd,
             .plan_mode = row.plan_mode,
+            .state = std.meta.stringToEnum(proto.SessionState, row.status) orelse .idle,
             .sandbox_enabled = self.cfg.permissions_enabled,
             .network_filtering_enabled = self.network.isActive(),
         };
+        if (try self.store.getPause(sid)) |paused| {
+            defer paused.deinit(self.gpa);
+            session.pause_requested.store(true, .release);
+            session.approval_mode = approval.Mode.parse(paused.approval_mode);
+            session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
+        }
         session.guest_max_runtime_live.store((try self.store.getSessionGuestRuntime(sid)) orelse std.math.maxInt(u64), .release);
         if (self.retained_approvals.get(sid)) |mode| {
             session.approval_mode = mode;
             session.approval_mode_live.store(@intFromEnum(mode), .release);
         }
+        if (session.pause_requested.load(.acquire)) try self.restorePausedInputs(session);
         try self.sessions.put(self.gpa, sid, session);
         return session;
     }
@@ -3020,6 +3110,94 @@ pub const Daemon = struct {
             initialized += 1;
         }
         return refs;
+    }
+
+    fn sessionPauseState(session: *const Session) proto.PauseState {
+        if (!session.pause_requested.load(.acquire)) return .none;
+        return if (session.state == .running or session.state == .awaiting_approval) .pausing else .paused;
+    }
+
+    fn pauseOne(self: *Daemon, session: *Session, restart: bool, force: bool) !void {
+        if (session.archived) return;
+        if (!session.pause_requested.load(.acquire)) {
+            if (session.state != .running and session.state != .awaiting_approval) return;
+            session.steer_mutex.lockUncancelable(self.io);
+            defer session.steer_mutex.unlock(self.io);
+            const pending = try self.gpa.alloc(store_mod.Store.PausedInput, session.steer_queue.items.len);
+            defer self.gpa.free(pending);
+            for (session.steer_queue.items, pending) |input, *item| item.* = .{ .id = ids.next(self.io), .input = input };
+            try self.store.checkpointPause(session.id, restart, @tagName(session.approval_mode), pending);
+            session.pause_requested.store(true, .release);
+            for (session.steer_queue.items) |input| input.deinit(self.gpa);
+            session.steer_queue.clearRetainingCapacity();
+            session.steer_accepting = false;
+        }
+        if (force or proto.isGuestModel(session.model) or session.state == .awaiting_approval)
+            cancelActiveSession(self, session);
+        self.broadcastStatus(session.id, session.state);
+    }
+
+    fn pauseSessionTree(self: *Daemon, root: *Session, restart: bool, force: bool) !void {
+        try self.pauseOne(root, restart, force);
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            if (sp.*.parent_sid == root.id) try self.pauseOne(sp.*, false, force);
+        }
+    }
+
+    fn pauseActiveSessions(self: *Daemon, restart: bool, force: bool) !void {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            if (sp.*.kind == .root) try self.pauseSessionTree(sp.*, restart, force);
+        }
+    }
+
+    fn restorePausedInputs(self: *Daemon, session: *Session) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const pending = try self.store.pausedInputs(arena_state.allocator(), session.id);
+        var seq = try self.store.lastSeq(session.id);
+        for (pending) |input| {
+            seq += 1;
+            const b = block.Block{ .id = input.id, .session_id = session.id, .turn_id = input.id, .seq = seq, .ts = nowMs(self.io), .body = .{ .steer = input.input } };
+            try self.store.appendBlock(b);
+            const line = try proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = session.id, .b = b } });
+            defer self.gpa.free(line);
+            self.fanOutLine(session.id, line);
+        }
+    }
+
+    fn resumeSession(self: *Daemon, session: *Session) !void {
+        if (session.archived or session.kind != .root) return;
+        if (session.state == .running or session.state == .awaiting_approval) return;
+        try self.restorePausedInputs(session);
+        const paused = (try self.store.getPause(session.id)) orelse return;
+        defer paused.deinit(self.gpa);
+        // Consume automatic restart intent before spawning: a failed resume
+        // remains manually recoverable, never a crash/restart retry loop.
+        try self.store.setPause(session.id, false, paused.approval_mode);
+        const prompt = try std.fmt.allocPrint(self.gpa, "{s}\n{s}", .{ resume_prompt, if (proto.isGuestModel(session.model)) paused.queued_text else "" });
+        defer self.gpa.free(prompt);
+        session.pause_requested.store(false, .release);
+        session.cancel.store(false, .release);
+        self.startTurnWithOptions(session, prompt, &.{}, true) catch |err| {
+            session.pause_requested.store(true, .release);
+            self.appendSessionNote(session.id, "resume failed to start; session remains paused");
+            self.broadcastStatus(session.id, session.state);
+            return err;
+        };
+        try self.store.clearPause(session.id);
+    }
+
+    fn resumePausedSessions(self: *Daemon, restart_only: bool) !void {
+        const sids = try self.store.pausedSessions(restart_only);
+        defer self.gpa.free(sids);
+        for (sids) |sid| {
+            const session = (try self.getOrLoadSession(sid)) orelse continue;
+            self.resumeSession(session) catch |err| {
+                std.log.err("session {d} could not resume: {t}", .{ sid, err });
+            };
+        }
     }
 
     fn requestUserCancel(self: *Daemon, session: *Session, now: i64) ?proto.InterruptResult {
@@ -3169,7 +3347,7 @@ pub const Daemon = struct {
         const parent = self.sessions.get(cs.parent_sid) orelse return error.ParentSessionMissing;
         if (parent.kind != .root) return error.NestedTaskDenied;
         if (parent.archived) return error.ParentSessionArchived;
-        if (parent.cancel.load(.acquire)) return error.Cancelled;
+        if (parent.cancel.load(.acquire) or parent.pause_requested.load(.acquire)) return error.Cancelled;
 
         const sid = ids.next(self.io);
         const model_src = cs.model orelse parent.model;
@@ -3284,6 +3462,7 @@ pub const Daemon = struct {
     ) !void {
         if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
             return error.SessionBusy;
+        if (session.pause_requested.load(.acquire) or self.pending_reboot != null) return error.SessionPaused;
         const job = try self.gpa.create(TurnJob);
         errdefer self.gpa.destroy(job);
         const cwd = try self.gpa.dupe(u8, session.cwd);
@@ -3353,6 +3532,7 @@ pub const Daemon = struct {
     fn startHandover(self: *Daemon, session: *Session, guest_model: []const u8) !void {
         if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
             return error.SessionBusy;
+        if (session.pause_requested.load(.acquire) or self.pending_reboot != null) return error.SessionPaused;
         const job = try self.gpa.create(TurnJob);
         errdefer self.gpa.destroy(job);
         const cwd = try self.gpa.dupe(u8, session.cwd);
@@ -3642,6 +3822,7 @@ pub const Daemon = struct {
             .input_display_text = job.display_text,
             .auto_continue_round_budget = job.kind == .root,
             .cancel = job.cancel,
+            .pause = &job.session.pause_requested,
             .park_clock = &job.session.park_clock,
             .guest_max_runtime_live = &job.session.guest_max_runtime_live,
             .poll_steer = TurnHooks.pollSteer,
@@ -4133,7 +4314,7 @@ pub const Daemon = struct {
             const self = job.daemon;
             job.session.steer_mutex.lockUncancelable(self.io);
             defer job.session.steer_mutex.unlock(self.io);
-            if (job.session.steer_queue.items.len == 0) return null;
+            if (job.session.pause_requested.load(.acquire) or job.session.steer_queue.items.len == 0) return null;
             const text = job.session.steer_queue.orderedRemove(0);
             // Transfer to the loop's allocator (same gpa in practice).
             _ = gpa;
@@ -4378,6 +4559,7 @@ pub const Daemon = struct {
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{
             .sid = sid,
             .state = state,
+            .pause = if (session) |ses| sessionPauseState(ses) else .none,
             .phase = if (session) |ses| if (active_turn)
                 @enumFromInt(ses.phase.load(.acquire))
             else
@@ -4411,6 +4593,7 @@ pub const Daemon = struct {
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{
             .sid = sid,
             .state = state,
+            .pause = if (session) |ses| sessionPauseState(ses) else .none,
             .err_text = err_text,
             .phase = if (session) |ses| if (active_turn)
                 @enumFromInt(ses.phase.load(.acquire))
@@ -4470,6 +4653,9 @@ pub const Daemon = struct {
         errdefer self.gpa.free(infos);
         for (rows, 0..) |row, i| {
             const live = self.sessions.get(row.id);
+            const stored_pause = if (live == null) try self.store.getPause(row.id) else null;
+            defer if (stored_pause) |paused| paused.deinit(self.gpa);
+
             const state = if (live) |session|
                 session.state
             else
@@ -4486,6 +4672,7 @@ pub const Daemon = struct {
                 .effort = row.effort,
                 .status = row.status,
                 .state = state,
+                .pause = if (live) |session| sessionPauseState(session) else if (stored_pause != null) .paused else .none,
                 .created_at = row.created_at,
                 .running = state == .running,
                 .sandboxed = self.sandbox_backend != .unavailable and
@@ -5108,7 +5295,16 @@ pub const Daemon = struct {
         self.sendTo(client, .{ .mcp_list_result = .{ .servers = wire } });
     }
 
+    fn refusePendingRebootForCheckpoint(self: *Daemon) void {
+        const requester = self.pending_reboot orelse return;
+        self.pending_reboot = null;
+        self.reboot_suspend = false;
+        self.store.disarmRestartPauses() catch {};
+        if (self.lookupClient(requester)) |client| self.sendTo(client, .{ .err = .{ .code = "checkpoint_failed", .msg = "reboot cancelled: could not persist paused session; retry /resume or reboot after fixing storage" } });
+    }
+
     fn refusePendingRebootForApproval(self: *Daemon) void {
+        if (self.reboot_suspend) return;
         const requester = self.pending_reboot orelse return;
         self.pending_reboot = null;
         if (self.lookupClient(requester)) |client| {
@@ -5956,6 +6152,7 @@ test "a disconnected requester cannot leave a delayed reboot armed" {
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
 
+    daemon.reboot_suspend = false;
     daemon.pending_reboot = 41;
     try daemon.handleEvent(.{ .client_gone = .{ .client_id = 7 } });
     try std.testing.expectEqual(@as(?u64, 41), daemon.pending_reboot);

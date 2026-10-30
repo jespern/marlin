@@ -189,6 +189,7 @@ pub const RunOpts = struct {
     /// Cooperative cancellation: checked between rounds and threaded into
     /// the HTTP layer. When set mid-stream the turn ends with .interrupted.
     cancel: ?*std.atomic.Value(bool) = null,
+    pause: ?*std.atomic.Value(bool) = null,
     /// Steer poll: return queued mid-turn user text (caller allocs w/ gpa;
     /// loop frees). Checked between rounds and after a tool-free response;
     /// accepted text is injected as a steer block before the turn may finish.
@@ -614,6 +615,11 @@ pub fn runTurn(
     while (round < opts.max_rounds) : (round += 1) {
         publishPhase(opts, .context);
         const assemble_started_ms = nowAwakeMs(io);
+        if (cancelled(opts.pause)) {
+            _ = try ap.append(.{ .system_note = .{ .text = "session paused at a round boundary" } });
+            try store.updateSessionUsage(opts.session_id, total_in, total_out);
+            return .{ .text = try gpa.dupe(u8, ""), .rounds = round, .tokens_in = total_in, .tokens_out = total_out, .interrupted = true };
+        }
         // -- cancellation checkpoint --
         if (cancelled(opts.cancel)) {
             _ = try ap.append(.{ .system_note = .{ .text = "turn interrupted by user" } });

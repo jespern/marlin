@@ -261,3 +261,23 @@ Directory completion is covered by scenario `31_cwd_completion.json`: relative
 and absolute paths, the daemon's isolated HOME, non-directory filtering, missing
 paths, request correlation, and cwd changes. TUI tests exercise delayed replies,
 stale query/session/cwd rejection, and Tab/arrow navigation over protocol results.
+
+Pause/resume coverage uses real socket clients and isolated daemon restarts in
+`32_pause_round` through `43_pause_child`: queued screenshots, reconnect/replay,
+forced shell interruption, pending approvals/questions, manual versus reboot
+intent, kill-9 during suspension, requester disconnect, natural completion races,
+Claude/Codex process teardown and vendor-session resume, three cycles across four
+concurrent sessions, and parent/child coordination. The guest peers in
+`fixtures/pause/` replace only external vendor processes. `44`–`48` exercise
+expired authentication via Claude results/envelopes/stderr and Codex stream/RPC
+errors, requiring actionable login instructions and exactly one guest invocation.
+Store tests cover atomic queued-input draining and attachment GC pins. TUI tests
+cover commands, draft preservation, pause metadata, and login-required alerts.
+Use `MARLIN_E2E_FILTER=pause zig build e2e` or
+`MARLIN_E2E_FILTER=guest_ zig build e2e` for focused iteration; the unfiltered suite
+remains the required final check.
+
+Scrollback rendering tests compare visible terminal cells while guest activity
+appears/disappears, streamed output finalizes, the composer/plan changes height,
+and turns settle. A separate wire-event test fills the bounded history window,
+keeps its first blocks intact under new output, and checks forward paging.

@@ -91,7 +91,9 @@ policy that failed open. Both default false when decoding an older daemon.
 | cc_approval | sid, tool, args_json | cc_approval_result — immediately when policy auto-allows/denies (read-only guest children deny writes outright), otherwise after a human answers the parked approval_request; sent by the `marlin cc_approve` bridge |
 | session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn, err{guest} on guest sessions |
 | interrupt | sid, report? | ok, or interrupt_result with phase/elapsed diagnostics when report=true (cooperative cancel; also denies a pending approval) |
-| reboot | force? | quiesce (wait for turns; force interrupts), acknowledge, finish teardown, retire the listener/lock, then close the connection — EOF is the requester's cue to re-exec; non-force returns err{approval_pending} rather than wait on an approval with no client |
+| session_pause | sid?, all?, force? | persist pause intent for an active root and its children; ok acknowledges the request, status.pause advances from pausing to paused after workers stop |
+| session_resume | sid?, all? | resume manually paused roots; idempotent for already idle sessions, err{busy} while an addressed session is still pausing |
+| reboot | force?, suspend_sessions? | with suspend_sessions=true, checkpoint active roots for automatic continuation after restart; otherwise retain legacy whole-turn drain/forced interrupt. Acknowledge, finish teardown, retire listener/lock, then close — EOF is the requester's cue to re-exec |
 | shutdown | — | optional daemon_stopping notice, ok, then clean teardown and connection close |
 | gc | expire_before_ms? | gc report (orphan blobs, expired blobs, bytes reclaimed); holds the store's connection mutex across its transaction |
 
@@ -186,7 +188,7 @@ flag is read at export time, so it covers everything still in the outbox.
 | message | when |
 |---|---|
 | daemon_stopping | deliberate shutdown, only for clients that opted into lifecycle_events |
-| hello_ok | handshake |
+| hello_ok | handshake; pause_resume advertises durable suspend/resume support (default false), hostname identifies the daemon host (default empty) |
 | session_created | reply to session_create |
 | session_list_result | reply to session_list |
 | input_history_result {entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
@@ -300,7 +302,9 @@ Shutdown/reboot `ok` acknowledges acceptance. Current clients also wait for
 EOF on that connection before declaring retirement; EOF without an ACK is
 uncertain and fails. A timeout fails visibly without claiming that the pending
 request completed. A pending reboot is cancelled if its requesting client
-disconnects before quiescence. The daemon flushes the shutdown ACK before
+disconnects before quiescence; any reboot suspension intents become manual pauses.
+`status.pause` and `SessionInfo.pause` are additive `none`/`pausing`/`paused` fields
+(default `none`), preserving the existing SessionState enum for older clients. The daemon flushes the shutdown ACK before
 closing client sockets. Clients may opt in with
 `hello.lifecycle_events = true` (default false).
 After receiving the ACK, a stop client half-closes its command direction. This

@@ -53,7 +53,7 @@ test "generic Claude connection errors include captured stderr" {
     );
 }
 
-test "specific Claude errors keep their original text" {
+test "Claude login errors explain how to authenticate on the daemon host" {
     const note = try claude_code_turn.claudeErrorNote(
         std.testing.allocator,
         "Not logged in · Please run /login",
@@ -61,7 +61,7 @@ test "specific Claude errors keep their original text" {
     );
     defer std.testing.allocator.free(note);
     try std.testing.expectEqualStrings(
-        "claude code error: Not logged in · Please run /login",
+        @import("../../core/guest.zig").loginRequiredNote(.claude_code),
         note,
     );
 }

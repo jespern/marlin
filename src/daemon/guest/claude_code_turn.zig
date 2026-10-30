@@ -6,6 +6,7 @@
 //! enforces — loop.zig stays the native agent turn.
 
 const std = @import("std");
+const guest_auth = @import("../../core/guest.zig");
 const Io = std.Io;
 
 const block = @import("../../core/block.zig");
@@ -266,6 +267,8 @@ pub fn claudeErrorNote(
     detail: []const u8,
     stderr: []const u8,
 ) ![]u8 {
+    if (guest_auth.isAuthFailure(detail) or guest_auth.isAuthFailure(stderr))
+        return allocator.dupe(u8, guest_auth.loginRequiredNote(.claude_code));
     const trimmed_detail = std.mem.trim(u8, detail, " \t\r\n");
     const compact_stderr = try compactDiagnostic(allocator, stderr, 512);
     defer allocator.free(compact_stderr);
@@ -533,6 +536,18 @@ fn ccInvoke(
             } orelse break;
             _ = line_arena_state.reset(.retain_capacity);
             const line_arena = line_arena_state.allocator();
+            // Claude can emit an authentication failure as an assistant
+            // envelope before (or without) a terminal result. Stop promptly.
+            if (std.json.parseFromSliceLeaky(std.json.Value, line_arena, line, .{})) |value| {
+                if (value == .object) if (value.object.get("error")) |failure| {
+                    if (failure == .string and guest_auth.isAuthFailure(failure.string)) {
+                        const note = guest_auth.loginRequiredNote(.claude_code);
+                        setDelegateError(note);
+                        _ = try ap.append(.{ .system_note = .{ .text = note } });
+                        return error.DelegateFailed;
+                    }
+                };
+            } else |_| {}
             var events: std.ArrayList(claude_code.Event) = .empty;
             claude_code.decodeLine(line_arena, line, &events) catch continue;
             if (first_event_at_ms == 0 and events.items.len > 0) first_event_at_ms = nowMs(io);
@@ -869,6 +884,16 @@ pub fn runClaudeCodeTurn(
     while (true) {
         rounds += 1;
         var outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh, rounds);
+        if (!outcome.cancelled and (guest_auth.isAuthFailure(outcome.result_error[0..outcome.result_error_len]) or
+            (outcome.result_is_error and guest_auth.isAuthFailure(outcome.final_text.items)) or
+            guest_auth.isAuthFailure(outcome.stderr_tail[0..outcome.stderr_len])))
+        {
+            outcome.final_text.deinit(gpa);
+            const note = guest_auth.loginRequiredNote(.claude_code);
+            setDelegateError(note);
+            _ = try ap.append(.{ .system_note = .{ .text = note } });
+            return error.DelegateFailed;
+        }
         // Session-identity mismatch: an invocation that never INITIALIZED
         // didn't run at all — `--resume` of an id Claude Code has never seen
         // exits 0 with an is_error result and no init event (observed live),

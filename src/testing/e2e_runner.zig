@@ -154,6 +154,7 @@ const Check = struct {
     /// Direct socket regression: approval publication, reconnect replay,
     /// steering while parked, and reboot refusal are one state-machine flow.
     approval_reconnect_flow: bool = false,
+    pause_flow: []const u8 = "",
     /// Fetch a stored full tool-output blob over the daemon protocol and
     /// require at least this many decoded bytes (exercises large replies).
     blob_roundtrip_min_bytes: u64 = 0,
@@ -196,6 +197,7 @@ pub fn main(init: std.process.Init) !u8 {
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        if (init.environ_map.get("MARLIN_E2E_FILTER")) |filter| if (std.mem.indexOf(u8, entry.name, filter) == null) continue;
         try names.append(arena, try arena.dupe(u8, entry.name));
     }
     std.mem.sort([]const u8, names.items, {}, lessThan);
@@ -345,6 +347,18 @@ fn runScenario(
     while (env_it.next()) |kv| {
         try env.put(kv.key_ptr.*, kv.value_ptr.*);
     }
+    if (std.mem.startsWith(u8, sf.check.pause_flow, "guest_")) {
+        const claude = std.mem.startsWith(u8, sf.check.pause_flow, "guest_claude");
+        const auth = std.mem.indexOf(u8, sf.check.pause_flow, "_auth_") != null;
+        const fixture_name: []const u8 = if (auth) (if (claude) "claude_auth.sh" else "codex_auth.sh") else (if (claude) "claude.sh" else "codex.sh");
+        const fixture = try std.fs.path.join(arena, &.{ scenarios_dir, "..", "fixtures", "pause", fixture_name });
+        const script = try Io.Dir.cwd().readFileAlloc(io, fixture, arena, .limited(64 * 1024));
+        const path = try std.fs.path.joinZ(arena, &.{ state_dir, "guest-peer" });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script });
+        if (std.c.chmod(path, 0o755) != 0) return error.GuestFixtureChmodFailed;
+        try env.put(if (claude) "MARLIN_CLAUDE_CODE_BIN" else "MARLIN_CODEX_BIN", path);
+        try env.put("MARLIN_AUTH_TEST_CASE", sf.check.pause_flow);
+    }
     // A successful client command may leave its intentionally daemonized
     // child alive in the command's owned process group. Remember every group
     // so cleanup can sweep it after the graceful shutdown attempt.
@@ -380,7 +394,7 @@ fn runScenario(
 
     // 3. Run ordinary CLI scenarios, or the direct multi-connection protocol
     // regression that cannot be expressed as a one-shot headless command.
-    if (sf.check.approval_reconnect_flow) {
+    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0) {
         const started = try process_io.run(gpa, io, .{
             .argv = &.{ marlin_bin, "ls" },
             .environ_map = &env,
@@ -392,7 +406,10 @@ fn runScenario(
         defer started.deinit(gpa);
         if (started.process_group_id) |group_id| try process_groups.append(gpa, group_id);
         if (started.term != .exited or started.term.exited != 0) return error.DaemonStartFailed;
-        try checkApprovalReconnectFlow(gpa, io, &env, state_dir);
+        if (sf.check.pause_flow.len > 0)
+            try checkPauseFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups, sf.check.pause_flow)
+        else
+            try checkApprovalReconnectFlow(gpa, io, &env, state_dir);
     } else {
         var runs: u8 = 0;
         while (runs < sf.check.runs) : (runs += 1) {
@@ -1091,6 +1108,289 @@ fn checkApprovalReconnectFlow(
         if (uintField(daemon_err, "request_id") != 103) return error.InputAckMismatch;
         break;
     }
+}
+
+fn pauseCreate(conn: *ProtocolConn, arena: std.mem.Allocator, cwd: []const u8, approvals: []const u8) !u64 {
+    try conn.send(.{ .session_create = .{ .cwd = cwd, .model = "local/testing", .approvals = approvals } });
+    const created = try recvTagBounded(conn, arena, "session_created");
+    const sid = uintField(created, "sid") orelse return error.SessionIdMissing;
+    try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+    _ = try recvTagBounded(conn, arena, "status");
+    return sid;
+}
+
+fn pauseWaitState(conn: *ProtocolConn, arena: std.mem.Allocator, sid: u64, pause: []const u8, state: []const u8) !void {
+    while (true) {
+        const msg = try recvBounded(conn, arena);
+        if (tagObject(msg, "err")) |err| {
+            reportDaemonError(conn.io, err);
+            return error.PauseFlowDaemonError;
+        }
+        const status = tagObject(msg, "status") orelse continue;
+        if (uintField(status, "sid") != sid) continue;
+        if (std.mem.eql(u8, stringField(status, "state") orelse "", "err")) {
+            print(conn.io, "turn error: {s}\n", .{stringField(status, "err_text") orelse "unknown"});
+            return error.PauseFlowTurnFailed;
+        }
+        if (std.mem.eql(u8, stringField(status, "pause") orelse "none", pause) and
+            std.mem.eql(u8, stringField(status, "state") orelse "", state)) return;
+    }
+}
+
+fn pauseWaitCall(conn: *ProtocolConn, arena: std.mem.Allocator, sid: u64) !void {
+    while (true) {
+        const msg = try recvBounded(conn, arena);
+        if (tagObject(msg, "status")) |status| {
+            if (uintField(status, "sid") == sid and std.mem.eql(u8, stringField(status, "state") orelse "", "err")) {
+                print(conn.io, "guest/turn error: {s}\n", .{stringField(status, "err_text") orelse "unknown"});
+                return error.PauseFlowTurnFailed;
+            }
+        }
+        const blk = tagObject(msg, "blk") orelse continue;
+        if (uintField(blk, "sid") != sid) continue;
+        const b = blk.get("b") orelse continue;
+        const body = b.object.get("body") orelse continue;
+        if (body.object.contains("tool_call")) return;
+    }
+}
+
+fn pauseAssertListed(conn: *ProtocolConn, arena: std.mem.Allocator, sid: u64, expected: []const u8) !void {
+    try conn.send(.{ .session_list = .{ .include_archived = false } });
+    const list = try recvTagBounded(conn, arena, "session_list_result");
+    for (list.get("sessions").?.array.items) |session| {
+        if (uintField(session.object, "sid") != sid) continue;
+        if (!std.mem.eql(u8, stringField(session.object, "pause") orelse "none", expected)) return error.PauseListingMismatch;
+        return;
+    }
+    return error.PausedSessionMissing;
+}
+
+fn pauseStartDaemon(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, exe: []const u8, groups: *std.ArrayList(std.posix.pid_t)) !void {
+    const result = try process_io.run(gpa, io, .{
+        .argv = &.{ exe, "ls" },
+        .environ_map = env,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = 256 * 1024,
+        .stderr_limit = 256 * 1024,
+        .timeout_ms = helper_timeout_ms,
+    });
+    defer result.deinit(gpa);
+    if (result.process_group_id) |group| try groups.append(gpa, group);
+    if (result.term != .exited or result.term.exited != 0) return error.PauseDaemonRestartFailed;
+}
+
+fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, exe: []const u8, groups: *std.ArrayList(std.posix.pid_t), flow: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    if (std.mem.startsWith(u8, flow, "guest_")) {
+        try conn.send(.{ .session_create = .{ .cwd = cwd, .model = if (std.mem.startsWith(u8, flow, "guest_claude")) @as([]const u8, "claudecode/default") else "codex/default", .approvals = "auto" } });
+        const created = try recvTagBounded(conn, arena, "session_created");
+        const sid = uintField(created, "sid").?;
+        try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+        try conn.send(.{ .input = .{ .sid = sid, .text = "guest pause task" } });
+        if (std.mem.indexOf(u8, flow, "_auth_") != null) {
+            while (true) {
+                const status = try recvTagBounded(conn, arena, "status");
+                if (uintField(status, "sid") != sid) continue;
+                if (!std.mem.eql(u8, stringField(status, "state") orelse "", "err")) continue;
+                const message = stringField(status, "err_text") orelse return error.AuthErrorMissing;
+                const command: []const u8 = if (std.mem.startsWith(u8, flow, "guest_claude")) "claude auth login" else "codex login";
+                if (std.mem.indexOf(u8, message, command) == null or std.mem.indexOf(u8, message, "daemon host") == null) return error.AuthLoginInstructionMissing;
+                break;
+            }
+            const path = try std.fs.path.join(arena, &.{ cwd, "auth-attempts" });
+            const attempts = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024));
+            if (!std.mem.eql(u8, attempts, "attempt\n")) return error.AuthFailureWasRetried;
+            return;
+        }
+        try pauseWaitCall(conn, arena, sid);
+        const pid_path = try std.fs.path.join(arena, &.{ cwd, "guest-pid" });
+        const pid_text = try Io.Dir.cwd().readFileAlloc(io, pid_path, arena, .limited(128));
+        const pid = try std.fmt.parseInt(std.posix.pid_t, pid_text, 10);
+        try conn.send(.{ .session_pause = .{ .all = true } });
+        _ = try recvTagBounded(conn, arena, "ok");
+        try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+        try pauseWaitState(conn, arena, sid, "paused", "idle");
+        if (std.c.kill(pid, @enumFromInt(0)) == 0) return error.PausedGuestStillRunning;
+        try conn.send(.{ .reboot = .{ .suspend_sessions = true } });
+        _ = try recvTagBounded(conn, arena, "ok");
+        while (true) {
+            _ = recvBounded(conn, arena) catch |err| {
+                if (err != error.EndOfStream and err != error.ReadFailed) return err;
+                break;
+            };
+        }
+        try pauseStartDaemon(gpa, io, env, cwd, exe, groups);
+        const replacement = try connectProtocol(gpa, io, env);
+        conn.deinit();
+        conn = replacement;
+        try pauseAssertListed(conn, arena, sid, "paused");
+        try conn.send(.{ .session_resume = .{ .all = true } });
+        _ = try recvTagBounded(conn, arena, "ok");
+        try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+        try pauseWaitState(conn, arena, sid, "none", "idle");
+        try pauseAssertListed(conn, arena, sid, "none");
+        return;
+    }
+    if (std.mem.eql(u8, flow, "parallel")) {
+        var sessions: [4]u64 = undefined;
+        for (&sessions) |*sid| sid.* = try pauseCreate(conn, arena, cwd, "auto");
+        for (0..3) |_| {
+            for (sessions) |sid| {
+                try conn.send(.{ .input = .{ .sid = sid, .text = "parallel pause task" } });
+                try pauseWaitCall(conn, arena, sid);
+            }
+            try conn.send(.{ .session_pause = .{ .all = true } });
+            _ = try recvTagBounded(conn, arena, "ok");
+            try conn.send(.{ .session_resume = .{ .sid = sessions[0] } });
+            try expectDaemonError(conn, arena, "busy");
+            for (sessions) |sid| {
+                try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+                try pauseWaitState(conn, arena, sid, "paused", "idle");
+                try pauseAssertListed(conn, arena, sid, "paused");
+            }
+            try conn.send(.{ .session_resume = .{ .all = true } });
+            _ = try recvTagBounded(conn, arena, "ok");
+            for (sessions) |sid| {
+                try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+                try pauseWaitState(conn, arena, sid, "none", "idle");
+            }
+        }
+        return;
+    }
+    if (std.mem.eql(u8, flow, "child")) {
+        try conn.send(.{ .session_watch = .{ .incremental = true } });
+        const sid = try pauseCreate(conn, arena, cwd, "auto");
+        try conn.send(.{ .input = .{ .sid = sid, .text = "parent pause task" } });
+        const child_sid = while (true) {
+            const update = try recvTagBounded(conn, arena, "session_upsert");
+            const child = update.get("session").?.object;
+            if (uintField(child, "parent_sid") == sid) break uintField(child, "sid").?;
+        };
+        try conn.send(.{ .sub = .{ .sid = child_sid, .from_seq = 0 } });
+        _ = try recvTagBounded(conn, arena, "delta");
+        try conn.send(.{ .session_pause = .{ .sid = sid } });
+        _ = try recvTagBounded(conn, arena, "ok");
+        try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+        try pauseWaitState(conn, arena, sid, "paused", "idle");
+        try pauseAssertListed(conn, arena, child_sid, "paused");
+        try conn.send(.{ .session_resume = .{ .sid = sid } });
+        _ = try recvTagBounded(conn, arena, "ok");
+        try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+        try pauseWaitState(conn, arena, sid, "none", "idle");
+        return;
+    }
+    const approval_flow = std.mem.eql(u8, flow, "approval");
+    const question_flow = std.mem.eql(u8, flow, "question");
+    const reboot_flow = std.mem.eql(u8, flow, "reboot");
+    const crash_flow = std.mem.eql(u8, flow, "crash");
+    const disconnect_flow = std.mem.eql(u8, flow, "disconnect");
+    const force_flow = std.mem.eql(u8, flow, "force");
+    const finish_flow = std.mem.eql(u8, flow, "finish");
+    const sid = try pauseCreate(conn, arena, cwd, if (approval_flow) "default" else "auto");
+    try conn.send(.{ .input = .{ .sid = sid, .text = "pause stress task" } });
+    if (approval_flow) {
+        var id_buf: [32]u8 = undefined;
+        _ = try waitApproval(conn, arena, sid, &id_buf);
+    } else if (question_flow) {
+        _ = try recvTagBounded(conn, arena, "question_request");
+    } else if (finish_flow) {
+        _ = try recvTagBounded(conn, arena, "delta");
+    } else try pauseWaitCall(conn, arena, sid);
+
+    if (!finish_flow) {
+        try conn.send(.{ .input = .{ .sid = sid, .text = "queued before suspension", .request_id = 77, .attachments = &.{.{ .name = "pause.png", .mime = "image/png", .data_base64 = "iVBORw0KGgpwYXlsb2Fk" }} } });
+        _ = try recvTagBounded(conn, arena, "ok");
+    }
+    try conn.send(.{ .session_pause = .{ .sid = sid, .force = force_flow } });
+    _ = try recvTagBounded(conn, arena, "ok");
+    if (finish_flow) {
+        try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+        try pauseWaitState(conn, arena, sid, "none", "idle");
+        try pauseAssertListed(conn, arena, sid, "none");
+        return;
+    }
+    // Duplicate requests are harmless, and input cannot accidentally unpause.
+    try conn.send(.{ .session_pause = .{ .sid = sid } });
+    try conn.send(.{ .input = .{ .sid = sid, .text = "must remain a draft", .request_id = 78 } });
+    try expectDaemonError(conn, arena, "paused");
+    // A fresh subscription verifies the persisted state even when an earlier
+    // terminal status was consumed while waiting for an acknowledgement.
+    try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+    try pauseWaitState(conn, arena, sid, "paused", "idle");
+    try pauseAssertListed(conn, arena, sid, "paused");
+
+    if (reboot_flow or crash_flow or disconnect_flow) {
+        const second = try pauseCreate(conn, arena, cwd, "auto");
+        try conn.send(.{ .input = .{ .sid = second, .text = "second restart task" } });
+        try pauseWaitCall(conn, arena, second);
+        try conn.send(.{ .input = .{ .sid = second, .text = "reboot queued screenshot", .request_id = 79, .attachments = &.{.{ .name = "reboot.png", .mime = "image/png", .data_base64 = "iVBORw0KGgpwYXlsb2Fk" }} } });
+        _ = try recvTagBounded(conn, arena, "ok");
+        const requester = try connectProtocol(gpa, io, env);
+        var requester_open = true;
+        defer if (requester_open) requester.deinit();
+        try requester.send(.{ .hello = .{ .proto_version = proto.proto_version } });
+        const hello = try recvTagBounded(requester, arena, "hello_ok");
+        const pid = uintField(hello, "daemon_pid") orelse return error.DaemonPidMissing;
+        try requester.send(.{ .reboot = .{ .suspend_sessions = true } });
+        try pauseWaitState(conn, arena, second, "pausing", "running");
+        if (crash_flow) {
+            if (std.c.kill(@intCast(pid), std.posix.SIG.KILL) != 0) return error.DaemonKillFailed;
+        } else if (disconnect_flow) {
+            requester.deinit();
+            requester_open = false;
+            try pauseWaitState(conn, arena, second, "paused", "idle");
+            try pauseAssertListed(conn, arena, second, "paused");
+            // Shutdown without reboot intent: both sessions must remain paused.
+            try conn.send(.{ .shutdown = struct {}{} });
+        } else {
+            _ = try recvTagBounded(requester, arena, "ok");
+        }
+        // EOF confirms the old daemon has released this connection.
+        while (true) {
+            _ = recvBounded(conn, arena) catch |err| {
+                if (err != error.EndOfStream and err != error.ReadFailed) return err;
+                break;
+            };
+        }
+        try pauseStartDaemon(gpa, io, env, cwd, exe, groups);
+        const replacement = try connectProtocol(gpa, io, env);
+        conn.deinit();
+        conn = replacement;
+        try pauseAssertListed(conn, arena, sid, "paused");
+        if (disconnect_flow) {
+            try pauseAssertListed(conn, arena, second, "paused");
+            try conn.send(.{ .session_resume = .{ .sid = second } });
+            _ = try recvTagBounded(conn, arena, "ok");
+        }
+        try conn.send(.{ .sub = .{ .sid = second, .from_seq = 0 } });
+        try pauseWaitState(conn, arena, second, "none", "idle");
+    } else {
+        // Manual pause survives dropping every subscriber and rehydrating.
+        const replacement = try connectProtocol(gpa, io, env);
+        conn.deinit();
+        conn = replacement;
+        try pauseAssertListed(conn, arena, sid, "paused");
+    }
+    try conn.send(.{ .session_resume = .{ .all = true } });
+    _ = try recvTagBounded(conn, arena, "ok");
+    try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+    if (approval_flow) {
+        var id_buf: [32]u8 = undefined;
+        const id = try waitApproval(conn, arena, sid, &id_buf);
+        try conn.send(.{ .approve = .{ .sid = sid, .approval_id = id, .decision = .granted } });
+    } else if (question_flow) {
+        const question = try recvTagBounded(conn, arena, "question_request");
+        try conn.send(.{ .question_answer = .{ .sid = sid, .question_id = stringField(question, "question_id").?, .answer = "Proceed" } });
+    }
+    try pauseWaitState(conn, arena, sid, "none", "idle");
+    try pauseAssertListed(conn, arena, sid, "none");
+    // Resuming an already completed session must not issue another model call.
+    try conn.send(.{ .session_resume = .{ .sid = sid } });
+    _ = try recvTagBounded(conn, arena, "ok");
 }
 
 fn checkSkillInvocation(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {

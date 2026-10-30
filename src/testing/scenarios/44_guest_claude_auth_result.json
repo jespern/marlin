@@ -1,0 +1,7 @@
+{
+  "steps": [],
+  "check": {
+    "argv": [],
+    "pause_flow": "guest_claude_auth_result"
+  }
+}

@@ -18,6 +18,73 @@ test {
     std.testing.refAllDecls(store_mod);
 }
 
+test "pause intents preserve queued steering atomically and distinguish restart from manual recovery" {
+    const gpa = std.testing.allocator;
+    var db = try Store.open(gpa, null);
+    defer db.close();
+    for (1..4) |sid| {
+        try db.createSession(sid, @intCast(sid), "/tmp", "local/testing", .auto);
+        try db.setSessionStatus(sid, "running");
+    }
+    try db.setPause(1, false, "auto");
+    try db.setPause(2, true, "default");
+    const steer = block.Block{ .id = 1, .session_id = 2, .turn_id = 1, .seq = 1, .ts = 0, .body = .{ .steer = .{ .text = "keep this screenshot instruction" } } };
+    try db.appendBlock(steer);
+    // A duplicate block rolls back the queued text together with the block.
+    try std.testing.expectError(error.SqliteStep, db.appendBlock(steer));
+    const paused = (try db.getPause(2)).?;
+    defer paused.deinit(gpa);
+    try std.testing.expect(paused.restart);
+    try std.testing.expectEqualStrings("\nkeep this screenshot instruction", paused.queued_text);
+    const automatic = try db.pausedSessions(true);
+    defer gpa.free(automatic);
+    try std.testing.expectEqualSlices(u64, &.{2}, automatic);
+    try db.recoverInterruptedSessions();
+    for (1..4) |sid| {
+        const row = try db.getSession(sid);
+        defer db.freeSession(row);
+        try std.testing.expectEqualStrings(if (sid == 3) "err" else "idle", row.status);
+    }
+    try db.disarmRestartPauses();
+    const disarmed = try db.pausedSessions(true);
+    defer gpa.free(disarmed);
+    try std.testing.expectEqual(@as(usize, 0), disarmed.len);
+    const manual = try db.pausedSessions(false);
+    defer gpa.free(manual);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, manual);
+    try db.clearPause(2);
+    try std.testing.expect(try db.getPause(2) == null);
+}
+
+test "pause checkpoints pin screenshot blobs and drain each queued message exactly once" {
+    const gpa = std.testing.allocator;
+    var db = try Store.open(gpa, null);
+    defer db.close();
+    try db.createSession(7, 1, "/tmp", "local/testing", .auto);
+    const hash = try db.putBlob("screenshot bytes", 1);
+    defer gpa.free(hash);
+    const pending = Store.PausedInput{ .id = 11, .input = .{ .text = "look here", .attachments = &.{.{ .hash = hash, .mime = "image/png", .name = "shot.png", .byte_len = 16 }} } };
+    try db.checkpointPause(7, true, "auto", &.{pending});
+    _ = try db.gc(100);
+    const before = try db.getBlob(hash);
+    defer gpa.free(before);
+    try std.testing.expectEqualStrings("screenshot bytes", before);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const saved = try db.pausedInputs(arena.allocator(), 7);
+    try std.testing.expectEqual(@as(usize, 1), saved.len);
+    try std.testing.expectEqualStrings("shot.png", saved[0].input.attachments[0].name);
+    try db.appendBlock(.{ .id = saved[0].id, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 100, .body = .{ .steer = saved[0].input } });
+    try std.testing.expect(!try db.hasPausedInputs(7));
+    const pause = (try db.getPause(7)).?;
+    defer pause.deinit(gpa);
+    try std.testing.expectEqualStrings("\nlook here", pause.queued_text);
+    _ = try db.gc(200);
+    const after = try db.getBlob(hash);
+    defer gpa.free(after);
+    try std.testing.expectEqualStrings("screenshot bytes", after);
+}
+
 fn expectQueryPlanUses(store: Store, comptime sql: [:0]const u8, bindings: []const i64, needle: []const u8) !void {
     const stmt = try store.prepare(sql);
     defer finalize(stmt);

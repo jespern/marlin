@@ -1,0 +1,19 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "pause stress task"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"pause stress completed\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ],
+      "delay_ms_between_events": 300
+    }
+  ],
+  "check": {
+    "argv": [],
+    "pause_flow": "finish"
+  }
+}

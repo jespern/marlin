@@ -60,6 +60,8 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
     .{ .name = "/compact", .description = "compact the current context" },
     .{ .name = "/config", .usage = " [tabbar|bell on|off|screensaver <duration|effect> [effect]]", .description = "view or change UI settings (persisted)", .accepts_args = true },
+    .{ .name = "/pause", .usage = " [all] [--force]", .description = "suspend active work", .accepts_args = true },
+    .{ .name = "/resume", .usage = " [all]", .description = "continue paused work", .accepts_args = true },
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
     .{ .name = "/quit", .description = "leave Marlin (sessions keep running)" },
@@ -818,6 +820,30 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.shellEscape(it.rest());
     } else if (std.mem.eql(u8, head, "!c")) {
         self.copyLastToolOutput();
+    } else if (std.mem.eql(u8, head, "/pause") or std.mem.eql(u8, head, "/resume")) {
+        if (!self.pause_supported) {
+            self.setNotice("pause/resume needs an updated daemon; rebuild both client and daemon", .{});
+            return;
+        }
+        const pause = std.mem.eql(u8, head, "/pause");
+        var all = false;
+        var force = false;
+        while (it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "all")) all = true else if (pause and std.mem.eql(u8, arg, "--force")) force = true else {
+                self.setNotice("usage: /pause [all] [--force] or /resume [all]", .{});
+                return;
+            }
+        }
+        const sid = self.rootSessionId(self.view.sid);
+        const msg: proto.ClientMsg = if (pause)
+            .{ .session_pause = .{ .sid = sid, .all = all, .force = force } }
+        else
+            .{ .session_resume = .{ .sid = sid, .all = all } };
+        self.conn.send(msg) catch {
+            self.setNotice("could not send {s} request", .{head});
+            return;
+        };
+        self.setNotice("{s} requested", .{if (pause) @as([]const u8, "pause") else "resume"});
     } else if (std.mem.eql(u8, head, "/reboot") or std.mem.eql(u8, head, "!rb") or std.mem.eql(u8, head, "!rbc")) {
         var rebuild: RebuildScope = if (std.mem.eql(u8, head, "!rbc"))
             .client
@@ -845,12 +871,12 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
                 return;
             }
         }
-        if (self.view.state == .awaiting_approval and !force and rebuild != .client) {
+        if (self.view.state == .awaiting_approval and !self.pause_supported and !force and rebuild != .client) {
             self.setNotice("approval pending — answer it, interrupt, or /reboot --force", .{});
             return;
         }
         if (self.view.state == .running and rebuild != .client) {
-            self.setNotice("turn running — /reboot waits for it (interrupt first if you want force)", .{});
+            self.setNotice("{s}", .{if (self.pause_supported) @as([]const u8, "reboot will suspend active work and resume it afterward") else "turn running — /reboot waits for it (interrupt first if you want force)"});
         }
         self.reboot_request = .{ .requested = true, .rebuild = rebuild, .force = force };
         self.should_quit = true;

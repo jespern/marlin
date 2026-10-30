@@ -1,0 +1,43 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "parent pause task"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"task\",\"arguments\":\"{\\\"prompt\\\": \\\"inspect child task\\\", \\\"max_rounds\\\": 5}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "inspect child task"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{}}]}",
+        "{\"choices\":[{\"delta\":{\"content\":\"child is inspecting\\n\"}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\": \\\"nonexistent.txt\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ],
+      "delay_ms_between_events": 200
+    },
+    {
+      "expect_contains": [
+        "parent pause task",
+        "interrupted",
+        "Resume the task suspended by Marlin"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"resumed successfully\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": [],
+    "pause_flow": "child"
+  }
+}

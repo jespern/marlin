@@ -40,6 +40,7 @@ const build_options = @import("build_options");
 const vaxis = @import("vaxis");
 
 const proto = @import("../core/proto.zig");
+const guest_auth = @import("../core/guest.zig");
 const block = @import("../core/block.zig");
 const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
@@ -300,6 +301,7 @@ const SessionSummary = struct {
     model: []u8,
     effort: proto.ReasoningEffort,
     state: proto.SessionState,
+    pause: proto.PauseState = .none,
     created_at: i64,
     label: []u8,
     /// Effective shell-sandbox state (session toggle AND verified backend).
@@ -335,6 +337,7 @@ const tab_label_max_cells: usize = 24;
 
 pub const TabActivity = enum {
     idle,
+    paused,
     done,
     running,
     err,
@@ -471,6 +474,7 @@ pub const App = struct {
     git_cwd: std.ArrayList(u8) = .empty,
     git_label: std.ArrayList(u8) = .empty,
     git_supported: bool = false,
+    pause_supported: bool = false,
     git_sid: u64 = 0,
     git_next_poll_ms: i64 = 0,
     /// Selector overlay: null = closed; value = highlighted index into the
@@ -1036,7 +1040,7 @@ pub const App = struct {
         var activity: TabActivity = if (self.unread_completions.contains(root_sid)) .done else .idle;
         for (self.sessions.items) |session| {
             if (!self.sessionBelongsToTree(session.sid, root_sid)) continue;
-            const candidate = tabActivityForState(session.state);
+            const candidate: TabActivity = if (session.pause == .paused) .paused else tabActivityForState(session.state);
             if (tabActivityRank(candidate) > tabActivityRank(activity)) activity = candidate;
         }
         return activity;
@@ -1371,12 +1375,14 @@ pub const App = struct {
 
             if (info.sid == self.view.sid) {
                 self.view.state = info.state;
+                self.view.pause = info.pause;
                 self.setCwdStr(info.cwd);
                 self.view.plan_mode = info.plan_mode;
                 self.view.usage_credits = info.usage_credits;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
             } else if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
+                saved.pause = info.pause;
                 saved.cwd.clearRetainingCapacity();
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
@@ -1442,7 +1448,7 @@ pub const App = struct {
             hierarchy,
             self.displaySessionHandle(&handle_buf, info.sid),
             identity,
-            @tagName(info.state),
+            if (info.pause != .none) @tagName(info.pause) else @tagName(info.state),
             info.cwd,
         }) catch {
             self.gpa.free(title);
@@ -1459,6 +1465,7 @@ pub const App = struct {
             .model = model,
             .effort = info.effort,
             .state = info.state,
+            .pause = info.pause,
             .created_at = info.created_at,
             .label = label,
             .sandboxed = info.sandboxed,
@@ -1480,6 +1487,7 @@ pub const App = struct {
             self.session_labels.items[i] = summary.label;
             if (info.sid == self.view.sid) {
                 self.view.state = info.state;
+                self.view.pause = info.pause;
                 self.setModelStr(info.model);
                 self.setCwdStr(info.cwd);
                 self.view.permissions_full = info.full_access;
@@ -1489,6 +1497,7 @@ pub const App = struct {
             }
             if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
+                saved.pause = info.pause;
                 saved.cwd.clearRetainingCapacity();
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
@@ -1540,12 +1549,14 @@ pub const App = struct {
         if (!known_recent) self.recent_sessions.append(self.gpa, info.sid) catch {};
         if (info.sid == self.view.sid) {
             self.view.state = info.state;
+            self.view.pause = info.pause;
             self.setCwdStr(info.cwd);
             self.view.plan_mode = info.plan_mode;
             self.view.usage_credits = info.usage_credits;
             if (!info.plan_mode) self.view.plan_proposal_ready = false;
         } else if (self.saved_views.get(info.sid)) |saved| {
             saved.state = info.state;
+            saved.pause = info.pause;
             saved.cwd.clearRetainingCapacity();
             saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
             saved.plan_mode = info.plan_mode;
@@ -1807,6 +1818,15 @@ pub const App = struct {
                     self.bufferOlderBlock(b.b);
                     return;
                 }
+                // Keep the bounded reading window intact instead of evicting
+                // its first blocks underneath the reader. Existing forward
+                // paging and G can catch up with the durable tail later.
+                if (!view.history_loading and view.scroll_up > 0 and
+                    view.blocks.items.len >= history_window_blocks and b.b.seq > view.last_seq)
+                {
+                    view.history_has_newer = true;
+                    view.releaseStreamingBuffers(self.gpa);
+                }
                 // While an old window is visible, live durable blocks advance
                 // the known frontier without being spliced across the gap.
                 if (view.history_has_newer and b.b.seq > view.last_seq) {
@@ -1893,10 +1913,12 @@ pub const App = struct {
             },
             .delta => |d| {
                 const view = self.liveView(d.sid) orelse return;
+                if (view.history_has_newer) return;
                 view.delta.appendSlice(self.gpa, d.text) catch {};
             },
             .reasoning_delta => |d| {
                 const view = self.liveView(d.sid) orelse return;
+                if (view.history_has_newer) return;
                 view.reasoning_delta.appendSlice(self.gpa, d.text) catch {};
             },
             .stream_status => |ss| {
@@ -1918,14 +1940,17 @@ pub const App = struct {
                     view.state
                 else
                     null;
-                self.updateCompletionUnread(s.sid, prior_state, s.state);
+                if (s.pause == .none) self.updateCompletionUnread(s.sid, prior_state, s.state);
                 if (self.liveView(s.sid) orelse self.saved_views.get(s.sid)) |recap_view| {
                     if (s.state == .running or s.state == .awaiting_approval or
                         prior_state == .running or prior_state == .awaiting_approval)
                         recap_view.recap.changed(status_now);
                 }
                 self.updateSessionSummaryState(s.sid, s.state);
-                if (prior_state == .running and s.state != .running and
+                for (self.sessions.items) |*summary| {
+                    if (summary.sid == s.sid) summary.pause = s.pause;
+                }
+                if (s.pause == .none and prior_state == .running and s.state != .running and
                     (s.sid != self.view.sid or !self.terminal_focused))
                 {
                     if (s.state == .err)
@@ -1936,6 +1961,9 @@ pub const App = struct {
                 const view = self.liveView(s.sid) orelse {
                     if (self.saved_views.get(s.sid)) |saved| {
                         saved.state = s.state;
+                        saved.pause = s.pause;
+                        if (s.state != .err) saved.login_required = false;
+                        if (s.err_text) |text| saved.login_required = guest_auth.loginRequiredBackend(text) != null;
                         if (s.usage_credits) |active| saved.usage_credits = active;
                         if (s.turn_ms) |elapsed| saved.turn_started_ms = status_now - @as(i64, @intCast(elapsed));
                         if (s.phase) |phase| {
@@ -2007,6 +2035,9 @@ pub const App = struct {
                     view.replaceGuestActivity(self.gpa, &.{}) catch {};
                 }
                 view.state = s.state;
+                view.pause = s.pause;
+                if (s.state != .err) view.login_required = false;
+                if (s.err_text) |text| view.login_required = guest_auth.loginRequiredBackend(text) != null;
                 if (s.usage_credits) |active| view.usage_credits = active;
                 self.syncAnimationTicker();
                 if (s.state != .awaiting_approval) {
@@ -2356,13 +2387,12 @@ pub const App = struct {
                 self.clearCompletedPlan();
             },
             .system_note => |sn| {
+                if (guest_auth.loginRequiredBackend(sn.text) != null) self.view.login_required = true;
                 if (!isCompactionStatusNote(sn.text))
                     self.pushDurableBlock(b, .system_note, sn.text, "", .ok);
             },
             .compaction => self.pushDurableBlock(b, .compaction, "context compacted", "", .ok),
         }
-        // New content: keep pinned to bottom unless the user scrolled up.
-        if (self.view.scroll_up > 0) self.view.scroll_up +|= 0; // stay where they are
         if (!self.view.history_loading and !self.view.history_has_newer)
             self.trimHistoryWindow(true);
     }
@@ -2531,6 +2561,10 @@ pub const App = struct {
             // Up then Enter can repeat them during this client lifetime.
             self.view.editor.pushHistory(trimmed);
             self.runCommand(trimmed);
+            return;
+        }
+        if (self.view.pause != .none) {
+            self.setNotice("session is {s}; use /resume before sending input", .{@tagName(self.view.pause)});
             return;
         }
         // A parked question owns the composer: the turn cannot take input
@@ -3714,6 +3748,7 @@ pub const App = struct {
                 .parent_sid = session.parent_sid,
                 .kind = session.kind,
                 .state = session.state,
+                .pause = session.pause,
                 .created_at = session.created_at,
                 .title = session.title,
                 .cwd = session.cwd,
@@ -4835,6 +4870,7 @@ fn tabActivityForState(state: proto.SessionState) TabActivity {
 fn tabActivityRank(activity: TabActivity) u8 {
     return switch (activity) {
         .idle => 0,
+        .paused => 1,
         .done => 1,
         .running => 2,
         .err => 3,
@@ -4845,6 +4881,7 @@ fn tabActivityRank(activity: TabActivity) u8 {
 fn tabActivityText(activity: TabActivity) []const u8 {
     return switch (activity) {
         .idle => " ·",
+        .paused => " ‖",
         .done => " ✓",
         .running => " ●",
         .err => " ×",
@@ -5035,7 +5072,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
         try candidates.append(arena, .{
             .sid = app.view.sid,
             .label = tabLabel(app, null),
-            .activity = if (app.unread_completions.contains(app.view.sid)) .done else tabActivityForState(app.view.state),
+            .activity = if (app.view.pause == .paused) .paused else if (app.unread_completions.contains(app.view.sid)) .done else tabActivityForState(app.view.state),
             .active = true,
             .created_at = 0,
         });
@@ -5408,7 +5445,7 @@ fn drawWelcomeRows(win: vaxis.Window, top_rows: usize, view_h: usize, arena: std
 
 fn tabActivityStyle(activity: TabActivity, active: bool) vaxis.Style {
     var style: vaxis.Style = switch (activity) {
-        .idle => .{ .fg = .{ .index = 8 }, .dim = true },
+        .idle, .paused => .{ .fg = .{ .index = 8 }, .dim = true },
         .done => .{ .fg = .{ .index = 2 } },
         .running => .{ .fg = .{ .index = 3 }, .bold = true },
         .err => .{ .fg = .{ .index = 1 }, .bold = true },
@@ -5799,6 +5836,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             app.search.highlight_line = target_line;
             // Avoid treating this deliberate reposition as transcript growth.
             app.view.last_total_lines = total;
+            app.view.last_view_h = view_h;
         }
         app.search.target_seq = 0;
     }
@@ -5819,17 +5857,19 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
             const desired_first = target_line -| (@as(usize, view_h) / 3);
             app.view.scroll_up = max_scroll -| @min(desired_first, max_scroll);
             app.view.last_total_lines = total;
+            app.view.last_view_h = view_h;
         }
         app.view.history_target_seq = 0;
     }
-    // Anchor while reading: scroll_up counts from the BOTTOM, so content
-    // arriving while scrolled up would slide the view. Compensate by the
-    // growth delta; pinned (scroll_up == 0) stays pinned.
-    if (app.view.scroll_up > 0 and total > app.view.last_total_lines) {
-        app.view.scroll_up +|= total - app.view.last_total_lines;
+    const max_scroll = total -| view_h;
+    // Preserve the first visible row in both directions: activity cards and
+    // streaming previews can disappear as well as grow. Composer/plan height
+    // changes also alter the distance from that row to the bottom.
+    if (app.view.scroll_up > 0 and app.view.last_total_lines > 0) {
+        const previous_first = (app.view.last_total_lines -| app.view.last_view_h) -| app.view.scroll_up;
+        app.view.scroll_up = max_scroll -| previous_first;
     }
     app.view.last_total_lines = total;
-    const max_scroll = total -| view_h;
     if (app.view.scroll_up > max_scroll) app.view.scroll_up = max_scroll;
 
     const DisplayLine = struct {
@@ -6030,14 +6070,14 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // ---- status bar ----
     const status_win = win.child(.{ .y_off = h - 1, .height = 1, .width = w });
     status_win.fill(.{ .style = Palette.status_bar });
-    const state_txt: []const u8 = switch (app.view.state) {
+    const state_txt: []const u8 = if (app.view.login_required) "LOGIN REQUIRED" else if (app.view.pause != .none) @tagName(app.view.pause) else switch (app.view.state) {
         .idle => "idle",
         .running => "running",
         .awaiting_approval => "APPROVAL?",
         .err => "error",
         .done => "done",
     };
-    const state_style: vaxis.Style = switch (app.view.state) {
+    const state_style: vaxis.Style = if (app.view.pause != .none) Palette.status_muted else switch (app.view.state) {
         .idle, .done => Palette.status_idle,
         .running => Palette.status_running,
         .awaiting_approval => Palette.status_approval,
@@ -6674,6 +6714,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     app.daemon_hostname = new_conn.hostname();
     app.reconnecting = false;
     app.git_supported = new_conn.git_status;
+    app.pause_supported = new_conn.pause_resume;
     app.git_next_poll_ms = 0;
     app.git_label.clearRetainingCapacity();
     app.recaps_supported = new_conn.session_recaps;
@@ -7034,6 +7075,7 @@ pub fn run(
         .io = io,
         .conn = conn,
         .git_supported = conn.git_status,
+        .pause_supported = conn.pause_resume,
         .daemon_hostname = conn.hostname(),
         .recaps_supported = conn.session_recaps,
         .view = .{

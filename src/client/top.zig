@@ -20,6 +20,7 @@ pub const RowView = struct {
     parent_sid: ?u64,
     kind: proto.SessionKind,
     state: proto.SessionState,
+    pause: proto.PauseState = .none,
     created_at: i64,
     archived: bool = false,
     depth: usize = 0,
@@ -480,7 +481,7 @@ pub fn rowSegments(
     n += 1;
     out[n] = .{ .text = "  ", .style = base };
     n += 1;
-    out[n] = .{ .text = try padded(arena, stateLabel(row.state), columns.state, false), .style = state_style };
+    out[n] = .{ .text = try padded(arena, if (row.pause != .none) @tagName(row.pause) else stateLabel(row.state), columns.state, false), .style = state_style };
     n += 1;
     out[n] = .{ .text = "  ", .style = base };
     n += 1;
@@ -674,6 +675,7 @@ const OwnedRow = struct {
     parent_sid: ?u64,
     kind: proto.SessionKind,
     state: proto.SessionState,
+    pause: proto.PauseState = .none,
     created_at: i64,
     archived: bool,
     title: []u8,
@@ -686,6 +688,7 @@ const OwnedRow = struct {
             .parent_sid = info.parent_sid,
             .kind = info.kind,
             .state = info.state,
+            .pause = info.pause,
             .created_at = info.created_at,
             .archived = info.archived,
             .title = try gpa.dupe(u8, info.title),
@@ -706,6 +709,7 @@ const OwnedRow = struct {
             .parent_sid = self.parent_sid,
             .kind = self.kind,
             .state = self.state,
+            .pause = self.pause,
             .created_at = self.created_at,
             .archived = self.archived,
             .title = self.title,
@@ -960,6 +964,7 @@ pub const Top = struct {
             .status => |s| for (self.rows.items) |*row| {
                 if (row.sid == s.sid) {
                     row.state = s.state;
+                    row.pause = s.pause;
                     break;
                 }
             },

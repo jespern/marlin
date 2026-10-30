@@ -24,6 +24,8 @@ pub const proto_version: u32 = 6;
 /// memory per connection.
 pub const max_line_bytes: usize = 32 * 1024 * 1024;
 
+pub const PauseState = enum { none, pausing, paused };
+
 pub const SessionState = enum { idle, running, awaiting_approval, err, done };
 
 /// Coarse, lock-free turn phase used for cancellation diagnostics. This is
@@ -399,6 +401,8 @@ pub const ClientMsg = union(enum) {
     ui_set_screensaver: struct { after_ms: u64, effect: []const u8 = "matrix" },
     /// Re-read config and atomically replace extensions while no turn is live.
     mcp_reload: struct {},
+    session_pause: struct { sid: u64 = 0, all: bool = false, force: bool = false },
+    session_resume: struct { sid: u64 = 0, all: bool = false },
     interrupt: struct {
         sid: u64,
         /// Opt into interrupt_result instead of the legacy ok reply.
@@ -427,7 +431,7 @@ pub const ClientMsg = union(enum) {
     /// release the socket, exit 0. Reply `ok` is sent RIGHT BEFORE exit; the
     /// requesting client execs the new binary when it sees it. Autostart
     /// then brings up the new daemon (one restart mechanism, not two).
-    reboot: struct { force: bool = false },
+    reboot: struct { force: bool = false, suspend_sessions: bool = false },
     shutdown: struct {},
 };
 
@@ -443,6 +447,7 @@ pub const DaemonMsg = union(enum) {
         daemon_version: []const u8,
         /// Host running the daemon; empty for older daemons or lookup failure.
         hostname: []const u8 = "",
+        pause_resume: bool = false,
         /// The daemon's kernel shell sandbox passed its startup canary;
         /// sessions may enable prompt-free sandboxed shell execution.
         sandbox_available: bool = false,
@@ -517,6 +522,7 @@ pub const DaemonMsg = union(enum) {
     status: struct {
         sid: u64,
         state: SessionState,
+        pause: PauseState = .none,
         err_text: ?[]const u8 = null,
         /// Ephemeral operational detail for running turns. Optional so old
         /// daemons decode as unknown phase and old clients ignore the field.
@@ -616,6 +622,7 @@ pub const SessionInfo = struct {
     /// Typed live state. Defaults to idle when decoding pre-M4 daemons; the
     /// legacy status/running fields remain on the wire for compatibility.
     state: SessionState = .idle,
+    pause: PauseState = .none,
     created_at: i64,
     running: bool,
     /// Effective shell-sandbox state: the session's toggle AND a verified

@@ -41,6 +41,25 @@ test {
     std.testing.refAllDecls(codex_turn);
 }
 
+test "authentication errors never enter Codex automatic continuation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{
+        \\{"message":"Bad Request","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":401}}}
+        ,
+        \\{"message":"refresh_token_reused","codexErrorInfo":"internalServerError"}
+        ,
+        \\{"message":"session expired","codexErrorInfo":"other"}
+        ,
+    }) |json| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+        const failure = try codex_turn.turnFailure(arena, value);
+        try std.testing.expect(!failure.recoverable);
+        try std.testing.expect(std.mem.startsWith(u8, failure.text, "Codex login required:"));
+    }
+}
+
 test "child turn completion is not the root turn boundary" {
     var child = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"threadId":"child-thread","turn":{"rootTurnId":"root-turn","status":"completed"}}
@@ -204,7 +223,7 @@ test "Codex failure classification keeps permanent errors terminal and preserves
     for ([_]struct { json: []const u8, recoverable: bool, text: []const u8 }{
         .{ .json = "{\"message\":\"{\\\"detail\\\":\\\"Bad Request\\\"}\",\"codexErrorInfo\":\"other\"}", .recoverable = true, .text = "Bad Request (the backend supplied no further explanation)" },
         .{ .json = "{\"message\":\"connection lost\",\"codexErrorInfo\":{\"responseStreamDisconnected\":{\"httpStatusCode\":503}},\"additionalDetails\":\"request id abc\"}", .recoverable = true, .text = "connection lost (Codex: responseStreamDisconnected) (HTTP 503): request id abc" },
-        .{ .json = "{\"message\":\"Unauthorized\",\"codexErrorInfo\":{\"httpConnectionFailed\":{\"httpStatusCode\":401}}}", .recoverable = false, .text = "Unauthorized (Codex: httpConnectionFailed) (HTTP 401)" },
+        .{ .json = "{\"message\":\"Unauthorized\",\"codexErrorInfo\":{\"httpConnectionFailed\":{\"httpStatusCode\":401}}}", .recoverable = false, .text = @import("../../core/guest.zig").loginRequiredNote(.codex) },
     }) |case| {
         const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, case.json, .{});
         const failure = try codex_turn.turnFailure(arena, value);
@@ -327,7 +346,7 @@ test "Codex terminal failure continues the same thread with bounded attempts and
         } else {
             try std.testing.expectError(error.DelegateFailed, loop.runTurn(gpa, io, &store, opts, "ORIGINAL_REQUEST", &.{}));
             const detail = @import("shared.zig").lastDelegateErrorNote().?;
-            try std.testing.expect(std.mem.indexOf(u8, detail, if (std.mem.eql(u8, mode, "repeat")) "Stopped after 2" else if (std.mem.eql(u8, mode, "rpc")) "invalid continuation" else "unauthorized") != null);
+            try std.testing.expect(std.mem.indexOf(u8, detail, if (std.mem.eql(u8, mode, "repeat")) "Stopped after 2" else if (std.mem.eql(u8, mode, "rpc")) "invalid continuation" else "Codex login required") != null);
         }
         const attempts = try Io.Dir.cwd().readFileAlloc(io, attempts_path, gpa, .limited(100));
         defer gpa.free(attempts);

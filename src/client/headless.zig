@@ -1299,7 +1299,7 @@ fn rebootLocalDaemon(
 fn requestReboot(gpa: std.mem.Allocator, io: Io, conn: *attach.Conn, force: bool) !bool {
     _ = gpa;
     try eprint(io, "marlin: waiting for daemon {d} to quiesce and close (up to 120s)...\n", .{conn.daemon_pid});
-    attach.requestStop(conn, .{ .reboot = .{ .force = force } }, 120_000) catch |err| {
+    attach.requestStop(conn, .{ .reboot = .{ .force = force, .suspend_sessions = conn.pause_resume } }, 120_000) catch |err| {
         if (err == error.DaemonError)
             try eprint(io, "marlin: reboot refused; daemon remains running\n", .{})
         else

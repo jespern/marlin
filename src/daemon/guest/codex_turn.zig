@@ -4,6 +4,7 @@
 //! loop.zig is the native agent turn; this file hosts a vendor agent.
 
 const std = @import("std");
+const guest_auth = @import("../../core/guest.zig");
 const Io = std.Io;
 
 const block = @import("../../core/block.zig");
@@ -92,6 +93,8 @@ pub fn turnFailure(arena: std.mem.Allocator, value: std.json.Value) !TurnFailure
     if (details.len > 0 and !std.mem.eql(u8, details, message)) try text.print(arena, ": {s}", .{details});
     if (details.len == 0 and std.mem.eql(u8, kind, "other") and std.mem.eql(u8, message, "Bad Request"))
         try text.appendSlice(arena, " (the backend supplied no further explanation)");
+    if (status == 401 or guest_auth.isAuthFailure(text.items))
+        return .{ .text = guest_auth.loginRequiredNote(.codex), .recoverable = false };
     return .{ .text = text.items, .recoverable = recoverable };
 }
 
@@ -237,7 +240,8 @@ fn codexWaitResponse(
 
 fn codexRpcError(arena: std.mem.Allocator, response: codex.Response) ?[]const u8 {
     const value = response.err orelse return null;
-    if (codex.strField(value, "message")) |message| return message;
+    if (codex.strField(value, "message")) |message|
+        return if (guest_auth.isAuthFailure(message)) guest_auth.loginRequiredNote(.codex) else message;
     return codex.stringify(arena, value) catch "app-server request failed";
 }
 
@@ -470,7 +474,7 @@ pub fn codexAccountError(account_result: std.json.Value) ?[]const u8 {
     if (account_type != null and std.mem.eql(u8, account_type.?, "chatgpt")) return null;
     if (account_type != null and std.mem.eql(u8, account_type.?, "apiKey"))
         return "Codex guest requires a ChatGPT login, but Codex is using an API key — run `codex logout`, then `codex login` without `--with-api-key`";
-    return "Codex guest requires a ChatGPT login — run `codex login`, then retry";
+    return guest_auth.loginRequiredNote(.codex);
 }
 
 fn codexSendTurnStart(
@@ -668,6 +672,13 @@ pub fn runCodexTurn(
         });
         const resumed = try codexWaitResponse(arena, reader, next_request_id);
         next_request_id += 1;
+        if (codexRpcError(arena, resumed)) |message| {
+            if (guest_auth.isAuthFailure(message)) {
+                setDelegateError(message);
+                _ = try ap.append(.{ .system_note = .{ .text = message } });
+                return error.DelegateFailed;
+            }
+        }
         if (resumed.err == null) {
             const result = resumed.result orelse return error.BadCodexResponse;
             const thread = codex.field(result, "thread") orelse return error.BadCodexResponse;
@@ -846,9 +857,14 @@ pub fn runCodexTurn(
                 } else if (std.mem.eql(u8, notification.method, "error")) {
                     if (!primary_thread) continue;
                     if (codex.strField(params, "turnId")) |id| if (!std.mem.eql(u8, id, active_turn_id)) continue;
-                    if (!(codex.boolField(params, "willRetry") orelse false)) {
-                        if (codex.field(params, "error")) |err_value| {
-                            const failure = try turnFailure(arena, err_value);
+                    if (codex.field(params, "error")) |err_value| {
+                        const failure = try turnFailure(arena, err_value);
+                        if (guest_auth.isAuthFailure(failure.text)) {
+                            failure_text = failure.text;
+                            failed = true;
+                            break :events;
+                        }
+                        if (!(codex.boolField(params, "willRetry") orelse false)) {
                             failure_text = failure.text;
                             failure_recoverable = failure.recoverable;
                         }
@@ -951,7 +967,9 @@ pub fn runCodexTurn(
         return error.DelegateTimeout;
     }
     if (!done or failed) {
-        const note = if (recovery_attempts > 0)
+        const note = if (guest_auth.isAuthFailure(failure_text))
+            try gpa.dupe(u8, guest_auth.loginRequiredNote(.codex))
+        else if (recovery_attempts > 0)
             try std.fmt.allocPrint(gpa, "Codex request failed: {s}. Stopped after {d} automatic continuation attempt(s); your saved thread is available to resume.", .{ failure_text, recovery_attempts })
         else
             try std.fmt.allocPrint(gpa, "Codex request failed: {s}. Your saved thread is available to resume.", .{failure_text});
