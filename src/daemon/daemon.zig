@@ -74,6 +74,7 @@ const task_tool = @import("tools/task.zig");
 const tools_registry = @import("tools/registry.zig");
 
 const daemon_version = build_options.version;
+extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
 
 const plan_accept_prompt =
     \\Implement the plan you just proposed. First create a concise durable execution plan with plan_update, then carry it through completion. Do not re-plan unless implementation evidence requires a change.
@@ -1343,9 +1344,12 @@ pub const Daemon = struct {
                 }
                 client.said_hello = true;
                 client.lifecycle_events = h.lifecycle_events;
+                var host_buf: [256]u8 = @splat(0);
+                const hostname = if (gethostname(&host_buf, host_buf.len) == 0) std.mem.sliceTo(&host_buf, 0) else "";
                 self.sendTo(client, .{ .hello_ok = .{
                     .proto_version = proto.proto_version,
                     .daemon_version = daemon_version,
+                    .hostname = hostname,
                     .sandbox_available = self.sandbox_backend != .unavailable,
                     .session_recaps = true,
                     .git_status = true,

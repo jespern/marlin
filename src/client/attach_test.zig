@@ -141,6 +141,7 @@ test "connect retries when a dying daemon closes during hello" {
     try std.testing.expect(conn.network_filtering);
     try std.testing.expectEqual(@as(u64, 0), conn.daemon_pid);
     try std.testing.expectEqualStrings("", conn.daemonExe());
+    try std.testing.expectEqualStrings("", conn.hostname());
 }
 
 test "child transport handshakes over subprocess stdio" {
@@ -154,7 +155,7 @@ test "child transport handshakes over subprocess stdio" {
     const conn = try spawnChildConn(gpa, io, &.{
         "/bin/sh",
         "-c",
-        "read line; printf '{\"hello_ok\":{\"proto_version\":2,\"daemon_version\":\"fake\",\"sandbox_available\":true,\"daemon_pid\":4242,\"daemon_exe\":\"/srv/marlin\",\"daemon_started_at_ms\":123,\"daemon_exe_mtime_ms\":100}}\\n'; cat > /dev/null",
+        "read line; printf '{\"hello_ok\":{\"proto_version\":2,\"daemon_version\":\"fake\",\"sandbox_available\":true,\"daemon_pid\":4242,\"daemon_exe\":\"/srv/marlin\",\"hostname\":\"buildbox.example.com\",\"daemon_started_at_ms\":123,\"daemon_exe_mtime_ms\":100}}\\n'; cat > /dev/null",
     });
     handshake(conn, 5_000, null) catch |err| {
         conn.deinit();
@@ -165,6 +166,7 @@ test "child transport handshakes over subprocess stdio" {
     try std.testing.expect(conn.transport == .child);
     try std.testing.expectEqual(@as(u64, 4242), conn.daemon_pid);
     try std.testing.expectEqualStrings("/srv/marlin", conn.daemonExe());
+    try std.testing.expectEqualStrings("buildbox.example.com", conn.hostname());
     try std.testing.expectEqual(@as(i64, 123), conn.daemon_started_at_ms);
     try std.testing.expectEqual(@as(i64, 100), conn.daemon_exe_mtime_ms);
 }

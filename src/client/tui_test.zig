@@ -2227,6 +2227,15 @@ test "status metadata is compact without losing its identity" {
     );
 }
 
+test "status location identifies the daemon host and strips its domain" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("buildbox:~/project", try tui.statusLocation(arena, "buildbox.example.com", "/home/me/project", "/home/me"));
+    try std.testing.expectEqualStrings("laptop:/srv/project", try tui.statusLocation(arena, "laptop", "/srv/project", ""));
+    try std.testing.expectEqualStrings("~/project", try tui.statusLocation(arena, "", "/home/me/project", "/home/me"));
+}
+
 test "diff language comes from edit summaries or git target paths" {
     try std.testing.expectEqual(
         SyntaxLanguage.zig,

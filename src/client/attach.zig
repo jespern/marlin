@@ -79,6 +79,12 @@ pub const Conn = struct {
     daemon_started_at_ms: i64 = 0,
     daemon_exe_buf: [4096]u8 = undefined,
     daemon_exe_len: usize = 0,
+    hostname_buf: [256]u8 = undefined,
+    hostname_len: usize = 0,
+
+    pub fn hostname(self: *const Conn) []const u8 {
+        return self.hostname_buf[0..self.hostname_len];
+    }
 
     pub fn daemonExe(self: *const Conn) []const u8 {
         return self.daemon_exe_buf[0..self.daemon_exe_len];
@@ -354,6 +360,8 @@ pub fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !v
     if (deadline.canceled.load(.acquire)) return error.ConnectCanceled;
     if (deadline.fired.load(.acquire)) return error.DaemonHandshakeTimedOut;
     conn.sandbox_available = hello.sandbox_available;
+    conn.hostname_len = @min(hello.hostname.len, conn.hostname_buf.len);
+    @memcpy(conn.hostname_buf[0..conn.hostname_len], hello.hostname[0..conn.hostname_len]);
     conn.session_recaps = hello.session_recaps;
     conn.git_status = hello.git_status;
     conn.network_filtering = hello.network_filtering;

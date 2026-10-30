@@ -441,6 +441,8 @@ pub const DaemonMsg = union(enum) {
     hello_ok: struct {
         proto_version: u32,
         daemon_version: []const u8,
+        /// Host running the daemon; empty for older daemons or lookup failure.
+        hostname: []const u8 = "",
         /// The daemon's kernel shell sandbox passed its startup canary;
         /// sessions may enable prompt-free sandboxed shell execution.
         sandbox_available: bool = false,

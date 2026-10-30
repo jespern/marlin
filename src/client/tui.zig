@@ -466,6 +466,8 @@ pub const App = struct {
     term_rows: u16 = 24,
     /// Used only to render cwd with a compact ~/ prefix.
     home: std.ArrayList(u8) = .empty,
+    /// Borrowed from the active connection; refreshed on reconnect.
+    daemon_hostname: []const u8 = "",
     git_cwd: std.ArrayList(u8) = .empty,
     git_label: std.ArrayList(u8) = .empty,
     git_supported: bool = false,
@@ -4598,6 +4600,13 @@ pub fn statusCwd(arena: std.mem.Allocator, cwd: []const u8, home: []const u8) ![
     return cwd;
 }
 
+pub fn statusLocation(arena: std.mem.Allocator, hostname: []const u8, cwd: []const u8, home: []const u8) ![]const u8 {
+    const path = try statusCwd(arena, cwd, home);
+    const host = hostname[0 .. std.mem.indexOfScalar(u8, hostname, '.') orelse hostname.len];
+    if (host.len == 0) return path;
+    return std.fmt.allocPrint(arena, "{s}:{s}", .{ host, path });
+}
+
 fn validCouncilName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |byte| {
@@ -6054,7 +6063,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         Palette.status_context_warn
     else
         Palette.status_context;
-    const cwd_txt = try statusCwd(arena, app.view.cwd.items, app.home.items);
+    const cwd_txt = try statusLocation(arena, app.daemon_hostname, app.view.cwd.items, app.home.items);
     const scroll_txt = if (app.view.history_has_newer)
         if (app.view.scroll_up > 0)
             try std.fmt.allocPrint(arena, "↕ {d} (G: latest)", .{app.view.scroll_up})
@@ -6662,6 +6671,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     rt.join();
     const old = app.conn;
     app.conn = new_conn;
+    app.daemon_hostname = new_conn.hostname();
     app.reconnecting = false;
     app.git_supported = new_conn.git_status;
     app.git_next_poll_ms = 0;
@@ -7024,6 +7034,7 @@ pub fn run(
         .io = io,
         .conn = conn,
         .git_supported = conn.git_status,
+        .daemon_hostname = conn.hostname(),
         .recaps_supported = conn.session_recaps,
         .view = .{
             .sid = sid,

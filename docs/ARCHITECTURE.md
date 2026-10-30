@@ -1280,7 +1280,10 @@ offers council actions and configured names for both `/council` and `/review`.
 Council create/edit reuses the model
 catalog as a filtered multi-select: Enter toggles seats, `Done` saves atomically
 through the daemon, and Esc discards the draft. The status bar
-reports background sessions only when actionable (`2 running · 1 approval`).
+shows the daemon's short hostname beside the cwd (`workstation:~/Work/marlin`),
+including over SSH. The hostname comes from the connection handshake, with no
+subprocess or polling; older daemons without this field retain the cwd-only label.
+It reports background sessions only when actionable (`2 running · 1 approval`).
 A split pane identifies its session with a compact pane label.
 
 **Ctrl+S is one work tree, not a session picker plus a process inspector.**
