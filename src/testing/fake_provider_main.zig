@@ -39,6 +39,9 @@ pub const Step = struct {
     sse: []const []const u8 = &.{},
     body: []const u8 = "",
     delay_ms_between_events: u32 = 0,
+    /// Signal request receipt with <gate>.ready, then wait for <gate>.release.
+    /// Paths are relative to the scenario's isolated working directory.
+    gate: ?[]const u8 = null,
 };
 
 pub const Scenario = struct {
@@ -141,6 +144,20 @@ pub fn main(init: std.process.Init) !u8 {
                     script_idx, std.json.fmt(needle, .{}), req.body[0..@min(req.body.len, 4000)],
                 });
                 return 3;
+            }
+        }
+
+        if (step.gate) |gate| {
+            const ready = try std.fmt.allocPrint(arena, "{s}.ready", .{gate});
+            const release = try std.fmt.allocPrint(arena, "{s}.release", .{gate});
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = ready, .data = "" });
+            const deadline = Io.Timestamp.now(io, .awake).nanoseconds + 30 * std.time.ns_per_s;
+            while (true) {
+                if (Io.Dir.cwd().access(io, release, .{})) |_| break else |err| {
+                    if (err != error.FileNotFound) return err;
+                }
+                if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline) return error.ScenarioGateTimedOut;
+                sleepMs(io, 10);
             }
         }
 

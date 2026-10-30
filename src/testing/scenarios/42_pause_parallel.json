@@ -5,7 +5,7 @@
         "parallel pause task"
       ],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-0 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]
@@ -15,7 +15,7 @@
         "parallel pause task"
       ],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-0 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]
@@ -25,7 +25,7 @@
         "parallel pause task"
       ],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-0 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]
@@ -35,91 +35,7 @@
         "parallel pause task"
       ],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
-        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
-        "[DONE]"
-      ]
-    },
-    {
-      "expect_contains": [
-        "parallel pause task",
-        "Resume the task suspended by Marlin"
-      ],
-      "sse": [
-        "{\"choices\":[{\"delta\":{\"content\":\"resumed successfully\"}}]}",
-        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-        "[DONE]"
-      ]
-    },
-    {
-      "expect_contains": [
-        "parallel pause task",
-        "Resume the task suspended by Marlin"
-      ],
-      "sse": [
-        "{\"choices\":[{\"delta\":{\"content\":\"resumed successfully\"}}]}",
-        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-        "[DONE]"
-      ]
-    },
-    {
-      "expect_contains": [
-        "parallel pause task",
-        "Resume the task suspended by Marlin"
-      ],
-      "sse": [
-        "{\"choices\":[{\"delta\":{\"content\":\"resumed successfully\"}}]}",
-        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-        "[DONE]"
-      ]
-    },
-    {
-      "expect_contains": [
-        "parallel pause task",
-        "Resume the task suspended by Marlin"
-      ],
-      "sse": [
-        "{\"choices\":[{\"delta\":{\"content\":\"resumed successfully\"}}]}",
-        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-        "[DONE]"
-      ]
-    },
-    {
-      "expect_contains": [
-        "parallel pause task"
-      ],
-      "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
-        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
-        "[DONE]"
-      ]
-    },
-    {
-      "expect_contains": [
-        "parallel pause task"
-      ],
-      "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
-        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
-        "[DONE]"
-      ]
-    },
-    {
-      "expect_contains": [
-        "parallel pause task"
-      ],
-      "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
-        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
-        "[DONE]"
-      ]
-    },
-    {
-      "expect_contains": [
-        "parallel pause task"
-      ],
-      "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-0 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]
@@ -173,7 +89,7 @@
         "parallel pause task"
       ],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-1 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]
@@ -183,7 +99,7 @@
         "parallel pause task"
       ],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-1 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]
@@ -193,7 +109,7 @@
         "parallel pause task"
       ],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-1 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]
@@ -203,7 +119,91 @@
         "parallel pause task"
       ],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 1; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-1 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "parallel pause task",
+        "Resume the task suspended by Marlin"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"resumed successfully\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "parallel pause task",
+        "Resume the task suspended by Marlin"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"resumed successfully\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "parallel pause task",
+        "Resume the task suspended by Marlin"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"resumed successfully\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "parallel pause task",
+        "Resume the task suspended by Marlin"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"resumed successfully\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "parallel pause task"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-2 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "parallel pause task"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-2 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "parallel pause task"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-2 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "parallel pause task"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_parallel\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f pause-release-2 ]; do sleep 0.01; done; printf parallel\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]

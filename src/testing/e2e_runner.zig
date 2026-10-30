@@ -291,6 +291,7 @@ fn runScenario(
     // 1. Spawn the fake provider; read PORT line.
     var prov = try std.process.spawn(io, .{
         .argv = &.{ fakeprov_bin, scenario_path },
+        .cwd = .{ .path = state_dir },
         .stdout = .pipe,
         // Never inherit the runner's stderr: an accidentally surviving
         // provider must not retain a caller's `tee`/pipeline write end.
@@ -1238,15 +1239,20 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
     if (std.mem.eql(u8, flow, "parallel")) {
         var sessions: [4]u64 = undefined;
         for (&sessions) |*sid| sid.* = try pauseCreate(conn, arena, cwd, "auto");
-        for (0..3) |_| {
+        for (0..3) |cycle| {
             for (sessions) |sid| {
                 try conn.send(.{ .input = .{ .sid = sid, .text = "parallel pause task" } });
                 try pauseWaitCall(conn, arena, sid);
             }
+            // Outlast the old one-second fixture race while all four tools
+            // remain parked behind a gate owned by this protocol client.
+            if (cycle == 0) try io.sleep(.fromMilliseconds(1_200), .awake);
             try conn.send(.{ .session_pause = .{ .all = true } });
             _ = try recvTagBounded(conn, arena, "ok");
             try conn.send(.{ .session_resume = .{ .sid = sessions[0] } });
             try expectDaemonError(conn, arena, "busy");
+            const release = try std.fmt.allocPrint(arena, "{s}/pause-release-{d}", .{ cwd, cycle });
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "" });
             for (sessions) |sid| {
                 try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
                 try pauseWaitState(conn, arena, sid, "paused", "idle");
@@ -1270,10 +1276,19 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
             const child = update.get("session").?.object;
             if (uintField(child, "parent_sid") == sid) break uintField(child, "sid").?;
         };
-        try conn.send(.{ .sub = .{ .sid = child_sid, .from_seq = 0 } });
-        _ = try recvTagBounded(conn, arena, "delta");
+        const ready = try std.fs.path.join(arena, &.{ cwd, "child-provider.ready" });
+        const deadline = Io.Timestamp.now(io, .awake).nanoseconds + @as(i96, helper_timeout_ms) * std.time.ns_per_ms;
+        while (true) {
+            if (Io.Dir.cwd().access(io, ready, .{})) |_| break else |err| {
+                if (err != error.FileNotFound) return err;
+            }
+            if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline) return error.ChildProviderNotReady;
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
         try conn.send(.{ .session_pause = .{ .sid = sid } });
         _ = try recvTagBounded(conn, arena, "ok");
+        const release = try std.fs.path.join(arena, &.{ cwd, "child-provider.release" });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "" });
         try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
         try pauseWaitState(conn, arena, sid, "paused", "idle");
         try pauseAssertListed(conn, arena, child_sid, "paused");

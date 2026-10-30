@@ -21,7 +21,7 @@
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ],
-      "delay_ms_between_events": 200
+      "gate": "child-provider"
     },
     {
       "expect_contains": [

@@ -267,7 +267,12 @@ Pause/resume coverage uses real socket clients and isolated daemon restarts in
 forced shell interruption, pending approvals/questions, manual versus reboot
 intent, kill-9 during suspension, requester disconnect, natural completion races,
 Claude/Codex process teardown and vendor-session resume, three cycles across four
-concurrent sessions, and parent/child coordination. The guest peers in
+concurrent sessions, and parent/child coordination.
+`42` parks each shell tool behind a per-cycle file gate until the pause is
+acknowledged. `43` uses the fake provider's optional `gate` field: it creates
+`<gate>.ready` after receiving the child request and waits for `<gate>.release`
+before responding (bounded to 30 seconds). These scenarios do not depend on
+short sleeps or catching ephemeral stream deltas. The guest peers in
 `fixtures/pause/` replace only external vendor processes. `44`–`48` exercise
 expired authentication via Claude results/envelopes/stderr and Codex stream/RPC
 errors, requiring actionable login instructions and exactly one guest invocation.
