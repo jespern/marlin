@@ -1,0 +1,28 @@
+{
+  "steps": [
+    {
+      "expect_contains": [
+        "remember this prompt after reconnect"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"persist-write\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\": \\\"restored.txt\\\", \\\"content\\\": \\\"full access survived\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": [
+        "persist-write"
+      ],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"restored permissions work\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "[DONE]"
+      ]
+    }
+  ],
+  "check": {
+    "argv": [],
+    "session_restore_flow": true
+  }
+}

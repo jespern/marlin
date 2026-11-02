@@ -301,7 +301,7 @@ pub const Session = struct {
     guest_max_runtime_live: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     /// Kernel shell sandbox + prompt-free shell execution (/sandbox).
     /// Seeded from cfg.permissions_enabled; effective only with a verified
-    /// backend. In-memory like approval_mode: a daemon restart returns the
+    /// backend. In-memory: a daemon restart returns the
     /// session to the configured default.
     sandbox_enabled: bool = false,
     /// Per-session gate for the daemon-global managed-tool hostname policy.
@@ -408,13 +408,6 @@ pub const Daemon = struct {
     /// registering after shutdown has begun draining the registry.
     accepting_clients: bool = true,
     sessions: std.AutoHashMapUnmanaged(u64, *Session) = .empty,
-    /// /permissions grants by sid. Loaded sessions are a working set that is
-    /// unloaded and rehydrated from SQLite behind the user's back, and the
-    /// durable row records no approval mode — without this the grant would
-    /// silently expire at the next unload (turn_done eviction, tab switch).
-    /// Daemon-lifetime on purpose: a restart still returns every session to
-    /// default approvals.
-    retained_approvals: std.AutoHashMapUnmanaged(u64, approval.Mode) = .empty,
     /// Held while any session is running a turn (macOS: prevents idle system
     /// sleep; elsewhere a no-op). Dispatcher-owned, synced after every event.
     sleep_assertion: power.SleepAssertion = .{},
@@ -1417,13 +1410,11 @@ pub const Daemon = struct {
                     .network_filtering_enabled = self.network.isActive(),
                 };
                 session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
-                if (session.approval_mode != .default)
-                    try self.retained_approvals.put(self.gpa, sid, session.approval_mode);
                 // Reserve every fallible in-memory resource before committing
                 // the durable row. After createSession succeeds, publishing to
                 // the map cannot fail and no ghost session can be left behind.
                 try self.sessions.ensureUnusedCapacity(self.gpa, 1);
-                try self.store.createSession(sid, nowMs(self.io), sc.cwd, sc.model, sc.effort);
+                try self.store.createSessionWithApprovals(sid, nowMs(self.io), sc.cwd, sc.model, sc.effort, session.approval_mode);
                 self.sessions.putAssumeCapacityNoClobber(sid, session);
                 self.sendTo(client, .{ .session_created = .{ .sid = sid, .request_id = sc.request_id } });
                 self.broadcastSessionUpsert(sid);
@@ -1432,12 +1423,11 @@ pub const Daemon = struct {
             .input_history => |request| {
                 var arena_state = std.heap.ArenaAllocator.init(self.gpa);
                 defer arena_state.deinit();
-                const entries = try self.store.recentInputs(
-                    arena_state.allocator(),
-                    request.sid,
-                    @min(request.limit, 1024),
-                );
-                self.sendTo(client, .{ .input_history_result = .{ .entries = entries } });
+                const entries = if (request.sid != 0)
+                    try self.store.recentSessionInputs(arena_state.allocator(), request.sid, @min(request.limit, 200))
+                else
+                    try self.store.recentInputs(arena_state.allocator(), 0, @min(request.limit, 1024));
+                self.sendTo(client, .{ .input_history_result = .{ .entries = entries, .sid = request.sid } });
             },
             .search => |request| {
                 if (request.query.len > 4096) {
@@ -1863,19 +1853,16 @@ pub const Daemon = struct {
                 // parked on the gate resolves that prompt immediately —
                 // /permissions full is most wanted exactly then.
                 const mode = approval.Mode.parse(sa.approvals);
+                try self.store.setSessionApprovals(sa.sid, mode);
                 session.approval_mode = mode;
                 session.approval_mode_live.store(@intFromEnum(mode), .release);
-                if (mode == .default) {
-                    _ = self.retained_approvals.remove(sa.sid);
-                } else {
-                    try self.retained_approvals.put(self.gpa, sa.sid, mode);
-                }
                 if (mode == .auto) {
                     if (session.gate.isPending(self.io)) |pending| {
                         _ = session.gate.resolve(self.io, pending, .approved);
                     }
                 }
                 self.sendTo(client, .{ .ok = .{} });
+                self.broadcastSessionUpsert(sa.sid);
             },
             .session_set_network_filtering => |sn| {
                 const session = (try self.getOrLoadSession(sn.sid)) orelse {
@@ -2052,6 +2039,19 @@ pub const Daemon = struct {
                             .plan_pinned = if (latest_plan) |plan| plan.pinned else false,
                         } });
                     }
+                }
+                if (s.prompt_history_limit > 0) {
+                    var history_arena = std.heap.ArenaAllocator.init(self.gpa);
+                    defer history_arena.deinit();
+                    const entries = try self.store.recentSessionInputs(history_arena.allocator(), s.sid, @min(s.prompt_history_limit, 200));
+                    var history_bytes: usize = 0;
+                    var history_count: usize = 0;
+                    for (entries) |entry| {
+                        if (entry.text.len > 2 * 1024 * 1024 -| history_bytes) break;
+                        history_bytes += entry.text.len;
+                        history_count += 1;
+                    }
+                    self.sendTo(client, .{ .input_history_result = .{ .entries = entries[0..history_count], .sid = s.sid } });
                 }
                 if ((bounded_forward and !caught_up) or (centered and !caught_up)) {
                     // Do not fan live blocks into a partially replayed client:
@@ -3005,20 +3005,16 @@ pub const Daemon = struct {
             .cwd = cwd,
             .plan_mode = row.plan_mode,
             .state = std.meta.stringToEnum(proto.SessionState, row.status) orelse .idle,
+            .approval_mode = row.approval_mode,
             .sandbox_enabled = self.cfg.permissions_enabled,
             .network_filtering_enabled = self.network.isActive(),
         };
         if (try self.store.getPause(sid)) |paused| {
             defer paused.deinit(self.gpa);
             session.pause_requested.store(true, .release);
-            session.approval_mode = approval.Mode.parse(paused.approval_mode);
-            session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
         }
         session.guest_max_runtime_live.store((try self.store.getSessionGuestRuntime(sid)) orelse std.math.maxInt(u64), .release);
-        if (self.retained_approvals.get(sid)) |mode| {
-            session.approval_mode = mode;
-            session.approval_mode_live.store(@intFromEnum(mode), .release);
-        }
+        session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
         if (session.pause_requested.load(.acquire)) try self.restorePausedInputs(session);
         try self.sessions.put(self.gpa, sid, session);
         return session;
@@ -4677,7 +4673,7 @@ pub const Daemon = struct {
                 .running = state == .running,
                 .sandboxed = self.sandbox_backend != .unavailable and
                     (if (live) |session| session.sandbox_enabled else self.cfg.permissions_enabled),
-                .full_access = if (live) |session| session.approval_mode == .auto else false,
+                .full_access = if (live) |session| session.approval_mode == .auto else row.approval_mode == .auto,
                 .plan_mode = if (live) |session| session.plan_mode else row.plan_mode,
                 .usage_credits = if (live) |session| session.usage_credits.load(.acquire) else false,
                 .network_filtering = self.network.isActive() and
@@ -5388,7 +5384,6 @@ pub const Daemon = struct {
         var sit = self.sessions.valueIterator();
         while (sit.next()) |sp| self.destroySession(sp.*);
         self.sessions.deinit(self.gpa);
-        self.retained_approvals.deinit(self.gpa);
         // The saved /otel mirror may hold a bearer token; zero, then free.
         inline for (.{ &self.otel_saved.endpoint, &self.otel_saved.traces_endpoint, &self.otel_saved.headers }) |slice| {
             if (slice.*.len > 0) {
@@ -6106,8 +6101,6 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
-    daemon.retained_approvals = .empty;
-    defer daemon.retained_approvals.deinit(gpa);
 
     try daemon.store.createSession(11, 0, "/tmp", "m", .auto);
 
@@ -6116,7 +6109,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     try std.testing.expectEqual(approval.Mode.default, session.approval_mode);
     session.approval_mode = .auto;
     session.approval_mode_live.store(@intFromEnum(approval.Mode.auto), .release);
-    try daemon.retained_approvals.put(gpa, 11, .auto);
+    try daemon.store.setSessionApprovals(11, .auto);
 
     // The working set unloads the idle session (turn_done eviction, tab
     // switch); rehydration must not silently revoke the grant.
@@ -6131,7 +6124,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     );
 
     // Revocation clears the retained grant the same way.
-    _ = daemon.retained_approvals.remove(11);
+    try daemon.store.setSessionApprovals(11, .default);
     daemon.unloadSession(11);
     const reloaded = (try daemon.getOrLoadSession(11)).?;
     try std.testing.expectEqual(approval.Mode.default, reloaded.approval_mode);

@@ -2783,6 +2783,8 @@ test "older replay page is prepended atomically in transcript order" {
         .label = try gpa.dupe(u8, ""),
     });
 
+    app.view.editor.pushHistory("newest");
+
     for ([_]struct { u64, []const u8 }{
         .{ 1, "oldest" },
         .{ 2, "middle" },
@@ -2817,7 +2819,8 @@ test "older replay page is prepended atomically in transcript order" {
     try std.testing.expect(app.view.history_complete);
     try std.testing.expect(!app.view.history_loading);
     try std.testing.expectEqual(@as(usize, 0), app.view.history_backfill.items.len);
-    try std.testing.expectEqual(@as(usize, 3), app.view.editor.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.view.editor.history.items.len);
+    try std.testing.expectEqualStrings("newest", app.view.editor.history.items[0]);
 }
 
 test "live blocks remain live while an older page is loading" {
@@ -5086,6 +5089,8 @@ test "parked approvals are findable per tree and globally; badge follows the ses
         .running = false,
     } });
 
+    try std.testing.expect(app.view.permissions_full);
+
     // Activating the flagged tree lands on the parked child, not the root.
     try std.testing.expectEqual(@as(?u64, 21), app.awaitingSessionInTree(20));
     try std.testing.expectEqual(@as(?u64, null), app.awaitingSessionInTree(10));
@@ -6851,4 +6856,41 @@ test "sending a screenshot during a turn frees the composer for more steering" {
         try std.testing.expectEqual(@as(usize, 0), second.input.attachments.len);
         try std.testing.expectEqual(@as(usize, 2), app.view.blocks.items.len);
     }
+}
+
+test "composer history survives transcript eviction and routes late replies to their own tab" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var entries: [200]proto.InputHistoryEntry = undefined;
+    for (&entries, 0..) |*entry, index| entry.* = .{
+        .sid = 7,
+        .seq = 200 - index,
+        .ts = @intCast(200 - index),
+        .text = try std.fmt.allocPrint(arena.allocator(), "prompt {d}", .{200 - index}),
+    };
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .input_history_result = .{ .sid = 7, .entries = &entries } }));
+    app.view.editor.histUp();
+    try std.testing.expectEqualStrings("prompt 200", app.view.editor.text.items);
+    app.view.editor.histDown();
+    for (1..history_window_blocks + 10) |seq| app.applyBlock(.{ .id = seq, .session_id = 7, .turn_id = 1, .seq = seq, .ts = 0, .body = .{ .system_note = .{ .text = "tool activity" } } });
+    try std.testing.expectEqual(@as(usize, 200), app.view.editor.history.items.len);
+    try app.switchSession(8, true);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"prompt_history_limit\":200") != null);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .input_history_result = .{ .entries = &.{.{ .sid = 7, .seq = 901, .ts = 901, .text = "other session" }} } }));
+    try std.testing.expectEqual(@as(usize, 0), app.view.editor.history.items.len);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .input_history_result = .{ .sid = 7, .entries = &.{.{ .sid = 7, .seq = 900, .ts = 900, .text = "late prompt" }} } }));
+    try std.testing.expectEqual(@as(usize, 0), app.view.editor.history.items.len);
+    try app.switchSession(7, true);
+    app.view.editor.histUp();
+    try std.testing.expectEqualStrings("late prompt", app.view.editor.text.items);
 }

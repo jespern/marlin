@@ -96,14 +96,15 @@ IMMEDIATELY, including the running turn: the loop reads the live mode per
 call, and granting full access while a call is parked on the approval gate
 resolves that prompt on the spot (that parked prompt is precisely when full
 access is wanted). The status bar shows a FULL ACCESS warning while active;
-a daemon restart returns the session to default.
+the grant is stored per session and survives tab switches and daemon restarts.
+`/permissions default` revokes it durably. Other sessions retain their own mode.
 
 `/sandbox on|off` toggles the shell sandbox per session; the config flag only
 seeds each session's default. Off means prompts return AND approved shell
 calls run unwrapped — the two travel together so "off" is never silent yolo.
 The toggle is client-initiated only (the model has no path to it), is
 rejected mid-turn, refuses to enable without a verified backend, and is
-in-memory like the session approval mode: a daemon restart returns the
+in-memory: a daemon restart returns the
 session to the configured default. The daemon probes the sandbox at every
 startup regardless of the flag so a later toggle-on needs no re-probe; the
 TUI shows the effective state (sandboxed / sandbox off / no sandbox) at the

@@ -1,4 +1,5 @@
-//! marlin cc_approve — internal stdio MCP server the daemon wires into
+//! marlin cc_approve — internal stdio MCP server for guest question pickers
+//! and Claude permission prompts. The daemon wires it into
 //! delegated Claude Code sessions as their --permission-prompt-tool
 //! (`claude -p … --mcp-config {…cc_approve --sid N}`).
 //!

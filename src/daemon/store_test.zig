@@ -597,15 +597,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v14 with performance telemetry and scaling indexes" {
+test "schema is v15 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 14), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 15), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 14), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 15), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
@@ -958,16 +958,18 @@ test "skill search and recalled inputs use the slash command while blocks retain
 test "v13 session runtime migration preserves defaults and independent overrides" {
     var store = try Store.open(std.testing.allocator, null);
     defer store.close();
+    try store.createSession(1, 0, "/", "claudecode/default", .auto);
+    try store.createSession(2, 0, "/", "codex/default", .auto);
     inline for ([_][:0]const u8{
         "ALTER TABLE sessions DROP COLUMN guest_max_runtime_ms",
+        "ALTER TABLE sessions DROP COLUMN approval_mode",
         "UPDATE kv SET value='13' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
         defer finalize(stmt);
         try std.testing.expectEqual(c.SQLITE_DONE, c.sqlite3_step(stmt));
     }
-    try store.createSession(1, 0, "/", "claudecode/default", .auto);
-    try store.createSession(2, 0, "/", "codex/default", .auto);
+
     try store.migrate();
     try std.testing.expectEqual(@as(?u64, null), try store.getSessionGuestRuntime(1));
     try store.setSessionGuestRuntime(1, 43_200_000);
@@ -978,4 +980,57 @@ test "v13 session runtime migration preserves defaults and independent overrides
     try store.setSessionGuestRuntime(1, null);
     try std.testing.expectEqual(@as(?u64, null), try store.getSessionGuestRuntime(1));
     try store.migrate();
+}
+
+test "v14 migration preserves paused grants and later revocation overrides old checkpoints" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+    try store.createSession(2, 0, "/", "m", .auto);
+    try store.setPause(1, false, "auto");
+    inline for (.{
+        "ALTER TABLE sessions DROP COLUMN approval_mode",
+        "UPDATE kv SET value='14' WHERE key='schema_version'",
+    }) |sql| {
+        const stmt = try store.prepare(sql);
+        defer finalize(stmt);
+        try std.testing.expectEqual(c.SQLITE_DONE, c.sqlite3_step(stmt));
+    }
+    try store.migrate();
+    const grant = try store.getSession(1);
+    defer store.freeSession(grant);
+    const normal = try store.getSession(2);
+    defer store.freeSession(normal);
+    try std.testing.expectEqual(@import("approval.zig").Mode.auto, grant.approval_mode);
+    try std.testing.expectEqual(@import("approval.zig").Mode.default, normal.approval_mode);
+    try store.setSessionApprovals(1, .default);
+    try store.migrate();
+    const listing = try store.getSessionListing(1);
+    defer listing.deinit(gpa);
+    try std.testing.expectEqual(@import("approval.zig").Mode.default, listing.approval_mode);
+}
+
+test "composer history returns the last 200 authored prompts independently of transcript output" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+    try store.createSession(2, 0, "/", "m", .auto);
+    for (1..301) |seq| {
+        var buf: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "prompt {d}", .{seq});
+        try store.appendBlock(.{ .id = seq, .session_id = 1, .turn_id = seq, .seq = seq, .ts = @intCast(seq), .body = .{ .user_msg = .{ .text = text } } });
+    }
+    for (301..501) |seq| try store.appendBlock(.{ .id = seq, .session_id = 1, .turn_id = 300, .seq = seq, .ts = @intCast(seq), .body = .{ .system_note = .{ .text = "lots of tool activity" } } });
+    try store.appendBlock(.{ .id = 501, .session_id = 1, .turn_id = 301, .seq = 501, .ts = 501, .body = .{ .user_msg = .{ .text = "internal continuation", .synthetic = true } } });
+    try store.appendBlock(.{ .id = 502, .session_id = 1, .turn_id = 301, .seq = 502, .ts = 502, .body = .{ .steer = .{ .text = "expanded skill", .display_text = "/review" } } });
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const entries = try store.recentSessionInputs(arena.allocator(), 1, 200);
+    try std.testing.expectEqual(@as(usize, 200), entries.len);
+    try std.testing.expectEqualStrings("/review", entries[0].text);
+    try std.testing.expectEqualStrings("prompt 300", entries[1].text);
+    try std.testing.expectEqualStrings("prompt 102", entries[199].text);
+    try std.testing.expectEqual(@as(usize, 0), (try store.recentSessionInputs(arena.allocator(), 2, 200)).len);
 }

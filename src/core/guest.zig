@@ -16,6 +16,21 @@ pub const progress_instructions =
     "repeating unchanged status, or exposing private chain-of-thought; give findings " ++
     "and brief decision summaries instead. Follow the user's preferences for verbosity.";
 
+/// Both guests share the daemon-backed picker, including in full-access mode.
+pub const question_instructions =
+    "When you need a user decision or clarification, use the marlin MCP tool " ++
+    "mcp__marlin__ask_user (ask_user on the marlin server). It opens an interactive " ++
+    "picker in Marlin and waits for the user's answer. Supply a concise question " ++
+    "and 2–9 short options; the user can always type a different answer. " ++
+    "Ask one question at a time and use the returned answer. Do not use " ++
+    "request_user_input or request_user_input_async: those interfaces are not wired " ++
+    "to Marlin's picker. Do not merely list choices in prose when the picker is available. " ++
+    "If the tool is unavailable or fails, ask in ordinary assistant text and explain " ++
+    "that the picker could not be opened. A dismissal is not an answer or approval. " ++
+    "Skip unnecessary questions when a reasonable default lets you proceed.";
+
+pub const interactive_instructions = question_instructions ++ "\n\n" ++ progress_instructions;
+
 pub const Backend = enum {
     claude_code,
     codex,

@@ -105,6 +105,15 @@ status. Native sessions follow the same communication style. The vendor still
 owns the agent loop and decides what thinking/summary text it exposes; Marlin
 does not generate substitute reasoning when none is provided.
 
+Both guests also receive the `marlin` stdio MCP `ask_user` tool, backed by
+`marlin cc_approve --sid <session>`. Shared instructions direct decisions and
+clarifications to this picker instead of the unconnected native Codex question
+interfaces. Codex's per-process MCP configuration exposes only `ask_user`, passes
+the daemon socket environment explicitly, requires successful initialization,
+and allows a seven-day human wait, matching Claude's bridge timeout. Thread
+start and resume both receive these instructions. Selected options and free-text
+answers travel through the same daemon question state, including reconnect replay.
+
 Nothing else. Semantic rendering of unknown tools is a TUI fact, not a
 guest-tool catalogue. Images stay durable in Marlin and are not smuggled
 into the binary. `/compact`, `/sandbox`, session `/network`, and Marlin
@@ -549,9 +558,8 @@ as an ordinary column rather than extracted from JSON on every turn. Leaving
 the frontier as a co-routine caused SQLite to recompute it per candidate row
 and turned large compacted sessions into a roughly 50-second pre-provider
 stall. Dedicated indexes cover block kind, turn-specific reads, session
-hierarchy, recent authored input, and recent telemetry. Ctrl+R uses separate
-bounded current-session and global-newest scans rather than a database-wide
-expression sort.
+hierarchy, recent authored input, and recent telemetry. Ctrl+R and arrow history use a bounded current-session scan, keeping
+prompts isolated between sessions without a database-wide expression sort.
 
 Local and test builds link the platform SQLite library to keep rebuilds fast.
 Official release builds pass `-Dembedded-sqlite=true` and compile the vendored
@@ -570,6 +578,17 @@ requests a bounded replay centered on that sequence, catches forward to the
 live edge without a subscription gap, positions the viewport, and highlights
 the matching block. Normal-mode `n`/`N` advances through the retained result
 set without re-running the query.
+
+Schema v15 persists each session’s approval mode, including full-access grants
+and revocations. Unloaded session listings use this durable value. Migration
+preserves grants in existing pause checkpoints; sessions without a recorded
+grant retain default approvals.
+
+Composer Up/Down history restores the latest 200 authored prompts for that
+session separately from the transcript page (with a 2 MiB text budget). Steering
+and slash-skill display text are included; synthetic continuations are excluded.
+Replies carry the session id so switching tabs cannot mix up their histories.
+Transcript-window eviction no longer clears composer history.
 
 Schema v14 adds a nullable per-session `guest_max_runtime_ms` override (null
 inherits config, zero disables the deadline). Schema v13 adds content-free local preparation telemetry, a materialized

@@ -121,12 +121,7 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
         }, .{});
         try argv.appendSlice(arena, &.{
             "--mcp-config",           mcp_config,
-            "--append-system-prompt",
-            "When you need the user to choose between options, call mcp__marlin__ask_user — it renders " ++
-                "an interactive picker in their terminal and pauses for the pick. Never list choices as " ++
-                "prose and ask them to reply; that is what ask_user replaces. Skip it when one option is " ++
-                "the obvious default: state your choice and proceed.\n\n" ++
-                @import("../../core/guest.zig").progress_instructions,
+            "--append-system-prompt", @import("../../core/guest.zig").interactive_instructions,
         });
     }
     switch (opts.permissions) {

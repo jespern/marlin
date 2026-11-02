@@ -554,7 +554,9 @@ pub fn runCodexTurn(
         otelOverrides(opts.otel_guest, codex.configNamesCollector(gpa, io, environ))
     else
         otelOverrides(opts.otel_guest, false);
-    const argv = try codex.buildArgv(arena, opts.tool_environ, otel_overrides);
+    const bridge: ?codex.Bridge = if (opts.marlin_exe) |exe| .{ .marlin_exe = exe, .sid = opts.session_id } else null;
+    const instructions = if (bridge != null) guest_auth.interactive_instructions else guest_auth.progress_instructions;
+    const argv = try codex.buildArgvWithBridge(arena, opts.tool_environ, otel_overrides, bridge);
     var guest_environ: ?std.process.Environ.Map = if (opts.tool_environ) |source|
         try permissions.toolEnvironment(gpa, source)
     else
@@ -663,7 +665,7 @@ pub fn runCodexTurn(
     if (saved_thread_id) |saved| {
         try codexRequest(arena, writer, "thread/resume", next_request_id, trace, .{
             .threadId = saved,
-            .developerInstructions = @import("../../core/guest.zig").progress_instructions,
+            .developerInstructions = instructions,
             .cwd = opts.cwd,
             .model = codexModel(opts),
             .approvalPolicy = codexApprovalPolicy(opts),
@@ -694,7 +696,7 @@ pub fn runCodexTurn(
     }
     if (thread_id.len == 0) {
         try codexRequest(arena, writer, "thread/start", next_request_id, trace, .{
-            .developerInstructions = @import("../../core/guest.zig").progress_instructions,
+            .developerInstructions = instructions,
             .cwd = opts.cwd,
             .model = codexModel(opts),
             .approvalPolicy = codexApprovalPolicy(opts),

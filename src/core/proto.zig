@@ -248,7 +248,7 @@ pub const ClientMsg = union(enum) {
     },
     session_list: struct { include_archived: bool = false },
     /// Recent authored messages for client-side fuzzy Ctrl+R recall. Results
-    /// are newest-first and span sessions.
+    /// are newest-first within sid; sid=0 explicitly searches across sessions.
     input_history: struct { sid: u64 = 0, limit: u32 = 256 },
     /// Durable transcript search. sid=0 searches every session.
     search: struct { query: []const u8, sid: u64 = 0, limit: u32 = 100 },
@@ -322,6 +322,8 @@ pub const ClientMsg = union(enum) {
         sid: u64,
         /// Opt into session_skills snapshots on attach and catalog changes.
         skill_catalog: bool = false,
+        /// Restore composer history independently of the transcript page.
+        prompt_history_limit: u32 = 0,
         from_seq: u64 = 0,
         tail_limit: u32 = 0,
         before_seq: u64 = 0,
@@ -478,7 +480,7 @@ pub const DaemonMsg = union(enum) {
     session_runtime_result: struct { sid: u64, max_runtime_ms: u64, uses_default: bool },
     session_created: struct { sid: u64, request_id: u64 = 0 },
     session_list_result: struct { sessions: []const SessionInfo },
-    input_history_result: struct { entries: []const InputHistoryEntry },
+    input_history_result: struct { entries: []const InputHistoryEntry, sid: u64 = 0 },
     search_result: struct { query: []const u8, sid: u64 = 0, hits: []const SearchHit },
     diagnostics_result: Diagnostics,
     otel_status_result: struct { enabled: bool, content: bool = false },

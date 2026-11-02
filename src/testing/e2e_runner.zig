@@ -154,6 +154,8 @@ const Check = struct {
     /// Direct socket regression: approval publication, reconnect replay,
     /// steering while parked, and reboot refusal are one state-machine flow.
     approval_reconnect_flow: bool = false,
+    session_restore_flow: bool = false,
+    codex_question_flow: bool = false,
     pause_flow: []const u8 = "",
     /// Fetch a stored full tool-output blob over the daemon protocol and
     /// require at least this many decoded bytes (exercises large replies).
@@ -360,6 +362,14 @@ fn runScenario(
         try env.put(if (claude) "MARLIN_CLAUDE_CODE_BIN" else "MARLIN_CODEX_BIN", path);
         try env.put("MARLIN_AUTH_TEST_CASE", sf.check.pause_flow);
     }
+    if (sf.check.codex_question_flow) {
+        const fixture = try std.fs.path.join(arena, &.{ scenarios_dir, "..", "fixtures", "codex_question.py" });
+        const script = try Io.Dir.cwd().readFileAlloc(io, fixture, arena, .limited(64 * 1024));
+        const path = try std.fs.path.joinZ(arena, &.{ state_dir, "guest-peer" });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script });
+        if (std.c.chmod(path, 0o755) != 0) return error.GuestFixtureChmodFailed;
+        try env.put("MARLIN_CODEX_BIN", path);
+    }
     // A successful client command may leave its intentionally daemonized
     // child alive in the command's owned process group. Remember every group
     // so cleanup can sweep it after the graceful shutdown attempt.
@@ -395,7 +405,7 @@ fn runScenario(
 
     // 3. Run ordinary CLI scenarios, or the direct multi-connection protocol
     // regression that cannot be expressed as a one-shot headless command.
-    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0) {
+    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0 or sf.check.session_restore_flow or sf.check.codex_question_flow) {
         const started = try process_io.run(gpa, io, .{
             .argv = &.{ marlin_bin, "ls" },
             .environ_map = &env,
@@ -407,7 +417,11 @@ fn runScenario(
         defer started.deinit(gpa);
         if (started.process_group_id) |group_id| try process_groups.append(gpa, group_id);
         if (started.term != .exited or started.term.exited != 0) return error.DaemonStartFailed;
-        if (sf.check.pause_flow.len > 0)
+        if (sf.check.codex_question_flow)
+            try checkCodexQuestionFlow(gpa, io, &env, state_dir)
+        else if (sf.check.session_restore_flow)
+            try checkSessionRestoreFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups)
+        else if (sf.check.pause_flow.len > 0)
             try checkPauseFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups, sf.check.pause_flow)
         else
             try checkApprovalReconnectFlow(gpa, io, &env, state_dir);
@@ -1178,6 +1192,102 @@ fn pauseStartDaemon(gpa: std.mem.Allocator, io: Io, env: *const std.process.Envi
     defer result.deinit(gpa);
     if (result.process_group_id) |group| try groups.append(gpa, group);
     if (result.term != .exited or result.term.exited != 0) return error.PauseDaemonRestartFailed;
+}
+
+fn assertFullAccess(conn: *ProtocolConn, arena: std.mem.Allocator, sid: u64, expected: bool) !void {
+    try conn.send(.{ .session_list = .{ .include_archived = false } });
+    const result = try recvTagBounded(conn, arena, "session_list_result");
+    for (result.get("sessions").?.array.items) |item| {
+        if (uintField(item.object, "sid") != sid) continue;
+        const full = item.object.get("full_access") orelse return error.FullAccessMissing;
+        if (full != .bool or full.bool != expected) return error.FullAccessMismatch;
+        return;
+    }
+    return error.SessionIdMissing;
+}
+
+fn checkSessionRestoreFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, exe: []const u8, groups: *std.ArrayList(std.posix.pid_t)) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    const full = try pauseCreate(conn, arena, cwd, "auto");
+    const changed = try pauseCreate(conn, arena, cwd, "default");
+    try assertFullAccess(conn, arena, changed, false);
+    try conn.send(.{ .session_set_approvals = .{ .sid = changed, .approvals = "auto" } });
+    _ = try recvTagBounded(conn, arena, "ok");
+    try conn.send(.{ .unsub = .{ .sid = full } });
+    try conn.send(.{ .unsub = .{ .sid = changed } });
+    try assertFullAccess(conn, arena, full, true);
+    try assertFullAccess(conn, arena, changed, true);
+    for (0..2) |restart| {
+        try conn.send(.{ .reboot = .{ .suspend_sessions = true } });
+        _ = try recvTagBounded(conn, arena, "ok");
+        while (true) {
+            _ = recvBounded(conn, arena) catch |err| {
+                if (err != error.EndOfStream and err != error.ReadFailed) return err;
+                break;
+            };
+        }
+        try pauseStartDaemon(gpa, io, env, cwd, exe, groups);
+        const replacement = try connectProtocol(gpa, io, env);
+        conn.deinit();
+        conn = replacement;
+        // Assert the unloaded catalog, before any tab rehydrates a session.
+        try assertFullAccess(conn, arena, full, true);
+        try assertFullAccess(conn, arena, changed, restart == 0);
+        if (restart == 0) {
+            try conn.send(.{ .session_set_approvals = .{ .sid = changed, .approvals = "default" } });
+            _ = try recvTagBounded(conn, arena, "ok");
+            try assertFullAccess(conn, arena, changed, false);
+            try conn.send(.{ .sub = .{ .sid = full, .from_seq = 0 } });
+            _ = try recvTagBounded(conn, arena, "status");
+            try conn.send(.{ .input = .{ .sid = full, .text = "remember this prompt after reconnect" } });
+            // A lost grant would park the write tool and time out here.
+            try pauseWaitState(conn, arena, full, "none", "idle");
+        }
+    }
+    try conn.send(.{ .sub = .{ .sid = full, .tail_limit = 1, .prompt_history_limit = 200 } });
+    const history = try recvTagBounded(conn, arena, "input_history_result");
+    if (uintField(history, "sid") != full) return error.HistorySessionMismatch;
+    const entries = history.get("entries").?.array.items;
+    if (entries.len != 1 or !std.mem.eql(u8, stringField(entries[0].object, "text") orelse "", "remember this prompt after reconnect")) return error.PromptHistoryMissing;
+    try conn.send(.{ .sub = .{ .sid = changed, .prompt_history_limit = 200 } });
+    const empty = try recvTagBounded(conn, arena, "input_history_result");
+    if (uintField(empty, "sid") != changed or empty.get("entries").?.array.items.len != 0) return error.HistoryLeakedAcrossSessions;
+}
+
+fn checkCodexQuestionFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    for ([_][]const u8{ "default", "auto" }) |mode| {
+        try conn.send(.{ .session_create = .{ .cwd = cwd, .model = "codex/default", .approvals = mode } });
+        const sid = uintField(try recvTagBounded(conn, arena, "session_created"), "sid").?;
+        try conn.send(.{ .sub = .{ .sid = sid } });
+        for ([_][]const u8{ "Per session", "Keep 175 prompts — please" }, 0..) |answer, round| {
+            try conn.send(.{ .input = .{ .sid = sid, .text = "ask about history" } });
+            var question = try recvTagBounded(conn, arena, "question_request");
+            if (uintField(question, "sid") != sid or !std.mem.eql(u8, stringField(question, "question") orelse "", "Where should history live?")) return error.WrongGuestQuestion;
+            const options = question.get("options").?.array.items;
+            if (options.len != 2 or !std.mem.eql(u8, options[0].string, "Per session")) return error.WrongGuestOptions;
+            if (round == 1) {
+                const replacement = try connectProtocol(gpa, io, env);
+                conn.deinit();
+                conn = replacement;
+                try conn.send(.{ .sub = .{ .sid = sid } });
+                question = try recvTagBounded(conn, arena, "question_request");
+            }
+            try conn.send(.{ .question_answer = .{ .sid = sid, .question_id = stringField(question, "question_id").?, .answer = answer } });
+            try pauseWaitState(conn, arena, sid, "none", "idle");
+            const path = try std.fmt.allocPrint(arena, "{s}/answer-{d}", .{ cwd, sid });
+            const actual = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024));
+            if (!std.mem.eql(u8, answer, actual)) return error.GuestAnswerMismatch;
+        }
+    }
 }
 
 fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, exe: []const u8, groups: *std.ArrayList(std.posix.pid_t), flow: []const u8) !void {

@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const block = @import("../core/block.zig");
+const ApprovalMode = @import("approval.zig").Mode;
 const Effort = @import("../core/effort.zig").Effort;
 const proto = @import("../core/proto.zig");
 const telemetry_ids = @import("../core/telemetry.zig");
@@ -57,6 +58,7 @@ const schema_sql =
     \\  max_rounds INTEGER,
     \\  archived_at INTEGER,
     \\  plan_mode INTEGER NOT NULL DEFAULT 0,
+    \\  approval_mode TEXT NOT NULL DEFAULT 'default',
     \\  guest_max_runtime_ms INTEGER,
     \\  codex_thread_id TEXT
     \\);
@@ -186,7 +188,7 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','14');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','15');
 ;
 
 pub const SessionRow = struct {
@@ -204,6 +206,7 @@ pub const SessionRow = struct {
     tokens_out: u64,
     archived: bool,
     plan_mode: bool,
+    approval_mode: ApprovalMode = .default,
 };
 
 pub const GcReport = struct {
@@ -482,6 +485,16 @@ pub const Store = struct {
                 \\UPDATE kv SET value='14' WHERE key='schema_version';
             );
         }
+        if (ver < 15) {
+            try self.execAll(
+                \\BEGIN IMMEDIATE;
+                \\ALTER TABLE sessions ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'default';
+                \\UPDATE sessions SET approval_mode=(SELECT p.approval_mode FROM session_pauses p WHERE p.session_id=sessions.id)
+                \\ WHERE EXISTS (SELECT 1 FROM session_pauses p WHERE p.session_id=sessions.id);
+                \\UPDATE kv SET value='15' WHERE key='schema_version';
+                \\COMMIT;
+            );
+        }
     }
 
     fn initializeSearch(self: *Store) Error!void {
@@ -600,8 +613,12 @@ pub const Store = struct {
     // ---------------------------------------------------------- sessions --
 
     pub fn createSession(self: Store, id: u64, created_at: i64, cwd: []const u8, model: []const u8, effort: Effort) Error!void {
+        return self.createSessionWithApprovals(id, created_at, cwd, model, effort, .default);
+    }
+
+    pub fn createSessionWithApprovals(self: Store, id: u64, created_at: i64, cwd: []const u8, model: []const u8, effort: Effort, mode: ApprovalMode) Error!void {
         const stmt = try self.prepare(
-            "INSERT INTO sessions(id, created_at, cwd, model, effort) VALUES(?,?,?,?,?)",
+            "INSERT INTO sessions(id, created_at, cwd, model, effort, approval_mode) VALUES(?,?,?,?,?,?)",
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(id));
@@ -609,6 +626,15 @@ pub const Store = struct {
         bindText(stmt, 3, cwd);
         bindText(stmt, 4, model);
         bindText(stmt, 5, @tagName(effort));
+        bindText(stmt, 6, @tagName(mode));
+        try stepDone(stmt);
+    }
+
+    pub fn setSessionApprovals(self: Store, id: u64, mode: ApprovalMode) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET approval_mode=? WHERE id=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, @tagName(mode));
+        bindInt(stmt, 2, @bitCast(id));
         try stepDone(stmt);
     }
 
@@ -1446,6 +1472,7 @@ pub const Store = struct {
         created_at: i64,
         archived: bool,
         plan_mode: bool,
+        approval_mode: ApprovalMode = .default,
 
         pub fn deinit(self: SessionListing, gpa: std.mem.Allocator) void {
             gpa.free(self.title);
@@ -1478,6 +1505,7 @@ pub const Store = struct {
             .created_at = c.sqlite3_column_int64(stmt, 10),
             .archived = c.sqlite3_column_int64(stmt, 11) != 0,
             .plan_mode = c.sqlite3_column_int64(stmt, 12) != 0,
+            .approval_mode = ApprovalMode.parse(columnText(stmt, 13)),
         };
     }
 
@@ -1487,7 +1515,7 @@ pub const Store = struct {
         const stmt = try self.prepare(
             \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
             \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
-            \\       s.archived_at IS NOT NULL, s.plan_mode
+            \\       s.archived_at IS NOT NULL, s.plan_mode, s.approval_mode
             \\FROM sessions s
             \\WHERE (? OR s.archived_at IS NULL)
             \\ORDER BY COALESCE((SELECT p.created_at FROM sessions p WHERE p.id=s.parent_sid), s.created_at) DESC,
@@ -1519,7 +1547,7 @@ pub const Store = struct {
         const stmt = try self.prepare(
             \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
             \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
-            \\       s.archived_at IS NOT NULL, s.plan_mode
+            \\       s.archived_at IS NOT NULL, s.plan_mode, s.approval_mode
             \\FROM sessions s WHERE s.id=?
         );
         defer finalize(stmt);
@@ -1541,7 +1569,7 @@ pub const Store = struct {
             \\)
             \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
             \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
-            \\       s.archived_at IS NOT NULL, s.plan_mode
+            \\       s.archived_at IS NOT NULL, s.plan_mode, s.approval_mode
             \\FROM sessions s JOIN session_tree t ON t.id=s.id
             \\ORDER BY CASE WHEN s.parent_sid IS NULL THEN 0 ELSE 1 END,
             \\         s.created_at ASC, s.id ASC
@@ -1579,7 +1607,7 @@ pub const Store = struct {
     /// Fetch one session row. Strings are allocated with gpa; caller frees.
     pub fn getSession(self: Store, id: u64) Error!SessionRow {
         const stmt = try self.prepare(
-            "SELECT parent_sid, kind, parent_block_id, COALESCE(max_rounds, 0), title, cwd, model, effort, status, tokens_in, tokens_out, archived_at IS NOT NULL, plan_mode FROM sessions WHERE id=?",
+            "SELECT parent_sid, kind, parent_block_id, COALESCE(max_rounds, 0), title, cwd, model, effort, status, tokens_in, tokens_out, archived_at IS NOT NULL, plan_mode, approval_mode FROM sessions WHERE id=?",
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(id));
@@ -1601,6 +1629,7 @@ pub const Store = struct {
             .tokens_out = @intCast(c.sqlite3_column_int64(stmt, 10)),
             .archived = c.sqlite3_column_int64(stmt, 11) != 0,
             .plan_mode = c.sqlite3_column_int64(stmt, 12) != 0,
+            .approval_mode = ApprovalMode.parse(columnText(stmt, 13)),
         };
     }
 
@@ -2187,6 +2216,14 @@ pub const Store = struct {
         current_session_id: u64,
         limit: u32,
     ) Error![]const proto.InputHistoryEntry {
+        return self.recentInputsScoped(arena, current_session_id, limit, true);
+    }
+
+    pub fn recentSessionInputs(self: Store, arena: std.mem.Allocator, sid: u64, limit: u32) Error![]const proto.InputHistoryEntry {
+        return self.recentInputsScoped(arena, sid, limit, false);
+    }
+
+    fn recentInputsScoped(self: Store, arena: std.mem.Allocator, current_session_id: u64, limit: u32, include_other_sessions: bool) Error![]const proto.InputHistoryEntry {
         const stmt = try self.prepare(
             \\SELECT session_id, seq, ts, text FROM (
             \\  SELECT session_id, seq, ts, text, block_id, 0 AS bucket FROM (
@@ -2207,7 +2244,7 @@ pub const Store = struct {
         bindInt(stmt, 1, @bitCast(current_session_id));
         bindInt(stmt, 2, @intCast(capped_limit));
         bindInt(stmt, 3, @bitCast(current_session_id));
-        bindInt(stmt, 4, @intCast(capped_limit));
+        bindInt(stmt, 4, if (include_other_sessions) @intCast(capped_limit) else 0);
         bindInt(stmt, 5, @intCast(capped_limit));
         var entries: std.ArrayList(proto.InputHistoryEntry) = .empty;
         while (true) {

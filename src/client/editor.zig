@@ -10,7 +10,7 @@
 //!   intact placeholders are display-only and stripped from submitted text.
 //! - History: Up at the first row / Down at the last row walk previous
 //!   submissions; the in-progress draft is saved and restored. History is
-//!   seeded from replayed user_msg blocks, so it survives reboots.
+//!   restored from the daemon separately from transcript paging.
 //! - Cursor movement is codepoint-wise (UTF-8 safe, grapheme-naive: wide
 //!   glyphs move as units because we step codepoints, but ZWJ sequences
 //!   may take several presses — acceptable for a prompt).
@@ -49,7 +49,7 @@ redo_stack: std.ArrayList(UndoState) = .empty,
 
 const UndoState = struct { text: []u8, cursor: usize };
 const max_undo_states = 100;
-pub const max_history_entries: usize = 256;
+pub const max_history_entries: usize = 200;
 pub const max_history_bytes: usize = 2 * 1024 * 1024;
 pub const max_history_entry_bytes: usize = 256 * 1024;
 

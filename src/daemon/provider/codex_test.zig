@@ -14,6 +14,22 @@ test {
     std.testing.refAllDecls(codex);
 }
 
+test "Codex question bridge scopes the session, escapes paths, and allows human wait time" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const argv = try codex.buildArgvWithBridge(arena_state.allocator(), null, null, .{
+        .marlin_exe = "/a space/\"quoted\"/back\\slash\nmarlin",
+        .sid = 42,
+    });
+    try std.testing.expectEqual(@as(usize, 8), argv.len);
+    try std.testing.expectEqualStrings("-c", argv[3]);
+    try std.testing.expectEqualStrings(
+        "mcp_servers.marlin={ command = \"/a space/\\\"quoted\\\"/back\\\\slash\\u000Amarlin\", args = [\"cc_approve\", \"--sid\", \"42\"], enabled = true, required = true, enabled_tools = [\"ask_user\"], disabled_tools = [], tool_timeout_sec = 604800, env_vars = [\"HOME\", \"MARLIN_SOCKET\", \"XDG_RUNTIME_DIR\"] }",
+        argv[4],
+    );
+    try std.testing.expectEqualStrings("app-server", argv[5]);
+}
+
 test "otel overrides compose per-signal URLs and gate the content-bearing log exporter" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

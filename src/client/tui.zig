@@ -820,13 +820,6 @@ pub const App = struct {
         self.view.history_backfill.clearRetainingCapacity();
     }
 
-    fn rebuildWindowHistory(self: *App) void {
-        self.view.editor.clearHistory();
-        for (self.view.blocks.items) |rendered| {
-            if (rendered.kind == .user_msg) self.view.editor.pushHistory(rendered.text);
-        }
-    }
-
     fn resetWindowLayout(self: *App) void {
         self.copy_cursor = null;
         self.view.sel_anchor = null;
@@ -883,7 +876,6 @@ pub const App = struct {
         if (excess == 0) return;
         if (keep_newest) self.dropWindowPrefix(excess) else self.dropWindowSuffix(excess);
         self.view.oldest_seq = self.firstWindowSeq();
-        self.rebuildWindowHistory();
         self.resetWindowLayout();
     }
 
@@ -1261,6 +1253,7 @@ pub const App = struct {
             self.view.history_before_seq = 0;
             self.conn.send(.{ .sub = .{
                 .skill_catalog = true,
+                .prompt_history_limit = Editor.max_history_entries,
                 .sid = sid,
                 .from_seq = 1,
                 .tail_limit = initial_replay_blocks,
@@ -1271,6 +1264,7 @@ pub const App = struct {
             self.view.history_loading = true;
             self.conn.send(.{ .sub = .{
                 .skill_catalog = true,
+                .prompt_history_limit = Editor.max_history_entries,
                 .sid = sid,
                 .from_seq = self.view.last_seq +| 1,
                 .replay_limit = initial_replay_blocks,
@@ -1284,6 +1278,7 @@ pub const App = struct {
             self.view.history_after_seq = 0;
             self.conn.send(.{ .sub = .{
                 .skill_catalog = true,
+                .prompt_history_limit = Editor.max_history_entries,
                 .sid = sid,
                 .tail_limit = initial_replay_blocks,
             } }) catch {
@@ -1376,6 +1371,7 @@ pub const App = struct {
             if (info.sid == self.view.sid) {
                 self.view.state = info.state;
                 self.view.pause = info.pause;
+                self.view.permissions_full = info.full_access;
                 self.setCwdStr(info.cwd);
                 self.view.plan_mode = info.plan_mode;
                 self.view.usage_credits = info.usage_credits;
@@ -1383,6 +1379,7 @@ pub const App = struct {
             } else if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
                 saved.pause = info.pause;
+                saved.permissions_full = info.full_access;
                 saved.cwd.clearRetainingCapacity();
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
@@ -1488,9 +1485,9 @@ pub const App = struct {
             if (info.sid == self.view.sid) {
                 self.view.state = info.state;
                 self.view.pause = info.pause;
+                self.view.permissions_full = info.full_access;
                 self.setModelStr(info.model);
                 self.setCwdStr(info.cwd);
-                self.view.permissions_full = info.full_access;
                 self.view.plan_mode = info.plan_mode;
                 self.view.usage_credits = info.usage_credits;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
@@ -1498,6 +1495,7 @@ pub const App = struct {
             if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
                 saved.pause = info.pause;
+                saved.permissions_full = info.full_access;
                 saved.cwd.clearRetainingCapacity();
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
@@ -1550,6 +1548,7 @@ pub const App = struct {
         if (info.sid == self.view.sid) {
             self.view.state = info.state;
             self.view.pause = info.pause;
+            self.view.permissions_full = info.full_access;
             self.setCwdStr(info.cwd);
             self.view.plan_mode = info.plan_mode;
             self.view.usage_credits = info.usage_credits;
@@ -1557,6 +1556,7 @@ pub const App = struct {
         } else if (self.saved_views.get(info.sid)) |saved| {
             saved.state = info.state;
             saved.pause = info.pause;
+            saved.permissions_full = info.full_access;
             saved.cwd.clearRetainingCapacity();
             saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
             saved.plan_mode = info.plan_mode;
@@ -1878,6 +1878,7 @@ pub const App = struct {
                     view.history_complete = !replay.has_older;
                     self.conn.send(.{ .sub = .{
                         .skill_catalog = true,
+                        .prompt_history_limit = Editor.max_history_entries,
                         .sid = view.sid,
                         .from_seq = replay.newest_seq +| 1,
                         .replay_limit = initial_replay_blocks,
@@ -1889,6 +1890,7 @@ pub const App = struct {
                     if (replay.has_newer and replay.newest_seq > 0) {
                         self.conn.send(.{ .sub = .{
                             .skill_catalog = true,
+                            .prompt_history_limit = Editor.max_history_entries,
                             .sid = view.sid,
                             .from_seq = replay.newest_seq +| 1,
                             .replay_limit = initial_replay_blocks,
@@ -2100,14 +2102,15 @@ pub const App = struct {
             .session_created => |sc| self.handleSessionCreated(sc.sid, sc.request_id),
             .session_list_result => |sl| self.replaceSessionSummaries(sl.sessions),
             .input_history_result => |history| {
+                const view = if (history.sid == 0 or history.sid == self.view.sid) &self.view else self.saved_views.get(history.sid) orelse return;
                 // The daemon sends newest-first. Push oldest-first so the
                 // editor's recency ordering and duplicate collapse agree.
                 var i = history.entries.len;
                 while (i > 0) {
                     i -= 1;
-                    self.view.editor.pushHistory(history.entries[i].text);
+                    if (history.entries[i].sid == view.sid) view.editor.pushHistory(history.entries[i].text);
                 }
-                if (self.history_search.active) self.refreshHistorySearch(true);
+                if (view == &self.view and self.history_search.active) self.refreshHistorySearch(true);
             },
             .search_result => |result| self.replaceSearchHits(result),
             .diagnostics_result => |report| {
@@ -2441,7 +2444,6 @@ pub const App = struct {
 
         self.trimHistoryWindow(false);
         self.view.history_target_seq = anchor;
-        self.rebuildWindowHistory();
         self.resetWindowLayout();
         self.setNotice("loaded {d} older blocks", .{loaded});
     }
@@ -2476,7 +2478,6 @@ pub const App = struct {
         self.trimHistoryWindow(true);
         self.view.oldest_seq = self.firstWindowSeq();
         self.view.history_target_seq = anchor;
-        self.rebuildWindowHistory();
         self.resetWindowLayout();
         self.setNotice("loaded {d} newer blocks", .{loaded});
     }
@@ -2525,7 +2526,6 @@ pub const App = struct {
         self.view.history_complete = !has_older;
         self.view.history_has_newer = has_newer;
         self.view.history_target_seq = anchor;
-        self.rebuildWindowHistory();
         self.resetWindowLayout();
     }
 
@@ -4479,6 +4479,7 @@ pub const App = struct {
         self.view.history_page_failed = false;
         self.conn.send(.{ .sub = .{
             .skill_catalog = true,
+            .prompt_history_limit = Editor.max_history_entries,
             .sid = self.view.sid,
             .tail_limit = initial_replay_blocks,
             .before_seq = self.view.history_before_seq,
@@ -4511,6 +4512,7 @@ pub const App = struct {
         self.view.history_page_failed = false;
         self.conn.send(.{ .sub = .{
             .skill_catalog = true,
+            .prompt_history_limit = Editor.max_history_entries,
             .sid = self.view.sid,
             .from_seq = self.view.history_after_seq,
             .replay_limit = initial_replay_blocks,
@@ -4533,6 +4535,7 @@ pub const App = struct {
         self.view.history_page_failed = false;
         self.conn.send(.{ .sub = .{
             .skill_catalog = true,
+            .prompt_history_limit = Editor.max_history_entries,
             .sid = self.view.sid,
             .tail_limit = initial_replay_blocks,
         } }) catch {
@@ -6665,6 +6668,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     if (app.view.last_seq == 0) {
         new_conn.send(.{ .sub = .{
             .skill_catalog = true,
+            .prompt_history_limit = Editor.max_history_entries,
             .sid = app.view.sid,
             .from_seq = 1,
             .tail_limit = initial_replay_blocks,
@@ -6676,6 +6680,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
         app.view.history_loading = true;
         new_conn.send(.{ .sub = .{
             .skill_catalog = true,
+            .prompt_history_limit = Editor.max_history_entries,
             .sid = app.view.sid,
             .from_seq = app.view.last_seq +| 1,
             .replay_limit = initial_replay_blocks,
@@ -6691,6 +6696,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
         app.view.history_after_seq = 0;
         new_conn.send(.{ .sub = .{
             .skill_catalog = true,
+            .prompt_history_limit = Editor.max_history_entries,
             .sid = app.view.sid,
             .tail_limit = initial_replay_blocks,
         } }) catch {
@@ -7064,6 +7070,7 @@ pub fn run(
         // the durable log if the user actually reaches this window's top.
         try conn.send(.{ .sub = .{
             .skill_catalog = true,
+            .prompt_history_limit = Editor.max_history_entries,
             .sid = sid,
             .from_seq = 1,
             .tail_limit = initial_replay_blocks,

@@ -286,3 +286,16 @@ Scrollback rendering tests compare visible terminal cells while guest activity
 appears/disappears, streamed output finalizes, the composer/plan changes height,
 and turns settle. A separate wire-event test fills the bounded history window,
 keeps its first blocks intact under new output, and checks forward paging.
+
+Scenario `49_session_restore` checks full-access grants from creation and live
+updates, unloaded listings, two daemon restarts, durable revocation, an actual
+write tool after restart, and prompt history when replay contains only the
+final answer. Store tests cover v14 migration and a 200-prompt history beyond
+a large output tail. Client tests cover history retention and late reply routing.
+
+Scenario `50_codex_question` substitutes an external app-server peer which parses
+the generated MCP TOML and launches the real `cc_approve` process. It checks
+question delivery and exact selected/free-text answer round trips, picker replay
+after reconnect, fresh/resumed threads, and default/full-access modes. The fixture
+uses the system Python 3 standard library. Provider tests also cover command-path escaping
+and retain bridge-free account model discovery.

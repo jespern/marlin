@@ -117,6 +117,7 @@ pub fn jumpToSearchHit(self: *App, sid: u64, seq: u64) !void {
         .sid = sid,
         .tail_limit = initial_replay_blocks,
         .around_seq = seq,
+        .prompt_history_limit = Editor.max_history_entries,
     } });
     self.rememberSession(sid);
     var handle_buf: session_handle.Full = undefined;
@@ -141,7 +142,7 @@ pub fn beginHistorySearch(self: *App) void {
     } }) catch {
         // The already-seeded current-session history remains useful when
         // a reconnect races the shortcut.
-        self.setNotice("global input history unavailable", .{});
+        self.setNotice("session input history unavailable", .{});
     };
 }
 

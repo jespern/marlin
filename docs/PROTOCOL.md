@@ -47,7 +47,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | presence | kind: terminal/phone, active, sid?, page_id? | ok or err |
 | session_create | cwd, model, effort?, title?, approvals?, request_id? | session_created{sid, request_id}; request_failed echoes request_id |
 | session_list | include_archived? | session_list_result{sessions}; archived omitted by default |
-| input_history | sid?, limit? | input_history_result{entries}; authored user/steer text across sessions, current sid first then newest, capped at 1024 |
+| input_history | sid?, limit? | input_history_result{sid,entries}; newest authored user/steer text within sid (up to 200); sid=0 explicitly requests global history (up to 1024) |
 | search | query, sid?, limit? | search_result{query,sid,hits}; sid=0 searches all sessions, capped at 200 results |
 | diagnostics | sid, turn_limit? | diagnostics_result; bounded provider/TTFT and local-preparation summary plus the latest turn waterfall |
 | model_list | — | model_list_result{models, pricing?}; merged OpenRouter and installed Codex app-server catalogs (cached ~1h), empty on total fetch failure so clients fall back to favorites |
@@ -64,7 +64,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_complete_cwd | sid, typed, request_id | session_cwd_completions{sid, cwd, typed, request_id, matches}; directory arguments resolved on the daemon host, including its HOME; replies are requested only |
 | session_set_cwd | sid, cwd | ok, or err{busy} mid-turn / err{bad_cwd}; relative paths resolve against the current session cwd, and the canonical existing directory is persisted and broadcast as session_upsert |
 | session_rename | sid, title | ok; title normalized like auto-titles (first line, trimmed, capped) and broadcast as session_upsert |
-| session_set_approvals | sid, approvals ("default" \| "auto") | ok; applies to the RUNNING turn too — granting full access resolves a parked prompt immediately |
+| session_set_approvals | sid, approvals ("default" \| "auto") | persists per session before ok and publishes refreshed session metadata; applies to the RUNNING turn too — granting full access resolves a parked prompt immediately |
 | session_runtime | sid, value? (duration, "off", or "default") | session_runtime_result{sid,max_runtime_ms,uses_default}; omit value to query; persists per session and updates running guest deadlines |
 | session_set_plan_mode | sid, enabled | ok, or err{busy} mid-turn; persists collaboration mode with the session |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on guest sessions |
@@ -191,7 +191,7 @@ flag is read at export time, so it covers everything still in the outbox.
 | hello_ok | handshake; pause_resume advertises durable suspend/resume support (default false), hostname identifies the daemon host (default empty) |
 | session_created | reply to session_create |
 | session_list_result | reply to session_list |
-| input_history_result {entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
+| input_history_result {sid,entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
 | search_result {query,sid,hits} | reply to search; each hit carries session/block identity, kind, location, timestamp, and an FTS-highlighted snippet |
 | diagnostics_result | reply to diagnostics; aggregate provider/TTFT, measured local-preparation, and legacy pre-provider percentiles/outliers; latest provider/tool waterfall includes setup, context-load/SQLite-wait rows/bytes/VM steps, assembly, and body serialization; contains no prompt or tool content |
 | otel_status_result {enabled,content} | reply to `otel_status`, `otel_configure`, or `otel_content`; never includes endpoint headers |
@@ -331,3 +331,8 @@ within two minutes of interaction (including focus-in); quiet reading past
 that threshold counts as idle. The dispatcher filters completion/failure and
 approval events; the optional worker checks presence again before delivery.
 Suppressed events are not queued for later. See [MOBILE.md](MOBILE.md).
+
+`sub.prompt_history_limit` (default 0) opts into an `input_history_result` for
+that session independently of the replay window, capped at 200 prompts and
+2 MiB of text. Replies include `sid` (default 0 for older daemons); clients
+route delayed replies to that session rather than whichever tab is active.

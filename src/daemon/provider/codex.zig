@@ -91,6 +91,17 @@ pub fn buildArgv(
     environ: ?*const std.process.Environ.Map,
     otel: ?Otel,
 ) ![]const []const u8 {
+    return buildArgvWithBridge(arena, environ, otel, null);
+}
+
+pub const Bridge = struct { marlin_exe: []const u8, sid: u64 };
+
+pub fn buildArgvWithBridge(
+    arena: std.mem.Allocator,
+    environ: ?*const std.process.Environ.Map,
+    otel: ?Otel,
+    bridge: ?Bridge,
+) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(arena, binaryPath(environ));
     // Codex's workspace-write sandbox defaults to NO network, which breaks
@@ -100,6 +111,15 @@ pub fn buildArgv(
     // read-only mode marlin gives child sessions.
     try argv.appendSlice(arena, &.{ "-c", "sandbox_workspace_write.network_access=true" });
     if (otel) |cfg| try appendOtelOverrides(arena, &argv, cfg);
+    if (bridge) |target| {
+        var config: std.ArrayList(u8) = .empty;
+        try config.appendSlice(arena, "mcp_servers.marlin={ command = ");
+        try appendTomlString(arena, &config, target.marlin_exe);
+        try config.appendSlice(arena, try std.fmt.allocPrint(arena,
+            \\, args = ["cc_approve", "--sid", "{d}"], enabled = true, required = true, enabled_tools = ["ask_user"], disabled_tools = [], tool_timeout_sec = 604800, env_vars = ["HOME", "MARLIN_SOCKET", "XDG_RUNTIME_DIR"] }}
+        , .{target.sid}));
+        try argv.appendSlice(arena, &.{ "-c", config.items });
+    }
     try argv.appendSlice(arena, &.{ "app-server", "--listen", "stdio://" });
     return argv.items;
 }
@@ -347,6 +367,7 @@ fn appendTomlString(arena: std.mem.Allocator, out: *std.ArrayList(u8), text: []c
             try out.append(arena, '\\');
             try out.append(arena, byte);
         },
+        0...0x1f, 0x7f => try out.appendSlice(arena, try std.fmt.allocPrint(arena, "\\u{X:0>4}", .{@as(u16, byte)})),
         else => try out.append(arena, byte),
     };
     try out.append(arena, '"');

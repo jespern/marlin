@@ -118,7 +118,7 @@ pub const SessionView = struct {
     /// revised without retyping the proposal.
     plan_proposal_ready: bool = false,
     /// /permissions full is active for this session (client-side mirror of
-    /// the daemon's approval mode; a daemon restart resets both to default).
+    /// the daemon's durable per-session approval mode).
     permissions_full: bool = false,
     /// Highest durable block incorporated for the session.
     last_seq: u64 = 0,
