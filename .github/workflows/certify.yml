@@ -4,7 +4,8 @@ name: certify
 # has Claude review the code that goes in (on the ANTHROPIC_API_KEY secret), attests the
 # statement and report, and keeps them for the registry. release.yml calls this after
 # publishing; run it by hand to re-certify an existing release, e.g. one published before
-# a certify fix. The pin is the only place marlin names a shadybin commit.
+# a certify fix. This is the only place marlin names shadybin's certify: @v1, which moves
+# to each compatible shadybin release, so it needs no updating.
 on:
   workflow_call:
     inputs:
@@ -29,7 +30,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: shadybin/shadybin/.github/workflows/certify.yml@4ea0d32386875b9a27575b04c7b1c1c58575a4e1 # v1.0.3
+    uses: shadybin/shadybin/.github/workflows/certify.yml@v1
     with:
       tag: ${{ inputs.tag }}
     secrets:
