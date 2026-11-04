@@ -1,4 +1,4 @@
-//! Unit tests for shell_tab.zig: `!!` shell tabs against a fake daemon.
+//! Unit tests for shell_tab.zig: shell sessions (`!!`) against a fake daemon.
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vt = @import("ghostty-vt");
@@ -74,8 +74,19 @@ const Harness = struct {
         try self.daemonSays("{{\"shell_snapshot\":{{\"shell_id\":{d},\"data_base64\":\"{s}\"}}}}", .{ shell_id, std.base64.standard.Encoder.encode(encoded, raw.written()) });
     }
 
+    /// `!!`, then the daemon opens shell 5 showing `screen`.
+    fn openShell(self: *Harness, screen: []const u8) !void {
+        self.app.runCommand("!!");
+        try self.daemonOpens((try self.sent())[0].shell_open.request_id, 5, screen);
+        _ = try self.sent();
+    }
+
     fn press(self: *Harness, k: vaxis.Key) bool {
         return shell_tab.key(&self.app, k);
+    }
+
+    fn sessionUpsert(self: *Harness, shell_id: u64) !void {
+        try self.daemonSays("{{\"session_upsert\":{{\"session\":{{\"sid\":42,\"title\":\"\",\"cwd\":\"/work/proj\",\"model\":\"m\",\"status\":\"idle\",\"created_at\":1,\"running\":false,\"shell_id\":{d}}}}}}}", .{shell_id});
     }
 };
 
@@ -87,19 +98,17 @@ fn decodedInput(arena: std.mem.Allocator, msg: proto.ClientMsg) ![]const u8 {
     return bytes;
 }
 
-const ctrl_bracket: vaxis.Key = .{ .codepoint = ']', .mods = .{ .ctrl = true } };
-
 test "!! explains itself when the daemon cannot serve shells" {
     var h: Harness = undefined;
     h.init(false);
     defer h.deinit();
     h.app.runCommand("!!");
-    try std.testing.expect(!shell_tab.visible(&h.app));
-    try std.testing.expect(std.mem.indexOf(u8, h.app.notice.items, "no shell tabs") != null);
+    try std.testing.expect(!shell_tab.active(&h.app));
+    try std.testing.expect(std.mem.indexOf(u8, h.app.notice.items, "no shell sessions") != null);
     try std.testing.expectEqual(@as(usize, 0), h.output.written().len);
 }
 
-test "a new shell buffers early keys, restores its snapshot, and acknowledges output" {
+test "!! turns the session into a shell sized to the transcript area" {
     var h: Harness = undefined;
     h.init(true);
     defer h.deinit();
@@ -109,7 +118,8 @@ test "a new shell buffers early keys, restores its snapshot, and acknowledges ou
     var msgs = try h.sent();
     const open = msgs[0].shell_open;
     try std.testing.expectEqual(@as(u64, 42), open.sid);
-    try std.testing.expectEqual(@as(u16, 24), open.rows); // one row for the bar
+    try std.testing.expectEqual(@as(u16, 80), open.cols);
+    try std.testing.expectEqual(@as(u16, 23), open.rows); // all but the tab bar and status line
     try std.testing.expectEqual(@as(u16, 9), open.cell_width);
 
     // Typed before the daemon confirmed: held, then flushed in order.
@@ -119,155 +129,160 @@ test "a new shell buffers early keys, restores its snapshot, and acknowledges ou
     try h.daemonOpens(open.request_id, 5, "$ ");
     msgs = try h.sent();
     try std.testing.expectEqualStrings("ls", try decodedInput(arena, msgs[0]));
-    try std.testing.expect(h.app.shells.items.items[0].emulator != null);
+    try std.testing.expect(shell_tab.live(&h.app) != null);
 
     var out_buf: [64]u8 = undefined;
     try h.daemonSays("{{\"shell_output\":{{\"shell_id\":5,\"data_base64\":\"{s}\"}}}}", .{std.base64.standard.Encoder.encode(&out_buf, "hi")});
-    msgs = try h.sent();
-    try std.testing.expectEqual(@as(u64, 2), msgs[0].shell_ack.bytes);
+    try std.testing.expectEqual(@as(u64, 2), (try h.sent())[0].shell_ack.bytes);
 
-    // Output for a shell this client is not showing is not ours.
-    try h.daemonSays("{{\"shell_output\":{{\"shell_id\":9,\"data_base64\":\"aGk=\"}}}}", .{});
+    // A second !! does not open another shell.
+    h.app.runCommand("!!");
     try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len);
 }
 
-test "ctrl+] menu: back to marlin, new shell, switch, detach, literal ^]" {
+test "Esc at the prompt enters normal mode; full-screen programs get Esc" {
     var h: Harness = undefined;
     h.init(true);
     defer h.deinit();
     const arena = h.arena.allocator();
+    try h.openShell("$ ");
 
-    h.app.runCommand("!!");
-    try h.daemonOpens((try h.sent())[0].shell_open.request_id, 5, "first");
-    _ = try h.sent();
-
-    // ctrl+] then esc: back to Marlin; keys are Marlin's again. A legacy
-    // terminal's ctrl+] arrives as the raw GS byte.
-    try std.testing.expect(h.press(.{ .codepoint = 0x1d }));
     try std.testing.expect(h.press(.{ .codepoint = vaxis.Key.escape }));
-    try std.testing.expect(!shell_tab.visible(&h.app));
-    try std.testing.expect(!h.press(.{ .codepoint = 'x', .text = "x" }));
-    h.app.runCommand("!!");
-    try std.testing.expect(shell_tab.visible(&h.app));
-    try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len); // same shell
+    try std.testing.expectEqual(tui.Mode.normal, h.app.mode);
+    try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len);
+    // Normal-mode keys are Marlin's; i resumes the live shell.
+    try std.testing.expect(!h.press(.{ .codepoint = 'k', .text = "k" }));
+    try std.testing.expect(h.press(.{ .codepoint = 'i', .text = "i" }));
+    try std.testing.expectEqual(tui.Mode.insert, h.app.mode);
+    try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len);
 
-    // ctrl+] n: a second shell, which becomes active.
-    _ = h.press(ctrl_bracket);
-    _ = h.press(.{ .codepoint = 'n', .text = "n" });
-    try h.daemonOpens((try h.sent())[0].shell_open.request_id, 6, "second");
+    // Alt+N stays Marlin's tab switching.
+    try std.testing.expect(!h.press(.{ .codepoint = '2', .text = "2", .mods = .{ .alt = true } }));
+
+    // vim switches to the alternate screen: now Esc is vim's.
+    var out_buf: [64]u8 = undefined;
+    try h.daemonSays("{{\"shell_output\":{{\"shell_id\":5,\"data_base64\":\"{s}\"}}}}", .{std.base64.standard.Encoder.encode(&out_buf, "\x1b[?1049h")});
     _ = try h.sent();
-    try std.testing.expectEqual(@as(usize, 1), h.app.shells.active);
-
-    // ctrl+] 1: back to the first, which is resized to this terminal.
-    _ = h.press(ctrl_bracket);
-    _ = h.press(.{ .codepoint = '1', .text = "1" });
-    try std.testing.expectEqual(@as(usize, 0), h.app.shells.active);
-    try std.testing.expectEqual(@as(u64, 5), (try h.sent())[0].shell_resize.shell_id);
-
-    // ctrl+] ctrl+]: the program gets a literal ^].
-    _ = h.press(ctrl_bracket);
-    _ = h.press(ctrl_bracket);
-    try std.testing.expectEqualStrings("\x1d", try decodedInput(arena, (try h.sent())[0]));
-
-    // ctrl+] d: detach; the shell keeps running on the daemon.
-    _ = h.press(ctrl_bracket);
-    _ = h.press(.{ .codepoint = 'd', .text = "d" });
-    try std.testing.expectEqual(@as(u64, 5), (try h.sent())[0].shell_detach.shell_id);
-    try std.testing.expectEqual(@as(usize, 1), h.app.shells.items.items.len);
-    try std.testing.expectEqual(@as(?u64, 6), h.app.shells.items.items[0].shell_id);
+    try std.testing.expect(shell_tab.fullScreen(&h.app));
+    try std.testing.expect(h.press(.{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expectEqual(tui.Mode.insert, h.app.mode);
+    try std.testing.expectEqualStrings("\x1b", try decodedInput(arena, (try h.sent())[0]));
 }
 
-test "!! with no tabs attaches every shell the daemon runs, titled from its list" {
+test "a session another client made a shell is attached when focused; its tab says so" {
     var h: Harness = undefined;
     h.init(true);
     defer h.deinit();
 
-    shell_tab.connected(&h.app);
-    try std.testing.expect((try h.sent())[0] == .shell_list);
-    try h.daemonSays("{{\"shell_list_result\":{{\"shells\":[{{\"shell_id\":3,\"title\":\"htop\"}},{{\"shell_id\":4,\"cwd\":\"/home/me/vim notes\"}}]}}}}", .{});
-
-    h.app.runCommand("!!");
+    try h.sessionUpsert(8);
+    shell_tab.sync(&h.app);
     const msgs = try h.sent();
-    try std.testing.expectEqual(@as(usize, 2), msgs.len);
-    try std.testing.expectEqual(@as(u64, 3), msgs[0].shell_attach.shell_id);
-    try std.testing.expectEqual(@as(u64, 4), msgs[1].shell_attach.shell_id);
-    try std.testing.expectEqual(@as(usize, 1), h.app.shells.active); // newest
-    try h.daemonOpens(msgs[0].shell_attach.request_id, 3, "a");
-    try h.daemonOpens(msgs[1].shell_attach.request_id, 4, "b");
+    try std.testing.expectEqual(@as(u64, 8), msgs[0].shell_attach.shell_id);
+    try std.testing.expectEqual(@as(u16, 23), msgs[0].shell_attach.rows);
+    const summary = h.app.sessionSummary(42).?;
+    try std.testing.expectEqualStrings("$ proj", summary.shell_label);
 
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    var render_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer render_out.deinit();
-    var vx = try vaxis.init(h.threaded.io(), std.testing.allocator, &env, .{});
-    defer vx.deinit(std.testing.allocator, &render_out.writer);
-    try vx.resize(std.testing.allocator, &render_out.writer, .{ .rows = 25, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
-    try tui.draw(&h.app, &vx, h.arena.allocator());
-    const win = vx.window();
-    try std.testing.expectEqualStrings("b", win.readCell(0, 0).?.char.grapheme);
-    var bar: std.ArrayList(u8) = .empty;
-    for (0..80) |col| try bar.appendSlice(h.arena.allocator(), win.readCell(@intCast(col), 24).?.char.grapheme);
-    try std.testing.expect(std.mem.indexOf(u8, bar.items, "1 htop") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bar.items, "2 vim notes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bar.items, "ctrl+] menu") != null);
+    // The shell ended before this client heard: the view lets go of it.
+    try h.daemonOpens(msgs[0].shell_attach.request_id, 8, "$ ");
+    try h.sessionUpsert(0);
+    shell_tab.sync(&h.app);
+    try std.testing.expect(!shell_tab.active(&h.app));
 }
 
-test "after a lost connection, tabs survive and reattach" {
+test "after a lost connection the shell reattaches; exit and refusal end it" {
     var h: Harness = undefined;
     h.init(true);
     defer h.deinit();
-
-    h.app.runCommand("!!");
-    try h.daemonOpens((try h.sent())[0].shell_open.request_id, 5, "kept");
-    _ = try h.sent();
+    try h.openShell("kept");
 
     shell_tab.connectionLost(&h.app);
     // While down, keys are swallowed rather than sent into the void.
     try std.testing.expect(h.press(.{ .codepoint = 'a', .text = "a" }));
     try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len);
-
     shell_tab.connected(&h.app);
-    const msgs = try h.sent();
-    try std.testing.expect(msgs[0] == .shell_list);
-    try std.testing.expectEqual(@as(u64, 5), msgs[1].shell_attach.shell_id);
-    try h.daemonOpens(msgs[1].shell_attach.request_id, 5, "restored");
-    try std.testing.expect(h.app.shells.items.items[0].attached);
-}
+    const attach_msg = (try h.sent())[0].shell_attach;
+    try std.testing.expectEqual(@as(u64, 5), attach_msg.shell_id);
+    try h.daemonOpens(attach_msg.request_id, 5, "restored");
 
-test "exit and refusal close the tab with a reason" {
-    var h: Harness = undefined;
-    h.init(true);
-    defer h.deinit();
+    try h.daemonSays("{{\"shell_exited\":{{\"shell_id\":5,\"code\":0}}}}", .{});
+    try std.testing.expect(!shell_tab.active(&h.app));
+    try std.testing.expectEqual(tui.Mode.insert, h.app.mode);
 
     h.app.runCommand("!!");
-    try h.daemonOpens((try h.sent())[0].shell_open.request_id, 5, "");
-    try h.daemonSays("{{\"shell_exited\":{{\"shell_id\":5,\"code\":3}}}}", .{});
-    try std.testing.expect(!shell_tab.visible(&h.app));
-    try std.testing.expect(std.mem.indexOf(u8, h.app.notice.items, "status 3") != null);
-
-    h.app.runCommand("!! new");
     const request_id = (try h.sent())[0].shell_open.request_id;
-    try h.daemonSays("{{\"err\":{{\"code\":\"shell\",\"msg\":\"could not start a shell: PtyUnavailable\",\"request_id\":{d}}}}}", .{request_id});
-    try std.testing.expectEqual(@as(usize, 0), h.app.shells.items.items.len);
-    try std.testing.expectEqualStrings("could not start a shell: PtyUnavailable", h.app.notice.items);
+    try h.daemonSays("{{\"err\":{{\"code\":\"busy\",\"msg\":\"the session is working; wait for its turn to finish\",\"request_id\":{d}}}}}", .{request_id});
+    try std.testing.expect(!shell_tab.active(&h.app));
+    try std.testing.expectEqualStrings("the session is working; wait for its turn to finish", h.app.notice.items);
 }
 
-test "shift+pgup scrolls back and typing returns to the live screen" {
+test "the terminal continues the transcript: drawn rows, cursor, and search" {
+    const gpa = std.testing.allocator;
     var h: Harness = undefined;
     h.init(true);
     defer h.deinit();
-
-    h.app.runCommand("!!");
     var lines: std.ArrayList(u8) = .empty;
-    for (0..60) |i| try lines.print(h.arena.allocator(), "line {d}\r\n", .{i});
-    try h.daemonOpens((try h.sent())[0].shell_open.request_id, 5, lines.items);
-    _ = try h.sent();
-    const emulator = h.app.shells.items.items[0].emulator.?;
+    for (0..40) |i| try lines.print(h.arena.allocator(), "line {d}\r\n", .{i});
+    try lines.appendSlice(h.arena.allocator(), "needle here\r\n$ ");
+    try h.openShell(lines.items);
 
-    try std.testing.expect(h.press(.{ .codepoint = vaxis.Key.page_up, .mods = .{ .shift = true } }));
-    try std.testing.expect(emulator.scrolledBack());
-    try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len);
-    _ = h.press(.{ .codepoint = 'q', .text = "q" });
-    try std.testing.expect(!emulator.scrolledBack());
-    try std.testing.expect((try h.sent())[0] == .shell_input);
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var render_out: std.Io.Writer.Allocating = .init(gpa);
+    defer render_out.deinit();
+    var vx = try vaxis.init(h.threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &render_out.writer);
+    try vx.resize(gpa, &render_out.writer, .{ .rows = 25, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    try tui.draw(&h.app, &vx, frame.allocator());
+
+    // Live: the screen fills the area above the status line, prompt last.
+    const win = vx.window();
+    const row_text = struct {
+        fn get(w: vaxis.Window, a: std.mem.Allocator, row: u16) ![]const u8 {
+            var out: std.ArrayList(u8) = .empty;
+            for (0..w.width) |col| try out.appendSlice(a, w.readCell(@intCast(col), row).?.char.grapheme);
+            return std.mem.trimEnd(u8, out.items, " ");
+        }
+    }.get;
+    try std.testing.expectEqualStrings("needle here", try row_text(win, frame.allocator(), 22));
+    try std.testing.expectEqualStrings("$", try row_text(win, frame.allocator(), 23));
+    try std.testing.expect(vx.screen.cursor_vis);
+    try std.testing.expectEqual(@as(u16, 23), vx.screen.cursor.row);
+
+    // Search finds rows in the terminal's scrollback too.
+    h.app.openSearchPrompt(42);
+    try h.app.picker_filter.appendSlice(gpa, "line 3");
+    h.app.submitSearch();
+    // "line 3" and "line 30".."line 39": newest first.
+    try std.testing.expectEqual(@as(usize, 11), h.app.search.line_hits.items.len);
+    try std.testing.expectEqual(tui.Mode.normal, h.app.mode);
+    const newest = h.app.search.highlight_line.?;
+    // n wraps to the oldest match, far up in the scrollback.
+    h.app.nextSearchHit(1);
+    try std.testing.expect(h.app.search.highlight_line.? < newest);
+    try std.testing.expect(h.app.view.scroll_up > 0);
+}
+
+test "Marlin's session keys work from a shell session's normal mode" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    const arena = h.arena.allocator();
+    try h.openShell("$ ");
+
+    // At the live prompt Ctrl+N is the shell's (readline: next history).
+    try std.testing.expect(h.press(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqualStrings("\x0e", try decodedInput(arena, (try h.sent())[0]));
+
+    // Esc, then Ctrl+N: Marlin makes a new session.
+    try std.testing.expect(h.press(.{ .codepoint = vaxis.Key.escape }));
+    const ctrl_n: vaxis.Key = .{ .codepoint = 'n', .mods = .{ .ctrl = true } };
+    try std.testing.expect(!h.press(ctrl_n));
+    try tui.handleKey(&h.app, ctrl_n);
+    var created = false;
+    for (try h.sent()) |msg| if (msg == .session_create) {
+        created = true;
+    };
+    try std.testing.expect(created);
 }

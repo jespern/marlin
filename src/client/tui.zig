@@ -314,12 +314,17 @@ const SessionSummary = struct {
     full_access: bool,
     plan_mode: bool,
     usage_credits: bool,
+    /// Non-zero while the session is a shell (`!!`).
+    shell_id: u64 = 0,
+    /// "$ name" tab label of a shell session; empty otherwise.
+    shell_label: []u8 = &.{},
 
     fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
         gpa.free(self.cwd);
         gpa.free(self.model);
         gpa.free(self.label);
+        gpa.free(self.shell_label);
     }
 };
 
@@ -444,6 +449,9 @@ pub const SearchState = struct {
     /// positioning after its durable pages arrive.
     target_seq: u64 = 0,
     highlight_line: ?usize = null,
+    /// A shell session searches its own transcript rows (the live terminal
+    /// is not durable yet): matching absolute line indices, oldest first.
+    line_hits: std.ArrayList(usize) = .empty,
 };
 
 pub const App = struct {
@@ -681,13 +689,10 @@ pub const App = struct {
     mk64_rom: ?[]u8 = null,
     mk64_autopilot: bool = false,
     remote_transport: bool = false,
-    /// The experimental `!!` shell tabs.
-    shells: shell_tab.Tabs = .{},
     reconnecting: bool = false,
     next_input_request_id: u64 = 1,
 
     pub fn deinit(self: *App) void {
-        self.shells.deinit(self.gpa);
         if (self.cwd_completion_arena) |*arena| arena.deinit();
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
@@ -703,6 +708,7 @@ pub const App = struct {
         self.clearSearchHits();
         self.search.hits.deinit(self.gpa);
         self.search.labels.deinit(self.gpa);
+        self.search.line_hits.deinit(self.gpa);
         self.council_detail_name.deinit(self.gpa);
         self.clearCouncilEdit();
         self.council_edit_name.deinit(self.gpa);
@@ -1475,6 +1481,11 @@ pub const App = struct {
             .full_access = info.full_access,
             .plan_mode = info.plan_mode,
             .usage_credits = info.usage_credits,
+            .shell_id = info.shell_id,
+            .shell_label = if (info.shell_id != 0)
+                std.fmt.allocPrint(self.gpa, "$ {s}", .{if (info.title.len > 0) info.title else if (std.fs.path.basename(info.cwd).len > 0) std.fs.path.basename(info.cwd) else "shell"}) catch &.{}
+            else
+                &.{},
         };
     }
 
@@ -1814,7 +1825,7 @@ pub const App = struct {
             .shell_snapshot => |m| shell_tab.snapshot(self, m),
             .shell_output => |m| shell_tab.output(self, m),
             .shell_exited => |m| shell_tab.exited(self, m),
-            .shell_list_result => |m| shell_tab.listed(self, m),
+            .shell_list_result => {},
             .daemon_stopping => {
                 // Deliberate shutdown must not enter the crash-reconnect path,
                 // which would immediately autostart a replacement daemon.
@@ -3041,7 +3052,7 @@ pub const App = struct {
     pub fn maybeStartScreensaver(self: *App) void {
         if (self.screensaver_active or self.screensaver_timeout_ms == 0) return;
         // A long build in the shell tab is not idleness.
-        if (shell_tab.visible(self)) return;
+        if (shell_tab.active(self)) return;
         const deadline = self.screensaver_deadline_ms.load(.acquire);
         if (deadline != 0 and nowWallMs(self.io) >= deadline) self.startScreensaver(self.screensaver_kind);
     }
@@ -4719,6 +4730,9 @@ fn transcriptView(app: *App) Transcript {
 
 pub fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(Line) {
     var transcript = transcriptView(app);
+    if (shell_tab.live(app)) |shell| if (!shell.emulator.?.onAlternateScreen()) {
+        transcript.extra_lines = try shell_tab.transcriptLines(shell, width);
+    };
     return layout_mod.layoutLines(arena, app.gpa, &transcript, width);
 }
 
@@ -5058,7 +5072,9 @@ fn flushTerminalNotification(app: *App, writer: *std.Io.Writer, arena: std.mem.A
 
 fn tabLabel(app: *const App, summary: ?*const SessionSummary) []const u8 {
     const identity = if (summary) |session|
-        if (session.title.len > 0)
+        if (session.shell_label.len > 0)
+            session.shell_label
+        else if (session.title.len > 0)
             session.title
         else if (std.fs.path.basename(session.cwd).len > 0)
             std.fs.path.basename(session.cwd)
@@ -5764,7 +5780,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const h = win.height;
     const w = win.width;
     if (h < 4 or w < 20) return;
-    if (shell_tab.visible(app)) return shell_tab.draw(app, win, arena);
+    shell_tab.sync(app);
     if (app.top_view != null) return drawTop(app, win, arena);
 
     if (app.show_tab_bar) try drawTabBar(app, win, arena);
@@ -5819,16 +5835,25 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const input_h: u16 = @intCast(inputPanelHeight(content_h) + @intFromBool(proposal_ready));
     // The plan's final framed row provides breathing room before the composer;
     // the ordinary transcript gap remains above the lowest surface.
-    const surfaces = planSurfaceLayout(h, top_rows, input_h, app.view.plan.items);
-    const plan_h = surfaces.plan_h;
-    const view_h = surfaces.view_h;
+    // A shell session has no composer or plan: its terminal fills the
+    // transcript area down to the status line.
+    const shell_session = shell_tab.active(app);
+    const shell_full_screen = shell_tab.fullScreen(app);
+    const surfaces = planSurfaceLayout(h, top_rows, if (shell_session) 0 else input_h, if (shell_session) &.{} else app.view.plan.items);
+    const plan_h = if (shell_session) 0 else surfaces.plan_h;
+    const view_h = if (shell_session) @as(@TypeOf(surfaces.view_h), @intCast(@as(usize, h) -| top_rows -| 1)) else surfaces.view_h;
+    if (shell_session) shell_tab.fit(app, w, @intCast(view_h));
 
     // ---- session view ----
     var transcript = transcriptView(app);
     // On very short terminals the TODO panel may not fit; keep the ordinary
     // ticker in that case so liveness never disappears with the panel.
     transcript.show_working_ticker = plan_h == 0;
-    var lines = try layout_mod.layoutLines(arena, app.gpa, &transcript, w);
+    if (shell_tab.live(app)) |shell| if (!shell_full_screen) {
+        transcript.extra_lines = try shell_tab.transcriptLines(shell, w);
+    };
+    var lines: std.ArrayList(Line) = if (shell_full_screen) .empty else try layout_mod.layoutLines(arena, app.gpa, &transcript, w);
+    if (shell_full_screen) try shell_tab.drawFullScreen(app, arena, win.child(.{ .y_off = @intCast(top_rows), .height = @intCast(view_h) }));
     const total = lines.items.len;
     if (app.search.target_seq > 0 and !app.view.history_loading) {
         var target_index: ?usize = null;
@@ -5972,7 +5997,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     // Empty-session welcome card: only when there is genuinely nothing to
     // show (fresh session, replay finished, no turn running).
-    if (total == 0 and !app.view.history_loading and app.view.state == .idle)
+    if (total == 0 and !app.view.history_loading and app.view.state == .idle and !shell_session)
         try drawWelcome(app, win, top_rows, view_h, arena);
 
     var hovered_timestamp: ?i64 = null;
@@ -6062,6 +6087,45 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         }
     }
 
+    if (shell_session) {
+        if (!shell_full_screen) shell_tab.placeCursor(app, win, @intCast(top_rows), @intCast(view_h), total);
+    } else try drawComposer(app, win, arena, .{
+        .h = h,
+        .w = w,
+        .input_h = input_h,
+        .plan_h = plan_h,
+        .content_h = content_h,
+        .panel_inner_w = panel_inner_w,
+        .prompt = prompt,
+        .proposal_ready = proposal_ready,
+    });
+
+    // ---- status bar ----
+    // Hover timestamps overlay the composer row; a shell session has none.
+    const timestamp_row: ?u16 = if (shell_session) null else h - input_h;
+    try drawStatusBar(app, win, arena, h, w, if (timestamp_row != null) hovered_timestamp else null, timestamp_row orelse 0);
+}
+
+const ComposerGeometry = struct {
+    h: u16,
+    w: u16,
+    input_h: u16,
+    plan_h: u16,
+    content_h: u16,
+    panel_inner_w: u16,
+    prompt: []const u8,
+    proposal_ready: bool,
+};
+
+fn drawComposer(app: *App, win: vaxis.Window, arena: std.mem.Allocator, g: ComposerGeometry) !void {
+    const h = g.h;
+    const w = g.w;
+    const input_h = g.input_h;
+    const plan_h = g.plan_h;
+    const content_h = g.content_h;
+    const panel_inner_w = g.panel_inner_w;
+    const prompt = g.prompt;
+    const proposal_ready = g.proposal_ready;
     const input_top = h - 1 - input_h;
     const plan_top = input_top -| plan_h;
     try drawPlan(app, win, arena, plan_top, plan_h);
@@ -6088,11 +6152,12 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     if (app.mode == .normal or app.history_search.active) win.hideCursor();
     if (app.setup.prompt == .none and !app.otel_header_prompt)
         try drawCommandMenu(app, win, arena, input_top, w);
+}
 
-    // ---- status bar ----
+fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16, w: u16, hovered_timestamp: ?i64, timestamp_row: u16) !void {
     const status_win = win.child(.{ .y_off = h - 1, .height = 1, .width = w });
     status_win.fill(.{ .style = Palette.status_bar });
-    const state_txt: []const u8 = if (app.view.login_required) "LOGIN REQUIRED" else if (app.view.pause != .none) @tagName(app.view.pause) else switch (app.view.state) {
+    const state_txt: []const u8 = if (shell_tab.active(app)) "shell" else if (app.view.login_required) "LOGIN REQUIRED" else if (app.view.pause != .none) @tagName(app.view.pause) else switch (app.view.state) {
         .idle => "idle",
         .running => "running",
         .awaiting_approval => "APPROVAL?",
@@ -6546,7 +6611,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     drawUiAnimation(app, win);
     if (!app.screensaver_active) {
         if (hovered_timestamp) |timestamp|
-            try drawTimestampOverlay(win, arena, input_top + 1, timestamp);
+            try drawTimestampOverlay(win, arena, timestamp_row, timestamp);
     }
 }
 
@@ -6904,7 +6969,6 @@ pub fn dispatchEvent(
                 try engine.resize(@intCast(@min(ws.cols, std.math.maxInt(u16))), ws.rows);
             }
             try vx.resize(gpa, tty.writer(), ws);
-            shell_tab.resize(app);
         },
         .paste => |text| {
             app.hover_mouse = null;

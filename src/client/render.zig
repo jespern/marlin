@@ -899,6 +899,14 @@ pub fn applyLineSyntax(win: vaxis.Window, row: u16, line: Line) void {
                         highlighted.style.dim = style.dim;
                         highlighted.style.italic = style.italic;
                         highlighted.style.strikethrough = style.strikethrough;
+                        // Terminal styling (shell sessions) carries these too.
+                        if (style.ul_style != .off) {
+                            highlighted.style.ul_style = style.ul_style;
+                            highlighted.style.ul = style.ul;
+                        }
+                        if (style.reverse) highlighted.style.reverse = true;
+                        if (style.blink) highlighted.style.blink = true;
+                        if (style.invisible) highlighted.style.invisible = true;
                         win.writeCell(@intCast(col), row, highlighted);
                     }
                 }

@@ -19,6 +19,8 @@ pub const Emulator = struct {
     /// Persistent so escape sequences split across output chunks parse.
     stream: vt.TerminalStream,
     render: vt.RenderState = .empty,
+    /// Bumped whenever the terminal changes, to invalidate derived views.
+    generation: u64 = 0,
 
     /// A blank terminal. Heap-allocated: the stream points at `terminal`.
     pub fn create(gpa: std.mem.Allocator, io: Io, grid_cols: u16, grid_rows: u16) !*Emulator {
@@ -65,12 +67,19 @@ pub const Emulator = struct {
 
     pub fn feed(self: *Emulator, bytes: []const u8) void {
         self.stream.nextSlice(bytes);
+        self.generation +%= 1;
+    }
+
+    /// Full-screen programs (vim, htop) run on the alternate screen.
+    pub fn onAlternateScreen(self: *const Emulator) bool {
+        return self.terminal.screens.active_key == .alternate;
     }
 
     pub fn resize(self: *Emulator, grid_cols: u16, grid_rows: u16) !void {
         if (grid_cols == 0 or grid_rows == 0) return;
         if (grid_cols == self.terminal.cols and grid_rows == self.terminal.rows) return;
         try self.terminal.resize(self.gpa, .{ .cols = grid_cols, .rows = grid_rows });
+        self.generation +%= 1;
     }
 
     /// Move the viewport through scrollback; negative is up.

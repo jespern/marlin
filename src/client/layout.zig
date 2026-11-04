@@ -1305,6 +1305,8 @@ pub const Transcript = struct {
     layout_cache: *LayoutCache,
     tail_layout_cache: *TailLayoutCache,
     stream_layout_cache: *StreamLayoutCache,
+    /// Rows appended after everything else (a shell session's terminal).
+    extra_lines: []const Line = &.{},
 };
 
 pub const InflightCall = struct { rb: *const RenderBlock, queued: usize };
@@ -2044,6 +2046,7 @@ pub fn layoutLines(
         try wrapPrefixed(arena, &lines, "  ", "1-9 picks · or type your own answer and press Enter", Palette.tool_out, w);
     }
     try resolveLineLinks(arena, lines.items);
+    try lines.appendSlice(arena, transcript.extra_lines);
     return lines;
 }
 
