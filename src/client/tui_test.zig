@@ -239,10 +239,23 @@ test "normal-mode reflexes: Esc cancels pending state, `!cmd` glues, counts do n
     try handleKey(&app, .{ .codepoint = 'q' });
     try std.testing.expect(app.should_quit);
 
-    // /detach is an alias for /quit.
+    // /detach and /exit are aliases for /quit.
     app.should_quit = false;
     app.runCommand("/detach");
     try std.testing.expect(app.should_quit);
+    app.should_quit = false;
+    app.runCommand("/exit");
+    try std.testing.expect(app.should_quit);
+    try std.testing.expect(!app.stop_daemon);
+
+    // /shutdown also stops the daemon, but not over running work unforced.
+    app.should_quit = false;
+    app.runCommand("/shutdown");
+    try std.testing.expect(!app.should_quit);
+    try std.testing.expect(!app.stop_daemon);
+    app.runCommand("/shutdown --force");
+    try std.testing.expect(app.should_quit);
+    try std.testing.expect(app.stop_daemon);
 }
 
 test "manners: notices expire, the plan offer is not a modal, a background approval rings once" {

@@ -1471,6 +1471,9 @@ test "a finished shell keeps its colors and wraps long rows" {
     const n = lines.len;
     try std.testing.expectEqualStrings("plain", lines[n - 3].text);
     try std.testing.expect(vaxis.Color.eql(lines[n - 3].syntax[0].style.fg, .{ .index = 1 }));
+    // An ended shell is drawn faint, colors and all.
+    try std.testing.expect(lines[n - 3].syntax[0].style.dim);
+    try std.testing.expect(lines[n - 2].style.dim);
     try std.testing.expectEqualStrings("0123456789ab", lines[n - 2].text);
     try std.testing.expectEqualStrings("cdef", lines[n - 1].text);
     try std.testing.expectEqual(@as(usize, 0), lines[n - 1].syntax[0].start);

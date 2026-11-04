@@ -19,14 +19,19 @@ pub const ShellState = struct {
     /// Grid size last told to the daemon.
     sent_cols: u16 = 0,
     sent_rows: u16 = 0,
-    /// Transcript rows of the terminal (scrollback then screen), rebuilt
-    /// when its output or the width changes.
+    /// Transcript rows of the terminal (scrollback then the screen down to
+    /// its cursor or last text), rebuilt when its output or the width
+    /// changes.
     lines_arena: std.heap.ArenaAllocator,
     lines: []const Line = &.{},
     /// The terminal row behind each of `lines`, to place images on them.
     pins: []const vt.Pin = &.{},
     lines_generation: u64 = std.math.maxInt(u64),
     lines_width: usize = 0,
+    /// How many of the screen's rows end `lines`: the empty rows below the
+    /// prompt are left out, so a new shell starts right under the session's
+    /// transcript instead of filling the view.
+    screen_rows_shown: usize = 0,
 
     pub fn create(gpa: std.mem.Allocator) !*ShellState {
         const self = try gpa.create(ShellState);

@@ -1828,7 +1828,8 @@ fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), 
             .text = try std.fmt.allocPrint(alloc, "  … {d} earlier lines", .{skip}),
             .style = Palette.collapse_hint,
         });
-        // Long rows wrap, as they did in the live shell.
+        // Long rows wrap, as they did in the live shell. Everything is
+        // faint: the shell has ended, its output is history.
         for (rows[skip..]) |row| {
             var start: usize = 0;
             while (true) {
@@ -1836,11 +1837,13 @@ fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), 
                 var spans: std.ArrayList(SyntaxSpan) = .empty;
                 for (row.syntax) |span| {
                     if (span.end <= start or span.start >= end) continue;
-                    try spans.append(alloc, .{ .start = @max(span.start, start) - start, .end = @min(span.end, end) - start, .style = span.style });
+                    var style = span.style;
+                    style.dim = true;
+                    try spans.append(alloc, .{ .start = @max(span.start, start) - start, .end = @min(span.end, end) - start, .style = style });
                 }
                 try lines.append(alloc, .{
                     .text = row.text[start..end],
-                    .style = .{},
+                    .style = ended_shell_style,
                     .syntax = spans.items,
                     .copy = .{ .join = if (start == 0) .newline else .direct },
                 });
@@ -1864,9 +1867,11 @@ fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), 
     while (it.next()) |row| : (index += 1) {
         if (index < skip) continue;
         const clipped = row[0..hardCellBreak(row, 0, w)];
-        try lines.append(alloc, .{ .text = clipped, .style = .{}, .copy = .{ .join = .newline } });
+        try lines.append(alloc, .{ .text = clipped, .style = ended_shell_style, .copy = .{ .join = .newline } });
     }
 }
+
+const ended_shell_style: vaxis.Style = .{ .dim = true };
 
 fn handoverInProgress(blocks: []const RenderBlock) bool {
     var awaiting_summary = false;

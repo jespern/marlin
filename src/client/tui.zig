@@ -26,7 +26,8 @@
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /cwd <path>, /search <query>, /animate <effect>,
 //!             /screensaver [effect], /new, /reset, /compact, /archive, /reboot [--build], /help,
-//!             /quit (alias /detach — sessions keep running in the daemon)
+//!             /quit (aliases /exit, /detach — sessions keep running in the daemon),
+//!             /shutdown [--force] (quit and stop the daemon)
 //!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
 //!              !c (copy last full tool output), !rb [client|both] / !rbc (scoped rebuild),
 //!              !s [effect] (screensaver)
@@ -682,6 +683,8 @@ pub const App = struct {
     /// Transient one-line notice shown in the status bar.
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
+    /// `/shutdown`: once the TUI is down, stop the daemon too.
+    stop_daemon: bool = false,
     awaiting_new_session: bool = false,
     reset_after_new_session: bool = false,
     pending_new_session_request_id: u64 = 0,
@@ -2574,8 +2577,7 @@ pub const App = struct {
     pub fn inputBlockedDuringReconnect(self: *App, text: []const u8) bool {
         if (!self.reconnecting) return false;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
-        if (std.mem.eql(u8, trimmed, "/quit") or std.mem.eql(u8, trimmed, "/q") or
-            std.mem.eql(u8, trimmed, "/detach")) return false;
+        if (commands.isQuitCommand(trimmed)) return false;
         self.setNotice("offline — reconnecting; draft kept, submit when connected", .{});
         return true;
     }
@@ -2585,9 +2587,8 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.view.attachments.items.len == 0) return;
         const is_command = isCommandInput(text);
-        const allowed_during_setup = std.mem.eql(u8, trimmed, "/quit") or
-            std.mem.eql(u8, trimmed, "/q") or
-            std.mem.eql(u8, trimmed, "/detach") or
+        const allowed_during_setup = commands.isQuitCommand(trimmed) or
+            std.mem.eql(u8, trimmed, "/shutdown") or
             (is_command and trimmed[0] == '!');
         if (self.setup.required and !allowed_during_setup) {
             self.beginSetup(true);
@@ -7567,6 +7568,16 @@ pub fn run(
             .{reason},
         );
         return 1;
+    }
+    if (app.stop_daemon) {
+        const stop_conn = (attach.tryConnect(gpa, io, environ) catch null) orelse return 0;
+        defer stop_conn.deinit();
+        attach.handshake(stop_conn, 2_000, null) catch {};
+        attach.requestStop(stop_conn, .{ .shutdown = .{} }, 30_000) catch |err| {
+            try eprint(io, "marlin: daemon shutdown not confirmed ({t}); it may still be stopping\n", .{err});
+            return 1;
+        };
+        try eprint(io, "marlin: daemon stopped\n", .{});
     }
     return 0;
 }

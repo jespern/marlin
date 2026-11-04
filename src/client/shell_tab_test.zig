@@ -459,3 +459,15 @@ test "Marlin's tab keys and Ctrl+N work in a shell; the prefix passes them on" {
     _ = h.press(.{ .codepoint = 'n', .mods = .{ .ctrl = true } });
     try std.testing.expectEqualStrings("\x0e", try decodedInput(arena, (try h.sent())[0]));
 }
+
+test "a new shell starts in place: the empty screen below its prompt is not shown" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    try h.openShell("first\r\n$ ");
+    const state = h.app.view.shell.?;
+    const lines = try shell_tab.transcriptLines(state, 80);
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings("$", std.mem.trimEnd(u8, lines[1].text, " "));
+    try std.testing.expectEqual(@as(usize, 2), state.screen_rows_shown);
+}

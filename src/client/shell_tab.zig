@@ -392,7 +392,10 @@ pub fn mouse(app: *App, m: vaxis.Mouse) bool {
     const full_screen = showingFullScreen(app);
     const at_prompt = app.mode == .insert and app.view.scroll_up == 0 and app.copy_cursor == null;
     if (!full_screen and !(at_prompt and emulator.tracksMouse())) return false;
-    const top: i32 = @intCast(app.tabBarRows());
+    // Full-screen programs fill the view; at the prompt the screen's first
+    // row sits wherever the transcript put it.
+    const screen_top: i32 = if (full_screen) 0 else @as(i32, @intCast(app.view.last_total_lines -| state.screen_rows_shown)) - @as(i32, @intCast(app.view.last_first_visible));
+    const top: i32 = @as(i32, @intCast(app.tabBarRows())) + screen_top;
     const row = @as(i32, m.row) - top;
     if (row < 0 or row >= emulator.terminal.rows or m.col < 0) return true;
     if (!emulator.tracksMouse()) {
@@ -449,15 +452,23 @@ pub fn transcriptLines(state: *ShellState, width: usize) ![]const Line {
     }
     std.mem.reverse(vt.Pin, pins.items);
 
-    const lines = try arena.alloc(Line, pins.items.len);
+    const all = try arena.alloc(Line, pins.items.len);
     var wrapped = false;
-    for (pins.items, lines) |pin, *line| {
+    for (pins.items, all) |pin, *line| {
         line.* = try rowLine(arena, pin, wrapped);
         wrapped = pin.rowAndCell().row.wrap;
     }
+    // Leave out the screen's empty rows below the cursor and the last text.
+    const screen_start = all.len -| emulator.terminal.rows;
+    var shown = @min(all.len, screen_start + screen.cursor.y + 1);
+    for (all[shown..], shown..) |line, i| if (line.text.len > 0) {
+        shown = i + 1;
+    };
+    const lines = all[0..shown];
     render.resolveLineLinks(arena, lines) catch {};
     state.lines = lines;
-    state.pins = pins.items;
+    state.pins = pins.items[0..shown];
+    state.screen_rows_shown = shown - screen_start;
     state.lines_generation = emulator.generation;
     state.lines_width = width;
     return lines;
@@ -519,7 +530,7 @@ pub fn placeCursor(app: *App, win: vaxis.Window, top_rows: u16, view_h: u16, tot
         return;
     }
     const cursor = t.screens.active.cursor;
-    const abs = total_lines -| t.rows + cursor.y;
+    const abs = total_lines -| state.screen_rows_shown + cursor.y;
     if (abs < app.view.last_first_visible) return win.hideCursor();
     const row = abs - app.view.last_first_visible;
     if (row >= view_h or cursor.x >= win.width) return win.hideCursor();
