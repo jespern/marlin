@@ -7223,7 +7223,7 @@ pub fn run(
     app.screensaver_timeout_ms = cfg.ui_screensaver_after_ms;
     app.screensaver_kind = effects.Kind.parse(cfg.ui_screensaver_effect) orelse .matrix;
     app.shell_prefix = shell_tab.Prefix.parse(cfg.ui_shell_prefix) orelse prefix: {
-        app.setNotice("[ui] shell_prefix \"{s}\" is not a ctrl+key; using ctrl+]", .{cfg.ui_shell_prefix});
+        app.setNotice("[ui] shell_prefix \"{s}\" is not a ctrl+key; using ctrl+b", .{cfg.ui_shell_prefix});
         break :prefix .default;
     };
     app.recordUserActivity();

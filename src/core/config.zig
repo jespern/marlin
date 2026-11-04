@@ -133,8 +133,8 @@ pub const Config = struct {
     /// Client-local inactivity delay before an opaque effect. Zero is off.
     ui_screensaver_after_ms: u64 = 0,
     ui_screensaver_effect: []const u8 = "matrix",
-    /// The key that precedes Marlin commands in a shell session ("ctrl+]").
-    ui_shell_prefix: []const u8 = "ctrl+]",
+    /// The key that precedes Marlin commands in a shell session ("ctrl+b").
+    ui_shell_prefix: []const u8 = "ctrl+b",
 };
 
 pub fn defaults() Config {

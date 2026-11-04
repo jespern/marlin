@@ -4,7 +4,7 @@
 //!
 //! The shell's scrollback and screen continue the session's transcript, so
 //! Marlin's ergonomics apply to it. Keys go to the shell, except after the
-//! prefix ([ui] shell_prefix, Ctrl+] by default), which takes one command:
+//! prefix ([ui] shell_prefix, Ctrl+B by default), which takes one command:
 //! 1-9 tab, n/p next/previous tab, c new session, [ or Esc normal mode
 //! (scroll, copy, search; from inside vim too, showing the scrollback), :
 //! Marlin's command line, the prefix again sends it to the program. At the
@@ -62,7 +62,8 @@ pub const Prefix = struct {
     /// codepoint rather than ctrl+key (Ctrl+] arrives as 0x1d).
     raw: ?u21 = null,
 
-    pub const default: Prefix = .{ .codepoint = ']', .raw = 0x1d };
+    /// tmux's prefix; inside a tmux running in a shell, press it twice.
+    pub const default: Prefix = .{ .codepoint = 'b' };
 
     /// "ctrl+]", "ctrl+b", "C-a", ...; null when not a usable ctrl+key.
     pub fn parse(spec: []const u8) ?Prefix {
