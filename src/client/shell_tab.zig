@@ -8,8 +8,8 @@
 //! session), and the prefix ([ui] shell_prefix, Ctrl+B by default), which
 //! takes one command: 1-9 tab, n/p next/previous tab, c new session, [ or
 //! Esc normal mode (scroll, copy, search; from inside vim too, showing the
-//! scrollback), : Marlin's command line, s a screenshot of the shell on the
-//! clipboard (macOS); the prefix again, or a key with a
+//! scrollback), : Marlin's command line, s a screenshot (as Alt+S); the
+//! prefix again, or a key with a
 //! modifier (Alt+b), goes to the program as is. At the prompt Esc also
 //! enters normal mode; i/a/Enter return to the live shell. Full-screen
 //! programs (vim, htop) draw between the tab bar and a blank row above the
@@ -27,8 +27,7 @@ const shell_images = @import("shell_images.zig");
 const SessionView = @import("session_view.zig").SessionView;
 const tui = @import("tui.zig");
 const keys = @import("keys.zig");
-const shell_shot = @import("shell_shot.zig");
-const builtin = @import("builtin");
+const screenshot = @import("screenshot.zig");
 const App = tui.App;
 
 const Line = render.Line;
@@ -347,7 +346,7 @@ fn prefixCommand(app: *App, state: *ShellState, k: vaxis.Key) void {
         'n' => app.cycleTab(1),
         'p' => app.cycleTab(-1),
         'c' => app.newSession() catch app.setNotice("could not create session", .{}),
-        's' => screenshot(app),
+        's' => screenshot.request(app, .full),
         '[', vaxis.Key.escape => {
             app.mode = .normal;
             app.refresh_requested = true;
@@ -715,89 +714,3 @@ fn imageStored(ctx: ?*anyopaque, image_key: shell_images.ImageKey) bool {
     };
     return false;
 }
-
-/// The shell rows on screen: a full-screen program's whole screen, else the
-/// shell's rows inside the transcript viewport.
-pub fn visibleRows(app: *App, arena: std.mem.Allocator) ![]const vt.Pin {
-    const state = live(app) orelse return &.{};
-    const t = &state.emulator.?.terminal;
-    var pins: std.ArrayList(vt.Pin) = .empty;
-    if (showingFullScreen(app)) {
-        var it = t.screens.active.pages.rowIterator(.right_down, .{ .active = .{} }, null);
-        while (it.next()) |pin| try pins.append(arena, pin);
-        return pins.items;
-    }
-    const shell_first = app.view.last_total_lines -| state.lines.len;
-    const first = app.view.last_first_visible;
-    const end = first + app.view.last_view_h;
-    for (state.pins, shell_first..) |pin, line| {
-        if (line >= first and line < end) try pins.append(arena, pin);
-    }
-    return pins.items;
-}
-
-/// Ctrl+B s, /screenshot: the shell's view as a PNG on the clipboard.
-pub fn screenshot(app: *App) void {
-    if (builtin.os.tag != .macos) return app.setNotice("shell screenshots need macOS", .{});
-    const state = live(app) orelse return app.setNotice("screenshots are of shell sessions (!! starts one)", .{});
-    if (app.screenshot_thread != null) return app.setNotice("a screenshot is already being taken", .{});
-    const loop = app.loop orelse return;
-    var arena_state = std.heap.ArenaAllocator.init(app.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const rows = visibleRows(app, arena) catch return app.setNotice("screenshot failed: out of memory", .{});
-    if (rows.len == 0) return app.setNotice("the shell is scrolled out of view", .{});
-    const theme = &app.terminal_theme;
-    const home = if (app.environ) |env| env.get("HOME") else null;
-    const json = shell_shot.describe(arena, rows, shell_shot.colorsFrom(theme.foreground, theme.background, theme.palette), .{
-        .cols = state.emulator.?.terminal.cols,
-        .cell_width = if (app.cell_px_w > 0) app.cell_px_w else 16,
-        .cell_height = if (app.cell_px_h > 0) app.cell_px_h else 34,
-    }, shell_shot.fontFamily(arena, app.io, home)) catch return app.setNotice("screenshot failed: out of memory", .{});
-    const tmp = if (app.environ) |env| env.get("TMPDIR") orelse "/tmp" else "/tmp";
-    const job = app.gpa.create(ScreenshotJob) catch return;
-    job.* = .{ .gpa = app.gpa, .io = app.io, .loop = loop, .environ = app.environ, .json = undefined, .tmp = undefined };
-    job.json = app.gpa.dupe(u8, json) catch {
-        app.gpa.destroy(job);
-        return;
-    };
-    job.tmp = app.gpa.dupe(u8, tmp) catch {
-        job.deinit();
-        return;
-    };
-    app.screenshot_thread = std.Thread.spawn(.{}, ScreenshotJob.run, .{job}) catch {
-        job.deinit();
-        return app.setNotice("screenshot failed: could not start", .{});
-    };
-    app.setNotice("taking a screenshot…", .{});
-}
-
-pub fn screenshotDone(app: *App, failure: ?[]const u8) void {
-    if (app.screenshot_thread) |thread| thread.join();
-    app.screenshot_thread = null;
-    if (failure) |reason| app.setNotice("screenshot failed: {s}", .{reason}) else app.setNotice("shell screenshot copied to the clipboard", .{});
-}
-
-const ScreenshotJob = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    loop: *vaxis.Loop(tui.Event),
-    environ: ?*const std.process.Environ.Map,
-    json: []u8,
-    tmp: []u8,
-
-    fn deinit(job: *ScreenshotJob) void {
-        job.gpa.free(job.json);
-        job.gpa.free(job.tmp);
-        job.gpa.destroy(job);
-    }
-
-    fn run(job: *ScreenshotJob) void {
-        defer job.deinit();
-        shell_shot.copyToClipboard(job.gpa, job.io, job.json, job.tmp, job.environ) catch |err| {
-            job.loop.postEvent(.{ .screenshot = @errorName(err) }) catch {};
-            return;
-        };
-        job.loop.postEvent(.{ .screenshot = null }) catch {};
-    }
-};

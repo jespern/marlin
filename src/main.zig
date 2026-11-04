@@ -80,7 +80,7 @@ test {
     _ = @import("client/shell_term_test.zig");
     _ = @import("client/shell_tab_test.zig");
     _ = @import("client/shell_styled_test.zig");
-    _ = @import("client/shell_shot_test.zig");
+    _ = @import("client/screenshot_test.zig");
     _ = @import("daemon/guest_models_test.zig");
     _ = @import("daemon/power_test.zig");
     _ = @import("core/effort_test.zig");

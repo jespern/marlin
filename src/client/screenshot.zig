@@ -1,11 +1,24 @@
-//! Screenshots of a shell session as PNG on the macOS clipboard. Terminals
-//! can only put text on the clipboard, so Marlin draws the image itself:
-//! the shell's rows become styled runs (cells resolved to the terminal's own
-//! colors), and a JXA script draws them with AppKit, which brings font
-//! fallback and emoji, and puts the PNG on the pasteboard.
+//! Screenshots as PNG on the macOS clipboard (Alt+S, /screenshot [slim]).
+//! Terminals can only put text on the clipboard, so Marlin draws the image
+//! itself from the frame it just rendered: the screen's cells become styled
+//! runs in the terminal's own colors, and a JXA script draws them with
+//! AppKit, which brings font fallback and emoji, and puts the PNG on the
+//! pasteboard. Kitty images are not in the frame and do not appear.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
+const vaxis = @import("vaxis");
 const vt = @import("ghostty-vt");
+const render = @import("render.zig");
+const tui = @import("tui.zig");
+const App = tui.App;
+
+pub const Mode = enum {
+    /// Everything on screen: tab bar, transcript or shell, status line.
+    full,
+    /// Only the transcript (or shell) area.
+    slim,
+};
 
 pub const Colors = struct {
     fg: [3]u8,
@@ -36,61 +49,141 @@ const Run = struct {
     joinable: bool,
 };
 
-/// The image as JSON for `script`: its grid, colors and font, then one
-/// entry per styled run: [row, col, width, text, fg, bg|null, flags].
-pub fn describe(arena: std.mem.Allocator, rows: []const vt.Pin, colors: Colors, geometry: Geometry, font: []const u8) ![]u8 {
+pub fn isKey(key: vaxis.Key) bool {
+    return key.matches('s', .{ .alt = true });
+}
+
+/// Ask for a screenshot of the next frame, so it shows the screen as it is
+/// without the keypress's own effects (the typed command, a notice).
+pub fn request(app: *App, mode: Mode) void {
+    if (builtin.os.tag != .macos) return app.setNotice("screenshots need macOS", .{});
+    if (app.screenshot_thread != null) return app.setNotice("a screenshot is already being taken", .{});
+    app.screenshot_request = mode;
+    app.refresh_requested = true;
+}
+
+/// After a frame is rendered: start the requested screenshot of it.
+pub fn takePending(app: *App, screen: *const vaxis.Screen) void {
+    const mode = app.screenshot_request orelse return;
+    app.screenshot_request = null;
+    const loop = app.loop orelse return;
+    var arena_state = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const top: usize = switch (mode) {
+        .full => 0,
+        .slim => app.tabBarRows(),
+    };
+    const end: usize = switch (mode) {
+        .full => screen.height,
+        .slim => @min(top + app.view.last_view_h, screen.height),
+    };
+    if (end <= top) return app.setNotice("nothing to capture", .{});
+    const theme = &app.terminal_theme;
+    const home = if (app.environ) |env| env.get("HOME") else null;
+    const json = describe(arena, screen, top, end, colorsFrom(theme.foreground, theme.background, theme.palette), .{
+        .cols = screen.width,
+        .cell_width = if (app.cell_px_w > 0) app.cell_px_w else 16,
+        .cell_height = if (app.cell_px_h > 0) app.cell_px_h else 34,
+    }, fontFamily(arena, app.io, home)) catch return app.setNotice("screenshot failed: out of memory", .{});
+    const tmp = if (app.environ) |env| env.get("TMPDIR") orelse "/tmp" else "/tmp";
+    const job = app.gpa.create(Job) catch return;
+    job.* = .{ .gpa = app.gpa, .io = app.io, .loop = loop, .environ = app.environ, .json = undefined, .tmp = undefined };
+    job.json = app.gpa.dupe(u8, json) catch {
+        app.gpa.destroy(job);
+        return;
+    };
+    job.tmp = app.gpa.dupe(u8, tmp) catch {
+        app.gpa.free(job.json);
+        app.gpa.destroy(job);
+        return;
+    };
+    app.screenshot_thread = std.Thread.spawn(.{}, Job.run, .{job}) catch {
+        job.deinit();
+        return app.setNotice("screenshot failed: could not start", .{});
+    };
+    app.setNotice("taking a screenshot…", .{});
+}
+
+pub fn done(app: *App, failure: ?[]const u8) void {
+    if (app.screenshot_thread) |thread| thread.join();
+    app.screenshot_thread = null;
+    if (failure) |reason| app.setNotice("screenshot failed: {s}", .{reason}) else app.setNotice("screenshot copied to the clipboard", .{});
+}
+
+const Job = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    loop: *vaxis.Loop(tui.Event),
+    environ: ?*const std.process.Environ.Map,
+    json: []u8,
+    tmp: []u8,
+
+    fn deinit(job: *Job) void {
+        job.gpa.free(job.json);
+        job.gpa.free(job.tmp);
+        job.gpa.destroy(job);
+    }
+
+    fn run(job: *Job) void {
+        defer job.deinit();
+        copyToClipboard(job.gpa, job.io, job.json, job.tmp, job.environ) catch |err| {
+            job.loop.postEvent(.{ .screenshot = @errorName(err) }) catch {};
+            return;
+        };
+        job.loop.postEvent(.{ .screenshot = null }) catch {};
+    }
+};
+
+/// Rows `top..end` of `screen` as JSON for `script`: the grid, colors and
+/// font, then one entry per styled run: [row, col, width, text, fg,
+/// bg|null, flags].
+pub fn describe(arena: std.mem.Allocator, screen: *const vaxis.Screen, top: usize, end: usize, colors: Colors, geometry: Geometry, font: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
-    try w.print("{{\"cols\":{d},\"rows\":{d},\"cw\":{d},\"ch\":{d},\"font\":", .{ geometry.cols, rows.len, geometry.cell_width, geometry.cell_height });
+    try w.print("{{\"cols\":{d},\"rows\":{d},\"cw\":{d},\"ch\":{d},\"font\":", .{ geometry.cols, end - top, geometry.cell_width, geometry.cell_height });
     try writeString(w, font);
     try w.print(",\"bg\":[{d},{d},{d}],\"runs\":[", .{ colors.bg[0], colors.bg[1], colors.bg[2] });
     var first = true;
-    for (rows, 0..) |pin, row| {
+    for (top..end) |y| {
+        const row = y - top;
         var run: ?Run = null;
         var col: usize = 0;
-        var buf: [4]u8 = undefined;
-        for (pin.cells(.all)) |*cell| {
-            if (cell.wide == .spacer_tail) continue;
-            defer col += 1;
-            const width: usize = if (cell.wide == .wide) 2 else 1;
-            const style: vt.Style = if (cell.style_id != 0) pin.style(cell) else .{};
-            var fg = resolve(style.fg_color, colors, colors.fg);
-            // Blank cells can carry a background of their own (erased lines).
-            var bg = switch (cell.content_tag) {
-                .bg_color_palette => colors.palette[cell.content.color_palette.data],
-                .bg_color_rgb => [3]u8{ cell.content.color_rgb.r, cell.content.color_rgb.g, cell.content.color_rgb.b },
-                else => resolve(style.bg_color, colors, colors.bg),
-            };
-            if (style.flags.inverse) std.mem.swap([3]u8, &fg, &bg);
-            if (style.flags.faint) fg = mix(fg, bg);
-            if (style.flags.invisible) fg = bg;
+        while (col < screen.width) {
+            const cell = screen.readCell(@intCast(col), @intCast(y)) orelse break;
+            const grapheme = cell.char.grapheme;
+            const measured: usize = if (cell.char.width > 0) cell.char.width else render.displayWidth(grapheme);
+            const width: usize = @max(measured, 1);
+            defer col += width;
+            const style = cell.style;
+            var fg = resolve(style.fg, colors, colors.fg);
+            var bg = resolve(style.bg, colors, colors.bg);
+            if (style.reverse) std.mem.swap([3]u8, &fg, &bg);
+            if (style.dim) fg = mix(fg, bg);
+            if (style.invisible) fg = bg;
             var flags: u8 = 0;
-            if (style.flags.bold) flags |= bold;
-            if (style.flags.italic) flags |= italic;
-            if (style.flags.underline != .none) flags |= underline;
-            if (style.flags.strikethrough) flags |= strikethrough;
+            if (style.bold) flags |= bold;
+            if (style.italic) flags |= italic;
+            if (style.ul_style != .off) flags |= underline;
+            if (style.strikethrough) flags |= strikethrough;
             const fill: ?[3]u8 = if (std.mem.eql(u8, &bg, &colors.bg)) null else bg;
 
-            const has_text = cell.hasText() and cell.wide != .spacer_head;
-            const cp: u21 = if (has_text) cell.codepoint() else ' ';
-            const ascii = width == 1 and cp < 0x7f and !(has_text and cell.hasGrapheme());
+            const text = if (grapheme.len == 0) " " else grapheme;
+            const ascii = width == 1 and text.len == 1 and text[0] >= 0x20 and text[0] < 0x7f;
             if (run) |*r| {
                 const same = r.joinable and ascii and r.col + r.width == col and r.flags == flags and
                     std.mem.eql(u8, &r.fg, &fg) and std.meta.eql(r.bg, fill);
                 if (same) {
-                    try r.text.append(arena, @intCast(cp));
+                    try r.text.append(arena, text[0]);
                     r.width += 1;
                     continue;
                 }
                 try flush(w, row, r, &first);
                 run = null;
             }
-            if (cp == ' ' and fill == null and flags & (underline | strikethrough) == 0) continue;
+            if (std.mem.eql(u8, text, " ") and fill == null and flags & (underline | strikethrough) == 0) continue;
             var next: Run = .{ .col = col, .width = width, .fg = fg, .bg = fill, .flags = flags, .joinable = ascii };
-            try next.text.appendSlice(arena, buf[0 .. std.unicode.utf8Encode(cp, &buf) catch 0]);
-            if (has_text and cell.hasGrapheme()) if (pin.grapheme(cell)) |extra| for (extra) |more| {
-                try next.text.appendSlice(arena, buf[0 .. std.unicode.utf8Encode(more, &buf) catch continue]);
-            };
+            try next.text.appendSlice(arena, text);
             run = next;
         }
         if (run) |*r| try flush(w, row, r, &first);
@@ -129,11 +222,11 @@ fn writeString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
-fn resolve(color: vt.Style.Color, colors: Colors, default: [3]u8) [3]u8 {
-    return switch (color.value()) {
-        .none => default,
-        .palette => |index| colors.palette[index],
-        .rgb => |rgb| .{ rgb.r, rgb.g, rgb.b },
+fn resolve(color: vaxis.Color, colors: Colors, default: [3]u8) [3]u8 {
+    return switch (color) {
+        .default => default,
+        .index => |index| colors.palette[index],
+        .rgb => |rgb| rgb,
     };
 }
 
@@ -178,7 +271,8 @@ pub fn configFont(config: []const u8) ?[]const u8 {
 }
 
 /// Draws `describe`'s JSON (path in argv[0]) and puts the PNG on the
-/// clipboard, at the screen's backing scale so it pastes at its real size.
+/// clipboard, at the screen's backing scale so it pastes at its real size;
+/// or writes it to argv[1] when given (MARLIN_SCREENSHOT_FILE, for tests).
 pub const script =
     \\ObjC.import('AppKit');
     \\function run(argv) {
@@ -217,6 +311,7 @@ pub const script =
     \\  var scale = $.NSScreen.mainScreen.isNil() ? 1 : $.NSScreen.mainScreen.backingScaleFactor;
     \\  rep.size = $.NSMakeSize(W / scale, H / scale);
     \\  var png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+    \\  if (argv[1]) { png.writeToFileAtomically(argv[1], true); return W + 'x' + H; }
     \\  var pb = $.NSPasteboard.generalPasteboard;
     \\  pb.clearContents;
     \\  pb.setDataForType(png, 'public.png');
@@ -235,7 +330,7 @@ pub fn copyToClipboard(gpa: std.mem.Allocator, io: Io, json: []const u8, tmp_dir
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
     const result = try std.process.run(gpa, io, .{
-        .argv = &.{ "/usr/bin/osascript", "-l", "JavaScript", "-e", script, path },
+        .argv = &.{ "/usr/bin/osascript", "-l", "JavaScript", "-e", script, path, if (environ) |env| env.get("MARLIN_SCREENSHOT_FILE") orelse "" else "" },
         .environ_map = environ,
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(16 * 1024),
@@ -244,7 +339,7 @@ pub fn copyToClipboard(gpa: std.mem.Allocator, io: Io, json: []const u8, tmp_dir
     defer gpa.free(result.stderr);
     switch (result.term) {
         .exited => |code| if (code != 0) {
-            std.log.scoped(.shell_shot).warn("osascript failed: {s}", .{result.stderr});
+            std.log.scoped(.screenshot).warn("osascript failed: {s}", .{result.stderr});
             return error.ScreenshotFailed;
         },
         else => return error.ScreenshotFailed,

@@ -12,6 +12,7 @@ const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const tui = @import("tui.zig");
 const shell_tab = @import("shell_tab.zig");
+const screenshot = @import("screenshot.zig");
 const App = tui.App;
 const RebuildScope = tui.RebuildScope;
 const OwnedCouncil = tui.OwnedCouncil;
@@ -71,7 +72,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/shutdown", .usage = " [--force]", .description = "leave Marlin and stop its daemon (ends shells and running work)", .accepts_args = true },
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
     .{ .name = "!!", .description = "turn this session into a shell (Ctrl+D turns it back)" },
-    .{ .name = "/screenshot", .description = "copy the shell's view to the clipboard as an image (Ctrl+B s)" },
+    .{ .name = "/screenshot", .usage = " [slim]", .description = "copy the window to the clipboard as an image (Alt+S); slim: transcript only", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!mk", .hidden = true, .description = "play Mario Kart", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
@@ -495,7 +496,9 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
     if (isQuitCommand(head)) {
         self.should_quit = true;
     } else if (std.mem.eql(u8, head, "/screenshot")) {
-        shell_tab.screenshot(self);
+        const arg = it.next();
+        if (arg) |mode| if (!std.mem.eql(u8, mode, "slim")) return self.setNotice("usage: /screenshot [slim]", .{});
+        screenshot.request(self, if (arg != null) .slim else .full);
     } else if (std.mem.eql(u8, head, "/shutdown")) {
         const force = if (it.next()) |arg| std.mem.eql(u8, arg, "--force") else false;
         if (!force) {

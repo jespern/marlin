@@ -19,6 +19,7 @@
 //!            (Ctrl+Backspace: the orb, from any mode);
 //!            / searches this transcript; </> or Left/Right switch tabs; q quit
 //!   global:  Ctrl+N creates a session; Ctrl+D/Ctrl+W archive when input is empty;
+//!            Alt+S copies a screenshot of the window to the clipboard (macOS);
 //!            Ctrl+L clears/redraws and returns to bottom;
 //!            Ctrl+T toggles the expanded tool transcript;
 //!            Alt/Option+Left/Right cycles tabs (moves by word while a draft is
@@ -63,6 +64,7 @@ const media = @import("media.zig");
 const render = @import("render.zig");
 const top_view = @import("top.zig");
 const shell_tab = @import("shell_tab.zig");
+const screenshot = @import("screenshot.zig");
 const log_gate = @import("../core/log_gate.zig");
 const shell_images = @import("shell_images.zig");
 const markdown = @import("markdown.zig");
@@ -151,7 +153,7 @@ pub const Event = union(enum) {
     voice: VoiceEvent,
     /// wipEout asset-bundle download verdicts.
     wipeout: WipeoutEvent,
-    /// Shell screenshot verdict: null when the PNG is on the clipboard,
+    /// Screenshot verdict: null when the PNG is on the clipboard,
     /// else a static reason.
     screenshot: ?[]const u8,
 };
@@ -634,8 +636,10 @@ pub const App = struct {
     /// First-run asset bundle download (progress shared with the worker).
     wipeout_download: ?*@import("asset_store").Progress = null,
     wipeout_download_thread: ?std.Thread = null,
-    /// A shell screenshot being drawn (osascript); joined when it reports.
+    /// A screenshot being drawn (osascript); joined when it reports.
     screenshot_thread: ?std.Thread = null,
+    /// Alt+S or /screenshot: capture the next rendered frame.
+    screenshot_request: ?screenshot.Mode = null,
     /// The `!wipeout` that triggered the download; re-run when it lands.
     wipeout_pending: ?WipeoutOptions = null,
     /// While set, key presses and releases go to the game until Escape.
@@ -2593,8 +2597,11 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.view.attachments.items.len == 0) return;
         const is_command = isCommandInput(text);
+        // Commands that need no provider work before setup is done.
+        const head = trimmed[0 .. std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len];
         const allowed_during_setup = commands.isQuitCommand(trimmed) or
-            std.mem.eql(u8, trimmed, "/shutdown") or
+            std.mem.eql(u8, head, "/shutdown") or
+            std.mem.eql(u8, head, "/screenshot") or
             (is_command and trimmed[0] == '!');
         if (self.setup.required and !allowed_during_setup) {
             self.beginSetup(true);
@@ -6938,6 +6945,7 @@ pub fn dispatchEvent(
             if (key.isModifier()) return;
             app.hover_mouse = null;
             app.recordUserActivity();
+            if (screenshot.isKey(key)) return screenshot.request(app, .full);
             if (shell_tab.key(app, key)) return;
             if (app.gameKey(key, true)) return;
             if (app.dismissScreensaver()) return;
@@ -6953,7 +6961,7 @@ pub fn dispatchEvent(
         },
         .voice => |vev| app.handleVoiceEvent(vev),
         .wipeout => |wev| app.handleWipeoutEvent(wev),
-        .screenshot => |failure| shell_tab.screenshotDone(app, failure),
+        .screenshot => |failure| screenshot.done(app, failure),
         .mouse => |m| {
             app.presence_last_activity_ms = nowWallMs(app.io);
             if (app.screensaver_active) return;
@@ -7532,6 +7540,7 @@ pub fn run(
             try flushTerminalNotification(&app, writer, frame_arena.allocator());
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
+            screenshot.takePending(&app, &vx.screen);
             if (app.kitty_graphics) shell_tab.showImages(&app, writer, frame_arena.allocator()) catch {};
             if (app.bell_pending) {
                 app.bell_pending = false;
