@@ -138,6 +138,8 @@ pub fn build(b: *std.Build) void {
     // ---- marlin ----
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const regex = b.dependency("regex", .{ .target = target, .optimize = optimize });
+    // Terminal emulation for the experimental shell tab (`!!`).
+    const ghostty = b.dependency("ghostty", .{ .target = target, .optimize = optimize });
     const exe = b.addExecutable(.{
         .name = "marlin",
         .root_module = b.createModule(.{
@@ -148,6 +150,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis.module("vaxis") },
                 .{ .name = "regex", .module = regex.module("regex") },
+                .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
             },
         }),
     });
@@ -218,6 +221,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "vaxis", .module = vaxis.module("vaxis") },
             .{ .name = "regex", .module = regex.module("regex") },
+            .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
         },
     });
     test_module.addImport("asset_store", asset_store);

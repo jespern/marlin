@@ -59,6 +59,7 @@ const recap = @import("recap.zig");
 const recap_limits = @import("../core/recap.zig");
 const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
+const shell_pty = @import("shell_pty.zig");
 const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const otel = @import("otel.zig");
@@ -176,6 +177,9 @@ const Event = union(enum) {
     /// Parent turn thread → dispatcher. All strings are gpa-owned; `future`
     /// points into the parked parent turn's stack until resolve().
     child_start: ChildStart,
+    /// Shell reader thread → dispatcher. `bytes` gpa-owned.
+    shell_output: struct { client_id: u64, shell_id: u64, bytes: []u8 },
+    shell_exited: struct { client_id: u64, shell_id: u64, status: shell_pty.Status },
     shutdown,
 };
 
@@ -408,6 +412,9 @@ pub const Daemon = struct {
     /// registering after shutdown has begun draining the registry.
     accepting_clients: bool = true,
     sessions: std.AutoHashMapUnmanaged(u64, *Session) = .empty,
+    /// Experimental `!!` shell tabs, each owned by one client. Dispatcher-owned.
+    shells: std.AutoHashMapUnmanaged(u64, *shell_pty.Shell) = .empty,
+    next_shell_id: u64 = 1,
     /// Held while any session is running a turn (macOS: prevents idle system
     /// sleep; elsewhere a no-op). Dispatcher-owned, synced after every event.
     sleep_assertion: power.SleepAssertion = .{},
@@ -761,6 +768,69 @@ pub const Daemon = struct {
         self.clients_mutex.unlock(self.io);
     }
 
+    /// Start a login shell on a PTY for `client` (`!!`), in the session's
+    /// cwd or the user's home. Failures reply err with the request id.
+    fn openShell(self: *Daemon, client: *Client, request_id: u64, sid: u64, cols: u16, rows: u16) !void {
+        const home = self.environ.get("HOME") orelse "/";
+        const cwd = if (sid != 0) if (try self.getOrLoadSession(sid)) |session| session.cwd else home else home;
+        const path = self.environ.get("SHELL") orelse "/bin/sh";
+        // A leading '-' in argv[0] asks for a login shell, as terminals do.
+        const argv0 = try std.fmt.allocPrint(self.gpa, "-{s}", .{std.fs.path.basename(path)});
+        defer self.gpa.free(argv0);
+        var environ = try self.environ.clone(self.gpa);
+        defer environ.deinit();
+        try environ.put("TERM", "xterm-256color");
+        try environ.put("COLORTERM", "truecolor");
+
+        const id = self.next_shell_id;
+        self.next_shell_id += 1;
+        const shell = shell_pty.Shell.spawn(self.gpa, self.io, id, client.id, .{
+            .path = path,
+            .argv = &.{argv0},
+            .cwd = cwd,
+            .environ = &environ,
+            .cols = cols,
+            .rows = rows,
+        }, .{ .ctx = self, .output = onShellOutput, .exited = onShellExited }) catch |err| {
+            const msg = try std.fmt.allocPrint(self.gpa, "could not start a shell: {t}", .{err});
+            defer self.gpa.free(msg);
+            self.sendTo(client, .{ .err = .{ .code = "shell", .msg = msg, .request_id = request_id } });
+            return;
+        };
+        self.shells.put(self.gpa, id, shell) catch |err| {
+            shell.destroy();
+            return err;
+        };
+        self.sendTo(client, .{ .shell_opened = .{ .shell_id = id, .request_id = request_id } });
+    }
+
+    fn ownedShell(self: *Daemon, client: *Client, shell_id: u64) ?*shell_pty.Shell {
+        const shell = self.shells.get(shell_id) orelse return null;
+        return if (shell.client_id == client.id) shell else null;
+    }
+
+    pub fn closeClientShells(self: *Daemon, client_id: u64) void {
+        while (true) {
+            var it = self.shells.valueIterator();
+            const shell = while (it.next()) |s| {
+                if (s.*.client_id == client_id) break s.*;
+            } else return;
+            _ = self.shells.remove(shell.id);
+            shell.destroy();
+        }
+    }
+
+    fn onShellOutput(ctx: *anyopaque, shell: *shell_pty.Shell, bytes: []const u8) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        const owned = self.gpa.dupe(u8, bytes) catch return;
+        self.events.push(self.io, .{ .shell_output = .{ .client_id = shell.client_id, .shell_id = shell.id, .bytes = owned } }) catch self.gpa.free(owned);
+    }
+
+    fn onShellExited(ctx: *anyopaque, shell: *shell_pty.Shell, status: shell_pty.Status) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        self.events.push(self.io, .{ .shell_exited = .{ .client_id = shell.client_id, .shell_id = shell.id, .status = status } }) catch {};
+    }
+
     fn lookupClient(self: *Daemon, id: u64) ?*Client {
         self.clients_mutex.lockUncancelable(self.io);
         defer self.clients_mutex.unlock(self.io);
@@ -998,6 +1068,7 @@ pub const Daemon = struct {
                     self.reboot_suspend = false;
                 }
                 self.dropCcPendingForClient(cg.client_id);
+                self.closeClientShells(cg.client_id);
                 if (self.removeClient(cg.client_id)) |client| {
                     // The registry no longer contains this client, so each
                     // subscription can now be tested against the remaining
@@ -1005,6 +1076,20 @@ pub const Daemon = struct {
                     for (client.subs.items) |sid| self.releaseSessionIfUnused(sid);
                     self.destroyClient(client);
                 }
+            },
+            .shell_output => |so| {
+                defer self.gpa.free(so.bytes);
+                if (!self.shells.contains(so.shell_id)) return;
+                const client = self.lookupClient(so.client_id) orelse return;
+                const encoder = std.base64.standard.Encoder;
+                const encoded = try self.gpa.alloc(u8, encoder.calcSize(so.bytes.len));
+                defer self.gpa.free(encoded);
+                self.sendTo(client, .{ .shell_output = .{ .shell_id = so.shell_id, .data_base64 = encoder.encode(encoded, so.bytes) } });
+            },
+            .shell_exited => |se| {
+                if (self.shells.fetchRemove(se.shell_id)) |entry| entry.value.destroy();
+                const client = self.lookupClient(se.client_id) orelse return;
+                self.sendTo(client, .{ .shell_exited = .{ .shell_id = se.shell_id, .code = se.status.code, .signal = se.status.signal } });
             },
             .turn_block => |tb| {
                 defer self.gpa.free(tb.line);
@@ -1390,7 +1475,23 @@ pub const Daemon = struct {
                     .daemon_pid = @intCast(std.c.getpid()),
                     .daemon_exe = self.marlin_exe orelse "",
                     .daemon_started_at_ms = self.started_at_ms,
+                    .remote_shell = true,
                 } });
+            },
+            .shell_open => |so| try self.openShell(client, so.request_id, so.sid, so.cols, so.rows),
+            .shell_input => |si| if (self.ownedShell(client, si.shell_id)) |shell| {
+                const decoder = std.base64.standard.Decoder;
+                const len = decoder.calcSizeForSlice(si.data_base64) catch return;
+                const bytes = try self.gpa.alloc(u8, len);
+                defer self.gpa.free(bytes);
+                decoder.decode(bytes, si.data_base64) catch return;
+                shell.write(bytes) catch {};
+            },
+            .shell_resize => |sr| if (self.ownedShell(client, sr.shell_id)) |shell| shell.resize(sr.cols, sr.rows),
+            .shell_ack => |sa| if (self.ownedShell(client, sa.shell_id)) |shell| shell.acknowledge(sa.bytes),
+            .shell_close => |sc| if (self.ownedShell(client, sc.shell_id)) |shell| {
+                _ = self.shells.remove(shell.id);
+                shell.destroy();
             },
             .session_create => |sc| {
                 const sid = ids.next(self.io);
@@ -5326,6 +5427,10 @@ pub const Daemon = struct {
     }
 
     fn shutdownCleanup(self: *Daemon) void {
+        var shells = self.shells.valueIterator();
+        while (shells.next()) |shell| shell.*.destroy();
+        self.shells.deinit(self.gpa);
+        self.shells = .empty;
         if (self.web_service) |service| service.stop();
         if (self.advertiser) |a| a.stop();
         self.sleep_assertion.sync(false);
@@ -5426,7 +5531,8 @@ pub const Daemon = struct {
     fn discardShutdownEvent(self: *Daemon, event: Event) void {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
-            .client_gone, .turn_resumed, .turn_usage_credits, .turn_phase, .shutdown => {},
+            .client_gone, .turn_resumed, .turn_usage_credits, .turn_phase, .shell_exited, .shutdown => {},
+            .shell_output => |value| self.gpa.free(value.bytes),
             .turn_block => |value| self.gpa.free(value.line),
             .turn_delta => |value| self.gpa.free(value.line),
             .turn_activity => |value| self.gpa.free(value.line),
@@ -6054,6 +6160,7 @@ test "a dying bridge client unparks its session's parked cc approval" {
     daemon.clients = .empty;
     daemon.clients_mutex = .init;
     daemon.presence = .{};
+    daemon.shells = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -6100,6 +6207,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     daemon.clients = .empty;
     daemon.clients_mutex = .init;
     daemon.presence = .{};
+    daemon.shells = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -6143,6 +6251,7 @@ test "a disconnected requester cannot leave a delayed reboot armed" {
     daemon.clients = .empty;
     daemon.clients_mutex = .init;
     daemon.presence = .{};
+    daemon.shells = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);

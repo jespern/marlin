@@ -435,6 +435,19 @@ pub const ClientMsg = union(enum) {
     /// then brings up the new daemon (one restart mechanism, not two).
     reboot: struct { force: bool = false, suspend_sessions: bool = false },
     shutdown: struct {},
+    /// Experimental shell tab (`!!`): a login shell on a PTY on the daemon's
+    /// host, started in the session's cwd (`sid` 0 = the user's home) and
+    /// owned by this connection. Replies shell_opened, or err with the same
+    /// request_id. Gated on hello_ok.remote_shell.
+    shell_open: struct { request_id: u64 = 0, sid: u64 = 0, cols: u16, rows: u16 },
+    /// Keystrokes, pastes, and terminal replies bound for the PTY.
+    shell_input: struct { shell_id: u64, data_base64: []const u8 },
+    shell_resize: struct { shell_id: u64, cols: u16, rows: u16 },
+    /// Output bytes the client has consumed. The daemon stops reading the
+    /// PTY while too much output is unacknowledged.
+    shell_ack: struct { shell_id: u64, bytes: u64 },
+    /// Hang up the shell. Closing the connection does the same.
+    shell_close: struct { shell_id: u64 },
 };
 
 pub const ApprovalAnswer = enum { granted, denied };
@@ -476,6 +489,8 @@ pub const DaemonMsg = union(enum) {
         daemon_pid: u64 = 0,
         daemon_exe: []const u8 = "",
         daemon_started_at_ms: i64 = 0,
+        /// Experimental: the daemon serves shell_open (the `!!` shell tab).
+        remote_shell: bool = false,
     },
     session_runtime_result: struct { sid: u64, max_runtime_ms: u64, uses_default: bool },
     session_created: struct { sid: u64, request_id: u64 = 0 },
@@ -603,6 +618,11 @@ pub const DaemonMsg = union(enum) {
     /// (currently input). Defaults preserve compatibility in both directions.
     ok: struct { request_id: u64 = 0 },
     err: struct { code: []const u8, msg: []const u8, request_id: u64 = 0 },
+    shell_opened: struct { shell_id: u64, request_id: u64 = 0 },
+    /// Raw PTY output; acknowledge it with shell_ack once consumed.
+    shell_output: struct { shell_id: u64, data_base64: []const u8 },
+    /// The shell exited (`code`) or was killed by a signal (`signal`).
+    shell_exited: struct { shell_id: u64, code: ?i32 = null, signal: ?i32 = null },
 };
 
 pub const SessionInfo = struct {

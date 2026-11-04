@@ -150,3 +150,107 @@ test "image steering keeps durable refs and gives guests readable files" {
     try std.testing.expectEqual(store.c.SQLITE_ROW, store.c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(i64, 3), store.c.sqlite3_column_int64(stmt, 0));
 }
+
+test "shells belong to the client that opened them and end with it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var peer = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer peer.close(io);
+    var stream = try server.accept(io);
+    defer stream.close(io);
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("SHELL", "/bin/sh");
+    try environ.put("HOME", "/");
+    try environ.put("PATH", "/usr/bin:/bin");
+
+    var daemon: daemon_mod.Daemon = undefined;
+    daemon.gpa = gpa;
+    daemon.io = io;
+    daemon.environ = &environ;
+    daemon.events = .init(gpa);
+    daemon.clients = .empty;
+    defer daemon.clients.deinit(gpa);
+    daemon.clients_mutex = .init;
+    daemon.sessions = .empty;
+    defer daemon.sessions.deinit(gpa);
+    daemon.shells = .empty;
+    daemon.next_shell_id = 1;
+    var owner = daemon_mod.Client{ .id = 1, .stream = stream, .outbox = .init(gpa), .said_hello = true };
+    var intruder = daemon_mod.Client{ .id = 2, .stream = stream, .outbox = .init(gpa), .said_hello = true };
+    defer for ([_]*daemon_mod.Client{ &owner, &intruder }) |client| {
+        while (client.outbox.tryPop(io)) |line| gpa.free(line.bytes);
+        client.outbox.deinit();
+    };
+    try daemon.clients.put(gpa, owner.id, &owner);
+    try daemon.clients.put(gpa, intruder.id, &intruder);
+    defer {
+        daemon.closeClientShells(owner.id);
+        while (daemon.events.tryPop(io)) |event| daemon.handleEvent(event) catch {};
+        daemon.events.deinit();
+        daemon.shells.deinit(gpa);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const send = struct {
+        fn line(d: *daemon_mod.Daemon, client_id: u64, comptime json: []const u8, args: anytype) !void {
+            const bytes = try std.fmt.allocPrint(d.gpa, json ++ "\n", args);
+            try d.handleEvent(.{ .client_msg = .{ .client_id = client_id, .msg_line = bytes } });
+        }
+    };
+
+    try send.line(&daemon, owner.id, "{{\"shell_open\":{{\"request_id\":3,\"cols\":80,\"rows\":24}}}}", .{});
+    const opened_line = owner.outbox.tryPop(io).?;
+    defer gpa.free(opened_line.bytes);
+    const opened = (try proto.decode(proto.DaemonMsg, arena.allocator(), opened_line.bytes)).shell_opened;
+    try std.testing.expectEqual(@as(u64, 3), opened.request_id);
+
+    // Another connection can neither hang up nor drive someone else's shell.
+    try send.line(&daemon, intruder.id, "{{\"shell_close\":{{\"shell_id\":{d}}}}}", .{opened.shell_id});
+    try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
+
+    var input_buf: [128]u8 = undefined;
+    const input = std.base64.standard.Encoder.encode(&input_buf, "echo hi-$((1+1)); exit 5\r");
+    try send.line(&daemon, owner.id, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"{s}\"}}}}", .{ opened.shell_id, input });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(gpa);
+    var exit_code: ?i32 = null;
+    pump: for (0..500) |_| {
+        while (daemon.events.tryPop(io)) |event| try daemon.handleEvent(event);
+        while (owner.outbox.tryPop(io)) |line| {
+            defer gpa.free(line.bytes);
+            switch (try proto.decode(proto.DaemonMsg, arena.allocator(), line.bytes)) {
+                .shell_output => |o| {
+                    const decoder = std.base64.standard.Decoder;
+                    const bytes = try arena.allocator().alloc(u8, try decoder.calcSizeForSlice(o.data_base64));
+                    try decoder.decode(bytes, o.data_base64);
+                    try output.appendSlice(gpa, bytes);
+                },
+                .shell_exited => |e| {
+                    exit_code = e.code;
+                    break :pump;
+                },
+                else => {},
+            }
+        }
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectEqual(@as(?i32, 5), exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "hi-2") != null);
+    try std.testing.expectEqual(@as(usize, 0), daemon.shells.count());
+    try std.testing.expect(intruder.outbox.tryPop(io) == null);
+
+    // A departing connection's shells are hung up with it.
+    try send.line(&daemon, owner.id, "{{\"shell_open\":{{\"request_id\":4,\"cols\":80,\"rows\":24}}}}", .{});
+    gpa.free(owner.outbox.tryPop(io).?.bytes);
+    try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
+    daemon.closeClientShells(owner.id);
+    try std.testing.expectEqual(@as(usize, 0), daemon.shells.count());
+}

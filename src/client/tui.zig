@@ -61,6 +61,7 @@ pub const SkyOverride = union(enum) { cycle, hour: f32 };
 const media = @import("media.zig");
 const render = @import("render.zig");
 const top_view = @import("top.zig");
+const shell_tab = @import("shell_tab.zig");
 const markdown = @import("markdown.zig");
 const layout_mod = @import("layout.zig");
 const commands = @import("commands.zig");
@@ -679,10 +680,13 @@ pub const App = struct {
     mk64_rom: ?[]u8 = null,
     mk64_autopilot: bool = false,
     remote_transport: bool = false,
+    /// The experimental `!!` shell tab, while one is open.
+    shell: ?*shell_tab.ShellTab = null,
     reconnecting: bool = false,
     next_input_request_id: u64 = 1,
 
     pub fn deinit(self: *App) void {
+        if (self.shell) |tab| tab.destroy(self.gpa);
         if (self.cwd_completion_arena) |*arena| arena.deinit();
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
@@ -1805,6 +1809,9 @@ pub const App = struct {
         const msg = proto.decode(proto.DaemonMsg, arena_state.allocator(), line) catch return;
 
         switch (msg) {
+            .shell_opened => |m| shell_tab.opened(self, m),
+            .shell_output => |m| shell_tab.output(self, m),
+            .shell_exited => |m| shell_tab.exited(self, m),
             .daemon_stopping => {
                 // Deliberate shutdown must not enter the crash-reconnect path,
                 // which would immediately autostart a replacement daemon.
@@ -2256,6 +2263,7 @@ pub const App = struct {
                 if (m.context_limit > 0) view.context_limit = m.context_limit;
             },
             .err => |e| {
+                if (shell_tab.failed(self, e.request_id, e.msg)) return;
                 self.rejectInput(e.request_id);
                 self.setup.status_pending = false;
                 if (self.setup.apply_pending) {
@@ -3024,6 +3032,8 @@ pub const App = struct {
 
     pub fn maybeStartScreensaver(self: *App) void {
         if (self.screensaver_active or self.screensaver_timeout_ms == 0) return;
+        // A long build in the shell tab is not idleness.
+        if (shell_tab.visible(self)) return;
         const deadline = self.screensaver_deadline_ms.load(.acquire);
         if (deadline != 0 and nowWallMs(self.io) >= deadline) self.startScreensaver(self.screensaver_kind);
     }
@@ -5746,6 +5756,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const h = win.height;
     const w = win.width;
     if (h < 4 or w < 20) return;
+    if (shell_tab.visible(app)) return shell_tab.draw(app, win, arena);
     if (app.top_view != null) return drawTop(app, win, arena);
 
     if (app.show_tab_bar) try drawTabBar(app, win, arena);
@@ -6823,6 +6834,7 @@ pub fn dispatchEvent(
             if (key.isModifier()) return;
             app.hover_mouse = null;
             app.recordUserActivity();
+            if (shell_tab.key(app, key)) return;
             if (app.gameKey(key, true)) return;
             if (app.dismissScreensaver()) return;
             try handleKey(app, key);
@@ -6839,7 +6851,7 @@ pub fn dispatchEvent(
         .wipeout => |wev| app.handleWipeoutEvent(wev),
         .mouse => |m| {
             app.presence_last_activity_ms = nowWallMs(app.io);
-            if (app.screensaver_active) return;
+            if (app.screensaver_active or shell_tab.visible(app)) return;
             app.hover_mouse = if (m.type == .motion and m.button == .none) m else null;
             vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null) .pointer else .default);
             if (linkAtMouse(vx.window(), m, app.link_super_held)) |uri| {
@@ -6882,9 +6894,15 @@ pub fn dispatchEvent(
                 try engine.resize(@intCast(@min(ws.cols, std.math.maxInt(u16))), ws.rows);
             }
             try vx.resize(gpa, tty.writer(), ws);
+            shell_tab.resize(app);
         },
         .paste => |text| {
             app.hover_mouse = null;
+            if (shell_tab.paste(app, @constCast(text))) {
+                app.recordUserActivity();
+                gpa.free(@constCast(text));
+                return;
+            }
             if (app.dismissScreensaver()) {
                 gpa.free(@constCast(text));
                 return;
@@ -6895,8 +6913,12 @@ pub fn dispatchEvent(
             gpa.free(@constCast(text));
         },
         .daemon_line => |line| app.handleDaemonLine(line),
-        .daemon_gone => |reason| verdicts.conn_lost = reason,
+        .daemon_gone => |reason| {
+            shell_tab.connectionLost(app);
+            verdicts.conn_lost = reason;
+        },
         .reconnected => |maybe| {
+            shell_tab.connectionLost(app);
             app.cwd_completion_key = null;
             app.cwd_completion_waiting_key = null;
             verdicts.reconnect = maybe;
