@@ -62,6 +62,7 @@ const media = @import("media.zig");
 const render = @import("render.zig");
 const top_view = @import("top.zig");
 const shell_tab = @import("shell_tab.zig");
+const log_gate = @import("../core/log_gate.zig");
 const markdown = @import("markdown.zig");
 const layout_mod = @import("layout.zig");
 const commands = @import("commands.zig");
@@ -7187,6 +7188,8 @@ pub fn run(
         defer loop.stop();
 
         try vx.enterAltScreen(writer);
+        log_gate.tui_active.store(true, .release);
+        defer log_gate.tui_active.store(false, .release);
         defer {
             vx.setTitle(writer, "") catch {};
             terminal_osc.writeProgress(writer, .hidden, 0) catch {};

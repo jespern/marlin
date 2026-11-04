@@ -27,6 +27,7 @@ const credentials = @import("core/credentials.zig");
 /// handle our errors; stderr is not a debug channel in a TUI app.
 pub const std_options: std.Options = .{
     .unexpected_error_tracing = false,
+    .logFn = @import("core/log_gate.zig").logFn,
 };
 
 pub fn main(init: std.process.Init) !u8 {
