@@ -286,3 +286,78 @@ test "Marlin's session keys work from a shell session's normal mode" {
     };
     try std.testing.expect(created);
 }
+
+test "Kitty images in a shell are sent once, placed over their rows, and removed when scrolled away" {
+    const gpa = std.testing.allocator;
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+
+    // A 2x2 RGB image shown over 4x2 cells, between two lines of text.
+    var pixels_b64: [16]u8 = undefined;
+    const pixels = std.base64.standard.Encoder.encode(&pixels_b64, &[_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 });
+    var screen: std.ArrayList(u8) = .empty;
+    try screen.print(h.arena.allocator(), "before\r\n\x1b_Ga=T,f=24,s=2,v=2,c=4,r=2;{s}\x1b\\\r\nafter\r\n$ ", .{pixels});
+    try h.openShell(screen.items);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var render_out: std.Io.Writer.Allocating = .init(gpa);
+    defer render_out.deinit();
+    var vx = try vaxis.init(h.threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &render_out.writer);
+    try vx.resize(gpa, &render_out.writer, .{ .rows = 25, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    try tui.draw(&h.app, &vx, frame.allocator());
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try shell_tab.showImages(&h.app, &out.writer, frame.allocator());
+    const first = out.written();
+    // Sent once, as RGB, then placed at the image's row: the tab bar is row
+    // 0 and "before" row 1, so the image starts on row 2 (1-based: 3).
+    try std.testing.expect(std.mem.indexOf(u8, first, "a=t,f=24,s=2,v=2,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\x1b[3;1H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, ",c=4,r=2,") != null);
+
+    // Next frame: placed again, not resent.
+    out.clearRetainingCapacity();
+    try shell_tab.showImages(&h.app, &out.writer, frame.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "a=t,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "a=p,") != null);
+
+    // A picker over the transcript hides it: the placement is deleted.
+    h.app.picker = 0;
+    out.clearRetainingCapacity();
+    try shell_tab.showImages(&h.app, &out.writer, frame.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "a=d,d=i,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "a=p,") == null);
+}
+
+test "`:` opens Marlin's command line in a shell session; Esc returns to the shell" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    try h.openShell("$ ");
+
+    _ = h.press(.{ .codepoint = vaxis.Key.escape });
+    const colon: vaxis.Key = .{ .codepoint = ':', .text = ":" };
+    try std.testing.expect(!h.press(colon));
+    try tui.handleKey(&h.app, colon);
+    try std.testing.expect(shell_tab.commandLineOpen(&h.app));
+    try std.testing.expectEqualStrings("/", h.app.view.editor.text.items);
+
+    // Typing edits the command, not the shell.
+    const q: vaxis.Key = .{ .codepoint = 'q', .text = "q" };
+    try std.testing.expect(!h.press(q));
+    try tui.handleKey(&h.app, q);
+    try std.testing.expectEqualStrings("/q", h.app.view.editor.text.items);
+    try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len);
+
+    // Esc discards it; keys are the shell's again.
+    try std.testing.expect(h.press(.{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expect(!shell_tab.commandLineOpen(&h.app));
+    try std.testing.expect(h.press(q));
+    try std.testing.expect((try h.sent())[0] == .shell_input);
+}

@@ -63,6 +63,7 @@ const render = @import("render.zig");
 const top_view = @import("top.zig");
 const shell_tab = @import("shell_tab.zig");
 const log_gate = @import("../core/log_gate.zig");
+const shell_images = @import("shell_images.zig");
 const markdown = @import("markdown.zig");
 const layout_mod = @import("layout.zig");
 const commands = @import("commands.zig");
@@ -640,6 +641,8 @@ pub const App = struct {
     /// Terminal capability from queryTerminal; pixel effects need it and
     /// otherwise start as their cell fallback.
     kitty_graphics: bool = false,
+    /// Kitty images of shell sessions currently on the host terminal.
+    shell_images: shell_images.Display = .{},
     /// Cell size in pixels from the winsize report (0 = unknown).
     cell_px_w: u32 = 0,
     cell_px_h: u32 = 0,
@@ -693,6 +696,7 @@ pub const App = struct {
     next_input_request_id: u64 = 1,
 
     pub fn deinit(self: *App) void {
+        self.shell_images.deinit(self.gpa);
         if (self.cwd_completion_arena) |*arena| arena.deinit();
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
@@ -6087,7 +6091,9 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         }
     }
 
-    if (shell_session) {
+    // A shell session draws the composer (over its bottom rows, without
+    // resizing the shell) only while a Marlin command is being typed.
+    if (shell_session and !shell_tab.commandLineOpen(app)) {
         if (!shell_full_screen) shell_tab.placeCursor(app, win, @intCast(top_rows), @intCast(view_h), total);
     } else try drawComposer(app, win, arena, .{
         .h = h,
@@ -7494,6 +7500,7 @@ pub fn run(
             try flushTerminalNotification(&app, writer, frame_arena.allocator());
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
+            if (app.kitty_graphics) shell_tab.showImages(&app, writer, frame_arena.allocator()) catch {};
             if (app.bell_pending) {
                 app.bell_pending = false;
                 try writer.writeAll("\x07");

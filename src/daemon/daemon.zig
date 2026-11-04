@@ -329,8 +329,6 @@ pub const Session = struct {
     question_gate: approval.QuestionGate = .{},
     /// One parked bridge ask_user question (cc_question), mirroring cc_pending.
     cc_question_pending: ?CcPending = null,
-    /// Non-zero while this session is an interactive shell (`!!`).
-    shell_id: u64 = 0,
     /// Complete encoded approval_request retained while the gate is armed.
     /// Dispatcher-owned; reconnecting subscribers/watchers receive this exact
     /// actionable state instead of only an unexplained awaiting status.
@@ -783,7 +781,7 @@ pub const Daemon = struct {
             self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session", .request_id = request_id } });
             return;
         };
-        if (session.shell_id != 0) if (self.shells.get(session.shell_id)) |host|
+        if (self.sessionShell(sid)) |host|
             return self.attachShell(client, host, request_id, geometry);
         if (session.state == .running or session.state == .awaiting_approval) {
             self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "the session is working; wait for its turn to finish", .request_id = request_id } });
@@ -818,7 +816,6 @@ pub const Daemon = struct {
             host.destroy();
             return err;
         };
-        session.shell_id = id;
         self.broadcastSessionUpsert(sid);
         try self.attachShell(client, host, request_id, null);
     }
@@ -832,7 +829,6 @@ pub const Daemon = struct {
         const sid = host.sid;
         const text = host.transcript(self.gpa, shell_transcript_max_bytes) catch null;
         host.destroy();
-        if (self.sessions.get(sid)) |session| session.shell_id = 0;
         if (text) |owned| {
             defer self.gpa.free(owned);
             self.appendSessionBlock(sid, .{ .shell_transcript = .{ .text = owned, .exit_code = status.code, .signal = status.signal } });
@@ -858,6 +854,15 @@ pub const Daemon = struct {
         const encoded = try self.gpa.alloc(u8, encoder.calcSize(snapshot.len));
         defer self.gpa.free(encoded);
         self.sendTo(client, .{ .shell_snapshot = .{ .shell_id = host.id, .data_base64 = encoder.encode(encoded, snapshot) } });
+    }
+
+    /// The shell session `sid` is, if any. Shells, not session objects, hold
+    /// this: an idle session is unloaded when its last viewer leaves, while
+    /// its shell keeps running.
+    pub fn sessionShell(self: *Daemon, sid: u64) ?*shell_host.Host {
+        var it = self.shells.valueIterator();
+        while (it.next()) |host| if (host.*.sid == sid) return host.*;
+        return null;
     }
 
     /// The shell, when `client` is attached to it.
@@ -1862,6 +1867,8 @@ pub const Daemon = struct {
                 }
             },
             .session_kill => |sk| {
+                // A shell session's shell ends with it (its transcript kept).
+                if (self.sessionShell(sk.sid)) |host| self.closeShell(host);
                 _ = self.cancelSessionTree(sk.sid);
                 self.requestSessionTreeEviction(sk.sid);
                 self.sendTo(client, .{ .ok = .{} });
@@ -1871,6 +1878,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                if (sa.archived) if (self.sessionShell(sa.sid)) |host| self.closeShell(host);
                 if (sa.archived and self.sessionTreeBusy(sa.sid)) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot archive a running session tree" } });
                     return;
@@ -2384,7 +2392,7 @@ pub const Daemon = struct {
                     self.sendInputError(client, inp.request_id, "paused", "session is pausing or paused; use /resume before sending input");
                     return;
                 }
-                if (session.shell_id != 0) {
+                if (self.sessionShell(inp.sid) != null) {
                     self.sendInputError(client, inp.request_id, "shell", "this session is a shell; exit it (Ctrl+D) to talk to the agent");
                     return;
                 }
@@ -4944,7 +4952,7 @@ pub const Daemon = struct {
                 .network_filtering = self.network.isActive() and
                     (if (live) |session| session.network_filtering_enabled else true),
                 .archived = row.archived,
-                .shell_id = if (live) |session| session.shell_id else 0,
+                .shell_id = if (self.sessionShell(row.id)) |host| host.id else 0,
             };
         }
         return infos;

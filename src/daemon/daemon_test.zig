@@ -277,7 +277,7 @@ test "shells outlive their opener and are shared by every viewer" {
     try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
 
     // While it is a shell, the session takes no agent input.
-    try std.testing.expectEqual(shell_id, session.shell_id);
+    try std.testing.expectEqual(shell_id, daemon.sessionShell(7).?.id);
     _ = try Helpers.drain(a, &opener, io);
     try Helpers.send(&daemon, opener.id, "{{\"input\":{{\"sid\":7,\"text\":\"hello agent\",\"request_id\":21}}}}", .{});
     var refused = false;
@@ -297,7 +297,7 @@ test "shells outlive their opener and are shared by every viewer" {
     try std.testing.expectEqual(shell_id, exited.?.shell_exited.shell_id);
 
     // The session is ordinary again, with the shell's output in its log.
-    try std.testing.expectEqual(@as(u64, 0), session.shell_id);
+    try std.testing.expect(daemon.sessionShell(7) == null);
     var blocks: std.ArrayList(@import("../core/block.zig").Block) = .empty;
     try daemon.store.loadTailInto(a, &blocks, 7, 1);
     const recorded = blocks.items[0].body.shell_transcript;

@@ -15,6 +15,7 @@ const proto = @import("../core/proto.zig");
 const render = @import("render.zig");
 const shell_term = @import("shell_term.zig");
 const ShellState = @import("shell_state.zig").ShellState;
+const shell_images = @import("shell_images.zig");
 const SessionView = @import("session_view.zig").SessionView;
 const tui = @import("tui.zig");
 const App = tui.App;
@@ -202,6 +203,16 @@ fn dropShell(app: *App, state: *ShellState) void {
 pub fn key(app: *App, k: vaxis.Key) bool {
     const state = app.view.shell orelse return false;
     const tab_switch = k.mods.alt and k.codepoint >= '1' and k.codepoint <= '9';
+    // Marlin's command line (`:` in normal mode): keys edit it until Enter
+    // runs it or Esc discards it, then the shell has them again.
+    if (commandLineOpen(app)) {
+        if (k.matches(vaxis.Key.escape, .{})) {
+            app.view.editor.clear();
+            enterLive(app);
+            return true;
+        }
+        return false;
+    }
     if (app.mode != .insert or app.copy_cursor != null) {
         if (isResumeKey(k) and app.copy_cursor == null) {
             enterLive(app);
@@ -234,15 +245,20 @@ fn isResumeKey(k: vaxis.Key) bool {
     if (k.matches(vaxis.Key.enter, .{})) return true;
     if (k.mods.ctrl or k.mods.alt or k.mods.super) return false;
     return switch (k.codepoint) {
-        'i', 'a', 'A', 'I', 'o', 'O', 's', 'S', ':' => true,
+        'i', 'a', 'A', 'I', 'o', 'O', 's', 'S' => true,
         else => false,
     };
+}
+
+/// A shell session shows Marlin's composer only while a command is typed.
+pub fn commandLineOpen(app: *const App) bool {
+    return app.view.shell != null and app.mode == .insert and app.view.editor.text.items.len > 0;
 }
 
 /// Route a paste in a shell session. `text` is rewritten in place.
 pub fn paste(app: *App, text: []u8) bool {
     const state = app.view.shell orelse return false;
-    if (app.mode != .insert) return false;
+    if (app.mode != .insert or commandLineOpen(app)) return false;
     const emulator = state.live() orelse return true;
     app.view.scroll_up = 0;
     var out: std.Io.Writer.Allocating = .init(app.gpa);
@@ -326,6 +342,7 @@ pub fn transcriptLines(state: *ShellState, width: usize) ![]const Line {
     }
     render.resolveLineLinks(arena, lines) catch {};
     state.lines = lines;
+    state.pins = pins.items;
     state.lines_generation = emulator.generation;
     state.lines_width = width;
     return lines;
@@ -472,4 +489,97 @@ fn sendInput(app: *App, state: *ShellState, bytes: []const u8) void {
     const buf = app.gpa.alloc(u8, encoder.calcSize(bytes.len)) catch return;
     defer app.gpa.free(buf);
     app.conn.send(.{ .shell_input = .{ .shell_id = id, .data_base64 = encoder.encode(buf, bytes) } }) catch {};
+}
+
+/// After each frame: show the focused shell's Kitty images over their rows
+/// (or the full-screen grid), and drop what is no longer shown or stored.
+pub fn showImages(app: *App, writer: *std.Io.Writer, arena: std.mem.Allocator) !void {
+    const covered = app.picker != null or app.top_view != null or app.shortcut_help;
+    const wants = if (covered) &.{} else try imageWants(app, arena);
+    try app.shell_images.update(app.gpa, writer, wants);
+    try app.shell_images.forget(writer, imageStored, app);
+}
+
+fn imageWants(app: *App, arena: std.mem.Allocator) ![]const shell_images.Want {
+    const state = live(app) orelse return &.{};
+    const emulator = state.emulator.?;
+    const t = &emulator.terminal;
+    const screen = t.screens.active;
+    const full_screen = emulator.onAlternateScreen();
+    const top: isize = @intCast(app.tabBarRows());
+    const view_h: isize = @intCast(app.view.last_view_h);
+    // Transcript index of the shell's first row (it ends the transcript).
+    const shell_first: isize = @intCast(app.view.last_total_lines -| state.lines.len);
+    const first_visible: isize = @intCast(app.view.last_first_visible);
+
+    var wants: std.ArrayList(shell_images.Want) = .empty;
+    const storage = &screen.kitty_images;
+    var it = storage.placements.iterator();
+    while (it.next()) |entry| {
+        const placement = entry.value_ptr.*;
+        const pin = switch (placement.location) {
+            .pin => |pin| pin,
+            else => continue,
+        };
+        if (pin.garbage) continue;
+        const image = storage.images.getPtr(entry.key_ptr.image_id) orelse continue;
+        const data = image.data.bytes() orelse continue;
+        const grid = placement.gridSize(image.*, t);
+        if (grid.rows == 0 or grid.cols == 0) continue;
+
+        const row_top: isize = if (full_screen) row: {
+            const point = screen.pages.pointFromPin(.active, pin.*) orelse continue;
+            break :row @intCast(point.active.y);
+        } else row: {
+            const index = for (state.pins, 0..) |candidate, i| {
+                if (candidate.node == pin.node and candidate.y == pin.y) break i;
+            } else continue;
+            break :row shell_first + @as(isize, @intCast(index)) - first_visible;
+        };
+        const rows: isize = @intCast(grid.rows);
+        const hidden_top: isize = @max(0, -row_top);
+        const visible_end = @min(row_top + rows, view_h);
+        const visible_start = @max(row_top, 0);
+        if (visible_end <= visible_start) continue;
+        const shown_rows = visible_end - visible_start;
+
+        // Crop the source to the rows on screen.
+        const source_w = if (placement.source_width > 0) placement.source_width else image.width -| placement.source_x;
+        const source_h = if (placement.source_height > 0) placement.source_height else image.height -| placement.source_y;
+        const crop_y: u32 = @intCast(@divTrunc(@as(i64, hidden_top) * source_h, rows));
+        const crop_h: u32 = @intCast(@divTrunc(@as(i64, shown_rows) * source_h, rows));
+        if (crop_h == 0) continue;
+
+        const id_bits = entry.key_ptr.placement_id;
+        try wants.append(arena, .{
+            .image = image,
+            .key = .{ .owner = @intFromPtr(emulator), .image_id = image.id, .data = @intFromPtr(data.ptr), .len = data.len },
+            .placement = ((id_bits.id & 0x3fffffff) | (@as(u32, @backingInt(id_bits.tag)) << 30)) + 1,
+            .col = @intCast(@min(pin.x, std.math.maxInt(u16))),
+            .row = @intCast(top + visible_start),
+            .cols = @intCast(@min(grid.cols, std.math.maxInt(u16))),
+            .rows = @intCast(shown_rows),
+            .x_offset = placement.x_offset,
+            .y_offset = if (hidden_top == 0) placement.y_offset else 0,
+            .source = .{ .x = placement.source_x, .y = placement.source_y + crop_y, .width = source_w, .height = crop_h },
+        });
+    }
+    return wants.items;
+}
+
+/// Whether some shell still holds this image data.
+fn imageStored(ctx: ?*anyopaque, image_key: shell_images.ImageKey) bool {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    var views = Views.init(app);
+    while (views.next()) |view| if (view.shell) |state| {
+        const emulator = state.emulator orelse continue;
+        if (@intFromPtr(emulator) != image_key.owner) continue;
+        for ([_]vt.ScreenSet.Key{ .primary, .alternate }) |which| {
+            const screen = emulator.terminal.screens.get(which) orelse continue;
+            const image = screen.kitty_images.images.getPtr(image_key.image_id) orelse continue;
+            const data = image.data.bytes() orelse continue;
+            if (@intFromPtr(data.ptr) == image_key.data and data.len == image_key.len) return true;
+        }
+    };
+    return false;
 }

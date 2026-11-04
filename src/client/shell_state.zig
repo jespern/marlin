@@ -3,6 +3,7 @@
 const std = @import("std");
 const shell_term = @import("shell_term.zig");
 const Line = @import("render.zig").Line;
+const vt = @import("ghostty-vt");
 
 pub const ShellState = struct {
     gpa: std.mem.Allocator,
@@ -22,6 +23,8 @@ pub const ShellState = struct {
     /// when its output or the width changes.
     lines_arena: std.heap.ArenaAllocator,
     lines: []const Line = &.{},
+    /// The terminal row behind each of `lines`, to place images on them.
+    pins: []const vt.Pin = &.{},
     lines_generation: u64 = std.math.maxInt(u64),
     lines_width: usize = 0,
 
