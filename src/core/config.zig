@@ -133,6 +133,8 @@ pub const Config = struct {
     /// Client-local inactivity delay before an opaque effect. Zero is off.
     ui_screensaver_after_ms: u64 = 0,
     ui_screensaver_effect: []const u8 = "matrix",
+    /// The key that precedes Marlin commands in a shell session ("ctrl+]").
+    ui_shell_prefix: []const u8 = "ctrl+]",
 };
 
 pub fn defaults() Config {
@@ -807,6 +809,7 @@ pub fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.ui_bell) |value| cfg.ui_bell = value;
     if (doc.ui_screensaver_after_ms) |value| cfg.ui_screensaver_after_ms = value;
     if (doc.ui_screensaver_effect) |value| cfg.ui_screensaver_effect = value;
+    if (doc.ui_shell_prefix) |value| cfg.ui_shell_prefix = value;
     if (doc.network_blocklists) |value| cfg.network_blocklists = value;
     if (doc.network_allow) |value| cfg.network_allow = value;
     if (doc.network_deny) |value| cfg.network_deny = value;

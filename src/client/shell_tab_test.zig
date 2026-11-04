@@ -361,3 +361,71 @@ test "`:` opens Marlin's command line in a shell session; Esc returns to the she
     try std.testing.expect(h.press(q));
     try std.testing.expect((try h.sent())[0] == .shell_input);
 }
+
+test "the shell prefix parses ctrl+key specs" {
+    const Prefix = shell_tab.Prefix;
+    const default = Prefix.parse("ctrl+]").?;
+    try std.testing.expectEqual(Prefix.default, default);
+    try std.testing.expectEqual(@as(u8, 0x1d), default.literal());
+    const b = Prefix.parse(" C-B ").?;
+    try std.testing.expectEqual(@as(u21, 'b'), b.codepoint);
+    try std.testing.expectEqual(@as(u8, 0x02), b.literal());
+    try std.testing.expect(Prefix.parse("ctrl+[") == null); // that is Escape
+    try std.testing.expect(Prefix.parse("ctrl+bb") == null);
+    try std.testing.expect(Prefix.parse("alt+x") == null);
+}
+
+test "after the prefix, one key is a Marlin command, from anywhere in the shell" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    const arena = h.arena.allocator();
+    try h.openShell("$ ");
+    const prefix: vaxis.Key = .{ .codepoint = ']', .mods = .{ .ctrl = true } };
+
+    // prefix c: a new session.
+    try std.testing.expect(h.press(prefix));
+    try std.testing.expect(h.app.shell_prefix_pending);
+    try std.testing.expect(h.press(.{ .codepoint = 'c', .text = "c" }));
+    var created = false;
+    for (try h.sent()) |msg| if (msg == .session_create) {
+        created = true;
+    };
+    try std.testing.expect(created);
+    h.app.awaiting_new_session = false;
+
+    // prefix prefix: the program gets a literal ^]; legacy GS works too.
+    _ = h.press(.{ .codepoint = 0x1d });
+    _ = h.press(prefix);
+    try std.testing.expectEqualStrings("\x1d", try decodedInput(arena, (try h.sent())[0]));
+
+    // Inside vim, prefix [ shows the scrollback in normal mode; i returns.
+    var out_buf: [64]u8 = undefined;
+    try h.daemonSays("{{\"shell_output\":{{\"shell_id\":5,\"data_base64\":\"{s}\"}}}}", .{std.base64.standard.Encoder.encode(&out_buf, "\x1b[?1049h")});
+    _ = try h.sent();
+    try std.testing.expect(shell_tab.showingFullScreen(&h.app));
+    _ = h.press(prefix);
+    _ = h.press(.{ .codepoint = '[', .text = "[" });
+    try std.testing.expectEqual(tui.Mode.normal, h.app.mode);
+    try std.testing.expect(!shell_tab.showingFullScreen(&h.app));
+    _ = h.press(.{ .codepoint = 'i', .text = "i" });
+    try std.testing.expect(shell_tab.showingFullScreen(&h.app));
+    try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len);
+}
+
+test "a configured prefix replaces Ctrl+], which then goes to the program" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    const arena = h.arena.allocator();
+    try h.openShell("$ ");
+    h.app.shell_prefix = shell_tab.Prefix.parse("ctrl+b").?;
+
+    _ = h.press(.{ .codepoint = ']', .mods = .{ .ctrl = true } });
+    try std.testing.expect(!h.app.shell_prefix_pending);
+    try std.testing.expectEqualStrings("\x1d", try decodedInput(arena, (try h.sent())[0]));
+    _ = h.press(.{ .codepoint = 'b', .mods = .{ .ctrl = true } });
+    try std.testing.expect(h.app.shell_prefix_pending);
+    _ = h.press(.{ .codepoint = '[', .text = "[" });
+    try std.testing.expectEqual(tui.Mode.normal, h.app.mode);
+}

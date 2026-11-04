@@ -3,11 +3,16 @@
 //! with the shell's output kept in the session's transcript.
 //!
 //! The shell's scrollback and screen continue the session's transcript, so
-//! Marlin's ergonomics apply to it: at the prompt Esc enters normal mode
-//! (scrolling, copy mode, selection, yank, search); i/a/Enter return to the
-//! live shell. Full-screen programs (vim, htop) draw over the transcript
-//! area and get every key, Esc included. Shells belong to the daemon: they
-//! keep running when this client leaves, and reattach when it returns.
+//! Marlin's ergonomics apply to it. Keys go to the shell, except after the
+//! prefix ([ui] shell_prefix, Ctrl+] by default), which takes one command:
+//! 1-9 tab, n/p next/previous tab, c new session, [ or Esc normal mode
+//! (scroll, copy, search; from inside vim too, showing the scrollback), :
+//! Marlin's command line, the prefix again sends it to the program. At the
+//! prompt Esc also enters normal mode; i/a/Enter return to the live shell.
+//! Full-screen programs (vim, htop) draw between the tab bar and status line
+//! and get every key but the prefix and Alt+1-9. Shells belong to the
+//! daemon: they keep running when this client leaves, and reattach when it
+//! returns.
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vt = @import("ghostty-vt");
@@ -43,6 +48,55 @@ pub fn fullScreen(app: *const App) bool {
     const state = live(app) orelse return false;
     return state.emulator.?.onAlternateScreen();
 }
+
+/// A full-screen program is on screen: it is running, and the user is not
+/// in normal mode reading the scrollback behind it.
+pub fn showingFullScreen(app: *const App) bool {
+    return fullScreen(app) and app.mode == .insert and app.copy_cursor == null;
+}
+
+/// The shell prefix: Ctrl plus one key.
+pub const Prefix = struct {
+    codepoint: u21,
+    /// The C0 byte legacy terminals send, which vaxis passes through as a
+    /// codepoint rather than ctrl+key (Ctrl+] arrives as 0x1d).
+    raw: ?u21 = null,
+
+    pub const default: Prefix = .{ .codepoint = ']', .raw = 0x1d };
+
+    /// "ctrl+]", "ctrl+b", "C-a", ...; null when not a usable ctrl+key.
+    pub fn parse(spec: []const u8) ?Prefix {
+        const trimmed = std.mem.trim(u8, spec, " \t");
+        const rest = if (std.ascii.startsWithIgnoreCase(trimmed, "ctrl+"))
+            trimmed[5..]
+        else if (std.ascii.startsWithIgnoreCase(trimmed, "c-"))
+            trimmed[2..]
+        else
+            return null;
+        if (rest.len != 1) return null;
+        const c = std.ascii.toLower(rest[0]);
+        return switch (c) {
+            'a'...'z', '@' => .{ .codepoint = c },
+            ']' => .{ .codepoint = c, .raw = 0x1d },
+            '\\' => .{ .codepoint = c, .raw = 0x1c },
+            '^' => .{ .codepoint = c, .raw = 0x1e },
+            '_' => .{ .codepoint = c, .raw = 0x1f },
+            else => null, // ctrl+[ is Escape itself
+        };
+    }
+
+    pub fn matches(self: Prefix, k: vaxis.Key) bool {
+        if (k.matches(self.codepoint, .{ .ctrl = true })) return true;
+        const raw = self.raw orelse return false;
+        return k.codepoint == raw and !k.mods.alt;
+    }
+
+    /// The byte the program gets when the prefix is pressed twice.
+    pub fn literal(self: Prefix) u8 {
+        if (self.raw) |raw| return @intCast(raw);
+        return if (self.codepoint == '@') 0 else @intCast(self.codepoint & 0x1f);
+    }
+};
 
 const Grid = struct { cols: u16, rows: u16, cell_width: u16, cell_height: u16 };
 
@@ -203,6 +257,16 @@ fn dropShell(app: *App, state: *ShellState) void {
 pub fn key(app: *App, k: vaxis.Key) bool {
     const state = app.view.shell orelse return false;
     const tab_switch = k.mods.alt and k.codepoint >= '1' and k.codepoint <= '9';
+    if (app.shell_prefix_pending) {
+        app.shell_prefix_pending = false;
+        prefixCommand(app, state, k);
+        return true;
+    }
+    if (app.shell_prefix.matches(k) and !commandLineOpen(app)) {
+        app.shell_prefix_pending = true;
+        app.refresh_requested = true;
+        return true;
+    }
     // Marlin's command line (`:` in normal mode): keys edit it until Enter
     // runs it or Esc discards it, then the shell has them again.
     if (commandLineOpen(app)) {
@@ -241,6 +305,31 @@ pub fn key(app: *App, k: vaxis.Key) bool {
     return true;
 }
 
+/// The key after the prefix.
+fn prefixCommand(app: *App, state: *ShellState, k: vaxis.Key) void {
+    app.refresh_requested = true;
+    if (app.shell_prefix.matches(k)) {
+        sendInput(app, state, &.{app.shell_prefix.literal()});
+        return;
+    }
+    if (k.mods.ctrl or k.mods.alt or k.mods.super) return;
+    switch (k.codepoint) {
+        '1'...'9' => app.jumpToTab(k.codepoint - '0'),
+        'n' => app.cycleTab(1),
+        'p' => app.cycleTab(-1),
+        'c' => app.newSession() catch app.setNotice("could not create session", .{}),
+        '[', vaxis.Key.escape => {
+            app.mode = .normal;
+            app.refresh_requested = true;
+        },
+        ':' => {
+            app.mode = .normal;
+            tui.handleKey(app, k) catch {};
+        },
+        else => app.setNotice("no shell command for that key", .{}),
+    }
+}
+
 fn isResumeKey(k: vaxis.Key) bool {
     if (k.matches(vaxis.Key.enter, .{})) return true;
     if (k.mods.ctrl or k.mods.alt or k.mods.super) return false;
@@ -274,7 +363,7 @@ pub fn paste(app: *App, text: []u8) bool {
 pub fn mouse(app: *App, m: vaxis.Mouse) bool {
     const state = live(app) orelse return false;
     const emulator = state.emulator.?;
-    const full_screen = emulator.onAlternateScreen();
+    const full_screen = showingFullScreen(app);
     const at_prompt = app.mode == .insert and app.view.scroll_up == 0 and app.copy_cursor == null;
     if (!full_screen and !(at_prompt and emulator.tracksMouse())) return false;
     const top: i32 = @intCast(app.tabBarRows());
@@ -504,8 +593,10 @@ fn imageWants(app: *App, arena: std.mem.Allocator) ![]const shell_images.Want {
     const state = live(app) orelse return &.{};
     const emulator = state.emulator.?;
     const t = &emulator.terminal;
-    const screen = t.screens.active;
-    const full_screen = emulator.onAlternateScreen();
+    const full_screen = showingFullScreen(app);
+    // Normal mode during a full-screen program shows the scrollback, whose
+    // images live on the primary screen.
+    const screen = if (full_screen) t.screens.active else t.screens.get(.primary) orelse t.screens.active;
     const top: isize = @intCast(app.tabBarRows());
     const view_h: isize = @intCast(app.view.last_view_h);
     // Transcript index of the shell's first row (it ends the transcript).

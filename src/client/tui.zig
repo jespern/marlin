@@ -641,6 +641,10 @@ pub const App = struct {
     /// Terminal capability from queryTerminal; pixel effects need it and
     /// otherwise start as their cell fallback.
     kitty_graphics: bool = false,
+    /// Precedes Marlin commands in a shell session ([ui] shell_prefix).
+    shell_prefix: shell_tab.Prefix = .default,
+    /// The prefix was pressed; the next key is a command.
+    shell_prefix_pending: bool = false,
     /// Kitty images of shell sessions currently on the host terminal.
     shell_images: shell_images.Display = .{},
     /// Cell size in pixels from the winsize report (0 = unknown).
@@ -4734,7 +4738,7 @@ fn transcriptView(app: *App) Transcript {
 
 pub fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(Line) {
     var transcript = transcriptView(app);
-    if (shell_tab.live(app)) |shell| if (!shell.emulator.?.onAlternateScreen()) {
+    if (shell_tab.live(app)) |shell| if (!shell_tab.showingFullScreen(app)) {
         transcript.extra_lines = try shell_tab.transcriptLines(shell, width);
     };
     return layout_mod.layoutLines(arena, app.gpa, &transcript, width);
@@ -5842,7 +5846,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // A shell session has no composer or plan: its terminal fills the
     // transcript area down to the status line.
     const shell_session = shell_tab.active(app);
-    const shell_full_screen = shell_tab.fullScreen(app);
+    const shell_full_screen = shell_tab.showingFullScreen(app);
     const surfaces = planSurfaceLayout(h, top_rows, if (shell_session) 0 else input_h, if (shell_session) &.{} else app.view.plan.items);
     const plan_h = if (shell_session) 0 else surfaces.plan_h;
     const view_h = if (shell_session) @as(@TypeOf(surfaces.view_h), @intCast(@as(usize, h) -| top_rows -| 1)) else surfaces.view_h;
@@ -6163,6 +6167,14 @@ fn drawComposer(app: *App, win: vaxis.Window, arena: std.mem.Allocator, g: Compo
 fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16, w: u16, hovered_timestamp: ?i64, timestamp_row: u16) !void {
     const status_win = win.child(.{ .y_off = h - 1, .height = 1, .width = w });
     status_win.fill(.{ .style = Palette.status_bar });
+    // The shell prefix waits for its command: the whole line says which.
+    if (app.shell_prefix_pending and shell_tab.active(app)) {
+        _ = status_win.print(&.{
+            .{ .text = " shell ▸ ", .style = Palette.status_approval },
+            .{ .text = "1-9 tab · n/p next/prev · c new session · [ normal mode · : command · prefix again sends it", .style = Palette.status_bar },
+        }, .{ .wrap = .none });
+        return;
+    }
     const state_txt: []const u8 = if (shell_tab.active(app)) "shell" else if (app.view.login_required) "LOGIN REQUIRED" else if (app.view.pause != .none) @tagName(app.view.pause) else switch (app.view.state) {
         .idle => "idle",
         .running => "running",
@@ -7210,6 +7222,10 @@ pub fn run(
     app.bell_enabled = cfg.ui_bell;
     app.screensaver_timeout_ms = cfg.ui_screensaver_after_ms;
     app.screensaver_kind = effects.Kind.parse(cfg.ui_screensaver_effect) orelse .matrix;
+    app.shell_prefix = shell_tab.Prefix.parse(cfg.ui_shell_prefix) orelse prefix: {
+        app.setNotice("[ui] shell_prefix \"{s}\" is not a ctrl+key; using ctrl+]", .{cfg.ui_shell_prefix});
+        break :prefix .default;
+    };
     app.recordUserActivity();
     app.view.recap.last_activity_ms = 0;
     app.syncAnimationTicker();
