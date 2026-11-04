@@ -5,7 +5,7 @@ test "a shipped frame: one sync update, cursor to the placement, one a=T under i
     var buf: [64 * 1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     const id: u32 = 0x4d61_7205;
-    try kitty.shipFrame(&w, "A" ** 10_000, id, 320, 240, true, .{ .col = 4, .row = 2, .cols = 72, .rows = 20 });
+    try kitty.shipFrame(&w, &@as([10_000]u8, @splat('A')), id, 320, 240, true, .{ .col = 4, .row = 2, .cols = 72, .rows = 20 });
     const out = w.buffered();
     var head: [128]u8 = undefined;
     const want = try std.fmt.bufPrint(&head, "\x1b[?2026h\x1b[3;5H\x1b_Ga=T,f=24,s=320,v=240,i={d},p=1,q=2,o=z,m=1,c=72,r=20,C=1;", .{id});
@@ -22,7 +22,7 @@ test "a shipped frame: one sync update, cursor to the placement, one a=T under i
 test "uncompressed frames carry no o=z; a small frame is one chunk" {
     var buf: [8 * 1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try kitty.shipFrame(&w, "B" ** 100, 7, 10, 5, false, .{ .col = 0, .row = 0, .cols = 80, .rows = 24 });
+    try kitty.shipFrame(&w, &@as([100]u8, @splat('B')), 7, 10, 5, false, .{ .col = 0, .row = 0, .cols = 80, .rows = 24 });
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[1;1H\x1b_Ga=T,f=24,s=10,v=5,i=7,p=1,q=2,m=0,c=80,r=24,C=1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "o=z") == null);

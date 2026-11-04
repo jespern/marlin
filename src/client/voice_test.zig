@@ -20,8 +20,7 @@ test {
 }
 
 test "engine catalog round-trips config names and knows its dependencies" {
-    inline for (@typeInfo(Engine).@"enum".fields) |f| {
-        const engine = @field(Engine, f.name);
+    for (std.meta.tags(Engine)) |engine| {
         try std.testing.expectEqual(engine, Engine.parse(engine.configName()).?);
         try std.testing.expect(engine.binaryCandidates().len > 0);
         try std.testing.expect(engine.installHint().len > 0);

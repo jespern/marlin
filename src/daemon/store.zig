@@ -14,9 +14,7 @@ const Effort = @import("../core/effort.zig").Effort;
 const proto = @import("../core/proto.zig");
 const telemetry_ids = @import("../core/telemetry.zig");
 
-pub const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+pub const c = @import("sqlite3_c");
 
 /// We always sqlite3_step() before the bound Zig slices go out of scope, so
 /// SQLITE_STATIC (no copy, null destructor) is safe and avoids the

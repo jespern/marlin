@@ -114,7 +114,7 @@ pub const Ui = struct {
     pub fn charWidth(c: u8, size: Size) i32 {
         if (c == ' ') return 8;
         const index = glyphIndex(c) orelse return 0;
-        return char_sets[@intFromEnum(size)].glyphs[index].width;
+        return char_sets[@backingInt(size)].glyphs[index].width;
     }
 
     pub fn textWidth(text: []const u8, size: Size) i32 {
@@ -124,8 +124,8 @@ pub const Ui = struct {
     }
 
     pub fn drawText(self: *const Ui, r: *render.Renderer, text: []const u8, at: Vec2i, size: Size, color: Rgba) void {
-        const set = &char_sets[@intFromEnum(size)];
-        const texture = self.font_textures[@intFromEnum(size)];
+        const set = &char_sets[@backingInt(size)];
+        const texture = self.font_textures[@backingInt(size)];
         var p = at;
         for (text) |c| {
             if (c == ' ') {
@@ -149,15 +149,15 @@ pub const Ui = struct {
     /// The pixel box `drawTextCenteredMagnified` covers for `text`.
     pub fn magnifiedTextSize(self: *const Ui, text: []const u8, size: Size, magnification: i32) Vec2i {
         const m = self.scale * @max(magnification, 1);
-        return Vec2i.init(textWidth(text, size) * m, @as(i32, @intCast(char_sets[@intFromEnum(size)].height)) * m);
+        return Vec2i.init(textWidth(text, size) * m, @as(i32, @intCast(char_sets[@backingInt(size)].height)) * m);
     }
 
     /// Text centered on a point at `magnification` times the UI scale: the
     /// same glyphs, blown up whole pixels, for the few words that must be
     /// read from across the room (the start countdown).
     pub fn drawTextCenteredMagnified(self: *const Ui, r: *render.Renderer, text: []const u8, center: Vec2i, size: Size, magnification: i32, color: Rgba) void {
-        const set = &char_sets[@intFromEnum(size)];
-        const texture = self.font_textures[@intFromEnum(size)];
+        const set = &char_sets[@backingInt(size)];
+        const texture = self.font_textures[@backingInt(size)];
         const m = self.scale * @max(magnification, 1);
         const height: i32 = @intCast(set.height);
         var p = Vec2i.init(center.x - @divTrunc(textWidth(text, size) * m, 2), center.y - @divTrunc(height * m, 2));
@@ -201,7 +201,7 @@ pub const Ui = struct {
     }
 
     pub fn drawIcon(self: *const Ui, r: *render.Renderer, icon: Icon, at: Vec2i, color: Rgba) void {
-        const texture = self.icon_textures[@intFromEnum(icon)];
+        const texture = self.icon_textures[@backingInt(icon)];
         r.push2d(at, self.scaled(r.textureSize(texture)), color, texture);
     }
 };

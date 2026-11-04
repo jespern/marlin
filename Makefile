@@ -5,7 +5,7 @@ MARLIN_INSTALL_TARGET ?=
 ZIG_CACHE_MAX_MB ?= 2048
 
 build: trim-cache
-	$(ZIG) build -Doptimize=ReleaseFast
+	$(ZIG) build -Doptimize=fast
 
 install: build
 	MARLIN_INSTALL_TARGET="$(MARLIN_INSTALL_TARGET)" scripts/install-dev.sh zig-out/bin/marlin

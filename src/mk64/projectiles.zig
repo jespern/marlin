@@ -19,10 +19,10 @@ pub const Actor = struct {
     launch_progress: i32 = 0,
 };
 pub const World = struct {
-    shields: [8]?Vec3 = .{null} ** 8,
-    blocked: [8]bool = .{false} ** 8,
+    shields: [8]?Vec3 = @splat(null),
+    blocked: [8]bool = @splat(false),
     blocks: u32 = 0,
-    actors: [32]Actor = .{Actor{}} ** 32,
+    actors: [32]Actor = @splat(Actor{}),
     hits: u32 = 0,
     pub fn spawn(self: *World, kind: Kind, owner: usize, g: game.Game, backward: bool) bool {
         for (&self.actors) |*a| if (!a.active) {
@@ -33,7 +33,7 @@ pub const World = struct {
         return false;
     }
     pub fn tick(self: *World, track: *const @import("course.zig").Course, racers: [8]*game.Game) void {
-        self.blocked = .{false} ** 8;
+        self.blocked = @splat(false);
         for (&self.actors) |*a| {
             if (!a.active) continue;
             a.life -|= 1;

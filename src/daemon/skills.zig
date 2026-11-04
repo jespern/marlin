@@ -2,10 +2,7 @@
 //! and full instructions plus resource paths on activation.
 const std = @import("std");
 const Io = std.Io;
-const yaml = @cImport({
-    @cDefine("YAML_DECLARE_STATIC", "1");
-    @cInclude("yaml.h");
-});
+const yaml = @import("yaml_c");
 
 pub const spec_name = "skill";
 pub const spec_description = "Load the full instructions and resource directory for one available skill by name.";
@@ -21,17 +18,17 @@ pub const Skill = struct {
     path: []u8,
 
     fn deinit(self: *Skill, gpa: std.mem.Allocator) void {
-        inline for (std.meta.fields(Skill)) |field| gpa.free(@field(self, field.name));
+        inline for (@typeInfo(Skill).@"struct".field_names) |name| gpa.free(@field(self, name));
     }
 
     fn clone(self: Skill, gpa: std.mem.Allocator) !Skill {
         var copy: Skill = undefined;
         var initialized: usize = 0;
-        errdefer inline for (std.meta.fields(Skill), 0..) |field, i| {
-            if (i < initialized) gpa.free(@field(copy, field.name));
+        errdefer inline for (@typeInfo(Skill).@"struct".field_names, 0..) |name, i| {
+            if (i < initialized) gpa.free(@field(copy, name));
         };
-        inline for (std.meta.fields(Skill)) |field| {
-            @field(copy, field.name) = try gpa.dupe(u8, @field(self, field.name));
+        inline for (@typeInfo(Skill).@"struct".field_names) |name| {
+            @field(copy, name) = try gpa.dupe(u8, @field(self, name));
             initialized += 1;
         }
         return copy;

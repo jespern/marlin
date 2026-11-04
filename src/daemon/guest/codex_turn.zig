@@ -533,6 +533,15 @@ fn sendCodexSteers(
     return count;
 }
 
+/// Pass an app-server read's result through, noting whether the server
+/// died so runCodexTurn's errdefer can surface its stderr tail.
+fn markServerExit(exited: *bool, result: anytype) @TypeOf(result) {
+    _ = result catch |err| {
+        if (err == error.CodexAppServerExited) exited.* = true;
+    };
+    return result;
+}
+
 pub fn runCodexTurn(
     gpa: std.mem.Allocator,
     io: Io,
@@ -614,7 +623,10 @@ pub fn runCodexTurn(
     // stderr tail captured and thrown away (observed live: two ~1s failures
     // with no trace anywhere). Tear down FIRST so the drain is complete, then
     // put the tail where the user can see it.
-    errdefer |err| if (err == error.CodexAppServerExited and
+    // errdefer cannot capture the error (Zig 0.17): the app-server reads
+    // below record an exit through markServerExit instead.
+    var server_exited = false;
+    errdefer if (server_exited and
         !watcher.cancelled.load(.acquire) and !watcher.timed_out.load(.acquire))
     {
         teardown.run();
@@ -634,7 +646,7 @@ pub fn runCodexTurn(
         .title = "Marlin",
         .version = build_options.version,
     } });
-    const initialized = try codexWaitResponse(arena, reader, 1);
+    const initialized = try markServerExit(&server_exited, codexWaitResponse(arena, reader, 1));
     if (codexRpcError(arena, initialized)) |message| {
         setDelegateError(message);
         _ = try ap.append(.{ .system_note = .{ .text = message } });
@@ -645,7 +657,7 @@ pub fn runCodexTurn(
     // Fail early with a useful login instruction instead of letting a null
     // account decay into an opaque failed turn.
     try codexRequest(arena, writer, "account/read", 2, trace, .{ .refreshToken = true });
-    const account_response = try codexWaitResponse(arena, reader, 2);
+    const account_response = try markServerExit(&server_exited, codexWaitResponse(arena, reader, 2));
     if (codexRpcError(arena, account_response)) |message| {
         setDelegateError(message);
         _ = try ap.append(.{ .system_note = .{ .text = message } });
@@ -672,7 +684,7 @@ pub fn runCodexTurn(
             .approvalsReviewer = "user",
             .sandbox = codexSandbox(opts),
         });
-        const resumed = try codexWaitResponse(arena, reader, next_request_id);
+        const resumed = try markServerExit(&server_exited, codexWaitResponse(arena, reader, next_request_id));
         next_request_id += 1;
         if (codexRpcError(arena, resumed)) |message| {
             if (guest_auth.isAuthFailure(message)) {
@@ -704,7 +716,7 @@ pub fn runCodexTurn(
             .sandbox = codexSandbox(opts),
             .ephemeral = false,
         });
-        const started = try codexWaitResponse(arena, reader, next_request_id);
+        const started = try markServerExit(&server_exited, codexWaitResponse(arena, reader, next_request_id));
         next_request_id += 1;
         if (codexRpcError(arena, started)) |message| {
             setDelegateError(message);
@@ -729,7 +741,7 @@ pub fn runCodexTurn(
         try prompt.appendSlice(gpa, try context.guestPrompt(history_arena_state.allocator(), history.items, first_text));
     }
 
-    var active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, prompt.items);
+    var active_turn_id = try markServerExit(&server_exited, codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, prompt.items));
     next_request_id += 1;
     var rounds: u32 = 1;
     var tokens_in: u64 = 0;
@@ -906,7 +918,7 @@ pub fn runCodexTurn(
                             try io.sleep(.fromMilliseconds(100), .awake);
                         }
                         if (cancelled(opts.cancel) or watcher.cancelled.load(.acquire) or watcher.timed_out.load(.acquire)) break :events;
-                        active_turn_id = codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, recovery_prompt) catch |err| {
+                        active_turn_id = markServerExit(&server_exited, codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, recovery_prompt)) catch |err| {
                             if (err != error.DelegateFailed) return @as(anyerror!TurnResult, err);
                             failure_text = lastDelegateErrorNote() orelse "Codex rejected automatic continuation";
                             break :events;
@@ -929,7 +941,7 @@ pub fn runCodexTurn(
                         defer text.deinit(gpa);
                         _ = try ap.append(.{ .steer = text });
                         final_text.clearRetainingCapacity();
-                        active_turn_id = try codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, text.text);
+                        active_turn_id = try markServerExit(&server_exited, codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, text.text));
                         next_request_id += 1;
                         rounds += 1;
                         failure_recoverable = false;

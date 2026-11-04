@@ -129,7 +129,7 @@ pub const Engine = struct {
     /// The image id this engine transmits under: fixed per kind, replaced in
     /// place every frame.
     pub fn imageId(kind: visual_effect.Kind) u32 {
-        return 0x4d61_7200 + @as(u32, @intFromEnum(kind)); // "Mar" + kind
+        return 0x4d61_7200 + @as(u32, @backingInt(kind)); // "Mar" + kind
     }
 
     /// Where the frame lands, in cells: the whole window, or for wipEout the
@@ -481,13 +481,13 @@ pub fn renderDemo(rgb: []u8, scratch: []u8, width: u16, height: u16, frame: u64)
     const transition_frames = @as(u64, fps);
     const scene_index: u2 = @intCast((frame / scene_frames) % 4);
     const local_frame = frame % scene_frames;
-    const scene: Scene = @enumFromInt(scene_index);
+    const scene: Scene = @fromBackingInt(@intCast(scene_index));
     renderScene(scene, rgb, width, height, frame);
 
     const transition_start = scene_frames - transition_frames;
     if (local_frame < transition_start) return;
     const next_index: u8 = (@as(u8, scene_index) + 1) % 4;
-    const next: Scene = @enumFromInt(next_index);
+    const next: Scene = @fromBackingInt(@intCast(next_index));
     renderScene(next, scratch, width, height, frame);
     const linear = @as(f32, @floatFromInt(local_frame - transition_start)) / @as(f32, @floatFromInt(transition_frames));
     const mix = linear * linear * (3.0 - 2.0 * linear);

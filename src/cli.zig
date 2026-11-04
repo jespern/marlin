@@ -51,8 +51,8 @@ pub const Command = enum {
     _rebuild,
 
     pub fn parse(word: []const u8) ?Command {
-        inline for (@typeInfo(Command).@"enum".fields) |f| {
-            if (std.mem.eql(u8, word, f.name)) return @field(Command, f.name);
+        for (std.meta.tags(Command)) |command| {
+            if (std.mem.eql(u8, word, @tagName(command))) return command;
         }
         return null;
     }
@@ -130,7 +130,7 @@ pub fn dispatch(
             const code = try top.run(gpa, io, environ, self_exe, &pick);
             if (pick.sid) |sid| {
                 var sid_buf: [25]u8 = undefined;
-                const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{sid});
+                const sid_str = try std.mem.printSentinel(&sid_buf, "@{d}", .{sid}, 0);
                 return runTui(gpa, io, environ, self_exe, sid_str, null);
             }
             return code;
@@ -225,7 +225,7 @@ fn runTui(
             @import("client/mk64.zig").runWithOptions(gpa, io, environ, path, .{ .autopilot = plan.mk64_autopilot }) catch |err| {
                 activity_notice = try std.fmt.allocPrint(gpa, "MK64: {s}", .{@errorName(err)});
             };
-            next_sid = try std.fmt.bufPrintZ(&reattach_sid_buf, "@{d}", .{plan.sid});
+            next_sid = try std.mem.printSentinel(&reattach_sid_buf, "@{d}", .{plan.sid}, 0);
             continue;
         }
         if (plan.shell) |request| {
@@ -234,13 +234,13 @@ fn runTui(
             _ = shell_result catch |err| {
                 try stderrPrint(io, "marlin: shell escape failed: {t}\n", .{err});
             };
-            next_sid = try std.fmt.bufPrintZ(&reattach_sid_buf, "@{d}", .{plan.sid});
+            next_sid = try std.mem.printSentinel(&reattach_sid_buf, "@{d}", .{plan.sid}, 0);
             continue;
         }
         if (!plan.request.requested) return code;
 
         var sid_buf: [25]u8 = undefined;
-        const sid_str = try std.fmt.bufPrintZ(&sid_buf, "@{d}", .{plan.sid});
+        const sid_str = try std.mem.printSentinel(&sid_buf, "@{d}", .{plan.sid}, 0);
         var argv: std.ArrayList([:0]const u8) = .empty;
         defer argv.deinit(gpa);
         switch (plan.request.rebuild) {

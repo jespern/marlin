@@ -22,7 +22,7 @@ pub fn progressForStates(states: []const @import("../core/proto.zig").SessionSta
 }
 
 pub fn writeProgress(writer: *std.Io.Writer, state: Progress, percent: u8) !void {
-    try writer.print("\x1b]9;4;{d};{d}\x1b\\", .{ @intFromEnum(state), @min(percent, 100) });
+    try writer.print("\x1b]9;4;{d};{d}\x1b\\", .{ @backingInt(state), @min(percent, 100) });
 }
 
 pub fn writeWorkingDirectory(writer: *std.Io.Writer, hostname: []const u8, path: []const u8) !void {
@@ -65,7 +65,7 @@ pub fn writeNotification(
 pub const Theme = struct {
     foreground: ?[3]u8 = null,
     background: ?[3]u8 = null,
-    palette: [16]?[3]u8 = [_]?[3]u8{null} ** 16,
+    palette: [16]?[3]u8 = @splat(null),
     shimmer: [10]vaxis.Color = fallback_shimmer,
 
     pub fn applyReport(self: *Theme, report: vaxis.Color.Report) void {

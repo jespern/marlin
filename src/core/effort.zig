@@ -26,8 +26,8 @@ pub const Effort = enum {
     };
 
     pub fn parse(value: []const u8) ?Effort {
-        inline for (std.meta.fields(Effort)) |field| {
-            if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+        for (std.meta.tags(Effort)) |effort| {
+            if (std.ascii.eqlIgnoreCase(value, @tagName(effort))) return effort;
         }
         return null;
     }

@@ -74,6 +74,7 @@ const spaces = render.spaces;
 const spinner_frames = render.spinner_frames;
 
 const tui = @import("tui.zig");
+const repeat = @import("../testing/repeat.zig").repeat;
 const App = tui.App;
 const EditCommand = tui.EditCommand;
 const Mode = tui.Mode;
@@ -3250,7 +3251,7 @@ test "legacy provider error notes are display-bounded" {
         },
     };
     defer app.deinit();
-    const old_raw_error = "provider returned HTTP 400: " ++ ("x" ** 1600) ++ " NEVER_RENDER_THIS_TAIL";
+    const old_raw_error = "provider returned HTTP 400: " ++ (repeat("x", 1600)) ++ " NEVER_RENDER_THIS_TAIL";
     app.pushBlock(.system_note, old_raw_error, "", .ok);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -5665,9 +5666,9 @@ test "scrollback stays fixed through live activity shrinking, output and viewpor
                     .{ .id = "test", .kind = .process, .name = "Tests", .detail = "Running checks" },
                 } } })),
                 1 => app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{ .sid = 42, .items = &.{} } })),
-                2 => app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .delta = .{ .sid = 42, .turn_id = 1, .text = "New output\n\n" ** 10 } })),
+                2 => app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .delta = .{ .sid = 42, .turn_id = 1, .text = repeat("New output\n\n", 10) } })),
                 3 => app.applyBlock(.{ .id = 1, .session_id = 42, .turn_id = 1, .seq = 1, .ts = 1, .body = .{ .assistant_msg = .{ .text = "Completed output" } } }),
-                4 => app.view.editor.insertSlice("draft line\n" ** 4),
+                4 => app.view.editor.insertSlice(repeat("draft line\n", 4)),
                 5 => app.view.editor.clear(),
                 6 => app.setPlan(&.{.{ .step = "Checking the implementation", .status = .in_progress }}),
                 7 => app.setPlan(&.{}),
@@ -5685,7 +5686,7 @@ test "scrollback stays fixed through live activity shrinking, output and viewpor
     try draw(&app, &vx, arena);
     try std.testing.expectEqual(first - 3, app.view.last_first_visible);
     app.view.scroll_up = 0;
-    try app.view.delta.appendSlice(gpa, "Follow the new output\n\n" ** 10);
+    try app.view.delta.appendSlice(gpa, repeat("Follow the new output\n\n", 10));
     try draw(&app, &vx, arena);
     try std.testing.expectEqual(@as(usize, 0), app.view.scroll_up);
     try std.testing.expectEqual(app.view.last_total_lines - app.view.last_view_h, app.view.last_first_visible);
@@ -5710,7 +5711,7 @@ test "long pinned prompts cap at ten rows and retain full scrollback" {
     var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
     defer app.deinit();
     app.view.state = .running;
-    const prompt = "a long request with details\n" ** 80;
+    const prompt = repeat("a long request with details\n", 80);
     try app.view.blocks.append(gpa, .{ .kind = .user_msg, .turn_id = 1, .text = try gpa.dupe(u8, prompt), .label = try gpa.dupe(u8, "") });
     try app.view.blocks.append(gpa, .{ .kind = .assistant_msg, .turn_id = 1, .text = try gpa.dupe(u8, "visible answer"), .label = try gpa.dupe(u8, "") });
     var frame = std.heap.ArenaAllocator.init(gpa);
@@ -6313,7 +6314,7 @@ test "hover timestamps overlay the right of the composer for all transcript outp
     for (app.view.blocks.items) |*rb| rb.deinit(gpa);
     app.view.blocks.clearRetainingCapacity();
     app.view.layout_epoch +%= 1;
-    app.pushDurableBlock(message, .assistant_msg, "output row\n" ** 40, "", .ok);
+    app.pushDurableBlock(message, .assistant_msg, repeat("output row\n", 40), "", .ok);
     try draw(&app, &vx, frame.allocator());
     app.view.scroll_up = 3;
     try dispatchEvent(&app, &vx, undefined, gpa, .{ .mouse = .{
@@ -6333,7 +6334,7 @@ test "hover timestamps overlay the right of the composer for all transcript outp
     app.view.scroll_up = 0;
     app.view.state = .running;
     app.pushDurableBlock(message, .user_msg, "pinned request", "", .ok);
-    try app.view.delta.appendSlice(gpa, "live output\n" ** 40);
+    try app.view.delta.appendSlice(gpa, repeat("live output\n", 40));
     try draw(&app, &vx, frame.allocator());
     try std.testing.expect(app.view.last_pinned_rows > 0);
     try dispatchEvent(&app, &vx, undefined, gpa, .{ .mouse = .{
@@ -6357,23 +6358,23 @@ test "hover timestamps overlay the right of the composer for all transcript outp
     for (app.view.blocks.items) |*rb| rb.deinit(gpa);
     app.view.blocks.clearRetainingCapacity();
     app.view.layout_epoch +%= 1;
-    app.pushDurableBlock(message, .tool_result, "x" ** 120, "", .ok);
+    app.pushDurableBlock(message, .tool_result, repeat("x", 120), "", .ok);
     app.hover_mouse = .{ .row = 1, .col = 10, .button = .none, .mods = .{}, .type = .motion };
     try draw(&app, &vx, frame.allocator());
     try std.testing.expectEqualStrings("x", vx.window().readCell(79, 1).?.char.grapheme);
     try expectTimestampBadge(vx.window(), @intCast(app.tabBarRows() + app.view.last_view_h + 2), expected);
 
     // The overlay stays on the first input row as a long draft grows the composer.
-    app.view.editor.insertSlice("draft text " ** 30);
+    app.view.editor.insertSlice(repeat("draft text ", 30));
     try draw(&app, &vx, frame.allocator());
     const input_row: u16 = @intCast(app.tabBarRows() + app.view.last_view_h + 2);
     try expectTimestampBadge(vx.window(), input_row, expected);
     try std.testing.expect(input_row < 21);
-    try std.testing.expectEqualStrings("draft text " ** 30, app.view.editor.text.items);
+    try std.testing.expectEqualStrings(repeat("draft text ", 30), app.view.editor.text.items);
     try dispatchEvent(&app, &vx, undefined, gpa, .mouse_leave, &verdicts);
     try draw(&app, &vx, frame.allocator());
     try std.testing.expect(timestampColumn(vx.window(), input_row, expected) == null);
-    try std.testing.expectEqualStrings("draft text " ** 30, app.view.editor.text.items);
+    try std.testing.expectEqualStrings(repeat("draft text ", 30), app.view.editor.text.items);
 
     // An occupied destination is cleared, including its old hyperlink and padding.
     for ([_]u16{ 20, 80 }) |width| {

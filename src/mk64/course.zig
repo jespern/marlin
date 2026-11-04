@@ -174,7 +174,7 @@ const Builder = struct {
     vertices: []Vertex,
     commands: []Command,
     triangles: std.ArrayList(Triangle) = .empty,
-    cache: [32]?Vertex = .{null} ** 32,
+    cache: [32]?Vertex = @splat(null),
     style: Style = .{},
     surface: u8 = 0,
     steps: usize = 0,

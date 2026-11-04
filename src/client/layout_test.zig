@@ -45,6 +45,7 @@ const lineWidthBytes = markdown.lineWidthBytes;
 const wrapMarkdown = markdown.wrapMarkdown;
 
 const layout = @import("layout.zig");
+const repeat = @import("../testing/repeat.zig").repeat;
 const ExpandPair = layout.ExpandPair;
 const LayoutCache = layout.LayoutCache;
 const RenderBlock = layout.RenderBlock;
@@ -766,7 +767,7 @@ test "live reasoning uses assistant-priority text" {
     try std.testing.expectEqualStrings("checking the implementation", reasoning.text2);
     try std.testing.expectEqual(Palette.assistant, reasoning.style2);
 
-    transcript.reasoning_delta = "Earlier context and investigation details. " ** 200 ++ "Latest finding: the server is healthy.";
+    transcript.reasoning_delta = repeat("Earlier context and investigation details. ", 200) ++ "Latest finding: the server is healthy.";
     const compact = try layoutLines(arena_state.allocator(), gpa, &transcript, 60);
     try std.testing.expectEqual(@as(usize, 3), compact.items.len);
     try std.testing.expect(std.mem.indexOf(u8, compact.items[2].text2, "healthy.") != null);
@@ -819,7 +820,7 @@ test "latest reasoning preview keeps link offsets after its continuation marker"
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var lines: std.ArrayList(Line) = .empty;
-    try layout.wrapReasoningPreview(arena, &lines, "**check** [docs](https://example.com) " ** 50, 30, true);
+    try layout.wrapReasoningPreview(arena, &lines, repeat("**check** [docs](https://example.com) ", 50), 30, true);
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
     try std.testing.expectEqualStrings("  … ", lines.items[0].text);
     try std.testing.expect(lines.items[0].links.len > 0);
@@ -1136,7 +1137,7 @@ test "handover notes render in full instead of a clipped system card" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const long_body = "A" ** 600;
+    const long_body = repeat("A", 600);
     const note = try std.fmt.allocPrint(gpa, "{s}{s}", .{ block.handover_prefix, long_body });
     defer gpa.free(note);
     const blocks = [_]RenderBlock{.{

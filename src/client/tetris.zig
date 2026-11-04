@@ -325,7 +325,7 @@ fn stateVisible(piece: Piece, state: State) bool {
 }
 
 fn shape(piece: Piece, rotation: u2) Shape {
-    return shapes[@intFromEnum(piece)][rotation];
+    return shapes[@backingInt(piece)][rotation];
 }
 
 /// min x, max x, min y, max y.
@@ -344,7 +344,7 @@ fn place(board: *[board_rows][board_cols]u8, piece: Piece, rotation: u2, x: i8, 
     for (shape(piece, rotation)) |point| {
         const by = y + point.y;
         if (by < 0) continue;
-        board[@intCast(by)][@intCast(x + point.x)] = @intFromEnum(piece) + 1;
+        board[@intCast(by)][@intCast(x + point.x)] = @backingInt(piece) + 1;
     }
 }
 
@@ -540,7 +540,7 @@ fn drawBoard(fb: PixelBuffer, game: *const Game, ox: i32, oy: i32, tile: i32) vo
             const x = game.active.x + point.x;
             const y = ghost_y + point.y;
             if (x < 0 or y < 0 or x >= board_cols or y >= board_rows) continue;
-            drawGhostBlock(fb, ox + @as(i32, x) * tile, oy + @as(i32, y) * tile, tile, colors[@intFromEnum(game.active.piece)]);
+            drawGhostBlock(fb, ox + @as(i32, x) * tile, oy + @as(i32, y) * tile, tile, colors[@backingInt(game.active.piece)]);
         }
     }
 
@@ -552,7 +552,7 @@ fn drawBoard(fb: PixelBuffer, game: *const Game, ox: i32, oy: i32, tile: i32) vo
         const x = game.active.x + point.x;
         const y = game.active.y + point.y;
         if (x < 0 or y < 0 or x >= board_cols or y >= board_rows) continue;
-        drawPixelBlock(fb, ox + @as(i32, x) * tile, oy + @as(i32, y) * tile + offset, tile, colors[@intFromEnum(game.active.piece)], true);
+        drawPixelBlock(fb, ox + @as(i32, x) * tile, oy + @as(i32, y) * tile + offset, tile, colors[@backingInt(game.active.piece)], true);
     }
 }
 
@@ -602,7 +602,7 @@ fn drawNextPanel(fb: PixelBuffer, x: i32, y: i32, width: i32, height: i32, game:
     const piece_h = @as(i32, bounds[3] - bounds[2] + 1) * preview_tile;
     const px = x + @divTrunc(width - piece_w, 2) - @as(i32, bounds[0]) * preview_tile;
     const py = y + @divTrunc(height - piece_h, 2) - @as(i32, bounds[2]) * preview_tile + @divTrunc(tile, 2);
-    for (shape(game.next, 0)) |point| drawPixelBlock(fb, px + @as(i32, point.x) * preview_tile, py + @as(i32, point.y) * preview_tile, preview_tile, colors[@intFromEnum(game.next)], true);
+    for (shape(game.next, 0)) |point| drawPixelBlock(fb, px + @as(i32, point.x) * preview_tile, py + @as(i32, point.y) * preview_tile, preview_tile, colors[@backingInt(game.next)], true);
 }
 
 fn drawCompactStats(fb: PixelBuffer, x: i32, y: i32, width: i32, game: *const Game) void {
@@ -770,7 +770,7 @@ pub const Engine = struct {
                 const y = self.game.active.y + point.y;
                 if (x < 0 or y < @as(i8, @intCast(first_row)) or y >= board_rows) continue;
                 const screen_y: usize = @intCast(y);
-                paintBlock(win, ox + @as(u16, @intCast(x)) * cell_w, oy + @as(u16, @intCast(screen_y - first_row)), cell_w, colors[@intFromEnum(self.game.active.piece)], opacity);
+                paintBlock(win, ox + @as(u16, @intCast(x)) * cell_w, oy + @as(u16, @intCast(screen_y - first_row)), cell_w, colors[@backingInt(self.game.active.piece)], opacity);
             }
         }
     }

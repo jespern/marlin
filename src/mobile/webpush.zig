@@ -85,7 +85,7 @@ fn writePrivateFile(io: Io, dir_path: []const u8, name: []const u8, bytes: []con
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, name }) catch return error.NameTooLong;
     const tmp = std.fmt.bufPrint(&tmp_buf, "{s}/{s}.{x}.part", .{ dir_path, name, std.mem.readInt(u64, &nonce, .little) }) catch return error.NameTooLong;
 
-    const file = try Io.Dir.cwd().createFile(io, tmp, .{ .exclusive = true, .permissions = @enumFromInt(0o600) });
+    const file = try Io.Dir.cwd().createFile(io, tmp, .{ .exclusive = true, .permissions = @fromBackingInt(@intCast(0o600)) });
     defer Io.Dir.cwd().deleteFile(io, tmp) catch {};
     {
         errdefer file.close(io);
@@ -378,7 +378,7 @@ fn deliverOne(job: *DeliveryJob) !bool {
         Io.Dir.cwd().deleteFile(io, path) catch {};
         return true;
     }
-    return @intFromEnum(status) >= 200 and @intFromEnum(status) < 300;
+    return @backingInt(status) >= 200 and @backingInt(status) < 300;
 }
 
 fn nowSeconds(io: Io) i64 {

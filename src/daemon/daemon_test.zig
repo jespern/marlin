@@ -59,7 +59,7 @@ test "guest progress cannot dismiss a parked question or approval" {
         .{ .approval_request = .{ .sid = 7, .approval_id = "12", .call_id = "call", .tool = "Bash", .args_json = "{}" } },
     }) |request| {
         session.state = .awaiting_approval;
-        session.phase.store(@intFromEnum(proto.TurnPhase.approval), .release);
+        session.phase.store(@backingInt(proto.TurnPhase.approval), .release);
         session.phase_started_at_ms.store(100, .release);
         session.pending_approval_line = try proto.encode(gpa, request);
         const parked_line = session.pending_approval_line.?;
@@ -68,7 +68,7 @@ test "guest progress cannot dismiss a parked question or approval" {
         for ([_]proto.TurnPhase{ .tool, .provider, .finishing }) |phase| {
             try daemon.handleEvent(.{ .turn_phase = .{ .sid = 7, .phase = phase, .started_at_ms = 200 } });
             try std.testing.expectEqual(proto.SessionState.awaiting_approval, session.state);
-            try std.testing.expectEqual(@intFromEnum(proto.TurnPhase.approval), session.phase.load(.acquire));
+            try std.testing.expectEqual(@backingInt(proto.TurnPhase.approval), session.phase.load(.acquire));
             try std.testing.expectEqual(@as(i64, 100), session.phase_started_at_ms.load(.acquire));
             try std.testing.expectEqualStrings(parked_line, session.pending_approval_line.?);
             try std.testing.expect(client.outbox.tryPop(io) == null);

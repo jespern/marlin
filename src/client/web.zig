@@ -291,7 +291,7 @@ fn logAccess(ctx: *ConnCtx, req: *const std.http.Server.Request, access: Access)
         @tagName(req.head.method),
         req.head.target,
         @tagName(req.head.version),
-        @intFromEnum(access.status),
+        @backingInt(access.status),
         access.bytes,
     }) catch return;
     writer.interface.flush() catch {};

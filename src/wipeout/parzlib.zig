@@ -45,8 +45,8 @@ fn compressBand(src: []const u8, window: []u8, out: []u8, final: bool) ?usize {
 pub const Encoder = struct {
     gpa: std.mem.Allocator,
     bands: usize,
-    windows: [max_bands][]u8 = [_][]u8{&.{}} ** max_bands,
-    outputs: [max_bands][]u8 = [_][]u8{&.{}} ** max_bands,
+    windows: [max_bands][]u8 = @splat(&.{}),
+    outputs: [max_bands][]u8 = @splat(&.{}),
 
     pub fn init(gpa: std.mem.Allocator, bands: usize) Encoder {
         return .{ .gpa = gpa, .bands = std.math.clamp(bands, 1, max_bands) };
@@ -81,7 +81,7 @@ pub const Encoder = struct {
         self.ensureBuffers(band_len) catch return null;
 
         var jobs: [max_bands]BandJob = undefined;
-        var threads: [max_bands]?std.Thread = .{null} ** max_bands;
+        var threads: [max_bands]?std.Thread = @splat(null);
         var i: usize = 0;
         while (i < bands) : (i += 1) {
             const start = i * band_len;

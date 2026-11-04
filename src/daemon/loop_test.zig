@@ -33,6 +33,7 @@ const Effort = @import("../core/effort.zig").Effort;
 const build_options = @import("build_options");
 
 const loop = @import("loop.zig");
+const repeat = @import("../testing/repeat.zig").repeat;
 const AnthropicWireChecks = loop.AnthropicWireChecks;
 const RunOpts = loop.RunOpts;
 const SteeringWireChecks = loop.SteeringWireChecks;
@@ -331,7 +332,7 @@ test "ask_user publishes its phase before the question and returns the full opti
     try std.testing.expectEqualStrings(long_option, out.output);
     try std.testing.expectEqualStrings("aqt", probe.events[0..probe.len]);
 
-    const too_long = "{\"question\":\"?\",\"options\":[\"" ++ ("x" ** 1025) ++ "\",\"y\"]}";
+    const too_long = "{\"question\":\"?\",\"options\":[\"" ++ (repeat("x", 1025)) ++ "\",\"y\"]}";
     const rejected = loop.runAskUser(gpa, io, opts, too_long);
     defer gpa.free(rejected.output);
     try std.testing.expectEqual(block.ToolStatus.err, rejected.status);
@@ -1072,7 +1073,7 @@ test "provider error note unwraps OpenRouter upstream error" {
 }
 
 test "provider error note clips malformed response bodies" {
-    const body = ("gateway dump\n" ** 80);
+    const body = (repeat("gateway dump\n", 80));
     const note = try providerErrorNote(std.testing.allocator, 502, body);
     defer std.testing.allocator.free(note);
     try std.testing.expect(note.len < 540);

@@ -53,7 +53,7 @@ pub fn fetch(
             }
         }
 
-        const url_z = try gpa.dupeZ(u8, current_url);
+        const url_z = try gpa.dupeSentinel(u8, current_url, 0);
         defer gpa.free(url_z);
         var next = http.getOne(gpa, io, environ, url_z, max_fetch_bytes, 60_000, cancel) catch |err| {
             return std.fmt.allocPrint(gpa, "error: fetch failed: {t}", .{err});

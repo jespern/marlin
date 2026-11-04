@@ -4,18 +4,18 @@ const Game = @import("game.zig").Game;
 pub const positions = @import("item_positions.zig").positions;
 pub const Kind = enum { mushroom, banana, shell, red_shell };
 pub const Items = struct {
-    trailing: [8]bool = .{false} ** 8,
-    armed: [8]bool = .{false} ** 8,
-    block_flash: [8]u8 = .{0} ** 8,
-    use_flash: [8]u8 = .{0} ** 8,
-    backward: [8]bool = .{false} ** 8,
-    kind: [8]Kind = .{.mushroom} ** 8,
-    roulette: [8]u8 = .{0} ** 8,
+    trailing: [8]bool = @splat(false),
+    armed: [8]bool = @splat(false),
+    block_flash: [8]u8 = @splat(0),
+    use_flash: [8]u8 = @splat(0),
+    backward: [8]bool = @splat(false),
+    kind: [8]Kind = @splat(.mushroom),
+    roulette: [8]u8 = @splat(0),
     random: u32 = 0x64c0ffee,
     world: @import("projectiles.zig").World = .{},
-    held: [8]bool = .{false} ** 8,
-    age: [8]u16 = .{0} ** 8,
-    cooldown: [positions.len]u16 = .{0} ** positions.len,
+    held: [8]bool = @splat(false),
+    age: [8]u16 = @splat(0),
+    cooldown: [positions.len]u16 = @splat(0),
     pickups: u32 = 0,
     uses: u32 = 0,
     pub fn tick(self: *Items) void {
@@ -83,7 +83,7 @@ pub const Items = struct {
         self.world.shields[id] = null;
     }
     pub fn prepareDefense(self: *Items, track: *const @import("course.zig").Course, racers: [8]*Game) void {
-        self.world.shields = .{null} ** 8;
+        self.world.shields = @splat(null);
         for (racers, 0..) |g, id| {
             if (!self.held[id] or g.finished or g.controller.spin_ticks > 0) {
                 self.cancelHold(id);

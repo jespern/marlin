@@ -135,7 +135,7 @@ pub const Session = struct {
 
         var state = game.State.init(saved);
         if (options.crt) |want_crt| state.save.crt = @intFromBool(want_crt);
-        if (options.difficulty) |d| state.save.difficulty = @intFromEnum(d);
+        if (options.difficulty) |d| state.save.difficulty = @backingInt(d);
         state.skip_intro = @intFromBool(!options.intro);
         if (options.explicit) {
             if (options.rapier) state.save.has_rapier_class = 1;

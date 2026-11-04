@@ -187,7 +187,7 @@ fn candidateHost(
 
     if (std.mem.indexOf(u8, raw, "://") != null) {
         const uri = std.Uri.parse(raw) catch return null;
-        const host = uri.getHost(host_buf) catch return null;
+        const host = std.Io.net.HostName.fromUri(uri, host_buf) catch return null;
         return host.bytes;
     }
 

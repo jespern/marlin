@@ -69,7 +69,7 @@ pub const crt_threads: usize = 6;
 pub fn crt(src: []const Rgba, width: usize, height: usize, dst: []u8, out_width: usize, out_height: usize, time: f32) void {
     std.debug.assert(src.len >= width * height and dst.len >= out_width * out_height * 3);
     const tables = Tables.build(time, @floatFromInt(out_height));
-    var threads: [crt_threads]?std.Thread = .{null} ** crt_threads;
+    var threads: [crt_threads]?std.Thread = @splat(null);
     const rows_per = (out_height + crt_threads - 1) / crt_threads;
     var i: usize = 0;
     while (i < crt_threads) : (i += 1) {

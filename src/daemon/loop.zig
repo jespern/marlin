@@ -1161,7 +1161,7 @@ pub fn runTurn(
 /// turn-start snapshot.
 pub fn effectiveApprovalMode(opts: RunOpts) approval.Mode {
     const live = opts.approval_mode_live orelse return opts.approval_mode;
-    return @enumFromInt(live.load(.acquire));
+    return @fromBackingInt(@intCast(live.load(.acquire)));
 }
 
 /// Guest agents ask only after their own sandbox/policy requires escalation.
@@ -2186,7 +2186,7 @@ const RoundObservation = struct {
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         const uri = std.Uri.parse(self.endpoint_url) catch null;
         const server_address = if (uri) |parsed| host: {
-            const host_name = parsed.getHost(&host_buf) catch break :host "";
+            const host_name = std.Io.net.HostName.fromUri(parsed, &host_buf) catch break :host "";
             break :host host_name.bytes;
         } else "";
         const server_port: u16 = if (uri) |parsed| parsed.port orelse

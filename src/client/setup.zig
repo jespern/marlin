@@ -100,7 +100,7 @@ pub fn applySetupStatus(self: *App, status: proto.SetupStatus) void {
 
 pub fn setupProviderFromItem(item: []const u8) ?SetupProvider {
     for (setup_provider_items, 0..) |candidate, index| {
-        if (std.mem.eql(u8, item, candidate)) return @enumFromInt(index);
+        if (std.mem.eql(u8, item, candidate)) return @fromBackingInt(@intCast(index));
     }
     return null;
 }

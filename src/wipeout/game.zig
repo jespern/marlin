@@ -88,7 +88,7 @@ const opts_shake = [_][]const u8{ "DISABLED", "REDUCED", "FULL" };
 const opts_difficulty = [_][]const u8{ "EASY", "NORMAL", "HARD" };
 
 fn optionText(set: u16, index: i32) []const u8 {
-    const kind: OptionSet = @enumFromInt(set);
+    const kind: OptionSet = @fromBackingInt(@intCast(set));
     const i: usize = @intCast(@max(index, 0));
     return switch (kind) {
         .off_on => opts_off_on[@min(i, opts_off_on.len - 1)],
@@ -258,7 +258,7 @@ pub const State = extern struct {
     }
 
     pub fn difficulty(self: *const State) race_mod.Difficulty {
-        return @enumFromInt(@min(self.save.difficulty, 2));
+        return @fromBackingInt(@intCast(@min(self.save.difficulty, 2)));
     }
 
     pub fn crtEnabled(self: *const State) bool {
@@ -268,7 +268,7 @@ pub const State = extern struct {
     /// The circuit the host should have loaded for the current scene.
     pub fn wantedTrack(self: *const State) ?u8 {
         if (self.scene != .race) return null;
-        return defs.trackNumber(self.circuit, @enumFromInt(self.race_class));
+        return defs.trackNumber(self.circuit, @fromBackingInt(@intCast(self.race_class)));
     }
 
     pub fn inRace(self: *const State) bool {
@@ -342,7 +342,7 @@ pub const State = extern struct {
             self.race = race_mod.Race.init(track, .{
                 .track = ctx.track_number,
                 .pilot = self.pilot,
-                .class = @enumFromInt(self.race_class),
+                .class = @fromBackingInt(@intCast(self.race_class)),
                 .race_type = if (self.race_type == .time_trial) .time_trial else .single,
                 .difficulty = self.difficulty(),
                 .intro = self.skip_intro == 0,
@@ -437,7 +437,7 @@ pub const State = extern struct {
             self.lives -= 1;
             if (self.lives == 0) {
                 self.menu.reset();
-                _ = self.menu.push("GAME OVER", 0).addButton(1, "", @intFromEnum(Action.game_over_continue));
+                _ = self.menu.push("GAME OVER", 0).addButton(1, "", @backingInt(Action.game_over_continue));
                 self.menu_active = 1;
                 self.paused = 0;
                 return;
@@ -463,8 +463,8 @@ pub const State = extern struct {
             }
             self.save_dirty = 1;
             self.menu.reset();
-            const page = self.menu.push("", @intFromEnum(PageKind.text_scroll));
-            _ = page.addButton(1, "", @intFromEnum(Action.scroll_continue));
+            const page = self.menu.push("", @backingInt(PageKind.text_scroll));
+            _ = page.addButton(1, "", @backingInt(Action.scroll_continue));
             self.scene_time = 0;
             self.menu_active = 1;
         } else {
@@ -478,7 +478,7 @@ pub const State = extern struct {
     fn handleMenu(self: *State, ctx: UpdateContext) void {
         // Pages with their own input (best times viewer, hall of fame).
         if (self.menu.current()) |page| {
-            switch (@as(PageKind, @enumFromInt(page.kind))) {
+            switch (@as(PageKind, @fromBackingInt(@intCast(page.kind)))) {
                 .best_times_view => self.bestTimesInput(ctx.input),
                 .hall_of_fame => {
                     if (self.hallOfFameInput(ctx.input)) return;
@@ -495,7 +495,7 @@ pub const State = extern struct {
                     self.menu_active = 0;
                 }
             },
-            .select => |sel| self.applyAction(@enumFromInt(sel.action), sel.data),
+            .select => |sel| self.applyAction(@fromBackingInt(@intCast(sel.action)), sel.data),
         }
     }
 
@@ -504,7 +504,7 @@ pub const State = extern struct {
             .none => {},
             .start_game => self.pageRaceClass(),
             .options => self.pageOptions(),
-            .quit => _ = self.menu.confirm("ARE YOU SURE YOU", "WANT TO QUIT", "YES", "NO", @intFromEnum(Action.quit_confirm)),
+            .quit => _ = self.menu.confirm("ARE YOU SURE YOU", "WANT TO QUIT", "YES", "NO", @backingInt(Action.quit_confirm)),
             .quit_confirm => if (data != 0) {
                 // Quitting returns to the title; the host decides what
                 // leaving the game altogether means.
@@ -518,7 +518,7 @@ pub const State = extern struct {
                 self.pageRaceType();
             },
             .type_select => {
-                self.race_type = @enumFromInt(@as(u8, @intCast(data)));
+                self.race_type = @fromBackingInt(@intCast(@as(u8, @intCast(data))));
                 self.pageTeam();
             },
             .team_select => {
@@ -562,7 +562,7 @@ pub const State = extern struct {
                 self.best_tab = @intCast(data);
                 self.best_class = 0;
                 self.best_circuit = 0;
-                const page = self.menu.push(if (data == 0) "BEST TIME TRIAL TIMES" else "BEST RACE TIMES", @intFromEnum(PageKind.best_times_view));
+                const page = self.menu.push(if (data == 0) "BEST TIME TRIAL TIMES" else "BEST RACE TIMES", @backingInt(PageKind.best_times_view));
                 page.layout |= menu_mod.Layout.fixed;
                 page.title_anchor = Anchor.top | Anchor.center;
                 page.title_pos = Vec2i.init(0, 30);
@@ -571,8 +571,8 @@ pub const State = extern struct {
                 self.paused = 0;
                 self.menu_active = 0;
             },
-            .pause_restart => _ = self.menu.confirm("ARE YOU SURE YOU", "WANT TO RESTART", "YES", "NO", @intFromEnum(Action.restart_confirm)),
-            .pause_quit => _ = self.menu.confirm("ARE YOU SURE YOU", "WANT TO QUIT", "YES", "NO", @intFromEnum(Action.ingame_quit_confirm)),
+            .pause_restart => _ = self.menu.confirm("ARE YOU SURE YOU", "WANT TO RESTART", "YES", "NO", @backingInt(Action.restart_confirm)),
+            .pause_quit => _ = self.menu.confirm("ARE YOU SURE YOU", "WANT TO QUIT", "YES", "NO", @backingInt(Action.ingame_quit_confirm)),
             .restart_confirm => if (data != 0) self.restartRace() else self.menu.pop(),
             .ingame_quit_confirm => if (data != 0) self.goToMainMenu() else self.menu.pop(),
             .stats_continue => {
@@ -580,13 +580,13 @@ pub const State = extern struct {
                     if (self.result.position <= defs.qualifying_rank) {
                         self.racePointsPage();
                     } else {
-                        const page = self.menu.confirm("CONTINUE QUALIFYING OR QUIT", "", "QUALIFY", "QUIT", @intFromEnum(Action.qualify_confirm));
+                        const page = self.menu.confirm("CONTINUE QUALIFYING OR QUIT", "", "QUALIFY", "QUIT", @backingInt(Action.qualify_confirm));
                         page.index = 0;
                     }
                 } else if (self.result.new_race_record != 0) {
                     self.hallOfFamePage();
                 } else {
-                    _ = self.menu.confirm("", "RESTART RACE", "RESTART", "QUIT", @intFromEnum(Action.restart_or_quit));
+                    _ = self.menu.confirm("", "RESTART RACE", "RESTART", "QUIT", @backingInt(Action.restart_or_quit));
                 }
             },
             .qualify_confirm => if (data != 0) self.restartRace() else self.goToMainMenu(),
@@ -596,7 +596,7 @@ pub const State = extern struct {
                 } else if (self.result.new_race_record != 0) {
                     self.hallOfFamePage();
                 } else {
-                    _ = self.menu.confirm("", "RESTART RACE", "RESTART", "QUIT", @intFromEnum(Action.restart_or_quit));
+                    _ = self.menu.confirm("", "RESTART RACE", "RESTART", "QUIT", @backingInt(Action.restart_or_quit));
                 }
             },
             .championship_continue => {
@@ -616,7 +616,7 @@ pub const State = extern struct {
     // -- main menu pages ---------------------------------------------------------
 
     fn fixedTopPage(self: *State, title: []const u8, kind: PageKind) *menu_mod.Page {
-        const page = self.menu.push(title, @intFromEnum(kind));
+        const page = self.menu.push(title, @backingInt(kind));
         page.layout |= menu_mod.Layout.fixed;
         page.title_pos = Vec2i.init(0, 30);
         page.title_anchor = Anchor.top | Anchor.center;
@@ -627,16 +627,16 @@ pub const State = extern struct {
 
     fn pageMain(self: *State) void {
         const page = self.fixedTopPage("OPTIONS", .main);
-        _ = page.addButton(0, "START GAME", @intFromEnum(Action.start_game));
-        _ = page.addButton(1, "OPTIONS", @intFromEnum(Action.options));
-        _ = page.addButton(2, "QUIT", @intFromEnum(Action.quit));
+        _ = page.addButton(0, "START GAME", @backingInt(Action.start_game));
+        _ = page.addButton(1, "OPTIONS", @backingInt(Action.options));
+        _ = page.addButton(2, "QUIT", @backingInt(Action.quit));
     }
 
     fn pageOptions(self: *State) void {
         const page = self.fixedTopPage("OPTIONS", .options);
-        _ = page.addButton(0, "GAME", @intFromEnum(Action.opt_game));
-        _ = page.addButton(1, "VIDEO", @intFromEnum(Action.opt_video));
-        _ = page.addButton(3, "BEST TIMES", @intFromEnum(Action.opt_best_times));
+        _ = page.addButton(0, "GAME", @backingInt(Action.opt_game));
+        _ = page.addButton(1, "VIDEO", @backingInt(Action.opt_video));
+        _ = page.addButton(3, "BEST TIMES", @backingInt(Action.opt_best_times));
     }
 
     fn optionsListPage(self: *State, title: []const u8, items_y: i32) *menu_mod.Page {
@@ -654,40 +654,40 @@ pub const State = extern struct {
 
     fn pageVideo(self: *State) void {
         const page = self.optionsListPage("VIDEO OPTIONS", -60);
-        page.addToggle(self.save.internal_roll, "INTERNAL VIEW ROLL", @intFromEnum(OptionSet.roll), opts_roll.len, @intFromEnum(Action.toggle_roll));
-        page.addToggle(self.save.screen_shake, "SCREEN SHAKE", @intFromEnum(OptionSet.shake), opts_shake.len, @intFromEnum(Action.toggle_shake));
-        page.addToggle(self.save.crt, "CRT EFFECT", @intFromEnum(OptionSet.off_on), opts_off_on.len, @intFromEnum(Action.toggle_crt));
+        page.addToggle(self.save.internal_roll, "INTERNAL VIEW ROLL", @backingInt(OptionSet.roll), opts_roll.len, @backingInt(Action.toggle_roll));
+        page.addToggle(self.save.screen_shake, "SCREEN SHAKE", @backingInt(OptionSet.shake), opts_shake.len, @backingInt(Action.toggle_shake));
+        page.addToggle(self.save.crt, "CRT EFFECT", @backingInt(OptionSet.off_on), opts_off_on.len, @backingInt(Action.toggle_crt));
     }
 
     fn pageGame(self: *State) void {
         const page = self.optionsListPage("GAME OPTIONS", -80);
-        page.addToggle(self.save.difficulty, "OPPONENTS", @intFromEnum(OptionSet.difficulty), opts_difficulty.len, @intFromEnum(Action.toggle_difficulty));
+        page.addToggle(self.save.difficulty, "OPPONENTS", @backingInt(OptionSet.difficulty), opts_difficulty.len, @backingInt(Action.toggle_difficulty));
     }
 
     fn pageBestTimes(self: *State) void {
         const page = self.fixedTopPage("VIEW BEST TIMES", .best_times);
-        _ = page.addButton(0, "TIME TRIAL TIMES", @intFromEnum(Action.best_times_tab));
-        _ = page.addButton(1, "RACE TIMES", @intFromEnum(Action.best_times_tab));
+        _ = page.addButton(0, "TIME TRIAL TIMES", @backingInt(Action.best_times_tab));
+        _ = page.addButton(1, "RACE TIMES", @backingInt(Action.best_times_tab));
     }
 
     fn pageRaceClass(self: *State) void {
         const page = self.fixedTopPage("SELECT RACING CLASS", .race_class);
-        for (defs.race_class_names, 0..) |name, i| _ = page.addButton(@intCast(i), name, @intFromEnum(Action.class_select));
+        for (defs.race_class_names, 0..) |name, i| _ = page.addButton(@intCast(i), name, @backingInt(Action.class_select));
     }
 
     fn pageRaceType(self: *State) void {
         const page = self.fixedTopPage("SELECT RACE TYPE", .race_type);
-        for (defs.race_type_names, 0..) |name, i| _ = page.addButton(@intCast(i), name, @intFromEnum(Action.type_select));
+        for (defs.race_type_names, 0..) |name, i| _ = page.addButton(@intCast(i), name, @backingInt(Action.type_select));
     }
 
     fn pageTeam(self: *State) void {
         const page = self.fixedTopPage("SELECT YOUR TEAM", .team);
-        for (defs.team_names, 0..) |name, i| _ = page.addButton(@intCast(i), name, @intFromEnum(Action.team_select));
+        for (defs.team_names, 0..) |name, i| _ = page.addButton(@intCast(i), name, @backingInt(Action.team_select));
     }
 
     fn pagePilot(self: *State) void {
         const page = self.fixedTopPage("CHOOSE YOUR PILOT", .pilot);
-        for (defs.team_pilots[self.team]) |pilot| _ = page.addButton(pilot, defs.pilot_names[pilot], @intFromEnum(Action.pilot_select));
+        for (defs.team_pilots[self.team]) |pilot| _ = page.addButton(pilot, defs.pilot_names[pilot], @backingInt(Action.pilot_select));
     }
 
     fn pageCircuit(self: *State) void {
@@ -695,7 +695,7 @@ pub const State = extern struct {
         page.items_pos = Vec2i.init(0, -100);
         for (defs.circuit_names, 0..) |name, i| {
             if (defs.circuit_is_bonus[i] and self.save.has_bonus_circuits == 0) continue;
-            _ = page.addButton(@intCast(i), name, @intFromEnum(Action.circuit_select));
+            _ = page.addButton(@intCast(i), name, @backingInt(Action.circuit_select));
         }
     }
 
@@ -704,17 +704,17 @@ pub const State = extern struct {
     fn pausePage(self: *State) void {
         self.menu.reset();
         const page = self.menu.push("PAUSED", 0);
-        _ = page.addButton(0, "CONTINUE", @intFromEnum(Action.pause_continue));
-        _ = page.addButton(0, "RESTART", @intFromEnum(Action.pause_restart));
-        _ = page.addButton(0, "QUIT", @intFromEnum(Action.pause_quit));
+        _ = page.addButton(0, "CONTINUE", @backingInt(Action.pause_continue));
+        _ = page.addButton(0, "RESTART", @backingInt(Action.pause_restart));
+        _ = page.addButton(0, "QUIT", @backingInt(Action.pause_quit));
     }
 
     fn resultsPage(self: *State, title: []const u8, kind: PageKind, action: Action) void {
-        const page = self.menu.push(title, @intFromEnum(kind));
+        const page = self.menu.push(title, @backingInt(kind));
         page.layout |= menu_mod.Layout.fixed;
         page.title_anchor = Anchor.middle | Anchor.center;
         page.title_pos = Vec2i.init(0, -100);
-        _ = page.addButton(1, "", @intFromEnum(action));
+        _ = page.addButton(1, "", @backingInt(action));
     }
 
     fn raceStatsPage(self: *State) void {
@@ -793,7 +793,7 @@ pub const State = extern struct {
             self.raceNext();
         } else {
             self.menu.reset();
-            _ = self.menu.confirm("", "RESTART RACE", "RESTART", "QUIT", @intFromEnum(Action.restart_or_quit));
+            _ = self.menu.confirm("", "RESTART RACE", "RESTART", "QUIT", @backingInt(Action.restart_or_quit));
         }
     }
 
@@ -862,7 +862,7 @@ pub const State = extern struct {
         if (self.menu_active != 0) {
             r.setView2d();
             r.setCullBackface(false);
-            const is_scroll = if (self.menu.current()) |p| p.kind == @intFromEnum(PageKind.text_scroll) else false;
+            const is_scroll = if (self.menu.current()) |p| p.kind == @backingInt(PageKind.text_scroll) else false;
             if (!is_scroll) r.push2d(Vec2i.init(0, 0), ctx.ui.screen, Rgba.init(0, 0, 0, 128), r.no_texture);
             r.setCullBackface(true);
             self.drawPageContent(ctx);
@@ -886,7 +886,7 @@ pub const State = extern struct {
         const r = ctx.renderer;
         const ui = ctx.ui;
         const page = self.menu.current() orelse return;
-        const kind: PageKind = @enumFromInt(page.kind);
+        const kind: PageKind = @fromBackingInt(@intCast(page.kind));
         const selected: i32 = if (page.entries_len > 0) page.entries[@intCast(page.index)].data else 0;
         const t = self.scene_time;
         const ma = ctx.menu_assets;
@@ -953,7 +953,7 @@ pub const State = extern struct {
         pos.y += 16;
         ui.drawTextCentered(r, defs.circuit_names[self.best_circuit], ui.pos(anchor, pos), .px12, ui_mod.color_accent);
         var entry_pos = Vec2i.init(pos.x - 110, pos.y + 24);
-        const table = self.save.tableConst(self.best_class, self.best_circuit, @enumFromInt(self.best_tab));
+        const table = self.save.tableConst(self.best_class, self.best_circuit, @fromBackingInt(@intCast(self.best_tab)));
         for (table.entries) |entry| {
             ui.drawText(r, std.mem.sliceTo(&entry.name, 0), ui.pos(anchor, entry_pos), .px16, ui_mod.color_default);
             ui.drawTime(r, entry.time, ui.pos(anchor, Vec2i.init(entry_pos.x + 110, entry_pos.y)), .px16, ui_mod.color_default);
@@ -1200,7 +1200,7 @@ test "winning the last circuit unlocks and shows the scroller" {
     s.raceNext();
     try std.testing.expectEqual(@as(u8, 1), s.save.has_rapier_class);
     try std.testing.expectEqual(ScrollKind.venom, s.scroll_kind);
-    try std.testing.expectEqual(@intFromEnum(PageKind.text_scroll), s.menu.current().?.kind);
+    try std.testing.expectEqual(@backingInt(PageKind.text_scroll), s.menu.current().?.kind);
     press(&s, .menu_select);
     try std.testing.expectEqual(Scene.main_menu, s.scene);
 

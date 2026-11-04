@@ -160,7 +160,7 @@ pub const Hud = struct {
             panel(r, 266, 36, 48, 48);
             if (race.items.held[0]) {
                 for (0..32) |y| for (0..40) |x| {
-                    const kind: usize = if (race.items.roulette[0] > 0) (race.items.roulette[0] / 5) % 4 else @intFromEnum(race.items.kind[0]);
+                    const kind: usize = if (race.items.roulette[0] > 0) (race.items.roulette[0] / 5) % 4 else @backingInt(race.items.kind[0]);
                     const p = self.icons[kind][y * 40 + x];
                     if (p[3] > 0) pixel(r, 270 + @as(i32, @intCast(x)), 38 + @as(i32, @intCast(y)), p[0..3].*);
                 };

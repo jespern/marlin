@@ -22,22 +22,22 @@ pub const Action = enum(u8) {
     menu_start,
 };
 
-pub const count = @typeInfo(Action).@"enum".fields.len;
+pub const count = @typeInfo(Action).@"enum".field_names.len;
 
 pub const State = extern struct {
-    held: [count]f32 = [_]f32{0} ** count,
-    pressed: [count]bool = [_]bool{false} ** count,
+    held: [count]f32 = @splat(0),
+    pressed: [count]bool = @splat(false),
 
     pub fn state(self: *const State, action: Action) f32 {
-        return self.held[@intFromEnum(action)];
+        return self.held[@backingInt(action)];
     }
 
     pub fn isPressed(self: *const State, action: Action) bool {
-        return self.pressed[@intFromEnum(action)];
+        return self.pressed[@backingInt(action)];
     }
 
     pub fn set(self: *State, action: Action, down: bool) void {
-        const i = @intFromEnum(action);
+        const i = @backingInt(action);
         if (down and self.held[i] == 0) self.pressed[i] = true;
         self.held[i] = if (down) 1 else 0;
     }

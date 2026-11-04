@@ -152,7 +152,7 @@ pub const Hud = struct {
 
         if (ship.weapon_type != .none) {
             if (extras.weapon_icons) |icons| {
-                const index: i16 = @as(i16, @intFromEnum(ship.weapon_type)) - 1;
+                const index: i16 = @as(i16, @backingInt(ship.weapon_type)) - 1;
                 if (icons.resolve(index)) |texture| {
                     r.push2d(ui.pos(Anchor.top | Anchor.center, Vec2i.init(-16, 20)), ui.scaled(Vec2i.init(32, 32)), Rgba.white, texture);
                 } else |_| {}

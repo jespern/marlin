@@ -691,9 +691,9 @@ pub fn isSalientToolErrorLine(line: []const u8) bool {
     for (prefixes) |prefix| {
         if (std.ascii.startsWithIgnoreCase(trimmed, prefix)) return true;
     }
-    return std.ascii.indexOfIgnoreCase(trimmed, " fail ") != null or
-        std.ascii.indexOfIgnoreCase(trimmed, ": permission denied") != null or
-        std.ascii.indexOfIgnoreCase(trimmed, ": access denied") != null;
+    return std.ascii.findIgnoreCase(trimmed, " fail ") != null or
+        std.ascii.findIgnoreCase(trimmed, ": permission denied") != null or
+        std.ascii.findIgnoreCase(trimmed, ": access denied") != null;
 }
 
 /// A calls-first batch can be visible while its tools are still running.
@@ -799,7 +799,7 @@ pub fn appendNetworkSuccessLine(
 ) !void {
     const output_start = lines.items.len;
     defer stampOutputLines(lines.items[output_start..], result.timestamp_ms);
-    const action: []const u8 = if (std.ascii.indexOfIgnoreCase(rb.label, "search") != null)
+    const action: []const u8 = if (std.ascii.findIgnoreCase(rb.label, "search") != null)
         "Searched"
     else
         "Fetched";

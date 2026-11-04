@@ -1,5 +1,6 @@
 const std = @import("std");
 const discovery = @import("discovery.zig");
+const repeat = @import("../testing/repeat.zig").repeat;
 
 test "TXT records round-trip: length-prefixed key=value, lookups by key" {
     var buf: [128]u8 = undefined;
@@ -24,7 +25,7 @@ test "TXT edge cases: empty value, truncated record, entry without '=', too long
     try std.testing.expect(discovery.txtValue("\x04flag\x03v=1", "v") != null); // boolean-style entry skipped
     try std.testing.expectError(error.NoSpaceLeft, discovery.buildTxt(&buf, &.{.{ .key = "sessions", .value = "1234567890" }}));
     var big: [300]u8 = undefined;
-    try std.testing.expectError(error.TxtEntryTooLong, discovery.buildTxt(&big, &.{.{ .key = "k", .value = "x" ** 255 }}));
+    try std.testing.expectError(error.TxtEntryTooLong, discovery.buildTxt(&big, &.{.{ .key = "k", .value = repeat("x", 255) }}));
 }
 
 test "remote targets: user@host, host alone, trailing dot stripped" {

@@ -286,7 +286,7 @@ pub const Session = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     pause_requested: std.atomic.Value(bool) = .init(false),
     /// Dispatcher-owned phase, including cancellation diagnostics.
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(proto.TurnPhase.idle)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(proto.TurnPhase.idle)),
     turn_started_at_ms: std.atomic.Value(i64) = .init(0),
     phase_started_at_ms: std.atomic.Value(i64) = .init(0),
     cancel_requested_at_ms: i64 = 0,
@@ -296,7 +296,7 @@ pub const Session = struct {
     approval_mode: approval.Mode = .default,
     /// Atomic mirror of approval_mode for the RUNNING turn thread; updated
     /// together with it so /permissions applies mid-turn.
-    approval_mode_live: std.atomic.Value(u8) = .init(@intFromEnum(approval.Mode.default)),
+    approval_mode_live: std.atomic.Value(u8) = .init(@backingInt(approval.Mode.default)),
     /// maxInt inherits the turn’s configured default; zero disables its deadline.
     guest_max_runtime_live: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     /// Kernel shell sandbox + prompt-free shell execution (/sandbox).
@@ -1028,7 +1028,7 @@ pub const Daemon = struct {
                 // can park the session while other guest tools keep running.
                 if (session.state != .running or session.pause_requested.load(.acquire)) return;
                 session.phase_started_at_ms.store(update.started_at_ms, .release);
-                session.phase.store(@intFromEnum(update.phase), .release);
+                session.phase.store(@backingInt(update.phase), .release);
                 const now = nowMs(self.io);
                 const line = try encodeTurnPhaseStatus(
                     self.gpa,
@@ -1187,7 +1187,7 @@ pub const Daemon = struct {
                 session.cancel_requests = 0;
                 session.turn_started_at_ms.store(0, .release);
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.idle), .release);
                 session.state = if (!paused and td.err_text != null) .err else .idle;
                 if (paused) self.restorePausedInputs(session) catch {
                     checkpoint_failed = true;
@@ -1409,7 +1409,7 @@ pub const Daemon = struct {
                     .sandbox_enabled = self.cfg.permissions_enabled,
                     .network_filtering_enabled = self.network.isActive(),
                 };
-                session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
+                session.approval_mode_live.store(@backingInt(session.approval_mode), .release);
                 // Reserve every fallible in-memory resource before committing
                 // the durable row. After createSession succeeds, publishing to
                 // the map cannot fail and no ghost session can be left behind.
@@ -1855,7 +1855,7 @@ pub const Daemon = struct {
                 const mode = approval.Mode.parse(sa.approvals);
                 try self.store.setSessionApprovals(sa.sid, mode);
                 session.approval_mode = mode;
-                session.approval_mode_live.store(@intFromEnum(mode), .release);
+                session.approval_mode_live.store(@backingInt(mode), .release);
                 if (mode == .auto) {
                     if (session.gate.isPending(self.io)) |pending| {
                         _ = session.gate.resolve(self.io, pending, .approved);
@@ -2093,7 +2093,7 @@ pub const Daemon = struct {
                     .state = state,
                     .pause = if (session) |ses| sessionPauseState(ses) else .none,
                     .phase = if (session) |ses| if (state == .running or state == .awaiting_approval)
-                        @enumFromInt(ses.phase.load(.acquire))
+                        @fromBackingInt(@intCast(ses.phase.load(.acquire)))
                     else
                         null else null,
                     .turn_ms = if (session) |ses| if (state == .running or state == .awaiting_approval)
@@ -2293,7 +2293,7 @@ pub const Daemon = struct {
                 if (session.pending_approval_line) |old| self.gpa.free(old);
                 session.pending_approval_line = line;
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.approval), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.approval), .release);
                 session.state = .awaiting_approval;
                 self.store.setSessionStatus(cq.sid, "awaiting_approval") catch {};
                 self.refusePendingRebootForApproval();
@@ -2328,7 +2328,7 @@ pub const Daemon = struct {
                 }
                 // Policy first: auto sessions and workspace-scoped calls are
                 // answered instantly (docs/PERMISSIONS.md auto-inside).
-                const mode: approval.Mode = @enumFromInt(session.approval_mode_live.load(.acquire));
+                const mode: approval.Mode = @fromBackingInt(@intCast(session.approval_mode_live.load(.acquire)));
                 if (mode == .auto or
                     permissions.ccAutoAllow(self.gpa, self.io, session.cwd, ca.tool, ca.args_json))
                 {
@@ -2359,7 +2359,7 @@ pub const Daemon = struct {
                 if (session.pending_approval_line) |old| self.gpa.free(old);
                 session.pending_approval_line = line;
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.approval), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.approval), .release);
                 session.state = .awaiting_approval;
                 self.store.setSessionStatus(ca.sid, "awaiting_approval") catch {};
                 self.refusePendingRebootForApproval();
@@ -2423,13 +2423,13 @@ pub const Daemon = struct {
                 job.started_at_ms = started_at;
                 session.turn_started_at_ms.store(started_at, .release);
                 session.phase_started_at_ms.store(started_at, .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.starting), .release);
                 session.state = .running;
                 const thread = std.Thread.spawn(.{}, compactMain, .{job}) catch |err| {
                     session.state = .idle;
                     session.turn_thread = null;
                     session.phase_started_at_ms.store(nowMs(self.io), .release);
-                    session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+                    session.phase.store(@backingInt(proto.TurnPhase.idle), .release);
                     return err;
                 };
                 session.turn_thread = thread;
@@ -3014,7 +3014,7 @@ pub const Daemon = struct {
             session.pause_requested.store(true, .release);
         }
         session.guest_max_runtime_live.store((try self.store.getSessionGuestRuntime(sid)) orelse std.math.maxInt(u64), .release);
-        session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
+        session.approval_mode_live.store(@backingInt(session.approval_mode), .release);
         if (session.pause_requested.load(.acquire)) try self.restorePausedInputs(session);
         try self.sessions.put(self.gpa, sid, session);
         return session;
@@ -3204,7 +3204,7 @@ pub const Daemon = struct {
         cancelActiveSession(self, session);
         const started = session.cancel_requested_at_ms;
         const pending_ms: u64 = if (now > started) @intCast(now - started) else 0;
-        const phase: proto.TurnPhase = @enumFromInt(session.phase.load(.acquire));
+        const phase: proto.TurnPhase = @fromBackingInt(@intCast(session.phase.load(.acquire)));
         const phase_started = session.phase_started_at_ms.load(.acquire);
         const phase_ms: u64 = if (now > phase_started) @intCast(now - phase_started) else 0;
         return .{
@@ -3508,7 +3508,7 @@ pub const Daemon = struct {
         session.steer_mutex.unlock(self.io);
         session.turn_started_at_ms.store(job.started_at_ms, .release);
         session.phase_started_at_ms.store(job.started_at_ms, .release);
-        session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
+        session.phase.store(@backingInt(proto.TurnPhase.starting), .release);
         session.state = .running;
         const thread = std.Thread.spawn(.{}, turnMain, .{job}) catch |err| {
             session.steer_mutex.lockUncancelable(self.io);
@@ -3517,7 +3517,7 @@ pub const Daemon = struct {
             session.state = .idle;
             session.turn_thread = null;
             session.phase_started_at_ms.store(nowMs(self.io), .release);
-            session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+            session.phase.store(@backingInt(proto.TurnPhase.idle), .release);
             return err;
         };
         session.turn_thread = thread;
@@ -3561,13 +3561,13 @@ pub const Daemon = struct {
         job.started_at_ms = started_at;
         session.turn_started_at_ms.store(started_at, .release);
         session.phase_started_at_ms.store(started_at, .release);
-        session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+        session.phase.store(@backingInt(proto.TurnPhase.provider), .release);
         session.state = .running;
         const thread = std.Thread.spawn(.{}, handoverMain, .{job}) catch |err| {
             session.state = .idle;
             session.turn_thread = null;
             session.phase_started_at_ms.store(nowMs(self.io), .release);
-            session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+            session.phase.store(@backingInt(proto.TurnPhase.idle), .release);
             return err;
         };
         session.turn_thread = thread;
@@ -4466,7 +4466,7 @@ pub const Daemon = struct {
         if (session.state == .awaiting_approval) {
             const phase_started = nowMs(self.io);
             session.phase_started_at_ms.store(phase_started, .release);
-            session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+            session.phase.store(@backingInt(proto.TurnPhase.provider), .release);
             session.state = .running;
             self.store.setSessionStatus(session.id, "running") catch {};
             self.broadcastStatus(session.id, .running);
@@ -4497,7 +4497,7 @@ pub const Daemon = struct {
         self.clearPendingApproval(session);
         if (session.state == .awaiting_approval) {
             session.phase_started_at_ms.store(nowMs(self.io), .release);
-            session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+            session.phase.store(@backingInt(proto.TurnPhase.provider), .release);
             session.state = .running;
             self.store.setSessionStatus(session.id, "running") catch {};
             self.broadcastStatus(session.id, .running);
@@ -4527,7 +4527,7 @@ pub const Daemon = struct {
             if (session.state == .awaiting_approval) {
                 const phase_started = nowMs(self.io);
                 session.phase_started_at_ms.store(phase_started, .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.provider), .release);
                 session.state = .running;
                 self.store.setSessionStatus(session.id, "running") catch {};
                 self.broadcastStatus(session.id, .running);
@@ -4557,7 +4557,7 @@ pub const Daemon = struct {
             .state = state,
             .pause = if (session) |ses| sessionPauseState(ses) else .none,
             .phase = if (session) |ses| if (active_turn)
-                @enumFromInt(ses.phase.load(.acquire))
+                @fromBackingInt(@intCast(ses.phase.load(.acquire)))
             else
                 null else null,
             .turn_ms = if (session) |ses| if (active_turn)
@@ -4592,7 +4592,7 @@ pub const Daemon = struct {
             .pause = if (session) |ses| sessionPauseState(ses) else .none,
             .err_text = err_text,
             .phase = if (session) |ses| if (active_turn)
-                @enumFromInt(ses.phase.load(.acquire))
+                @fromBackingInt(@intCast(ses.phase.load(.acquire)))
             else
                 null else null,
             .turn_ms = if (session) |ses| if (active_turn)
@@ -4930,7 +4930,7 @@ pub const Daemon = struct {
         var it = std.mem.tokenizeScalar(u8, path, ':');
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         while (it.next()) |dir| {
-            const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, default_binary }) catch continue;
+            const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, default_binary }, 0) catch continue;
             if (std.c.access(full, 1) == 0) return true; // 1 = X_OK
         }
         return false;
@@ -6110,7 +6110,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     const session = (try daemon.getOrLoadSession(11)).?;
     try std.testing.expectEqual(approval.Mode.default, session.approval_mode);
     session.approval_mode = .auto;
-    session.approval_mode_live.store(@intFromEnum(approval.Mode.auto), .release);
+    session.approval_mode_live.store(@backingInt(approval.Mode.auto), .release);
     try daemon.store.setSessionApprovals(11, .auto);
 
     // The working set unloads the idle session (turn_done eviction, tab
@@ -6121,7 +6121,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     defer daemon.unloadSession(11);
     try std.testing.expectEqual(approval.Mode.auto, rehydrated.approval_mode);
     try std.testing.expectEqual(
-        @intFromEnum(approval.Mode.auto),
+        @backingInt(approval.Mode.auto),
         rehydrated.approval_mode_live.load(.acquire),
     );
 

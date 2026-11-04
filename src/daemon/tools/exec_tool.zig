@@ -49,7 +49,7 @@ pub fn run(
 
     const exit_code: i64 = switch (result.term) {
         .exited => |code| code,
-        .signal => |signal| -@as(i64, @intFromEnum(signal)),
+        .signal => |signal| -@as(i64, @backingInt(signal)),
         else => -1,
     };
     var output: []u8 = undefined;
