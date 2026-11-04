@@ -151,6 +151,9 @@ pub const Event = union(enum) {
     voice: VoiceEvent,
     /// wipEout asset-bundle download verdicts.
     wipeout: WipeoutEvent,
+    /// Shell screenshot verdict: null when the PNG is on the clipboard,
+    /// else a static reason.
+    screenshot: ?[]const u8,
 };
 
 pub const WipeoutEvent = union(enum) {
@@ -631,6 +634,8 @@ pub const App = struct {
     /// First-run asset bundle download (progress shared with the worker).
     wipeout_download: ?*@import("asset_store").Progress = null,
     wipeout_download_thread: ?std.Thread = null,
+    /// A shell screenshot being drawn (osascript); joined when it reports.
+    screenshot_thread: ?std.Thread = null,
     /// The `!wipeout` that triggered the download; re-run when it lands.
     wipeout_pending: ?WipeoutOptions = null,
     /// While set, key presses and releases go to the game until Escape.
@@ -753,6 +758,7 @@ pub const App = struct {
         if (self.wipeout_download) |progress| progress.cancel.store(true, .release);
         if (self.wipeout_download_thread) |t| t.join();
         if (self.wipeout_download) |progress| self.gpa.destroy(progress);
+        if (self.screenshot_thread) |t| t.join();
         self.recent_sessions.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.web_text.deinit(self.gpa);
@@ -6947,6 +6953,7 @@ pub fn dispatchEvent(
         },
         .voice => |vev| app.handleVoiceEvent(vev),
         .wipeout => |wev| app.handleWipeoutEvent(wev),
+        .screenshot => |failure| shell_tab.screenshotDone(app, failure),
         .mouse => |m| {
             app.presence_last_activity_ms = nowWallMs(app.io);
             if (app.screensaver_active) return;

@@ -71,6 +71,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/shutdown", .usage = " [--force]", .description = "leave Marlin and stop its daemon (ends shells and running work)", .accepts_args = true },
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
     .{ .name = "!!", .description = "turn this session into a shell (Ctrl+D turns it back)" },
+    .{ .name = "/screenshot", .description = "copy the shell's view to the clipboard as an image (Ctrl+B s)" },
     .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!mk", .hidden = true, .description = "play Mario Kart", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
@@ -493,6 +494,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
 
     if (isQuitCommand(head)) {
         self.should_quit = true;
+    } else if (std.mem.eql(u8, head, "/screenshot")) {
+        shell_tab.screenshot(self);
     } else if (std.mem.eql(u8, head, "/shutdown")) {
         const force = if (it.next()) |arg| std.mem.eql(u8, arg, "--force") else false;
         if (!force) {
