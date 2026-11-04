@@ -1,10 +1,9 @@
-//! Experimental shell tab (`!!`): interactive shells on pseudo-terminals,
-//! each owned by one client connection.
+//! Experimental shell tab (`!!`): interactive shells on pseudo-terminals.
 //!
 //! The dispatcher thread spawns and closes shells; one reader thread per
 //! shell polls the PTY master, hands output to the sink, and reaps the shell
-//! when it exits. Output past `ack_window` unacknowledged bytes pauses the
-//! reader, so a runaway program can never fill a client's outbox.
+//! when it exits. Output the consumer has not acknowledged past `ack_window`
+//! pauses the reader, so a runaway program cannot outrun the daemon.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -42,15 +41,21 @@ pub const Options = struct {
     argv: []const []const u8,
     cwd: []const u8,
     environ: *const std.process.Environ.Map,
+    size: Winsize,
+};
+
+pub const Winsize = struct {
     cols: u16,
     rows: u16,
+    /// Pixel size of the whole grid; zero when unknown.
+    width_px: u32 = 0,
+    height_px: u32 = 0,
 };
 
 pub const Shell = struct {
     gpa: std.mem.Allocator,
     io: Io,
     id: u64,
-    client_id: u64,
     master: c_int,
     pid: c.pid_t,
     sink: Sink,
@@ -59,7 +64,7 @@ pub const Shell = struct {
     reaped: std.atomic.Value(bool) = .init(false),
     unacked: std.atomic.Value(usize) = .init(0),
 
-    pub fn spawn(gpa: std.mem.Allocator, io: Io, id: u64, client_id: u64, opts: Options, sink: Sink) !*Shell {
+    pub fn spawn(gpa: std.mem.Allocator, io: Io, id: u64, opts: Options, sink: Sink) !*Shell {
         // Everything the child needs is prepared before fork: between fork
         // and exec only async-signal-safe calls are allowed.
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -82,7 +87,7 @@ pub const Shell = struct {
         const slave = c.open(ptsname(master) orelse return error.PtyUnavailable, .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true });
         if (slave < 0) return error.PtyUnavailable;
         defer _ = c.close(slave);
-        setWinsize(master, opts.cols, opts.rows);
+        setWinsize(master, opts.size);
 
         const pid = fork();
         if (pid < 0) return error.ForkFailed;
@@ -93,7 +98,7 @@ pub const Shell = struct {
             _ = c.waitpid(pid, null, 0);
             return err;
         };
-        self.* = .{ .gpa = gpa, .io = io, .id = id, .client_id = client_id, .master = master, .pid = pid, .sink = sink };
+        self.* = .{ .gpa = gpa, .io = io, .id = id, .master = master, .pid = pid, .sink = sink };
         self.thread = std.Thread.spawn(.{}, readLoop, .{self}) catch |err| {
             self.thread = null;
             self.destroy();
@@ -128,8 +133,8 @@ pub const Shell = struct {
         }
     }
 
-    pub fn resize(self: *Shell, cols: u16, rows: u16) void {
-        setWinsize(self.master, cols, rows);
+    pub fn resize(self: *Shell, size: Winsize) void {
+        setWinsize(self.master, size);
     }
 
     pub fn acknowledge(self: *Shell, bytes: u64) void {
@@ -197,8 +202,13 @@ pub const Shell = struct {
     }
 };
 
-fn setWinsize(fd: c_int, cols: u16, rows: u16) void {
-    const ws: c.winsize = .{ .row = @max(rows, 1), .col = @max(cols, 1), .xpixel = 0, .ypixel = 0 };
+fn setWinsize(fd: c_int, size: Winsize) void {
+    const ws: c.winsize = .{
+        .row = @max(size.rows, 1),
+        .col = @max(size.cols, 1),
+        .xpixel = @intCast(@min(size.width_px, std.math.maxInt(u16))),
+        .ypixel = @intCast(@min(size.height_px, std.math.maxInt(u16))),
+    };
     _ = ioctl(fd, tiocswinsz, &ws);
 }
 

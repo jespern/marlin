@@ -151,7 +151,7 @@ test "image steering keeps durable refs and gives guests readable files" {
     try std.testing.expectEqual(@as(i64, 3), store.c.sqlite3_column_int64(stmt, 0));
 }
 
-test "shells belong to the client that opened them and end with it" {
+test "shells outlive their opener and are shared by every viewer" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -181,76 +181,96 @@ test "shells belong to the client that opened them and end with it" {
     defer daemon.sessions.deinit(gpa);
     daemon.shells = .empty;
     daemon.next_shell_id = 1;
-    var owner = daemon_mod.Client{ .id = 1, .stream = stream, .outbox = .init(gpa), .said_hello = true };
-    var intruder = daemon_mod.Client{ .id = 2, .stream = stream, .outbox = .init(gpa), .said_hello = true };
-    defer for ([_]*daemon_mod.Client{ &owner, &intruder }) |client| {
+    var opener = daemon_mod.Client{ .id = 1, .stream = stream, .outbox = .init(gpa), .said_hello = true };
+    var other = daemon_mod.Client{ .id = 2, .stream = stream, .outbox = .init(gpa), .said_hello = true };
+    defer for ([_]*daemon_mod.Client{ &opener, &other }) |client| {
         while (client.outbox.tryPop(io)) |line| gpa.free(line.bytes);
         client.outbox.deinit();
     };
-    try daemon.clients.put(gpa, owner.id, &owner);
-    try daemon.clients.put(gpa, intruder.id, &intruder);
+    try daemon.clients.put(gpa, opener.id, &opener);
+    try daemon.clients.put(gpa, other.id, &other);
     defer {
-        daemon.closeClientShells(owner.id);
-        while (daemon.events.tryPop(io)) |event| daemon.handleEvent(event) catch {};
-        daemon.events.deinit();
+        var hosts = daemon.shells.valueIterator();
+        while (hosts.next()) |host| host.*.destroy();
         daemon.shells.deinit(gpa);
+        while (daemon.events.tryPop(io)) |event| switch (event) {
+            .shell_output => |o| gpa.free(o.bytes),
+            else => {},
+        };
+        daemon.events.deinit();
     }
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const send = struct {
-        fn line(d: *daemon_mod.Daemon, client_id: u64, comptime json: []const u8, args: anytype) !void {
+    const a = arena.allocator();
+    const Helpers = struct {
+        fn send(d: *daemon_mod.Daemon, client_id: u64, comptime json: []const u8, args: anytype) !void {
             const bytes = try std.fmt.allocPrint(d.gpa, json ++ "\n", args);
             try d.handleEvent(.{ .client_msg = .{ .client_id = client_id, .msg_line = bytes } });
         }
-    };
-
-    try send.line(&daemon, owner.id, "{{\"shell_open\":{{\"request_id\":3,\"cols\":80,\"rows\":24}}}}", .{});
-    const opened_line = owner.outbox.tryPop(io).?;
-    defer gpa.free(opened_line.bytes);
-    const opened = (try proto.decode(proto.DaemonMsg, arena.allocator(), opened_line.bytes)).shell_opened;
-    try std.testing.expectEqual(@as(u64, 3), opened.request_id);
-
-    // Another connection can neither hang up nor drive someone else's shell.
-    try send.line(&daemon, intruder.id, "{{\"shell_close\":{{\"shell_id\":{d}}}}}", .{opened.shell_id});
-    try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
-
-    var input_buf: [128]u8 = undefined;
-    const input = std.base64.standard.Encoder.encode(&input_buf, "echo hi-$((1+1)); exit 5\r");
-    try send.line(&daemon, owner.id, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"{s}\"}}}}", .{ opened.shell_id, input });
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(gpa);
-    var exit_code: ?i32 = null;
-    pump: for (0..500) |_| {
-        while (daemon.events.tryPop(io)) |event| try daemon.handleEvent(event);
-        while (owner.outbox.tryPop(io)) |line| {
-            defer gpa.free(line.bytes);
-            switch (try proto.decode(proto.DaemonMsg, arena.allocator(), line.bytes)) {
+        fn drain(alloc: std.mem.Allocator, client: *daemon_mod.Client, io_: std.Io) ![]proto.DaemonMsg {
+            var msgs: std.ArrayList(proto.DaemonMsg) = .empty;
+            while (client.outbox.tryPop(io_)) |line| {
+                defer client.outbox.gpa.free(line.bytes);
+                try msgs.append(alloc, try proto.decode(proto.DaemonMsg, alloc, try alloc.dupe(u8, line.bytes)));
+            }
+            return msgs.items;
+        }
+        fn output(alloc: std.mem.Allocator, msgs: []const proto.DaemonMsg, into: *std.ArrayList(u8)) !?proto.DaemonMsg {
+            for (msgs) |msg| switch (msg) {
                 .shell_output => |o| {
                     const decoder = std.base64.standard.Decoder;
-                    const bytes = try arena.allocator().alloc(u8, try decoder.calcSizeForSlice(o.data_base64));
+                    const bytes = try alloc.alloc(u8, try decoder.calcSizeForSlice(o.data_base64));
                     try decoder.decode(bytes, o.data_base64);
-                    try output.appendSlice(gpa, bytes);
+                    try into.appendSlice(alloc, bytes);
                 },
-                .shell_exited => |e| {
-                    exit_code = e.code;
-                    break :pump;
-                },
+                .shell_exited => return msg,
                 else => {},
-            }
+            };
+            return null;
         }
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    try std.testing.expectEqual(@as(?i32, 5), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "hi-2") != null);
-    try std.testing.expectEqual(@as(usize, 0), daemon.shells.count());
-    try std.testing.expect(intruder.outbox.tryPop(io) == null);
+    };
 
-    // A departing connection's shells are hung up with it.
-    try send.line(&daemon, owner.id, "{{\"shell_open\":{{\"request_id\":4,\"cols\":80,\"rows\":24}}}}", .{});
-    gpa.free(owner.outbox.tryPop(io).?.bytes);
+    try Helpers.send(&daemon, opener.id, "{{\"shell_open\":{{\"request_id\":3,\"cols\":80,\"rows\":24}}}}", .{});
+    var msgs = try Helpers.drain(a, &opener, io);
+    try std.testing.expectEqual(@as(u64, 3), msgs[0].shell_opened.request_id);
+    const shell_id = msgs[0].shell_opened.shell_id;
+    try std.testing.expectEqual(shell_id, msgs[1].shell_snapshot.shell_id);
+
+    // Not a viewer: cannot hang it up.
+    try Helpers.send(&daemon, other.id, "{{\"shell_close\":{{\"shell_id\":{d}}}}}", .{shell_id});
     try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
-    daemon.closeClientShells(owner.id);
+
+    // A second client attaches and sees what the shell prints next.
+    try Helpers.send(&daemon, other.id, "{{\"shell_attach\":{{\"request_id\":8,\"shell_id\":{d},\"cols\":100,\"rows\":30}}}}", .{shell_id});
+    msgs = try Helpers.drain(a, &other, io);
+    try std.testing.expectEqual(@as(u64, 8), msgs[0].shell_opened.request_id);
+    try std.testing.expect(msgs[1] == .shell_snapshot);
+
+    var input_buf: [128]u8 = undefined;
+    const input = std.base64.standard.Encoder.encode(&input_buf, "echo hi-$((1+1))\r");
+    try Helpers.send(&daemon, opener.id, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"{s}\"}}}}", .{ shell_id, input });
+    var seen_opener: std.ArrayList(u8) = .empty;
+    var seen_other: std.ArrayList(u8) = .empty;
+    for (0..500) |_| {
+        while (daemon.events.tryPop(io)) |event| try daemon.handleEvent(event);
+        _ = try Helpers.output(a, try Helpers.drain(a, &opener, io), &seen_opener);
+        _ = try Helpers.output(a, try Helpers.drain(a, &other, io), &seen_other);
+        if (std.mem.indexOf(u8, seen_other.items, "hi-2") != null and std.mem.indexOf(u8, seen_opener.items, "hi-2") != null) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.Timeout;
+
+    // The opener leaving does not end the shell.
+    daemon.detachClientShells(opener.id);
+    try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
+
+    // Closing reaches everyone still viewing.
+    try Helpers.send(&daemon, other.id, "{{\"shell_close\":{{\"shell_id\":{d}}}}}", .{shell_id});
     try std.testing.expectEqual(@as(usize, 0), daemon.shells.count());
+    var exited: ?proto.DaemonMsg = null;
+    for (try Helpers.drain(a, &other, io)) |msg| if (msg == .shell_exited) {
+        exited = msg;
+    };
+    try std.testing.expectEqual(shell_id, exited.?.shell_exited.shell_id);
+    try std.testing.expect((try Helpers.drain(a, &opener, io)).len == 0);
 }

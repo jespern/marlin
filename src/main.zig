@@ -28,6 +28,14 @@ const credentials = @import("core/credentials.zig");
 pub const std_options: std.Options = .{
     .unexpected_error_tracing = false,
     .logFn = @import("core/log_gate.zig").logFn,
+    // libghostty-vt (shell tabs) warns about every unimplemented mode or
+    // sequence a program uses; that is routine, not news for the daemon log.
+    .log_scope_levels = &.{
+        .{ .scope = .stream, .level = .err },
+        .{ .scope = .stream_terminal, .level = .err },
+        .{ .scope = .osc, .level = .err },
+        .{ .scope = .kitty_gfx, .level = .err },
+    },
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -64,6 +72,7 @@ test {
     _ = @import("daemon/shell_network_test.zig");
     _ = @import("daemon/process_io_test.zig");
     _ = @import("daemon/shell_pty_test.zig");
+    _ = @import("daemon/shell_host_test.zig");
     _ = @import("client/shell_term_test.zig");
     _ = @import("client/shell_tab_test.zig");
     _ = @import("daemon/guest_models_test.zig");

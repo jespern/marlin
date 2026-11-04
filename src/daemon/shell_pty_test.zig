@@ -68,13 +68,12 @@ fn shEnviron() !std.process.Environ.Map {
 }
 
 fn spawnSh(io: std.Io, environ: *const std.process.Environ.Map, script: []const u8, recorder: *Recorder, cols: u16, rows: u16) !*Shell {
-    return Shell.spawn(std.testing.allocator, io, 1, 7, .{
+    return Shell.spawn(std.testing.allocator, io, 1, .{
         .path = "/bin/sh",
         .argv = &.{ "sh", "-c", script },
         .cwd = "/",
         .environ = environ,
-        .cols = cols,
-        .rows = rows,
+        .size = .{ .cols = cols, .rows = rows, .width_px = @as(u32, cols) * 9, .height_px = @as(u32, rows) * 18 },
     }, recorder.sink());
 }
 

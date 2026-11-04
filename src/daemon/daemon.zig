@@ -60,6 +60,7 @@ const recap_limits = @import("../core/recap.zig");
 const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
 const shell_pty = @import("shell_pty.zig");
+const shell_host = @import("shell_host.zig");
 const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const otel = @import("otel.zig");
@@ -178,8 +179,8 @@ const Event = union(enum) {
     /// points into the parked parent turn's stack until resolve().
     child_start: ChildStart,
     /// Shell reader thread → dispatcher. `bytes` gpa-owned.
-    shell_output: struct { client_id: u64, shell_id: u64, bytes: []u8 },
-    shell_exited: struct { client_id: u64, shell_id: u64, status: shell_pty.Status },
+    shell_output: struct { shell_id: u64, bytes: []u8 },
+    shell_exited: struct { shell_id: u64, status: shell_pty.Status },
     shutdown,
 };
 
@@ -206,6 +207,8 @@ pub const Client = struct {
     watches_sessions: bool = false,
     /// Additive catalog events are opt-in for protocol-v1 compatibility.
     watches_session_deltas: bool = false,
+    /// Sent shell_list: receives shell_list_result on every change.
+    watches_shells: bool = false,
 
     fn subscribed(self: *const Client, sid: u64) bool {
         for (self.subs.items) |s| {
@@ -412,8 +415,9 @@ pub const Daemon = struct {
     /// registering after shutdown has begun draining the registry.
     accepting_clients: bool = true,
     sessions: std.AutoHashMapUnmanaged(u64, *Session) = .empty,
-    /// Experimental `!!` shell tabs, each owned by one client. Dispatcher-owned.
-    shells: std.AutoHashMapUnmanaged(u64, *shell_pty.Shell) = .empty,
+    /// Experimental `!!` shell tabs; they outlive the clients viewing them.
+    /// Dispatcher-owned.
+    shells: std.AutoHashMapUnmanaged(u64, *shell_host.Host) = .empty,
     next_shell_id: u64 = 1,
     /// Held while any session is running a turn (macOS: prevents idle system
     /// sleep; elsewhere a no-op). Dispatcher-owned, synced after every event.
@@ -768,9 +772,10 @@ pub const Daemon = struct {
         self.clients_mutex.unlock(self.io);
     }
 
-    /// Start a login shell on a PTY for `client` (`!!`), in the session's
-    /// cwd or the user's home. Failures reply err with the request id.
-    fn openShell(self: *Daemon, client: *Client, request_id: u64, sid: u64, cols: u16, rows: u16) !void {
+    /// Start a login shell on a PTY (`!!`) in the session's cwd or the
+    /// user's home, and attach `client` to it. Failures reply err with the
+    /// request id.
+    fn openShell(self: *Daemon, client: *Client, request_id: u64, sid: u64, geometry: shell_host.Geometry) !void {
         const home = self.environ.get("HOME") orelse "/";
         const cwd = if (sid != 0) if (try self.getOrLoadSession(sid)) |session| session.cwd else home else home;
         const path = self.environ.get("SHELL") orelse "/bin/sh";
@@ -784,51 +789,123 @@ pub const Daemon = struct {
 
         const id = self.next_shell_id;
         self.next_shell_id += 1;
-        const shell = shell_pty.Shell.spawn(self.gpa, self.io, id, client.id, .{
+        const host = try shell_host.Host.create(self.gpa, self.io, id, cwd, nowMs(self.io), geometry);
+        host.start(self.io, .{
             .path = path,
             .argv = &.{argv0},
             .cwd = cwd,
             .environ = &environ,
-            .cols = cols,
-            .rows = rows,
+            .size = shellWinsize(geometry),
         }, .{ .ctx = self, .output = onShellOutput, .exited = onShellExited }) catch |err| {
+            host.destroy();
             const msg = try std.fmt.allocPrint(self.gpa, "could not start a shell: {t}", .{err});
             defer self.gpa.free(msg);
             self.sendTo(client, .{ .err = .{ .code = "shell", .msg = msg, .request_id = request_id } });
             return;
         };
-        self.shells.put(self.gpa, id, shell) catch |err| {
-            shell.destroy();
+        self.shells.put(self.gpa, id, host) catch |err| {
+            host.destroy();
             return err;
         };
-        self.sendTo(client, .{ .shell_opened = .{ .shell_id = id, .request_id = request_id } });
+        try self.attachShell(client, host, request_id, null);
     }
 
-    fn ownedShell(self: *Daemon, client: *Client, shell_id: u64) ?*shell_pty.Shell {
-        const shell = self.shells.get(shell_id) orelse return null;
-        return if (shell.client_id == client.id) shell else null;
+    /// Make `client` a viewer of `host` (resizing it to the client when
+    /// `geometry` is given) and bring it up to date with a snapshot.
+    fn attachShell(self: *Daemon, client: *Client, host: *shell_host.Host, request_id: u64, geometry: ?shell_host.Geometry) !void {
+        try host.attach(client.id);
+        if (geometry) |g| host.resize(g);
+        self.sendTo(client, .{ .shell_opened = .{ .shell_id = host.id, .request_id = request_id } });
+        try self.sendShellSnapshot(client, host);
+        self.broadcastShellList();
     }
 
-    pub fn closeClientShells(self: *Daemon, client_id: u64) void {
-        while (true) {
-            var it = self.shells.valueIterator();
-            const shell = while (it.next()) |s| {
-                if (s.*.client_id == client_id) break s.*;
-            } else return;
-            _ = self.shells.remove(shell.id);
-            shell.destroy();
-        }
+    fn sendShellSnapshot(self: *Daemon, client: *Client, host: *shell_host.Host) !void {
+        const snapshot = try host.snapshot(self.gpa);
+        defer self.gpa.free(snapshot);
+        const encoder = std.base64.standard.Encoder;
+        const encoded = try self.gpa.alloc(u8, encoder.calcSize(snapshot.len));
+        defer self.gpa.free(encoded);
+        self.sendTo(client, .{ .shell_snapshot = .{ .shell_id = host.id, .data_base64 = encoder.encode(encoded, snapshot) } });
+    }
+
+    /// The shell, when `client` is attached to it.
+    fn viewedShell(self: *Daemon, client: *Client, shell_id: u64) ?*shell_host.Host {
+        const host = self.shells.get(shell_id) orelse return null;
+        return if (host.viewer(client.id) != null) host else null;
+    }
+
+    /// A departing connection stops viewing; its shells keep running.
+    pub fn detachClientShells(self: *Daemon, client_id: u64) void {
+        var it = self.shells.valueIterator();
+        while (it.next()) |host| host.*.detach(client_id);
+    }
+
+    /// Hang up a shell for everyone viewing it.
+    fn closeShell(self: *Daemon, host: *shell_host.Host) void {
+        _ = self.shells.remove(host.id);
+        for (host.viewers.items) |viewer| if (self.lookupClient(viewer.client_id)) |client|
+            self.sendTo(client, .{ .shell_exited = .{ .shell_id = host.id, .signal = 1 } });
+        host.destroy();
+        self.broadcastShellList();
+    }
+
+    fn shellListMsg(self: *Daemon, arena: std.mem.Allocator) !proto.DaemonMsg {
+        const infos = try arena.alloc(proto.ShellInfo, self.shells.count());
+        var it = self.shells.valueIterator();
+        var i: usize = 0;
+        while (it.next()) |host| : (i += 1) infos[i] = .{
+            .shell_id = host.*.id,
+            .title = host.*.title(),
+            .cwd = host.*.cwd,
+            .created_at_ms = host.*.created_at_ms,
+            .viewers = @intCast(host.*.viewers.items.len),
+        };
+        std.mem.sort(proto.ShellInfo, infos, {}, struct {
+            fn lessThan(_: void, a: proto.ShellInfo, b: proto.ShellInfo) bool {
+                return a.shell_id < b.shell_id;
+            }
+        }.lessThan);
+        return .{ .shell_list_result = .{ .shells = infos } };
+    }
+
+    fn sendShellList(self: *Daemon, client: *Client) void {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        self.sendTo(client, self.shellListMsg(arena.allocator()) catch return);
+    }
+
+    fn broadcastShellList(self: *Daemon) void {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const line = proto.encode(arena.allocator(), self.shellListMsg(arena.allocator()) catch return) catch return;
+        self.forEachClient(ShellListCtx{ .self = self, .line = line }, struct {
+            fn send(ctx: ShellListCtx, client: *Client) void {
+                if (client.said_hello and client.watches_shells) ctx.self.sendLine(client, ctx.line);
+            }
+        }.send);
+    }
+
+    const ShellListCtx = struct { self: *Daemon, line: []const u8 };
+
+    fn shellWinsize(geometry: shell_host.Geometry) shell_pty.Winsize {
+        return .{
+            .cols = geometry.cols,
+            .rows = geometry.rows,
+            .width_px = @as(u32, geometry.cols) * geometry.cell_width,
+            .height_px = @as(u32, geometry.rows) * geometry.cell_height,
+        };
     }
 
     fn onShellOutput(ctx: *anyopaque, shell: *shell_pty.Shell, bytes: []const u8) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
         const owned = self.gpa.dupe(u8, bytes) catch return;
-        self.events.push(self.io, .{ .shell_output = .{ .client_id = shell.client_id, .shell_id = shell.id, .bytes = owned } }) catch self.gpa.free(owned);
+        self.events.push(self.io, .{ .shell_output = .{ .shell_id = shell.id, .bytes = owned } }) catch self.gpa.free(owned);
     }
 
     fn onShellExited(ctx: *anyopaque, shell: *shell_pty.Shell, status: shell_pty.Status) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
-        self.events.push(self.io, .{ .shell_exited = .{ .client_id = shell.client_id, .shell_id = shell.id, .status = status } }) catch {};
+        self.events.push(self.io, .{ .shell_exited = .{ .shell_id = shell.id, .status = status } }) catch {};
     }
 
     fn lookupClient(self: *Daemon, id: u64) ?*Client {
@@ -1068,7 +1145,7 @@ pub const Daemon = struct {
                     self.reboot_suspend = false;
                 }
                 self.dropCcPendingForClient(cg.client_id);
-                self.closeClientShells(cg.client_id);
+                self.detachClientShells(cg.client_id);
                 if (self.removeClient(cg.client_id)) |client| {
                     // The registry no longer contains this client, so each
                     // subscription can now be tested against the remaining
@@ -1079,17 +1156,37 @@ pub const Daemon = struct {
             },
             .shell_output => |so| {
                 defer self.gpa.free(so.bytes);
-                if (!self.shells.contains(so.shell_id)) return;
-                const client = self.lookupClient(so.client_id) orelse return;
-                const encoder = std.base64.standard.Encoder;
-                const encoded = try self.gpa.alloc(u8, encoder.calcSize(so.bytes.len));
-                defer self.gpa.free(encoded);
-                self.sendTo(client, .{ .shell_output = .{ .shell_id = so.shell_id, .data_base64 = encoder.encode(encoded, so.bytes) } });
+                const host = self.shells.get(so.shell_id) orelse return;
+                host.feed(so.bytes);
+                // Mirrored: the reader may go on, whatever viewers do.
+                if (host.pty) |pty| pty.acknowledge(so.bytes.len);
+                var encoded: ?[]u8 = null;
+                defer if (encoded) |bytes| self.gpa.free(bytes);
+                for (host.viewers.items) |*viewer| {
+                    if (viewer.stale) continue;
+                    if (viewer.unacked + so.bytes.len > shell_host.viewer_window) {
+                        // Too far behind: stop sending; a snapshot catches it up.
+                        viewer.stale = true;
+                        continue;
+                    }
+                    const client = self.lookupClient(viewer.client_id) orelse continue;
+                    if (encoded == null) {
+                        const encoder = std.base64.standard.Encoder;
+                        const buf = try self.gpa.alloc(u8, encoder.calcSize(so.bytes.len));
+                        encoded = @constCast(encoder.encode(buf, so.bytes));
+                    }
+                    self.sendTo(client, .{ .shell_output = .{ .shell_id = so.shell_id, .data_base64 = encoded.? } });
+                    viewer.unacked += so.bytes.len;
+                }
+                if (host.titleChanged()) self.broadcastShellList();
             },
             .shell_exited => |se| {
-                if (self.shells.fetchRemove(se.shell_id)) |entry| entry.value.destroy();
-                const client = self.lookupClient(se.client_id) orelse return;
-                self.sendTo(client, .{ .shell_exited = .{ .shell_id = se.shell_id, .code = se.status.code, .signal = se.status.signal } });
+                const entry = self.shells.fetchRemove(se.shell_id) orelse return;
+                const host = entry.value;
+                for (host.viewers.items) |viewer| if (self.lookupClient(viewer.client_id)) |client|
+                    self.sendTo(client, .{ .shell_exited = .{ .shell_id = se.shell_id, .code = se.status.code, .signal = se.status.signal } });
+                host.destroy();
+                self.broadcastShellList();
             },
             .turn_block => |tb| {
                 defer self.gpa.free(tb.line);
@@ -1478,21 +1575,55 @@ pub const Daemon = struct {
                     .remote_shell = true,
                 } });
             },
-            .shell_open => |so| try self.openShell(client, so.request_id, so.sid, so.cols, so.rows),
-            .shell_input => |si| if (self.ownedShell(client, si.shell_id)) |shell| {
+            .shell_open => |so| try self.openShell(client, so.request_id, so.sid, .{
+                .cols = so.cols,
+                .rows = so.rows,
+                .cell_width = so.cell_width,
+                .cell_height = so.cell_height,
+            }),
+            .shell_attach => |sa| {
+                const host = self.shells.get(sa.shell_id) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_shell", .msg = "that shell has exited", .request_id = sa.request_id } });
+                    return;
+                };
+                try self.attachShell(client, host, sa.request_id, .{
+                    .cols = sa.cols,
+                    .rows = sa.rows,
+                    .cell_width = sa.cell_width,
+                    .cell_height = sa.cell_height,
+                });
+            },
+            .shell_detach => |sd| if (self.shells.get(sd.shell_id)) |host| {
+                host.detach(client.id);
+                self.broadcastShellList();
+            },
+            .shell_list => {
+                client.watches_shells = true;
+                self.sendShellList(client);
+            },
+            .shell_input => |si| if (self.viewedShell(client, si.shell_id)) |host| {
                 const decoder = std.base64.standard.Decoder;
                 const len = decoder.calcSizeForSlice(si.data_base64) catch return;
                 const bytes = try self.gpa.alloc(u8, len);
                 defer self.gpa.free(bytes);
                 decoder.decode(bytes, si.data_base64) catch return;
-                shell.write(bytes) catch {};
+                host.write(bytes) catch {};
             },
-            .shell_resize => |sr| if (self.ownedShell(client, sr.shell_id)) |shell| shell.resize(sr.cols, sr.rows),
-            .shell_ack => |sa| if (self.ownedShell(client, sa.shell_id)) |shell| shell.acknowledge(sa.bytes),
-            .shell_close => |sc| if (self.ownedShell(client, sc.shell_id)) |shell| {
-                _ = self.shells.remove(shell.id);
-                shell.destroy();
+            .shell_resize => |sr| if (self.viewedShell(client, sr.shell_id)) |host| host.resize(.{
+                .cols = sr.cols,
+                .rows = sr.rows,
+                .cell_width = sr.cell_width,
+                .cell_height = sr.cell_height,
+            }),
+            .shell_ack => |sa| if (self.viewedShell(client, sa.shell_id)) |host| {
+                const viewer = host.viewer(client.id).?;
+                viewer.unacked -|= @intCast(@min(sa.bytes, std.math.maxInt(usize)));
+                if (viewer.stale and viewer.unacked == 0) {
+                    viewer.stale = false;
+                    try self.sendShellSnapshot(client, host);
+                }
             },
+            .shell_close => |sc| if (self.viewedShell(client, sc.shell_id)) |host| self.closeShell(host),
             .session_create => |sc| {
                 const sid = ids.next(self.io);
                 const session = try self.gpa.create(Session);

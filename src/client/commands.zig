@@ -68,7 +68,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/quit", .description = "leave Marlin (sessions keep running)" },
     .{ .name = "/detach", .description = "leave Marlin (sessions keep running)" },
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
-    .{ .name = "!!", .description = "open a shell on the daemon's host (experimental; ctrl+] returns)" },
+    .{ .name = "!!", .usage = " [new]", .description = "shell tabs on the daemon's host (experimental; ctrl+] for the menu)", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!mk", .hidden = true, .description = "play Mario Kart", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
@@ -972,7 +972,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.shortcut_help = true;
         self.help_scroll = shortcut_help_rows.len;
     } else if (std.mem.eql(u8, head, "!!")) {
-        shell_tab.open(self);
+        const arg = std.mem.trim(u8, it.rest(), " \t");
+        if (std.mem.eql(u8, arg, "new")) shell_tab.openNew(self) else shell_tab.open(self);
     } else if (head.len > 1 and head[0] == '!') {
         // `!ls -la` — every shell and vim accept the bang glued to the
         // command. The exact `!c`/`!rb`/`!rbc` shortcuts matched above.

@@ -681,13 +681,13 @@ pub const App = struct {
     mk64_rom: ?[]u8 = null,
     mk64_autopilot: bool = false,
     remote_transport: bool = false,
-    /// The experimental `!!` shell tab, while one is open.
-    shell: ?*shell_tab.ShellTab = null,
+    /// The experimental `!!` shell tabs.
+    shells: shell_tab.Tabs = .{},
     reconnecting: bool = false,
     next_input_request_id: u64 = 1,
 
     pub fn deinit(self: *App) void {
-        if (self.shell) |tab| tab.destroy(self.gpa);
+        self.shells.deinit(self.gpa);
         if (self.cwd_completion_arena) |*arena| arena.deinit();
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
@@ -1811,8 +1811,10 @@ pub const App = struct {
 
         switch (msg) {
             .shell_opened => |m| shell_tab.opened(self, m),
+            .shell_snapshot => |m| shell_tab.snapshot(self, m),
             .shell_output => |m| shell_tab.output(self, m),
             .shell_exited => |m| shell_tab.exited(self, m),
+            .shell_list_result => |m| shell_tab.listed(self, m),
             .daemon_stopping => {
                 // Deliberate shutdown must not enter the crash-reconnect path,
                 // which would immediately autostart a replacement daemon.
@@ -6741,6 +6743,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     rt.* = new_rt;
     old.deinit();
     app.cacheWelcomeFacts();
+    shell_tab.connected(app);
     if (app.awaiting_new_session) {
         const command: []const u8 = if (app.reset_after_new_session) "/reset" else "/new";
         app.awaiting_new_session = false;
@@ -6852,7 +6855,8 @@ pub fn dispatchEvent(
         .wipeout => |wev| app.handleWipeoutEvent(wev),
         .mouse => |m| {
             app.presence_last_activity_ms = nowWallMs(app.io);
-            if (app.screensaver_active or shell_tab.visible(app)) return;
+            if (app.screensaver_active) return;
+            if (shell_tab.mouse(app, m)) return;
             app.hover_mouse = if (m.type == .motion and m.button == .none) m else null;
             vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null) .pointer else .default);
             if (linkAtMouse(vx.window(), m, app.link_super_held)) |uri| {
@@ -7264,6 +7268,7 @@ pub fn run(
         defer app.animation_stop.store(true, .release);
 
         app.sendPresence(true);
+        shell_tab.connected(&app);
         app.conn.send(.{ .web_status = .{} }) catch {};
 
         // First frame before any event arrives.

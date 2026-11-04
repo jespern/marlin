@@ -1,14 +1,17 @@
 //! Client-side terminal emulation for the experimental shell tab (`!!`).
 //!
-//! PTY output from the daemon is fed through libghostty-vt; the resulting
-//! grid is drawn into a vaxis window. Replies the emulated terminal owes the
-//! program (cursor position and device attribute reports, ...) queue up in
-//! `replies` and go back upstream as shell input, exactly as a terminal
-//! would write them to its PTY.
+//! A read-only libghostty-vt mirror of a shell the daemon runs: restored
+//! from the daemon's snapshot, then fed the PTY output that follows it, and
+//! drawn into a vaxis window. The daemon's own mirror answers the program's
+//! terminal queries, so this one never writes back.
 const std = @import("std");
 const Io = std.Io;
 const vaxis = @import("vaxis");
 const vt = @import("ghostty-vt");
+
+/// Matches the daemon's mirror, so a restored snapshot keeps its history.
+pub const scrollback_bytes: usize = 16 * 1024 * 1024;
+const max_continuation_bytes: usize = 64 * 1024;
 
 pub const Emulator = struct {
     gpa: std.mem.Allocator,
@@ -16,21 +19,39 @@ pub const Emulator = struct {
     /// Persistent so escape sequences split across output chunks parse.
     stream: vt.TerminalStream,
     render: vt.RenderState = .empty,
-    replies: std.ArrayList(u8) = .empty,
 
-    /// Heap-allocated: the stream's handler points at `terminal`.
+    /// A blank terminal. Heap-allocated: the stream points at `terminal`.
     pub fn create(gpa: std.mem.Allocator, io: Io, grid_cols: u16, grid_rows: u16) !*Emulator {
-        const self = try gpa.create(Emulator);
-        errdefer gpa.destroy(self);
-        self.* = .{
-            .gpa = gpa,
-            .terminal = try .init(io, gpa, .{ .cols = @max(grid_cols, 1), .rows = @max(grid_rows, 1) }),
-            .stream = undefined,
+        const terminal: vt.Terminal = try .init(io, gpa, .{
+            .cols = @max(grid_cols, 1),
+            .rows = @max(grid_rows, 1),
+            .max_scrollback_bytes = scrollback_bytes,
+        });
+        return adopt(gpa, terminal, "");
+    }
+
+    /// Restore a daemon snapshot: the terminal moves to its final address,
+    /// then its stream replays any half-parsed sequence exactly once.
+    pub fn fromSnapshot(gpa: std.mem.Allocator, io: Io, bytes: []const u8) !*Emulator {
+        var reader: Io.Reader = .fixed(bytes);
+        var decoded = try vt.snapshot.decode(gpa, io, &reader, .{ .max_continuation_bytes = max_continuation_bytes });
+        defer decoded.deinit(gpa);
+        const pending: []const u8 = switch (decoded.continuation) {
+            .ground => "",
+            .bytes => |b| b,
         };
-        var handler = self.terminal.vtHandler();
-        handler.effects.write_pty = writePty;
-        handler.effects.device_attributes = deviceAttributes;
-        self.stream = .init(.{ .allocator = gpa, .handler = handler });
+        return adopt(gpa, decoded.toOwned(), pending);
+    }
+
+    fn adopt(gpa: std.mem.Allocator, terminal: vt.Terminal, pending: []const u8) !*Emulator {
+        var owned = terminal;
+        const self = gpa.create(Emulator) catch |err| {
+            owned.deinit(gpa);
+            return err;
+        };
+        self.* = .{ .gpa = gpa, .terminal = owned, .stream = undefined };
+        self.stream = self.terminal.vtStream();
+        if (pending.len > 0) self.stream.nextSlice(pending);
         return self;
     }
 
@@ -39,7 +60,6 @@ pub const Emulator = struct {
         self.stream.deinit();
         self.render.deinit(gpa);
         self.terminal.deinit(gpa);
-        self.replies.deinit(gpa);
         gpa.destroy(self);
     }
 
@@ -51,6 +71,62 @@ pub const Emulator = struct {
         if (grid_cols == 0 or grid_rows == 0) return;
         if (grid_cols == self.terminal.cols and grid_rows == self.terminal.rows) return;
         try self.terminal.resize(self.gpa, .{ .cols = grid_cols, .rows = grid_rows });
+    }
+
+    /// Move the viewport through scrollback; negative is up.
+    pub fn scroll(self: *Emulator, rows_delta: isize) void {
+        self.terminal.scrollViewport(.{ .delta = rows_delta });
+    }
+
+    pub fn scrollToBottom(self: *Emulator) void {
+        self.terminal.scrollViewport(.bottom);
+    }
+
+    /// True while the viewport shows history rather than the live screen.
+    pub fn scrolledBack(self: *const Emulator) bool {
+        return self.terminal.screens.active.pages.viewport != .active;
+    }
+
+    /// True when the program asked for mouse reports (htop, vim, ...).
+    pub fn tracksMouse(self: *const Emulator) bool {
+        return self.terminal.flags.mouse_event != .none;
+    }
+
+    /// Encode a mouse event at grid cell (col, row) for a program tracking
+    /// the mouse. Cell pixel sizes may be zero when the host terminal never
+    /// said; any consistent size works for cell-based reports.
+    pub fn encodeMouse(self: *const Emulator, writer: *Io.Writer, mouse: vaxis.Mouse, col: u16, row: u16, cell_width: u16, cell_height: u16) !void {
+        const cw: u32 = if (cell_width > 0) cell_width else 10;
+        const ch: u32 = if (cell_height > 0) cell_height else 20;
+        const button: ?vt.input.MouseButton = switch (mouse.button) {
+            .left => .left,
+            .middle => .middle,
+            .right => .right,
+            .wheel_up => .four,
+            .wheel_down => .five,
+            .wheel_left => .six,
+            .wheel_right => .seven,
+            .none => null,
+            else => return,
+        };
+        const action: vt.input.MouseAction = switch (mouse.type) {
+            .press => .press,
+            .release => .release,
+            .motion, .drag => .motion,
+        };
+        try vt.input.encodeMouse(writer, .{
+            .action = action,
+            .button = button,
+            .mods = .{ .shift = mouse.mods.shift, .alt = mouse.mods.alt, .ctrl = mouse.mods.ctrl },
+            .pos = .{
+                .x = (@as(f32, @floatFromInt(col)) + 0.5) * @as(f32, @floatFromInt(cw)),
+                .y = (@as(f32, @floatFromInt(row)) + 0.5) * @as(f32, @floatFromInt(ch)),
+            },
+        }, .fromTerminal(&self.terminal, .{
+            .screen = .{ .width = cw * self.terminal.cols, .height = ch * self.terminal.rows },
+            .cell = .{ .width = cw, .height = ch },
+            .padding = .{},
+        }));
     }
 
     pub fn cols(self: *const Emulator) u16 {
@@ -121,16 +197,6 @@ pub const Emulator = struct {
             return;
         };
         win.hideCursor();
-    }
-
-    fn writePty(handler: *vt.TerminalStream.Handler, bytes: []const u8) void {
-        const stream: *vt.TerminalStream = @fieldParentPtr("handler", handler);
-        const self: *Emulator = @alignCast(@fieldParentPtr("stream", stream));
-        self.replies.appendSlice(self.gpa, bytes) catch {};
-    }
-
-    fn deviceAttributes(_: *vt.TerminalStream.Handler) vt.device_attributes.Attributes {
-        return .{};
     }
 };
 
