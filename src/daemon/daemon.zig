@@ -425,6 +425,10 @@ pub const Daemon = struct {
     sleep_assertion: power.SleepAssertion = .{},
     next_client_id: u64 = 1,
     running: std.atomic.Value(bool) = .init(true),
+    /// Write end of the accept loop's wake pipe (-1 without one). Shutdown
+    /// wakes accept through it rather than only by connecting to the socket
+    /// path, which may be gone or belong to another daemon by then.
+    accept_wake_write: std.atomic.Value(i32) = .init(-1),
     /// /reboot in flight: client id awaiting the coordinated shutdown.
     /// The daemon quiesces (waits for turns to reach done) then acks + exits.
     pending_reboot: ?u64 = null,
@@ -676,6 +680,20 @@ pub const Daemon = struct {
             };
         }
 
+        var accept_wake_fds: [2]std.posix.fd_t = undefined;
+        const accept_wake: ?[2]std.posix.fd_t = wake: {
+            if (builtin.os.tag == .windows or std.c.pipe(&accept_wake_fds) != 0) break :wake null;
+            setCloseOnExec(accept_wake_fds[0]) catch {};
+            setCloseOnExec(accept_wake_fds[1]) catch {};
+            break :wake accept_wake_fds;
+        };
+        defer if (accept_wake) |fds| {
+            self.accept_wake_write.store(-1, .release);
+            _ = std.c.close(fds[1]);
+            _ = std.c.close(fds[0]);
+        };
+        if (accept_wake) |fds| self.accept_wake_write.store(@intCast(fds[1]), .release);
+
         // Dispatcher thread: consumes events, owns all state.
         const dispatcher = try std.Thread.spawn(.{}, dispatchLoop, .{&self});
 
@@ -718,9 +736,18 @@ pub const Daemon = struct {
             }}) catch null;
         }
 
-        // Accept loop (main thread). Exits when the listener errors out
-        // (dispatcher deletes the socket file on shutdown to unblock us).
+        // Accept loop (main thread). Exits when shutdown writes the wake
+        // pipe (or, without one, when its nudge connection arrives).
         while (true) {
+            if (accept_wake) |fds| {
+                var ready = [_]std.c.pollfd{
+                    .{ .fd = server.socket.handle, .events = std.c.POLL.IN, .revents = 0 },
+                    .{ .fd = fds[0], .events = std.c.POLL.IN, .revents = 0 },
+                };
+                if (std.c.poll(&ready, ready.len, -1) < 0) continue; // EINTR
+                if (ready[1].revents != 0 or !self.running.load(.acquire)) break;
+                if (ready[0].revents == 0) continue;
+            }
             const stream = server.accept(io) catch break;
             if (!self.running.load(.acquire)) {
                 stream.close(io);
@@ -5588,6 +5615,11 @@ pub const Daemon = struct {
     }
 
     fn nudgeAcceptLoop(self: *Daemon) void {
+        const wake = self.accept_wake_write.load(.acquire);
+        if (wake >= 0) {
+            _ = std.c.write(wake, "x", 1);
+            return;
+        }
         const sock_path = proto.socketPath(self.gpa, self.environ) catch return;
         defer self.gpa.free(sock_path);
         const ua = Io.net.UnixAddress.init(sock_path) catch return;
@@ -5919,7 +5951,13 @@ const ShutdownWatcher = struct {
 
     fn run(w: ShutdownWatcher) void {
         var buf: [1]u8 = undefined;
-        const n = std.posix.read(w.read_fd, &buf) catch return;
+        // Retry interrupted reads: a watcher that quits early leaves SIGTERM
+        // with no effect at all.
+        const n = while (true) {
+            const rc = std.c.read(w.read_fd, &buf, 1);
+            if (rc >= 0) break rc;
+            if (std.c._errno().* != @backingInt(std.c.E.INTR)) return;
+        };
         if (n == 0) return; // pipe closed: normal shutdown already underway
         std.log.info("marlind: shutdown signal received", .{});
         w.daemon.events.push(w.daemon.io, .shutdown) catch {};
