@@ -60,7 +60,8 @@ const schema_sql =
     \\  plan_mode INTEGER NOT NULL DEFAULT 0,
     \\  approval_mode TEXT NOT NULL DEFAULT 'default',
     \\  guest_max_runtime_ms INTEGER,
-    \\  codex_thread_id TEXT
+    \\  codex_thread_id TEXT,
+    \\  title_locked INTEGER NOT NULL DEFAULT 0
     \\);
     \\CREATE TABLE IF NOT EXISTS session_pauses(
     \\  session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
@@ -188,7 +189,7 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','15');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','16');
 ;
 
 pub const SessionRow = struct {
@@ -207,6 +208,8 @@ pub const SessionRow = struct {
     archived: bool,
     plan_mode: bool,
     approval_mode: ApprovalMode = .default,
+    /// Set by an explicit rename; auto-titling never overwrites it.
+    title_locked: bool = false,
 };
 
 pub const GcReport = struct {
@@ -493,6 +496,12 @@ pub const Store = struct {
                 \\ WHERE EXISTS (SELECT 1 FROM session_pauses p WHERE p.session_id=sessions.id);
                 \\UPDATE kv SET value='15' WHERE key='schema_version';
                 \\COMMIT;
+            );
+        }
+        if (ver < 16) {
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0;
+                \\UPDATE kv SET value='16' WHERE key='schema_version';
             );
         }
     }
@@ -1403,6 +1412,15 @@ pub const Store = struct {
         try stepDone(stmt);
     }
 
+    /// A user-chosen title, locked against later auto-titling.
+    pub fn renameSession(self: Store, id: u64, title: []const u8) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET title=?, title_locked=1 WHERE id=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, title);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
     pub fn setSessionEffort(self: Store, id: u64, effort: Effort) Error!void {
         const stmt = try self.prepare("UPDATE sessions SET effort=? WHERE id=?");
         defer finalize(stmt);
@@ -1607,7 +1625,7 @@ pub const Store = struct {
     /// Fetch one session row. Strings are allocated with gpa; caller frees.
     pub fn getSession(self: Store, id: u64) Error!SessionRow {
         const stmt = try self.prepare(
-            "SELECT parent_sid, kind, parent_block_id, COALESCE(max_rounds, 0), title, cwd, model, effort, status, tokens_in, tokens_out, archived_at IS NOT NULL, plan_mode, approval_mode FROM sessions WHERE id=?",
+            "SELECT parent_sid, kind, parent_block_id, COALESCE(max_rounds, 0), title, cwd, model, effort, status, tokens_in, tokens_out, archived_at IS NOT NULL, plan_mode, approval_mode, title_locked FROM sessions WHERE id=?",
         );
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(id));
@@ -1630,6 +1648,7 @@ pub const Store = struct {
             .archived = c.sqlite3_column_int64(stmt, 11) != 0,
             .plan_mode = c.sqlite3_column_int64(stmt, 12) != 0,
             .approval_mode = ApprovalMode.parse(columnText(stmt, 13)),
+            .title_locked = c.sqlite3_column_int64(stmt, 14) != 0,
         };
     }
 

@@ -597,15 +597,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v15 with performance telemetry and scaling indexes" {
+test "schema is v16 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 15), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 16), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 15), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 16), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
@@ -955,6 +955,24 @@ test "skill search and recalled inputs use the slash command while blocks retain
     try std.testing.expectEqualStrings("/review banana", loaded[0].blk.body.user_msg.display_text.?);
 }
 
+test "renaming a session locks its title; auto titles stay unlocked" {
+    var store = try Store.open(std.testing.allocator, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+
+    try store.setSessionTitle(1, "auto title");
+    const auto = try store.getSession(1);
+    defer store.freeSession(auto);
+    try std.testing.expect(!auto.title_locked);
+
+    try store.renameSession(1, "my title");
+    try store.setSessionTitle(1, "my title");
+    const renamed = try store.getSession(1);
+    defer store.freeSession(renamed);
+    try std.testing.expect(renamed.title_locked);
+    try std.testing.expectEqualStrings("my title", renamed.title);
+}
+
 test "v13 session runtime migration preserves defaults and independent overrides" {
     var store = try Store.open(std.testing.allocator, null);
     defer store.close();
@@ -963,6 +981,7 @@ test "v13 session runtime migration preserves defaults and independent overrides
     inline for ([_][:0]const u8{
         "ALTER TABLE sessions DROP COLUMN guest_max_runtime_ms",
         "ALTER TABLE sessions DROP COLUMN approval_mode",
+        "ALTER TABLE sessions DROP COLUMN title_locked",
         "UPDATE kv SET value='13' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
@@ -991,6 +1010,7 @@ test "v14 migration preserves paused grants and later revocation overrides old c
     try store.setPause(1, false, "auto");
     inline for (.{
         "ALTER TABLE sessions DROP COLUMN approval_mode",
+        "ALTER TABLE sessions DROP COLUMN title_locked",
         "UPDATE kv SET value='14' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);

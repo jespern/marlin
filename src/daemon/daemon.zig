@@ -276,7 +276,7 @@ pub const Session = struct {
     parent_block_id: ?u64 = null,
     max_rounds: u32 = 128,
     archived: bool = false,
-    has_title: bool = false,
+    title_state: TitleState = .none,
     model: []u8, // gpa-owned
     effort: proto.ReasoningEffort = .auto,
     cwd: []u8, // gpa-owned
@@ -1643,11 +1643,11 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "bad_title", .msg = "title cannot be empty" } });
                     return;
                 }
-                self.store.setSessionTitle(sr.sid, title) catch {
+                self.store.renameSession(sr.sid, title) catch {
                     self.sendTo(client, .{ .err = .{ .code = "store", .msg = "could not update session title" } });
                     return;
                 };
-                session.has_title = true;
+                session.title_state = .user;
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sr.sid);
             },
@@ -2203,11 +2203,11 @@ pub const Daemon = struct {
                     return;
                 };
                 // A root tab describes its latest substantive task. Generic
-                // follow-ups and steers preserve it; child titles stay fixed
-                // to the prompt that created the child.
-                if (turnTitle(session.kind, session.has_title, inp.text)) |title| {
+                // follow-ups, steers and /rename titles preserve it; child
+                // titles stay fixed to the prompt that created the child.
+                if (turnTitle(session.kind, session.title_state, inp.text)) |title| {
                     if (self.store.setSessionTitle(inp.sid, title)) |_| {
-                        session.has_title = true;
+                        session.title_state = .auto;
                         self.broadcastSessionUpsert(inp.sid);
                     } else |_| {}
                 }
@@ -2999,7 +2999,7 @@ pub const Daemon = struct {
             .parent_block_id = row.parent_block_id,
             .max_rounds = if (row.max_rounds > 0) row.max_rounds else 128,
             .archived = row.archived,
-            .has_title = row.title.len > 0,
+            .title_state = if (row.title_locked) .user else if (row.title.len > 0) .auto else .none,
             .model = model,
             .effort = row.effort,
             .cwd = cwd,
@@ -5755,10 +5755,12 @@ fn resolveSessionCwd(
     return owned;
 }
 
-fn turnTitle(kind: proto.SessionKind, has_title: bool, prompt: []const u8) ?[]const u8 {
-    if (kind != .root) return null;
+pub const TitleState = enum { none, auto, user };
+
+pub fn turnTitle(kind: proto.SessionKind, state: TitleState, prompt: []const u8) ?[]const u8 {
+    if (kind != .root or state == .user) return null;
     const title = taskTitle(prompt);
-    if (title.len == 0 or (has_title and isGenericFollowUp(title))) return null;
+    if (title.len == 0 or (state == .auto and isGenericFollowUp(title))) return null;
     return title;
 }
 
@@ -5795,12 +5797,12 @@ test "session cwd resolves relative paths and requires an existing directory" {
 }
 
 test "root turns derive titles from substantive prompts" {
-    try std.testing.expectEqualStrings("integrating tetris client", turnTitle(.root, true, "  integrating tetris client  \nextra context").?);
-    try std.testing.expectEqualStrings("fix CI", turnTitle(.root, true, "fix CI").?);
-    try std.testing.expectEqualStrings("commit it", turnTitle(.root, false, "commit it").?);
-    try std.testing.expect(turnTitle(.root, true, "  \nignored") == null);
-    try std.testing.expect(turnTitle(.task_child, true, "child prompt") == null);
-    try std.testing.expect(turnTitle(.review_child, true, "review prompt") == null);
+    try std.testing.expectEqualStrings("integrating tetris client", turnTitle(.root, .auto, "  integrating tetris client  \nextra context").?);
+    try std.testing.expectEqualStrings("fix CI", turnTitle(.root, .auto, "fix CI").?);
+    try std.testing.expectEqualStrings("commit it", turnTitle(.root, .none, "commit it").?);
+    try std.testing.expect(turnTitle(.root, .auto, "  \nignored") == null);
+    try std.testing.expect(turnTitle(.task_child, .auto, "child prompt") == null);
+    try std.testing.expect(turnTitle(.review_child, .auto, "review prompt") == null);
 }
 
 test "generic follow-ups preserve an existing root title" {
@@ -5814,7 +5816,7 @@ test "generic follow-ups preserve an existing root title" {
         "run the tests",
         "try again",
     };
-    for (prompts) |prompt| try std.testing.expect(turnTitle(.root, true, prompt) == null);
+    for (prompts) |prompt| try std.testing.expect(turnTitle(.root, .auto, prompt) == null);
 }
 
 test "only successful child turns auto-archive" {

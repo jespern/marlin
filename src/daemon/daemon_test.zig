@@ -8,6 +8,12 @@ test {
     std.testing.refAllDecls(daemon_mod);
 }
 
+test "a /rename title survives later substantive prompts" {
+    try std.testing.expect(daemon_mod.turnTitle(.root, .user, "integrating tetris client") == null);
+    try std.testing.expect(daemon_mod.turnTitle(.root, .user, "commit it") == null);
+    try std.testing.expectEqualStrings("integrating tetris client", daemon_mod.turnTitle(.root, .auto, "integrating tetris client").?);
+}
+
 test "guest progress cannot dismiss a parked question or approval" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
