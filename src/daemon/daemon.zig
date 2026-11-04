@@ -61,6 +61,7 @@ const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
 const shell_pty = @import("shell_pty.zig");
 const shell_host = @import("shell_host.zig");
+const shell_env = @import("shell_env.zig");
 const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const otel = @import("otel.zig");
@@ -328,6 +329,8 @@ pub const Session = struct {
     question_gate: approval.QuestionGate = .{},
     /// One parked bridge ask_user question (cc_question), mirroring cc_pending.
     cc_question_pending: ?CcPending = null,
+    /// Non-zero while this session is an interactive shell (`!!`).
+    shell_id: u64 = 0,
     /// Complete encoded approval_request retained while the gate is armed.
     /// Dispatcher-owned; reconnecting subscribers/watchers receive this exact
     /// actionable state instead of only an unexplained awaiting status.
@@ -772,24 +775,32 @@ pub const Daemon = struct {
         self.clients_mutex.unlock(self.io);
     }
 
-    /// Start a login shell on a PTY (`!!`) in the session's cwd or the
-    /// user's home, and attach `client` to it. Failures reply err with the
-    /// request id.
+    /// Turn session `sid` into a shell (`!!`): a login shell on a PTY in the
+    /// session's cwd, with `client` attached. A session that already is a
+    /// shell is attached to instead. Failures reply err with the request id.
     fn openShell(self: *Daemon, client: *Client, request_id: u64, sid: u64, geometry: shell_host.Geometry) !void {
-        const home = self.environ.get("HOME") orelse "/";
-        const cwd = if (sid != 0) if (try self.getOrLoadSession(sid)) |session| session.cwd else home else home;
+        const session = (try self.getOrLoadSession(sid)) orelse {
+            self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session", .request_id = request_id } });
+            return;
+        };
+        if (session.shell_id != 0) if (self.shells.get(session.shell_id)) |host|
+            return self.attachShell(client, host, request_id, geometry);
+        if (session.state == .running or session.state == .awaiting_approval) {
+            self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "the session is working; wait for its turn to finish", .request_id = request_id } });
+            return;
+        }
+        const cwd = session.cwd;
         const path = self.environ.get("SHELL") orelse "/bin/sh";
         // A leading '-' in argv[0] asks for a login shell, as terminals do.
         const argv0 = try std.fmt.allocPrint(self.gpa, "-{s}", .{std.fs.path.basename(path)});
         defer self.gpa.free(argv0);
         var environ = try self.environ.clone(self.gpa);
         defer environ.deinit();
-        try environ.put("TERM", "xterm-256color");
-        try environ.put("COLORTERM", "truecolor");
+        try shell_env.prepare(self.gpa, &environ, shell_env.fileExists, @constCast(&self.io));
 
         const id = self.next_shell_id;
         self.next_shell_id += 1;
-        const host = try shell_host.Host.create(self.gpa, self.io, id, cwd, nowMs(self.io), geometry);
+        const host = try shell_host.Host.create(self.gpa, self.io, id, sid, cwd, nowMs(self.io), geometry);
         host.start(self.io, .{
             .path = path,
             .argv = &.{argv0},
@@ -807,7 +818,27 @@ pub const Daemon = struct {
             host.destroy();
             return err;
         };
+        session.shell_id = id;
+        self.broadcastSessionUpsert(sid);
         try self.attachShell(client, host, request_id, null);
+    }
+
+    /// The shell is over (exited, or killed): tell its viewers, record its
+    /// transcript in the session, and make the session ordinary again.
+    fn endShell(self: *Daemon, host: *shell_host.Host, status: shell_pty.Status) void {
+        _ = self.shells.remove(host.id);
+        for (host.viewers.items) |viewer| if (self.lookupClient(viewer.client_id)) |client|
+            self.sendTo(client, .{ .shell_exited = .{ .shell_id = host.id, .code = status.code, .signal = status.signal } });
+        const sid = host.sid;
+        const text = host.transcript(self.gpa, shell_transcript_max_bytes) catch null;
+        host.destroy();
+        if (self.sessions.get(sid)) |session| session.shell_id = 0;
+        if (text) |owned| {
+            defer self.gpa.free(owned);
+            self.appendSessionBlock(sid, .{ .shell_transcript = .{ .text = owned, .exit_code = status.code, .signal = status.signal } });
+        }
+        self.broadcastShellList();
+        self.broadcastSessionUpsert(sid);
     }
 
     /// Make `client` a viewer of `host` (resizing it to the client when
@@ -843,11 +874,7 @@ pub const Daemon = struct {
 
     /// Hang up a shell for everyone viewing it.
     fn closeShell(self: *Daemon, host: *shell_host.Host) void {
-        _ = self.shells.remove(host.id);
-        for (host.viewers.items) |viewer| if (self.lookupClient(viewer.client_id)) |client|
-            self.sendTo(client, .{ .shell_exited = .{ .shell_id = host.id, .signal = 1 } });
-        host.destroy();
-        self.broadcastShellList();
+        self.endShell(host, .{ .signal = 1 });
     }
 
     fn shellListMsg(self: *Daemon, arena: std.mem.Allocator) !proto.DaemonMsg {
@@ -1181,12 +1208,8 @@ pub const Daemon = struct {
                 if (host.titleChanged()) self.broadcastShellList();
             },
             .shell_exited => |se| {
-                const entry = self.shells.fetchRemove(se.shell_id) orelse return;
-                const host = entry.value;
-                for (host.viewers.items) |viewer| if (self.lookupClient(viewer.client_id)) |client|
-                    self.sendTo(client, .{ .shell_exited = .{ .shell_id = se.shell_id, .code = se.status.code, .signal = se.status.signal } });
-                host.destroy();
-                self.broadcastShellList();
+                const host = self.shells.get(se.shell_id) orelse return;
+                self.endShell(host, se.status);
             },
             .turn_block => |tb| {
                 defer self.gpa.free(tb.line);
@@ -2359,6 +2382,10 @@ pub const Daemon = struct {
                 };
                 if (session.pause_requested.load(.acquire) or self.pending_reboot != null) {
                     self.sendInputError(client, inp.request_id, "paused", "session is pausing or paused; use /resume before sending input");
+                    return;
+                }
+                if (session.shell_id != 0) {
+                    self.sendInputError(client, inp.request_id, "shell", "this session is a shell; exit it (Ctrl+D) to talk to the agent");
                     return;
                 }
                 if (session.archived) {
@@ -3864,13 +3891,19 @@ pub const Daemon = struct {
     /// Append and publish a daemon-side lifecycle note when no TurnJob exists
     /// (for example if an automatic continuation thread cannot be spawned).
     fn appendSessionNote(self: *Daemon, sid: u64, text: []const u8) void {
+        self.appendSessionBlock(sid, .{ .system_note = .{ .text = text } });
+    }
+
+    /// Append a block outside any turn (none may be running: a turn's
+    /// appender owns the session's seq while it runs) and fan it out.
+    fn appendSessionBlock(self: *Daemon, sid: u64, body: block.Body) void {
         const b = block.Block{
             .id = ids.next(self.io),
             .session_id = sid,
             .turn_id = ids.next(self.io),
             .seq = (self.store.lastSeq(sid) catch return) + 1,
             .ts = nowMs(self.io),
-            .body = .{ .system_note = .{ .text = text } },
+            .body = body,
         };
         self.store.appendBlock(b) catch return;
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = sid, .b = b } }) catch return;
@@ -4911,6 +4944,7 @@ pub const Daemon = struct {
                 .network_filtering = self.network.isActive() and
                     (if (live) |session| session.network_filtering_enabled else true),
                 .archived = row.archived,
+                .shell_id = if (live) |session| session.shell_id else 0,
             };
         }
         return infos;
@@ -5693,6 +5727,8 @@ pub const Daemon = struct {
 };
 
 const max_message_attachments: usize = 4;
+/// Shell output kept in a session when its shell ends.
+const shell_transcript_max_bytes: usize = 1024 * 1024;
 const max_attachment_bytes: usize = 10 * 1024 * 1024;
 const max_message_attachment_bytes: usize = 20 * 1024 * 1024;
 

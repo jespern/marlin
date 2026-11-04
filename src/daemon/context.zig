@@ -252,6 +252,26 @@ pub const MediaLoader = *const fn (
     hash: []const u8,
 ) anyerror![]const u8;
 
+/// Model-visible shell transcript tail: the newest output matters most.
+pub const shell_transcript_context_bytes: usize = 16 * 1024;
+
+/// How a shell the user ran in this session reads to the model.
+pub fn shellTranscriptContext(arena: std.mem.Allocator, text: []const u8, exit_code: ?i32, signal: ?i32) ![]const u8 {
+    const tail = text[text.len -| shell_transcript_context_bytes..];
+    const elided = text.len - tail.len;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "[The user ran an interactive shell in this session's working directory. Its terminal output follows");
+    if (elided > 0) try out.print(arena, " (the first {d} bytes are elided)", .{elided});
+    try out.appendSlice(arena, ".]\n```\n");
+    try out.appendSlice(arena, tail);
+    try out.appendSlice(arena, "\n```\n");
+    if (signal) |s|
+        try out.print(arena, "[The shell was ended by signal {d}.]", .{s})
+    else if (exit_code) |code|
+        try out.print(arena, "[The shell exited with status {d}.]", .{code});
+    return out.items;
+}
+
 fn appendUserContent(arena: std.mem.Allocator, msgs: *std.ArrayList(provider.Message), text: []const u8, attachments: []const block.MediaRef, seq: u64, opts: AssembleOpts) !void {
     if (attachments.len == 0 or seq < opts.prune_before_seq or
         opts.media_loader == null or opts.media_loader_ctx == null)
@@ -454,6 +474,7 @@ pub fn assemble(
             // input. Old compactions could bisect a parallel batch and leave
             // exactly this shape; omit it so those sessions self-heal.
             .tool_result => {},
+            .shell_transcript => |st| try msgs.append(arena, .{ .role = .user, .payload = .{ .text = try shellTranscriptContext(arena, st.text, st.exit_code, st.signal) } }),
             .reasoning, .approval, .plan, .system_note => {}, // not sent to the model
             .compaction => {}, // handled above
         }
@@ -732,6 +753,7 @@ pub fn renderForSummary(
             .tool_result => |tr| try out.print(arena, "RESULT ({t}): {s}\n\n", .{ tr.status, tr.inline_body[0..@min(tr.inline_body.len, 1500)] }),
             .compaction => |cp| if (include_compactions)
                 try out.print(arena, "[EARLIER SUMMARY]\n{s}\n\n", .{cp.summary}),
+            .shell_transcript => |st| try out.print(arena, "SHELL (user): {s}\n\n", .{st.text[st.text.len -| 1500..]}),
             .reasoning, .approval, .plan, .system_note => {},
         }
         if (out.items.len > byte_budget) {
@@ -756,7 +778,7 @@ pub fn handoverSource(blocks: []const block.Block) []const block.Block {
     };
     const candidate = blocks[start..];
     for (candidate) |b| switch (b.body) {
-        .user_msg, .assistant_msg, .tool_call, .tool_result, .steer, .reasoning => return candidate,
+        .user_msg, .assistant_msg, .tool_call, .tool_result, .steer, .reasoning, .shell_transcript => return candidate,
         // After a cwd marker, durable raw blocks are still available and are
         // the only trustworthy evidence of work in the new project. A later
         // compaction may have summarized across the marker.

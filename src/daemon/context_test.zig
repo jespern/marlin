@@ -579,3 +579,21 @@ test "handoverDefect rejects tool markup, missing sections, and stubs; accepts a
     const good = "## Goal\nWire codex trace context.\n## Accomplished\nSpans nest under the turn.\n## In progress\nDocs paragraph.\n## Files\nsrc/daemon/guest/codex_turn.zig\n## Constraints\nNo env var interface for Codex.\n## Next\nFinish docs/OBSERVABILITY.md and run zig build test.";
     try std.testing.expectEqual(@as(?context.HandoverDefect, null), context.handoverDefect(good));
 }
+
+test "a shell transcript reaches the model as user context, newest output kept" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const short = try context.shellTranscriptContext(a, "$ ls\nfile.txt", 0, null);
+    try std.testing.expect(std.mem.startsWith(u8, short, "[The user ran an interactive shell"));
+    try std.testing.expect(std.mem.indexOf(u8, short, "$ ls\nfile.txt") != null);
+    try std.testing.expect(std.mem.endsWith(u8, short, "[The shell exited with status 0.]"));
+
+    const long = try a.alloc(u8, context.shell_transcript_context_bytes + 100);
+    @memset(long, 'x');
+    @memcpy(long[long.len - 4 ..], "TAIL");
+    const clipped = try context.shellTranscriptContext(a, long, null, 9);
+    try std.testing.expect(std.mem.indexOf(u8, clipped, "first 100 bytes are elided") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clipped, "TAIL") != null);
+    try std.testing.expect(std.mem.endsWith(u8, clipped, "[The shell was ended by signal 9.]"));
+}

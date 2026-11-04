@@ -38,6 +38,8 @@ pub const Geometry = struct {
 pub const Host = struct {
     gpa: std.mem.Allocator,
     id: u64,
+    /// The session this shell turned into a shell.
+    sid: u64,
     pty: ?*shell_pty.Shell = null,
     terminal: vt.Terminal,
     stream: vt.TerminalStream,
@@ -50,7 +52,7 @@ pub const Host = struct {
 
     /// Heap-allocated: the stream's handler points at `terminal`. The PTY is
     /// spawned by `start` once the host is at its final address.
-    pub fn create(gpa: std.mem.Allocator, io: Io, id: u64, cwd: []const u8, created_at_ms: i64, geometry: Geometry) !*Host {
+    pub fn create(gpa: std.mem.Allocator, io: Io, id: u64, sid: u64, cwd: []const u8, created_at_ms: i64, geometry: Geometry) !*Host {
         const self = try gpa.create(Host);
         errdefer gpa.destroy(self);
         const owned_cwd = try gpa.dupe(u8, cwd);
@@ -58,6 +60,7 @@ pub const Host = struct {
         self.* = .{
             .gpa = gpa,
             .id = id,
+            .sid = sid,
             .terminal = try .init(io, gpa, .{
                 .cols = @max(geometry.cols, 1),
                 .rows = @max(geometry.rows, 1),
@@ -124,6 +127,21 @@ pub const Host = struct {
             .rows = self.terminal.rows,
             .cell_size_px = .{ .width = self.geometry.cell_width, .height = self.geometry.cell_height },
         }) catch {};
+    }
+
+    /// The shell's scrollback and screen as plain text, soft wraps joined
+    /// and trailing blank lines dropped, keeping the newest `max_bytes`.
+    pub fn transcript(self: *Host, gpa: std.mem.Allocator, max_bytes: usize) ![]u8 {
+        const screen = self.terminal.screens.get(.primary) orelse self.terminal.screens.active;
+        const full = try screen.dumpStringAllocUnwrapped(gpa, .{ .screen = .{} });
+        defer gpa.free(full);
+        const trimmed = std.mem.trimEnd(u8, full, " \n");
+        var cut = trimmed.len -| max_bytes;
+        // Start on a line boundary when cutting.
+        if (cut > 0) if (std.mem.indexOfScalarPos(u8, trimmed, cut, '\n')) |nl| {
+            cut = nl + 1;
+        };
+        return gpa.dupe(u8, trimmed[cut..]);
     }
 
     pub fn title(self: *const Host) []const u8 {

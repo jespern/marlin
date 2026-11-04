@@ -444,6 +444,11 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
             text = sn.text;
         },
         .compaction => text = "context compacted",
+        .shell_transcript => |st| {
+            text = st.text;
+            generated_label = try shellExitLabel(gpa, st.exit_code, st.signal);
+            label = generated_label.?;
+        },
     }
 
     const owned_text = if (generated_text) |owned| blk: {
@@ -1774,9 +1779,52 @@ pub fn layoutBlockRange(
                 try blankLine(alloc, lines);
                 try wrapPrefixed(alloc, lines, "  ≋ ", "context compacted", Palette.note, w);
             },
+            .shell_transcript => {
+                try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
+                try appendShellTranscript(alloc, lines, rb.text, rb.label, w);
+            },
         }
     }
     try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
+}
+
+/// Lines of a finished shell shown in a session transcript; the rest stays
+/// in the block (search, copy, model context).
+pub const shell_transcript_display_lines: usize = 2000;
+
+pub fn shellExitLabel(gpa: std.mem.Allocator, exit_code: ?i32, signal: ?i32) ![]u8 {
+    if (signal) |s| return std.fmt.allocPrint(gpa, "ended by signal {d}", .{s});
+    if (exit_code) |code| if (code != 0) return std.fmt.allocPrint(gpa, "exited {d}", .{code});
+    return gpa.dupe(u8, "exited");
+}
+
+/// A finished shell: a header, then its output verbatim, one row per line.
+fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), text: []const u8, status: []const u8, w: usize) !void {
+    try blankLine(alloc, lines);
+    try lines.append(alloc, .{
+        .text = "  $ ",
+        .style = Palette.shell_command,
+        .text2 = "shell",
+        .style2 = Palette.shell_command,
+        .text3 = try std.fmt.allocPrint(alloc, " · {s}", .{status}),
+        .style3 = Palette.collapse_hint,
+    });
+    const body = std.mem.trimEnd(u8, text, "\n");
+    var total: usize = 0;
+    var count = std.mem.splitScalar(u8, body, '\n');
+    while (count.next()) |_| total += 1;
+    const skip = total -| shell_transcript_display_lines;
+    if (skip > 0) try lines.append(alloc, .{
+        .text = try std.fmt.allocPrint(alloc, "  … {d} earlier lines", .{skip}),
+        .style = Palette.collapse_hint,
+    });
+    var it = std.mem.splitScalar(u8, body, '\n');
+    var index: usize = 0;
+    while (it.next()) |row| : (index += 1) {
+        if (index < skip) continue;
+        const clipped = row[0..hardCellBreak(row, 0, w)];
+        try lines.append(alloc, .{ .text = clipped, .style = .{}, .copy = .{ .join = .newline } });
+    }
 }
 
 fn handoverInProgress(blocks: []const RenderBlock) bool {

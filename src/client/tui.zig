@@ -2406,6 +2406,11 @@ pub const App = struct {
                     self.pushDurableBlock(b, .system_note, sn.text, "", .ok);
             },
             .compaction => self.pushDurableBlock(b, .compaction, "context compacted", "", .ok),
+            .shell_transcript => |st| {
+                const label = layout_mod.shellExitLabel(self.gpa, st.exit_code, st.signal) catch return;
+                defer self.gpa.free(label);
+                self.pushDurableBlock(b, .shell_transcript, st.text, label, .ok);
+            },
         }
         if (!self.view.history_loading and !self.view.history_has_newer)
             self.trimHistoryWindow(true);

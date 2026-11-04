@@ -440,9 +440,12 @@ pub const ClientMsg = union(enum) {
     /// it exits or is closed, and any client may attach to view and drive
     /// it. Gated on hello_ok.remote_shell.
     ///
-    /// Start one in the session's cwd (`sid` 0 = the user's home) and attach
-    /// to it. Replies shell_opened then shell_snapshot, or err with the same
-    /// request_id. Cell sizes (pixels) are zero when unknown.
+    /// Turn session `sid` into a shell, started in its cwd, and attach to
+    /// it; when the session already is one, just attach. Replies
+    /// shell_opened then shell_snapshot, or err with the same request_id.
+    /// When the shell ends, its transcript is appended to the session and
+    /// the session is an ordinary one again. Cell sizes (pixels) are zero
+    /// when unknown.
     shell_open: struct { request_id: u64 = 0, sid: u64 = 0, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0 },
     /// View and drive a running shell, resizing it to this client. Replies
     /// shell_opened then shell_snapshot; shell_output follows.
@@ -687,6 +690,9 @@ pub const SessionInfo = struct {
     usage_credits: bool = false,
     /// Archived sessions appear only in explicitly inclusive list requests.
     archived: bool = false,
+    /// Non-zero while the session is an interactive shell (`!!`): its
+    /// transcript area shows that shell, which input goes to.
+    shell_id: u64 = 0,
 };
 
 /// Encode one message as an NDJSON line (incl. trailing \n). Caller frees.

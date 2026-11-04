@@ -181,6 +181,18 @@ test "shells outlive their opener and are shared by every viewer" {
     defer daemon.sessions.deinit(gpa);
     daemon.shells = .empty;
     daemon.next_shell_id = 1;
+    daemon.store = try store.Store.open(gpa, null);
+    defer daemon.store.close();
+    daemon.cfg = .{};
+    daemon.network = .{ .gpa = gpa };
+    daemon.advertiser = null;
+    daemon.sandbox_backend = .unavailable;
+    daemon.presence = .{};
+    try daemon.store.createSession(7, 0, "/", "m", .auto);
+    var session = daemon_mod.Session{ .id = 7, .model = try gpa.dupe(u8, "m"), .cwd = try gpa.dupe(u8, "/") };
+    defer gpa.free(session.model);
+    defer gpa.free(session.cwd);
+    try daemon.sessions.put(gpa, session.id, &session);
     var opener = daemon_mod.Client{ .id = 1, .stream = stream, .outbox = .init(gpa), .said_hello = true };
     var other = daemon_mod.Client{ .id = 2, .stream = stream, .outbox = .init(gpa), .said_hello = true };
     defer for ([_]*daemon_mod.Client{ &opener, &other }) |client| {
@@ -231,7 +243,7 @@ test "shells outlive their opener and are shared by every viewer" {
         }
     };
 
-    try Helpers.send(&daemon, opener.id, "{{\"shell_open\":{{\"request_id\":3,\"cols\":80,\"rows\":24}}}}", .{});
+    try Helpers.send(&daemon, opener.id, "{{\"shell_open\":{{\"request_id\":3,\"sid\":7,\"cols\":80,\"rows\":24}}}}", .{});
     var msgs = try Helpers.drain(a, &opener, io);
     try std.testing.expectEqual(@as(u64, 3), msgs[0].shell_opened.request_id);
     const shell_id = msgs[0].shell_opened.shell_id;
@@ -264,6 +276,17 @@ test "shells outlive their opener and are shared by every viewer" {
     daemon.detachClientShells(opener.id);
     try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
 
+    // While it is a shell, the session takes no agent input.
+    try std.testing.expectEqual(shell_id, session.shell_id);
+    _ = try Helpers.drain(a, &opener, io);
+    try Helpers.send(&daemon, opener.id, "{{\"input\":{{\"sid\":7,\"text\":\"hello agent\",\"request_id\":21}}}}", .{});
+    var refused = false;
+    for (try Helpers.drain(a, &opener, io)) |msg| if (msg == .err and msg.err.request_id == 21) {
+        try std.testing.expectEqualStrings("shell", msg.err.code);
+        refused = true;
+    };
+    try std.testing.expect(refused);
+
     // Closing reaches everyone still viewing.
     try Helpers.send(&daemon, other.id, "{{\"shell_close\":{{\"shell_id\":{d}}}}}", .{shell_id});
     try std.testing.expectEqual(@as(usize, 0), daemon.shells.count());
@@ -272,5 +295,12 @@ test "shells outlive their opener and are shared by every viewer" {
         exited = msg;
     };
     try std.testing.expectEqual(shell_id, exited.?.shell_exited.shell_id);
-    try std.testing.expect((try Helpers.drain(a, &opener, io)).len == 0);
+
+    // The session is ordinary again, with the shell's output in its log.
+    try std.testing.expectEqual(@as(u64, 0), session.shell_id);
+    var blocks: std.ArrayList(@import("../core/block.zig").Block) = .empty;
+    try daemon.store.loadTailInto(a, &blocks, 7, 1);
+    const recorded = blocks.items[0].body.shell_transcript;
+    try std.testing.expect(std.mem.indexOf(u8, recorded.text, "hi-2") != null);
+    try std.testing.expectEqual(@as(?i32, 1), recorded.signal);
 }

@@ -2639,6 +2639,7 @@ fn searchTextAlloc(allocator: std.mem.Allocator, blk: block.Block) !?[]const u8 
         .plan => |plan| for (plan.items) |item| try appendSearchPart(&out, allocator, item.step),
         .compaction => |compaction| try appendSearchPart(&out, allocator, compaction.summary),
         .system_note => |note| try appendSearchPart(&out, allocator, note.text),
+        .shell_transcript => |shell| try appendSearchPart(&out, allocator, shell.text),
         .approval => return null,
     }
     return if (out.items.len > 0) out.items else null;

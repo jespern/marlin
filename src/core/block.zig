@@ -23,6 +23,7 @@ pub const BlockKind = enum {
     plan,
     compaction,
     system_note,
+    shell_transcript,
 };
 
 pub const ToolStatus = enum { ok, err, denied, interrupted };
@@ -130,6 +131,14 @@ pub const Body = union(BlockKind) {
         covers_to_seq: u64,
     },
     system_note: struct { text: []const u8 },
+    /// A shell the user ran in this session (`!!`), recorded when it ended:
+    /// its scrollback and final screen as plain text. Shown to the user as
+    /// shell output and to the model as context.
+    shell_transcript: struct {
+        text: []const u8,
+        exit_code: ?i32 = null,
+        signal: ?i32 = null,
+    },
 };
 
 /// Native→guest handover body. Clients render this in full (not the usual

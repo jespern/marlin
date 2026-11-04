@@ -60,7 +60,7 @@ test "the daemon's mirror answers terminal queries with no viewer attached" {
     defer environ.deinit();
     try environ.put("PATH", "/usr/bin:/bin");
 
-    const host = try shell_host.Host.create(gpa, io, 1, "/", 0, .{ .cols = 80, .rows = 24, .cell_width = 9, .cell_height = 18 });
+    const host = try shell_host.Host.create(gpa, io, 1, 9, "/", 0, .{ .cols = 80, .rows = 24, .cell_width = 9, .cell_height = 18 });
     defer host.destroy();
     var relay: Relay = .{ .io = io };
     defer relay.deinit();
@@ -86,7 +86,7 @@ test "a host snapshot decodes to the same screen" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const host = try shell_host.Host.create(gpa, io, 1, "/", 0, .{ .cols = 20, .rows = 4 });
+    const host = try shell_host.Host.create(gpa, io, 1, 9, "/", 0, .{ .cols = 20, .rows = 4 });
     defer host.destroy();
     host.feed("\x1b]2;my title\x07hello\r\nworld\x1b[");
     try std.testing.expect(host.titleChanged());
@@ -108,7 +108,7 @@ test "viewers attach once and detach cleanly" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const host = try shell_host.Host.create(gpa, threaded.io(), 1, "/", 0, .{ .cols = 20, .rows = 4 });
+    const host = try shell_host.Host.create(gpa, threaded.io(), 1, 9, "/", 0, .{ .cols = 20, .rows = 4 });
     defer host.destroy();
     try host.attach(7);
     host.viewer(7).?.unacked = 99;
@@ -117,4 +117,20 @@ test "viewers attach once and detach cleanly" {
     try std.testing.expectEqual(@as(usize, 0), host.viewer(7).?.unacked);
     host.detach(7);
     try std.testing.expect(host.viewer(7) == null);
+}
+
+test "the transcript joins soft wraps, keeps scrollback, and keeps the newest bytes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const host = try shell_host.Host.create(gpa, threaded.io(), 1, 9, "/", 0, .{ .cols = 10, .rows = 3 });
+    defer host.destroy();
+    host.feed("first\r\nsecond\r\nthird\r\na-line-longer-than-ten\r\n$ ");
+    const text = try host.transcript(gpa, 1 << 20);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("first\nsecond\nthird\na-line-longer-than-ten\n$", text);
+
+    const tail = try host.transcript(gpa, 12);
+    defer gpa.free(tail);
+    try std.testing.expectEqualStrings("$", tail);
 }
