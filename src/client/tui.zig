@@ -2429,6 +2429,11 @@ pub const App = struct {
                 const label = layout_mod.shellExitLabel(self.gpa, st.exit_code, st.signal) catch return;
                 defer self.gpa.free(label);
                 self.pushDurableBlock(b, .shell_transcript, st.text, label, .ok);
+                if (st.styled) |styled| if (styled.len > 0) {
+                    const rendered = &self.view.blocks.items[self.view.blocks.items.len - 1];
+                    if (rendered.seq == b.seq and rendered.styled.len == 0)
+                        rendered.styled = self.gpa.dupe(u8, styled) catch &.{};
+                };
             },
         }
         if (!self.view.history_loading and !self.view.history_has_newer)
@@ -5844,12 +5849,12 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     // The plan's final framed row provides breathing room before the composer;
     // the ordinary transcript gap remains above the lowest surface.
     // A shell session has no composer or plan: its terminal fills the
-    // transcript area down to the status line.
+    // transcript area down to a blank row above the status line.
     const shell_session = shell_tab.active(app);
     const shell_full_screen = shell_tab.showingFullScreen(app);
     const surfaces = planSurfaceLayout(h, top_rows, if (shell_session) 0 else input_h, if (shell_session) &.{} else app.view.plan.items);
     const plan_h = if (shell_session) 0 else surfaces.plan_h;
-    const view_h = if (shell_session) @as(@TypeOf(surfaces.view_h), @intCast(@as(usize, h) -| top_rows -| 1)) else surfaces.view_h;
+    const view_h = if (shell_session) @as(@TypeOf(surfaces.view_h), @intCast(@as(usize, h) -| top_rows -| shell_tab.bottom_rows)) else surfaces.view_h;
     if (shell_session) shell_tab.fit(app, w, @intCast(view_h));
 
     // ---- session view ----
@@ -7158,7 +7163,10 @@ pub fn run(
             try conn.send(.{ .setup_status = .{ .probe_guests = false } });
             const setup = try conn.recvUntil(arena, .setup_status_result);
             setup_at_start = .fromWire(setup);
-            start_setup = !setup.completed and list.sessions.len == 0;
+            // First run opens setup only when the default model has no
+            // working backend; otherwise the user gets a session at once.
+            start_setup = !setup.completed and list.sessions.len == 0 and
+                !setup_at_start.?.modelReady(setup.default_model);
             effort_at_start = setup.default_effort;
             const configured_model_len = @min(setup.default_model.len, model_buf.len);
             @memcpy(model_buf[0..configured_model_len], setup.default_model[0..configured_model_len]);

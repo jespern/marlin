@@ -1428,3 +1428,52 @@ test "Sleep rows show compact requested durations without expanding the transcri
         try std.testing.expectEqual(@as(?[]const u8, null), try toolDisplayArgDecoded(arena, "Sleep", args, ""));
     }
 }
+
+test "a finished shell keeps its colors and wraps long rows" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{.{
+        .kind = .shell_transcript,
+        .turn_id = 1,
+        .text = @constCast("plain\n0123456789abcdef"),
+        .label = @constCast("exited"),
+        .styled = @constCast("\x1b[31mplain\x1b[0m\r\n0123456789\x1b[1mabcdef"),
+    }};
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = (try layoutLines(arena_state.allocator(), gpa, &transcript, 12)).items;
+    const n = lines.len;
+    try std.testing.expectEqualStrings("plain", lines[n - 3].text);
+    try std.testing.expect(vaxis.Color.eql(lines[n - 3].syntax[0].style.fg, .{ .index = 1 }));
+    try std.testing.expectEqualStrings("0123456789ab", lines[n - 2].text);
+    try std.testing.expectEqualStrings("cdef", lines[n - 1].text);
+    try std.testing.expectEqual(@as(usize, 0), lines[n - 1].syntax[0].start);
+    try std.testing.expect(lines[n - 1].syntax[0].style.bold);
+    try std.testing.expect(lines[n - 1].copy.join == .direct);
+}

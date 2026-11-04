@@ -134,3 +134,17 @@ test "the transcript joins soft wraps, keeps scrollback, and keeps the newest by
     defer gpa.free(tail);
     try std.testing.expectEqualStrings("$", tail);
 }
+
+test "the styled transcript keeps colors and joins soft wraps" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const host = try shell_host.Host.create(gpa, threaded.io(), 1, 9, "/", 0, .{ .cols = 10, .rows = 3 });
+    defer host.destroy();
+    host.feed("\x1b[31mred\x1b[0m plain\r\na-line-longer-than-ten\r\n$ ");
+    const styled = try host.styledTranscript(gpa, 1 << 20);
+    defer gpa.free(styled);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "a-line-longer-than-ten") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "red") != null);
+}

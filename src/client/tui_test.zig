@@ -6895,3 +6895,11 @@ test "composer history survives transcript eviction and routes late replies to t
     app.view.editor.histUp();
     try std.testing.expectEqualStrings("late prompt", app.view.editor.text.items);
 }
+
+test "a model is ready when its backend is, and unknown prefixes are trusted" {
+    const ready: setup_mod.SetupReadiness = .{ .claude_code_available = true, .openrouter_ready = false };
+    try std.testing.expect(ready.modelReady("claudecode/fable"));
+    try std.testing.expect(!ready.modelReady("openrouter/anthropic/claude-sonnet-4.5"));
+    try std.testing.expect(!ready.modelReady("codex/default"));
+    try std.testing.expect(ready.modelReady("someday/model"));
+}

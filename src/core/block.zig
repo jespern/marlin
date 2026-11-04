@@ -135,7 +135,11 @@ pub const Body = union(BlockKind) {
     /// its scrollback and final screen as plain text. Shown to the user as
     /// shell output and to the model as context.
     shell_transcript: struct {
+        /// Plain text: model context and search.
         text: []const u8,
+        /// The same output with its colors and attributes (VT/SGR), for
+        /// display; null for blocks recorded before it existed.
+        styled: ?[]const u8 = null,
         exit_code: ?i32 = null,
         signal: ?i32 = null,
     },

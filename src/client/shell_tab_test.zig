@@ -119,7 +119,7 @@ test "!! turns the session into a shell sized to the transcript area" {
     const open = msgs[0].shell_open;
     try std.testing.expectEqual(@as(u64, 42), open.sid);
     try std.testing.expectEqual(@as(u16, 80), open.cols);
-    try std.testing.expectEqual(@as(u16, 23), open.rows); // all but the tab bar and status line
+    try std.testing.expectEqual(@as(u16, 22), open.rows); // all but the tab bar, a blank row, and the status line
     try std.testing.expectEqual(@as(u16, 9), open.cell_width);
 
     // Typed before the daemon confirmed: held, then flushed in order.
@@ -178,7 +178,7 @@ test "a session another client made a shell is attached when focused; its tab sa
     shell_tab.sync(&h.app);
     const msgs = try h.sent();
     try std.testing.expectEqual(@as(u64, 8), msgs[0].shell_attach.shell_id);
-    try std.testing.expectEqual(@as(u16, 23), msgs[0].shell_attach.rows);
+    try std.testing.expectEqual(@as(u16, 22), msgs[0].shell_attach.rows);
     const summary = h.app.sessionSummary(42).?;
     try std.testing.expectEqualStrings("$ proj", summary.shell_label);
 
@@ -236,7 +236,8 @@ test "the terminal continues the transcript: drawn rows, cursor, and search" {
     defer frame.deinit();
     try tui.draw(&h.app, &vx, frame.allocator());
 
-    // Live: the screen fills the area above the status line, prompt last.
+    // Live: the screen fills the area down to the blank row above the
+    // status line, prompt last.
     const win = vx.window();
     const row_text = struct {
         fn get(w: vaxis.Window, a: std.mem.Allocator, row: u16) ![]const u8 {
@@ -245,10 +246,11 @@ test "the terminal continues the transcript: drawn rows, cursor, and search" {
             return std.mem.trimEnd(u8, out.items, " ");
         }
     }.get;
-    try std.testing.expectEqualStrings("needle here", try row_text(win, frame.allocator(), 22));
-    try std.testing.expectEqualStrings("$", try row_text(win, frame.allocator(), 23));
+    try std.testing.expectEqualStrings("needle here", try row_text(win, frame.allocator(), 21));
+    try std.testing.expectEqualStrings("$", try row_text(win, frame.allocator(), 22));
+    try std.testing.expectEqualStrings("", try row_text(win, frame.allocator(), 23));
     try std.testing.expect(vx.screen.cursor_vis);
-    try std.testing.expectEqual(@as(u16, 23), vx.screen.cursor.row);
+    try std.testing.expectEqual(@as(u16, 22), vx.screen.cursor.row);
 
     // Search finds rows in the terminal's scrollback too.
     h.app.openSearchPrompt(42);
@@ -268,12 +270,7 @@ test "Marlin's session keys work from a shell session's normal mode" {
     var h: Harness = undefined;
     h.init(true);
     defer h.deinit();
-    const arena = h.arena.allocator();
     try h.openShell("$ ");
-
-    // At the live prompt Ctrl+N is the shell's (readline: next history).
-    try std.testing.expect(h.press(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqualStrings("\x0e", try decodedInput(arena, (try h.sent())[0]));
 
     // Esc, then Ctrl+N: Marlin makes a new session.
     try std.testing.expect(h.press(.{ .codepoint = vaxis.Key.escape }));
@@ -429,4 +426,36 @@ test "a configured prefix replaces Ctrl+B, which then goes to the program" {
     try std.testing.expect(h.app.shell_prefix_pending);
     _ = h.press(.{ .codepoint = '[', .text = "[" });
     try std.testing.expectEqual(tui.Mode.normal, h.app.mode);
+}
+
+test "Marlin's tab keys and Ctrl+N work in a shell; the prefix passes them on" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    const arena = h.arena.allocator();
+    try h.openShell("$ ");
+    const prefix: vaxis.Key = .{ .codepoint = 'b', .mods = .{ .ctrl = true } };
+    const alt_b: vaxis.Key = .{ .codepoint = 'b', .mods = .{ .alt = true } };
+
+    // Alt+arrows and Alt+b/f (Option+arrows in Ghostty) switch tabs.
+    try std.testing.expect(h.press(.{ .codepoint = vaxis.Key.left, .mods = .{ .alt = true } }));
+    try std.testing.expect(h.press(alt_b));
+    try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len);
+
+    // After the prefix, Alt+b reaches the shell: readline's word motion.
+    _ = h.press(prefix);
+    _ = h.press(alt_b);
+    try std.testing.expectEqualStrings("\x1bb", try decodedInput(arena, (try h.sent())[0]));
+
+    // Ctrl+N at the prompt: a new session.
+    _ = h.press(.{ .codepoint = 'n', .mods = .{ .ctrl = true } });
+    try std.testing.expect((try h.sent())[0] == .session_create);
+    h.app.awaiting_new_session = false;
+
+    // In a full-screen program, Ctrl+N is the program's.
+    var out_buf: [64]u8 = undefined;
+    try h.daemonSays("{{\"shell_output\":{{\"shell_id\":5,\"data_base64\":\"{s}\"}}}}", .{std.base64.standard.Encoder.encode(&out_buf, "\x1b[?1049h")});
+    _ = try h.sent();
+    _ = h.press(.{ .codepoint = 'n', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqualStrings("\x0e", try decodedInput(arena, (try h.sent())[0]));
 }

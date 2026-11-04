@@ -828,10 +828,12 @@ pub const Daemon = struct {
             self.sendTo(client, .{ .shell_exited = .{ .shell_id = host.id, .code = status.code, .signal = status.signal } });
         const sid = host.sid;
         const text = host.transcript(self.gpa, shell_transcript_max_bytes) catch null;
+        const styled = host.styledTranscript(self.gpa, shell_transcript_max_bytes) catch null;
+        defer if (styled) |owned| self.gpa.free(owned);
         host.destroy();
         if (text) |owned| {
             defer self.gpa.free(owned);
-            self.appendSessionBlock(sid, .{ .shell_transcript = .{ .text = owned, .exit_code = status.code, .signal = status.signal } });
+            self.appendSessionBlock(sid, .{ .shell_transcript = .{ .text = owned, .styled = styled, .exit_code = status.code, .signal = status.signal } });
         }
         self.broadcastShellList();
         self.broadcastSessionUpsert(sid);

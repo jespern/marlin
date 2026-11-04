@@ -3,14 +3,16 @@
 //! with the shell's output kept in the session's transcript.
 //!
 //! The shell's scrollback and screen continue the session's transcript, so
-//! Marlin's ergonomics apply to it. Keys go to the shell, except after the
-//! prefix ([ui] shell_prefix, Ctrl+B by default), which takes one command:
-//! 1-9 tab, n/p next/previous tab, c new session, [ or Esc normal mode
-//! (scroll, copy, search; from inside vim too, showing the scrollback), :
-//! Marlin's command line, the prefix again sends it to the program. At the
-//! prompt Esc also enters normal mode; i/a/Enter return to the live shell.
-//! Full-screen programs (vim, htop) draw between the tab bar and status line
-//! and get every key but the prefix and Alt+1-9. Shells belong to the
+//! Marlin's ergonomics apply to it. Keys go to the shell, except Marlin's
+//! tab keys (Alt+1-9, Alt+arrows / Alt+b/f), Ctrl+N at the prompt (a new
+//! session), and the prefix ([ui] shell_prefix, Ctrl+B by default), which
+//! takes one command: 1-9 tab, n/p next/previous tab, c new session, [ or
+//! Esc normal mode (scroll, copy, search; from inside vim too, showing the
+//! scrollback), : Marlin's command line; the prefix again, or a key with a
+//! modifier (Alt+b), goes to the program as is. At the prompt Esc also
+//! enters normal mode; i/a/Enter return to the live shell. Full-screen
+//! programs (vim, htop) draw between the tab bar and a blank row above the
+//! status line and get Ctrl+N and Esc too. Shells belong to the
 //! daemon: they keep running when this client leaves, and reattach when it
 //! returns.
 const std = @import("std");
@@ -23,6 +25,7 @@ const ShellState = @import("shell_state.zig").ShellState;
 const shell_images = @import("shell_images.zig");
 const SessionView = @import("session_view.zig").SessionView;
 const tui = @import("tui.zig");
+const keys = @import("keys.zig");
 const App = tui.App;
 
 const Line = render.Line;
@@ -101,11 +104,14 @@ pub const Prefix = struct {
 
 const Grid = struct { cols: u16, rows: u16, cell_width: u16, cell_height: u16 };
 
-/// The transcript area: everything but the tab bar and the status line.
+/// Rows below a shell: a blank row, then the status line.
+pub const bottom_rows: u16 = 2;
+
+/// The transcript area: everything but the tab bar and `bottom_rows`.
 fn gridSize(app: *const App) Grid {
     return .{
         .cols = @intCast(std.math.clamp(app.term_cols, 1, std.math.maxInt(u16))),
-        .rows = @max(app.term_rows -| @as(u16, @intCast(app.tabBarRows())) -| 1, 1),
+        .rows = @max(app.term_rows -| @as(u16, @intCast(app.tabBarRows())) -| bottom_rows, 1),
         .cell_width = @intCast(@min(app.cell_px_w, std.math.maxInt(u16))),
         .cell_height = @intCast(@min(app.cell_px_h, std.math.maxInt(u16))),
     };
@@ -286,6 +292,11 @@ pub fn key(app: *App, k: vaxis.Key) bool {
         return false;
     }
     if (tab_switch) return false;
+    // Tab keys work in a shell as in any session.
+    if (keys.optionTabNavigationDirection(k)) |direction| {
+        app.cycleTab(direction);
+        return true;
+    }
     const emulator = state.live() orelse {
         // Opening: keep what was typed for when the shell is up. While
         // reconnecting, keys are dropped: typing blind into a shell that
@@ -296,6 +307,12 @@ pub fn key(app: *App, k: vaxis.Key) bool {
     if (!emulator.onAlternateScreen() and k.matches(vaxis.Key.escape, .{})) {
         app.mode = .normal;
         app.refresh_requested = true;
+        return true;
+    }
+    // A new session, as anywhere; full-screen programs keep Ctrl+N
+    // (completion in vim) and the arrows cover shell history.
+    if (!emulator.onAlternateScreen() and keys.isNewSessionKey(k)) {
+        app.newSession() catch app.setNotice("could not create session", .{});
         return true;
     }
     app.view.scroll_up = 0;
@@ -313,7 +330,15 @@ fn prefixCommand(app: *App, state: *ShellState, k: vaxis.Key) void {
         sendInput(app, state, &.{app.shell_prefix.literal()});
         return;
     }
-    if (k.mods.ctrl or k.mods.alt or k.mods.super) return;
+    // Keys Marlin keeps for itself (Alt+b, Ctrl+N) reach the program here.
+    if (k.mods.ctrl or k.mods.alt or k.mods.super) {
+        const emulator = state.live() orelse return;
+        var out: std.Io.Writer.Allocating = .init(app.gpa);
+        defer out.deinit();
+        emulator.encodeKey(&out.writer, k) catch return;
+        sendInput(app, state, out.written());
+        return;
+    }
     switch (k.codepoint) {
         '1'...'9' => app.jumpToTab(k.codepoint - '0'),
         'n' => app.cycleTab(1),
@@ -379,10 +404,10 @@ pub fn mouse(app: *App, m: vaxis.Mouse) bool {
             else => null,
         };
         if (arrow == null or m.type != .press) return true;
-        var keys: std.Io.Writer.Allocating = .init(app.gpa);
-        defer keys.deinit();
-        for (0..3) |_| emulator.encodeKey(&keys.writer, .{ .codepoint = arrow.? }) catch return true;
-        sendInput(app, state, keys.written());
+        var presses: std.Io.Writer.Allocating = .init(app.gpa);
+        defer presses.deinit();
+        for (0..3) |_| emulator.encodeKey(&presses.writer, .{ .codepoint = arrow.? }) catch return true;
+        sendInput(app, state, presses.written());
         return true;
     }
     const grid = gridSize(app);

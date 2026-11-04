@@ -7,6 +7,7 @@ const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const render = @import("render.zig");
 const markdown = @import("markdown.zig");
+const shell_styled = @import("shell_styled.zig");
 const Palette = render.Palette;
 const LinkSpan = render.LinkSpan;
 const SyntaxSpan = render.SyntaxSpan;
@@ -245,6 +246,9 @@ pub const RenderBlock = struct {
     /// Content-addressed uncapped tool output. Null means `text` is already
     /// the complete result and can be copied without another daemon query.
     full_body_ref: ?[]u8 = null,
+    /// shell_transcript: the output with its colors as VT text; empty when
+    /// the block predates it, and `text` is drawn plain.
+    styled: []u8 = &.{},
     /// Source payload size supplied by the tool runtime when available.
     payload_bytes: ?u64 = null,
     /// reasoning blocks: true = deliberate mid-turn narration (visible);
@@ -268,6 +272,7 @@ pub const RenderBlock = struct {
         for (self.plan_items) |item| gpa.free(item.step);
         if (self.plan_items.len > 0) gpa.free(self.plan_items);
         if (self.full_body_ref) |ref| gpa.free(ref);
+        if (self.styled.len > 0) gpa.free(self.styled);
     }
 };
 
@@ -386,6 +391,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     var label: []const u8 = "";
     var status: block.ToolStatus = .ok;
     var full_body_ref: ?[]const u8 = null;
+    var styled: []const u8 = "";
     var payload_bytes: ?u64 = null;
     var generated_text: ?[]u8 = null;
     var generated_label: ?[]u8 = null;
@@ -446,6 +452,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .compaction => text = "context compacted",
         .shell_transcript => |st| {
             text = st.text;
+            styled = st.styled orelse "";
             generated_label = try shellExitLabel(gpa, st.exit_code, st.signal);
             label = generated_label.?;
         },
@@ -469,6 +476,8 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         else => "",
     };
     const owned_call_id: []u8 = if (call_id.len > 0) try gpa.dupe(u8, call_id) else &.{};
+    errdefer if (owned_call_id.len > 0) gpa.free(owned_call_id);
+    const owned_styled: []u8 = if (styled.len > 0) try gpa.dupe(u8, styled) else &.{};
 
     return .{
         .kind = kind,
@@ -482,6 +491,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .status = status,
         .full_body_ref = owned_ref,
         .payload_bytes = payload_bytes,
+        .styled = owned_styled,
     };
 }
 
@@ -1783,7 +1793,7 @@ pub fn layoutBlockRange(
             },
             .shell_transcript => {
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
-                try appendShellTranscript(alloc, lines, rb.text, rb.label, w);
+                try appendShellTranscript(alloc, lines, rb.text, rb.styled, rb.label, w);
             },
         }
     }
@@ -1801,7 +1811,7 @@ pub fn shellExitLabel(gpa: std.mem.Allocator, exit_code: ?i32, signal: ?i32) ![]
 }
 
 /// A finished shell: a header, then its output verbatim, one row per line.
-fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), text: []const u8, status: []const u8, w: usize) !void {
+fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), text: []const u8, styled: []const u8, status: []const u8, w: usize) !void {
     try blankLine(alloc, lines);
     try lines.append(alloc, .{
         .text = "  $ ",
@@ -1811,6 +1821,35 @@ fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), 
         .text3 = try std.fmt.allocPrint(alloc, " · {s}", .{status}),
         .style3 = Palette.collapse_hint,
     });
+    if (styled.len > 0) {
+        const rows = try shell_styled.rows(alloc, styled);
+        const skip = rows.len -| shell_transcript_display_lines;
+        if (skip > 0) try lines.append(alloc, .{
+            .text = try std.fmt.allocPrint(alloc, "  … {d} earlier lines", .{skip}),
+            .style = Palette.collapse_hint,
+        });
+        // Long rows wrap, as they did in the live shell.
+        for (rows[skip..]) |row| {
+            var start: usize = 0;
+            while (true) {
+                const end = hardCellBreak(row.text, start, @max(w, 1));
+                var spans: std.ArrayList(SyntaxSpan) = .empty;
+                for (row.syntax) |span| {
+                    if (span.end <= start or span.start >= end) continue;
+                    try spans.append(alloc, .{ .start = @max(span.start, start) - start, .end = @min(span.end, end) - start, .style = span.style });
+                }
+                try lines.append(alloc, .{
+                    .text = row.text[start..end],
+                    .style = .{},
+                    .syntax = spans.items,
+                    .copy = .{ .join = if (start == 0) .newline else .direct },
+                });
+                if (end <= start or end >= row.text.len) break;
+                start = end;
+            }
+        }
+        return;
+    }
     const body = std.mem.trimEnd(u8, text, "\n");
     var total: usize = 0;
     var count = std.mem.splitScalar(u8, body, '\n');

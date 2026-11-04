@@ -312,7 +312,12 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .covers_to_seq = value.covers_to_seq,
         } },
         .system_note => |value| .{ .system_note = .{ .text = try arena.dupe(u8, value.text) } },
-        .shell_transcript => |value| .{ .shell_transcript = .{ .text = try arena.dupe(u8, value.text), .exit_code = value.exit_code, .signal = value.signal } },
+        .shell_transcript => |value| .{ .shell_transcript = .{
+            .text = try arena.dupe(u8, value.text),
+            .styled = if (value.styled) |styled| try arena.dupe(u8, styled) else null,
+            .exit_code = value.exit_code,
+            .signal = value.signal,
+        } },
     };
 }
 

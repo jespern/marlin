@@ -144,6 +144,23 @@ pub const Host = struct {
         return gpa.dupe(u8, trimmed[cut..]);
     }
 
+    /// The transcript with colors and attributes as VT (SGR) text, soft wraps
+    /// joined, newest `max_bytes` kept (cut at a line boundary).
+    pub fn styledTranscript(self: *Host, gpa: std.mem.Allocator, max_bytes: usize) ![]u8 {
+        const screen = self.terminal.screens.get(.primary) orelse self.terminal.screens.active;
+        // Inline SGR (and OSC 8) per cell run; no trailing cursor/mode state.
+        const formatter: vt.formatter.ScreenFormatter = .init(screen, .{ .emit = .vt, .unwrap = true });
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try formatter.format(&out.writer);
+        const full = std.mem.trimEnd(u8, out.written(), " \r\n");
+        var cut = full.len -| max_bytes;
+        if (cut > 0) if (std.mem.indexOfScalarPos(u8, full, cut, '\n')) |nl| {
+            cut = nl + 1;
+        };
+        return gpa.dupe(u8, full[cut..]);
+    }
+
     pub fn title(self: *const Host) []const u8 {
         return self.terminal.getTitle() orelse "";
     }
