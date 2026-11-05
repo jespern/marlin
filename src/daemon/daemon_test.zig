@@ -188,6 +188,9 @@ test "shells outlive their opener and are shared by every viewer" {
     daemon.advertiser = null;
     daemon.sandbox_backend = .unavailable;
     daemon.presence = .{};
+    // Built field by field from undefined: every field the code under test
+    // reads must be set, or it reads garbage (a phantom reboot on Linux).
+    daemon.pending_reboot = null;
     try daemon.store.createSession(7, 0, "/", "m", .auto);
     var session = daemon_mod.Session{ .id = 7, .model = try gpa.dupe(u8, "m"), .cwd = try gpa.dupe(u8, "/") };
     defer gpa.free(session.model);
