@@ -78,7 +78,11 @@ fn configureSqlite(module: *std.Build.Module, b: *std.Build, embedded: bool) voi
             .flags = sqlite_flags,
         });
     } else {
-        module.linkSystemLibrary("sqlite3", .{});
+        // macOS ships libsqlite3 in its SDK, so pkg-config adds nothing
+        // there, and an old glib pkg-config aborts on `--list-all` when any
+        // installed .pc file lacks a field, which fails the whole build.
+        const macos = if (module.resolved_target) |target| target.result.os.tag == .macos else false;
+        module.linkSystemLibrary("sqlite3", .{ .use_pkg_config = if (macos) .no else .yes });
     }
 }
 
