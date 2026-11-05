@@ -1480,3 +1480,47 @@ test "a finished shell keeps its colors and wraps long rows" {
     try std.testing.expect(lines[n - 1].syntax[0].style.bold);
     try std.testing.expect(lines[n - 1].copy.join == .direct);
 }
+
+test "a message without text shows (empty input) in its card" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast(""), .label = @constCast("▣ clipboard.png · image/png · 440.4KiB") },
+    };
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = (try layoutLines(arena_state.allocator(), gpa, &transcript, 80)).items;
+    var found = false;
+    for (lines) |line| if (std.mem.eql(u8, line.text2, "(empty input)")) {
+        found = true;
+        try std.testing.expect(line.style2.italic);
+        try std.testing.expectEqualStrings(" ❯ ", line.text);
+    };
+    try std.testing.expect(found);
+}

@@ -530,6 +530,21 @@ fn wrapInputCard(
     if (body_width < 8) return;
 
     try lines.append(arena, .{ .text = if (queued) "   Queued" else "", .style = Palette.prompt_hint, .fill_style = Palette.prompt_panel });
+    // A message with no text (an image alone, say) still gets a visible
+    // body rather than a bare prompt mark.
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        var placeholder_style = text_style;
+        placeholder_style.italic = true;
+        try lines.append(arena, .{
+            .text = first_prefix,
+            .style = if (steer) Palette.steer else Palette.prompt_mark,
+            .text2 = "(empty input)",
+            .style2 = placeholder_style,
+            .fill_style = Palette.prompt_panel,
+        });
+        try lines.append(arena, .{ .text = "", .style = Palette.prompt_text, .fill_style = Palette.prompt_panel });
+        return;
+    }
     var first = true;
     var logical = std.mem.splitScalar(u8, text, '\n');
     while (logical.next()) |raw_line| {
