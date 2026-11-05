@@ -21,12 +21,12 @@ const profiles = [_]Profile{
 pub const Race = struct {
     items: @import("items.zig").Items = .{},
     opponents: [7]Game,
-    trials: [7]Trial = .{Trial{}} ** 7,
-    drift_ticks: [7]?u8 = .{null} ** 7,
-    drift_laps: [7]i32 = .{-1} ** 7,
-    finish_order: [8]u8 = .{0} ** 8,
+    trials: [7]Trial = @splat(Trial{}),
+    drift_ticks: [7]?u8 = @splat(null),
+    drift_laps: [7]i32 = @splat(-1),
+    finish_order: [8]u8 = @splat(0),
     finish_count: u8 = 0,
-    finish_place: [8]u8 = .{0} ** 8,
+    finish_place: [8]u8 = @splat(0),
     contacts: u32 = 0,
     boosts: u32 = 0,
     pub fn init(track: *const Course, engine: Class, player: *Game) Race {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 /// marlin build graph.
 ///
@@ -28,15 +29,45 @@ const sqlite_flags = &.{
 /// The daemon's scoped idle-sleep assertion (src/daemon/power.zig) calls
 /// IOKit/CoreFoundation directly; other platforms compile it as a no-op and
 /// link nothing extra.
-fn configurePower(module: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget) void {
+fn configurePower(module: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget, macos_sdk: ?[]const u8) void {
     if (target.result.os.tag != .macos) return;
-    if (b.sysroot) |sysroot| {
-        const frameworks = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" });
+    if (macos_sdk) |sdk| {
+        const frameworks = b.pathJoin(&.{ sdk, "System/Library/Frameworks" });
         module.addSystemFrameworkPath(.{ .cwd_relative = frameworks });
     }
     module.linkFramework("IOKit", .{});
     module.linkFramework("CoreFoundation", .{});
 }
+
+/// C bindings, translated at build time (`@cImport` is gone in 0.17).
+const CBindings = struct {
+    sqlite3: *std.Build.Module,
+    yaml: *std.Build.Module,
+
+    fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, embedded_sqlite: bool) CBindings {
+        const translate_c = b.dependency("translate_c", .{});
+        const sqlite3: Translator = .init(translate_c, .{
+            .name = "sqlite3_c",
+            .c_source_file = b.path("src/daemon/c/sqlite3.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        if (embedded_sqlite) sqlite3.addIncludePath(b.path("vendor/sqlite"));
+        const yaml: Translator = .init(translate_c, .{
+            .name = "yaml_c",
+            .c_source_file = b.path("src/daemon/c/yaml.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        yaml.addIncludePath(b.path("vendor/libyaml"));
+        return .{ .sqlite3 = sqlite3.mod, .yaml = yaml.mod };
+    }
+
+    fn addTo(self: CBindings, module: *std.Build.Module) void {
+        module.addImport("sqlite3_c", self.sqlite3);
+        module.addImport("yaml_c", self.yaml);
+    }
+};
 
 fn configureSqlite(module: *std.Build.Module, b: *std.Build, embedded: bool) void {
     module.link_libc = true;
@@ -65,37 +96,40 @@ fn configureYaml(module: *std.Build.Module, b: *std.Build) void {
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // The installed binary is the daily driver: default it to ReleaseFast so
+    // The installed binary is the daily driver: default it to fast so
     // a plain `zig build` can never silently replace it with a Debug build
     // (5-10x slower TUI/JSON/sqlite). Deliberately NOT standardOptimizeOption
     // with preferred_optimize_mode: that replaces -Doptimize with -Drelease
     // and still defaults to Debug, which broke `marlin reboot --build`'s
-    // explicit -Doptimize=ReleaseFast. Unit tests keep their own Debug
+    // explicit -Doptimize=fast. Unit tests keep their own Debug
     // module below for safety checks and fast compile iteration.
-    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
+    const optimize = b.option(std.lang.Optimize, "optimize", "Prioritize performance, safety, or binary size") orelse .fast;
     const version = b.option([]const u8, "version", "Marlin version embedded in the binary") orelse "0.0.0-dev";
     // Release binaries carry no debug info: it held build-cache paths whose hashes depend
     // on the build machine's CPU (a dependency builds a code generator for the host), so
     // two builds of the same tag on different x86 runners differed in those paths alone.
     // Stripped, a release rebuilds byte for byte, and is smaller.
-    const strip = b.option(bool, "strip", "Omit debug info (default: on unless Debug)") orelse (optimize != .Debug);
+    const strip = b.option(bool, "strip", "Omit debug info (default: on unless Debug)") orelse (optimize != .debug);
     const embedded_sqlite = b.option(
         bool,
         "embedded-sqlite",
         "Compile vendored SQLite into Marlin (official releases enable this)",
     ) orelse false;
+    // `zig build --sysroot` is gone in 0.17; release builds name the SDK
+    // whose frameworks the power assertion links against.
+    const macos_sdk = b.option([]const u8, "macos-sdk", "macOS SDK path for framework lookup (release builds)");
 
     const asset_store = b.createModule(.{ .root_source_file = b.path("src/asset_store.zig"), .target = target });
-    const asset_store_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/asset_store.zig"), .target = target, .optimize = .Debug }) });
+    const asset_store_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/asset_store.zig"), .target = target, .optimize = .debug }) });
     const asset_store_run = b.addRunArtifact(asset_store_tests);
     b.step("asset-store-test", "Test shared asset verification and caching").dependOn(&asset_store_run.step);
     // ---- source formatting ----
-    const format = b.addFmt(.{ .paths = &.{ "src", "build.zig" } });
+    const format = b.addFmt(.{ .paths = &.{ b.path("src"), b.path("build.zig") } });
     const format_step = b.step("fmt", "Format Zig source");
     format_step.dependOn(&format.step);
 
     const format_check = b.addFmt(.{
-        .paths = &.{ "src", "build.zig" },
+        .paths = &.{ b.path("src"), b.path("build.zig") },
         .check = true,
     });
     const format_check_step = b.step("fmt-check", "Check Zig source formatting");
@@ -104,6 +138,8 @@ pub fn build(b: *std.Build) void {
     // ---- marlin ----
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const regex = b.dependency("regex", .{ .target = target, .optimize = optimize });
+    // Terminal emulation for the experimental shell tab (`!!`).
+    const ghostty = b.dependency("ghostty", .{ .target = target, .optimize = optimize });
     const exe = b.addExecutable(.{
         .name = "marlin",
         .root_module = b.createModule(.{
@@ -114,13 +150,16 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis.module("vaxis") },
                 .{ .name = "regex", .module = regex.module("regex") },
+                .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
             },
         }),
     });
     exe.root_module.addImport("asset_store", asset_store);
+    const c_bindings: CBindings = .init(b, target, optimize, embedded_sqlite);
+    c_bindings.addTo(exe.root_module);
     configureSqlite(exe.root_module, b, embedded_sqlite);
     configureYaml(exe.root_module, b);
-    configurePower(exe.root_module, b, target);
+    configurePower(exe.root_module, b, target, macos_sdk);
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     exe.root_module.addOptions("build_options", build_options);
@@ -129,7 +168,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Build and run marlin");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
     // ---- Pure-Zig Mario Kart 64 port ----
@@ -149,13 +188,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const asset_run = b.addRunArtifact(asset_import);
-    if (b.args) |args| asset_run.addArgs(args);
+    asset_run.addPassthruArgs();
     asset_run.has_side_effects = true;
     b.step("mk64-import", "Regenerate the versioned MK64 asset bundle from the USA ROM").dependOn(&asset_run.step);
     const mk64_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/mk64/root.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = .debug,
     }) });
     mk64_tests.root_module.addImport("asset_store", asset_store);
     b.step("mk64-test", "Test the pure-Zig MK64 port").dependOn(&b.addRunArtifact(mk64_tests).step);
@@ -165,7 +204,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wipeout/root.zig"),
             .target = target,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     wipeout_tests.root_module.addImport("asset_store", asset_store);
@@ -178,16 +217,18 @@ pub fn build(b: *std.Build) void {
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = .debug,
         .imports = &.{
             .{ .name = "vaxis", .module = vaxis.module("vaxis") },
             .{ .name = "regex", .module = regex.module("regex") },
+            .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
         },
     });
     test_module.addImport("asset_store", asset_store);
+    CBindings.init(b, target, .debug, embedded_sqlite).addTo(test_module);
     configureSqlite(test_module, b, embedded_sqlite);
     configureYaml(test_module, b);
-    configurePower(test_module, b, target);
+    configurePower(test_module, b, target, macos_sdk);
     test_module.addOptions("build_options", build_options);
     const exe_tests = b.addTest(.{ .root_module = test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
@@ -206,11 +247,9 @@ pub fn build(b: *std.Build) void {
     });
 
     const fake_model_cmd = b.addRunArtifact(fakeprov);
-    fake_model_cmd.addArgs(&.{ "--port", "5757", "--repeat-last" });
-    if (b.args) |args|
-        fake_model_cmd.addArgs(args)
-    else
-        fake_model_cmd.addFileArg(b.path("src/testing/fixtures/local_testing.json"));
+    fake_model_cmd.addArgs(&.{ "--port", "5757", "--repeat-last", "--default-scenario" });
+    fake_model_cmd.addFileArg(b.path("src/testing/fixtures/local_testing.json"));
+    fake_model_cmd.addPassthruArgs();
     fake_model_cmd.has_side_effects = true;
     const fake_model_step = b.step("fake-model", "Run the scripted local/testing model on 127.0.0.1:5757");
     fake_model_step.dependOn(&fake_model_cmd.step);

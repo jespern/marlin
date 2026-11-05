@@ -26,7 +26,7 @@ pub const State = struct {
     wheel: u16 = 0,
     ticks: u64 = 0,
     duration: u8 = 0,
-    particles: [10]Particle = .{Particle{}} ** 10,
+    particles: [10]Particle = @splat(Particle{}),
     next_particle: usize = 0,
 
     pub fn init(pos: Vec3, yaw: f32) State {

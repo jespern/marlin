@@ -41,7 +41,7 @@ pub const Particles = extern struct {
             .velocity = velocity,
             .size = size,
             .timer = rng.float(0.75, 1.0),
-            .texture = self.texture_start + @intFromEnum(kind),
+            .texture = self.texture_start + @backingInt(kind),
         };
         self.active += 1;
     }

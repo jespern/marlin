@@ -8,6 +8,7 @@ const block = @import("../core/block.zig");
 const Editor = @import("editor.zig");
 const media = @import("media.zig");
 const layout = @import("layout.zig");
+const ShellState = @import("shell_state.zig").ShellState;
 const RenderBlock = layout.RenderBlock;
 const LayoutCache = layout.LayoutCache;
 const TailLayoutCache = layout.TailLayoutCache;
@@ -201,8 +202,13 @@ pub const SessionView = struct {
     /// Inactive views are a cache, not durable state: an evicted session
     /// replays from seq 1 when reopened.
     last_used: u64 = 0,
+    /// Set while this session is a shell (`!!`): its transcript area shows
+    /// the terminal and input goes to it.
+    shell: ?*ShellState = null,
 
     pub fn deinit(self: *SessionView, gpa: std.mem.Allocator) void {
+        if (self.shell) |shell| shell.destroy();
+        self.shell = null;
         self.editor.deinit();
         for (self.attachments.items) |*attachment| attachment.deinit(gpa);
         self.attachments.deinit(gpa);

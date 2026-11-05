@@ -62,6 +62,8 @@ pub const Conn = struct {
     sandbox_available: bool = false,
     session_recaps: bool = false,
     git_status: bool = false,
+    /// Experimental: the daemon serves the `!!` shell tab.
+    remote_shell: bool = false,
     pause_resume: bool = false,
     network_filtering: bool = false,
     network_configured: bool = false,
@@ -365,6 +367,7 @@ pub fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !v
     @memcpy(conn.hostname_buf[0..conn.hostname_len], hello.hostname[0..conn.hostname_len]);
     conn.session_recaps = hello.session_recaps;
     conn.git_status = hello.git_status;
+    conn.remote_shell = hello.remote_shell;
     conn.pause_resume = hello.pause_resume;
     conn.network_filtering = hello.network_filtering;
     conn.network_configured = hello.network_configured;

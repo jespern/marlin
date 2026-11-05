@@ -345,7 +345,7 @@ const Keys = struct {
         }
         return false;
     }
-    held: [9]bool = .{false} ** 9,
+    held: [9]bool = @splat(false),
     fn update(self: *Keys, key: vaxis.Key, down: bool) void {
         const codes = [9]u21{ 'w', vaxis.Key.up, 's', vaxis.Key.down, 'a', vaxis.Key.left, 'd', vaxis.Key.right, ' ' };
         for (codes, 0..) |code, i| if (key.matches(code, .{}) or (!down and key.codepoint == code)) {

@@ -234,7 +234,7 @@ fn readColor(reader: *bytes.Reader) Error!Rgba {
 fn readPrimitive(reader: *bytes.Reader, textures: TextureList, vertex_count: usize) Error!Prim {
     const raw_type = try reader.i16Be();
     const flag = try reader.i16Be();
-    const kind: PrimType = @enumFromInt(raw_type);
+    const kind: PrimType = @fromBackingInt(@intCast(raw_type));
     var p = Prim{ .kind = .other, .flag = flag };
 
     switch (kind) {

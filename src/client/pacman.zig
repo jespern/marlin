@@ -85,7 +85,7 @@ pub const Dir = enum(u8) {
     }
 
     fn fromIndex(i: usize) Dir {
-        return @enumFromInt(@as(u8, @intCast(i % 4)) + 1);
+        return @fromBackingInt(@intCast(@as(u8, @intCast(i % 4)) + 1));
     }
 };
 

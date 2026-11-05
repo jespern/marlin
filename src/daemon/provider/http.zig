@@ -95,7 +95,7 @@ fn setTransportDetail(comptime fmt: []const u8, args: anytype) void {
 
 fn urlHost(url: []const u8, buffer: *[Io.net.HostName.max_len]u8) []const u8 {
     const uri = std.Uri.parse(url) catch return "unknown host";
-    return (uri.getHost(buffer) catch return "unknown host").bytes;
+    return (std.Io.net.HostName.fromUri(uri, buffer) catch return "unknown host").bytes;
 }
 
 fn recordTransportFailure(stage: []const u8, host: []const u8, err: anyerror) void {
@@ -514,7 +514,7 @@ fn streamPostRun(
     var response = request.receiveHead(&.{}) catch |err| return mapResponseHead(&request, stream_req.url, err);
     progress.response_started.store(true, .release);
     markActivity(progress);
-    const status: i64 = @intFromEnum(response.head.status);
+    const status: i64 = @backingInt(response.head.status);
     const is_error = status >= 400;
 
     var error_body: std.ArrayList(u8) = .empty;
@@ -687,7 +687,7 @@ fn getRun(
 
     var redirect_buffer: [8192]u8 = undefined;
     var response = request.receiveHead(if (redirect_behavior == .unhandled) &.{} else &redirect_buffer) catch |err| return mapResponseHead(&request, url, err);
-    const status: i64 = @intFromEnum(response.head.status);
+    const status: i64 = @backingInt(response.head.status);
     const content_type = if (response.head.content_type) |value| try gpa.dupe(u8, value) else null;
     errdefer if (content_type) |value| gpa.free(value);
     const location = if (response.head.location) |value| try gpa.dupe(u8, value) else null;
@@ -781,7 +781,7 @@ fn acquirePooledOrPreflightDns(
     const uri = std.Uri.parse(url) catch return error.InvalidRequest;
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.InvalidRequest;
     var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
-    const destination = uri.getHost(&host_buffer) catch return error.InvalidRequest;
+    const destination = std.Io.net.HostName.fromUri(uri, &host_buffer) catch return error.InvalidRequest;
     const port: u16 = uri.port orelse switch (protocol) {
         .plain => @as(u16, 80),
         .tls => @as(u16, 443),
@@ -796,7 +796,9 @@ fn acquirePooledOrPreflightDns(
             .host = destination,
             .port = port,
             .protocol = protocol,
-        })) |connection| {
+        }) catch |err| switch (err) {
+            error.Canceled => return error.Cancelled,
+        }) |connection| {
             if (pooledConnectionIsReusable(client.io, connection)) return connection;
             std.log.debug("discarding stale pooled HTTP connection to {s}:{d}", .{ destination.bytes, port });
             connection.closing = true;

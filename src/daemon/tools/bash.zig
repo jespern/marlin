@@ -134,7 +134,7 @@ pub fn run(
 
     const exit_code: i64 = switch (res.term) {
         .exited => |code| code,
-        .signal => |sig| -@as(i64, @intFromEnum(sig)),
+        .signal => |sig| -@as(i64, @backingInt(sig)),
         else => -1,
     };
     return .{

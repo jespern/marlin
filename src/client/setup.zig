@@ -51,6 +51,22 @@ pub const SetupReadiness = struct {
             .local_ready = status.local_ready,
         };
     }
+
+    /// Whether the backend behind `model` can run a turn. Prefixes Marlin
+    /// does not know are trusted; the daemon reports their failures.
+    pub fn modelReady(self: SetupReadiness, model: []const u8) bool {
+        const Backend = enum { openrouter, vercel, anthropic, litellm, local, codex, claudecode };
+        const prefix = model[0 .. std.mem.indexOfScalar(u8, model, '/') orelse model.len];
+        return switch (std.meta.stringToEnum(Backend, prefix) orelse return true) {
+            .openrouter => self.openrouter_ready,
+            .vercel => self.vercel_ready,
+            .anthropic => self.anthropic_ready,
+            .litellm => self.litellm_ready,
+            .local => self.local_ready,
+            .codex => self.codex_available,
+            .claudecode => self.claude_code_available,
+        };
+    }
 };
 
 pub fn validSetupProviderName(name: []const u8) bool {
@@ -100,7 +116,7 @@ pub fn applySetupStatus(self: *App, status: proto.SetupStatus) void {
 
 pub fn setupProviderFromItem(item: []const u8) ?SetupProvider {
     for (setup_provider_items, 0..) |candidate, index| {
-        if (std.mem.eql(u8, item, candidate)) return @enumFromInt(index);
+        if (std.mem.eql(u8, item, candidate)) return @fromBackingInt(@intCast(index));
     }
     return null;
 }

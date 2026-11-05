@@ -7,7 +7,7 @@
 //! live inside marlin itself — we fake the network peer, nothing else.
 //!
 //! Contract with the runner (src/testing/e2e_runner.zig):
-//!   - args: [--port N] [--repeat-last] <scenario.json>
+//!   - args: [--port N] [--repeat-last] [--default-scenario <path>] [<scenario.json>]
 //!   - picks a free port (random + retry), prints "PORT <n>\n" on stdout
 //!     when listening, then serves exactly scenario.steps.len requests.
 //!     An explicit port supports the manual local/testing developer model;
@@ -196,6 +196,9 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn parseArgs(args: []const [:0]const u8) ?Args {
     var parsed = Args{ .scenario_path = "" };
+    // `zig build fake-model` passes its bundled fixture here; a scenario
+    // given after `--` takes precedence.
+    var default_path: []const u8 = "";
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -207,12 +210,17 @@ fn parseArgs(args: []const [:0]const u8) ?Args {
         } else if (std.mem.eql(u8, arg, "--repeat-last")) {
             if (parsed.repeat_last) return null;
             parsed.repeat_last = true;
+        } else if (std.mem.eql(u8, arg, "--default-scenario")) {
+            i += 1;
+            if (i >= args.len or default_path.len > 0) return null;
+            default_path = args[i];
         } else if (parsed.scenario_path.len == 0) {
             parsed.scenario_path = arg;
         } else {
             return null;
         }
     }
+    if (parsed.scenario_path.len == 0) parsed.scenario_path = default_path;
     return if (parsed.scenario_path.len > 0) parsed else null;
 }
 

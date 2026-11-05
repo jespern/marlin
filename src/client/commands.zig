@@ -11,6 +11,8 @@ const wipeout_effect = @import("wipeout_effect.zig");
 const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const tui = @import("tui.zig");
+const shell_tab = @import("shell_tab.zig");
+const screenshot = @import("screenshot.zig");
 const App = tui.App;
 const RebuildScope = tui.RebuildScope;
 const OwnedCouncil = tui.OwnedCouncil;
@@ -65,8 +67,12 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
     .{ .name = "/help", .description = "show commands and key bindings" },
     .{ .name = "/quit", .description = "leave Marlin (sessions keep running)" },
+    .{ .name = "/exit", .description = "leave Marlin (sessions keep running)" },
     .{ .name = "/detach", .description = "leave Marlin (sessions keep running)" },
+    .{ .name = "/shutdown", .usage = " [--force]", .description = "leave Marlin and stop its daemon (ends shells and running work)", .accepts_args = true },
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
+    .{ .name = "!!", .description = "turn this session into a shell (Ctrl+D turns it back)" },
+    .{ .name = "/screenshot", .usage = " [slim]", .description = "copy the window to the clipboard as an image (Alt+S); slim: transcript only", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!mk", .hidden = true, .description = "play Mario Kart", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
@@ -475,13 +481,39 @@ pub fn skillInvocation(text: []const u8) ?SkillInvocation {
     return .{ .name = name, .arguments = std.mem.trimStart(u8, words.rest(), " \t\r\n") };
 }
 
+/// Leaving the client; sessions keep running in the daemon.
+pub fn isQuitCommand(head: []const u8) bool {
+    for ([_][]const u8{ "/quit", "/q", "/exit", "/detach" }) |name| {
+        if (std.mem.eql(u8, head, name)) return true;
+    }
+    return false;
+}
+
 pub fn runCommand(self: *App, cmd: []const u8) void {
     var it = std.mem.tokenizeAny(u8, cmd, " \t\r\n");
     const head = it.next() orelse return;
 
-    if (std.mem.eql(u8, head, "/quit") or std.mem.eql(u8, head, "/q") or
-        std.mem.eql(u8, head, "/detach"))
-    {
+    if (isQuitCommand(head)) {
+        self.should_quit = true;
+    } else if (std.mem.eql(u8, head, "/screenshot")) {
+        const arg = it.next();
+        if (arg) |mode| if (!std.mem.eql(u8, mode, "slim")) return self.setNotice("usage: /screenshot [slim]", .{});
+        screenshot.request(self, if (arg != null) .slim else .full);
+    } else if (std.mem.eql(u8, head, "/shutdown")) {
+        const force = if (it.next()) |arg| std.mem.eql(u8, arg, "--force") else false;
+        if (!force) {
+            var busy: usize = 0;
+            var shells: usize = 0;
+            for (self.sessions.items) |s| {
+                if (s.state == .running or s.state == .awaiting_approval) busy += 1;
+                if (s.shell_id != 0) shells += 1;
+            }
+            if (busy + shells > 0) {
+                self.setNotice("{d} running session(s), {d} shell(s) would end — /shutdown --force to stop anyway", .{ busy, shells });
+                return;
+            }
+        }
+        self.stop_daemon = true;
         self.should_quit = true;
     } else if (std.mem.eql(u8, head, "/mk64") or std.mem.eql(u8, head, "!mk")) {
         launchMarioKart(self, it.rest(), false);
@@ -969,6 +1001,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         // panel scrolled to its generated COMMANDS section instead.
         self.shortcut_help = true;
         self.help_scroll = shortcut_help_rows.len;
+    } else if (std.mem.eql(u8, head, "!!")) {
+        shell_tab.open(self);
     } else if (head.len > 1 and head[0] == '!') {
         // `!ls -la` — every shell and vim accept the bang glued to the
         // command. The exact `!c`/`!rb`/`!rbc` shortcuts matched above.

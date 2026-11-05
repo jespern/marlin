@@ -132,7 +132,7 @@ pub const Renderer = struct {
             .owner = owner,
         };
         self.setScreenSize(width, height);
-        const grey = [_]Rgba{Rgba.white} ** 4;
+        const grey: [4]Rgba = @splat(Rgba.white);
         self.no_texture = try self.createTexture(2, 2, &grey);
         return self;
     }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const recap = @import("recap.zig");
 const block = @import("../core/block.zig");
+const repeat = @import("../testing/repeat.zig").repeat;
 
 test {
     std.testing.refAllDecls(recap);
@@ -16,7 +17,7 @@ test "recap snapshot keeps latest request and answer ahead of long tool output" 
         .session_id = 1,
         .turn_id = 1,
         .ts = 1,
-        .body = .{ .tool_result = .{ .call_id = "c", .status = .ok, .inline_body = "x" ** 20_000, .full_body_ref = null } },
+        .body = .{ .tool_result = .{ .call_id = "c", .status = .ok, .inline_body = repeat("x", 20_000), .full_body_ref = null } },
     };
     blocks[0].body = .{ .user_msg = .{ .text = "Fix login" } };
     blocks[29].body = .{ .assistant_msg = .{ .text = "Fixed login; tests pass. Deployment still pending." } };

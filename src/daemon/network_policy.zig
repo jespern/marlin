@@ -144,7 +144,7 @@ pub const Policy = struct {
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
             !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.UnsupportedScheme;
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = try uri.getHost(&host_buf);
+        const host = try std.Io.net.HostName.fromUri(uri, &host_buf);
         return self.checkHost(host.bytes);
     }
 

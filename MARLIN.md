@@ -1,6 +1,6 @@
 # Marlin — repo instructions
 
-Marlin is a daemon-based AI coding agent in Zig (0.16): `marlind` owns all
+Marlin is a daemon-based AI coding agent in Zig (0.17): `marlind` owns all
 state (sessions, agent loop, sqlite store, provider connections); the TUI and
 headless CLI are thin socket clients. Start with `docs/ARCHITECTURE.md` for
 the design and `docs/TESTING.md` for verification. Shipped behavior is defined by the code and its tests; docs
@@ -26,10 +26,10 @@ answer is no. Standing walls: README Principles, and ARCHITECTURE
   pre-push hook checks the whole working tree, and CI checks the pushed
   commit. Install both hooks once with `scripts/install-git-hooks.sh`.
 - `zig build` — build AND install `zig-out/bin/marlin`, defaulting to
-  ReleaseFast for source installs. Official release artifacts are built
-  ReleaseSafe (safety checks stay on in a long-running daemon); the
-  ReleaseFast/ReleaseSafe delta is unmeasured, and a Debug install is
-  noticeably slower. Pass `-Doptimize=Debug` only for debugging the binary.
+  `fast` for source installs. Official release artifacts are built
+  `safe` (safety checks stay on in a long-running daemon); the
+  fast/safe delta is unmeasured, and a debug install is
+  noticeably slower. Pass `-Doptimize=debug` only for debugging the binary.
   Unit tests always compile Debug regardless. `zig build test` and
   `zig build e2e` do NOT install; a running daemon only picks up changes
   after an install + reboot (`!rb` in the TUI).

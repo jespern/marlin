@@ -75,8 +75,8 @@ pub const Peer = struct {
 /// The advertised instance name: `user@host`, host without its domain.
 pub fn instanceName(buf: []u8, user: []const u8, hostname: []const u8) ![:0]const u8 {
     const host = hostname[0 .. std.mem.indexOfScalar(u8, hostname, '.') orelse hostname.len];
-    if (user.len == 0) return std.fmt.bufPrintZ(buf, "{s}", .{host});
-    return std.fmt.bufPrintZ(buf, "{s}@{s}", .{ user, host });
+    if (user.len == 0) return std.mem.printSentinel(buf, "{s}", .{host}, 0);
+    return std.mem.printSentinel(buf, "{s}@{s}", .{ user, host }, 0);
 }
 
 extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
@@ -274,8 +274,8 @@ const Browser = if (supported) struct {
         for (self.pending.items) |p| if (std.mem.eql(u8, p.name, n)) return; // same instance, another interface
         const p = self.arena.create(Pending) catch return;
         p.* = .{
-            .name = self.arena.dupeZ(u8, n) catch return,
-            .domain = self.arena.dupeZ(u8, std.mem.span(domain orelse "local.")) catch return,
+            .name = self.arena.dupeSentinel(u8, n, 0) catch return,
+            .domain = self.arena.dupeSentinel(u8, std.mem.span(domain orelse "local."), 0) catch return,
             .iface = iface,
             .browser = self,
         };

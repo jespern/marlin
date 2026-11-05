@@ -52,7 +52,7 @@ fn write(w: *std.Io.Writer, value: anytype) anyerror!void {
             try w.writeInt(u32, @intCast(value.len), .little);
             for (value) |v| try write(w, v);
         },
-        .@"struct" => inline for (std.meta.fields(T)) |f| try write(w, @field(value, f.name)),
+        .@"struct" => |info| inline for (info.field_names) |name| try write(w, @field(value, name)),
         else => @compileError("unsupported asset field"),
     }
 }
@@ -92,9 +92,9 @@ const Decoder = struct {
                 for (result) |*v| v.* = try self.read(info.child);
                 return result;
             },
-            .@"struct" => {
+            .@"struct" => |info| {
                 var result: T = undefined;
-                inline for (std.meta.fields(T)) |f| @field(result, f.name) = try self.read(f.type);
+                inline for (info.field_names, info.field_types) |name, field_type| @field(result, name) = try self.read(field_type);
                 return result;
             },
             else => @compileError("unsupported asset field"),
@@ -140,7 +140,7 @@ pub fn importRom(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
         sprite.* = try kart.Sprite.loadCharacter(gpa, bytes, c);
         for (&k.frames, 0..) |*f, fi| {
             f.indices = sprite.indices[fi];
-            var used_colours = [_]bool{false} ** 256;
+            var used_colours: [256]bool = @splat(false);
             for (f.indices) |idx| used_colours[idx] = true;
             var colours: std.ArrayList(Colour) = .empty;
             for (used_colours, 0..) |keep, idx| if (keep) {
@@ -217,7 +217,7 @@ pub fn load(gpa: std.mem.Allocator, bytes: []const u8) !Set {
         s.spark_large = d.spark_large;
         for (k.frames, 0..) |f, fi| {
             s.indices[fi] = f.indices;
-            var seen = [_]bool{false} ** 256;
+            var seen: [256]bool = @splat(false);
             for (f.colours) |c| {
                 if (seen[c.index]) return error.InvalidAssets;
                 seen[c.index] = true;

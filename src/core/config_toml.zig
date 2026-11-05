@@ -78,6 +78,7 @@ pub const Document = struct {
     ui_bell: ?bool = null,
     ui_screensaver_after_ms: ?u64 = null,
     ui_screensaver_effect: ?[]const u8 = null,
+    ui_shell_prefix: ?[]const u8 = null,
     network_blocklists: ?[]const u8 = null,
     network_allow: ?[]const u8 = null,
     network_deny: ?[]const u8 = null,
@@ -241,6 +242,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
                 if (std.mem.eql(u8, key, "bell")) doc.ui_bell = try boolean(value);
                 if (std.mem.eql(u8, key, "screensaver_after")) doc.ui_screensaver_after_ms = try durationMs(value);
                 if (std.mem.eql(u8, key, "screensaver_effect")) doc.ui_screensaver_effect = try string(arena, value);
+                if (std.mem.eql(u8, key, "shell_prefix")) doc.ui_shell_prefix = try string(arena, value);
             },
             .voice => {
                 if (std.mem.eql(u8, key, "enabled")) doc.voice_enabled = try boolean(value);

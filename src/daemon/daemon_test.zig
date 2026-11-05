@@ -59,7 +59,7 @@ test "guest progress cannot dismiss a parked question or approval" {
         .{ .approval_request = .{ .sid = 7, .approval_id = "12", .call_id = "call", .tool = "Bash", .args_json = "{}" } },
     }) |request| {
         session.state = .awaiting_approval;
-        session.phase.store(@intFromEnum(proto.TurnPhase.approval), .release);
+        session.phase.store(@backingInt(proto.TurnPhase.approval), .release);
         session.phase_started_at_ms.store(100, .release);
         session.pending_approval_line = try proto.encode(gpa, request);
         const parked_line = session.pending_approval_line.?;
@@ -68,7 +68,7 @@ test "guest progress cannot dismiss a parked question or approval" {
         for ([_]proto.TurnPhase{ .tool, .provider, .finishing }) |phase| {
             try daemon.handleEvent(.{ .turn_phase = .{ .sid = 7, .phase = phase, .started_at_ms = 200 } });
             try std.testing.expectEqual(proto.SessionState.awaiting_approval, session.state);
-            try std.testing.expectEqual(@intFromEnum(proto.TurnPhase.approval), session.phase.load(.acquire));
+            try std.testing.expectEqual(@backingInt(proto.TurnPhase.approval), session.phase.load(.acquire));
             try std.testing.expectEqual(@as(i64, 100), session.phase_started_at_ms.load(.acquire));
             try std.testing.expectEqualStrings(parked_line, session.pending_approval_line.?);
             try std.testing.expect(client.outbox.tryPop(io) == null);
@@ -149,4 +149,158 @@ test "image steering keeps durable refs and gives guests readable files" {
     defer store.finalize(stmt);
     try std.testing.expectEqual(store.c.SQLITE_ROW, store.c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(i64, 3), store.c.sqlite3_column_int64(stmt, 0));
+}
+
+test "shells outlive their opener and are shared by every viewer" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var peer = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer peer.close(io);
+    var stream = try server.accept(io);
+    defer stream.close(io);
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("SHELL", "/bin/sh");
+    try environ.put("HOME", "/");
+    try environ.put("PATH", "/usr/bin:/bin");
+
+    var daemon: daemon_mod.Daemon = undefined;
+    daemon.gpa = gpa;
+    daemon.io = io;
+    daemon.environ = &environ;
+    daemon.events = .init(gpa);
+    daemon.clients = .empty;
+    defer daemon.clients.deinit(gpa);
+    daemon.clients_mutex = .init;
+    daemon.sessions = .empty;
+    defer daemon.sessions.deinit(gpa);
+    daemon.shells = .empty;
+    daemon.next_shell_id = 1;
+    daemon.store = try store.Store.open(gpa, null);
+    defer daemon.store.close();
+    daemon.cfg = .{};
+    daemon.network = .{ .gpa = gpa };
+    daemon.advertiser = null;
+    daemon.sandbox_backend = .unavailable;
+    daemon.presence = .{};
+    try daemon.store.createSession(7, 0, "/", "m", .auto);
+    var session = daemon_mod.Session{ .id = 7, .model = try gpa.dupe(u8, "m"), .cwd = try gpa.dupe(u8, "/") };
+    defer gpa.free(session.model);
+    defer gpa.free(session.cwd);
+    try daemon.sessions.put(gpa, session.id, &session);
+    var opener = daemon_mod.Client{ .id = 1, .stream = stream, .outbox = .init(gpa), .said_hello = true };
+    var other = daemon_mod.Client{ .id = 2, .stream = stream, .outbox = .init(gpa), .said_hello = true };
+    defer for ([_]*daemon_mod.Client{ &opener, &other }) |client| {
+        while (client.outbox.tryPop(io)) |line| gpa.free(line.bytes);
+        client.outbox.deinit();
+    };
+    try daemon.clients.put(gpa, opener.id, &opener);
+    try daemon.clients.put(gpa, other.id, &other);
+    defer {
+        var hosts = daemon.shells.valueIterator();
+        while (hosts.next()) |host| host.*.destroy();
+        daemon.shells.deinit(gpa);
+        while (daemon.events.tryPop(io)) |event| switch (event) {
+            .shell_output => |o| gpa.free(o.bytes),
+            else => {},
+        };
+        daemon.events.deinit();
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Helpers = struct {
+        fn send(d: *daemon_mod.Daemon, client_id: u64, comptime json: []const u8, args: anytype) !void {
+            const bytes = try std.fmt.allocPrint(d.gpa, json ++ "\n", args);
+            try d.handleEvent(.{ .client_msg = .{ .client_id = client_id, .msg_line = bytes } });
+        }
+        fn drain(alloc: std.mem.Allocator, client: *daemon_mod.Client, io_: std.Io) ![]proto.DaemonMsg {
+            var msgs: std.ArrayList(proto.DaemonMsg) = .empty;
+            while (client.outbox.tryPop(io_)) |line| {
+                defer client.outbox.gpa.free(line.bytes);
+                try msgs.append(alloc, try proto.decode(proto.DaemonMsg, alloc, try alloc.dupe(u8, line.bytes)));
+            }
+            return msgs.items;
+        }
+        fn output(alloc: std.mem.Allocator, msgs: []const proto.DaemonMsg, into: *std.ArrayList(u8)) !?proto.DaemonMsg {
+            for (msgs) |msg| switch (msg) {
+                .shell_output => |o| {
+                    const decoder = std.base64.standard.Decoder;
+                    const bytes = try alloc.alloc(u8, try decoder.calcSizeForSlice(o.data_base64));
+                    try decoder.decode(bytes, o.data_base64);
+                    try into.appendSlice(alloc, bytes);
+                },
+                .shell_exited => return msg,
+                else => {},
+            };
+            return null;
+        }
+    };
+
+    try Helpers.send(&daemon, opener.id, "{{\"shell_open\":{{\"request_id\":3,\"sid\":7,\"cols\":80,\"rows\":24}}}}", .{});
+    var msgs = try Helpers.drain(a, &opener, io);
+    try std.testing.expectEqual(@as(u64, 3), msgs[0].shell_opened.request_id);
+    const shell_id = msgs[0].shell_opened.shell_id;
+    try std.testing.expectEqual(shell_id, msgs[1].shell_snapshot.shell_id);
+
+    // Not a viewer: cannot hang it up.
+    try Helpers.send(&daemon, other.id, "{{\"shell_close\":{{\"shell_id\":{d}}}}}", .{shell_id});
+    try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
+
+    // A second client attaches and sees what the shell prints next.
+    try Helpers.send(&daemon, other.id, "{{\"shell_attach\":{{\"request_id\":8,\"shell_id\":{d},\"cols\":100,\"rows\":30}}}}", .{shell_id});
+    msgs = try Helpers.drain(a, &other, io);
+    try std.testing.expectEqual(@as(u64, 8), msgs[0].shell_opened.request_id);
+    try std.testing.expect(msgs[1] == .shell_snapshot);
+
+    var input_buf: [128]u8 = undefined;
+    const input = std.base64.standard.Encoder.encode(&input_buf, "echo hi-$((1+1))\r");
+    try Helpers.send(&daemon, opener.id, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"{s}\"}}}}", .{ shell_id, input });
+    var seen_opener: std.ArrayList(u8) = .empty;
+    var seen_other: std.ArrayList(u8) = .empty;
+    for (0..500) |_| {
+        while (daemon.events.tryPop(io)) |event| try daemon.handleEvent(event);
+        _ = try Helpers.output(a, try Helpers.drain(a, &opener, io), &seen_opener);
+        _ = try Helpers.output(a, try Helpers.drain(a, &other, io), &seen_other);
+        if (std.mem.indexOf(u8, seen_other.items, "hi-2") != null and std.mem.indexOf(u8, seen_opener.items, "hi-2") != null) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.Timeout;
+
+    // The opener leaving does not end the shell.
+    daemon.detachClientShells(opener.id);
+    try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
+
+    // While it is a shell, the session takes no agent input.
+    try std.testing.expectEqual(shell_id, daemon.sessionShell(7).?.id);
+    _ = try Helpers.drain(a, &opener, io);
+    try Helpers.send(&daemon, opener.id, "{{\"input\":{{\"sid\":7,\"text\":\"hello agent\",\"request_id\":21}}}}", .{});
+    var refused = false;
+    for (try Helpers.drain(a, &opener, io)) |msg| if (msg == .err and msg.err.request_id == 21) {
+        try std.testing.expectEqualStrings("shell", msg.err.code);
+        refused = true;
+    };
+    try std.testing.expect(refused);
+
+    // Closing reaches everyone still viewing.
+    try Helpers.send(&daemon, other.id, "{{\"shell_close\":{{\"shell_id\":{d}}}}}", .{shell_id});
+    try std.testing.expectEqual(@as(usize, 0), daemon.shells.count());
+    var exited: ?proto.DaemonMsg = null;
+    for (try Helpers.drain(a, &other, io)) |msg| if (msg == .shell_exited) {
+        exited = msg;
+    };
+    try std.testing.expectEqual(shell_id, exited.?.shell_exited.shell_id);
+
+    // The session is ordinary again, with the shell's output in its log.
+    try std.testing.expect(daemon.sessionShell(7) == null);
+    var blocks: std.ArrayList(@import("../core/block.zig").Block) = .empty;
+    try daemon.store.loadTailInto(a, &blocks, 7, 1);
+    const recorded = blocks.items[0].body.shell_transcript;
+    try std.testing.expect(std.mem.indexOf(u8, recorded.text, "hi-2") != null);
+    try std.testing.expectEqual(@as(?i32, 1), recorded.signal);
 }

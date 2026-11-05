@@ -7,6 +7,7 @@ const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const render = @import("render.zig");
 const markdown = @import("markdown.zig");
+const shell_styled = @import("shell_styled.zig");
 const Palette = render.Palette;
 const LinkSpan = render.LinkSpan;
 const SyntaxSpan = render.SyntaxSpan;
@@ -245,6 +246,9 @@ pub const RenderBlock = struct {
     /// Content-addressed uncapped tool output. Null means `text` is already
     /// the complete result and can be copied without another daemon query.
     full_body_ref: ?[]u8 = null,
+    /// shell_transcript: the output with its colors as VT text; empty when
+    /// the block predates it, and `text` is drawn plain.
+    styled: []u8 = &.{},
     /// Source payload size supplied by the tool runtime when available.
     payload_bytes: ?u64 = null,
     /// reasoning blocks: true = deliberate mid-turn narration (visible);
@@ -268,6 +272,7 @@ pub const RenderBlock = struct {
         for (self.plan_items) |item| gpa.free(item.step);
         if (self.plan_items.len > 0) gpa.free(self.plan_items);
         if (self.full_body_ref) |ref| gpa.free(ref);
+        if (self.styled.len > 0) gpa.free(self.styled);
     }
 };
 
@@ -386,6 +391,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     var label: []const u8 = "";
     var status: block.ToolStatus = .ok;
     var full_body_ref: ?[]const u8 = null;
+    var styled: []const u8 = "";
     var payload_bytes: ?u64 = null;
     var generated_text: ?[]u8 = null;
     var generated_label: ?[]u8 = null;
@@ -444,6 +450,12 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
             text = sn.text;
         },
         .compaction => text = "context compacted",
+        .shell_transcript => |st| {
+            text = st.text;
+            styled = st.styled orelse "";
+            generated_label = try shellExitLabel(gpa, st.exit_code, st.signal);
+            label = generated_label.?;
+        },
     }
 
     const owned_text = if (generated_text) |owned| blk: {
@@ -464,6 +476,8 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         else => "",
     };
     const owned_call_id: []u8 = if (call_id.len > 0) try gpa.dupe(u8, call_id) else &.{};
+    errdefer if (owned_call_id.len > 0) gpa.free(owned_call_id);
+    const owned_styled: []u8 = if (styled.len > 0) try gpa.dupe(u8, styled) else &.{};
 
     return .{
         .kind = kind,
@@ -477,6 +491,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .status = status,
         .full_body_ref = owned_ref,
         .payload_bytes = payload_bytes,
+        .styled = owned_styled,
     };
 }
 
@@ -706,9 +721,9 @@ pub fn isSalientToolErrorLine(line: []const u8) bool {
     for (prefixes) |prefix| {
         if (std.ascii.startsWithIgnoreCase(trimmed, prefix)) return true;
     }
-    return std.ascii.indexOfIgnoreCase(trimmed, " fail ") != null or
-        std.ascii.indexOfIgnoreCase(trimmed, ": permission denied") != null or
-        std.ascii.indexOfIgnoreCase(trimmed, ": access denied") != null;
+    return std.ascii.findIgnoreCase(trimmed, " fail ") != null or
+        std.ascii.findIgnoreCase(trimmed, ": permission denied") != null or
+        std.ascii.findIgnoreCase(trimmed, ": access denied") != null;
 }
 
 /// A calls-first batch can be visible while its tools are still running.
@@ -814,7 +829,7 @@ pub fn appendNetworkSuccessLine(
 ) !void {
     const output_start = lines.items.len;
     defer stampOutputLines(lines.items[output_start..], result.timestamp_ms);
-    const action: []const u8 = if (std.ascii.indexOfIgnoreCase(rb.label, "search") != null)
+    const action: []const u8 = if (std.ascii.findIgnoreCase(rb.label, "search") != null)
         "Searched"
     else
         "Fetched";
@@ -1315,6 +1330,8 @@ pub const Transcript = struct {
     layout_cache: *LayoutCache,
     tail_layout_cache: *TailLayoutCache,
     stream_layout_cache: *StreamLayoutCache,
+    /// Rows appended after everything else (a shell session's terminal).
+    extra_lines: []const Line = &.{},
 };
 
 pub const InflightCall = struct { rb: *const RenderBlock, queued: usize };
@@ -1792,10 +1809,87 @@ pub fn layoutBlockRange(
                 try blankLine(alloc, lines);
                 try wrapPrefixed(alloc, lines, "  ≋ ", "context compacted", Palette.note, w);
             },
+            .shell_transcript => {
+                try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
+                try appendShellTranscript(alloc, lines, rb.text, rb.styled, rb.label, w);
+            },
         }
     }
     try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
 }
+
+/// Lines of a finished shell shown in a session transcript; the rest stays
+/// in the block (search, copy, model context).
+pub const shell_transcript_display_lines: usize = 2000;
+
+pub fn shellExitLabel(gpa: std.mem.Allocator, exit_code: ?i32, signal: ?i32) ![]u8 {
+    if (signal) |s| return std.fmt.allocPrint(gpa, "ended by signal {d}", .{s});
+    if (exit_code) |code| if (code != 0) return std.fmt.allocPrint(gpa, "exited {d}", .{code});
+    return gpa.dupe(u8, "exited");
+}
+
+/// A finished shell: a header, then its output verbatim, one row per line.
+fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), text: []const u8, styled: []const u8, status: []const u8, w: usize) !void {
+    try blankLine(alloc, lines);
+    try lines.append(alloc, .{
+        .text = "  $ ",
+        .style = Palette.shell_command,
+        .text2 = "shell",
+        .style2 = Palette.shell_command,
+        .text3 = try std.fmt.allocPrint(alloc, " · {s}", .{status}),
+        .style3 = Palette.collapse_hint,
+    });
+    if (styled.len > 0) {
+        const rows = try shell_styled.rows(alloc, styled);
+        const skip = rows.len -| shell_transcript_display_lines;
+        if (skip > 0) try lines.append(alloc, .{
+            .text = try std.fmt.allocPrint(alloc, "  … {d} earlier lines", .{skip}),
+            .style = Palette.collapse_hint,
+        });
+        // Long rows wrap, as they did in the live shell. Everything is
+        // faint: the shell has ended, its output is history.
+        for (rows[skip..]) |row| {
+            var start: usize = 0;
+            while (true) {
+                const end = hardCellBreak(row.text, start, @max(w, 1));
+                var spans: std.ArrayList(SyntaxSpan) = .empty;
+                for (row.syntax) |span| {
+                    if (span.end <= start or span.start >= end) continue;
+                    var style = span.style;
+                    style.dim = true;
+                    try spans.append(alloc, .{ .start = @max(span.start, start) - start, .end = @min(span.end, end) - start, .style = style });
+                }
+                try lines.append(alloc, .{
+                    .text = row.text[start..end],
+                    .style = ended_shell_style,
+                    .syntax = spans.items,
+                    .copy = .{ .join = if (start == 0) .newline else .direct },
+                });
+                if (end <= start or end >= row.text.len) break;
+                start = end;
+            }
+        }
+        return;
+    }
+    const body = std.mem.trimEnd(u8, text, "\n");
+    var total: usize = 0;
+    var count = std.mem.splitScalar(u8, body, '\n');
+    while (count.next()) |_| total += 1;
+    const skip = total -| shell_transcript_display_lines;
+    if (skip > 0) try lines.append(alloc, .{
+        .text = try std.fmt.allocPrint(alloc, "  … {d} earlier lines", .{skip}),
+        .style = Palette.collapse_hint,
+    });
+    var it = std.mem.splitScalar(u8, body, '\n');
+    var index: usize = 0;
+    while (it.next()) |row| : (index += 1) {
+        if (index < skip) continue;
+        const clipped = row[0..hardCellBreak(row, 0, w)];
+        try lines.append(alloc, .{ .text = clipped, .style = ended_shell_style, .copy = .{ .join = .newline } });
+    }
+}
+
+const ended_shell_style: vaxis.Style = .{ .dim = true };
 
 fn handoverInProgress(blocks: []const RenderBlock) bool {
     var awaiting_summary = false;
@@ -2014,6 +2108,7 @@ pub fn layoutLines(
         try wrapPrefixed(arena, &lines, "  ", "1-9 picks · or type your own answer and press Enter", Palette.tool_out, w);
     }
     try resolveLineLinks(arena, lines.items);
+    try lines.appendSlice(arena, transcript.extra_lines);
     return lines;
 }
 

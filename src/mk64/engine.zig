@@ -6,7 +6,7 @@ pub const Class = enum {
     cc150,
     cc200,
     pub fn next(self: Class) Class {
-        return @enumFromInt((@as(u8, @intFromEnum(self)) + 1) % 4);
+        return @fromBackingInt(@intCast((@as(u8, @backingInt(self)) + 1) % 4));
     }
     pub fn label(self: Class) []const u8 {
         return switch (self) {

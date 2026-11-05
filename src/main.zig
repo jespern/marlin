@@ -27,9 +27,20 @@ const credentials = @import("core/credentials.zig");
 /// handle our errors; stderr is not a debug channel in a TUI app.
 pub const std_options: std.Options = .{
     .unexpected_error_tracing = false,
+    .logFn = @import("core/log_gate.zig").logFn,
+    // libghostty-vt (shell tabs) warns about every unimplemented mode or
+    // sequence a program uses; that is routine, not news for the daemon log.
+    .log_scope_levels = &.{
+        .{ .scope = .stream, .level = .err },
+        .{ .scope = .stream_terminal, .level = .err },
+        .{ .scope = .osc, .level = .err },
+        .{ .scope = .kitty_gfx, .level = .err },
+    },
 };
 
 pub fn main(init: std.process.Init) !u8 {
+    // Shell sessions' terminals (daemon and client alike) decode PNG images.
+    @import("core/png.zig").install();
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     const self_exe = if (args.len > 0) args[0] else "marlin";
@@ -62,6 +73,14 @@ test {
     _ = @import("daemon/guest/claude_code_turn_test.zig");
     _ = @import("daemon/shell_network_test.zig");
     _ = @import("daemon/process_io_test.zig");
+    _ = @import("daemon/shell_pty_test.zig");
+    _ = @import("daemon/shell_host_test.zig");
+    _ = @import("daemon/shell_env_test.zig");
+    _ = @import("core/png_test.zig");
+    _ = @import("client/shell_term_test.zig");
+    _ = @import("client/shell_tab_test.zig");
+    _ = @import("client/shell_styled_test.zig");
+    _ = @import("client/screenshot_test.zig");
     _ = @import("daemon/guest_models_test.zig");
     _ = @import("daemon/power_test.zig");
     _ = @import("core/effort_test.zig");

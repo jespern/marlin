@@ -7,6 +7,7 @@ const block = @import("../core/block.zig");
 const provider = @import("provider/provider.zig");
 
 const context = @import("context.zig");
+const repeat = @import("../testing/repeat.zig").repeat;
 const assemble = context.assemble;
 const capInline = context.capInline;
 const latestHandover = context.latestHandover;
@@ -33,7 +34,7 @@ test "cap inline: small output untouched, big output windowed" {
     const small = try capInline(gpa, "tiny", 100);
     try std.testing.expectEqualStrings("tiny", small);
 
-    const big_src = "A" ** 300;
+    const big_src = repeat("A", 300);
     const capped = try capInline(gpa, big_src, 100);
     defer gpa.free(capped);
     try std.testing.expect(capped.len < 200);
@@ -304,7 +305,7 @@ test "assemble: prune frontier stubs old tool bodies only" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const big = "X" ** 200;
+    const big = repeat("X", 200);
     const blocks = [_]block.Block{
         tb(1, .{ .user_msg = .{ .text = "q" } }),
         tb(2, .{ .tool_call = .{ .call_id = "c1", .name = "bash", .args_json = "{}" } }),
@@ -379,7 +380,7 @@ test "assemble resolves durable image refs only for active provider context" {
 test "planPrune: protects recent output, hysteresis on small reclaim" {
     // 3 tool results à ~2500 tokens (10k chars). protect=4000 → newest two
     // protected (5000 ≥ 4000 after two), oldest reclaimable ~2500.
-    const big = "Y" ** 10_000;
+    const big = repeat("Y", 10_000);
     const blocks = [_]block.Block{
         tb(1, .{ .tool_result = .{ .call_id = "a", .status = .ok, .inline_body = big, .full_body_ref = null } }),
         tb(2, .{ .tool_result = .{ .call_id = "b", .status = .ok, .inline_body = big, .full_body_ref = null } }),
@@ -577,4 +578,22 @@ test "handoverDefect rejects tool markup, missing sections, and stubs; accepts a
     try std.testing.expectEqual(@as(?context.HandoverDefect, .too_short), context.handoverDefect("## Goal\n## Next"));
     const good = "## Goal\nWire codex trace context.\n## Accomplished\nSpans nest under the turn.\n## In progress\nDocs paragraph.\n## Files\nsrc/daemon/guest/codex_turn.zig\n## Constraints\nNo env var interface for Codex.\n## Next\nFinish docs/OBSERVABILITY.md and run zig build test.";
     try std.testing.expectEqual(@as(?context.HandoverDefect, null), context.handoverDefect(good));
+}
+
+test "a shell transcript reaches the model as user context, newest output kept" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const short = try context.shellTranscriptContext(a, "$ ls\nfile.txt", 0, null);
+    try std.testing.expect(std.mem.startsWith(u8, short, "[The user ran an interactive shell"));
+    try std.testing.expect(std.mem.indexOf(u8, short, "$ ls\nfile.txt") != null);
+    try std.testing.expect(std.mem.endsWith(u8, short, "[The shell exited with status 0.]"));
+
+    const long = try a.alloc(u8, context.shell_transcript_context_bytes + 100);
+    @memset(long, 'x');
+    @memcpy(long[long.len - 4 ..], "TAIL");
+    const clipped = try context.shellTranscriptContext(a, long, null, 9);
+    try std.testing.expect(std.mem.indexOf(u8, clipped, "first 100 bytes are elided") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clipped, "TAIL") != null);
+    try std.testing.expect(std.mem.endsWith(u8, clipped, "[The shell was ended by signal 9.]"));
 }

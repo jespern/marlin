@@ -8,6 +8,7 @@ const process_io = @import("../process_io.zig");
 const nowMs = @import("../loop.zig").nowMs;
 
 const shared = @import("shared.zig");
+const repeat = @import("../../testing/repeat.zig").repeat;
 const max_event_line_bytes = shared.max_event_line_bytes;
 const takeEventLine = shared.takeEventLine;
 
@@ -17,7 +18,7 @@ test {
 
 test "takeEventLine returns lines longer than the reader buffer intact" {
     const gpa = std.testing.allocator;
-    const long = "{" ++ "x" ** 100 ++ "}\n";
+    const long = "{" ++ repeat("x", 100) ++ "}\n";
     var buffer: [16]u8 = undefined;
     var tr: std.testing.Reader = .init(&buffer, &.{
         .{ .buffer = "short\n" },
@@ -34,7 +35,7 @@ test "takeEventLine returns lines longer than the reader buffer intact" {
 
 test "takeEventLine drops one over-limit line and keeps reading" {
     const gpa = std.testing.allocator;
-    const huge = "y" ** 200 ++ "\n";
+    const huge = repeat("y", 200) ++ "\n";
     var buffer: [16]u8 = undefined;
     var tr: std.testing.Reader = .init(&buffer, &.{
         .{ .buffer = huge },

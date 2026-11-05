@@ -179,12 +179,12 @@ pub fn main(init: std.process.Init) !u8 {
         std.log.err("usage: e2e_runner <marlin-bin> <fakeprov-bin> <scenarios-dir>", .{});
         return 2;
     }
-    // Build-system artifact args may be relative to the runner's original
-    // cwd. Resolve them before each scenario moves Marlin into its isolated
-    // working directory.
+    // Build-system args may be relative to the runner's original cwd (since
+    // Zig 0.17, directory args are too). Resolve them before each scenario
+    // moves Marlin and the fake provider into an isolated working directory.
     const marlin_bin = try Io.Dir.cwd().realPathFileAlloc(io, args[1], arena);
     const fakeprov_bin = try Io.Dir.cwd().realPathFileAlloc(io, args[2], arena);
-    const scenarios_dir = args[3];
+    const scenarios_dir = try Io.Dir.cwd().realPathFileAlloc(io, args[3], arena);
     const temp_root = temp_dir.rootFromEnvironment(init.environ_map.get("TMPDIR"));
 
     var dir = Io.Dir.cwd().openDir(io, scenarios_dir, .{ .iterate = true }) catch |e| {
@@ -1325,7 +1325,7 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
         _ = try recvTagBounded(conn, arena, "ok");
         try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
         try pauseWaitState(conn, arena, sid, "paused", "idle");
-        if (std.c.kill(pid, @enumFromInt(0)) == 0) return error.PausedGuestStillRunning;
+        if (std.c.kill(pid, @fromBackingInt(@intCast(0))) == 0) return error.PausedGuestStillRunning;
         try conn.send(.{ .reboot = .{ .suspend_sessions = true } });
         _ = try recvTagBounded(conn, arena, "ok");
         while (true) {

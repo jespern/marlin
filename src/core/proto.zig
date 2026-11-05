@@ -437,6 +437,43 @@ pub const ClientMsg = union(enum) {
     /// then brings up the new daemon (one restart mechanism, not two).
     reboot: struct { force: bool = false, suspend_sessions: bool = false },
     shutdown: struct {},
+    /// Experimental shell tabs (`!!`): login shells on PTYs on the daemon's
+    /// host. A shell belongs to the daemon, not a connection: it runs until
+    /// it exits or is closed, and any client may attach to view and drive
+    /// it. Gated on hello_ok.remote_shell.
+    ///
+    /// Turn session `sid` into a shell, started in its cwd, and attach to
+    /// it; when the session already is one, just attach. Replies
+    /// shell_opened then shell_snapshot, or err with the same request_id.
+    /// When the shell ends, its transcript is appended to the session and
+    /// the session is an ordinary one again. Cell sizes (pixels) are zero
+    /// when unknown.
+    shell_open: struct { request_id: u64 = 0, sid: u64 = 0, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0 },
+    /// View and drive a running shell, resizing it to this client. Replies
+    /// shell_opened then shell_snapshot; shell_output follows.
+    shell_attach: struct { request_id: u64 = 0, shell_id: u64, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0 },
+    /// Stop viewing; the shell keeps running.
+    shell_detach: struct { shell_id: u64 },
+    /// Replies shell_list_result now and whenever the set of shells or a
+    /// title changes.
+    shell_list: struct {},
+    /// Keystrokes and pastes bound for the PTY (attached clients only).
+    shell_input: struct { shell_id: u64, data_base64: []const u8 },
+    shell_resize: struct { shell_id: u64, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0 },
+    /// Output bytes the client has consumed. A client too far behind stops
+    /// receiving live output and gets a fresh snapshot once it catches up.
+    shell_ack: struct { shell_id: u64, bytes: u64 },
+    /// Hang up the shell for everyone.
+    shell_close: struct { shell_id: u64 },
+};
+
+pub const ShellInfo = struct {
+    shell_id: u64,
+    /// Program-set title (OSC 0/2); empty when none.
+    title: []const u8 = "",
+    cwd: []const u8 = "",
+    created_at_ms: i64 = 0,
+    viewers: u32 = 0,
 };
 
 pub const ApprovalAnswer = enum { granted, denied };
@@ -478,6 +515,8 @@ pub const DaemonMsg = union(enum) {
         daemon_pid: u64 = 0,
         daemon_exe: []const u8 = "",
         daemon_started_at_ms: i64 = 0,
+        /// Experimental: the daemon serves shell_open (the `!!` shell tab).
+        remote_shell: bool = false,
     },
     session_runtime_result: struct { sid: u64, max_runtime_ms: u64, uses_default: bool },
     session_created: struct { sid: u64, request_id: u64 = 0 },
@@ -605,6 +644,15 @@ pub const DaemonMsg = union(enum) {
     /// (currently input). Defaults preserve compatibility in both directions.
     ok: struct { request_id: u64 = 0 },
     err: struct { code: []const u8, msg: []const u8, request_id: u64 = 0 },
+    shell_opened: struct { shell_id: u64, request_id: u64 = 0 },
+    /// The shell's whole terminal state (libghostty-vt snapshot format):
+    /// replaces anything the client held. Live shell_output follows it.
+    shell_snapshot: struct { shell_id: u64, data_base64: []const u8 },
+    /// Raw PTY output; acknowledge it with shell_ack once consumed.
+    shell_output: struct { shell_id: u64, data_base64: []const u8 },
+    /// The shell exited (`code`) or was killed by a signal (`signal`).
+    shell_exited: struct { shell_id: u64, code: ?i32 = null, signal: ?i32 = null },
+    shell_list_result: struct { shells: []const ShellInfo },
 };
 
 pub const SessionInfo = struct {
@@ -644,6 +692,9 @@ pub const SessionInfo = struct {
     usage_credits: bool = false,
     /// Archived sessions appear only in explicitly inclusive list requests.
     archived: bool = false,
+    /// Non-zero while the session is an interactive shell (`!!`): its
+    /// transcript area shows that shell, which input goes to.
+    shell_id: u64 = 0,
 };
 
 /// Encode one message as an NDJSON line (incl. trailing \n). Caller frees.

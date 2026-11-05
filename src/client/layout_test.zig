@@ -45,6 +45,7 @@ const lineWidthBytes = markdown.lineWidthBytes;
 const wrapMarkdown = markdown.wrapMarkdown;
 
 const layout = @import("layout.zig");
+const repeat = @import("../testing/repeat.zig").repeat;
 const ExpandPair = layout.ExpandPair;
 const LayoutCache = layout.LayoutCache;
 const RenderBlock = layout.RenderBlock;
@@ -766,7 +767,7 @@ test "live reasoning uses assistant-priority text" {
     try std.testing.expectEqualStrings("checking the implementation", reasoning.text2);
     try std.testing.expectEqual(Palette.assistant, reasoning.style2);
 
-    transcript.reasoning_delta = "Earlier context and investigation details. " ** 200 ++ "Latest finding: the server is healthy.";
+    transcript.reasoning_delta = repeat("Earlier context and investigation details. ", 200) ++ "Latest finding: the server is healthy.";
     const compact = try layoutLines(arena_state.allocator(), gpa, &transcript, 60);
     try std.testing.expectEqual(@as(usize, 3), compact.items.len);
     try std.testing.expect(std.mem.indexOf(u8, compact.items[2].text2, "healthy.") != null);
@@ -819,7 +820,7 @@ test "latest reasoning preview keeps link offsets after its continuation marker"
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var lines: std.ArrayList(Line) = .empty;
-    try layout.wrapReasoningPreview(arena, &lines, "**check** [docs](https://example.com) " ** 50, 30, true);
+    try layout.wrapReasoningPreview(arena, &lines, repeat("**check** [docs](https://example.com) ", 50), 30, true);
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
     try std.testing.expectEqualStrings("  … ", lines.items[0].text);
     try std.testing.expect(lines.items[0].links.len > 0);
@@ -1136,7 +1137,7 @@ test "handover notes render in full instead of a clipped system card" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const long_body = "A" ** 600;
+    const long_body = repeat("A", 600);
     const note = try std.fmt.allocPrint(gpa, "{s}{s}", .{ block.handover_prefix, long_body });
     defer gpa.free(note);
     const blocks = [_]RenderBlock{.{
@@ -1426,6 +1427,58 @@ test "Sleep rows show compact requested durations without expanding the transcri
     for ([_][]const u8{ "{}", "{\"durationMs\":-1}", "{\"durationMs\":\"bad\"}", "{" }) |args| {
         try std.testing.expectEqual(@as(?[]const u8, null), try toolDisplayArgDecoded(arena, "Sleep", args, ""));
     }
+}
+
+test "a finished shell keeps its colors and wraps long rows" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{.{
+        .kind = .shell_transcript,
+        .turn_id = 1,
+        .text = @constCast("plain\n0123456789abcdef"),
+        .label = @constCast("exited"),
+        .styled = @constCast("\x1b[31mplain\x1b[0m\r\n0123456789\x1b[1mabcdef"),
+    }};
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = (try layoutLines(arena_state.allocator(), gpa, &transcript, 12)).items;
+    const n = lines.len;
+    try std.testing.expectEqualStrings("plain", lines[n - 3].text);
+    try std.testing.expect(vaxis.Color.eql(lines[n - 3].syntax[0].style.fg, .{ .index = 1 }));
+    // An ended shell is drawn faint, colors and all.
+    try std.testing.expect(lines[n - 3].syntax[0].style.dim);
+    try std.testing.expect(lines[n - 2].style.dim);
+    try std.testing.expectEqualStrings("0123456789ab", lines[n - 2].text);
+    try std.testing.expectEqualStrings("cdef", lines[n - 1].text);
+    try std.testing.expectEqual(@as(usize, 0), lines[n - 1].syntax[0].start);
+    try std.testing.expect(lines[n - 1].syntax[0].style.bold);
+    try std.testing.expect(lines[n - 1].copy.join == .direct);
 }
 
 test "a message without text shows (empty input) in its card" {

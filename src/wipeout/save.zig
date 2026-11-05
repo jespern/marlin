@@ -46,11 +46,11 @@ pub const SaveData = extern struct {
     }
 
     pub fn table(self: *SaveData, class: u8, circuit: u8, tab: Tab) *Highscores {
-        return &self.highscores[class][circuit][@intFromEnum(tab)];
+        return &self.highscores[class][circuit][@backingInt(tab)];
     }
 
     pub fn tableConst(self: *const SaveData, class: u8, circuit: u8, tab: Tab) *const Highscores {
-        return &self.highscores[class][circuit][@intFromEnum(tab)];
+        return &self.highscores[class][circuit][@backingInt(tab)];
     }
 };
 
@@ -70,8 +70,8 @@ fn hs(lap: f32, entries: [num_highscores]Entry) Highscores {
 /// tab (the original stores them in that order under indices 1 and 0).
 pub const defaults: SaveData = blk: {
     var d = SaveData{ .highscores = undefined };
-    const R = @intFromEnum(Tab.race);
-    const T = @intFromEnum(Tab.time_trial);
+    const R = @backingInt(Tab.race);
+    const T = @backingInt(Tab.time_trial);
     // Venom
     d.highscores[0][0][R] = hs(85.83, .{ e("WIP", 254.50), e("EOU", 271.17), e("TPC", 289.50), e("NOT", 294.50), e("PSX", 314.50) });
     d.highscores[0][0][T] = hs(85.83, .{ e("MVE", 254.50), e("ALM", 271.17), e("POL", 289.50), e("NIK", 294.50), e("DAR", 314.50) });

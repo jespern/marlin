@@ -13,6 +13,43 @@ const PickerKind = tui.PickerKind;
 const initial_replay_blocks = tui.initial_replay_blocks;
 const deinitPlan = tui.deinitPlan;
 const Editor = @import("editor.zig");
+const shell_tab = @import("shell_tab.zig");
+
+/// Search a shell session's transcript rows (conversation and terminal),
+/// then show the newest match; n/N step through the rest.
+fn searchLines(self: *App, query: []const u8) void {
+    self.picker = null;
+    self.clearSearchHits();
+    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena.deinit();
+    const width: u16 = @intCast(std.math.clamp(self.term_cols, 1, std.math.maxInt(u16)));
+    const lines = tui.layoutLines(arena.allocator(), self, width) catch return;
+    for (lines.items, 0..) |line, index| {
+        const text = @import("render.zig").lineText(arena.allocator(), line) catch continue;
+        if (containsIgnoreCase(text, query) != null) self.search.line_hits.append(self.gpa, index) catch return;
+    }
+    self.picker_filter.clearRetainingCapacity();
+    const count = self.search.line_hits.items.len;
+    if (count == 0) {
+        self.setNotice("no match for '{s}'", .{query});
+        return;
+    }
+    self.search.cursor = count - 1;
+    self.setNotice("{d} match{s} · n/N to step", .{ count, if (count == 1) "" else "es" });
+    jumpToLine(self, self.search.line_hits.items[count - 1]);
+}
+
+/// Bring transcript line `line` into view in normal mode and highlight it.
+fn jumpToLine(self: *App, line: usize) void {
+    self.mode = .normal;
+    self.search.highlight_line = line;
+    const total = self.view.last_total_lines;
+    const view_h = @max(self.view.last_view_h, 1);
+    // Center it where possible; draw clamps to the transcript's extent.
+    const bottom_gap = (total -| 1) -| line;
+    self.view.scroll_up = bottom_gap -| (view_h / 2);
+    self.refresh_requested = true;
+}
 
 pub const SearchHitOwned = struct {
     sid: u64,
@@ -191,6 +228,7 @@ pub fn finishHistorySearch(self: *App) void {
 }
 
 pub fn clearSearchHits(self: *App) void {
+    self.search.line_hits.clearRetainingCapacity();
     for (self.search.hits.items) |*hit| hit.deinit(self.gpa);
     self.search.hits.clearRetainingCapacity();
     self.search.labels.clearRetainingCapacity();
@@ -207,6 +245,7 @@ pub fn openSearchPrompt(self: *App, session_id: u64) void {
 pub fn submitSearch(self: *App) void {
     const query = std.mem.trim(u8, self.picker_filter.items, " \t\r\n");
     if (query.len == 0 or self.search.pending) return;
+    if (shell_tab.active(self) and self.search.scope_sid == self.view.sid) return searchLines(self, query);
     self.search.pending = true;
     self.conn.send(.{ .search = .{
         .query = query,
@@ -267,6 +306,14 @@ pub fn selectSearchHit(self: *App, label: []const u8) ?SearchHitOwned {
 }
 
 pub fn nextSearchHit(self: *App, direction: i8) void {
+    if (self.search.line_hits.items.len > 0) {
+        const lines = self.search.line_hits.items.len;
+        self.search.cursor = if (direction < 0)
+            (self.search.cursor + lines - 1) % lines
+        else
+            (self.search.cursor + 1) % lines;
+        return jumpToLine(self, self.search.line_hits.items[self.search.cursor]);
+    }
     const len = self.search.hits.items.len;
     if (len == 0) {
         self.setNotice("no active search · press /", .{});

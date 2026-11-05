@@ -59,6 +59,9 @@ const recap = @import("recap.zig");
 const recap_limits = @import("../core/recap.zig");
 const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
+const shell_pty = @import("shell_pty.zig");
+const shell_host = @import("shell_host.zig");
+const shell_env = @import("shell_env.zig");
 const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const otel = @import("otel.zig");
@@ -176,6 +179,9 @@ const Event = union(enum) {
     /// Parent turn thread → dispatcher. All strings are gpa-owned; `future`
     /// points into the parked parent turn's stack until resolve().
     child_start: ChildStart,
+    /// Shell reader thread → dispatcher. `bytes` gpa-owned.
+    shell_output: struct { shell_id: u64, bytes: []u8 },
+    shell_exited: struct { shell_id: u64, status: shell_pty.Status },
     shutdown,
 };
 
@@ -202,6 +208,8 @@ pub const Client = struct {
     watches_sessions: bool = false,
     /// Additive catalog events are opt-in for protocol-v1 compatibility.
     watches_session_deltas: bool = false,
+    /// Sent shell_list: receives shell_list_result on every change.
+    watches_shells: bool = false,
 
     fn subscribed(self: *const Client, sid: u64) bool {
         for (self.subs.items) |s| {
@@ -286,7 +294,7 @@ pub const Session = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     pause_requested: std.atomic.Value(bool) = .init(false),
     /// Dispatcher-owned phase, including cancellation diagnostics.
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(proto.TurnPhase.idle)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(proto.TurnPhase.idle)),
     turn_started_at_ms: std.atomic.Value(i64) = .init(0),
     phase_started_at_ms: std.atomic.Value(i64) = .init(0),
     cancel_requested_at_ms: i64 = 0,
@@ -296,7 +304,7 @@ pub const Session = struct {
     approval_mode: approval.Mode = .default,
     /// Atomic mirror of approval_mode for the RUNNING turn thread; updated
     /// together with it so /permissions applies mid-turn.
-    approval_mode_live: std.atomic.Value(u8) = .init(@intFromEnum(approval.Mode.default)),
+    approval_mode_live: std.atomic.Value(u8) = .init(@backingInt(approval.Mode.default)),
     /// maxInt inherits the turn’s configured default; zero disables its deadline.
     guest_max_runtime_live: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     /// Kernel shell sandbox + prompt-free shell execution (/sandbox).
@@ -408,11 +416,19 @@ pub const Daemon = struct {
     /// registering after shutdown has begun draining the registry.
     accepting_clients: bool = true,
     sessions: std.AutoHashMapUnmanaged(u64, *Session) = .empty,
+    /// Experimental `!!` shell tabs; they outlive the clients viewing them.
+    /// Dispatcher-owned.
+    shells: std.AutoHashMapUnmanaged(u64, *shell_host.Host) = .empty,
+    next_shell_id: u64 = 1,
     /// Held while any session is running a turn (macOS: prevents idle system
     /// sleep; elsewhere a no-op). Dispatcher-owned, synced after every event.
     sleep_assertion: power.SleepAssertion = .{},
     next_client_id: u64 = 1,
     running: std.atomic.Value(bool) = .init(true),
+    /// Write end of the accept loop's wake pipe (-1 without one). Shutdown
+    /// wakes accept through it rather than only by connecting to the socket
+    /// path, which may be gone or belong to another daemon by then.
+    accept_wake_write: std.atomic.Value(i32) = .init(-1),
     /// /reboot in flight: client id awaiting the coordinated shutdown.
     /// The daemon quiesces (waits for turns to reach done) then acks + exits.
     pending_reboot: ?u64 = null,
@@ -664,6 +680,20 @@ pub const Daemon = struct {
             };
         }
 
+        var accept_wake_fds: [2]std.posix.fd_t = undefined;
+        const accept_wake: ?[2]std.posix.fd_t = wake: {
+            if (builtin.os.tag == .windows or std.c.pipe(&accept_wake_fds) != 0) break :wake null;
+            setCloseOnExec(accept_wake_fds[0]) catch {};
+            setCloseOnExec(accept_wake_fds[1]) catch {};
+            break :wake accept_wake_fds;
+        };
+        defer if (accept_wake) |fds| {
+            self.accept_wake_write.store(-1, .release);
+            _ = std.c.close(fds[1]);
+            _ = std.c.close(fds[0]);
+        };
+        if (accept_wake) |fds| self.accept_wake_write.store(@intCast(fds[1]), .release);
+
         // Dispatcher thread: consumes events, owns all state.
         const dispatcher = try std.Thread.spawn(.{}, dispatchLoop, .{&self});
 
@@ -706,9 +736,18 @@ pub const Daemon = struct {
             }}) catch null;
         }
 
-        // Accept loop (main thread). Exits when the listener errors out
-        // (dispatcher deletes the socket file on shutdown to unblock us).
+        // Accept loop (main thread). Exits when shutdown writes the wake
+        // pipe (or, without one, when its nudge connection arrives).
         while (true) {
+            if (accept_wake) |fds| {
+                var ready = [_]std.c.pollfd{
+                    .{ .fd = server.socket.handle, .events = std.c.POLL.IN, .revents = 0 },
+                    .{ .fd = fds[0], .events = std.c.POLL.IN, .revents = 0 },
+                };
+                if (std.c.poll(&ready, ready.len, -1) < 0) continue; // EINTR
+                if (ready[1].revents != 0 or !self.running.load(.acquire)) break;
+                if (ready[0].revents == 0) continue;
+            }
             const stream = server.accept(io) catch break;
             if (!self.running.load(.acquire)) {
                 stream.close(io);
@@ -759,6 +798,175 @@ pub const Daemon = struct {
             return err;
         };
         self.clients_mutex.unlock(self.io);
+    }
+
+    /// Turn session `sid` into a shell (`!!`): a login shell on a PTY in the
+    /// session's cwd, with `client` attached. A session that already is a
+    /// shell is attached to instead. Failures reply err with the request id.
+    fn openShell(self: *Daemon, client: *Client, request_id: u64, sid: u64, geometry: shell_host.Geometry) !void {
+        const session = (try self.getOrLoadSession(sid)) orelse {
+            self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session", .request_id = request_id } });
+            return;
+        };
+        if (self.sessionShell(sid)) |host|
+            return self.attachShell(client, host, request_id, geometry);
+        if (session.state == .running or session.state == .awaiting_approval) {
+            self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "the session is working; wait for its turn to finish", .request_id = request_id } });
+            return;
+        }
+        const cwd = session.cwd;
+        const path = self.environ.get("SHELL") orelse "/bin/sh";
+        // A leading '-' in argv[0] asks for a login shell, as terminals do.
+        const argv0 = try std.fmt.allocPrint(self.gpa, "-{s}", .{std.fs.path.basename(path)});
+        defer self.gpa.free(argv0);
+        var environ = try self.environ.clone(self.gpa);
+        defer environ.deinit();
+        try shell_env.prepare(self.gpa, &environ, shell_env.fileExists, @constCast(&self.io));
+
+        const id = self.next_shell_id;
+        self.next_shell_id += 1;
+        const host = try shell_host.Host.create(self.gpa, self.io, id, sid, cwd, nowMs(self.io), geometry);
+        host.start(self.io, .{
+            .path = path,
+            .argv = &.{argv0},
+            .cwd = cwd,
+            .environ = &environ,
+            .size = shellWinsize(geometry),
+        }, .{ .ctx = self, .output = onShellOutput, .exited = onShellExited }) catch |err| {
+            host.destroy();
+            const msg = try std.fmt.allocPrint(self.gpa, "could not start a shell: {t}", .{err});
+            defer self.gpa.free(msg);
+            self.sendTo(client, .{ .err = .{ .code = "shell", .msg = msg, .request_id = request_id } });
+            return;
+        };
+        self.shells.put(self.gpa, id, host) catch |err| {
+            host.destroy();
+            return err;
+        };
+        self.broadcastSessionUpsert(sid);
+        try self.attachShell(client, host, request_id, null);
+    }
+
+    /// The shell is over (exited, or killed): tell its viewers, record its
+    /// transcript in the session, and make the session ordinary again.
+    fn endShell(self: *Daemon, host: *shell_host.Host, status: shell_pty.Status) void {
+        _ = self.shells.remove(host.id);
+        for (host.viewers.items) |viewer| if (self.lookupClient(viewer.client_id)) |client|
+            self.sendTo(client, .{ .shell_exited = .{ .shell_id = host.id, .code = status.code, .signal = status.signal } });
+        const sid = host.sid;
+        const text = host.transcript(self.gpa, shell_transcript_max_bytes) catch null;
+        const styled = host.styledTranscript(self.gpa, shell_transcript_max_bytes) catch null;
+        defer if (styled) |owned| self.gpa.free(owned);
+        host.destroy();
+        if (text) |owned| {
+            defer self.gpa.free(owned);
+            self.appendSessionBlock(sid, .{ .shell_transcript = .{ .text = owned, .styled = styled, .exit_code = status.code, .signal = status.signal } });
+        }
+        self.broadcastShellList();
+        self.broadcastSessionUpsert(sid);
+    }
+
+    /// Make `client` a viewer of `host` (resizing it to the client when
+    /// `geometry` is given) and bring it up to date with a snapshot.
+    fn attachShell(self: *Daemon, client: *Client, host: *shell_host.Host, request_id: u64, geometry: ?shell_host.Geometry) !void {
+        try host.attach(client.id);
+        if (geometry) |g| host.resize(g);
+        self.sendTo(client, .{ .shell_opened = .{ .shell_id = host.id, .request_id = request_id } });
+        try self.sendShellSnapshot(client, host);
+        self.broadcastShellList();
+    }
+
+    fn sendShellSnapshot(self: *Daemon, client: *Client, host: *shell_host.Host) !void {
+        const snapshot = try host.snapshot(self.gpa);
+        defer self.gpa.free(snapshot);
+        const encoder = std.base64.standard.Encoder;
+        const encoded = try self.gpa.alloc(u8, encoder.calcSize(snapshot.len));
+        defer self.gpa.free(encoded);
+        self.sendTo(client, .{ .shell_snapshot = .{ .shell_id = host.id, .data_base64 = encoder.encode(encoded, snapshot) } });
+    }
+
+    /// The shell session `sid` is, if any. Shells, not session objects, hold
+    /// this: an idle session is unloaded when its last viewer leaves, while
+    /// its shell keeps running.
+    pub fn sessionShell(self: *Daemon, sid: u64) ?*shell_host.Host {
+        var it = self.shells.valueIterator();
+        while (it.next()) |host| if (host.*.sid == sid) return host.*;
+        return null;
+    }
+
+    /// The shell, when `client` is attached to it.
+    fn viewedShell(self: *Daemon, client: *Client, shell_id: u64) ?*shell_host.Host {
+        const host = self.shells.get(shell_id) orelse return null;
+        return if (host.viewer(client.id) != null) host else null;
+    }
+
+    /// A departing connection stops viewing; its shells keep running.
+    pub fn detachClientShells(self: *Daemon, client_id: u64) void {
+        var it = self.shells.valueIterator();
+        while (it.next()) |host| host.*.detach(client_id);
+    }
+
+    /// Hang up a shell for everyone viewing it.
+    fn closeShell(self: *Daemon, host: *shell_host.Host) void {
+        self.endShell(host, .{ .signal = 1 });
+    }
+
+    fn shellListMsg(self: *Daemon, arena: std.mem.Allocator) !proto.DaemonMsg {
+        const infos = try arena.alloc(proto.ShellInfo, self.shells.count());
+        var it = self.shells.valueIterator();
+        var i: usize = 0;
+        while (it.next()) |host| : (i += 1) infos[i] = .{
+            .shell_id = host.*.id,
+            .title = host.*.title(),
+            .cwd = host.*.cwd,
+            .created_at_ms = host.*.created_at_ms,
+            .viewers = @intCast(host.*.viewers.items.len),
+        };
+        std.mem.sort(proto.ShellInfo, infos, {}, struct {
+            fn lessThan(_: void, a: proto.ShellInfo, b: proto.ShellInfo) bool {
+                return a.shell_id < b.shell_id;
+            }
+        }.lessThan);
+        return .{ .shell_list_result = .{ .shells = infos } };
+    }
+
+    fn sendShellList(self: *Daemon, client: *Client) void {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        self.sendTo(client, self.shellListMsg(arena.allocator()) catch return);
+    }
+
+    fn broadcastShellList(self: *Daemon) void {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const line = proto.encode(arena.allocator(), self.shellListMsg(arena.allocator()) catch return) catch return;
+        self.forEachClient(ShellListCtx{ .self = self, .line = line }, struct {
+            fn send(ctx: ShellListCtx, client: *Client) void {
+                if (client.said_hello and client.watches_shells) ctx.self.sendLine(client, ctx.line);
+            }
+        }.send);
+    }
+
+    const ShellListCtx = struct { self: *Daemon, line: []const u8 };
+
+    fn shellWinsize(geometry: shell_host.Geometry) shell_pty.Winsize {
+        return .{
+            .cols = geometry.cols,
+            .rows = geometry.rows,
+            .width_px = @as(u32, geometry.cols) * geometry.cell_width,
+            .height_px = @as(u32, geometry.rows) * geometry.cell_height,
+        };
+    }
+
+    fn onShellOutput(ctx: *anyopaque, shell: *shell_pty.Shell, bytes: []const u8) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        const owned = self.gpa.dupe(u8, bytes) catch return;
+        self.events.push(self.io, .{ .shell_output = .{ .shell_id = shell.id, .bytes = owned } }) catch self.gpa.free(owned);
+    }
+
+    fn onShellExited(ctx: *anyopaque, shell: *shell_pty.Shell, status: shell_pty.Status) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        self.events.push(self.io, .{ .shell_exited = .{ .shell_id = shell.id, .status = status } }) catch {};
     }
 
     fn lookupClient(self: *Daemon, id: u64) ?*Client {
@@ -998,6 +1206,7 @@ pub const Daemon = struct {
                     self.reboot_suspend = false;
                 }
                 self.dropCcPendingForClient(cg.client_id);
+                self.detachClientShells(cg.client_id);
                 if (self.removeClient(cg.client_id)) |client| {
                     // The registry no longer contains this client, so each
                     // subscription can now be tested against the remaining
@@ -1005,6 +1214,36 @@ pub const Daemon = struct {
                     for (client.subs.items) |sid| self.releaseSessionIfUnused(sid);
                     self.destroyClient(client);
                 }
+            },
+            .shell_output => |so| {
+                defer self.gpa.free(so.bytes);
+                const host = self.shells.get(so.shell_id) orelse return;
+                host.feed(so.bytes);
+                // Mirrored: the reader may go on, whatever viewers do.
+                if (host.pty) |pty| pty.acknowledge(so.bytes.len);
+                var encoded: ?[]u8 = null;
+                defer if (encoded) |bytes| self.gpa.free(bytes);
+                for (host.viewers.items) |*viewer| {
+                    if (viewer.stale) continue;
+                    if (viewer.unacked + so.bytes.len > shell_host.viewer_window) {
+                        // Too far behind: stop sending; a snapshot catches it up.
+                        viewer.stale = true;
+                        continue;
+                    }
+                    const client = self.lookupClient(viewer.client_id) orelse continue;
+                    if (encoded == null) {
+                        const encoder = std.base64.standard.Encoder;
+                        const buf = try self.gpa.alloc(u8, encoder.calcSize(so.bytes.len));
+                        encoded = @constCast(encoder.encode(buf, so.bytes));
+                    }
+                    self.sendTo(client, .{ .shell_output = .{ .shell_id = so.shell_id, .data_base64 = encoded.? } });
+                    viewer.unacked += so.bytes.len;
+                }
+                if (host.titleChanged()) self.broadcastShellList();
+            },
+            .shell_exited => |se| {
+                const host = self.shells.get(se.shell_id) orelse return;
+                self.endShell(host, se.status);
             },
             .turn_block => |tb| {
                 defer self.gpa.free(tb.line);
@@ -1028,7 +1267,7 @@ pub const Daemon = struct {
                 // can park the session while other guest tools keep running.
                 if (session.state != .running or session.pause_requested.load(.acquire)) return;
                 session.phase_started_at_ms.store(update.started_at_ms, .release);
-                session.phase.store(@intFromEnum(update.phase), .release);
+                session.phase.store(@backingInt(update.phase), .release);
                 const now = nowMs(self.io);
                 const line = try encodeTurnPhaseStatus(
                     self.gpa,
@@ -1187,7 +1426,7 @@ pub const Daemon = struct {
                 session.cancel_requests = 0;
                 session.turn_started_at_ms.store(0, .release);
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.idle), .release);
                 session.state = if (!paused and td.err_text != null) .err else .idle;
                 if (paused) self.restorePausedInputs(session) catch {
                     checkpoint_failed = true;
@@ -1390,8 +1629,58 @@ pub const Daemon = struct {
                     .daemon_pid = @intCast(std.c.getpid()),
                     .daemon_exe = self.marlin_exe orelse "",
                     .daemon_started_at_ms = self.started_at_ms,
+                    .remote_shell = true,
                 } });
             },
+            .shell_open => |so| try self.openShell(client, so.request_id, so.sid, .{
+                .cols = so.cols,
+                .rows = so.rows,
+                .cell_width = so.cell_width,
+                .cell_height = so.cell_height,
+            }),
+            .shell_attach => |sa| {
+                const host = self.shells.get(sa.shell_id) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_shell", .msg = "that shell has exited", .request_id = sa.request_id } });
+                    return;
+                };
+                try self.attachShell(client, host, sa.request_id, .{
+                    .cols = sa.cols,
+                    .rows = sa.rows,
+                    .cell_width = sa.cell_width,
+                    .cell_height = sa.cell_height,
+                });
+            },
+            .shell_detach => |sd| if (self.shells.get(sd.shell_id)) |host| {
+                host.detach(client.id);
+                self.broadcastShellList();
+            },
+            .shell_list => {
+                client.watches_shells = true;
+                self.sendShellList(client);
+            },
+            .shell_input => |si| if (self.viewedShell(client, si.shell_id)) |host| {
+                const decoder = std.base64.standard.Decoder;
+                const len = decoder.calcSizeForSlice(si.data_base64) catch return;
+                const bytes = try self.gpa.alloc(u8, len);
+                defer self.gpa.free(bytes);
+                decoder.decode(bytes, si.data_base64) catch return;
+                host.write(bytes) catch {};
+            },
+            .shell_resize => |sr| if (self.viewedShell(client, sr.shell_id)) |host| host.resize(.{
+                .cols = sr.cols,
+                .rows = sr.rows,
+                .cell_width = sr.cell_width,
+                .cell_height = sr.cell_height,
+            }),
+            .shell_ack => |sa| if (self.viewedShell(client, sa.shell_id)) |host| {
+                const viewer = host.viewer(client.id).?;
+                viewer.unacked -|= @intCast(@min(sa.bytes, std.math.maxInt(usize)));
+                if (viewer.stale and viewer.unacked == 0) {
+                    viewer.stale = false;
+                    try self.sendShellSnapshot(client, host);
+                }
+            },
+            .shell_close => |sc| if (self.viewedShell(client, sc.shell_id)) |host| self.closeShell(host),
             .session_create => |sc| {
                 const sid = ids.next(self.io);
                 const session = try self.gpa.create(Session);
@@ -1409,7 +1698,7 @@ pub const Daemon = struct {
                     .sandbox_enabled = self.cfg.permissions_enabled,
                     .network_filtering_enabled = self.network.isActive(),
                 };
-                session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
+                session.approval_mode_live.store(@backingInt(session.approval_mode), .release);
                 // Reserve every fallible in-memory resource before committing
                 // the durable row. After createSession succeeds, publishing to
                 // the map cannot fail and no ghost session can be left behind.
@@ -1607,6 +1896,8 @@ pub const Daemon = struct {
                 }
             },
             .session_kill => |sk| {
+                // A shell session's shell ends with it (its transcript kept).
+                if (self.sessionShell(sk.sid)) |host| self.closeShell(host);
                 _ = self.cancelSessionTree(sk.sid);
                 self.requestSessionTreeEviction(sk.sid);
                 self.sendTo(client, .{ .ok = .{} });
@@ -1616,6 +1907,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
                     return;
                 };
+                if (sa.archived) if (self.sessionShell(sa.sid)) |host| self.closeShell(host);
                 if (sa.archived and self.sessionTreeBusy(sa.sid)) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot archive a running session tree" } });
                     return;
@@ -1855,7 +2147,7 @@ pub const Daemon = struct {
                 const mode = approval.Mode.parse(sa.approvals);
                 try self.store.setSessionApprovals(sa.sid, mode);
                 session.approval_mode = mode;
-                session.approval_mode_live.store(@intFromEnum(mode), .release);
+                session.approval_mode_live.store(@backingInt(mode), .release);
                 if (mode == .auto) {
                     if (session.gate.isPending(self.io)) |pending| {
                         _ = session.gate.resolve(self.io, pending, .approved);
@@ -2093,7 +2385,7 @@ pub const Daemon = struct {
                     .state = state,
                     .pause = if (session) |ses| sessionPauseState(ses) else .none,
                     .phase = if (session) |ses| if (state == .running or state == .awaiting_approval)
-                        @enumFromInt(ses.phase.load(.acquire))
+                        @fromBackingInt(@intCast(ses.phase.load(.acquire)))
                     else
                         null else null,
                     .turn_ms = if (session) |ses| if (state == .running or state == .awaiting_approval)
@@ -2127,6 +2419,10 @@ pub const Daemon = struct {
                 };
                 if (session.pause_requested.load(.acquire) or self.pending_reboot != null) {
                     self.sendInputError(client, inp.request_id, "paused", "session is pausing or paused; use /resume before sending input");
+                    return;
+                }
+                if (self.sessionShell(inp.sid) != null) {
+                    self.sendInputError(client, inp.request_id, "shell", "this session is a shell; exit it (Ctrl+D) to talk to the agent");
                     return;
                 }
                 if (session.archived) {
@@ -2293,7 +2589,7 @@ pub const Daemon = struct {
                 if (session.pending_approval_line) |old| self.gpa.free(old);
                 session.pending_approval_line = line;
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.approval), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.approval), .release);
                 session.state = .awaiting_approval;
                 self.store.setSessionStatus(cq.sid, "awaiting_approval") catch {};
                 self.refusePendingRebootForApproval();
@@ -2328,7 +2624,7 @@ pub const Daemon = struct {
                 }
                 // Policy first: auto sessions and workspace-scoped calls are
                 // answered instantly (docs/PERMISSIONS.md auto-inside).
-                const mode: approval.Mode = @enumFromInt(session.approval_mode_live.load(.acquire));
+                const mode: approval.Mode = @fromBackingInt(@intCast(session.approval_mode_live.load(.acquire)));
                 if (mode == .auto or
                     permissions.ccAutoAllow(self.gpa, self.io, session.cwd, ca.tool, ca.args_json))
                 {
@@ -2359,7 +2655,7 @@ pub const Daemon = struct {
                 if (session.pending_approval_line) |old| self.gpa.free(old);
                 session.pending_approval_line = line;
                 session.phase_started_at_ms.store(nowMs(self.io), .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.approval), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.approval), .release);
                 session.state = .awaiting_approval;
                 self.store.setSessionStatus(ca.sid, "awaiting_approval") catch {};
                 self.refusePendingRebootForApproval();
@@ -2423,13 +2719,13 @@ pub const Daemon = struct {
                 job.started_at_ms = started_at;
                 session.turn_started_at_ms.store(started_at, .release);
                 session.phase_started_at_ms.store(started_at, .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.starting), .release);
                 session.state = .running;
                 const thread = std.Thread.spawn(.{}, compactMain, .{job}) catch |err| {
                     session.state = .idle;
                     session.turn_thread = null;
                     session.phase_started_at_ms.store(nowMs(self.io), .release);
-                    session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+                    session.phase.store(@backingInt(proto.TurnPhase.idle), .release);
                     return err;
                 };
                 session.turn_thread = thread;
@@ -3014,7 +3310,7 @@ pub const Daemon = struct {
             session.pause_requested.store(true, .release);
         }
         session.guest_max_runtime_live.store((try self.store.getSessionGuestRuntime(sid)) orelse std.math.maxInt(u64), .release);
-        session.approval_mode_live.store(@intFromEnum(session.approval_mode), .release);
+        session.approval_mode_live.store(@backingInt(session.approval_mode), .release);
         if (session.pause_requested.load(.acquire)) try self.restorePausedInputs(session);
         try self.sessions.put(self.gpa, sid, session);
         return session;
@@ -3204,7 +3500,7 @@ pub const Daemon = struct {
         cancelActiveSession(self, session);
         const started = session.cancel_requested_at_ms;
         const pending_ms: u64 = if (now > started) @intCast(now - started) else 0;
-        const phase: proto.TurnPhase = @enumFromInt(session.phase.load(.acquire));
+        const phase: proto.TurnPhase = @fromBackingInt(@intCast(session.phase.load(.acquire)));
         const phase_started = session.phase_started_at_ms.load(.acquire);
         const phase_ms: u64 = if (now > phase_started) @intCast(now - phase_started) else 0;
         return .{
@@ -3508,7 +3804,7 @@ pub const Daemon = struct {
         session.steer_mutex.unlock(self.io);
         session.turn_started_at_ms.store(job.started_at_ms, .release);
         session.phase_started_at_ms.store(job.started_at_ms, .release);
-        session.phase.store(@intFromEnum(proto.TurnPhase.starting), .release);
+        session.phase.store(@backingInt(proto.TurnPhase.starting), .release);
         session.state = .running;
         const thread = std.Thread.spawn(.{}, turnMain, .{job}) catch |err| {
             session.steer_mutex.lockUncancelable(self.io);
@@ -3517,7 +3813,7 @@ pub const Daemon = struct {
             session.state = .idle;
             session.turn_thread = null;
             session.phase_started_at_ms.store(nowMs(self.io), .release);
-            session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+            session.phase.store(@backingInt(proto.TurnPhase.idle), .release);
             return err;
         };
         session.turn_thread = thread;
@@ -3561,13 +3857,13 @@ pub const Daemon = struct {
         job.started_at_ms = started_at;
         session.turn_started_at_ms.store(started_at, .release);
         session.phase_started_at_ms.store(started_at, .release);
-        session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+        session.phase.store(@backingInt(proto.TurnPhase.provider), .release);
         session.state = .running;
         const thread = std.Thread.spawn(.{}, handoverMain, .{job}) catch |err| {
             session.state = .idle;
             session.turn_thread = null;
             session.phase_started_at_ms.store(nowMs(self.io), .release);
-            session.phase.store(@intFromEnum(proto.TurnPhase.idle), .release);
+            session.phase.store(@backingInt(proto.TurnPhase.idle), .release);
             return err;
         };
         session.turn_thread = thread;
@@ -3632,13 +3928,19 @@ pub const Daemon = struct {
     /// Append and publish a daemon-side lifecycle note when no TurnJob exists
     /// (for example if an automatic continuation thread cannot be spawned).
     fn appendSessionNote(self: *Daemon, sid: u64, text: []const u8) void {
+        self.appendSessionBlock(sid, .{ .system_note = .{ .text = text } });
+    }
+
+    /// Append a block outside any turn (none may be running: a turn's
+    /// appender owns the session's seq while it runs) and fan it out.
+    fn appendSessionBlock(self: *Daemon, sid: u64, body: block.Body) void {
         const b = block.Block{
             .id = ids.next(self.io),
             .session_id = sid,
             .turn_id = ids.next(self.io),
             .seq = (self.store.lastSeq(sid) catch return) + 1,
             .ts = nowMs(self.io),
-            .body = .{ .system_note = .{ .text = text } },
+            .body = body,
         };
         self.store.appendBlock(b) catch return;
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = sid, .b = b } }) catch return;
@@ -4467,7 +4769,7 @@ pub const Daemon = struct {
         if (session.state == .awaiting_approval) {
             const phase_started = nowMs(self.io);
             session.phase_started_at_ms.store(phase_started, .release);
-            session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+            session.phase.store(@backingInt(proto.TurnPhase.provider), .release);
             session.state = .running;
             self.store.setSessionStatus(session.id, "running") catch {};
             self.broadcastStatus(session.id, .running);
@@ -4498,7 +4800,7 @@ pub const Daemon = struct {
         self.clearPendingApproval(session);
         if (session.state == .awaiting_approval) {
             session.phase_started_at_ms.store(nowMs(self.io), .release);
-            session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+            session.phase.store(@backingInt(proto.TurnPhase.provider), .release);
             session.state = .running;
             self.store.setSessionStatus(session.id, "running") catch {};
             self.broadcastStatus(session.id, .running);
@@ -4528,7 +4830,7 @@ pub const Daemon = struct {
             if (session.state == .awaiting_approval) {
                 const phase_started = nowMs(self.io);
                 session.phase_started_at_ms.store(phase_started, .release);
-                session.phase.store(@intFromEnum(proto.TurnPhase.provider), .release);
+                session.phase.store(@backingInt(proto.TurnPhase.provider), .release);
                 session.state = .running;
                 self.store.setSessionStatus(session.id, "running") catch {};
                 self.broadcastStatus(session.id, .running);
@@ -4558,7 +4860,7 @@ pub const Daemon = struct {
             .state = state,
             .pause = if (session) |ses| sessionPauseState(ses) else .none,
             .phase = if (session) |ses| if (active_turn)
-                @enumFromInt(ses.phase.load(.acquire))
+                @fromBackingInt(@intCast(ses.phase.load(.acquire)))
             else
                 null else null,
             .turn_ms = if (session) |ses| if (active_turn)
@@ -4593,7 +4895,7 @@ pub const Daemon = struct {
             .pause = if (session) |ses| sessionPauseState(ses) else .none,
             .err_text = err_text,
             .phase = if (session) |ses| if (active_turn)
-                @enumFromInt(ses.phase.load(.acquire))
+                @fromBackingInt(@intCast(ses.phase.load(.acquire)))
             else
                 null else null,
             .turn_ms = if (session) |ses| if (active_turn)
@@ -4680,6 +4982,7 @@ pub const Daemon = struct {
                 .network_filtering = self.network.isActive() and
                     (if (live) |session| session.network_filtering_enabled else true),
                 .archived = row.archived,
+                .shell_id = if (self.sessionShell(row.id)) |host| host.id else 0,
             };
         }
         return infos;
@@ -4931,7 +5234,7 @@ pub const Daemon = struct {
         var it = std.mem.tokenizeScalar(u8, path, ':');
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         while (it.next()) |dir| {
-            const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, default_binary }) catch continue;
+            const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, default_binary }, 0) catch continue;
             if (std.c.access(full, 1) == 0) return true; // 1 = X_OK
         }
         return false;
@@ -5313,6 +5616,11 @@ pub const Daemon = struct {
     }
 
     fn nudgeAcceptLoop(self: *Daemon) void {
+        const wake = self.accept_wake_write.load(.acquire);
+        if (wake >= 0) {
+            _ = std.c.write(wake, "x", 1);
+            return;
+        }
         const sock_path = proto.socketPath(self.gpa, self.environ) catch return;
         defer self.gpa.free(sock_path);
         const ua = Io.net.UnixAddress.init(sock_path) catch return;
@@ -5327,6 +5635,10 @@ pub const Daemon = struct {
     }
 
     fn shutdownCleanup(self: *Daemon) void {
+        var shells = self.shells.valueIterator();
+        while (shells.next()) |shell| shell.*.destroy();
+        self.shells.deinit(self.gpa);
+        self.shells = .empty;
         if (self.web_service) |service| service.stop();
         if (self.advertiser) |a| a.stop();
         self.sleep_assertion.sync(false);
@@ -5427,7 +5739,8 @@ pub const Daemon = struct {
     fn discardShutdownEvent(self: *Daemon, event: Event) void {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
-            .client_gone, .turn_resumed, .turn_usage_credits, .turn_phase, .shutdown => {},
+            .client_gone, .turn_resumed, .turn_usage_credits, .turn_phase, .shell_exited, .shutdown => {},
+            .shell_output => |value| self.gpa.free(value.bytes),
             .turn_block => |value| self.gpa.free(value.line),
             .turn_delta => |value| self.gpa.free(value.line),
             .turn_activity => |value| self.gpa.free(value.line),
@@ -5457,6 +5770,8 @@ pub const Daemon = struct {
 };
 
 const max_message_attachments: usize = 4;
+/// Shell output kept in a session when its shell ends.
+const shell_transcript_max_bytes: usize = 1024 * 1024;
 const max_attachment_bytes: usize = 10 * 1024 * 1024;
 const max_message_attachment_bytes: usize = 20 * 1024 * 1024;
 
@@ -5637,7 +5952,13 @@ const ShutdownWatcher = struct {
 
     fn run(w: ShutdownWatcher) void {
         var buf: [1]u8 = undefined;
-        const n = std.posix.read(w.read_fd, &buf) catch return;
+        // Retry interrupted reads: a watcher that quits early leaves SIGTERM
+        // with no effect at all.
+        const n = while (true) {
+            const rc = std.c.read(w.read_fd, &buf, 1);
+            if (rc >= 0) break rc;
+            if (std.c._errno().* != @backingInt(std.c.E.INTR)) return;
+        };
         if (n == 0) return; // pipe closed: normal shutdown already underway
         std.log.info("marlind: shutdown signal received", .{});
         w.daemon.events.push(w.daemon.io, .shutdown) catch {};
@@ -6055,6 +6376,7 @@ test "a dying bridge client unparks its session's parked cc approval" {
     daemon.clients = .empty;
     daemon.clients_mutex = .init;
     daemon.presence = .{};
+    daemon.shells = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -6101,6 +6423,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     daemon.clients = .empty;
     daemon.clients_mutex = .init;
     daemon.presence = .{};
+    daemon.shells = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -6111,7 +6434,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     const session = (try daemon.getOrLoadSession(11)).?;
     try std.testing.expectEqual(approval.Mode.default, session.approval_mode);
     session.approval_mode = .auto;
-    session.approval_mode_live.store(@intFromEnum(approval.Mode.auto), .release);
+    session.approval_mode_live.store(@backingInt(approval.Mode.auto), .release);
     try daemon.store.setSessionApprovals(11, .auto);
 
     // The working set unloads the idle session (turn_done eviction, tab
@@ -6122,7 +6445,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     defer daemon.unloadSession(11);
     try std.testing.expectEqual(approval.Mode.auto, rehydrated.approval_mode);
     try std.testing.expectEqual(
-        @intFromEnum(approval.Mode.auto),
+        @backingInt(approval.Mode.auto),
         rehydrated.approval_mode_live.load(.acquire),
     );
 
@@ -6144,6 +6467,7 @@ test "a disconnected requester cannot leave a delayed reboot armed" {
     daemon.clients = .empty;
     daemon.clients_mutex = .init;
     daemon.presence = .{};
+    daemon.shells = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);

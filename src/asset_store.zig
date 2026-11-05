@@ -109,7 +109,7 @@ pub fn migrate(a: std.mem.Allocator, io: Io, spec: Spec, old: []const u8, dest: 
 fn download(a: std.mem.Allocator, io: Io, spec: Spec, progress: *Progress) ![]u8 {
     var client: std.http.Client = .{ .allocator = a, .io = io };
     defer client.deinit();
-    var request = try client.request(.GET, try std.Uri.parse(spec.url), .{ .redirect_behavior = @enumFromInt(3) });
+    var request = try client.request(.GET, try std.Uri.parse(spec.url), .{ .redirect_behavior = @fromBackingInt(@intCast(3)) });
     defer request.deinit();
     try request.sendBodiless();
     var head: [4096]u8 = undefined;

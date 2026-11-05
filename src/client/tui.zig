@@ -19,6 +19,7 @@
 //!            (Ctrl+Backspace: the orb, from any mode);
 //!            / searches this transcript; </> or Left/Right switch tabs; q quit
 //!   global:  Ctrl+N creates a session; Ctrl+D/Ctrl+W archive when input is empty;
+//!            Alt+S copies a screenshot of the window to the clipboard (macOS);
 //!            Ctrl+L clears/redraws and returns to bottom;
 //!            Ctrl+T toggles the expanded tool transcript;
 //!            Alt/Option+Left/Right cycles tabs (moves by word while a draft is
@@ -26,7 +27,8 @@
 //!   approval pending: y approve, n deny (both modes, input empty)
 //!   commands: /model <m>, /effort <level>, /cwd <path>, /search <query>, /animate <effect>,
 //!             /screensaver [effect], /new, /reset, /compact, /archive, /reboot [--build], /help,
-//!             /quit (alias /detach — sessions keep running in the daemon)
+//!             /quit (aliases /exit, /detach — sessions keep running in the daemon),
+//!             /shutdown [--force] (quit and stop the daemon)
 //!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
 //!              !c (copy last full tool output), !rb [client|both] / !rbc (scoped rebuild),
 //!              !s [effect] (screensaver)
@@ -61,6 +63,10 @@ pub const SkyOverride = union(enum) { cycle, hour: f32 };
 const media = @import("media.zig");
 const render = @import("render.zig");
 const top_view = @import("top.zig");
+const shell_tab = @import("shell_tab.zig");
+const screenshot = @import("screenshot.zig");
+const log_gate = @import("../core/log_gate.zig");
+const shell_images = @import("shell_images.zig");
 const markdown = @import("markdown.zig");
 const layout_mod = @import("layout.zig");
 const commands = @import("commands.zig");
@@ -151,6 +157,9 @@ pub const Event = union(enum) {
     voice: VoiceEvent,
     /// wipEout asset-bundle download verdicts.
     wipeout: WipeoutEvent,
+    /// Screenshot verdict: null when the PNG is on the clipboard,
+    /// else a static reason.
+    screenshot: ?[]const u8,
 };
 
 pub const WipeoutEvent = union(enum) {
@@ -316,12 +325,17 @@ const SessionSummary = struct {
     full_access: bool,
     plan_mode: bool,
     usage_credits: bool,
+    /// Non-zero while the session is a shell (`!!`).
+    shell_id: u64 = 0,
+    /// "$ name" tab label of a shell session; empty otherwise.
+    shell_label: []u8 = &.{},
 
     fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
         gpa.free(self.cwd);
         gpa.free(self.model);
         gpa.free(self.label);
+        gpa.free(self.shell_label);
     }
 };
 
@@ -446,6 +460,9 @@ pub const SearchState = struct {
     /// positioning after its durable pages arrive.
     target_seq: u64 = 0,
     highlight_line: ?usize = null,
+    /// A shell session searches its own transcript rows (the live terminal
+    /// is not durable yet): matching absolute line indices, oldest first.
+    line_hits: std.ArrayList(usize) = .empty,
 };
 
 pub const App = struct {
@@ -623,6 +640,10 @@ pub const App = struct {
     /// First-run asset bundle download (progress shared with the worker).
     wipeout_download: ?*@import("asset_store").Progress = null,
     wipeout_download_thread: ?std.Thread = null,
+    /// A screenshot being drawn (osascript); joined when it reports.
+    screenshot_thread: ?std.Thread = null,
+    /// Alt+S or /screenshot: capture the next rendered frame.
+    screenshot_request: ?screenshot.Mode = null,
     /// The `!wipeout` that triggered the download; re-run when it lands.
     wipeout_pending: ?WipeoutOptions = null,
     /// While set, key presses and releases go to the game until Escape.
@@ -634,6 +655,12 @@ pub const App = struct {
     /// Terminal capability from queryTerminal; pixel effects need it and
     /// otherwise start as their cell fallback.
     kitty_graphics: bool = false,
+    /// Precedes Marlin commands in a shell session ([ui] shell_prefix).
+    shell_prefix: shell_tab.Prefix = .default,
+    /// The prefix was pressed; the next key is a command.
+    shell_prefix_pending: bool = false,
+    /// Kitty images of shell sessions currently on the host terminal.
+    shell_images: shell_images.Display = .{},
     /// Cell size in pixels from the winsize report (0 = unknown).
     cell_px_w: u32 = 0,
     cell_px_h: u32 = 0,
@@ -674,6 +701,8 @@ pub const App = struct {
     paste_collect: ?std.ArrayList(u8) = null,
     /// The last pasted key was CR, so a following LF is the same newline.
     paste_after_cr: bool = false,
+    /// `/shutdown`: once the TUI is down, stop the daemon too.
+    stop_daemon: bool = false,
     awaiting_new_session: bool = false,
     reset_after_new_session: bool = false,
     pending_new_session_request_id: u64 = 0,
@@ -692,6 +721,7 @@ pub const App = struct {
     next_input_request_id: u64 = 1,
 
     pub fn deinit(self: *App) void {
+        self.shell_images.deinit(self.gpa);
         if (self.cwd_completion_arena) |*arena| arena.deinit();
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
@@ -707,6 +737,7 @@ pub const App = struct {
         self.clearSearchHits();
         self.search.hits.deinit(self.gpa);
         self.search.labels.deinit(self.gpa);
+        self.search.line_hits.deinit(self.gpa);
         self.council_detail_name.deinit(self.gpa);
         self.clearCouncilEdit();
         self.council_edit_name.deinit(self.gpa);
@@ -740,6 +771,7 @@ pub const App = struct {
         if (self.wipeout_download) |progress| progress.cancel.store(true, .release);
         if (self.wipeout_download_thread) |t| t.join();
         if (self.wipeout_download) |progress| self.gpa.destroy(progress);
+        if (self.screenshot_thread) |t| t.join();
         self.recent_sessions.deinit(self.gpa);
         if (self.paste_collect) |*collected| collected.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
@@ -1472,6 +1504,11 @@ pub const App = struct {
             .full_access = info.full_access,
             .plan_mode = info.plan_mode,
             .usage_credits = info.usage_credits,
+            .shell_id = info.shell_id,
+            .shell_label = if (info.shell_id != 0)
+                std.fmt.allocPrint(self.gpa, "$ {s}", .{if (info.title.len > 0) info.title else if (std.fs.path.basename(info.cwd).len > 0) std.fs.path.basename(info.cwd) else "shell"}) catch &.{}
+            else
+                &.{},
         };
     }
 
@@ -1808,6 +1845,11 @@ pub const App = struct {
         const msg = proto.decode(proto.DaemonMsg, arena_state.allocator(), line) catch return;
 
         switch (msg) {
+            .shell_opened => |m| shell_tab.opened(self, m),
+            .shell_snapshot => |m| shell_tab.snapshot(self, m),
+            .shell_output => |m| shell_tab.output(self, m),
+            .shell_exited => |m| shell_tab.exited(self, m),
+            .shell_list_result => {},
             .daemon_stopping => {
                 // Deliberate shutdown must not enter the crash-reconnect path,
                 // which would immediately autostart a replacement daemon.
@@ -2259,6 +2301,7 @@ pub const App = struct {
                 if (m.context_limit > 0) view.context_limit = m.context_limit;
             },
             .err => |e| {
+                if (shell_tab.failed(self, e.request_id, e.msg)) return;
                 self.rejectInput(e.request_id);
                 self.setup.status_pending = false;
                 if (self.setup.apply_pending) {
@@ -2398,6 +2441,16 @@ pub const App = struct {
                     self.pushDurableBlock(b, .system_note, sn.text, "", .ok);
             },
             .compaction => self.pushDurableBlock(b, .compaction, "context compacted", "", .ok),
+            .shell_transcript => |st| {
+                const label = layout_mod.shellExitLabel(self.gpa, st.exit_code, st.signal) catch return;
+                defer self.gpa.free(label);
+                self.pushDurableBlock(b, .shell_transcript, st.text, label, .ok);
+                if (st.styled) |styled| if (styled.len > 0) {
+                    const rendered = &self.view.blocks.items[self.view.blocks.items.len - 1];
+                    if (rendered.seq == b.seq and rendered.styled.len == 0)
+                        rendered.styled = self.gpa.dupe(u8, styled) catch &.{};
+                };
+            },
         }
         if (!self.view.history_loading and !self.view.history_has_newer)
             self.trimHistoryWindow(true);
@@ -2537,8 +2590,7 @@ pub const App = struct {
     pub fn inputBlockedDuringReconnect(self: *App, text: []const u8) bool {
         if (!self.reconnecting) return false;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
-        if (std.mem.eql(u8, trimmed, "/quit") or std.mem.eql(u8, trimmed, "/q") or
-            std.mem.eql(u8, trimmed, "/detach")) return false;
+        if (commands.isQuitCommand(trimmed)) return false;
         self.setNotice("offline — reconnecting; draft kept, submit when connected", .{});
         return true;
     }
@@ -2548,9 +2600,11 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.view.attachments.items.len == 0) return;
         const is_command = isCommandInput(text);
-        const allowed_during_setup = std.mem.eql(u8, trimmed, "/quit") or
-            std.mem.eql(u8, trimmed, "/q") or
-            std.mem.eql(u8, trimmed, "/detach") or
+        // Commands that need no provider work before setup is done.
+        const head = trimmed[0 .. std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len];
+        const allowed_during_setup = commands.isQuitCommand(trimmed) or
+            std.mem.eql(u8, head, "/shutdown") or
+            std.mem.eql(u8, head, "/screenshot") or
             (is_command and trimmed[0] == '!');
         if (self.setup.required and !allowed_during_setup) {
             self.beginSetup(true);
@@ -3027,6 +3081,8 @@ pub const App = struct {
 
     pub fn maybeStartScreensaver(self: *App) void {
         if (self.screensaver_active or self.screensaver_timeout_ms == 0) return;
+        // A long build in the shell tab is not idleness.
+        if (shell_tab.active(self)) return;
         const deadline = self.screensaver_deadline_ms.load(.acquire);
         if (deadline != 0 and nowWallMs(self.io) >= deadline) self.startScreensaver(self.screensaver_kind);
     }
@@ -4704,6 +4760,9 @@ fn transcriptView(app: *App) Transcript {
 
 pub fn layoutLines(arena: std.mem.Allocator, app: *App, width: u16) !std.ArrayList(Line) {
     var transcript = transcriptView(app);
+    if (shell_tab.live(app)) |shell| if (!shell_tab.showingFullScreen(app)) {
+        transcript.extra_lines = try shell_tab.transcriptLines(shell, width);
+    };
     return layout_mod.layoutLines(arena, app.gpa, &transcript, width);
 }
 
@@ -5043,7 +5102,9 @@ fn flushTerminalNotification(app: *App, writer: *std.Io.Writer, arena: std.mem.A
 
 fn tabLabel(app: *const App, summary: ?*const SessionSummary) []const u8 {
     const identity = if (summary) |session|
-        if (session.title.len > 0)
+        if (session.shell_label.len > 0)
+            session.shell_label
+        else if (session.title.len > 0)
             session.title
         else if (std.fs.path.basename(session.cwd).len > 0)
             std.fs.path.basename(session.cwd)
@@ -5749,6 +5810,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const h = win.height;
     const w = win.width;
     if (h < 4 or w < 20) return;
+    shell_tab.sync(app);
     if (app.top_view != null) return drawTop(app, win, arena);
 
     if (app.show_tab_bar) try drawTabBar(app, win, arena);
@@ -5803,16 +5865,25 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const input_h: u16 = @intCast(inputPanelHeight(content_h) + @intFromBool(proposal_ready));
     // The plan's final framed row provides breathing room before the composer;
     // the ordinary transcript gap remains above the lowest surface.
-    const surfaces = planSurfaceLayout(h, top_rows, input_h, app.view.plan.items);
-    const plan_h = surfaces.plan_h;
-    const view_h = surfaces.view_h;
+    // A shell session has no composer or plan: its terminal fills the
+    // transcript area down to a blank row above the status line.
+    const shell_session = shell_tab.active(app);
+    const shell_full_screen = shell_tab.showingFullScreen(app);
+    const surfaces = planSurfaceLayout(h, top_rows, if (shell_session) 0 else input_h, if (shell_session) &.{} else app.view.plan.items);
+    const plan_h = if (shell_session) 0 else surfaces.plan_h;
+    const view_h = if (shell_session) @as(@TypeOf(surfaces.view_h), @intCast(@as(usize, h) -| top_rows -| shell_tab.bottom_rows)) else surfaces.view_h;
+    if (shell_session) shell_tab.fit(app, w, @intCast(view_h));
 
     // ---- session view ----
     var transcript = transcriptView(app);
     // On very short terminals the TODO panel may not fit; keep the ordinary
     // ticker in that case so liveness never disappears with the panel.
     transcript.show_working_ticker = plan_h == 0;
-    var lines = try layout_mod.layoutLines(arena, app.gpa, &transcript, w);
+    if (shell_tab.live(app)) |shell| if (!shell_full_screen) {
+        transcript.extra_lines = try shell_tab.transcriptLines(shell, w);
+    };
+    var lines: std.ArrayList(Line) = if (shell_full_screen) .empty else try layout_mod.layoutLines(arena, app.gpa, &transcript, w);
+    if (shell_full_screen) try shell_tab.drawFullScreen(app, arena, win.child(.{ .y_off = @intCast(top_rows), .height = @intCast(view_h) }));
     const total = lines.items.len;
     if (app.search.target_seq > 0 and !app.view.history_loading) {
         var target_index: ?usize = null;
@@ -5956,7 +6027,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
 
     // Empty-session welcome card: only when there is genuinely nothing to
     // show (fresh session, replay finished, no turn running).
-    if (total == 0 and !app.view.history_loading and app.view.state == .idle)
+    if (total == 0 and !app.view.history_loading and app.view.state == .idle and !shell_session)
         try drawWelcome(app, win, top_rows, view_h, arena);
 
     var hovered_timestamp: ?i64 = null;
@@ -6046,6 +6117,47 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
         }
     }
 
+    // A shell session draws the composer (over its bottom rows, without
+    // resizing the shell) only while a Marlin command is being typed.
+    if (shell_session and !shell_tab.commandLineOpen(app)) {
+        if (!shell_full_screen) shell_tab.placeCursor(app, win, @intCast(top_rows), @intCast(view_h), total);
+    } else try drawComposer(app, win, arena, .{
+        .h = h,
+        .w = w,
+        .input_h = input_h,
+        .plan_h = plan_h,
+        .content_h = content_h,
+        .panel_inner_w = panel_inner_w,
+        .prompt = prompt,
+        .proposal_ready = proposal_ready,
+    });
+
+    // ---- status bar ----
+    // Hover timestamps overlay the composer row; a shell session has none.
+    const timestamp_row: ?u16 = if (shell_session) null else h - input_h;
+    try drawStatusBar(app, win, arena, h, w, if (timestamp_row != null) hovered_timestamp else null, timestamp_row orelse 0);
+}
+
+const ComposerGeometry = struct {
+    h: u16,
+    w: u16,
+    input_h: u16,
+    plan_h: u16,
+    content_h: u16,
+    panel_inner_w: u16,
+    prompt: []const u8,
+    proposal_ready: bool,
+};
+
+fn drawComposer(app: *App, win: vaxis.Window, arena: std.mem.Allocator, g: ComposerGeometry) !void {
+    const h = g.h;
+    const w = g.w;
+    const input_h = g.input_h;
+    const plan_h = g.plan_h;
+    const content_h = g.content_h;
+    const panel_inner_w = g.panel_inner_w;
+    const prompt = g.prompt;
+    const proposal_ready = g.proposal_ready;
     const input_top = h - 1 - input_h;
     const plan_top = input_top -| plan_h;
     try drawPlan(app, win, arena, plan_top, plan_h);
@@ -6072,11 +6184,20 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     if (app.mode == .normal or app.history_search.active) win.hideCursor();
     if (app.setup.prompt == .none and !app.otel_header_prompt)
         try drawCommandMenu(app, win, arena, input_top, w);
+}
 
-    // ---- status bar ----
+fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16, w: u16, hovered_timestamp: ?i64, timestamp_row: u16) !void {
     const status_win = win.child(.{ .y_off = h - 1, .height = 1, .width = w });
     status_win.fill(.{ .style = Palette.status_bar });
-    const state_txt: []const u8 = if (app.view.login_required) "LOGIN REQUIRED" else if (app.view.pause != .none) @tagName(app.view.pause) else switch (app.view.state) {
+    // The shell prefix waits for its command: the whole line says which.
+    if (app.shell_prefix_pending and shell_tab.active(app)) {
+        _ = status_win.print(&.{
+            .{ .text = " shell ▸ ", .style = Palette.status_approval },
+            .{ .text = "1-9 tab · n/p next/prev · c new session · [ normal mode · : command · prefix again sends it", .style = Palette.status_bar },
+        }, .{ .wrap = .none });
+        return;
+    }
+    const state_txt: []const u8 = if (shell_tab.active(app)) "shell" else if (app.view.login_required) "LOGIN REQUIRED" else if (app.view.pause != .none) @tagName(app.view.pause) else switch (app.view.state) {
         .idle => "idle",
         .running => "running",
         .awaiting_approval => "APPROVAL?",
@@ -6530,7 +6651,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     drawUiAnimation(app, win);
     if (!app.screensaver_active) {
         if (hovered_timestamp) |timestamp|
-            try drawTimestampOverlay(win, arena, input_top + 1, timestamp);
+            try drawTimestampOverlay(win, arena, timestamp_row, timestamp);
     }
 }
 
@@ -6732,6 +6853,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     rt.* = new_rt;
     old.deinit();
     app.cacheWelcomeFacts();
+    shell_tab.connected(app);
     if (app.awaiting_new_session) {
         const command: []const u8 = if (app.reset_after_new_session) "/reset" else "/new";
         app.awaiting_new_session = false;
@@ -6831,10 +6953,12 @@ fn collectPastedKey(app: *App, gpa: std.mem.Allocator, key: vaxis.Key) void {
     }
 }
 
-/// Text pasted into the composer; takes ownership of `text` (gpa).
+/// Pasted text, to a live shell (as a paste the program can tell apart
+/// from typing) or the composer; takes ownership of `text` (gpa).
 fn pasteText(app: *App, gpa: std.mem.Allocator, text: []const u8) void {
     defer gpa.free(@constCast(text));
     app.hover_mouse = null;
+    if (shell_tab.paste(app, @constCast(text))) return app.recordUserActivity();
     if (app.dismissScreensaver()) return;
     app.recordUserActivity();
     app.view.editor.paste(text);
@@ -6860,6 +6984,8 @@ pub fn dispatchEvent(
             if (key.isModifier()) return;
             app.hover_mouse = null;
             app.recordUserActivity();
+            if (screenshot.isKey(key)) return screenshot.request(app, .full);
+            if (shell_tab.key(app, key)) return;
             if (app.gameKey(key, true)) return;
             if (app.dismissScreensaver()) return;
             try handleKey(app, key);
@@ -6874,9 +7000,11 @@ pub fn dispatchEvent(
         },
         .voice => |vev| app.handleVoiceEvent(vev),
         .wipeout => |wev| app.handleWipeoutEvent(wev),
+        .screenshot => |failure| screenshot.done(app, failure),
         .mouse => |m| {
             app.presence_last_activity_ms = nowWallMs(app.io);
             if (app.screensaver_active) return;
+            if (shell_tab.mouse(app, m)) return;
             app.hover_mouse = if (m.type == .motion and m.button == .none) m else null;
             vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null) .pointer else .default);
             if (linkAtMouse(vx.window(), m, app.link_super_held)) |uri| {
@@ -6935,8 +7063,12 @@ pub fn dispatchEvent(
             pasteText(app, gpa, text);
         },
         .daemon_line => |line| app.handleDaemonLine(line),
-        .daemon_gone => |reason| verdicts.conn_lost = reason,
+        .daemon_gone => |reason| {
+            shell_tab.connectionLost(app);
+            verdicts.conn_lost = reason;
+        },
         .reconnected => |maybe| {
+            shell_tab.connectionLost(app);
             app.cwd_completion_key = null;
             app.cwd_completion_waiting_key = null;
             verdicts.reconnect = maybe;
@@ -7084,7 +7216,10 @@ pub fn run(
             try conn.send(.{ .setup_status = .{ .probe_guests = false } });
             const setup = try conn.recvUntil(arena, .setup_status_result);
             setup_at_start = .fromWire(setup);
-            start_setup = !setup.completed and list.sessions.len == 0;
+            // First run opens setup only when the default model has no
+            // working backend; otherwise the user gets a session at once.
+            start_setup = !setup.completed and list.sessions.len == 0 and
+                !setup_at_start.?.modelReady(setup.default_model);
             effort_at_start = setup.default_effort;
             const configured_model_len = @min(setup.default_model.len, model_buf.len);
             @memcpy(model_buf[0..configured_model_len], setup.default_model[0..configured_model_len]);
@@ -7148,6 +7283,10 @@ pub fn run(
     app.bell_enabled = cfg.ui_bell;
     app.screensaver_timeout_ms = cfg.ui_screensaver_after_ms;
     app.screensaver_kind = effects.Kind.parse(cfg.ui_screensaver_effect) orelse .matrix;
+    app.shell_prefix = shell_tab.Prefix.parse(cfg.ui_shell_prefix) orelse prefix: {
+        app.setNotice("[ui] shell_prefix \"{s}\" is not a ctrl+key; using ctrl+b", .{cfg.ui_shell_prefix});
+        break :prefix .default;
+    };
     app.recordUserActivity();
     app.view.recap.last_activity_ms = 0;
     app.syncAnimationTicker();
@@ -7205,6 +7344,8 @@ pub fn run(
         defer loop.stop();
 
         try vx.enterAltScreen(writer);
+        log_gate.tui_active.store(true, .release);
+        defer log_gate.tui_active.store(false, .release);
         defer {
             vx.setTitle(writer, "") catch {};
             terminal_osc.writeProgress(writer, .hidden, 0) catch {};
@@ -7279,6 +7420,7 @@ pub fn run(
         defer app.animation_stop.store(true, .release);
 
         app.sendPresence(true);
+        shell_tab.connected(&app);
         app.conn.send(.{ .web_status = .{} }) catch {};
 
         // First frame before any event arrives.
@@ -7443,6 +7585,8 @@ pub fn run(
             try flushTerminalNotification(&app, writer, frame_arena.allocator());
             try draw(&app, &vx, frame_arena.allocator());
             try vx.render(writer);
+            screenshot.takePending(&app, &vx.screen);
+            if (app.kitty_graphics) shell_tab.showImages(&app, writer, frame_arena.allocator()) catch {};
             if (app.bell_pending) {
                 app.bell_pending = false;
                 try writer.writeAll("\x07");
@@ -7485,6 +7629,16 @@ pub fn run(
             .{reason},
         );
         return 1;
+    }
+    if (app.stop_daemon) {
+        const stop_conn = (attach.tryConnect(gpa, io, environ) catch null) orelse return 0;
+        defer stop_conn.deinit();
+        attach.handshake(stop_conn, 2_000, null) catch {};
+        attach.requestStop(stop_conn, .{ .shutdown = .{} }, 30_000) catch |err| {
+            try eprint(io, "marlin: daemon shutdown not confirmed ({t}); it may still be stopping\n", .{err});
+            return 1;
+        };
+        try eprint(io, "marlin: daemon stopped\n", .{});
     }
     return 0;
 }

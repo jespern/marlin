@@ -175,7 +175,7 @@ fn abiFromRet(ret: usize) ?u32 {
 pub fn grant(arena: std.mem.Allocator, ruleset_fd: i32, path: []const u8, rights: u64) !void {
     if (builtin.os.tag != .linux) return error.LandlockUnsupported;
     const linux = std.os.linux;
-    const path_z = try arena.dupeZ(u8, path);
+    const path_z = try arena.dupeSentinel(u8, path, 0);
     const open_ret = linux.open(path_z, .{ .PATH = true, .CLOEXEC = true }, 0);
     if (linux.errno(open_ret) != .SUCCESS) return error.OpenFailed;
     const fd: i32 = @intCast(open_ret);

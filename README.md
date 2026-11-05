@@ -406,11 +406,11 @@ SQLite library. Official release builds compile the vendored amalgamation into
 the binary. To reproduce that configuration locally:
 
 ```sh
-zig build -Doptimize=ReleaseSafe -Dembedded-sqlite=true
+zig build -Doptimize=safe -Dembedded-sqlite=true
 ```
 
 To temporarily replace the Marlin selected by your current `PATH` with this
-checkout's ReleaseFast build:
+checkout's `-Doptimize=fast` build:
 
 ```sh
 make install

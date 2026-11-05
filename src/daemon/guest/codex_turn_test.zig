@@ -119,7 +119,7 @@ test "codex permission modes reach new and resumed threads" {
     // Exercise both fresh threads and permission changes on existing threads.
     for ([_]loop.ToolProfile{ .full, .read_only, .plan }, 1..) |profile, session_id| {
         try store.createSession(session_id, 0, temp.path, "codex/default", .auto);
-        var live = std.atomic.Value(u8).init(@intFromEnum(approval.Mode.auto));
+        var live = std.atomic.Value(u8).init(@backingInt(approval.Mode.auto));
         const opts: loop.RunOpts = .{
             .session_id = session_id,
             .cwd = temp.path,
@@ -131,7 +131,7 @@ test "codex permission modes reach new and resumed threads" {
             .approval_mode_live = &live,
         };
         for ([_]approval.Mode{ .auto, .default, .auto }, 0..) |mode, turn| {
-            live.store(@intFromEnum(mode), .release);
+            live.store(@backingInt(mode), .release);
             const expected = try std.fmt.allocPrint(gpa, "{s} {s} {s}\n", .{
                 if (profile != .full) "read-only" else if (mode == .auto) "danger-full-access" else "workspace-write",
                 if (profile != .full or mode == .auto) "never" else "on-request",

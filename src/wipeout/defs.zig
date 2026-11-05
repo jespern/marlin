@@ -118,7 +118,7 @@ pub const pilot_portraits = [num_pilots][]const u8{
 };
 
 pub fn trackNumber(circuit: u8, class: RaceClass) u8 {
-    return circuit_tracks[circuit][@intFromEnum(class)];
+    return circuit_tracks[circuit][@backingInt(class)];
 }
 
 pub const CircuitSettings = struct {
@@ -162,7 +162,7 @@ pub const ai_settings = [2][7]AiSetting{
 
 pub fn aiSetting(class: RaceClass, inv_start_rank: u8) AiSetting {
     const index: usize = @min(@max(inv_start_rank, 1) - 1, 6);
-    return ai_settings[@intFromEnum(class)][index];
+    return ai_settings[@backingInt(class)][index];
 }
 
 pub const WeaponType = enum(u8) {

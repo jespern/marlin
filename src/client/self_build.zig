@@ -18,7 +18,7 @@ pub fn build(gpa: std.mem.Allocator, io: Io, label: []const u8) ![]u8 {
 
     try eprint(io, "marlin: building {s} in {s}...\n", .{ label, root });
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "zig", "build", "-Doptimize=ReleaseFast" },
+        .argv = &.{ "zig", "build", "-Doptimize=fast" },
         .cwd = .{ .path = root },
     });
     const term = try child.wait(io);

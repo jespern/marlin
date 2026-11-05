@@ -34,8 +34,7 @@ pub const Engine = enum {
     }
 
     pub fn parse(name: []const u8) ?Engine {
-        inline for (@typeInfo(Engine).@"enum".fields) |f| {
-            const e = @field(Engine, f.name);
+        for (std.meta.tags(Engine)) |e| {
             if (std.mem.eql(u8, name, e.configName())) return e;
         }
         return null;
@@ -241,7 +240,7 @@ pub fn download(
 
     const uri = try std.Uri.parse(url);
     var request = try client.request(.GET, uri, .{
-        .redirect_behavior = @enumFromInt(8),
+        .redirect_behavior = @fromBackingInt(@intCast(8)),
         .extra_headers = if (offset > 0)
             &.{.{ .name = "range", .value = range_value }}
         else
@@ -252,7 +251,7 @@ pub fn download(
 
     var redirect_buffer: [4096]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
-    const status = @intFromEnum(response.head.status);
+    const status = @backingInt(response.head.status);
     if (offset > 0 and status == 200) {
         // Server ignored the range: start over.
         offset = 0;

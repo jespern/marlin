@@ -40,8 +40,7 @@ test "scenes render deterministically and fill every channel" {
     defer gpa.free(b);
     const scratch = try gpa.alloc(u8, a.len);
     defer gpa.free(scratch);
-    inline for (std.meta.fields(Scene)) |field| {
-        const scene: Scene = @enumFromInt(field.value);
+    for (std.meta.tags(Scene)) |scene| {
         renderScene(scene, a, w, h, 37);
         renderScene(scene, b, w, h, 37);
         try std.testing.expectEqualSlices(u8, a, b);

@@ -177,26 +177,26 @@ pub const Weapons = extern struct {
             .missile => {
                 w.timer = missile_duration;
                 w.model = .missile;
-                w.trail_particle = @intFromEnum(particle.Kind.smoke);
-                w.track_hit_particle = @intFromEnum(particle.Kind.fire_white);
-                w.ship_hit_particle = @intFromEnum(particle.Kind.fire);
+                w.trail_particle = @backingInt(particle.Kind.smoke);
+                w.track_hit_particle = @backingInt(particle.Kind.fire_white);
+                w.ship_hit_particle = @backingInt(particle.Kind.fire);
                 w.target = ship.weapon_target;
                 w.drag = 0.25;
             },
             .rocket => {
                 w.timer = rocket_duration;
                 w.model = .rocket;
-                w.trail_particle = @intFromEnum(particle.Kind.smoke);
-                w.track_hit_particle = @intFromEnum(particle.Kind.fire_white);
-                w.ship_hit_particle = @intFromEnum(particle.Kind.fire);
+                w.trail_particle = @backingInt(particle.Kind.smoke);
+                w.track_hit_particle = @backingInt(particle.Kind.fire_white);
+                w.ship_hit_particle = @backingInt(particle.Kind.fire);
                 w.drag = 0.03125;
             },
             .ebolt => {
                 w.timer = ebolt_duration;
                 w.model = .ebolt;
-                w.trail_particle = @intFromEnum(particle.Kind.ebolt);
-                w.track_hit_particle = @intFromEnum(particle.Kind.ebolt);
-                w.ship_hit_particle = @intFromEnum(particle.Kind.greeny);
+                w.trail_particle = @backingInt(particle.Kind.ebolt);
+                w.track_hit_particle = @backingInt(particle.Kind.ebolt);
+                w.ship_hit_particle = @backingInt(particle.Kind.greeny);
                 w.target = ship.weapon_target;
                 w.drag = 0.25;
             },
@@ -253,7 +253,7 @@ pub const Weapons = extern struct {
             var p: usize = 0;
             while (p < 32) : (p += 1) {
                 if (w.ship_hit_particle >= 0) {
-                    ctx.particles.spawn(w.position, @enumFromInt(w.ship_hit_particle), base_vel.add(particle.randomVector(ctx.rng, 512)), 256, ctx.rng);
+                    ctx.particles.spawn(w.position, @fromBackingInt(@intCast(w.ship_hit_particle)), base_vel.add(particle.randomVector(ctx.rng, 512)), 256, ctx.rng);
                 }
             }
             return ship;
@@ -324,7 +324,7 @@ pub const Weapons = extern struct {
                     w.angle.y = ctx.rng.float(0, math.pi * 2);
                     w.trail_particle = no_particle;
                     w.track_hit_particle = no_particle;
-                    w.ship_hit_particle = @intFromEnum(particle.Kind.fire);
+                    w.ship_hit_particle = @backingInt(particle.Kind.fire);
                 },
                 .mine => if (w.timer <= 0) {
                     w.active = 0;
@@ -368,7 +368,7 @@ pub const Weapons = extern struct {
                     w.trail_spawn_timer += ctx.dt;
                     while (w.trail_spawn_timer > 0) {
                         const pos = w.position.sub(w.velocity.scale(30 * ctx.dt * w.trail_spawn_timer));
-                        ctx.particles.spawn(pos, @enumFromInt(w.trail_particle), particle.randomVector(ctx.rng, 128), 128, ctx.rng);
+                        ctx.particles.spawn(pos, @fromBackingInt(@intCast(w.trail_particle)), particle.randomVector(ctx.rng, 128), 128, ctx.rng);
                         w.trail_spawn_timer -= particle_spawn_rate;
                     }
                 }
@@ -378,7 +378,7 @@ pub const Weapons = extern struct {
                     var p: usize = 0;
                     while (p < 32) : (p += 1) {
                         if (w.track_hit_particle >= 0) {
-                            ctx.particles.spawn(w.position, @enumFromInt(w.track_hit_particle), particle.randomVector(ctx.rng, 512), 256, ctx.rng);
+                            ctx.particles.spawn(w.position, @fromBackingInt(@intCast(w.track_hit_particle)), particle.randomVector(ctx.rng, 512), 256, ctx.rng);
                         }
                     }
                     w.active = 0;

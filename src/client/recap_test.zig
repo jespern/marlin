@@ -1,6 +1,7 @@
 const std = @import("std");
 const recap = @import("recap.zig");
 const limits = @import("../core/recap.zig");
+const repeat = @import("../testing/repeat.zig").repeat;
 
 test {
     std.testing.refAllDecls(recap);
@@ -47,7 +48,7 @@ test "recap clipping keeps Unicode intact and collapses line breaks" {
     const text = try limits.plainText(gpa, "  Work\n\nfinished.\tReview next.  ");
     defer gpa.free(text);
     try std.testing.expectEqualStrings("Work finished. Review next.", text);
-    const long = try limits.plainText(gpa, "😀 " ** 300);
+    const long = try limits.plainText(gpa, repeat("😀 ", 300));
     defer gpa.free(long);
     try std.testing.expect(long.len <= limits.max_text_bytes);
     try std.testing.expect(std.unicode.utf8ValidateSlice(long));

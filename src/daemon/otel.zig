@@ -240,7 +240,7 @@ pub fn buildEndpoint(gpa: std.mem.Allocator, raw: []const u8, traces_specific: b
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
         !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InvalidOtelEndpoint;
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    _ = uri.getHost(&host_buf) catch return error.InvalidOtelEndpoint;
+    _ = std.Io.net.HostName.fromUri(uri, &host_buf) catch return error.InvalidOtelEndpoint;
 
     if (traces_specific or std.mem.endsWith(u8, raw, "/v1/traces"))
         return std.fmt.allocPrintSentinel(gpa, "{s}", .{raw}, 0);

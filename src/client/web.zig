@@ -291,7 +291,7 @@ fn logAccess(ctx: *ConnCtx, req: *const std.http.Server.Request, access: Access)
         @tagName(req.head.method),
         req.head.target,
         @tagName(req.head.version),
-        @intFromEnum(access.status),
+        @backingInt(access.status),
         access.bytes,
     }) catch return;
     writer.interface.flush() catch {};
@@ -399,12 +399,22 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !voi
     {
         var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
         defer arena_state.deinit();
-        _ = proto.decode(proto.ClientMsg, arena_state.allocator(), trimmed) catch {
+        const msg = proto.decode(proto.ClientMsg, arena_state.allocator(), trimmed) catch {
             try reply(req, access,
                 \\{"err":{"code":"bad_msg","msg":"not a valid client message"}}
             , .{ .status = .bad_request, .extra_headers = &json_header });
             return;
         };
+        // The shell tab is a terminal-client feature; a browser never gets a PTY.
+        switch (msg) {
+            .shell_open, .shell_input, .shell_resize, .shell_ack, .shell_close => {
+                try reply(req, access,
+                    \\{"err":{"code":"forbidden","msg":"shell messages are not available over the web bridge"}}
+                , .{ .status = .forbidden, .extra_headers = &json_header });
+                return;
+            },
+            else => {},
+        }
     }
 
     const conn = attach.connect(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe) catch {

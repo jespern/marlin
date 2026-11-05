@@ -25,8 +25,8 @@ pub const Kind = enum {
     rocket,
 
     pub fn parse(value: []const u8) ?Kind {
-        inline for (std.meta.fields(Kind)) |field| {
-            if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+        for (std.meta.tags(Kind)) |kind| {
+            if (std.ascii.eqlIgnoreCase(value, @tagName(kind))) return kind;
         }
         // daybreak's first name (2026-09-04), kept so a saved config still loads.
         if (std.ascii.eqlIgnoreCase(value, "shadowbox")) return .daybreak;
@@ -108,10 +108,9 @@ pub const kinds = std.enums.values(Kind);
 pub const usage_list = blk: {
     var text: []const u8 = "";
     var count: usize = 0;
-    for (std.meta.fields(Kind)) |field| {
-        const kind: Kind = @enumFromInt(field.value);
+    for (std.meta.tags(Kind)) |kind| {
         if (kind.playable()) continue;
-        text = text ++ (if (count == 0) "" else "|") ++ field.name;
+        text = text ++ (if (count == 0) "" else "|") ++ @tagName(kind);
         count += 1;
     }
     break :blk text;
@@ -120,10 +119,9 @@ pub const usage_list = blk: {
 pub const configurable_usage_list = blk: {
     var text: []const u8 = "";
     var count: usize = 0;
-    for (std.meta.fields(Kind)) |field| {
-        const kind: Kind = @enumFromInt(field.value);
+    for (std.meta.tags(Kind)) |kind| {
         if (!kind.configurable() or kind.playable()) continue;
-        text = text ++ (if (count == 0) "" else "|") ++ field.name;
+        text = text ++ (if (count == 0) "" else "|") ++ @tagName(kind);
         count += 1;
     }
     break :blk text;
