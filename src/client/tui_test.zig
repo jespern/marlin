@@ -6916,3 +6916,50 @@ test "a model is ready when its backend is, and unknown prefixes are trusted" {
     try std.testing.expect(!ready.modelReady("codex/default"));
     try std.testing.expect(ready.modelReady("someday/model"));
 }
+
+test "a bracketed paste arrives as one paste, not as keystrokes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    var verdicts = TransportVerdicts{};
+    const pasteKeys = struct {
+        /// The keys vaxis reports for `text` inside a bracketed paste.
+        fn send(a: *App, v: *TransportVerdicts, text: []const u8) !void {
+            try dispatchEvent(a, undefined, undefined, std.testing.allocator, .paste_start, v);
+            for (text, 0..) |byte, i| {
+                const key: vaxis.Key = switch (byte) {
+                    '\r' => .{ .codepoint = vaxis.Key.enter },
+                    '\n' => .{ .codepoint = 'j', .mods = .{ .ctrl = true } },
+                    '\t' => .{ .codepoint = vaxis.Key.tab },
+                    else => .{ .codepoint = byte, .text = text[i .. i + 1] },
+                };
+                try dispatchEvent(a, undefined, undefined, std.testing.allocator, .{ .key_press = key }, v);
+            }
+            try dispatchEvent(a, undefined, undefined, std.testing.allocator, .paste_end, v);
+        }
+    }.send;
+
+    // Pasted newlines are text, not Enter: nothing is submitted. CRLF and
+    // a terminal's CR-for-newline both become "\n".
+    try pasteKeys(&app, &verdicts, "a\r\nb\tc\rd");
+    try std.testing.expectEqualStrings("a\nb\tc\nd", app.view.editor.text.items);
+    try std.testing.expect(app.paste_collect == null);
+
+    // A long paste becomes a chip that expands to the whole text on submit.
+    app.view.editor.clear();
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(gpa);
+    for (0..400) |i| try long.print(gpa, "line {d:0>4} alpha beta gamma\r", .{i});
+    try pasteKeys(&app, &verdicts, long.items);
+    try std.testing.expectEqualStrings("[paste #1: 401 lines]", app.view.editor.text.items);
+    const expanded = try app.view.editor.takeExpandedWithImages(0);
+    defer gpa.free(expanded);
+    try std.testing.expect(std.mem.startsWith(u8, expanded, "line 0000 alpha beta gamma\nline 0001"));
+    try std.testing.expect(std.mem.endsWith(u8, expanded, "line 0399 alpha beta gamma\n"));
+
+    // Keys after the paste behave as keys again.
+    try dispatchEvent(&app, undefined, undefined, gpa, .{ .key_press = .{ .codepoint = 'x', .text = "x" } }, &verdicts);
+    try std.testing.expectEqualStrings("x", app.view.editor.text.items);
+}

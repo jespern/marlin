@@ -471,3 +471,26 @@ test "a new shell starts in place: the empty screen below its prompt is not show
     try std.testing.expectEqualStrings("$", std.mem.trimEnd(u8, lines[1].text, " "));
     try std.testing.expectEqual(@as(usize, 2), state.screen_rows_shown);
 }
+
+test "a bracketed paste reaches the shell as one paste" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    const arena = h.arena.allocator();
+    try h.openShell("$ ");
+    var verdicts = tui.TransportVerdicts{};
+    const gpa = std.testing.allocator;
+    try tui.dispatchEvent(&h.app, undefined, undefined, gpa, .paste_start, &verdicts);
+    for ([_]vaxis.Key{
+        .{ .codepoint = 'a', .text = "a" },
+        .{ .codepoint = vaxis.Key.enter },
+        .{ .codepoint = 'b', .text = "b" },
+    }) |key| try tui.dispatchEvent(&h.app, undefined, undefined, gpa, .{ .key_press = key }, &verdicts);
+    try std.testing.expectEqual(@as(usize, 0), (try h.sent()).len); // nothing typed yet
+    try tui.dispatchEvent(&h.app, undefined, undefined, gpa, .paste_end, &verdicts);
+    const msgs = try h.sent();
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    const bytes = try decodedInput(arena, msgs[0]);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "b") != null);
+}

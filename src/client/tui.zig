@@ -136,9 +136,13 @@ pub const Event = union(enum) {
     winsize: vaxis.Winsize,
     /// Animation clock; posted only while a turn is running.
     tick,
-    /// Bracketed paste text (allocated by the loop's paste allocator = gpa;
-    /// handler frees).
+    /// Pasted text, gpa-owned (handler frees): an OSC 52 clipboard reply,
+    /// or a bracketed paste collected between paste_start and paste_end.
     paste: []const u8,
+    /// Bracketed paste markers. vaxis reports the pasted text in between as
+    /// ordinary key presses; they are collected into one `paste`.
+    paste_start,
+    paste_end,
     /// One raw NDJSON line from the daemon (gpa-owned; handler frees).
     daemon_line: []u8,
     /// Stable error name from the reader thread (for example EndOfStream).
@@ -692,6 +696,11 @@ pub const App = struct {
     /// Transient one-line notice shown in the status bar.
     notice: std.ArrayList(u8) = .empty,
     should_quit: bool = false,
+    /// Set between paste_start and paste_end: the keys of a bracketed paste
+    /// are its text, not commands (a pasted newline must not submit).
+    paste_collect: ?std.ArrayList(u8) = null,
+    /// The last pasted key was CR, so a following LF is the same newline.
+    paste_after_cr: bool = false,
     /// `/shutdown`: once the TUI is down, stop the daemon too.
     stop_daemon: bool = false,
     awaiting_new_session: bool = false,
@@ -764,6 +773,7 @@ pub const App = struct {
         if (self.wipeout_download) |progress| self.gpa.destroy(progress);
         if (self.screenshot_thread) |t| t.join();
         self.recent_sessions.deinit(self.gpa);
+        if (self.paste_collect) |*collected| collected.deinit(self.gpa);
         self.tab_hits.deinit(self.gpa);
         self.web_text.deinit(self.gpa);
         self.terminal_title.deinit(self.gpa);
@@ -6927,6 +6937,41 @@ fn openExternalLink(app: *App, uri: []const u8) void {
 /// The one place every Event variant is handled. The main loop calls it for
 /// the event it woke on and for each event drained behind a daemon line, so
 /// a new variant is added here once and the compiler enforces coverage.
+/// Largest bracketed paste kept; the rest is dropped.
+const max_paste_bytes: usize = 16 * 1024 * 1024;
+
+/// One key of a bracketed paste, as the text it stands for. Terminals send
+/// a pasted newline as CR (Enter), some as CRLF or LF (Ctrl+J); each is one
+/// "\n". Other control keys carry no text and are dropped.
+fn collectPastedKey(app: *App, gpa: std.mem.Allocator, key: vaxis.Key) void {
+    const collected = &app.paste_collect.?;
+    const after_cr = app.paste_after_cr;
+    app.paste_after_cr = false;
+    if (collected.items.len >= max_paste_bytes) return;
+    if (key.matches(vaxis.Key.enter, .{})) {
+        collected.append(gpa, '\n') catch {};
+        app.paste_after_cr = true;
+    } else if (key.matches('j', .{ .ctrl = true })) {
+        if (!after_cr) collected.append(gpa, '\n') catch {};
+    } else if (key.matches(vaxis.Key.tab, .{})) {
+        collected.append(gpa, '\t') catch {};
+    } else if (key.text) |text| {
+        collected.appendSlice(gpa, text) catch {};
+    }
+}
+
+/// Pasted text, to a live shell (as a paste the program can tell apart
+/// from typing) or the composer; takes ownership of `text` (gpa).
+fn pasteText(app: *App, gpa: std.mem.Allocator, text: []const u8) void {
+    defer gpa.free(@constCast(text));
+    app.hover_mouse = null;
+    if (shell_tab.paste(app, @constCast(text))) return app.recordUserActivity();
+    if (app.dismissScreensaver()) return;
+    app.recordUserActivity();
+    app.view.editor.paste(text);
+    if (app.otel_header_prompt or app.setup.prompt == .credential) @memset(@constCast(text), 0);
+}
+
 pub fn dispatchEvent(
     app: *App,
     vx: *vaxis.Vaxis,
@@ -6937,6 +6982,7 @@ pub fn dispatchEvent(
 ) !void {
     switch (event) {
         .key_press => |key| {
+            if (app.paste_collect != null) return collectPastedKey(app, gpa, key);
             // A lone modifier press is not intent: cmd-tab away from the
             // terminal reports the cmd press itself (kitty protocol), and
             // that must not dismiss the screensaver or count as activity.
@@ -7009,21 +7055,19 @@ pub fn dispatchEvent(
             }
             try vx.resize(gpa, tty.writer(), ws);
         },
-        .paste => |text| {
-            app.hover_mouse = null;
-            if (shell_tab.paste(app, @constCast(text))) {
-                app.recordUserActivity();
-                gpa.free(@constCast(text));
+        .paste => |text| pasteText(app, gpa, text),
+        .paste_start => {
+            if (app.paste_collect == null) app.paste_collect = .empty;
+            app.paste_after_cr = false;
+        },
+        .paste_end => {
+            var collected = app.paste_collect orelse return;
+            app.paste_collect = null;
+            const text = collected.toOwnedSlice(gpa) catch {
+                collected.deinit(gpa);
                 return;
-            }
-            if (app.dismissScreensaver()) {
-                gpa.free(@constCast(text));
-                return;
-            }
-            app.recordUserActivity();
-            app.view.editor.paste(text);
-            if (app.otel_header_prompt or app.setup.prompt == .credential) @memset(@constCast(text), 0);
-            gpa.free(@constCast(text));
+            };
+            pasteText(app, gpa, text);
         },
         .daemon_line => |line| app.handleDaemonLine(line),
         .daemon_gone => |reason| {
@@ -7420,7 +7464,15 @@ pub fn run(
                         try dispatchEvent(&app, &vx, &tty, gpa, queued, &verdicts);
                     }
                 },
-                else => try dispatchEvent(&app, &vx, &tty, gpa, event, &verdicts),
+                else => {
+                    try dispatchEvent(&app, &vx, &tty, gpa, event, &verdicts);
+                    // A bracketed paste arrives as one key event per
+                    // character: take what is queued of it before redrawing.
+                    while (app.paste_collect != null) {
+                        const queued = (try loop.tryEvent()) orelse break;
+                        try dispatchEvent(&app, &vx, &tty, gpa, queued, &verdicts);
+                    }
+                },
             }
             const conn_lost = verdicts.conn_lost;
             const reconnect_verdict = verdicts.reconnect;
