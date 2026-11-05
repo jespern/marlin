@@ -566,6 +566,9 @@ fn ccInvoke(
                 .child_output => |nested_output| {
                     try activity.appendOutput(nested_output.parent_tool_use_id, nested_output.text);
                 },
+                .child_model => |nested| {
+                    try activity.setModel(nested.parent_tool_use_id, nested.model);
+                },
                 .reasoning => |text| {
                     _ = try ap.append(.{ .reasoning = .{ .text = text } });
                 },

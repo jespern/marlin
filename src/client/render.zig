@@ -922,6 +922,10 @@ pub fn applyLineLinks(win: vaxis.Window, row: u16, line: Line) void {
         var it = vaxis.unicode.graphemeIterator(part);
         while (it.next()) |grapheme| {
             const bytes = grapheme.bytes(part);
+            // Rows print without wrapping, which stops at the first newline
+            // (a heredoc's body behind a Bash header). Links past it would
+            // underline blank cells further along the row.
+            if (std.mem.eql(u8, bytes, "\n")) return;
             const start = byte_offset + part_offset;
             const end = start + bytes.len;
             const cell_width: usize = @intCast(win.gwidth(bytes));

@@ -194,3 +194,10 @@ test "standalone top owns global activity snapshots and clears them" {
     view.handleLine(try proto.encode(gpa, proto.DaemonMsg{ .guest_activity = .{ .sid = 7, .items = &.{} } }));
     try std.testing.expectEqual(@as(usize, 0), view.activity(7).len);
 }
+
+test "activity rows show a subagent's model, falling back to the work kind" {
+    try std.testing.expectEqualStrings("claude-haiku-5-5", top.activityModelLabel(.{ .id = "a", .kind = .agent, .name = "Agent", .model = "claude-haiku-5-5" }));
+    try std.testing.expectEqualStrings("gpt-5.5", top.activityModelLabel(.{ .id = "a", .kind = .agent, .name = "Agent", .model = "openai/gpt-5.5" }));
+    try std.testing.expectEqualStrings("agent", top.activityModelLabel(.{ .id = "a", .kind = .agent, .name = "Agent" }));
+    try std.testing.expectEqualStrings("process", top.activityModelLabel(.{ .id = "p", .kind = .process, .name = "Bash" }));
+}

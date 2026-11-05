@@ -13,6 +13,7 @@ const Owned = struct {
     kind: proto.GuestActivityKind,
     name: []u8,
     detail: []u8,
+    model: []u8,
     output: []u8,
     started_at_ms: i64,
 
@@ -21,6 +22,7 @@ const Owned = struct {
         gpa.free(self.parent_id);
         gpa.free(self.name);
         gpa.free(self.detail);
+        gpa.free(self.model);
         gpa.free(self.output);
     }
 };
@@ -77,6 +79,8 @@ pub const Tracker = struct {
         errdefer self.gpa.free(owned_name);
         const owned_detail = try self.gpa.dupe(u8, detail);
         errdefer self.gpa.free(owned_detail);
+        const owned_model = try self.gpa.dupe(u8, "");
+        errdefer self.gpa.free(owned_model);
         const owned_output = try self.gpa.dupe(u8, "");
         errdefer self.gpa.free(owned_output);
         const owned = Owned{
@@ -85,6 +89,7 @@ pub const Tracker = struct {
             .kind = kind,
             .name = owned_name,
             .detail = owned_detail,
+            .model = owned_model,
             .output = owned_output,
             .started_at_ms = started_at_ms,
         };
@@ -107,6 +112,21 @@ pub const Tracker = struct {
                 @memcpy(replacement[keep_old..], bytes[bytes.len - keep_new ..]);
             self.gpa.free(item.output);
             item.output = replacement;
+            self.publish();
+            return;
+        }
+    }
+
+    /// Record the model a node runs on. Unknown ids and repeats are no-ops,
+    /// so adapters may report it on every message.
+    pub fn setModel(self: *Tracker, id: []const u8, model: []const u8) !void {
+        if (id.len == 0 or model.len == 0) return;
+        for (self.items.items) |*item| {
+            if (!std.mem.eql(u8, item.id, id)) continue;
+            if (std.mem.eql(u8, item.model, model)) return;
+            const replacement = try self.gpa.dupe(u8, model);
+            self.gpa.free(item.model);
+            item.model = replacement;
             self.publish();
             return;
         }
@@ -167,6 +187,7 @@ pub const Tracker = struct {
             .kind = item.kind,
             .name = item.name,
             .detail = item.detail,
+            .model = item.model,
             .output = item.output,
             .started_at_ms = item.started_at_ms,
         });

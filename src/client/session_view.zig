@@ -248,6 +248,7 @@ pub const SessionView = struct {
             .kind = item.kind,
             .name = try a.dupe(u8, item.name),
             .detail = try a.dupe(u8, item.detail),
+            .model = try a.dupe(u8, item.model),
             .output = try a.dupe(u8, item.output),
             .started_at_ms = item.started_at_ms,
         };

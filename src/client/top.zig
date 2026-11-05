@@ -326,6 +326,16 @@ fn activityIcon(kind: proto.GuestActivityKind) []const u8 {
     };
 }
 
+/// MODEL column for an activity row: the subagent's model when the guest
+/// reported one, otherwise what kind of work the row is.
+pub fn activityModelLabel(item: proto.GuestActivity) []const u8 {
+    return if (item.model.len > 0) modelName(item.model) else activityKindLabel(item.kind);
+}
+
+fn activityModelSuffix(arena: std.mem.Allocator, item: proto.GuestActivity) ![]const u8 {
+    return if (item.model.len > 0) std.fmt.allocPrint(arena, " · model {s}", .{item.model}) else "";
+}
+
 fn activityKindLabel(kind: proto.GuestActivityKind) []const u8 {
     return switch (kind) {
         .agent => "agent",
@@ -413,7 +423,7 @@ pub fn drawActivityInspector(
     const detail_top = win.height - detail_rows - 1;
     const detail_win = win.child(.{ .y_off = @intCast(detail_top), .height = @intCast(detail_rows), .width = win.width });
     detail_win.fill(.{ .style = Palette.prompt_panel });
-    const identity = try std.fmt.allocPrint(arena, " {s} {s}  id {s}", .{ activityIcon(chosen.kind), activityKindLabel(chosen.kind), chosen.id });
+    const identity = try std.fmt.allocPrint(arena, " {s} {s}  id {s}{s}", .{ activityIcon(chosen.kind), activityKindLabel(chosen.kind), chosen.id, try activityModelSuffix(arena, chosen) });
     _ = detail_win.printSegment(.{ .text = truncateRight(identity, win.width -| 1), .style = .{ .fg = Palette.soft_blue, .bold = true } }, .{ .wrap = .none });
     if (detail_rows > 1 and chosen.parent_id.len > 0) {
         const parent = try std.fmt.allocPrint(arena, " parent {s}", .{chosen.parent_id});
@@ -536,7 +546,7 @@ fn activitySegments(
     if (columns.model > 0) {
         out[n] = .{ .text = "  ", .style = base };
         n += 1;
-        out[n] = .{ .text = try padded(arena, activityKindLabel(row.item.kind), columns.model, false), .style = base };
+        out[n] = .{ .text = try padded(arena, truncateRight(activityModelLabel(row.item), columns.model), columns.model, false), .style = base };
         n += 1;
     }
     if (columns.cwd > 0) {
@@ -554,7 +564,7 @@ fn activitySegments(
 
 fn drawActivityDetail(win: vaxis.Window, arena: std.mem.Allocator, row: ActivityRow) !void {
     win.fill(.{ .style = Palette.prompt_panel });
-    const identity = try std.fmt.allocPrint(arena, " {s} {s} · id {s}", .{ activityIcon(row.item.kind), activityKindLabel(row.item.kind), row.item.id });
+    const identity = try std.fmt.allocPrint(arena, " {s} {s} · id {s}{s}", .{ activityIcon(row.item.kind), activityKindLabel(row.item.kind), row.item.id, try activityModelSuffix(arena, row.item) });
     _ = win.printSegment(.{ .text = truncateRight(identity, win.width -| 1), .style = .{ .fg = Palette.soft_blue, .bold = true } }, .{ .wrap = .none });
     if (win.height > 1 and row.item.parent_id.len > 0) {
         const parent = try std.fmt.allocPrint(arena, " parent {s}", .{row.item.parent_id});
@@ -784,6 +794,7 @@ pub const Top = struct {
             .kind = item.kind,
             .name = a.dupe(u8, item.name) catch return arena.deinit(),
             .detail = a.dupe(u8, item.detail) catch return arena.deinit(),
+            .model = a.dupe(u8, item.model) catch return arena.deinit(),
             .output = a.dupe(u8, item.output) catch return arena.deinit(),
             .started_at_ms = item.started_at_ms,
         };

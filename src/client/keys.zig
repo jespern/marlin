@@ -413,24 +413,24 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
             return;
         }
     }
-    // Nothing parked HERE but something parked elsewhere: y/n jump to it
-    // instead of dead-keying. Deliberately never answers a background
-    // approval blind — you approve only what is on screen.
-    if (app.view.pending == null and app.view.editor.isEmpty() and
-        (key.matches('y', .{}) or key.matches('n', .{})))
-    {
-        if (app.firstAwaitingSid()) |awaiting_sid| {
-            app.switchSession(awaiting_sid, true) catch return;
-            app.setNotice("approval pending here — y approves, n denies", .{});
-            return;
-        }
-    }
-
     switch (app.mode) {
         .insert => {
             const ed = &app.view.editor;
             if (key.matches('r', .{ .ctrl = true })) {
                 app.beginHistorySearch();
+                return;
+            }
+            // Paging follows the wheel contract: scrolling back is a
+            // normal-mode excursion, and paging down to the bottom ends it.
+            if (key.matches(vaxis.Key.page_up, .{})) {
+                app.view.scroll_up +|= 20;
+                app.mode = .normal;
+                app.maybeRequestHistoryAtTop();
+                return;
+            }
+            if (key.matches(vaxis.Key.page_down, .{})) {
+                app.view.scroll_up -|= 20;
+                app.maybeRequestHistoryAtBottom();
                 return;
             }
             // Same width draw() gives the editor: terminal minus the prompt.
@@ -671,6 +671,11 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
             } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
                 app.view.scroll_up -|= 20 * app.takeCount();
                 app.maybeRequestHistoryAtBottom();
+                // Like wheel-down: PgDn back to the live tail resumes typing.
+                // Ctrl-D stays a pure vim motion.
+                if (key.matches(vaxis.Key.page_down, .{}) and app.view.scroll_up == 0 and
+                    !app.view.history_has_newer)
+                    app.mode = .insert;
             } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
                 app.view.scroll_up +|= 20 * app.takeCount();
                 app.maybeRequestHistoryAtTop();

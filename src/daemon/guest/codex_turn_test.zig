@@ -367,3 +367,34 @@ test "Codex terminal failure continues the same thread with bounded attempts and
         try std.testing.expectEqual(@as(usize, 1), results);
     }
 }
+
+test "codex subagent threads publish the model they run on" {
+    const Sink = struct {
+        model: [64]u8 = undefined,
+        len: usize = 0,
+        fn publish(ctx: ?*anyopaque, items: []const proto.GuestActivity) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.len = 0;
+            if (items.len == 0) return;
+            self.len = @min(items[0].model.len, self.model.len);
+            @memcpy(self.model[0..self.len], items[0].model[0..self.len]);
+        }
+    };
+    var sink: Sink = .{};
+    const guest_activity = @import("activity.zig");
+    var tracker = guest_activity.Tracker.init(std.testing.allocator, Sink.publish, &sink);
+    defer tracker.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"thread":{"id":"child","parentThreadId":"root","agentNickname":"Scout","model":"gpt-5.5-codex"}}
+    , .{});
+    defer parsed.deinit();
+    try codex_turn.codexThreadStarted(&tracker, parsed.value, "root", 10);
+    try std.testing.expectEqualStrings("gpt-5.5-codex", sink.model[0..sink.len]);
+
+    // Repeats are no-ops and an empty report never clears a known model.
+    try tracker.setModel("child", "");
+    try tracker.setModel("unknown", "other");
+    try std.testing.expectEqualStrings("gpt-5.5-codex", sink.model[0..sink.len]);
+    try tracker.setModel("child", "gpt-5.5");
+    try std.testing.expectEqualStrings("gpt-5.5", sink.model[0..sink.len]);
+}

@@ -198,6 +198,11 @@ pub const Event = union(enum) {
         parent_tool_use_id: []const u8,
         text: []const u8,
     },
+    /// Model reported on a forwarded Claude subagent message.
+    child_model: struct {
+        parent_tool_use_id: []const u8,
+        model: []const u8,
+    },
     /// Completed assistant thinking content block.
     reasoning: []const u8,
     /// Assistant tool_use content block.
@@ -344,6 +349,11 @@ pub fn decodeLine(
                 } });
             }
         }
+        if (parent_tool_use_id.len > 0) if (messageModel(root)) |model|
+            try out.append(arena, .{ .child_model = .{
+                .parent_tool_use_id = parent_tool_use_id,
+                .model = model,
+            } });
         return;
     }
     if (std.mem.eql(u8, t, "stream_event")) {
@@ -447,6 +457,13 @@ pub fn decodeLine(
         return;
     }
     // Unknown types are forward-compatible and ignored.
+}
+
+fn messageModel(root: std.json.ObjectMap) ?[]const u8 {
+    const msg = root.get("message") orelse return null;
+    if (msg != .object) return null;
+    const model = strField(msg.object, "model") orelse return null;
+    return if (model.len > 0) model else null;
 }
 
 fn messageContent(root: std.json.ObjectMap) ?[]std.json.Value {

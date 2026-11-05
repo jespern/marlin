@@ -515,6 +515,21 @@ fn wrapInputCard(
     if (body_width < 8) return;
 
     try lines.append(arena, .{ .text = if (queued) "   Queued" else "", .style = Palette.prompt_hint, .fill_style = Palette.prompt_panel });
+    // A message with no text (an image alone, say) still gets a visible
+    // body rather than a bare prompt mark.
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        var placeholder_style = text_style;
+        placeholder_style.italic = true;
+        try lines.append(arena, .{
+            .text = first_prefix,
+            .style = if (steer) Palette.steer else Palette.prompt_mark,
+            .text2 = "(empty input)",
+            .style2 = placeholder_style,
+            .fill_style = Palette.prompt_panel,
+        });
+        try lines.append(arena, .{ .text = "", .style = Palette.prompt_text, .fill_style = Palette.prompt_panel });
+        return;
+    }
     var first = true;
     var logical = std.mem.splitScalar(u8, text, '\n');
     while (logical.next()) |raw_line| {
@@ -1475,7 +1490,10 @@ fn appendGuestActivityChildren(
             .style = Palette.working,
             .text2 = activity_text,
             .style2 = if (item.kind == .agent) Palette.status_model else Palette.collapse_hint,
-            .text3 = try std.fmt.allocPrint(arena, " · {s}", .{try secondsAlloc(arena, elapsed_s)}),
+            .text3 = if (item.model.len > 0)
+                try std.fmt.allocPrint(arena, " · {s} · {s}", .{ item.model, try secondsAlloc(arena, elapsed_s) })
+            else
+                try std.fmt.allocPrint(arena, " · {s}", .{try secondsAlloc(arena, elapsed_s)}),
             .style3 = Palette.collapse_hint,
             .syntax = if (std.ascii.eqlIgnoreCase(item.name, "bash") and item_detail.len > 0)
                 try shellCommandSpans(arena, item_detail, 2 + activity_head.len + " · ".len)

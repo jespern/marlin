@@ -409,3 +409,26 @@ test "decode: stream-json stdin replay is surfaced as user input" {
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expectEqualStrings("change direction", events.items[0].replayed_user);
 }
+
+test "decode: forwarded subagent messages report the subagent's model" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+
+    try decodeLine(arena,
+        \\{"type":"assistant","parent_tool_use_id":"agent-1","message":{"model":"claude-haiku-5-5","content":[{"type":"text","text":"child prose"}]}}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expectEqualStrings("child prose", events.items[0].child_output.text);
+    try std.testing.expectEqualStrings("agent-1", events.items[1].child_model.parent_tool_use_id);
+    try std.testing.expectEqualStrings("claude-haiku-5-5", events.items[1].child_model.model);
+
+    // The root agent's own model is the session's, not a subagent's.
+    events.clearRetainingCapacity();
+    try decodeLine(arena,
+        \\{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"root prose"}]}}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("root prose", events.items[0].text);
+}

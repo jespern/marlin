@@ -374,7 +374,7 @@ fn codexSubagentEvent(
     return true;
 }
 
-fn codexThreadStarted(
+pub fn codexThreadStarted(
     activity: *guest_activity.Tracker,
     params: std.json.Value,
     root_thread_id: []const u8,
@@ -394,6 +394,7 @@ fn codexThreadStarted(
         codex.strField(thread, "preview") orelse "",
         started_at_ms,
     );
+    try activity.setModel(id, codex.strField(thread, "model") orelse "");
 }
 
 fn appendCodexItemStarted(

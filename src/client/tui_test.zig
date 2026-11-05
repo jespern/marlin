@@ -3846,6 +3846,36 @@ test "mouse scroll changes composer mode and G returns to insert at the live tai
     try std.testing.expectEqual(Mode.insert, app.mode);
 }
 
+test "page keys scroll from insert mode and page down to the tail resumes typing" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.view.editor.insertSlice("draft");
+
+    try handleKey(&app, .{ .codepoint = vaxis.Key.page_up });
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try std.testing.expectEqual(@as(usize, 20), app.view.scroll_up);
+    try std.testing.expectEqualStrings("draft", app.view.editor.text.items);
+
+    try handleKey(&app, .{ .codepoint = vaxis.Key.page_up });
+    try std.testing.expectEqual(@as(usize, 40), app.view.scroll_up);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.page_down });
+    try std.testing.expectEqual(@as(usize, 20), app.view.scroll_up);
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.page_down });
+    try std.testing.expectEqual(@as(usize, 0), app.view.scroll_up);
+    try std.testing.expectEqual(Mode.insert, app.mode);
+
+    // Ctrl-D is a vim motion; reaching the tail with it stays in normal.
+    app.mode = .normal;
+    app.view.scroll_up = 20;
+    try handleKey(&app, .{ .codepoint = 'd', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqual(@as(usize, 0), app.view.scroll_up);
+    try std.testing.expectEqual(Mode.normal, app.mode);
+}
+
 test "active prompt scrolls normally before sticking at the top" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -5047,7 +5077,7 @@ test "plan table uses semantic markers, stable columns, and concise timing" {
     try std.testing.expectEqual(@as(?u64, 3_000), planItemTimeMs(&app, timed_active, 50_000));
 }
 
-test "parked approvals are findable per tree and globally; badge follows the session" {
+test "parked approvals are findable per tree; typing never jumps tabs" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -5094,8 +5124,12 @@ test "parked approvals are findable per tree and globally; badge follows the ses
     // Activating the flagged tree lands on the parked child, not the root.
     try std.testing.expectEqual(@as(?u64, 21), app.awaitingSessionInTree(20));
     try std.testing.expectEqual(@as(?u64, null), app.awaitingSessionInTree(10));
-    // y/n with nothing parked here jumps to the parked session.
-    try std.testing.expectEqual(@as(?u64, 21), app.firstAwaitingSid());
+    // A question or approval parked in another tab never pulls you there:
+    // y/n starting a message ("no, …") just type.
+    try handleKey(&app, .{ .codepoint = 'n', .text = "n" });
+    try std.testing.expectEqual(@as(u64, 10), app.view.sid);
+    try std.testing.expectEqualStrings("n", app.view.editor.text.items);
+    app.view.editor.clear();
 
     // FULL ACCESS is per session (server truth), not App state: an upsert
     // for the focused session updates the badge; other sessions never do.
@@ -6893,4 +6927,51 @@ test "composer history survives transcript eviction and routes late replies to t
     try app.switchSession(7, true);
     app.view.editor.histUp();
     try std.testing.expectEqualStrings("late prompt", app.view.editor.text.items);
+}
+
+test "a bracketed paste arrives as one paste, not as keystrokes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    var verdicts = TransportVerdicts{};
+    const pasteKeys = struct {
+        /// The keys vaxis reports for `text` inside a bracketed paste.
+        fn send(a: *App, v: *TransportVerdicts, text: []const u8) !void {
+            try dispatchEvent(a, undefined, undefined, std.testing.allocator, .paste_start, v);
+            for (text, 0..) |byte, i| {
+                const key: vaxis.Key = switch (byte) {
+                    '\r' => .{ .codepoint = vaxis.Key.enter },
+                    '\n' => .{ .codepoint = 'j', .mods = .{ .ctrl = true } },
+                    '\t' => .{ .codepoint = vaxis.Key.tab },
+                    else => .{ .codepoint = byte, .text = text[i .. i + 1] },
+                };
+                try dispatchEvent(a, undefined, undefined, std.testing.allocator, .{ .key_press = key }, v);
+            }
+            try dispatchEvent(a, undefined, undefined, std.testing.allocator, .paste_end, v);
+        }
+    }.send;
+
+    // Pasted newlines are text, not Enter: nothing is submitted. CRLF and
+    // a terminal's CR-for-newline both become "\n".
+    try pasteKeys(&app, &verdicts, "a\r\nb\tc\rd");
+    try std.testing.expectEqualStrings("a\nb\tc\nd", app.view.editor.text.items);
+    try std.testing.expect(app.paste_collect == null);
+
+    // A long paste becomes a chip that expands to the whole text on submit.
+    app.view.editor.clear();
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(gpa);
+    for (0..400) |i| try long.print(gpa, "line {d:0>4} alpha beta gamma\r", .{i});
+    try pasteKeys(&app, &verdicts, long.items);
+    try std.testing.expectEqualStrings("[paste #1: 401 lines]", app.view.editor.text.items);
+    const expanded = try app.view.editor.takeExpandedWithImages(0);
+    defer gpa.free(expanded);
+    try std.testing.expect(std.mem.startsWith(u8, expanded, "line 0000 alpha beta gamma\nline 0001"));
+    try std.testing.expect(std.mem.endsWith(u8, expanded, "line 0399 alpha beta gamma\n"));
+
+    // Keys after the paste behave as keys again.
+    try dispatchEvent(&app, undefined, undefined, gpa, .{ .key_press = .{ .codepoint = 'x', .text = "x" } }, &verdicts);
+    try std.testing.expectEqualStrings("x", app.view.editor.text.items);
 }
