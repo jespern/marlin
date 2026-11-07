@@ -140,10 +140,14 @@ pub fn build(b: *std.Build) void {
     format_check_step.dependOn(&format_check.step);
 
     // ---- marlin ----
-    const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
-    const regex = b.dependency("regex", .{ .target = target, .optimize = optimize });
-    // Terminal emulation for the experimental shell tab (`!!`).
+    // Terminal emulation for shell sessions (`!!`).
     const ghostty = b.dependency("ghostty", .{ .target = target, .optimize = optimize });
+    // vaxis and libghostty-vt share one uucode package, and a file may belong
+    // to only one module, so vaxis uses libghostty's uucode module (whose
+    // table config is built for this pairing) instead of making its own.
+    const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize, .external_uucode = true });
+    vaxis.module("vaxis").addImport("uucode", ghostty.module("ghostty-vt").import_table.get("uucode").?);
+    const regex = b.dependency("regex", .{ .target = target, .optimize = optimize });
     const exe = b.addExecutable(.{
         .name = "marlin",
         .root_module = b.createModule(.{
