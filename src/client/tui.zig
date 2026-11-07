@@ -157,6 +157,8 @@ pub const Event = union(enum) {
     voice: VoiceEvent,
     /// wipEout asset-bundle download verdicts.
     wipeout: WipeoutEvent,
+    /// A frame of streamed-text pacing (every 16 ms while rows wait).
+    stream_frame,
     /// Screenshot verdict: null when the PNG is on the clipboard,
     /// else a static reason.
     screenshot: ?[]const u8,
@@ -675,6 +677,8 @@ pub const App = struct {
     screensaver_deadline_ms: std.atomic.Value(i64) = .init(0),
     ui_animation_active: std.atomic.Value(bool) = .init(false),
     animation_active: std.atomic.Value(bool) = .init(false),
+    /// Streamed rows are waiting to be revealed: frames at 60 fps.
+    stream_pacing_active: std.atomic.Value(bool) = .init(false),
     animation_stop: std.atomic.Value(bool) = .init(false),
     cfg: config.Config = .{},
     /// Copy-mode (vim-style keyboard selection over the transcript):
@@ -1962,6 +1966,7 @@ pub const App = struct {
                 const view = self.liveView(d.sid) orelse return;
                 if (view.history_has_newer) return;
                 view.delta.appendSlice(self.gpa, d.text) catch {};
+                if (view == &self.view) self.stream_pacing_active.store(true, .release);
             },
             .reasoning_delta => |d| {
                 const view = self.liveView(d.sid) orelse return;
@@ -2999,6 +3004,17 @@ pub const App = struct {
         } else {
             self.setNotice("wipEout data  connecting… {d} KB", .{done >> 10});
         }
+    }
+
+    /// One frame of streamed-text pacing for the visible session.
+    pub fn paceStream(self: *App) void {
+        if (self.view.delta.items.len == 0) {
+            self.view.stream_pacer.reset();
+            self.stream_pacing_active.store(false, .release);
+            return;
+        }
+        const behind = self.view.stream_pacer.tick(self.view.stream_layout_cache.committedRows(), nowWallMs(self.io));
+        self.stream_pacing_active.store(behind, .release);
     }
 
     pub fn handleWipeoutEvent(self: *App, ev: WipeoutEvent) void {
@@ -4309,19 +4325,25 @@ pub const App = struct {
             self.setNotice("new session already being created", .{});
             return;
         }
+        // Inherit the current tab's directory so Ctrl+n from a project keeps
+        // working in it; the client's own cwd is only a fallback (and is
+        // meaningless for a --remote client anyway).
         var cwd_buf: [4096]u8 = undefined;
-        const cwd_len = try std.process.currentPath(self.io, &cwd_buf);
+        const cwd: []const u8 = if (self.view.cwd.items.len > 0)
+            self.view.cwd.items
+        else
+            cwd_buf[0..try std.process.currentPath(self.io, &cwd_buf)];
         const request_id = self.next_input_request_id;
         self.next_input_request_id +%= 1;
         if (self.next_input_request_id == 0) self.next_input_request_id = 1;
         try self.conn.send(.{ .session_create = .{
-            .cwd = cwd_buf[0..cwd_len],
+            .cwd = cwd,
             .model = self.view.model.items,
             .effort = self.view.effort,
             .request_id = request_id,
         } });
         self.pending_new_cwd.clearRetainingCapacity();
-        try self.pending_new_cwd.appendSlice(self.gpa, cwd_buf[0..cwd_len]);
+        try self.pending_new_cwd.appendSlice(self.gpa, cwd);
         // The reply is routed through the reader thread; we can't recv here.
         // Optimistic switch happens when session_created arrives — but that
         // message has no sub; simplest correct M2 flow: remember we asked.
@@ -4755,6 +4777,7 @@ fn transcriptView(app: *App) Transcript {
         .layout_cache = &app.view.layout_cache,
         .tail_layout_cache = &app.view.tail_layout_cache,
         .stream_layout_cache = &app.view.stream_layout_cache,
+        .stream_reveal_rows = if (app.view.delta.items.len == 0) std.math.maxInt(usize) else app.view.stream_pacer.revealed,
     };
 }
 
@@ -7000,6 +7023,7 @@ pub fn dispatchEvent(
         },
         .voice => |vev| app.handleVoiceEvent(vev),
         .wipeout => |wev| app.handleWipeoutEvent(wev),
+        .stream_frame => app.paceStream(),
         .screenshot => |failure| screenshot.done(app, failure),
         .mouse => |m| {
             app.presence_last_activity_ms = nowWallMs(app.io);
@@ -7078,7 +7102,21 @@ pub fn dispatchEvent(
 
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
     var next_presence_tick: i64 = 0;
+    var last_tick_ms: i64 = 0;
     while (!app.animation_stop.load(.acquire)) {
+        // Streamed text waiting to be revealed gets 60 fps frames of its
+        // own; the regular tick keeps its cadence meanwhile.
+        if (app.stream_pacing_active.load(.acquire)) {
+            loop.postEvent(.stream_frame) catch return;
+            const now = nowWallMs(app.io);
+            if (now - last_tick_ms >= 90) {
+                loop.postEvent(.tick) catch return;
+                last_tick_ms = now;
+            }
+            app.io.sleep(.fromMilliseconds(16), .awake) catch {};
+            continue;
+        }
+        last_tick_ms = nowWallMs(app.io);
         if (app.game_active.load(.acquire) or app.fast_effect_active.load(.acquire)) {
             // Games and high-motion effects use the 60 fps presentation tier.
             loop.postEvent(.tick) catch return;
@@ -7088,7 +7126,11 @@ fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
             app.io.sleep(.fromMilliseconds(33), .awake) catch {};
         } else if (app.animation_active.load(.acquire)) {
             loop.postEvent(.tick) catch return;
-            app.io.sleep(.fromMilliseconds(90), .awake) catch {};
+            // In slices, so newly streamed rows start pacing promptly.
+            for (0..6) |_| {
+                if (app.stream_pacing_active.load(.acquire)) break;
+                app.io.sleep(.fromMilliseconds(15), .awake) catch {};
+            }
         } else {
             app.io.sleep(.fromMilliseconds(200), .awake) catch {};
             const now = nowWallMs(app.io);

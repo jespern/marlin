@@ -1745,6 +1745,38 @@ test "correlated session creation replies clear only the matching pending reques
     try std.testing.expectEqual(@as(usize, 0), app.pending_new_cwd.items.len);
 }
 
+test "ctrl-n opens the new session in the current tab's directory and model" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setCwdStr("/tmp/some/project");
+    app.setModelStr("vendor/tab-model");
+    app.view.effort = .high;
+    try handleKey(&app, .{ .codepoint = 'n', .mods = .{ .ctrl = true } });
+    try std.testing.expect(app.awaiting_new_session);
+    try std.testing.expectEqualStrings("/tmp/some/project", app.pending_new_cwd.items);
+    const line = std.mem.trimEnd(u8, output.written(), "\n");
+    const msg = try proto.decode(proto.ClientMsg, arena.allocator(), line);
+    try std.testing.expectEqualStrings("/tmp/some/project", msg.session_create.cwd);
+    try std.testing.expectEqualStrings("vendor/tab-model", msg.session_create.model);
+    try std.testing.expectEqual(proto.ReasoningEffort.high, msg.session_create.effort);
+
+    // The created tab keeps both even before the daemon's upsert lands.
+    app.handleSessionCreated(2, app.pending_new_session_request_id);
+    try std.testing.expectEqual(@as(u64, 2), app.view.sid);
+    try std.testing.expectEqualStrings("vendor/tab-model", app.view.model.items);
+    try std.testing.expectEqualStrings("/tmp/some/project", app.view.cwd.items);
+}
+
 test "reset opens a blank session before archiving idle trees and preserves active work" {
     const gpa = std.testing.allocator;
     var threaded: Io.Threaded = .init(gpa, .{});
@@ -4874,7 +4906,7 @@ test "finalized reasoning clears only its live stream channel across rounds" {
     try std.testing.expectEqual(@as(usize, 0), app.view.delta.items.len);
     try std.testing.expectEqualStrings("next raw", app.view.reasoning_delta.items);
     try std.testing.expectEqual(@as(usize, 0), app.view.stream_layout_cache.lines.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.view.stream_layout_cache.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.stream_layout_cache.preview.len);
     try std.testing.expectEqual(@as(usize, 0), app.view.stream_layout_cache.source_len);
 
     try app.view.delta.appendSlice(gpa, "next commentary");

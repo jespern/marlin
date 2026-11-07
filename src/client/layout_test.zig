@@ -451,7 +451,7 @@ test "stream layout is append-only and matches a one-shot provisional wrap" {
             defer arena_state.deinit();
             const arena = arena_state.allocator();
             var lines: std.ArrayList(Line) = .empty;
-            try cache.appendTo(arena, &lines);
+            try cache.appendTo(arena, &lines, std.math.maxInt(usize));
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(gpa_inner);
             for (lines.items) |line| {
@@ -1523,4 +1523,156 @@ test "a message without text shows (empty input) in its card" {
         try std.testing.expectEqualStrings(" ❯ ", line.text);
     };
     try std.testing.expect(found);
+}
+
+fn streamText(gpa: std.mem.Allocator, cache: *const StreamLayoutCache) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList(Line) = .empty;
+    try cache.appendTo(arena, &lines, std.math.maxInt(usize));
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (lines.items) |line| {
+        try out.appendSlice(gpa, try lineText(arena, line));
+        try out.append(gpa, '\n');
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn streamIn(gpa: std.mem.Allocator, cache: *StreamLayoutCache, received: *std.ArrayList(u8), more: []const u8, width: usize) !void {
+    var at: usize = 0;
+    while (at < more.len) {
+        const end = @min(at + 5, more.len);
+        try received.appendSlice(gpa, more[at..end]);
+        try cache.update(gpa, received.items, width);
+        at = end;
+    }
+}
+
+test "streaming renders settled blocks as Markdown and keeps the tail raw" {
+    const gpa = std.testing.allocator;
+    var cache = StreamLayoutCache{};
+    defer cache.reset(gpa);
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(gpa);
+
+    try streamIn(gpa, &cache, &received, "Intro with **bold** words.\n\nStill **writ", 80);
+    var text = try streamText(gpa, &cache);
+    // The first paragraph settled: its Markdown is rendered (no ** left).
+    try std.testing.expect(std.mem.indexOf(u8, text, "Intro with bold words.") != null);
+    // The tail is still raw prose.
+    try std.testing.expect(std.mem.indexOf(u8, text, "Still **writ") != null);
+    gpa.free(text);
+
+    // A blank line inside an open fence settles nothing.
+    const settled_before = cache.settled_len;
+    try streamIn(gpa, &cache, &received, "ing**.\n\n```zig\nconst a = 1;\n\nconst b = 2;\n", 80);
+    try std.testing.expect(cache.settled_len > settled_before); // the paragraph before the fence
+    const before_fence = cache.settled_len;
+    try std.testing.expect(std.mem.endsWith(u8, received.items[0..before_fence], "\n\n"));
+    try std.testing.expect(std.mem.indexOf(u8, received.items[before_fence..], "```zig") != null);
+    text = try streamText(gpa, &cache);
+    // The open fence already shows as a code panel that grows line by line.
+    try std.testing.expect(std.mem.indexOf(u8, text, "```") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "const b = 2;") != null);
+    gpa.free(text);
+
+    // Closing the fence and a blank line settle the code block.
+    try streamIn(gpa, &cache, &received, "```\n\nAfter.", 80);
+    try std.testing.expect(cache.settled_len > before_fence);
+    text = try streamText(gpa, &cache);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "```") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "const b = 2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "After.") != null);
+}
+
+test "a fully settled stream matches the finished message's render" {
+    const gpa = std.testing.allocator;
+    const source = "# Heading\n\nSome *emphasis* and `code`.\n\n" ++
+        "| a | b |\n|---|---|\n| 1 | 2 |\n\n" ++
+        "- one\n- two\n\n```sh\necho hi\n```\n\n";
+    var cache = StreamLayoutCache{};
+    defer cache.reset(gpa);
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(gpa);
+    try streamIn(gpa, &cache, &received, source, 72);
+    try std.testing.expectEqual(source.len, cache.settled_len);
+    const streamed = try streamText(gpa, &cache);
+    defer gpa.free(streamed);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var final: std.ArrayList(Line) = .empty;
+    try markdown.wrapMarkdown(arena, &final, std.mem.trim(u8, source, "\n"), 72);
+    var final_text: std.ArrayList(u8) = .empty;
+    for (final.items) |line| {
+        try final_text.appendSlice(arena, try lineText(arena, line));
+        try final_text.append(arena, '\n');
+    }
+    try std.testing.expectEqualStrings(std.mem.trimEnd(u8, final_text.items, "\n"), std.mem.trimEnd(u8, streamed, "\n"));
+}
+
+test "a finished line gets Markdown before its block ends; a table stays raw until done" {
+    const gpa = std.testing.allocator;
+    var cache = StreamLayoutCache{};
+    defer cache.reset(gpa);
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(gpa);
+
+    // No blank line yet, but the first line is complete: it is Markdown.
+    try streamIn(gpa, &cache, &received, "- first **item**\n- seco", 80);
+    var text = try streamText(gpa, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, text, "first item") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "- seco") != null); // the preview is raw
+    gpa.free(text);
+
+    // A table being written keeps its pipes until a non-table line ends it.
+    try streamIn(gpa, &cache, &received, "nd\n\n| a | b |\n|---|---|\n| 1 | 2 |\n", 80);
+    text = try streamText(gpa, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, text, "| 1 | 2 |") != null);
+    gpa.free(text);
+    try streamIn(gpa, &cache, &received, "\nDone.\n", 80);
+    text = try streamText(gpa, &cache);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "| 1 | 2 |") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Done.") != null);
+}
+
+test "streamed rows are revealed one per frame and catch up when behind" {
+    var pacer: layout.StreamPacer = .{};
+    // A small backlog drains one row per frame.
+    try std.testing.expect(pacer.tick(3, 1000));
+    try std.testing.expectEqual(@as(usize, 1), pacer.revealed);
+    try std.testing.expect(pacer.tick(3, 1016));
+    try std.testing.expect(!pacer.tick(3, 1032));
+    try std.testing.expectEqual(@as(usize, 3), pacer.revealed);
+    try std.testing.expect(!pacer.tick(3, 1048)); // nothing new
+
+    // A burst deeper than the catch-up depth is shown at once.
+    try std.testing.expect(!pacer.tick(3 + layout.StreamPacer.catch_up_rows + 1, 2000));
+    try std.testing.expectEqual(@as(usize, 3 + layout.StreamPacer.catch_up_rows + 1), pacer.revealed);
+
+    // A backlog that stays too long is flushed too.
+    _ = pacer.tick(pacer.revealed + 3, 3000);
+    try std.testing.expect(!pacer.tick(pacer.revealed + 2, 3000 + layout.StreamPacer.catch_up_age_ms + 1));
+}
+
+test "the preview of the unfinished line waits for revealed rows" {
+    const gpa = std.testing.allocator;
+    var cache = StreamLayoutCache{};
+    defer cache.reset(gpa);
+    try cache.update(gpa, "one\ntwo\nthr", 80);
+    try std.testing.expectEqual(@as(usize, 2), cache.committedRows()); // "one", "two"; "thr" is the preview
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var none: std.ArrayList(Line) = .empty;
+    try cache.appendTo(arena_state.allocator(), &none, 0);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
+    var all: std.ArrayList(Line) = .empty;
+    try cache.appendTo(arena_state.allocator(), &all, cache.committedRows());
+    try std.testing.expect(all.items.len > cache.committedRows()); // rows + the preview
 }

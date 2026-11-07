@@ -195,6 +195,8 @@ pub const SessionView = struct {
     /// Incremental provisional assistant text; finalized blocks use the full
     /// Markdown layout caches above.
     stream_layout_cache: StreamLayoutCache = .{},
+    /// How much of the live stream is revealed (paced like Codex).
+    stream_pacer: layout.StreamPacer = .{},
     /// Bumped whenever existing blocks mutate in place or the block list is
     /// replaced (session switch) — invalidates layout_cache.
     layout_epoch: u64 = 0,

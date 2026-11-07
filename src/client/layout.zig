@@ -105,19 +105,42 @@ pub const TailLayoutCache = struct {
     }
 };
 
-/// Append-only live assistant layout. Streaming text is provisional, so it
-/// uses a light prose rail and receives full Markdown treatment only when the
-/// finalized durable block arrives. Complete wrapped rows are baked once;
-/// only the short unfinished row is reconsidered as new deltas arrive.
+/// Live assistant layout, shaped like Codex's stream: Markdown is rendered as
+/// soon as it is unambiguous, and rows are revealed at a steady pace.
+///
+/// - Settled blocks (up to the last blank line outside a code fence) are
+///   rendered once with the finished message's renderer and cached.
+/// - The block being written is re-rendered with Markdown each time one of
+///   its lines completes. An open code fence is rendered as if closed, so it
+///   grows as a code panel; a table being written stays raw until it ends,
+///   since every new row can resize its columns.
+/// - The unfinished line is a plain preview, replaced as it grows.
+///
+/// `appendTo` takes how many rows to reveal (see `StreamPacer`); the preview
+/// shows only once every complete row is revealed, so text never appears
+/// out of order.
 pub const StreamLayoutCache = struct {
     arena_state: ?*std.heap.ArenaAllocator = null,
+    /// Settled Markdown rows.
     lines: std.ArrayList(Line) = .empty,
-    pending: std.ArrayList(u8) = .empty,
     source_len: usize = 0,
     width: usize = 0,
     first_prefix: []const u8 = "",
     continuation_prefix: []const u8 = "",
-    at_line_start: bool = true,
+    /// Bytes of the source rendered into `lines`.
+    settled_len: usize = 0,
+    /// Boundary scan state: the next unscanned line, whether it is inside a
+    /// code fence (and which), and the last settle point found.
+    scan_pos: usize = 0,
+    scan_fence: ?u8 = null,
+    settle_at: usize = 0,
+    /// The block being written, rendered from settled_len to block_end
+    /// (just past its last complete line), in its own arena.
+    block_arena: ?*std.heap.ArenaAllocator = null,
+    block_lines: []const Line = &.{},
+    block_end: usize = 0,
+    /// The unfinished last line.
+    preview: []const u8 = "",
 
     pub fn allocator(self: *StreamLayoutCache, gpa: std.mem.Allocator) !std.mem.Allocator {
         if (self.arena_state == null) {
@@ -129,11 +152,10 @@ pub const StreamLayoutCache = struct {
     }
 
     pub fn reset(self: *StreamLayoutCache, gpa: std.mem.Allocator) void {
-        self.pending.deinit(gpa);
-        if (self.arena_state) |arena| {
+        inline for (.{ self.arena_state, self.block_arena }) |maybe| if (maybe) |arena| {
             arena.deinit();
             gpa.destroy(arena);
-        }
+        };
         self.* = .{};
     }
 
@@ -145,83 +167,183 @@ pub const StreamLayoutCache = struct {
         self.continuation_prefix = try spaces(arena, displayWidth(self.first_prefix));
     }
 
-    pub fn discardPendingPrefix(self: *StreamLayoutCache, count: usize) void {
-        const remaining = self.pending.items.len - count;
-        std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[count..]);
-        self.pending.items.len = remaining;
+    /// Complete rows: settled Markdown, then the block being written. Rows
+    /// past this are the preview of the unfinished line.
+    pub fn committedRows(self: *const StreamLayoutCache) usize {
+        const gap: usize = @intFromBool(self.lines.items.len > 0 and self.block_lines.len > 0);
+        return self.lines.items.len + gap + self.block_lines.len;
     }
 
-    pub fn appendRow(self: *StreamLayoutCache, gpa: std.mem.Allocator, text: []const u8) !void {
-        const arena = try self.allocator(gpa);
-        const prefix = if (self.at_line_start) self.first_prefix else self.continuation_prefix;
-        const rendered = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, text });
-        try self.lines.append(arena, .{ .text = rendered, .style = Palette.assistant });
-        self.at_line_start = false;
-    }
-
-    pub fn appendBlank(self: *StreamLayoutCache, gpa: std.mem.Allocator) !void {
-        const arena = try self.allocator(gpa);
-        if (self.lines.items.len == 0 or lineWidthBytes(self.lines.items[self.lines.items.len - 1]) != 0)
-            try self.lines.append(arena, .{ .text = "", .style = .{} });
-    }
-
-    pub fn commitCompleteLine(self: *StreamLayoutCache, gpa: std.mem.Allocator, text: []const u8) !void {
-        if (text.len == 0) {
-            try self.appendBlank(gpa);
-            self.at_line_start = true;
-            return;
+    /// Advance the settle point over the complete lines received since the
+    /// last scan: just past a blank line that is outside a code fence.
+    fn scanSettled(self: *StreamLayoutCache, text: []const u8) void {
+        while (std.mem.indexOfScalarPos(u8, text, self.scan_pos, '\n')) |newline| {
+            const line = std.mem.trim(u8, text[self.scan_pos..newline], " \t\r");
+            self.scan_pos = newline + 1;
+            if (fenceChar(line)) |char| {
+                if (self.scan_fence) |fence| {
+                    if (char == fence) self.scan_fence = null;
+                } else self.scan_fence = char;
+            } else if (line.len == 0 and self.scan_fence == null) {
+                self.settle_at = self.scan_pos;
+            }
         }
+    }
+
+    fn fenceChar(line: []const u8) ?u8 {
+        if (std.mem.startsWith(u8, line, "```") or std.mem.startsWith(u8, line, "~~~")) return line[0];
+        return null;
+    }
+
+    /// Render newly settled text as Markdown, once.
+    fn settle(self: *StreamLayoutCache, gpa: std.mem.Allocator, text: []const u8) !void {
+        if (self.settle_at <= self.settled_len) return;
+        const arena = try self.allocator(gpa);
+        const chunk = std.mem.trim(u8, text[self.settled_len..self.settle_at], "\n");
+        if (chunk.len > 0) {
+            if (self.lines.items.len > 0) try blankLine(arena, &self.lines);
+            try wrapMarkdown(arena, &self.lines, chunk, self.width);
+            trimTrailingBlank(&self.lines);
+        }
+        self.settled_len = self.settle_at;
+        self.block_end = 0; // the block restarts after the settled text
+    }
+
+    /// Re-render the block being written when one of its lines completes.
+    fn renderBlock(self: *StreamLayoutCache, gpa: std.mem.Allocator, text: []const u8) !void {
+        const end = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |nl| @max(nl + 1, self.settled_len) else self.settled_len;
+        if (end == self.block_end) return;
+        self.block_end = end;
+        if (self.block_arena == null) {
+            const arena = try gpa.create(std.heap.ArenaAllocator);
+            arena.* = .init(gpa);
+            self.block_arena = arena;
+        }
+        _ = self.block_arena.?.reset(.retain_capacity);
+        const arena = self.block_arena.?.allocator();
+        var rows: std.ArrayList(Line) = .empty;
+        const source = std.mem.trim(u8, text[self.settled_len..end], "\n");
+        if (source.len > 0) {
+            // A table still being written stays raw from its first row.
+            const table_start = trailingTableStart(source);
+            const markdown_part = std.mem.trimEnd(u8, source[0..table_start], "\n");
+            if (markdown_part.len > 0) {
+                if (self.scan_fence) |fence| {
+                    // Render an open fence as if closed: a growing code panel.
+                    const closed = try std.fmt.allocPrint(arena, "{s}\n{c}{c}{c}", .{ markdown_part, fence, fence, fence });
+                    try wrapMarkdown(arena, &rows, closed, self.width);
+                } else try wrapMarkdown(arena, &rows, markdown_part, self.width);
+                trimTrailingBlank(&rows);
+            }
+            if (table_start < source.len) {
+                if (rows.items.len > 0) try blankLine(arena, &rows);
+                var raw = std.mem.splitScalar(u8, source[table_start..], '\n');
+                while (raw.next()) |row| try self.appendPlain(arena, &rows, row);
+            }
+        }
+        self.block_lines = rows.items;
+    }
+
+    /// Where a trailing run of table rows starts in `source` (its length
+    /// when the source does not end in one). Code fences are not tables.
+    fn trailingTableStart(source: []const u8) usize {
+        var start = source.len;
+        var end = source.len;
+        while (end > 0) {
+            const line_start = if (std.mem.lastIndexOfScalar(u8, source[0..end], '\n')) |nl| nl + 1 else 0;
+            const line = std.mem.trim(u8, source[line_start..end], " \t\r");
+            if (line.len == 0 or line[0] != '|') break;
+            start = line_start;
+            if (line_start == 0) break;
+            end = line_start - 1;
+        }
+        return start;
+    }
+
+    /// One source line on the plain prose rail, wrapped at the measure.
+    fn appendPlain(self: *const StreamLayoutCache, arena: std.mem.Allocator, rows: *std.ArrayList(Line), text: []const u8) !void {
         var start: usize = 0;
-        while (start < text.len) {
-            const prefix = if (self.at_line_start) self.first_prefix else self.continuation_prefix;
+        var first = true;
+        while (true) {
+            const prefix = if (first) self.first_prefix else self.continuation_prefix;
             const capacity = markdownMeasure(self.width) -| displayWidth(prefix);
             if (capacity == 0) return;
             var end = wordBreak(text, start, capacity);
             if (end == start) end = hardCellBreak(text, start, capacity);
-            try self.appendRow(gpa, text[start..end]);
+            try rows.append(arena, .{ .text = prefix, .style = Palette.assistant, .text2 = text[start..end], .style2 = Palette.assistant });
+            first = false;
             start = end;
             while (start < text.len and (text[start] == ' ' or text[start] == '\t')) start += 1;
+            if (start >= text.len) return;
         }
-        self.at_line_start = true;
     }
 
-    pub fn commitFullPendingRows(self: *StreamLayoutCache, gpa: std.mem.Allocator) !void {
-        while (self.pending.items.len > 0) {
-            const prefix = if (self.at_line_start) self.first_prefix else self.continuation_prefix;
-            const capacity = markdownMeasure(self.width) -| displayWidth(prefix);
-            if (capacity == 0) return;
-            var end = wordBreak(self.pending.items, 0, capacity);
-            if (end >= self.pending.items.len) return;
-            if (end == 0) end = hardCellBreak(self.pending.items, 0, capacity);
-            try self.appendRow(gpa, self.pending.items[0..end]);
-            while (end < self.pending.items.len and
-                (self.pending.items[end] == ' ' or self.pending.items[end] == '\t')) end += 1;
-            self.discardPendingPrefix(end);
-        }
+    fn trimTrailingBlank(rows: *std.ArrayList(Line)) void {
+        while (rows.items.len > 0 and lineWidthBytes(rows.items[rows.items.len - 1]) == 0) rows.items.len -= 1;
     }
 
     pub fn update(self: *StreamLayoutCache, gpa: std.mem.Allocator, text: []const u8, width: usize) !void {
         if (self.width != width or text.len < self.source_len) self.reset(gpa);
         try self.prepare(gpa, width);
-        try self.pending.appendSlice(gpa, text[self.source_len..]);
+        self.scanSettled(text);
+        try self.settle(gpa, text);
+        try self.renderBlock(gpa, text);
         self.source_len = text.len;
-
-        while (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |newline| {
-            try self.commitCompleteLine(gpa, self.pending.items[0..newline]);
-            self.discardPendingPrefix(newline + 1);
-        }
-        try self.commitFullPendingRows(gpa);
+        const tail_start = @max(self.block_end, self.settled_len);
+        self.preview = std.mem.trimStart(u8, text[tail_start..], "\n");
     }
 
-    pub fn appendTo(self: *const StreamLayoutCache, arena: std.mem.Allocator, out: *std.ArrayList(Line)) !void {
-        try out.appendSlice(arena, self.lines.items);
-        if (self.pending.items.len == 0) return;
-        try out.append(arena, .{
-            .text = if (self.at_line_start) self.first_prefix else self.continuation_prefix,
-            .style = Palette.assistant,
-            .text2 = self.pending.items,
-            .style2 = Palette.assistant,
-        });
+    /// Append up to `reveal` complete rows, and the unfinished line once all
+    /// complete rows are revealed.
+    pub fn appendTo(self: *const StreamLayoutCache, arena: std.mem.Allocator, out: *std.ArrayList(Line), reveal: usize) !void {
+        var budget = reveal;
+        const settled = self.lines.items[0..@min(budget, self.lines.items.len)];
+        try out.appendSlice(arena, settled);
+        budget -= settled.len;
+        if (settled.len < self.lines.items.len) return;
+        if (self.lines.items.len > 0 and self.block_lines.len > 0) {
+            if (budget == 0) return;
+            try out.append(arena, .{ .text = "", .style = .{} });
+            budget -= 1;
+        }
+        const shown = self.block_lines[0..@min(budget, self.block_lines.len)];
+        try out.appendSlice(arena, shown);
+        if (shown.len < self.block_lines.len or self.preview.len == 0) return;
+        if (self.committedRows() > 0) try out.append(arena, .{ .text = "", .style = .{} });
+        try self.appendPlain(arena, out, self.preview);
+    }
+};
+
+/// Paces the reveal of streamed rows like Codex: one row per frame while the
+/// backlog is small, everything at once when it grows deep or old, so bursts
+/// from the network become a steady scroll without falling behind.
+pub const StreamPacer = struct {
+    revealed: usize = 0,
+    /// When the current backlog began; zero without one.
+    backlog_since_ms: i64 = 0,
+
+    pub const catch_up_rows: usize = 8;
+    pub const catch_up_age_ms: i64 = 120;
+
+    pub fn reset(self: *StreamPacer) void {
+        self.* = .{};
+    }
+
+    /// One frame: reveal a row, or all of them when behind. True while rows
+    /// remain to reveal.
+    pub fn tick(self: *StreamPacer, committed: usize, now_ms: i64) bool {
+        if (committed < self.revealed) self.revealed = committed;
+        if (self.revealed == committed) {
+            self.backlog_since_ms = 0;
+            return false;
+        }
+        if (self.backlog_since_ms == 0) self.backlog_since_ms = now_ms;
+        const backlog = committed - self.revealed;
+        if (backlog > catch_up_rows or now_ms - self.backlog_since_ms > catch_up_age_ms) {
+            self.revealed = committed;
+        } else self.revealed += 1;
+        if (self.revealed == committed) self.backlog_since_ms = 0;
+        return self.revealed < committed;
     }
 };
 
@@ -1330,6 +1452,8 @@ pub const Transcript = struct {
     layout_cache: *LayoutCache,
     tail_layout_cache: *TailLayoutCache,
     stream_layout_cache: *StreamLayoutCache,
+    /// Streamed rows to show (StreamPacer); all of them by default.
+    stream_reveal_rows: usize = std.math.maxInt(usize),
     /// Rows appended after everything else (a shell session's terminal).
     extra_lines: []const Line = &.{},
 };
@@ -2031,7 +2155,7 @@ pub fn layoutLines(
         defer stampOutputLines(lines.items[first..], live_timestamp);
         try blankLine(arena, &lines);
         try transcript.stream_layout_cache.update(gpa, transcript.delta, w);
-        try transcript.stream_layout_cache.appendTo(arena, &lines);
+        try transcript.stream_layout_cache.appendTo(arena, &lines, transcript.stream_reveal_rows);
     } else if (transcript.state == .running and transcript.show_working_ticker and
         (transcript.reasoning_delta.len == 0 or transcript.guest_activity.len > 0))
     {
