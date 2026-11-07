@@ -34,6 +34,9 @@ fn configurePower(module: *std.Build.Module, b: *std.Build, target: std.Build.Re
     if (macos_sdk) |sdk| {
         const frameworks = b.pathJoin(&.{ sdk, "System/Library/Frameworks" });
         module.addSystemFrameworkPath(.{ .cwd_relative = frameworks });
+        // CoreFoundation's stub names /usr/lib/libobjc.A.dylib; without a
+        // sysroot, the linker finds it only through the SDK's usr/lib.
+        module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
     }
     module.linkFramework("IOKit", .{});
     module.linkFramework("CoreFoundation", .{});
