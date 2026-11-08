@@ -353,7 +353,7 @@
     <img class="fish" src="assets/marlin.gif" alt="a marlin leaping out of the ocean, majestically, at 64 colors">
     <h1><span class="tilde">~*~</span> marlin <span class="tilde">~*~</span></h1>
     <p class="tagline">fast, durable terminal agents that <b>SWIM</b> between clients &nbsp;🐟&nbsp; built in Zig</p>
-    <p class="release-line">current release: <a href="https://github.com/jespern/marlin/releases/tag/v0.2.0">v0.2.0</a></p>
+    <p class="release-line">current release: <a href="https://github.com/jespern/marlin/releases/tag/v0.2.1">v0.2.1</a></p>
   </header>
 
   <div class="install">
@@ -421,7 +421,18 @@
     <h2>&gt;&gt; what's NEW <span class="badge blink">HOT!!</span></h2>
 
     <div class="release">
-      <h3>v0.2.0 <span class="date">· 2026-11-07</span></h3>
+      <h3>v0.2.1 <span class="date">· 2026-11-08</span></h3>
+      <ul class="starlist">
+        <li><b>security</b>: the web bridge refused opening and typing into shells, but a browser on the loopback web UI could still list running shells and attach to one to read it. Every shell message is now refused</li>
+        <li><b>screenshots, painted the way Ghostty paints</b>: Marlin draws the PNG itself with Ghostty's own font code, so box drawing and blocks match Ghostty pixel for pixel; <code class="inline">!ss</code> takes one, and JetBrains Mono is fetched on first use instead of being built in</li>
+        <li><b>tabs</b>: a dim <code class="inline">❯</code> or <code class="inline">$</code> before each tab's number tells agent sessions from shells</li>
+        <li><b>guests</b>: a missing working directory is reported as such, not as a missing binary</li>
+        <li><a href="https://github.com/jespern/marlin/releases/tag/v0.2.1">release on GitHub</a></li>
+      </ul>
+    </div>
+
+    <details class="release">
+      <summary>v0.2.0 <span class="date">· 2026-11-07</span></summary>
       <ul class="starlist">
         <li><b>shell sessions</b>: <code class="inline">!!</code> turns any session into a login shell on the daemon host, emulated by libghostty-vt. Shells survive detaching, quitting, reconnects, and restarts; scrollback, Vim normal mode, <code class="inline">/</code> search, the mouse, full-screen programs, and Kitty images all work. <code class="inline">Ctrl+B</code> reaches Marlin's keys, and <code class="inline">Ctrl+D</code> hands the session back with the shell's output in its transcript</li>
         <li><b>screenshots</b>: <code class="inline">Alt+S</code> or <code class="inline">/screenshot [slim]</code> copies a PNG of exactly what Marlin rendered</li>
@@ -435,7 +446,7 @@
         <li><b>under the hood</b>: ported to Zig 0.17, with terminal emulation on libghostty-vt 1.0</li>
         <li><a href="https://github.com/jespern/marlin/releases/tag/v0.2.0">release on GitHub</a></li>
       </ul>
-    </div>
+    </details>
 
     <details class="release">
       <summary>v0.1.7 <span class="date">· 2026-10-16</span></summary>
