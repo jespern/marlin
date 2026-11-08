@@ -365,7 +365,10 @@ pub const ClientMsg = union(enum) {
     /// (the reply may be arbitrarily delayed; the bridge waits).
     cc_approval: struct { sid: u64, tool: []const u8, args_json: []const u8 },
     /// Manual L2 compaction (/compact). Rejected while a turn is running.
-    session_compact: struct { sid: u64 },
+    /// Compact a session's context. A guest compacts its own (Claude
+    /// Code's /compact, Codex's thread/compact/start); `instructions`
+    /// steers what Claude Code keeps.
+    session_compact: struct { sid: u64, instructions: []const u8 = "" },
     /// Full model catalog for the /model picker: daemon fetches the
     /// provider's model list (cached ~1h) and replies model_list_result.
     model_list: struct {},

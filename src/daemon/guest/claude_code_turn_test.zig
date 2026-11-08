@@ -103,3 +103,101 @@ test "the context gauge takes the session's own model window, not a helper's" {
     try std.testing.expectEqual(@as(u64, 42_000), used.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1_000_000), limit.load(.acquire));
 }
+
+test "compaction notes say who compacted, how, and by how much" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "≡ Claude Code compacted its context: 25.6k → 10.7k tokens",
+        try claude_code_turn.compactionNote(arena, "Claude Code", "manual", 25_646, 10_741),
+    );
+    try std.testing.expectEqualStrings(
+        "≡ Claude Code compacted its context automatically (180.0k tokens before)",
+        try claude_code_turn.compactionNote(arena, "Claude Code", "auto", 180_000, null),
+    );
+    try std.testing.expectEqualStrings(
+        "≡ Codex compacted its context",
+        try claude_code_turn.compactionNote(arena, "Codex", "manual", 0, null),
+    );
+}
+
+test "Claude Code /compact resumes the conversation with the focus and never starts one" {
+    const loop = @import("../loop.zig");
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-claude-compact");
+    defer temp.deinit();
+    // Events as claude -p 2.1.314 sends them for /compact; "missing" mode is
+    // a --resume of a conversation Claude Code never had.
+    const script =
+        \\#!/bin/sh
+        \\echo x >> invocations
+        \\case "$*" in *"--resume "*) ;; *) exit 9 ;; esac
+        \\read -r mode < mode
+        \\if [ "$mode" = missing ]; then
+        \\  echo '{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: x"]}'
+        \\  exit 0
+        \\fi
+        \\IFS= read -r line
+        \\case "$line" in *'/compact keep the API decisions'*) ;; *) exit 8 ;; esac
+        \\echo '{"type":"system","subtype":"init","session_id":"x"}'
+        \\echo '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":25646,"post_tokens":10741}}'
+        \\echo '{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}'
+        \\echo '{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}'
+        \\echo '{"type":"result","subtype":"success","is_error":false,"result":"","usage":{"input_tokens":0,"output_tokens":0}}'
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-claude" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+    const mode_path = try std.fs.path.join(gpa, &.{ temp.path, "mode" });
+    defer gpa.free(mode_path);
+    const invocations_path = try std.fs.path.join(gpa, &.{ temp.path, "invocations" });
+    defer gpa.free(invocations_path);
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(claude_code.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+    var used: std.atomic.Value(u64) = .init(0);
+
+    for ([_][]const u8{ "present", "missing" }) |mode| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = mode_path, .data = mode });
+        Io.Dir.cwd().deleteFile(io, invocations_path) catch {};
+        var store = try Store.open(gpa, null);
+        defer store.close();
+        try store.createSession(1, 0, temp.path, "claudecode/fable-5", .auto);
+        const result = try loop.runTurn(gpa, io, &store, .{
+            .session_id = 1,
+            .cwd = temp.path,
+            .endpoint = .{ .url = "", .bearer = null, .model = "fable-5", .backend = .{ .guest = .claude_code } },
+            .cfg = .{},
+            .tool_environ = &env,
+            .approval_mode = .auto,
+            .context_used_out = &used,
+            .guest_compact = "keep the API decisions",
+        }, "keep the API decisions", &.{});
+        defer gpa.free(result.text);
+
+        const blocks = try store.getBlocks(1, 1, 100);
+        defer {
+            for (blocks) |*b| b.deinit();
+            gpa.free(blocks);
+        }
+        // Only the note: no user message, no empty reply, no replayed summary.
+        try std.testing.expectEqual(@as(usize, 1), blocks.len);
+        const note = blocks[0].blk.body.system_note.text;
+        if (std.mem.eql(u8, mode, "present")) {
+            try std.testing.expectEqualStrings("≡ Claude Code compacted its context: 25.6k → 10.7k tokens", note);
+            try std.testing.expectEqual(@as(u64, 10741), used.load(.acquire));
+        } else {
+            try std.testing.expect(std.mem.startsWith(u8, note, "nothing to compact yet"));
+        }
+        // One invocation: a missing conversation is not retried as a new one.
+        const invocations = try Io.Dir.cwd().readFileAlloc(io, invocations_path, gpa, .limited(100));
+        defer gpa.free(invocations);
+        try std.testing.expectEqualStrings("x\n", invocations);
+    }
+}

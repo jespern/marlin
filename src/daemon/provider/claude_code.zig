@@ -228,6 +228,9 @@ pub const Event = union(enum) {
     /// From a result's modelUsage: a model's context window. Results list
     /// every model the invocation used, subagents and helpers included.
     context_window: struct { model: []const u8, tokens: u64 },
+    /// system/compact_boundary: Claude Code compacted its context, on
+    /// /compact ("manual") or near its limit ("auto").
+    compacted: struct { trigger: []const u8, pre_tokens: u64, post_tokens: ?u64 },
     /// system/background_tasks_changed: the authoritative open-task list.
     /// After a `result`, a non-empty list means the run is parked waiting
     /// for these to finish (it emits another result when they do).
@@ -294,6 +297,13 @@ pub fn decodeLine(
         const st = strField(root, "subtype") orelse return;
         if (std.mem.eql(u8, st, "init")) {
             try out.append(arena, .init);
+        } else if (std.mem.eql(u8, st, "compact_boundary")) {
+            const meta: ?std.json.ObjectMap = if (root.get("compact_metadata")) |m| if (m == .object) m.object else null else null;
+            try out.append(arena, .{ .compacted = .{
+                .trigger = if (meta) |m| strField(m, "trigger") orelse "" else "",
+                .pre_tokens = if (meta) |m| uintField(m, "pre_tokens") orelse 0 else 0,
+                .post_tokens = if (meta) |m| uintField(m, "post_tokens") else null,
+            } });
         } else if (std.mem.eql(u8, st, "background_tasks_changed")) {
             const tasks: []const std.json.Value = if (root.get("tasks")) |v| switch (v) {
                 .array => |a| a.items,

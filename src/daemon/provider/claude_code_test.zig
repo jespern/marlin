@@ -468,3 +468,40 @@ test "decode: context size per top-level call, windows from the result (claude -
     try std.testing.expectEqual(@as(u64, 2 + 11852 + 13741), used.?);
     try std.testing.expectEqual(@as(u64, 1_000_000), window.?);
 }
+
+test "decode: /compact reports its boundary; the summary it replays is not user input (claude -p 2.1.314)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"status","status":"compacting","session_id":"s"}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":25646,"post_tokens":10741,"cumulative_dropped_tokens":14905,"duration_ms":2685},"logical_parent_uuid":"1a5c","session_id":"s"}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation."},"session_id":"s"}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"session_id":"s"}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"result","subtype":"success","is_error":false,"result":"","usage":{"input_tokens":0,"output_tokens":0}}
+    , &events);
+
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    const compacted = events.items[0].compacted;
+    try std.testing.expectEqualStrings("manual", compacted.trigger);
+    try std.testing.expectEqual(@as(u64, 25646), compacted.pre_tokens);
+    try std.testing.expectEqual(@as(?u64, 10741), compacted.post_tokens);
+    try std.testing.expect(events.items[1] == .result);
+
+    // An older Claude Code reports no post-compaction size.
+    events.clearRetainingCapacity();
+    try decodeLine(arena,
+        \\{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":180000}}
+    , &events);
+    try std.testing.expectEqual(@as(?u64, null), events.items[0].compacted.post_tokens);
+}

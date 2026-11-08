@@ -423,3 +423,88 @@ test "Codex token usage fills the turn totals and the context gauge" {
     try std.testing.expectEqual(@as(u64, 2), used.load(.acquire));
     try std.testing.expectEqual(@as(u64, 272000), limit.load(.acquire));
 }
+
+test "Codex /compact compacts the saved thread in a turn of its own, and never starts one" {
+    const loop = @import("../loop.zig");
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-codex-compact");
+    defer temp.deinit();
+    // The sequence Codex 0.166.0's app-server sends for thread/compact/start.
+    const script =
+        \\#!/bin/sh
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*) echo '{"id":1,"result":{}}' ;;
+        \\    *'"method":"account/read"'*) echo '{"id":2,"result":{"account":{"type":"chatgpt"}}}' ;;
+        \\    *'"method":"thread/resume"'*) echo '{"id":3,"result":{"thread":{"id":"saved-thread"}}}' ;;
+        \\    *'"method":"thread/start"'*) echo started > thread-started; echo '{"id":3,"result":{"thread":{"id":"new-thread"}}}' ;;
+        \\    *'"method":"turn/start"'*) echo prompted > prompted; exit 9 ;;
+        \\    *'"method":"thread/compact/start"'*)
+        \\      case "$line" in *'"threadId":"saved-thread"'*) ;; *) exit 10 ;; esac
+        \\      echo '{"id":4,"result":null}'
+        \\      echo '{"method":"turn/started","params":{"threadId":"saved-thread","turn":{"id":"compact-turn","status":"inProgress"}}}'
+        \\      echo '{"method":"item/started","params":{"threadId":"saved-thread","turnId":"compact-turn","item":{"type":"contextCompaction","id":"c1"}}}'
+        \\      echo '{"method":"thread/tokenUsage/updated","params":{"threadId":"saved-thread","turnId":"compact-turn","tokenUsage":{"last":{"totalTokens":21576,"inputTokens":0,"outputTokens":0},"modelContextWindow":258400}}}'
+        \\      echo '{"method":"item/completed","params":{"threadId":"saved-thread","turnId":"compact-turn","item":{"type":"contextCompaction","id":"c1"}}}'
+        \\      echo '{"method":"turn/completed","params":{"threadId":"saved-thread","turn":{"id":"compact-turn","status":"completed","error":null}}}' ;;
+        \\  esac
+        \\done
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-codex" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(codex.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var used: std.atomic.Value(u64) = .init(0);
+    var limit: std.atomic.Value(u64) = .init(0);
+
+    for ([_]bool{ true, false }) |has_thread| {
+        var store = try Store.open(gpa, null);
+        defer store.close();
+        try store.createSession(1, 0, temp.path, "codex/default", .auto);
+        if (has_thread) try store.setCodexThreadId(1, "saved-thread");
+        const result = try loop.runTurn(gpa, io, &store, .{
+            .session_id = 1,
+            .cwd = temp.path,
+            .endpoint = .{ .url = "", .bearer = null, .model = "default", .backend = .{ .guest = .codex } },
+            .cfg = config.defaults(),
+            .tool_environ = &env,
+            .cancel = &cancel,
+            .context_used_out = &used,
+            .context_limit_out = &limit,
+            .guest_compact = "",
+        }, "", &.{});
+        defer gpa.free(result.text);
+        try std.testing.expect(!result.interrupted);
+
+        const blocks = try store.getBlocks(1, 1, 100);
+        defer {
+            for (blocks) |*b| b.deinit();
+            gpa.free(blocks);
+        }
+        // No user message: /compact is not something to say to the agent.
+        for (blocks) |b| try std.testing.expect(b.blk.body != .user_msg);
+        try std.testing.expectEqual(@as(usize, 1), blocks.len);
+        const note = blocks[0].blk.body.system_note.text;
+        if (has_thread) {
+            try std.testing.expectEqualStrings("≡ Codex compacted its context", note);
+            try std.testing.expectEqual(@as(u64, 21576), used.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 258400), limit.load(.acquire));
+        } else {
+            try std.testing.expect(std.mem.startsWith(u8, note, "nothing to compact yet"));
+        }
+    }
+    // Neither case started a thread or prompted the agent.
+    for ([_][]const u8{ "thread-started", "prompted" }) |marker| {
+        const path = try std.fs.path.join(gpa, &.{ temp.path, marker });
+        defer gpa.free(path);
+        try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+    }
+}

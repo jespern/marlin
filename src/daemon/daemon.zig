@@ -2683,15 +2683,23 @@ pub const Daemon = struct {
                     return;
                 };
                 if (self.rejectArchivedSession(client, session)) return;
-                if (proto.isGuestModel(session.model)) {
-                    self.sendTo(client, .{ .err = .{
-                        .code = "guest",
-                        .msg = "guest agents manage their own context; /compact is a native-session command",
-                    } });
-                    return;
-                }
                 if (session.state == .running or session.state == .awaiting_approval) {
                     self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "cannot compact mid-turn" } });
+                    return;
+                }
+                if (proto.isGuestModel(session.model)) {
+                    if (session.turn_thread) |t| {
+                        t.join();
+                        session.turn_thread = null;
+                    }
+                    self.startGuestCompact(session, sc.instructions) catch |err| {
+                        self.sendTo(client, .{ .err = .{
+                            .code = if (err == error.SessionPaused) "paused" else "busy",
+                            .msg = if (err == error.SessionPaused) "session is paused; /resume before compacting" else "cannot compact mid-turn",
+                        } });
+                        return;
+                    };
+                    self.sendTo(client, .{ .ok = .{} });
                     return;
                 }
                 if (session.turn_thread) |t| {
@@ -3726,6 +3734,9 @@ pub const Daemon = struct {
         approval_mode: approval.Mode,
         plan_mode: bool,
         synthetic_input: bool = false,
+        /// A guest compacting its own context: `text` holds the focus
+        /// instructions, not a prompt; no user message, no steering.
+        guest_compact: bool = false,
         /// OTLP collector snapshot for guest telemetry pass-down. Duped on
         /// the dispatcher thread — exporter replacement happens there too,
         /// so the turn thread never reads exporter-owned strings.
@@ -3760,6 +3771,24 @@ pub const Daemon = struct {
         attachments: []const block.MediaRef,
         synthetic_input: bool,
         display_text: ?[]const u8,
+    ) !void {
+        return self.startTurnJob(session, text, attachments, synthetic_input, display_text, false);
+    }
+
+    /// A guest session's /compact: the guest compacts its own context in a
+    /// turn of its own, with `instructions` as Claude Code's focus.
+    fn startGuestCompact(self: *Daemon, session: *Session, instructions: []const u8) !void {
+        return self.startTurnJob(session, instructions, &.{}, true, null, true);
+    }
+
+    fn startTurnJob(
+        self: *Daemon,
+        session: *Session,
+        text: []const u8,
+        attachments: []const block.MediaRef,
+        synthetic_input: bool,
+        display_text: ?[]const u8,
+        guest_compact: bool,
     ) !void {
         if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
             return error.SessionBusy;
@@ -3805,11 +3834,12 @@ pub const Daemon = struct {
             .approval_mode = session.approval_mode,
             .plan_mode = session.plan_mode,
             .synthetic_input = synthetic_input,
+            .guest_compact = guest_compact,
             .cancel = &session.cancel,
             .session = session,
         };
         session.steer_mutex.lockUncancelable(self.io);
-        session.steer_accepting = true;
+        session.steer_accepting = !guest_compact;
         session.steer_mutex.unlock(self.io);
         session.turn_started_at_ms.store(job.started_at_ms, .release);
         session.phase_started_at_ms.store(job.started_at_ms, .release);
@@ -3888,10 +3918,12 @@ pub const Daemon = struct {
     fn persistFailedTurn(self: *Daemon, job: *TurnJob, note: []const u8) void {
         const turn_id = if (job.turn_id != 0) job.turn_id else ids.next(self.io);
         var seq = self.store.lastSeq(job.sid) catch return;
-        const bodies = [_]block.Body{
+        const all = [_]block.Body{
             .{ .user_msg = .{ .text = job.text, .display_text = job.display_text, .attachments = job.attachments } },
             .{ .system_note = .{ .text = note } },
         };
+        // A compaction's text is focus instructions, not something typed.
+        const bodies = if (job.guest_compact) all[1..] else all[0..];
         for (bodies) |body| {
             seq += 1;
             const b = block.Block{
@@ -4133,9 +4165,10 @@ pub const Daemon = struct {
             .pause = &job.session.pause_requested,
             .park_clock = &job.session.park_clock,
             .guest_max_runtime_live = &job.session.guest_max_runtime_live,
-            .poll_steer = TurnHooks.pollSteer,
+            .poll_steer = if (job.guest_compact) null else TurnHooks.pollSteer,
             .try_close_steer = TurnHooks.tryCloseSteer,
             .max_rounds = job.max_rounds,
+            .guest_compact = if (job.guest_compact) job.text else null,
         }, job.text, job.attachments) catch |e| {
             // Delegated failures carry actionable prose (missing binary,
             // login required, or guest-reported error); prefer that detail.

@@ -99,6 +99,8 @@ pub const CcOutcome = struct {
     /// its context window out of a result's per-model usage.
     context_model: [128]u8 = undefined,
     context_model_len: usize = 0,
+    /// A compact_boundary arrived.
+    compacted: bool = false,
     /// gpa-owned final text (may be empty).
     final_text: std.ArrayList(u8) = .empty,
     /// The last successful result's text is already an assistant_msg block.
@@ -697,6 +699,12 @@ fn ccInvoke(
                 },
                 .context_used => |used| outcome.noteContextUsed(used.model, used.tokens, opts.context_used_out),
                 .context_window => |window| outcome.noteContextWindow(window.model, window.tokens, opts.context_limit_out),
+                .compacted => |compaction| {
+                    outcome.compacted = true;
+                    const note = try compactionNote(line_arena, "Claude Code", compaction.trigger, compaction.pre_tokens, compaction.post_tokens);
+                    _ = try ap.append(.{ .system_note = .{ .text = note } });
+                    if (compaction.post_tokens) |post| if (opts.context_used_out) |out| out.store(post, .release);
+                },
                 .usage_credits => |active| {
                     if (usage_credits.* == active) continue;
                     _ = try ap.append(.{ .system_note = .{ .text = usageCreditsTransitionNote(active) } });
@@ -720,7 +728,8 @@ fn ccInvoke(
                     try outcome.final_text.appendSlice(gpa, if (r.text.len > 0) r.text else pending_text.items);
                     pending_text.clearRetainingCapacity();
                     outcome.final_persisted = false;
-                    if (!r.is_error) {
+                    // /compact answers with nothing; its note says what happened.
+                    if (!r.is_error and opts.guest_compact == null) {
                         _ = try ap.append(.{ .assistant_msg = .{ .text = outcome.final_text.items } });
                         outcome.final_persisted = true;
                     }
@@ -889,6 +898,91 @@ fn ccInvoke(
         }) catch |err| std.log.warn("could not persist guest round telemetry: {t}", .{err});
     }
     return outcome;
+}
+
+/// "≡ Claude Code compacted its context: 25.6k → 10.7k tokens", with
+/// "automatically" when the guest did it on its own.
+pub fn compactionNote(arena: std.mem.Allocator, guest: []const u8, trigger: []const u8, pre: u64, post: ?u64) ![]const u8 {
+    const how = if (std.mem.eql(u8, trigger, "auto")) " automatically" else "";
+    var sizes: []const u8 = "";
+    if (pre > 0) {
+        var pre_buf: [16]u8 = undefined;
+        var post_buf: [16]u8 = undefined;
+        sizes = if (post) |p|
+            try std.fmt.allocPrint(arena, ": {s} → {s} tokens", .{ kiloTokens(&pre_buf, pre), kiloTokens(&post_buf, p) })
+        else
+            try std.fmt.allocPrint(arena, " ({s} tokens before)", .{kiloTokens(&pre_buf, pre)});
+    }
+    return std.fmt.allocPrint(arena, "≡ {s} compacted its context{s}{s}", .{ guest, how, sizes });
+}
+
+fn kiloTokens(buf: []u8, n: u64) []const u8 {
+    if (n < 1000) return std.fmt.bufPrint(buf, "{d}", .{n}) catch "?";
+    return std.fmt.bufPrint(buf, "{d}.{d}k", .{ n / 1000, (n % 1000) / 100 }) catch "?";
+}
+
+/// A guest session's /compact: Claude Code's own /compact (with any focus
+/// instructions) against the session's conversation. Resume only — with no
+/// conversation there is nothing to compact, and starting one would make
+/// something to compact. The compact_boundary event writes the note and
+/// moves the context gauge.
+pub fn compactClaudeCode(
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *Store,
+    opts: RunOpts,
+    ap: *Appender,
+    instructions: []const u8,
+) !TurnResult {
+    shared.clearDelegateError();
+    publishPhase(opts, .compaction);
+    const prompt = if (instructions.len > 0)
+        try std.fmt.allocPrint(gpa, "/compact {s}", .{instructions})
+    else
+        try gpa.dupe(u8, "/compact");
+    defer gpa.free(prompt);
+    var usage_credits = if (opts.usage_credits_live) |live| live.load(.acquire) else false;
+    var outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt, false, 1);
+    defer outcome.final_text.deinit(gpa);
+    const result: TurnResult = .{ .text = try gpa.dupe(u8, ""), .rounds = 1, .tokens_in = outcome.tokens_in, .tokens_out = outcome.tokens_out };
+    errdefer gpa.free(result.text);
+    try store.updateSessionUsage(opts.session_id, outcome.tokens_in, outcome.tokens_out);
+
+    const failure: ?[]const u8 = if (!outcome.cancelled and (guest_auth.isAuthFailure(outcome.result_error[0..outcome.result_error_len]) or
+        guest_auth.isAuthFailure(outcome.stderr_tail[0..outcome.stderr_len])))
+        guest_auth.loginRequiredNote(.claude_code)
+    else if (outcome.cancelled or outcome.timed_out or !outcome.got_init)
+        null
+    else if (!outcome.got_result)
+        "claude code exited without finishing /compact"
+    else if (outcome.result_is_error)
+        if (outcome.result_error_len > 0) outcome.result_error[0..outcome.result_error_len] else "claude code could not compact its context"
+    else
+        null;
+    if (failure) |note| {
+        setDelegateError(note);
+        _ = try ap.append(.{ .system_note = .{ .text = note } });
+        return error.DelegateFailed;
+    }
+    if (outcome.cancelled) {
+        _ = try ap.append(.{ .system_note = .{ .text = "compaction interrupted by user" } });
+        var interrupted = result;
+        interrupted.interrupted = true;
+        return interrupted;
+    }
+    if (outcome.timed_out) {
+        const note = try shared.deadlineNote(gpa, "claude code", outcome.timed_out_runtime_ms);
+        defer gpa.free(note);
+        setDelegateError(note);
+        _ = try ap.append(.{ .system_note = .{ .text = note } });
+        return error.DelegateTimeout;
+    }
+    // `--resume` of a conversation Claude Code never had exits without init.
+    if (!outcome.got_init)
+        _ = try ap.append(.{ .system_note = .{ .text = "nothing to compact yet: Claude Code has no conversation for this session" } })
+    else if (!outcome.compacted)
+        _ = try ap.append(.{ .system_note = .{ .text = "Claude Code finished /compact without compacting its context" } });
+    return result;
 }
 
 /// A delegated turn: one or more `claude -p` invocations (steers queued

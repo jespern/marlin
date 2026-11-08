@@ -42,6 +42,7 @@ const tryCloseSteering = loop.tryCloseSteering;
 const shared = @import("shared.zig");
 const guest_activity = @import("activity.zig");
 const compactDiagnostic = @import("claude_code_turn.zig").compactDiagnostic;
+const compactionNote = @import("claude_code_turn.zig").compactionNote;
 const setDelegateError = shared.setDelegateError;
 const lastDelegateErrorNote = shared.lastDelegateErrorNote;
 const putEnvDefault = shared.putEnvDefault;
@@ -507,6 +508,25 @@ fn codexSendTurnStart(
     return codex.strField(turn, "id") orelse error.BadCodexResponse;
 }
 
+/// A guest session's /compact: Codex compacts the thread in a turn of its
+/// own, whose id comes with turn/started (the response is null).
+fn codexSendCompactStart(
+    arena: std.mem.Allocator,
+    writer: *Io.Writer,
+    reader: *Io.Reader,
+    request_id: i64,
+    thread_id: []const u8,
+    trace: ?codex.Trace,
+) ![]const u8 {
+    try codexRequest(arena, writer, "thread/compact/start", request_id, trace, .{ .threadId = thread_id });
+    const response = try codexWaitResponse(arena, reader, request_id);
+    if (codexRpcError(arena, response)) |message| {
+        setDelegateError(message);
+        return error.DelegateFailed;
+    }
+    return "";
+}
+
 fn sendCodexSteers(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -725,6 +745,11 @@ pub fn runCodexTurn(
     } else {
         thread_id = "";
     }
+    // Compacting needs a thread with something in it; never start one.
+    if (opts.guest_compact != null and thread_id.len == 0) {
+        _ = try ap.append(.{ .system_note = .{ .text = "nothing to compact yet: Codex has no thread for this session" } });
+        return .{ .text = try gpa.dupe(u8, ""), .rounds = 0, .tokens_in = 0, .tokens_out = 0 };
+    }
     if (thread_id.len == 0) {
         try codexRequest(arena, writer, "thread/start", next_request_id, trace, .{
             .developerInstructions = instructions,
@@ -760,7 +785,10 @@ pub fn runCodexTurn(
         try prompt.appendSlice(gpa, try context.guestPrompt(history_arena_state.allocator(), history.items, first_text));
     }
 
-    var active_turn_id = try markServerExit(&server_exited, codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, prompt.items));
+    var active_turn_id = if (opts.guest_compact != null)
+        try markServerExit(&server_exited, codexSendCompactStart(arena, writer, reader, next_request_id, thread_id, trace))
+    else
+        try markServerExit(&server_exited, codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, prompt.items));
     next_request_id += 1;
     var rounds: u32 = 1;
     var tokens_in: u64 = 0;
@@ -823,6 +851,11 @@ pub fn runCodexTurn(
                 const primary_thread = isPrimaryCodexThread(params, thread_id);
                 if (std.mem.eql(u8, notification.method, "thread/started")) {
                     try codexThreadStarted(&activity, params, thread_id, nowMs(io));
+                } else if (std.mem.eql(u8, notification.method, "turn/started")) {
+                    // A compaction's turn id arrives here, not in its response.
+                    if (!primary_thread or active_turn_id.len > 0) continue;
+                    const turn = codex.field(params, "turn") orelse continue;
+                    active_turn_id = try arena.dupe(u8, codex.strField(turn, "id") orelse continue);
                 } else if (std.mem.eql(u8, notification.method, "item/agentMessage/delta")) {
                     if (!primary_thread) {
                         // A subagent's prose is its live output in the tree.
@@ -887,6 +920,10 @@ pub fn runCodexTurn(
                             }
                         } else if (std.mem.eql(u8, kind, "reasoning")) {
                             try appendCodexReasoning(line_arena, ap, item);
+                        } else if (std.mem.eql(u8, kind, "contextCompaction")) {
+                            const trigger = if (opts.guest_compact != null) "manual" else "auto";
+                            const note = try compactionNote(line_arena, "Codex", trigger, 0, null);
+                            _ = try ap.append(.{ .system_note = .{ .text = note } });
                         } else {
                             _ = try appendCodexToolCompleted(gpa, line_arena, ap, opts, item);
                         }
@@ -916,7 +953,7 @@ pub fn runCodexTurn(
                     // boundary of the root turn we were asked to drive.
                     if (!primary_thread) continue;
                     const turn = codex.field(params, "turn") orelse continue;
-                    if (codex.strField(turn, "id")) |id| if (!std.mem.eql(u8, id, active_turn_id)) continue;
+                    if (codex.strField(turn, "id")) |id| if (active_turn_id.len > 0 and !std.mem.eql(u8, id, active_turn_id)) continue;
                     tokens_in += current_tokens_in;
                     tokens_out += current_tokens_out;
                     current_tokens_in = 0;
@@ -932,7 +969,7 @@ pub fn runCodexTurn(
                         }
                     }
 
-                    if (failed and failure_recoverable and recovery_attempts < max_recovery_attempts and
+                    if (failed and failure_recoverable and recovery_attempts < max_recovery_attempts and opts.guest_compact == null and
                         !cancelled(opts.cancel) and !watcher.cancelled.load(.acquire) and !watcher.timed_out.load(.acquire))
                     {
                         recovery_attempts += 1;

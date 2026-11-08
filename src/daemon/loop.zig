@@ -126,6 +126,9 @@ pub const RunOpts = struct {
     /// Guest turns only: the guest's own model context window, as it
     /// reports it (Marlin does not assemble guest context).
     context_limit_out: ?*std.atomic.Value(u64) = null,
+    /// Guest turns only: compact the guest's own context instead of
+    /// prompting it; the value is focus instructions ("" for none).
+    guest_compact: ?[]const u8 = null,
     /// Dispatcher/daemon preparation before entering runTurn.
     initial_setup_ms: u64 = 0,
     /// Session approval mode (default: mutating tools ask). Snapshot used
@@ -535,6 +538,10 @@ pub fn runTurn(
             .opts = &opts,
             .seq = try store.lastSeq(opts.session_id),
             .turn_id = resolvedTurnId(opts, io),
+        };
+        if (opts.guest_compact) |instructions| return switch (guest) {
+            .claude_code => claude_code_turn.compactClaudeCode(gpa, io, store, opts, &ap, instructions),
+            .codex => runCodexTurn(gpa, io, store, opts, &ap, ""),
         };
         const fresh = ap.seq == 0;
         const user_block_id = try ap.append(.{ .user_msg = .{

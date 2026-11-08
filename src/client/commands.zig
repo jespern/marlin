@@ -60,7 +60,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
-    .{ .name = "/compact", .description = "compact the current context" },
+    .{ .name = "/compact", .usage = " [focus]", .description = "compact the current context (guests compact their own; focus steers Claude Code's summary)", .accepts_args = true },
     .{ .name = "/config", .usage = " [tabbar|bell|pacing on|off|screensaver <duration|effect> [effect]]", .description = "view or change UI settings (persisted)", .accepts_args = true },
     .{ .name = "/pause", .usage = " [all] [--force]", .description = "suspend active work", .accepts_args = true },
     .{ .name = "/resume", .usage = " [all]", .description = "continue paused work", .accepts_args = true },
@@ -914,16 +914,18 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.reboot_request = .{ .requested = true, .rebuild = rebuild, .force = force };
         self.should_quit = true;
     } else if (std.mem.eql(u8, head, "/compact")) {
-        if (proto.isGuestModel(self.view.model.items)) {
-            self.setNotice("guest agents manage their own context — /compact is native-only", .{});
-            return;
-        }
         if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot compact mid-turn", .{});
             return;
         }
-        self.conn.send(.{ .session_compact = .{ .sid = self.view.sid } }) catch return;
-        self.setNotice("compacting…", .{});
+        const focus = std.mem.trim(u8, it.rest(), " \t");
+        self.conn.send(.{ .session_compact = .{ .sid = self.view.sid, .instructions = focus } }) catch return;
+        // Only Claude Code's /compact takes focus instructions.
+        const takes_focus = proto.guestBackend(self.view.model.items) == .claude_code;
+        if (focus.len > 0 and !takes_focus)
+            self.setNotice("compacting… (focus instructions are only for Claude Code sessions)", .{})
+        else
+            self.setNotice("compacting…", .{});
     } else if (std.mem.eql(u8, head, "/diagnostics")) {
         if (it.next() != null) {
             self.setNotice("usage: /diagnostics", .{});
