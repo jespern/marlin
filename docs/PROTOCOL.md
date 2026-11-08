@@ -82,8 +82,9 @@ policy that failed open. Both default false when decoding an older daemon.
 | mcp_list | — | mcp_list_result with per-server readiness, tool count, and discovery error |
 | mcp_add | name, cmd[] | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
 | mcp_remove | name | mcp_list_result after atomically persisting config and rebuilding extensions; err{busy} while any turn is live |
-| ui_set_tab_bar | enabled | ui_config_result{tab_bar, bell, screensaver_after_ms, screensaver_effect} after daemon-serialized atomic persistence to config.toml |
+| ui_set_tab_bar | enabled | ui_config_result{tab_bar, bell, stream_pacing, screensaver_after_ms, screensaver_effect} after daemon-serialized atomic persistence to config.toml |
 | ui_set_bell | enabled | ui_config_result with all UI preferences; `[ui] bell` — BEL on a non-focused approval |
+| ui_set_stream_pacing | enabled | ui_config_result with all UI preferences; `[ui] stream_pacing` — reveal a streaming reply row by row at 60 fps (default off: finished lines show at once) |
 | ui_set_screensaver | after_ms, effect? | ui_config_result with all UI preferences; whole seconds only, persisted as canonical `Ns`, `Nm`, or `Nh` plus `screensaver_effect`; zero means `off`, and an omitted additive effect defaults to `matrix` |
 | mcp_restart | name | mcp_list_result after rediscovery; failure is reported as server health, not daemon failure |
 | mcp_reload | — | mcp_list_result after atomic registry replacement; old registry survives invalid config/build failure |

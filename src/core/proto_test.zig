@@ -403,7 +403,7 @@ test "older hello defaults network configuration state" {
     try std.testing.expectEqual(@as(i64, 0), m.hello_ok.daemon_exe_mtime_ms);
 }
 
-test "older ui config replies default the screensaver off" {
+test "older ui config replies default the screensaver and pacing off" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const msg = try decode(DaemonMsg, arena_state.allocator(),
@@ -411,6 +411,7 @@ test "older ui config replies default the screensaver off" {
     );
     try std.testing.expectEqual(@as(u64, 0), msg.ui_config_result.screensaver_after_ms);
     try std.testing.expectEqualStrings("matrix", msg.ui_config_result.screensaver_effect);
+    try std.testing.expect(!msg.ui_config_result.stream_pacing);
 }
 
 test "status phase is additive and decode-compatible" {

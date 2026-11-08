@@ -130,6 +130,9 @@ pub const Config = struct {
     /// the one out-of-band signal a multiplexer owes you while you look
     /// elsewhere. `[ui] bell = false` / `/config bell off` silences it.
     ui_bell: bool = true,
+    /// Reveal a streaming reply row by row at 60 fps instead of showing each
+    /// finished line at once. `[ui] stream_pacing = true` / `/config pacing on`.
+    ui_stream_pacing: bool = false,
     /// Client-local inactivity delay before an opaque effect. Zero is off.
     ui_screensaver_after_ms: u64 = 0,
     ui_screensaver_effect: []const u8 = "matrix",
@@ -311,7 +314,7 @@ pub fn removeMcpServer(
     try replaceRaw(gpa, io, environ, updated);
 }
 
-/// Persist one `[ui]` boolean (`tab_bar`, `bell`), editing the user's
+/// Persist one `[ui]` boolean (`tab_bar`, `bell`, `stream_pacing`), editing the user's
 /// config.toml surgically: replace the existing key line, insert it into an
 /// existing [ui] table, or append a fresh table — everything else stays
 /// byte-for-byte, and the result must reparse before it may replace the file.
@@ -807,6 +810,7 @@ pub fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.discovery_enabled) |value| cfg.discovery_enabled = value;
     if (doc.ui_tab_bar) |value| cfg.ui_tab_bar = value;
     if (doc.ui_bell) |value| cfg.ui_bell = value;
+    if (doc.ui_stream_pacing) |value| cfg.ui_stream_pacing = value;
     if (doc.ui_screensaver_after_ms) |value| cfg.ui_screensaver_after_ms = value;
     if (doc.ui_screensaver_effect) |value| cfg.ui_screensaver_effect = value;
     if (doc.ui_shell_prefix) |value| cfg.ui_shell_prefix = value;

@@ -3042,12 +3042,7 @@ pub const Daemon = struct {
                     return;
                 };
                 self.cfg.ui_tab_bar = request.enabled;
-                self.sendTo(client, .{ .ui_config_result = .{
-                    .tab_bar = self.cfg.ui_tab_bar,
-                    .bell = self.cfg.ui_bell,
-                    .screensaver_after_ms = self.cfg.ui_screensaver_after_ms,
-                    .screensaver_effect = self.cfg.ui_screensaver_effect,
-                } });
+                self.sendUiConfig(client);
             },
             .ui_set_bell => |request| {
                 config.setUiFlag(self.gpa, self.io, self.environ, "bell", request.enabled) catch |err| {
@@ -3059,12 +3054,19 @@ pub const Daemon = struct {
                     return;
                 };
                 self.cfg.ui_bell = request.enabled;
-                self.sendTo(client, .{ .ui_config_result = .{
-                    .tab_bar = self.cfg.ui_tab_bar,
-                    .bell = self.cfg.ui_bell,
-                    .screensaver_after_ms = self.cfg.ui_screensaver_after_ms,
-                    .screensaver_effect = self.cfg.ui_screensaver_effect,
-                } });
+                self.sendUiConfig(client);
+            },
+            .ui_set_stream_pacing => |request| {
+                config.setUiFlag(self.gpa, self.io, self.environ, "stream_pacing", request.enabled) catch |err| {
+                    std.log.warn("could not persist stream-pacing preference: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{
+                        .code = "config",
+                        .msg = "could not save stream-pacing preference to config.toml",
+                    } });
+                    return;
+                };
+                self.cfg.ui_stream_pacing = request.enabled;
+                self.sendUiConfig(client);
             },
             .ui_set_screensaver => |request| {
                 var duration_buf: [32]u8 = undefined;
@@ -3085,12 +3087,7 @@ pub const Daemon = struct {
                 };
                 self.cfg.ui_screensaver_after_ms = request.after_ms;
                 self.cfg.ui_screensaver_effect = config.canonicalScreensaverEffect(request.effect) catch unreachable;
-                self.sendTo(client, .{ .ui_config_result = .{
-                    .tab_bar = self.cfg.ui_tab_bar,
-                    .bell = self.cfg.ui_bell,
-                    .screensaver_after_ms = self.cfg.ui_screensaver_after_ms,
-                    .screensaver_effect = self.cfg.ui_screensaver_effect,
-                } });
+                self.sendUiConfig(client);
             },
             .mcp_remove => |request| {
                 if (self.anySessionBusy()) {
@@ -5588,6 +5585,16 @@ pub const Daemon = struct {
             }
             field.dst.* = copy;
         }
+    }
+
+    fn sendUiConfig(self: *Daemon, client: *Client) void {
+        self.sendTo(client, .{ .ui_config_result = .{
+            .tab_bar = self.cfg.ui_tab_bar,
+            .bell = self.cfg.ui_bell,
+            .stream_pacing = self.cfg.ui_stream_pacing,
+            .screensaver_after_ms = self.cfg.ui_screensaver_after_ms,
+            .screensaver_effect = self.cfg.ui_screensaver_effect,
+        } });
     }
 
     fn sendMcpStatus(self: *Daemon, client: *Client) void {

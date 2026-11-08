@@ -624,6 +624,9 @@ pub const App = struct {
     /// approval. The one out-of-band signal; everything else stays quiet.
     bell_enabled: bool = true,
     bell_pending: bool = false,
+    /// [ui] stream_pacing: reveal a streaming reply row by row at 60 fps.
+    /// Off, every finished line shows the moment it arrives.
+    stream_pacing: bool = false,
     /// Scroll offset of the `?` help panel (rows are static + generated).
     help_scroll: usize = 0,
     /// Wall-clock ms after which the status notice clears itself. Read by
@@ -1966,7 +1969,7 @@ pub const App = struct {
                 const view = self.liveView(d.sid) orelse return;
                 if (view.history_has_newer) return;
                 view.delta.appendSlice(self.gpa, d.text) catch {};
-                if (view == &self.view) self.stream_pacing_active.store(true, .release);
+                if (view == &self.view and self.stream_pacing) self.stream_pacing_active.store(true, .release);
             },
             .reasoning_delta => |d| {
                 const view = self.liveView(d.sid) orelse return;
@@ -2276,13 +2279,15 @@ pub const App = struct {
             .ui_config_result => |result| {
                 self.show_tab_bar = result.tab_bar;
                 self.bell_enabled = result.bell;
+                self.setStreamPacing(result.stream_pacing);
                 self.screensaver_timeout_ms = result.screensaver_after_ms;
                 self.screensaver_kind = effects.Kind.parse(result.screensaver_effect) orelse .matrix;
                 self.refresh_requested = true;
                 var duration_buf: [32]u8 = undefined;
-                self.setNotice("saved · tabbar {s} · bell {s} · screensaver {s} {s}", .{
+                self.setNotice("saved · tabbar {s} · bell {s} · pacing {s} · screensaver {s} {s}", .{
                     onOff(result.tab_bar),
                     onOff(result.bell),
+                    onOff(result.stream_pacing),
                     config.formatDuration(&duration_buf, result.screensaver_after_ms) catch "invalid",
                     self.screensaver_kind.name(),
                 });
@@ -3008,9 +3013,16 @@ pub const App = struct {
         }
     }
 
+    /// Turn the paced reveal on or off. Turning it on mid-reply starts from
+    /// what is already on screen instead of hiding it again.
+    pub fn setStreamPacing(self: *App, enabled: bool) void {
+        if (enabled and !self.stream_pacing) self.view.stream_pacer.revealed = self.view.stream_layout_cache.committedRows();
+        self.stream_pacing = enabled;
+    }
+
     /// One frame of streamed-text pacing for the visible session.
     pub fn paceStream(self: *App) void {
-        if (self.view.delta.items.len == 0) {
+        if (!self.stream_pacing or self.view.delta.items.len == 0) {
             self.view.stream_pacer.reset();
             self.stream_pacing_active.store(false, .release);
             return;
@@ -4783,7 +4795,7 @@ fn transcriptView(app: *App) Transcript {
         .layout_cache = &app.view.layout_cache,
         .tail_layout_cache = &app.view.tail_layout_cache,
         .stream_layout_cache = &app.view.stream_layout_cache,
-        .stream_reveal_rows = if (app.view.delta.items.len == 0) std.math.maxInt(usize) else app.view.stream_pacer.revealed,
+        .stream_reveal_rows = if (!app.stream_pacing or app.view.delta.items.len == 0) std.math.maxInt(usize) else app.view.stream_pacer.revealed,
     };
 }
 
@@ -7337,6 +7349,7 @@ pub fn run(
     if (setup_at_start) |readiness| app.setup.readiness = readiness;
     app.show_tab_bar = cfg.ui_tab_bar;
     app.bell_enabled = cfg.ui_bell;
+    app.stream_pacing = cfg.ui_stream_pacing;
     app.screensaver_timeout_ms = cfg.ui_screensaver_after_ms;
     app.screensaver_kind = effects.Kind.parse(cfg.ui_screensaver_effect) orelse .matrix;
     app.shell_prefix = shell_tab.Prefix.parse(cfg.ui_shell_prefix) orelse prefix: {

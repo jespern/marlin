@@ -61,7 +61,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
     .{ .name = "/compact", .description = "compact the current context" },
-    .{ .name = "/config", .usage = " [tabbar|bell on|off|screensaver <duration|effect> [effect]]", .description = "view or change UI settings (persisted)", .accepts_args = true },
+    .{ .name = "/config", .usage = " [tabbar|bell|pacing on|off|screensaver <duration|effect> [effect]]", .description = "view or change UI settings (persisted)", .accepts_args = true },
     .{ .name = "/pause", .usage = " [all] [--force]", .description = "suspend active work", .accepts_args = true },
     .{ .name = "/resume", .usage = " [all]", .description = "continue paused work", .accepts_args = true },
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
@@ -1019,9 +1019,10 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
 pub fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra: ?[]const u8) void {
     const name = setting orelse {
         var duration_buf: [32]u8 = undefined;
-        self.setNotice("config · tabbar {s} · bell {s} · screensaver {s} {s}", .{
+        self.setNotice("config · tabbar {s} · bell {s} · pacing {s} · screensaver {s} {s}", .{
             onOff(self.show_tab_bar),
             onOff(self.bell_enabled),
+            onOff(self.stream_pacing),
             config.formatDuration(&duration_buf, self.screensaver_timeout_ms) catch "invalid",
             self.screensaver_kind.name(),
         });
@@ -1085,29 +1086,37 @@ pub fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra
         return;
     }
 
-    const is_tabbar = std.mem.eql(u8, name, "tabbar");
-    const is_bell = std.mem.eql(u8, name, "bell");
-    if (!is_tabbar and !is_bell) {
-        self.setNotice("usage: /config <tabbar|bell> [on|off] or /config screensaver <duration|effect> [effect]", .{});
+    const Flag = enum { tabbar, bell, pacing };
+    const flag = std.meta.stringToEnum(Flag, name) orelse {
+        self.setNotice("usage: /config <tabbar|bell|pacing> [on|off] or /config screensaver <duration|effect> [effect]", .{});
         return;
-    }
-    const current = if (is_tabbar) self.show_tab_bar else self.bell_enabled;
+    };
+    const current = switch (flag) {
+        .tabbar => self.show_tab_bar,
+        .bell => self.bell_enabled,
+        .pacing => self.stream_pacing,
+    };
     const enable = if (value) |v| blk: {
         if (std.mem.eql(u8, v, "on") or std.mem.eql(u8, v, "true")) break :blk true;
         if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false")) break :blk false;
-        self.setNotice("usage: /config <tabbar|bell> [on|off]", .{});
+        self.setNotice("usage: /config <tabbar|bell|pacing> [on|off]", .{});
         return;
     } else !current;
-    if (is_tabbar) {
-        self.show_tab_bar = enable;
-        self.refresh_requested = true;
-    } else {
-        self.bell_enabled = enable;
-    }
-    const msg: proto.ClientMsg = if (is_tabbar)
-        .{ .ui_set_tab_bar = .{ .enabled = enable } }
-    else
-        .{ .ui_set_bell = .{ .enabled = enable } };
+    const msg: proto.ClientMsg = switch (flag) {
+        .tabbar => msg: {
+            self.show_tab_bar = enable;
+            self.refresh_requested = true;
+            break :msg .{ .ui_set_tab_bar = .{ .enabled = enable } };
+        },
+        .bell => msg: {
+            self.bell_enabled = enable;
+            break :msg .{ .ui_set_bell = .{ .enabled = enable } };
+        },
+        .pacing => msg: {
+            self.setStreamPacing(enable);
+            break :msg .{ .ui_set_stream_pacing = .{ .enabled = enable } };
+        },
+    };
     self.conn.send(msg) catch |err| {
         self.setNotice("{s} {s} (not saved: {t})", .{ name, onOff(enable), err });
         return;

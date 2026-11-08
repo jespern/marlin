@@ -401,6 +401,8 @@ pub const ClientMsg = union(enum) {
     ui_set_tab_bar: struct { enabled: bool },
     /// Persist `[ui] bell` (terminal BEL on a background approval).
     ui_set_bell: struct { enabled: bool },
+    /// Persist `[ui] stream_pacing` (paced row-by-row reveal of a reply).
+    ui_set_stream_pacing: struct { enabled: bool },
     /// Persist the client-local inactivity delay and selected effect.
     ui_set_screensaver: struct { after_ms: u64, effect: []const u8 = "matrix" },
     /// Re-read config and atomically replace extensions while no turn is live.
@@ -621,6 +623,7 @@ pub const DaemonMsg = union(enum) {
     ui_config_result: struct {
         tab_bar: bool,
         bell: bool = true,
+        stream_pacing: bool = false,
         screensaver_after_ms: u64 = 0,
         screensaver_effect: []const u8 = "matrix",
     },
