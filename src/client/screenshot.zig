@@ -1,17 +1,22 @@
-//! Screenshots as PNG on the macOS clipboard (Alt+S, /screenshot [slim]).
-//! Terminals can only put text on the clipboard, so Marlin draws the image
-//! itself from the frame it just rendered: the screen's cells become styled
-//! runs in the terminal's own colors, and a JXA script draws them with
-//! AppKit, which brings font fallback and emoji, and puts the PNG on the
-//! pasteboard. Kitty images are not in the frame and do not appear.
+//! Screenshots as PNG on the macOS clipboard (Alt+S, /screenshot [slim],
+//! !ss). Terminals can only put text on the clipboard, so Marlin paints the
+//! image itself from the frame it just rendered, the way Ghostty paints it:
+//! Ghostty's font setup and sprite font, CoreText shaping, the terminal's
+//! own colors, and the shell's Kitty images (raster.zig,
+//! raster_coretext.zig). Painting runs on a thread from a copy of the
+//! frame; the PNG goes to the pasteboard, or to MARLIN_SCREENSHOT_FILE.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const vaxis = @import("vaxis");
 const vt = @import("ghostty-vt");
+const ghostty_font = @import("ghostty_font");
 const render = @import("render.zig");
+const raster = @import("raster.zig");
+const shell_tab = @import("shell_tab.zig");
 const tui = @import("tui.zig");
 const App = tui.App;
+const coretext = if (builtin.os.tag == .macos) @import("raster_coretext.zig") else struct {};
 
 pub const Mode = enum {
     /// Everything on screen: tab bar, transcript or shell, status line.
@@ -20,33 +25,27 @@ pub const Mode = enum {
     slim,
 };
 
+/// What a screenshot thread reports back.
+pub const Outcome = union(enum) {
+    /// On the clipboard; `exact` when the font grid matched the
+    /// terminal's cells, so text sits where the terminal drew it.
+    copied: struct { exact: bool },
+    failed: []const u8,
+};
+
 pub const Colors = struct {
     fg: [3]u8,
     bg: [3]u8,
     palette: [256][3]u8,
 };
 
-pub const Geometry = struct {
-    cols: usize,
-    /// Cell size in device pixels.
-    cell_width: u32,
-    cell_height: u32,
-};
-
-const bold: u8 = 1;
-const italic: u8 = 2;
-const underline: u8 = 4;
-const strikethrough: u8 = 8;
-
-const Run = struct {
-    col: usize,
-    width: usize,
-    text: std.ArrayList(u8) = .empty,
-    fg: [3]u8,
-    bg: ?[3]u8,
-    flags: u8,
-    /// Plain ASCII cells, which may join a following run of the same style.
-    joinable: bool,
+/// Ghostty's config keys that change how the frame is painted.
+pub const GhosttyConfig = struct {
+    font: if (builtin.os.tag == .macos) coretext.Config else void = if (builtin.os.tag == .macos) .{} else {},
+    faint_opacity: f64 = 0.5,
+    cursor_color: ?[3]u8 = null,
+    cursor_text: ?[3]u8 = null,
+    cursor_style: raster.CursorStyle = .block,
 };
 
 pub fn isKey(key: vaxis.Key) bool {
@@ -62,14 +61,13 @@ pub fn request(app: *App, mode: Mode) void {
     app.refresh_requested = true;
 }
 
-/// After a frame is rendered: start the requested screenshot of it.
+/// After a frame is rendered: copy the requested part of it and paint it
+/// on a thread.
 pub fn takePending(app: *App, screen: *const vaxis.Screen) void {
+    if (builtin.os.tag != .macos) return;
     const mode = app.screenshot_request orelse return;
     app.screenshot_request = null;
     const loop = app.loop orelse return;
-    var arena_state = std.heap.ArenaAllocator.init(app.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
     const top: usize = switch (mode) {
         .full => 0,
         .slim => app.tabBarRows(),
@@ -79,24 +77,24 @@ pub fn takePending(app: *App, screen: *const vaxis.Screen) void {
         .slim => @min(top + app.view.last_view_h, screen.height),
     };
     if (end <= top) return app.setNotice("nothing to capture", .{});
-    const theme = &app.terminal_theme;
-    const home = if (app.environ) |env| env.get("HOME") else null;
-    const json = describe(arena, screen, top, end, colorsFrom(theme.foreground, theme.background, theme.palette), .{
-        .cols = screen.width,
+
+    const job = app.gpa.create(Job) catch return app.setNotice("screenshot failed: out of memory", .{});
+    job.* = .{
+        .arena = .init(app.gpa),
+        .gpa = app.gpa,
+        .io = app.io,
+        .loop = loop,
+        .frame = undefined,
+        .config = undefined,
         .cell_width = if (app.cell_px_w > 0) app.cell_px_w else 16,
         .cell_height = if (app.cell_px_h > 0) app.cell_px_h else 34,
-    }, fontFamily(arena, app.io, home)) catch return app.setNotice("screenshot failed: out of memory", .{});
-    const tmp = if (app.environ) |env| env.get("TMPDIR") orelse "/tmp" else "/tmp";
-    const job = app.gpa.create(Job) catch return;
-    job.* = .{ .gpa = app.gpa, .io = app.io, .loop = loop, .environ = app.environ, .json = undefined, .tmp = undefined };
-    job.json = app.gpa.dupe(u8, json) catch {
-        app.gpa.destroy(job);
-        return;
+        .tmp = undefined,
+        .file = null,
     };
-    job.tmp = app.gpa.dupe(u8, tmp) catch {
-        app.gpa.free(job.json);
-        app.gpa.destroy(job);
-        return;
+    const prepared = job.prepare(app, screen, top, end);
+    prepared catch {
+        job.deinit();
+        return app.setNotice("screenshot failed: out of memory", .{});
     };
     app.screenshot_thread = std.Thread.spawn(.{}, Job.run, .{job}) catch {
         job.deinit();
@@ -105,121 +103,192 @@ pub fn takePending(app: *App, screen: *const vaxis.Screen) void {
     app.setNotice("taking a screenshot…", .{});
 }
 
-pub fn done(app: *App, failure: ?[]const u8) void {
+pub fn done(app: *App, outcome: Outcome) void {
     if (app.screenshot_thread) |thread| thread.join();
     app.screenshot_thread = null;
-    if (failure) |reason| app.setNotice("screenshot failed: {s}", .{reason}) else app.setNotice("screenshot copied to the clipboard", .{});
+    switch (outcome) {
+        .copied => |copied| if (copied.exact)
+            app.setNotice("screenshot copied to the clipboard", .{})
+        else
+            app.setNotice("screenshot copied (the terminal's font grid differs from Ghostty's; text placement is approximate)", .{}),
+        .failed => |reason| app.setNotice("screenshot failed: {s}", .{reason}),
+    }
 }
 
 const Job = struct {
+    arena: std.heap.ArenaAllocator,
     gpa: std.mem.Allocator,
     io: Io,
     loop: *vaxis.Loop(tui.Event),
-    environ: ?*const std.process.Environ.Map,
-    json: []u8,
-    tmp: []u8,
+    frame: raster.Frame,
+    config: GhosttyConfig,
+    cell_width: u32,
+    cell_height: u32,
+    tmp: []const u8,
+    file: ?[]const u8,
 
     fn deinit(job: *Job) void {
-        job.gpa.free(job.json);
-        job.gpa.free(job.tmp);
+        job.arena.deinit();
         job.gpa.destroy(job);
+    }
+
+    /// Everything the thread needs, copied out of the app and the screen.
+    fn prepare(job: *Job, app: *App, screen: *const vaxis.Screen, top: usize, end: usize) !void {
+        const arena = job.arena.allocator();
+        const home = if (app.environ) |env| env.get("HOME") else null;
+        job.config = loadGhosttyConfig(arena, app.io, home);
+        const theme = &app.terminal_theme;
+        job.frame = try frameFrom(arena, screen, top, end, colorsFrom(theme.foreground, theme.background, theme.palette), job.config);
+        job.frame.images = try imagesFrom(arena, app, top, end, job.cell_width, job.cell_height);
+        const env = app.environ;
+        job.tmp = try arena.dupe(u8, if (env) |e| e.get("TMPDIR") orelse "/tmp" else "/tmp");
+        if (env) |e| if (e.get("MARLIN_SCREENSHOT_FILE")) |path| {
+            job.file = try arena.dupe(u8, path);
+        };
     }
 
     fn run(job: *Job) void {
         defer job.deinit();
-        copyToClipboard(job.gpa, job.io, job.json, job.tmp, job.environ) catch |err| {
-            job.loop.postEvent(.{ .screenshot = @errorName(err) }) catch {};
-            return;
-        };
-        job.loop.postEvent(.{ .screenshot = null }) catch {};
+        const outcome: Outcome = if (job.paint()) |exact| .{ .copied = .{ .exact = exact } } else |err| .{ .failed = @errorName(err) };
+        job.loop.postEvent(.{ .screenshot = outcome }) catch {};
+    }
+
+    fn paint(job: *Job) !bool {
+        if (builtin.os.tag != .macos) return error.Unsupported;
+        ghostty_font.setIo(job.io);
+        var fonts = try coretext.Fonts.init(job.gpa, job.config.font, job.cell_width, job.cell_height);
+        defer fonts.deinit();
+        const picture = try raster.paint(job.gpa, job.frame, fonts.metrics, fonts.text(), .{ .padding = 2 * fonts.metrics.cell_width });
+        defer picture.deinit(job.gpa);
+        const png = try raster.encodePng(job.gpa, picture, fonts.scale);
+        defer job.gpa.free(png);
+        if (job.file) |path| {
+            try Io.Dir.cwd().writeFile(job.io, .{ .sub_path = path, .data = png });
+        } else {
+            try copyToClipboard(job.gpa, job.io, png, job.tmp);
+        }
+        return fonts.exact_grid;
     }
 };
 
-/// Rows `top..end` of `screen` as JSON for `script`: the grid, colors and
-/// font, then one entry per styled run: [row, col, width, text, fg,
-/// bg|null, flags].
-pub fn describe(arena: std.mem.Allocator, screen: *const vaxis.Screen, top: usize, end: usize, colors: Colors, geometry: Geometry, font: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    const w = &out.writer;
-    try w.print("{{\"cols\":{d},\"rows\":{d},\"cw\":{d},\"ch\":{d},\"font\":", .{ geometry.cols, end - top, geometry.cell_width, geometry.cell_height });
-    try writeString(w, font);
-    try w.print(",\"bg\":[{d},{d},{d}],\"runs\":[", .{ colors.bg[0], colors.bg[1], colors.bg[2] });
-    var first = true;
-    for (top..end) |y| {
-        const row = y - top;
-        var run: ?Run = null;
+/// Rows `top..end` of `screen` as cells to paint, in the terminal's
+/// colors, styled the way Ghostty styles them.
+pub fn frameFrom(arena: std.mem.Allocator, screen: *const vaxis.Screen, top: usize, end: usize, colors: Colors, config: GhosttyConfig) !raster.Frame {
+    const cols: u16 = screen.width;
+    const rows: u16 = @intCast(end - top);
+    const cells = try arena.alloc(raster.Cell, @as(usize, cols) * rows);
+    const faint: u8 = @intFromFloat(@round(std.math.clamp(config.faint_opacity, 0, 1) * 255));
+    for (0..rows) |r| {
         var col: usize = 0;
-        while (col < screen.width) {
-            const cell = screen.readCell(@intCast(col), @intCast(y)) orelse break;
-            const grapheme = cell.char.grapheme;
-            const measured: usize = if (cell.char.width > 0) cell.char.width else render.displayWidth(grapheme);
-            const width: usize = @max(measured, 1);
-            defer col += width;
+        while (col < cols) {
+            const out = &cells[r * cols + col];
+            const cell = screen.readCell(@intCast(col), @intCast(top + r)) orelse {
+                out.* = .{ .fg = colors.fg, .bg = colors.bg };
+                col += 1;
+                continue;
+            };
             const style = cell.style;
             var fg = resolve(style.fg, colors, colors.fg);
             var bg = resolve(style.bg, colors, colors.bg);
             if (style.reverse) std.mem.swap([3]u8, &fg, &bg);
-            if (style.dim) fg = mix(fg, bg);
-            if (style.invisible) fg = bg;
-            var flags: u8 = 0;
-            if (style.bold) flags |= bold;
-            if (style.italic) flags |= italic;
-            if (style.ul_style != .off) flags |= underline;
-            if (style.strikethrough) flags |= strikethrough;
-            const fill: ?[3]u8 = if (std.mem.eql(u8, &bg, &colors.bg)) null else bg;
-
-            const text = if (grapheme.len == 0) " " else grapheme;
-            const ascii = width == 1 and text.len == 1 and text[0] >= 0x20 and text[0] < 0x7f;
-            if (run) |*r| {
-                const same = r.joinable and ascii and r.col + r.width == col and r.flags == flags and
-                    std.mem.eql(u8, &r.fg, &fg) and std.meta.eql(r.bg, fill);
-                if (same) {
-                    try r.text.append(arena, text[0]);
-                    r.width += 1;
-                    continue;
-                }
-                try flush(w, row, r, &first);
-                run = null;
-            }
-            if (std.mem.eql(u8, text, " ") and fill == null and flags & (underline | strikethrough) == 0) continue;
-            var next: Run = .{ .col = col, .width = width, .fg = fg, .bg = fill, .flags = flags, .joinable = ascii };
-            try next.text.appendSlice(arena, text);
-            run = next;
+            const grapheme = cell.char.grapheme;
+            const measured: usize = if (cell.char.width > 0) cell.char.width else render.displayWidth(grapheme);
+            const width: usize = std.math.clamp(measured, 1, 2);
+            out.* = .{
+                .text = if (style.invisible or std.mem.eql(u8, grapheme, " ")) "" else try arena.dupe(u8, grapheme),
+                .width = @intCast(width),
+                .fg = fg,
+                .bg = bg,
+                .alpha = if (style.dim) faint else 255,
+                .bold = style.bold,
+                .italic = style.italic,
+                .strikethrough = style.strikethrough,
+                .underline = switch (style.ul_style) {
+                    .off => .none,
+                    .single => .single,
+                    .double => .double,
+                    .curly => .curly,
+                    .dotted => .dotted,
+                    .dashed => .dashed,
+                },
+                .underline_color = switch (style.ul) {
+                    .default => null,
+                    else => resolve(style.ul, colors, fg),
+                },
+            };
+            // The tail of a wide grapheme: nothing of its own.
+            for (1..width) |k| if (col + k < cols) {
+                cells[r * cols + col + k] = .{ .width = 0, .fg = fg, .bg = bg };
+            };
+            col += width;
         }
-        if (run) |*r| try flush(w, row, r, &first);
     }
-    try w.writeAll("]}");
-    return out.written();
+    const cursor: ?raster.Cursor = if (screen.cursor_vis and screen.cursor.row >= top and screen.cursor.row < end and screen.cursor.col < cols) .{
+        .col = @intCast(screen.cursor.col),
+        .row = @intCast(screen.cursor.row - top),
+        .style = switch (screen.cursor_shape) {
+            .default => config.cursor_style,
+            .block, .block_blink => .block,
+            .underline, .underline_blink => .underline,
+            .beam, .beam_blink => .bar,
+        },
+        .color = config.cursor_color,
+        .text = config.cursor_text,
+    } else null;
+    return .{ .cols = cols, .rows = rows, .cells = cells, .background = colors.bg, .cursor = cursor };
 }
 
-fn flush(w: *std.Io.Writer, row: usize, run: *const Run, first: *bool) !void {
-    var text: []const u8 = run.text.items;
-    var width = run.width;
-    // Trailing blanks draw nothing unless they are filled or lined.
-    if (run.joinable and run.bg == null and run.flags & (underline | strikethrough) == 0) {
-        const trimmed = std.mem.trimEnd(u8, text, " ");
-        width -= text.len - trimmed.len;
-        text = trimmed;
+/// The shell's Kitty images as the host terminal shows them: each crop
+/// scaled into its cell box, copied out as RGBA.
+fn imagesFrom(arena: std.mem.Allocator, app: *App, top: usize, end: usize, cell_width: u32, cell_height: u32) ![]const raster.Image {
+    const covered = app.picker != null or app.top_view != null or app.shortcut_help;
+    if (covered) return &.{};
+    const wants = try shell_tab.imageWants(app, arena);
+    var images: std.ArrayList(raster.Image) = .empty;
+    for (wants) |want| {
+        if (want.row < top or want.row >= end) continue;
+        const rgba = try rgbaFrom(arena, want.image) orelse continue;
+        try images.append(arena, .{
+            .pixels = rgba,
+            .width = want.image.width,
+            .height = want.image.height,
+            .src_x = want.source.x,
+            .src_y = want.source.y,
+            .src_width = @min(want.source.width, want.image.width -| want.source.x),
+            .src_height = @min(want.source.height, want.image.height -| want.source.y),
+            .x = @intCast(@as(u32, want.col) * cell_width + want.x_offset),
+            .y = @intCast(@as(u32, want.row - @as(u16, @intCast(top))) * cell_height + want.y_offset),
+            .dst_width = @as(u32, want.cols) * cell_width,
+            .dst_height = @as(u32, want.rows) * cell_height,
+        });
     }
-    if (text.len == 0) return;
-    if (!first.*) try w.writeByte(',');
-    first.* = false;
-    try w.print("[{d},{d},{d},", .{ row, run.col, width });
-    try writeString(w, text);
-    try w.print(",[{d},{d},{d}],", .{ run.fg[0], run.fg[1], run.fg[2] });
-    if (run.bg) |bg| try w.print("[{d},{d},{d}]", .{ bg[0], bg[1], bg[2] }) else try w.writeAll("null");
-    try w.print(",{d}]", .{run.flags});
+    return images.items;
 }
 
-fn writeString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        0...0x1f, 0x7f => try w.print("\\u{x:0>4}", .{c}),
-        else => try w.writeByte(c),
-    };
-    try w.writeByte('"');
+fn rgbaFrom(arena: std.mem.Allocator, image: *const vt.kitty.graphics.Image) !?[]const u8 {
+    const data = image.data.bytes() orelse return null;
+    const n = @as(usize, image.width) * image.height;
+    const out = try arena.alloc(u8, n * 4);
+    switch (image.format) {
+        .rgba => {
+            if (data.len < n * 4) return null;
+            @memcpy(out, data[0 .. n * 4]);
+        },
+        .rgb => {
+            if (data.len < n * 3) return null;
+            for (0..n) |i| out[i * 4 ..][0..4].* = .{ data[i * 3], data[i * 3 + 1], data[i * 3 + 2], 255 };
+        },
+        .gray => {
+            if (data.len < n) return null;
+            for (0..n) |i| out[i * 4 ..][0..4].* = .{ data[i], data[i], data[i], 255 };
+        },
+        .gray_alpha => {
+            if (data.len < n * 2) return null;
+            for (0..n) |i| out[i * 4 ..][0..4].* = .{ data[i * 2], data[i * 2], data[i * 2], data[i * 2 + 1] };
+        },
+        .png => return null,
+    }
+    return out;
 }
 
 fn resolve(color: vaxis.Color, colors: Colors, default: [3]u8) [3]u8 {
@@ -228,13 +297,6 @@ fn resolve(color: vaxis.Color, colors: Colors, default: [3]u8) [3]u8 {
         .index => |index| colors.palette[index],
         .rgb => |rgb| rgb,
     };
-}
-
-/// Halfway from `fg` to `bg`: faint text.
-fn mix(fg: [3]u8, bg: [3]u8) [3]u8 {
-    var out: [3]u8 = undefined;
-    for (&out, fg, bg) |*c, f, b| c.* = @intCast((@as(u16, f) + b) / 2);
-    return out;
 }
 
 /// The xterm palette with the terminal's reported colors over it.
@@ -247,91 +309,106 @@ pub fn colorsFrom(fg: ?[3]u8, bg: ?[3]u8, reported: [16]?[3]u8) Colors {
     return colors;
 }
 
-/// The terminal's font when it is Ghostty and names one; else Menlo.
-pub fn fontFamily(arena: std.mem.Allocator, io: Io, home: ?[]const u8) []const u8 {
-    const dir = home orelse return "Menlo";
+/// Ghostty's config, from where Ghostty reads it.
+pub fn loadGhosttyConfig(arena: std.mem.Allocator, io: Io, home: ?[]const u8) GhosttyConfig {
+    const dir = home orelse return .{};
+    var text: std.ArrayList(u8) = .empty;
     for ([_][]const u8{ ".config/ghostty/config", "Library/Application Support/com.mitchellh.ghostty/config" }) |rel| {
         const path = std.fs.path.join(arena, &.{ dir, rel }) catch continue;
-        const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256 * 1024)) catch continue;
-        if (configFont(text)) |font| return font;
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256 * 1024)) catch continue;
+        text.appendSlice(arena, bytes) catch {};
+        text.append(arena, '\n') catch {};
     }
-    return "Menlo";
+    return parseGhosttyConfig(arena, text.items);
 }
 
-pub fn configFont(config: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, config, '\n');
+/// The keys of Ghostty's config that screenshots honor. Repeatable keys
+/// accumulate; an empty value resets them, as in Ghostty.
+pub fn parseGhosttyConfig(arena: std.mem.Allocator, config_text: []const u8) GhosttyConfig {
+    var config: GhosttyConfig = .{};
+    const Lists = struct {
+        family: std.ArrayList([]const u8) = .empty,
+        bold: std.ArrayList([]const u8) = .empty,
+        italic: std.ArrayList([]const u8) = .empty,
+        bold_italic: std.ArrayList([]const u8) = .empty,
+        features: std.ArrayList([]const u8) = .empty,
+    };
+    var lists: Lists = .{};
+    var lines = std.mem.splitScalar(u8, config_text, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..eq], " \t"), "font-family")) continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, std.mem.trim(u8, line[eq + 1 ..], " \t"), "\"");
-        if (value.len > 0) return value;
+        const list: ?*std.ArrayList([]const u8) = if (std.mem.eql(u8, key, "font-family"))
+            &lists.family
+        else if (std.mem.eql(u8, key, "font-family-bold"))
+            &lists.bold
+        else if (std.mem.eql(u8, key, "font-family-italic"))
+            &lists.italic
+        else if (std.mem.eql(u8, key, "font-family-bold-italic"))
+            &lists.bold_italic
+        else if (std.mem.eql(u8, key, "font-feature"))
+            &lists.features
+        else
+            null;
+        if (list) |l| {
+            if (value.len == 0) l.clearRetainingCapacity() else l.append(arena, value) catch {};
+            continue;
+        }
+        if (std.mem.eql(u8, key, "faint-opacity")) {
+            config.faint_opacity = std.fmt.parseFloat(f64, value) catch config.faint_opacity;
+        } else if (std.mem.eql(u8, key, "cursor-color")) {
+            config.cursor_color = parseColor(value);
+        } else if (std.mem.eql(u8, key, "cursor-text")) {
+            config.cursor_text = parseColor(value);
+        } else if (std.mem.eql(u8, key, "cursor-style")) {
+            if (std.mem.eql(u8, value, "bar")) config.cursor_style = .bar;
+            if (std.mem.eql(u8, value, "underline")) config.cursor_style = .underline;
+            if (std.mem.eql(u8, value, "block")) config.cursor_style = .block;
+            if (std.mem.eql(u8, value, "block_hollow")) config.cursor_style = .hollow;
+        } else if (builtin.os.tag == .macos) {
+            if (std.mem.eql(u8, key, "font-size")) {
+                config.font.size = std.fmt.parseFloat(f64, value) catch config.font.size;
+            } else if (std.mem.eql(u8, key, "font-thicken")) {
+                config.font.font_thicken = std.mem.eql(u8, value, "true");
+            } else if (std.mem.eql(u8, key, "font-thicken-strength")) {
+                config.font.font_thicken_strength = std.fmt.parseInt(u8, value, 10) catch config.font.font_thicken_strength;
+            }
+        }
     }
-    return null;
+    if (builtin.os.tag == .macos) {
+        config.font.family = lists.family.items;
+        config.font.family_bold = lists.bold.items;
+        config.font.family_italic = lists.italic.items;
+        config.font.family_bold_italic = lists.bold_italic.items;
+        config.font.features = lists.features.items;
+    }
+    return config;
 }
 
-/// Draws `describe`'s JSON (path in argv[0]) and puts the PNG on the
-/// clipboard, at the screen's backing scale so it pastes at its real size;
-/// or writes it to argv[1] when given (MARLIN_SCREENSHOT_FILE, for tests).
-pub const script =
-    \\ObjC.import('AppKit');
-    \\function run(argv) {
-    \\  var d = JSON.parse($.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null).js);
-    \\  var pad = d.cw * 2, W = d.cols * d.cw + 2 * pad, H = d.rows * d.ch + 2 * pad;
-    \\  var rep = $.NSBitmapImageRep.alloc.initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(null, W, H, 8, 4, true, false, $.NSDeviceRGBColorSpace, 0, 0);
-    \\  $.NSGraphicsContext.saveGraphicsState;
-    \\  $.NSGraphicsContext.setCurrentContext($.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep));
-    \\  function color(c) { return $.NSColor.colorWithSRGBRedGreenBlueAlpha(c[0] / 255, c[1] / 255, c[2] / 255, 1); }
-    \\  function attrs(font, fg, flags) {
-    \\    var keys = [$.NSFontAttributeName, $.NSForegroundColorAttributeName], vals = [font, color(fg)];
-    \\    if (flags & 4) { keys.push($.NSUnderlineStyleAttributeName); vals.push($(1)); }
-    \\    if (flags & 8) { keys.push($.NSStrikethroughStyleAttributeName); vals.push($(1)); }
-    \\    return $.NSDictionary.dictionaryWithObjectsForKeys($(vals), $(keys));
-    \\  }
-    \\  color(d.bg).setFill; $.NSRectFill($.NSMakeRect(0, 0, W, H));
-    \\  var probe = $.NSFont.fontWithNameSize(d.font, 100);
-    \\  if (probe.isNil()) probe = $.NSFont.monospacedSystemFontOfSizeWeight(100, 0);
-    \\  var em = $('M').sizeWithAttributes(attrs(probe, d.bg, 0)).width;
-    \\  var size = 100 * d.cw / em, fm = $.NSFontManager.sharedFontManager, fonts = {};
-    \\  function font(flags) {
-    \\    var k = flags & 3; if (fonts[k]) return fonts[k];
-    \\    var f = $.NSFont.fontWithNameSize(probe.fontName, size);
-    \\    if (k & 1) f = fm.convertFontToHaveTrait(f, 2);
-    \\    if (k & 2) f = fm.convertFontToHaveTrait(f, 1);
-    \\    return fonts[k] = f;
-    \\  }
-    \\  var regular = font(0), lh = regular.ascender - regular.descender + regular.leading;
-    \\  d.runs.forEach(function (r) {
-    \\    var x = pad + r[1] * d.cw, y = H - pad - (r[0] + 1) * d.ch;
-    \\    if (r[5]) { color(r[5]).setFill; $.NSRectFill($.NSMakeRect(x, y, r[2] * d.cw, d.ch)); }
-    \\    if (r[3].trim().length) $(r[3]).drawAtPointWithAttributes($.NSMakePoint(x, y + (d.ch - lh) / 2), attrs(font(r[6]), r[4], r[6]));
-    \\    else if (r[6] & 12) $(r[3]).drawAtPointWithAttributes($.NSMakePoint(x, y + (d.ch - lh) / 2), attrs(font(r[6]), r[4], r[6]));
-    \\  });
-    \\  $.NSGraphicsContext.restoreGraphicsState;
-    \\  var scale = $.NSScreen.mainScreen.isNil() ? 1 : $.NSScreen.mainScreen.backingScaleFactor;
-    \\  rep.size = $.NSMakeSize(W / scale, H / scale);
-    \\  var png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
-    \\  if (argv[1]) { png.writeToFileAtomically(argv[1], true); return W + 'x' + H; }
-    \\  var pb = $.NSPasteboard.generalPasteboard;
-    \\  pb.clearContents;
-    \\  pb.setDataForType(png, 'public.png');
-    \\  return W + 'x' + H;
-    \\}
-;
+fn parseColor(value: []const u8) ?[3]u8 {
+    const hex = if (value.len > 0 and value[0] == '#') value[1..] else value;
+    if (hex.len != 6) return null;
+    var out: [3]u8 = undefined;
+    for (&out, 0..) |*c, i| c.* = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch return null;
+    return out;
+}
 
-/// Runs `script` on `json`; blocking, so callers use a thread.
-pub fn copyToClipboard(gpa: std.mem.Allocator, io: Io, json: []const u8, tmp_dir: []const u8, environ: ?*const std.process.Environ.Map) !void {
+/// Put `png` on the pasteboard through a JXA script; blocking, so callers
+/// use a thread.
+pub fn copyToClipboard(gpa: std.mem.Allocator, io: Io, png: []const u8, tmp_dir: []const u8) !void {
     var name_buf: [64]u8 = undefined;
     var random: [8]u8 = undefined;
     io.random(&random);
-    const name = try std.fmt.bufPrint(&name_buf, "marlin-shot-{x}.json", .{std.mem.readInt(u64, &random, .little)});
+    const name = try std.fmt.bufPrint(&name_buf, "marlin-shot-{x}.png", .{std.mem.readInt(u64, &random, .little)});
     const path = try std.fs.path.join(gpa, &.{ tmp_dir, name });
     defer gpa.free(path);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = png });
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
     const result = try std.process.run(gpa, io, .{
-        .argv = &.{ "/usr/bin/osascript", "-l", "JavaScript", "-e", script, path, if (environ) |env| env.get("MARLIN_SCREENSHOT_FILE") orelse "" else "" },
-        .environ_map = environ,
+        .argv = &.{ "/usr/bin/osascript", "-l", "JavaScript", "-e", clipboard_script, path },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(16 * 1024),
     });
@@ -340,8 +417,19 @@ pub fn copyToClipboard(gpa: std.mem.Allocator, io: Io, json: []const u8, tmp_dir
     switch (result.term) {
         .exited => |code| if (code != 0) {
             std.log.scoped(.screenshot).warn("osascript failed: {s}", .{result.stderr});
-            return error.ScreenshotFailed;
+            return error.ClipboardFailed;
         },
-        else => return error.ScreenshotFailed,
+        else => return error.ClipboardFailed,
     }
 }
+
+const clipboard_script =
+    \\ObjC.import('AppKit');
+    \\function run(argv) {
+    \\  var png = $.NSData.dataWithContentsOfFile(argv[0]);
+    \\  if (png.isNil()) throw new Error('no image');
+    \\  var pb = $.NSPasteboard.generalPasteboard;
+    \\  pb.clearContents;
+    \\  pb.setDataForType(png, 'public.png');
+    \\}
+;

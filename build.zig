@@ -42,6 +42,78 @@ fn configurePower(module: *std.Build.Module, b: *std.Build, target: std.Build.Re
     module.linkFramework("CoreFoundation", .{});
 }
 
+/// Ghostty's font metrics, OpenType table readers, and sprite font (box
+/// drawing, blocks, underlines, cursors), so screenshots draw them exactly
+/// as Ghostty does. The files come unmodified from the pinned Ghostty
+/// source; they import their neighbours by relative path, so they are laid
+/// out in a generated tree beside small stand-ins for the rest of Ghostty
+/// (src/client/ghostty_font/).
+fn ghosttyFont(b: *std.Build, ghostty: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
+    const tree = b.addWriteFiles();
+    const from_ghostty = [_][]const u8{
+        "lib/compat/reader.zig",
+        "unicode/lut.zig",
+        "font/Metrics.zig",
+        "font/Glyph.zig",
+        "font/nerd_font_attributes.zig",
+        "font/nerd_font_tables.zig",
+        "font/opentype/sfnt.zig",
+        "font/opentype/head.zig",
+        "font/opentype/hhea.zig",
+        "font/opentype/os2.zig",
+        "font/opentype/post.zig",
+        "font/sprite.zig",
+        "font/sprite/canvas.zig",
+        "font/sprite/draw/common.zig",
+        "font/sprite/draw/block.zig",
+        "font/sprite/draw/box.zig",
+        "font/sprite/draw/braille.zig",
+        "font/sprite/draw/branch.zig",
+        "font/sprite/draw/geometric_shapes.zig",
+        "font/sprite/draw/powerline.zig",
+        "font/sprite/draw/special.zig",
+        "font/sprite/draw/symbols_for_legacy_computing.zig",
+        "font/sprite/draw/symbols_for_legacy_computing_supplement.zig",
+        "font/sprite/draw/octants.txt",
+    };
+    for (from_ghostty) |rel| _ = tree.addCopyFile(ghostty.path(b.fmt("src/{s}", .{rel})), rel);
+    const stand_ins = [_][2][]const u8{
+        .{ "root.zig", "root.zig" },
+        .{ "quirks.zig", "quirks.zig" },
+        .{ "global.zig", "global.zig" },
+        .{ "font_main.zig", "font/main.zig" },
+        .{ "sprite_face.zig", "font/sprite/Face.zig" },
+        .{ "unused.zig", "config.zig" },
+        .{ "unused.zig", "datastruct/comparison.zig" },
+        .{ "unused.zig", "font/embedded.zig" },
+    };
+    for (stand_ins) |pair| _ = tree.addCopyFile(b.path(b.fmt("src/client/ghostty_font/{s}", .{pair[0]})), pair[1]);
+    const z2d = b.dependency("z2d", .{ .target = target, .optimize = optimize });
+    return b.createModule(.{
+        .root_source_file = tree.getDirectory().path(b, "root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "z2d", .module = z2d.module("z2d") },
+            // The Unicode tables vaxis and libghostty-vt already share; they
+            // carry Ghostty's `is_symbol` property.
+            .{ .name = "uucode", .module = ghostty.module("ghostty-vt").import_table.get("uucode").? },
+        },
+    });
+}
+
+/// Screenshots draw text with CoreText in the font Ghostty uses, which by
+/// default is its own embedded JetBrains Mono.
+fn configureScreenshot(module: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget, font: *std.Build.Module) void {
+    module.addImport("ghostty_font", font);
+    if (target.result.os.tag != .macos) return;
+    module.linkFramework("CoreText", .{});
+    module.linkFramework("CoreGraphics", .{});
+    const jetbrains_mono = b.dependency("jetbrains_mono", .{});
+    module.addAnonymousImport("jetbrains_mono_variable", .{ .root_source_file = jetbrains_mono.path("fonts/variable/JetBrainsMono[wght].ttf") });
+    module.addAnonymousImport("jetbrains_mono_variable_italic", .{ .root_source_file = jetbrains_mono.path("fonts/variable/JetBrainsMono-Italic[wght].ttf") });
+}
+
 /// C bindings, translated at build time (`@cImport` is gone in 0.17).
 const CBindings = struct {
     sqlite3: *std.Build.Module,
@@ -171,6 +243,8 @@ pub fn build(b: *std.Build) void {
     configureSqlite(exe.root_module, b, embedded_sqlite);
     configureYaml(exe.root_module, b);
     configurePower(exe.root_module, b, target, macos_sdk);
+    const ghostty_font = ghosttyFont(b, ghostty, target, optimize);
+    configureScreenshot(exe.root_module, b, target, ghostty_font);
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     exe.root_module.addOptions("build_options", build_options);
@@ -240,6 +314,14 @@ pub fn build(b: *std.Build) void {
     configureSqlite(test_module, b, embedded_sqlite);
     configureYaml(test_module, b);
     configurePower(test_module, b, target, macos_sdk);
+    configureScreenshot(test_module, b, target, ghosttyFont(b, ghostty, target, .debug));
+    // Ghostty's own reference renderings of its box-drawing sprites, which
+    // screenshots must reproduce exactly.
+    for ([_][]const u8{ "18x36+4", "12x24+3", "11x21+2", "9x17+1" }) |size| {
+        test_module.addAnonymousImport(b.fmt("sprite_reference_{s}", .{size}), .{
+            .root_source_file = ghostty.path(b.fmt("src/font/sprite/testdata/U+2500...U+25FF-{s}.png", .{size})),
+        });
+    }
     test_module.addOptions("build_options", build_options);
     const exe_tests = b.addTest(.{ .root_module = test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);

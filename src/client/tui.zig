@@ -159,9 +159,8 @@ pub const Event = union(enum) {
     wipeout: WipeoutEvent,
     /// A frame of streamed-text pacing (every 16 ms while rows wait).
     stream_frame,
-    /// Screenshot verdict: null when the PNG is on the clipboard,
-    /// else a static reason.
-    screenshot: ?[]const u8,
+    /// A screenshot thread's verdict.
+    screenshot: screenshot.Outcome,
 };
 
 pub const WipeoutEvent = union(enum) {
@@ -643,7 +642,7 @@ pub const App = struct {
     /// First-run asset bundle download (progress shared with the worker).
     wipeout_download: ?*@import("asset_store").Progress = null,
     wipeout_download_thread: ?std.Thread = null,
-    /// A screenshot being drawn (osascript); joined when it reports.
+    /// A screenshot being painted; joined when it reports.
     screenshot_thread: ?std.Thread = null,
     /// Alt+S or /screenshot: capture the next rendered frame.
     screenshot_request: ?screenshot.Mode = null,
@@ -7033,7 +7032,7 @@ pub fn dispatchEvent(
         .voice => |vev| app.handleVoiceEvent(vev),
         .wipeout => |wev| app.handleWipeoutEvent(wev),
         .stream_frame => app.paceStream(),
-        .screenshot => |failure| screenshot.done(app, failure),
+        .screenshot => |outcome| screenshot.done(app, outcome),
         .mouse => |m| {
             app.presence_last_activity_ms = nowWallMs(app.io);
             if (app.screensaver_active) return;

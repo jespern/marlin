@@ -629,7 +629,7 @@ pub fn showImages(app: *App, writer: *std.Io.Writer, arena: std.mem.Allocator) !
     try app.shell_images.forget(writer, imageStored, app);
 }
 
-fn imageWants(app: *App, arena: std.mem.Allocator) ![]const shell_images.Want {
+pub fn imageWants(app: *App, arena: std.mem.Allocator) ![]const shell_images.Want {
     const state = live(app) orelse return &.{};
     const emulator = state.emulator.?;
     const t = &emulator.terminal;

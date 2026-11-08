@@ -21,6 +21,14 @@
             .url = "https://github.com/ghostty-org/ghostty/archive/0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec.tar.gz",
             .hash = "ghostty-1.4.1-dev-5UdBC58_nQWN3FHzqvvLtKzhOKptGc_uH9t7ejdTBGd3",
         },
+        .z2d = .{
+            .url = "https://deps.files.ghostty.org/z2d-8787d71bac42d9aab00428ccb37a4fd453418761.tar.gz",
+            .hash = "z2d-0.13.2-j5P_HkkVFAAtOSQPRTS7wbZLbYs7oETRn7nUKSUwDjM_",
+        },
+        .jetbrains_mono = .{
+            .url = "https://deps.files.ghostty.org/JetBrainsMono-2.304.tar.gz",
+            .hash = "N-V-__8AAIC5lwAVPJJzxnCAahSvZTIlG-HhtOvnM1uh-66x",
+        },
     },
     .paths = .{
         "build.zig",

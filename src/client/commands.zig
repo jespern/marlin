@@ -75,6 +75,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/screenshot", .usage = " [slim]", .description = "copy the window to the clipboard as an image (Alt+S); slim: transcript only", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
     .{ .name = "!mk", .hidden = true, .description = "play Mario Kart", .accepts_args = true },
+    .{ .name = "!ss", .usage = " [slim]", .description = "copy the window to the clipboard as an image (alias for /screenshot)", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
     .{ .name = "!rbc", .description = "rebuild only the local client (alias for !rb client)" },
@@ -495,9 +496,9 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
 
     if (isQuitCommand(head)) {
         self.should_quit = true;
-    } else if (std.mem.eql(u8, head, "/screenshot")) {
+    } else if (std.mem.eql(u8, head, "/screenshot") or std.mem.eql(u8, head, "!ss")) {
         const arg = it.next();
-        if (arg) |mode| if (!std.mem.eql(u8, mode, "slim")) return self.setNotice("usage: /screenshot [slim]", .{});
+        if (arg) |mode| if (!std.mem.eql(u8, mode, "slim")) return self.setNotice("usage: {s} [slim]", .{head});
         screenshot.request(self, if (arg != null) .slim else .full);
     } else if (std.mem.eql(u8, head, "/shutdown")) {
         const force = if (it.next()) |arg| std.mem.eql(u8, arg, "--force") else false;
