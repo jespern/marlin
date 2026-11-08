@@ -2308,8 +2308,11 @@ test "status metadata is compact without losing its identity" {
         "(guest) codex/default",
         try statusModel(arena, "codex/default"),
     );
-    try std.testing.expectEqualStrings("ctx n/a", try statusContext(arena, true, false, 0, 200_000));
-    try std.testing.expectEqualStrings("(using api credits)", try statusContext(arena, true, true, 0, 200_000));
+    try std.testing.expectEqualStrings("ctx n/a", try statusContext(arena, true, false, 0, 0));
+    try std.testing.expectEqualStrings("(using api credits)", try statusContext(arena, true, true, 0, 0));
+    // A guest that has reported its window gets the gauge.
+    try std.testing.expectEqualStrings("ctx 3%", try statusContext(arena, true, false, 30_000, 1_000_000));
+    try std.testing.expectEqualStrings("ctx 3% (using api credits)", try statusContext(arena, true, true, 30_000, 1_000_000));
     try std.testing.expectEqualStrings("ctx 12%", try statusContext(arena, false, false, 24_000, 200_000));
     try std.testing.expectEqualStrings("", try statusContext(arena, false, false, 0, 0));
     try std.testing.expectEqualStrings(

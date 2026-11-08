@@ -543,6 +543,27 @@ fn markServerExit(exited: *bool, result: anytype) @TypeOf(result) {
     return result;
 }
 
+/// thread/tokenUsage/updated: the last request's usage (counted into the
+/// turn's totals), and the context gauge: that request's total tokens, as
+/// Codex's own gauge counts what the thread holds, against the model's
+/// window when Codex knows it.
+pub fn readTokenUsage(
+    usage: std.json.Value,
+    context_used: ?*std.atomic.Value(u64),
+    context_limit: ?*std.atomic.Value(u64),
+    tokens_in: *u64,
+    tokens_out: *u64,
+) void {
+    if (codex.field(usage, "last")) |last| {
+        tokens_in.* = @intCast(@max(0, codex.intField(last, "inputTokens") orelse 0));
+        tokens_out.* = @intCast(@max(0, codex.intField(last, "outputTokens") orelse 0));
+        if (codex.intField(last, "totalTokens")) |total| if (context_used) |out|
+            out.store(@intCast(@max(0, total)), .release);
+    }
+    if (codex.intField(usage, "modelContextWindow")) |window| if (window > 0) if (context_limit) |out|
+        out.store(@intCast(window), .release);
+}
+
 pub fn runCodexTurn(
     gpa: std.mem.Allocator,
     io: Io,
@@ -862,10 +883,7 @@ pub fn runCodexTurn(
                 } else if (std.mem.eql(u8, notification.method, "thread/tokenUsage/updated")) {
                     if (!primary_thread) continue;
                     if (codex.field(params, "tokenUsage")) |usage|
-                        if (codex.field(usage, "last")) |last| {
-                            current_tokens_in = @intCast(@max(0, codex.intField(last, "inputTokens") orelse 0));
-                            current_tokens_out = @intCast(@max(0, codex.intField(last, "outputTokens") orelse 0));
-                        };
+                        readTokenUsage(usage, opts.context_used_out, opts.context_limit_out, &current_tokens_in, &current_tokens_out);
                 } else if (std.mem.eql(u8, notification.method, "error")) {
                     if (!primary_thread) continue;
                     if (codex.strField(params, "turnId")) |id| if (!std.mem.eql(u8, id, active_turn_id)) continue;

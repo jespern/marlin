@@ -599,7 +599,9 @@ pub const DaemonMsg = union(enum) {
         tokens_in: u64,
         tokens_out: u64,
         /// Estimated tokens in the assembled context (0 = not yet measured)
-        /// and the model's window, for the status bar's context gauge.
+        /// and the model's window, for the status bar's context gauge. For a
+        /// guest, the prompt size of its latest model call and the window it
+        /// reports; limit 0 until it has (no gauge).
         context_used: u64 = 0,
         context_limit: u64 = 0,
     },

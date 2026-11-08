@@ -2302,8 +2302,10 @@ pub const App = struct {
                 const view = self.liveView(m.sid) orelse return;
                 view.tokens_in = m.tokens_in;
                 view.tokens_out = m.tokens_out;
-                if (m.context_used > 0) view.context_used = m.context_used;
-                if (m.context_limit > 0) view.context_limit = m.context_limit;
+                // The daemon's figures are authoritative; a zero limit (a
+                // guest that has not reported its window) clears the gauge.
+                view.context_used = m.context_used;
+                view.context_limit = m.context_limit;
             },
             .err => |e| {
                 if (shell_tab.failed(self, e.request_id, e.msg)) return;
@@ -4702,10 +4704,14 @@ pub fn statusModel(arena: std.mem.Allocator, model: []const u8) ![]const u8 {
 
 /// Guest sessions do not run Marlin's assembler, so ctx% is always a lie
 /// (used stays 0; the limit lookup even matches `claudecode` as `claude`).
+/// The status bar's context gauge. Guests report their own window once a
+/// model call has run; until then they have none to show.
 pub fn statusContext(arena: std.mem.Allocator, guest: bool, usage_credits: bool, used: u64, limit: u64) ![]const u8 {
-    if (guest) return if (usage_credits) "(using api credits)" else "ctx n/a";
+    if (guest and limit == 0) return if (usage_credits) "(using api credits)" else "ctx n/a";
     if (limit == 0) return "";
-    return std.fmt.allocPrint(arena, "ctx {d}%", .{used * 100 / limit});
+    const percent = @min(used * 100 / limit, 100);
+    if (guest and usage_credits) return std.fmt.allocPrint(arena, "ctx {d}% (using api credits)", .{percent});
+    return std.fmt.allocPrint(arena, "ctx {d}%", .{percent});
 }
 
 pub fn statusCwd(arena: std.mem.Allocator, cwd: []const u8, home: []const u8) ![]const u8 {
@@ -6253,7 +6259,7 @@ fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16,
         app.view.context_used,
         app.view.context_limit,
     );
-    const ctx_style = if (guest)
+    const ctx_style = if (guest and app.view.context_limit == 0)
         Palette.status_muted
     else if (context_percent >= 90)
         Palette.status_context_hot

@@ -398,3 +398,28 @@ test "codex subagent threads publish the model they run on" {
     try tracker.setModel("child", "gpt-5.5");
     try std.testing.expectEqualStrings("gpt-5.5", sink.model[0..sink.len]);
 }
+
+test "Codex token usage fills the turn totals and the context gauge" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"last":{"inputTokens":30000,"cachedInputTokens":28000,"outputTokens":500,"reasoningOutputTokens":120,"totalTokens":30500},"total":{"totalTokens":91000},"modelContextWindow":272000}
+    , .{});
+    defer parsed.deinit();
+    var used: std.atomic.Value(u64) = .init(0);
+    var limit: std.atomic.Value(u64) = .init(0);
+    var tokens_in: u64 = 0;
+    var tokens_out: u64 = 0;
+    codex_turn.readTokenUsage(parsed.value, &used, &limit, &tokens_in, &tokens_out);
+    try std.testing.expectEqual(@as(u64, 30000), tokens_in);
+    try std.testing.expectEqual(@as(u64, 500), tokens_out);
+    try std.testing.expectEqual(@as(u64, 30500), used.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 272000), limit.load(.acquire));
+
+    // An unknown window (null) leaves the last known one.
+    var unknown = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"last":{"inputTokens":1,"outputTokens":1,"totalTokens":2},"modelContextWindow":null}
+    , .{});
+    defer unknown.deinit();
+    codex_turn.readTokenUsage(unknown.value, &used, &limit, &tokens_in, &tokens_out);
+    try std.testing.expectEqual(@as(u64, 2), used.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 272000), limit.load(.acquire));
+}

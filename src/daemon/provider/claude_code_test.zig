@@ -432,3 +432,39 @@ test "decode: forwarded subagent messages report the subagent's model" {
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expectEqualStrings("root prose", events.items[0].text);
 }
+
+test "decode: context size per top-level call, windows from the result (claude -p 2.1.314)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+
+    try decodeLine(arena,
+        \\{"type":"assistant","message":{"model":"claude-haiku-5-5","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":13741,"cache_read_input_tokens":11852,"output_tokens":4}}}
+    , &events);
+    // A subagent's call is not this session's context.
+    try decodeLine(arena,
+        \\{"type":"assistant","parent_tool_use_id":"t9","message":{"model":"claude-opus-5-5","content":[],"usage":{"input_tokens":900000}}}
+    , &events);
+    try decodeLine(arena,
+        \\{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":2,"output_tokens":14},"modelUsage":{"claude-haiku-5-5":{"inputTokens":2,"contextWindow":1000000,"maxOutputTokens":128000}}}
+    , &events);
+
+    var used: ?u64 = null;
+    var window: ?u64 = null;
+    for (events.items) |ev| switch (ev) {
+        .context_used => |c| {
+            try std.testing.expectEqualStrings("claude-haiku-5-5", c.model);
+            try std.testing.expect(used == null);
+            used = c.tokens;
+        },
+        .context_window => |w| {
+            try std.testing.expectEqualStrings("claude-haiku-5-5", w.model);
+            window = w.tokens;
+        },
+        else => {},
+    };
+    // Fresh input + cache reads + cache writes: the prompt, not the reply.
+    try std.testing.expectEqual(@as(u64, 2 + 11852 + 13741), used.?);
+    try std.testing.expectEqual(@as(u64, 1_000_000), window.?);
+}

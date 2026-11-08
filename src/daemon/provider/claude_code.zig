@@ -222,6 +222,12 @@ pub const Event = union(enum) {
     },
     /// Claude Code's structured signal that paid usage credits are active.
     usage_credits: bool,
+    /// The prompt size of a top-level model call (fresh input + cache reads
+    /// + cache writes): what the session's context window holds now.
+    context_used: struct { model: []const u8, tokens: u64 },
+    /// From a result's modelUsage: a model's context window. Results list
+    /// every model the invocation used, subagents and helpers included.
+    context_window: struct { model: []const u8, tokens: u64 },
     /// system/background_tasks_changed: the authoritative open-task list.
     /// After a `result`, a non-empty list means the run is parked waiting
     /// for these to finish (it emits another result when they do).
@@ -354,6 +360,14 @@ pub fn decodeLine(
                 .parent_tool_use_id = parent_tool_use_id,
                 .model = model,
             } });
+        if (parent_tool_use_id.len == 0) if (messageUsage(root)) |usage| {
+            try out.append(arena, .{ .context_used = .{
+                .model = messageModel(root) orelse "",
+                .tokens = (uintField(usage, "input_tokens") orelse 0) +
+                    (uintField(usage, "cache_read_input_tokens") orelse 0) +
+                    (uintField(usage, "cache_creation_input_tokens") orelse 0),
+            } });
+        };
         return;
     }
     if (std.mem.eql(u8, t, "stream_event")) {
@@ -421,6 +435,14 @@ pub fn decodeLine(
         return;
     }
     if (std.mem.eql(u8, t, "result")) {
+        if (root.get("modelUsage")) |models| if (models == .object) {
+            var it = models.object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .object) continue;
+                const window = uintField(entry.value_ptr.object, "contextWindow") orelse continue;
+                try out.append(arena, .{ .context_window = .{ .model = entry.key_ptr.*, .tokens = window } });
+            }
+        };
         var tokens_in: u64 = 0;
         var tokens_out: u64 = 0;
         var cached: u64 = 0;
@@ -464,6 +486,13 @@ fn messageModel(root: std.json.ObjectMap) ?[]const u8 {
     if (msg != .object) return null;
     const model = strField(msg.object, "model") orelse return null;
     return if (model.len > 0) model else null;
+}
+
+fn messageUsage(root: std.json.ObjectMap) ?std.json.ObjectMap {
+    const msg = root.get("message") orelse return null;
+    if (msg != .object) return null;
+    const usage = msg.object.get("usage") orelse return null;
+    return if (usage == .object) usage.object else null;
 }
 
 fn messageContent(root: std.json.ObjectMap) ?[]std.json.Value {

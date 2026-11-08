@@ -76,7 +76,7 @@ fn activityDetail(arena: std.mem.Allocator, input_json: []const u8) []const u8 {
     return "";
 }
 
-const CcOutcome = struct {
+pub const CcOutcome = struct {
     got_init: bool = false,
     got_result: bool = false,
     result_count: u32 = 0,
@@ -94,6 +94,10 @@ const CcOutcome = struct {
     tokens_out: u64 = 0,
     cached_tokens: u64 = 0,
     cache_write_tokens: u64 = 0,
+    /// The session's own model, from its latest top-level message, to pick
+    /// its context window out of a result's per-model usage.
+    context_model: [128]u8 = undefined,
+    context_model_len: usize = 0,
     /// gpa-owned final text (may be empty).
     final_text: std.ArrayList(u8) = .empty,
     /// The last successful result's text is already an assistant_msg block.
@@ -102,6 +106,20 @@ const CcOutcome = struct {
     final_persisted: bool = false,
     stderr_tail: [4096]u8 = undefined,
     stderr_len: usize = 0,
+
+    /// A top-level model call: its prompt is what the context holds now.
+    pub fn noteContextUsed(self: *@This(), model: []const u8, tokens: u64, out: ?*std.atomic.Value(u64)) void {
+        if (out) |o| o.store(tokens, .release);
+        self.context_model_len = @min(model.len, self.context_model.len);
+        @memcpy(self.context_model[0..self.context_model_len], model[0..self.context_model_len]);
+    }
+
+    /// One model's window from a result; only the session's own counts.
+    pub fn noteContextWindow(self: *@This(), model: []const u8, tokens: u64, out: ?*std.atomic.Value(u64)) void {
+        const own = self.context_model[0..self.context_model_len];
+        if (own.len > 0 and !std.mem.eql(u8, own, model)) return;
+        if (out) |o| o.store(tokens, .release);
+    }
 };
 
 fn writeCcUserInput(allocator: std.mem.Allocator, writer: *Io.Writer, text: []const u8) !void {
@@ -653,6 +671,8 @@ fn ccInvoke(
                     if (open_tools == 0) publishPhase(opts, guestToolPhase(open_tools));
                     if (opts.on_tool) |cb| cb(opts.on_delta_ctx, "claude", .done);
                 },
+                .context_used => |used| outcome.noteContextUsed(used.model, used.tokens, opts.context_used_out),
+                .context_window => |window| outcome.noteContextWindow(window.model, window.tokens, opts.context_limit_out),
                 .usage_credits => |active| {
                     if (usage_credits.* == active) continue;
                     _ = try ap.append(.{ .system_note = .{ .text = usageCreditsTransitionNote(active) } });

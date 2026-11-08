@@ -123,6 +123,9 @@ pub const RunOpts = struct {
     /// Written with the estimated assembled context tokens each round
     /// (status-bar accounting; provider-reported usage resyncs it per turn).
     context_used_out: ?*std.atomic.Value(u64) = null,
+    /// Guest turns only: the guest's own model context window, as it
+    /// reports it (Marlin does not assemble guest context).
+    context_limit_out: ?*std.atomic.Value(u64) = null,
     /// Dispatcher/daemon preparation before entering runTurn.
     initial_setup_ms: u64 = 0,
     /// Session approval mode (default: mutating tools ask). Snapshot used

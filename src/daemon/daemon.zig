@@ -347,8 +347,11 @@ pub const Session = struct {
     /// daemon restart pruning re-derives from scratch (worst case: one
     /// slightly-fatter first request).
     prune_frontier: u64 = 0,
-    /// Last estimated assembled context size (tokens), for status display.
+    /// Last estimated assembled context size (tokens), for status display;
+    /// for a guest, the prompt size of its latest model call.
     context_used: std.atomic.Value(u64) = .init(0),
+    /// A guest's context window as it reports it; 0 until it has.
+    guest_context_limit: std.atomic.Value(u64) = .init(0),
     /// Queued mid-turn steer texts (gpa-owned), drained by poll_steer.
     steer_queue: std.ArrayList(block.Input) = .empty,
     /// Guarded by steer_mutex. A turn closes this atomically with observing
@@ -365,6 +368,13 @@ pub const Session = struct {
     /// Applied on turn_done (success, fail, or interrupt) so the next turn
     /// is guest. Dispatcher-owned.
     pending_guest_model: ?[]u8 = null,
+
+    /// After a model switch a guest's reported window no longer applies; with
+    /// none, broadcastMeta shows no guest gauge until the new model reports.
+    /// A native model re-estimates context_used on its next round.
+    pub fn forgetContext(self: *Session) void {
+        self.guest_context_limit.store(0, .release);
+    }
 };
 
 // ---------------------------------------------------------------- daemon --
@@ -1414,6 +1424,7 @@ pub const Daemon = struct {
                     self.gpa.free(session.model);
                     session.model = guest;
                     session.usage_credits.store(false, .release);
+                    session.forgetContext();
                     self.broadcastSessionUpsert(td.sid);
                 }
                 // A bridge prompt cannot outlive its turn; deny any stray one
@@ -2052,6 +2063,7 @@ pub const Daemon = struct {
                 self.gpa.free(session.model);
                 session.model = new_model;
                 session.usage_credits.store(false, .release);
+                session.forgetContext();
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sm.sid);
             },
@@ -4096,6 +4108,7 @@ pub const Daemon = struct {
             .compaction_endpoint = if (cep) |*c| .{ .url = c.url, .bearer = c.bearer, .model = c.model, .provider_name = c.provider_name, .backend = c.backend } else null,
             .prune_frontier = &job.session.prune_frontier,
             .context_used_out = &job.session.context_used,
+            .context_limit_out = &job.session.guest_context_limit,
             .initial_setup_ms = @intCast(@max(0, nowMs(self.io) - job.started_at_ms)),
             .approval_mode = job.approval_mode,
             .approval_mode_live = &job.session.approval_mode_live,
@@ -5331,13 +5344,15 @@ pub const Daemon = struct {
         var used: u64 = 0;
         var limit: u64 = 0;
         if (self.sessions.get(sid)) |session| {
-            // Guest turns never assemble Marlin context; a limit lookup on
-            // `claudecode/…` still returns a window (the "claude" substring)
-            // and the TUI would paint ctx 0%.
-            if (!proto.isGuestModel(session.model)) {
-                used = session.context_used.load(.acquire);
-                limit = context.contextLimit(session.model);
-            }
+            used = session.context_used.load(.acquire);
+            // Guests never assemble Marlin context, so the window is the one
+            // they report (a lookup on `claudecode/…` would match "claude"
+            // and paint a wrong gauge); none reported, no gauge.
+            limit = if (proto.isGuestModel(session.model))
+                session.guest_context_limit.load(.acquire)
+            else
+                context.contextLimit(session.model);
+            if (limit == 0) used = 0;
         }
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .session_meta = .{
             .sid = sid,

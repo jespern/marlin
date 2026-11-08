@@ -90,3 +90,16 @@ test "background Claude agents remain agents, not generic processes" {
     try std.testing.expectEqual(proto.GuestActivityKind.process, claude_code_turn.toolActivityKind("Bash"));
     try std.testing.expectEqual(proto.GuestActivityKind.tool, claude_code_turn.toolActivityKind("Read"));
 }
+
+test "the context gauge takes the session's own model window, not a helper's" {
+    var used: std.atomic.Value(u64) = .init(0);
+    var limit: std.atomic.Value(u64) = .init(0);
+    var outcome: claude_code_turn.CcOutcome = .{};
+    defer outcome.final_text.deinit(std.testing.allocator);
+    outcome.noteContextUsed("claude-opus-5-5", 42_000, &used);
+    outcome.noteContextWindow("claude-haiku-5-5", 200_000, &limit);
+    try std.testing.expectEqual(@as(u64, 0), limit.load(.acquire));
+    outcome.noteContextWindow("claude-opus-5-5", 1_000_000, &limit);
+    try std.testing.expectEqual(@as(u64, 42_000), used.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1_000_000), limit.load(.acquire));
+}
