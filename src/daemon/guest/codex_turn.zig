@@ -824,7 +824,13 @@ pub fn runCodexTurn(
                 if (std.mem.eql(u8, notification.method, "thread/started")) {
                     try codexThreadStarted(&activity, params, thread_id, nowMs(io));
                 } else if (std.mem.eql(u8, notification.method, "item/agentMessage/delta")) {
-                    if (!primary_thread) continue;
+                    if (!primary_thread) {
+                        // A subagent's prose is its live output in the tree.
+                        const thread = codex.strField(params, "threadId") orelse continue;
+                        const delta = codex.strField(params, "delta") orelse continue;
+                        try activity.appendOutput(thread, delta);
+                        continue;
+                    }
                     if (codex.strField(params, "delta")) |delta|
                         if (opts.on_delta) |callback| callback(opts.on_delta_ctx, delta);
                 } else if (std.mem.eql(u8, notification.method, "item/reasoning/summaryTextDelta")) {
@@ -862,7 +868,12 @@ pub fn runCodexTurn(
                     if (codex.field(params, "item")) |item| {
                         if (try codexSubagentEvent(&activity, item, nowMs(io))) continue;
                         activity.finish(codex.strField(item, "id") orelse "");
-                        if (!primary_thread) continue;
+                        if (!primary_thread) {
+                            // Each of a subagent's messages ends its own line.
+                            if (std.mem.eql(u8, codex.strField(item, "type") orelse "", "agentMessage"))
+                                if (codex.strField(params, "threadId")) |thread| try activity.appendOutput(thread, "\n");
+                            continue;
+                        }
                         const kind = codex.strField(item, "type") orelse "";
                         if (std.mem.eql(u8, kind, "agentMessage")) {
                             const text = codex.strField(item, "text") orelse "";

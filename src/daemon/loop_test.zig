@@ -885,6 +885,9 @@ test "codex guest persists app-server items and resumes its durable thread" {
         \\      echo '{"method":"item/started","params":{"threadId":"thread_marlin_test","turnId":"turn_test","item":{"id":"spawn_1","type":"subAgentActivity","kind":"started","agentThreadId":"child_thread","agentPath":"/root/scout"}}}'
         \\      echo '{"method":"item/started","params":{"threadId":"child_thread","turnId":"child_turn","item":{"id":"child_cmd","type":"commandExecution","command":"sleep 1","cwd":"/tmp","status":"inProgress"}}}'
         \\      echo '{"method":"item/commandExecution/outputDelta","params":{"threadId":"child_thread","turnId":"child_turn","itemId":"child_cmd","delta":"working\\n"}}'
+        \\      echo '{"method":"item/agentMessage/delta","params":{"threadId":"child_thread","turnId":"child_turn","itemId":"child_msg","delta":"scouting "}}'
+        \\      echo '{"method":"item/agentMessage/delta","params":{"threadId":"child_thread","turnId":"child_turn","itemId":"child_msg","delta":"files"}}'
+        \\      echo '{"method":"item/completed","params":{"threadId":"child_thread","turnId":"child_turn","item":{"id":"child_msg","type":"agentMessage","text":"scouting files"}}}'
         \\      echo '{"method":"turn/completed","params":{"threadId":"child_thread","turn":{"id":"child_turn","rootTurnId":"turn_test","status":"completed"}}}'
         \\      echo '{"method":"item/started","params":{"threadId":"thread_marlin_test","turnId":"turn_test","item":{"id":"child_done","type":"subAgentActivity","kind":"completed","agentThreadId":"child_thread","agentPath":"/root/scout"}}}'
         \\      echo '{"method":"item/agentMessage/delta","params":{"threadId":"thread_marlin_test","turnId":"turn_test","itemId":"msg_1","delta":"CODEX-OK"}}'
@@ -913,13 +916,18 @@ test "codex guest persists app-server items and resumes its durable thread" {
         saw_nested_process: bool = false,
         saw_command_detail: bool = false,
         saw_command_output: bool = false,
+        saw_agent_output: bool = false,
 
         fn publish(ctx: ?*anyopaque, items: []const proto.GuestActivity) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             var agent = false;
             var process = false;
             for (items) |item| {
-                if (item.kind == .agent and std.mem.eql(u8, item.id, "child_thread")) agent = true;
+                if (item.kind == .agent and std.mem.eql(u8, item.id, "child_thread")) {
+                    agent = true;
+                    // A subagent's prose is its live output, a line per message.
+                    if (std.mem.indexOf(u8, item.output, "scouting files\n") != null) self.saw_agent_output = true;
+                }
                 if (item.kind == .process and std.mem.eql(u8, item.parent_id, "child_thread")) {
                     process = true;
                     if (std.mem.indexOf(u8, item.detail, "sleep 1") != null) self.saw_command_detail = true;
@@ -946,6 +954,7 @@ test "codex guest persists app-server items and resumes its durable thread" {
     try std.testing.expect(activity_probe.saw_nested_process);
     try std.testing.expect(activity_probe.saw_command_detail);
     try std.testing.expect(activity_probe.saw_command_output);
+    try std.testing.expect(activity_probe.saw_agent_output);
     try std.testing.expectEqual(@as(u64, 12), first.tokens_in);
     try std.testing.expectEqual(@as(u64, 4), first.tokens_out);
     const thread_id = (try store.getCodexThreadId(1)).?;

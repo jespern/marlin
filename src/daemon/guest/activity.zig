@@ -1,6 +1,7 @@
 //! Ephemeral activity tree shared by delegated guest adapters.
 
 const std = @import("std");
+const Io = std.Io;
 const proto = @import("../../core/proto.zig");
 
 pub const max_output_bytes: usize = 64 * 1024;
@@ -32,12 +33,26 @@ pub const Tracker = struct {
     callback: ?PublishFn,
     ctx: ?*anyopaque,
     items: std.ArrayList(Owned) = .empty,
+    /// Set when another thread shares the tree (a tail.Tailer adding live
+    /// output): every public method then holds mutex.
+    io: ?Io = null,
+    mutex: Io.Mutex = .init,
+
+    fn lock(self: *Tracker) void {
+        if (self.io) |io| self.mutex.lockUncancelable(io);
+    }
+
+    fn unlock(self: *Tracker) void {
+        if (self.io) |io| self.mutex.unlock(io);
+    }
 
     pub fn init(gpa: std.mem.Allocator, callback: ?PublishFn, ctx: ?*anyopaque) Tracker {
         return .{ .gpa = gpa, .callback = callback, .ctx = ctx };
     }
 
     pub fn deinit(self: *Tracker) void {
+        self.lock();
+        defer self.unlock();
         if (self.items.items.len > 0) {
             self.clearItems();
             self.publish();
@@ -54,6 +69,8 @@ pub const Tracker = struct {
         detail: []const u8,
         started_at_ms: i64,
     ) !void {
+        self.lock();
+        defer self.unlock();
         if (id.len == 0) return;
         for (self.items.items) |*item| if (std.mem.eql(u8, item.id, id)) {
             const new_parent = try self.gpa.dupe(u8, parent_id);
@@ -100,6 +117,8 @@ pub const Tracker = struct {
     /// Append output to an active node while keeping activity snapshots
     /// bounded. When the cap is crossed, retain the newest bytes.
     pub fn appendOutput(self: *Tracker, id: []const u8, bytes: []const u8) !void {
+        self.lock();
+        defer self.unlock();
         if (id.len == 0 or bytes.len == 0) return;
         for (self.items.items) |*item| {
             if (!std.mem.eql(u8, item.id, id)) continue;
@@ -120,6 +139,8 @@ pub const Tracker = struct {
     /// Record the model a node runs on. Unknown ids and repeats are no-ops,
     /// so adapters may report it on every message.
     pub fn setModel(self: *Tracker, id: []const u8, model: []const u8) !void {
+        self.lock();
+        defer self.unlock();
         if (id.len == 0 or model.len == 0) return;
         for (self.items.items) |*item| {
             if (!std.mem.eql(u8, item.id, id)) continue;
@@ -132,14 +153,18 @@ pub const Tracker = struct {
         }
     }
 
-    pub fn isNested(self: *const Tracker, id: []const u8) bool {
+    pub fn isNested(self: *Tracker, id: []const u8) bool {
+        self.lock();
+        defer self.unlock();
         for (self.items.items) |item| {
             if (std.mem.eql(u8, item.id, id)) return item.parent_id.len > 0;
         }
         return false;
     }
 
-    pub fn contains(self: *const Tracker, id: []const u8) bool {
+    pub fn contains(self: *Tracker, id: []const u8) bool {
+        self.lock();
+        defer self.unlock();
         for (self.items.items) |item| {
             if (std.mem.eql(u8, item.id, id)) return true;
         }
@@ -147,6 +172,8 @@ pub const Tracker = struct {
     }
 
     pub fn finish(self: *Tracker, id: []const u8) void {
+        self.lock();
+        defer self.unlock();
         var removed = false;
         var i = self.items.items.len;
         while (i > 0) {
@@ -160,6 +187,8 @@ pub const Tracker = struct {
     }
 
     pub fn clearKind(self: *Tracker, kind: proto.GuestActivityKind) void {
+        self.lock();
+        defer self.unlock();
         var changed = false;
         var i = self.items.items.len;
         while (i > 0) {

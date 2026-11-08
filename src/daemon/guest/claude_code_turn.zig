@@ -42,6 +42,7 @@ const tryCloseSteering = loop.tryCloseSteering;
 
 const shared = @import("shared.zig");
 const guest_activity = @import("activity.zig");
+const guest_tail = @import("tail.zig");
 const setDelegateError = shared.setDelegateError;
 const lastDelegateErrorNote = shared.lastDelegateErrorNote;
 const putEnvDefault = shared.putEnvDefault;
@@ -240,6 +241,13 @@ const CcInputPump = struct {
 
 pub fn backgroundActivityKind(task_type: []const u8) proto.GuestActivityKind {
     return if (std.mem.eql(u8, task_type, "local_agent")) .agent else .process;
+}
+
+/// A whole block of output (a tool result, a subagent's message), ending its
+/// own line so what follows (a tailed transcript, the next block) starts anew.
+fn appendOutputLine(activity: *guest_activity.Tracker, id: []const u8, text: []const u8) !void {
+    try activity.appendOutput(id, text);
+    if (text.len > 0 and text[text.len - 1] != '\n') try activity.appendOutput(id, "\n");
 }
 
 pub fn toolActivityKind(name: []const u8) proto.GuestActivityKind {
@@ -521,6 +529,13 @@ fn ccInvoke(
     var open_tools: usize = 0;
     var activity = guest_activity.Tracker.init(gpa, opts.on_guest_activity, opts.on_delta_ctx);
     defer activity.deinit();
+    // Live output of background commands and subagents, read from the files
+    // Claude Code writes, from a thread of its own: the tree is shared.
+    activity.io = io;
+    var tail_uuid_buf: [36]u8 = undefined;
+    var tailer = guest_tail.Tailer.init(gpa, io, &activity, claude_code.sessionUuid(&tail_uuid_buf, opts.session_id), opts.cwd, opts.tool_environ);
+    tailer.start();
+    defer tailer.deinit();
     const BackgroundLink = struct { task_id: []u8, tool_use_id: []u8 };
     var background_links: std.ArrayList(BackgroundLink) = .empty;
     defer {
@@ -579,7 +594,9 @@ fn ccInvoke(
                     try pending_text.appendSlice(gpa, text);
                 },
                 .child_output => |nested_output| {
-                    try activity.appendOutput(nested_output.parent_tool_use_id, nested_output.text);
+                    // A tailed transcript already carries the subagent's prose.
+                    if (!tailer.tailsTranscript(nested_output.parent_tool_use_id))
+                        try appendOutputLine(&activity, nested_output.parent_tool_use_id, nested_output.text);
                 },
                 .child_model => |nested| {
                     try activity.setModel(nested.parent_tool_use_id, nested.model);
@@ -596,6 +613,7 @@ fn ccInvoke(
                         activityDetail(line_arena, tu.input_json),
                         nowMs(io),
                     );
+                    if (toolActivityKind(tu.name) == .agent) tailer.watchSubagent(tu.id);
                     // Forwarded subagent tools exist to drive the live tree;
                     // persisting them would flatten child internals into the
                     // parent's transcript and duplicate the Agent result.
@@ -628,13 +646,19 @@ fn ccInvoke(
                 },
                 .tool_result => |tr| {
                     const nested = tr.parent_tool_use_id.len > 0 or activity.isNested(tr.tool_use_id);
-                    try activity.appendOutput(tr.tool_use_id, tr.text);
+                    if (guest_tail.backgroundOutputPath(tr.text)) |path|
+                        tailer.watchTaskOutput(tr.tool_use_id, path)
+                    else if (!tailer.tailsTranscript(tr.tool_use_id))
+                        try appendOutputLine(&activity, tr.tool_use_id, tr.text);
                     var stays_open = false;
                     for (background_links.items) |link| if (std.mem.eql(u8, link.tool_use_id, tr.tool_use_id)) {
                         stays_open = true;
                         break;
                     };
-                    if (!stays_open) activity.finish(tr.tool_use_id);
+                    if (!stays_open) {
+                        tailer.unwatch(tr.tool_use_id);
+                        activity.finish(tr.tool_use_id);
+                    }
                     if (nested) continue;
                     const cap = opts.cfg.inline_tool_cap_bytes;
                     // Same capture-time redaction as native tool results:
@@ -763,6 +787,7 @@ fn ccInvoke(
                 .task_notification => |notification| {
                     replied = false;
                     const activity_id = if (notification.tool_use_id.len > 0) notification.tool_use_id else notification.task_id;
+                    tailer.unwatch(activity_id);
                     activity.finish(activity_id);
                     for (background_links.items, 0..) |link, i| {
                         if (!std.mem.eql(u8, link.tool_use_id, activity_id)) continue;
