@@ -180,7 +180,7 @@ test "a session another client made a shell is attached when focused; its tab sa
     try std.testing.expectEqual(@as(u64, 8), msgs[0].shell_attach.shell_id);
     try std.testing.expectEqual(@as(u16, 22), msgs[0].shell_attach.rows);
     const summary = h.app.sessionSummary(42).?;
-    try std.testing.expectEqualStrings("$ proj", summary.shell_label);
+    try std.testing.expectEqualStrings("proj", summary.shell_label);
 
     // The shell ended before this client heard: the view lets go of it.
     try h.daemonOpens(msgs[0].shell_attach.request_id, 8, "$ ");

@@ -3681,6 +3681,30 @@ test "tab bar is permanent, root-only, chronological, and rolls up child activit
     try std.testing.expectEqual(@as(u64, 99), fallback.items[0].sid);
 }
 
+test "tab bar marks shell tabs apart from agent tabs and sizes for the glyph" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 10, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 10, .title = "agent", .cwd = "/work/alpha", .model = "m", .status = "idle", .created_at = 10, .running = false },
+        .{ .sid = 20, .title = "", .cwd = "/work/beta", .model = "m", .status = "idle", .created_at = 20, .running = false, .shell_id = 7 },
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const layout = try layoutTabBar(arena_state.allocator(), &app, 120);
+    try std.testing.expectEqual(@as(usize, 2), layout.items.len);
+    try std.testing.expect(!layout.items[0].shell);
+    try std.testing.expect(layout.items[1].shell);
+    // The glyph marks the shell, so its label no longer carries a "$ ".
+    try std.testing.expectEqualStrings("beta", layout.items[1].label);
+    // " ❯ 1 agent" + two activity cells + " ": the glyph and its gap cost two.
+    try std.testing.expectEqual(@as(usize, 1 + 1 + 1 + 1 + 1 + 5 + 2 + 1), layout.items[0].width);
+}
+
 test "background completion is unread until its root tab is focused" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -4011,11 +4035,14 @@ test "draw permanently reserves and paints the clickable tab row" {
     try std.testing.expectEqual(@as(usize, 6), app.view.last_view_h);
     const tab_cell = vx.window().readCell(0, 0).?;
     try std.testing.expect(vaxis.Color.eql(tab_cell.style.bg, Palette.prompt_bg));
-    const index_cell = vx.window().readCell(1, 0).?;
+    const glyph_cell = vx.window().readCell(1, 0).?;
+    try std.testing.expectEqualStrings("❯", glyph_cell.char.grapheme);
+    try std.testing.expect(glyph_cell.style.dim);
+    const index_cell = vx.window().readCell(3, 0).?;
     try std.testing.expectEqualStrings("1", index_cell.char.grapheme);
     try std.testing.expect(index_cell.style.dim);
     try std.testing.expect(!index_cell.style.bold);
-    const title_cell = vx.window().readCell(3, 0).?;
+    const title_cell = vx.window().readCell(5, 0).?;
     try std.testing.expectEqualStrings("m", title_cell.char.grapheme);
     try std.testing.expect(title_cell.style.bold);
 

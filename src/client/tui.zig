@@ -384,6 +384,7 @@ const TabLayoutItem = struct {
     label: []const u8,
     activity: TabActivity,
     active: bool,
+    shell: bool = false,
     x: usize,
     width: usize,
 };
@@ -1510,7 +1511,7 @@ pub const App = struct {
             .usage_credits = info.usage_credits,
             .shell_id = info.shell_id,
             .shell_label = if (info.shell_id != 0)
-                std.fmt.allocPrint(self.gpa, "$ {s}", .{if (info.title.len > 0) info.title else if (std.fs.path.basename(info.cwd).len > 0) std.fs.path.basename(info.cwd) else "shell"}) catch &.{}
+                self.gpa.dupe(u8, if (info.title.len > 0) info.title else if (std.fs.path.basename(info.cwd).len > 0) std.fs.path.basename(info.cwd) else "shell") catch &.{}
             else
                 &.{},
         };
@@ -4983,11 +4984,13 @@ const TabCandidate = struct {
     label: []const u8,
     activity: TabActivity,
     active: bool,
+    shell: bool = false,
     created_at: i64,
 
     fn width(self: TabCandidate) usize {
-        // leading space + index + separator + label + activity + trailing space
-        return decimalDigits(self.index) + displayWidth(self.label) + 5;
+        // leading space + kind glyph + separator + index + separator + label
+        // + two activity cells + trailing space
+        return decimalDigits(self.index) + displayWidth(self.label) + 7;
     }
 };
 
@@ -5155,6 +5158,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
             .label = tabLabel(app, session),
             .activity = app.tabActivity(session.sid),
             .active = session.sid == active_root,
+            .shell = session.shell_id != 0,
             .created_at = session.created_at,
         });
     }
@@ -5164,6 +5168,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
             .label = tabLabel(app, null),
             .activity = if (app.view.pause == .paused) .paused else if (app.unread_completions.contains(app.view.sid)) .done else tabActivityForState(app.view.state),
             .active = true,
+            .shell = app.view.shell != null,
             .created_at = 0,
         });
     }
@@ -5224,6 +5229,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
             .label = candidate.label,
             .activity = candidate.activity,
             .active = candidate.active,
+            .shell = candidate.shell,
             .x = x,
             .width = item_width,
         });
@@ -5579,9 +5585,12 @@ fn drawTabBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
         var index_style = style;
         index_style.bold = false;
         index_style.dim = true;
-        const label_capacity = item.width -| (5 + displayWidth(index_text));
+        const label_capacity = item.width -| (7 + displayWidth(index_text));
         const label_end = hardCellBreak(item.label, 0, label_capacity);
         const segments = [_]vaxis.Segment{
+            .{ .text = " ", .style = style },
+            // Agent tabs wear the composer's prompt, shells their own.
+            .{ .text = if (item.shell) "$" else "❯", .style = index_style },
             .{ .text = " ", .style = style },
             .{ .text = index_text, .style = index_style },
             .{ .text = " ", .style = style },
