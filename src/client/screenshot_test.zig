@@ -3,6 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const screenshot = @import("screenshot.zig");
+const asset_store = @import("asset_store");
 
 fn put(screen: *vaxis.Screen, col: u16, row: u16, text: []const u8, style: vaxis.Style) void {
     for (text, 0..) |_, i| screen.writeCell(col + @as(u16, @intCast(i)), row, .{ .char = .{ .grapheme = text[i .. i + 1], .width = 1 }, .style = style });
@@ -90,4 +91,10 @@ test "Ghostty's config: fonts accumulate and reset, colors and cursor parse" {
 test "Alt+S is the screenshot key" {
     try std.testing.expect(screenshot.isKey(.{ .codepoint = 's', .mods = .{ .alt = true } }));
     try std.testing.expect(!screenshot.isKey(.{ .codepoint = 's' }));
+}
+
+test "the default font download is the font Ghostty pins" {
+    const gpa = std.testing.allocator;
+    try asset_store.verify(gpa, screenshot.default_font[0], @embedFile("jetbrains_mono_variable"));
+    try asset_store.verify(gpa, screenshot.default_font[1], @embedFile("jetbrains_mono_variable_italic"));
 }

@@ -102,16 +102,13 @@ fn ghosttyFont(b: *std.Build, ghostty: *std.Build.Dependency, target: std.Build.
     });
 }
 
-/// Screenshots draw text with CoreText in the font Ghostty uses, which by
-/// default is its own embedded JetBrains Mono.
-fn configureScreenshot(module: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget, font: *std.Build.Module) void {
+/// Screenshots draw text with CoreText in the font Ghostty uses. Its
+/// default, JetBrains Mono, is fetched on first use, not linked in.
+fn configureScreenshot(module: *std.Build.Module, target: std.Build.ResolvedTarget, font: *std.Build.Module) void {
     module.addImport("ghostty_font", font);
     if (target.result.os.tag != .macos) return;
     module.linkFramework("CoreText", .{});
     module.linkFramework("CoreGraphics", .{});
-    const jetbrains_mono = b.dependency("jetbrains_mono", .{});
-    module.addAnonymousImport("jetbrains_mono_variable", .{ .root_source_file = jetbrains_mono.path("fonts/variable/JetBrainsMono[wght].ttf") });
-    module.addAnonymousImport("jetbrains_mono_variable_italic", .{ .root_source_file = jetbrains_mono.path("fonts/variable/JetBrainsMono-Italic[wght].ttf") });
 }
 
 /// C bindings, translated at build time (`@cImport` is gone in 0.17).
@@ -243,8 +240,10 @@ pub fn build(b: *std.Build) void {
     configureSqlite(exe.root_module, b, embedded_sqlite);
     configureYaml(exe.root_module, b);
     configurePower(exe.root_module, b, target, macos_sdk);
-    const ghostty_font = ghosttyFont(b, ghostty, target, optimize);
-    configureScreenshot(exe.root_module, b, target, ghostty_font);
+    // Built for size: screenshots draw it once per capture, and fast mode
+    // unrolls Ghostty's comptime sprite tables into ~85 KB more code.
+    const ghostty_font = ghosttyFont(b, ghostty, target, if (optimize == .debug) .debug else .small);
+    configureScreenshot(exe.root_module, target, ghostty_font);
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     exe.root_module.addOptions("build_options", build_options);
@@ -314,7 +313,13 @@ pub fn build(b: *std.Build) void {
     configureSqlite(test_module, b, embedded_sqlite);
     configureYaml(test_module, b);
     configurePower(test_module, b, target, macos_sdk);
-    configureScreenshot(test_module, b, target, ghosttyFont(b, ghostty, target, .debug));
+    configureScreenshot(test_module, target, ghosttyFont(b, ghostty, target, .debug));
+    // The default font screenshots download, from Ghostty's own pin, so
+    // tests need no network and can check the download digests.
+    if (b.lazyDependency("jetbrains_mono", .{})) |jetbrains_mono| {
+        test_module.addAnonymousImport("jetbrains_mono_variable", .{ .root_source_file = jetbrains_mono.path("fonts/variable/JetBrainsMono[wght].ttf") });
+        test_module.addAnonymousImport("jetbrains_mono_variable_italic", .{ .root_source_file = jetbrains_mono.path("fonts/variable/JetBrainsMono-Italic[wght].ttf") });
+    }
     // Ghostty's own reference renderings of its box-drawing sprites, which
     // screenshots must reproduce exactly.
     for ([_][]const u8{ "18x36+4", "12x24+3", "11x21+2", "9x17+1" }) |size| {

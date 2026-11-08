@@ -26,7 +26,14 @@ pub const Config = struct {
     features: []const []const u8 = &.{},
     font_thicken: bool = false,
     font_thicken_strength: u8 = 255,
+    /// Ghostty's built-in JetBrains Mono (variable, upright and italic),
+    /// which it uses when font-family is unset and as a fallback after it.
+    /// Fetched on demand rather than carried in the binary; without it,
+    /// Menlo stands in and the grid is unlikely to match.
+    default_font: ?DefaultFont = null,
 };
+
+pub const DefaultFont = struct { regular: []const u8, italic: []const u8 };
 
 const Style = enum { regular, bold, italic, bold_italic };
 
@@ -172,11 +179,15 @@ pub const Fonts = struct {
         }
         try self.completeStyles();
 
+        const default = self.config.default_font orelse {
+            if (self.faces[0].items.len == 0) try self.loadStandIn(px);
+            return;
+        };
         const embedded = [4]struct { []const u8, ?f64 }{
-            .{ @embedFile("jetbrains_mono_variable"), null },
-            .{ @embedFile("jetbrains_mono_variable"), 700 },
-            .{ @embedFile("jetbrains_mono_variable_italic"), null },
-            .{ @embedFile("jetbrains_mono_variable_italic"), 700 },
+            .{ default.regular, null },
+            .{ default.regular, 700 },
+            .{ default.italic, null },
+            .{ default.italic, 700 },
         };
         for (embedded, 0..) |entry, i| {
             var font = try fontFromData(entry[0], px);
@@ -187,6 +198,15 @@ pub const Fonts = struct {
             }
             try self.addFace(@fromBackingInt(@intCast(i)), font, true, null);
         }
+    }
+
+    /// No configured family and no default font: Menlo, in every style.
+    fn loadStandIn(self: *Fonts, px: f64) !void {
+        const desc = try discoverFirst(.{ .family = "Menlo", .size = self.config.size }) orelse return error.NoFont;
+        defer release(desc);
+        const font = CTFontCreateWithFontDescriptor(desc, px, null) orelse return error.NoFont;
+        try self.addFace(.regular, font, false, null);
+        try self.completeStyles();
     }
 
     /// Ghostty's Collection.completeStyles: a style with no face gets the

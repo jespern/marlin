@@ -28,6 +28,8 @@
         .jetbrains_mono = .{
             .url = "https://deps.files.ghostty.org/JetBrainsMono-2.304.tar.gz",
             .hash = "N-V-__8AAIC5lwAVPJJzxnCAahSvZTIlG-HhtOvnM1uh-66x",
+            // Tests only: screenshots download these fonts on demand.
+            .lazy = true,
         },
     },
     .paths = .{

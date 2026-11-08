@@ -6,13 +6,19 @@ const raster = @import("raster.zig");
 const ghostty_font = @import("ghostty_font");
 const coretext = if (builtin.os.tag == .macos) @import("raster_coretext.zig") else struct {};
 
+/// Ghostty's default font, as screenshots download it.
+const default_font = if (builtin.os.tag == .macos) coretext.DefaultFont{
+    .regular = @embedFile("jetbrains_mono_variable"),
+    .italic = @embedFile("jetbrains_mono_variable_italic"),
+} else {};
+
 fn cell(text: []const u8, width: u2) raster.Cell {
     return .{ .text = text, .width = width, .fg = .{ 255, 255, 255 }, .bg = .{ 0, 0, 0 } };
 }
 
 test "Ghostty's default font gives Ghostty's 13pt Retina grid exactly" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
-    var fonts = try coretext.Fonts.init(std.testing.allocator, .{}, 16, 34);
+    var fonts = try coretext.Fonts.init(std.testing.allocator, .{ .default_font = default_font }, 16, 34);
     defer fonts.deinit();
     try std.testing.expect(fonts.exact_grid);
     try std.testing.expectEqual(@as(f64, 2), fonts.scale);
@@ -22,7 +28,7 @@ test "Ghostty's default font gives Ghostty's 13pt Retina grid exactly" {
 
 test "a cell grid the font cannot make is forced, baseline centered" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
-    var fonts = try coretext.Fonts.init(std.testing.allocator, .{}, 16, 40);
+    var fonts = try coretext.Fonts.init(std.testing.allocator, .{ .default_font = default_font }, 16, 40);
     defer fonts.deinit();
     try std.testing.expect(!fonts.exact_grid);
     try std.testing.expectEqual(@as(u32, 40), fonts.metrics.cell_height);
@@ -31,7 +37,7 @@ test "a cell grid the font cannot make is forced, baseline centered" {
 test "text shapes to one glyph per cell, ligatures included" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var fonts = try coretext.Fonts.init(gpa, .{}, 16, 34);
+    var fonts = try coretext.Fonts.init(gpa, .{ .default_font = default_font }, 16, 34);
     defer fonts.deinit();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -58,7 +64,7 @@ test "text shapes to one glyph per cell, ligatures included" {
 test "emoji fall back to a color font across two cells" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var fonts = try coretext.Fonts.init(gpa, .{}, 16, 34);
+    var fonts = try coretext.Fonts.init(gpa, .{ .default_font = default_font }, 16, 34);
     defer fonts.deinit();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -78,4 +84,11 @@ test "font-feature parses Ghostty's syntaxes" {
     try std.testing.expectEqual(Feature{ .tag = "cv01".*, .value = 2 }, Feature.parse("cv01=2").?);
     try std.testing.expectEqual(Feature{ .tag = "liga".*, .value = 0 }, Feature.parse("liga off").?);
     try std.testing.expect(Feature.parse("toolong") == null);
+}
+
+test "without Ghostty's default font, Menlo stands in" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var fonts = try coretext.Fonts.init(std.testing.allocator, .{}, 16, 34);
+    defer fonts.deinit();
+    try std.testing.expectEqual(@as(u32, 34), fonts.metrics.cell_height);
 }

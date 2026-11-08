@@ -5,12 +5,14 @@
 //! own colors, and the shell's Kitty images (raster.zig,
 //! raster_coretext.zig). Painting runs on a thread from a copy of the
 //! frame; the PNG goes to the pasteboard, or to MARLIN_SCREENSHOT_FILE.
+//! Ghostty's default font is downloaded on first use and cached.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const vaxis = @import("vaxis");
 const vt = @import("ghostty-vt");
 const ghostty_font = @import("ghostty_font");
+const asset_store = @import("asset_store");
 const render = @import("render.zig");
 const raster = @import("raster.zig");
 const shell_tab = @import("shell_tab.zig");
@@ -48,6 +50,29 @@ pub const GhosttyConfig = struct {
     cursor_style: raster.CursorStyle = .block,
 };
 
+/// Ghostty's built-in default font: JetBrains Mono 2.304, the files
+/// Ghostty pins (same digests), from JetBrains' release tag.
+pub const default_font = [2]asset_store.Spec{
+    .{
+        .filename = "JetBrainsMono-wght.ttf",
+        .sha256 = "662a196d58f1183bf2d77428b6d5283fe3f45161ab021bea4036bc98e5cac016",
+        .url = "https://raw.githubusercontent.com/JetBrains/JetBrainsMono/v2.304/fonts/variable/JetBrainsMono%5Bwght%5D.ttf",
+        .max_bytes = 1024 * 1024,
+        .validate = validateFont,
+    },
+    .{
+        .filename = "JetBrainsMono-Italic-wght.ttf",
+        .sha256 = "f115aaa12113718c02ce72864fe6823b87241bc23d3e44cf1220155f861063f2",
+        .url = "https://raw.githubusercontent.com/JetBrains/JetBrainsMono/v2.304/fonts/variable/JetBrainsMono-Italic%5Bwght%5D.ttf",
+        .max_bytes = 1024 * 1024,
+        .validate = validateFont,
+    },
+};
+
+fn validateFont(_: std.mem.Allocator, bytes: []const u8) anyerror!void {
+    if (bytes.len < 12 or !std.mem.eql(u8, bytes[0..4], "\x00\x01\x00\x00")) return error.NotTrueType;
+}
+
 pub fn isKey(key: vaxis.Key) bool {
     return key.matches('s', .{ .alt = true });
 }
@@ -84,6 +109,7 @@ pub fn takePending(app: *App, screen: *const vaxis.Screen) void {
         .gpa = app.gpa,
         .io = app.io,
         .loop = loop,
+        .environ = app.environ,
         .frame = undefined,
         .config = undefined,
         .cell_width = if (app.cell_px_w > 0) app.cell_px_w else 16,
@@ -110,7 +136,7 @@ pub fn done(app: *App, outcome: Outcome) void {
         .copied => |copied| if (copied.exact)
             app.setNotice("screenshot copied to the clipboard", .{})
         else
-            app.setNotice("screenshot copied (the terminal's font grid differs from Ghostty's; text placement is approximate)", .{}),
+            app.setNotice("screenshot copied (approximate: Ghostty's font or cell grid could not be matched)", .{}),
         .failed => |reason| app.setNotice("screenshot failed: {s}", .{reason}),
     }
 }
@@ -120,6 +146,7 @@ const Job = struct {
     gpa: std.mem.Allocator,
     io: Io,
     loop: *vaxis.Loop(tui.Event),
+    environ: ?*const std.process.Environ.Map,
     frame: raster.Frame,
     config: GhosttyConfig,
     cell_width: u32,
@@ -156,7 +183,14 @@ const Job = struct {
     fn paint(job: *Job) !bool {
         if (builtin.os.tag != .macos) return error.Unsupported;
         ghostty_font.setIo(job.io);
-        var fonts = try coretext.Fonts.init(job.gpa, job.config.font, job.cell_width, job.cell_height);
+        var font_config = job.config.font;
+        const fetched = fetchDefaultFont(job.gpa, job.io, job.environ);
+        defer if (fetched) |f| {
+            job.gpa.free(f.regular);
+            job.gpa.free(f.italic);
+        };
+        font_config.default_font = fetched;
+        var fonts = try coretext.Fonts.init(job.gpa, font_config, job.cell_width, job.cell_height);
         defer fonts.deinit();
         const picture = try raster.paint(job.gpa, job.frame, fonts.metrics, fonts.text(), .{ .padding = 2 * fonts.metrics.cell_width });
         defer picture.deinit(job.gpa);
@@ -167,9 +201,29 @@ const Job = struct {
         } else {
             try copyToClipboard(job.gpa, job.io, png, job.tmp);
         }
-        return fonts.exact_grid;
+        return fonts.exact_grid and fetched != null;
     }
 };
+
+/// Ghostty's default font from the cache, downloading it the first time;
+/// null when it cannot be had (offline, say).
+fn fetchDefaultFont(gpa: std.mem.Allocator, io: Io, environ: ?*const std.process.Environ.Map) ?coretext.DefaultFont {
+    if (builtin.os.tag != .macos) return null;
+    const env = environ orelse return null;
+    var bytes: [2]?[]u8 = .{ null, null };
+    for (default_font, &bytes) |spec, *out| {
+        var progress: asset_store.Progress = .{};
+        const path = asset_store.cachePath(gpa, env, spec) catch break;
+        defer gpa.free(path);
+        out.* = asset_store.acquireAt(gpa, io, spec, path, &progress) catch |err| {
+            std.log.scoped(.screenshot).warn("could not fetch {s}: {t}", .{ spec.filename, err });
+            break;
+        };
+    }
+    if (bytes[0] != null and bytes[1] != null) return .{ .regular = bytes[0].?, .italic = bytes[1].? };
+    for (bytes) |b| if (b) |owned| gpa.free(owned);
+    return null;
+}
 
 /// Rows `top..end` of `screen` as cells to paint, in the terminal's
 /// colors, styled the way Ghostty styles them.
