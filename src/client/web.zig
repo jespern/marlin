@@ -52,6 +52,13 @@ const default_port: u16 = 8377;
 
 /// macOS app installs bundle the CLI without adding a PATH executable.
 /// Explicit CLI mode prevents background launches from opening a GUI.
+/// Shell sessions are a terminal-client feature: a browser never gets a PTY,
+/// nor sees one. Every shell_* message is refused, including any added later,
+/// since attaching or listing would expose a running shell's screen.
+pub fn allowedOverWeb(msg: proto.ClientMsg) bool {
+    return !std.mem.startsWith(u8, @tagName(msg), "shell_");
+}
+
 pub fn runTailscale(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const []const u8) !std.process.RunResult {
     return runTailscaleCommand(gpa, io, environ, "tailscale", args) catch |err| {
         if (err != error.FileNotFound or @import("builtin").os.tag != .macos) return err;
@@ -405,15 +412,11 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !voi
             , .{ .status = .bad_request, .extra_headers = &json_header });
             return;
         };
-        // The shell tab is a terminal-client feature; a browser never gets a PTY.
-        switch (msg) {
-            .shell_open, .shell_input, .shell_resize, .shell_ack, .shell_close => {
-                try reply(req, access,
-                    \\{"err":{"code":"forbidden","msg":"shell messages are not available over the web bridge"}}
-                , .{ .status = .forbidden, .extra_headers = &json_header });
-                return;
-            },
-            else => {},
+        if (!allowedOverWeb(msg)) {
+            try reply(req, access,
+                \\{"err":{"code":"forbidden","msg":"shell messages are not available over the web bridge"}}
+            , .{ .status = .forbidden, .extra_headers = &json_header });
+            return;
         }
     }
 

@@ -82,3 +82,18 @@ test "access log timestamps are Common Log Format in UTC" {
     try std.testing.expectEqualStrings("01/Jan/1970:00:00:00 +0000", web.clfTime(&buf, 0));
     try std.testing.expectEqualStrings("01/Jan/1970:00:00:00 +0000", web.clfTime(&buf, -5));
 }
+
+test "the web bridge refuses every shell message, attaching and listing too" {
+    const refused = [_]proto.ClientMsg{
+        .{ .shell_open = .{ .cols = 80, .rows = 24 } },
+        .{ .shell_attach = .{ .shell_id = 1, .cols = 80, .rows = 24 } },
+        .{ .shell_detach = .{ .shell_id = 1 } },
+        .{ .shell_list = .{} },
+        .{ .shell_input = .{ .shell_id = 1, .data_base64 = "" } },
+        .{ .shell_resize = .{ .shell_id = 1, .cols = 80, .rows = 24 } },
+        .{ .shell_ack = .{ .shell_id = 1, .bytes = 0 } },
+        .{ .shell_close = .{ .shell_id = 1 } },
+    };
+    for (refused) |msg| try std.testing.expect(!web.allowedOverWeb(msg));
+    try std.testing.expect(web.allowedOverWeb(.{ .session_list = .{} }));
+}
