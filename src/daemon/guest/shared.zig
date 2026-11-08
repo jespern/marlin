@@ -39,6 +39,22 @@ pub fn setDelegateError(text: []const u8) void {
     @memcpy(delegate_error_buf[0..delegate_error_len], text[0..delegate_error_len]);
 }
 
+/// Spawn's FileNotFound also covers a vanished cwd, not just argv[0].
+pub fn spawnErrorNote(gpa: Allocator, io: Io, cwd: []const u8, err: std.process.SpawnError, backend: @import("../../core/guest.zig").Backend) ![]u8 {
+    var dir = Io.Dir.cwd().openDir(io, cwd, .{}) catch |cwd_err| {
+        return std.fmt.allocPrint(gpa, "working directory unavailable ({t}): {s} — use /cwd <existing-directory>, then retry", .{ cwd_err, cwd });
+    };
+    dir.close(io);
+    if (err == error.FileNotFound) return gpa.dupe(u8, switch (backend) {
+        .claude_code => "claude binary not found — install Claude Code (or set MARLIN_CLAUDE_CODE_BIN)",
+        .codex => "codex binary not found — install Codex (or set MARLIN_CODEX_BIN)",
+    });
+    return std.fmt.allocPrint(gpa, "failed to spawn {s}: {t}", .{ switch (backend) {
+        .claude_code => "claude",
+        .codex => "codex app-server",
+    }, err });
+}
+
 /// Put a key only when the parent environment didn't set it — the operator's
 /// own value always wins over Marlin's pass-down defaults.
 pub fn putEnvDefault(map: *std.process.Environ.Map, key: []const u8, value: []const u8) bool {

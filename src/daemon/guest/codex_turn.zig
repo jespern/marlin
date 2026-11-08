@@ -597,10 +597,7 @@ pub fn runCodexTurn(
         .stderr = .pipe,
         .pgid = 0,
     }) catch |err| {
-        const note: []const u8 = if (err == error.FileNotFound)
-            "codex binary not found — install Codex (or set MARLIN_CODEX_BIN)"
-        else
-            "failed to spawn codex app-server";
+        const note = try shared.spawnErrorNote(arena, io, opts.cwd, err, .codex);
         setDelegateError(note);
         _ = try ap.append(.{ .system_note = .{ .text = note } });
         return error.DelegateSpawnFailed;

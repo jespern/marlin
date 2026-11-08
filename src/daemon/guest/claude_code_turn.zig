@@ -412,10 +412,7 @@ fn ccInvoke(
         .stderr = .pipe,
         .pgid = 0,
     }) catch |err| {
-        const text: []const u8 = if (err == error.FileNotFound)
-            "claude binary not found — install Claude Code (or set MARLIN_CLAUDE_CODE_BIN)"
-        else
-            "failed to spawn claude";
+        const text = try shared.spawnErrorNote(arena, io, opts.cwd, err, .claude_code);
         setDelegateError(text);
         _ = try ap.append(.{ .system_note = .{ .text = text } });
         return error.DelegateSpawnFailed;

@@ -452,6 +452,57 @@ test "root round budget becomes an automatic continuation checkpoint" {
     try std.testing.expectEqualStrings("internal round checkpoint reached", loaded[1].blk.body.system_note.text);
 }
 
+test "guest launch errors distinguish unavailable working directories from missing binaries" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-guest-spawn");
+    defer temp.deinit();
+    const missing = try std.fs.path.join(gpa, &.{ temp.path, "missing" });
+    defer gpa.free(missing);
+    const file = try std.fs.path.join(gpa, &.{ temp.path, "file" });
+    defer gpa.free(file);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "not a directory" });
+
+    for ([_]@import("../core/guest.zig").Backend{ .claude_code, .codex }) |backend| {
+        for ([_][]const u8{ missing, file, temp.path }) |cwd| {
+            const valid_cwd = std.mem.eql(u8, cwd, temp.path);
+            var env = std.process.Environ.Map.init(gpa);
+            defer env.deinit();
+            try env.put(if (backend == .claude_code) claude_code.binary_env else codex.binary_env, if (valid_cwd) missing else "/bin/sh");
+            var store = try Store.open(gpa, null);
+            defer store.close();
+            try store.createSession(1, 0, cwd, if (backend == .claude_code) "claudecode/default" else "codex/default", .auto);
+            try std.testing.expectError(error.DelegateSpawnFailed, runTurn(gpa, io, &store, .{
+                .session_id = 1,
+                .cwd = cwd,
+                .endpoint = .{ .url = "", .bearer = null, .model = "default", .backend = .{ .guest = backend } },
+                .cfg = .{},
+                .tool_environ = &env,
+            }, "inspect", &.{}));
+            const loaded = try store.getBlocks(1, 1, 100);
+            defer {
+                for (loaded) |*lb| lb.deinit();
+                gpa.free(loaded);
+            }
+            try std.testing.expectEqual(@as(usize, 2), loaded.len);
+            const note = loaded[1].blk.body.system_note.text;
+            try std.testing.expectEqualStrings(note, loop.lastDelegateErrorNote().?);
+            if (valid_cwd) {
+                try std.testing.expect(std.mem.indexOf(u8, note, "binary not found") != null);
+                try std.testing.expect(std.mem.indexOf(u8, note, if (backend == .claude_code) "MARLIN_CLAUDE_CODE_BIN" else "MARLIN_CODEX_BIN") != null);
+            } else {
+                try std.testing.expect(std.mem.startsWith(u8, note, "working directory unavailable"));
+                try std.testing.expect(std.mem.indexOf(u8, note, cwd) != null);
+                try std.testing.expect(std.mem.indexOf(u8, note, "/cwd <existing-directory>") != null);
+                try std.testing.expect(std.mem.indexOf(u8, note, "binary not found") == null);
+            }
+        }
+    }
+}
+
 test "delegated claude code turn persists rate-limit transitions through its ordered appender" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;

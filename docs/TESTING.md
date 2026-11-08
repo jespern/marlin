@@ -70,7 +70,9 @@ are covered synthetically and by the full-binary e2e batch scenario.
 
 Guest adapters are tested at their process boundary in `guest/*_test.zig`
 and provider adapter tests: executable fixture peers validate argv and JSONL
-in both directions. The Codex fixture
+in both directions. Guest launch regressions in `loop_test.zig` distinguish a
+missing or non-directory cwd from a missing executable for both backends;
+an unavailable cwd reports the path and `/cwd` recovery instructions. The Codex fixture
 covers initialize/account checks, durable `thread/resume`, item-to-block
 projection, approval responses, token usage, and secret-environment scrubbing.
 
