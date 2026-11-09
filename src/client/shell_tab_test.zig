@@ -181,6 +181,9 @@ test "a session another client made a shell is attached when focused; its tab sa
     try std.testing.expectEqual(@as(u16, 22), msgs[0].shell_attach.rows);
     const summary = h.app.sessionSummary(42).?;
     try std.testing.expectEqualStrings("proj", summary.shell_label);
+    // A title the program sets (OSC 0/2) names the tab instead.
+    try h.daemonSays("{{\"session_upsert\":{{\"session\":{{\"sid\":42,\"title\":\"\",\"cwd\":\"/work/proj\",\"model\":\"m\",\"status\":\"idle\",\"created_at\":1,\"running\":false,\"shell_id\":8,\"shell_title\":\"vim notes.md\"}}}}}}", .{});
+    try std.testing.expectEqualStrings("vim notes.md", h.app.sessionSummary(42).?.shell_label);
 
     // The shell ended before this client heard: the view lets go of it.
     try h.daemonOpens(msgs[0].shell_attach.request_id, 8, "$ ");

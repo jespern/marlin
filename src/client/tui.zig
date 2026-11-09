@@ -1513,7 +1513,7 @@ pub const App = struct {
             .usage_credits = info.usage_credits,
             .shell_id = info.shell_id,
             .shell_label = if (info.shell_id != 0)
-                self.gpa.dupe(u8, if (info.title.len > 0) info.title else if (std.fs.path.basename(info.cwd).len > 0) std.fs.path.basename(info.cwd) else "shell") catch &.{}
+                self.gpa.dupe(u8, if (info.shell_title.len > 0) info.shell_title else if (info.title.len > 0) info.title else if (std.fs.path.basename(info.cwd).len > 0) std.fs.path.basename(info.cwd) else "shell") catch &.{}
             else
                 &.{},
         };

@@ -707,6 +707,8 @@ pub const SessionInfo = struct {
     /// Non-zero while the session is an interactive shell (`!!`): its
     /// transcript area shows that shell, which input goes to.
     shell_id: u64 = 0,
+    /// The title the shell's program set (OSC 0/2); empty when none.
+    shell_title: []const u8 = "",
 };
 
 /// Encode one message as an NDJSON line (incl. trailing \n). Caller frees.

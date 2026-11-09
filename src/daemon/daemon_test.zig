@@ -275,6 +275,24 @@ test "shells outlive their opener and are shared by every viewer" {
         try io.sleep(.fromMilliseconds(10), .awake);
     } else return error.Timeout;
 
+    // A title the program sets reaches clients with the session.
+    other.watches_sessions = true;
+    other.watches_session_deltas = true;
+    const titled = std.base64.standard.Encoder.encode(&input_buf, "printf '\\033]2;%s\\007' tab-$((3+3))\r");
+    try Helpers.send(&daemon, other.id, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"{s}\"}}}}", .{ shell_id, titled });
+    var titled_seen = false;
+    for (0..500) |_| {
+        while (daemon.events.tryPop(io)) |event| try daemon.handleEvent(event);
+        for (try Helpers.drain(a, &other, io)) |msg| switch (msg) {
+            .session_upsert => |up| if (std.mem.eql(u8, up.session.shell_title, "tab-6")) {
+                titled_seen = true;
+            },
+            else => {},
+        };
+        if (titled_seen) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.Timeout;
+
     // The opener leaving does not end the shell.
     daemon.detachClientShells(opener.id);
     try std.testing.expectEqual(@as(usize, 1), daemon.shells.count());
