@@ -457,10 +457,12 @@ pub const ClientMsg = union(enum) {
     /// When the shell ends, its transcript is appended to the session and
     /// the session is an ordinary one again. Cell sizes (pixels) are zero
     /// when unknown.
-    shell_open: struct { request_id: u64 = 0, sid: u64 = 0, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0 },
+    shell_open: struct { request_id: u64 = 0, sid: u64 = 0, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0, theme: ?ShellTheme = null },
     /// View and drive a running shell, resizing it to this client. Replies
     /// shell_opened then shell_snapshot; shell_output follows.
-    shell_attach: struct { request_id: u64 = 0, shell_id: u64, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0 },
+    shell_attach: struct { request_id: u64 = 0, shell_id: u64, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0, theme: ?ShellTheme = null },
+    /// The viewer's terminal colors changed (they arrive after startup).
+    shell_theme: struct { shell_id: u64, theme: ShellTheme },
     /// Stop viewing; the shell keeps running.
     shell_detach: struct { shell_id: u64 },
     /// Replies shell_list_result now and whenever the set of shells or a
@@ -474,6 +476,14 @@ pub const ClientMsg = union(enum) {
     shell_ack: struct { shell_id: u64, bytes: u64 },
     /// Hang up the shell for everyone.
     shell_close: struct { shell_id: u64 },
+};
+
+/// A viewer's terminal colors: a shell's defaults, so programs asking
+/// (OSC 4/10/11) hear what the user sees. Unknown entries stay null.
+pub const ShellTheme = struct {
+    foreground: ?[3]u8 = null,
+    background: ?[3]u8 = null,
+    palette: [16]?[3]u8 = @splat(null),
 };
 
 pub const ShellInfo = struct {

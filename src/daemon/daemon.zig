@@ -1655,17 +1655,21 @@ pub const Daemon = struct {
                     .remote_shell = true,
                 } });
             },
-            .shell_open => |so| try self.openShell(client, so.request_id, so.sid, .{
-                .cols = so.cols,
-                .rows = so.rows,
-                .cell_width = so.cell_width,
-                .cell_height = so.cell_height,
-            }),
+            .shell_open => |so| {
+                try self.openShell(client, so.request_id, so.sid, .{
+                    .cols = so.cols,
+                    .rows = so.rows,
+                    .cell_width = so.cell_width,
+                    .cell_height = so.cell_height,
+                });
+                if (so.theme) |theme| if (self.sessionShell(so.sid)) |host| host.setTheme(theme);
+            },
             .shell_attach => |sa| {
                 const host = self.shells.get(sa.shell_id) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_shell", .msg = "that shell has exited", .request_id = sa.request_id } });
                     return;
                 };
+                if (sa.theme) |theme| host.setTheme(theme);
                 try self.attachShell(client, host, sa.request_id, .{
                     .cols = sa.cols,
                     .rows = sa.rows,
@@ -1673,6 +1677,7 @@ pub const Daemon = struct {
                     .cell_height = sa.cell_height,
                 });
             },
+            .shell_theme => |st| if (self.viewedShell(client, st.shell_id)) |host| host.setTheme(st.theme),
             .shell_detach => |sd| if (self.shells.get(sd.shell_id)) |host| {
                 host.detach(client.id);
                 self.broadcastShellList();

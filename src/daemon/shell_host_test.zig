@@ -148,3 +148,28 @@ test "the styled transcript keeps colors and joins soft wraps" {
     try std.testing.expect(std.mem.indexOf(u8, styled, "a-line-longer-than-ten") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "red") != null);
 }
+
+test "a viewer's colors are the shell's defaults; a program's own colors still win" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const host = try shell_host.Host.create(gpa, threaded.io(), 1, 9, "/", 0, .{ .cols = 20, .rows = 4 });
+    defer host.destroy();
+    // Before any viewer says, there is no default to report (OSC 10/11
+    // queries went unanswered).
+    try std.testing.expect(host.terminal.colors.background.get() == null);
+
+    var palette: [16]?[3]u8 = @splat(null);
+    palette[1] = .{ 200, 10, 10 };
+    host.setTheme(.{ .foreground = .{ 220, 220, 220 }, .background = .{ 0x28, 0x2c, 0x34 }, .palette = palette });
+    const bg = host.terminal.colors.background.get().?;
+    try std.testing.expectEqual([3]u8{ 0x28, 0x2c, 0x34 }, [3]u8{ bg.r, bg.g, bg.b });
+    const red = host.terminal.colors.palette.current[1];
+    try std.testing.expectEqual([3]u8{ 200, 10, 10 }, [3]u8{ red.r, red.g, red.b });
+
+    // A program that sets its own background keeps it over the default.
+    host.feed("\x1b]11;rgb:00/00/ff\x07");
+    host.setTheme(.{ .background = .{ 1, 2, 3 } });
+    const own = host.terminal.colors.background.get().?;
+    try std.testing.expectEqual([3]u8{ 0, 0, 0xff }, [3]u8{ own.r, own.g, own.b });
+}

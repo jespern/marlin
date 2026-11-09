@@ -7082,7 +7082,10 @@ pub fn dispatchEvent(
             app.terminal_focused = false;
             if (app.game_mode) if (app.wipeout_game) |game| game.releaseKeys();
         },
-        .color_report => |report| app.terminal_theme.applyReport(report),
+        .color_report => |report| {
+            app.terminal_theme.applyReport(report);
+            shell_tab.themeChanged(app);
+        },
         .tick => {
             app.maybeRequestGitStatus(nowWallMs(app.io));
             app.maybeRequestRecap(nowWallMs(app.io));

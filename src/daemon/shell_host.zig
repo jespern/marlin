@@ -11,6 +11,7 @@ const std = @import("std");
 const Io = std.Io;
 const vt = @import("ghostty-vt");
 const shell_pty = @import("shell_pty.zig");
+const proto = @import("../core/proto.zig");
 
 /// Output a viewer may have unacknowledged before it stops receiving live
 /// bytes; once it catches up it is resynced with a snapshot.
@@ -106,6 +107,20 @@ pub const Host = struct {
     }
 
     /// The latest viewer to size the shell wins, as in tmux.
+    /// A viewer's terminal colors as this shell's defaults (the latest
+    /// viewer wins, as for size), so OSC 4/10/11 queries are answered with
+    /// the colors on screen. A program's own color settings still win.
+    pub fn setTheme(self: *Host, theme: proto.ShellTheme) void {
+        const colors = &self.terminal.colors;
+        if (theme.foreground) |rgb| colors.foreground.default = .{ .r = rgb[0], .g = rgb[1], .b = rgb[2] };
+        if (theme.background) |rgb| colors.background.default = .{ .r = rgb[0], .g = rgb[1], .b = rgb[2] };
+        var palette = colors.palette.original.*;
+        for (theme.palette, 0..) |maybe, i| if (maybe) |rgb| {
+            palette[i] = .{ .r = rgb[0], .g = rgb[1], .b = rgb[2] };
+        };
+        colors.palette.changeDefault(self.gpa, palette) catch {};
+    }
+
     pub fn resize(self: *Host, geometry: Geometry) void {
         const cols = @max(geometry.cols, 1);
         const rows = @max(geometry.rows, 1);

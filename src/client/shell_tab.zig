@@ -149,6 +149,7 @@ pub fn open(app: *App) void {
         .rows = grid.rows,
         .cell_width = grid.cell_width,
         .cell_height = grid.cell_height,
+        .theme = theme(app),
     } }) catch {
         state.destroy();
         app.setNotice("could not reach the daemon to open a shell", .{});
@@ -180,6 +181,24 @@ pub fn sync(app: *App) void {
     enterLive(app);
 }
 
+/// This terminal's colors, for the shell's programs to ask about; null
+/// until the terminal has reported any.
+pub fn theme(app: *const App) ?proto.ShellTheme {
+    const t = &app.terminal_theme;
+    var known = t.foreground != null or t.background != null;
+    for (t.palette) |entry| known = known or entry != null;
+    if (!known) return null;
+    return .{ .foreground = t.foreground, .background = t.background, .palette = t.palette };
+}
+
+/// The terminal reported a color after the shell attached: pass it on.
+pub fn themeChanged(app: *App) void {
+    const state = live(app) orelse return;
+    const id = state.shell_id orelse return;
+    const colors = theme(app) orelse return;
+    app.conn.send(.{ .shell_theme = .{ .shell_id = id, .theme = colors } }) catch {};
+}
+
 fn sendAttach(app: *App, state: *ShellState) void {
     const id = state.shell_id orelse return;
     const grid = gridSize(app);
@@ -190,6 +209,7 @@ fn sendAttach(app: *App, state: *ShellState) void {
         .rows = grid.rows,
         .cell_width = grid.cell_width,
         .cell_height = grid.cell_height,
+        .theme = theme(app),
     } }) catch return;
     state.sent_cols = grid.cols;
     state.sent_rows = grid.rows;

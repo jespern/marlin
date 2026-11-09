@@ -488,6 +488,24 @@ test "a live shell's OSC 8 links are links on its rows; found URLs join them" {
     try std.testing.expectEqualStrings("https://x.test/b", row.links[1].uri);
 }
 
+test "shells hear this terminal's colors when opened and when they change" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    h.app.terminal_theme.background = .{ 1, 2, 3 };
+    h.app.runCommand("!!");
+    const open = (try h.sent())[0].shell_open;
+    try std.testing.expectEqual([3]u8{ 1, 2, 3 }, open.theme.?.background.?);
+    try h.daemonOpens(open.request_id, 5, "$ ");
+
+    // A color the terminal reports later is passed on.
+    _ = try h.sent();
+    h.app.terminal_theme.foreground = .{ 9, 9, 9 };
+    shell_tab.themeChanged(&h.app);
+    const msgs = try h.sent();
+    try std.testing.expectEqual([3]u8{ 9, 9, 9 }, msgs[0].shell_theme.theme.foreground.?);
+}
+
 test "a bracketed paste reaches the shell as one paste" {
     var h: Harness = undefined;
     h.init(true);
