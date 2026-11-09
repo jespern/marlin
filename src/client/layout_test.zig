@@ -57,7 +57,7 @@ const activePromptLineRange = layout.activePromptLineRange;
 const appendNetworkSuccessLine = layout.appendNetworkSuccessLine;
 const appendToolCallLine = layout.appendToolCallLine;
 const currentInflightCall = layout.currentInflightCall;
-const commentaryNearDuplicate = layout.commentaryNearDuplicate;
+const commentaryRestatedBy = layout.commentaryRestatedBy;
 const diffIntroNote = layout.diffIntroNote;
 const diffSummaryNote = layout.diffSummaryNote;
 const layoutBlockRange = layout.layoutBlockRange;
@@ -524,22 +524,38 @@ test "layout line safety limit produces a visible truncation" {
 }
 
 test "commentary duplicate detection ignores casing, punctuation, and modest rewording" {
-    try std.testing.expect(commentaryNearDuplicate(
+    try std.testing.expect(commentaryRestatedBy(
         "Isolating terminal-title hunks from concurrent workspace changes.",
         "Isolating terminal title hunks from concurrent workspace changes",
     ));
-    try std.testing.expect(commentaryNearDuplicate(
+    try std.testing.expect(commentaryRestatedBy(
         "Staging only terminal-title hunks while preserving all other workspace changes.",
         "Only the terminal title implementation is staged; all other workspace changes are preserved.",
     ));
-    try std.testing.expect(!commentaryNearDuplicate(
+    try std.testing.expect(!commentaryRestatedBy(
         "Checking the approval gate in loop.zig.",
         "Running the focused TUI tests.",
     ));
-    try std.testing.expect(!commentaryNearDuplicate(
+    try std.testing.expect(!commentaryRestatedBy(
         "Reading layout.zig.",
         "Reviewing layout.zig.",
     ));
+}
+
+test "a short follow-up does not restate a long explanation it borrows words from" {
+    const explanation =
+        \\## The "Later" thing
+        \\
+        \\Every list lives in its own iCloud zone. The Inbox has a fixed name, so two
+        \\devices creating it before they sync end up with one Inbox. Later gets a
+        \\random name today, so two devices can each create a Later and you would see
+        \\two. Giving Later a fixed identity fixes that, and neither list can then be
+        \\deleted without breaking the guarantee.
+    ;
+    const decided = "Decided: Later gets a fixed identity, and neither Inbox nor Later can be deleted.";
+    try std.testing.expect(!commentaryRestatedBy(explanation, decided));
+    // The other direction is a genuine restatement and may still fold.
+    try std.testing.expect(commentaryRestatedBy(decided, explanation));
 }
 
 test "default transcript suppresses repeated commentary within a turn" {

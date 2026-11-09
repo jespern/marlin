@@ -456,24 +456,21 @@ fn normalizedCommentaryEqual(a: []const u8, b: []const u8) bool {
     }
 }
 
-pub fn commentaryNearDuplicate(a: []const u8, b: []const u8) bool {
-    if (normalizedCommentaryEqual(a, b)) return true;
+/// Whether `later` says what `earlier` said: it repeats most of earlier's
+/// words. One-sided on purpose — a short "Decided: X" that happens to reuse
+/// the words of a long explanation before it does not cover that explanation.
+pub fn commentaryRestatedBy(earlier: []const u8, later: []const u8) bool {
+    if (normalizedCommentaryEqual(earlier, later)) return true;
 
-    var a_count: usize = 0;
-    var b_count: usize = 0;
-    var shared: usize = 0;
-    var a_words = std.mem.tokenizeAny(u8, a, commentary_word_delimiters);
-    while (a_words.next()) |word| {
-        if (!significantCommentaryWord(word) or commentaryWordSeenBefore(a, word)) continue;
-        a_count += 1;
-        if (commentaryHasWord(b, word)) shared += 1;
+    var count: usize = 0;
+    var repeated: usize = 0;
+    var words = std.mem.tokenizeAny(u8, earlier, commentary_word_delimiters);
+    while (words.next()) |word| {
+        if (!significantCommentaryWord(word) or commentaryWordSeenBefore(earlier, word)) continue;
+        count += 1;
+        if (commentaryHasWord(later, word)) repeated += 1;
     }
-    var b_words = std.mem.tokenizeAny(u8, b, commentary_word_delimiters);
-    while (b_words.next()) |word| {
-        if (significantCommentaryWord(word) and !commentaryWordSeenBefore(b, word)) b_count += 1;
-    }
-    const smaller = @min(a_count, b_count);
-    return smaller >= 5 and shared * 10 >= smaller * 7;
+    return count >= 5 and repeated * 10 >= count * 7;
 }
 
 fn commentarySuperseded(blocks: []const RenderBlock, index: usize) bool {
@@ -482,7 +479,7 @@ fn commentarySuperseded(blocks: []const RenderBlock, index: usize) bool {
     while (next < blocks.len and blocks[next].turn_id == current.turn_id) : (next += 1) {
         const candidate = blocks[next];
         if ((candidate.kind == .reasoning and candidate.commentary) or candidate.kind == .assistant_msg) {
-            if (commentaryNearDuplicate(current.text, candidate.text)) return true;
+            if (commentaryRestatedBy(current.text, candidate.text)) return true;
         }
     }
     return false;
