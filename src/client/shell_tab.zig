@@ -480,6 +480,8 @@ pub fn transcriptLines(state: *ShellState, width: usize) ![]const Line {
 fn rowLine(arena: std.mem.Allocator, pin: vt.Pin, continues: bool) !Line {
     var text: std.ArrayList(u8) = .empty;
     var spans: std.ArrayList(SyntaxSpan) = .empty;
+    var links: std.ArrayList(render.LinkSpan) = .empty;
+    const page = pin.node.page();
     var keep: usize = 0; // bytes worth keeping: text, or styled blanks
     var buf: [4]u8 = undefined;
     const cells = pin.cells(.all);
@@ -492,6 +494,17 @@ fn rowLine(arena: std.mem.Allocator, pin: vt.Pin, continues: bool) !Line {
                 try text.appendSlice(arena, buf[0 .. std.unicode.utf8Encode(cp, &buf) catch continue]);
             };
         } else try text.append(arena, ' ');
+        // The program's OSC 8 link on this cell, joined with its neighbours.
+        if (cell.hyperlink) if (page.lookupHyperlink(cell)) |id| {
+            const uri = page.hyperlink_set.get(page.memory, id).uri.slice(page.memory);
+            if (render.allowedLinkUri(uri)) {
+                const last = if (links.items.len > 0) &links.items[links.items.len - 1] else null;
+                if (last != null and last.?.end == start and std.mem.eql(u8, last.?.uri, uri))
+                    last.?.end = text.items.len
+                else
+                    try links.append(arena, .{ .start = start, .end = text.items.len, .uri = try arena.dupe(u8, uri) });
+            }
+        };
         var style: vaxis.Style = if (cell.style_id != 0) shell_term.cellStyle(pin.style(cell)) else .{};
         switch (cell.content_tag) {
             .bg_color_palette => style.bg = .{ .index = cell.content.color_palette.data },
@@ -514,6 +527,7 @@ fn rowLine(arena: std.mem.Allocator, pin: vt.Pin, continues: bool) !Line {
         .text = text.items[0..keep],
         .style = .{},
         .syntax = spans.items,
+        .links = links.items,
         .copy = .{ .join = if (continues) .direct else .newline },
     };
 }

@@ -10,32 +10,47 @@ const shell_term = @import("shell_term.zig");
 pub const Row = struct {
     text: []const u8,
     syntax: []const render.SyntaxSpan,
+    /// The program's OSC 8 hyperlinks, allowlisted.
+    links: []const render.LinkSpan = &.{},
 };
 
 const SepList = @FieldType(vt.sgr.Parser, "params_sep");
 const max_params = SepList.bit_length;
 
-/// Rows of visible text with style spans; escape sequences other than SGR
-/// are dropped, and a style carries across rows as in a terminal. Trailing
-/// blank rows are left out.
+/// Rows of visible text with style spans and OSC 8 links; other escape
+/// sequences are dropped, and a style or link carries across rows as in a
+/// terminal. Trailing blank rows are left out.
 pub fn rows(arena: std.mem.Allocator, styled: []const u8) ![]Row {
     var out: std.ArrayList(Row) = .empty;
     var text: std.ArrayList(u8) = .empty;
     var spans: std.ArrayList(render.SyntaxSpan) = .empty;
+    var links: std.ArrayList(render.LinkSpan) = .empty;
     var pen: vt.Style = .{};
     var style: vaxis.Style = .{};
+    // The open hyperlink, and where in this row it began.
+    var link: ?[]const u8 = null;
+    var link_start: usize = 0;
     var i: usize = 0;
     while (i < styled.len) {
         const c = styled[i];
         switch (c) {
             0x1b => {
-                i = try escape(styled, i, &pen);
+                var next_link = link;
+                i = try escape(styled, i, &pen, &next_link);
                 style = shell_term.cellStyle(pen);
+                if (!optionalEql(next_link, link)) {
+                    if (link) |uri| try closeLink(arena, &links, uri, link_start, text.items.len);
+                    link = if (next_link) |uri| try arena.dupe(u8, uri) else null;
+                    link_start = text.items.len;
+                }
             },
             '\n' => {
-                try out.append(arena, .{ .text = text.items, .syntax = spans.items });
+                if (link) |uri| try closeLink(arena, &links, uri, link_start, text.items.len);
+                link_start = 0;
+                try out.append(arena, .{ .text = text.items, .syntax = spans.items, .links = links.items });
                 text = .empty;
                 spans = .empty;
+                links = .empty;
                 i += 1;
             },
             '\r' => i += 1,
@@ -57,15 +72,25 @@ pub fn rows(arena: std.mem.Allocator, styled: []const u8) ![]Row {
             },
         }
     }
-    if (text.items.len > 0) try out.append(arena, .{ .text = text.items, .syntax = spans.items });
+    if (link) |uri| try closeLink(arena, &links, uri, link_start, text.items.len);
+    if (text.items.len > 0) try out.append(arena, .{ .text = text.items, .syntax = spans.items, .links = links.items });
     var len = out.items.len;
     while (len > 0 and std.mem.trim(u8, out.items[len - 1].text, " ").len == 0) len -= 1;
     return out.items[0..len];
 }
 
+fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn closeLink(arena: std.mem.Allocator, links: *std.ArrayList(render.LinkSpan), uri: []const u8, start: usize, end: usize) !void {
+    if (end > start and render.allowedLinkUri(uri)) try links.append(arena, .{ .start = start, .end = end, .uri = uri });
+}
+
 /// Skip the escape sequence at `start`, applying it to `pen` when it is
-/// SGR. Returns the index just past it.
-fn escape(bytes: []const u8, start: usize, pen: *vt.Style) !usize {
+/// SGR and to `link` when it is OSC 8. Returns the index just past it.
+fn escape(bytes: []const u8, start: usize, pen: *vt.Style, link: *?[]const u8) !usize {
     if (start + 1 >= bytes.len) return bytes.len;
     switch (bytes[start + 1]) {
         '[' => {
@@ -78,11 +103,19 @@ fn escape(bytes: []const u8, start: usize, pen: *vt.Style) !usize {
         ']' => {
             // OSC: up to BEL or ST.
             var end = start + 2;
-            while (end < bytes.len) : (end += 1) {
-                if (bytes[end] == 0x07) return end + 1;
-                if (bytes[end] == 0x1b and end + 1 < bytes.len and bytes[end + 1] == '\\') return end + 2;
+            const after: usize = while (end < bytes.len) : (end += 1) {
+                if (bytes[end] == 0x07) break end + 1;
+                if (bytes[end] == 0x1b and end + 1 < bytes.len and bytes[end + 1] == '\\') break end + 2;
+            } else return bytes.len;
+            // OSC 8 ; params ; uri — an empty uri closes the link.
+            const body = bytes[start + 2 .. end];
+            if (std.mem.startsWith(u8, body, "8;")) {
+                if (std.mem.indexOfScalarPos(u8, body, 2, ';')) |sep| {
+                    const uri = body[sep + 1 ..];
+                    link.* = if (uri.len > 0) uri else null;
+                }
             }
-            return bytes.len;
+            return after;
         },
         else => return start + 2,
     }

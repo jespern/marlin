@@ -475,6 +475,19 @@ test "a new shell starts in place: the empty screen below its prompt is not show
     try std.testing.expectEqual(@as(usize, 2), state.screen_rows_shown);
 }
 
+test "a live shell's OSC 8 links are links on its rows; found URLs join them" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    try h.openShell("\x1b]8;;file:///etc/hosts\x1b\\hosts\x1b]8;;\x1b\\ and https://x.test/b\r\n$ ");
+    const lines = try shell_tab.transcriptLines(h.app.view.shell.?, 80);
+    const row = lines[0];
+    try std.testing.expectEqual(@as(usize, 2), row.links.len);
+    try std.testing.expectEqualStrings("file:///etc/hosts", row.links[0].uri);
+    try std.testing.expectEqualStrings("hosts", row.text[row.links[0].start..row.links[0].end]);
+    try std.testing.expectEqualStrings("https://x.test/b", row.links[1].uri);
+}
+
 test "a bracketed paste reaches the shell as one paste" {
     var h: Harness = undefined;
     h.init(true);

@@ -1984,6 +1984,7 @@ fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), 
                     .text = row.text[start..end],
                     .style = ended_shell_style,
                     .syntax = spans.items,
+                    .links = try linksForChunk(alloc, row.links, start, end, 0),
                     .copy = .{ .join = if (start == 0) .newline else .direct },
                 });
                 if (end <= start or end >= row.text.len) break;

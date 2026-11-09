@@ -59,3 +59,20 @@ test "links hidden behind a newline never underline the row's blank cells" {
     }
     try std.testing.expectEqual(@as(usize, "https://example.com/a".len), underlined);
 }
+
+test "program links: allowlisted schemes only, and found URLs never overlap them" {
+    try std.testing.expect(render.allowedLinkUri("https://x.test/a?b=1"));
+    try std.testing.expect(render.allowedLinkUri("file:///tmp/x"));
+    try std.testing.expect(!render.allowedLinkUri("javascript:alert(1)"));
+    try std.testing.expect(!render.allowedLinkUri("https://x.test/\x1b]52;c;evil"));
+    try std.testing.expect(!render.allowedLinkUri("https://x.test/a b"));
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const explicit = [_]render.LinkSpan{.{ .start = 0, .end = 5, .uri = "file:///a" }};
+    const found = [_]render.LinkSpan{ .{ .start = 3, .end = 9, .uri = "https://overlap" }, .{ .start = 10, .end = 20, .uri = "https://free" } };
+    const merged = try render.mergeLinks(arena.allocator(), &explicit, &found);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+    try std.testing.expectEqualStrings("file:///a", merged[0].uri);
+    try std.testing.expectEqualStrings("https://free", merged[1].uri);
+}

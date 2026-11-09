@@ -854,9 +854,32 @@ pub fn resolveLineLinks(arena: std.mem.Allocator, lines: []Line) !void {
     for (lines) |*line| {
         if (line.links_resolved) continue;
         const text = try lineText(arena, line.*);
-        line.links = try findLinkSpans(arena, text);
+        line.links = try mergeLinks(arena, line.links, try findLinkSpans(arena, text));
         line.links_resolved = true;
     }
+}
+
+/// Links a line already carries (a program's OSC 8) win; URLs found in its
+/// text add to them where they do not overlap.
+pub fn mergeLinks(arena: std.mem.Allocator, explicit: []const LinkSpan, found: []const LinkSpan) ![]const LinkSpan {
+    if (explicit.len == 0) return found;
+    var out: std.ArrayList(LinkSpan) = .empty;
+    try out.appendSlice(arena, explicit);
+    outer: for (found) |link| {
+        for (explicit) |kept| if (link.start < kept.end and link.end > kept.start) continue :outer;
+        try out.append(arena, link);
+    }
+    return out.items;
+}
+
+/// A link a program may put on screen: http(s) or a file URI, as Marlin's
+/// own links, with no bytes that would end or corrupt the OSC 8 sequence.
+pub fn allowedLinkUri(uri: []const u8) bool {
+    if (!std.mem.startsWith(u8, uri, "https://") and
+        !std.mem.startsWith(u8, uri, "http://") and
+        !std.mem.startsWith(u8, uri, "file://")) return false;
+    for (uri) |byte| if (byte <= ' ' or byte == 0x7f) return false;
+    return true;
 }
 
 pub fn linkForBytes(links: []const LinkSpan, start: usize, end: usize) ?[]const u8 {
