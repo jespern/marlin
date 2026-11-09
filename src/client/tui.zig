@@ -4350,11 +4350,16 @@ pub const App = struct {
         const request_id = self.next_input_request_id;
         self.next_input_request_id +%= 1;
         if (self.next_input_request_id == 0) self.next_input_request_id = 1;
+        // From a shell, where the shell is now: the daemon asks the OS on
+        // the shell's host. `cwd` stands if the shell has gone.
+        const in_shell = self.view.shell != null or
+            (if (self.sessionSummary(self.view.sid)) |summary| summary.shell_id != 0 else false);
         try self.conn.send(.{ .session_create = .{
             .cwd = cwd,
             .model = self.view.model.items,
             .effort = self.view.effort,
             .request_id = request_id,
+            .cwd_from_sid = if (in_shell) self.view.sid else 0,
         } });
         self.pending_new_cwd.clearRetainingCapacity();
         try self.pending_new_cwd.appendSlice(self.gpa, cwd);

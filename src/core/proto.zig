@@ -247,6 +247,10 @@ pub const ClientMsg = union(enum) {
         /// "default" = mutating tools ask; "auto" = everything auto-approved
         /// (headless one-shots and --yolo).
         approvals: []const u8 = "default",
+        /// A session whose live shell's current directory replaces `cwd`
+        /// (Ctrl+N from a shell). The shell runs on the daemon host, so the
+        /// daemon resolves it; 0, or no live shell, keeps `cwd`.
+        cwd_from_sid: u64 = 0,
     },
     session_list: struct { include_archived: bool = false },
     /// Recent authored messages for client-side fuzzy Ctrl+R recall. Results

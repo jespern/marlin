@@ -25,8 +25,39 @@ extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
 extern "c" fn fork() c.pid_t;
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+extern "c" fn tcgetpgrp(fd: c_int) c.pid_t;
+extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, size: c_int) c_int;
 
 pub const Status = struct { code: ?i32 = null, signal: ?i32 = null };
+
+pub const max_path = 1024;
+
+/// A process's current working directory, from the OS.
+pub fn processDir(pid: c.pid_t, buf: *[max_path]u8) ?[]const u8 {
+    switch (builtin.os.tag) {
+        .macos => {
+            // struct proc_vnodepathinfo: the cwd's vnode_info_path (a 152-byte
+            // vnode_info, then a MAXPATHLEN path), then the root directory's.
+            const vnode_info_size = 152;
+            const pathinfo_size = 2 * (vnode_info_size + max_path);
+            var info: [pathinfo_size]u8 align(8) = undefined;
+            const PROC_PIDVNODEPATHINFO = 9;
+            if (proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, pathinfo_size) != pathinfo_size) return null;
+            const path = std.mem.sliceTo(info[vnode_info_size..][0..max_path], 0);
+            if (path.len == 0) return null;
+            @memcpy(buf[0..path.len], path);
+            return buf[0..path.len];
+        },
+        .linux => {
+            var link_buf: [64]u8 = undefined;
+            const link = std.fmt.bufPrintSentinel(&link_buf, "/proc/{d}/cwd", .{pid}, 0) catch return null;
+            const n = c.readlink(link, buf, buf.len);
+            if (n <= 0) return null;
+            return buf[0..@intCast(n)];
+        },
+        else => return null,
+    }
+}
 
 /// Callbacks run on the shell's reader thread.
 pub const Sink = struct {
@@ -131,6 +162,18 @@ pub const Shell = struct {
             if (n < 0) return error.PtyWriteFailed;
             rest = rest[@intCast(n)..];
         }
+    }
+
+    /// Where the shell is now: the working directory of the PTY's foreground
+    /// process (the shell at its prompt, or what it is running), else of the
+    /// shell itself, as the OS reports it; tmux's pane_current_path. Asked
+    /// when needed, so it never goes stale and needs nothing from the shell.
+    /// Null once the shell is reaped (its pid may belong to another process).
+    pub fn currentDir(self: *Shell, buf: *[max_path]u8) ?[]const u8 {
+        if (self.reaped.load(.acquire)) return null;
+        const foreground = tcgetpgrp(self.master);
+        if (foreground > 0) if (processDir(foreground, buf)) |dir| return dir;
+        return processDir(self.pid, buf);
     }
 
     pub fn resize(self: *Shell, size: Winsize) void {

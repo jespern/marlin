@@ -174,3 +174,31 @@ test "unacknowledged output pauses the reader until the client catches up" {
     } else return error.Timeout;
     try std.testing.expect(recorder.snapshot().len >= total);
 }
+
+test "the shell's current directory follows its cd, as the OS reports it" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var environ = try shEnviron();
+    defer environ.deinit();
+    var recorder: Recorder = .{ .io = io };
+    defer recorder.deinit();
+    const tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, "/tmp", std.testing.allocator);
+    defer std.testing.allocator.free(tmp);
+
+    // Started in "/", then cd'd: the answer is where it is, not where it began.
+    const shell = try spawnSh(io, &environ, "cd /tmp && printf ready && read line", &recorder, 80, 24);
+    defer shell.destroy();
+    try recorder.wait("ready");
+    var buf: [shell_pty.max_path]u8 = undefined;
+    try std.testing.expectEqualStrings(tmp, shell.currentDir(&buf).?);
+
+    // Once the shell is gone there is no answer to give.
+    try shell.write("\r");
+    try recorder.wait("");
+    for (0..500) |_| {
+        if (shell.reaped.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(shell.currentDir(&buf) == null);
+}

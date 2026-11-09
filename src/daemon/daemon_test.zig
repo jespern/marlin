@@ -290,6 +290,30 @@ test "shells outlive their opener and are shared by every viewer" {
     };
     try std.testing.expect(refused);
 
+    // Ctrl+N from the shell: the new session starts where the shell is now,
+    // not where it was opened.
+    const cd = std.base64.standard.Encoder.encode(&input_buf, "cd /tmp && echo moved-$((2+2))\r");
+    try Helpers.send(&daemon, other.id, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"{s}\"}}}}", .{ shell_id, cd });
+    for (0..500) |_| {
+        while (daemon.events.tryPop(io)) |event| try daemon.handleEvent(event);
+        _ = try Helpers.output(a, try Helpers.drain(a, &other, io), &seen_other);
+        if (std.mem.indexOf(u8, seen_other.items, "moved-4") != null) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.Timeout;
+    try Helpers.send(&daemon, other.id, "{{\"session_create\":{{\"cwd\":\"/\",\"model\":\"m\",\"request_id\":31,\"cwd_from_sid\":7}}}}", .{});
+    var created_sid: ?u64 = null;
+    for (try Helpers.drain(a, &other, io)) |msg| if (msg == .session_created and msg.session_created.request_id == 31) {
+        created_sid = msg.session_created.sid;
+    };
+    const created = daemon.sessions.fetchRemove(created_sid.?).?.value;
+    defer {
+        gpa.free(created.model);
+        gpa.free(created.cwd);
+        gpa.destroy(created);
+    }
+    const tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, "/tmp", a);
+    try std.testing.expectEqualStrings(tmp, created.cwd);
+
     // Closing reaches everyone still viewing.
     try Helpers.send(&daemon, other.id, "{{\"shell_close\":{{\"shell_id\":{d}}}}}", .{shell_id});
     try std.testing.expectEqual(@as(usize, 0), daemon.shells.count());

@@ -1769,12 +1769,38 @@ test "ctrl-n opens the new session in the current tab's directory and model" {
     try std.testing.expectEqualStrings("/tmp/some/project", msg.session_create.cwd);
     try std.testing.expectEqualStrings("vendor/tab-model", msg.session_create.model);
     try std.testing.expectEqual(proto.ReasoningEffort.high, msg.session_create.effort);
+    // Not a shell: no shell to ask where it is.
+    try std.testing.expectEqual(@as(u64, 0), msg.session_create.cwd_from_sid);
 
     // The created tab keeps both even before the daemon's upsert lands.
     app.handleSessionCreated(2, app.pending_new_session_request_id);
     try std.testing.expectEqual(@as(u64, 2), app.view.sid);
     try std.testing.expectEqualStrings("vendor/tab-model", app.view.model.items);
     try std.testing.expectEqualStrings("/tmp/some/project", app.view.cwd.items);
+}
+
+test "ctrl-n from a shell session asks the daemon for the shell's current directory" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 7, .title = "", .cwd = "/where/it/opened", .model = "m", .status = "idle", .created_at = 7, .running = false, .shell_id = 3 },
+    });
+    app.setCwdStr("/where/it/opened");
+    try app.newSession();
+    const msg = try proto.decode(proto.ClientMsg, arena.allocator(), std.mem.trimEnd(u8, output.written(), "\n"));
+    try std.testing.expectEqual(@as(u64, 7), msg.session_create.cwd_from_sid);
+    // The tab's directory still goes along, for a shell that has gone.
+    try std.testing.expectEqualStrings("/where/it/opened", msg.session_create.cwd);
 }
 
 test "reset opens a blank session before archiving idle trees and preserves active work" {

@@ -898,6 +898,14 @@ pub const Daemon = struct {
     /// The shell session `sid` is, if any. Shells, not session objects, hold
     /// this: an idle session is unloaded when its last viewer leaves, while
     /// its shell keeps running.
+    /// The current directory of session `sid`'s live shell, if it has one.
+    fn shellDir(self: *Daemon, sid: u64, buf: *[shell_pty.max_path]u8) ?[]const u8 {
+        if (sid == 0) return null;
+        const host = self.sessionShell(sid) orelse return null;
+        const pty = host.pty orelse return null;
+        return pty.currentDir(buf);
+    }
+
     pub fn sessionShell(self: *Daemon, sid: u64) ?*shell_host.Host {
         var it = self.shells.valueIterator();
         while (it.next()) |host| if (host.*.sid == sid) return host.*;
@@ -1698,7 +1706,9 @@ pub const Daemon = struct {
                 errdefer self.gpa.destroy(session);
                 const model = try self.gpa.dupe(u8, sc.model);
                 errdefer self.gpa.free(model);
-                const cwd = try self.gpa.dupe(u8, sc.cwd);
+                var shell_dir_buf: [shell_pty.max_path]u8 = undefined;
+                const requested_cwd = self.shellDir(sc.cwd_from_sid, &shell_dir_buf) orelse sc.cwd;
+                const cwd = try self.gpa.dupe(u8, requested_cwd);
                 errdefer self.gpa.free(cwd);
                 session.* = .{
                     .id = sid,
@@ -1714,7 +1724,7 @@ pub const Daemon = struct {
                 // the durable row. After createSession succeeds, publishing to
                 // the map cannot fail and no ghost session can be left behind.
                 try self.sessions.ensureUnusedCapacity(self.gpa, 1);
-                try self.store.createSessionWithApprovals(sid, nowMs(self.io), sc.cwd, sc.model, sc.effort, session.approval_mode);
+                try self.store.createSessionWithApprovals(sid, nowMs(self.io), requested_cwd, sc.model, sc.effort, session.approval_mode);
                 self.sessions.putAssumeCapacityNoClobber(sid, session);
                 self.sendTo(client, .{ .session_created = .{ .sid = sid, .request_id = sc.request_id } });
                 self.broadcastSessionUpsert(sid);
