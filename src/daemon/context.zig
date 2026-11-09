@@ -268,6 +268,7 @@ pub fn shellTranscriptContext(arena: std.mem.Allocator, st: block.ShellTranscrip
     try out.appendSlice(arena, ".]\n```\n");
     try out.appendSlice(arena, tail);
     try out.appendSlice(arena, "\n```\n");
+    try appendShellCommands(arena, &out, st.commands);
     if (st.lost) {
         if (st.command) |command|
             try out.print(arena, "[The shell ended when Marlin stopped, while `{s}` was running.]", .{command})
@@ -278,6 +279,25 @@ pub fn shellTranscriptContext(arena: std.mem.Allocator, st: block.ShellTranscrip
     else if (st.exit_code) |code|
         try out.print(arena, "[The shell exited with status {d}.]", .{code});
     return out.items;
+}
+
+/// The commands the shell reported running, newest last, each with its exit
+/// status: which ones failed, without reading it off the output.
+pub const shell_commands_in_context = 20;
+
+fn appendShellCommands(arena: std.mem.Allocator, out: *std.ArrayList(u8), commands: []const block.ShellCommand) !void {
+    var named: usize = 0;
+    for (commands) |c| named += @intFromBool(c.command.len > 0);
+    if (named == 0) return;
+    try out.appendSlice(arena, "[Commands run in it, oldest first, with exit status:\n");
+    const shown = commands[commands.len -| shell_commands_in_context..];
+    if (shown.len < commands.len) try out.print(arena, "  ({d} earlier commands omitted)\n", .{commands.len - shown.len});
+    for (shown) |c| {
+        if (c.command.len == 0) continue;
+        try out.print(arena, "  $ {s}", .{c.command});
+        if (c.exit_code) |code| try out.print(arena, "  → exit {d}\n", .{code}) else try out.appendSlice(arena, "  → no status\n");
+    }
+    try out.appendSlice(arena, "]\n");
 }
 
 fn appendUserContent(arena: std.mem.Allocator, msgs: *std.ArrayList(provider.Message), text: []const u8, attachments: []const block.MediaRef, seq: u64, opts: AssembleOpts) !void {
@@ -765,7 +785,11 @@ pub fn renderForSummary(
             .tool_result => |tr| try out.print(arena, "RESULT ({t}): {s}\n\n", .{ tr.status, tr.inline_body[0..@min(tr.inline_body.len, 1500)] }),
             .compaction => |cp| if (include_compactions)
                 try out.print(arena, "[EARLIER SUMMARY]\n{s}\n\n", .{cp.summary}),
-            .shell_transcript => |st| try out.print(arena, "SHELL (user): {s}\n\n", .{st.text[st.text.len -| 1500..]}),
+            .shell_transcript => |st| {
+                try out.print(arena, "SHELL (user): {s}\n", .{st.text[st.text.len -| 1500..]});
+                try appendShellCommands(arena, &out, st.commands);
+                try out.appendSlice(arena, "\n");
+            },
             .reasoning, .approval, .plan, .system_note => {},
         }
         if (out.items.len > byte_budget) {

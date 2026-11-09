@@ -54,3 +54,51 @@ test "a system-wide entry needs no TERMINFO; no entry falls back to xterm-256col
     try std.testing.expect(plain.get("TERM_PROGRAM") == null);
     try std.testing.expectEqualStrings("truecolor", plain.get("COLORTERM").?);
 }
+
+test "Ghostty's installed shell integration is injected for zsh, fish, and bash" {
+    const gpa = std.testing.allocator;
+    const res = "/opt/ghostty";
+    var fake: Fake = .{ .present = &.{
+        res ++ "/shell-integration/zsh/.zshenv",
+        res ++ "/shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish",
+        res ++ "/shell-integration/bash/ghostty.bash",
+    } };
+
+    var zsh = try base(gpa);
+    defer zsh.deinit();
+    try zsh.put("GHOSTTY_RESOURCES_DIR", res);
+    try zsh.put("ZDOTDIR", "/home/me/.config/zsh");
+    try std.testing.expect(!(try shell_env.integrate(gpa, &zsh, "/bin/zsh", Fake.probe, &fake)).bash_posix);
+    try std.testing.expectEqualStrings(res ++ "/shell-integration/zsh", zsh.get("ZDOTDIR").?);
+    // The user's own ZDOTDIR is restored by the integration.
+    try std.testing.expectEqualStrings("/home/me/.config/zsh", zsh.get("GHOSTTY_ZSH_ZDOTDIR").?);
+    try std.testing.expectEqualStrings("cursor:blink,title", zsh.get("GHOSTTY_SHELL_FEATURES").?);
+
+    var fish = try base(gpa);
+    defer fish.deinit();
+    try fish.put("GHOSTTY_RESOURCES_DIR", res);
+    _ = try shell_env.integrate(gpa, &fish, "/opt/homebrew/bin/fish", Fake.probe, &fake);
+    try std.testing.expectEqualStrings(res ++ "/shell-integration:/usr/local/share:/usr/share", fish.get("XDG_DATA_DIRS").?);
+    try std.testing.expectEqualStrings(res ++ "/shell-integration", fish.get("GHOSTTY_SHELL_INTEGRATION_XDG_DIR").?);
+
+    var bash = try base(gpa);
+    defer bash.deinit();
+    try bash.put("GHOSTTY_RESOURCES_DIR", res);
+    try bash.put("ENV", "/home/me/.shinit");
+    try std.testing.expect((try shell_env.integrate(gpa, &bash, "/usr/local/bin/bash", Fake.probe, &fake)).bash_posix);
+    try std.testing.expectEqualStrings(res ++ "/shell-integration/bash/ghostty.bash", bash.get("ENV").?);
+    try std.testing.expectEqualStrings("/home/me/.shinit", bash.get("GHOSTTY_BASH_ENV").?);
+    try std.testing.expectEqualStrings("/home/me/.bash_history", bash.get("HISTFILE").?);
+
+    // Another shell, or no Ghostty here: nothing changes.
+    var sh = try base(gpa);
+    defer sh.deinit();
+    try sh.put("GHOSTTY_RESOURCES_DIR", res);
+    _ = try shell_env.integrate(gpa, &sh, "/bin/sh", Fake.probe, &fake);
+    try std.testing.expect(sh.get("GHOSTTY_SHELL_FEATURES") == null);
+    var none = try base(gpa);
+    defer none.deinit();
+    var empty: Fake = .{ .present = &.{} };
+    _ = try shell_env.integrate(gpa, &none, "/bin/zsh", Fake.probe, &empty);
+    try std.testing.expect(none.get("ZDOTDIR") == null);
+}

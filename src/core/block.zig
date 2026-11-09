@@ -151,6 +151,15 @@ pub const ShellTranscript = struct {
     /// What was running in the foreground when it was lost, with arguments;
     /// null at the prompt.
     command: ?[]const u8 = null,
+    /// The commands it ran, oldest first, as the shell reported them
+    /// (OSC 133); empty when it did not.
+    commands: []const ShellCommand = &.{},
+};
+
+pub const ShellCommand = struct {
+    command: []const u8,
+    /// Null while running, or when the shell did not say.
+    exit_code: ?i32 = null,
 };
 
 /// Native→guest handover body. Clients render this in full (not the usual

@@ -596,6 +596,17 @@ test "a shell transcript reaches the model as user context, newest output kept" 
     try std.testing.expect(std.mem.indexOf(u8, clipped, "first 100 bytes are elided") != null);
     try std.testing.expect(std.mem.indexOf(u8, clipped, "TAIL") != null);
     try std.testing.expect(std.mem.endsWith(u8, clipped, "[The shell was ended by signal 9.]"));
+
+    // Commands the shell reported, with their exit status.
+    const commands = [_]@import("../core/block.zig").ShellCommand{
+        .{ .command = "make test", .exit_code = 2 },
+        .{ .command = "", .exit_code = 0 },
+        .{ .command = "vim notes.md" },
+    };
+    const with_commands = try context.shellTranscriptContext(a, .{ .text = "FAIL", .exit_code = 0, .commands = &commands });
+    try std.testing.expect(std.mem.indexOf(u8, with_commands, "  $ make test  → exit 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_commands, "  $ vim notes.md  → no status\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, with_commands, "[The shell exited with status 0.]"));
 }
 
 test "a shell lost with Marlin tells the model what was running" {

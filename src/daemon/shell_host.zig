@@ -12,6 +12,7 @@ const Io = std.Io;
 const vt = @import("ghostty-vt");
 const shell_pty = @import("shell_pty.zig");
 const proto = @import("../core/proto.zig");
+const block = @import("../core/block.zig");
 
 /// Output a viewer may have unacknowledged before it stops receiving live
 /// bytes; once it catches up it is resynced with a snapshot.
@@ -53,6 +54,9 @@ pub const Host = struct {
     /// What programs signalled during the last feed, for the daemon to send
     /// on (owned strings; see takeSignals).
     signals: std.ArrayList(proto.ShellSignal) = .empty,
+    /// Commands the shell reported running (OSC 133), oldest first, the
+    /// newest `max_commands` kept; owned text.
+    commands: std.ArrayList(block.ShellCommand) = .empty,
 
     /// Heap-allocated: the stream's handler points at `terminal`. The PTY is
     /// spawned by `start` once the host is at its final address.
@@ -82,6 +86,7 @@ pub const Host = struct {
         handler.effects.bell = onBell;
         handler.effects.desktop_notification = onNotification;
         handler.effects.progress_report = onProgress;
+        handler.effects.semantic_prompt = onSemanticPrompt;
         self.stream = .init(.{ .allocator = gpa, .handler = handler, .continuation_max_bytes = max_continuation_bytes });
         self.applyCellSize();
         return self;
@@ -100,6 +105,8 @@ pub const Host = struct {
         self.announced_title.deinit(gpa);
         self.freeSignals();
         self.signals.deinit(gpa);
+        for (self.commands.items) |command| gpa.free(command.command);
+        self.commands.deinit(gpa);
         gpa.free(self.cwd);
         gpa.destroy(self);
     }
@@ -288,6 +295,77 @@ pub const Host = struct {
             },
             .percent = report.progress,
         });
+    }
+
+    pub const max_commands = 64;
+
+    /// OSC 133: a command starts (C, with its command line when the shell
+    /// sends it) and ends (D, with its exit code).
+    fn onSemanticPrompt(handler: *vt.TerminalStream.Handler, event: vt.TerminalStream.Handler.SemanticPrompt) void {
+        const self = fromHandler(handler);
+        switch (event.kind) {
+            .output_start => {
+                if (self.commands.items.len == max_commands) {
+                    self.gpa.free(self.commands.items[0].command);
+                    _ = self.commands.orderedRemove(0);
+                }
+                // Shells that do not send the command line (Ghostty's own zsh
+                // integration) typed it into cells marked as input.
+                var typed: [1024]u8 = undefined;
+                const command = if (event.command.len > 0) event.command else self.typedCommand(&typed);
+                const text = self.gpa.dupe(u8, std.mem.trim(u8, command, " \t\r\n")) catch return;
+                self.commands.append(self.gpa, .{ .command = text }) catch self.gpa.free(text);
+            },
+            .command_end => if (self.commands.items.len > 0) {
+                const last = &self.commands.items[self.commands.items.len - 1];
+                if (last.exit_code == null) last.exit_code = event.exit_code;
+            },
+            else => {},
+        }
+    }
+
+    /// The command line just entered: the input-marked cells (OSC 133 B to
+    /// C) on the rows ending at the cursor, up to the row its prompt began
+    /// on (a command that printed nothing sits right above), joined.
+    fn typedCommand(self: *Host, buf: []u8) []const u8 {
+        const screen = self.terminal.screens.active;
+        var pin = screen.cursor.page_pin.*;
+        var rows: [8][]const u8 = undefined;
+        var row_bufs: [8][256]u8 = undefined;
+        var count: usize = 0;
+        var seen_input = false;
+        for (0..rows.len) |_| {
+            const row = inputText(pin, &row_bufs[count]);
+            if (row.text.len > 0) {
+                rows[count] = row.text;
+                count += 1;
+                seen_input = true;
+                if (row.prompted) break;
+            } else if (seen_input) break;
+            if (count == rows.len) break;
+            pin = pin.up(1) orelse break;
+        }
+        var w: std.Io.Writer = .fixed(buf);
+        var i = count;
+        while (i > 0) {
+            i -= 1;
+            w.writeAll(rows[i]) catch break;
+        }
+        return w.buffered();
+    }
+
+    /// A row's input-marked text, and whether a prompt starts on it.
+    fn inputText(pin: vt.Pin, buf: []u8) struct { text: []const u8, prompted: bool } {
+        var w: std.Io.Writer = .fixed(buf);
+        var prompted = false;
+        for (pin.cells(.all)) |*cell| {
+            if (cell.semantic_content == .prompt) prompted = true;
+            if (cell.semantic_content != .input or !cell.hasText()) continue;
+            var cp_buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cell.codepoint(), &cp_buf) catch continue;
+            w.writeAll(cp_buf[0..n]) catch break;
+        }
+        return .{ .text = w.buffered(), .prompted = prompted };
     }
 
     fn writePty(handler: *vt.TerminalStream.Handler, bytes: []const u8) void {

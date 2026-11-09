@@ -196,3 +196,56 @@ test "bells, notifications, and progress from programs become signals for the us
     host.freeSignals();
     try std.testing.expectEqual(@as(usize, 0), host.takeSignals().len);
 }
+
+test "commands and their exit codes come from OSC 133, typed or sent" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const host = try shell_host.Host.create(gpa, threaded.io(), 1, 9, "/", 0, .{ .cols = 40, .rows = 6 });
+    defer host.destroy();
+    // A shell that sends no command line (Ghostty's zsh integration): the
+    // command is read from the cells typed after the prompt.
+    host.feed("\x1b]133;A\x07~ % \x1b]133;B\x07make test\r\n\x1b]133;C\x07FAIL\r\n\x1b]133;D;2\x07");
+    // One that sends it.
+    host.feed("\x1b]133;A\x07~ % \x1b]133;B\x07ls\r\n\x1b]133;C;cmdline_url=ls%20-la\x07x\r\n\x1b]133;D;0\x07");
+    try std.testing.expectEqual(@as(usize, 2), host.commands.items.len);
+    try std.testing.expectEqualStrings("make test", host.commands.items[0].command);
+    try std.testing.expectEqual(@as(?i32, 2), host.commands.items[0].exit_code);
+    try std.testing.expectEqualStrings("ls -la", host.commands.items[1].command);
+    try std.testing.expectEqual(@as(?i32, 0), host.commands.items[1].exit_code);
+}
+
+test "a real zsh with the installed Ghostty's integration reports its commands" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-zsh-133");
+    defer temp.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/bin:/bin");
+    try environ.put("HOME", temp.path);
+    try environ.put("TERM", "xterm-256color");
+    const shell_env = @import("shell_env.zig");
+    std.Io.Dir.cwd().access(io, "/bin/zsh", .{}) catch return error.SkipZigTest;
+    _ = try shell_env.integrate(gpa, &environ, "/bin/zsh", shell_env.fileExists, @constCast(&io));
+    if (environ.get("ZDOTDIR") == null) return error.SkipZigTest; // no Ghostty on this host
+
+    const host = try shell_host.Host.create(gpa, io, 1, 9, temp.path, 0, .{ .cols = 80, .rows = 24 });
+    defer host.destroy();
+    var relay: Relay = .{ .io = io };
+    defer relay.deinit();
+    try host.start(io, .{ .path = "/bin/zsh", .argv = &.{ "zsh", "-i" }, .cwd = temp.path, .environ = &environ, .size = .{ .cols = 80, .rows = 24 } }, relay.sink());
+    try host.write("false\r");
+    try host.write("echo done-$((4+4))\r");
+    for (0..500) |_| {
+        _ = try relay.pump(host);
+        if (host.commands.items.len >= 2 and host.commands.items[1].exit_code != null) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.Timeout;
+    try std.testing.expectEqualStrings("false", host.commands.items[0].command);
+    try std.testing.expectEqual(@as(?i32, 1), host.commands.items[0].exit_code);
+    try std.testing.expectEqualStrings("echo done-$((4+4))", host.commands.items[1].command);
+    try std.testing.expectEqual(@as(?i32, 0), host.commands.items[1].exit_code);
+}

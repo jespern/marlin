@@ -839,13 +839,14 @@ pub const Daemon = struct {
         var environ = try self.environ.clone(self.gpa);
         defer environ.deinit();
         try shell_env.prepare(self.gpa, &environ, shell_env.fileExists, @constCast(&self.io));
+        const integration = try shell_env.integrate(self.gpa, &environ, path, shell_env.fileExists, @constCast(&self.io));
 
         const id = self.next_shell_id;
         self.next_shell_id += 1;
         const host = try shell_host.Host.create(self.gpa, self.io, id, sid, cwd, nowMs(self.io), geometry);
         host.start(self.io, .{
             .path = path,
-            .argv = &.{argv0},
+            .argv = if (integration.bash_posix) &.{ argv0, "--posix" } else &.{argv0},
             .cwd = cwd,
             .environ = &environ,
             .size = shellWinsize(geometry),
@@ -876,10 +877,11 @@ pub const Daemon = struct {
         const text = host.transcript(self.gpa, shell_transcript_max_bytes) catch null;
         const styled = host.styledTranscript(self.gpa, shell_transcript_max_bytes) catch null;
         defer if (styled) |owned| self.gpa.free(owned);
-        host.destroy();
+        // The block is written before the host (which owns the commands) goes.
+        defer host.destroy();
         if (text) |owned| {
             defer self.gpa.free(owned);
-            self.appendSessionBlock(sid, .{ .shell_transcript = .{ .text = owned, .styled = styled, .exit_code = status.code, .signal = status.signal } });
+            self.appendSessionBlock(sid, .{ .shell_transcript = .{ .text = owned, .styled = styled, .exit_code = status.code, .signal = status.signal, .commands = host.commands.items } });
         }
         self.broadcastShellList();
         self.broadcastSessionUpsert(sid);
