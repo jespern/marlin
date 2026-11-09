@@ -1237,6 +1237,8 @@ pub const Daemon = struct {
                 defer self.gpa.free(so.bytes);
                 const host = self.shells.get(so.shell_id) orelse return;
                 host.feed(so.bytes);
+                for (host.takeSignals()) |signal| self.fanOutShellSignal(signal);
+                host.freeSignals();
                 // Mirrored: the reader may go on, whatever viewers do.
                 if (host.pty) |pty| pty.acknowledge(so.bytes.len);
                 var encoded: ?[]u8 = null;
@@ -5099,6 +5101,20 @@ pub const Daemon = struct {
         self.forEachClient(ctx, struct {
             fn send(value: @TypeOf(ctx), client: *Client) void {
                 if (!client.said_hello or !client.watches_sessions or !client.watches_session_deltas) return;
+                value.daemon.sendLine(client, value.encoded);
+            }
+        }.send);
+    }
+
+    /// A program in a shell asked for the user: every session watcher hears
+    /// it, so a shell in a background tab can still reach them.
+    fn fanOutShellSignal(self: *Daemon, signal: proto.ShellSignal) void {
+        const line = proto.encode(self.gpa, proto.DaemonMsg{ .shell_signal = signal }) catch return;
+        defer self.gpa.free(line);
+        const ctx = struct { daemon: *Daemon, encoded: []const u8 }{ .daemon = self, .encoded = line };
+        self.forEachClient(ctx, struct {
+            fn send(value: @TypeOf(ctx), client: *Client) void {
+                if (!client.said_hello or !client.watches_sessions) return;
                 value.daemon.sendLine(client, value.encoded);
             }
         }.send);

@@ -506,6 +506,31 @@ test "shells hear this terminal's colors when opened and when they change" {
     try std.testing.expectEqual([3]u8{ 9, 9, 9 }, msgs[0].shell_theme.theme.foreground.?);
 }
 
+test "a shell's bell, notifications, and progress reach this terminal" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    try h.sessionUpsert(8);
+    h.app.bell_enabled = true;
+    try h.daemonSays("{{\"shell_signal\":{{\"sid\":42,\"shell_id\":8,\"kind\":\"bell\"}}}}", .{});
+    try std.testing.expect(h.app.bell_pending);
+
+    try h.daemonSays("{{\"shell_signal\":{{\"sid\":42,\"shell_id\":8,\"kind\":\"notification\",\"title\":\"Build\",\"body\":\"done\"}}}}", .{});
+    try std.testing.expectEqualStrings("Build: done", h.app.notification_body.items);
+    try std.testing.expectEqualStrings("Marlin · proj", h.app.notification_title.items);
+
+    // Progress shows while no agent work is pending, and goes when removed.
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try h.daemonSays("{{\"shell_signal\":{{\"sid\":42,\"shell_id\":8,\"kind\":\"progress\",\"progress\":\"set\",\"percent\":42}}}}", .{});
+    try tui.updateTerminalProgress(&h.app, &out.writer);
+    try std.testing.expectEqualStrings("\x1b]9;4;1;42\x1b\\", out.written());
+    out.clearRetainingCapacity();
+    try h.daemonSays("{{\"shell_signal\":{{\"sid\":42,\"shell_id\":8,\"kind\":\"progress\",\"progress\":\"remove\"}}}}", .{});
+    try tui.updateTerminalProgress(&h.app, &out.writer);
+    try std.testing.expectEqualStrings("\x1b]9;4;0;0\x1b\\", out.written());
+}
+
 test "a bracketed paste reaches the shell as one paste" {
     var h: Harness = undefined;
     h.init(true);

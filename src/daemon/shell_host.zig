@@ -50,6 +50,9 @@ pub const Host = struct {
     created_at_ms: i64,
     /// Title last announced in a shell list, to notice OSC title changes.
     announced_title: std.ArrayList(u8) = .empty,
+    /// What programs signalled during the last feed, for the daemon to send
+    /// on (owned strings; see takeSignals).
+    signals: std.ArrayList(proto.ShellSignal) = .empty,
 
     /// Heap-allocated: the stream's handler points at `terminal`. The PTY is
     /// spawned by `start` once the host is at its final address.
@@ -76,6 +79,9 @@ pub const Host = struct {
         handler.effects.write_pty = writePty;
         handler.effects.device_attributes = deviceAttributes;
         handler.effects.size = sizeReport;
+        handler.effects.bell = onBell;
+        handler.effects.desktop_notification = onNotification;
+        handler.effects.progress_report = onProgress;
         self.stream = .init(.{ .allocator = gpa, .handler = handler, .continuation_max_bytes = max_continuation_bytes });
         self.applyCellSize();
         return self;
@@ -92,6 +98,8 @@ pub const Host = struct {
         self.terminal.deinit(gpa);
         self.viewers.deinit(gpa);
         self.announced_title.deinit(gpa);
+        self.freeSignals();
+        self.signals.deinit(gpa);
         gpa.free(self.cwd);
         gpa.destroy(self);
     }
@@ -227,6 +235,59 @@ pub const Host = struct {
     fn fromHandler(handler: *vt.TerminalStream.Handler) *Host {
         const stream: *vt.TerminalStream = @fieldParentPtr("handler", handler);
         return @alignCast(@fieldParentPtr("stream", stream));
+    }
+
+    /// The signals from the last feed; valid until the next takeSignals.
+    pub fn takeSignals(self: *Host) []const proto.ShellSignal {
+        return self.signals.items;
+    }
+
+    /// Drop signals already sent on.
+    pub fn freeSignals(self: *Host) void {
+        for (self.signals.items) |sent| {
+            self.gpa.free(sent.title);
+            self.gpa.free(sent.body);
+        }
+        self.signals.clearRetainingCapacity();
+    }
+
+    fn signal(self: *Host, value: proto.ShellSignal) void {
+        var owned = value;
+        owned.sid = self.sid;
+        owned.shell_id = self.id;
+        owned.title = self.gpa.dupe(u8, value.title) catch return;
+        owned.body = self.gpa.dupe(u8, value.body) catch {
+            self.gpa.free(owned.title);
+            return;
+        };
+        self.signals.append(self.gpa, owned) catch {
+            self.gpa.free(owned.title);
+            self.gpa.free(owned.body);
+        };
+    }
+
+    fn onBell(handler: *vt.TerminalStream.Handler) void {
+        fromHandler(handler).signal(.{ .sid = 0, .shell_id = 0, .kind = .bell });
+    }
+
+    fn onNotification(handler: *vt.TerminalStream.Handler, note: vt.TerminalStream.Action.ShowDesktopNotification) void {
+        fromHandler(handler).signal(.{ .sid = 0, .shell_id = 0, .kind = .notification, .title = note.title, .body = note.body });
+    }
+
+    fn onProgress(handler: *vt.TerminalStream.Handler, report: vt.osc.Command.ProgressReport) void {
+        fromHandler(handler).signal(.{
+            .sid = 0,
+            .shell_id = 0,
+            .kind = .progress,
+            .progress = switch (report.state) {
+                .remove => .remove,
+                .set => .set,
+                .@"error" => .@"error",
+                .indeterminate => .indeterminate,
+                .pause => .pause,
+            },
+            .percent = report.progress,
+        });
     }
 
     fn writePty(handler: *vt.TerminalStream.Handler, bytes: []const u8) void {

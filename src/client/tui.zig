@@ -596,6 +596,9 @@ pub const App = struct {
     terminal_cwd: std.ArrayList(u8) = .empty,
     terminal_restore_cwd: std.ArrayList(u8) = .empty,
     terminal_progress: ?terminal_osc.Progress = null,
+    terminal_progress_percent: u8 = 0,
+    /// Progress shell programs report (OSC 9;4), by session.
+    shell_progress: std.AutoHashMapUnmanaged(u64, ShellProgress) = .empty,
     terminal_focused: bool = true,
     presence_last_sent_ms: i64 = 0,
     presence_last_activity_ms: i64 = 0,
@@ -768,6 +771,7 @@ pub const App = struct {
         while (activity_it.next()) |snapshot| snapshot.deinit();
         self.guest_activities.deinit(self.gpa);
         self.background_approvals.deinit(self.gpa);
+        self.shell_progress.deinit(self.gpa);
         self.unread_completions.deinit(self.gpa);
         self.clearCouncils();
         self.councils.deinit(self.gpa);
@@ -989,10 +993,43 @@ pub const App = struct {
         self.view.cwd.appendSlice(self.gpa, cwd) catch {};
     }
 
+    /// A shell's program asked for the user: its bell rings this terminal's
+    /// (when bells are on), its notification is Marlin's, and its progress
+    /// shows in this terminal's while no agent work is pending.
+    pub fn shellSignal(self: *App, signal: proto.ShellSignal) void {
+        switch (signal.kind) {
+            .bell => if (self.bell_enabled) {
+                self.bell_pending = true;
+            },
+            .notification => {
+                var buf: [512]u8 = undefined;
+                const text = if (signal.title.len > 0 and signal.body.len > 0)
+                    std.fmt.bufPrint(&buf, "{s}: {s}", .{ signal.title, signal.body }) catch signal.body
+                else if (signal.body.len > 0) signal.body else signal.title;
+                if (text.len > 0) self.queueTerminalNotification(signal.sid, text);
+            },
+            .progress => {
+                if (signal.progress == .remove) {
+                    _ = self.shell_progress.remove(signal.sid);
+                } else self.shell_progress.put(self.gpa, signal.sid, .{
+                    .state = switch (signal.progress) {
+                        .remove => unreachable,
+                        .set => .normal,
+                        .@"error" => .error_state,
+                        .indeterminate => .indeterminate,
+                        .pause => .warning,
+                    },
+                    .percent = signal.percent orelse 0,
+                }) catch {};
+                self.refresh_requested = true;
+            },
+        }
+    }
+
     fn queueTerminalNotification(self: *App, sid: u64, body: []const u8) void {
         const summary = self.sessionSummary(sid);
         const identity = if (summary) |session|
-            if (session.title.len > 0) session.title else std.fs.path.basename(session.cwd)
+            if (session.shell_label.len > 0) session.shell_label else if (session.title.len > 0) session.title else std.fs.path.basename(session.cwd)
         else
             "session";
         self.notification_title.clearRetainingCapacity();
@@ -1856,6 +1893,7 @@ pub const App = struct {
             .shell_snapshot => |m| shell_tab.snapshot(self, m),
             .shell_output => |m| shell_tab.output(self, m),
             .shell_exited => |m| shell_tab.exited(self, m),
+            .shell_signal => |signal| self.shellSignal(signal),
             .shell_list_result => {},
             .daemon_stopping => {
                 // Deliberate shutdown must not enter the crash-reconnect path,
@@ -5127,11 +5165,31 @@ pub fn terminalProgress(app: *const App) terminal_osc.Progress {
     return if (running) .indeterminate else .hidden;
 }
 
+pub const ShellProgress = struct { state: terminal_osc.Progress, percent: u8 = 0 };
+
+/// A live shell's progress: the focused session's first, else any.
+pub fn shellProgress(app: *const App) ?ShellProgress {
+    if (app.shell_progress.get(app.view.sid)) |own| if (isLiveShell(app, app.view.sid)) return own;
+    var it = app.shell_progress.iterator();
+    while (it.next()) |entry| if (isLiveShell(app, entry.key_ptr.*)) return entry.value_ptr.*;
+    return null;
+}
+
+fn isLiveShell(app: *const App, sid: u64) bool {
+    const summary = app.sessionSummary(sid) orelse return false;
+    return summary.shell_id != 0;
+}
+
 pub fn updateTerminalProgress(app: *App, writer: *std.Io.Writer) !void {
-    const progress = terminalProgress(app);
-    if (app.terminal_progress == progress) return;
-    try terminal_osc.writeProgress(writer, progress, 0);
-    app.terminal_progress = progress;
+    // Agent work speaks first; a shell's progress fills the quiet.
+    var progress: ShellProgress = .{ .state = terminalProgress(app) };
+    if (progress.state == .hidden) if (shellProgress(app)) |shell| {
+        progress = shell;
+    };
+    if (app.terminal_progress == progress.state and app.terminal_progress_percent == progress.percent) return;
+    try terminal_osc.writeProgress(writer, progress.state, progress.percent);
+    app.terminal_progress = progress.state;
+    app.terminal_progress_percent = progress.percent;
 }
 
 fn flushTerminalNotification(app: *App, writer: *std.Io.Writer, arena: std.mem.Allocator) !void {

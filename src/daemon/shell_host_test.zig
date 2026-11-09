@@ -173,3 +173,26 @@ test "a viewer's colors are the shell's defaults; a program's own colors still w
     const own = host.terminal.colors.background.get().?;
     try std.testing.expectEqual([3]u8{ 0, 0, 0xff }, [3]u8{ own.r, own.g, own.b });
 }
+
+test "bells, notifications, and progress from programs become signals for the user" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const host = try shell_host.Host.create(gpa, threaded.io(), 4, 9, "/", 0, .{ .cols = 40, .rows = 4 });
+    defer host.destroy();
+    host.feed("make\x07\x1b]777;notify;Build;done in 3s\x1b\\\x1b]9;tests passed\x07\x1b]9;4;1;42\x07");
+    const signals = host.takeSignals();
+    try std.testing.expectEqual(@as(usize, 4), signals.len);
+    try std.testing.expectEqual(.bell, signals[0].kind);
+    try std.testing.expectEqual(@as(u64, 9), signals[0].sid);
+    try std.testing.expectEqual(@as(u64, 4), signals[0].shell_id);
+    try std.testing.expectEqual(.notification, signals[1].kind);
+    try std.testing.expectEqualStrings("Build", signals[1].title);
+    try std.testing.expectEqualStrings("done in 3s", signals[1].body);
+    try std.testing.expectEqualStrings("tests passed", signals[2].body);
+    try std.testing.expectEqual(.progress, signals[3].kind);
+    try std.testing.expectEqual(.set, signals[3].progress);
+    try std.testing.expectEqual(@as(?u8, 42), signals[3].percent);
+    host.freeSignals();
+    try std.testing.expectEqual(@as(usize, 0), host.takeSignals().len);
+}

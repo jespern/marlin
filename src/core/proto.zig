@@ -486,6 +486,22 @@ pub const ShellTheme = struct {
     palette: [16]?[3]u8 = @splat(null),
 };
 
+/// Something a shell's program signalled for the user (BEL; OSC 9/777
+/// notifications; OSC 9;4 progress).
+pub const ShellSignal = struct {
+    sid: u64,
+    shell_id: u64,
+    kind: Kind,
+    title: []const u8 = "",
+    body: []const u8 = "",
+    progress: Progress = .remove,
+    /// 0-100 for `set`, `error`, and `pause`, when the program gave one.
+    percent: ?u8 = null,
+
+    pub const Kind = enum { bell, notification, progress };
+    pub const Progress = enum { remove, set, @"error", indeterminate, pause };
+};
+
 pub const ShellInfo = struct {
     shell_id: u64,
     /// Program-set title (OSC 0/2); empty when none.
@@ -672,6 +688,9 @@ pub const DaemonMsg = union(enum) {
     shell_snapshot: struct { shell_id: u64, data_base64: []const u8 },
     /// Raw PTY output; acknowledge it with shell_ack once consumed.
     shell_output: struct { shell_id: u64, data_base64: []const u8 },
+    /// A program in any shell signalled (to every session watcher, so a
+    /// shell in another tab can still reach the user).
+    shell_signal: ShellSignal,
     /// The shell exited (`code`) or was killed by a signal (`signal`).
     shell_exited: struct { shell_id: u64, code: ?i32 = null, signal: ?i32 = null },
     shell_list_result: struct { shells: []const ShellInfo },
