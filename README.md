@@ -2,358 +2,135 @@
 
 [![shadybin](https://img.shields.io/endpoint?url=https://shadybin.dev/registry/github.com/jespern/marlin/badge.json)](https://shadybin.dev/registry/github.com/jespern/marlin/)
 
-**A durable session multiplexer for AI agents, written in Zig.**
+**Keep your coding agents running after you close the terminal.**
 
-One static binary. A daemon that owns your agent sessions and keeps them running;
-thin clients that attach locally or over SSH. Run native and vendor agents
-in one workspace, with searchable transcripts and structured approvals.
+Marlin is a daemon that owns your agent sessions, and a fast terminal UI that
+attaches to them. Run Claude Code and Codex on the subscriptions you already
+pay for, or Marlin's own agent on any model with an API key, side by side in
+tabs. Close the laptop and the work continues. Come back from another
+terminal, over SSH, or from your phone.
+
+One static binary, written in Zig. No Node, no Python, no terminal scraping.
 
 ## Install
 
-Install the latest macOS or Linux release in `~/.local/bin` without sudo:
+macOS or Linux, into `~/.local/bin`, without sudo:
 
 ```sh
 curl -fsSL https://marlin.wtf/install.sh | sh
 ```
 
-The installer selects the release for your architecture and verifies its
-SHA-256 checksum. To pin this release, pipe into `MARLIN_VERSION=0.1.5 sh`.
+The installer picks the release for your architecture and verifies its
+SHA-256 checksum. To pin a release, pipe into `MARLIN_VERSION=0.2.1 sh`.
 
-Or use [Homebrew](https://brew.sh/) on macOS or Linux:
+Or with [Homebrew](https://brew.sh/):
 
 ```sh
 brew install jespern/tap/marlin
 ```
 
-## First run
+## Start
 
-Run `marlin` and the first screen asks where inference should run. Choose a
-native provider such as OpenRouter, Vercel AI Gateway, Anthropic, LiteLLM, or
-another OpenAI-compatible endpoint, or host an installed Codex or Claude Code
-agent as a guest. Native API keys are entered in a masked prompt and saved by
-the daemon in `~/.config/marlin/credentials` with mode 0600. Guest choices use
-the vendor CLI's existing login and tell you the exact login command when the
-daemon host is not authenticated.
+```sh
+marlin
+```
 
-The setup is daemon-owned, so it works the same over `marlin --remote`: keys,
-config, guest binaries, and login state are checked on the machine that will
-run the turn. `/setup` reopens the flow later. `marlin run` never prompts; on a
-fresh unconfigured daemon it exits with an instruction to complete interactive
-setup or pass an explicit model whose credentials already exist on that host.
+The first screen asks where inference should run:
 
-## One place for ongoing agent work
+- **Claude Code or Codex.** Marlin hosts the CLI you already have installed
+  and uses its login, so the work runs on your subscription. If the CLI is
+  not logged in, Marlin tells you the exact command.
+- **Marlin's native agent.** Enter a key for OpenRouter, Anthropic, Vercel AI
+  Gateway, LiteLLM, or any OpenAI-compatible endpoint.
 
-Marlin keeps agent sessions running in a daemon. The terminal UI, headless
-CLI, and optional phone web client all consume the same structured protocol.
-Close a client, move to another machine, and attach again: the daemon keeps
-working as long as its host stays running.
+You can mix them: every session picks its own agent and model with `/model`.
 
-Use Marlin's native agent with OpenRouter, Anthropic, or an OpenAI-compatible
-endpoint, or host installed Claude Code and Codex agents using their existing
-logins. Guest agents own their inference, tools, context, and permissions;
-Marlin supplies the shared session interface. Switching between native and
-guest backends involves a context handover; see
+## If you use Claude Code or Codex today
+
+Marlin runs the official binaries. They keep their own tools, context, and
+permissions. What Marlin adds is everything around them:
+
+- **Work that outlives the terminal.** The daemon owns the turn. Closing the
+  window, a dropped SSH connection, or a daemon restart does not lose it.
+  `/pause` and `/resume` survive reboots.
+- **Every agent in one place.** Sessions are tabs. `Ctrl+S` shows all of
+  them with their live work underneath: subagents, running commands, and
+  background jobs, each with inspectable output.
+- **Steer while it works.** Type while the agent is running; your message is
+  queued, stays visible, and can carry images.
+- **Reach it from anywhere.** `marlin --remote <host>` attaches over SSH,
+  and `marlin discover` finds the Marlins on your LAN. The web companion
+  lets you watch sessions and answer approvals from your phone over your
+  own tailnet ([setup](docs/MOBILE.md)).
+- **A real shell in every session.** `!!` turns a session into a login shell
+  on the daemon's host. It survives detaching and restarts, and `Ctrl+D`
+  hands the session back with the shell's output in the transcript.
+- **Long runs you can leave alone.** `/runtime 12h` sets how long a guest
+  may run, `/compact` compacts its context, and a gauge shows how full that
+  context is.
+- **Nothing is thrown away.** Messages, tool calls, and full tool output are
+  structured records in SQLite. `/search` covers every session, including
+  archived ones, and compaction never deletes history.
+- **Scriptable.** `marlin run`, `marlin ls`, `marlin inspect --json`, and
+  `marlin top` work from ordinary shell scripts.
+
+## Native agent or guest
+
+| | Guest (Claude Code, Codex) | Native |
+|---|---|---|
+| Inference | the vendor's binary, on your subscription | any model by API key |
+| Tools and context | the vendor's | Marlin's tools, MCP servers, skills, and plugins |
+| Permissions | the vendor's, with approvals bridged into Marlin | Marlin's approvals and shell sandbox |
+| Context management | the vendor's, with `/compact` and a gauge | output caps, pruning, and compaction |
+| Delegation | the vendor's subagents, shown in the work tree | durable child tasks and multi-model review councils |
+
+Both kinds share the same sessions, transcript, search, steering, shells,
+and clients. Switching a session between them hands the context over; see
 [native and guest sessions](docs/ARCHITECTURE.md#native-vs-guest-agents).
 
+## Everyday commands
+
 ```sh
-marlin                         # open the TUI; setup runs on first use
-marlin ls                      # list durable sessions and short handles
-marlin                          # the session rooted in this directory, or a new one here
-marlin attach 63df              # reattach using a unique handle prefix
-marlin attach --session-file .marlin-session  # publish the selected full handle
-marlin inspect 63df --json      # inspect state, recent blocks, and diagnostics
+marlin                         # the session rooted in this directory, or a new one
+marlin ls                      # list sessions and their short handles
+marlin attach 63df             # reattach by a unique handle prefix
+marlin --remote host           # attach to a daemon on another machine over SSH
 marlin top                     # live session tree, including child work
+marlin inspect 63df --json     # state, recent blocks, and diagnostics
+marlin run "fix the failing test"   # headless turn
 ```
 
-Inside the TUI, `/new` starts a session, `/model` selects its agent/model,
-and `/reset` archives idle sessions and opens a fresh session with the startup
-screen. Running sessions, pending approvals, and their parents stay open.
-Archived transcripts remain searchable.
-After a completed turn sits idle for three minutes, a short recap is added to
-the session scrollback. Escape keeps its normal Vim behavior. Recaps summarize the task, outcome, and
-unfinished work without starting another agent turn. They use `model_compaction`
-when configured, otherwise the session's native model (a configured native
-default/favorite for guest sessions). If that model is unavailable, the recap
-uses an excerpt labeled “Last exchange”.
-`/cwd <path>` (or `/cd <path>`) changes its working directory while idle. Tab completes paths;
-Up/Down select directory matches, Tab inserts the selection, and Enter uses it.
-Without a selection, Enter uses the typed path. `Ctrl+S` opens the
-session switcher, and `/detach` closes the client while work
-continues. `marlin --remote <host>` attaches through SSH, and `marlin discover` lists
-the marlins on your LAN over Bonjour with the `--remote` target for each.
+Inside the TUI:
 
-Marlin supports [Agent Skills](https://agentskills.io/specification): a directory
-containing `SKILL.md` with YAML `name` and `description`, Markdown instructions,
-and optional `scripts/`, `references/`, and `assets/`. For example:
+| | |
+|---|---|
+| `/new`, `Ctrl+N` | new session |
+| `/model` | pick the agent and model |
+| `Ctrl+S`, `/top` | live work tree and session switcher |
+| `/search <query>` | search every transcript |
+| `/cwd <path>` | change the session's directory |
+| `!!` | turn the session into a shell; `Ctrl+D` hands it back |
+| `!<command>` | run one command in the session's workspace |
+| `Shift+Tab` | Plan mode |
+| `Alt+S`, `/screenshot` | copy a PNG of the window |
+| `/pause`, `/resume` | suspend and continue work |
+| `/detach` | leave; sessions keep running |
 
-```text
-.agents/skills/code-review/SKILL.md
-```
+Editing is modal, with Vim navigation in the transcript and the composer.
 
-```markdown
----
-name: code-review
-description: Review code changes for correctness and missing tests.
----
-Read the diff and check the affected callers.
-See references/checklist.md for the review checklist.
-```
+## Documentation
 
-Skills are discovered in this order (the first matching name wins):
-
-1. `<cwd>/.marlin/skills/`
-2. `<cwd>/.agents/skills/`
-3. The configured `[skills].directories`, which default to
-   `~/.config/marlin/skills/` (or `$XDG_CONFIG_HOME/marlin/skills/`) and
-   `~/.agents/skills/`.
-
-Project skills are refreshed for each native turn and slash invocation,
-including after `/cwd` changes; discovery is relative to the exact session cwd,
-not its ancestors. User skills are indexed at daemon startup; `/mcp reload`
-refreshes them. Custom `[skills].directories` replace the user defaults.
-Symlinked skill directories work. Legacy flat `.md` skills directly in a
-skills root remain supported. Bundled reference documents are not indexed as
-separate skills. Invalid files and shadowed names are reported in daemon logs.
-
-Native agents see only the catalog until they call the `skill` tool. Activation
-provides instructions, metadata, and the absolute resource directory; resources
-are read or executed through the regular tools as needed. YAML supports quoted,
-literal and folded strings and nested metadata. Optional `license`,
-`compatibility`, `metadata`, and `allowed-tools` fields are preserved;
-`allowed-tools` is advisory and does not change Marlin's permission checks.
-
-For explicit invocation, type `/skill-name` or `/skill-name <arguments>`. Marlin
-sends the full instructions to the agent, substituting `$ARGUMENTS`,
-`$ARGUMENTS[N]`, and `$N`. Positional arguments are zero-based and support
-quoting; arguments are appended when there are no placeholders. Unknown skills
-return an error. The transcript shows your slash command, while the rendered
-instructions remain in model context. Marlin commands take precedence when
-names overlap. Guest agents receive explicitly invoked Marlin skills through
-the same path; automatic discovery and activation during guest turns are
-handled by the guest harness. Client-specific frontmatter execution settings
-and dynamic shell templates are not implemented by Marlin.
-
-Skill-only Claude Code marketplaces can also be installed directly:
-
-```text
-/plugin marketplace add miradorlabs/agent-plugins
-/plugin install mirador@miradorlabs
-/mirador:submit-pr <optional PR title>
-```
-
-Use `/plugin list`, `/plugin marketplace update miradorlabs`, and
-`/plugin uninstall mirador@miradorlabs` to manage installations. Uninstall a
-marketplace's plugins before `/plugin marketplace remove miradorlabs`. The same
-commands work from the terminal as `marlin plugin ...`. GitHub `owner/repo`,
-HTTPS/SSH Git URLs, and local Git repositories are accepted; private repositories
-use your existing Git credentials. For local paths containing spaces, use the
-terminal command with a quoted argument.
-
-Type `/` or a prefix such as `/mirador:` to see installed skills and their
-descriptions. Use arrow keys to select and Tab to complete, then add arguments
-and press Enter. Completion refreshes after plugin changes and `/cwd` changes.
-
-This first version supports plugins with `.claude-plugin/plugin.json` and the
-standard `skills/` directory, sourced by a relative path inside the marketplace
-repository. Hooks, MCP/LSP servers, agents, legacy commands, custom component
-paths, and external plugin sources are rejected explicitly. Skill instructions
-still use the current harness's tools and permissions; importing a plugin does
-not implement Claude-specific execution features.
-
-Installations are Marlin-specific and take effect on the next native turn or
-explicit skill invocation, without `/mcp reload`. Installed skills use
-`plugin-name:skill-name`; installing the same plugin name from two marketplaces
-is rejected. Updates validate installed plugins before atomically switching
-snapshots. Existing turns keep their previous instructions and resource paths.
-Snapshots are stored under the Marlin config directory's `plugins/` folder and
-are retained after update/uninstall so those paths remain usable; automatic
-cache cleanup is not yet implemented.
-
-Native agents automatically read project instructions before the first turn
-and again on each subsequent turn, including after `/cwd` changes. Marlin uses
-the first nonempty readable file in the session cwd in this order:
-`MARLIN.md`, `AGENTS.md`, `AGENT.md`.
-
-The TUI status line shows the Git branch beside the cwd, with `↑`/`↓` commit
-counts against its origin upstream (or `origin/<branch>`). It uses local remote
-refs without fetching and checks metadata in the background about every five
-seconds. Repository and branch detection read files directly; Git only
-recomputes commit counts when relevant metadata changes. Nothing Git-related
-appears outside repositories, and counts are omitted when the origin branch
-is unavailable.
-
-## What makes it useful
-
-- **Durable, searchable work.** Messages, tool calls, results, plans, and
-  approvals are structured blocks in SQLite. Compaction changes what the
-  model sees while preserving the original transcript and full tool outputs.
-  `/search <query>` searches across sessions; `!c` copies the last tool output.
-- **A clear view of ongoing work.** Root tabs roll up child activity and
-  approvals. The activity row distinguishes model wait, streaming, tools,
-  delegation, and compaction. `/diagnostics` separates provider latency,
-  time to first token, tool time, and failures.
-- **Approvals you can return to.** Permission requests are protocol events.
-  Attach from another terminal or use the optional phone client to answer a
-  parked request. Native and guest permissions have different owners; the
-  interface reports that distinction.
-- **Planning and delegation.** Shift+Tab enters Plan mode. Native execution
-  plans survive compaction and restart; `task` and `task_batch` create durable,
-  attachable children for focused read-only work. Configured review councils
-  combine model perspectives through the same delegation mechanism.
-- **Terminal ergonomics.** Modal editing, `Ctrl+R` input history, transcript
-  search, image attachments, and shell escapes keep routine work close.
-  `!<command>` runs in the session workspace; bare `!` opens a local shell.
-  Direct remote attachments refuse shell escapes; use Marlin inside SSH or
-  mosh when the terminal and workspace live on another host.
-  See [terminal effects](docs/TERMINAL_EFFECTS.md) for the optional playful bits.
-- **Small deployment footprint.** One native binary, daemon-owned setup and
-  credentials, and SSH for remote transport. MCP servers, custom tools, and
-  hooks extend it at process boundaries.
-
-Marlin is a daily driver under active development. Multiple panes are
-[planned](docs/PANES_PLAN.md); the current TUI uses tabs and one focused view.
-
-## Principles
-
-1. **Speed and simplicity are features.** Single static binary, instant startup,
-   tiny memory footprint. `scp` it to a server and run it. No node_modules, no
-   venv, no runtime.
-2. **The store is append-only truth; context is a derived view.** Compaction,
-   truncation, and pruning shape what the model sees — never what's on disk.
-   Scrollback and copy always operate on full data.
-3. **Keep prompt-cache breaks rare and explainable.** Context is prefix-stable
-   between explicit pruning and compaction boundaries. Both are coarse-grained,
-   logged events rather than incidental per-turn rewrites.
-4. **Extensibility at process boundaries.** MCP servers for tools, hook scripts
-   for events, executables as custom tools. The Zig core stays small and stable;
-   churn lives in scripts.
-5. **OpenRouter first for the native agent; two wire dialects, not N.**
-   OpenAI-compatible covers most models; Anthropic Messages is the one
-   extra wire. Claude Code and Codex are guest sessions, not dialects: their
-   official binaries own inference, context, and tools.
-   Do not add a third wire. OpenRouter is the default, not a hard
-   dependency: `anthropic/`, `vercel/`, `litellm/`, `local/`, and configured
-   `[providers.*]` entries can all route independently.
-6. **Agent panes only — no VTE.** Splits show marlin sessions, which are
-   structured data we render ourselves. No terminal emulation tarpit. (If an
-   embedded terminal is ever truly needed: libghostty-vt, not hand-rolled.)
-7. **Daily driver, not kitchen sink.** Marlin exists to be driven all day,
-   and that is the whole test: a feature earns its place by surviving
-   dogfood, not by being well designed, and a surface that stops earning
-   its keep gets deleted rather than maintained. Unshipped work, including workspace snapshots, waits until daily use
-   demands it. When in doubt, the answer is no.
-
-## MCP servers
-
-MCP is daemon-owned rather than a client-side plugin shim. Stdio servers are
-discovered independently, so one broken server is reported as unavailable
-without taking down Marlin or hiding healthy servers. Manage the durable config
-from either client surface:
-
-```sh
-marlin mcp add playwright -- npx @playwright/mcp
-marlin mcp list
-marlin mcp restart playwright
-marlin mcp remove playwright
-```
-
-The TUI equivalents are `/mcp`, `/mcp add`, `/mcp restart`, `/mcp remove`, and
-`/mcp reload`. Tool read/write policy follows MCP annotations with exact
-`readonly_tools` and `mutating_tools` config overrides. Image results are stored
-as transcript media and sent back to vision-capable providers. Streamable HTTP
-transport remains later work; stdio is the supported product path today.
-
-## Provider routing
-
-Model ids are `provider/model`. Marlin strips the first component before
-sending the request, so `vercel/anthropic/claude-sonnet-4` sends
-`anthropic/claude-sonnet-4` to Vercel AI Gateway.
-
-The built-in native routes are:
-
-- `openrouter/<model>` with `OPENROUTER_API_KEY`
-- `vercel/<model>` with `AI_GATEWAY_API_KEY`
-- `litellm/<model>` at `http://127.0.0.1:4000/v1`, optionally with
-  `LITELLM_API_KEY`
-- `anthropic/<model>` with `ANTHROPIC_API_KEY`
-- `local/<model>` with `MARLIN_LOCAL_BASE_URL` and the optional
-  `MARLIN_LOCAL_API_KEY`
-
-Any other OpenAI Chat Completions-compatible router or direct endpoint is a
-small config entry:
-
-```toml
-[providers.requesty]
-base_url = "https://router.requesty.ai/v1"
-api_key_env = "REQUESTY_API_KEY"
-
-[model]
-favorites = ["requesty/openai/gpt-5", "litellm/fast-code"]
-```
-
-`base_url` stops at the API root; Marlin appends `/chat/completions`. The
-credential field names an environment variable and never contains the secret.
-Use `api_key_env = "NONE"` for an intentionally keyless endpoint. Provider
-config takes effect the next time the daemon starts. Configured favorites stay
-available in the model picker alongside the fetched OpenRouter catalog. Key
-variable names must end in `_API_KEY`, `_TOKEN`, or `_SECRET` so Marlin's tool
-boundary strips and redacts them automatically.
-
-## Guest runtime limits
-
-Use `/runtime 12h` in a session to allow an overnight Claude Code or Codex run,
-or `/runtime off` to disable its deadline. `/runtime` shows the current setting;
-`/runtime default` restores the configured default. Tab completes common values.
-The override persists with that session and applies immediately to a running guest.
-
-Durations use `s`, `m`, or `h`. The allowance is measured from the current guest
-invocation's start, excluding time waiting for your approval or answer; changing
-it does not restart the clock. Lowering it below elapsed runtime ends the run.
-Interrupt and daemon shutdown still stop the guest when the deadline is off.
-This setting covers guest execution, not native model requests or bash timeouts.
-
-The default is four hours. Set a different default in
-`~/.config/marlin/config.toml` on the daemon host, then restart the daemon:
-
-```toml
-[guest]
-max_runtime = "12h" # or "off"; omitted defaults to "4h"
-```
-
-## Context management today
-
-Marlin implements a three-stage structural cascade:
-
-1. Tool output is capped before it enters model context; the complete output
-   remains available in the SQLite blob store.
-2. Once context crosses a soft threshold, old inline tool results are replaced
-   with short stubs while a recent-output window is protected.
-3. Near the model's context limit, Marlin writes an LLM-generated continuation
-   summary, preserves a recent tail, and rehydrates windows from recently
-   written files plus a continuation note.
-
-That is useful layered context management, but it is not yet a claim of mature
-semantic "microcompaction." Fixture tests cover the mechanics and boundary
-invariants; long-running quality and cost behavior still need M3 burn-in.
-
-## What v1 deliberately does NOT do
-
-- No messaging gateway (Telegram/Discord/...) — hook scripts cover notification.
-- No hosted or multi-user web product. the daemon-managed web companion is an opt-in,
-  localhost-only client on the same protocol, fronted by `tailscale serve`
-  and Host/Origin-checked (no token; the tailnet is the gate) — install it to a
-  phone home screen to watch sessions and answer parked approvals over your
-  own tailnet. See [mobile companion setup](docs/MOBILE.md) for the stable phone address
-  and optional presence-aware notifications.
-- No voice *stack*: no realtime voice models, wake words, or audio in the
-  protocol — ever. What exists is deliberately smaller: `/voice setup` (TUI)
-  configures local, offline push-to-talk dictation into the composer —
-  ffmpeg records, whisper.cpp (or parakeet-mlx) transcribes at the client
-  edge, both as optional subprocesses that are never mentioned until you
-  ask. Dormant until invoked; the daemon never learns audio exists.
-- No OCR/video pipelines, themes, cron, profiles.
-- No embedded terminal emulator / editor panes.
-- No Tailscale embedding — your tailnet already reaches the daemon socket.
+- [Using Marlin](docs/USING.md): first run, sessions, recaps, the status line
+- [Skills, plugins, and project instructions](docs/SKILLS.md)
+- [Providers, MCP servers, and limits](docs/CONFIGURATION.md)
+- [Phone companion](docs/MOBILE.md)
+- [Permissions and the secret boundary](docs/PERMISSIONS.md)
+- [Review councils](docs/REVIEW.md)
+- [Observability](docs/OBSERVABILITY.md)
+- [Terminal effects](docs/TERMINAL_EFFECTS.md), the optional playful bits
+- [Architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), and
+  [testing](docs/TESTING.md)
+- [Development builds](docs/DEVELOPMENT.md)
 
 ## Architecture at a glance
 
@@ -362,8 +139,8 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
                     │            marlind (daemon)          │
    ssh/mosh/tailnet │  ┌─────────┐ ┌─────────┐ ┌─────────┐ │
   ┌──────────┐      │  │session 1│ │session 2│ │session N│ │
-  │marlin TUI├──────┼─▶│agent    │ │agent    │ │agent    │ │
-  └──────────┘ unix │  │loop     │ │loop     │ │loop     │ │
+  │marlin TUI├──────┼─▶│agent    │ │agent    │ │shell    │ │
+  └──────────┘ unix │  │loop     │ │loop     │ │         │ │
   ┌──────────┐ sock │  └────┬────┘ └────┬────┘ └────┬────┘ │
   │marlin web├──────┤       ▼           ▼           ▼      │
   │ (phone,  │      │  ┌──────────────────────────────┐    │
@@ -377,68 +154,64 @@ invariants; long-running quality and cost behavior still need M3 burn-in.
                          (guest sessions: their binary)
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and
-[docs/MILESTONES.md](docs/MILESTONES.md) for the build order.
+The TUI, the headless CLI, and the web companion are thin clients of the
+same structured protocol. Session state is typed events, not text scraped
+from a terminal.
 
-## Prior art & what we steal
+## Principles
+
+1. **Speed and simplicity are features.** Single static binary, instant
+   startup, tiny memory footprint. `scp` it to a server and run it.
+2. **The store is append-only truth; context is a derived view.**
+   Compaction, truncation, and pruning shape what the model sees, never
+   what is on disk. Scrollback and copy always operate on full data.
+3. **Keep prompt-cache breaks rare and explainable.** Context is
+   prefix-stable between explicit pruning and compaction boundaries.
+4. **Extensibility at process boundaries.** MCP servers for tools, hook
+   scripts for events, executables as custom tools. The Zig core stays
+   small and stable; churn lives in scripts.
+5. **Two native wire dialects, not N.** OpenAI-compatible covers most
+   models; Anthropic Messages is the one extra wire. Claude Code and Codex
+   are guests, not dialects: their official binaries own inference,
+   context, and tools.
+6. **Borrow the terminal emulator.** Agent sessions are structured data
+   Marlin renders itself. Shell sessions are emulated by libghostty-vt;
+   Marlin does not hand-roll a VT.
+7. **Daily driver, not kitchen sink.** A feature earns its place by
+   surviving daily use, not by being well designed, and a surface that
+   stops earning its keep gets deleted. When in doubt, the answer is no.
+
+## What Marlin deliberately does not do
+
+- No messaging gateway (Telegram, Discord, and so on). Hook scripts cover
+  notification.
+- No hosted or multi-user web product. The web companion listens on
+  localhost only and is reached through `tailscale serve`; the tailnet is
+  the gate.
+- No voice stack. `/voice setup` configures local, offline push-to-talk
+  dictation into the composer, and that is all.
+- No OCR or video pipelines, themes, or cron.
+- No editor panes.
+- No Tailscale embedding. Your tailnet already reaches the daemon.
+
+## Status
+
+Marlin is a development preview and a daily driver. It is self-hosting:
+Marlin is developed from inside Marlin. Config and protocol details may
+still move. Releases and their notes are on
+[marlin.wtf](https://marlin.wtf).
+
+## Prior art and what we steal
 
 | Project | What we take |
 |---|---|
-| **herdr** | The UX bar: daemon+attach ergonomics, mobile-aware layout, status sidebar |
-| **zag** (Zig) | Append-only JSONL w/ tail recovery, compaction cascade, lossless mid-turn steering as queued follow-up, headless eval mode, seatbelt/Landlock sandboxing of bash |
-| **pi** | Minimal-tool philosophy (~6 tools is enough), simplicity discipline |
-| **Hermes** | Skills-as-markdown, store-full/truncate-at-assembly, output caps w/ file pointers |
-| **OpenCode** | Pruning constants & algorithm (protect recent 40k tool-output tokens, stub older) |
-| **Claude Code** | Layered context reduction, headroom-triggered compaction, and continuation rehydration |
-| **KrillClaw / graff** | Proof of tiny Zig core; lenient JSON repair; SSE parsing in Zig |
-
-## SQLite and local builds
-
-SQLite remains Marlin's canonical store: WAL, indexed session/block queries,
-migrations, hierarchy, and content-addressed blobs would otherwise become a
-home-grown database layer around JSONL. Searchable rendered text is projected
-into a compact side table; FTS5 powers transcript search when available, with a
-bounded scan fallback for system SQLite builds that omit it. Raw blobs and
-binary attachments are never indexed.
-
-For fast local iteration, `zig build` and `zig build test` link the system
-SQLite library. Official release builds compile the vendored amalgamation into
-the binary. To reproduce that configuration locally:
-
-```sh
-zig build -Doptimize=safe -Dembedded-sqlite=true
-```
-
-To temporarily replace the Marlin selected by your current `PATH` with this
-checkout's `-Doptimize=fast` build:
-
-```sh
-make install
-marlin reboot       # activate it in an already-running daemon
-```
-
-The install is sanity-checked and atomically replaces the resolved executable.
-That means an install.sh binary in `~/.local/bin` is replaced directly; a
-Homebrew entry keeps its public symlink and replaces the currently linked keg
-binary. Homebrew may overwrite that development build during a later upgrade or
-reinstall. If Homebrew's public path holds a regular file instead of its
-symlink (an old clobbered install), the installer refuses and prints the
-`rm … && brew link marlin` that repairs it. For a development build that survives Homebrew upgrades, use an
-explicit `~/.local/bin` target and keep that directory before Homebrew in
-`PATH`. To choose an explicit destination instead of the active `PATH` entry:
-
-```sh
-make install MARLIN_INSTALL_TARGET="$HOME/.local/bin/marlin"
-```
-
-The script refuses to overwrite an existing executable that does not identify
-itself as Marlin. `make install` only activates the new client executable; a
-running daemon keeps its old executable until `marlin reboot` succeeds. If a
-turn or approval prevents a normal reboot, resolve it first rather than forcing
-an install-time shutdown.
-
-Run `make test-install` to exercise the developer installer without touching
-your real installation.
+| **herdr** | The UX bar: daemon and attach ergonomics, mobile-aware layout |
+| **zag** (Zig) | Tail recovery, compaction cascade, lossless mid-turn steering, headless mode, Seatbelt/Landlock sandboxing of bash |
+| **pi** | Minimal-tool philosophy, simplicity discipline |
+| **Hermes** | Skills as Markdown, store-full and truncate-at-assembly, output caps with file pointers |
+| **OpenCode** | Pruning constants and algorithm |
+| **Claude Code** | Layered context reduction, headroom-triggered compaction, continuation rehydration |
+| **KrillClaw / graff** | Proof of a tiny Zig core; lenient JSON repair; SSE parsing in Zig |
 
 ## License
 

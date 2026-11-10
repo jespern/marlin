@@ -1386,7 +1386,8 @@ lifecycle.
   arbitrary attach, v visual-select,
   y yank).
 - **Splits (not yet implemented)**: binary-tree layout, each pane = a
-  session view (or the same session twice). No VTE anywhere. The daemon
+  session view (or the same session twice). Agent panes need no VT; a shell
+  session brings libghostty-vt's. The daemon
   already fans blocks out to every session a client has subscribed, so splits
   are a client-only change; the prerequisite `SessionView` extraction and the
   rest of the plan are in `docs/PANES_PLAN.md`.

@@ -3,7 +3,7 @@
 ```
 marlin/
 ├── build.zig
-├── build.zig.zon              # deps: libvaxis, regex; vendored SQLite for releases
+├── build.zig.zon              # deps: libvaxis, regex, libghostty-vt; vendored SQLite for releases
 ├── src/
 │   ├── main.zig               # entry; test import block (every file must be reachable)
 │   ├── cli.zig                # arg parse → daemon | attach | run | ls | top | ... | --remote
@@ -217,7 +217,7 @@ Kept as a decision record; none of these are open.
 3. **Block body schema versioning**: DECIDED: store schema migrations at
    daemon boot + `proto_version` handshake rejection; block bodies are
    std.json tagged unions.
-4. **Zig version pin**: DECIDED: track the Zig version libvaxis follows
-   (0.16-dev line); deps vendored via build.zig.zon.
+4. **Zig version pin**: DECIDED: track the current Zig release (0.17 since
+   2026-11-04); deps pinned via build.zig.zon.
 5. **Name check**: DECIDED: shipping as `marlin`.
 ```
