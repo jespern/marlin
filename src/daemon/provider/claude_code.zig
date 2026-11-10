@@ -64,7 +64,16 @@ pub const ArgvOpts = struct {
     /// Marlin effort; `auto` omits `--effort`. Claude Code accepts
     /// low/medium/high/xhigh/max (`claude --help`).
     effort: Effort = .auto,
+    /// The user's profile section, appended after Marlin's own instructions
+    /// on every invocation. Empty = none.
+    profile: []const u8 = "",
 };
+
+/// Marlin's standing guest instructions plus the user's profile, if any.
+pub fn systemPromptAppend(arena: std.mem.Allocator, base: []const u8, profile: []const u8) ![]const u8 {
+    if (profile.len == 0) return base;
+    return std.mem.concat(arena, u8, &.{ base, "\n\n", profile });
+}
 
 /// Map Marlin effort onto Claude `--effort`. `auto` means omit the flag.
 /// `none`/`minimal` have no CC equivalent and collapse to `low`.
@@ -121,7 +130,7 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
         }, .{});
         try argv.appendSlice(arena, &.{
             "--mcp-config",           mcp_config,
-            "--append-system-prompt", @import("../../core/guest.zig").interactive_instructions,
+            "--append-system-prompt", try systemPromptAppend(arena, @import("../../core/guest.zig").interactive_instructions, opts.profile),
         });
     }
     switch (opts.permissions) {
@@ -148,7 +157,7 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
         });
     }
     if (opts.bridge == null) try argv.appendSlice(arena, &.{
-        "--append-system-prompt", @import("../../core/guest.zig").progress_instructions,
+        "--append-system-prompt", try systemPromptAppend(arena, @import("../../core/guest.zig").progress_instructions, opts.profile),
     });
     if (effortFlag(opts.effort)) |level| {
         try argv.appendSlice(arena, &.{ "--effort", level });

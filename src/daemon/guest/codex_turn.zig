@@ -28,6 +28,7 @@ const build_options = @import("build_options");
 // The native loop owns the block appender, turn options, phase publication,
 // steer handling, and approval resolution; guests borrow exactly these.
 const loop = @import("../loop.zig");
+const profile = @import("../profile.zig");
 const Appender = loop.Appender;
 const RunOpts = loop.RunOpts;
 const TurnResult = loop.TurnResult;
@@ -606,7 +607,11 @@ pub fn runCodexTurn(
     else
         otelOverrides(opts.otel_guest, false);
     const bridge: ?codex.Bridge = if (opts.marlin_exe) |exe| .{ .marlin_exe = exe, .sid = opts.session_id } else null;
-    const instructions = if (bridge != null) guest_auth.interactive_instructions else guest_auth.progress_instructions;
+    const instructions = try claude_code.systemPromptAppend(
+        arena,
+        if (bridge != null) guest_auth.interactive_instructions else guest_auth.progress_instructions,
+        profile.load(arena, io, opts.tool_environ, opts.cwd) orelse "",
+    );
     const argv = try codex.buildArgvWithBridge(arena, opts.tool_environ, otel_overrides, bridge);
     var guest_environ: ?std.process.Environ.Map = if (opts.tool_environ) |source|
         try permissions.toolEnvironment(gpa, source)

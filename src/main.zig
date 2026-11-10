@@ -118,6 +118,7 @@ test {
     _ = @import("daemon/hooks_test.zig");
     _ = @import("daemon/skills_test.zig");
     _ = @import("daemon/plugins_test.zig");
+    _ = @import("daemon/profile_test.zig");
     _ = @import("daemon/tools/registry_test.zig");
     _ = @import("daemon/tools/bash_test.zig");
     _ = @import("daemon/tools/files_test.zig");

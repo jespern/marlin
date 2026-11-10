@@ -239,6 +239,8 @@ pub const AssembleOpts = struct {
     /// Repo-local instructions (MARLIN.md / AGENTS.md / AGENT.md at the session root),
     /// injected verbatim under a PROJECT INSTRUCTIONS header. Empty = none.
     project_instructions: []const u8 = "",
+    /// The user's profile section (profile.zig), header included. Empty = none.
+    user_profile: []const u8 = "",
     /// Per-turn dynamic facts (cwd, platform, date, git, sandbox, network),
     /// pre-rendered by the loop including its ENVIRONMENT header.
     environment: []const u8 = "",
@@ -329,6 +331,10 @@ pub fn assemble(
     if (opts.system_prompt_suffix.len > 0) {
         try sys.append(arena, '\n');
         try sys.appendSlice(arena, opts.system_prompt_suffix);
+    }
+    if (opts.user_profile.len > 0) {
+        try sys.appendSlice(arena, "\n\n");
+        try sys.appendSlice(arena, opts.user_profile);
     }
     if (opts.project_instructions.len > 0) {
         try sys.appendSlice(arena, "\n\nPROJECT INSTRUCTIONS (from the repository; follow unless the user overrides)\n");

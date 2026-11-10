@@ -20,6 +20,7 @@ const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const extensions = @import("extensions.zig");
 const skills = @import("skills.zig");
+const profile = @import("profile.zig");
 const provider = @import("provider/provider.zig");
 const openai = @import("provider/openai_compat.zig");
 const anthropic = @import("provider/anthropic.zig");
@@ -617,6 +618,8 @@ pub fn runTurn(
     // the dynamic environment (cwd, git, date, sandbox/network regime).
     const project_instructions = projectInstructions(gpa, io, opts.cwd);
     defer if (project_instructions) |pi| gpa.free(pi);
+    const user_profile = profile.load(gpa, io, opts.tool_environ, opts.cwd);
+    defer if (user_profile) |up| gpa.free(up);
     const environment: ?[]u8 = environmentBlock(gpa, io, &opts) catch null;
     defer if (environment) |env| gpa.free(env);
 
@@ -666,6 +669,7 @@ pub fn runTurn(
             .prune_before_seq = frontier,
             .system_prompt_suffix = system_prompt_suffix,
             .project_instructions = project_instructions orelse "",
+            .user_profile = user_profile orelse "",
             .environment = environment orelse "",
             .media_loader = loadMedia,
             .media_loader_ctx = store,

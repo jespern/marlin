@@ -30,6 +30,7 @@ const build_options = @import("build_options");
 // The native loop owns the block appender, turn options, phase publication,
 // steer handling, and approval resolution; guests borrow exactly these.
 const loop = @import("../loop.zig");
+const profile = @import("../profile.zig");
 const Appender = loop.Appender;
 const RunOpts = loop.RunOpts;
 const TurnResult = loop.TurnResult;
@@ -366,6 +367,7 @@ fn ccInvoke(
         // preserve their explicit parent-facing tool budget.
         .max_turns = if (opts.auto_continue_round_budget) null else opts.max_rounds,
         .effort = opts.effort,
+        .profile = profile.load(arena, io, opts.tool_environ, opts.cwd) orelse "",
     });
 
     // A bridged permission prompt can park on a human for a long time;
