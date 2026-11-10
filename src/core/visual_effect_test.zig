@@ -41,10 +41,6 @@ test "backends, fallbacks, and the generated usage list" {
     try std.testing.expectEqual(Backend.pixel, Kind.orb.backend());
     try std.testing.expect(Kind.orb.configurable() and Kind.orb.fullScreenOnly());
     try std.testing.expectEqual(Kind.matrix, Kind.matrix.fallback());
-    try std.testing.expectEqual(Backend.pixel, Kind.wipeout.backend());
-    try std.testing.expect(!Kind.wipeout.configurable() and Kind.wipeout.fullScreenOnly() and !Kind.wipeout.cellCapable());
-    try std.testing.expectEqual(Kind.stars, Kind.wipeout.fallback());
-    try std.testing.expect(Kind.wipeout.playable() and !Kind.tetris.playable());
     try std.testing.expectEqualStrings("matrix|strings|stars|plasma|tetris|pacman|tunnel|metaballs|horizon|demo|daybreak|orb|rocket", usage_list);
     try std.testing.expectEqualStrings("matrix|strings|stars|plasma|pacman|tunnel|metaballs|horizon|demo|daybreak|orb|rocket", configurable_usage_list);
 }

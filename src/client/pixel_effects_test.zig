@@ -130,28 +130,13 @@ test "the probe's transport: one a=T per shipped frame at the placement, nothing
     try std.testing.expectError(error.NoGraphicsCapability, engine.transmit(&vx, &out.writer));
 }
 
-test "wipEout is placed in the largest centered 4:3 box; other effects fill the window" {
-    var game = Engine.init(std.testing.allocator, .wipeout, 1);
-    defer game.deinit();
-    game.setCellPixels(8, 16);
-    try game.reset(80, 24, 1); // 640×384 px: 4:3 fits 64 columns, centered
-    const box = game.placementBox();
-    try std.testing.expectEqual(@as(u16, 8), @as(u16, @intCast(box.x)));
-    try std.testing.expectEqual(@as(u16, 0), @as(u16, @intCast(box.y)));
-    try std.testing.expectEqual(@as(u16, 64), box.cols);
-    try std.testing.expectEqual(@as(u16, 24), box.rows);
-    var full = Engine.init(std.testing.allocator, .plasma, 1);
-    defer full.deinit();
-    full.setCellPixels(8, 16);
-    try full.reset(80, 24, 1);
-    const whole = full.placementBox();
-    try std.testing.expectEqual(@as(u16, 80), whole.cols);
-    try std.testing.expectEqual(@as(u16, 24), whole.rows);
-    // The budget knob: 0 means every base tick ships.
+test "a zero wire budget ships every base tick" {
+    var engine = Engine.init(std.testing.allocator, .tunnel, 1);
+    defer engine.deinit();
     pixel_effects.setWireBudget(0);
     defer pixel_effects.setWireBudget(10_000_000);
-    game.last_frame_bytes = 1_000_000;
-    try std.testing.expectEqual(@as(u8, 1), game.effectiveEvery());
+    engine.last_frame_bytes = 1_000_000;
+    try std.testing.expectEqual(@as(u8, 1), engine.effectiveEvery());
 }
 test "the wire budget stretches the ship interval for heavy frames" {
     var engine = Engine.init(std.testing.allocator, .tunnel, 1);
@@ -167,12 +152,10 @@ test "the wire budget stretches the ship interval for heavy frames" {
     engine.last_frame_bytes = 100_000_000; // absurd: never slower than one frame a second
     try std.testing.expectEqual(@as(u8, 30), engine.effectiveEvery());
 
-    // wipEout is driven at 60 Hz: 320×240 frames (~62 KB) and the 2x CRT
-    // pass (~150 KB) both ship every tick under the 10 MB/s budget; a
-    // 200 KB frame would drop to every second tick.
-    var game = Engine.init(std.testing.allocator, .wipeout, 1);
+    // The orb is driven at 60 Hz: 62 KB and 150 KB frames both ship every
+    // tick under the 10 MB/s budget; a 200 KB frame drops to every second.
+    var game = Engine.init(std.testing.allocator, .orb, 1);
     defer game.deinit();
-    try std.testing.expectEqual(@as(usize, 60), pixel_effects.tickRate(.wipeout));
     try std.testing.expectEqual(@as(usize, 60), pixel_effects.tickRate(.orb));
     game.last_frame_bytes = 62_000;
     try std.testing.expectEqual(@as(u8, 1), game.effectiveEvery());

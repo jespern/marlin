@@ -1541,8 +1541,7 @@ lifecycle.
   id `p=1` (the protocol replaces a placement with the same image id and
   placement id; without one every display adds another, and a 60 fps game
   piled up thousands the terminal drew each frame until it stuttered),
-  placed at the effect's cell rectangle (the window, or wipEout's centered
-  4:3 box) with
+  placed over the whole window with
   `c=,r=` so the terminal scales it, `q=2` so it stays quiet, `o=z` zlib
   when smaller, 4 KiB chunks — the probe's transport, which has survived
   every stress run. vaxis is kept out of graphics (the TUI clears
@@ -1551,12 +1550,12 @@ lifecycle.
   keys re-placed an unretransmitted image ~60×/s, the one traffic shape the
   surviving probe stream never had and the leading suspect for Ghostty
   1.3.1 dying under marlin alone — confirmed 2026-09-07: with the churn
-  gone, two minutes of wipEout at 60 fps (~4 MiB/s) and a 14 MiB/s raw
+  gone, two minutes of a 60 fps game (~4 MiB/s) and a 14 MiB/s raw
   stress run both left the terminal flat. A wire budget of 10 MB/s
   (`pixel_effects.wire_budget_bytes_per_second`; `MARLIN_WIRE_BUDGET`
   overrides it, 0 for none) is a courtesy cap that lets every effect ship at
   its base rate — Pac-Man 30 fps, daybreak (720×405 at most) 10 fps, orb
-  (the same envelope) and wipEout every 60 Hz tick, and the demoscene scenes
+  (the same envelope) every 60 Hz tick, and the demoscene scenes
   (320 px wide) at 30 fps — and still
   reins in a runaway scene.
   Placements use the default z-index (above text) because terminals disagree

@@ -7,7 +7,6 @@ const std = @import("std");
 const proto = @import("../core/proto.zig");
 const config = @import("../core/config.zig");
 const effects = @import("effects.zig");
-const wipeout_effect = @import("wipeout_effect.zig");
 const voice = @import("voice.zig");
 const Editor = @import("editor.zig");
 const tui = @import("tui.zig");
@@ -51,7 +50,6 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
     .{ .name = "/animate", .usage = " <" ++ effects.usage_list ++ ">", .description = "play a transient screen effect", .accepts_args = true },
     .{ .name = "/screensaver", .usage = " [" ++ effects.usage_list ++ "]", .description = "start a continuous full-screen effect", .accepts_args = true },
-    .{ .name = "/mk64", .hidden = true, .description = "play Mario Kart (pure Zig)", .accepts_args = true },
     .{ .name = "/otel", .usage = " [set <endpoint>|status|on|off]", .description = "configure OTLP export (persists across restarts)", .accepts_args = true },
     .{ .name = "/new", .description = "start a new session" },
     .{ .name = "/reset", .description = "archive idle sessions and open a fresh startup screen" },
@@ -74,12 +72,10 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "!!", .description = "turn this session into a shell (Ctrl+D turns it back)" },
     .{ .name = "/screenshot", .usage = " [slim]", .description = "copy the window to the clipboard as an image (Alt+S); slim: transcript only", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last full tool output" },
-    .{ .name = "!mk", .hidden = true, .description = "play Mario Kart", .accepts_args = true },
     .{ .name = "!ss", .usage = " [slim]", .description = "copy the window to the clipboard as an image (alias for /screenshot)", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
     .{ .name = "!rbc", .description = "rebuild only the local client (alias for !rb client)" },
-    .{ .name = "!wipeout", .hidden = true, .usage = " [circuit] [pilot] [venom|rapier] [easy|normal|hard] [trial] [nointro] [crt|nocrt] [new]", .description = "play wipEout — type `!wipeout ` to pick a circuit; Esc leaves, bare !wipeout resumes", .accepts_args = true },
 };
 
 pub const CommandSuggestion = struct {
@@ -128,15 +124,13 @@ pub fn commandQuery(editor: *const Editor) ?[]const u8 {
             !std.mem.eql(u8, head, "/screensaver") and
             !std.mem.eql(u8, head, "/otel") and
             !isCwdCommand(head) and
-            !std.mem.eql(u8, head, "!rb") and
-            !std.mem.eql(u8, head, "!wipeout")) return null;
+            !std.mem.eql(u8, head, "!rb")) return null;
         const rest = std.mem.trimStart(u8, text[space..], " \t");
         // /cwd consumes the whole tail, including spaces in directory names.
         // Keep cursor motion as editing; completion operates at the path's end.
         if (isCwdCommand(head)) return if (editor.cursor == text.len) text else null;
-        // One argument is the rule; `!wipeout` stacks words (circuit, pilot,
-        // class, flags) and offers the next one at each step.
-        if (!std.mem.eql(u8, head, "!wipeout") and std.mem.indexOfAny(u8, rest, " \t") != null) return null;
+        // One argument is the rule.
+        if (std.mem.indexOfAny(u8, rest, " \t") != null) return null;
     }
     return text;
 }
@@ -286,44 +280,12 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
         }
         return out.items;
     }
-    if (query.len > "!wipeout".len and
-        std.mem.eql(u8, query[0.."!wipeout".len], "!wipeout") and
-        (query["!wipeout".len] == ' ' or query["!wipeout".len] == '\t'))
-    {
-        // Circuits by name first, then pilots and flags, filtered by the word
-        // being typed; Enter launches.
-        const rest = query["!wipeout".len..];
-        var tokens: [12][]const u8 = undefined;
-        var n: usize = 0;
-        var words = std.mem.tokenizeAny(u8, rest, " \t");
-        while (words.next()) |w| {
-            if (n == tokens.len) break;
-            tokens[n] = w;
-            n += 1;
-        }
-        const typing = rest.len > 0 and rest[rest.len - 1] != ' ' and rest[rest.len - 1] != '\t' and n > 0;
-        const partial: []const u8 = if (typing) tokens[n - 1] else "";
-        const complete = if (typing) tokens[0 .. n - 1] else tokens[0..n];
-        var candidates: [32]wipeout_effect.Candidate = undefined;
-        const base = query[0 .. query.len - partial.len];
-        for (wipeout_effect.launchCandidates(complete, partial, &candidates)) |c| {
-            const replacement = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, c.word });
-            try out.append(arena, .{
-                .label = replacement,
-                .description = c.description,
-                .replacement = replacement,
-                .submit_on_enter = true,
-            });
-        }
-        return out.items;
-    }
     if (query.len > "/animate".len and
         std.mem.eql(u8, query[0.."/animate".len], "/animate") and
         (query["/animate".len] == ' ' or query["/animate".len] == '\t'))
     {
         const rest = std.mem.trimStart(u8, query["/animate".len..], " \t");
         for (effects.kinds) |kind| {
-            if (kind.playable() and rest.len == 0) continue;
             const name = kind.name();
             if (rest.len <= name.len and std.ascii.eqlIgnoreCase(rest, name[0..rest.len])) {
                 const replacement = try std.fmt.allocPrint(arena, "/animate {s}", .{name});
@@ -342,12 +304,7 @@ pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const Co
         (query["/screensaver".len] == ' ' or query["/screensaver".len] == '\t'))
     {
         const rest = std.mem.trimStart(u8, query["/screensaver".len..], " \t");
-        const mario = "mariokart";
-        if (rest.len > 0 and rest.len <= mario.len and std.ascii.eqlIgnoreCase(rest, mario[0..rest.len])) {
-            try out.append(arena, .{ .label = "/screensaver mariokart", .replacement = "/screensaver mariokart", .description = "Mario Kart autopilot (full-screen)", .submit_on_enter = true });
-        }
         for (effects.kinds) |kind| {
-            if (kind.playable() and rest.len == 0) continue;
             const name = kind.name();
             if (rest.len <= name.len and std.ascii.eqlIgnoreCase(rest, name[0..rest.len])) {
                 const replacement = try std.fmt.allocPrint(arena, "/screensaver {s}", .{name});
@@ -516,8 +473,6 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         }
         self.stop_daemon = true;
         self.should_quit = true;
-    } else if (std.mem.eql(u8, head, "/mk64") or std.mem.eql(u8, head, "!mk")) {
-        launchMarioKart(self, it.rest(), false);
     } else if (std.mem.eql(u8, head, "/setup")) {
         self.requestSetup(false);
     } else if (std.mem.eql(u8, head, "/model")) {
@@ -943,10 +898,6 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             self.setNotice("unknown effect {s}", .{name});
             return;
         };
-        if (kind.playable()) {
-            self.setNotice("{s} is a game, not an effect — start it with !{s}", .{ kind.name(), kind.name() });
-            return;
-        }
         const sky_arg = it.next();
         if (it.next() != null) {
             self.setNotice("usage: /animate <" ++ effects.usage_list ++ "> [hour|cycle]", .{});
@@ -956,18 +907,10 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.startUiAnimation(kind);
     } else if (std.mem.eql(u8, head, "/screensaver") or std.mem.eql(u8, head, "!s")) {
         const selected = it.next();
-        if (selected) |name| if (std.ascii.eqlIgnoreCase(name, "mariokart")) {
-            launchMarioKart(self, it.rest(), true);
-            return;
-        };
         const kind = if (selected) |name| effects.Kind.parse(name) orelse {
             self.setNotice("unknown effect {s}", .{name});
             return;
         } else self.screensaver_kind;
-        if (kind.playable()) {
-            self.setNotice("{s} is a game, not a screensaver — start it with !{s}", .{ kind.name(), kind.name() });
-            return;
-        }
         const sky_arg = it.next();
         if (it.next() != null) {
             self.setNotice("usage: /screensaver [" ++ effects.usage_list ++ "] [hour|cycle]", .{});
@@ -975,19 +918,6 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         }
         if (!self.applySkyArg(kind, sky_arg)) return;
         self.startScreensaver(kind);
-    } else if (std.mem.eql(u8, head, "!wipeout")) {
-        var args: [12][]const u8 = undefined;
-        var count: usize = 0;
-        while (it.next()) |arg| {
-            if (count == args.len) break;
-            args[count] = arg;
-            count += 1;
-        }
-        var message: [256]u8 = undefined;
-        switch (wipeout_effect.parseLaunchArgs(args[0..count], &message)) {
-            .ok => |options| self.startWipeout(options),
-            .invalid => |why| self.setNotice("!wipeout: {s} · usage: !wipeout [circuit] [pilot] [venom|rapier] [easy|normal|hard] [trial] [nointro] [crt|nocrt] [new]", .{why}),
-        }
     } else if (std.mem.eql(u8, head, "/otel")) {
         self.otelCommand(it.next(), it.rest());
     } else if (std.mem.eql(u8, head, "/config")) {
@@ -1298,20 +1228,4 @@ pub fn toggleSandbox(self: *App, arg: []const u8) void {
     } else {
         self.setNotice("sandbox off — every shell call asks again", .{});
     }
-}
-
-fn launchMarioKart(self: *App, raw_arg: []const u8, autoplay: bool) void {
-    const raw = std.mem.trim(u8, raw_arg, " \t");
-    const arg = if (raw.len >= 2 and ((raw[0] == '"' and raw[raw.len - 1] == '"') or (raw[0] == '\'' and raw[raw.len - 1] == '\''))) raw[1 .. raw.len - 1] else raw;
-    const configured = if (self.environ) |env| env.get("MARLIN_MK64_ASSETS") orelse env.get("MARLIN_MK64_ROM") else null;
-    const path = if (arg.len > 0) arg else configured orelse "";
-    if (path.len > 0 and !std.fs.path.isAbsolute(path)) {
-        self.setNotice("Mario Kart needs an absolute bundle or US ROM path", .{});
-        return;
-    }
-    const copy = self.gpa.dupe(u8, path) catch return;
-    if (self.mk64_rom) |old| self.gpa.free(old);
-    self.mk64_rom = copy;
-    self.mk64_autopilot = autoplay;
-    self.should_quit = true;
 }

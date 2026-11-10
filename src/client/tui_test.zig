@@ -11,8 +11,6 @@ const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const voice = @import("voice.zig");
-const wipeout_effect = @import("wipeout_effect.zig");
-const wipeout = @import("../wipeout/root.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const media = @import("media.zig");
@@ -992,39 +990,6 @@ test "a lone modifier neither wakes the screensaver nor counts as activity" {
         &verdicts,
     );
     try std.testing.expect(!app.screensaver_active);
-}
-
-test "focus loss releases held wipEout controls" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var app = App{
-        .gpa = gpa,
-        .io = threaded.io(),
-        .conn = undefined,
-        .view = .{
-            .sid = 1,
-            .editor = Editor.init(gpa),
-        },
-        .game_mode = true,
-    };
-    defer app.deinit();
-
-    var session: wipeout.session.Session = undefined;
-    session.input = .{};
-    session.input.set(.left, true);
-    session.input.set(.fire, true);
-    session.autopilot = true;
-    var game = wipeout_effect.Game{ .session = &session, .gpa = undefined };
-    app.wipeout_game = &game;
-    defer app.wipeout_game = null;
-
-    var verdicts = TransportVerdicts{};
-    try dispatchEvent(&app, undefined, undefined, gpa, .focus_out, &verdicts);
-    try std.testing.expect(!app.terminal_focused);
-    try std.testing.expect(!session.input.anyHeld());
-    try std.testing.expect(!session.input.isPressed(.fire));
-    try std.testing.expect(!session.autopilot);
 }
 
 test "mouse activity neither wakes nor postpones the screensaver" {
@@ -5449,119 +5414,6 @@ test "deliberate daemon shutdown exits the TUI before reconnect" {
     try std.testing.expect(!app.should_quit);
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .daemon_stopping = .{} }));
     try std.testing.expect(app.should_quit);
-}
-
-test "Mario Kart TUI aliases select manual or autoplay without shell escape" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var environ = std.process.Environ.Map.init(gpa);
-    defer environ.deinit();
-    try environ.put("HOME", "/tmp/mario-home");
-    var app = App{ .gpa = gpa, .io = threaded.io(), .environ = &environ, .conn = undefined, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
-    defer app.deinit();
-    app.runCommand("!mk");
-    try std.testing.expect(app.should_quit and !app.shell_requested and !app.mk64_autopilot);
-    try std.testing.expectEqualStrings("", app.mk64_rom.?);
-    app.should_quit = false;
-    app.runCommand("/screensaver mariokart '/tmp/ROM with spaces.z64'");
-    try std.testing.expect(app.should_quit and app.mk64_autopilot and !app.shell_requested);
-    try std.testing.expectEqualStrings("/tmp/ROM with spaces.z64", app.mk64_rom.?);
-    try std.testing.expectEqual(@as(u64, 7), app.view.sid);
-    app.should_quit = false;
-    try environ.put("MARLIN_MK64_ROM", "/tmp/ROM with spaces.z64");
-    app.runCommand("!mk");
-    try std.testing.expect(!app.mk64_autopilot);
-    try std.testing.expectEqualStrings("/tmp/ROM with spaces.z64", app.mk64_rom.?);
-    app.should_quit = false;
-    app.runCommand("!s mariokart");
-    try std.testing.expect(app.mk64_autopilot and app.should_quit);
-    app.should_quit = false;
-    try environ.put("MARLIN_MK64_ASSETS", "/tmp/custom.mkassets");
-    app.runCommand("!mk");
-    try std.testing.expectEqualStrings("/tmp/custom.mkassets", app.mk64_rom.?);
-    app.should_quit = false;
-    app.runCommand("!mk relative.z64");
-    try std.testing.expect(!app.should_quit);
-}
-
-test "Mario Kart launch commands are discoverable in completion" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    app.view.editor.insertSlice("!mk");
-    var suggestions = try commandSuggestions(&app, arena.allocator());
-    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
-    try std.testing.expectEqualStrings("!mk", suggestions[0].replacement);
-    app.view.editor.clear();
-    app.view.editor.insertSlice("/screensaver mari");
-    suggestions = try commandSuggestions(&app, arena.allocator());
-    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
-    try std.testing.expectEqualStrings("/screensaver mariokart", suggestions[0].replacement);
-    try std.testing.expect(suggestions[0].submit_on_enter);
-}
-
-test "optional games stay out of general command and effect suggestions" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    for ([_][]const u8{ "!", "/", "/screensaver ", "/animate " }) |query| {
-        app.view.editor.clear();
-        app.view.editor.insertSlice(query);
-        for (try commandSuggestions(&app, arena.allocator())) |suggestion| {
-            try std.testing.expect(std.mem.indexOf(u8, suggestion.replacement, "wipeout") == null);
-            try std.testing.expect(std.mem.indexOf(u8, suggestion.replacement, "mariokart") == null);
-            try std.testing.expect(!std.mem.eql(u8, suggestion.replacement, "!mk"));
-            try std.testing.expect(!std.mem.eql(u8, suggestion.replacement, "/mk64"));
-        }
-    }
-}
-
-test "typing `!wipeout ` in the composer lists the circuits by name, then pilots and flags" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var app = App{
-        .gpa = gpa,
-        .io = threaded.io(),
-        .conn = undefined,
-        .view = .{ .sid = 1, .editor = Editor.init(gpa) },
-    };
-    defer app.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    app.view.editor.insertSlice("!wipeout ");
-    var suggestions = try commandSuggestions(&app, arena_state.allocator());
-    try std.testing.expectEqual(@as(usize, 7), suggestions.len);
-    try std.testing.expectEqualStrings("!wipeout altima", suggestions[0].label);
-    try std.testing.expectEqualStrings("ALTIMA VII · circuit 1", suggestions[0].description);
-    try std.testing.expect(suggestions[0].submit_on_enter);
-
-    app.view.editor.clear();
-    app.view.editor.insertSlice("!wipeout te");
-    arena_state.deinit();
-    arena_state = std.heap.ArenaAllocator.init(gpa);
-    suggestions = try commandSuggestions(&app, arena_state.allocator());
-    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
-    try std.testing.expectEqualStrings("!wipeout terramax", suggestions[0].replacement);
-
-    app.view.editor.clear();
-    app.view.editor.insertSlice("!wipeout terramax r");
-    arena_state.deinit();
-    arena_state = std.heap.ArenaAllocator.init(gpa);
-    suggestions = try commandSuggestions(&app, arena_state.allocator());
-    try std.testing.expectEqual(@as(usize, 2), suggestions.len);
-    try std.testing.expectEqualStrings("!wipeout terramax rapier", suggestions[0].replacement);
-    try std.testing.expectEqualStrings("!wipeout terramax race", suggestions[1].replacement);
 }
 
 test "web status view preserves the session draft and Escape returns to it" {

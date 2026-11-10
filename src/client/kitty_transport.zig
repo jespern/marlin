@@ -1,6 +1,5 @@
-//! The Kitty graphics wire format for a shipped frame, shared by the client's
-//! pixel-effect engine and the wipEout probe's `--client-transport`, so the
-//! probe's A/B exercises the client's exact bytes.
+//! The Kitty graphics wire format for a shipped frame, used by the client's
+//! pixel-effect engine.
 //!
 //! One frame is one synchronized update (DEC 2026) holding a cursor move to
 //! the placement's top-left and one `a=T` (transmit-and-display) under a

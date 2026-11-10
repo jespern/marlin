@@ -11,8 +11,7 @@
 //! display mints another, and a 60 fps game piles up thousands the terminal
 //! draws each frame), placed at the effect's rectangle with `c=,r=` so the
 //! terminal scales it, `q=2` so it does not answer, `o=z` zlib when
-//! smaller, 4 KiB chunks. The bytes come from wipeout/kitty_transport.zig,
-//! which the probe's `--client-transport` shares. vaxis is kept
+//! smaller, 4 KiB chunks. The bytes come from kitty_transport.zig. vaxis is kept
 //! out of graphics entirely (the TUI clears `caps.kitty_graphics` after
 //! the query): its render used to delete every placement and re-place the
 //! image on each redraw, so a game tick or a held key re-placed an image
@@ -31,8 +30,8 @@ const tetris = @import("tetris.zig");
 const daybreak = @import("daybreak.zig");
 const rocket = @import("rocket.zig");
 const orb = @import("orb.zig");
-const wipeout_effect = @import("wipeout_effect.zig");
-const kitty = @import("../wipeout/kitty_transport.zig");
+const parzlib = @import("parzlib.zig");
+const kitty = @import("kitty_transport.zig");
 
 pub const Scene = enum { plasma, tunnel, metaballs, horizon };
 
@@ -85,16 +84,13 @@ pub const Engine = struct {
     /// window.
     game: pacman.Game,
     tetris_game: tetris.Game,
-    /// The wipEout race for the wipeout kind. Owned by the App (it outlives
-    /// engines so a hidden game resumes); null renders black.
-    wipeout_game: ?*wipeout_effect.Game = null,
     background: []u8 = &.{},
     background_generation: u64 = 0,
     zbuf: []u8 = &.{},
     window: []u8 = &.{},
     /// Banded multi-threaded zlib for large frames; null uses the
     /// single-stream compressor.
-    par_encoder: ?wipeout_effect.parzlib.Encoder = null,
+    par_encoder: ?parzlib.Encoder = null,
 
     pub fn init(gpa: std.mem.Allocator, kind: visual_effect.Kind, seed: u64) Engine {
         return .{ .gpa = gpa, .kind = kind, .seed = seed, .seed_offset = effect.hash(seed) % 600, .game = pacman.Game.init(seed), .tetris_game = tetris.Game.init(seed) };
@@ -132,13 +128,6 @@ pub const Engine = struct {
         return 0x4d61_7200 + @as(u32, @backingInt(kind)); // "Mar" + kind
     }
 
-    /// Where the frame lands, in cells: the whole window, or for wipEout the
-    /// largest centered 4:3 rectangle so `.fill` scaling never stretches it.
-    pub fn placementBox(self: *const Engine) Letterbox {
-        if (self.kind == .wipeout) return letterbox(self.cols, self.rows, self.cell_px_w, self.cell_px_h, 4, 3);
-        return .{ .x = 0, .y = 0, .cols = self.cols, .rows = self.rows };
-    }
-
     pub fn setSky(self: *Engine, sky: daybreak.Sky) void {
         self.sky = sky;
     }
@@ -173,13 +162,7 @@ pub const Engine = struct {
             const layout = pacman.layoutForAspect(@as(u32, @max(cols, 1)) * self.cell_px_w, @as(u32, @max(rows, 1)) * self.cell_px_h);
             if (layout.cols != self.game.cols or layout.rows != self.game.rows) self.game.configure(layout.cols, layout.rows);
         }
-        var dims = framebufferSize(cols, rows, self.cell_px_w, self.cell_px_h, self.kind);
-        if (self.kind == .wipeout) {
-            if (self.wipeout_game) |g| {
-                const out = g.outputSize();
-                dims = .{ .width = out.width, .height = out.height };
-            }
-        }
+        const dims = framebufferSize(cols, rows, self.cell_px_w, self.cell_px_h, self.kind);
         if (dims.width == self.width and dims.height == self.height and self.rgb.len > 0) return;
         self.freeBuffers();
         self.width = dims.width;
@@ -205,21 +188,17 @@ pub const Engine = struct {
         self.window = try self.gpa.alloc(u8, 2 * std.compress.flate.max_window_len);
         // Frames past ~200k pixels are worth splitting across threads;
         // smaller ones finish faster on one.
-        if (pixels >= 200_000) self.par_encoder = wipeout_effect.parzlib.Encoder.init(self.gpa, parallel_zlib_bands);
+        if (pixels >= 200_000) self.par_encoder = parzlib.Encoder.init(self.gpa, parallel_zlib_bands);
         self.transmit_every = shipEvery(self.kind, pixels);
-        if (self.kind == .wipeout) {
-            if (self.wipeout_game) |g| self.transmit_every = g.outputSize().ship_every;
-        }
         self.last_frame_bytes = 0;
     }
 
     /// Base ticks per shipped frame, before the wire budget. Daybreak moves
-    /// slowly and ships at 10 fps; the orb and wipEout ship every 60 Hz tick;
+    /// slowly and ships at 10 fps; the orb ships every 60 Hz tick;
     /// very large boards halve to keep deflate off the critical path.
     fn shipEvery(kind: visual_effect.Kind, pixels: usize) u8 {
         if (kind == .daybreak) return 3;
         if (kind == .orb) return 1;
-        if (kind == .wipeout) return 1;
         return if (pixels > 700_000) 2 else 1;
     }
 
@@ -227,8 +206,6 @@ pub const Engine = struct {
     /// so that the last frame's size times the resulting rate stays under
     /// `wire_budget_bytes_per_second`. Nothing shipped yet means the base.
     pub fn effectiveEvery(self: *const Engine) u8 {
-        // Applies to every kind, wipEout included (the game keeps simulating
-        // at 60 Hz whatever the shipped rate).
         if (self.last_frame_bytes == 0 or wire_budget_bytes_per_second == 0) return self.transmit_every;
         const rate = tickRate(self.kind);
         const needed = (self.last_frame_bytes * rate + wire_budget_bytes_per_second - 1) / wire_budget_bytes_per_second;
@@ -251,9 +228,6 @@ pub const Engine = struct {
         self.frame +%= 1;
         if (self.kind == .pacman) self.game.tick();
         if (self.kind == .tetris) self.tetris_game.tick();
-        if (self.kind == .wipeout) {
-            if (self.wipeout_game) |g| g.tick();
-        }
     }
 
     /// Render this tick's frame and ship it. Must run before draw() so the
@@ -263,12 +237,6 @@ pub const Engine = struct {
     pub fn transmit(self: *Engine, vx: *vaxis.Vaxis, tty: *std.Io.Writer) !void {
         if (!self.graphics) return error.NoGraphicsCapability;
         if (self.rgb.len == 0) try self.resize(self.cols, self.rows);
-        if (self.kind == .wipeout) {
-            if (self.wipeout_game) |g| {
-                const out = g.outputSize();
-                if (out.width != self.width or out.height != self.height) try self.resize(self.cols, self.rows);
-            }
-        }
         if (self.image != null and (self.transmitted_frame == self.frame or self.frame % self.effectiveEvery() != 0)) return;
         const frame = self.frame + self.seed_offset;
         switch (self.kind) {
@@ -286,7 +254,6 @@ pub const Engine = struct {
                 orb.render(self.rgb, self.scratch, self.background, self.width, self.height, self.frame, self.seed);
             },
             .tetris => tetris.renderPixels(&self.tetris_game, self.rgb, self.width, self.height),
-            .wipeout => if (self.wipeout_game) |g| g.render(self.rgb, self.width, self.height) else @memset(self.rgb, 0),
             .pacman => {
                 if (self.background_generation != self.game.generation) {
                     pacman.renderBackground(&self.game, self.background, self.width, self.height);
@@ -312,12 +279,11 @@ pub const Engine = struct {
         // One frame is one synchronized update holding one a=T under this
         // kind's image id and placement id 1: the terminal replaces the
         // placement rather than adding one per frame (kitty_transport.zig).
-        const box = self.placementBox();
         try kitty.shipFrame(tty, encoded, id, self.width, self.height, compressed, .{
-            .col = @intCast(box.x),
-            .row = @intCast(box.y),
-            .cols = box.cols,
-            .rows = box.rows,
+            .col = 0,
+            .row = 0,
+            .cols = self.cols,
+            .rows = self.rows,
         });
         try tty.flush();
         self.image = vaxis.Image.init(id, self.width, self.height);
@@ -371,18 +337,18 @@ fn deflate(dst: []u8, window: []u8, src: []const u8) ?[]u8 {
 
 /// The animation thread's tick rate; ship intervals are counted in ticks.
 pub const ticks_per_second: usize = 30;
-/// The game tier's tick rate (16 ms) while wipEout is up.
+/// The fast tier's tick rate (16 ms), for the orb.
 pub const game_ticks_per_second: usize = 60;
 
 /// Ticks per second an engine of this kind is driven at.
 pub fn tickRate(kind: visual_effect.Kind) usize {
-    return if (kind == .wipeout or kind == .orb) game_ticks_per_second else ticks_per_second;
+    return if (kind == .orb) game_ticks_per_second else ticks_per_second;
 }
 /// What any one effect may put on the wire — a courtesy cap, not a crash
 /// guard: Ghostty 1.3.1 took 14 MiB/s of raw frames for 40 s and 2 min of
-/// wipEout at 60 fps (~4 MiB/s) without complaint once the placement churn
-/// was gone (2026-09-07). 10 MB/s lets every effect ship at its base rate,
-/// wipEout's CRT pass included, and still throttles a runaway scene.
+/// a 60 fps game (~4 MiB/s) without complaint once the placement churn
+/// was gone (2026-09-07). 10 MB/s lets every effect ship at its base rate
+/// and still throttles a runaway scene.
 pub var wire_budget_bytes_per_second: usize = 10_000_000;
 
 /// `MARLIN_WIRE_BUDGET`: bytes per second, 0 for no budget.
@@ -391,33 +357,6 @@ pub fn setWireBudget(bytes_per_second: usize) void {
 }
 
 pub const Dimensions = struct { width: u16, height: u16 };
-
-pub const Letterbox = struct { x: i17, y: i17, cols: u16, rows: u16 };
-
-/// Largest `aspect_w:aspect_h` cell rectangle centered in a window, given
-/// the cell pixel size.
-pub fn letterbox(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, aspect_w: u32, aspect_h: u32) Letterbox {
-    if (cols == 0 or rows == 0) return .{ .x = 0, .y = 0, .cols = cols, .rows = rows };
-    const cw: u32 = if (cell_px_w > 0) cell_px_w else default_cell_w;
-    const ch: u32 = if (cell_px_h > 0) cell_px_h else default_cell_h;
-    const full_w: u64 = @as(u64, cols) * cw;
-    const full_h: u64 = @as(u64, rows) * ch;
-    var out_cols: u32 = cols;
-    var out_rows: u32 = rows;
-    if (full_w * aspect_h > full_h * aspect_w) {
-        out_cols = @intCast(@max((full_h * aspect_w / aspect_h + cw / 2) / cw, 1));
-    } else {
-        out_rows = @intCast(@max((full_w * aspect_h / aspect_w + ch / 2) / ch, 1));
-    }
-    out_cols = @min(out_cols, cols);
-    out_rows = @min(out_rows, rows);
-    return .{
-        .x = @intCast((cols - out_cols) / 2),
-        .y = @intCast((rows - out_rows) / 2),
-        .cols = @intCast(out_cols),
-        .rows = @intCast(out_rows),
-    };
-}
 
 /// Pick a framebuffer whose aspect matches the window's pixel aspect, with
 /// the width clamped into the band that keeps 30 fps encoding cheap. The
@@ -451,11 +390,6 @@ pub fn framebufferSize(cols: u16, rows: u16, cell_px_w: u32, cell_px_h: u32, kin
         const by_aspect: u32 = height * win_w / @max(win_h, 1);
         const width: u32 = std.math.clamp(by_aspect, @as(u32, layout.cols) * t, 1600);
         return .{ .width = @intCast(width), .height = @intCast(height) };
-    }
-    if (kind == .wipeout) {
-        // PSX-native 240p (2x with the CRT pass, see Engine.resize); the
-        // image is letterboxed to 4:3 at draw time.
-        return .{ .width = wipeout_effect.render_width, .height = wipeout_effect.render_height };
     }
     if (kind == .tetris) {
         // The arcade cabinet uses the entire viewport. Render near terminal

@@ -255,46 +255,6 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
-    // ---- Pure-Zig Mario Kart 64 port ----
-    const mk64_module = b.createModule(.{
-        .root_source_file = b.path("src/mk64/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    mk64_module.addImport("asset_store", asset_store);
-    const asset_import = b.addExecutable(.{
-        .name = "mk64-import",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/testing/mk64_import.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "mk64", .module = mk64_module }},
-        }),
-    });
-    const asset_run = b.addRunArtifact(asset_import);
-    asset_run.addPassthruArgs();
-    asset_run.has_side_effects = true;
-    b.step("mk64-import", "Regenerate the versioned MK64 asset bundle from the USA ROM").dependOn(&asset_run.step);
-    const mk64_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/mk64/root.zig"),
-        .target = target,
-        .optimize = .debug,
-    }) });
-    mk64_tests.root_module.addImport("asset_store", asset_store);
-    b.step("mk64-test", "Test the pure-Zig MK64 port").dependOn(&b.addRunArtifact(mk64_tests).step);
-
-    // ---- wipEout port tests ----
-    const wipeout_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wipeout/root.zig"),
-            .target = target,
-            .optimize = .debug,
-        }),
-    });
-    wipeout_tests.root_module.addImport("asset_store", asset_store);
-    const wipeout_test_step = b.step("wipeout-test", "Run wipEout port unit tests");
-    wipeout_test_step.dependOn(&b.addRunArtifact(wipeout_tests).step);
-
     // ---- unit tests ----
     // Dedicated Debug module: safety checks stay on and test compiles stay
     // fast regardless of the install optimize mode.

@@ -145,8 +145,6 @@ test {
     _ = @import("client/remote_rebuild_test.zig");
     _ = @import("client/self_build_test.zig");
     _ = @import("client/voice_test.zig");
-    _ = @import("client/wipeout_effect_test.zig");
-    _ = @import("wipeout/hud_test.zig");
     _ = @import("client/web_test.zig");
     _ = @import("mobile/presence_test.zig");
     _ = @import("mobile/webpush_test.zig");
@@ -159,7 +157,8 @@ test {
     _ = @import("client/effect.zig");
     _ = @import("client/effects_test.zig");
     _ = @import("client/pixel_effects_test.zig");
-    _ = @import("wipeout/kitty_transport_test.zig");
+    _ = @import("client/kitty_transport_test.zig");
+    _ = @import("client/parzlib_test.zig");
     _ = @import("client/daybreak_test.zig");
     _ = @import("client/orb_test.zig");
     _ = @import("client/rocket_test.zig");
