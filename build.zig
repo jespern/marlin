@@ -249,6 +249,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("asset_store", asset_store);
+    // PNG decoding for Kitty images in shells: the decoder libghostty-vt
+    // already carries, not a second image library.
+    const wuffs = ghostty.module("ghostty-vt").import_table.get("wuffs").?;
+    exe.root_module.addImport("wuffs", wuffs);
     const c_bindings: CBindings = .init(b, target, optimize, embedded_sqlite);
     c_bindings.addTo(exe.root_module);
     configureSqlite(exe.root_module, b, embedded_sqlite);
@@ -284,6 +288,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     test_module.addImport("asset_store", asset_store);
+    test_module.addImport("wuffs", wuffs);
     CBindings.init(b, target, .debug, embedded_sqlite).addTo(test_module);
     configureSqlite(test_module, b, embedded_sqlite);
     configureYaml(test_module, b);
