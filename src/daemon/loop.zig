@@ -163,6 +163,9 @@ pub const RunOpts = struct {
     /// Guest billing state shared with the daemon and transition notification.
     usage_credits_live: ?*std.atomic.Value(bool) = null,
     on_usage_credits: ?*const fn (ctx: ?*anyopaque, active: bool) void = null,
+    /// A guest that runs as a long-lived server (Muse Code's `muse serve`)
+    /// reports its process id when it starts and zero when it is gone.
+    on_guest_process: ?*const fn (ctx: ?*anyopaque, pid: u32) void = null,
     on_delta_ctx: ?*anyopaque = null,
     /// Called when a tool starts/finishes (for progress display).
     on_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, phase: ToolPhase) void = null,
@@ -545,6 +548,7 @@ pub fn runTurn(
         if (opts.guest_compact) |instructions| return switch (guest) {
             .claude_code => claude_code_turn.compactClaudeCode(gpa, io, store, opts, &ap, instructions),
             .codex => runCodexTurn(gpa, io, store, opts, &ap, ""),
+            .muse => runMuseTurn(gpa, io, store, opts, &ap, ""),
         };
         const fresh = ap.seq == 0;
         const user_block_id = try ap.append(.{ .user_msg = .{
@@ -565,6 +569,7 @@ pub fn runTurn(
         return switch (guest) {
             .claude_code => runClaudeCodeTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text, fresh),
             .codex => runCodexTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text),
+            .muse => runMuseTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text),
         };
     }
 
@@ -1400,6 +1405,8 @@ const guest_shared = @import("guest/shared.zig");
 pub const lastDelegateErrorNote = guest_shared.lastDelegateErrorNote;
 const runClaudeCodeTurn = claude_code_turn.runClaudeCodeTurn;
 const runCodexTurn = codex_turn.runCodexTurn;
+pub const muse_turn = @import("guest/muse_turn.zig");
+const runMuseTurn = muse_turn.runMuseTurn;
 
 /// Summaries are bounded prose, not agent output; a fixed budget keeps the
 /// anthropic max_tokens requirement independent of the session's headroom.
@@ -1549,6 +1556,7 @@ pub fn writeHandover(
     const guest_label: []const u8 = switch (proto.guestBackend(guest_model) orelse return error.UnknownGuest) {
         .claude_code => "Claude Code",
         .codex => "Codex guest",
+        .muse => "Muse Code",
     };
     const announce = try std.fmt.allocPrint(
         arena,

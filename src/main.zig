@@ -70,6 +70,7 @@ test {
     _ = @import("daemon/provider/claude_code_test.zig");
     _ = @import("daemon/guest/shared_test.zig");
     _ = @import("daemon/guest/codex_turn_test.zig");
+    _ = @import("daemon/guest/muse_turn_test.zig");
     _ = @import("daemon/guest/claude_code_turn_test.zig");
     _ = @import("daemon/guest/tail_test.zig");
     _ = @import("daemon/shell_network_test.zig");
@@ -136,6 +137,7 @@ test {
     _ = @import("daemon/provider/registry_test.zig");
     _ = @import("daemon/tools/task_test.zig");
     _ = @import("daemon/provider/codex_test.zig");
+    _ = @import("daemon/provider/muse_test.zig");
     _ = @import("core/visual_effect_test.zig");
     _ = @import("client/attach_test.zig");
     _ = @import("client/session_file_test.zig");

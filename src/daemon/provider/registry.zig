@@ -81,6 +81,18 @@ pub fn resolve(
         };
     }
 
+    if (std.mem.eql(u8, provider_name, "muse")) {
+        // No wire endpoint or API key: `muse serve` runs under the user's
+        // own Meta login. "muse/default" keeps Muse's configured model.
+        return .{
+            .url = std.fmt.allocPrintSentinel(gpa, "", .{}, 0) catch return error.OutOfMemory,
+            .bearer = null,
+            .model = try gpa.dupe(u8, model),
+            .provider_name = try gpa.dupe(u8, "meta"),
+            .backend = .{ .guest = .muse },
+        };
+    }
+
     const configured = findConfigured(cfg, provider_name);
 
     if (std.mem.eql(u8, provider_name, "openrouter"))

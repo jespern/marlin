@@ -69,6 +69,7 @@ const extensions = @import("extensions.zig");
 const registry = @import("provider/registry.zig");
 const claude_code = @import("provider/claude_code.zig");
 const codex = @import("provider/codex.zig");
+const muse = @import("provider/muse.zig");
 const guest_models = @import("guest_models.zig");
 const http = @import("provider/http.zig");
 const process_io = @import("process_io.zig");
@@ -161,6 +162,7 @@ const Event = union(enum) {
     /// watchers (Ctrl+S / `marlin top`) receive them for every live session.
     turn_activity: struct { sid: u64, line: []u8 },
     turn_usage_credits: struct { sid: u64, active: bool },
+    turn_guest_pid: struct { sid: u64, pid: u32 },
     turn_phase: struct { sid: u64, phase: proto.TurnPhase, started_at_ms: i64 },
     /// A tool call needs a client decision; fan out approval_request and
     /// flip session status to awaiting_approval. Line pre-encoded.
@@ -320,6 +322,9 @@ pub const Session = struct {
     /// Claude Code's latest structured overage signal. Ephemeral: the guest
     /// reports it again when rate-limit state changes.
     usage_credits: std.atomic.Value(bool) = .init(false),
+    /// The guest server process serving the running turn (`muse serve`);
+    /// 0 when none runs.
+    guest_pid: std.atomic.Value(u32) = .init(0),
     /// Latest complete delegated-guest activity snapshot. The turn thread
     /// replaces it under the mutex; subscribers read it for reconnects.
     guest_activity_mutex: Io.Mutex = .init,
@@ -1329,6 +1334,11 @@ pub const Daemon = struct {
             .turn_usage_credits => |usage| {
                 const session = self.sessions.get(usage.sid) orelse return;
                 self.broadcastUsageCredits(usage.sid, session.state, usage.active);
+            },
+            .turn_guest_pid => |update| {
+                const session = self.sessions.get(update.sid) orelse return;
+                session.guest_pid.store(update.pid, .release);
+                self.broadcastStatus(update.sid, session.state);
             },
             .turn_phase => |update| {
                 const session = self.sessions.get(update.sid) orelse return;
@@ -2475,6 +2485,7 @@ pub const Daemon = struct {
                     else
                         null else null,
                     .usage_credits = if (session) |ses| ses.usage_credits.load(.acquire) else false,
+                    .guest_pid = if (session) |ses| ses.guest_pid.load(.acquire) else 0,
                 } });
             },
             .unsub => |u| {
@@ -2867,6 +2878,7 @@ pub const Daemon = struct {
                     const available = switch (backend) {
                         .claude_code => self.claudeCodeAuthenticated(),
                         .codex => self.codexAuthenticated(),
+                        .muse => self.museAuthenticated(),
                     };
                     if (!available) {
                         self.sendTo(client, .{ .err = .{
@@ -4220,6 +4232,7 @@ pub const Daemon = struct {
             .on_guest_activity = TurnHooks.onGuestActivity,
             .usage_credits_live = &job.session.usage_credits,
             .on_usage_credits = TurnHooks.onUsageCredits,
+            .on_guest_process = TurnHooks.onGuestProcess,
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
             .on_task = if (job.kind == .root) TurnHooks.onTask else null,
@@ -4637,6 +4650,11 @@ pub const Daemon = struct {
             self.events.push(self.io, .{ .turn_activity = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
         }
 
+        fn onGuestProcess(ctx: ?*anyopaque, pid: u32) void {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            job.daemon.events.push(job.daemon.io, .{ .turn_guest_pid = .{ .sid = job.sid, .pid = pid } }) catch {};
+        }
+
         fn onUsageCredits(ctx: ?*anyopaque, active: bool) void {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             job.daemon.events.push(job.daemon.io, .{ .turn_usage_credits = .{
@@ -4981,6 +4999,7 @@ pub const Daemon = struct {
             else
                 null else null,
             .usage_credits = active,
+            .guest_pid = if (session) |ses| ses.guest_pid.load(.acquire) else 0,
         } }) catch return;
         defer self.gpa.free(line);
         const ctx = FanCtx{ .self = self, .sid = sid, .line = line };
@@ -5016,6 +5035,7 @@ pub const Daemon = struct {
             else
                 null else null,
             .usage_credits = if (session) |ses| ses.usage_credits.load(.acquire) else false,
+            .guest_pid = if (session) |ses| ses.guest_pid.load(.acquire) else 0,
         } }) catch return;
         defer self.gpa.free(line);
         const ctx = FanCtx{ .self = self, .sid = sid, .line = line };
@@ -5088,6 +5108,7 @@ pub const Daemon = struct {
                 .full_access = if (live) |session| session.approval_mode == .auto else row.approval_mode == .auto,
                 .plan_mode = if (live) |session| session.plan_mode else row.plan_mode,
                 .usage_credits = if (live) |session| session.usage_credits.load(.acquire) else false,
+                .guest_pid = if (live) |session| session.guest_pid.load(.acquire) else 0,
                 .network_filtering = self.network.isActive() and
                     (if (live) |session| session.network_filtering_enabled else true),
                 .archived = row.archived,
@@ -5240,6 +5261,10 @@ pub const Daemon = struct {
             }) catch return;
             self.appendNativeAnthropicIds(arena, &local_list, "claudecode/") catch return;
         }
+        if (self.museAvailable()) {
+            // `default` keeps the model the user's Muse settings choose.
+            local_list.append(arena, "muse/default") catch return;
+        }
         if (self.codexAvailable()) {
             // `default` delegates model selection to the user's Codex config;
             // concrete ids come from Codex's own model cache and the
@@ -5344,6 +5369,25 @@ pub const Daemon = struct {
     /// override, or `claude` executable somewhere on the daemon's PATH.
     fn claudeCodeAvailable(self: *Daemon) bool {
         return self.guestBinaryAvailable(claude_code.binary_env, claude_code.default_binary);
+    }
+
+    fn museAvailable(self: *Daemon) bool {
+        return self.guestBinaryAvailable(muse.binary_env, muse.default_binary);
+    }
+
+    /// Muse has no status command; a stored login or an API key is what it
+    /// authenticates with (`muse login` writes `~/.config/muse/auth.json`).
+    fn museAuthenticated(self: *Daemon) bool {
+        if (!self.museAvailable()) return false;
+        if (envReady(self.environ, "META_API_KEY")) return true;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = if (self.environ.get("XDG_CONFIG_HOME")) |config_home|
+            std.fmt.bufPrintSentinel(&buf, "{s}/muse/auth.json", .{config_home}, 0) catch return false
+        else if (self.environ.get("HOME")) |home|
+            std.fmt.bufPrintSentinel(&buf, "{s}/.config/muse/auth.json", .{home}, 0) catch return false
+        else
+            return false;
+        return std.c.access(path, 0) == 0;
     }
 
     fn codexAvailable(self: *Daemon) bool {
@@ -5879,7 +5923,7 @@ pub const Daemon = struct {
     fn discardShutdownEvent(self: *Daemon, event: Event) void {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
-            .client_gone, .turn_resumed, .turn_usage_credits, .turn_phase, .shell_exited, .shell_settled, .shutdown => {},
+            .client_gone, .turn_resumed, .turn_usage_credits, .turn_guest_pid, .turn_phase, .shell_exited, .shell_settled, .shutdown => {},
             .shell_output => |value| self.gpa.free(value.bytes),
             .turn_block => |value| self.gpa.free(value.line),
             .turn_delta => |value| self.gpa.free(value.line),

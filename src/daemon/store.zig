@@ -59,7 +59,8 @@ const schema_sql =
     \\  approval_mode TEXT NOT NULL DEFAULT 'default',
     \\  guest_max_runtime_ms INTEGER,
     \\  codex_thread_id TEXT,
-    \\  title_locked INTEGER NOT NULL DEFAULT 0
+    \\  title_locked INTEGER NOT NULL DEFAULT 0,
+    \\  muse_session_id TEXT
     \\);
     \\CREATE TABLE IF NOT EXISTS live_shells(
     \\  session_id INTEGER PRIMARY KEY,
@@ -193,7 +194,7 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','16');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','17');
 ;
 
 pub const SessionRow = struct {
@@ -506,6 +507,12 @@ pub const Store = struct {
             try self.execAll(
                 \\ALTER TABLE sessions ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0;
                 \\UPDATE kv SET value='16' WHERE key='schema_version';
+            );
+        }
+        if (ver < 17) {
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN muse_session_id TEXT;
+                \\UPDATE kv SET value='17' WHERE key='schema_version';
             );
         }
     }
@@ -1512,6 +1519,27 @@ pub const Store = struct {
     /// Caller owns the returned thread id.
     pub fn getCodexThreadId(self: Store, id: u64) Error!?[]const u8 {
         const stmt = try self.prepare("SELECT codex_thread_id FROM sessions WHERE id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return error.NotFound;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+        return try self.dupeCol(stmt, 0);
+    }
+
+    /// The Muse Code session a Marlin session continues; null to start one.
+    pub fn setMuseSessionId(self: Store, id: u64, muse_id: ?[]const u8) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET muse_session_id=? WHERE id=?");
+        defer finalize(stmt);
+        if (muse_id) |value| bindText(stmt, 1, value) else bindNull(stmt, 1);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
+    /// Caller owns the returned id.
+    pub fn getMuseSessionId(self: Store, id: u64) Error!?[]const u8 {
+        const stmt = try self.prepare("SELECT muse_session_id FROM sessions WHERE id=?");
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(id));
         const rc = c.sqlite3_step(stmt);

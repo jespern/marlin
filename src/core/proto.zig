@@ -611,6 +611,9 @@ pub const DaemonMsg = union(enum) {
         phase_ms: ?u64 = null,
         /// Claude guest billing state when this status carries an update.
         usage_credits: ?bool = null,
+        /// The guest server process serving this session (Muse Code's
+        /// `muse serve`) when this status carries an update; 0 when none runs.
+        guest_pid: ?u32 = null,
     },
     approval_request: struct {
         sid: u64,
@@ -731,6 +734,9 @@ pub const SessionInfo = struct {
     plan_mode: bool = false,
     /// Claude guest is currently consuming paid API usage credits.
     usage_credits: bool = false,
+    /// The guest server process serving this session right now (Muse Code's
+    /// `muse serve`); 0 when none runs.
+    guest_pid: u32 = 0,
     /// Archived sessions appear only in explicitly inclusive list requests.
     archived: bool = false,
     /// Non-zero while the session is an interactive shell (`!!`): its

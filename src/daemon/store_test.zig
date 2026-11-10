@@ -597,15 +597,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v16 with performance telemetry and scaling indexes" {
+test "schema is v17 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 16), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 17), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 16), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 17), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
@@ -982,6 +982,7 @@ test "v13 session runtime migration preserves defaults and independent overrides
         "ALTER TABLE sessions DROP COLUMN guest_max_runtime_ms",
         "ALTER TABLE sessions DROP COLUMN approval_mode",
         "ALTER TABLE sessions DROP COLUMN title_locked",
+        "ALTER TABLE sessions DROP COLUMN muse_session_id",
         "UPDATE kv SET value='13' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
@@ -1011,6 +1012,7 @@ test "v14 migration preserves paused grants and later revocation overrides old c
     inline for (.{
         "ALTER TABLE sessions DROP COLUMN approval_mode",
         "ALTER TABLE sessions DROP COLUMN title_locked",
+        "ALTER TABLE sessions DROP COLUMN muse_session_id",
         "UPDATE kv SET value='14' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
@@ -1078,4 +1080,18 @@ test "a running shell's saved state is kept until cleared" {
     try db.clearLiveShell(7);
     try db.clearLiveShell(99);
     try std.testing.expectEqual(@as(usize, 0), (try db.liveShells(arena.allocator())).len);
+}
+
+test "a Muse session id is kept per Marlin session until cleared" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(5, 1, "/tmp", "muse/default", .auto);
+    try std.testing.expectEqual(@as(?[]const u8, null), try store.getMuseSessionId(5));
+    try store.setMuseSessionId(5, "01a1c358-cbf4-72e2-a9bc-461e6a74f412");
+    const saved = (try store.getMuseSessionId(5)).?;
+    defer gpa.free(saved);
+    try std.testing.expectEqualStrings("01a1c358-cbf4-72e2-a9bc-461e6a74f412", saved);
+    try store.setMuseSessionId(5, null);
+    try std.testing.expectEqual(@as(?[]const u8, null), try store.getMuseSessionId(5));
 }

@@ -133,6 +133,7 @@ const run = tui.run;
 const setup_provider_items = tui.setup_provider_items;
 const shortcut_help_rows = tui.shortcut_help_rows;
 const statusContext = tui.statusContext;
+const statusGuestProcess = tui.statusGuestProcess;
 const statusCwd = tui.statusCwd;
 const statusModel = tui.statusModel;
 const tabMouseAction = tui.tabMouseAction;
@@ -7084,4 +7085,13 @@ test "a bracketed paste arrives as one paste, not as keystrokes" {
     // Keys after the paste behave as keys again.
     try dispatchEvent(&app, undefined, undefined, gpa, .{ .key_press = .{ .codepoint = 'x', .text = "x" } }, &verdicts);
     try std.testing.expectEqualStrings("x", app.view.editor.text.items);
+}
+
+test "a Muse session shows its muse serve process while it runs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("muse serve 4242", (try statusGuestProcess(arena, "muse/default", 4242)).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try statusGuestProcess(arena, "muse/default", 0));
+    try std.testing.expectEqual(@as(?[]const u8, null), try statusGuestProcess(arena, "codex/default", 4242));
 }

@@ -55,10 +55,17 @@ run that agent. Some sessions host someone else's.
 `task`/`task_batch`, `plan_update`, L0/L1/L2. The TUI is a client of this
 loop. This is the product.
 
-**Guest** (`claudecode/`, `codex/`): an official vendor agent owns the turn.
-Claude Code runs through `claude -p`; Codex runs through the stable
+**Guest** (`claudecode/`, `codex/`, `muse/`): an official vendor agent owns
+the turn. Claude Code runs through `claude -p`; Codex runs through the stable
 `codex app-server` JSONL protocol and uses the account already established by
-`codex login` (including ChatGPT subscription login). Marlin's job is the
+`codex login` (including ChatGPT subscription login). Muse Code runs through
+`muse serve` (MSP: JSON-RPC on stdio, UUIDv7 command ids) under `muse login`.
+Muse keeps working after a turn ends (subagents run as background workflows,
+and Muse starts a turn of its own to report them), so a Marlin turn lasts until
+the Muse session is idle with no background work; the status line shows the
+`muse serve` pid meanwhile. Muse's own approvals and questions use Marlin's
+approval bar and picker (`:ask-me` profile; `:unrestricted` under full access,
+`:read-only` for read-only children). Marlin's job is the
 multiplexer: persist structured events as blocks, attach, interrupt, resume
 the vendor thread, copy, and park *their* permission prompts on *our* approval
 bar. Marlin tools, Seatbelt, network screening, MCP-as-agent-tools,

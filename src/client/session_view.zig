@@ -111,6 +111,8 @@ pub const SessionView = struct {
     context_used: u64 = 0,
     context_limit: u64 = 0,
     usage_credits: bool = false,
+    /// The guest server process serving this session (`muse serve`); 0 when none.
+    guest_pid: u32 = 0,
     guest_activity: []const proto.GuestActivity = &.{},
     guest_activity_arena: ?std.heap.ArenaAllocator = null,
     /// Persistent daemon-owned collaboration mode for the session.

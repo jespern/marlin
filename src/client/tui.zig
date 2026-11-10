@@ -326,6 +326,8 @@ const SessionSummary = struct {
     full_access: bool,
     plan_mode: bool,
     usage_credits: bool,
+    /// The guest server process serving the session (`muse serve`); 0 when none.
+    guest_pid: u32 = 0,
     /// Non-zero while the session is a shell (`!!`).
     shell_id: u64 = 0,
     /// "$ name" tab label of a shell session; empty otherwise.
@@ -1306,6 +1308,7 @@ pub const App = struct {
             self.view.state = summary.state;
             self.view.plan_mode = summary.plan_mode;
             self.view.usage_credits = summary.usage_credits;
+            self.view.guest_pid = summary.guest_pid;
         }
         self.view.show_tool_transcript = self.expanded_transcripts.contains(sid);
         if (self.background_approvals.get(sid)) |pending| {
@@ -1453,6 +1456,7 @@ pub const App = struct {
                 self.setCwdStr(info.cwd);
                 self.view.plan_mode = info.plan_mode;
                 self.view.usage_credits = info.usage_credits;
+                self.view.guest_pid = info.guest_pid;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
             } else if (self.saved_views.get(info.sid)) |saved| {
                 saved.state = info.state;
@@ -1462,6 +1466,7 @@ pub const App = struct {
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
                 saved.usage_credits = info.usage_credits;
+                saved.guest_pid = info.guest_pid;
                 if (!info.plan_mode) saved.plan_proposal_ready = false;
             }
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
@@ -1548,6 +1553,7 @@ pub const App = struct {
             .full_access = info.full_access,
             .plan_mode = info.plan_mode,
             .usage_credits = info.usage_credits,
+            .guest_pid = info.guest_pid,
             .shell_id = info.shell_id,
             .shell_label = if (info.shell_id != 0)
                 self.gpa.dupe(u8, if (info.shell_title.len > 0) info.shell_title else if (info.title.len > 0) info.title else if (std.fs.path.basename(info.cwd).len > 0) std.fs.path.basename(info.cwd) else "shell") catch &.{}
@@ -1573,6 +1579,7 @@ pub const App = struct {
                 self.setCwdStr(info.cwd);
                 self.view.plan_mode = info.plan_mode;
                 self.view.usage_credits = info.usage_credits;
+                self.view.guest_pid = info.guest_pid;
                 if (!info.plan_mode) self.view.plan_proposal_ready = false;
             }
             if (self.saved_views.get(info.sid)) |saved| {
@@ -1583,6 +1590,7 @@ pub const App = struct {
                 saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
                 saved.plan_mode = info.plan_mode;
                 saved.usage_credits = info.usage_credits;
+                saved.guest_pid = info.guest_pid;
                 if (!info.plan_mode) saved.plan_proposal_ready = false;
             }
             if (info.state != .awaiting_approval) _ = self.background_approvals.remove(info.sid);
@@ -1635,6 +1643,7 @@ pub const App = struct {
             self.setCwdStr(info.cwd);
             self.view.plan_mode = info.plan_mode;
             self.view.usage_credits = info.usage_credits;
+            self.view.guest_pid = info.guest_pid;
             if (!info.plan_mode) self.view.plan_proposal_ready = false;
         } else if (self.saved_views.get(info.sid)) |saved| {
             saved.state = info.state;
@@ -1644,6 +1653,7 @@ pub const App = struct {
             saved.cwd.appendSlice(self.gpa, info.cwd) catch {};
             saved.plan_mode = info.plan_mode;
             saved.usage_credits = info.usage_credits;
+            saved.guest_pid = info.guest_pid;
             if (!info.plan_mode) saved.plan_proposal_ready = false;
         }
         self.normalizeTopSelection();
@@ -2058,6 +2068,7 @@ pub const App = struct {
                         if (s.state != .err) saved.login_required = false;
                         if (s.err_text) |text| saved.login_required = guest_auth.loginRequiredBackend(text) != null;
                         if (s.usage_credits) |active| saved.usage_credits = active;
+                        if (s.guest_pid) |pid| saved.guest_pid = pid;
                         if (s.turn_ms) |elapsed| saved.turn_started_ms = status_now - @as(i64, @intCast(elapsed));
                         if (s.phase) |phase| {
                             if (saved.turn_phase != phase) {
@@ -2132,6 +2143,7 @@ pub const App = struct {
                 if (s.state != .err) view.login_required = false;
                 if (s.err_text) |text| view.login_required = guest_auth.loginRequiredBackend(text) != null;
                 if (s.usage_credits) |active| view.usage_credits = active;
+                if (s.guest_pid) |pid| view.guest_pid = pid;
                 self.syncAnimationTicker();
                 if (s.state != .awaiting_approval) {
                     view.pending = null;
@@ -4761,6 +4773,13 @@ pub fn statusModel(arena: std.mem.Allocator, model: []const u8) ![]const u8 {
 /// (used stays 0; the limit lookup even matches `claudecode` as `claude`).
 /// The status bar's context gauge. Guests report their own window once a
 /// model call has run; until then they have none to show.
+/// The guest server process behind the session while it runs: Muse Code's
+/// `muse serve`, which lives for the whole of a turn and its background work.
+pub fn statusGuestProcess(arena: std.mem.Allocator, model: []const u8, pid: u32) !?[]const u8 {
+    if (pid == 0 or proto.guestBackend(model) != .muse) return null;
+    return try std.fmt.allocPrint(arena, "muse serve {d}", .{pid});
+}
+
 pub fn statusContext(arena: std.mem.Allocator, guest: bool, usage_credits: bool, used: u64, limit: u64) ![]const u8 {
     if (guest and limit == 0) return if (usage_credits) "(using api credits)" else "ctx n/a";
     if (limit == 0) return "";
@@ -6447,7 +6466,7 @@ fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16,
     else
         "";
 
-    var status_segments: [39]vaxis.Segment = undefined;
+    var status_segments: [41]vaxis.Segment = undefined;
     var status_n: usize = 0;
     status_segments[status_n] = .{ .text = " ", .style = Palette.status_bar };
     status_n += 1;
@@ -6468,6 +6487,12 @@ fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16,
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
         status_segments[status_n] = .{ .text = ctx_txt, .style = ctx_style };
+        status_n += 1;
+    }
+    if (try statusGuestProcess(arena, app.view.model.items, app.view.guest_pid)) |process_txt| {
+        status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+        status_n += 1;
+        status_segments[status_n] = .{ .text = process_txt, .style = Palette.status_muted };
         status_n += 1;
     }
     status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };

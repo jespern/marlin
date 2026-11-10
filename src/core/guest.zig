@@ -34,6 +34,7 @@ pub const interactive_instructions = question_instructions ++ "\n\n" ++ progress
 pub const Backend = enum {
     claude_code,
     codex,
+    muse,
 };
 
 /// Call only on vendor error fields/stderr, never ordinary assistant prose.
@@ -59,18 +60,21 @@ pub fn loginRequiredNote(which: Backend) []const u8 {
     return switch (which) {
         .claude_code => "Claude login required: authentication expired or was rejected. Run `claude auth login` on the daemon host, then retry this session. Your transcript is saved.",
         .codex => "Codex login required: authentication expired or was rejected. Run `codex login` on the daemon host, then retry this session. Your transcript is saved.",
+        .muse => "Muse login required: authentication expired or was rejected. Run `muse login` on the daemon host, then retry this session. Your transcript is saved.",
     };
 }
 
 pub fn loginRequiredBackend(text: []const u8) ?Backend {
     if (std.mem.startsWith(u8, text, "Claude login required:")) return .claude_code;
     if (std.mem.startsWith(u8, text, "Codex login required:")) return .codex;
+    if (std.mem.startsWith(u8, text, "Muse login required:")) return .muse;
     return null;
 }
 
 pub fn backend(model: []const u8) ?Backend {
     if (std.mem.startsWith(u8, model, "claudecode/")) return .claude_code;
     if (std.mem.startsWith(u8, model, "codex/")) return .codex;
+    if (std.mem.startsWith(u8, model, "muse/")) return .muse;
     return null;
 }
 
