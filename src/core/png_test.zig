@@ -29,6 +29,10 @@ test "the wuffs decoder matches zigimg on real PNGs" {
         @embedFile("../client/webui-icon-180.png"),
         @embedFile("sprite_reference_18x36+4"),
         @embedFile("sprite_reference_9x17+1"),
+        @embedFile("png_sample_rgba"),
+        @embedFile("png_sample_palette"),
+        @embedFile("png_sample_gray_alpha"),
+        @embedFile("png_sample_rgba16"),
     };
     for (samples) |bytes| {
         var reference = try zigimg.Image.fromMemory(gpa, bytes);

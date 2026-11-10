@@ -307,6 +307,16 @@ pub fn build(b: *std.Build) void {
             .root_source_file = ghostty.path(b.fmt("src/font/sprite/testdata/U+2500...U+25FF-{s}.png", .{size})),
         });
     }
+    // PNGs with alpha, a palette, and 16-bit channels, to hold the shell
+    // PNG decoder to the pixels zigimg produced.
+    for ([_][2][]const u8{
+        .{ "png_sample_rgba", "images/gnome/16.png" },
+        .{ "png_sample_palette", "images/Ghostty.icon/Assets/gloss.png" },
+        .{ "png_sample_gray_alpha", "macos/Assets.xcassets/Custom Icon/CustomIconGhost.imageset/ghosty.png" },
+        .{ "png_sample_rgba16", "images/icons/icon_256@2x.png" },
+    }) |sample| {
+        test_module.addAnonymousImport(sample[0], .{ .root_source_file = ghostty.path(sample[1]) });
+    }
     test_module.addOptions("build_options", build_options);
     const exe_tests = b.addTest(.{ .root_module = test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
