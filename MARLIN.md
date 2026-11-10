@@ -71,6 +71,10 @@ answer is no. Standing walls: README Principles, and ARCHITECTURE
 - Tool/runtime errors are data returned to the model, never crashes.
 - Comments are sparse and explain constraints the code can't express; no
   change-narration.
+- Binary size: `std.mem.sort` (block sort) costs about 14 KB per element
+  type. Short lists use `std.sort.insertion`, which is also stable; lists
+  whose equal elements are interchangeable use `std.mem.sortUnstable`. Keep
+  `std.mem.sort` for long lists that need a stable order.
 - When behavior changes, update the relevant `docs/*.md` in the same change
   — the milestone docs track "implemented vs verified" honestly; don't
   claim verified without a test or live probe.

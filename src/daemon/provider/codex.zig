@@ -293,7 +293,7 @@ pub fn parseModels(gpa: std.mem.Allocator, result: std.json.Value) ![]CatalogMod
         }
         try out.append(gpa, .{ .id = id });
     }
-    std.mem.sort(CatalogModel, out.items, {}, struct {
+    std.sort.insertion(CatalogModel, out.items, {}, struct {
         fn lessThan(_: void, a: CatalogModel, b: CatalogModel) bool {
             return std.mem.lessThan(u8, a.id, b.id);
         }

@@ -96,7 +96,7 @@ pub const Index = struct {
     }
 
     fn finish(self: *Index) !void {
-        std.mem.sort(Skill, self.items.items, {}, lessThan);
+        std.sort.insertion(Skill, self.items.items, {}, lessThan);
         const prompt = try self.buildPrompt();
         errdefer self.gpa.free(prompt);
         const names = try self.gpa.alloc([]const u8, self.items.items.len);
@@ -231,7 +231,7 @@ const Scan = struct {
             errdefer gpa.free(name);
             try names.append(gpa, name);
         }
-        std.mem.sort([]u8, names.items, {}, struct {
+        std.mem.sortUnstable([]u8, names.items, {}, struct {
             fn less(_: void, a: []u8, b: []u8) bool {
                 return std.mem.lessThan(u8, a, b);
             }

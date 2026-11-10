@@ -99,7 +99,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
             .created_at = 0,
         });
     }
-    std.mem.sort(TabCandidate, candidates.items, {}, struct {
+    std.sort.insertion(TabCandidate, candidates.items, {}, struct {
         fn lessThan(_: void, a: TabCandidate, b: TabCandidate) bool {
             return a.created_at < b.created_at or (a.created_at == b.created_at and a.sid < b.sid);
         }

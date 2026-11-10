@@ -2782,7 +2782,7 @@ fn nsToMs(ns: i96) u64 {
 }
 
 fn sortDurations(values: *std.ArrayList(u64)) void {
-    std.mem.sort(u64, values.items, {}, struct {
+    std.mem.sortUnstable(u64, values.items, {}, struct {
         fn lessThan(_: void, a: u64, b: u64) bool {
             return a < b;
         }

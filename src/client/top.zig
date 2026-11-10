@@ -158,7 +158,7 @@ fn appendTreeOrder(
     for (rows, 0..) |row, i| {
         if (!emitted[i] and row.parent_sid == parent_sid) try children.append(arena, i);
     }
-    std.mem.sort(usize, children.items, rows, rowLessThan);
+    std.sort.insertion(usize, children.items, rows, rowLessThan);
     for (children.items) |i| {
         if (emitted[i]) continue;
         emitted[i] = true;
@@ -186,7 +186,7 @@ pub fn orderedIndices(arena: std.mem.Allocator, rows: []const RowView) ![]const 
         }
         if (row.parent_sid == null or !parent_present) try roots.append(arena, i);
     }
-    std.mem.sort(usize, roots.items, rows, rowLessThan);
+    std.sort.insertion(usize, roots.items, rows, rowLessThan);
     for (roots.items) |i| {
         if (emitted[i]) continue;
         emitted[i] = true;
@@ -197,7 +197,7 @@ pub fn orderedIndices(arena: std.mem.Allocator, rows: []const RowView) ![]const 
     var remaining: std.ArrayList(usize) = .empty;
     defer remaining.deinit(arena);
     for (rows, 0..) |_, i| if (!emitted[i]) try remaining.append(arena, i);
-    std.mem.sort(usize, remaining.items, rows, rowLessThan);
+    std.sort.insertion(usize, remaining.items, rows, rowLessThan);
     for (remaining.items) |i| try out.append(arena, i);
     return out.toOwnedSlice(arena);
 }

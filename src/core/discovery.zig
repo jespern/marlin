@@ -103,7 +103,7 @@ fn padTo(w: *Io.Writer, text: []const u8, width: usize) !void {
 
 /// Peers as a table, sorted by name. `peers` is reordered in place.
 pub fn renderTable(w: *Io.Writer, peers: []Peer) !void {
-    std.mem.sort(Peer, peers, {}, lessByName);
+    std.sort.insertion(Peer, peers, {}, lessByName);
     var name_w: usize = "NAME".len;
     var host_w: usize = "HOST".len;
     var ver_w: usize = "VERSION".len;

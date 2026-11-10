@@ -135,7 +135,7 @@ pub const Server = struct {
             try self.initializeLegacy();
             try self.listAllTools();
         };
-        std.mem.sort(Tool, self.tools.items, {}, struct {
+        std.sort.insertion(Tool, self.tools.items, {}, struct {
             fn less(_: void, a: Tool, b: Tool) bool {
                 return std.mem.lessThan(u8, a.public_name, b.public_name);
             }

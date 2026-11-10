@@ -983,7 +983,7 @@ pub const Daemon = struct {
             .created_at_ms = host.*.created_at_ms,
             .viewers = @intCast(host.*.viewers.items.len),
         };
-        std.mem.sort(proto.ShellInfo, infos, {}, struct {
+        std.sort.insertion(proto.ShellInfo, infos, {}, struct {
             fn lessThan(_: void, a: proto.ShellInfo, b: proto.ShellInfo) bool {
                 return a.shell_id < b.shell_id;
             }
@@ -5467,7 +5467,7 @@ pub const Daemon = struct {
         }
 
         if (!any_source) return last_err orelse error.CatalogUnavailable;
-        std.mem.sort(CatalogModel, out.items, {}, struct {
+        std.sort.insertion(CatalogModel, out.items, {}, struct {
             fn lessThan(_: void, a: CatalogModel, b: CatalogModel) bool {
                 return std.mem.lessThan(u8, a.id, b.id);
             }
@@ -6058,7 +6058,7 @@ fn parseCatalog(gpa: std.mem.Allocator, body: []const u8) ![]CatalogModel {
             .tiered = catalogPricingIsTiered(raw_pricing),
         });
     }
-    std.mem.sort(CatalogModel, out.items, {}, struct {
+    std.sort.insertion(CatalogModel, out.items, {}, struct {
         fn lessThan(_: void, a: CatalogModel, b: CatalogModel) bool {
             return std.mem.lessThan(u8, a.id, b.id);
         }
