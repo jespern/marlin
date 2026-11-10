@@ -111,6 +111,20 @@ fn configureScreenshot(module: *std.Build.Module, target: std.Build.ResolvedTarg
     module.linkFramework("CoreGraphics", .{});
 }
 
+/// A stripped build cannot print stack traces (Zig turns them off without
+/// debug info), so the unwind tables every module would emit are dead
+/// weight, about 0.4 MB. Crashes still report their panic message.
+fn dropUnwindTables(b: *std.Build, root: *std.Build.Module) void {
+    var seen: std.array_hash_map.Auto(*std.Build.Module, void) = .empty;
+    seen.put(b.allocator, root, {}) catch @panic("OOM");
+    var i: usize = 0;
+    while (i < seen.count()) : (i += 1) {
+        const module = seen.keys()[i];
+        module.unwind_tables = .none;
+        for (module.import_table.values()) |import| seen.put(b.allocator, import, {}) catch @panic("OOM");
+    }
+}
+
 /// C bindings, translated at build time (`@cImport` is gone in 0.17).
 const CBindings = struct {
     sqlite3: *std.Build.Module,
@@ -247,6 +261,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     exe.root_module.addOptions("build_options", build_options);
+    if (strip) dropUnwindTables(b, exe.root_module);
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Build and run marlin");
