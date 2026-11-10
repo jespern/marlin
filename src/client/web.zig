@@ -41,12 +41,12 @@ const html = @embedFile("webui.html");
 const mobile_push = @import("../mobile/push.zig");
 const service_worker = @embedFile("webui-sw.js");
 const icon_180 = @embedFile("webui-icon-180.png");
-const icon_512 = @embedFile("webui-icon-512.png");
+const icon_512 = @embedFile("webui-icon-512.jpg");
 const manifest =
     \\{"name":"marlin","short_name":"marlin","start_url":"/","display":"standalone",
     \\"background_color":"#17191d","theme_color":"#17191d","icons":[
     \\{"src":"/icon-180.png","sizes":"180x180","type":"image/png"},
-    \\{"src":"/icon-512.png","sizes":"512x512","type":"image/png"}]}
+    \\{"src":"/icon-512.jpg","sizes":"512x512","type":"image/jpeg"}]}
 ;
 const default_port: u16 = 8377;
 
@@ -344,9 +344,9 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         try reply(req, &access, icon_180, .{ .extra_headers = &.{
             .{ .name = "content-type", .value = "image/png" },
         } });
-    } else if (std.mem.eql(u8, target, "/icon-512.png")) {
+    } else if (std.mem.eql(u8, target, "/icon-512.jpg")) {
         try reply(req, &access, icon_512, .{ .extra_headers = &.{
-            .{ .name = "content-type", .value = "image/png" },
+            .{ .name = "content-type", .value = "image/jpeg" },
         } });
     } else if (std.mem.startsWith(u8, target, "/events")) {
         try serveEvents(ctx, req, &access);
