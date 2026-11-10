@@ -505,3 +505,21 @@ test "decode: /compact reports its boundary; the summary it replays is not user 
     , &events);
     try std.testing.expectEqual(@as(?u64, null), events.items[0].compacted.post_tokens);
 }
+
+test "decode: a slash command's echo is a string replay, and still a replay (claude -p 2.1.314)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var events: std.ArrayList(Event) = .empty;
+    // Exactly as stream-json input with --replay-user-messages echoes /compact.
+    try decodeLine(arena_state.allocator(),
+        \\{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"isReplay":true,"session_id":"s"}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("<local-command-stdout>Compacted </local-command-stdout>", events.items[0].replayed_user);
+    // A subagent's string message is not the root's replay.
+    events.clearRetainingCapacity();
+    try decodeLine(arena_state.allocator(),
+        \\{"type":"user","parent_tool_use_id":"t1","message":{"role":"user","content":"hi"},"isReplay":true}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 0), events.items.len);
+}

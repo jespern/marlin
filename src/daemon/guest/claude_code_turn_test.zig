@@ -146,8 +146,10 @@ test "Claude Code /compact resumes the conversation with the focus and never sta
         \\echo '{"type":"system","subtype":"init","session_id":"x"}'
         \\echo '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":25646,"post_tokens":10741}}'
         \\echo '{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}'
-        \\echo '{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}'
+        \\echo '{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"isReplay":true}'
         \\echo '{"type":"result","subtype":"success","is_error":false,"result":"","usage":{"input_tokens":0,"output_tokens":0}}'
+        \\# Like claude -p with stream-json input: it waits for more until stdin closes.
+        \\cat > /dev/null
     ;
     const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-claude" });
     defer gpa.free(script_path);
@@ -173,7 +175,8 @@ test "Claude Code /compact resumes the conversation with the focus and never sta
             .session_id = 1,
             .cwd = temp.path,
             .endpoint = .{ .url = "", .bearer = null, .model = "fable-5", .backend = .{ .guest = .claude_code } },
-            .cfg = .{},
+            // A hang (stdin never closed) fails fast instead of stalling.
+            .cfg = .{ .guest_max_runtime_ms = 5_000 },
             .tool_environ = &env,
             .approval_mode = .auto,
             .context_used_out = &used,

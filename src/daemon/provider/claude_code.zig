@@ -409,8 +409,15 @@ pub fn decodeLine(
     }
     if (std.mem.eql(u8, t, "user")) {
         const parent_tool_use_id = strField(root, "parent_tool_use_id") orelse "";
+        const replay = parent_tool_use_id.len == 0 and (boolField(root, "isReplay") orelse false);
+        // A slash command (/compact) is echoed as its output, a plain string:
+        // still the replay that tells Marlin the message was taken.
+        if (replay) if (messageString(root)) |text| {
+            try out.append(arena, .{ .replayed_user = text });
+            return;
+        };
         const content = messageContent(root) orelse return;
-        if (parent_tool_use_id.len == 0 and (boolField(root, "isReplay") orelse false)) {
+        if (replay) {
             for (content) |item| {
                 if (item != .object) continue;
                 if (!std.mem.eql(u8, strField(item.object, "type") orelse "", "text")) continue;
@@ -512,6 +519,13 @@ fn messageUsage(root: std.json.ObjectMap) ?std.json.ObjectMap {
     if (msg != .object) return null;
     const usage = msg.object.get("usage") orelse return null;
     return if (usage == .object) usage.object else null;
+}
+
+fn messageString(root: std.json.ObjectMap) ?[]const u8 {
+    const msg = root.get("message") orelse return null;
+    if (msg != .object) return null;
+    const content = msg.object.get("content") orelse return null;
+    return if (content == .string) content.string else null;
 }
 
 fn messageContent(root: std.json.ObjectMap) ?[]std.json.Value {
