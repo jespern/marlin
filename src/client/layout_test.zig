@@ -1692,3 +1692,16 @@ test "the preview of the unfinished line waits for revealed rows" {
     try cache.appendTo(arena_state.allocator(), &all, cache.committedRows());
     try std.testing.expect(all.items.len > cache.committedRows()); // rows + the preview
 }
+
+test "a shell lost with Marlin says so, and what was running" {
+    const gpa = std.testing.allocator;
+    const running = try layout.shellExitLabel(gpa, .{ .text = "", .lost = true, .command = "htop" });
+    defer gpa.free(running);
+    try std.testing.expectEqualStrings("ended when Marlin stopped · htop was running", running);
+    const at_prompt = try layout.shellExitLabel(gpa, .{ .text = "", .lost = true });
+    defer gpa.free(at_prompt);
+    try std.testing.expectEqualStrings("ended when Marlin stopped", at_prompt);
+    const exited = try layout.shellExitLabel(gpa, .{ .text = "", .exit_code = 2 });
+    defer gpa.free(exited);
+    try std.testing.expectEqualStrings("exited 2", exited);
+}

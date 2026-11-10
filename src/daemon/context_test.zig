@@ -584,7 +584,7 @@ test "a shell transcript reaches the model as user context, newest output kept" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const short = try context.shellTranscriptContext(a, "$ ls\nfile.txt", 0, null);
+    const short = try context.shellTranscriptContext(a, .{ .text = "$ ls\nfile.txt", .exit_code = 0 });
     try std.testing.expect(std.mem.startsWith(u8, short, "[The user ran an interactive shell"));
     try std.testing.expect(std.mem.indexOf(u8, short, "$ ls\nfile.txt") != null);
     try std.testing.expect(std.mem.endsWith(u8, short, "[The shell exited with status 0.]"));
@@ -592,8 +592,18 @@ test "a shell transcript reaches the model as user context, newest output kept" 
     const long = try a.alloc(u8, context.shell_transcript_context_bytes + 100);
     @memset(long, 'x');
     @memcpy(long[long.len - 4 ..], "TAIL");
-    const clipped = try context.shellTranscriptContext(a, long, null, 9);
+    const clipped = try context.shellTranscriptContext(a, .{ .text = long, .signal = 9 });
     try std.testing.expect(std.mem.indexOf(u8, clipped, "first 100 bytes are elided") != null);
     try std.testing.expect(std.mem.indexOf(u8, clipped, "TAIL") != null);
     try std.testing.expect(std.mem.endsWith(u8, clipped, "[The shell was ended by signal 9.]"));
+}
+
+test "a shell lost with Marlin tells the model what was running" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const running = try context.shellTranscriptContext(a, .{ .text = "$ htop", .lost = true, .command = "htop -d 10" });
+    try std.testing.expect(std.mem.endsWith(u8, running, "[The shell ended when Marlin stopped, while `htop -d 10` was running.]"));
+    const at_prompt = try context.shellTranscriptContext(a, .{ .text = "$ ", .lost = true });
+    try std.testing.expect(std.mem.endsWith(u8, at_prompt, "[The shell ended when Marlin stopped.]"));
 }

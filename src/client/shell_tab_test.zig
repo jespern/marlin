@@ -218,6 +218,21 @@ test "after a lost connection the shell reattaches; exit and refusal end it" {
     try std.testing.expectEqualStrings("the session is working; wait for its turn to finish", h.app.notice.items);
 }
 
+test "a shell that died with the daemon is let go quietly on reconnect" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    try h.openShell("kept");
+
+    shell_tab.connectionLost(&h.app);
+    shell_tab.connected(&h.app);
+    const attach_msg = (try h.sent())[0].shell_attach;
+    h.app.notice.clearRetainingCapacity();
+    try h.daemonSays("{{\"err\":{{\"code\":\"no_shell\",\"msg\":\"that shell has exited\",\"request_id\":{d}}}}}", .{attach_msg.request_id});
+    try std.testing.expect(!shell_tab.active(&h.app));
+    try std.testing.expectEqualStrings("", h.app.notice.items);
+}
+
 test "the terminal continues the transcript: drawn rows, cursor, and search" {
     const gpa = std.testing.allocator;
     var h: Harness = undefined;

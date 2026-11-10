@@ -572,7 +572,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .shell_transcript => |st| {
             text = st.text;
             styled = st.styled orelse "";
-            generated_label = try shellExitLabel(gpa, st.exit_code, st.signal);
+            generated_label = try shellExitLabel(gpa, st);
             label = generated_label.?;
         },
     }
@@ -1943,9 +1943,13 @@ pub fn layoutBlockRange(
 /// in the block (search, copy, model context).
 pub const shell_transcript_display_lines: usize = 2000;
 
-pub fn shellExitLabel(gpa: std.mem.Allocator, exit_code: ?i32, signal: ?i32) ![]u8 {
-    if (signal) |s| return std.fmt.allocPrint(gpa, "ended by signal {d}", .{s});
-    if (exit_code) |code| if (code != 0) return std.fmt.allocPrint(gpa, "exited {d}", .{code});
+pub fn shellExitLabel(gpa: std.mem.Allocator, st: block.ShellTranscript) ![]u8 {
+    if (st.lost) {
+        if (st.command) |command| return std.fmt.allocPrint(gpa, "ended when Marlin stopped · {s} was running", .{command});
+        return gpa.dupe(u8, "ended when Marlin stopped");
+    }
+    if (st.signal) |s| return std.fmt.allocPrint(gpa, "ended by signal {d}", .{s});
+    if (st.exit_code) |code| if (code != 0) return std.fmt.allocPrint(gpa, "exited {d}", .{code});
     return gpa.dupe(u8, "exited");
 }
 

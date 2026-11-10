@@ -61,6 +61,12 @@ const schema_sql =
     \\  codex_thread_id TEXT,
     \\  title_locked INTEGER NOT NULL DEFAULT 0
     \\);
+    \\CREATE TABLE IF NOT EXISTS live_shells(
+    \\  session_id INTEGER PRIMARY KEY,
+    \\  command TEXT NOT NULL DEFAULT '',
+    \\  text TEXT NOT NULL DEFAULT '',
+    \\  styled TEXT NOT NULL DEFAULT ''
+    \\);
     \\CREATE TABLE IF NOT EXISTS session_pauses(
     \\  session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
     \\  restart INTEGER NOT NULL DEFAULT 0,
@@ -816,6 +822,47 @@ pub const Store = struct {
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(sid));
         try stepDone(stmt);
+    }
+
+    /// A running shell as last saved: what a daemon that died with it left.
+    pub const LiveShell = struct { sid: u64, session_exists: bool, command: []const u8, text: []const u8, styled: []const u8 };
+
+    /// Record the latest state of session `sid`'s running shell.
+    pub fn saveLiveShell(self: Store, sid: u64, command: []const u8, text: []const u8, styled: []const u8) Error!void {
+        const stmt = try self.prepare("INSERT INTO live_shells(session_id,command,text,styled) VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET command=excluded.command,text=excluded.text,styled=excluded.styled");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(sid));
+        bindText(stmt, 2, command);
+        bindText(stmt, 3, text);
+        bindText(stmt, 4, styled);
+        try stepDone(stmt);
+    }
+
+    pub fn clearLiveShell(self: Store, sid: u64) Error!void {
+        const stmt = try self.prepare("DELETE FROM live_shells WHERE session_id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(sid));
+        try stepDone(stmt);
+    }
+
+    /// Every shell recorded as running.
+    pub fn liveShells(self: Store, arena: std.mem.Allocator) Error![]LiveShell {
+        const stmt = try self.prepare("SELECT l.session_id,l.command,l.text,l.styled,s.id IS NOT NULL FROM live_shells l LEFT JOIN sessions s ON s.id=l.session_id ORDER BY l.session_id");
+        defer finalize(stmt);
+        var out: std.ArrayList(LiveShell) = .empty;
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            try out.append(arena, .{
+                .sid = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .session_exists = c.sqlite3_column_int(stmt, 4) != 0,
+                .command = try arena.dupe(u8, columnText(stmt, 1)),
+                .text = try arena.dupe(u8, columnText(stmt, 2)),
+                .styled = try arena.dupe(u8, columnText(stmt, 3)),
+            });
+        }
+        return out.toOwnedSlice(arena);
     }
 
     pub fn appendPausedSteer(self: Store, sid: u64, text: []const u8) Error!void {

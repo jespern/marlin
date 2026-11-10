@@ -202,3 +202,59 @@ test "the shell's current directory follows its cd, as the OS reports it" {
     }
     try std.testing.expect(shell.currentDir(&buf) == null);
 }
+
+test "output settles after a quiet second, at most every interval, and during unbroken output" {
+    const quiet = shell_pty.settle_quiet_ms;
+    const interval = shell_pty.settle_interval_ms;
+    var settle: shell_pty.Settle = .{};
+    try std.testing.expect(!settle.quiet(0)); // nothing written yet
+    try std.testing.expect(!settle.output(100));
+    try std.testing.expect(!settle.quiet(100 + quiet - 1));
+    try std.testing.expect(settle.quiet(100 + quiet)); // the first settle needs no interval
+    try std.testing.expect(!settle.quiet(100 + quiet + 5_000)); // nothing new
+
+    // More output soon after: it waits out the interval, then settles.
+    const last = 100 + quiet;
+    try std.testing.expect(!settle.output(last + 2_000));
+    try std.testing.expect(!settle.quiet(last + 2_000 + quiet));
+    try std.testing.expect(settle.quiet(last + interval));
+
+    // Output that never pauses still settles once an interval has passed.
+    var busy: shell_pty.Settle = .{};
+    var now: i64 = 0;
+    var fired: usize = 0;
+    while (now < 3 * interval) : (now += 50) {
+        if (busy.output(now)) fired += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), fired);
+}
+
+test "a process's command line comes back with its arguments" {
+    var buf: [256]u8 = undefined;
+    const command = shell_pty.processCommand(std.testing.allocator, std.c.getpid(), &buf) orelse return error.NoCommand;
+    try std.testing.expect(command.len > 0);
+    var small: [4]u8 = undefined;
+    const cut = shell_pty.processCommand(std.testing.allocator, std.c.getpid(), &small) orelse return error.NoCommand;
+    try std.testing.expectEqual(@as(usize, 4), cut.len);
+}
+
+test "the foreground command is what the shell runs, and nothing at its prompt" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var environ = try shEnviron();
+    defer environ.deinit();
+    var recorder: Recorder = .{ .io = io };
+    defer recorder.deinit();
+
+    // Job control puts `sleep` in its own, foreground, process group.
+    const shell = try spawnSh(io, &environ, "set -m; sleep 30", &recorder, 80, 24);
+    defer shell.destroy();
+    var buf: [64]u8 = undefined;
+    var waited: usize = 0;
+    const command = while (waited < 200) : (waited += 1) {
+        if (shell.foregroundCommand(&buf)) |found| break found;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.NoForegroundCommand;
+    try std.testing.expectEqualStrings("sleep 30", command);
+}

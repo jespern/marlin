@@ -15,6 +15,11 @@ const read_chunk: usize = 16 * 1024;
 /// Poll timeout: how quickly the reader notices closing or a shell exit
 /// that leaves the PTY held open by a background job.
 const poll_ms: c_int = 100;
+/// Output counts as settled after this much quiet...
+pub const settle_quiet_ms: i64 = 1_000;
+/// ...but settles at most this often, and at least this often while a
+/// program keeps writing without pause.
+pub const settle_interval_ms: i64 = 10_000;
 
 const tiocswinsz: c_ulong = if (builtin.os.tag == .linux) std.os.linux.T.IOCSWINSZ else 0x80087467;
 const tiocsctty: c_ulong = if (builtin.os.tag == .linux) std.os.linux.T.IOCSCTTY else 0x20007461;
@@ -31,6 +36,59 @@ extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopa
 pub const Status = struct { code: ?i32 = null, signal: ?i32 = null };
 
 pub const max_path = 1024;
+
+/// A process's command line, arguments joined by spaces and cut to fit
+/// `buf`; null when the OS will not say.
+pub fn processCommand(gpa: std.mem.Allocator, pid: c.pid_t, buf: []u8) ?[]const u8 {
+    switch (builtin.os.tag) {
+        .macos => {
+            // KERN_PROCARGS2: argc, the executable path, NUL padding, then
+            // argc NUL-terminated arguments, then the environment.
+            const raw = gpa.alloc(u8, 1024 * 1024) catch return null;
+            defer gpa.free(raw);
+            var mib = [3]c_int{ 1, 49, pid }; // CTL_KERN, KERN_PROCARGS2
+            var size: usize = raw.len;
+            if (c.sysctl(&mib, mib.len, raw.ptr, &size, null, 0) != 0 or size < @sizeOf(c_int)) return null;
+            const argc: usize = @intCast(@max(0, std.mem.readInt(c_int, raw[0..@sizeOf(c_int)], builtin.cpu.arch.endian())));
+            var rest = raw[@sizeOf(c_int)..size];
+            const exe_end = std.mem.indexOfScalar(u8, rest, 0) orelse return null;
+            rest = rest[exe_end..];
+            while (rest.len > 0 and rest[0] == 0) rest = rest[1..];
+            var args = std.mem.splitScalar(u8, rest, 0);
+            return joinArgs(&args, argc, buf);
+        },
+        .linux => {
+            var path_buf: [64]u8 = undefined;
+            const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/cmdline", .{pid}, 0) catch return null;
+            const fd = c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+            if (fd < 0) return null;
+            defer _ = c.close(fd);
+            var raw: [4096]u8 = undefined;
+            const n = c.read(fd, &raw, raw.len);
+            if (n <= 0) return null;
+            var args = std.mem.splitScalar(u8, std.mem.trimEnd(u8, raw[0..@intCast(n)], "\x00"), 0);
+            return joinArgs(&args, std.math.maxInt(usize), buf);
+        },
+        else => return null,
+    }
+}
+
+fn joinArgs(args: *std.mem.SplitIterator(u8, .scalar), argc: usize, buf: []u8) ?[]const u8 {
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < argc) : (i += 1) {
+        const arg = args.next() orelse break;
+        if (len > 0 and len < buf.len) {
+            buf[len] = ' ';
+            len += 1;
+        }
+        const n = @min(arg.len, buf.len - len);
+        @memcpy(buf[len..][0..n], arg[0..n]);
+        len += n;
+        if (len == buf.len) break;
+    }
+    return if (len == 0) null else buf[0..len];
+}
 
 /// A process's current working directory, from the OS.
 pub fn processDir(pid: c.pid_t, buf: *[max_path]u8) ?[]const u8 {
@@ -64,6 +122,10 @@ pub const Sink = struct {
     ctx: *anyopaque,
     output: *const fn (ctx: *anyopaque, shell: *Shell, bytes: []const u8) void,
     exited: *const fn (ctx: *anyopaque, shell: *Shell, status: Status) void,
+    /// Output has gone quiet since the last call (see settle_quiet_ms), a
+    /// moment to save the shell's state. Never more often than
+    /// settle_interval_ms.
+    settled: ?*const fn (ctx: *anyopaque, shell: *Shell) void = null,
 };
 
 pub const Options = struct {
@@ -176,6 +238,15 @@ pub const Shell = struct {
         return processDir(self.pid, buf);
     }
 
+    /// The command the shell is running in the foreground, with its
+    /// arguments; null at the prompt (the shell itself is in front).
+    pub fn foregroundCommand(self: *Shell, buf: []u8) ?[]const u8 {
+        if (self.reaped.load(.acquire)) return null;
+        const foreground = tcgetpgrp(self.master);
+        if (foreground <= 0 or foreground == self.pid) return null;
+        return processCommand(self.gpa, foreground, buf);
+    }
+
     pub fn resize(self: *Shell, size: Winsize) void {
         setWinsize(self.master, size);
     }
@@ -188,6 +259,7 @@ pub const Shell = struct {
 
     fn readLoop(self: *Shell) void {
         var buf: [read_chunk]u8 = undefined;
+        var settle: Settle = .{};
         while (!self.closing.load(.acquire)) {
             if (self.unacked.load(.acquire) >= ack_window) {
                 self.io.sleep(.fromMilliseconds(5), .awake) catch {};
@@ -200,12 +272,14 @@ pub const Shell = struct {
                     const n = c.read(self.master, &buf, buf.len);
                     if (n > 0) {
                         self.emit(buf[0..@intCast(n)]);
+                        if (settle.output(self.nowMs())) self.signalSettled();
                         continue;
                     }
                 }
                 // EOF, or EIO once every slave descriptor closed (Linux).
                 break;
             }
+            if (settle.quiet(self.nowMs())) self.signalSettled();
             // Idle: the shell may have exited while a background job holds
             // the PTY open, which never produces EOF.
             if (self.tryReap()) |status| return self.finish(status);
@@ -214,6 +288,14 @@ pub const Shell = struct {
             if (self.tryReap()) |status| return self.finish(status);
             self.io.sleep(.fromMilliseconds(50), .awake) catch {};
         }
+    }
+
+    fn signalSettled(self: *Shell) void {
+        if (self.sink.settled) |settled| settled(self.sink.ctx, self);
+    }
+
+    fn nowMs(self: *Shell) i64 {
+        return @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
     }
 
     fn emit(self: *Shell, bytes: []const u8) void {
@@ -242,6 +324,45 @@ pub const Shell = struct {
         if (c.W.IFEXITED(status)) return .{ .code = c.W.EXITSTATUS(status) };
         if (c.W.IFSIGNALED(status)) return .{ .signal = @intCast(@backingInt(c.W.TERMSIG(status))) };
         return .{};
+    }
+};
+
+/// When output counts as settled: once it has been quiet for
+/// settle_quiet_ms, at most every settle_interval_ms, and at least that
+/// often while output never pauses.
+pub const Settle = struct {
+    /// When output began arriving since the last settle; null when none has.
+    dirty_since_ms: ?i64 = null,
+    last_output_ms: i64 = 0,
+    /// Null before the first settle.
+    last_settle_ms: ?i64 = null,
+
+    /// Output arrived at `now`; true when it has run unbroken long enough
+    /// that it is time to settle anyway.
+    pub fn output(self: *Settle, now: i64) bool {
+        const since = self.dirty_since_ms orelse now;
+        self.dirty_since_ms = since;
+        self.last_output_ms = now;
+        if (now - since < settle_interval_ms or !self.intervalPassed(now)) return false;
+        return self.fire(now);
+    }
+
+    /// The reader found nothing to read at `now`; true when it is time.
+    pub fn quiet(self: *Settle, now: i64) bool {
+        if (self.dirty_since_ms == null or now - self.last_output_ms < settle_quiet_ms) return false;
+        if (!self.intervalPassed(now)) return false;
+        return self.fire(now);
+    }
+
+    fn intervalPassed(self: *const Settle, now: i64) bool {
+        const last = self.last_settle_ms orelse return true;
+        return now - last >= settle_interval_ms;
+    }
+
+    fn fire(self: *Settle, now: i64) bool {
+        self.dirty_since_ms = null;
+        self.last_settle_ms = now;
+        return true;
     }
 };
 

@@ -1054,3 +1054,28 @@ test "composer history returns the last 200 authored prompts independently of tr
     try std.testing.expectEqualStrings("prompt 102", entries[199].text);
     try std.testing.expectEqual(@as(usize, 0), (try store.recentSessionInputs(arena.allocator(), 2, 200)).len);
 }
+
+test "a running shell's saved state is kept until cleared" {
+    const gpa = std.testing.allocator;
+    var db = try Store.open(gpa, null);
+    defer db.close();
+    try db.createSession(7, 1, "/tmp", "local/testing", .auto);
+    try db.saveLiveShell(7, "", "$ ", "");
+    try db.saveLiveShell(7, "htop", "$ htop", "\x1b[1m$\x1b[0m htop");
+    try db.saveLiveShell(99, "vim", "gone", ""); // its session was deleted
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const shells = try db.liveShells(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), shells.len);
+    try std.testing.expectEqual(@as(u64, 7), shells[0].sid);
+    try std.testing.expect(shells[0].session_exists);
+    try std.testing.expect(!shells[1].session_exists);
+    try std.testing.expectEqualStrings("htop", shells[0].command);
+    try std.testing.expectEqualStrings("$ htop", shells[0].text);
+    try std.testing.expectEqualStrings("\x1b[1m$\x1b[0m htop", shells[0].styled);
+
+    try db.clearLiveShell(7);
+    try db.clearLiveShell(99);
+    try std.testing.expectEqual(@as(usize, 0), (try db.liveShells(arena.allocator())).len);
+}

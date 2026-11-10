@@ -629,13 +629,16 @@ pub fn exited(app: *App, msg: anytype) void {
 }
 
 /// An err reply to our shell_open or shell_attach. Returns true when ours.
-pub fn failed(app: *App, request_id: u64, message: []const u8) bool {
+pub fn failed(app: *App, request_id: u64, code: []const u8, message: []const u8) bool {
     if (request_id == 0) return false;
     var views = Views.init(app);
     while (views.next()) |view| if (view.shell) |state| {
-        if (state.request_id != request_id or state.emulator != null) continue;
+        if (state.request_id != request_id) continue;
         dropShell(app, state);
-        app.setNotice("{s}", .{message});
+        // A shell gone by the time we reattach has said why in the
+        // transcript (it exited, or Marlin stopped with it); other
+        // refusals need a word.
+        if (!std.mem.eql(u8, code, "no_shell")) app.setNotice("{s}", .{message});
         return true;
     };
     return false;

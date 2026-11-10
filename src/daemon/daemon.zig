@@ -182,6 +182,8 @@ const Event = union(enum) {
     /// Shell reader thread → dispatcher. `bytes` gpa-owned.
     shell_output: struct { shell_id: u64, bytes: []u8 },
     shell_exited: struct { shell_id: u64, status: shell_pty.Status },
+    /// The shell's output went quiet: time to save its state.
+    shell_settled: struct { shell_id: u64 },
     shutdown,
 };
 
@@ -842,7 +844,7 @@ pub const Daemon = struct {
             .cwd = cwd,
             .environ = &environ,
             .size = shellWinsize(geometry),
-        }, .{ .ctx = self, .output = onShellOutput, .exited = onShellExited }) catch |err| {
+        }, .{ .ctx = self, .output = onShellOutput, .exited = onShellExited, .settled = onShellSettled }) catch |err| {
             host.destroy();
             const msg = try std.fmt.allocPrint(self.gpa, "could not start a shell: {t}", .{err});
             defer self.gpa.free(msg);
@@ -853,6 +855,7 @@ pub const Daemon = struct {
             host.destroy();
             return err;
         };
+        self.saveShellState(host);
         self.broadcastSessionUpsert(sid);
         try self.attachShell(client, host, request_id, null);
     }
@@ -864,6 +867,7 @@ pub const Daemon = struct {
         for (host.viewers.items) |viewer| if (self.lookupClient(viewer.client_id)) |client|
             self.sendTo(client, .{ .shell_exited = .{ .shell_id = host.id, .code = status.code, .signal = status.signal } });
         const sid = host.sid;
+        self.store.clearLiveShell(sid) catch |err| std.log.warn("could not clear saved shell state: {t}", .{err});
         const text = host.transcript(self.gpa, shell_transcript_max_bytes) catch null;
         const styled = host.styledTranscript(self.gpa, shell_transcript_max_bytes) catch null;
         defer if (styled) |owned| self.gpa.free(owned);
@@ -874,6 +878,40 @@ pub const Daemon = struct {
         }
         self.broadcastShellList();
         self.broadcastSessionUpsert(sid);
+    }
+
+    /// Keep the store's copy of a running shell current, so that when the
+    /// daemon goes down with it (a crash, a reboot, /shutdown) the next start
+    /// can show what was there and say what was running.
+    fn saveShellState(self: *Daemon, host: *shell_host.Host) void {
+        var command_buf: [shell_command_max_bytes]u8 = undefined;
+        const command = if (host.pty) |pty| pty.foregroundCommand(&command_buf) orelse "" else "";
+        const text = host.transcript(self.gpa, live_shell_max_bytes) catch return;
+        defer self.gpa.free(text);
+        const styled = host.styledTranscript(self.gpa, live_shell_max_bytes) catch return;
+        defer self.gpa.free(styled);
+        self.store.saveLiveShell(host.sid, command, text, styled) catch |err|
+            std.log.warn("could not save shell state: {t}", .{err});
+    }
+
+    /// Shells the store still lists as running died with the last daemon:
+    /// record each in its session the way an exit would, saying so.
+    fn recoverLostShells(self: *Daemon) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const lost = self.store.liveShells(arena_state.allocator()) catch |err| {
+            std.log.warn("could not read saved shell state: {t}", .{err});
+            return;
+        };
+        for (lost) |shell| {
+            if (shell.session_exists) self.appendSessionBlock(shell.sid, .{ .shell_transcript = .{
+                .text = shell.text,
+                .styled = if (shell.styled.len > 0) shell.styled else null,
+                .lost = true,
+                .command = if (shell.command.len > 0) shell.command else null,
+            } });
+            self.store.clearLiveShell(shell.sid) catch |err| std.log.warn("could not clear saved shell state: {t}", .{err});
+        }
     }
 
     /// Make `client` a viewer of `host` (resizing it to the client when
@@ -985,6 +1023,11 @@ pub const Daemon = struct {
     fn onShellExited(ctx: *anyopaque, shell: *shell_pty.Shell, status: shell_pty.Status) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
         self.events.push(self.io, .{ .shell_exited = .{ .shell_id = shell.id, .status = status } }) catch {};
+    }
+
+    fn onShellSettled(ctx: *anyopaque, shell: *shell_pty.Shell) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        self.events.push(self.io, .{ .shell_settled = .{ .shell_id = shell.id } }) catch {};
     }
 
     fn lookupClient(self: *Daemon, id: u64) ?*Client {
@@ -1142,6 +1185,7 @@ pub const Daemon = struct {
     // --------------------------------------------------------- dispatcher --
 
     fn dispatchLoop(self: *Daemon) void {
+        self.recoverLostShells();
         self.resumePausedSessions(true) catch |err| std.log.err("could not resume suspended sessions: {t}", .{err});
         while (self.events.pop(self.io)) |ev| {
             self.handleEvent(ev) catch |e| {
@@ -1269,6 +1313,7 @@ pub const Daemon = struct {
                 const host = self.shells.get(se.shell_id) orelse return;
                 self.endShell(host, se.status);
             },
+            .shell_settled => |ss| if (self.shells.get(ss.shell_id)) |host| self.saveShellState(host),
             .turn_block => |tb| {
                 defer self.gpa.free(tb.line);
                 self.fanOutLine(tb.sid, tb.line);
@@ -5727,7 +5772,11 @@ pub const Daemon = struct {
 
     fn shutdownCleanup(self: *Daemon) void {
         var shells = self.shells.valueIterator();
-        while (shells.next()) |shell| shell.*.destroy();
+        while (shells.next()) |shell| {
+            // Their last state, for the next start to report.
+            self.saveShellState(shell.*);
+            shell.*.destroy();
+        }
         self.shells.deinit(self.gpa);
         self.shells = .empty;
         if (self.web_service) |service| service.stop();
@@ -5830,7 +5879,7 @@ pub const Daemon = struct {
     fn discardShutdownEvent(self: *Daemon, event: Event) void {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
-            .client_gone, .turn_resumed, .turn_usage_credits, .turn_phase, .shell_exited, .shutdown => {},
+            .client_gone, .turn_resumed, .turn_usage_credits, .turn_phase, .shell_exited, .shell_settled, .shutdown => {},
             .shell_output => |value| self.gpa.free(value.bytes),
             .turn_block => |value| self.gpa.free(value.line),
             .turn_delta => |value| self.gpa.free(value.line),
@@ -5863,6 +5912,9 @@ pub const Daemon = struct {
 const max_message_attachments: usize = 4;
 /// Shell output kept in a session when its shell ends.
 const shell_transcript_max_bytes: usize = 1024 * 1024;
+/// A running shell's saved state is rewritten as it goes, so it keeps less.
+const live_shell_max_bytes: usize = 256 * 1024;
+const shell_command_max_bytes: usize = 200;
 const max_attachment_bytes: usize = 10 * 1024 * 1024;
 const max_message_attachment_bytes: usize = 20 * 1024 * 1024;
 

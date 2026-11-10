@@ -2351,7 +2351,7 @@ pub const App = struct {
                 view.context_limit = m.context_limit;
             },
             .err => |e| {
-                if (shell_tab.failed(self, e.request_id, e.msg)) return;
+                if (shell_tab.failed(self, e.request_id, e.code, e.msg)) return;
                 self.rejectInput(e.request_id);
                 self.setup.status_pending = false;
                 if (self.setup.apply_pending) {
@@ -2492,7 +2492,7 @@ pub const App = struct {
             },
             .compaction => self.pushDurableBlock(b, .compaction, "context compacted", "", .ok),
             .shell_transcript => |st| {
-                const label = layout_mod.shellExitLabel(self.gpa, st.exit_code, st.signal) catch return;
+                const label = layout_mod.shellExitLabel(self.gpa, st) catch return;
                 defer self.gpa.free(label);
                 self.pushDurableBlock(b, .shell_transcript, st.text, label, .ok);
                 if (st.styled) |styled| if (styled.len > 0) {

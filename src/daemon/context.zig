@@ -258,7 +258,8 @@ pub const MediaLoader = *const fn (
 pub const shell_transcript_context_bytes: usize = 16 * 1024;
 
 /// How a shell the user ran in this session reads to the model.
-pub fn shellTranscriptContext(arena: std.mem.Allocator, text: []const u8, exit_code: ?i32, signal: ?i32) ![]const u8 {
+pub fn shellTranscriptContext(arena: std.mem.Allocator, st: block.ShellTranscript) ![]const u8 {
+    const text = st.text;
     const tail = text[text.len -| shell_transcript_context_bytes..];
     const elided = text.len - tail.len;
     var out: std.ArrayList(u8) = .empty;
@@ -267,9 +268,14 @@ pub fn shellTranscriptContext(arena: std.mem.Allocator, text: []const u8, exit_c
     try out.appendSlice(arena, ".]\n```\n");
     try out.appendSlice(arena, tail);
     try out.appendSlice(arena, "\n```\n");
-    if (signal) |s|
+    if (st.lost) {
+        if (st.command) |command|
+            try out.print(arena, "[The shell ended when Marlin stopped, while `{s}` was running.]", .{command})
+        else
+            try out.appendSlice(arena, "[The shell ended when Marlin stopped.]");
+    } else if (st.signal) |s|
         try out.print(arena, "[The shell was ended by signal {d}.]", .{s})
-    else if (exit_code) |code|
+    else if (st.exit_code) |code|
         try out.print(arena, "[The shell exited with status {d}.]", .{code});
     return out.items;
 }
@@ -480,7 +486,7 @@ pub fn assemble(
             // input. Old compactions could bisect a parallel batch and leave
             // exactly this shape; omit it so those sessions self-heal.
             .tool_result => {},
-            .shell_transcript => |st| try msgs.append(arena, .{ .role = .user, .payload = .{ .text = try shellTranscriptContext(arena, st.text, st.exit_code, st.signal) } }),
+            .shell_transcript => |st| try msgs.append(arena, .{ .role = .user, .payload = .{ .text = try shellTranscriptContext(arena, st) } }),
             .reasoning, .approval, .plan, .system_note => {}, // not sent to the model
             .compaction => {}, // handled above
         }

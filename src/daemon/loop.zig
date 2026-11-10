@@ -324,6 +324,8 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .styled = if (value.styled) |styled| try arena.dupe(u8, styled) else null,
             .exit_code = value.exit_code,
             .signal = value.signal,
+            .lost = value.lost,
+            .command = if (value.command) |command| try arena.dupe(u8, command) else null,
         } },
     };
 }
