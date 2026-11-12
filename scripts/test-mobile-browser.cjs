@@ -81,11 +81,17 @@ async function main() {
       const status=document.querySelector('#status').getBoundingClientRect();
       return {bottom:composer.bottom,top:composer.top,statusBottom:status.bottom,height:visualViewport.height,offset:visualViewport.offsetTop,scroll:window.scrollY};
     });
+    // The page re-fits on the next animation frame after a resize: wait for
+    // that instead of a fixed sleep, then assert (the assert explains a miss).
+    const settle=()=>page.waitForFunction(()=>{
+      const c=document.querySelector('#composer').getBoundingClientRect();
+      return Math.abs(c.bottom-visualViewport.height-visualViewport.offsetTop)<2;
+    },null,{timeout:5000}).catch(()=>{});
     let b=await bounds(); assert.ok(Math.abs(b.bottom-b.height-b.offset)<2,JSON.stringify(b));
     assert.ok(b.statusBottom<=b.top+1);
     await page.locator('#input').focus();
     await page.setViewportSize({width:390,height:420});
-    await sleep(100);
+    await settle();
     b=await bounds(); assert.ok(Math.abs(b.bottom-b.height-b.offset)<2,JSON.stringify(b));
     assert.equal(b.scroll,0);
     await page.evaluate(()=>{
@@ -93,13 +99,13 @@ async function main() {
       for(let i=0;i<150;i++) {const p=document.createElement('p');p.textContent='Reading fixture '+i;t.append(p);}
       t.scrollTop=400;
     });
-    await page.setViewportSize({width:390,height:600}); await sleep(100);
+    await page.setViewportSize({width:390,height:600}); await settle();
     assert.equal(await page.locator('#transcript').evaluate(t=>t.scrollTop),400);
     await context.setOffline(true);
     await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Offline');
     await context.setOffline(false);
     await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
-    await page.setViewportSize({width:844,height:390}); await sleep(100);
+    await page.setViewportSize({width:844,height:390}); await settle();
     b=await bounds(); assert.ok(Math.abs(b.bottom-390)<2,JSON.stringify(b));
     assert.deepEqual(errors,[]);
     // ---- pairing: the public name requires a paired device ----
