@@ -53,7 +53,7 @@ is unavailable.
 - **Durable, searchable work.** Messages, tool calls, results, plans, and
   approvals are structured blocks in SQLite. Compaction changes what the
   model sees while preserving the original transcript and full tool outputs.
-  `/search <query>` searches across sessions; `!c` copies the last tool output.
+  `/search <query>` searches across sessions; `!c` copies the last reply's text and `!co` the last full tool output.
 - **A clear view of ongoing work.** Root tabs roll up child activity and
   approvals. The activity row distinguishes model wait, streaming, tools,
   delegation, and compaction. `/diagnostics` separates provider latency,

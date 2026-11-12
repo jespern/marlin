@@ -214,10 +214,15 @@ pub fn appendMarkdownLine(
     continuation_prefix: []const u8,
     base_style: vaxis.Style,
     width: usize,
+    /// Display column where copying starts on the first row: decorative
+    /// markers (paragraph •, heading ◆, quote │) sit before it; list
+    /// markers stay copyable so a copied list still reads as one.
+    copy_col: usize,
 ) !void {
+    const first_copy: render.CopyRow = .{ .content_col = @intCast(@min(copy_col, std.math.maxInt(u16))) };
     const rendered = try inlineMarkdown(arena, raw);
     if (rendered.text.len == 0) {
-        try lines.append(arena, .{ .text = first_prefix, .style = base_style });
+        try lines.append(arena, .{ .text = first_prefix, .style = base_style, .copy = first_copy });
         return;
     }
 
@@ -241,7 +246,7 @@ pub fn appendMarkdownLine(
             .links = try linksForChunk(arena, rendered.links, start, end, line_prefix.len),
             .syntax = try stylesForChunk(arena, rendered.styles, start, end, line_prefix.len),
             .links_resolved = true,
-            .copy = if (first) .{} else render.continuationCopy(displayWidth(line_prefix), consumed_space),
+            .copy = if (first) first_copy else render.continuationCopy(displayWidth(line_prefix), consumed_space),
         });
         first = false;
         start = end;
@@ -731,12 +736,12 @@ pub fn appendCallout(
     const first_line = lines.items.len;
     if (show_label) {
         const label = try std.fmt.allocPrint(arena, "**{s}**", .{calloutLabel(kind)});
-        try appendMarkdownLine(arena, lines, label, prefix, continuation, Palette.md_callout, measure);
+        try appendMarkdownLine(arena, lines, label, prefix, continuation, Palette.md_callout, measure, displayWidth(prefix));
     }
     if (bodies.len == 0) {
-        try appendMarkdownLine(arena, lines, "", prefix, continuation, Palette.md_callout, measure);
+        try appendMarkdownLine(arena, lines, "", prefix, continuation, Palette.md_callout, measure, displayWidth(prefix));
     } else for (bodies) |body| {
-        try appendMarkdownLine(arena, lines, body, prefix, continuation, Palette.md_callout, measure);
+        try appendMarkdownLine(arena, lines, body, prefix, continuation, Palette.md_callout, measure, displayWidth(prefix));
     }
     try decorateCalloutLines(arena, lines, first_line, gutter, measure, kind);
 }
@@ -872,7 +877,7 @@ pub fn wrapMarkdown(
                 continue;
             }
             const prefix = try std.fmt.allocPrint(arena, "{s}│ ", .{gutter});
-            try appendMarkdownLine(arena, lines, quote, prefix, prefix, Palette.md_quote, measure);
+            try appendMarkdownLine(arena, lines, quote, prefix, prefix, Palette.md_quote, measure, displayWidth(prefix));
             i += 1;
             continue;
         }
@@ -904,7 +909,7 @@ pub fn wrapMarkdown(
                 Palette.md_heading_2
             else
                 Palette.md_heading_3;
-            try appendMarkdownLine(arena, lines, trimmed[level + 1 ..], prefix, continuation, style, measure);
+            try appendMarkdownLine(arena, lines, trimmed[level + 1 ..], prefix, continuation, style, measure, displayWidth(prefix));
             i += 1;
             continue;
         }
@@ -913,7 +918,7 @@ pub fn wrapMarkdown(
             const indent = try spaces(arena, item.indent);
             const prefix = try std.fmt.allocPrint(arena, "{s}{s}{s} ", .{ gutter, indent, item.marker });
             const continuation = try spaces(arena, displayWidth(prefix));
-            try appendMarkdownLine(arena, lines, item.content, prefix, continuation, Palette.assistant, measure);
+            try appendMarkdownLine(arena, lines, item.content, prefix, continuation, Palette.assistant, measure, displayWidth(gutter));
             i += 1;
             continue;
         }
@@ -935,6 +940,7 @@ pub fn wrapMarkdown(
             paragraph_continuation,
             if (lead) Palette.md_lead else Palette.assistant,
             measure,
+            displayWidth(paragraph_prefix),
         );
         i += 1;
     }

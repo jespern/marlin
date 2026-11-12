@@ -71,7 +71,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_set_network_filtering | sid, enabled | ok, or err when busy/no policy loaded, err{guest} on guest sessions |
 | sub | sid, from_seq, tail_limit?, before_seq?, around_seq?, replay_limit?, replay_done?, skill_catalog? | replayed blk×N, optional replay_done marker, then status once live; skill_catalog opts the connection into session_skills snapshots for subscribed sessions |
 | unsub | sid | ok |
-| blob_get | hash | blob_result{hash, bytes}; the uncapped tool output behind a truncated inline body (`!c`) |
+| blob_get | hash | blob_result{hash, bytes}; the uncapped tool output behind a truncated inline body (`!co`) |
 | input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer while an agent turn is accepting them (running/awaiting approval); newly started root turns update the session title from the prompt's normalized first line, except generic follow-ups such as `commit it` preserve an existing title; steers and child turns do not retitle; compact, handover, and the atomic finishing edge return `err{not_steerable}` |
 | council_list | — | council_list_result with every configured [[council]] roster |
 | council_set | name, models[] | council_list_result after atomically persisting the (new or replaced) [[council]] table to config.toml |

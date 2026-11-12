@@ -500,7 +500,7 @@ Key decisions:
 
 - **`tool_result` stores full output out-of-band.** `inline_body` is the capped
   head+tail actually eligible for model context; `full_body_ref` points to a
-  content-addressed blob in SQLite. `!c` and
+  content-addressed blob in SQLite. `!co` and
   scrollback read the full blob; context assembly reads `inline_body`. The cap
   happens at capture time for the *inline* copy only — the full output is never
   lost. (Hermes pattern.)
@@ -642,7 +642,7 @@ regenerable/low-value with age; block structure is not.
   `--expire-days N` also truncates older full bodies to tombstones, but only
   when every reference is also older than the horizon and none of their
   sessions is running or awaiting approval. Every
-  block and ref remains resolvable — scrollback never breaks, and `!c` says
+  block and ref remains resolvable — scrollback never breaks, and `!co` says
   "expired or missing" instead of returning empty data. There is no silent
   default retention horizon.
 - The GC transaction is: orphan sweep → optional expired-body demotion →
@@ -674,7 +674,7 @@ shape is std.json's tagged-union form `{"<type>":{...payload}}`, not the
 `{"t": ...}` sketch this section originally carried. Highlights, using the
 real names: `session_create`/`session_list`/`session_kill`, `sub {sid,
 from_seq, tail_limit?, before_seq?, replay_done?}`, `input` (message or steer), `approve`, `interrupt`,
-`session_compact`, and `blob_get {hash}` for full tool output (`!c`); daemon
+`session_compact`, and `blob_get {hash}` for full tool output (`!co`); daemon
 → client is `blk`, `delta`/`reasoning_delta`/`stream_status` (ephemeral),
 `status`, `approval_request`, `session_meta`, `err`. There is no
 `copy.query` and no `blocks.get` — copy is content-addressed blob fetch, and

@@ -71,7 +71,8 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
     .{ .name = "!!", .description = "turn this session into a shell (Ctrl+D turns it back)" },
     .{ .name = "/screenshot", .usage = " [slim]", .description = "copy the window to the clipboard as an image (Alt+S); slim: transcript only", .accepts_args = true },
-    .{ .name = "!c", .description = "copy the last full tool output" },
+    .{ .name = "!c", .description = "copy the last reply's text (no tool calls or output)" },
+    .{ .name = "!co", .description = "copy the last full tool output" },
     .{ .name = "!ss", .usage = " [slim]", .description = "copy the window to the clipboard as an image (alias for /screenshot)", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
     .{ .name = "!rb", .usage = " [client|both]", .description = "rebuild attached Marlin, local client, or both", .accepts_args = true },
@@ -807,6 +808,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
     } else if (std.mem.eql(u8, head, "!")) {
         self.shellEscape(it.rest());
     } else if (std.mem.eql(u8, head, "!c")) {
+        self.copyLastReply();
+    } else if (std.mem.eql(u8, head, "!co")) {
         self.copyLastToolOutput();
     } else if (std.mem.eql(u8, head, "/pause") or std.mem.eql(u8, head, "/resume")) {
         if (!self.pause_supported) {
@@ -938,7 +941,7 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         shell_tab.open(self);
     } else if (head.len > 1 and head[0] == '!') {
         // `!ls -la` — every shell and vim accept the bang glued to the
-        // command. The exact `!c`/`!rb`/`!rbc` shortcuts matched above.
+        // command. The exact `!c`/`!co`/`!rb`/`!rbc` shortcuts matched above.
         self.shellEscape(cmd[1..]);
     } else if (skillInvocation(cmd) != null) {
         self.submitInput(cmd);

@@ -4131,7 +4131,7 @@ test "empty session draws the welcome card; content reclaims it" {
     try std.testing.expect(!found);
 }
 
-test "tool results retain full blob refs and inline !c stages clipboard text" {
+test "tool results retain full blob refs and inline !co stages clipboard text" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -4164,13 +4164,13 @@ test "tool results retain full blob refs and inline !c stages clipboard text" {
     app.view.blocks.clearRetainingCapacity();
 
     app.pushBlock(.tool_result, "complete output", "", .ok);
-    app.runCommand("!c");
+    app.runCommand("!co");
     try std.testing.expectEqualStrings("complete output", app.clipboard_pending.items);
     // No paired call in view → generic source label.
     try std.testing.expectEqualStrings("tool", app.clipboard_desc.items);
 }
 
-test "!c names the folded source it copies (positional batch pairing)" {
+test "!co names the folded source it copies (positional batch pairing)" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -4222,9 +4222,58 @@ test "!c names the folded source it copies (positional batch pairing)" {
         seq += 1;
     }
 
-    app.runCommand("!c");
+    app.runCommand("!co");
     try std.testing.expectEqualStrings("259|## Implementation slices", app.clipboard_pending.items);
     try std.testing.expectEqualStrings("Read docs/PERMISSIONS.md", app.clipboard_desc.items);
+}
+
+test "!c copies the last reply's rendered prose, not its tool calls" {
+    // Case: !c copied the last tool result; Jesper expected exactly what a
+    // mouse drag over the answer yields.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
+    };
+    defer app.deinit();
+
+    app.runCommand("!c");
+    try std.testing.expect(!app.reply_copy_pending);
+
+    const Body = @FieldType(block.Block, "body");
+    const bodies = [_]struct { turn: u64, body: Body }{
+        .{ .turn = 1, .body = .{ .assistant_msg = .{ .text = "Earlier turn." } } },
+        .{ .turn = 2, .body = .{ .assistant_msg = .{ .text = "Checking **both** files:" } } },
+        .{ .turn = 2, .body = .{ .tool_call = .{ .call_id = "c1", .name = "bash", .args_json = "{\"command\":\"ls\"}" } } },
+        .{ .turn = 2, .body = .{ .tool_result = .{ .call_id = "c1", .status = .ok, .inline_body = "a.zig\nb.zig", .full_body_ref = null } } },
+        .{ .turn = 2, .body = .{ .assistant_msg = .{ .text = "Found:\n\n- `a.zig`\n- b.zig" } } },
+    };
+    for (bodies, 1..) |b, seq| app.applyBlock(.{
+        .id = seq,
+        .session_id = 1,
+        .turn_id = b.turn,
+        .seq = seq,
+        .ts = 0,
+        .body = b.body,
+    });
+
+    app.runCommand("!c");
+    try std.testing.expect(app.reply_copy_pending);
+
+    var screen = try vaxis.Screen.init(gpa, .{ .rows = 4, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win = vaxis.Window{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 80, .height = 4, .screen = &screen };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const text = try app.lastReplyText(arena_state.allocator(), win, 80);
+    try std.testing.expectEqualStrings("Checking both files:\n\nFound:\n\n• a.zig\n• b.zig", text);
 }
 
 test "local commands enter editor history" {

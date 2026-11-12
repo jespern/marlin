@@ -30,7 +30,7 @@
 //!             /quit (aliases /exit, /detach — sessions keep running in the daemon),
 //!             /shutdown [--force] (quit and stop the daemon)
 //!   shortcuts: ! <command> (local shell command), bare ! (interactive shell),
-//!              !c (copy last full tool output), !rb [client|both] / !rbc (scoped rebuild),
+//!              !c (copy last reply), !co (copy last full tool output), !rb [client|both] / !rbc (scoped rebuild),
 //!              !s [effect] (screensaver)
 //!   paste:   bracketed paste; large pastes become [paste #N: X lines]
 //!            chips, expanded into the message on send.
@@ -613,6 +613,8 @@ pub const App = struct {
     /// What `!c` is copying ("read_file docs/FOO.md"); folded transcripts
     /// hide the source block, so the notice must identify it.
     clipboard_desc: std.ArrayList(u8) = .empty,
+    /// `!c` asked for the last reply; the frame loop renders and copies it.
+    reply_copy_pending: bool = false,
     /// Top tab strip ([ui] tab_bar; /config tabbar toggles + persists).
     /// Hiding the bar only removes CHROME: alt+N, alt+arrows, gt/gT, </> keep working.
     show_tab_bar: bool = true,
@@ -3501,6 +3503,47 @@ pub const App = struct {
         self.setNotice("no tool output to copy", .{});
     }
 
+    /// `!c`: copy the last reply the way dragging over it would — the
+    /// rendered prose only, no tool calls, results, or reasoning. Wrapping
+    /// needs the terminal's grapheme widths, so the frame loop resolves it.
+    pub fn copyLastReply(self: *App) void {
+        if (self.lastReplyTurn() == null) {
+            self.setNotice("no reply to copy", .{});
+            return;
+        }
+        self.reply_copy_pending = true;
+    }
+
+    fn lastReplyTurn(self: *const App) ?u64 {
+        var i = self.view.blocks.items.len;
+        while (i > 0) {
+            i -= 1;
+            const b = self.view.blocks.items[i];
+            if (b.kind == .assistant_msg and b.text.len > 0) return b.turn_id;
+        }
+        return null;
+    }
+
+    /// Every assistant message of the last replying turn, rendered and
+    /// copied through the same path as a mouse selection, one blank line
+    /// between messages that tool calls separated.
+    pub fn lastReplyText(self: *const App, arena: std.mem.Allocator, win: vaxis.Window, width: usize) ![]const u8 {
+        const turn = self.lastReplyTurn() orelse return "";
+        var out: std.ArrayList(u8) = .empty;
+        for (self.view.blocks.items) |b| {
+            if (b.kind != .assistant_msg or b.turn_id != turn) continue;
+            var lines: std.ArrayList(Line) = .empty;
+            try markdown.wrapMarkdown(arena, &lines, b.text, width);
+            if (lines.items.len == 0) continue;
+            const all = Selection.init(.{ .line = 0, .col = 0 }, .{ .line = lines.items.len - 1, .col = std.math.maxInt(usize) });
+            const text = std.mem.trim(u8, try selectedText(arena, win, lines.items, all), " \n");
+            if (text.len == 0) continue;
+            if (out.items.len > 0) try out.appendSlice(arena, "\n\n");
+            try out.appendSlice(arena, text);
+        }
+        return out.items;
+    }
+
     /// `! <cmd>` / `!cmd`: run through $SHELL in the focused session cwd
     /// (bare `!` = interactive shell). The TUI tears down first; the
     /// entry point reattaches when the shell exits.
@@ -5901,6 +5944,21 @@ pub fn run(
                 if (app.view.sel_clear_after_copy) {
                     app.view.sel_clear_after_copy = false;
                     app.view.sel_anchor = null;
+                }
+            }
+
+            if (app.reply_copy_pending) {
+                app.reply_copy_pending = false;
+                const farena = frame_arena.allocator();
+                const text = try app.lastReplyText(farena, vx.window(), @intCast(app.term_cols));
+                if (text.len == 0) {
+                    app.setNotice("no reply to copy", .{});
+                } else if (vx.copyToSystemClipboard(writer, text, farena)) |_| {
+                    app.yank_register.clearRetainingCapacity();
+                    app.yank_register.appendSlice(app.gpa, text) catch {};
+                    app.setNotice("copied last reply · {Bi:.1}", .{@as(u64, text.len)});
+                } else |_| {
+                    app.setNotice("clipboard copy failed", .{});
                 }
             }
 
