@@ -17,8 +17,49 @@ marlin mcp remove playwright
 The TUI equivalents are `/mcp`, `/mcp add`, `/mcp restart`, `/mcp remove`, and
 `/mcp reload`. Tool read/write policy follows MCP annotations with exact
 `readonly_tools` and `mutating_tools` config overrides. Image results are stored
-as transcript media and sent back to vision-capable providers. Streamable HTTP
-transport remains later work; stdio is the supported product path today.
+as transcript media and sent back to vision-capable providers.
+
+### Remote servers and sign-in
+
+A server with a URL instead of a command speaks Streamable HTTP (MCP
+2026-07-28, falling back to 2025-11-25 sessions for older servers):
+
+```sh
+marlin mcp add linear https://mcp.linear.app/mcp
+```
+
+```toml
+[[mcp]]
+name = "linear"
+url = "https://mcp.linear.app/mcp"   # HTTPS, or plain HTTP to this machine only
+headers = ["X-Team: core"]           # optional extra request headers
+```
+
+A server that wants OAuth shows as `needs login` in `/mcp`. `/mcp login
+<name>` (or `marlin mcp login <name>`) finds the server's authorization
+server, registers Marlin as a native client, and posts a sign-in link. After
+you approve, the browser returns to a listener on the daemon's `127.0.0.1`.
+When that machine is not the one running your browser (over SSH, say), the
+browser's redirect fails; copy the address it tried to open and run
+`/mcp login <name> <that-url>` to finish. Tokens live in
+`~/.config/marlin/mcp-auth.json` (mode 0600), bound to the server's URL, and
+refresh on their own. `/mcp logout <name>` deletes them.
+
+Local servers can carry extra environment: `env = ["KEY=value"]`.
+
+### Plugin servers
+
+Plugins installed with `/plugin install` may ship MCP servers, in `.mcp.json`
+or `mcpServers` in `plugin.json`, as Claude Code plugins do. They register as
+`plugin_<plugin>_<server>`, so their tools carry Claude Code's names
+(`mcp__plugin_<plugin>_<server>__<tool>`), and `${CLAUDE_PLUGIN_ROOT}`,
+`${CLAUDE_PLUGIN_DATA}`, `${VAR}` and `${VAR:-default}` expand. Local (stdio)
+and Streamable HTTP servers are supported; SSE, WebSocket, and bundled
+(`.mcpb`) servers are refused at install. A configured server with the same
+name wins over a plugin's.
+
+These servers serve native Marlin sessions. Claude Code and Codex guests keep
+their own MCP configuration.
 
 ## Provider routing
 

@@ -55,7 +55,9 @@ and dynamic shell templates are not implemented by Marlin.
 
 ## Plugins
 
-Skill-only Claude Code marketplaces can also be installed directly:
+Claude Code plugin marketplaces can also be installed directly. Plugins may
+carry skills and MCP servers (see docs/CONFIGURATION.md); hooks, agents, and
+commands are refused:
 
 ```text
 /plugin marketplace add miradorlabs/agent-plugins

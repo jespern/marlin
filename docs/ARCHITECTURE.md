@@ -1122,8 +1122,13 @@ secret IMMORTAL):
 
 **Extension tools — process boundaries only:**
 
-- **MCP client** (v1): stdio transport is shipped; streamable HTTP remains a
-  later transport. Config lists servers;
+- **MCP client** (v1): stdio and Streamable HTTP (2026-07-28, with a
+  2025-11-25 session fallback) are shipped. Remote servers authorize with
+  OAuth per the MCP spec (`tools/mcp_oauth.zig`: protected-resource and
+  authorization-server discovery, dynamic client registration, PKCE, RFC 9207
+  issuer check); `/mcp login` runs the flow on a thread with a loopback
+  callback listener (`mcp_login.zig`), and a pasted callback URL is replayed
+  into that listener. Config lists servers;
   their tools appear in the registry with provider-safe names
   (`mcp__playwright__click`). Approval policy applies identically. The client
   speaks the current stateless protocol and falls back to the deployed legacy
@@ -1196,10 +1201,11 @@ precedence; skill selection inserts the name plus a space for arguments and
 requires a subsequent Enter to invoke. Cached entries only apply to their
 reported cwd, including when switching sessions or attaching over SSH.
 
-**Skill-only plugins** (`daemon/plugins.zig`) import Claude marketplace catalogs
+**Plugins** (`daemon/plugins.zig`) import Claude marketplace catalogs
 using `.claude-plugin/marketplace.json`. Only relative in-repository plugin
-sources and the default `skills/` layout are accepted. Semantic manifest fields
-for unsupported components, conventional hooks/agents/commands/MCP/LSP files,
+sources, the default `skills/` layout, and MCP servers (`.mcp.json` or
+`mcpServers`, see `plugin_mcp.zig`) are accepted. Semantic manifest fields
+for unsupported components, conventional hooks/agents/commands/LSP files,
 and paths or symlinks escaping the plugin boundary are rejected. No plugin
 installation scripts run. Git operations use existing credentials, disable
 terminal prompting and hooks, and have a 60-second cancellation-aware timeout.
