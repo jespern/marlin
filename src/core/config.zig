@@ -705,6 +705,8 @@ pub fn addMcpServerText(
 ) ![]u8 {
     try validateToolName(name);
     if (cmd.len == 0) return error.McpServerMissingCommand;
+    const remote = cmd.len == 1 and isMcpUrlArgument(cmd[0]);
+    if (remote and !validMcpUrl(cmd[0])) return error.InvalidMcpUrl;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -720,12 +722,18 @@ pub fn addMcpServerText(
     if (out.items.len > 0) try out.append(gpa, '\n');
     try out.appendSlice(gpa, "[[mcp]]\nname = ");
     try appendTomlString(&out, gpa, name);
-    try out.appendSlice(gpa, "\ncmd = [");
-    for (cmd, 0..) |arg, i| {
-        if (i > 0) try out.appendSlice(gpa, ", ");
-        try appendTomlString(&out, gpa, arg);
+    if (remote) {
+        try out.appendSlice(gpa, "\nurl = ");
+        try appendTomlString(&out, gpa, cmd[0]);
+        try out.append(gpa, '\n');
+    } else {
+        try out.appendSlice(gpa, "\ncmd = [");
+        for (cmd, 0..) |arg, i| {
+            if (i > 0) try out.appendSlice(gpa, ", ");
+            try appendTomlString(&out, gpa, arg);
+        }
+        try out.appendSlice(gpa, "]\n");
     }
-    try out.appendSlice(gpa, "]\n");
 
     // Validate the generated document before it can replace the user's file.
     var verify_arena = std.heap.ArenaAllocator.init(gpa);
@@ -884,11 +892,37 @@ pub fn validate(gpa: std.mem.Allocator, cfg: Config) !void {
     }
     for (cfg.mcp_servers, 0..) |server, i| {
         try validateToolName(server.name);
-        if (server.cmd.len == 0) return error.McpServerMissingCommand;
+        if ((server.cmd.len == 0) == (server.url == null)) return error.McpServerMissingCommand;
+        if (server.url) |url| if (!validMcpUrl(url)) return error.InvalidMcpUrl;
+        for (server.headers) |line| if (!validHeaderLine(line)) return error.InvalidMcpHeader;
         for (cfg.mcp_servers[0..i]) |previous| {
             if (std.mem.eql(u8, previous.name, server.name)) return error.DuplicateMcpServer;
         }
     }
+}
+
+/// Remote MCP endpoints must be HTTPS; plain HTTP only to this machine.
+pub fn validMcpUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    const host = switch (uri.host orelse return false) {
+        inline else => |h| h,
+    };
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return host.len > 0;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
+    return std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "[::1]") or std.mem.eql(u8, host, "::1");
+}
+
+pub fn isMcpUrlArgument(arg: []const u8) bool {
+    return std.mem.startsWith(u8, arg, "https://") or std.mem.startsWith(u8, arg, "http://");
+}
+
+fn validHeaderLine(line: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+    const name = std.mem.trim(u8, line[0..colon], " \t");
+    if (name.len == 0) return false;
+    for (name) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+    for (line) |c| if (c == '\r' or c == '\n') return false;
+    return true;
 }
 
 fn isBuiltInProvider(name: []const u8) bool {

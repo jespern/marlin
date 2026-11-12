@@ -730,6 +730,191 @@ fn getRun(
     };
 }
 
+pub const max_captured_headers = 4;
+
+/// Receives a streamed response body. Returning false ends the read early
+/// and closes the connection; it is not an error.
+pub const BodySink = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, bytes: []const u8) bool,
+};
+
+/// One bounded request of any method, for callers that need more than the
+/// provider stream: a body with its own content type, extra headers, and
+/// named response headers (MCP sessions, OAuth challenges).
+pub const Exchange = struct {
+    method: std.http.Method = .GET,
+    url: []const u8,
+    headers: []const std.http.Header = &.{},
+    bearer: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+    accept: ?[]const u8 = null,
+    body: ?[]const u8 = null,
+    max_bytes: usize = 1024 * 1024,
+    /// Absolute bound on the whole exchange, head and body.
+    timeout_ms: i64 = 30_000,
+    cancel: ?*std.atomic.Value(bool) = null,
+    /// Response header names (case-insensitive) copied into `captured`.
+    capture: []const []const u8 = &.{},
+    /// Stream the body here instead of collecting it.
+    sink: ?BodySink = null,
+};
+
+pub const ExchangeResult = struct {
+    status: i64,
+    body: []u8,
+    content_type: ?[]u8,
+    captured: [max_captured_headers]?[]u8 = @splat(null),
+
+    pub fn deinit(self: ExchangeResult, gpa: std.mem.Allocator) void {
+        gpa.free(self.body);
+        if (self.content_type) |value| gpa.free(value);
+        for (self.captured) |value| if (value) |v| gpa.free(v);
+    }
+};
+
+pub fn exchange(client: *std.http.Client, gpa: std.mem.Allocator, req: Exchange) Error!ExchangeResult {
+    if (req.capture.len > max_captured_headers) return error.InvalidRequest;
+    transport_cause = null;
+    transport_detail_len = 0;
+    const pooled = try acquirePooledOrPreflightDns(client, gpa, req.url, req.timeout_ms, req.cancel);
+    var progress = StreamProgress{};
+    var deadline = StreamDeadline{
+        .io = client.io,
+        .cancel = req.cancel,
+        .progress = &progress,
+        .response_head_timeout_ms = req.timeout_ms,
+        .idle_timeout_ms = req.timeout_ms,
+        .total_timeout_ms = req.timeout_ms,
+    };
+    deadline.start() catch {
+        if (pooled) |connection| client.connection_pool.release(connection, client.io);
+        return error.ConcurrencyUnavailable;
+    };
+    const result = exchangeRun(client, gpa, req, &progress, pooled);
+    const reason = deadline.finish();
+    if (reason != .none) {
+        if (result) |response| response.deinit(gpa) else |_| {}
+        return switch (reason) {
+            .cancelled => error.Cancelled,
+            .response_head_timeout, .idle_timeout, .total_timeout => {
+                var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+                setTransportDetail("request {s}: timed out after {d} ms", .{ urlHost(req.url, &host_buffer), req.timeout_ms });
+                return error.HttpTimeout;
+            },
+            .none => unreachable,
+        };
+    }
+    return result;
+}
+
+fn exchangeRun(
+    client: *std.http.Client,
+    gpa: std.mem.Allocator,
+    req: Exchange,
+    progress: *StreamProgress,
+    pooled_connection: ?*std.http.Client.Connection,
+) Error!ExchangeResult {
+    var owns_pooled_connection = pooled_connection != null;
+    errdefer if (owns_pooled_connection)
+        client.connection_pool.release(pooled_connection.?, client.io);
+    if (isCancelled(req.cancel)) return error.Cancelled;
+
+    const uri = std.Uri.parse(req.url) catch return error.InvalidRequest;
+    var auth_storage: ?[]u8 = null;
+    defer if (auth_storage) |auth| gpa.free(auth);
+    const authorization: std.http.Client.Request.Headers.Value = if (req.bearer) |token| blk: {
+        auth_storage = try std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
+        break :blk .{ .override = auth_storage.? };
+    } else .omit;
+    var extra: std.ArrayList(std.http.Header) = .empty;
+    defer extra.deinit(gpa);
+    try extra.appendSlice(gpa, req.headers);
+    if (req.accept) |accept| try extra.append(gpa, .{ .name = "Accept", .value = accept });
+
+    var request = client.request(req.method, uri, .{
+        .connection = pooled_connection,
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .authorization = authorization,
+            .user_agent = .{ .override = "marlin/0.0" },
+            .content_type = if (req.content_type) |value| .{ .override = value } else .omit,
+            // A streamed reply must not sit behind a decompression window.
+            .accept_encoding = .{ .override = "identity" },
+        },
+        .extra_headers = extra.items,
+    }) catch |err| {
+        if (pooled_connection) |connection| connection.closing = true;
+        return mapUrlConnect(req.url, "request setup", err);
+    };
+    owns_pooled_connection = false;
+    defer request.deinit();
+    progress.registerConnection(client.io, request.connection.?);
+    defer progress.clearConnection(client.io);
+    if (progress.aborted.load(.acquire)) return error.Cancelled;
+
+    if (req.body) |body| {
+        request.transfer_encoding = .{ .content_length = body.len };
+        var body_writer = request.sendBodyUnflushed(&.{}) catch |err| return mapRequestConnect(&request, req.url, err);
+        body_writer.writer.writeAll(body) catch |err| return mapRequestConnect(&request, req.url, err);
+        body_writer.end() catch |err| return mapRequestConnect(&request, req.url, err);
+        request.connection.?.flush() catch |err| return mapRequestConnect(&request, req.url, err);
+    } else {
+        request.sendBodiless() catch |err| return mapRequestConnect(&request, req.url, err);
+    }
+
+    var response = request.receiveHead(&.{}) catch |err| return mapResponseHead(&request, req.url, err);
+    progress.response_started.store(true, .release);
+    markActivity(progress);
+    var result: ExchangeResult = .{ .status = @backingInt(response.head.status), .body = &.{}, .content_type = null };
+    errdefer result.deinit(gpa);
+    if (response.head.content_type) |value| result.content_type = try gpa.dupe(u8, value);
+    // Header strings die once the body reader starts; copy them first.
+    var headers = response.head.iterateHeaders();
+    while (headers.next()) |header| {
+        for (req.capture, 0..) |name, i| {
+            if (result.captured[i] != null or !std.ascii.eqlIgnoreCase(header.name, name)) continue;
+            result.captured[i] = try gpa.dupe(u8, header.value);
+        }
+    }
+
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(gpa);
+    var transfer_buffer: [8192]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    var total: usize = 0;
+    while (total < req.max_bytes) {
+        if (isCancelled(req.cancel)) {
+            if (request.connection) |connection| connection.closing = true;
+            return error.Cancelled;
+        }
+        reader.fill(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => {
+                const cause = response.bodyErr() orelse error.ReadFailed;
+                var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
+                recordTransportFailure("response body", urlHost(req.url, &host_buffer), cause);
+                return error.ReadFailed;
+            },
+        };
+        const bytes = reader.buffered();
+        const take = bytes[0..@min(bytes.len, req.max_bytes - total)];
+        markActivity(progress);
+        total += take.len;
+        if (req.sink) |sink| {
+            if (!sink.func(sink.ctx, take)) {
+                if (request.connection) |connection| connection.closing = true;
+                reader.toss(take.len);
+                break;
+            }
+        } else try body.appendSlice(gpa, take);
+        reader.toss(take.len);
+    }
+    if (total >= req.max_bytes and request.connection != null) request.connection.?.closing = true;
+    result.body = try body.toOwnedSlice(gpa);
+    return result;
+}
+
 fn markActivity(progress: *StreamProgress) void {
     _ = progress.activity_generation.fetchAdd(1, .release);
 }

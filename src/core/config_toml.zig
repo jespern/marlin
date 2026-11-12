@@ -21,7 +21,12 @@ pub const ExecTool = struct {
 
 pub const McpServer = struct {
     name: []const u8,
-    cmd: []const []const u8,
+    /// A local server's command (stdio). Empty for a remote server.
+    cmd: []const []const u8 = &.{},
+    /// A remote server's Streamable HTTP endpoint. Exactly one of cmd/url.
+    url: ?[]const u8 = null,
+    /// Extra request headers for a remote server, as `Name: value` lines.
+    headers: []const []const u8 = &.{},
     mutating: bool,
     readonly_tools: []const []const u8 = &.{},
     mutating_tools: []const []const u8 = &.{},
@@ -129,6 +134,8 @@ const PendingExec = struct {
 const PendingMcp = struct {
     name: ?[]const u8 = null,
     cmd: ?[]const []const u8 = null,
+    url: ?[]const u8 = null,
+    headers: []const []const u8 = &.{},
     mutating: bool = true,
     readonly_tools: []const []const u8 = &.{},
     mutating_tools: []const []const u8 = &.{},
@@ -293,6 +300,8 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
                 const current = &(pending_mcp orelse return error.InvalidToml);
                 if (std.mem.eql(u8, key, "name")) current.name = try string(arena, value);
                 if (std.mem.eql(u8, key, "cmd")) current.cmd = try command(arena, value);
+                if (std.mem.eql(u8, key, "url")) current.url = try string(arena, value);
+                if (std.mem.eql(u8, key, "headers")) current.headers = try stringArray(arena, value);
                 if (std.mem.eql(u8, key, "mutating")) current.mutating = try boolean(value);
                 if (std.mem.eql(u8, key, "readonly_tools")) current.readonly_tools = try stringArray(arena, value);
                 if (std.mem.eql(u8, key, "mutating_tools")) current.mutating_tools = try stringArray(arena, value);
@@ -356,11 +365,13 @@ fn finishPending(
     }
     if (pending_mcp.*) |pending| {
         const name = pending.name orelse return error.McpServerMissingName;
-        const cmd = pending.cmd orelse return error.McpServerMissingCommand;
-        if (cmd.len == 0) return error.McpServerMissingCommand;
+        const cmd = pending.cmd orelse &.{};
+        if ((cmd.len == 0) == (pending.url == null)) return error.McpServerMissingCommand;
         try mcp_servers.append(arena, .{
             .name = name,
             .cmd = cmd,
+            .url = pending.url,
+            .headers = pending.headers,
             .mutating = pending.mutating,
             .readonly_tools = pending.readonly_tools,
             .mutating_tools = pending.mutating_tools,
