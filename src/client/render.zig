@@ -116,6 +116,10 @@ pub const Palette = struct {
     pub const syntax_function: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x82, 0xaa, 0xff } } };
     pub const syntax_constant: vaxis.Style = .{ .fg = soft_blue };
     pub const note: vaxis.Style = .{ .fg = soft_blue };
+    /// An asked-and-answered question in the transcript: the question reads
+    /// as prose, the options recede, and the user's pick wears their color.
+    pub const question_head: vaxis.Style = .{ .bold = true };
+    pub const question_option: vaxis.Style = .{ .fg = .{ .index = 7 } };
     pub const steer: vaxis.Style = .{ .fg = .{ .index = 5 }, .bg = prompt_bg }; // magenta
     pub const status_bg: vaxis.Color = .{ .index = 0 };
     pub const status_bar: vaxis.Style = .{ .bg = status_bg, .fg = .{ .index = 7 } };

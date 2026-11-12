@@ -1705,3 +1705,86 @@ test "a shell lost with Marlin says so, and what was running" {
     defer gpa.free(exited);
     try std.testing.expectEqualStrings("exited 2", exited);
 }
+
+fn questionTranscriptText(arena: std.mem.Allocator, blocks: []const RenderBlock, guest: bool) ![]const u8 {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = blocks,
+        .show_tool_transcript = false,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .guest = guest,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    const lines = try layoutLines(arena, gpa, &transcript, 100);
+    var out: std.ArrayList(u8) = .empty;
+    for (lines.items) |line| {
+        try out.appendSlice(arena, try lineText(arena, line));
+        try out.append(arena, '\n');
+    }
+    return out.items;
+}
+
+test "ask_user renders as the question, its options, and the answer on every backend" {
+    // Case: a guest asked with context and choices; once answered the
+    // transcript kept only "⚙ mcp__marlin__ask_user".
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = "{\"question\":\"Which way?\",\"options\":[\"Alpha\",\"Beta\"]}";
+    const codex_args = "{\"type\":\"mcpToolCall\",\"tool\":\"ask_user\",\"arguments\":" ++ args ++ "}";
+    const codex_answer = "{\"content\":[{\"type\":\"text\",\"text\":\"Beta\"}]}";
+    const cases = [_]struct { name: []const u8, args: []const u8, answer: []const u8, guest: bool }{
+        .{ .name = "mcp__marlin__ask_user", .args = args, .answer = "Beta", .guest = true },
+        .{ .name = "MCP marlin/ask_user", .args = codex_args, .answer = codex_answer, .guest = true },
+        .{ .name = "ask_user", .args = args, .answer = "Beta", .guest = false },
+    };
+    for (cases) |c| {
+        const blocks = [_]RenderBlock{
+            .{ .kind = .tool_call, .text = try arena.dupe(u8, "{}"), .label = try arena.dupe(u8, "grep") },
+            .{ .kind = .tool_result, .text = try arena.dupe(u8, "one match"), .label = try arena.dupe(u8, "") },
+            .{ .kind = .tool_call, .text = try arena.dupe(u8, c.args), .label = try arena.dupe(u8, c.name) },
+            .{ .kind = .tool_result, .text = try arena.dupe(u8, c.answer), .label = try arena.dupe(u8, "") },
+        };
+        const text = try questionTranscriptText(arena, &blocks, c.guest);
+        try std.testing.expect(std.mem.indexOf(u8, text, "  ? Which way?\n      1. Alpha\n    ✓ 2. Beta\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "ask_user") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "↳") == null);
+    }
+
+    // A typed answer shows in the user's words; a call that never returned
+    // says so instead of printing Codex's `null` body.
+    const typed = [_]RenderBlock{
+        .{ .kind = .tool_call, .text = try arena.dupe(u8, args), .label = try arena.dupe(u8, "mcp__marlin__ask_user") },
+        .{ .kind = .tool_result, .text = try arena.dupe(u8, "neither, try Gamma"), .label = try arena.dupe(u8, "") },
+    };
+    const typed_text = try questionTranscriptText(arena, &typed, true);
+    try std.testing.expect(std.mem.indexOf(u8, typed_text, "      2. Beta\n  ↳ neither, try Gamma\n") != null);
+    const failed = [_]RenderBlock{
+        .{ .kind = .tool_call, .text = try arena.dupe(u8, codex_args), .label = try arena.dupe(u8, "MCP marlin/ask_user") },
+        .{ .kind = .tool_result, .text = try arena.dupe(u8, "null"), .label = try arena.dupe(u8, ""), .status = .err },
+    };
+    const failed_text = try questionTranscriptText(arena, &failed, true);
+    try std.testing.expect(std.mem.indexOf(u8, failed_text, "  ↳ no answer\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_text, "null") == null);
+}

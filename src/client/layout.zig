@@ -878,6 +878,86 @@ pub fn pendingToolBatch(blocks: []const RenderBlock, start: usize) ?CollapsedToo
     return null;
 }
 
+/// ask_user under each backend's name: native, Claude Code's MCP prefix,
+/// and Codex's "MCP server/tool" label.
+pub fn isAskUserTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "ask_user") or
+        std.mem.eql(u8, name, "mcp__marlin__ask_user") or
+        std.mem.eql(u8, name, "MCP marlin/ask_user");
+}
+
+/// An ask_user call as what happened rather than as tool machinery: the
+/// question, every option with the pick marked, and the user's own words
+/// when they typed instead of picking. Without a result the options stand
+/// unmarked (the turn ended before an answer).
+pub fn appendQuestionRecord(
+    alloc: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    call: RenderBlock,
+    result: ?RenderBlock,
+    w: usize,
+) !void {
+    const args = questionArgs(alloc, call.text);
+    const answered = result != null and result.?.status == .ok;
+    const answer: ?[]const u8 = if (result) |r| questionAnswer(alloc, r.text) else null;
+    try blankLine(alloc, lines);
+    try wrapPrefixed(alloc, lines, "  ? ", if (args.question.len > 0) args.question else "(question)", Palette.question_head, w);
+    var picked = false;
+    for (args.options, 1..) |option, n| {
+        const chosen = answered and std.mem.eql(u8, std.mem.trim(u8, option, " \t"), answer.?);
+        picked = picked or chosen;
+        const row = try std.fmt.allocPrint(alloc, "{s} {d}. {s}", .{ if (chosen) "✓" else " ", n, option });
+        try wrapPrefixed(alloc, lines, "    ", row, if (chosen) Palette.user else Palette.question_option, w);
+    }
+    if (picked) return;
+    if (answered and answer.?.len > 0)
+        try wrapPrefixed(alloc, lines, "  ↳ ", answer.?, Palette.user, w)
+    else if (result != null)
+        try wrapPrefixed(alloc, lines, "  ↳ ", if (answer.?.len > 0) answer.? else "no answer", Palette.note, w);
+}
+
+const QuestionArgs = struct { question: []const u8 = "", options: []const []const u8 = &.{} };
+
+/// Native and Claude Code store `{question, options}`; Codex stores its
+/// whole mcpToolCall item with them under `arguments`.
+pub fn questionArgs(alloc: std.mem.Allocator, args_json: []const u8) QuestionArgs {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, alloc, args_json, .{}) catch return .{};
+    if (root != .object) return .{};
+    const obj = if (root.object.get("arguments")) |inner| (if (inner == .object) inner.object else root.object) else root.object;
+    var out: QuestionArgs = .{};
+    if (obj.get("question")) |q| if (q == .string) {
+        out.question = q.string;
+    };
+    if (obj.get("options")) |opts| if (opts == .array) {
+        var list: std.ArrayList([]const u8) = .empty;
+        for (opts.array.items) |o| if (o == .string) list.append(alloc, o.string) catch return out;
+        out.options = list.items;
+    };
+    return out;
+}
+
+/// The answer text: verbatim for native and Claude Code; Codex hands back
+/// the MCP result object, whose text content is the answer. A JSON null
+/// (Codex's body for a call that never returned) is no answer.
+pub fn questionAnswer(alloc: std.mem.Allocator, body: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "null")) return "";
+    if (trimmed.len == 0 or trimmed[0] != '{') return trimmed;
+    const root = std.json.parseFromSliceLeaky(std.json.Value, alloc, trimmed, .{}) catch return trimmed;
+    if (root != .object) return trimmed;
+    const content = root.object.get("content") orelse return trimmed;
+    if (content != .array) return trimmed;
+    var out: std.ArrayList(u8) = .empty;
+    for (content.array.items) |item| {
+        if (item != .object) continue;
+        const text = item.object.get("text") orelse continue;
+        if (text != .string) continue;
+        if (out.items.len > 0) out.append(alloc, '\n') catch return trimmed;
+        out.appendSlice(alloc, text.string) catch return trimmed;
+    }
+    return if (out.items.len > 0) std.mem.trim(u8, out.items, " \t\r\n") else trimmed;
+}
+
 /// Flatten blocks + delta into wrapped display lines for a given width.
 /// Returned list and its line slices use `arena` (per-frame).
 /// Render blocks[start..end) as display lines. `alloc` owns every derived
@@ -1224,7 +1304,8 @@ pub fn scanToolBatch(
                 const author_diff = isDiffOutput(blocks[i].text) and
                     isFileEditTool(blocks[call_idx].label);
                 const network_read = !failed and isNetworkReadTool(blocks[call_idx].label);
-                if (failed or author_diff or network_read) {
+                const question = isAskUserTool(blocks[call_idx].label);
+                if (failed or author_diff or network_read or question) {
                     try expand.append(alloc, .{
                         .call = call_idx,
                         .result = i,
@@ -1803,7 +1884,9 @@ pub fn layoutBlockRange(
                     // instead of hugging the summary line above.
                     try blankLine(alloc, lines);
                     const result = blocks_all[pair.result];
-                    if (pair.show_result) {
+                    if (isAskUserTool(blocks_all[pair.call].label)) {
+                        try appendQuestionRecord(alloc, lines, blocks_all[pair.call], result, w);
+                    } else if (pair.show_result) {
                         const note = if (result.status == .ok) try diffSummaryNote(alloc, result.text) else null;
                         try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note, result);
                         try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
@@ -1857,9 +1940,17 @@ pub fn layoutBlockRange(
             },
             .tool_call => {
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
-                if (!last_dense) try blankLine(alloc, lines);
                 last_tool_label.* = rb.label;
                 const result = pairedToolResult(transcript.blocks, block_idx);
+                if (isAskUserTool(rb.label)) {
+                    // While parked, the picker card below shows it live.
+                    const parked = result == null and transcript.question != null and
+                        rb.turn_id == transcript.blocks[transcript.blocks.len - 1].turn_id;
+                    if (!parked)
+                        try appendQuestionRecord(alloc, lines, rb, result, w);
+                    continue;
+                }
+                if (!last_dense) try blankLine(alloc, lines);
                 const note = if (result != null and result.?.status == .ok and isFileEditTool(rb.label))
                     try diffSummaryNote(alloc, result.?.text)
                 else
@@ -1879,6 +1970,8 @@ pub fn layoutBlockRange(
                     transcript.blocks[call_idx].label
                 else
                     last_tool_label.*;
+                // The question record above already shows the answer.
+                if (isAskUserTool(tool_label)) continue;
                 // Guest trail: the call line is the progress signal; a
                 // successful result body is machinery unless it is an
                 // authored diff. Failures always show.
