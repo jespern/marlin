@@ -52,6 +52,15 @@ test "host gate: loopback and configured hosts pass, rebinding shapes do not" {
     try std.testing.expect(hostAllowed(&.{}, "127.0.0.1:9000"));
 }
 
+test "a configured host may carry the proxy's port; only the name is matched" {
+    const with_port: []const []const u8 = &.{"marlin.example.com:8443"};
+    try std.testing.expect(hostAllowed(with_port, "marlin.example.com:8443"));
+    try std.testing.expect(hostAllowed(with_port, "marlin.example.com"));
+    try std.testing.expect(!hostAllowed(with_port, "evil.example.com:8443"));
+    try std.testing.expect(originAllowed(with_port, "https://marlin.example.com:8443"));
+    try std.testing.expect(!originAllowed(with_port, "https://evil.example.com:8443"));
+}
+
 test "origin gate: absent or same-host origins pass, cross-site does not" {
     try std.testing.expect(originAllowed(hosts, null)); // same-origin / curl
     try std.testing.expect(originAllowed(hosts, "http://localhost:8377"));

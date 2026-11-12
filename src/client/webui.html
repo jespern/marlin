@@ -1191,7 +1191,7 @@ async function boot() {
   if (!settings.paired) { showPairing(); return; }
   // Loopback needs no address advertisement (you are already here); the
   // footer stays quiet unless something is actionable.
-  if (settings.host && location.hostname !== settings.host) {
+  if (settings.host && location.host !== settings.host) {
     const url = 'https://' + settings.host + '/';
     $('#canonical-url').href = url;
     $('#canonical-url').textContent = url;

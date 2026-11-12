@@ -18,8 +18,9 @@ push = true                  # default
 - `listen` is the address the bridge binds. Loopback by default; set the LAN
   address (or `"0.0.0.0"`) so the proxy can reach it.
 - `hosts` are the names the bridge answers to besides loopback. The first is
-  the address the Web tab and the phone app advertise. A request under one of
-  these names must come from a paired device.
+  the address the Web tab and the phone app advertise; add the proxy's port
+  when it is not 443 (`"marlin.example.com:8443"`). Only the name is matched.
+  A request under one of these names must come from a paired device.
 - `proxy`, when set, is the only non-loopback address allowed to connect.
   Its `X-Forwarded-For` names the real client in the access log, and
   `X-Forwarded-Proto: https` marks the device cookie `Secure`.
@@ -88,13 +89,15 @@ addresses are reachable either way. The Mac itself runs no Tailscale.
    - Handlers: for that domain, upstream `<Mac LAN IP>`, port `8377`.
      Caddy passes the original Host and sets `X-Forwarded-For` and
      `X-Forwarded-Proto`; event streams (SSE) flush without buffering.
-   - Caddy needs port 443 on the LAN interface: if the OPNsense web GUI uses
-     443, move it (System → Settings → Administration → TCP port).
+   - The OPNsense web GUI usually holds 443 (and 80). Rather than move it,
+     give Caddy other ports in its General settings (HTTPS 8443, HTTP 8080:
+     DNS-01 needs neither 80 nor 443) and put the port in Marlin's `hosts`:
+     `hosts = ["marlin.example.com:8443"]`. The phone URL becomes
+     `https://marlin.example.com:8443/`.
 
 3. **DNS on the LAN.** Services → Unbound DNS → Overrides: host `marlin`,
-   domain `example.com`, IP `<OPNsense LAN IP>` (where Caddy listens). If
-   DNS rebind protection is on (Unbound → Advanced → Private Domains), add
-   `example.com` there, or Unbound drops the private answer.
+   domain `example.com`, IP `<OPNsense LAN IP>` (where Caddy listens).
+   Rebind protection only filters upstream answers, never these overrides.
 
 4. **DNS away from home.** In the Tailscale admin console → DNS, add a
    split-DNS nameserver `<OPNsense LAN IP>` restricted to `example.com`. The
@@ -103,11 +106,11 @@ addresses are reachable either way. The Mac itself runs no Tailscale.
    in Cloudflare, unproxied: no split DNS, but the LAN address is public.)
 
 5. **Firewall.** Allow the LAN and the Tailscale interface to reach the
-   OPNsense LAN address on 443. With `proxy` set, the Mac's port 8377 refuses
+   OPNsense LAN address on Caddy's HTTPS port. With `proxy` set, the Mac's port 8377 refuses
    everyone but OPNsense anyway.
 
-Check from the Mac: `curl -s https://marlin.example.com/connection` answers
-`{"host":"marlin.example.com","push_enabled":true,"paired":false}`, and the
+Check from the Mac: `curl -s https://marlin.example.com[:port]/connection` answers
+`{"host":"marlin.example.com[:port]","push_enabled":true,"paired":false}`, and the
 Web tab log shows each request with the client's real address.
 
 ## Phone notifications

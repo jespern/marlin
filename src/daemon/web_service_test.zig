@@ -24,6 +24,9 @@ test "companion log is bounded, strips controls, and advertises the configured h
     s.hosts = &.{ "marlin.example.com", "victory.local" };
     snapshot = try s.snapshot(arena.allocator());
     try std.testing.expectEqualStrings("https://marlin.example.com/", snapshot.url);
+    s.hosts = &.{"marlin.example.com:8443"};
+    snapshot = try s.snapshot(arena.allocator());
+    try std.testing.expectEqualStrings("https://marlin.example.com:8443/", snapshot.url);
     try std.testing.expectEqualStrings("bad [31m log", snapshot.logs[127]);
 }
 test "companion owns the real child process and reaps it on stop" {

@@ -686,12 +686,14 @@ fn isLoopbackName(host: []const u8) bool {
 
 /// A Host header is ours when it names loopback or one of `[web] hosts`
 /// (any port, case- and trailing-dot tolerant). Absent/foreign Hosts — the
-/// shape of a DNS-rebinding request — are rejected.
+/// shape of a DNS-rebinding request — are rejected. A `hosts` entry may
+/// carry the proxy's port ("name:8443") so the advertised URL is right; only
+/// the name is matched.
 pub fn hostAllowed(hosts: []const []const u8, host_header: ?[]const u8) bool {
     const host = hostName(host_header orelse return false);
     if (isLoopbackName(host)) return true;
     for (hosts) |allowed| {
-        if (std.ascii.eqlIgnoreCase(host, std.mem.trimEnd(u8, allowed, "."))) return true;
+        if (std.ascii.eqlIgnoreCase(host, hostName(allowed))) return true;
     }
     return false;
 }
