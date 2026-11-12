@@ -164,6 +164,31 @@ fn sourceUrl(arena: std.mem.Allocator, source: []const u8, cwd: []const u8) ![]c
     return std.fmt.allocPrint(arena, "https://github.com/{s}/{s}.git", .{ owner, repo });
 }
 
+/// The daemon cannot prompt, and over SSH the login keychain is often out
+/// of reach, so a private GitHub marketplace would fail with "could not read
+/// Username". The user's configured helpers still go first; a logged-in `gh`
+/// (which also honors GH_TOKEN/GITHUB_TOKEN) answers when they have nothing.
+pub fn cloneArgv(arena: std.mem.Allocator, source: []const u8, path: []const u8, gh: bool) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ "git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false" });
+    if (gh and std.mem.startsWith(u8, source, "https://github.com/"))
+        try argv.appendSlice(arena, &.{ "-c", "credential.https://github.com.helper=!gh auth git-credential" });
+    try argv.appendSlice(arena, &.{ "clone", "--depth", "1", "--no-local", "--no-recurse-submodules", "--", source, path });
+    return argv.items;
+}
+
+fn onPath(io: Io, environ: *const std.process.Environ.Map, name: []const u8) bool {
+    const path = environ.get("PATH") orelse return false;
+    var dirs = std.mem.tokenizeScalar(u8, path, ':');
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    while (dirs.next()) |dir| {
+        const candidate = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch continue;
+        Io.Dir.cwd().access(io, candidate, .{ .execute = true }) catch continue;
+        return true;
+    }
+    return false;
+}
+
 const Manager = struct {
     arena: std.mem.Allocator,
     io: Io,
@@ -184,7 +209,7 @@ const Manager = struct {
         for ([_][]const u8{ "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES" }) |key| _ = env.swapRemove(key);
         try env.put("GIT_TERMINAL_PROMPT", "0");
         const result = try process_io.run(self.arena, self.io, .{
-            .argv = &.{ "git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "clone", "--depth", "1", "--no-local", "--no-recurse-submodules", "--", source, path },
+            .argv = try cloneArgv(self.arena, source, path, onPath(self.io, self.environ, "gh")),
             .environ_map = &env,
             .timeout_ms = 60_000,
             .cancel = self.cancel,

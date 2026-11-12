@@ -150,3 +150,25 @@ test "plugin installer rejects remote plugin sources and path escapes without ch
     try command(gpa, io, &env, root, .marketplace_add, "-bad-option", false, "InvalidMarketplaceSource");
     try command(gpa, io, &env, root, .marketplace_remove, "bad-market", true, "Removed");
 }
+
+test "GitHub marketplace clones fall back to gh for credentials" {
+    // Case: /plugin marketplace add on a private repo failed with "could not
+    // read Username" because the daemon cannot prompt.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const helper = "credential.https://github.com.helper=!gh auth git-credential";
+    const github = try plugins.cloneArgv(arena, "https://github.com/acme/plugins.git", "/tmp/x", true);
+    try std.testing.expect(containsArg(github, helper));
+    // The override precedes the subcommand, and the source stays after `--`.
+    try std.testing.expectEqualStrings("clone", github[7]);
+    try std.testing.expectEqualStrings("https://github.com/acme/plugins.git", github[github.len - 2]);
+    try std.testing.expect(!containsArg(try plugins.cloneArgv(arena, "https://github.com/acme/plugins.git", "/tmp/x", false), helper));
+    try std.testing.expect(!containsArg(try plugins.cloneArgv(arena, "https://gitlab.com/acme/plugins.git", "/tmp/x", true), helper));
+    try std.testing.expect(!containsArg(try plugins.cloneArgv(arena, "/srv/plugins", "/tmp/x", true), helper));
+}
+
+fn containsArg(argv: []const []const u8, arg: []const u8) bool {
+    for (argv) |a| if (std.mem.eql(u8, a, arg)) return true;
+    return false;
+}
