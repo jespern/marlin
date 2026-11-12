@@ -1,4 +1,4 @@
-//! Headless protocol clients: `marlin run`, `marlin ls`, `marlin inspect`,
+//! Headless protocol clients: `marlin run`, `marlin ls`, `marlin inspect`, `marlin watch`,
 //! `marlin archive`, `marlin unarchive`, `marlin kill`, and `marlin shutdown`.
 //! All drive the daemon over the socket — the in-process M0 path is gone; the daemon
 //! autostarts on demand (attach.connect).
@@ -604,6 +604,154 @@ pub fn run(
         try print(io, "\n\n[{d} in / {d} out tokens, session {s}]\n", .{ tokens_in, tokens_out, resolved.text() });
     }
     return 0;
+}
+
+pub const WatchOptions = struct {
+    handle: ?[]const u8 = null,
+    json: bool = false,
+    until_idle: bool = false,
+};
+
+pub fn parseWatchOptions(args: []const [:0]const u8) !WatchOptions {
+    var options = WatchOptions{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            options.json = true;
+        } else if (std.mem.eql(u8, arg, "--until-idle")) {
+            options.until_idle = true;
+        } else if (std.mem.startsWith(u8, arg, "--") or options.handle != null) {
+            return error.InvalidArgument;
+        } else {
+            options.handle = arg;
+        }
+    }
+    if (options.handle == null) return error.MissingHandle;
+    return options;
+}
+
+/// A read-only projection of one live subscription. Every JSON event is one
+/// complete line; finalized blocks avoid duplicate token/final-message output.
+pub const WatchStream = struct {
+    sid: u64,
+    handle: []const u8,
+    options: WatchOptions,
+    writer: *Io.Writer,
+
+    fn json(self: *WatchStream, value: anytype) !void {
+        try std.json.Stringify.value(value, .{}, self.writer);
+        try self.writer.writeByte('\n');
+    }
+
+    pub fn fail(self: *WatchStream, code: []const u8, message: []const u8) !u8 {
+        if (self.options.json) {
+            try self.json(.{ .event = "error", .session = self.handle, .code = code, .message = message });
+        } else {
+            try self.writer.print("error: {s}: {s}\n", .{ code, message });
+        }
+        try self.writer.flush();
+        return 1;
+    }
+
+    /// Null continues watching. Terminal session states only end the stream
+    /// when requested; an approval or a parked question never counts as done.
+    pub fn accept(self: *WatchStream, msg: proto.DaemonMsg) !?u8 {
+        switch (msg) {
+            .status => |status| {
+                if (status.sid != self.sid) return null;
+                if (self.options.json) {
+                    try self.json(.{
+                        .event = "status",
+                        .session = self.handle,
+                        .state = status.state,
+                        .phase = status.phase,
+                        .pause = status.pause,
+                        .err_text = status.err_text,
+                    });
+                } else {
+                    try self.writer.print("{s}", .{@tagName(status.state)});
+                    if (status.phase) |phase| try self.writer.print(" ({s})", .{@tagName(phase)});
+                    if (status.pause != .none) try self.writer.print(" · {s}", .{@tagName(status.pause)});
+                    if (status.err_text) |text| try self.writer.print(": {s}", .{text});
+                    try self.writer.writeByte('\n');
+                }
+                try self.writer.flush();
+                if (self.options.until_idle) switch (status.state) {
+                    .idle, .done => return 0,
+                    .err => return 1,
+                    else => {},
+                };
+            },
+            .blk => |entry| {
+                if (entry.sid != self.sid) return null;
+                if (self.options.json) {
+                    try self.json(.{
+                        .event = "block",
+                        .session = self.handle,
+                        .seq = entry.b.seq,
+                        .ts = entry.b.ts,
+                        .body = entry.b.body,
+                    });
+                } else switch (entry.b.body) {
+                    .assistant_msg => |message| try self.writer.print("{s}\n", .{message.text}),
+                    .user_msg => |message| if (!message.synthetic) {
+                        try self.writer.print("> {s}\n", .{message.display_text orelse message.text});
+                    },
+                    .steer => |message| try self.writer.print("> {s}\n", .{message.display_text orelse message.text}),
+                    .reasoning => |reasoning| if (reasoning.commentary) {
+                        try self.writer.print("{s}\n", .{reasoning.text});
+                    },
+                    .tool_call => |call| try self.writer.print("[tool: {s}]\n", .{call.name}),
+                    .tool_result => |result| try self.writer.print("[tool: {s}]\n", .{@tagName(result.status)}),
+                    .system_note => |note| try self.writer.print("[{s}]\n", .{note.text}),
+                    else => try self.writer.print("[{s}]\n", .{@tagName(entry.b.kind())}),
+                }
+                try self.writer.flush();
+            },
+            .err => |err| return try self.fail(err.code, err.msg),
+            .daemon_stopping => return try self.fail("daemon_stopping", "daemon is stopping; reconnect to watch again"),
+            else => {},
+        }
+        return null;
+    }
+};
+
+/// Subscribe once and block on actual events. This client neither sends input
+/// nor answers approvals, and a disconnected stream cannot imply completion.
+pub fn streamWatch(gpa: std.mem.Allocator, conn: *attach.Conn, stream: *WatchStream) !u8 {
+    try conn.send(.{ .sub = .{ .sid = stream.sid, .from_seq = 0 } });
+    while (true) {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const msg = conn.recv(arena.allocator()) catch |err| {
+            return stream.fail(@errorName(err), "daemon connection lost before the watch ended");
+        };
+        if (try stream.accept(msg)) |code| return code;
+    }
+}
+
+pub fn watch(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    const options = parseWatchOptions(args) catch {
+        try eprint(io, "usage: marlin watch <session-handle> [--json] [--until-idle]\n", .{});
+        return 2;
+    };
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |err| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{err});
+        return 1;
+    };
+    defer conn.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var resolved = (try resolveSessionArg(io, conn, arena.allocator(), options.handle.?)) orelse return 2;
+    var buffer: [8192]u8 = undefined;
+    var output: Io.File.Writer = .init(.stdout(), io, &buffer);
+    var stream = WatchStream{ .sid = resolved.sid, .handle = resolved.text(), .options = options, .writer = &output.interface };
+    return streamWatch(gpa, conn, &stream);
 }
 
 const InspectOptions = struct {

@@ -97,8 +97,21 @@ marlin attach 63df             # reattach by a unique handle prefix
 marlin --remote host           # attach to a daemon on another machine over SSH
 marlin top                     # live session tree, including child work
 marlin inspect 63df --json     # state, recent blocks, and diagnostics
+marlin watch 63df --json       # current status, then live status and finalized blocks
+marlin watch 63df --until-idle # wait for the current turn to finish
 marlin run "fix the failing test"   # headless turn
 ```
+
+`watch` subscribes to the daemon's event stream without polling or replaying
+history. `--json` writes one JSON object per line, with an `event` of `status`,
+`block`, or `error` and the session's short handle in `session`. Status events
+include `state`, `phase`, `pause`, and `err_text`; block events include `seq`,
+`ts` (Unix milliseconds), and the typed `body`. The stream is read-only;
+approvals and questions stay with the interactive client. `--until-idle`
+exits 0 on `idle` or `done` (including an already-idle session), 1 on a failed
+session or a lost connection, and 2 for invalid arguments. Without that flag,
+it keeps watching across turns until interrupted or disconnected. As with
+other commands, `--remote <host>` routes the subscription over SSH.
 
 Inside the TUI:
 

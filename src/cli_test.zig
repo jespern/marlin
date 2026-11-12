@@ -109,6 +109,7 @@ test "attach option parsing rejects malformed arguments" {
 test "command parse" {
     try std.testing.expectEqual(Command.run, Command.parse("run").?);
     try std.testing.expectEqual(Command.top, Command.parse("top").?);
+    try std.testing.expectEqual(Command.watch, Command.parse("watch").?);
     try std.testing.expectEqual(Command.archive, Command.parse("archive").?);
     try std.testing.expectEqual(Command.unarchive, Command.parse("unarchive").?);
     try std.testing.expectEqual(Command.shutdown, Command.parse("shutdown").?);

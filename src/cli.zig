@@ -27,6 +27,7 @@ pub const Command = enum {
     top,
     search,
     inspect,
+    watch,
     diagnostics,
     archive,
     unarchive,
@@ -124,6 +125,7 @@ pub fn dispatch(
         },
         .search => return headless.search(gpa, io, environ, self_exe, rest),
         .inspect => return headless.inspect(gpa, io, environ, self_exe, rest),
+        .watch => return headless.watch(gpa, io, environ, self_exe, rest),
         .diagnostics => return headless.diagnostics(gpa, io, environ, self_exe, rest),
         .archive => return headless.setArchived(gpa, io, environ, self_exe, rest, true),
         .unarchive => return headless.setArchived(gpa, io, environ, self_exe, rest, false),
@@ -345,6 +347,7 @@ const help_text =
     \\  marlin search <query>  search durable transcripts across sessions
     \\  marlin inspect <handle> [options]  inspect session state, plan, blocks, and diagnostics
     \\      --json | --plan | --kind <kind> | --limit N | --around SEQ | --turn latest
+    \\  marlin watch <handle> [--json] [--until-idle]  stream live session events
     \\  marlin diagnostics [handle] [--json]  inspect recent turn timings
     \\  marlin diagnostics --daemon [--json]  identify the connected daemon
     \\  marlin archive <handle> hide a session tree without deleting it
