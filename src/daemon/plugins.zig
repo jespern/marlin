@@ -4,13 +4,15 @@ const std = @import("std");
 const Io = std.Io;
 const skills = @import("skills.zig");
 const process_io = @import("process_io.zig");
+const plugin_mcp = @import("plugin_mcp.zig");
+const config = @import("../core/config.zig");
 pub const Command = @import("../core/plugin_command.zig").Command;
 
 const Marketplace = struct { name: []const u8, source: []const u8, snapshot: []const u8 };
 const Installed = struct { name: []const u8, marketplace: []const u8, snapshot: []const u8, path: []const u8, version: []const u8 };
 const State = struct { version: u32 = 1, marketplaces: []Marketplace = &.{}, installed: []Installed = &.{} };
 const Catalog = struct { name: []const u8, entries: []std.json.Value };
-const Plugin = struct { name: []const u8, path: []const u8, version: []const u8 };
+const Plugin = struct { name: []const u8, path: []const u8, version: []const u8, mcp: []const plugin_mcp.Def = &.{}, skills: usize = 0 };
 
 pub fn rootPath(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
     const config_dir = try @import("../core/credentials.zig").configDir(gpa, environ);
@@ -102,7 +104,7 @@ fn skillOnlyManifest(manifest: std.json.Value) !void {
     // custom paths, rather than accepting a partially installed plugin.
     var it = manifest.object.iterator();
     while (it.next()) |entry| {
-        const allowed = [_][]const u8{ "name", "version", "description", "author", "homepage", "repository", "license", "keywords", "source", "category", "tags" };
+        const allowed = [_][]const u8{ "name", "version", "description", "author", "homepage", "repository", "license", "keywords", "source", "category", "tags", "mcpServers" };
         for (allowed) |key| {
             if (std.mem.eql(u8, key, entry.key_ptr.*)) break;
         } else return error.UnsupportedPluginComponent;
@@ -121,7 +123,7 @@ fn inspectPlugin(arena: std.mem.Allocator, io: Io, checkout: []const u8, cat: Ca
     if (!std.mem.eql(u8, string(manifest, "name") orelse return error.InvalidPluginManifest, name)) return error.PluginNameMismatch;
     const version = string(manifest, "version") orelse string(entry, "version") orelse "unversioned";
     // Check conventional components even when omitted from plugin.json.
-    const unsupported = [_][]const u8{ "hooks", "agents", "commands", ".mcp.json", ".lsp.json", "settings.json", "output-styles", "scripts", "bin" };
+    const unsupported = [_][]const u8{ "hooks", "agents", "commands", ".lsp.json", "settings.json", "output-styles", "scripts", "bin" };
     for (unsupported) |component| {
         const target = try std.fs.path.join(arena, &.{ path, component });
         Io.Dir.cwd().access(io, target, .{}) catch |err| switch (err) {
@@ -130,7 +132,11 @@ fn inspectPlugin(arena: std.mem.Allocator, io: Io, checkout: []const u8, cat: Ca
         };
         return error.UnsupportedPluginComponent;
     }
-    const skill_dir = try contained(arena, io, path, "skills");
+    const mcp = try plugin_mcp.declared(arena, io, path, &.{ manifest, entry });
+    const skill_dir: ?[]const u8 = contained(arena, io, path, "skills") catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
     // Every resource must stay in the plugin, including symlink targets.
     var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     defer dir.close(io);
@@ -143,10 +149,14 @@ fn inspectPlugin(arena: std.mem.Allocator, io: Io, checkout: []const u8, cat: Ca
         if (file.kind == .sym_link) _ = try contained(arena, io, path, file.path);
         if (file.kind != .file and file.kind != .directory and file.kind != .sym_link) return error.UnsupportedPluginComponent;
     }
-    var index = try skills.Index.load(arena, io, &.{skill_dir});
-    defer index.deinit();
-    if (index.items.items.len == 0) return error.NoUsableSkills;
-    return .{ .name = name, .path = relative, .version = version };
+    var skill_count: usize = 0;
+    if (skill_dir) |directory| {
+        var index = try skills.Index.load(arena, io, &.{directory});
+        defer index.deinit();
+        skill_count = index.items.items.len;
+    }
+    if (skill_count == 0 and mcp.len == 0) return error.NoUsableSkills;
+    return .{ .name = name, .path = relative, .version = version, .mcp = mcp, .skills = skill_count };
 }
 
 fn sourceUrl(arena: std.mem.Allocator, source: []const u8, cwd: []const u8) ![]const u8 {
@@ -312,7 +322,17 @@ const Manager = struct {
                 extended[state.installed.len] = .{ .name = name, .marketplace = market_name, .snapshot = market.snapshot, .path = plugin.path, .version = plugin.version };
                 state.installed = extended;
                 try saveState(a, self.io, self.root, state);
-                return std.fmt.allocPrint(a, "Installed {s} ({s}). Invoke /{s}:<skill>; native agents discover its skills on the next turn.", .{ arg, plugin.version, name });
+                var out: std.ArrayList(u8) = .empty;
+                try out.print(a, "Installed {s} ({s}).", .{ arg, plugin.version });
+                if (plugin.skills > 0) try out.print(a, " Invoke /{s}:<skill>; native agents discover its {d} skills on the next turn.", .{ name, plugin.skills });
+                for (plugin.mcp) |def| {
+                    const server = try plugin_mcp.serverName(a, name, def.name);
+                    if (def.url != null)
+                        try out.print(a, "\n  MCP server {s} (remote): sign in with /mcp login {s}", .{ server, server })
+                    else
+                        try out.print(a, "\n  MCP server {s} (local)", .{server});
+                }
+                return out.toOwnedSlice(a);
             },
         }
     }
@@ -327,7 +347,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.M
     var manager = Manager{ .arena = a, .io = io, .root = root, .environ = environ, .cancel = cancel };
     const message = manager.execute(command, cwd) catch |err| {
         const why = switch (err) {
-            error.UnsupportedPluginComponent => "Only skill-only plugins with the standard skills/ layout are supported; hooks, MCP/LSP servers, agents, commands and custom manifest components are not installed.",
+            error.UnsupportedPluginComponent => "Only skills and MCP servers are supported; plugins with hooks, LSP servers, agents, commands, or custom manifest components are not installed.",
+            error.UnsupportedMcpTransport => "This plugin ships an MCP server over SSE, WebSocket, or a headers helper; Marlin supports local (stdio) and Streamable HTTP servers.",
+            error.UnsupportedMcpBundle => "This plugin ships its MCP servers as a bundle (.mcpb/.dxt or a URL); Marlin reads JSON server definitions only.",
+            error.InvalidMcpConfig => "This plugin's MCP server definitions are malformed.",
             error.UnsupportedPluginSource => "Only plugin sources that are relative paths inside the marketplace repository are supported.",
             error.MarketplaceInUse => "Uninstall this marketplace's plugins before removing it.",
             error.PluginNamespaceConflict => "A plugin with this name is installed from another marketplace; uninstall it first.",
@@ -339,6 +362,40 @@ pub fn run(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.M
     return .{ .ok = true, .message = try gpa.dupe(u8, message) };
 }
 
+/// MCP servers of every installed plugin, as Marlin config. A plugin whose
+/// definitions no longer parse is skipped with a warning, not fatal: one bad
+/// plugin must not take the daemon's other tools down.
+pub fn mcpConfigs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, root: []const u8) ![]config.McpServer {
+    const state = readState(arena, io, root) catch |err| {
+        std.log.warn("plugin registry unreadable for MCP servers: {t}", .{err});
+        return &.{};
+    };
+    var out: std.ArrayList(config.McpServer) = .empty;
+    for (state.installed) |entry| {
+        const servers = pluginMcp(arena, io, environ, root, entry) catch |err| {
+            std.log.warn("plugin {s}: MCP servers skipped: {t}", .{ entry.name, err });
+            continue;
+        };
+        try out.appendSlice(arena, servers);
+    }
+    return out.items;
+}
+
+fn pluginMcp(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, root: []const u8, entry: Installed) ![]config.McpServer {
+    const checkout = try std.fs.path.join(arena, &.{ root, "snapshots", entry.snapshot });
+    const plugin = try contained(arena, io, checkout, entry.path);
+    var manifests: std.ArrayList(std.json.Value) = .empty;
+    if (contained(arena, io, plugin, ".claude-plugin/plugin.json")) |path| {
+        try manifests.append(arena, try readJson(arena, io, path));
+    } else |_| {}
+    if (catalog(arena, io, checkout)) |cat| {
+        for (cat.entries) |candidate| if (std.mem.eql(u8, string(candidate, "name") orelse "", entry.name)) try manifests.append(arena, candidate);
+    } else |_| {}
+    const data = try std.fs.path.join(arena, &.{ root, "data", entry.name });
+    Io.Dir.cwd().createDirPath(io, data) catch {};
+    return plugin_mcp.configsFor(arena, io, environ, entry.name, plugin, data, manifests.items);
+}
+
 pub fn loadSkills(index: *skills.Index, io: Io, root: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(index.gpa);
     defer arena_state.deinit();
@@ -347,7 +404,11 @@ pub fn loadSkills(index: *skills.Index, io: Io, root: []const u8) !void {
     for (state.installed) |entry| {
         const checkout = try std.fs.path.join(a, &.{ root, "snapshots", entry.snapshot });
         const plugin = try contained(a, io, checkout, entry.path);
-        const directory = try contained(a, io, plugin, "skills");
+        // MCP-only plugins have no skills directory.
+        const directory = contained(a, io, plugin, "skills") catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
         var loaded = try skills.Index.load(index.gpa, io, &.{directory});
         defer loaded.deinit();
         try index.merge(&loaded, entry.name);

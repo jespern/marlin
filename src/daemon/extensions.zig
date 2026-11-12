@@ -14,6 +14,8 @@ const permissions = @import("permissions.zig");
 const skills = @import("skills.zig");
 const exec_tool = @import("tools/exec_tool.zig");
 const mcp = @import("tools/mcp.zig");
+const oauth = @import("tools/mcp_oauth.zig");
+const plugins = @import("plugins.zig");
 const registry = @import("tools/registry.zig");
 
 pub const Spec = registry.Spec;
@@ -39,7 +41,13 @@ const Mcp = struct {
 
     fn setError(self: *Mcp, gpa: std.mem.Allocator, err: anyerror) void {
         if (self.last_error) |message| gpa.free(message);
-        self.last_error = std.fmt.allocPrint(gpa, "{t}", .{err}) catch
+        const detail = self.server.detail();
+        self.last_error = (if (err == error.McpUnauthorized)
+            std.fmt.allocPrint(gpa, "needs login · /mcp login {s}", .{self.server.name})
+        else if (detail.len > 0)
+            std.fmt.allocPrint(gpa, "{s}", .{detail})
+        else
+            std.fmt.allocPrint(gpa, "{t}", .{err})) catch
             gpa.dupe(u8, "out of memory while recording MCP error") catch null;
     }
 
@@ -87,6 +95,8 @@ pub const Runtime = struct {
     specs_list: std.ArrayList(Spec) = .empty,
     exec_tools: std.ArrayList(Exec) = .empty,
     mcp_servers: std.ArrayList(Mcp) = .empty,
+    /// Per-server environments (a server with its own `env`).
+    owned_environs: std.ArrayList(*std.process.Environ.Map) = .empty,
     skill_index: skills.Index,
     hook_paths: HookPaths,
     hook_mutex: Io.Mutex = .init,
@@ -157,9 +167,32 @@ pub const Runtime = struct {
             try self.specs_list.append(gpa, spec);
         }
 
-        for (cfg.mcp_servers) |server_cfg| {
-            const argv = try expandPaths(arena, server_cfg.cmd, environ.get("HOME"));
-            const server = try mcp.Server.init(gpa, io, server_cfg.name, argv, child_environ);
+        const auth_path = oauth.storePath(arena, environ) catch null;
+        // Configured servers first; a plugin server never shadows one.
+        const plugin_servers = if (skill_index.plugin_root) |root| try plugins.mcpConfigs(arena, io, environ, root) else &.{};
+        const all_servers = try std.mem.concat(arena, config.McpServer, &.{ cfg.mcp_servers, plugin_servers });
+        for (all_servers, 0..) |server_cfg, index| {
+            const shadowed = for (all_servers[0..index]) |earlier| {
+                if (std.mem.eql(u8, earlier.name, server_cfg.name)) break true;
+            } else false;
+            if (shadowed) {
+                std.log.warn("MCP server '{s}' is defined twice; keeping the first", .{server_cfg.name});
+                continue;
+            }
+            const server_environ = if (server_cfg.env.len == 0) child_environ else blk: {
+                const map = try arena.create(std.process.Environ.Map);
+                map.* = try child_environ.clone(gpa);
+                try self.owned_environs.append(gpa, map);
+                for (server_cfg.env) |line| {
+                    const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+                    try map.put(line[0..eq], line[eq + 1 ..]);
+                }
+                break :blk map;
+            };
+            const server = if (server_cfg.url) |url|
+                try mcp.Server.initHttp(gpa, io, server_cfg.name, url, server_cfg.headers, server_environ, auth_path)
+            else
+                try mcp.Server.init(gpa, io, server_cfg.name, try expandPaths(arena, server_cfg.cmd, environ.get("HOME")), server_environ);
             const entry = Mcp{
                 .server = server,
                 .default_mutating = server_cfg.mutating,
@@ -216,6 +249,8 @@ pub const Runtime = struct {
 
         for (self.mcp_servers.items) |*entry| entry.deinit(self.gpa);
         self.mcp_servers.deinit(self.gpa);
+        for (self.owned_environs.items) |map| map.deinit();
+        self.owned_environs.deinit(self.gpa);
         self.exec_tools.deinit(self.gpa);
         self.specs_list.deinit(self.gpa);
         self.skill_index.deinit();
@@ -238,6 +273,11 @@ pub const Runtime = struct {
         for (self.specs_list.items) |*spec| {
             if (std.mem.eql(u8, spec.name, name)) return spec;
         }
+        return null;
+    }
+
+    pub fn mcpServer(self: *const Runtime, name: []const u8) ?*mcp.Server {
+        for (self.mcp_servers.items) |entry| if (std.mem.eql(u8, entry.server.name, name)) return entry.server;
         return null;
     }
 

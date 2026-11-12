@@ -420,6 +420,11 @@ pub const ClientMsg = union(enum) {
     /// Persist a stdio server in config.toml, then rebuild the live registry.
     mcp_add: struct { name: []const u8, cmd: []const []const u8 },
     mcp_remove: struct { name: []const u8 },
+    /// Start OAuth for a remote server, or finish it with the callback URL
+    /// the user pasted from their browser.
+    mcp_login: struct { name: []const u8, callback: ?[]const u8 = null },
+    /// Forget a remote server's stored credentials.
+    mcp_logout: struct { name: []const u8 },
     /// Persist one client UI preference through the daemon-owned config path.
     ui_set_tab_bar: struct { enabled: bool },
     /// Persist `[ui] bell` (terminal BEL on a background approval).
@@ -674,6 +679,8 @@ pub const DaemonMsg = union(enum) {
     setup_result: struct { model: []const u8, session_updated: bool = false },
     plugin_result: struct { ok: bool, message: []const u8 },
     mcp_list_result: struct { servers: []const McpServerInfo },
+    /// Progress and outcome of an MCP login, for the transcript.
+    mcp_note: struct { ok: bool, message: []const u8, done: bool = true },
     /// Terminal reply after a UI preference is durable.
     ui_config_result: struct {
         tab_bar: bool,

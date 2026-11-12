@@ -67,6 +67,8 @@ const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const otel = @import("otel.zig");
 const extensions = @import("extensions.zig");
+const mcp_login = @import("mcp_login.zig");
+const mcp_oauth = @import("tools/mcp_oauth.zig");
 const registry = @import("provider/registry.zig");
 const claude_code = @import("provider/claude_code.zig");
 const codex = @import("provider/codex.zig");
@@ -176,6 +178,10 @@ const Event = union(enum) {
     recap_ready: RecapResult,
     git_ready: *GitResult,
     plugin_ready: *PluginJob,
+    /// An MCP login reached its sign-in URL, or ended. The job stays owned
+    /// by `mcp_logins` until its `mcp_login_done` is handled.
+    mcp_login_url: *mcp_login.Job,
+    mcp_login_done: *mcp_login.Job,
     /// Turn thread → dispatcher completion. final_text and err_text are
     /// separately owned because child task results serialize both fields.
     turn_done: struct { sid: u64, interrupted: bool, round_budget_reached: bool, err_text: ?[]u8, final_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
@@ -481,6 +487,7 @@ pub const Daemon = struct {
     catalog_cancel: std.atomic.Value(bool) = .init(false),
     catalog_thread: ?std.Thread = null,
     plugin_thread: ?std.Thread = null,
+    mcp_logins: std.ArrayList(*mcp_login.Job) = .empty,
     plugin_cancel: std.atomic.Value(bool) = .init(false),
     git_thread: ?std.Thread = null,
     git_cancel: std.atomic.Value(bool) = .init(false),
@@ -1410,13 +1417,66 @@ pub const Daemon = struct {
                     self.sendCatalog(client);
                 }
             },
+            .mcp_login_url => |job| {
+                if (self.lookupClient(job.client_id)) |client| {
+                    const message = try std.fmt.allocPrint(self.gpa,
+                        \\Sign in to {s}: {s}
+                        \\If your browser cannot reach this machine after you approve, copy the address it was sent to and run /mcp login {s} <that-url>.
+                    , .{ job.name, job.authorization_url.?, job.name });
+                    defer self.gpa.free(message);
+                    self.sendTo(client, .{ .mcp_note = .{ .ok = true, .message = message, .done = false } });
+                }
+            },
+            .mcp_login_done => |job| {
+                for (self.mcp_logins.items, 0..) |candidate, i| if (candidate == job) {
+                    _ = self.mcp_logins.orderedRemove(i);
+                    break;
+                };
+                defer job.deinit();
+                const message = job.message orelse "MCP login ended";
+                var ok = job.ok;
+                var text: []u8 = try self.gpa.dupe(u8, message);
+                defer self.gpa.free(text);
+                if (ok) {
+                    if (self.anySessionBusy()) {
+                        self.gpa.free(text);
+                        text = try std.fmt.allocPrint(self.gpa, "{s}. Its tools load once running turns finish: /mcp restart {s}", .{ message, job.name });
+                    } else if (!(self.extensions.restartMcp(job.name) catch false)) {
+                        ok = false;
+                        self.gpa.free(text);
+                        text = try std.fmt.allocPrint(self.gpa, "{s}, but its tools did not load: see /mcp", .{message});
+                    } else {
+                        const count = if (self.extensions.mcpServer(job.name)) |server| server.tools.items.len else 0;
+                        self.gpa.free(text);
+                        text = try std.fmt.allocPrint(self.gpa, "{s} · {d} tools", .{ message, count });
+                    }
+                }
+                const recipients = [_]?u64{ job.client_id, if (job.paste_client_id != job.client_id) job.paste_client_id else null };
+                for (recipients) |id| if (id) |client_id| if (self.lookupClient(client_id)) |c| {
+                    self.sendTo(c, .{ .mcp_note = .{ .ok = ok, .message = text } });
+                };
+            },
             .plugin_ready => |job| {
                 if (self.plugin_thread) |thread| thread.join();
                 self.plugin_thread = null;
                 defer job.deinit();
-                if (self.lookupClient(job.client_id)) |client|
-                    self.sendTo(client, .{ .plugin_result = .{ .ok = job.result.ok, .message = job.result.message } });
-                if (job.result.ok) self.refreshSkillCatalogs();
+                // Plugins may bring MCP servers: rebuild extensions so they
+                // appear (and leave) without a restart. The result goes out
+                // first; the refreshed skill catalog follows it.
+                const busy = job.result.ok and self.anySessionBusy();
+                if (self.lookupClient(job.client_id)) |client| {
+                    const message = if (busy) try std.mem.concat(self.gpa, u8, &.{ job.result.message, "\nAny MCP servers it brings load once running turns finish: /mcp reload" }) else try self.gpa.dupe(u8, job.result.message);
+                    defer self.gpa.free(message);
+                    self.sendTo(client, .{ .plugin_result = .{ .ok = job.result.ok, .message = message } });
+                }
+                if (job.result.ok) {
+                    if (busy) self.refreshSkillCatalogs() else self.reloadExtensions() catch |err| {
+                        std.log.warn("extension reload after plugin change failed: {t}", .{err});
+                        self.refreshSkillCatalogs();
+                        if (self.lookupClient(job.client_id)) |client|
+                            self.sendTo(client, .{ .mcp_note = .{ .ok = false, .message = "Could not reload extensions after the plugin change; run /mcp reload" } });
+                    };
+                }
             },
             .git_ready => |result| {
                 defer self.gpa.destroy(result);
@@ -3139,6 +3199,65 @@ pub const Daemon = struct {
                 };
                 self.sendMcpStatus(client);
             },
+            .mcp_login => |request| {
+                if (request.callback) |callback| {
+                    const job = self.pendingLogin(request.name) orelse {
+                        self.sendTo(client, .{ .mcp_note = .{ .ok = false, .message = "No login in progress for that server; run /mcp login <name> first." } });
+                        return;
+                    };
+                    job.deliver(callback) catch {
+                        self.sendTo(client, .{ .mcp_note = .{ .ok = false, .message = "That does not look like the sign-in redirect URL (it should contain ?code=…&state=…)." } });
+                        return;
+                    };
+                    job.paste_client_id = client.id;
+                    if (client.id != job.client_id)
+                        self.sendTo(client, .{ .mcp_note = .{ .ok = true, .message = "Finishing sign-in…", .done = false } });
+                    return;
+                }
+                const server = self.extensions.mcpServer(request.name) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_mcp_server", .msg = "unknown MCP server" } });
+                    return;
+                };
+                if (!server.isRemote()) {
+                    self.sendTo(client, .{ .err = .{ .code = "mcp_login", .msg = "only remote (url) MCP servers sign in" } });
+                    return;
+                }
+                if (self.pendingLogin(request.name)) |previous| previous.cancel();
+                const auth_path = try mcp_oauth.storePath(self.gpa, self.environ);
+                defer self.gpa.free(auth_path);
+                try self.mcp_logins.ensureUnusedCapacity(self.gpa, 1);
+                const job = mcp_login.start(self.gpa, self.io, self.environ, client.id, request.name, server.url.?, server.lastChallenge() orelse "", auth_path, .{
+                    .ctx = self,
+                    .func = mcpLoginNotify,
+                }) catch |err| {
+                    const text = try std.fmt.allocPrint(self.gpa, "could not start login: {t}", .{err});
+                    defer self.gpa.free(text);
+                    self.sendTo(client, .{ .mcp_note = .{ .ok = false, .message = text } });
+                    return;
+                };
+                self.mcp_logins.appendAssumeCapacity(job);
+                self.sendTo(client, .{ .mcp_note = .{ .ok = true, .message = "Finding where to sign in…", .done = false } });
+            },
+            .mcp_logout => |request| {
+                const server = self.extensions.mcpServer(request.name) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_mcp_server", .msg = "unknown MCP server" } });
+                    return;
+                };
+                if (self.pendingLogin(request.name)) |job| job.cancel();
+                const auth_path = try mcp_oauth.storePath(self.gpa, self.environ);
+                defer self.gpa.free(auth_path);
+                mcp_oauth.save(self.gpa, self.io, auth_path, request.name, null) catch |err| {
+                    const text = try std.fmt.allocPrint(self.gpa, "could not remove stored credentials: {t}", .{err});
+                    defer self.gpa.free(text);
+                    self.sendTo(client, .{ .mcp_note = .{ .ok = false, .message = text } });
+                    return;
+                };
+                if (server.isRemote() and !self.anySessionBusy()) _ = self.extensions.restartMcp(request.name) catch false;
+                const text = try std.fmt.allocPrint(self.gpa, "Signed out of {s}; its tokens were deleted here (the server may still list the grant until you revoke it there)", .{request.name});
+                defer self.gpa.free(text);
+                self.sendTo(client, .{ .mcp_note = .{ .ok = true, .message = text } });
+                self.sendMcpStatus(client);
+            },
             .mcp_add => |request| {
                 if (self.anySessionBusy()) {
                     self.sendTo(client, .{ .err = .{
@@ -4422,6 +4541,25 @@ pub const Daemon = struct {
             .branch = result.snapshot.branch(),
             .counts = if (result.snapshot.counts) |c| .{ .ahead = c.ahead, .behind = c.behind } else null,
         } });
+    }
+
+    fn pendingLogin(self: *Daemon, name: []const u8) ?*mcp_login.Job {
+        var i = self.mcp_logins.items.len;
+        while (i > 0) {
+            i -= 1;
+            const job = self.mcp_logins.items[i];
+            if (std.mem.eql(u8, job.name, name)) return job;
+        }
+        return null;
+    }
+
+    fn mcpLoginNotify(ctx: *anyopaque, job: *mcp_login.Job, event: mcp_login.Event) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        const queued: Event = switch (event) {
+            .url_ready => .{ .mcp_login_url = job },
+            .finished => .{ .mcp_login_done = job },
+        };
+        self.events.push(self.io, queued) catch std.log.err("MCP login event dropped: {s}", .{@tagName(event)});
     }
 
     fn pluginMain(job: *PluginJob) void {
@@ -5895,6 +6033,11 @@ pub const Daemon = struct {
         self.plugin_cancel.store(true, .release);
         if (self.plugin_thread) |thread| thread.join();
         self.plugin_thread = null;
+        for (self.mcp_logins.items) |job| {
+            job.cancel();
+            if (job.thread) |thread| thread.join();
+            job.thread = null;
+        }
         self.git_cancel.store(true, .release);
         if (self.git_thread) |thread| thread.join();
         self.git_thread = null;
@@ -5915,6 +6058,8 @@ pub const Daemon = struct {
         // behind it. Resolve child futures first and release every owned
         // payload; Mpsc only owns the value slots, not their allocations.
         while (self.events.tryPop(self.io)) |event| self.discardShutdownEvent(event);
+        for (self.mcp_logins.items) |job| job.deinit();
+        self.mcp_logins.deinit(self.gpa);
 
         for (self.catalog.items) |m| self.gpa.free(m.id);
         self.catalog.deinit(self.gpa);
@@ -5991,6 +6136,8 @@ pub const Daemon = struct {
             },
             .recap_ready => |value| self.gpa.free(value.text),
             .plugin_ready => |job| job.deinit(),
+            // Owned by mcp_logins, freed after the drain.
+            .mcp_login_url, .mcp_login_done => {},
             .git_ready => |value| {
                 self.gpa.free(value.cwd);
                 self.gpa.destroy(value);

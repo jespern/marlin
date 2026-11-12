@@ -37,8 +37,8 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
     .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
-    .{ .name = "/plugin", .usage = " [list|marketplace|install|uninstall]", .description = "manage skill-only plugins and marketplaces", .accepts_args = true },
-    .{ .name = "/mcp", .usage = " [add|remove|restart|reload]", .description = "inspect and manage MCP servers", .accepts_args = true },
+    .{ .name = "/plugin", .usage = " [list|marketplace|install|uninstall]", .description = "manage plugins (skills and MCP servers) and marketplaces", .accepts_args = true },
+    .{ .name = "/mcp", .usage = " [add|remove|restart|reload|login|logout]", .description = "inspect and manage MCP servers; login signs in to a remote one", .accepts_args = true },
     .{ .name = "/council", .usage = " [<name>|new <name>|edit <name>|remove <name>]", .description = "list, inspect, or edit review councils", .accepts_args = true },
     .{ .name = "/voice", .usage = " [setup|mode|off]", .description = "dictate into the composer (local STT; setup on first use)", .accepts_args = true },
     .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
@@ -575,12 +575,37 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             self.conn.send(.{ .mcp_remove = .{ .name = name } }) catch {
                 self.setNotice("could not remove MCP server", .{});
             };
+        } else if (std.mem.eql(u8, action.?, "login")) {
+            const name = it.next() orelse {
+                self.setNotice("usage: /mcp login <name> [callback-url]", .{});
+                return;
+            };
+            const callback = it.next();
+            if (it.next() != null) {
+                self.setNotice("usage: /mcp login <name> [callback-url]", .{});
+                return;
+            }
+            self.conn.send(.{ .mcp_login = .{ .name = name, .callback = callback } }) catch {
+                self.setNotice("could not start MCP login", .{});
+            };
+        } else if (std.mem.eql(u8, action.?, "logout")) {
+            const name = it.next() orelse {
+                self.setNotice("usage: /mcp logout <name>", .{});
+                return;
+            };
+            if (it.next() != null) {
+                self.setNotice("usage: /mcp logout <name>", .{});
+                return;
+            }
+            self.conn.send(.{ .mcp_logout = .{ .name = name } }) catch {
+                self.setNotice("could not sign out of MCP server", .{});
+            };
         } else if (std.mem.eql(u8, action.?, "reload") and it.next() == null) {
             self.conn.send(.{ .mcp_reload = .{} }) catch {
                 self.setNotice("could not reload MCP config", .{});
             };
         } else {
-            self.setNotice("usage: /mcp [add <name> <command> [args...]|remove <name>|restart <name>|reload]", .{});
+            self.setNotice("usage: /mcp [add <name> <command or https-url>|remove <name>|restart <name>|reload|login <name> [callback-url]|logout <name>]", .{});
         }
     } else if (std.mem.eql(u8, head, "/plugin")) {
         const plugin_command = @import("../core/plugin_command.zig");

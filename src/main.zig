@@ -129,6 +129,7 @@ test {
     _ = @import("daemon/tools/exec_tool_test.zig");
     _ = @import("daemon/tools/mcp_test.zig");
     _ = @import("daemon/tools/mcp_oauth_test.zig");
+    _ = @import("daemon/mcp_login_test.zig");
     _ = @import("daemon/provider/provider_test.zig");
     _ = @import("daemon/provider/openai_compat_test.zig");
     _ = @import("daemon/provider/dsml_test.zig");

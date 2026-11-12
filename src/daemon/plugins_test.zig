@@ -99,10 +99,10 @@ test "skill-only marketplace install update rollback and uninstall use immutable
     try std.testing.expectEqualStrings("RESOURCE_V1", old_bytes);
     try std.testing.expect(std.mem.startsWith(u8, loaded.content, "PLUGIN_V1"));
 
-    try write(a, io, repo, "plugins/demo/.mcp.json", "{\"mcpServers\":{}}");
+    try write(a, io, repo, "plugins/demo/hooks/hooks.json", "{}");
     try git(gpa, io, repo, &.{ "add", "." });
     try git(gpa, io, repo, &.{ "commit", "-qm", "unsupported" });
-    try command(gpa, io, &env, root, .marketplace_update, "fixture-market", false, "Only skill-only plugins");
+    try command(gpa, io, &env, root, .marketplace_update, "fixture-market", false, "Only skills and MCP servers");
     var after_failure = try base.forProject(io, temp.path);
     defer after_failure.deinit();
     try std.testing.expectEqualStrings(second.get("demo:review").?.path, after_failure.get("demo:review").?.path);
@@ -144,7 +144,7 @@ test "plugin installer rejects remote plugin sources and path escapes without ch
     try command(gpa, io, &env, root, .marketplace_add, repo, true, "bad-market");
     try command(gpa, io, &env, root, .install, "escape@bad-market", false, "UnsafePluginPath");
     try command(gpa, io, &env, root, .install, "remote@bad-market", false, "Only plugin sources");
-    try command(gpa, io, &env, root, .install, "hooks@bad-market", false, "Only skill-only plugins");
+    try command(gpa, io, &env, root, .install, "hooks@bad-market", false, "Only skills and MCP servers");
     try command(gpa, io, &env, root, .install, "linked@bad-market", false, "UnsafePluginPath");
     try command(gpa, io, &env, root, .install, "resource@bad-market", false, "UnsafePluginPath");
     try command(gpa, io, &env, root, .marketplace_add, "-bad-option", false, "InvalidMarketplaceSource");
@@ -171,4 +171,62 @@ test "GitHub marketplace clones fall back to gh for credentials" {
 fn containsArg(argv: []const []const u8, arg: []const u8) bool {
     for (argv) |a| if (std.mem.eql(u8, a, arg)) return true;
     return false;
+}
+
+test "plugins bring MCP servers from .mcp.json and plugin.json under Claude Code's names" {
+    // Case: mirador@miradorlabs ships the Linear MCP server in .mcp.json and
+    // was refused as "not skill-only".
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-plugin-mcp");
+    defer temp.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const repo = try std.fs.path.join(a, &.{ temp.path, "repo" });
+    const root = try std.fs.path.join(a, &.{ temp.path, "installed" });
+    try write(a, io, repo, ".claude-plugin/marketplace.json",
+        \\{"name":"team","plugins":[{"name":"tools","source":"./plugins/tools"},{"name":"sse","source":"./plugins/sse"}]}
+    );
+    try write(a, io, repo, "plugins/tools/.claude-plugin/plugin.json",
+        \\{"name":"tools","version":"0.8.0","mcpServers":{"local":{"command":"${CLAUDE_PLUGIN_ROOT}/bin-server","args":["--data","${CLAUDE_PLUGIN_DATA}"],"env":{"TOKEN":"${FIXTURE_TOKEN:-none}"}}}}
+    );
+    try write(a, io, repo, "plugins/tools/.mcp.json",
+        \\{"mcpServers":{"linear":{"type":"http","url":"https://mcp.linear.app/mcp"}}}
+    );
+    try write(a, io, repo, "plugins/tools/skills/review/SKILL.md", skill);
+    try write(a, io, repo, "plugins/sse/.claude-plugin/plugin.json", "{\"name\":\"sse\"}");
+    try write(a, io, repo, "plugins/sse/.mcp.json",
+        \\{"mcpServers":{"old":{"type":"sse","url":"https://example.com/sse"}}}
+    );
+    try git(gpa, io, repo, &.{ "init", "-q" });
+    try git(gpa, io, repo, &.{ "add", "." });
+    try git(gpa, io, repo, &.{ "commit", "-qm", "fixture" });
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("PATH", "/usr/bin:/bin");
+    try env.put("HOME", temp.path);
+    try command(gpa, io, &env, root, .marketplace_add, repo, true, "tools@team");
+    try command(gpa, io, &env, root, .install, "tools@team", true, "/mcp login plugin_tools_linear");
+    try command(gpa, io, &env, root, .install, "sse@team", false, "SSE");
+
+    const servers = try plugins.mcpConfigs(a, io, &env, root);
+    try std.testing.expectEqual(@as(usize, 2), servers.len);
+    var remote: ?usize = null;
+    var local: ?usize = null;
+    for (servers, 0..) |server, i| {
+        if (std.mem.eql(u8, server.name, "plugin_tools_linear")) remote = i;
+        if (std.mem.eql(u8, server.name, "plugin_tools_local")) local = i;
+    }
+    try std.testing.expectEqualStrings("https://mcp.linear.app/mcp", servers[remote.?].url.?);
+    const stdio = servers[local.?];
+    try std.testing.expect(std.mem.endsWith(u8, stdio.cmd[0], "/plugins/tools/bin-server"));
+    try std.testing.expect(std.fs.path.isAbsolute(stdio.cmd[0]));
+    try std.testing.expect(std.mem.endsWith(u8, stdio.cmd[2], "/data/tools"));
+    try std.testing.expectEqualStrings("TOKEN=none", stdio.env[0]);
+
+    try command(gpa, io, &env, root, .uninstall, "tools@team", true, "Uninstalled");
+    try std.testing.expectEqual(@as(usize, 0), (try plugins.mcpConfigs(a, io, &env, root)).len);
 }

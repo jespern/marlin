@@ -266,10 +266,15 @@ fn readStore(arena: std.mem.Allocator, io: Io, path: []const u8) !StoreFile {
     return std.json.parseFromSliceLeaky(StoreFile, arena, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
 }
 
+/// Servers refresh on their own threads; their read-modify-write of the
+/// shared file must not interleave.
+var store_mutex: Io.Mutex = .init;
+
 /// Replace (or with null, drop) one server's credentials. The file is
 /// created 0600 before any secret is written, then renamed into place.
-/// Callers serialize writes (the daemon owns one writer at a time).
 pub fn save(gpa: std.mem.Allocator, io: Io, path: []const u8, name: []const u8, credentials: ?Credentials) !void {
+    store_mutex.lockUncancelable(io);
+    defer store_mutex.unlock(io);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

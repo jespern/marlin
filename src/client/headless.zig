@@ -16,6 +16,7 @@ const Io = std.Io;
 
 const block = @import("../core/block.zig");
 const proto = @import("../core/proto.zig");
+const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const media = @import("media.zig");
@@ -308,6 +309,11 @@ pub fn mcp(
         try conn.send(.{ .mcp_list = .{} });
     } else if (args.len == 2 and std.mem.eql(u8, args[0], "restart")) {
         try conn.send(.{ .mcp_restart = .{ .name = args[1] } });
+    } else if (args.len == 3 and std.mem.eql(u8, args[0], "add") and config.isMcpUrlArgument(args[2])) {
+        const owned = try gpa.alloc([]const u8, 1);
+        command_args = owned;
+        owned[0] = args[2];
+        try conn.send(.{ .mcp_add = .{ .name = args[1], .cmd = owned } });
     } else if (args.len >= 4 and std.mem.eql(u8, args[0], "add") and std.mem.eql(u8, args[2], "--")) {
         const owned = try gpa.alloc([]const u8, args.len - 3);
         command_args = owned;
@@ -317,8 +323,14 @@ pub fn mcp(
         try conn.send(.{ .mcp_remove = .{ .name = args[1] } });
     } else if (args.len == 1 and std.mem.eql(u8, args[0], "reload")) {
         try conn.send(.{ .mcp_reload = .{} });
+    } else if ((args.len == 2 or args.len == 3) and std.mem.eql(u8, args[0], "login")) {
+        try conn.send(.{ .mcp_login = .{ .name = args[1], .callback = if (args.len == 3) args[2] else null } });
+        return mcpNotes(io, conn);
+    } else if (args.len == 2 and std.mem.eql(u8, args[0], "logout")) {
+        try conn.send(.{ .mcp_logout = .{ .name = args[1] } });
+        return mcpNotes(io, conn);
     } else {
-        try eprint(io, "usage: marlin mcp [list|add <name> -- <command> [args...]|remove <name>|restart <name>|reload]\n", .{});
+        try eprint(io, "usage: marlin mcp [list|add <name> -- <command> [args...]|add <name> <https-url>|remove <name>|restart <name>|reload|login <name> [callback-url]|logout <name>]\n", .{});
         return 2;
     }
 
@@ -339,6 +351,18 @@ pub fn mcp(
         }
     }
     return if (healthy) 0 else 1;
+}
+
+/// Print login progress until the daemon says the exchange is over.
+fn mcpNotes(io: Io, conn: *attach.Conn) !u8 {
+    var arena_state = std.heap.ArenaAllocator.init(conn.gpa);
+    defer arena_state.deinit();
+    while (true) {
+        _ = arena_state.reset(.retain_capacity);
+        const note = conn.recvUntil(arena_state.allocator(), .mcp_note) catch return 1;
+        if (note.ok) try print(io, "{s}\n", .{note.message}) else try eprint(io, "{s}\n", .{note.message});
+        if (note.done) return if (note.ok) 0 else 1;
+    }
 }
 
 fn sessionIds(arena: std.mem.Allocator, sessions: []const proto.SessionInfo) ![]u64 {

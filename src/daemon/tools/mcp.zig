@@ -1,6 +1,8 @@
-//! MCP client: stdio transport first (JSON-RPC over child process pipes),
-//! HTTP later. Config lists servers; their tools register under provider-safe
-//! `mcp__<server>__<tool>` names with the same approval policy machinery.
+//! MCP client over stdio (JSON-RPC over child process pipes) or Streamable
+//! HTTP (one POST per message, answered as JSON or an SSE stream, with OAuth
+//! bearer tokens from mcp_oauth). Config lists servers; their tools register
+//! under provider-safe `mcp__<server>__<tool>` names with the same approval
+//! policy machinery.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -8,10 +10,15 @@ const Io = std.Io;
 
 const block = @import("../../core/block.zig");
 const registry = @import("registry.zig");
+const http = @import("../provider/http.zig");
+const sse = @import("../provider/sse.zig");
+const oauth = @import("mcp_oauth.zig");
 
 pub const current_protocol = "2026-07-28";
 pub const legacy_protocol = "2025-11-25";
 pub const request_timeout_ms: u32 = 15_000;
+/// A remote exchange crosses the network and may run a slow tool.
+pub const http_timeout_ms: i64 = 120_000;
 pub const max_message_bytes: usize = 8 * 1024 * 1024;
 pub const max_media_items: usize = 4;
 pub const max_media_bytes: usize = 10 * 1024 * 1024;
@@ -24,14 +31,24 @@ pub const Tool = struct {
     /// MCP's optional ToolAnnotations.readOnlyHint. Null means the server did
     /// not classify the tool and Marlin should use configured policy.
     read_only_hint: ?bool = null,
+    /// Arguments the schema marks `x-mcp-header`, mirrored as
+    /// `Mcp-Param-<header>` on HTTP calls.
+    header_params: []HeaderParam = &.{},
 
     fn deinit(self: *Tool, gpa: std.mem.Allocator) void {
         gpa.free(self.public_name);
         gpa.free(self.remote_name);
         gpa.free(self.description);
         gpa.free(self.schema_json);
+        for (self.header_params) |param| {
+            gpa.free(param.argument);
+            gpa.free(param.header);
+        }
+        gpa.free(self.header_params);
     }
 };
+
+pub const HeaderParam = struct { argument: []u8, header: []u8 };
 
 pub const CallResult = struct {
     output: []u8,
@@ -70,6 +87,26 @@ pub const Server = struct {
     /// so the failure paths can be exercised without 15-second tests.
     timeout_ms: u32 = request_timeout_ms,
 
+    // Streamable HTTP. `url` set means a remote server: no child process.
+    url: ?[]u8 = null,
+    /// Configured extra headers, as `Name: value` lines.
+    headers: [][]u8 = &.{},
+    pool: ?*http.Pool = null,
+    /// Where OAuth credentials live; null disables bearer auth.
+    auth_path: ?[]u8 = null,
+    /// 2025-11-25 servers only: the session from `initialize`, the version
+    /// it negotiated, and whether the handshake has completed.
+    session_id: ?[]u8 = null,
+    legacy_version: [32]u8 = undefined,
+    legacy_version_len: usize = 0,
+    http_ready: bool = false,
+    http_timeout_ms: i64 = http_timeout_ms,
+    /// The last 401/403 `WWW-Authenticate`, for `/mcp login`.
+    challenge: ?[]u8 = null,
+    /// Human words for the last failure, shown in `/mcp` status.
+    detail_buf: [200]u8 = undefined,
+    detail_len: usize = 0,
+
     pub fn init(
         gpa: std.mem.Allocator,
         io: Io,
@@ -100,14 +137,69 @@ pub const Server = struct {
         return self;
     }
 
+    /// A remote server. Nothing connects until discovery.
+    pub fn initHttp(
+        gpa: std.mem.Allocator,
+        io: Io,
+        name: []const u8,
+        url: []const u8,
+        headers: []const []const u8,
+        environ: ?*const std.process.Environ.Map,
+        auth_path: ?[]const u8,
+    ) !*Server {
+        const self = try gpa.create(Server);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .name = try gpa.dupe(u8, name),
+            .argv = &.{},
+            .environ = environ,
+        };
+        errdefer self.deinit();
+        self.url = try gpa.dupe(u8, url);
+        self.headers = try gpa.alloc([]u8, headers.len);
+        for (self.headers) |*line| line.* = &.{};
+        for (headers, 0..) |line, i| self.headers[i] = try gpa.dupe(u8, line);
+        if (auth_path) |path| self.auth_path = try gpa.dupe(u8, path);
+        const pool = try gpa.create(http.Pool);
+        errdefer gpa.destroy(pool);
+        pool.* = try http.Pool.init(gpa, io, environ);
+        self.pool = pool;
+        return self;
+    }
+
     pub fn deinit(self: *Server) void {
         self.reset();
         for (self.tools.items) |*tool| tool.deinit(self.gpa);
         self.tools.deinit(self.gpa);
         for (self.argv) |arg| self.gpa.free(arg);
         self.gpa.free(self.argv);
+        if (self.url) |url| self.gpa.free(url);
+        for (self.headers) |line| self.gpa.free(line);
+        if (self.headers.len > 0) self.gpa.free(self.headers);
+        if (self.auth_path) |path| self.gpa.free(path);
+        if (self.challenge) |value| self.gpa.free(value);
+        if (self.pool) |pool| {
+            pool.deinit();
+            self.gpa.destroy(pool);
+        }
         self.gpa.free(self.name);
         self.gpa.destroy(self);
+    }
+
+    pub fn isRemote(self: *const Server) bool {
+        return self.url != null;
+    }
+
+    /// The last failure in words, empty when there is none to add.
+    pub fn detail(self: *const Server) []const u8 {
+        return self.detail_buf[0..self.detail_len];
+    }
+
+    fn setDetail(self: *Server, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.bufPrint(&self.detail_buf, fmt, args) catch self.detail_buf[0..];
+        self.detail_len = text.len;
     }
 
     /// Start the server and cache a deterministic tools/list snapshot.
@@ -124,9 +216,12 @@ pub const Server = struct {
         for (self.tools.items) |*tool| tool.deinit(self.gpa);
         self.tools.clearRetainingCapacity();
 
+        self.detail_len = 0;
         try self.start();
         self.mode = .modern;
-        self.listAllTools() catch {
+        self.listAllTools() catch |err| {
+            // A login is the fix, not an older protocol.
+            if (err == error.McpUnauthorized or err == error.Cancelled) return err;
             // Most deployed servers still implement the 2025 lifecycle. A
             // fresh process avoids carrying any pre-initialize error state.
             self.reset();
@@ -180,6 +275,7 @@ pub const Server = struct {
     }
 
     fn start(self: *Server) !void {
+        if (self.url != null) return;
         if (self.child != null) return;
         self.child = try std.process.spawn(self.io, .{
             .argv = @ptrCast(self.argv),
@@ -193,6 +289,12 @@ pub const Server = struct {
     }
 
     fn reset(self: *Server) void {
+        if (self.url != null) {
+            if (self.session_id) |id| self.gpa.free(id);
+            self.session_id = null;
+            self.http_ready = false;
+            return;
+        }
         self.reader = null;
         self.writer = null;
         if (self.child) |*child| child.kill(self.io);
@@ -200,6 +302,10 @@ pub const Server = struct {
     }
 
     fn ensureReady(self: *Server) !void {
+        if (self.url != null) {
+            if (self.mode == .legacy and !self.http_ready) try self.initializeLegacy();
+            return;
+        }
         if (self.child != null) return;
         try self.start();
         if (self.mode == .legacy) try self.initializeLegacy();
@@ -211,10 +317,17 @@ pub const Server = struct {
         const params = try std.fmt.allocPrint(arena_state.allocator(),
             \\{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"marlin","version":"{s}"}}}}
         , .{build_options.version});
-        _ = try self.request(arena_state.allocator(), "initialize", params);
+        const response = try self.request(arena_state.allocator(), "initialize", params);
+        if (self.url != null) {
+            // Later requests carry the version the server chose.
+            const version = if (resultObject(response)) |result| stringField(result, "protocolVersion") orelse legacy_protocol else legacy_protocol;
+            self.legacy_version_len = @min(version.len, self.legacy_version.len);
+            @memcpy(self.legacy_version[0..self.legacy_version_len], version[0..self.legacy_version_len]);
+        }
         try self.notify(
             \\{"jsonrpc":"2.0","method":"notifications/initialized"}
         );
+        if (self.url != null) self.http_ready = true;
     }
 
     fn listAllTools(self: *Server) !void {
@@ -252,6 +365,14 @@ pub const Server = struct {
         errdefer self.gpa.free(remote_owned);
         const description_owned = try self.gpa.dupe(u8, description);
         errdefer self.gpa.free(description_owned);
+        const header_params = try headerParams(self.gpa, schema_value);
+        errdefer {
+            for (header_params) |param| {
+                self.gpa.free(param.argument);
+                self.gpa.free(param.header);
+            }
+            self.gpa.free(header_params);
+        }
         const read_only_hint: ?bool = if (value.object.get("annotations")) |annotations|
             if (annotations == .object)
                 if (annotations.object.get("readOnlyHint")) |hint|
@@ -268,6 +389,7 @@ pub const Server = struct {
             .description = description_owned,
             .schema_json = schema,
             .read_only_hint = read_only_hint,
+            .header_params = header_params,
         });
     }
 
@@ -318,6 +440,7 @@ pub const Server = struct {
         params_json: []const u8,
         cancel: ?*const std.atomic.Value(bool),
     ) !std.json.Value {
+        if (self.url != null) return self.httpRequest(arena, method, params_json, cancel);
         const id = self.next_id;
         self.next_id +%= 1;
         const line = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}", .{ id, method, params_json });
@@ -346,7 +469,226 @@ pub const Server = struct {
     }
 
     fn notify(self: *Server, line: []const u8) !void {
+        if (self.url != null) {
+            var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena_state.deinit();
+            const method = blk: {
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), line, .{}) catch break :blk "";
+                break :blk if (parsed == .object) stringField(parsed.object, "method") orelse "" else "";
+            };
+            _ = try self.httpPost(arena_state.allocator(), method, null, line, null, null);
+            return;
+        }
         try self.writeMessage(line);
+    }
+
+    // ------------------------------------------------- Streamable HTTP --
+
+    const HttpOutcome = union(enum) { response: std.json.Value, accepted, unauthorized, session_expired };
+
+    fn httpRequest(
+        self: *Server,
+        arena: std.mem.Allocator,
+        method: []const u8,
+        params_json: []const u8,
+        cancel: ?*const std.atomic.Value(bool),
+    ) !std.json.Value {
+        const id = self.next_id;
+        self.next_id +%= 1;
+        const body = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}", .{ id, method, params_json });
+        var retried = false;
+        while (true) {
+            switch (try self.httpPost(arena, method, params_json, body, id, cancel)) {
+                .response => |value| return value,
+                .accepted => return error.InvalidMcpResponse,
+                .unauthorized => {
+                    // One refresh, then the user has to log in again.
+                    if (!retried and self.forceRefresh(arena)) {
+                        retried = true;
+                        continue;
+                    }
+                    self.setDetail("needs login: /mcp login {s}", .{self.name});
+                    return error.McpUnauthorized;
+                },
+                .session_expired => {
+                    if (retried or std.mem.eql(u8, method, "initialize")) return error.McpSessionExpired;
+                    retried = true;
+                    self.reset();
+                    try self.initializeLegacy();
+                },
+            }
+        }
+    }
+
+    /// One POST. `id` null means a notification, answered 202.
+    fn httpPost(
+        self: *Server,
+        arena: std.mem.Allocator,
+        method: []const u8,
+        params_json: ?[]const u8,
+        body: []const u8,
+        id: ?u64,
+        cancel: ?*const std.atomic.Value(bool),
+    ) !HttpOutcome {
+        var headers: std.ArrayList(std.http.Header) = .empty;
+        for (self.headers) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            try headers.append(arena, .{
+                .name = std.mem.trim(u8, line[0..colon], " \t"),
+                .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
+            });
+        }
+        if (self.mode == .modern) {
+            try headers.append(arena, .{ .name = "MCP-Protocol-Version", .value = current_protocol });
+            try headers.append(arena, .{ .name = "Mcp-Method", .value = try encodeHeaderValue(arena, method) });
+            if (params_json) |params| try self.appendRoutingHeaders(arena, &headers, method, params);
+        } else if (!std.mem.eql(u8, method, "initialize")) {
+            const version = if (self.legacy_version_len > 0) self.legacy_version[0..self.legacy_version_len] else legacy_protocol;
+            try headers.append(arena, .{ .name = "MCP-Protocol-Version", .value = version });
+            if (self.session_id) |session| try headers.append(arena, .{ .name = "Mcp-Session-Id", .value = session });
+        }
+
+        var sink: ResponseSink = .{ .gpa = self.gpa, .arena = arena, .id = id, .parser = .init(self.gpa) };
+        defer sink.deinit();
+        const pool = self.pool orelse return error.McpServerNotRunning;
+        const result = http.exchange(&pool.client, self.gpa, .{
+            .method = .POST,
+            .url = self.url.?,
+            .headers = headers.items,
+            .bearer = self.bearerToken(arena),
+            .content_type = "application/json",
+            .accept = "application/json, text/event-stream",
+            .body = body,
+            .max_bytes = max_message_bytes,
+            .timeout_ms = self.http_timeout_ms,
+            .cancel = @constCast(cancel),
+            .capture = &.{ "Mcp-Session-Id", "WWW-Authenticate" },
+            .sink = .{ .ctx = &sink, .func = ResponseSink.write },
+        }) catch |err| {
+            if (err == error.Cancelled) return error.Cancelled;
+            self.setDetail("{s}", .{http.lastTransportDetail() orelse @errorName(err)});
+            return err;
+        };
+        defer result.deinit(self.gpa);
+
+        switch (result.status) {
+            401 => {
+                self.setChallenge(result.captured[1]);
+                return .unauthorized;
+            },
+            403 => {
+                const header = result.captured[1] orelse "";
+                if (std.mem.indexOf(u8, header, "insufficient_scope") != null) {
+                    self.setChallenge(header);
+                    return .unauthorized;
+                }
+                self.setDetail("HTTP 403 forbidden", .{});
+                return error.McpHttpStatus;
+            },
+            404 => if (self.mode == .legacy and self.session_id != null) return .session_expired,
+            202, 204 => if (id == null) return .accepted,
+            else => {},
+        }
+        if (result.status != 200) {
+            self.setDetail("HTTP {d} from {s}", .{ result.status, method });
+            return error.McpHttpStatus;
+        }
+        if (id == null) return .accepted;
+        if (std.mem.eql(u8, method, "initialize")) if (result.captured[0]) |session| {
+            if (self.session_id) |old| self.gpa.free(old);
+            self.session_id = try self.gpa.dupe(u8, session);
+        };
+        const value = sink.found orelse blk: {
+            // A plain JSON body; an SSE stream that ended without our answer
+            // parses as nothing here and fails below.
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, sink.raw.items, .{ .allocate = .alloc_always }) catch
+                return error.InvalidMcpResponse;
+            break :blk parsed;
+        };
+        if (!responseMatches(value, id.?)) return error.InvalidMcpResponse;
+        if (value.object.get("error")) |rpc_error| {
+            if (rpc_error == .object) if (stringField(rpc_error.object, "message")) |message| self.setDetail("{s}", .{message});
+            return error.McpRpcError;
+        }
+        if (value.object.get("result") == null) return error.InvalidMcpResponse;
+        return .{ .response = value };
+    }
+
+    /// Modern requests mirror routing facts into headers: the tool or
+    /// resource name, and schema-marked arguments as Mcp-Param-*.
+    fn appendRoutingHeaders(
+        self: *Server,
+        arena: std.mem.Allocator,
+        headers: *std.ArrayList(std.http.Header),
+        method: []const u8,
+        params_json: []const u8,
+    ) !void {
+        const named = std.mem.eql(u8, method, "tools/call") or std.mem.eql(u8, method, "prompts/get") or
+            std.mem.eql(u8, method, "resources/read");
+        if (!named) return;
+        const params = std.json.parseFromSliceLeaky(std.json.Value, arena, params_json, .{ .allocate = .alloc_always }) catch return;
+        if (params != .object) return;
+        const name = stringField(params.object, "name") orelse stringField(params.object, "uri") orelse return;
+        try headers.append(arena, .{ .name = "Mcp-Name", .value = try encodeHeaderValue(arena, name) });
+        if (!std.mem.eql(u8, method, "tools/call")) return;
+        const tool = for (self.tools.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.remote_name, name)) break candidate;
+        } else return;
+        const args = params.object.get("arguments") orelse return;
+        if (args != .object) return;
+        for (tool.header_params) |param| {
+            const value = args.object.get(param.argument) orelse continue;
+            const text = switch (value) {
+                .string => |v| v,
+                .integer => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
+                .float => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
+                .number_string => |v| v,
+                .bool => |v| if (v) "true" else "false",
+                else => continue,
+            };
+            try headers.append(arena, .{
+                .name = try std.fmt.allocPrint(arena, "Mcp-Param-{s}", .{param.header}),
+                .value = try encodeHeaderValue(arena, text),
+            });
+        }
+    }
+
+    fn setChallenge(self: *Server, header: ?[]const u8) void {
+        if (self.challenge) |old| self.gpa.free(old);
+        self.challenge = if (header) |value| self.gpa.dupe(u8, value) catch null else null;
+    }
+
+    /// The stored access token, refreshed first when it has expired.
+    fn bearerToken(self: *Server, arena: std.mem.Allocator) ?[]const u8 {
+        const path = self.auth_path orelse return null;
+        const creds = oauth.load(arena, self.io, path, self.name, self.url.?) orelse return null;
+        if (!creds.expired(nowMs(self.io))) return creds.access_token;
+        const refreshed = self.refreshWith(arena, creds) orelse return null;
+        return refreshed.access_token;
+    }
+
+    /// After a 401: refresh whatever is stored, if it can be refreshed.
+    fn forceRefresh(self: *Server, arena: std.mem.Allocator) bool {
+        const path = self.auth_path orelse return false;
+        const creds = oauth.load(arena, self.io, path, self.name, self.url.?) orelse return false;
+        return self.refreshWith(arena, creds) != null;
+    }
+
+    fn refreshWith(self: *Server, arena: std.mem.Allocator, creds: oauth.Credentials) ?oauth.Credentials {
+        if (creds.refresh_token == null) return null;
+        const pool = self.pool orelse return null;
+        const refreshed = oauth.refresh(&pool.client, self.gpa, arena, nowMs(self.io), creds) catch |err| {
+            std.log.warn("MCP server '{s}' token refresh failed: {t} {s}", .{ self.name, err, oauth.failureDetail() });
+            return null;
+        };
+        oauth.save(self.gpa, self.io, self.auth_path.?, self.name, refreshed) catch |err|
+            std.log.warn("MCP server '{s}' could not store refreshed token: {t}", .{ self.name, err });
+        return refreshed;
+    }
+
+    /// The challenge from the last 401/403, for starting a login.
+    pub fn lastChallenge(self: *const Server) ?[]const u8 {
+        return self.challenge;
     }
 
     fn writeMessage(self: *Server, line: []const u8) !void {
@@ -473,6 +815,98 @@ pub const Server = struct {
         };
     }
 };
+
+/// Collects an HTTP response body and, when it is an SSE stream, stops at
+/// the event carrying the response to `id`: a server may keep the stream
+/// open after answering.
+const ResponseSink = struct {
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    id: ?u64,
+    parser: sse.Parser,
+    raw: std.ArrayList(u8) = .empty,
+    found: ?std.json.Value = null,
+
+    fn deinit(self: *ResponseSink) void {
+        self.parser.deinit();
+        self.raw.deinit(self.gpa);
+    }
+
+    fn write(ctx: *anyopaque, bytes: []const u8) bool {
+        const self: *ResponseSink = @ptrCast(@alignCast(ctx));
+        self.raw.appendSlice(self.gpa, bytes) catch return false;
+        if (self.id == null) return true;
+        self.parser.feed(bytes, self, onEvent) catch return true;
+        return self.found == null;
+    }
+
+    fn onEvent(self: *ResponseSink, event: sse.Event) void {
+        if (self.found != null or self.id == null) return;
+        const value = std.json.parseFromSliceLeaky(std.json.Value, self.arena, event.data, .{ .allocate = .alloc_always }) catch return;
+        if (responseMatches(value, self.id.?)) self.found = value;
+    }
+};
+
+fn responseMatches(value: std.json.Value, id: u64) bool {
+    if (value != .object) return false;
+    const response_id = value.object.get("id") orelse return false;
+    return response_id == .integer and response_id.integer >= 0 and @as(u64, @intCast(response_id.integer)) == id;
+}
+
+/// Header values that are not plain visible ASCII (or that look like the
+/// sentinel itself, or carry edge whitespace) travel as `=?base64?…?=`.
+pub fn encodeHeaderValue(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
+    var plain = true;
+    for (value) |c| if (c < 0x20 or c > 0x7e) {
+        plain = false;
+    };
+    if (value.len > 0 and (value[0] == ' ' or value[value.len - 1] == ' ')) plain = false;
+    if (std.mem.startsWith(u8, value, "=?base64?") and std.mem.endsWith(u8, value, "?=")) plain = false;
+    if (plain) return value;
+    const encoder = std.base64.standard.Encoder;
+    const out = try arena.alloc(u8, "=?base64?".len + encoder.calcSize(value.len) + "?=".len);
+    @memcpy(out[0.."=?base64?".len], "=?base64?");
+    _ = encoder.encode(out["=?base64?".len .. out.len - 2], value);
+    @memcpy(out[out.len - 2 ..], "?=");
+    return out;
+}
+
+/// `x-mcp-header` markers on top-level schema properties. Header names must
+/// be HTTP tokens; anything else is ignored rather than sent malformed.
+fn headerParams(gpa: std.mem.Allocator, schema: std.json.Value) ![]HeaderParam {
+    var out: std.ArrayList(HeaderParam) = .empty;
+    errdefer {
+        for (out.items) |param| {
+            gpa.free(param.argument);
+            gpa.free(param.header);
+        }
+        out.deinit(gpa);
+    }
+    if (schema != .object) return out.toOwnedSlice(gpa);
+    const properties = schema.object.get("properties") orelse return out.toOwnedSlice(gpa);
+    if (properties != .object) return out.toOwnedSlice(gpa);
+    var it = properties.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const marker = entry.value_ptr.object.get("x-mcp-header") orelse continue;
+        if (marker != .string or marker.string.len == 0) continue;
+        const valid = for (marker.string) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') break false;
+        } else true;
+        if (!valid) continue;
+        const argument = try gpa.dupe(u8, entry.key_ptr.*);
+        errdefer gpa.free(argument);
+        const header = try gpa.dupe(u8, marker.string);
+        errdefer gpa.free(header);
+        try out.append(gpa, .{ .argument = argument, .header = header });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn nowMs(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
 
 fn appendResultText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
     if (out.items.len > 0) try out.append(gpa, '\n');

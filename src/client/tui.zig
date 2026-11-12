@@ -2304,6 +2304,10 @@ pub const App = struct {
                 self.setNotice("{s}", .{if (result.ok) "plugin command completed" else "plugin command failed — see transcript"});
             },
             .mcp_list_result => |result| self.showMcpStatus(result.servers),
+            .mcp_note => |note| {
+                self.pushBlock(.system_note, note.message, "mcp", if (note.ok) .ok else .err);
+                self.setNotice("{s}", .{if (!note.ok) "MCP login failed — see transcript" else if (note.done) "MCP · see transcript" else "MCP · waiting for sign-in"});
+            },
             .ui_config_result => |result| {
                 self.show_tab_bar = result.tab_bar;
                 self.bell_enabled = result.bell;

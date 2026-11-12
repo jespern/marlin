@@ -27,6 +27,8 @@ pub const McpServer = struct {
     url: ?[]const u8 = null,
     /// Extra request headers for a remote server, as `Name: value` lines.
     headers: []const []const u8 = &.{},
+    /// Extra environment for a local server, as `KEY=value` entries.
+    env: []const []const u8 = &.{},
     mutating: bool,
     readonly_tools: []const []const u8 = &.{},
     mutating_tools: []const []const u8 = &.{},
@@ -136,6 +138,7 @@ const PendingMcp = struct {
     cmd: ?[]const []const u8 = null,
     url: ?[]const u8 = null,
     headers: []const []const u8 = &.{},
+    env: []const []const u8 = &.{},
     mutating: bool = true,
     readonly_tools: []const []const u8 = &.{},
     mutating_tools: []const []const u8 = &.{},
@@ -302,6 +305,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
                 if (std.mem.eql(u8, key, "cmd")) current.cmd = try command(arena, value);
                 if (std.mem.eql(u8, key, "url")) current.url = try string(arena, value);
                 if (std.mem.eql(u8, key, "headers")) current.headers = try stringArray(arena, value);
+                if (std.mem.eql(u8, key, "env")) current.env = try stringArray(arena, value);
                 if (std.mem.eql(u8, key, "mutating")) current.mutating = try boolean(value);
                 if (std.mem.eql(u8, key, "readonly_tools")) current.readonly_tools = try stringArray(arena, value);
                 if (std.mem.eql(u8, key, "mutating_tools")) current.mutating_tools = try stringArray(arena, value);
@@ -372,6 +376,7 @@ fn finishPending(
             .cmd = cmd,
             .url = pending.url,
             .headers = pending.headers,
+            .env = pending.env,
             .mutating = pending.mutating,
             .readonly_tools = pending.readonly_tools,
             .mutating_tools = pending.mutating_tools,

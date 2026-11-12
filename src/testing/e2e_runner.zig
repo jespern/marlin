@@ -1620,7 +1620,7 @@ fn checkPlugins(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.
     }
     const commands = [_]struct { args: []const []const u8, ok: bool = true, contains: []const u8 }{
         .{ .args = &.{ "marketplace", "add", "./marketplace" }, .contains = "Added marketplace fixture-market" },
-        .{ .args = &.{ "install", "unsupported@fixture-market" }, .ok = false, .contains = "Only skill-only plugins" },
+        .{ .args = &.{ "install", "unsupported@fixture-market" }, .ok = false, .contains = "Only skills and MCP servers" },
         .{ .args = &.{ "install", "demo@fixture-market" }, .contains = "Installed demo@fixture-market" },
         .{ .args = &.{"list"}, .contains = "demo@fixture-market" },
     };
