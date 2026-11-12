@@ -155,3 +155,33 @@ test "[discovery] enabled parses; absent stays null so the default (on) applies"
     const absent = try parse(arena.allocator(), "[web]\nport = 8378\n");
     try std.testing.expect(absent.discovery_enabled == null);
 }
+
+test "remote MCP servers parse url, headers, and env, and need exactly one of cmd/url" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const doc = try parse(arena,
+        \\[[mcp]]
+        \\name = "linear"
+        \\url = "https://mcp.linear.app/mcp"
+        \\headers = ["X-Team: core"]
+        \\mutating = false
+        \\
+        \\[[mcp]]
+        \\name = "files"
+        \\cmd = ["mcp-files"]
+        \\env = ["ROOT=/srv"]
+    );
+    try std.testing.expectEqual(@as(usize, 2), doc.mcp_servers.len);
+    try std.testing.expectEqualStrings("https://mcp.linear.app/mcp", doc.mcp_servers[0].url.?);
+    try std.testing.expectEqualStrings("X-Team: core", doc.mcp_servers[0].headers[0]);
+    try std.testing.expect(!doc.mcp_servers[0].mutating);
+    try std.testing.expectEqual(@as(usize, 0), doc.mcp_servers[0].cmd.len);
+    try std.testing.expectEqualStrings("ROOT=/srv", doc.mcp_servers[1].env[0]);
+    try std.testing.expectError(error.McpServerMissingCommand, parse(arena,
+        \\[[mcp]]
+        \\name = "both"
+        \\cmd = ["x"]
+        \\url = "https://example.com/mcp"
+    ));
+}
