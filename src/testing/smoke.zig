@@ -120,7 +120,7 @@ fn check(gpa: std.mem.Allocator, io: Io, c: Check) !u32 {
 
 fn print(io: Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [8192]u8 = undefined;
-    var w: Io.File.Writer = .init(.stdout(), io, &buf);
+    var w: Io.File.Writer = .initStreaming(.stdout(), io, &buf);
     w.interface.print(fmt, args) catch return;
     w.interface.flush() catch return;
 }

@@ -749,7 +749,7 @@ pub fn watch(
     defer arena.deinit();
     var resolved = (try resolveSessionArg(io, conn, arena.allocator(), options.handle.?)) orelse return 2;
     var buffer: [8192]u8 = undefined;
-    var output: Io.File.Writer = .init(.stdout(), io, &buffer);
+    var output: Io.File.Writer = .initStreaming(.stdout(), io, &buffer);
     var stream = WatchStream{ .sid = resolved.sid, .handle = resolved.text(), .options = options, .writer = &output.interface };
     return streamWatch(gpa, conn, &stream);
 }
@@ -1459,14 +1459,14 @@ fn requestReboot(gpa: std.mem.Allocator, io: Io, conn: *attach.Conn, force: bool
 
 fn print(io: Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [8192]u8 = undefined;
-    var w: Io.File.Writer = .init(.stdout(), io, &buf);
+    var w: Io.File.Writer = .initStreaming(.stdout(), io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
 }
 
 fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
-    var w: Io.File.Writer = .init(.stderr(), io, &buf);
+    var w: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
 }

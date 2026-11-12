@@ -278,7 +278,7 @@ fn sleepMs(io: Io, ms: u32) void {
 
 fn stdoutPrint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
-    var w: Io.File.Writer = .init(.stdout(), io, &buf);
+    var w: Io.File.Writer = .initStreaming(.stdout(), io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
 }

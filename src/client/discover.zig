@@ -42,7 +42,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.M
         return 1;
     }
     var buf: [8192]u8 = undefined;
-    var w: Io.File.Writer = .init(.stdout(), io, &buf);
+    var w: Io.File.Writer = .initStreaming(.stdout(), io, &buf);
     try discovery.renderTable(&w.interface, peers);
     try w.interface.flush();
     return 0;
@@ -50,7 +50,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.M
 
 fn eprint(io: Io, comptime fmt: []const u8, fmt_args: anytype) !void {
     var buf: [1024]u8 = undefined;
-    var w: Io.File.Writer = .init(.stderr(), io, &buf);
+    var w: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
     try w.interface.print(fmt, fmt_args);
     try w.interface.flush();
 }

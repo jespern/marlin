@@ -1352,7 +1352,7 @@ pub fn run(
 
 fn eprint(io: Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
-    var writer: Io.File.Writer = .init(.stderr(), io, &buf);
+    var writer: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
     try writer.interface.print(fmt, args);
     try writer.interface.flush();
 }
