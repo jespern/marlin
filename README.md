@@ -60,8 +60,8 @@ permissions. What Marlin adds is everything around them:
   queued, stays visible, and can carry images.
 - **Reach it from anywhere.** `marlin --remote <host>` attaches over SSH,
   and `marlin discover` finds the Marlins on your LAN. The web companion
-  lets you watch sessions and answer approvals from your phone over your
-  own tailnet ([setup](docs/MOBILE.md)).
+  lets you watch sessions and answer approvals from a paired phone behind
+  your own HTTPS proxy ([setup](docs/MOBILE.md)).
 - **A real shell in every session.** `!!` turns a session into a login shell
   on the daemon's host. It survives detaching and restarts, and `Ctrl+D`
   hands the session back with the shell's output in the transcript.
@@ -199,13 +199,14 @@ from a terminal.
 - No messaging gateway (Telegram, Discord, and so on). Hook scripts cover
   notification.
 - No hosted or multi-user web product. The web companion listens on
-  localhost only and is reached through `tailscale serve`; the tailnet is
-  the gate.
+  localhost unless you point a reverse proxy at it; phones pair once with a
+  code from the terminal.
 - No voice stack. `/voice setup` configures local, offline push-to-talk
   dictation into the composer, and that is all.
 - No OCR or video pipelines, themes, or cron.
 - No editor panes.
-- No Tailscale embedding. Your tailnet already reaches the daemon.
+- No TLS or VPN embedding. Your proxy terminates HTTPS; your network
+  (LAN, VPN, tailnet) already reaches the daemon.
 
 ## Status
 

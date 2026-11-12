@@ -1,44 +1,126 @@
 # Mobile companion
 
-Marlin starts its phone companion automatically with the daemon. Opt in persistently
-in `~/.config/marlin/config.toml`:
+Marlin starts its phone companion automatically with the daemon: a small web
+app on `http://127.0.0.1:8377/` that shows every session, streams replies, and
+answers approvals. On the machine itself it needs no login. To use it from a
+phone, put an HTTPS reverse proxy in front of it, give it a name, and pair the
+phone once.
 
 ```toml
 [web]
-enabled = true
-tailscale = true
-push = true
+enabled = true               # default
+listen = "192.168.1.20"      # this machine's LAN address; default 127.0.0.1
+hosts = ["marlin.example.com"]
+proxy = "192.168.1.1"        # the reverse proxy; nothing else on the LAN may connect
+push = true                  # default
 ```
 
-All three switches default to false. `enabled` starts a daemon-owned companion
-process; no separate terminal or `marlin web` command is needed. It stays up
-when you detach a TUI, and stops when the daemon shuts down or reboots. `tailscale` runs `tailscale serve --bg` each
-time the web bridge starts. On macOS, Marlin also finds the CLI bundled in
-`/Applications/Tailscale.app` and forces CLI mode. Install and sign in to Tailscale on both devices,
-and enable HTTPS/Serve in the tailnet. The bridge still binds only loopback;
-Host and Origin checks remain in place. This is a full-control companion for
-your own machine and tailnet, not a public or multi-user service.
+- `listen` is the address the bridge binds. Loopback by default; set the LAN
+  address (or `"0.0.0.0"`) so the proxy can reach it.
+- `hosts` are the names the bridge answers to besides loopback. The first is
+  the address the Web tab and the phone app advertise. A request under one of
+  these names must come from a paired device.
+- `proxy`, when set, is the only non-loopback address allowed to connect.
+  Its `X-Forwarded-For` names the real client in the access log, and
+  `X-Forwarded-Proto: https` marks the device cookie `Secure`.
 
-Open the **Web** tab (or type `/web`) for the HTTPS hostname and live access log,
-then use Safari's **Add to Home Screen**. Use this hostname instead of a LAN or
-Tailscale IP. It survives IP changes; it does not keep the laptop online.
-The web process and Tailscale must be running to open the app, and the daemon
-must be awake and online to send notifications. After changing configuration,
-restart/reboot the daemon when its current work can safely finish. No launch-at-login service is installed by these switches.
+Restart the daemon after changing these (`/reboot` when its work can safely
+finish). The old `tailscale = true` switch is gone and ignored if present.
+
+## Trust model
+
+- **Loopback is trusted**, as before: a loopback peer asking for `localhost`
+  or `127.0.0.1` needs no login. A proxy on the same machine forwarding a
+  phone's request does not count: that request names a public host.
+- **Everything else must be paired.** Unpaired devices get only the app shell,
+  `/connection`, and `/pair`; every API, event stream, and push route answers
+  `403 unpaired`.
+- **Pairing** trades a 6-digit code for a long-lived cookie. Codes come from
+  the daemon, last five minutes, work once, and are burned after five wrong
+  guesses. Each device gets a random 256-bit token; only its SHA-256 is
+  stored, in `$XDG_STATE_HOME/marlin/web/pairing.json` (default
+  `~/.local/state`, mode 0600). The cookie is `HttpOnly`, `SameSite=Lax`,
+  lasts 400 days (Chrome's cap), and renews whenever the app opens.
+- Host and Origin checks still reject DNS-rebinding and cross-site requests.
+- This is a full-control companion for your own machine, not a multi-user
+  service: a paired phone can do anything the terminal can, except shell
+  sessions, which are never exposed over the web.
+
+## Pairing a phone
+
+1. In Marlin, open `/web` and press `p` (or run `/web pair`). The code appears
+   beside the address with the time left.
+2. On the phone, open `https://<host>/`. The app shows a code field; type the
+   code. It submits on the sixth digit.
+3. Add to Home Screen. If the Home Screen app ever asks for a code, pair again
+   from inside it: iOS can keep its cookies apart from Safari's.
+
+`/web` lists paired devices as `#n name date`. `/web unpair <n>` forgets one:
+its next request is refused, and its open event streams close immediately.
+
+A new address means a new web app origin: after moving hosts, add the app to
+the Home Screen again and re-enable notifications.
+
+## Example: OPNsense with Tailscale on the firewall
+
+One name that works on the home Wi-Fi and away. The phone runs Tailscale only
+when away; OPNsense is a Tailscale subnet router for the LAN, so the same LAN
+addresses are reachable either way. The Mac itself runs no Tailscale.
+
+1. **Marlin** (`~/.config/marlin/config.toml` on the Mac):
+
+   ```toml
+   [web]
+   listen = "<Mac LAN IP>"
+   hosts = ["marlin.example.com"]
+   proxy = "<OPNsense LAN IP>"
+   ```
+
+   Give the Mac a static DHCP lease so its address does not move.
+
+2. **Certificate and proxy: Caddy on OPNsense.** Install `os-caddy`
+   (System → Firmware → Plugins). Under Services → Caddy Web Server:
+   - General: enable; set the ACME email; DNS Provider: Cloudflare, with an
+     API token limited to *Zone → DNS → Edit* on that one zone. DNS-01
+     validation needs no inbound port, so nothing is exposed to the internet.
+   - Reverse Proxy → Domains: `marlin.example.com`, port 443, with the DNS-01
+     challenge enabled.
+   - Handlers: for that domain, upstream `<Mac LAN IP>`, port `8377`.
+     Caddy passes the original Host and sets `X-Forwarded-For` and
+     `X-Forwarded-Proto`; event streams (SSE) flush without buffering.
+   - Caddy needs port 443 on the LAN interface: if the OPNsense web GUI uses
+     443, move it (System → Settings → Administration → TCP port).
+
+3. **DNS on the LAN.** Services → Unbound DNS → Overrides: host `marlin`,
+   domain `example.com`, IP `<OPNsense LAN IP>` (where Caddy listens). If
+   DNS rebind protection is on (Unbound → Advanced → Private Domains), add
+   `example.com` there, or Unbound drops the private answer.
+
+4. **DNS away from home.** In the Tailscale admin console → DNS, add a
+   split-DNS nameserver `<OPNsense LAN IP>` restricted to `example.com`. The
+   phone then asks OPNsense through the subnet route and gets the same LAN
+   answer. (Alternatively, publish the private address as a public A record
+   in Cloudflare, unproxied: no split DNS, but the LAN address is public.)
+
+5. **Firewall.** Allow the LAN and the Tailscale interface to reach the
+   OPNsense LAN address on 443. With `proxy` set, the Mac's port 8377 refuses
+   everyone but OPNsense anyway.
+
+Check from the Mac: `curl -s https://marlin.example.com/connection` answers
+`{"host":"marlin.example.com","push_enabled":true,"paired":false}`, and the
+Web tab log shows each request with the client's real address.
 
 ## Phone notifications
 
-Push requires Node.js 22 or later on the daemon/web host's PATH. The embedded
-helper uses only Node built-ins; no npm dependencies, hosted relay, public
-listener, or Apple developer account is needed. This first implementation
-runs beside the daemon, including on remote hosts. `/web` and `marlin web`
-inspect the attached daemon’s companion; use that host’s Tailscale URL.
+Push requires the Home Screen app (iOS 16.4 or later) over HTTPS. The embedded
+helper uses no hosted relay and no Apple developer account. `/web` and
+`marlin web` inspect the attached daemon's companion.
 
-On iOS 16.4 or later, open the Home Screen app, open its session drawer, and tap
-**Enable notifications**. Permission is requested from this tap; it cannot be
-granted from the laptop. **Disable notifications** revokes the server
-subscription and unsubscribes the browser. Browser permission can separately
-be changed in iPhone Settings.
+Open the Home Screen app, open its session drawer, and tap **Enable
+notifications**. Permission is requested from this tap; it cannot be granted
+from the laptop. **Disable notifications** revokes the server subscription and
+unsubscribes the browser. Browser permission can separately be changed in
+iPhone Settings.
 
 The policy is daemon-owned:
 
@@ -68,8 +150,8 @@ refocusing the terminal, as with any network notification.
 
 Push delivery uses the browser vendor's HTTPS endpoint (Apple, Google, Mozilla,
 or Microsoft); redirects and other destinations are rejected. The desktop's
-network must permit these services. Sending a push does not require the phone
-to be on the tailnet, but opening Marlin does.
+network must permit these services. Sending a push does not depend on the
+proxy or the phone's network; opening Marlin does.
 
 ## Layout and reconnect behavior
 
@@ -83,27 +165,32 @@ replays session history with the existing sequence deduplication.
 
 ## Verification
 
-Run `zig build test`, `zig build e2e`, and `zig build mobile-test` (the last
-requires Node). Push tests use a receiving crypto peer and real helper
-subprocesses with isolated persistent state. For a browser check, install
-Playwright separately and run `node scripts/test-mobile-browser.cjs` with
-`MARLIN_PLAYWRIGHT_MODULE` pointing to its `playwright-core` module if needed,
-and `MARLIN_CHROMIUM_PATH` pointing to a Chromium/Chrome executable.
-The browser test uses an isolated real Marlin daemon/web bridge. A real iPhone
-is still required to validate OS permission, APNs delivery, and keyboard
-animation behavior end to end.
+Run `zig build test` and `zig build e2e`. For the browser check, install
+Playwright separately (`npm install playwright-core` in a scratch directory)
+and run `node scripts/test-mobile-browser.cjs` from the repository root, with
+`MARLIN_PLAYWRIGHT_MODULE` pointing to its `playwright-core` module and
+`MARLIN_CHROMIUM_PATH` to a Chromium/Chrome executable if needed. It drives an
+isolated real daemon and web bridge: layout and reconnect; pairing over raw
+HTTP (unpaired refusals, wrong and single-use codes, cookie flags, renewal);
+pairing through the real code screen under a public name; and unpairing,
+including the revoked device's open stream closing. Push tests use a receiving
+crypto peer and real helper subprocesses with isolated persistent state. A
+real iPhone is still required to validate OS permission, APNs delivery, and
+keyboard animation behavior end to end.
 
 ## Web tab
 
-The Web tab keeps the service state and canonical address above the latest 128
-log entries. Arrow keys or the mouse wheel scroll; `r` refreshes, and Escape
-returns to the session with its draft intact. Status refreshes once per second
-while the tab is open. HTTP access entries include a timestamp, method, and
-route, never query strings, prompt bodies, or push subscription keys.
+The Web tab pins the service state, the advertised address with any live
+pairing code, and the keys (`p` pairs a phone) above the paired devices and the
+latest 128 log entries. Arrow keys or the mouse wheel scroll; `r` refreshes,
+and Escape returns to the session with its draft intact. Status refreshes once
+per second while the tab is open. HTTP access entries carry the client
+address, a timestamp, the method, and the route; never prompt bodies, cookies,
+or push subscription keys.
 
-`marlin web` now prints the managed companion’s status and exits. Configure
-`[web] port = 8377` to change the listener port (1–65535); the old `--port`
-argument is rejected. A bind/startup failure appears in the log and leaves
-the daemon usable; resolve the error and restart Marlin to retry. The child
-process boundary isolates HTTP failures from the daemon and is fully managed
-by it. A separate login service is not installed.
+`marlin web` prints the managed companion's status and paired-device count and
+exits. Configure `[web] port = 8377` to change the listener port (1–65535). A
+bind/startup failure (including an invalid `listen` or `proxy` address)
+appears in the log and leaves the daemon usable; resolve the error and restart
+Marlin to retry. The child process boundary isolates HTTP failures from the
+daemon and is fully managed by it. A separate login service is not installed.

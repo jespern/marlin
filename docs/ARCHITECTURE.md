@@ -252,9 +252,10 @@ the remote-named invocation as the ONLY terminal tool in the daily drive —
 full mux (tabs, approvals, drafts), local clipboard and image paste,
 OSC 52 — with ssh as a dumb pipe underneath. No new transport protocol,
 ever. The web client is the companion for phones and terminal-less
-machines, exposed via opt-in `tailscale serve` in front of the
-localhost port (Host/Origin-checked, tokenless — the tailnet is the trust
-boundary) rather than marlin-grown TLS/auth machinery.
+machines. Loopback stays tokenless (Host/Origin-checked); beyond it, an
+HTTPS reverse proxy you already run fronts the port (`[web] listen`,
+`hosts`, `proxy`) and phones pair once with a short code from /web
+(docs/MOBILE.md). Marlin grows no TLS, only that one pairing cookie.
 
 A local `marlin` client speaks the wire protocol to a remote daemon, ssh
 carrying NDJSON instead of terminal frames. `--remote <host>` routes the
