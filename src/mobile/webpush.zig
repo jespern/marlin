@@ -77,7 +77,7 @@ pub fn subscriptionFilename(endpoint: []const u8) [77]u8 {
 /// 0600 exclusive write via a unique temp name. `first_wins` links (keeps an
 /// existing file — VAPID keys must never be replaced once a phone has paired
 /// against them); otherwise renames (subscriptions update in place).
-fn writePrivateFile(io: Io, dir_path: []const u8, name: []const u8, bytes: []const u8, first_wins: bool) !void {
+pub fn writePrivateFile(io: Io, dir_path: []const u8, name: []const u8, bytes: []const u8, first_wins: bool) !void {
     var path_buf: [1024]u8 = undefined;
     var tmp_buf: [1024]u8 = undefined;
     var nonce: [8]u8 = undefined;

@@ -102,14 +102,22 @@ pub const Config = struct {
     /// only, and Host/Origin checks close the browser-shaped holes. It remains
     /// an unauthenticated local surface that can drive every daemon capability
     /// (including shutdown) — `/web disable` or `[web] enabled = false` turns
-    /// it off; do not run it enabled on a multi-user box.
+    /// it off; do not run it enabled on a multi-user box. Requests under a
+    /// `hosts` name need a paired device instead (mobile/pairing.zig).
     web_enabled: bool = true,
     web_port: u16 = 8377,
 
-    /// `marlin web` attempts `tailscale serve` so the UI is reachable at a
-    /// fixed tailnet https URL (the tailnet is the trust boundary). Opt in
-    /// with `[web] tailscale = true`; absent/unavailable CLI stays loopback-only.
-    web_tailscale: bool = false,
+    /// Address the bridge listens on. Loopback by default; set a LAN address
+    /// (or "0.0.0.0") so a reverse proxy can reach it (docs/MOBILE.md).
+    web_listen: []const u8 = "127.0.0.1",
+    /// Public names the bridge answers to besides loopback, e.g.
+    /// ["marlin.example.com"]. A request under one of these names must carry
+    /// a paired device cookie; the first is the address /web advertises.
+    web_hosts: []const []const u8 = &.{},
+    /// When set, the only non-loopback peer allowed to connect: the reverse
+    /// proxy that terminates HTTPS. Its X-Forwarded-For names the client in
+    /// the access log.
+    web_proxy: ?[]const u8 = null,
     /// Standards-based phone push via the bounded `marlin _push` helper.
     /// On by default: it is inert until a phone actually subscribes, and the
     /// subscribe surface is the web UI, which the user already reached.
@@ -806,7 +814,9 @@ pub fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.workspace_enabled) |value| cfg.workspace_enabled = value;
     if (doc.web_enabled) |value| cfg.web_enabled = value;
     if (doc.web_port) |value| cfg.web_port = value;
-    if (doc.web_tailscale) |value| cfg.web_tailscale = value;
+    if (doc.web_listen) |value| cfg.web_listen = value;
+    if (doc.web_hosts) |value| cfg.web_hosts = value;
+    if (doc.web_proxy) |value| cfg.web_proxy = value;
     if (doc.web_push) |value| cfg.web_push = value;
     if (doc.discovery_enabled) |value| cfg.discovery_enabled = value;
     if (doc.ui_tab_bar) |value| cfg.ui_tab_bar = value;

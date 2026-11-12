@@ -66,6 +66,24 @@
   #push-toggle { margin-top: 10px; }
   #connection-badge { font-size: 11px; color: var(--yellow); }
   #connection-help, #push-help { color: var(--dim); margin-top: 6px; }
+  /* Pairing: a device reaching Marlin under its public name pairs once. */
+  #pair {
+    position: fixed; inset: 0; z-index: 50; background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    padding: calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom));
+  }
+  #pair[hidden] { display: none; }
+  #pair form { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 14px; }
+  #pair h1 { font-size: 14px; color: var(--accent); letter-spacing: 1px; }
+  #pair p { color: var(--dim); }
+  #pair kbd { color: var(--fg); font: inherit; }
+  #pair-code {
+    font: inherit; font-size: 28px; letter-spacing: 10px; text-align: center;
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 10px 0; width: 100%;
+  }
+  #pair-code:focus { outline: none; border-color: var(--accent); }
+  #pair-error { color: var(--red); min-height: 1.5em; }
   #transcript { order: 1; flex: 1; min-height: 0; overflow-y: auto; padding: 18px 22px; }
   #history-more { display: none; margin: 0 auto 14px; }
   #history-more.show { display: block; }
@@ -233,6 +251,16 @@
 </style>
 </head>
 <body>
+<div id="pair" hidden>
+  <form id="pair-form">
+    <h1>MARLIN</h1>
+    <p>Pair this device: in Marlin, open <kbd>/web</kbd> and press <kbd>p</kbd>, then type the code it shows.</p>
+    <input id="pair-code" inputmode="numeric" autocomplete="one-time-code" maxlength="7"
+      placeholder="000000" aria-label="pairing code">
+    <button id="pair-go" class="act yes" type="submit">Pair</button>
+    <p id="pair-error" role="alert"></p>
+  </form>
+</div>
 <div id="side">
   <h1>MARLIN <button id="new-btn" title="new session">+ new</button></h1>
   <div id="sessions"></div>
@@ -369,7 +397,9 @@ function renderMd(text) {
 
 async function send(rawJson) {
   const r = await fetch('/send', { method: 'POST', body: rawJson });
-  return JSON.parse(bigints(await r.text()));
+  const reply = JSON.parse(bigints(await r.text()));
+  if (reply.err && reply.err.code === 'unpaired') showPairing('This device is no longer paired.');
+  return reply;
 }
 
 function notice(text) {
@@ -1043,19 +1073,35 @@ async function pushRequest(action, body) {
 function pushLabel() {
   $('#push-toggle').textContent = pushSubscription ? 'Disable notifications' : 'Enable notifications';
 }
-async function setupCompanion() {
+// ---- pairing ----
+function showPairing(message = '') {
+  $('#pair').hidden = false;
+  $('#pair-error').textContent = message;
+  $('#pair-code').focus();
+}
+async function submitPairing() {
+  const code = $('#pair-code').value.replace(/\D/g, '');
+  if (code.length !== 6) return;
+  const button = $('#pair-go');
+  button.disabled = true;
   try {
-    const response = await fetch('/connection');
-    if (!response.ok) throw Error('connection settings unavailable');
-    const settings = await response.json();
-    // Loopback needs no address advertisement (you are already here) and no
-    // Tailscale lecture; the footer stays quiet unless something is actionable.
-    if (settings.tailnet_host) {
-      const url = 'https://' + settings.tailnet_host + '/';
-      $('#canonical-url').href = url;
-      $('#canonical-url').textContent = url;
-      $('#connection-help').textContent = 'Add to Home Screen from this address.';
+    const response = await fetch('/pair', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({code})});
+    if (!response.ok) {
+      const reply = await response.json().catch(() => ({}));
+      throw Error((reply.err && reply.err.msg) || 'Pairing failed.');
     }
+    location.reload();
+  } catch (error) {
+    $('#pair-code').value = '';
+    $('#pair-error').textContent = error.message;
+  } finally { button.disabled = false; }
+}
+$('#pair-form').onsubmit = event => { event.preventDefault(); submitPairing(); };
+$('#pair-code').addEventListener('input', () => {
+  if ($('#pair-code').value.replace(/\D/g, '').length === 6) submitPairing();
+});
+async function setupPush(settings) {
+  try {
     if (!settings.push_enabled) return;
     if (!isSecureContext || !('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
       $('#push-help').textContent = 'Notifications need the Home Screen app (iOS 16.4+).';
@@ -1093,7 +1139,6 @@ $('#push-toggle').onclick = async () => {
   } catch (error) { $('#push-help').textContent = error.message; }
   finally { button.disabled = false; }
 };
-setupCompanion();
 
 // iOS can pan the visual viewport as well as resize it for the keyboard.
 // Fit that rectangle without scrolling the document or losing reading position.
@@ -1132,7 +1177,30 @@ $('#new-btn').onclick = async () => {
   if (r.session_created) { sid = null; await loadSessions(); }
 };
 
-loadSessions().catch(() => connectionState('Reconnecting…'));
+// Unpaired devices see only the pairing screen; loopback is always paired.
+async function boot() {
+  let settings;
+  try {
+    const response = await fetch('/connection');
+    if (!response.ok) throw Error('connection settings unavailable');
+    settings = await response.json();
+  } catch {
+    connectionState(navigator.onLine ? 'Reconnecting…' : 'Offline');
+    return;
+  }
+  if (!settings.paired) { showPairing(); return; }
+  // Loopback needs no address advertisement (you are already here); the
+  // footer stays quiet unless something is actionable.
+  if (settings.host && location.hostname !== settings.host) {
+    const url = 'https://' + settings.host + '/';
+    $('#canonical-url').href = url;
+    $('#canonical-url').textContent = url;
+    $('#connection-help').textContent = 'Add to Home Screen from this address.';
+  }
+  loadSessions().catch(() => connectionState('Reconnecting…'));
+  setupPush(settings);
+}
+boot();
 </script>
 </body>
 </html>

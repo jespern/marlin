@@ -44,7 +44,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
     .{ .name = "/plan", .usage = " [task|off|clear]", .description = "enter Plan mode or manage its execution todo", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
-    .{ .name = "/web", .usage = " [enable|disable]", .description = "companion status and access log; enable/disable persists to config", .accepts_args = true },
+    .{ .name = "/web", .usage = " [enable|disable|pair|unpair <n>]", .description = "companion status, phone pairing, and access log; enable/disable persists to config", .accepts_args = true },
     .{ .name = "/top", .description = "live session overview and switcher" },
     .{ .name = "/search", .usage = " [query]", .description = "search across durable transcripts", .accepts_args = true },
     .{ .name = "/diagnostics", .description = "inspect recent turn, provider, and tool timing" },
@@ -761,8 +761,17 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
                 self.setNotice("web companion enabled and saved — /web for status", .{})
             else
                 self.setNotice("web companion disabled and saved", .{});
+        } else if (std.mem.eql(u8, arg, "pair")) {
+            self.pairPhone();
+        } else if (std.mem.startsWith(u8, arg, "unpair")) {
+            const id = std.fmt.parseInt(u32, std.mem.trim(u8, arg["unpair".len..], " \t#"), 10) catch {
+                self.setNotice("usage: /web unpair <n> — numbers are listed in /web", .{});
+                return;
+            };
+            if (!self.web_view) self.openWeb();
+            self.conn.send(.{ .web_unpair = .{ .id = id } }) catch self.setNotice("cannot reach the daemon", .{});
         } else {
-            self.setNotice("usage: /web [enable|disable]", .{});
+            self.setNotice("usage: /web [enable|disable|pair|unpair <n>]", .{});
         }
     } else if (std.mem.eql(u8, head, "/top")) {
         self.openTop();

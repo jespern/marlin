@@ -1120,6 +1120,11 @@ pub const App = struct {
         return if (self.show_tab_bar) tab_bar_height else 0;
     }
 
+    pub fn pairPhone(self: *App) void {
+        if (!self.web_view) self.openWeb();
+        self.conn.send(.{ .web_pair = .{} }) catch self.setNotice("cannot reach the daemon for a pairing code", .{});
+    }
+
     pub fn openWeb(self: *App) void {
         self.web_view = true;
         self.top_view = null;
@@ -2362,9 +2367,7 @@ pub const App = struct {
             .web_status_result => |status| {
                 self.web_available = status.enabled;
                 self.web_text.clearRetainingCapacity();
-                self.web_text.print(self.gpa, "Web companion · {s}\n{s}\nEsc: return · ↑↓: scroll · r: refresh · Ctrl/Cmd-click: open link\n\n", .{ status.state, status.url }) catch {};
-                if (!status.enabled) self.web_text.appendSlice(self.gpa, "Enable [web] enabled = true in the daemon config and restart Marlin.\n") catch {};
-                for (status.logs) |entry| self.web_text.print(self.gpa, "{s}\n", .{entry}) catch {};
+                writeWebStatus(&self.web_text, self.gpa, status, render.nowWallMs(self.io)) catch {};
             },
             .ok => |ok| self.acknowledgeInput(ok.request_id),
             else => {},
@@ -6278,3 +6281,27 @@ fn mediaErrorMessage(err: anyerror) []const u8 {
 const validSetupProviderName = setup_mod.validSetupProviderName;
 
 pub const handleKey = keys.handleKey;
+
+/// The Web tab's text: three pinned rows (state, address + pairing code,
+/// keys), then paired devices, then the companion log.
+pub fn writeWebStatus(out: *std.ArrayList(u8), gpa: std.mem.Allocator, status: proto.WebStatus, now_ms: i64) !void {
+    try out.print(gpa, "Web companion · {s}\n{s}", .{ status.state, status.url });
+    if (status.pair_code.len == 6 and status.pair_expires_ms > now_ms) {
+        const left_s = @divTrunc(status.pair_expires_ms - now_ms + 999, 1000);
+        try out.print(gpa, " · pairing code {s} {s} · ", .{ status.pair_code[0..3], status.pair_code[3..] });
+        if (left_s >= 60) try out.print(gpa, "{d}m left", .{@divTrunc(left_s + 59, 60)}) else try out.print(gpa, "{d}s left", .{left_s});
+    }
+    try out.appendSlice(gpa, "\nEsc: return · ↑↓: scroll · r: refresh · p: pair a phone · Ctrl/Cmd-click: open link\n\n");
+    if (!status.enabled) try out.appendSlice(gpa, "Enable [web] enabled = true in the daemon config and restart Marlin.\n");
+    if (status.devices.len > 0) {
+        try out.appendSlice(gpa, "Paired:");
+        for (status.devices) |device| {
+            const day = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(@divTrunc(device.paired_ms, 1000), 0)) };
+            const year_day = day.getEpochDay().calculateYearDay();
+            const month_day = year_day.calculateMonthDay();
+            try out.print(gpa, " #{d} {s} {d}-{d:0>2}-{d:0>2} ·", .{ device.id, device.name, year_day.year, month_day.month.numeric(), month_day.day_index + 1 });
+        }
+        try out.appendSlice(gpa, " /web unpair <n> removes one\n\n");
+    }
+    for (status.logs) |entry| try out.print(gpa, "{s}\n", .{entry});
+}

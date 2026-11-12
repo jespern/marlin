@@ -224,7 +224,17 @@ pub const AttachmentUpload = struct {
 };
 
 /// Client → daemon.
-pub const WebStatus = struct { enabled: bool = false, state: []const u8 = "disabled", url: []const u8 = "", logs: []const []const u8 = &.{} };
+pub const WebDevice = struct { id: u32, name: []const u8, paired_ms: i64 };
+pub const WebStatus = struct {
+    enabled: bool = false,
+    state: []const u8 = "disabled",
+    url: []const u8 = "",
+    logs: []const []const u8 = &.{},
+    /// The outstanding pairing code ("" when none) and when it lapses.
+    pair_code: []const u8 = "",
+    pair_expires_ms: i64 = 0,
+    devices: []const WebDevice = &.{},
+};
 pub const SkillInfo = struct { name: []const u8, description: []const u8 };
 
 pub const ClientMsg = union(enum) {
@@ -232,6 +242,12 @@ pub const ClientMsg = union(enum) {
     /// /web enable|disable: start or stop the companion now. Durability is
     /// the client's job (it writes `[web] enabled` to config.toml itself).
     web_control: struct { enabled: bool },
+    /// Issue a phone pairing code (replacing any outstanding one); answered
+    /// with web_status_result carrying it.
+    web_pair: struct {},
+    /// Forget a paired phone and close its open streams; answered with
+    /// web_status_result.
+    web_unpair: struct { id: u32 },
     /// Terminal leases belong to this connection. Phone leases use a per-page id
     /// because HTTP requests use fresh daemon connections. No transcript data.
     presence: struct { kind: enum { terminal, phone }, active: bool, sid: u64 = 0, page_id: u64 = 0 },
@@ -516,6 +532,9 @@ pub const ApprovalAnswer = enum { granted, denied };
 /// Daemon → client.
 pub const DaemonMsg = union(enum) {
     web_status_result: WebStatus,
+    /// A phone was unpaired. Sent to session watchers so the web bridge's
+    /// open event streams re-check their device and close if it is gone.
+    web_devices_changed: struct {},
     /// Opt-in via hello.lifecycle_events; deliberate shutdown must not autostart.
     daemon_stopping: struct {},
     hello_ok: struct {

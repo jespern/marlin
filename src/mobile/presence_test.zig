@@ -43,9 +43,11 @@ test "presence wire roundtrip retains full width phone and session ids" {
     const encoded = try proto.encode(arena.allocator(), decoded);
     try std.testing.expectEqualStrings(wire, std.mem.trimEnd(u8, encoded, "\n"));
 }
-test "web and push serve by default; tailnet exposure stays opt in" {
+test "web and push serve by default; LAN exposure stays opt in" {
     const cfg: config.Config = .{};
     try std.testing.expect(cfg.web_enabled);
     try std.testing.expect(cfg.web_push);
-    try std.testing.expect(!cfg.web_tailscale);
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.web_listen);
+    try std.testing.expectEqual(@as(usize, 0), cfg.web_hosts.len);
+    try std.testing.expect(cfg.web_proxy == null);
 }

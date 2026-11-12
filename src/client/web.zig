@@ -15,15 +15,17 @@
 //! connection, everything else is stateless per request — the same shape as
 //! any other marlin client.
 //!
-//! Binds 127.0.0.1 only. The trust boundary is the TRANSPORT: loopback, or
-//! the tailnet when `tailscale serve` proxies the port to this node's fixed
-//! https URL (`[web] tailscale = true` opts in).
-//! No token, no login — a phone opens the same URL forever. What remains is
-//! what a BROWSER can be tricked into sending, and both vectors identify
-//! themselves in headers: DNS rebinding arrives under a foreign Host,
-//! cross-site POSTs carry a foreign Origin. Both are rejected; curl and the
-//! PWA never notice. A hostile local user is explicitly out of scope
-//! (loopback is machine-wide — /web disable on a multi-user box).
+//! Binds `[web] listen` (127.0.0.1 by default). Loopback is trusted as
+//! before: a loopback peer asking for a loopback Host needs no login. Every
+//! other request names one of `[web] hosts` — the address a reverse proxy
+//! serves over HTTPS — and must carry a paired device cookie
+//! (mobile/pairing.zig): the phone types a code the terminal shows, once.
+//! Unpaired requests get only the app shell, /connection, and /pair. With
+//! `[web] proxy` set, no other non-loopback peer may even connect.
+//! What a BROWSER can be tricked into sending identifies itself in headers:
+//! DNS rebinding arrives under a foreign Host, cross-site POSTs carry a
+//! foreign Origin. Both are rejected. A hostile local user is explicitly out
+//! of scope (loopback is machine-wide — /web disable on a multi-user box).
 //! Serving honors `[web] enabled` (on by default; /web enable|disable
 //! persists the switch, MARLIN_WEB=1 overrides for one-offs).
 //!
@@ -39,6 +41,7 @@ const attach = @import("attach.zig");
 
 const html = @embedFile("webui.html");
 const mobile_push = @import("../mobile/push.zig");
+const pairing = @import("../mobile/pairing.zig");
 const service_worker = @embedFile("webui-sw.js");
 const icon_180 = @embedFile("webui-icon-180.png");
 const icon_512 = @embedFile("webui-icon-512.jpg");
@@ -50,74 +53,11 @@ const manifest =
 ;
 const default_port: u16 = 8377;
 
-/// macOS app installs bundle the CLI without adding a PATH executable.
-/// Explicit CLI mode prevents background launches from opening a GUI.
 /// Shell sessions are a terminal-client feature: a browser never gets a PTY,
 /// nor sees one. Every shell_* message is refused, including any added later,
 /// since attaching or listing would expose a running shell's screen.
 pub fn allowedOverWeb(msg: proto.ClientMsg) bool {
     return !std.mem.startsWith(u8, @tagName(msg), "shell_");
-}
-
-pub fn runTailscale(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const []const u8) !std.process.RunResult {
-    return runTailscaleCommand(gpa, io, environ, "tailscale", args) catch |err| {
-        if (err != error.FileNotFound or @import("builtin").os.tag != .macos) return err;
-        return runTailscaleCommand(gpa, io, environ, "/Applications/Tailscale.app/Contents/MacOS/Tailscale", args);
-    };
-}
-
-pub fn runTailscaleCommand(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, executable: []const u8, args: []const []const u8) !std.process.RunResult {
-    if (args.len > 7) return error.TooManyArguments;
-    var env = try environ.clone(gpa);
-    defer env.deinit();
-    try env.put("TAILSCALE_BE_CLI", "1");
-    var argv: [8][]const u8 = undefined;
-    argv[0] = executable;
-    @memcpy(argv[1 .. args.len + 1], args);
-    return std.process.run(gpa, io, .{
-        .argv = argv[0 .. args.len + 1],
-        .environ_map = &env,
-        .stdout_limit = .limited(4 * 1024 * 1024),
-        .stderr_limit = .limited(16 * 1024),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } },
-    });
-}
-
-/// Best-effort `tailscale serve --bg <port>`: expose the loopback port at
-/// this node's fixed tailnet https URL. Returns the gpa-owned tailnet host
-/// name when serving, null (with a log line) when tailscale is absent,
-/// logged out, or the CLI shape is unrecognized — the UI stays usable on
-/// loopback either way.
-fn setupTailscale(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, port: u16) ?[]u8 {
-    var port_buf: [8]u8 = undefined;
-    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
-
-    const serve_result = runTailscale(gpa, io, environ, &.{ "serve", "--bg", port_str }) catch |err| {
-        std.log.info("tailscale serve unavailable ({t}); web ui is loopback-only", .{err});
-        return null;
-    };
-    defer gpa.free(serve_result.stdout);
-    defer gpa.free(serve_result.stderr);
-    if (serve_result.term != .exited or serve_result.term.exited != 0) {
-        const detail = std.mem.trim(u8, serve_result.stderr, " \t\r\n");
-        std.log.warn("tailscale serve refused ({s}); web ui is loopback-only", .{detail});
-        return null;
-    }
-
-    const status = runTailscale(gpa, io, environ, &.{ "status", "--json" }) catch return null;
-    defer gpa.free(status.stdout);
-    defer gpa.free(status.stderr);
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), status.stdout, .{}) catch return null;
-    if (parsed != .object) return null;
-    const self_node = parsed.object.get("Self") orelse return null;
-    if (self_node != .object) return null;
-    const dns = self_node.object.get("DNSName") orelse return null;
-    if (dns != .string) return null;
-    const host = std.mem.trimEnd(u8, dns.string, ".");
-    if (host.len == 0) return null;
-    return gpa.dupe(u8, host) catch null;
 }
 
 /// Block on the daemon-held stdin pipe; its EOF means the daemon exited (any
@@ -142,26 +82,20 @@ pub fn serve(
 ) !u8 {
     // Enabled by default; disabled is an explicit user choice (/web disable
     // or `[web] enabled = false`), so honor it and say the way back.
-    var port: u16 = default_port;
-    var want_tailscale = false;
-    var want_push = false;
-    {
-        var loaded = config.load(gpa, io, environ) catch |e| {
-            std.log.err("cannot load config: {t}", .{e});
-            return 1;
-        };
-        defer loaded.deinit();
-        if (!loaded.value.web_enabled) {
-            std.log.err(
-                "the web ui is disabled — run /web enable in marlin (or set [web] enabled = true; MARLIN_WEB=1 for a one-off).",
-                .{},
-            );
-            return 2;
-        }
-        port = loaded.value.web_port;
-        want_tailscale = loaded.value.web_tailscale;
-        want_push = loaded.value.web_push and environ.get("MARLIN_REMOTE") == null;
+    var loaded = config.load(gpa, io, environ) catch |e| {
+        std.log.err("cannot load config: {t}", .{e});
+        return 1;
+    };
+    defer loaded.deinit();
+    const cfg = loaded.value;
+    if (!cfg.web_enabled) {
+        std.log.err(
+            "the web ui is disabled — run /web enable in marlin (or set [web] enabled = true; MARLIN_WEB=1 for a one-off).",
+            .{},
+        );
+        return 2;
     }
+    var port: u16 = cfg.web_port;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -173,6 +107,14 @@ pub fn serve(
             };
         }
     }
+    var addr = Io.net.IpAddress.parse(cfg.web_listen, port) catch {
+        std.log.err("[web] listen = \"{s}\" is not an IP address", .{cfg.web_listen});
+        return 2;
+    };
+    const proxy: ?Io.net.IpAddress = if (cfg.web_proxy) |text| Io.net.IpAddress.parse(text, 0) catch {
+        std.log.err("[web] proxy = \"{s}\" is not an IP address", .{text});
+        return 2;
+    } else null;
 
     // Connect once up front: autostarts the daemon and fails fast on a
     // broken socket before we claim the HTTP port.
@@ -192,31 +134,42 @@ pub fn serve(
         if (watch) |t| t.detach();
     }
 
-    var addr = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
     var server = addr.listen(io, .{ .reuse_address = true }) catch |e| {
-        std.log.err("cannot listen on 127.0.0.1:{d}: {t}", .{ port, e });
+        std.log.err("cannot listen on {f}: {t}", .{ addr, e });
         return 1;
     };
     defer server.deinit(io);
 
-    const tailnet_host: ?[]const u8 = if (want_tailscale) setupTailscale(gpa, io, environ, port) else null;
-    defer if (tailnet_host) |h| gpa.free(@constCast(h));
-    std.log.info("marlin web ui on http://127.0.0.1:{d}/", .{port});
-    if (tailnet_host) |host| {
-        std.log.info("tailnet: https://{s}/ (fixed URL; the tailnet is the gate)", .{host});
+    const pairing_root = pairing.stateRoot(gpa, environ) catch null;
+    defer if (pairing_root) |root| gpa.free(root);
+    var settings: Settings = .{
+        .hosts = cfg.web_hosts,
+        .proxy = proxy,
+        .push_enabled = cfg.web_push and environ.get("MARLIN_REMOTE") == null,
+        .pairing_root = pairing_root,
+    };
+    std.log.info("marlin web ui on http://{f}/", .{addr});
+    if (cfg.web_hosts.len > 0) {
+        std.log.info("phone: https://{s}/ (paired devices only)", .{cfg.web_hosts[0]});
+    } else if (!isLoopback(addr)) {
+        std.log.warn("listening beyond loopback with no [web] hosts: remote requests are refused", .{});
     }
 
     while (true) {
-        const stream = server.accept(io) catch break;
+        var stream = server.accept(io) catch break;
+        const peer = stream.socket.address;
+        if (!peerAllowed(proxy, peer)) {
+            std.log.warn("refused {f}: not the [web] proxy", .{peer});
+            stream.close(io);
+            continue;
+        }
         const ctx = gpa.create(ConnCtx) catch {
-            var s = stream;
-            s.close(io);
+            stream.close(io);
             continue;
         };
-        ctx.* = .{ .gpa = gpa, .io = io, .environ = environ, .self_exe = self_exe, .stream = stream, .tailnet_host = tailnet_host, .push_enabled = want_push };
+        ctx.* = .{ .gpa = gpa, .io = io, .environ = environ, .self_exe = self_exe, .stream = stream, .peer = peer, .settings = &settings };
         const thread = std.Thread.spawn(.{}, connMain, .{ctx}) catch {
-            var s = stream;
-            s.close(io);
+            stream.close(io);
             gpa.destroy(ctx);
             continue;
         };
@@ -225,16 +178,27 @@ pub fn serve(
     return 0;
 }
 
+/// Read once at startup and shared by every connection thread.
+const Settings = struct {
+    /// `[web] hosts`: public names allowed in Host/Origin besides loopback.
+    hosts: []const []const u8,
+    proxy: ?Io.net.IpAddress,
+    push_enabled: bool,
+    /// pairing.json's directory; null without HOME/XDG_STATE_HOME, in which
+    /// case nothing can pair and only loopback works.
+    pairing_root: ?[]const u8,
+    /// Serializes this process's read-modify-write of pairing.json.
+    pair_mutex: Io.Mutex = .init,
+};
+
 const ConnCtx = struct {
     gpa: std.mem.Allocator,
     io: Io,
     environ: *const std.process.Environ.Map,
     self_exe: []const u8,
     stream: Io.net.Stream,
-    /// Non-null when tailscale serve fronts this port; its DNS name is then
-    /// an allowed Host/Origin alongside loopback.
-    tailnet_host: ?[]const u8,
-    push_enabled: bool = false,
+    peer: Io.net.IpAddress,
+    settings: *Settings,
 };
 
 fn connMain(ctx: *ConnCtx) void {
@@ -283,21 +247,43 @@ pub fn clfTime(buf: []u8, epoch_seconds: i64) []const u8 {
     }) catch buf[0..0];
 }
 
+/// The parts of a request head that outlive its body. Reading a body
+/// invalidates `req.head` strings and may reuse the header buffer, so every
+/// handler reads these instead.
+const Head = struct {
+    method: std.http.Method,
+    version: std.http.Version,
+    target_buf: [512]u8 = undefined,
+    target_len: usize = 0,
+    client_buf: [64]u8 = undefined,
+    client_len: usize = 0,
+    user_agent: []const u8 = "",
+    user_agent_buf: [256]u8 = undefined,
+    https: bool = false,
+
+    fn target(self: *const Head) []const u8 {
+        return self.target_buf[0..self.target_len];
+    }
+    fn client(self: *const Head) []const u8 {
+        return self.client_buf[0..self.client_len];
+    }
+};
+
 /// One access.log line per finished request, written directly to stderr
 /// (NOT std.log: no `info:` prefix) so the companion ring and the /web tab
 /// show plain Common Log Format. Streams log at completion with their total
-/// body bytes, the way nginx does. The bridge binds loopback only, so the
-/// peer is always 127.0.0.1.
-fn logAccess(ctx: *ConnCtx, req: *const std.http.Server.Request, access: Access) void {
+/// body bytes, the way nginx does.
+fn logAccess(ctx: *ConnCtx, head: *const Head, access: Access) void {
     var when_buf: [40]u8 = undefined;
     const when = clfTime(&when_buf, Io.Timestamp.now(ctx.io, .real).toSeconds());
     var buffer: [1024]u8 = undefined;
     var writer = Io.File.stderr().writer(ctx.io, &buffer);
-    writer.interface.print("127.0.0.1 - - [{s}] \"{s} {s} {s}\" {d} {d}\n", .{
+    writer.interface.print("{s} - - [{s}] \"{s} {s} {s}\" {d} {d}\n", .{
+        head.client(),
         when,
-        @tagName(req.head.method),
-        req.head.target,
-        @tagName(req.head.version),
+        @tagName(head.method),
+        head.target(),
+        @tagName(head.version),
         @backingInt(access.status),
         access.bytes,
     }) catch return;
@@ -305,29 +291,65 @@ fn logAccess(ctx: *ConnCtx, req: *const std.http.Server.Request, access: Access)
 }
 
 fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
-    const target = req.head.target;
+    var head: Head = .{ .method = req.head.method, .version = req.head.version };
+    head.target_len = @min(req.head.target.len, head.target_buf.len);
+    @memcpy(head.target_buf[0..head.target_len], req.head.target[0..head.target_len]);
+    head.client_len = clientAddress(&head.client_buf, ctx.settings.proxy, ctx.peer, headerValue(req, "x-forwarded-for")).len;
+    if (headerValue(req, "user-agent")) |ua| {
+        const n = @min(ua.len, head.user_agent_buf.len);
+        @memcpy(head.user_agent_buf[0..n], ua[0..n]);
+        head.user_agent = head.user_agent_buf[0..n];
+    }
+    head.https = if (headerValue(req, "x-forwarded-proto")) |proto_name| std.ascii.eqlIgnoreCase(proto_name, "https") else false;
+    const target = head.target();
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     var access = Access{};
-    defer logAccess(ctx, req, access);
+    defer logAccess(ctx, &head, access);
 
-    // Transport is the trust boundary (loopback / tailnet); these header
-    // checks close the two ways a BROWSER can be steered across it. DNS
-    // rebinding reaches us under the attacker's Host; a cross-site POST
-    // carries the attacker's Origin. Same-origin requests, curl, and the
-    // installed PWA pass untouched — nothing here ever needs re-auth.
-    if (!hostAllowed(ctx.tailnet_host, headerValue(req, "host"))) {
+    // These header checks close the two ways a BROWSER can be steered across
+    // the boundary. DNS rebinding reaches us under the attacker's Host; a
+    // cross-site POST carries the attacker's Origin. Same-origin requests,
+    // curl, and the installed PWA pass untouched.
+    const settings = ctx.settings;
+    const host = headerValue(req, "host");
+    if (!hostAllowed(settings.hosts, host)) {
         try reply(req, &access, "forbidden: unrecognized Host\n", .{ .status = .forbidden });
         return;
     }
-    if (req.head.method == .POST and !originAllowed(ctx.tailnet_host, headerValue(req, "origin"))) {
+    if (req.head.method == .POST and !originAllowed(settings.hosts, headerValue(req, "origin"))) {
         try reply(req, &access, "forbidden: cross-origin request\n", .{ .status = .forbidden });
         return;
     }
 
+    // Loopback asking for itself is trusted, as it always was. Anything
+    // addressed to a public name is a remote device and must be paired.
+    const local = isLocal(ctx.peer, host);
+    var token_buf: [pairing.token_len]u8 = undefined;
+    const device: ?[]const u8 = if (local) null else knownDevice(ctx, &token_buf, headerValue(req, "cookie"));
+    const paired = local or device != null;
+    if (!paired and !publicRoute(req.head.method, path)) {
+        try reply(req, &access,
+            \\{"err":{"code":"unpaired","msg":"pair this device first"}}
+        , .{ .status = .forbidden, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+        return;
+    }
+
     if (std.mem.eql(u8, target, "/connection")) {
-        const body = try std.json.Stringify.valueAlloc(ctx.gpa, .{ .tailnet_host = ctx.tailnet_host, .push_enabled = ctx.push_enabled }, .{});
+        const body = try std.json.Stringify.valueAlloc(ctx.gpa, .{
+            .host = if (settings.hosts.len > 0) settings.hosts[0] else null,
+            .push_enabled = settings.push_enabled,
+            .paired = paired,
+        }, .{});
         defer ctx.gpa.free(body);
-        try reply(req, &access, body, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" } } });
+        // Each visit renews a paired device's cookie, so it never lapses
+        // while the phone is in use.
+        var cookie_buf: [256]u8 = undefined;
+        const renew: []const std.http.Header = if (device) |token| &.{.{ .name = "set-cookie", .value = deviceCookie(&cookie_buf, token, head.https) }} else &.{};
+        var headers: [3]std.http.Header = .{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" }, undefined };
+        if (renew.len == 1) headers[2] = renew[0];
+        try reply(req, &access, body, .{ .extra_headers = headers[0 .. 2 + renew.len] });
+    } else if (std.mem.eql(u8, path, "/pair") and req.head.method == .POST) {
+        try servePair(ctx, req, &head, &access);
     } else if (std.mem.eql(u8, target, "/sw.js")) {
         try reply(req, &access, service_worker, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "text/javascript" }, .{ .name = "cache-control", .value = "no-cache" } } });
     } else if (std.mem.startsWith(u8, path, "/push/")) {
@@ -349,9 +371,13 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
             .{ .name = "content-type", .value = "image/jpeg" },
         } });
     } else if (std.mem.startsWith(u8, target, "/events")) {
-        try serveEvents(ctx, req, &access);
+        try serveEvents(ctx, req, target, device, &access);
+        // An event stream has no length: only closing the connection tells
+        // the client it ended (a revoked device, a daemon that went away).
+        return error.StreamEnded;
     } else if (std.mem.startsWith(u8, target, "/history")) {
-        try serveHistory(ctx, req, &access);
+        try serveHistory(ctx, req, target, &access);
+        return error.StreamEnded;
     } else if (std.mem.eql(u8, target, "/send") and req.head.method == .POST) {
         try serveSend(ctx, req, &access);
     } else {
@@ -359,8 +385,95 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     }
 }
 
+/// What an unpaired device may load: the app shell (so it can show the
+/// pairing screen), /connection (so it knows to), and /pair itself.
+pub fn publicRoute(method: std.http.Method, path: []const u8) bool {
+    if (method == .POST) return std.mem.eql(u8, path, "/pair");
+    if (method != .GET and method != .HEAD) return false;
+    const routes = [_][]const u8{ "/", "/index.html", "/manifest.webmanifest", "/icon-180.png", "/icon-512.jpg", "/sw.js", "/connection" };
+    for (routes) |route| {
+        if (std.mem.eql(u8, path, route)) return true;
+    }
+    return false;
+}
+
+/// The device token from the request's cookie when it belongs to a paired
+/// device, copied into `buf`; null otherwise.
+fn knownDevice(ctx: *ConnCtx, buf: *[pairing.token_len]u8, cookie_header: ?[]const u8) ?[]const u8 {
+    const root = ctx.settings.pairing_root orelse return null;
+    const token = cookieValue(cookie_header, pairing.cookie_name) orelse return null;
+    if (token.len != pairing.token_len) return null;
+    if (!(pairing.verify(ctx.gpa, ctx.io, root, token) catch false)) return null;
+    @memcpy(buf, token);
+    return buf;
+}
+
+pub fn deviceCookie(buf: []u8, token: []const u8, secure: bool) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}={s}; Path=/; Max-Age={d}; HttpOnly; SameSite=Lax{s}", .{
+        pairing.cookie_name,
+        token,
+        pairing.cookie_max_age_s,
+        if (secure) "; Secure" else "",
+    }) catch unreachable;
+}
+
+/// POST /pair {"code":"123456"}: trade the code /web shows for a device
+/// cookie. A wrong guess counts against the code (pairing.max_failures).
+fn servePair(ctx: *ConnCtx, req: *std.http.Server.Request, head: *const Head, access: *Access) !void {
+    const json_header = [_]std.http.Header{.{ .name = "content-type", .value = "application/json" }};
+    const root = ctx.settings.pairing_root orelse {
+        try reply(req, access,
+            \\{"err":{"code":"pairing","msg":"pairing needs a state directory on the Marlin host"}}
+        , .{ .status = .service_unavailable, .extra_headers = &json_header });
+        return;
+    };
+    var body_buf: [256]u8 = undefined;
+    const body_reader = try req.readerExpectContinue(&body_buf);
+    const body = body_reader.allocRemaining(ctx.gpa, .limited(body_buf.len)) catch {
+        try reply(req, access, "body too large\n", .{ .status = .payload_too_large });
+        return;
+    };
+    defer ctx.gpa.free(body);
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const attempt = std.json.parseFromSliceLeaky(struct { code: []const u8 }, arena_state.allocator(), body, .{ .ignore_unknown_fields = true }) catch {
+        try reply(req, access,
+            \\{"err":{"code":"bad_msg","msg":"expected {\"code\":\"...\"}"}}
+        , .{ .status = .bad_request, .extra_headers = &json_header });
+        return;
+    };
+
+    const name = pairing.deviceName(if (head.user_agent.len > 0) head.user_agent else null);
+    const now_ms = Io.Timestamp.now(ctx.io, .real).toMilliseconds();
+    const redeemed = blk: {
+        ctx.settings.pair_mutex.lockUncancelable(ctx.io);
+        defer ctx.settings.pair_mutex.unlock(ctx.io);
+        break :blk pairing.redeem(ctx.gpa, ctx.io, root, attempt.code, name, now_ms) catch |err| {
+            std.log.err("pairing failed: {t}", .{err});
+            try reply(req, access,
+                \\{"err":{"code":"pairing","msg":"could not save the pairing; see /web on the Marlin host"}}
+            , .{ .status = .internal_server_error, .extra_headers = &json_header });
+            return;
+        };
+    };
+    const device = redeemed orelse {
+        std.log.warn("pairing attempt from {s} rejected", .{head.client()});
+        try reply(req, access,
+            \\{"err":{"code":"bad_code","msg":"wrong or expired code — press p in /web for a new one"}}
+        , .{ .status = .forbidden, .extra_headers = &json_header });
+        return;
+    };
+    std.log.info("paired {s} #{d} from {s}", .{ name, device.id, head.client() });
+    var cookie_buf: [256]u8 = undefined;
+    try reply(req, access, "{\"paired\":true}", .{ .extra_headers = &.{
+        json_header[0],
+        .{ .name = "cache-control", .value = "no-store" },
+        .{ .name = "set-cookie", .value = deviceCookie(&cookie_buf, &device.token, head.https) },
+    } });
+}
+
 fn servePush(ctx: *ConnCtx, req: *std.http.Server.Request, path: []const u8, access: *Access) !void {
-    if (!ctx.push_enabled) {
+    if (!ctx.settings.push_enabled) {
         try reply(req, access, "phone push is disabled", .{ .status = .not_found });
         return;
     }
@@ -442,8 +555,10 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !voi
 }
 
 /// Dedicated daemon connection per SSE stream; ends when either side closes.
-fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !void {
-    const sid = sidFromQuery(req.head.target) orelse {
+/// `device` is the paired device's token (null for loopback); the stream
+/// ends as soon as that device is unpaired.
+fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request, target: []const u8, device: ?[]const u8, access: *Access) !void {
+    const sid = sidFromQuery(target) orelse {
         try reply(req, access, "missing or bad sid\n", .{ .status = .bad_request });
         return;
     };
@@ -478,6 +593,12 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !v
         const line = conn.readLine() catch break;
         defer ctx.gpa.free(line);
         const body = std.mem.trimEnd(u8, line, "\r\n");
+        if (std.mem.startsWith(u8, body, "{\"web_devices_changed\":")) {
+            const token = device orelse continue;
+            const root = ctx.settings.pairing_root orelse break;
+            if (pairing.verify(ctx.gpa, ctx.io, root, token) catch false) continue;
+            break;
+        }
         response.writer.writeAll("data: ") catch break;
         response.writer.writeAll(body) catch break;
         response.writer.writeAll("\n\n") catch break;
@@ -493,12 +614,12 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !v
 
 /// One bounded older-history page as SSE. Unlike /events this stream ends at
 /// replay_done; the browser opens it only when the user asks for more.
-fn serveHistory(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !void {
-    const sid = queryU64(req.head.target, "sid") orelse {
+fn serveHistory(ctx: *ConnCtx, req: *std.http.Server.Request, target: []const u8, access: *Access) !void {
+    const sid = queryU64(target, "sid") orelse {
         try reply(req, access, "missing or bad sid\n", .{ .status = .bad_request });
         return;
     };
-    const before = queryU64(req.head.target, "before") orelse {
+    const before = queryU64(target, "before") orelse {
         try reply(req, access, "missing or bad before seq\n", .{ .status = .bad_request });
         return;
     };
@@ -554,15 +675,22 @@ fn headerValue(req: *const std.http.Server.Request, name: []const u8) ?[]const u
     return null;
 }
 
-/// A Host header is ours when it names loopback or the tailnet DNS name
-/// (any port, trailing-dot tolerant). Absent/foreign Hosts — the shape of a
-/// DNS-rebinding request — are rejected.
-pub fn hostAllowed(tailnet_host: ?[]const u8, host_header: ?[]const u8) bool {
-    const raw = host_header orelse return false;
-    const host = std.mem.trimEnd(u8, raw[0 .. std.mem.lastIndexOfScalar(u8, raw, ':') orelse raw.len], ".");
-    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
-    if (std.mem.eql(u8, host, "127.0.0.1")) return true;
-    if (tailnet_host) |allowed| {
+/// The name part of a Host header: port and trailing dot stripped.
+fn hostName(raw: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, raw[0 .. std.mem.lastIndexOfScalar(u8, raw, ':') orelse raw.len], ".");
+}
+
+fn isLoopbackName(host: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "127.0.0.1");
+}
+
+/// A Host header is ours when it names loopback or one of `[web] hosts`
+/// (any port, case- and trailing-dot tolerant). Absent/foreign Hosts — the
+/// shape of a DNS-rebinding request — are rejected.
+pub fn hostAllowed(hosts: []const []const u8, host_header: ?[]const u8) bool {
+    const host = hostName(host_header orelse return false);
+    if (isLoopbackName(host)) return true;
+    for (hosts) |allowed| {
         if (std.ascii.eqlIgnoreCase(host, std.mem.trimEnd(u8, allowed, "."))) return true;
     }
     return false;
@@ -572,7 +700,7 @@ pub fn hostAllowed(tailnet_host: ?[]const u8, host_header: ?[]const u8) bool {
 /// same-origin request or a non-browser client, both fine. A present Origin
 /// must resolve to an allowed host over http(s) — anything else (including
 /// the literal "null" of sandboxed frames) is a cross-site request.
-pub fn originAllowed(tailnet_host: ?[]const u8, origin_header: ?[]const u8) bool {
+pub fn originAllowed(hosts: []const []const u8, origin_header: ?[]const u8) bool {
     const origin = origin_header orelse return true;
     const rest = if (std.mem.startsWith(u8, origin, "https://"))
         origin["https://".len..]
@@ -580,7 +708,82 @@ pub fn originAllowed(tailnet_host: ?[]const u8, origin_header: ?[]const u8) bool
         origin["http://".len..]
     else
         return false;
-    return hostAllowed(tailnet_host, rest);
+    return hostAllowed(hosts, rest);
+}
+
+/// The local machine: a loopback peer asking for a loopback name. Both
+/// halves matter — a LAN peer can claim `Host: localhost`, and a proxy on
+/// this machine connects from loopback on behalf of a remote phone.
+pub fn isLocal(peer: Io.net.IpAddress, host_header: ?[]const u8) bool {
+    return isLoopback(peer) and isLoopbackName(hostName(host_header orelse return false));
+}
+
+/// IPv4 bytes of an address, unwrapping IPv4-mapped IPv6 (a dual-stack
+/// listener sees v4 peers as ::ffff:a.b.c.d).
+fn ip4Bytes(addr: Io.net.IpAddress) ?[4]u8 {
+    return switch (addr) {
+        .ip4 => |a| a.bytes,
+        .ip6 => |a| if (std.mem.eql(u8, a.bytes[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) a.bytes[12..16].* else null,
+    };
+}
+
+const ip6_loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+pub fn isLoopback(addr: Io.net.IpAddress) bool {
+    if (ip4Bytes(addr)) |bytes| return bytes[0] == 127;
+    return switch (addr) {
+        .ip6 => |a| std.mem.eql(u8, &a.bytes, &ip6_loopback),
+        .ip4 => unreachable,
+    };
+}
+
+/// Same host, any port.
+pub fn sameHost(a: Io.net.IpAddress, b: Io.net.IpAddress) bool {
+    if (ip4Bytes(a)) |x| {
+        const y = ip4Bytes(b) orelse return false;
+        return std.mem.eql(u8, &x, &y);
+    }
+    if (ip4Bytes(b) != null) return false;
+    return std.mem.eql(u8, &a.ip6.bytes, &b.ip6.bytes);
+}
+
+/// Loopback always connects; with `[web] proxy` set, it is the only other
+/// peer that may.
+pub fn peerAllowed(proxy: ?Io.net.IpAddress, peer: Io.net.IpAddress) bool {
+    if (isLoopback(peer)) return true;
+    const only = proxy orelse return true;
+    return sameHost(only, peer);
+}
+
+/// The client to name in the access log: the peer's address, or the first
+/// X-Forwarded-For entry when the peer is the configured proxy (only it is
+/// trusted to say who it forwards for).
+pub fn clientAddress(buf: []u8, proxy: ?Io.net.IpAddress, peer: Io.net.IpAddress, forwarded_for: ?[]const u8) []const u8 {
+    if (proxy) |p| if (sameHost(p, peer)) if (forwarded_for) |list| {
+        const first = std.mem.trim(u8, list[0 .. std.mem.indexOfScalar(u8, list, ',') orelse list.len], " \t");
+        if (first.len > 0 and first.len <= buf.len) {
+            @memcpy(buf[0..first.len], first);
+            return buf[0..first.len];
+        }
+    };
+    if (ip4Bytes(peer)) |b| return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch buf[0..0];
+    var w: Io.Writer = .fixed(buf);
+    peer.format(&w) catch return buf[0..0];
+    // "[addr]:port" → "addr"
+    const text = w.buffered();
+    const end = std.mem.indexOfScalar(u8, text, ']') orelse return text;
+    return text[1..end];
+}
+
+/// One cookie's value from a Cookie header ("a=1; b=2").
+pub fn cookieValue(header: ?[]const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, header orelse return null, ';');
+    while (it.next()) |pair| {
+        const trimmed = std.mem.trim(u8, pair, " \t");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        if (std.mem.eql(u8, trimmed[0..eq], name)) return trimmed[eq + 1 ..];
+    }
+    return null;
 }
 
 pub fn queryU64(target: []const u8, name: []const u8) ?u64 {

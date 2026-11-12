@@ -71,7 +71,9 @@ pub const Document = struct {
     voice_mode: ?[]const u8 = null,
     voice_model: ?[]const u8 = null,
     voice_stt_bin: ?[]const u8 = null,
-    web_tailscale: ?bool = null,
+    web_listen: ?[]const u8 = null,
+    web_hosts: ?[]const []const u8 = null,
+    web_proxy: ?[]const u8 = null,
     web_push: ?bool = null,
     discovery_enabled: ?bool = null,
     ui_tab_bar: ?bool = null,
@@ -232,7 +234,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
                     if (port == 0) return error.InvalidValue;
                     doc.web_port = port;
                 }
-                if (std.mem.eql(u8, key, "tailscale")) doc.web_tailscale = try boolean(value);
+                if (std.mem.eql(u8, key, "listen")) doc.web_listen = try string(arena, value);
+                if (std.mem.eql(u8, key, "hosts")) doc.web_hosts = try stringArray(arena, value);
+                if (std.mem.eql(u8, key, "proxy")) doc.web_proxy = try string(arena, value);
                 if (std.mem.eql(u8, key, "push")) doc.web_push = try boolean(value);
             },
             .discovery => if (std.mem.eql(u8, key, "enabled")) {

@@ -76,13 +76,15 @@ test "known malformed values fail" {
     ));
 }
 
-test "web tailscale and ui tab_bar flags parse" {
+test "web exposure and ui tab_bar flags parse" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const doc = try parse(arena_state.allocator(),
         \\[web]
         \\enabled = true
-        \\tailscale = false
+        \\listen = "0.0.0.0"
+        \\hosts = ["marlin.example.com", "victory.local"]
+        \\proxy = "192.168.1.1"
         \\push = true
         \\[ui]
         \\tab_bar = false
@@ -95,7 +97,10 @@ test "web tailscale and ui tab_bar flags parse" {
         \\default = "local/qwen"
     );
     try std.testing.expect(doc.web_enabled.?);
-    try std.testing.expect(!doc.web_tailscale.?);
+    try std.testing.expectEqualStrings("0.0.0.0", doc.web_listen.?);
+    try std.testing.expectEqual(@as(usize, 2), doc.web_hosts.?.len);
+    try std.testing.expectEqualStrings("victory.local", doc.web_hosts.?[1]);
+    try std.testing.expectEqualStrings("192.168.1.1", doc.web_proxy.?);
     try std.testing.expect(doc.web_push.?);
     try std.testing.expect(!doc.ui_tab_bar.?);
     try std.testing.expect(!doc.ui_bell.?);

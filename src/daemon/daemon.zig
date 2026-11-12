@@ -43,6 +43,7 @@ const Io = std.Io;
 
 const proto = @import("../core/proto.zig");
 const web_service_mod = @import("web_service.zig");
+const pairing = @import("../mobile/pairing.zig");
 const discovery = @import("../core/discovery.zig");
 const mobile_push = @import("../mobile/push.zig");
 const mobile_presence = @import("../mobile/presence.zig");
@@ -687,7 +688,7 @@ pub const Daemon = struct {
             } else |err| std.log.warn("discovery: not advertising: {t}", .{err});
         }
 
-        var companion = web_service_mod.Service{ .gpa = gpa, .io = io, .environ = environ, .exe = self.marlin_exe orelse "", .port = cfg.web_port };
+        var companion = web_service_mod.Service{ .gpa = gpa, .io = io, .environ = environ, .exe = self.marlin_exe orelse "", .port = cfg.web_port, .hosts = cfg.web_hosts };
         defer companion.stop();
         // Registered even while disabled so /web enable can start it later.
         if (self.marlin_exe != null) self.web_service = &companion;
@@ -1638,21 +1639,74 @@ pub const Daemon = struct {
         if (self.phone_push) |worker| worker.notify(sid, needs_input, failed);
     }
 
+    /// Companion state, log, and pairing: the live code and paired devices
+    /// are read from pairing.json, which the web bridge also writes.
+    fn sendWebStatus(self: *Daemon, client: *Client) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var status: proto.WebStatus = if (self.web_service) |service| try service.snapshot(arena) else .{
+            .enabled = self.cfg.web_enabled,
+            .state = if (self.cfg.web_enabled) "failed" else "disabled",
+        };
+        if (self.web_service != null) status.enabled = self.cfg.web_enabled;
+        if (pairing.stateRoot(arena, self.environ)) |root| {
+            if (pairing.load(arena, self.io, root)) |state| {
+                if (pairing.activeCode(state, nowMs(self.io))) |code| {
+                    status.pair_code = code.digits;
+                    status.pair_expires_ms = code.expires_ms;
+                }
+                const devices = try arena.alloc(proto.WebDevice, state.devices.len);
+                for (devices, state.devices) |*out, device| out.* = .{ .id = device.id, .name = device.name, .paired_ms = device.paired_ms };
+                status.devices = devices;
+            } else |err| std.log.warn("cannot read pairing state: {t}", .{err});
+        } else |_| {}
+        self.sendTo(client, .{ .web_status_result = status });
+    }
+
     fn handleClientMsg(self: *Daemon, client: *Client, msg: proto.ClientMsg) !void {
         if (!client.said_hello and msg != .hello) {
             self.sendTo(client, .{ .err = .{ .code = "no_hello", .msg = "hello required first" } });
             return;
         }
         switch (msg) {
-            .web_status => {
-                var arena: std.heap.ArenaAllocator = .init(self.gpa);
-                defer arena.deinit();
-                var status: proto.WebStatus = if (self.web_service) |service| try service.snapshot(arena.allocator()) else .{
-                    .enabled = self.cfg.web_enabled,
-                    .state = if (self.cfg.web_enabled) "failed" else "disabled",
+            .web_status => try self.sendWebStatus(client),
+            .web_pair => {
+                const root = pairing.stateRoot(self.gpa, self.environ) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "web", .msg = "pairing needs HOME or XDG_STATE_HOME on the daemon host" } });
+                    return;
                 };
-                if (self.web_service != null) status.enabled = self.cfg.web_enabled;
-                self.sendTo(client, .{ .web_status_result = status });
+                defer self.gpa.free(root);
+                _ = pairing.issue(self.gpa, self.io, root, nowMs(self.io)) catch |err| {
+                    std.log.warn("cannot issue a pairing code: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{ .code = "web", .msg = "could not create a pairing code" } });
+                    return;
+                };
+                try self.sendWebStatus(client);
+            },
+            .web_unpair => |u| {
+                const root = pairing.stateRoot(self.gpa, self.environ) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "web", .msg = "pairing needs HOME or XDG_STATE_HOME on the daemon host" } });
+                    return;
+                };
+                defer self.gpa.free(root);
+                const revoked = pairing.revoke(self.gpa, self.io, root, u.id) catch |err| {
+                    std.log.warn("cannot revoke device {d}: {t}", .{ u.id, err });
+                    self.sendTo(client, .{ .err = .{ .code = "web", .msg = "could not update the paired devices" } });
+                    return;
+                };
+                if (!revoked) {
+                    self.sendTo(client, .{ .err = .{ .code = "web", .msg = "no paired device with that number" } });
+                    return;
+                }
+                // Requests re-check the cookie, but open event streams were
+                // admitted earlier: each re-checks its device on this event.
+                self.forEachClient(self, struct {
+                    fn send(daemon: *Daemon, watcher: *Client) void {
+                        if (watcher.said_hello and watcher.watches_sessions) daemon.sendTo(watcher, .{ .web_devices_changed = .{} });
+                    }
+                }.send);
+                try self.sendWebStatus(client);
             },
             .web_control => |wc| {
                 // The client has already persisted [web] enabled; this applies

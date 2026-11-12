@@ -151,7 +151,7 @@ pub fn dispatch(
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
             const status = try conn.recvUntil(arena.allocator(), .web_status_result);
-            try stdoutPrint(io, "Web companion: {s}\n{s}\nOpen /web inside Marlin for the live access log.\n", .{ status.state, status.url });
+            try stdoutPrint(io, "Web companion: {s}\n{s}\n{d} paired device(s). Open /web inside Marlin to pair a phone and for the live access log.\n", .{ status.state, status.url, status.devices.len });
             return 0;
         },
         .attach => {
@@ -363,7 +363,7 @@ const help_text =
     \\                         rebuild scoped source binaries, then reattach
     \\  marlin shutdown        stop the daemon
     \\  marlin web             show the daemon-managed companion status
-    \\                         (127.0.0.1:8377; tailnet via tailscale serve)
+    \\                         (127.0.0.1:8377; phones pair via /web, docs/MOBILE.md)
     \\  marlin discover [--wait S]  list the marlins on this network (Bonjour)
     \\                         with a --remote target for each
     \\  marlin --remote <host> [command …]  run any of the above against

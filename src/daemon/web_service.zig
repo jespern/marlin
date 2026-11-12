@@ -17,9 +17,9 @@ pub const Service = struct {
     lengths: [128]usize = @splat(0),
     count: usize = 0,
     next: usize = 0,
-    url: [256]u8 = undefined,
-    url_len: usize = 0,
     port: u16,
+    /// `[web] hosts`; the first is the address /web advertises.
+    hosts: []const []const u8 = &.{},
 
     /// Idempotent, and restartable after stop(): /web disable then enable
     /// cycles the same Service. Thread handle is dispatcher-owned.
@@ -50,12 +50,6 @@ pub const Service = struct {
         self.lengths[self.next] = n;
         self.next = (self.next + 1) % self.logs.len;
         self.count = @min(self.count + 1, self.logs.len);
-        if (std.mem.indexOf(u8, text, "tailnet: https://")) |marker| {
-            const at = marker + 9;
-            const end = std.mem.indexOfScalarPos(u8, text, at, ' ') orelse text.len;
-            self.url_len = @min(end - at, self.url.len);
-            @memcpy(self.url[0..self.url_len], text[at..][0..self.url_len]);
-        }
     }
     pub fn snapshot(self: *Service, arena: std.mem.Allocator) !proto.WebStatus {
         self.mutex.lockUncancelable(self.io);
@@ -65,8 +59,8 @@ pub const Service = struct {
             const at = (self.next + self.logs.len - self.count + i) % self.logs.len;
             line.* = try arena.dupe(u8, self.logs[at][0..self.lengths[at]]);
         }
-        return .{ .enabled = true, .state = self.state, .url = if (self.url_len > 0)
-            try arena.dupe(u8, self.url[0..self.url_len])
+        return .{ .enabled = true, .state = self.state, .url = if (self.hosts.len > 0)
+            try std.fmt.allocPrint(arena, "https://{s}/", .{self.hosts[0]})
         else
             try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/", .{self.port}), .logs = lines };
     }

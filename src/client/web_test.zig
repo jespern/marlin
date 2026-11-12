@@ -30,48 +30,94 @@ test "sid query parsing accepts u64 and rejects garbage" {
     try std.testing.expectEqual(@as(?u64, null), queryU64("/history?sid=42&before=nope", "before"));
 }
 
-test "host gate: loopback and tailnet pass, rebinding shapes do not" {
-    const tail: ?[]const u8 = "box.tail1234.ts.net";
-    try std.testing.expect(hostAllowed(tail, "localhost:8377"));
-    try std.testing.expect(hostAllowed(tail, "localhost"));
-    try std.testing.expect(hostAllowed(tail, "127.0.0.1:8377"));
-    try std.testing.expect(hostAllowed(tail, "box.tail1234.ts.net"));
-    try std.testing.expect(hostAllowed(tail, "BOX.tail1234.ts.net:443"));
-    try std.testing.expect(hostAllowed(tail, "box.tail1234.ts.net."));
-    try std.testing.expect(!hostAllowed(tail, "attacker.example"));
-    try std.testing.expect(!hostAllowed(tail, "evil.box.tail1234.ts.net"));
-    try std.testing.expect(!hostAllowed(tail, null));
-    try std.testing.expect(!hostAllowed(null, "box.tail1234.ts.net"));
-    try std.testing.expect(hostAllowed(null, "127.0.0.1:9000"));
+const hosts: []const []const u8 = &.{ "marlin.example.com", "victory.local." };
+
+fn ip(text: []const u8, port: u16) Io.net.IpAddress {
+    return Io.net.IpAddress.parse(text, port) catch unreachable;
+}
+
+test "host gate: loopback and configured hosts pass, rebinding shapes do not" {
+    try std.testing.expect(hostAllowed(hosts, "localhost:8377"));
+    try std.testing.expect(hostAllowed(hosts, "localhost"));
+    try std.testing.expect(hostAllowed(hosts, "127.0.0.1:8377"));
+    try std.testing.expect(hostAllowed(hosts, "marlin.example.com"));
+    try std.testing.expect(hostAllowed(hosts, "MARLIN.example.com:443"));
+    try std.testing.expect(hostAllowed(hosts, "marlin.example.com."));
+    try std.testing.expect(hostAllowed(hosts, "victory.local:8377"));
+    try std.testing.expect(!hostAllowed(hosts, "attacker.example"));
+    try std.testing.expect(!hostAllowed(hosts, "evil.marlin.example.com"));
+    try std.testing.expect(!hostAllowed(hosts, "192.168.1.20:8377"));
+    try std.testing.expect(!hostAllowed(hosts, null));
+    try std.testing.expect(!hostAllowed(&.{}, "marlin.example.com"));
+    try std.testing.expect(hostAllowed(&.{}, "127.0.0.1:9000"));
 }
 
 test "origin gate: absent or same-host origins pass, cross-site does not" {
-    const tail: ?[]const u8 = "box.tail1234.ts.net";
-    try std.testing.expect(originAllowed(tail, null)); // same-origin / curl
-    try std.testing.expect(originAllowed(tail, "http://localhost:8377"));
-    try std.testing.expect(originAllowed(tail, "https://box.tail1234.ts.net"));
-    try std.testing.expect(!originAllowed(tail, "https://attacker.example"));
-    try std.testing.expect(!originAllowed(tail, "null"));
-    try std.testing.expect(!originAllowed(tail, "file://x"));
-    try std.testing.expect(!originAllowed(null, "https://box.tail1234.ts.net"));
+    try std.testing.expect(originAllowed(hosts, null)); // same-origin / curl
+    try std.testing.expect(originAllowed(hosts, "http://localhost:8377"));
+    try std.testing.expect(originAllowed(hosts, "https://marlin.example.com"));
+    try std.testing.expect(!originAllowed(hosts, "https://attacker.example"));
+    try std.testing.expect(!originAllowed(hosts, "null"));
+    try std.testing.expect(!originAllowed(hosts, "file://x"));
+    try std.testing.expect(!originAllowed(&.{}, "https://marlin.example.com"));
 }
 
-test "Tailscale subprocess forces CLI mode and preserves argument boundaries" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const gpa = std.testing.allocator;
-    var threaded: Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    var env: std.process.Environ.Map = .init(gpa);
-    defer env.deinit();
-    try env.put("TAILSCALE_BE_CLI", "0");
-    const result = try web.runTailscaleCommand(gpa, threaded.io(), &env, "/bin/sh", &.{
-        "-c", "test \"$TAILSCALE_BE_CLI\" = 1 || exit 7; printf '%s|%s' \"$1\" \"$2\"", "peer", "serve --bg", "8377",
-    });
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("serve --bg|8377", result.stdout);
-    try std.testing.expectEqualStrings("0", env.get("TAILSCALE_BE_CLI").?);
+test "only loopback asking for a loopback name skips pairing" {
+    try std.testing.expect(web.isLocal(ip("127.0.0.1", 50000), "127.0.0.1:8377"));
+    try std.testing.expect(web.isLocal(ip("::1", 50000), "localhost:8377"));
+    // A LAN peer claiming a loopback Host is still remote.
+    try std.testing.expect(!web.isLocal(ip("192.168.1.30", 50000), "localhost"));
+    // A proxy on this machine forwarding a phone's request is remote too.
+    try std.testing.expect(!web.isLocal(ip("127.0.0.1", 50000), "marlin.example.com"));
+    try std.testing.expect(!web.isLocal(ip("127.0.0.1", 50000), null));
+}
+
+test "with a proxy configured, only it and loopback may connect" {
+    const proxy = ip("192.168.1.1", 0);
+    try std.testing.expect(web.peerAllowed(proxy, ip("192.168.1.1", 41000)));
+    try std.testing.expect(web.peerAllowed(proxy, ip("::ffff:192.168.1.1", 41000)));
+    try std.testing.expect(web.peerAllowed(proxy, ip("127.0.0.1", 41000)));
+    try std.testing.expect(web.peerAllowed(proxy, ip("::1", 41000)));
+    try std.testing.expect(!web.peerAllowed(proxy, ip("192.168.1.30", 41000)));
+    try std.testing.expect(!web.peerAllowed(proxy, ip("fe80::1", 41000)));
+    try std.testing.expect(web.peerAllowed(null, ip("192.168.1.30", 41000)));
+}
+
+test "access log names the forwarded client only when the proxy says so" {
+    var buf: [64]u8 = undefined;
+    const proxy = ip("192.168.1.1", 0);
+    try std.testing.expectEqualStrings("100.101.1.2", web.clientAddress(&buf, proxy, ip("192.168.1.1", 41000), "100.101.1.2, 192.168.1.1"));
+    // Anyone else's X-Forwarded-For is ignored.
+    try std.testing.expectEqualStrings("192.168.1.30", web.clientAddress(&buf, proxy, ip("192.168.1.30", 41000), "1.2.3.4"));
+    try std.testing.expectEqualStrings("127.0.0.1", web.clientAddress(&buf, null, ip("127.0.0.1", 41000), "1.2.3.4"));
+    try std.testing.expectEqualStrings("192.168.1.1", web.clientAddress(&buf, proxy, ip("192.168.1.1", 41000), null));
+    try std.testing.expectEqualStrings("::1", web.clientAddress(&buf, null, ip("::1", 41000), null));
+}
+
+test "device cookie is read from any position and set long-lived" {
+    try std.testing.expectEqualStrings("abc", web.cookieValue("marlin_device=abc", "marlin_device").?);
+    try std.testing.expectEqualStrings("abc", web.cookieValue("x=1; marlin_device=abc; y=2", "marlin_device").?);
+    try std.testing.expect(web.cookieValue("xmarlin_device=abc", "marlin_device") == null);
+    try std.testing.expect(web.cookieValue(null, "marlin_device") == null);
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "marlin_device=t0k; Path=/; Max-Age=34560000; HttpOnly; SameSite=Lax; Secure",
+        web.deviceCookie(&buf, "t0k", true),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, web.deviceCookie(&buf, "t0k", false), "Secure") == null);
+}
+
+test "unpaired devices reach only the app shell and the pairing route" {
+    for ([_][]const u8{ "/", "/index.html", "/manifest.webmanifest", "/icon-180.png", "/sw.js", "/connection" }) |path| {
+        try std.testing.expect(web.publicRoute(.GET, path));
+    }
+    try std.testing.expect(web.publicRoute(.POST, "/pair"));
+    for ([_][]const u8{ "/events", "/history", "/push/info" }) |path| {
+        try std.testing.expect(!web.publicRoute(.GET, path));
+    }
+    try std.testing.expect(!web.publicRoute(.POST, "/send"));
+    try std.testing.expect(!web.publicRoute(.POST, "/push/subscribe"));
+    try std.testing.expect(!web.publicRoute(.GET, "/pair"));
 }
 
 test "access log timestamps are Common Log Format in UTC" {

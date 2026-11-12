@@ -3,7 +3,7 @@ const service = @import("web_service.zig");
 test {
     std.testing.refAllDecls(service);
 }
-test "companion log is bounded, strips controls, and only trusts the tailnet startup URL" {
+test "companion log is bounded, strips controls, and advertises the configured host" {
     const gpa = std.testing.allocator;
     var io: std.Io.Threaded = .init(gpa, .{});
     defer io.deinit();
@@ -17,10 +17,13 @@ test "companion log is bounded, strips controls, and only trusts the tailnet sta
     var snapshot = try s.snapshot(arena.allocator());
     try std.testing.expectEqual(@as(usize, 128), snapshot.logs.len);
     try std.testing.expectEqualStrings("http://127.0.0.1:8377/", snapshot.url);
-    s.append("tailnet: https://box.example/ (fixed URL)");
+    s.append("phone: https://admin.example/ (log lines never set the URL)");
     s.append("bad\x1b[31m\rlog");
     snapshot = try s.snapshot(arena.allocator());
-    try std.testing.expectEqualStrings("https://box.example/", snapshot.url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8377/", snapshot.url);
+    s.hosts = &.{ "marlin.example.com", "victory.local" };
+    snapshot = try s.snapshot(arena.allocator());
+    try std.testing.expectEqualStrings("https://marlin.example.com/", snapshot.url);
     try std.testing.expectEqualStrings("bad [31m log", snapshot.logs[127]);
 }
 test "companion owns the real child process and reaps it on stop" {

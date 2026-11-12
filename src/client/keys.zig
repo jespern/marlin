@@ -43,6 +43,8 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         }
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) app.web_view = false else if (key.matches(vaxis.Key.up, .{})) app.web_scroll +|= 1 else if (key.matches(vaxis.Key.down, .{})) app.web_scroll -|= 1 else if (key.matches('r', .{})) {
             app.web_poll_ms = 0;
+        } else if (key.matches('p', .{})) {
+            app.pairPhone();
         }
         return;
     }

@@ -6996,3 +6996,33 @@ test "a Muse session shows its muse serve process while it runs" {
     try std.testing.expectEqual(@as(?[]const u8, null), try statusGuestProcess(arena, "muse/default", 0));
     try std.testing.expectEqual(@as(?[]const u8, null), try statusGuestProcess(arena, "codex/default", 4242));
 }
+
+test "web tab pins the pairing code beside the address and lists paired phones" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const devices = [_]proto.WebDevice{.{ .id = 2, .name = "iPhone", .paired_ms = 1_794_441_600_000 }};
+    try tui.writeWebStatus(&out, gpa, .{
+        .enabled = true,
+        .state = "running",
+        .url = "https://marlin.example.com/",
+        .logs = &.{"paired iPhone #2 from 100.101.1.2"},
+        .pair_code = "482913",
+        .pair_expires_ms = 300_000,
+        .devices = &devices,
+    }, 1_000);
+    var lines = std.mem.splitScalar(u8, out.items, '\n');
+    try std.testing.expectEqualStrings("Web companion · running", lines.next().?);
+    try std.testing.expectEqualStrings("https://marlin.example.com/ · pairing code 482 913 · 5m left", lines.next().?);
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "p: pair a phone") != null);
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try std.testing.expectEqualStrings("Paired: #2 iPhone 2026-11-12 · /web unpair <n> removes one", lines.next().?);
+
+    // An expired code disappears; seconds show under a minute.
+    out.clearRetainingCapacity();
+    try tui.writeWebStatus(&out, gpa, .{ .state = "running", .url = "u", .pair_code = "482913", .pair_expires_ms = 300_000 }, 300_000);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "pairing code") == null);
+    out.clearRetainingCapacity();
+    try tui.writeWebStatus(&out, gpa, .{ .enabled = true, .state = "running", .url = "u", .pair_code = "482913", .pair_expires_ms = 45_000 }, 1_000);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "· 44s left") != null);
+}
