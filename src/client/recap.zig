@@ -1,3 +1,4 @@
+const std = @import("std");
 const proto = @import("../core/proto.zig");
 const limits = @import("../core/recap.zig");
 
@@ -8,6 +9,11 @@ pub const State = struct {
     pending_seq: u64 = 0,
     retry_at_ms: i64 = 0,
     shown_seq: u64 = 0,
+    /// The shown recap itself. It lives only in this client, so a window
+    /// reload (tab switch, reconnect, paging) that swaps in the daemon's
+    /// blocks drops it; the view puts it back from here.
+    text: std.ArrayList(u8) = .empty,
+    generated: bool = false,
 
     pub fn changed(self: *State, timestamp: i64) void {
         self.last_change_ms = @max(self.last_change_ms, timestamp);

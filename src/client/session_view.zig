@@ -223,6 +223,7 @@ pub const SessionView = struct {
         self.delta.deinit(gpa);
         self.reasoning_delta.deinit(gpa);
         deinitPlan(gpa, &self.plan);
+        self.recap.text.deinit(gpa);
         self.model.deinit(gpa);
         self.cwd.deinit(gpa);
         if (self.skills_arena) |*arena| arena.deinit();
@@ -269,17 +270,42 @@ pub const SessionView = struct {
 
     pub fn appendRecap(self: *SessionView, gpa: std.mem.Allocator, seq: u64, text: []const u8, generated: bool) !void {
         if (text.len == 0 or self.recap.shown_seq == seq) return;
-        const owned_text = try gpa.dupe(u8, @import("../core/recap.zig").clipped(text, @import("../core/recap.zig").max_text_bytes));
+        const limits = @import("../core/recap.zig");
+        self.recap.text.clearRetainingCapacity();
+        try self.recap.text.appendSlice(gpa, limits.clipped(text, limits.max_text_bytes));
+        self.recap.generated = generated;
+        self.recap.shown_seq = seq;
+        try self.insertRecap(gpa, self.blocks.items.len);
+    }
+
+    /// Put the shown recap back after a window reload replaced the blocks:
+    /// right after the block it summarized, when that block is in the
+    /// window and the recap is not already there.
+    pub fn restoreRecap(self: *SessionView, gpa: std.mem.Allocator) !void {
+        if (self.recap.shown_seq == 0 or self.recap.text.items.len == 0) return;
+        for (self.blocks.items) |rb| if (isRecapBlock(rb)) return;
+        const anchor = for (self.blocks.items, 0..) |rb, i| {
+            if (rb.seq == self.recap.shown_seq) break i;
+        } else return;
+        try self.insertRecap(gpa, anchor + 1);
+    }
+
+    fn insertRecap(self: *SessionView, gpa: std.mem.Allocator, at: usize) !void {
+        const owned_text = try gpa.dupe(u8, self.recap.text.items);
         errdefer gpa.free(owned_text);
-        const label = try gpa.dupe(u8, if (generated) "Recap" else "Last exchange");
+        const label = try gpa.dupe(u8, if (self.recap.generated) "Recap" else "Last exchange");
         errdefer gpa.free(label);
-        try self.blocks.append(gpa, .{
+        try self.blocks.insert(gpa, at, .{
             .kind = .system_note,
             .text = owned_text,
             .label = label,
-            .turn_id = if (self.blocks.getLastOrNull()) |last| last.turn_id else 0,
+            .turn_id = if (at > 0) self.blocks.items[at - 1].turn_id else 0,
         });
-        self.recap.shown_seq = seq;
+    }
+
+    fn isRecapBlock(rb: RenderBlock) bool {
+        return rb.kind == .system_note and rb.seq == 0 and
+            (std.mem.eql(u8, rb.label, "Recap") or std.mem.eql(u8, rb.label, "Last exchange"));
     }
 
     /// Drop provisional streaming text once a turn settles so an idle view,

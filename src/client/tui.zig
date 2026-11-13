@@ -849,6 +849,8 @@ pub const App = struct {
     }
 
     fn resetWindowLayout(self: *App) void {
+        // Every window change ends here; the client-only recap rejoins it.
+        self.view.restoreRecap(self.gpa) catch {};
         self.copy_cursor = null;
         self.view.sel_anchor = null;
         self.view.sel_dragging = false;

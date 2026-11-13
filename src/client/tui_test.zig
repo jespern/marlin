@@ -7026,3 +7026,41 @@ test "web tab pins the pairing code beside the address and lists paired phones" 
     try tui.writeWebStatus(&out, gpa, .{ .enabled = true, .state = "running", .url = "u", .pair_code = "482913", .pair_expires_ms = 45_000 }, 1_000);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "· 44s left") != null);
 }
+
+test "a recap survives the window reload of a tab switch or reconnect" {
+    // Case: recaps blipped in and out. The recap lives only in the client,
+    // and the tail reload on refocus swapped it out of the view for good.
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .state = .idle,
+    } };
+    defer app.deinit();
+    const blocks = [_]block.Block{
+        .{ .id = 1, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 100, .body = .{ .user_msg = .{ .text = "fix the parser" } } },
+        .{ .id = 2, .session_id = 7, .turn_id = 1, .seq = 2, .ts = 110, .body = .{ .assistant_msg = .{ .text = "Fixed it." } } },
+    };
+    for (blocks) |b| app.applyBlock(b);
+    app.view.last_seq = 2;
+    try app.view.appendRecap(gpa, 2, "You fixed the parser.", true);
+    try std.testing.expectEqual(@as(usize, 3), app.view.blocks.items.len);
+
+    // Refocus: the daemon's newest window replaces the blocks.
+    for (blocks) |b| try app.view.history_backfill.append(gpa, (try allocDurableRenderBlock(gpa, b)).?);
+    app.finishReplacementHistoryPage(1, 2, false, false, 0);
+    try std.testing.expectEqual(@as(usize, 3), app.view.blocks.items.len);
+    const recap = app.view.blocks.items[2];
+    try std.testing.expectEqualStrings("Recap", recap.label);
+    try std.testing.expectEqualStrings("You fixed the parser.", recap.text);
+
+    // Restoring is idempotent, and a window without the summarized block
+    // has no place for it.
+    try app.view.restoreRecap(gpa);
+    try std.testing.expectEqual(@as(usize, 3), app.view.blocks.items.len);
+    try app.view.history_backfill.append(gpa, (try allocDurableRenderBlock(gpa, blocks[0])).?);
+    app.finishReplacementHistoryPage(1, 1, false, true, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+}
