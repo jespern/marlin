@@ -60,7 +60,9 @@ const schema_sql =
     \\  guest_max_runtime_ms INTEGER,
     \\  codex_thread_id TEXT,
     \\  title_locked INTEGER NOT NULL DEFAULT 0,
-    \\  muse_session_id TEXT
+    \\  muse_session_id TEXT,
+    \\  context_used INTEGER,
+    \\  guest_context_limit INTEGER
     \\);
     \\CREATE TABLE IF NOT EXISTS live_shells(
     \\  session_id INTEGER PRIMARY KEY,
@@ -194,7 +196,7 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','17');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','18');
 ;
 
 pub const SessionRow = struct {
@@ -513,6 +515,13 @@ pub const Store = struct {
             try self.execAll(
                 \\ALTER TABLE sessions ADD COLUMN muse_session_id TEXT;
                 \\UPDATE kv SET value='17' WHERE key='schema_version';
+            );
+        }
+        if (ver < 18) {
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN context_used INTEGER;
+                \\ALTER TABLE sessions ADD COLUMN guest_context_limit INTEGER;
+                \\UPDATE kv SET value='18' WHERE key='schema_version';
             );
         }
     }
@@ -1498,6 +1507,32 @@ pub const Store = struct {
         if (rc != c.SQLITE_ROW) return error.SqliteStep;
         if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
         return @intCast(c.sqlite3_column_int64(stmt, 0));
+    }
+
+    /// The status gauge's last figures, so a restarted daemon still knows
+    /// them: the context size, and a guest's reported window. Null = unknown.
+    pub const SessionContext = struct { used: ?u64 = null, guest_limit: ?u64 = null };
+
+    pub fn setSessionContext(self: Store, id: u64, ctx: SessionContext) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET context_used=?, guest_context_limit=? WHERE id=?");
+        defer finalize(stmt);
+        if (ctx.used) |v| bindInt(stmt, 1, @bitCast(v)) else bindNull(stmt, 1);
+        if (ctx.guest_limit) |v| bindInt(stmt, 2, @bitCast(v)) else bindNull(stmt, 2);
+        bindInt(stmt, 3, @bitCast(id));
+        try stepDone(stmt);
+    }
+
+    pub fn getSessionContext(self: Store, id: u64) Error!SessionContext {
+        const stmt = try self.prepare("SELECT context_used, guest_context_limit FROM sessions WHERE id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return error.NotFound;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        var out: SessionContext = .{};
+        if (c.sqlite3_column_type(stmt, 0) != c.SQLITE_NULL) out.used = @bitCast(c.sqlite3_column_int64(stmt, 0));
+        if (c.sqlite3_column_type(stmt, 1) != c.SQLITE_NULL) out.guest_limit = @bitCast(c.sqlite3_column_int64(stmt, 1));
+        return out;
     }
 
     pub fn setSessionPlanMode(self: Store, id: u64, enabled: bool) Error!void {

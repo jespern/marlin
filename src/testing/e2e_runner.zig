@@ -1253,6 +1253,11 @@ fn checkSessionRestoreFlow(gpa: std.mem.Allocator, io: Io, env: *const std.proce
     if (uintField(history, "sid") != full) return error.HistorySessionMismatch;
     const entries = history.get("entries").?.array.items;
     if (entries.len != 1 or !std.mem.eql(u8, stringField(entries[0].object, "text") orelse "", "remember this prompt after reconnect")) return error.PromptHistoryMissing;
+    // The status gauge came back from the store across both restarts, and a
+    // subscriber gets it at once instead of after the next turn.
+    const meta = try recvTagBounded(conn, arena, "session_meta");
+    if (uintField(meta, "sid") != full or (uintField(meta, "context_used") orelse 0) == 0 or
+        (uintField(meta, "context_limit") orelse 0) == 0) return error.ContextGaugeLost;
     try conn.send(.{ .sub = .{ .sid = changed, .prompt_history_limit = 200 } });
     const empty = try recvTagBounded(conn, arena, "input_history_result");
     if (uintField(empty, "sid") != changed or empty.get("entries").?.array.items.len != 0) return error.HistoryLeakedAcrossSessions;
@@ -1645,7 +1650,9 @@ fn checkPlugins(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.
     if (sessions != .array or sessions.array.items.len != 1) return error.SessionIdMissing;
     const sid = uintField(sessions.array.items[0].object, "sid") orelse return error.SessionIdMissing;
     try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
-    const legacy_status = try recvBounded(conn, arena);
+    // Without the opt-in, no skill catalog: the gauge, then status.
+    var legacy_status = try recvBounded(conn, arena);
+    if (tagObject(legacy_status, "session_meta") != null) legacy_status = try recvBounded(conn, arena);
     if (tagObject(legacy_status, "status") == null) return error.UnexpectedSkillCatalog;
     try conn.send(.{ .sub = .{ .sid = sid, .skill_catalog = true } });
     const catalog = try recvTagBounded(conn, arena, "session_skills");

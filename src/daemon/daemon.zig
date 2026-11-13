@@ -389,6 +389,13 @@ pub const Session = struct {
     pub fn forgetContext(self: *Session) void {
         self.guest_context_limit.store(0, .release);
     }
+
+    /// The gauge as persisted: unknown (null) where nothing was measured.
+    fn storedContext(self: *const Session) store_mod.Store.SessionContext {
+        const used = self.context_used.load(.acquire);
+        const limit = self.guest_context_limit.load(.acquire);
+        return .{ .used = if (used > 0) used else null, .guest_limit = if (limit > 0) limit else null };
+    }
 };
 
 // ---------------------------------------------------------------- daemon --
@@ -1557,6 +1564,7 @@ pub const Daemon = struct {
                     session.model = guest;
                     session.usage_credits.store(false, .release);
                     session.forgetContext();
+                    self.store.setSessionContext(td.sid, session.storedContext()) catch {};
                     self.broadcastSessionUpsert(td.sid);
                 }
                 // A bridge prompt cannot outlive its turn; deny any stray one
@@ -2256,6 +2264,7 @@ pub const Daemon = struct {
                 session.model = new_model;
                 session.usage_credits.store(false, .release);
                 session.forgetContext();
+                self.store.setSessionContext(sm.sid, session.storedContext()) catch {};
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sm.sid);
             },
@@ -2583,6 +2592,9 @@ pub const Daemon = struct {
                     ses.guest_activity_mutex.unlock(self.io);
                     break :blk ses.state;
                 } else .idle;
+                // The gauge before status, as at turn end: a reattached
+                // client otherwise shows nothing until the next turn ends.
+                if (session != null) self.sendTo(client, self.sessionMeta(s.sid, 0, 0));
                 const status_now = nowMs(self.io);
                 self.sendTo(client, .{ .status = .{
                     .sid = s.sid,
@@ -3580,6 +3592,11 @@ pub const Daemon = struct {
             session.pause_requested.store(true, .release);
         }
         session.guest_max_runtime_live.store((try self.store.getSessionGuestRuntime(sid)) orelse std.math.maxInt(u64), .release);
+        // The gauge survives a daemon restart: a guest's window is otherwise
+        // unknown until its next model call reports it.
+        const stored_context = try self.store.getSessionContext(sid);
+        session.context_used.store(stored_context.used orelse 0, .release);
+        session.guest_context_limit.store(stored_context.guest_limit orelse 0, .release);
         session.approval_mode_live.store(@backingInt(session.approval_mode), .release);
         if (session.pause_requested.load(.acquire)) try self.restorePausedInputs(session);
         try self.sessions.put(self.gpa, sid, session);
@@ -5690,6 +5707,16 @@ pub const Daemon = struct {
     }
 
     fn broadcastMeta(self: *Daemon, sid: u64, tin: u64, tout: u64) void {
+        if (self.sessions.get(sid)) |session|
+            self.store.setSessionContext(sid, session.storedContext()) catch |err|
+                std.log.warn("could not persist context gauge: {t}", .{err});
+        const line = proto.encode(self.gpa, self.sessionMeta(sid, tin, tout)) catch return;
+        defer self.gpa.free(line);
+        self.fanOutLine(sid, line);
+    }
+
+    /// The status gauge for `sid` as the daemon knows it now.
+    fn sessionMeta(self: *Daemon, sid: u64, tin: u64, tout: u64) proto.DaemonMsg {
         var used: u64 = 0;
         var limit: u64 = 0;
         if (self.sessions.get(sid)) |session| {
@@ -5703,15 +5730,13 @@ pub const Daemon = struct {
                 context.contextLimit(session.model);
             if (limit == 0) used = 0;
         }
-        const line = proto.encode(self.gpa, proto.DaemonMsg{ .session_meta = .{
+        return .{ .session_meta = .{
             .sid = sid,
             .tokens_in = tin,
             .tokens_out = tout,
             .context_used = used,
             .context_limit = limit,
-        } }) catch return;
-        defer self.gpa.free(line);
-        self.fanOutLine(sid, line);
+        } };
     }
 
     // ---------------------------------------------------------- shutdown --

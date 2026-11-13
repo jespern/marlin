@@ -597,15 +597,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v17 with performance telemetry and scaling indexes" {
+test "schema is v18 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 17), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 18), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 17), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 18), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
@@ -983,6 +983,8 @@ test "v13 session runtime migration preserves defaults and independent overrides
         "ALTER TABLE sessions DROP COLUMN approval_mode",
         "ALTER TABLE sessions DROP COLUMN title_locked",
         "ALTER TABLE sessions DROP COLUMN muse_session_id",
+        "ALTER TABLE sessions DROP COLUMN context_used",
+        "ALTER TABLE sessions DROP COLUMN guest_context_limit",
         "UPDATE kv SET value='13' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
@@ -1013,6 +1015,8 @@ test "v14 migration preserves paused grants and later revocation overrides old c
         "ALTER TABLE sessions DROP COLUMN approval_mode",
         "ALTER TABLE sessions DROP COLUMN title_locked",
         "ALTER TABLE sessions DROP COLUMN muse_session_id",
+        "ALTER TABLE sessions DROP COLUMN context_used",
+        "ALTER TABLE sessions DROP COLUMN guest_context_limit",
         "UPDATE kv SET value='14' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
@@ -1094,4 +1098,18 @@ test "a Muse session id is kept per Marlin session until cleared" {
     try std.testing.expectEqualStrings("01a1c358-cbf4-72e2-a9bc-461e6a74f412", saved);
     try store.setMuseSessionId(5, null);
     try std.testing.expectEqual(@as(?[]const u8, null), try store.getMuseSessionId(5));
+}
+
+test "the context gauge survives a daemon restart and unknown stays null" {
+    // Case: after !rb every guest tab read "ctx n/a" until its next turn.
+    var store = try Store.open(std.testing.allocator, null);
+    defer store.close();
+    try store.createSession(3, 0, "/", "claudecode/claude-opus-5-5", .auto);
+    try std.testing.expectEqual(Store.SessionContext{}, try store.getSessionContext(3));
+    try store.setSessionContext(3, .{ .used = 41_000, .guest_limit = 1_000_000 });
+    try std.testing.expectEqual(Store.SessionContext{ .used = 41_000, .guest_limit = 1_000_000 }, try store.getSessionContext(3));
+    // A model switch forgets the window but keeps the measured size.
+    try store.setSessionContext(3, .{ .used = 41_000 });
+    try std.testing.expectEqual(Store.SessionContext{ .used = 41_000 }, try store.getSessionContext(3));
+    try std.testing.expectError(error.NotFound, store.getSessionContext(99));
 }
