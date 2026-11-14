@@ -160,9 +160,10 @@
     border-radius: 50%; border: 1px solid var(--line); background: var(--panel2); color: var(--fg);
     font: 12px/1 inherit; cursor: pointer;
   }
+  #composer .prompt { padding: 12px 0 12px 16px; color: var(--accent); }
   #attach-btn {
     font: inherit; font-size: 18px; line-height: 1; background: none; border: 0;
-    color: var(--dim); padding: 12px 4px 12px 16px; cursor: pointer;
+    color: var(--dim); padding: 12px 2px 12px 10px; cursor: pointer;
   }
   #attach-btn:hover { color: var(--fg); }
   #input {
@@ -256,7 +257,7 @@
     #side h1 button { padding: 4px 10px; }
     #transcript { padding: 12px; }
     #input { font-size: 16px; } /* <16px makes iOS zoom the page on focus */
-    #attach-btn { padding-top: 13px; }
+    #composer .prompt, #attach-btn { padding-top: 13px; }
     button.act { padding: 8px 14px; }
     #approval { padding: 10px 12px; flex-wrap: wrap; }
     #approval .q { flex-basis: 100%; white-space: normal; word-break: break-word; max-height: 4.5em; overflow-y: auto; }
@@ -306,6 +307,7 @@
   </div>
   <div id="composer">
     <div id="attachments"></div>
+    <span class="prompt">❯</span>
     <button id="attach-btn" title="attach images" aria-label="attach images">+</button>
     <input id="file" type="file" accept="image/*" multiple hidden>
     <input id="input" autocomplete="off" spellcheck="true" autocapitalize="sentences"
@@ -1253,6 +1255,11 @@ $('#push-toggle').onclick = async () => {
 if (window.visualViewport) {
   const vv = window.visualViewport;
   let frame = 0;
+  const standalone = () => navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+  // iOS keeps screen.width/height in portrait terms; pick the edge that
+  // matches the current orientation.
+  const screenHeight = () => window.innerWidth > window.innerHeight
+    ? Math.min(screen.width, screen.height) : Math.max(screen.width, screen.height);
   function fitViewport() {
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(() => {
@@ -1263,6 +1270,13 @@ if (window.visualViewport) {
         document.body.style.height = vv.height + 'px';
         document.body.style.top = vv.offsetTop + 'px';
         document.body.style.setProperty('--bottom-inset', '0px');
+      } else if (standalone()) {
+        // A Home Screen app has no browser chrome: it owns the screen. iOS
+        // still reports the viewport (vh, dvh, innerHeight, fixed bottom:0)
+        // short by the status bar, so size to the screen itself.
+        document.body.style.height = screenHeight() + 'px';
+        document.body.style.top = '0px';
+        document.body.style.removeProperty('--bottom-inset');
       } else {
         document.body.style.height = '';
         document.body.style.top = '';
