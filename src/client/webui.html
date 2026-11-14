@@ -107,18 +107,36 @@
   /* The marker is absolutely positioned so it aligns with the first line of
      the markdown body (whose leading <p> is block-level); as inline ::before
      content it stranded the dot alone on its own line above the text. */
-  .reasoning { color: var(--dim); padding: 0 12px 0 24px; position: relative; }
+  /* Reasoning reads like assistant prose (render.zig: reasoning = assistant),
+     marked only by the cyan dot. */
+  .reasoning { color: var(--fg); padding: 0 12px 0 24px; position: relative; }
   .reasoning::before { content: "·"; color: var(--accent); font-weight: bold; position: absolute; left: 12px; top: 0; }
+  /* Tool rows mirror the TUI: dim machinery (⚙ name), a bold blue target for
+     file tools, and shell commands colored by role (render.zig shell_*). */
   .tool summary { color: var(--dim); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .tool summary .name { color: var(--blue); }
-  .tool summary .prev { color: var(--dim); }
+  .tool summary .name { color: var(--dim); }
+  .tool summary .prev { color: var(--blue); font-weight: 700; }
+  .tool summary .prev.sh { color: #c8ccd4; font-weight: 400; }
+  .sh-exe { color: #82aaff; font-weight: 700; }
+  .sh-flag { color: #89ddff; }
+  .sh-op { color: #c792ea; font-weight: 700; }
+  .sh-str { color: #c3e88d; }
+  .sh-path { color: #8aa6bf; }
+  .sh-var, .sh-num { color: #f78c6c; }
+  .sh-kw { color: #c792ea; font-weight: 700; }
+  .sh-com { color: #697098; font-style: italic; }
+  /* A run of tool calls folds into one "Ran N commands" line. */
+  .tool-group > summary { color: var(--fg); cursor: pointer; }
+  .tool-group > summary .failed { color: var(--red); }
+  .tool-group:not(.single) > .block { margin: 4px 0 4px 18px; }
+  .tool-group.single > summary { display: none; }
   .tool pre, .md pre {
     background: var(--panel); margin: 4px 0; padding: 8px 12px;
     border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere;
   }
   .tool pre { color: var(--dim); max-height: 340px; overflow-y: auto; }
   .tool.err summary { color: var(--red); }
-  .note { color: var(--dim); font-size: 13px; }
+  .note { color: var(--code); font-size: 13px; } /* render.zig: note = soft blue */
   /* markdown */
   .md p, .md ul, .md ol, .md blockquote, .md table, .md h1, .md h2, .md h3, .md h4 { margin: 0 0 8px; }
   .md h1, .md h2 { font-size: 16px; color: var(--accent); }
@@ -493,6 +511,116 @@ function rejectOptimisticInput(pending, message, uncertain) {
   notice(message);
 }
 
+// Port of render.zig shellCommandSpans: lexical shell styling that picks out
+// what people scan for (programs, flags, operators, strings, paths,
+// variables) without parsing the shell.
+const shellKeywords = new Set('case do done elif else esac fi for function if in select then time until while'.split(' '));
+const shellCommandKeywords = new Set('do elif else for function if select then time until while'.split(' '));
+const shellWrappers = new Set('command builtin env exec nohup sudo'.split(' '));
+const isShellOp = c => '&|;<>()'.includes(c);
+const isDigit = c => c >= '0' && c <= '9';
+function shellOperatorEnd(cmd, start) {
+  let at = start;
+  while (at < cmd.length && isDigit(cmd[at])) at++;
+  if (at === cmd.length || !isShellOp(cmd[at])) return -1;
+  if (at > start && cmd[at] !== '<' && cmd[at] !== '>') return -1;
+  at++;
+  while (at < cmd.length && (isShellOp(cmd[at]) || isDigit(cmd[at]))) at++;
+  return at;
+}
+function operatorExpectsCommand(op) {
+  if (!op || isDigit(op[0]) || op[0] === '<' || op[0] === '>' || op.startsWith('&>')) return false;
+  return /[|;&()]/.test(op);
+}
+// Drop a redundant `zsh -lc "…"` launcher when the payload is wholly quoted
+// (render.zig shellDisplayCommand).
+function shellDisplayCommand(command) {
+  const m = command.trim().match(/^(\S+)((?:\s+-\S*)*?)\s+(--command|-[^-\s]*c[^\s]*)\s+(["'])([\s\S]*)\4$/);
+  if (!m || !/^(sh|bash|zsh|dash|ksh|fish)$/.test(m[1].split('/').pop())) return command;
+  return m[5];
+}
+function shellHtml(cmd) {
+  let out = '', at = 0, expect = true;
+  const span = (cls, a, b) => { out += '<span class="sh-' + cls + '">' + esc(cmd.slice(a, b)) + '</span>'; };
+  while (at < cmd.length) {
+    const ws = at;
+    while (at < cmd.length && (cmd[at] === ' ' || cmd[at] === '\t')) at++;
+    out += esc(cmd.slice(ws, at));
+    if (at >= cmd.length) break;
+    const c = cmd[at];
+    if (c === '#') { span('com', at, cmd.length); break; }
+    if (c === '"' || c === "'" || c === '`') {
+      let end = at + 1;
+      while (end < cmd.length) {
+        if (cmd[end] === '\\' && c !== "'") { end = Math.min(end + 2, cmd.length); continue; }
+        if (cmd[end] === c) { end++; break; }
+        end++;
+      }
+      span('str', at, end); expect = false; at = end; continue;
+    }
+    if (c === '$') {
+      let end = at + 1;
+      if (cmd[end] === '{') { while (end < cmd.length && cmd[end] !== '}') end++; if (end < cmd.length) end++; }
+      else while (end < cmd.length && /[A-Za-z0-9_]/.test(cmd[end])) end++;
+      span('var', at, end); at = end; continue;
+    }
+    const opEnd = shellOperatorEnd(cmd, at);
+    if (opEnd !== -1) {
+      span('op', at, opEnd);
+      if (operatorExpectsCommand(cmd.slice(at, opEnd))) expect = true;
+      at = opEnd; continue;
+    }
+    let end = at + 1;
+    while (end < cmd.length && !' \t"\'`'.includes(cmd[end]) && !isShellOp(cmd[end])) end++;
+    const word = cmd.slice(at, end);
+    const assignment = word.includes('=') && word[0] !== '-';
+    if (expect && assignment) span('var', at, end);
+    else if (shellKeywords.has(word)) { span('kw', at, end); expect = shellCommandKeywords.has(word); }
+    else if (expect) { span('exe', at, end); expect = shellWrappers.has(word); }
+    else if (word.length > 1 && word[0] === '-') span('flag', at, end);
+    else if (/^[.~/]/.test(word) || word.includes('/')) span('path', at, end);
+    else if (assignment) span('var', at, end);
+    else if (/^\d+$/.test(word)) span('num', at, end);
+    else out += esc(word);
+    at = end;
+  }
+  return out;
+}
+
+// Consecutive tool calls fold into one "Ran N commands" line, as in the TUI;
+// the description notes and approvals between them fold in with them. A
+// lone call shows as its own row.
+function lastToolGroup(t) {
+  const last = t.lastElementChild;
+  return last && last.classList.contains('tool-group') ? last : null;
+}
+function updateToolGroup(g) {
+  const calls = [...g.children].filter(c => c.classList.contains('tool'));
+  const failed = calls.filter(c => c.classList.contains('err')).length;
+  const running = calls.filter(c => c.dataset.call && !c.querySelector('pre')).length;
+  const single = calls.length <= 1;
+  if (single !== g.classList.contains('single')) {
+    g.classList.toggle('single', single);
+    g.open = single;
+  }
+  const s = g.firstElementChild;
+  s.replaceChildren('⚙ ' + (running ? 'Running ' : 'Ran ') + calls.length + (calls.length === 1 ? ' command' : ' commands'));
+  if (failed) s.appendChild(el('span', 'failed', ' · ' + failed + ' failed'));
+}
+function addToToolGroup(t, node, kind) {
+  let g = lastToolGroup(t);
+  if (!g) {
+    if (kind !== 'tool_call') return false;
+    g = el('details', 'block tool-group single');
+    g.open = true;
+    g.appendChild(el('summary'));
+    t.appendChild(g);
+  }
+  g.appendChild(node);
+  updateToolGroup(g);
+  return true;
+}
+
 function toolPreview(name, argsJson) {
   try {
     const a = JSON.parse(argsJson);
@@ -552,7 +680,13 @@ function addBlock(b, target = $('#transcript'), live = true) {
     node = el('details', 'block tool');
     const s = el('summary', null, '⚙ ');
     s.appendChild(el('span', 'name', v.name));
-    s.appendChild(el('span', 'prev', ' ' + toolPreview(v.name, v.args_json).slice(0, 140)));
+    s.appendChild(document.createTextNode(' '));
+    const preview = toolPreview(v.name, v.args_json).slice(0, 400);
+    if ((v.name || '').toLowerCase() === 'bash') {
+      const prev = el('span', 'prev sh');
+      prev.innerHTML = shellHtml(shellDisplayCommand(preview));
+      s.appendChild(prev);
+    } else s.appendChild(el('span', 'prev', preview));
     node.appendChild(s);
     node.dataset.call = v.call_id;
   } else if (kind === 'tool_result') {
@@ -569,6 +703,11 @@ function addBlock(b, target = $('#transcript'), live = true) {
         if (live && typeof b.ts === 'number' && b.ts >= openedAt) call.open = true;
       }
       call.appendChild(pre);
+      const group = call.closest('.tool-group');
+      if (group) {
+        updateToolGroup(group);
+        if (call.open) group.open = true;
+      }
       return;
     }
     node = el('details', 'block tool' + (v.status !== 'ok' ? ' err' : ''));
@@ -585,7 +724,8 @@ function addBlock(b, target = $('#transcript'), live = true) {
     node = el('div', 'block user', '↪ ' + v.text);
   }
   if (node) {
-    t.appendChild(node);
+    const foldable = kind === 'tool_call' || kind === 'tool_result' || kind === 'system_note' || kind === 'approval';
+    if (!foldable || !addToToolGroup(t, node, kind)) t.appendChild(node);
     if (live) scrollBottom();
   }
 }

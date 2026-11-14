@@ -121,6 +121,34 @@ async function main() {
       document.querySelector('#transcript').appendChild(d);
     });
     assert.ok(await page.locator('#transcript').evaluate(t=>t.scrollWidth<=t.clientWidth+1));
+    // Tool runs fold like the TUI's "Ran N commands"; colors follow its palette.
+    const tools=await page.evaluate(()=>{
+      const t=document.querySelector('#transcript'), now=Date.now();
+      const call=(id,command)=>addBlock({ts:now,body:{tool_call:{name:'Bash',call_id:id,args_json:JSON.stringify({command})}}});
+      const result=(id,status='ok')=>addBlock({ts:now,body:{tool_result:{call_id:id,status,inline_body:'out'}}});
+      call('c1','git status | head -3');
+      const g=t.lastElementChild;
+      const lone={single:g.classList.contains('single'),open:g.open,exe:g.querySelector('.sh-exe').textContent,op:g.querySelector('.sh-op').textContent};
+      addBlock({ts:now,body:{system_note:{text:'Show status'}}});
+      result('c1'); call('c2','zsh -lc "rg -n x src/"'); result('c2');
+      const folded={single:g.classList.contains('single'),open:g.open,summary:g.firstElementChild.textContent,
+        rows:g.querySelectorAll(':scope > .tool').length,notes:g.querySelectorAll(':scope > .note').length,
+        unwrapped:g.querySelectorAll('.tool')[1].querySelector('.prev').textContent};
+      call('c3','false'); result('c3','error');
+      const failed={summary:g.firstElementChild.textContent,open:g.open};
+      addBlock({ts:now,body:{assistant_msg:{text:'done'}}});
+      call('c4','ls');
+      const next=t.lastElementChild!==g && t.lastElementChild.classList.contains('single');
+      addBlock({ts:now,body:{reasoning:{text:'thinking'}}});
+      const cs=sel=>getComputedStyle(t.querySelector(sel)).color;
+      return {lone,folded,failed,next,reasoning:cs('.reasoning'),body:getComputedStyle(document.body).color,note:cs('.block.note')};
+    });
+    assert.deepEqual(tools.lone,{single:true,open:true,exe:'git',op:'|'});
+    assert.deepEqual(tools.folded,{single:false,open:false,summary:'⚙ Ran 2 commands',rows:2,notes:1,unwrapped:'rg -n x src/'});
+    assert.deepEqual(tools.failed,{summary:'⚙ Ran 3 commands · 1 failed',open:true});
+    assert.equal(tools.next,true);
+    assert.equal(tools.reasoning,tools.body);
+    assert.equal(tools.note,'rgb(138, 166, 191)');
     // An image well over the bridge's old 64 KB body cap goes through and persists.
     await page.evaluate(async()=>{
       const c=document.createElement('canvas'); c.width=c.height=1500;
