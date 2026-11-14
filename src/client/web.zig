@@ -342,6 +342,9 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
             .host = if (settings.hosts.len > 0) settings.hosts[0] else null,
             .push_enabled = settings.push_enabled,
             .paired = paired,
+            // For ~/… paths in the status line, as the TUI shows them; only
+            // a paired device learns the account's home directory.
+            .home = if (paired) ctx.environ.get("HOME") else null,
         }, .{});
         defer ctx.gpa.free(body);
         // Each visit renews a paired device's cookie, so it never lapses

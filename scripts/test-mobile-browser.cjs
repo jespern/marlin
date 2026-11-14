@@ -45,7 +45,7 @@ async function main() {
   try {
     await waitReady();
     const settings=await (await fetch(origin+'/connection')).json();
-    assert.deepEqual(settings,{host:'marlin.test',push_enabled:true,paired:true});
+    assert.deepEqual(settings,{host:'marlin.test',push_enabled:true,paired:true,home:root});
     let managed;
     for (let i=0;i<100;i++) {
       managed=(await post({web_status:{}})).web_status_result;
@@ -117,7 +117,7 @@ async function main() {
     b=await bounds(); assert.ok(Math.abs(b.bottom-390)<2,JSON.stringify(b));
 
     // The attach button comes first, then the prompt marker.
-    assert.deepEqual(await page.locator('#composer > :not(#attachments):not([hidden])').evaluateAll(n=>n.map(e=>e.className||e.id)),['attach-btn','prompt','input']);
+    assert.deepEqual(await page.locator('#composer > :not(#attachments):not([hidden])').evaluateAll(n=>n.map(e=>e.className||e.id)),['attach-btn','prompt','input','send-btn']);
     // Composer: spellcheck on; status shows the short model name.
     assert.equal(await page.locator('#input').getAttribute('spellcheck'),'true');
     assert.equal(await page.locator('#input').getAttribute('autocorrect'),'on');
@@ -190,8 +190,7 @@ async function main() {
         // Typed words answer a pending question instead of becoming a message.
         handle({question_request:{sid:qsid,question_id:'q2',question:'Name?',options:[]}});
         const input=document.querySelector('#input'); input.value='Bob';
-        input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
-        await new Promise(r=>setTimeout(r,0));
+        await submitComposer(); // Enter on a keyboard, ↑ on a phone
         out.typed=sent.pop();
         // An approval names the tool and its argument, not raw JSON.
         handle({approval_request:{sid:qsid,approval_id:'a1',call_id:'c9',tool:'Bash',args_json:JSON.stringify({command:'git push'})}});
@@ -240,10 +239,74 @@ async function main() {
       const sent=[]; window.send=async raw=>{sent.push(JSON.parse(raw)); return {ok:{}};};
       handle({approval_request:{sid,approval_id:'a2',call_id:'c',tool:'Read',args_json:'{"file_path":"x"}'}});
       document.querySelector('#input').dispatchEvent(new KeyboardEvent('keydown',{key:'y',bubbles:true}));
-      return sent.map(m=>m.approve&&m.approve.decision);
+      const decisions=sent.map(m=>m.approve&&m.approve.decision);
+      // A real keyboard: Shift+Enter is a newline, Enter sends.
+      const input=document.querySelector('#input'); input.value='two\nlines';
+      input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',shiftKey:true,bubbles:true,cancelable:true}));
+      const afterShift=sent.length;
+      input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+      return {decisions,shiftSent:afterShift>1,enterText:(sent.find(m=>m.input)||{input:{}}).input.text};
     });
-    assert.deepEqual(hotkey,['granted']);
+    assert.deepEqual(hotkey,{decisions:['granted'],shiftSent:false,enterText:'two\nlines'});
     await desk.close();
+    // Composer and status: multi-line on a phone, queued while busy, no
+    // forced scrolling, folder and credits in the status line, session marks.
+    const comp=await page.evaluate(async()=>{
+      await loadSessions(); // earlier stubbed commands left an empty list
+      const out={}, sent=[], realSend=window.send, real=window.matchMedia.bind(window);
+      window.send=async raw=>{sent.push(JSON.parse(raw)); return {ok:{}};};
+      try {
+        out.cwd=document.querySelector('#status .cwd').textContent.replace(/\u200e/g,'');
+        // Phone: Return is a newline; the ↑ button sends, newline included.
+        window.matchMedia=q=>q==='(pointer: coarse)'?{matches:true}:q==='(pointer: fine)'?{matches:false}:real(q);
+        const input=document.querySelector('#input');
+        input.value='line one';
+        input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+        out.enterSent=sent.length;
+        input.value='line one\nline two'; input.dispatchEvent(new Event('input'));
+        out.sendEnabled=!document.querySelector('#send-btn').disabled;
+        document.querySelector('#send-btn').dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,cancelable:true}));
+        await new Promise(r=>setTimeout(r,0));
+        out.sentText=(sent.find(m=>m.input)||{input:{}}).input.text;
+        window.matchMedia=real;
+        // Queued: sent while running, marked at once (the spinner hid this).
+        setState('running');
+        input.value='also this'; await submitComposer();
+        out.queued=[...document.querySelectorAll('.user.optimistic')].pop().classList.contains('queued');
+        setState('idle');
+        // Reading older output: new blocks keep the place and offer ↓ new.
+        const t=document.querySelector('#transcript');
+        for(let i=0;i<60;i++) addBlock({ts:Date.now(),body:{assistant_msg:{text:'filler '+i}}});
+        t.scrollTop=0; t.dispatchEvent(new Event('scroll'));
+        addBlock({ts:Date.now(),body:{assistant_msg:{text:'new output'}}});
+        out.kept=t.scrollTop===0; out.jump=document.querySelector('#jump').classList.contains('show');
+        document.querySelector('#jump').click();
+        out.bottom=t.scrollHeight-t.clientHeight-t.scrollTop<2;
+        // Credits and context colors as in the TUI.
+        handle({status:{sid,state:'idle',usage_credits:true}});
+        out.credits=document.querySelector('#status .credits').textContent;
+        setContext({context_used:75,context_limit:100}); out.warn=document.querySelector('#status .ctx').className;
+        setContext({context_used:95,context_limit:100}); out.hot=document.querySelector('#status .ctx').className;
+        // Session marks: running, approval, error, paused, unread completion.
+        const base={title:'x',model:'m',cwd:'/'};
+        renderSessions([{...base,sid:'91',state:'running'},{...base,sid:'92',state:'awaiting_approval'},{...base,sid:'93',state:'err'},
+          {...base,sid:'94',state:'idle',pause:'paused'},{...base,sid:'95',state:'idle'},{...base,sid:'96',state:'running'}]);
+        handle({status:{sid:'96',state:'idle'}});
+        out.marks=[...document.querySelectorAll('#sessions .mark')].map(m=>m.textContent+m.className.replace('mark ',':'));
+      } finally { window.send=realSend; window.matchMedia=real; }
+      return out;
+    });
+    assert.equal(comp.cwd,'~');
+    assert.equal(comp.enterSent,0);
+    assert.equal(comp.sendEnabled,true);
+    assert.equal(comp.sentText,'line one\nline two');
+    assert.equal(comp.queued,true);
+    assert.deepEqual([comp.kept,comp.jump,comp.bottom],[true,true,true]);
+    assert.equal(comp.credits,' · api credits');
+    assert.deepEqual([comp.warn,comp.hot],['ctx warn','ctx hot']);
+    assert.deepEqual(comp.marks,['●:running','!:approval','×:err','‖:paused','·:idle','✓:done']);
+    await page.reload();
+    await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
     // An image well over the bridge's old 64 KB body cap goes through and persists.
     await page.evaluate(async()=>{
       const c=document.createElement('canvas'); c.width=c.height=1500;
@@ -255,7 +318,7 @@ async function main() {
     });
     await page.locator('#attachments img').waitFor({state:'visible'});
     await page.locator('#input').fill('look at this');
-    await page.locator('#input').press('Enter');
+    await page.evaluate(()=>submitComposer()); // Enter on a keyboard, ↑ on a phone
     await page.waitForFunction(()=>!document.querySelector('#attachments img'));
     await page.reload();
     await page.waitForFunction(()=>[...document.querySelectorAll('.block.user:not(.optimistic)')].some(n=>n.textContent==='look at this [1 image]'));
@@ -273,7 +336,7 @@ async function main() {
     assert.equal(await homeScreen.locator('#composer').evaluate(c=>Math.round(c.getBoundingClientRect().bottom)),785);
     await standaloneContext.close();
     // ---- pairing: the public name requires a paired device ----
-    assert.deepEqual((await remote('GET','/connection')).json(),{host:'marlin.test',push_enabled:true,paired:false});
+    assert.deepEqual((await remote('GET','/connection')).json(),{host:'marlin.test',push_enabled:true,paired:false,home:null});
     assert.equal((await remote('GET','/')).status,200);
     let denied=await remote('POST','/send',{body:'{"session_list":{}}'});
     assert.equal(denied.status,403); assert.equal(denied.json().err.code,'unpaired');
