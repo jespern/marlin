@@ -1668,6 +1668,7 @@ $('#push-toggle').onclick = async () => {
 if (window.visualViewport) {
   const vv = window.visualViewport;
   let frame = 0;
+  let fullHeight = 0, fullWide = null;
   function fitViewport() {
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(() => {
@@ -1675,11 +1676,16 @@ if (window.visualViewport) {
       const atBottom = transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop < 48;
       // Follow the visible area on phones: when the keyboard is up iOS pans
       // it within the page (offsetTop) and the page must follow, or the top
-      // bar scrolls away and a strip opens under the composer. Whether the
-      // keyboard shows is read from focus on a touch screen, not from
-      // innerHeight: a Home Screen app may resize both together.
-      const typing = document.activeElement === $('#input') &&
-        (matchMedia('(pointer: coarse)').matches || window.innerHeight - vv.height > 100);
+      // bar scrolls away and a strip opens under the composer. The keyboard
+      // is up when the visible height has shrunk from its full height for
+      // this orientation (not innerHeight, which a Home Screen app may
+      // resize along with it, and not focus: changing the layout at the
+      // moment of the tap moves the field under the finger and iOS drops
+      // the tap).
+      const wide = window.innerWidth > window.innerHeight;
+      if (wide !== fullWide) { fullHeight = 0; fullWide = wide; }
+      fullHeight = Math.max(fullHeight, vv.height);
+      const typing = fullHeight - vv.height > 120;
       if (matchMedia('(max-width: 700px)').matches && vv.scale === 1) {
         document.body.style.height = vv.height + 'px';
         document.body.style.top = vv.offsetTop + 'px';

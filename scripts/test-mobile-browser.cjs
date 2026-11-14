@@ -89,20 +89,17 @@ async function main() {
     },null,{timeout:5000}).catch(()=>{});
     let b=await bounds(); assert.ok(Math.abs(b.bottom-b.height-b.offset)<2,JSON.stringify(b));
     assert.ok(b.statusBottom<=b.top+1);
+    // Focusing alone must not move the field: iOS drops a tap whose target
+    // shifts under the finger (it took two taps to start typing).
+    const inputRect=()=>page.locator('#input').evaluate(i=>JSON.stringify(i.getBoundingClientRect()));
+    const beforeFocus=await inputRect();
     await page.locator('#input').focus();
+    await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));
+    assert.equal(await inputRect(),beforeFocus);
+    // The keyboard (the visible height shrinking) drops the home-indicator padding.
     await page.setViewportSize({width:390,height:420});
     await settle();
-    // Focused on a touch screen = keyboard up: no home-indicator padding.
-    // (Chromium's mobile emulation still reports a fine pointer; fake coarse.)
-    assert.equal(await page.evaluate(async()=>{
-      const real=window.matchMedia.bind(window);
-      window.matchMedia=q=>q==='(pointer: coarse)'?{matches:true}:real(q);
-      window.dispatchEvent(new Event('resize'));
-      await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
-      const inset=document.body.style.getPropertyValue('--bottom-inset');
-      window.matchMedia=real;
-      return inset;
-    }),'0px');
+    assert.equal(await page.evaluate(()=>document.body.style.getPropertyValue('--bottom-inset')),'0px');
     b=await bounds(); assert.ok(Math.abs(b.bottom-b.height-b.offset)<2,JSON.stringify(b));
     assert.equal(b.scroll,0);
     await page.evaluate(()=>{
