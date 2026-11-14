@@ -52,6 +52,9 @@ const manifest =
     \\{"src":"/icon-512.jpg","sizes":"512x512","type":"image/jpeg"}]}
 ;
 const default_port: u16 = 8377;
+/// One /send body: room for a message with the daemon's attachment ceiling
+/// (4 images, 20 MiB decoded) in base64, plus the text.
+pub const max_send_bytes = 28 * 1024 * 1024;
 
 /// Shell sessions are a terminal-client feature: a browser never gets a PTY,
 /// nor sees one. Every shell_* message is refused, including any added later,
@@ -507,7 +510,7 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !voi
 
     var body_buf: [64 * 1024]u8 = undefined;
     const body_reader = try req.readerExpectContinue(&body_buf);
-    const line = body_reader.allocRemaining(ctx.gpa, .limited(body_buf.len)) catch {
+    const line = body_reader.allocRemaining(ctx.gpa, .limited(max_send_bytes)) catch {
         try reply(req, access, "body too large\n", .{ .status = .payload_too_large });
         return;
     };

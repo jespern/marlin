@@ -107,6 +107,33 @@ async function main() {
     await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
     await page.setViewportSize({width:844,height:390}); await settle();
     b=await bounds(); assert.ok(Math.abs(b.bottom-390)<2,JSON.stringify(b));
+
+    // Composer: spellcheck on; status shows the short model name.
+    assert.equal(await page.locator('#input').getAttribute('spellcheck'),'true');
+    assert.equal(await page.locator('#input').getAttribute('autocorrect'),'on');
+    assert.equal(await page.locator('#status .model').textContent(),'testing');
+    // Nothing in the transcript scrolls sideways, however long the line.
+    await page.evaluate(()=>{
+      const pre=document.createElement('pre'); pre.textContent='x'.repeat(2000);
+      const d=document.createElement('div'); d.className='block md'; d.appendChild(pre);
+      document.querySelector('#transcript').appendChild(d);
+    });
+    assert.ok(await page.locator('#transcript').evaluate(t=>t.scrollWidth<=t.clientWidth+1));
+    // An image well over the bridge's old 64 KB body cap goes through and persists.
+    await page.evaluate(async()=>{
+      const c=document.createElement('canvas'); c.width=c.height=1500;
+      const g=c.getContext('2d');
+      for(let i=0;i<6000;i++){g.fillStyle='hsl('+(i*37%360)+' 80% '+(20+i%60)+'%)';g.fillRect((i*7919)%1500,(i*104729)%1500,23,23);}
+      const blob=await new Promise(r=>c.toBlob(r,'image/png'));
+      const dt=new DataTransfer(); dt.items.add(new File([blob],'shot.png',{type:'image/png'}));
+      const input=document.querySelector('#file'); input.files=dt.files; input.dispatchEvent(new Event('change'));
+    });
+    await page.locator('#attachments img').waitFor({state:'visible'});
+    await page.locator('#input').fill('look at this');
+    await page.locator('#input').press('Enter');
+    await page.waitForFunction(()=>!document.querySelector('#attachments img'));
+    await page.reload();
+    await page.waitForFunction(()=>[...document.querySelectorAll('.block.user:not(.optimistic)')].some(n=>n.textContent==='look at this [1 image]'));
     assert.deepEqual(errors,[]);
     // ---- pairing: the public name requires a paired device ----
     assert.deepEqual((await remote('GET','/connection')).json(),{host:'marlin.test',push_enabled:true,paired:false});

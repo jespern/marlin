@@ -26,8 +26,11 @@
   * { box-sizing: border-box; margin: 0; }
   html { height: 100%; overflow: hidden; }
   body {
-    background: var(--bg); color: var(--fg); height: 100vh; height: 100dvh; display: flex;
-    position: fixed; top: 0; left: 0; width: 100%; overflow: hidden;
+    background: var(--bg); color: var(--fg); display: flex;
+    /* Edges, not 100vh/100dvh: in an iOS Home Screen app those (and
+       visualViewport.height) come up short by the status bar, leaving a
+       blank band under the composer. Only the open keyboard sets a height. */
+    position: fixed; top: 0; bottom: 0; left: 0; width: 100%; overflow: hidden;
     font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
     overscroll-behavior: none; -webkit-tap-highlight-color: transparent;
     touch-action: manipulation;
@@ -84,7 +87,7 @@
   }
   #pair-code:focus { outline: none; border-color: var(--accent); }
   #pair-error { color: var(--red); min-height: 1.5em; }
-  #transcript { order: 1; flex: 1; min-height: 0; overflow-y: auto; padding: 18px 22px; }
+  #transcript { order: 1; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-wrap: anywhere; padding: 18px 22px; }
   #history-more { display: none; margin: 0 auto 14px; }
   #history-more.show { display: block; }
   .block { margin: 0 0 10px; }
@@ -106,12 +109,12 @@
      content it stranded the dot alone on its own line above the text. */
   .reasoning { color: var(--dim); padding: 0 12px 0 24px; position: relative; }
   .reasoning::before { content: "·"; color: var(--accent); font-weight: bold; position: absolute; left: 12px; top: 0; }
-  .tool summary { color: var(--dim); cursor: pointer; }
+  .tool summary { color: var(--dim); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .tool summary .name { color: var(--blue); }
   .tool summary .prev { color: var(--dim); }
   .tool pre, .md pre {
     background: var(--panel); margin: 4px 0; padding: 8px 12px;
-    border-radius: 4px; overflow-x: auto;
+    border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere;
   }
   .tool pre { color: var(--dim); max-height: 340px; overflow-y: auto; }
   .tool.err summary { color: var(--red); }
@@ -147,8 +150,21 @@
   button.act:hover { border-color: var(--dim); }
   button.act.yes { border-color: var(--green); color: var(--green); }
   button.act.no { border-color: var(--red); color: var(--red); }
-  #composer { order: 4; padding-bottom: var(--bottom-inset, env(safe-area-inset-bottom)); display: flex; border-top: 1px solid var(--line); background: var(--panel); }
-  #composer .prompt { padding: 12px 0 12px 16px; color: var(--accent); }
+  #composer { order: 4; padding-bottom: var(--bottom-inset, env(safe-area-inset-bottom)); display: flex; flex-wrap: wrap; border-top: 1px solid var(--line); background: var(--panel); }
+  #attachments { flex-basis: 100%; display: flex; gap: 8px; padding: 8px 12px 0; }
+  #attachments:empty { display: none; }
+  #attachments .att { position: relative; }
+  #attachments img { width: 56px; height: 56px; object-fit: cover; border-radius: 4px; border: 1px solid var(--line); display: block; }
+  #attachments button {
+    position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; padding: 0;
+    border-radius: 50%; border: 1px solid var(--line); background: var(--panel2); color: var(--fg);
+    font: 12px/1 inherit; cursor: pointer;
+  }
+  #attach-btn {
+    font: inherit; font-size: 18px; line-height: 1; background: none; border: 0;
+    color: var(--dim); padding: 12px 4px 12px 16px; cursor: pointer;
+  }
+  #attach-btn:hover { color: var(--fg); }
   #input {
     flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: var(--fg);
     font: inherit; padding: 12px;
@@ -161,6 +177,7 @@
   #status .state.running { color: var(--green); }
   #status .state.awaiting_approval { color: var(--yellow); }
   #status .state.err { color: var(--red); }
+  #status .ctx.high { color: var(--yellow); }
   #status .notice { color: var(--yellow); }
   #status .model { cursor: pointer; }
   #status .model:hover { color: var(--fg); }
@@ -198,7 +215,9 @@
   #interrupt.show { display: inline-flex; }
   #interrupt:hover { color: var(--red); border-color: var(--line); opacity: 1; }
   #interrupt.armed { color: var(--red); border-color: var(--red); opacity: 1; }
-  #sandbox-btn.on { color: var(--green); border-color: var(--green); }
+  /* Sandboxed is the norm, so the pill only appears when it is off. */
+  #sandbox-btn { display: none; color: var(--yellow); border-color: var(--yellow); }
+  #sandbox-btn.off { display: inline-flex; }
   /* ---- mobile: sidebar becomes an off-canvas drawer behind a top bar ---- */
   @media (max-width: 700px) {
     #topbar {
@@ -237,7 +256,7 @@
     #side h1 button { padding: 4px 10px; }
     #transcript { padding: 12px; }
     #input { font-size: 16px; } /* <16px makes iOS zoom the page on focus */
-    #composer .prompt { padding-top: 13px; }
+    #attach-btn { padding-top: 13px; }
     button.act { padding: 8px 14px; }
     #approval { padding: 10px 12px; flex-wrap: wrap; }
     #approval .q { flex-basis: 100%; white-space: normal; word-break: break-word; max-height: 4.5em; overflow-y: auto; }
@@ -286,9 +305,11 @@
     <button class="act no">deny</button>
   </div>
   <div id="composer">
-    <span class="prompt">❯</span>
-    <input id="input" autocomplete="off" spellcheck="false" autocapitalize="off"
-      autocorrect="off" enterkeyhint="send" placeholder="message marlin…">
+    <div id="attachments"></div>
+    <button id="attach-btn" title="attach images" aria-label="attach images">+</button>
+    <input id="file" type="file" accept="image/*" multiple hidden>
+    <input id="input" autocomplete="off" spellcheck="true" autocapitalize="sentences"
+      autocorrect="on" enterkeyhint="send" placeholder="message marlin…">
   </div>
   <div id="picker" role="listbox">
     <input id="picker-filter" placeholder="filter models…" autocomplete="off">
@@ -296,10 +317,10 @@
   </div>
   <div id="slashmenu" role="listbox"></div>
   <div id="status">
-    <span class="state">idle</span><span>·</span><span class="model" title="switch model"></span>
+    <span class="state">idle</span><span class="ctx"></span><span>·</span><span class="model" title="switch model"></span>
     <span class="notice"></span>
     <span class="right">
-      <button id="sandbox-btn" class="act">⛨ sandbox</button>
+      <button id="sandbox-btn" class="act" title="the shell sandbox is off; click to turn it on">⛨ sandbox off</button>
       <button id="interrupt" class="act" title="interrupt running turn" aria-label="interrupt running turn">⏹</button>
     </span>
   </div>
@@ -510,8 +531,11 @@ function addBlock(b, target = $('#transcript'), live = true) {
       node = el('div', 'block note', '[' + rehydrationNote(v.text) + ']');
     else if (live && settleOptimisticInput(kind, v.text || ''))
       return;
-    else
+    else {
       node = el('div', 'block user', v.text);
+      const n = (v.attachments || []).length;
+      if (n) node.appendChild(el('span', 'note', (v.text ? ' ' : '') + '[' + n + (n === 1 ? ' image]' : ' images]')));
+    }
   }
   else if (kind === 'assistant_msg') {
     if (live) { clearDelta(); clearReasoning(); }
@@ -583,6 +607,26 @@ function disarmInterrupt() {
 
 const spinFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 let spinTimer = null, spinIndex = 0;
+// "claudecode/claude-opus-5-5" → "opus-5.5": the last path segment, without
+// the vendor prefix, with a trailing "-N-M" version read as "N.M".
+function shortModel(model) {
+  return (model || '').split('/').pop().replace(/^claude-/, '').replace(/-(\d+)-(\d+)$/, '-$1.$2');
+}
+function setModelLabel(model) {
+  const label = $('#status .model');
+  label.textContent = shortModel(model);
+  label.title = (model || '') + ' · switch model';
+}
+// Context fill from session_meta; blank until the daemon has measured it.
+function setContext(meta) {
+  const ctx = $('#status .ctx');
+  const used = meta ? Number(meta.context_used) : 0, limit = meta ? Number(meta.context_limit) : 0;
+  if (!limit || !used) { ctx.textContent = ''; ctx.className = 'ctx'; return; }
+  const pct = Math.min(100, Math.round(used / limit * 100));
+  ctx.textContent = ' · ' + pct + '%';
+  ctx.title = used.toLocaleString() + ' of ' + limit.toLocaleString() + ' tokens';
+  ctx.className = 'ctx' + (pct >= 80 ? ' high' : '');
+}
 function setState(state) {
   const st = $('#status .state');
   if (spinTimer) { clearInterval(spinTimer); spinTimer = null; }
@@ -644,6 +688,8 @@ function handle(m) {
     reasoningText += m.reasoning_delta.text;
     reasoningEl.innerHTML = renderMd(reasoningText);
     scrollBottom();
+  } else if (m.session_meta) {
+    if (m.session_meta.sid === sid) setContext(m.session_meta);
   } else if (m.status) {
     const summary = sessionsCache.find(s => s.sid === m.status.sid);
     if (summary) summary.state = m.status.state;
@@ -717,7 +763,7 @@ function renderSessions(list) {
   for (const s of list) {
     const d = el('div', 'sess' + (s.parent_sid ? ' child' : '') + (s.sid === sid ? ' active' : ''));
     d.appendChild(el('div', 't', s.title || '(untitled)'));
-    d.appendChild(el('div', 'm', s.state + ' · ' + (s.model || '').split('/').slice(-1)[0]));
+    d.appendChild(el('div', 'm', s.state + ' · ' + shortModel(s.model)));
     const pen = el('button', 'rename', '✎');
     pen.title = 'rename';
     pen.onclick = ev => { ev.stopPropagation(); renameSession(s); };
@@ -728,9 +774,7 @@ function renderSessions(list) {
       cur = s;
       $('#topbar .title').textContent = s.title || '(untitled)';
       tabTitle(s);
-      $('#sandbox-btn').classList.toggle('on', !!s.sandboxed);
-      $('#sandbox-btn').textContent = s.sandboxed ? '⛨ sandboxed' : '⛨ sandbox off';
-      $('#sandbox-btn').title = s.sandboxed ? 'click to disable the shell sandbox' : 'click to enable the shell sandbox';
+      $('#sandbox-btn').classList.toggle('off', !s.sandboxed);
     }
   }
 }
@@ -760,7 +804,8 @@ function open(s) {
   $('#transcript').replaceChildren($('#history-more'));
   updateHistoryButton();
   $('#approval').classList.remove('show');
-  $('#status .model').textContent = s.model || '';
+  setModelLabel(s.model);
+  setContext(null);
   setState(s.state);
   connectEvents();
   loadSessions();
@@ -859,7 +904,7 @@ $('#input').addEventListener('keydown', async e => {
   }
   if (e.key !== 'Enter') return;
   const text = e.target.value.trim();
-  if (!text || !sid) return;
+  if ((!text && !pendingAttachments.length) || !sid) return;
   if (text.startsWith('/')) {
     e.target.value = '';
     hideSlashMenu();
@@ -869,10 +914,12 @@ $('#input').addEventListener('keydown', async e => {
   const targetSid = sid;
   const state = $('#status .state').textContent;
   const pending = addOptimisticInput(targetSid, text, state === 'running' || state === 'awaiting_approval');
+  const uploads = takeAttachments();
+  if (uploads.length) pending.node.appendChild(el('span', 'note', (text ? ' ' : '') + '[' + uploads.length + (uploads.length === 1 ? ' image]' : ' images]')));
   e.target.value = '';
   try {
     const r = await send('{"input":{"sid":' + targetSid + ',"text":' + JSON.stringify(text) +
-      ',"request_id":' + pending.requestId + '}}');
+      ',"request_id":' + pending.requestId + ',"attachments":' + JSON.stringify(uploads) + '}}');
     if (r.err) rejectOptimisticInput(pending, r.err.msg || 'message was not accepted', false);
     else if (pending.node.isConnected && pendingInputs.includes(pending)) pending.node.classList.add('accepted');
   } catch (err) {
@@ -881,6 +928,67 @@ $('#input').addEventListener('keydown', async e => {
     rejectOptimisticInput(pending, 'delivery unconfirmed; waiting for session replay', true);
   }
 });
+// ---- image attachments: picked or photographed, downscaled, sent inline ----
+// The daemon takes up to 4 images per message. Re-encoding as JPEG through a
+// canvas bounds the size and turns HEIC photos into something models read.
+const maxAttachments = 4, maxImageEdge = 2048;
+let pendingAttachments = [];
+function renderAttachments() {
+  const box = $('#attachments');
+  box.replaceChildren();
+  pendingAttachments.forEach((a, i) => {
+    const item = el('div', 'att');
+    const img = el('img'); img.src = a.thumb; img.alt = a.name;
+    const remove = el('button', null, '×');
+    remove.title = 'remove'; remove.setAttribute('aria-label', 'remove ' + a.name);
+    remove.onclick = () => { URL.revokeObjectURL(a.thumb); pendingAttachments.splice(i, 1); renderAttachments(); };
+    item.append(img, remove);
+    box.appendChild(item);
+  });
+}
+function takeAttachments() {
+  const uploads = pendingAttachments.map(({name, mime, data_base64}) => ({name, mime, data_base64}));
+  pendingAttachments.forEach(a => URL.revokeObjectURL(a.thumb));
+  pendingAttachments = [];
+  renderAttachments();
+  return uploads;
+}
+async function encodeImage(file) {
+  const thumb = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = thumb;
+    await img.decode();
+    const scale = Math.min(1, maxImageEdge / Math.max(img.naturalWidth, img.naturalHeight));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.88));
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
+    const name = (file.name || 'image').replace(/\.[^.]*$/, '') + '.jpg';
+    return {name, mime: 'image/jpeg', data_base64: String(dataUrl).split(',')[1], thumb};
+  } catch {
+    URL.revokeObjectURL(thumb);
+    throw Error('could not read ' + (file.name || 'that image'));
+  }
+}
+$('#attach-btn').onclick = () => $('#file').click();
+$('#file').onchange = async e => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  for (const file of files) {
+    if (pendingAttachments.length >= maxAttachments) { notice('at most ' + maxAttachments + ' images per message'); break; }
+    try { pendingAttachments.push(await encodeImage(file)); renderAttachments(); }
+    catch (err) { notice(err.message); }
+  }
+  $('#input').focus();
+};
 $('#approval .yes').onclick = () =>
   send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"granted"}}');
 $('#approval .no').onclick = () =>
@@ -959,7 +1067,7 @@ async function openModelPicker() {
 async function setModel(model) {
   const r = await send('{"session_set_model":{"sid":' + sid + ',"model":' + JSON.stringify(model) + '}}');
   if (r.err) { notice(r.err.msg); return; }
-  $('#status .model').textContent = model;
+  setModelLabel(model);
   loadSessions();
 }
 $('#status .model').onclick = () => {
@@ -996,7 +1104,7 @@ async function slashCommand(raw) {
   if (cmd === '/model') {
     if (!arg) return openModelPicker();
     r = await send('{"session_set_model":{"sid":' + sid + ',"model":' + JSON.stringify(arg) + '}}');
-    if (!r.err) $('#status .model').textContent = arg;
+    if (!r.err) setModelLabel(arg);
   } else if (cmd === '/sandbox') {
     const enable = arg === 'on' ? true : arg === 'off' ? false : !(cur && cur.sandboxed);
     r = await send('{"session_set_sandbox":{"sid":' + sid + ',"enabled":' + enable + '}}');
@@ -1150,11 +1258,11 @@ if (window.visualViewport) {
     frame = requestAnimationFrame(() => {
       const transcript = $('#transcript');
       const atBottom = transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop < 48;
-      if (matchMedia('(max-width: 700px)').matches && vv.scale === 1) {
+      const keyboard = window.innerHeight - vv.height > 100;
+      if (matchMedia('(max-width: 700px)').matches && vv.scale === 1 && keyboard) {
         document.body.style.height = vv.height + 'px';
         document.body.style.top = vv.offsetTop + 'px';
-        const keyboard = document.activeElement === $('#input') && window.innerHeight - vv.height > 100;
-        document.body.style.setProperty('--bottom-inset', keyboard ? '0px' : 'env(safe-area-inset-bottom)');
+        document.body.style.setProperty('--bottom-inset', '0px');
       } else {
         document.body.style.height = '';
         document.body.style.top = '';
