@@ -92,6 +92,17 @@ async function main() {
     await page.locator('#input').focus();
     await page.setViewportSize({width:390,height:420});
     await settle();
+    // Focused on a touch screen = keyboard up: no home-indicator padding.
+    // (Chromium's mobile emulation still reports a fine pointer; fake coarse.)
+    assert.equal(await page.evaluate(async()=>{
+      const real=window.matchMedia.bind(window);
+      window.matchMedia=q=>q==='(pointer: coarse)'?{matches:true}:real(q);
+      window.dispatchEvent(new Event('resize'));
+      await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+      const inset=document.body.style.getPropertyValue('--bottom-inset');
+      window.matchMedia=real;
+      return inset;
+    }),'0px');
     b=await bounds(); assert.ok(Math.abs(b.bottom-b.height-b.offset)<2,JSON.stringify(b));
     assert.equal(b.scroll,0);
     await page.evaluate(()=>{

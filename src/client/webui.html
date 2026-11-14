@@ -1673,11 +1673,18 @@ if (window.visualViewport) {
     frame = requestAnimationFrame(() => {
       const transcript = $('#transcript');
       const atBottom = transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop < 48;
-      const keyboard = window.innerHeight - vv.height > 100;
-      if (matchMedia('(max-width: 700px)').matches && vv.scale === 1 && keyboard) {
+      // Follow the visible area on phones: when the keyboard is up iOS pans
+      // it within the page (offsetTop) and the page must follow, or the top
+      // bar scrolls away and a strip opens under the composer. Whether the
+      // keyboard shows is read from focus on a touch screen, not from
+      // innerHeight: a Home Screen app may resize both together.
+      const typing = document.activeElement === $('#input') &&
+        (matchMedia('(pointer: coarse)').matches || window.innerHeight - vv.height > 100);
+      if (matchMedia('(max-width: 700px)').matches && vv.scale === 1) {
         document.body.style.height = vv.height + 'px';
         document.body.style.top = vv.offsetTop + 'px';
-        document.body.style.setProperty('--bottom-inset', '0px');
+        if (typing) document.body.style.setProperty('--bottom-inset', '0px');
+        else document.body.style.removeProperty('--bottom-inset');
       } else {
         document.body.style.height = '';
         document.body.style.top = '';
