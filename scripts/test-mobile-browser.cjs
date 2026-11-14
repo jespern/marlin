@@ -149,6 +149,14 @@ async function main() {
     assert.equal(tools.next,true);
     assert.equal(tools.reasoning,tools.body);
     assert.equal(tools.note,'rgb(138, 166, 191)');
+    // File tools show their path (session-relative), never the raw arguments JSON.
+    const readRow=await page.evaluate(cwd=>{
+      addBlock({ts:Date.now(),body:{assistant_msg:{text:'reading'}}});
+      addBlock({ts:Date.now(),body:{tool_call:{name:'Read',call_id:'r1',args_json:JSON.stringify({file_path:cwd+'/src/web.zig',limit:40})}}});
+      addBlock({ts:Date.now(),body:{tool_call:{name:'TodoWrite',call_id:'t1',args_json:JSON.stringify({todos:[{content:'x'}]})}}});
+      return [...document.querySelectorAll('#transcript .tool summary')].slice(-2).map(s=>s.textContent);
+    },root);
+    assert.deepEqual(readRow,['⚙ Read src/web.zig','⚙ TodoWrite']);
     // An image well over the bridge's old 64 KB body cap goes through and persists.
     await page.evaluate(async()=>{
       const c=document.createElement('canvas'); c.width=c.height=1500;

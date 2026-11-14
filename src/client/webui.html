@@ -621,17 +621,55 @@ function addToToolGroup(t, node, kind) {
   return true;
 }
 
-function toolPreview(name, argsJson) {
-  try {
-    const a = JSON.parse(argsJson);
-    if (a.command) return a.command;
-    if (a.path) return a.path;
-    if (a.pattern) return a.pattern;
-    if (a.url) return a.url;
-    if (a.prompt) return a.prompt;
-    if (a.name) return a.name;
-  } catch (e) {}
-  return (argsJson || '');
+// Port of layout.zig toolDisplayName / decodedDisplayArg / shortenDisplayPath:
+// each tool shows the one argument worth scanning, never raw JSON.
+const lower = n => (n || '').toLowerCase();
+const isReadTool = n => lower(n) === 'read' || n === 'read_file';
+const isFileTool = n => isReadTool(n) || lower(n) === 'write' || n === 'write_file' || lower(n) === 'edit';
+const isFileEditTool = n => ['edit', 'write_file', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(n);
+function toolDisplayName(name) {
+  const n = lower(name);
+  if (n === 'sleep') return 'Sleep';
+  if (isReadTool(name)) return 'Read';
+  if (n === 'write' || name === 'write_file') return 'Write';
+  const names = {edit: 'Edit', bash: 'Bash', grep: 'Grep', glob: 'Glob', fetch: 'Fetch', webfetch: 'Fetch', websearch: 'Search', task: 'Task'};
+  if (names[n]) return names[n];
+  if (name === 'task_batch') return 'Tasks';
+  if (name === 'plan_update') return 'Plan';
+  return name;
+}
+// Session-relative paths; an absolute path elsewhere keeps only its basename.
+function shortenDisplayPath(path, cwd) {
+  const root = cwd === '/' ? cwd : (cwd || '').replace(/\/+$/, '');
+  if (root && path.startsWith(root)) {
+    if (path.length === root.length) return '.';
+    if (root === '/') return path.slice(1);
+    if (path[root.length] === '/') return path.slice(root.length + 1);
+  }
+  return path.split('/').pop();
+}
+function toolDisplayArg(name, argsJson, cwd) {
+  let a;
+  try { a = JSON.parse(argsJson || '{}'); } catch { return null; }
+  if (!a || typeof a !== 'object') return null;
+  const str = v => typeof v === 'string' ? v : null;
+  const path = v => v === null ? null : {value: v.startsWith('/') ? shortenDisplayPath(v, cwd) : v, isPath: true};
+  const n = lower(name);
+  if (isFileTool(name) || isFileEditTool(name))
+    return path(str(a.path) ?? str(a.file_path) ?? str(a.filePath) ?? str(a.notebook_path));
+  const plain = v => v === null ? null : {value: v, isPath: false};
+  if (n === 'bash') return plain(str(a.command));
+  if (n === 'grep' || n === 'glob') return plain(str(a.pattern));
+  if (n === 'fetch' || n === 'webfetch') return plain(str(a.url));
+  if (n === 'websearch') return plain(str(a.query));
+  if (n === 'task') return plain(str(a.description) ?? str(a.prompt));
+  if (name === 'plan_update') return plain(str(a.explanation));
+  for (const [key, isPath] of [['path', true], ['file_path', true], ['command', false], ['pattern', false],
+                               ['url', false], ['query', false], ['description', false], ['prompt', false]]) {
+    const v = str(a[key]);
+    if (v !== null) return isPath ? path(v) : plain(v);
+  }
+  return null;
 }
 
 const rehydrationPrefix = '[rehydrated after compaction]';
@@ -679,14 +717,17 @@ function addBlock(b, target = $('#transcript'), live = true) {
   } else if (kind === 'tool_call') {
     node = el('details', 'block tool');
     const s = el('summary', null, '⚙ ');
-    s.appendChild(el('span', 'name', v.name));
-    s.appendChild(document.createTextNode(' '));
-    const preview = toolPreview(v.name, v.args_json).slice(0, 400);
-    if ((v.name || '').toLowerCase() === 'bash') {
-      const prev = el('span', 'prev sh');
-      prev.innerHTML = shellHtml(shellDisplayCommand(preview));
-      s.appendChild(prev);
-    } else s.appendChild(el('span', 'prev', preview));
+    s.appendChild(el('span', 'name', toolDisplayName(v.name)));
+    const arg = toolDisplayArg(v.name, v.args_json, cur ? cur.cwd : '');
+    if (arg) {
+      s.appendChild(document.createTextNode(' '));
+      const preview = arg.value.slice(0, 400);
+      if (lower(v.name) === 'bash') {
+        const prev = el('span', 'prev sh');
+        prev.innerHTML = shellHtml(shellDisplayCommand(preview));
+        s.appendChild(prev);
+      } else s.appendChild(el('span', 'prev', preview));
+    }
     node.appendChild(s);
     node.dataset.call = v.call_id;
   } else if (kind === 'tool_result') {
