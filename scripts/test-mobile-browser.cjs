@@ -157,6 +157,85 @@ async function main() {
       return [...document.querySelectorAll('#transcript .tool summary')].slice(-2).map(s=>s.textContent);
     },root);
     assert.deepEqual(readRow,['⚙ Read src/web.zig','⚙ TodoWrite']);
+    // Interactive cards behave like the TUI's: questions, approvals, Plan offers.
+    const cards=await page.evaluate(async()=>{
+      const sent=[], realSend=window.send;
+      window.send=async raw=>{sent.push(JSON.parse(raw)); return {ok:{}};};
+      const out={};
+      try {
+        const qsid=sid;
+        // A question: options are buttons; the pick answers it.
+        handle({question_request:{sid:qsid,question_id:'q1',question:'Which way?',options:['Left','Right']}});
+        out.card=[document.querySelector('#question').classList.contains('show'),document.querySelector('#question .q').textContent,
+          [...document.querySelectorAll('#question .opts button')].map(b=>b.textContent)];
+        // Its transcript record waits behind the live card.
+        addBlock({ts:Date.now(),body:{tool_call:{name:'mcp__marlin__ask_user',call_id:'ask1',args_json:JSON.stringify({question:'Which way?',options:['Left','Right']})}}});
+        const record=document.querySelector('[data-call="ask1"]');
+        out.hiddenWhileAsking=getComputedStyle(record).display;
+        out.recordUnfolded=!record.closest('.tool-group');
+        document.querySelectorAll('#question .opts button')[1].click();
+        await new Promise(r=>setTimeout(r,0));
+        out.answer=sent.pop();
+        out.cardAfter=document.querySelector('#question').classList.contains('show');
+        addBlock({ts:Date.now(),body:{tool_result:{call_id:'ask1',status:'ok',inline_body:'Right'}}});
+        out.record=[getComputedStyle(record).display!=='none',[...record.querySelectorAll('.opt')].map(o=>o.textContent+(o.classList.contains('chosen')?'*':''))];
+        // Typed words answer a pending question instead of becoming a message.
+        handle({question_request:{sid:qsid,question_id:'q2',question:'Name?',options:[]}});
+        const input=document.querySelector('#input'); input.value='Bob';
+        input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+        await new Promise(r=>setTimeout(r,0));
+        out.typed=sent.pop();
+        // An approval names the tool and its argument, not raw JSON.
+        handle({approval_request:{sid:qsid,approval_id:'a1',call_id:'c9',tool:'Bash',args_json:JSON.stringify({command:'git push'})}});
+        out.approval=[document.querySelector('#approval .q').textContent,!!document.querySelector('#approval .q .sh-exe')];
+        document.querySelector('#approval .yes').click();
+        out.approved=sent.pop();
+        // Plan mode: a finished proposal offers implement/revise/dismiss.
+        cur.plan_mode=true; setState('idle');
+        addBlock({ts:Date.now(),body:{assistant_msg:{text:'Plan: do the thing'}}});
+        out.offer=document.querySelector('#plan-offer').classList.contains('show');
+        document.querySelector('#plan-implement').click();
+        await new Promise(r=>setTimeout(r,0));
+        out.accepted=sent.pop();
+        out.offerAfter=document.querySelector('#plan-offer').classList.contains('show');
+        cur.plan_mode=false;
+        await slashCommand('/plan');
+        out.planCmd=sent.find(m=>m.session_set_plan_mode);
+        out.planPrompt=document.querySelector('#composer').classList.contains('plan');
+        await slashCommand('/plan off');
+        sent.pop();
+      } finally { window.send=realSend; }
+      return out;
+    });
+    assert.deepEqual(cards.card,[true,'? Which way?',['1Left','2Right']]);
+    assert.equal(cards.hiddenWhileAsking,'none');
+    assert.equal(cards.recordUnfolded,true);
+    assert.equal(cards.answer.question_answer.question_id,'q1');
+    assert.equal(cards.answer.question_answer.answer,'Right');
+    assert.equal(cards.cardAfter,false);
+    assert.deepEqual(cards.record,[true,['  1. Left','✓ 2. Right*']]);
+    assert.deepEqual([cards.typed.question_answer.question_id,cards.typed.question_answer.answer],['q2','Bob']);
+    assert.deepEqual(cards.approval,['⚠ approve Bash git push ?',true]);
+    assert.deepEqual(cards.approved.approve,{sid:cards.approved.approve.sid,approval_id:'a1',decision:'granted'});
+    assert.equal(cards.offer,true);
+    assert.ok(cards.accepted.plan_accept);
+    assert.equal(cards.offerAfter,false);
+    assert.equal(cards.planCmd.session_set_plan_mode.enabled,true);
+    assert.equal(cards.planPrompt,true);
+    // With a real keyboard and an empty composer, y approves (as in the TUI);
+    // on a phone the same keystroke is just text.
+    const desk=await browser.newContext({viewport:{width:1200,height:800}});
+    const deskPage=await desk.newPage();
+    await deskPage.goto(origin+'/?sid='+sid);
+    await deskPage.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
+    const hotkey=await deskPage.evaluate(()=>{
+      const sent=[]; window.send=async raw=>{sent.push(JSON.parse(raw)); return {ok:{}};};
+      handle({approval_request:{sid,approval_id:'a2',call_id:'c',tool:'Read',args_json:'{"file_path":"x"}'}});
+      document.querySelector('#input').dispatchEvent(new KeyboardEvent('keydown',{key:'y',bubbles:true}));
+      return sent.map(m=>m.approve&&m.approve.decision);
+    });
+    assert.deepEqual(hotkey,['granted']);
+    await desk.close();
     // An image well over the bridge's old 64 KB body cap goes through and persists.
     await page.evaluate(async()=>{
       const c=document.createElement('canvas'); c.width=c.height=1500;

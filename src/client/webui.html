@@ -160,7 +160,35 @@
     padding: 10px 22px; gap: 12px; align-items: center;
   }
   #approval.show { display: flex; }
-  #approval .q { flex: 1; color: var(--yellow); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* The agent's question (render.zig approval_card: yellow, bold). */
+  #question {
+    order: 2; display: none; background: #3a2f1e; border-top: 1px solid var(--yellow);
+    padding: 10px 22px;
+  }
+  #question.show { display: block; }
+  #question .q { color: var(--yellow); font-weight: 700; white-space: pre-wrap; overflow-wrap: anywhere; margin-bottom: 6px; }
+  #question .opts { display: flex; flex-direction: column; gap: 6px; }
+  #question .opts button { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+  #question .opts .n { color: var(--dim); margin-right: 6px; }
+  #question .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  /* A finished Plan-mode proposal is an offer, not a modal. */
+  #plan-offer {
+    order: 2; display: none; background: #282d34; border-top: 1px solid var(--line);
+    padding: 8px 22px; gap: 10px; align-items: center; flex-wrap: wrap; color: var(--code); font-weight: 700;
+  }
+  #plan-offer.show { display: flex; }
+  #plan-offer .label { flex: 1; white-space: nowrap; }
+  #composer.plan .prompt { color: var(--code); }
+  /* An asked question in the transcript: question as prose, options recede,
+     the pick in the user's color (render.zig question_head/question_option). */
+  .question-record .qh { font-weight: 700; }
+  .question-record .opt { color: #c8ccd4; padding-left: 16px; }
+  .question-record .opt.chosen { color: var(--accent); font-weight: 700; }
+  .question-record .ans { color: var(--accent); font-weight: 700; padding-left: 16px; }
+  .question-record .ans.none { color: var(--code); font-weight: 400; }
+  body.asking .question-record:not(.done) { display: none; }
+  #approval .q { flex: 1; color: var(--yellow); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #approval .q .prev { font-weight: 400; }
   button.act {
     font: inherit; padding: 3px 12px; border-radius: 4px; border: 1px solid var(--line);
     background: var(--panel2); color: var(--fg); cursor: pointer;
@@ -278,6 +306,7 @@
     #composer .prompt, #attach-btn { padding-top: 13px; }
     button.act { padding: 8px 14px; }
     #approval { padding: 10px 12px; flex-wrap: wrap; }
+    #question, #plan-offer { padding-left: 12px; padding-right: 12px; }
     #approval .q { flex-basis: 100%; white-space: normal; word-break: break-word; max-height: 4.5em; overflow-y: auto; }
     #status .model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #status .right { flex-shrink: 0; }
@@ -322,6 +351,17 @@
     <span class="q"></span>
     <button class="act yes">approve</button>
     <button class="act no">deny</button>
+  </div>
+  <div id="question" role="dialog" aria-live="polite">
+    <div class="q"></div>
+    <div class="opts"></div>
+    <div class="hint"></div>
+  </div>
+  <div id="plan-offer">
+    <span class="label">plan ready</span>
+    <button class="act yes" id="plan-implement" title="Enter">implement</button>
+    <button class="act" id="plan-revise" title="e">revise</button>
+    <button class="act" id="plan-dismiss" title="Esc">dismiss</button>
   </div>
   <div id="composer">
     <div id="attachments"></div>
@@ -695,7 +735,10 @@ function addBlock(b, target = $('#transcript'), live = true) {
   const v = b.body[kind];
   let node = null;
   if (kind === 'user_msg') {
-    if (v.synthetic || (v.text || '').startsWith(rehydrationPrefix))
+    const synthetic = v.synthetic || (v.text || '').startsWith(rehydrationPrefix);
+    // The user spoke after a proposal: it is no longer the open offer.
+    if (!synthetic && target === $('#transcript')) planProposalReady = false;
+    if (synthetic)
       node = el('div', 'block note', '[' + rehydrationNote(v.text) + ']');
     else if (live && settleOptimisticInput(kind, v.text || ''))
       return;
@@ -707,6 +750,7 @@ function addBlock(b, target = $('#transcript'), live = true) {
   }
   else if (kind === 'assistant_msg') {
     if (live) { clearDelta(); clearReasoning(); }
+    if (cur && cur.plan_mode && target === $('#transcript')) { planProposalReady = true; updatePlanOffer(); }
     node = el('div', 'block md');
     node.innerHTML = renderMd(v.text);
   } else if (kind === 'reasoning') {
@@ -714,6 +758,8 @@ function addBlock(b, target = $('#transcript'), live = true) {
     else if (live && deltaText === v.text) clearDelta();
     node = el('div', 'block reasoning md');
     node.innerHTML = renderMd(v.text);
+  } else if (kind === 'tool_call' && isAskUserTool(v.name)) {
+    node = questionRecord(v);
   } else if (kind === 'tool_call') {
     node = el('details', 'block tool');
     const s = el('summary', null, '⚙ ');
@@ -736,6 +782,7 @@ function addBlock(b, target = $('#transcript'), live = true) {
     if (isDiff(body)) pre.innerHTML = diffHtml(body);
     else pre.textContent = body;
     const call = t.querySelector(`[data-call="${CSS.escape(v.call_id || '')}"]`);
+    if (call && call.classList.contains('question-record')) { answerQuestionRecord(call, v); return; }
     if (call) {
       if (v.status && v.status !== 'ok') {
         call.classList.add('err');
@@ -765,7 +812,9 @@ function addBlock(b, target = $('#transcript'), live = true) {
     node = el('div', 'block user', '↪ ' + v.text);
   }
   if (node) {
-    const foldable = kind === 'tool_call' || kind === 'tool_result' || kind === 'system_note' || kind === 'approval';
+    // An asked question is a conversation turn, not machinery: never folded.
+    const foldable = (kind === 'tool_call' && !node.classList.contains('question-record')) ||
+      kind === 'tool_result' || kind === 'system_note' || kind === 'approval';
     if (!foldable || !addToToolGroup(t, node, kind)) t.appendChild(node);
     if (live) scrollBottom();
   }
@@ -826,7 +875,8 @@ function setState(state) {
   st.className = 'state ' + state;
   $('#interrupt').classList.toggle('show', state === 'running' || state === 'awaiting_approval');
   if (state !== 'running' && state !== 'awaiting_approval') disarmInterrupt();
-  if (state !== 'awaiting_approval') $('#approval').classList.remove('show');
+  if (state !== 'awaiting_approval') { $('#approval').classList.remove('show'); hideQuestion(); }
+  updatePlanOffer();
 }
 
 function handle(m) {
@@ -881,9 +931,11 @@ function handle(m) {
   } else if (m.approval_request) {
     if (m.approval_request.sid !== sid) return;
     approvalId = m.approval_request.approval_id;
-    $('#approval .q').textContent =
-      'approve ' + m.approval_request.tool + ' ' + m.approval_request.args_json.slice(0, 160) + ' ?';
+    renderApproval(m.approval_request.tool, m.approval_request.args_json);
     $('#approval').classList.add('show');
+  } else if (m.question_request) {
+    if (m.question_request.sid !== sid) return;
+    showQuestion(m.question_request);
   } else if (m.session_list_result) {
     renderSessions(m.session_list_result.sessions);
   } else if (m.session_upsert) {
@@ -958,6 +1010,7 @@ function renderSessions(list) {
       $('#topbar .title').textContent = s.title || '(untitled)';
       tabTitle(s);
       $('#sandbox-btn').classList.toggle('off', !s.sandboxed);
+      updatePlanOffer();
     }
   }
 }
@@ -987,6 +1040,8 @@ function open(s) {
   $('#transcript').replaceChildren($('#history-more'));
   updateHistoryButton();
   $('#approval').classList.remove('show');
+  hideQuestion();
+  planProposalReady = false;
   setModelLabel(s.model);
   setContext(null);
   setState(s.state);
@@ -1016,6 +1071,7 @@ const slash_commands = [
   { name: '/sandbox', usage: ' [on|off]', desc: 'toggle the shell sandbox' },
   { name: '/permissions', usage: ' [full|default]', desc: 'full access or default approvals' },
   { name: '/compact', usage: '', desc: 'compact the current context' },
+  { name: '/plan', usage: ' [task|off|clear]', desc: 'enter Plan mode or manage its execution todo' },
   { name: '/rename', usage: ' <title>', desc: 'rename this session' },
   { name: '/archive', usage: '', desc: 'archive this session' },
   { name: '/new', usage: '', desc: 'start a new session' },
@@ -1060,6 +1116,21 @@ $('#input').addEventListener('input', () => { slashSel = 0; renderSlashMenu(); }
 $('#input').addEventListener('blur', () => setTimeout(hideSlashMenu, 150));
 $('#input').addEventListener('keydown', async e => {
   const menu_open = $('#slashmenu').classList.contains('show');
+  const empty = !e.target.value && !pendingAttachments.length;
+  if (empty && hasKeyboard() && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (pendingQuestion && e.key >= '1' && e.key <= '9') {
+      const option = (pendingQuestion.options || [])[Number(e.key) - 1];
+      if (option !== undefined) { e.preventDefault(); answerQuestion(option); return; }
+    }
+    if ($('#approval').classList.contains('show') && (e.key === 'y' || e.key === 'n')) {
+      e.preventDefault(); approve(e.key === 'y'); return;
+    }
+    if ($('#plan-offer').classList.contains('show')) {
+      if (e.key === 'Enter') { e.preventDefault(); acceptPlan(); return; }
+      if (e.key === 'e') { e.preventDefault(); revisePlan(); return; }
+      if (e.key === 'Escape') { e.preventDefault(); dismissPlan(); return; }
+    }
+  }
   if (e.key === 'Escape') {
     e.target.value = '';
     hideSlashMenu();
@@ -1094,12 +1165,19 @@ $('#input').addEventListener('keydown', async e => {
     slashCommand(text).catch(() => notice('command failed'));
     return;
   }
+  e.target.value = '';
+  // A parked question owns the composer: typed text IS the answer.
+  if (pendingQuestion && text) { answerQuestion(text); return; }
+  await submitInput(text);
+});
+async function submitInput(text) {
   const targetSid = sid;
   const state = $('#status .state').textContent;
   const pending = addOptimisticInput(targetSid, text, state === 'running' || state === 'awaiting_approval');
   const uploads = takeAttachments();
   if (uploads.length) pending.node.appendChild(el('span', 'note', (text ? ' ' : '') + '[' + uploads.length + (uploads.length === 1 ? ' image]' : ' images]')));
-  e.target.value = '';
+  planProposalReady = false;
+  updatePlanOffer();
   try {
     const r = await send('{"input":{"sid":' + targetSid + ',"text":' + JSON.stringify(text) +
       ',"request_id":' + pending.requestId + ',"attachments":' + JSON.stringify(uploads) + '}}');
@@ -1110,7 +1188,7 @@ $('#input').addEventListener('keydown', async e => {
     // the message. Keep it reconcilable with the SSE block instead of lying.
     rejectOptimisticInput(pending, 'delivery unconfirmed; waiting for session replay', true);
   }
-});
+}
 // ---- image attachments: picked or photographed, downscaled, sent inline ----
 // The daemon takes up to 4 images per message. Re-encoding as JPEG through a
 // canvas bounds the size and turns HEIC photos into something models read.
@@ -1172,10 +1250,151 @@ $('#file').onchange = async e => {
   }
   $('#input').focus();
 };
-$('#approval .yes').onclick = () =>
-  send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"granted"}}');
-$('#approval .no').onclick = () =>
-  send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"denied"}}');
+// ---- approvals, questions, Plan-mode offers: the TUI's cards and keys ----
+// Hotkeys (y/n, 1-9, Enter/e/Esc) need an empty composer, as in the TUI, and
+// a real keyboard: on a phone the first letter of a typed reply must not act.
+const hasKeyboard = () => matchMedia('(pointer: fine)').matches;
+function renderApproval(tool, argsJson) {
+  const q = $('#approval .q');
+  q.replaceChildren('⚠ approve ' + toolDisplayName(tool));
+  const arg = toolDisplayArg(tool, argsJson, cur ? cur.cwd : '');
+  if (arg) {
+    q.appendChild(document.createTextNode(' '));
+    const prev = el('span', 'prev' + (lower(tool) === 'bash' ? ' sh' : ''));
+    if (lower(tool) === 'bash') prev.innerHTML = shellHtml(shellDisplayCommand(arg.value));
+    else prev.textContent = arg.value;
+    q.appendChild(prev);
+  }
+  q.appendChild(document.createTextNode(' ?'));
+  q.title = q.textContent;
+}
+function approve(granted) {
+  if (!approvalId) return;
+  send('{"approve":{"sid":' + sid + ',"approval_id":' + JSON.stringify(approvalId) + ',"decision":"' + (granted ? 'granted' : 'denied') + '"}}');
+}
+
+const isAskUserTool = name => name === 'ask_user' || name === 'mcp__marlin__ask_user' || name === 'MCP marlin/ask_user';
+let pendingQuestion = null;
+function showQuestion(qr) {
+  pendingQuestion = qr;
+  $('#question .q').textContent = '? ' + qr.question;
+  const opts = $('#question .opts');
+  opts.replaceChildren();
+  (qr.options || []).slice(0, 9).forEach((option, i) => {
+    const b = el('button', 'act');
+    b.appendChild(el('span', 'n', String(i + 1)));
+    b.appendChild(document.createTextNode(option));
+    b.onclick = () => answerQuestion(option);
+    opts.appendChild(b);
+  });
+  $('#question .hint').textContent = (qr.options || []).length
+    ? (hasKeyboard() ? '1-9 picks · or type your own answer and press Enter' : 'tap an option, or type your own answer')
+    : 'type your answer and press Enter';
+  $('#question').classList.add('show');
+  document.body.classList.add('asking');
+  scrollBottom();
+}
+function hideQuestion() {
+  pendingQuestion = null;
+  $('#question').classList.remove('show');
+  document.body.classList.remove('asking');
+}
+async function answerQuestion(answer) {
+  const q = pendingQuestion;
+  if (!q) return;
+  hideQuestion();
+  const r = await send('{"question_answer":{"sid":' + q.sid + ',"question_id":' + JSON.stringify(q.question_id) +
+    ',"answer":' + JSON.stringify(answer) + '}}');
+  if (r.err) notice('could not send the answer: ' + (r.err.msg || r.err.code));
+}
+
+// Native and Claude Code store {question, options}; Codex nests them under
+// `arguments` and answers with an MCP result object (layout.zig questionArgs
+// / questionAnswer).
+function questionArgs(argsJson) {
+  let a;
+  try { a = JSON.parse(argsJson || '{}'); } catch { return {question: '', options: []}; }
+  if (a && typeof a.arguments === 'object' && a.arguments) a = a.arguments;
+  return {question: typeof a.question === 'string' ? a.question : '',
+          options: Array.isArray(a.options) ? a.options.filter(o => typeof o === 'string') : []};
+}
+function questionAnswerText(body) {
+  const t = (body || '').trim();
+  if (t === 'null') return '';
+  if (!t.startsWith('{')) return t;
+  try {
+    const r = JSON.parse(t);
+    if (!Array.isArray(r.content)) return t;
+    const text = r.content.filter(c => c && typeof c.text === 'string').map(c => c.text).join('\n').trim();
+    return text || t;
+  } catch { return t; }
+}
+function questionRecord(v) {
+  const node = el('div', 'block question-record');
+  node.dataset.call = v.call_id;
+  const args = questionArgs(v.args_json);
+  node.appendChild(el('div', 'qh', '? ' + (args.question || '(question)')));
+  args.options.forEach((option, i) => node.appendChild(el('div', 'opt', '  ' + (i + 1) + '. ' + option)));
+  return node;
+}
+function answerQuestionRecord(node, result) {
+  node.classList.add('done');
+  const answered = result.status === 'ok';
+  const answer = questionAnswerText(result.inline_body || '');
+  let picked = false;
+  for (const row of node.querySelectorAll('.opt')) {
+    const option = row.textContent.replace(/^\s*\d+\. /, '');
+    const chosen = answered && option.trim() === answer;
+    row.classList.toggle('chosen', chosen);
+    row.textContent = (chosen ? '✓ ' : '  ') + row.textContent.slice(2);
+    picked = picked || chosen;
+  }
+  if (picked) return;
+  if (answered && answer) node.appendChild(el('div', 'ans', '↳ ' + answer));
+  else node.appendChild(el('div', 'ans none', '↳ ' + (answer || 'no answer')));
+}
+
+let planProposalReady = false;
+function updatePlanOffer() {
+  const plan = !!(cur && cur.plan_mode);
+  $('#composer').classList.toggle('plan', plan);
+  const show = plan && planProposalReady && $('#status .state').className.includes('idle');
+  $('#plan-offer').classList.toggle('show', show);
+
+}
+async function acceptPlan() {
+  if (!planProposalReady || !sid) return;
+  planProposalReady = false;
+  updatePlanOffer();
+  const r = await send('{"plan_accept":{"sid":' + sid + '}}');
+  notice(r.err ? 'could not start implementation' : 'plan accepted · starting implementation…');
+}
+function revisePlan() {
+  planProposalReady = false;
+  updatePlanOffer();
+  $('#input').focus();
+  notice('revise the plan in the composer');
+}
+function dismissPlan() {
+  planProposalReady = false;
+  updatePlanOffer();
+  notice('proposal dismissed · Plan mode remains on');
+}
+$('#plan-implement').onclick = acceptPlan;
+$('#plan-revise').onclick = revisePlan;
+$('#plan-dismiss').onclick = dismissPlan;
+async function setPlanMode(enabled) {
+  const r = await send('{"session_set_plan_mode":{"sid":' + sid + ',"enabled":' + enabled + '}}');
+  if (r.err) { notice('could not change Plan mode'); return false; }
+  if (cur) cur.plan_mode = enabled;
+  planProposalReady = false;
+  updatePlanOffer();
+  notice(enabled ? 'Plan mode on · read-only investigation · /plan off exits' : 'Plan mode off');
+  return true;
+}
+
+$('#approval .yes').onclick = () => approve(true);
+$('#approval .no').onclick = () => approve(false);
 $('#interrupt').onclick = async () => {
   if (!sid) return;
   const button = $('#interrupt');
@@ -1295,6 +1514,17 @@ async function slashCommand(raw) {
     const full = arg === 'full' ? true : arg === 'default' ? false : !(cur && cur.full_access);
     r = await send('{"session_set_approvals":{"sid":' + sid + ',"approvals":"' + (full ? 'auto' : 'default') + '"}}');
     if (!r.err) notice(full ? 'FULL ACCESS — nothing asks for approval' : 'default approvals restored');
+  } else if (cmd === '/plan') {
+    // The TUI's semantics: bare enters Plan mode, a task enters it and sends
+    // the task, `off` leaves, `clear` completes the latest unfinished plan.
+    const state = $('#status .state').className;
+    if (arg === 'clear') {
+      if (state.includes('running') || state.includes('awaiting_approval')) { notice('cannot clear a plan mid-turn'); return; }
+      r = await send('{"plan_clear":{"sid":' + sid + '}}');
+      if (!r.err) notice('plan cleared');
+    } else if (arg === 'off') await setPlanMode(false);
+    else if (!arg) await setPlanMode(true);
+    else if (await setPlanMode(true)) await submitInput(arg);
   } else if (cmd === '/compact') {
     r = await send('{"session_compact":{"sid":' + sid + '}}');
     if (!r.err) notice('compacting…');
