@@ -9,19 +9,23 @@ phone once.
 ```toml
 [web]
 enabled = true               # default
-listen = "192.168.1.20"      # this machine's LAN address; default 127.0.0.1
+listen = "0.0.0.0"           # default 127.0.0.1; see below
 hosts = ["marlin.example.com"]
 proxy = "192.168.1.1"        # the reverse proxy; nothing else on the LAN may connect
 push = true                  # default
 ```
 
-- `listen` is the address the bridge binds. Loopback by default; set the LAN
-  address (or `"0.0.0.0"`) so the proxy can reach it.
+- `listen` is the address the bridge binds. Loopback by default. Use
+  `"0.0.0.0"` with `proxy` so the proxy can reach it while loopback keeps
+  working; a single LAN address would stop loopback.
 - `hosts` are the names the bridge answers to besides loopback. The first is
   the address the Web tab and the phone app advertise; add the proxy's port
   when it is not 443 (`"marlin.example.com:8443"`). Only the name is matched.
   A request under one of these names must come from a paired device.
 - `proxy`, when set, is the only non-loopback address allowed to connect.
+  It is the address the proxy connects *from*, which on a box with several
+  addresses may not be the one you browse to: the Web tab logs
+  `refused <addr>: not the [web] proxy` for anyone else, so check there.
   Its `X-Forwarded-For` names the real client in the access log, and
   `X-Forwarded-Proto: https` marks the device cookie `Secure`.
 
@@ -72,7 +76,7 @@ addresses are reachable either way. The Mac itself runs no Tailscale.
 
    ```toml
    [web]
-   listen = "<Mac LAN IP>"
+   listen = "0.0.0.0"
    hosts = ["marlin.example.com"]
    proxy = "<OPNsense LAN IP>"
    ```
