@@ -108,8 +108,8 @@ async function main() {
     await page.setViewportSize({width:844,height:390}); await settle();
     b=await bounds(); assert.ok(Math.abs(b.bottom-390)<2,JSON.stringify(b));
 
-    // The prompt marker stays, with the attach button after it.
-    assert.deepEqual(await page.locator('#composer > :not(#attachments):not([hidden])').evaluateAll(n=>n.map(e=>e.className||e.id)),['prompt','attach-btn','input']);
+    // The attach button comes first, then the prompt marker.
+    assert.deepEqual(await page.locator('#composer > :not(#attachments):not([hidden])').evaluateAll(n=>n.map(e=>e.className||e.id)),['attach-btn','prompt','input']);
     // Composer: spellcheck on; status shows the short model name.
     assert.equal(await page.locator('#input').getAttribute('spellcheck'),'true');
     assert.equal(await page.locator('#input').getAttribute('autocorrect'),'on');
