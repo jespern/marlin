@@ -252,15 +252,17 @@ async function main() {
     await page.reload();
     await page.waitForFunction(()=>[...document.querySelectorAll('.block.user:not(.optimistic)')].some(n=>n.textContent==='look at this [1 image]'));
     assert.deepEqual(errors,[]);
-    // A Home Screen app sizes itself to the screen, not to the viewport iOS
-    // reports short by the status bar (simulated: screen taller than it).
+    // A Home Screen app fills its web view and never extends past it: iOS
+    // can report a screen taller than the view, and content laid out to the
+    // screen is clipped (the composer vanished). Opaque status bar style.
+    assert.equal(await page.locator('meta[name="apple-mobile-web-app-status-bar-style"]').getAttribute('content'),'black');
     const standaloneContext=await browser.newContext({viewport:{width:390,height:785},deviceScaleFactor:3,isMobile:true,hasTouch:true,screen:{width:390,height:844}});
     await standaloneContext.addInitScript(()=>Object.defineProperty(Navigator.prototype,'standalone',{get:()=>true}));
     const homeScreen=await standaloneContext.newPage();
     await homeScreen.goto(origin+'/?sid='+sid);
     await homeScreen.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
-    await homeScreen.waitForFunction(()=>document.body.getBoundingClientRect().height===844);
-    assert.equal(await homeScreen.locator('#composer').evaluate(c=>Math.round(c.getBoundingClientRect().bottom)),844);
+    await sleep(200);
+    assert.equal(await homeScreen.locator('#composer').evaluate(c=>Math.round(c.getBoundingClientRect().bottom)),785);
     await standaloneContext.close();
     // ---- pairing: the public name requires a paired device ----
     assert.deepEqual((await remote('GET','/connection')).json(),{host:'marlin.test',push_enabled:true,paired:false});

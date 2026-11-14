@@ -6,7 +6,11 @@
 <meta name="theme-color" content="#17191d">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- Opaque, not black-translucent: a translucent Home Screen app lays the
+     page out from under the status bar but iOS sizes its web view short by
+     the status bar's height, leaving a band at the bottom the page cannot
+     paint. Opaque starts the view below the status bar and fills the rest. -->
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="marlin">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon-180.png">
@@ -27,9 +31,7 @@
   html { height: 100%; overflow: hidden; }
   body {
     background: var(--bg); color: var(--fg); display: flex;
-    /* Edges, not 100vh/100dvh: in an iOS Home Screen app those (and
-       visualViewport.height) come up short by the status bar, leaving a
-       blank band under the composer. Only the open keyboard sets a height. */
+    /* Edges, not 100vh/100dvh; only the open keyboard sets a height. */
     position: fixed; top: 0; bottom: 0; left: 0; width: 100%; overflow: hidden;
     font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
     overscroll-behavior: none; -webkit-tap-highlight-color: transparent;
@@ -1666,11 +1668,6 @@ $('#push-toggle').onclick = async () => {
 if (window.visualViewport) {
   const vv = window.visualViewport;
   let frame = 0;
-  const standalone = () => navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
-  // iOS keeps screen.width/height in portrait terms; pick the edge that
-  // matches the current orientation.
-  const screenHeight = () => window.innerWidth > window.innerHeight
-    ? Math.min(screen.width, screen.height) : Math.max(screen.width, screen.height);
   function fitViewport() {
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(() => {
@@ -1681,13 +1678,6 @@ if (window.visualViewport) {
         document.body.style.height = vv.height + 'px';
         document.body.style.top = vv.offsetTop + 'px';
         document.body.style.setProperty('--bottom-inset', '0px');
-      } else if (standalone()) {
-        // A Home Screen app has no browser chrome: it owns the screen. iOS
-        // still reports the viewport (vh, dvh, innerHeight, fixed bottom:0)
-        // short by the status bar, so size to the screen itself.
-        document.body.style.height = screenHeight() + 'px';
-        document.body.style.top = '0px';
-        document.body.style.removeProperty('--bottom-inset');
       } else {
         document.body.style.height = '';
         document.body.style.top = '';
