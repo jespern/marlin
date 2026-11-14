@@ -16,7 +16,13 @@ async function main() {
   for(const name of Object.keys(env)) if(/API_KEY|TOKEN|SECRET/.test(name)) delete env[name];
   const reserve=net.createServer(); await new Promise(r=>reserve.listen(0,'127.0.0.1',r));
   const port=reserve.address().port; await new Promise(r=>reserve.close(r));
-  fs.writeFileSync(path.join(config,'config.toml'),'[web]\nenabled = true\npush = true\nhosts = ["marlin.test"]\nport = '+port+'\n');
+  // Dictation stand-ins: ffmpeg copies -i <in> to the last argument; the
+  // engine reads the "wav" and prints whisper-style output.
+  const fakes=path.join(root,'fakebin'); fs.mkdirSync(fakes);
+  fs.writeFileSync(path.join(fakes,'ffmpeg'),'#!/bin/sh\nin=""; while [ $# -gt 1 ]; do [ "$1" = -i ] && in="$2"; shift; done\ncp "$in" "$1"\n',{mode:0o755});
+  fs.writeFileSync(path.join(fakes,'whisper-cli'),'#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -f ] && wav="$2"; shift; done\n[ "$(cat "$wav")" = AUDIO ] || exit 3\necho "[00:00:00.000 --> 00:00:01.000]  hello from   the phone"\n',{mode:0o755});
+  env.PATH=fakes+':'+env.PATH;
+  fs.writeFileSync(path.join(config,'config.toml'),'[web]\nenabled = true\npush = true\nhosts = ["marlin.test"]\nport = '+port+'\n[voice]\nenabled = true\nengine = "whisper-turbo"\nmodel = "/models/x.bin"\nstt_bin = "'+path.join(fakes,'whisper-cli')+'"\n');
   const binary=path.resolve('zig-out/bin/marlin');
   const daemon=spawn(binary,['daemon'],{env,stdio:['ignore','ignore','pipe']});
   let logs=''; daemon.stderr.on('data',b=>logs+=b);
@@ -117,7 +123,7 @@ async function main() {
     b=await bounds(); assert.ok(Math.abs(b.bottom-390)<2,JSON.stringify(b));
 
     // The attach button comes first, then the prompt marker.
-    assert.deepEqual(await page.locator('#composer > :not(#attachments):not([hidden])').evaluateAll(n=>n.map(e=>e.className||e.id)),['attach-btn','prompt','input','send-btn']);
+    assert.deepEqual(await page.locator('#composer > :not(#attachments):not([hidden])').evaluateAll(n=>n.map(e=>e.className||e.id)),['attach-btn','prompt','input','mic-btn','send-btn']);
     // Composer: spellcheck on; status shows the short model name.
     assert.equal(await page.locator('#input').getAttribute('spellcheck'),'true');
     assert.equal(await page.locator('#input').getAttribute('autocorrect'),'on');
@@ -307,6 +313,16 @@ async function main() {
     assert.deepEqual(comp.marks,['●:running','!:approval','×:err','‖:paused','·:idle','✓:done']);
     await page.reload();
     await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
+    // Dictation: the clip goes to /transcribe, runs /voice's engine on the
+    // daemon host, and the text lands at the cursor; unpaired devices are refused.
+    assert.equal((await remote('POST','/transcribe',{body:'AUDIO'})).status,403);
+    const dictated=await page.evaluate(async()=>{
+      const input=document.querySelector('#input'); input.value='please'; input.setSelectionRange(6,6);
+      await finishDictation(new Blob(['AUDIO'],{type:'audio/mp4'}));
+      const text=input.value; input.value=''; growInput();
+      return {text,visible:!document.querySelector('#mic-btn').hidden};
+    });
+    assert.deepEqual(dictated,{text:'please hello from the phone',visible:true});
     // An image well over the bridge's old 64 KB body cap goes through and persists.
     await page.evaluate(async()=>{
       const c=document.createElement('canvas'); c.width=c.height=1500;

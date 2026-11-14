@@ -42,6 +42,7 @@ const attach = @import("attach.zig");
 const html = @embedFile("webui.html");
 const mobile_push = @import("../mobile/push.zig");
 const pairing = @import("../mobile/pairing.zig");
+const web_transcribe = @import("web_transcribe.zig");
 const service_worker = @embedFile("webui-sw.js");
 const icon_180 = @embedFile("webui-icon-180.png");
 const icon_512 = @embedFile("webui-icon-512.jpg");
@@ -55,6 +56,8 @@ const default_port: u16 = 8377;
 /// One /send body: room for a message with the daemon's attachment ceiling
 /// (4 images, 20 MiB decoded) in base64, plus the text.
 pub const max_send_bytes = 28 * 1024 * 1024;
+/// One dictation clip: minutes of compressed phone audio.
+pub const max_clip_bytes = 25 * 1024 * 1024;
 
 /// Shell sessions are a terminal-client feature: a browser never gets a PTY,
 /// nor sees one. Every shell_* message is refused, including any added later,
@@ -358,6 +361,8 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         try servePair(ctx, req, &head, &access);
     } else if (std.mem.eql(u8, target, "/sw.js")) {
         try reply(req, &access, service_worker, .{ .extra_headers = &.{ .{ .name = "content-type", .value = "text/javascript" }, .{ .name = "cache-control", .value = "no-cache" } } });
+    } else if (std.mem.eql(u8, path, "/transcribe") and req.head.method == .POST) {
+        try serveTranscribe(ctx, req, &access);
     } else if (std.mem.startsWith(u8, path, "/push/")) {
         try servePush(ctx, req, path, &access);
     } else if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
@@ -476,6 +481,47 @@ fn servePair(ctx: *ConnCtx, req: *std.http.Server.Request, head: *const Head, ac
         .{ .name = "cache-control", .value = "no-store" },
         .{ .name = "set-cookie", .value = deviceCookie(&cookie_buf, &device.token, head.https) },
     } });
+}
+
+/// POST /transcribe: body is one recorded clip (any container ffmpeg reads);
+/// replies {"text": "..."} from the daemon host's /voice engine. [voice] is
+/// read per request, so running /voice setup needs no restart.
+fn serveTranscribe(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !void {
+    const json_header = [_]std.http.Header{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" } };
+    var body_buf: [64 * 1024]u8 = undefined;
+    const reader = try req.readerExpectContinue(&body_buf);
+    const audio = reader.allocRemaining(ctx.gpa, .limited(max_clip_bytes)) catch {
+        try reply(req, access,
+            \\{"err":{"code":"too_large","msg":"that recording is too long"}}
+        , .{ .status = .payload_too_large, .extra_headers = &json_header });
+        return;
+    };
+    defer ctx.gpa.free(audio);
+    var loaded = config.load(ctx.gpa, ctx.io, ctx.environ) catch {
+        try reply(req, access,
+            \\{"err":{"code":"config","msg":"cannot read Marlin's config"}}
+        , .{ .status = .internal_server_error, .extra_headers = &json_header });
+        return;
+    };
+    defer loaded.deinit();
+    const rt = web_transcribe.runtime(ctx.gpa, ctx.io, ctx.environ, loaded.value) catch {
+        try reply(req, access,
+            \\{"err":{"code":"voice_setup","msg":"voice isn't set up: run /voice setup in Marlin on the Mac"}}
+        , .{ .status = .conflict, .extra_headers = &json_header });
+        return;
+    };
+    defer ctx.gpa.free(rt.ffmpeg);
+    const text = web_transcribe.transcribe(ctx.gpa, ctx.io, ctx.environ, rt, audio) catch |err| {
+        std.log.warn("dictation failed: {t}", .{err});
+        try reply(req, access,
+            \\{"err":{"code":"transcribe","msg":"transcription failed; see /web on the Mac"}}
+        , .{ .status = .internal_server_error, .extra_headers = &json_header });
+        return;
+    };
+    defer ctx.gpa.free(text);
+    const body = try std.json.Stringify.valueAlloc(ctx.gpa, .{ .text = text }, .{});
+    defer ctx.gpa.free(body);
+    try reply(req, access, body, .{ .extra_headers = &json_header });
 }
 
 fn servePush(ctx: *ConnCtx, req: *std.http.Server.Request, path: []const u8, access: *Access) !void {

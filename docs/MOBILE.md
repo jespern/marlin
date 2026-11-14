@@ -117,6 +117,16 @@ Check from the Mac: `curl -s https://marlin.example.com[:port]/connection` answe
 `{"host":"marlin.example.com[:port]","push_enabled":true,"paired":false}`, and the
 Web tab log shows each request with the client's real address.
 
+## Dictation
+
+The composer's mic button records on the phone and transcribes on the
+daemon's machine with the same local engine as the TUI's `/voice` (whisper.cpp
+or parakeet, chosen by `/voice setup` there; ffmpeg converts the phone's m4a).
+Tap to record, tap again to stop; the text lands at the cursor for review and
+is never sent on its own. Nothing leaves the machine: the clip is a temp file,
+deleted after transcription. Until `/voice setup` has run on the daemon's
+machine, the button says so. iOS keyboard dictation keeps working as well.
+
 ## Phone notifications
 
 Push requires the Home Screen app (iOS 16.4 or later) over HTTPS. The embedded
