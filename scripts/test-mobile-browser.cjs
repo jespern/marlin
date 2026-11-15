@@ -421,6 +421,44 @@ async function main() {
     assert.equal(await page.evaluate(()=>String(sid)),String(otherSid));
     await page.goto(origin+'/?sid='+sid);
     await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
+    // A draft's text survives the app closing, per session; sending clears it.
+    const connected=()=>page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
+    await page.locator('#input').fill('half a thought');
+    await page.evaluate(id=>open(sessionsCache.find(s=>String(s.sid)===String(id))),otherSid);
+    await page.locator('#input').fill('other thought');
+    await page.goto(origin+'/?sid='+sid); await connected();
+    assert.equal(await page.locator('#input').inputValue(),'half a thought');
+    await page.goto(origin+'/?sid='+otherSid); await connected();
+    assert.equal(await page.locator('#input').inputValue(),'other thought');
+    await page.locator('#input').fill('');
+    await page.goto(origin+'/?sid='+otherSid); await connected();
+    assert.equal(await page.locator('#input').inputValue(),'');
+    await page.goto(origin+'/?sid='+sid); await connected();
+    await page.locator('#input').fill('');
+    // Where you were reading survives too, as a block and its offset; a view
+    // following the bottom stores nothing and reopens at the bottom.
+    const reading=await page.evaluate(async()=>{
+      const frame=()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+      const t=document.querySelector('#transcript');
+      for(let i=0;i<40;i++) addBlock({seq:900000+i,ts:Date.now(),body:{assistant_msg:{text:'reading '+i}}});
+      await frame();
+      const target=t.querySelector('[data-seq="900010"]');
+      t.dispatchEvent(new WheelEvent('wheel',{deltaY:-120}));
+      t.scrollTop+=target.getBoundingClientRect().top-t.getBoundingClientRect().top-7;
+      t.dispatchEvent(new Event('scroll')); await frame();
+      window.dispatchEvent(new Event('pagehide'));
+      const kept=(keptState()[String(sid)]||{}).read;
+      scrollBottom(true); await frame();
+      pendingReading=kept;
+      handle({replay_done:{sid,oldest_seq:0,has_older:false}}); await frame();
+      const at=Math.round(target.getBoundingClientRect().top-t.getBoundingClientRect().top);
+      scrollBottom(true); await frame();
+      window.dispatchEvent(new Event('pagehide'));
+      const following=!(keptState()[String(sid)]||{}).read;
+      t.querySelectorAll('[data-seq^="9000"]').forEach(n=>n.remove());
+      return {kept,at,following};
+    });
+    assert.deepEqual(reading,{kept:{seq:'900010',offset:7},at:7,following:true});
     // An image well over the bridge's old 64 KB body cap goes through and persists.
     await page.evaluate(async()=>{
       const c=document.createElement('canvas'); c.width=c.height=1500;

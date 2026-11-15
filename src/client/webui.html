@@ -934,6 +934,7 @@ function addBlock(b, target = $('#transcript'), live = true) {
     node = el('div', 'block user', '↪ ' + v.text);
   }
   if (node) {
+    if (b.seq) node.dataset.seq = b.seq;
     // An asked question is a conversation turn, not machinery: never folded.
     const foldable = (kind === 'tool_call' && !node.classList.contains('question-record')) ||
       kind === 'tool_result' || kind === 'system_note' || kind === 'approval';
@@ -1052,6 +1053,7 @@ function handle(m) {
       if (m.replay_done.oldest_seq) oldestSeq = m.replay_done.oldest_seq;
       historyHasOlder = !!m.replay_done.has_older;
       updateHistoryButton();
+      if (pendingReading) { applyReading(pendingReading); pendingReading = null; }
     }
   } else if (m.delta) {
     if (m.delta.sid !== sid) return;
@@ -1117,6 +1119,7 @@ function handle(m) {
     renderSessions(next);
   } else if (m.session_remove) {
     drafts.delete(String(m.session_remove.sid));
+    updateKept(m.session_remove.sid, 'text', ''); updateKept(m.session_remove.sid, 'read', null);
     renderSessions(sessionsCache.filter(s => s.sid !== m.session_remove.sid));
   } else if (m.interrupt_result) {
     const r = m.interrupt_result;
@@ -1192,6 +1195,7 @@ function drawer(show) {
 
 function open(s) {
   drawer(false);
+  keepReading();
   closeShellView();
   lostShellId = 0;
   disarmInterrupt();
@@ -1205,6 +1209,7 @@ function open(s) {
   sid = s.sid;
   cur = s;
   rememberSession(s.sid);
+  pendingReading = (keptState()[String(s.sid)] || {}).read || null;
   lastSeq = 0;
   oldestSeq = 0;
   historyHasOlder = false;
@@ -1354,6 +1359,7 @@ async function submitComposer() {
   if ((!text && !pendingAttachments.length) || !sid) return;
   input.value = '';
   growInput();
+  keepDraftText(sid, '');
   // `!!` makes this session a shell; `!! <command>` runs just that.
   if (/^!!(\s|$)/.test(text)) { shellConnect({sid, command: text.slice(2).trim()}); return; }
   if (text.startsWith('/')) {
@@ -1388,7 +1394,7 @@ function stashDraft() {
   else drafts.delete(String(sid));
 }
 function restoreDraft(id) {
-  const draft = drafts.get(String(id)) || {text: '', attachments: []};
+  const draft = drafts.get(String(id)) || {text: (keptState()[String(id)] || {}).text || '', attachments: []};
   drafts.delete(String(id));
   $('#input').value = draft.text;
   pendingAttachments = draft.attachments;
@@ -1401,8 +1407,48 @@ function stashedDraft(id) {
 function addDraftText(id, text) {
   if (String(id) === String(sid)) { insertAtCursor(text); return; }
   const draft = stashedDraft(id);
+  if (!draft.text) draft.text = (keptState()[String(id)] || {}).text || '';
   draft.text += (draft.text && !/\s$/.test(draft.text) ? ' ' : '') + text;
+  keepDraftText(id, draft.text);
 }
+
+// ---- what survives closing the app, per session: the draft's text (its
+// images stay in memory: megabytes would overflow localStorage) and where
+// you were reading, as a block and its offset from the top (the transcript
+// is rebuilt from the daemon, so pixels would not hold). Following the
+// bottom is the default and is not stored.
+const keptKey = 'marlin.kept';
+function keptState() { try { return JSON.parse(localStorage.getItem(keptKey) || '{}') || {}; } catch { return {}; } }
+function updateKept(id, field, value) {
+  const kept = keptState(), key = String(id), entry = kept[key] || {};
+  if (value) entry[field] = value; else delete entry[field];
+  if (Object.keys(entry).length) kept[key] = entry; else delete kept[key];
+  try { localStorage.setItem(keptKey, JSON.stringify(kept)); } catch {}
+}
+const keepDraftText = (id, text) => { if (id != null) updateKept(id, 'text', text); };
+// The block at the top of the view, unless the view follows the bottom.
+function readingAnchor() {
+  if (transcriptStick.pinned) return null;
+  const t = $('#transcript'), top = t.getBoundingClientRect().top;
+  for (const node of t.querySelectorAll('[data-seq]')) {
+    const r = node.getBoundingClientRect();
+    if (r.bottom > top + 1) return {seq: node.dataset.seq, offset: Math.round(r.top - top)};
+  }
+  return null;
+}
+function applyReading(anchor) {
+  const t = $('#transcript');
+  const node = anchor && t.querySelector(`[data-seq="${CSS.escape(String(anchor.seq))}"]`);
+  if (!node) return false; // older than what was loaded: the bottom it is
+  transcriptStick.set(false);
+  t.scrollTop += node.getBoundingClientRect().top - t.getBoundingClientRect().top - anchor.offset;
+  return true;
+}
+function keepReading() { if (sid != null && !shellView) updateKept(sid, 'read', readingAnchor()); }
+let pendingReading = null; // restored once the opened session's replay is in
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') keepReading(); });
+window.addEventListener('pagehide', keepReading);
+$('#input').addEventListener('input', e => { if (!shellView) keepDraftText(sid, e.target.value); });
 function addDraftAttachment(id, attachment) {
   if (String(id) === String(sid)) { pendingAttachments.push(attachment); renderAttachments(); return; }
   stashedDraft(id).attachments.push(attachment);
@@ -1466,6 +1512,7 @@ function insertAtCursor(text) {
   const at = (before + lead + text).length;
   input.setSelectionRange(at, at);
   growInput();
+  keepDraftText(sid, input.value);
 }
 $('#mic-btn').onclick = () => recorder ? stopDictation() : startDictation();
 $('#mic-btn').hidden = !canRecord();
