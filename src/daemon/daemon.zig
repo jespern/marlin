@@ -835,13 +835,13 @@ pub const Daemon = struct {
     /// Turn session `sid` into a shell (`!!`): a login shell on a PTY in the
     /// session's cwd, with `client` attached. A session that already is a
     /// shell is attached to instead. Failures reply err with the request id.
-    fn openShell(self: *Daemon, client: *Client, request_id: u64, sid: u64, geometry: shell_host.Geometry, command: ?[]const u8) !void {
+    fn openShell(self: *Daemon, client: *Client, request_id: u64, sid: u64, geometry: shell_host.Geometry, command: ?[]const u8, follow_size: bool) !void {
         const session = (try self.getOrLoadSession(sid)) orelse {
             self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session", .request_id = request_id } });
             return;
         };
         if (self.sessionShell(sid)) |host|
-            return self.attachShell(client, host, request_id, geometry);
+            return self.attachShell(client, host, request_id, geometry, follow_size);
         if (session.state == .running or session.state == .awaiting_approval) {
             self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "the session is working; wait for its turn to finish", .request_id = request_id } });
             return;
@@ -887,7 +887,9 @@ pub const Daemon = struct {
         };
         self.saveShellState(host);
         self.broadcastSessionUpsert(sid);
-        try self.attachShell(client, host, request_id, null);
+        // Started at the opener's size: attaching changes nothing.
+        try self.attachShell(client, host, request_id, geometry, true);
+        if (host.viewer(client.id)) |v| v.follow_size = follow_size;
     }
 
     /// The shell is over (exited, or killed): tell its viewers, record its
@@ -947,9 +949,12 @@ pub const Daemon = struct {
 
     /// Make `client` a viewer of `host` (resizing it to the client when
     /// `geometry` is given) and bring it up to date with a snapshot.
-    fn attachShell(self: *Daemon, client: *Client, host: *shell_host.Host, request_id: u64, geometry: ?shell_host.Geometry) !void {
+    fn attachShell(self: *Daemon, client: *Client, host: *shell_host.Host, request_id: u64, geometry: shell_host.Geometry, follow_size: bool) !void {
         try host.attach(client.id);
-        if (geometry) |g| host.resize(g);
+        const v = host.viewer(client.id).?;
+        v.geometry = geometry;
+        v.follow_size = follow_size;
+        if (!follow_size) self.resizeShell(host, geometry);
         self.sendTo(client, .{ .shell_opened = .{ .shell_id = host.id, .request_id = request_id } });
         try self.sendShellSnapshot(client, host);
         self.broadcastShellList();
@@ -962,6 +967,16 @@ pub const Daemon = struct {
         const encoded = try self.gpa.alloc(u8, encoder.calcSize(snapshot.len));
         defer self.gpa.free(encoded);
         self.sendTo(client, .{ .shell_snapshot = .{ .shell_id = host.id, .data_base64 = encoder.encode(encoded, snapshot) } });
+    }
+
+    /// Size the shell, telling the viewers that follow its size.
+    fn resizeShell(self: *Daemon, host: *shell_host.Host, geometry: shell_host.Geometry) void {
+        const before = host.geometry;
+        if (std.meta.eql(before, geometry)) return; // every keystroke asks
+        host.resize(geometry);
+        if (host.geometry.cols == before.cols and host.geometry.rows == before.rows) return;
+        for (host.viewers.items) |v| if (v.follow_size) if (self.lookupClient(v.client_id)) |viewer|
+            self.sendTo(viewer, .{ .shell_resized = .{ .shell_id = host.id, .cols = host.geometry.cols, .rows = host.geometry.rows } });
     }
 
     /// The shell session `sid` is, if any. Shells, not session objects, hold
@@ -1851,7 +1866,7 @@ pub const Daemon = struct {
                     .rows = so.rows,
                     .cell_width = so.cell_width,
                     .cell_height = so.cell_height,
-                }, so.command);
+                }, so.command, so.follow_size);
                 if (so.theme) |theme| if (self.sessionShell(so.sid)) |host| host.setTheme(theme);
             },
             .shell_attach => |sa| {
@@ -1865,7 +1880,7 @@ pub const Daemon = struct {
                     .rows = sa.rows,
                     .cell_width = sa.cell_width,
                     .cell_height = sa.cell_height,
-                });
+                }, sa.follow_size);
             },
             .shell_theme => |st| if (self.viewedShell(client, st.shell_id)) |host| host.setTheme(st.theme),
             .shell_detach => |sd| if (self.shells.get(sd.shell_id)) |host| {
@@ -1877,6 +1892,8 @@ pub const Daemon = struct {
                 self.sendShellList(client);
             },
             .shell_input => |si| if (self.viewedShell(client, si.shell_id)) |host| {
+                // Whoever types sets the size (tmux's `window-size latest`).
+                if (host.viewer(client.id).?.geometry) |g| self.resizeShell(host, g);
                 const decoder = std.base64.standard.Decoder;
                 const len = decoder.calcSizeForSlice(si.data_base64) catch return;
                 const bytes = try self.gpa.alloc(u8, len);
@@ -1884,12 +1901,11 @@ pub const Daemon = struct {
                 decoder.decode(bytes, si.data_base64) catch return;
                 host.write(bytes) catch {};
             },
-            .shell_resize => |sr| if (self.viewedShell(client, sr.shell_id)) |host| host.resize(.{
-                .cols = sr.cols,
-                .rows = sr.rows,
-                .cell_width = sr.cell_width,
-                .cell_height = sr.cell_height,
-            }),
+            .shell_resize => |sr| if (self.viewedShell(client, sr.shell_id)) |host| {
+                const g: shell_host.Geometry = .{ .cols = sr.cols, .rows = sr.rows, .cell_width = sr.cell_width, .cell_height = sr.cell_height };
+                host.viewer(client.id).?.geometry = g;
+                self.resizeShell(host, g);
+            },
             .shell_ack => |sa| if (self.viewedShell(client, sa.shell_id)) |host| {
                 const viewer = host.viewer(client.id).?;
                 viewer.unacked -|= @intCast(@min(sa.bytes, std.math.maxInt(usize)));

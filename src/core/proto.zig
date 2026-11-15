@@ -479,10 +479,17 @@ pub const ClientMsg = union(enum) {
     /// the session is an ordinary one again. Cell sizes (pixels) are zero
     /// when unknown. With `command` (`!! <command>`), the shell runs just
     /// that and ends with it; ignored when the session already is a shell.
-    shell_open: struct { request_id: u64 = 0, sid: u64 = 0, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0, theme: ?ShellTheme = null, command: ?[]const u8 = null },
+    /// `follow_size`: see shell_attach.
+    shell_open: struct { request_id: u64 = 0, sid: u64 = 0, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0, theme: ?ShellTheme = null, command: ?[]const u8 = null, follow_size: bool = false },
     /// View and drive a running shell, resizing it to this client. Replies
     /// shell_opened then shell_snapshot; shell_output follows.
-    shell_attach: struct { request_id: u64 = 0, shell_id: u64, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0, theme: ?ShellTheme = null },
+    ///
+    /// A shell has one size; the viewer that last typed (or resized) sets
+    /// it, as tmux's `window-size latest`. With `follow_size` the viewer
+    /// draws at the shell's size instead: attaching leaves it alone, and
+    /// shell_resized reports each change. Its cols and rows still count as
+    /// its size once it types.
+    shell_attach: struct { request_id: u64 = 0, shell_id: u64, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0, theme: ?ShellTheme = null, follow_size: bool = false },
     /// The viewer's terminal colors changed (they arrive after startup).
     shell_theme: struct { shell_id: u64, theme: ShellTheme },
     /// Stop viewing; the shell keeps running.
@@ -723,6 +730,9 @@ pub const DaemonMsg = union(enum) {
     shell_signal: ShellSignal,
     /// The shell exited (`code`) or was killed by a signal (`signal`).
     shell_exited: struct { shell_id: u64, code: ?i32 = null, signal: ?i32 = null },
+    /// The shell's size changed; only to viewers that attached with
+    /// `follow_size`.
+    shell_resized: struct { shell_id: u64, cols: u16, rows: u16 },
     shell_list_result: struct { shells: []const ShellInfo },
 };
 

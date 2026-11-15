@@ -27,6 +27,11 @@ pub const Viewer = struct {
     unacked: usize = 0,
     /// Dropped live bytes while behind; owed a snapshot.
     stale: bool = false,
+    /// The size this viewer would have the shell be; it takes the shell
+    /// to it when it types.
+    geometry: ?Geometry = null,
+    /// Draws at the shell's size and is told when it changes.
+    follow_size: bool = false,
 };
 
 pub const Geometry = struct {

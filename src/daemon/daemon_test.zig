@@ -350,79 +350,125 @@ test "shells outlive their opener and are shared by every viewer" {
     try std.testing.expectEqual(@as(?i32, 1), recorded.signal);
 }
 
-test "!! <command>: the shell runs just that and hands the session back when it ends" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    var peer = try server.socket.address.connect(io, .{ .mode = .stream });
-    defer peer.close(io);
-    var stream = try server.accept(io);
-    defer stream.close(io);
+/// A daemon with session 7 (cwd /, shell /bin/sh) and connected clients 1
+/// and 2, for shell tests. Heap-allocated: clients point into it.
+const ShellRig = struct {
+    gpa: std.mem.Allocator,
+    threaded: std.Io.Threaded,
+    server: std.Io.net.Server,
+    peer: std.Io.net.Stream,
+    stream: std.Io.net.Stream,
+    environ: std.process.Environ.Map,
+    daemon: daemon_mod.Daemon,
+    session: daemon_mod.Session,
+    clients: [2]daemon_mod.Client,
+    arena: std.heap.ArenaAllocator,
 
-    var environ = std.process.Environ.Map.init(gpa);
-    defer environ.deinit();
-    try environ.put("SHELL", "/bin/sh");
-    try environ.put("HOME", "/");
-    try environ.put("PATH", "/usr/bin:/bin");
-
-    var daemon: daemon_mod.Daemon = undefined;
-    daemon.gpa = gpa;
-    daemon.io = io;
-    daemon.environ = &environ;
-    daemon.events = .init(gpa);
-    daemon.clients = .empty;
-    defer daemon.clients.deinit(gpa);
-    daemon.clients_mutex = .init;
-    daemon.sessions = .empty;
-    defer daemon.sessions.deinit(gpa);
-    daemon.shells = .empty;
-    daemon.next_shell_id = 1;
-    daemon.store = try store.Store.open(gpa, null);
-    defer daemon.store.close();
-    daemon.cfg = .{};
-    daemon.network = .{ .gpa = gpa };
-    daemon.advertiser = null;
-    daemon.sandbox_backend = .unavailable;
-    daemon.presence = .{};
-    daemon.pending_reboot = null;
-    try daemon.store.createSession(7, 0, "/", "m", .auto);
-    var session = daemon_mod.Session{ .id = 7, .model = try gpa.dupe(u8, "m"), .cwd = try gpa.dupe(u8, "/") };
-    defer gpa.free(session.model);
-    defer gpa.free(session.cwd);
-    try daemon.sessions.put(gpa, session.id, &session);
-    var client = daemon_mod.Client{ .id = 1, .stream = stream, .outbox = .init(gpa), .said_hello = true };
-    defer {
-        while (client.outbox.tryPop(io)) |line| gpa.free(line.bytes);
-        client.outbox.deinit();
+    fn create() !*ShellRig {
+        const gpa = std.testing.allocator;
+        const r = try gpa.create(ShellRig);
+        r.gpa = gpa;
+        r.threaded = .init(gpa, .{});
+        const io = r.threaded.io();
+        r.server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+        r.peer = try r.server.socket.address.connect(io, .{ .mode = .stream });
+        r.stream = try r.server.accept(io);
+        r.environ = std.process.Environ.Map.init(gpa);
+        try r.environ.put("SHELL", "/bin/sh");
+        try r.environ.put("HOME", "/");
+        try r.environ.put("PATH", "/usr/bin:/bin");
+        const d = &r.daemon;
+        d.gpa = gpa;
+        d.io = io;
+        d.environ = &r.environ;
+        d.events = .init(gpa);
+        d.clients = .empty;
+        d.clients_mutex = .init;
+        d.sessions = .empty;
+        d.shells = .empty;
+        d.next_shell_id = 1;
+        d.store = try store.Store.open(gpa, null);
+        d.cfg = .{};
+        d.network = .{ .gpa = gpa };
+        d.advertiser = null;
+        d.sandbox_backend = .unavailable;
+        d.presence = .{};
+        d.pending_reboot = null;
+        try d.store.createSession(7, 0, "/", "m", .auto);
+        r.session = .{ .id = 7, .model = try gpa.dupe(u8, "m"), .cwd = try gpa.dupe(u8, "/") };
+        try d.sessions.put(gpa, r.session.id, &r.session);
+        for (&r.clients, 1..) |*client, id| {
+            client.* = .{ .id = id, .stream = r.stream, .outbox = .init(gpa), .said_hello = true };
+            try d.clients.put(gpa, client.id, client);
+        }
+        r.arena = .init(gpa);
+        return r;
     }
-    try daemon.clients.put(gpa, client.id, &client);
-    defer {
-        var hosts = daemon.shells.valueIterator();
+
+    fn destroy(r: *ShellRig) void {
+        const gpa = r.gpa;
+        const io = r.threaded.io();
+        var hosts = r.daemon.shells.valueIterator();
         while (hosts.next()) |host| host.*.destroy();
-        daemon.shells.deinit(gpa);
-        while (daemon.events.tryPop(io)) |event| switch (event) {
+        r.daemon.shells.deinit(gpa);
+        while (r.daemon.events.tryPop(io)) |event| switch (event) {
             .shell_output => |o| gpa.free(o.bytes),
             else => {},
         };
-        daemon.events.deinit();
+        r.daemon.events.deinit();
+        for (&r.clients) |*client| {
+            while (client.outbox.tryPop(io)) |line| gpa.free(line.bytes);
+            client.outbox.deinit();
+        }
+        r.daemon.clients.deinit(gpa);
+        r.daemon.sessions.deinit(gpa);
+        gpa.free(r.session.model);
+        gpa.free(r.session.cwd);
+        r.daemon.store.close();
+        r.environ.deinit();
+        r.stream.close(io);
+        r.peer.close(io);
+        r.server.deinit(io);
+        r.arena.deinit();
+        r.threaded.deinit();
+        gpa.destroy(r);
     }
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
 
-    const open = try std.fmt.allocPrint(gpa, "{{\"shell_open\":{{\"request_id\":3,\"sid\":7,\"cols\":80,\"rows\":24,\"command\":\" echo ran-$((2+3)); exit 3 \"}}}}\n", .{});
-    try daemon.handleEvent(.{ .client_msg = .{ .client_id = client.id, .msg_line = open } });
+    fn send(r: *ShellRig, client_id: u64, comptime json: []const u8, args: anytype) !void {
+        const bytes = try std.fmt.allocPrint(r.gpa, json ++ "\n", args);
+        try r.daemon.handleEvent(.{ .client_msg = .{ .client_id = client_id, .msg_line = bytes } });
+    }
+
+    /// What the daemon sent client `id` since last asked.
+    fn drain(r: *ShellRig, id: u64) ![]proto.DaemonMsg {
+        const a = r.arena.allocator();
+        var msgs: std.ArrayList(proto.DaemonMsg) = .empty;
+        const client = &r.clients[id - 1];
+        while (client.outbox.tryPop(r.threaded.io())) |line| {
+            defer r.gpa.free(line.bytes);
+            try msgs.append(a, try proto.decode(proto.DaemonMsg, a, try a.dupe(u8, line.bytes)));
+        }
+        return msgs.items;
+    }
+
+    /// Run the daemon's queued events (PTY output, exits).
+    fn pump(r: *ShellRig) !void {
+        while (r.daemon.events.tryPop(r.threaded.io())) |event| try r.daemon.handleEvent(event);
+    }
+};
+
+test "!! <command>: the shell runs just that and hands the session back when it ends" {
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const io = r.threaded.io();
+
+    try r.send(1, "{{\"shell_open\":{{\"request_id\":3,\"sid\":7,\"cols\":80,\"rows\":24,\"command\":\" echo ran-$((2+3)); exit 3 \"}}}}", .{});
     var exited: ?proto.DaemonMsg = null;
     for (0..500) |_| {
-        while (daemon.events.tryPop(io)) |event| try daemon.handleEvent(event);
-        while (client.outbox.tryPop(io)) |line| {
-            defer gpa.free(line.bytes);
-            const msg = try proto.decode(proto.DaemonMsg, a, try a.dupe(u8, line.bytes));
-            if (msg == .shell_exited) exited = msg;
-        }
+        try r.pump();
+        for (try r.drain(1)) |msg| if (msg == .shell_exited) {
+            exited = msg;
+        };
         if (exited != null) break;
         try io.sleep(.fromMilliseconds(10), .awake);
     } else return error.Timeout;
@@ -430,11 +476,53 @@ test "!! <command>: the shell runs just that and hands the session back when it 
 
     // Nobody pressed Ctrl+D: the session is ordinary again, the command and
     // what it printed in its log.
-    try std.testing.expect(daemon.sessionShell(7) == null);
+    try std.testing.expect(r.daemon.sessionShell(7) == null);
     var blocks: std.ArrayList(@import("../core/block.zig").Block) = .empty;
-    try daemon.store.loadTailInto(a, &blocks, 7, 1);
+    try r.daemon.store.loadTailInto(r.arena.allocator(), &blocks, 7, 1);
     const recorded = blocks.items[0].body.shell_transcript;
     try std.testing.expectEqualStrings("echo ran-$((2+3)); exit 3", recorded.ran.?);
     try std.testing.expect(std.mem.indexOf(u8, recorded.text, "ran-5") != null);
     try std.testing.expectEqual(@as(?i32, 3), recorded.exit_code);
+}
+
+test "a shell takes the size of whoever types; a follower is told, never resizes it by looking" {
+    const r = try ShellRig.create();
+    defer r.destroy();
+
+    try r.send(1, "{{\"shell_open\":{{\"request_id\":3,\"sid\":7,\"cols\":120,\"rows\":40}}}}", .{});
+    const shell_id = (try r.drain(1))[0].shell_opened.shell_id;
+    const host = r.daemon.shells.get(shell_id).?;
+
+    // A phone looks: the shell keeps the terminal's size.
+    try r.send(2, "{{\"shell_attach\":{{\"request_id\":4,\"shell_id\":{d},\"cols\":44,\"rows\":30,\"follow_size\":true}}}}", .{shell_id});
+    _ = try r.drain(2);
+    try std.testing.expectEqual(@as(u16, 120), host.geometry.cols);
+
+    // The phone types: the shell takes its size, and the phone hears so.
+    try r.send(2, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"Cg==\"}}}}", .{shell_id});
+    try std.testing.expectEqual(@as(u16, 44), host.geometry.cols);
+    try std.testing.expectEqual(@as(u16, 30), host.geometry.rows);
+    var resized = false;
+    for (try r.drain(2)) |msg| if (msg == .shell_resized) {
+        try std.testing.expectEqual(@as(u16, 44), msg.shell_resized.cols);
+        resized = true;
+    };
+    try std.testing.expect(resized);
+    // The terminal client, which sizes itself, is not told.
+    for (try r.drain(1)) |msg| try std.testing.expect(msg != .shell_resized);
+
+    // Back at the terminal: typing there takes the size back.
+    try r.send(1, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"Cg==\"}}}}", .{shell_id});
+    try std.testing.expectEqual(@as(u16, 120), host.geometry.cols);
+    resized = false;
+    for (try r.drain(2)) |msg| if (msg == .shell_resized) {
+        try std.testing.expectEqual(@as(u16, 120), msg.shell_resized.cols);
+        try std.testing.expectEqual(@as(u16, 40), msg.shell_resized.rows);
+        resized = true;
+    };
+    try std.testing.expect(resized);
+
+    // Typing again at the same size resizes nothing.
+    try r.send(1, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"Cg==\"}}}}", .{shell_id});
+    for (try r.drain(2)) |msg| try std.testing.expect(msg != .shell_resized);
 }
