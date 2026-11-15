@@ -21,7 +21,7 @@ curl -fsSL https://marlin.wtf/install.sh | sh
 ```
 
 The installer picks the release for your architecture and verifies its
-SHA-256 checksum. To pin a release, pipe into `MARLIN_VERSION=0.2.1 sh`.
+SHA-256 checksum. To pin a release, pipe into `MARLIN_VERSION=0.2.2 sh`.
 
 Or with [Homebrew](https://brew.sh/):
 

@@ -353,7 +353,7 @@
     <img class="fish" src="assets/marlin.gif" alt="a marlin leaping out of the ocean, majestically, at 64 colors">
     <h1><span class="tilde">~*~</span> marlin <span class="tilde">~*~</span></h1>
     <p class="tagline">fast, durable terminal agents that <b>SWIM</b> between clients &nbsp;🐟&nbsp; built in Zig</p>
-    <p class="release-line">current release: <a href="https://github.com/jespern/marlin/releases/tag/v0.2.1">v0.2.1</a></p>
+    <p class="release-line">current release: <a href="https://github.com/jespern/marlin/releases/tag/v0.2.2">v0.2.2</a></p>
   </header>
 
   <div class="install">
@@ -412,7 +412,7 @@
     stable 1.0 product. The native agent, Claude Code and Codex guest sessions,
     structured multiplexer, scriptable inspection CLI, extension platform,
     durable plans, child delegation, review councils, SSH remote client,
-    tailnet web UI, daemon-owned shell sessions, and durable pause/resume are
+    phone web app, daemon-owned shell sessions, and durable pause/resume are
     built. Current work is concentrated on hardening edges,
     diagnostics, and performance. Config and protocol details may still move.
   </div>
@@ -421,7 +421,25 @@
     <h2>&gt;&gt; what's NEW <span class="badge blink">HOT!!</span></h2>
 
     <div class="release">
-      <h3>v0.2.1 <span class="date">· 2026-11-08</span></h3>
+      <h3>v0.2.2 <span class="date">· 2026-11-15</span></h3>
+      <ul class="starlist">
+        <li><b>the phone app, off Tailscale</b>: put the web companion behind any reverse proxy and pair a phone once with a six-digit code (<code class="inline">/web pair</code>, or <code class="inline">p</code> on the Web tab); unpairing cuts its live streams at once. <code class="inline">[web] listen</code>, <code class="inline">hosts</code>, and <code class="inline">proxy</code> replace <code class="inline">tailscale = true</code>, which is now ignored: see docs/MOBILE.md</li>
+        <li><b>the phone app, like the TUI</b>: the TUI's colors, tool rows, and "Ran N commands" folds; questions, approvals, and Plan offers answered from the phone; image attachments; a multi-line composer with one draft per session; status with context, credits, and cwd; session marks; and it never scrolls away from what you're reading</li>
+        <li><b>dictation</b>: tap the mic in the phone app, and the clip is transcribed on your Mac with <code class="inline">/voice</code>'s local engine, into the composer for review</li>
+        <li><b>remote MCP servers</b>: Streamable HTTP servers, OAuth sign-in with <code class="inline">/mcp login</code>, and MCP servers that plugins bring</li>
+        <li><b>Muse Code</b> joins Claude Code and Codex as a guest agent (<code class="inline">muse/default</code>)</li>
+        <li><b>a user profile</b>: <code class="inline">~/.config/marlin/profile.md</code> reaches every agent, native or guest, fresh each turn</li>
+        <li><b>shells</b>: with Ghostty installed, shells report their commands and exit codes to the agent; bells, notifications, and progress reach you from background tabs; tabs take the title their program sets; links and color queries work; and a shell cut off by a crash or <code class="inline">/shutdown</code> says what it was running</li>
+        <li><b>guests</b>: context gauge and <code class="inline">/compact</code> for Claude Code and Codex, and live output from their subagents and background commands</li>
+        <li><b>small things</b>: <code class="inline">!c</code> copies the last reply's prose (<code class="inline">!co</code> the tool output), <code class="inline">marlin watch</code> streams a session read-only, asked questions stay in the transcript with their answer, and private GitHub plugin marketplaces clone through <code class="inline">gh</code></li>
+        <li><b>changed default</b>: the paced 60 fps stream reveal is now opt-in (<code class="inline">/config pacing on</code>); replies still render line by line</li>
+        <li><b>fixes</b>: Claude Code <code class="inline">/compact</code> no longer hangs, recaps and the context gauge survive tab switches, reattach, and restarts, and CLI output redirected to a file keeps every line</li>
+        <li><a href="https://github.com/jespern/marlin/releases/tag/v0.2.2">release on GitHub</a></li>
+      </ul>
+    </div>
+
+    <details class="release">
+      <summary>v0.2.1 <span class="date">· 2026-11-08</span></summary>
       <ul class="starlist">
         <li><b>security</b>: the web bridge refused opening and typing into shells, but a browser on the loopback web UI could still list running shells and attach to one to read it. Every shell message is now refused</li>
         <li><b>screenshots, painted the way Ghostty paints</b>: Marlin draws the PNG itself with Ghostty's own font code, so box drawing and blocks match Ghostty pixel for pixel; <code class="inline">!ss</code> takes one, and JetBrains Mono is fetched on first use instead of being built in</li>
@@ -429,7 +447,7 @@
         <li><b>guests</b>: a missing working directory is reported as such, not as a missing binary</li>
         <li><a href="https://github.com/jespern/marlin/releases/tag/v0.2.1">release on GitHub</a></li>
       </ul>
-    </div>
+    </details>
 
     <details class="release">
       <summary>v0.2.0 <span class="date">· 2026-11-07</span></summary>
