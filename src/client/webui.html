@@ -579,13 +579,44 @@ function el(tag, cls, text) {
 // New output follows only while the reader is at the bottom; scrolled up,
 // they keep their place and "↓ new" offers the way back. Sending, opening a
 // session, and that button force the jump.
-let pinned = true;
 function nearBottom(t) { return t.scrollHeight - t.clientHeight - t.scrollTop < 48; }
+// Follow new output at the bottom until the reader scrolls up, and keep
+// following through whatever moves the bottom away without them: the
+// keyboard opening, a card or the composer taking room, a block expanding,
+// an image loading. Only scrolling up unpins: a swipe or wheel up, or the
+// view moving up while its content and size stayed put (a scrollbar drag,
+// a key). Getting back near the bottom pins again.
+function sticky(view, onPin = () => {}) {
+  const s = {pinned: true, top: 0, height: 0, client: 0};
+  const settle = () => { s.top = view.scrollTop; s.height = view.scrollHeight; s.client = view.clientHeight; };
+  s.set = pinned => { if (s.pinned !== pinned) { s.pinned = pinned; onPin(pinned); } };
+  s.stick = () => { if (s.pinned) view.scrollTop = view.scrollHeight; settle(); };
+  view.addEventListener('scroll', () => {
+    const up = view.scrollTop < s.top - 1 && view.scrollHeight === s.height && view.clientHeight === s.client;
+    if (nearBottom(view)) s.set(true);
+    else if (up) s.set(false);
+    settle();
+  }, {passive: true});
+  view.addEventListener('wheel', e => { if (e.deltaY < 0) s.set(false); }, {passive: true});
+  let touchY = null;
+  view.addEventListener('touchstart', e => { touchY = e.touches[0].clientY; }, {passive: true});
+  view.addEventListener('touchmove', e => {
+    const y = e.touches[0].clientY;
+    if (touchY !== null && y > touchY + 4) s.set(false); // finger down: older output
+    touchY = y;
+  }, {passive: true});
+  new ResizeObserver(s.stick).observe(view);
+  new MutationObserver(s.stick).observe(view, {childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['open']});
+  view.addEventListener('load', s.stick, true);
+  return s;
+}
+const transcriptStick = sticky($('#transcript'), pinned => { if (pinned) $('#jump').classList.remove('show'); });
+const termStick = sticky($('#term'));
 function scrollBottom(force = false) {
   const t = $('#transcript');
-  if (force || pinned) {
+  if (force) transcriptStick.set(true);
+  if (transcriptStick.pinned) {
     t.scrollTop = t.scrollHeight;
-    pinned = true;
     $('#jump').classList.remove('show');
   } else $('#jump').classList.add('show');
 }
@@ -1164,7 +1195,7 @@ function open(s) {
   closeShellView();
   lostShellId = 0;
   disarmInterrupt();
-  pinned = true;
+  transcriptStick.set(true);
   $('#jump').classList.remove('show');
   unreadDone.delete(String(s.sid));
   pendingInputs = [];
@@ -1635,7 +1666,7 @@ function syncShell() {
 function drawFrame(f) {
   shellView.frame = f;
   const t = $('#term');
-  const stick = nearBottom(t);
+  if (!shellView.drawn) termStick.set(true);
   // Wider than this screen (another terminal sized it): shrink to fit.
   t.style.fontSize = termFontPx * Math.min(1, shellView.grid.cols / f.cols) + 'px';
   const cursor = f.cursor.visible ? {row: f.history + f.cursor.y, col: f.cursor.x} : null;
@@ -1643,7 +1674,6 @@ function drawFrame(f) {
   const want = f.alternate ? f.history + f.rows : (cursor ? cursor.row + 1 : 0);
   while (lines.length < want) lines.push('');
   t.innerHTML = sgrRows(lines.join('\n'), cursor).map(r => `<div class="row">${r}</div>`).join('');
-  if (stick || !shellView.drawn) t.scrollTop = t.scrollHeight;
   shellView.drawn = true;
 }
 function shellSend(data) {
@@ -1724,10 +1754,6 @@ window.addEventListener('resize', () => {
   if (shellView.typed && shellWs && shellWs.readyState === 1) shellWs.send(JSON.stringify({resize: grid}));
   if (shellView.frame) drawFrame(shellView.frame);
 });
-$('#transcript').addEventListener('scroll', () => {
-  pinned = nearBottom($('#transcript'));
-  if (pinned) $('#jump').classList.remove('show');
-}, {passive: true});
 async function submitInput(text) {
   const targetSid = sid;
   // The class, not the text: while running the text carries the spinner.

@@ -109,10 +109,13 @@ async function main() {
     assert.equal(await page.evaluate(()=>document.body.style.getPropertyValue('--bottom-inset')),'0px');
     b=await bounds(); assert.ok(Math.abs(b.bottom-b.height-b.offset)<2,JSON.stringify(b));
     assert.equal(b.scroll,0);
-    await page.evaluate(()=>{
+    await page.evaluate(async()=>{
       const t=document.querySelector('#transcript');
       for(let i=0;i<150;i++) {const p=document.createElement('p');p.textContent='Reading fixture '+i;t.append(p);}
+      await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+      // The reader scrolls back to read.
       t.scrollTop=400;
+      await new Promise(r=>t.addEventListener('scroll',r,{once:true}));
     });
     await page.setViewportSize({width:390,height:600}); await settle();
     assert.equal(await page.locator('#transcript').evaluate(t=>t.scrollTop),400);
@@ -284,6 +287,7 @@ async function main() {
         // Reading older output: new blocks keep the place and offer ↓ new.
         const t=document.querySelector('#transcript');
         for(let i=0;i<60;i++) addBlock({ts:Date.now(),body:{assistant_msg:{text:'filler '+i}}});
+        await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
         t.scrollTop=0; t.dispatchEvent(new Event('scroll'));
         addBlock({ts:Date.now(),body:{assistant_msg:{text:'new output'}}});
         out.kept=t.scrollTop===0; out.jump=document.querySelector('#jump').classList.contains('show');
@@ -309,6 +313,32 @@ async function main() {
     assert.equal(comp.sentText,'line one\nline two');
     assert.equal(comp.queued,true);
     assert.deepEqual([comp.kept,comp.jump,comp.bottom],[true,true,true]);
+    // Following the bottom survives what moves it without the reader: the
+    // keyboard shrinking the view (a scroll event follows on iOS), a block
+    // expanding. Only scrolling up stops it.
+    const sticks=await page.evaluate(async()=>{
+      const frame=()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+      const t=document.querySelector('#transcript');
+      const atBottom=()=>t.scrollHeight-t.clientHeight-t.scrollTop<2;
+      const out={};
+      scrollBottom(true); await frame();
+      t.style.maxHeight='120px'; await frame(); t.dispatchEvent(new Event('scroll'));
+      addBlock({ts:Date.now(),body:{assistant_msg:{text:'after the keyboard'}}}); await frame();
+      out.keyboard=atBottom();
+      t.style.maxHeight=''; await frame();
+      const d=document.createElement('details'); d.innerHTML='<summary>tool</summary>'+'<p>line</p>'.repeat(30);
+      t.appendChild(d); await frame();
+      d.open=true; await frame();
+      out.expanded=atBottom();
+      d.remove(); await frame();
+      t.dispatchEvent(new WheelEvent('wheel',{deltaY:-120})); t.scrollTop=0; t.dispatchEvent(new Event('scroll'));
+      addBlock({ts:Date.now(),body:{assistant_msg:{text:'while reading'}}}); await frame();
+      out.reading=t.scrollTop===0&&document.querySelector('#jump').classList.contains('show');
+      scrollBottom(true); await frame();
+      out.back=atBottom()&&!document.querySelector('#jump').classList.contains('show');
+      return out;
+    });
+    assert.deepEqual(sticks,{keyboard:true,expanded:true,reading:true,back:true});
     assert.equal(comp.credits,' · api credits');
     assert.deepEqual([comp.warn,comp.hot],['ctx agent warn','ctx agent hot']);
     assert.deepEqual(comp.marks,['●:running','!:approval','×:err','‖:paused','·:idle','✓:done']);
