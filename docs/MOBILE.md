@@ -81,7 +81,9 @@ addresses are reachable either way. The Mac itself runs no Tailscale.
    proxy = "<OPNsense LAN IP>"
    ```
 
-   Give the Mac a static DHCP lease so its address does not move.
+   The Mac's address must not move under Caddy: point Caddy at its DHCP host
+   name (step 2), or give it a static lease. A lease that silently moves shows
+   up as Caddy answering 502.
 
 2. **Certificate and proxy: Caddy on OPNsense.** Install `os-caddy`
    (System → Firmware → Plugins). Under Services → Caddy Web Server:
@@ -90,7 +92,10 @@ addresses are reachable either way. The Mac itself runs no Tailscale.
      validation needs no inbound port, so nothing is exposed to the internet.
    - Reverse Proxy → Domains: `marlin.example.com`, port 443, with the DNS-01
      challenge enabled.
-   - Handlers: for that domain, upstream `<Mac LAN IP>`, port `8377`.
+   - Handlers: for that domain, upstream `<mac>.<local domain>` (the name
+     OPNsense's DNS registers from the Mac's DHCP lease, e.g.
+     `victory.home`; check with `dig @<OPNsense LAN IP> <name>`), port `8377`.
+     A name follows the Mac when its lease changes; a bare IP needs a static lease.
      Caddy passes the original Host and sets `X-Forwarded-For` and
      `X-Forwarded-Proto`; event streams (SSE) flush without buffering.
    - The OPNsense web GUI usually holds 443 (and 80). Rather than move it,

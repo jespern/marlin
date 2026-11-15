@@ -66,7 +66,7 @@ async function main() {
     const created=await post({session_create:{cwd:root,model:'local/testing',title:'Mobile check'}});
     const sid=created.session_created.sid;
     assert.match(sid,/^\d+$/);
-    await post({session_create:{cwd:root,model:'local/testing',title:'Another session'}});
+    const otherSid=(await post({session_create:{cwd:root,model:'local/testing',title:'Another session'}})).session_created.sid;
     // Golden replies from the real daemon, including short-lived phone requests.
     assert.deepEqual(await post({presence:{kind:'phone',active:true,sid:1,page_id:456}}),{ok:{request_id:0}});
     assert.deepEqual(await post({presence:{kind:'phone',active:false,sid:1,page_id:456}}),{ok:{request_id:0}});
@@ -318,11 +318,33 @@ async function main() {
     assert.equal((await remote('POST','/transcribe',{body:'AUDIO'})).status,403);
     const dictated=await page.evaluate(async()=>{
       const input=document.querySelector('#input'); input.value='please'; input.setSelectionRange(6,6);
-      await finishDictation(new Blob(['AUDIO'],{type:'audio/mp4'}));
+      await finishDictation(sid,new Blob(['AUDIO'],{type:'audio/mp4'}));
       const text=input.value; input.value=''; growInput();
       return {text,visible:!document.querySelector('#mic-btn').hidden};
     });
     assert.deepEqual(dictated,{text:'please hello from the phone',visible:true});
+    // Each session keeps its own draft, and a transcription finishing after
+    // a switch lands in the session it was recorded in, not the open one.
+    const switched=await page.evaluate(async other=>{
+      const home=cur, input=document.querySelector('#input');
+      input.value='draft here';
+      const done=finishDictation(sid,new Blob(['AUDIO'],{type:'audio/mp4'}));
+      open(sessionsCache.find(s=>String(s.sid)===String(other)));
+      const emptyOnSwitch=input.value;
+      await done;
+      const otherAfter=input.value;
+      input.value='other draft';
+      open(home);
+      const back=input.value;
+      open(sessionsCache.find(s=>String(s.sid)===String(other)));
+      const otherKept=input.value;
+      input.value='';
+      open(home);
+      input.value=''; growInput();
+      return {emptyOnSwitch,otherAfter,back,otherKept};
+    },otherSid);
+    assert.deepEqual(switched,{emptyOnSwitch:'',otherAfter:'',back:'draft here hello from the phone',otherKept:'other draft'});
+    await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
     // An image well over the bridge's old 64 KB body cap goes through and persists.
     await page.evaluate(async()=>{
       const c=document.createElement('canvas'); c.width=c.height=1500;

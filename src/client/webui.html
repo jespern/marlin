@@ -1045,6 +1045,7 @@ function handle(m) {
     }
     renderSessions(next);
   } else if (m.session_remove) {
+    drafts.delete(String(m.session_remove.sid));
     renderSessions(sessionsCache.filter(s => s.sid !== m.session_remove.sid));
   } else if (m.interrupt_result) {
     const r = m.interrupt_result;
@@ -1123,6 +1124,7 @@ function open(s) {
   $('#jump').classList.remove('show');
   unreadDone.delete(String(s.sid));
   pendingInputs = [];
+  stashDraft();
   $('#topbar .title').textContent = s.title || '(untitled)';
   tabTitle(s);
   sid = s.sid;
@@ -1144,6 +1146,7 @@ function open(s) {
   setModelLabel(s.model);
   setContext(null);
   setState(s.state);
+  restoreDraft(s.sid);
   connectEvents();
   loadSessions();
 }
@@ -1289,12 +1292,45 @@ $('#input').addEventListener('input', growInput);
 $('#send-btn').addEventListener('pointerdown', e => { e.preventDefault(); submitComposer(); });
 $('#jump').onclick = () => scrollBottom(true);
 
+// ---- per-session drafts: each session keeps its own composer, as each TUI
+// tab has its own editor. Slow results (a transcription, an image still
+// encoding) land in the session they were started from, open or not.
+const drafts = new Map(); // String(sid) -> {text, attachments}
+function stashDraft() {
+  if (sid == null) return;
+  const text = $('#input').value;
+  if (text || pendingAttachments.length) drafts.set(String(sid), {text, attachments: pendingAttachments});
+  else drafts.delete(String(sid));
+}
+function restoreDraft(id) {
+  const draft = drafts.get(String(id)) || {text: '', attachments: []};
+  drafts.delete(String(id));
+  $('#input').value = draft.text;
+  pendingAttachments = draft.attachments;
+  renderAttachments();
+}
+function stashedDraft(id) {
+  if (!drafts.has(String(id))) drafts.set(String(id), {text: '', attachments: []});
+  return drafts.get(String(id));
+}
+function addDraftText(id, text) {
+  if (String(id) === String(sid)) { insertAtCursor(text); return; }
+  const draft = stashedDraft(id);
+  draft.text += (draft.text && !/\s$/.test(draft.text) ? ' ' : '') + text;
+}
+function addDraftAttachment(id, attachment) {
+  if (String(id) === String(sid)) { pendingAttachments.push(attachment); renderAttachments(); return; }
+  stashedDraft(id).attachments.push(attachment);
+}
+const draftAttachmentCount = id => String(id) === String(sid) ? pendingAttachments.length : (drafts.get(String(id)) || {attachments: []}).attachments.length;
+
 // ---- dictation: record here, transcribe on the Mac with /voice's engine ----
 // Tap to record, tap again to stop; the text lands at the cursor for review,
 // never sent on its own (as in the TUI).
 let recorder = null, recordTimer = null;
 const canRecord = () => !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
 async function startDictation() {
+  const targetSid = sid;
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({audio: true}); }
   catch { notice('microphone access was denied'); return; }
@@ -1306,7 +1342,7 @@ async function startDictation() {
     stream.getTracks().forEach(t => t.stop());
     const type = recorder.mimeType;
     recorder = null;
-    finishDictation(new Blob(chunks, {type}));
+    finishDictation(targetSid, new Blob(chunks, {type}));
   };
   recorder.start();
   $('#mic-btn').classList.add('rec');
@@ -1317,7 +1353,7 @@ function stopDictation() {
   $('#mic-btn').classList.remove('rec');
   if (recorder && recorder.state !== 'inactive') recorder.stop();
 }
-async function finishDictation(blob) {
+async function finishDictation(targetSid, blob) {
   if (!blob.size) return;
   const button = $('#mic-btn'), input = $('#input'), placeholder = input.placeholder;
   button.classList.add('busy');
@@ -1327,7 +1363,7 @@ async function finishDictation(blob) {
     const r = await fetch('/transcribe', {method: 'POST', headers: {'Content-Type': blob.type || 'application/octet-stream'}, body: blob});
     const reply = await r.json().catch(() => ({}));
     if (!r.ok) throw Error((reply.err && reply.err.msg) || 'transcription failed');
-    if (reply.text) insertAtCursor(reply.text);
+    if (reply.text) addDraftText(targetSid, reply.text);
     else notice('no speech heard');
   } catch (err) { notice(err.message); }
   finally {
@@ -1425,14 +1461,14 @@ async function encodeImage(file) {
 }
 $('#attach-btn').onclick = () => $('#file').click();
 $('#file').onchange = async e => {
-  const files = [...e.target.files];
+  const files = [...e.target.files], targetSid = sid;
   e.target.value = '';
   for (const file of files) {
-    if (pendingAttachments.length >= maxAttachments) { notice('at most ' + maxAttachments + ' images per message'); break; }
-    try { pendingAttachments.push(await encodeImage(file)); renderAttachments(); }
+    if (draftAttachmentCount(targetSid) >= maxAttachments) { notice('at most ' + maxAttachments + ' images per message'); break; }
+    try { addDraftAttachment(targetSid, await encodeImage(file)); }
     catch (err) { notice(err.message); }
   }
-  $('#input').focus();
+  if (String(targetSid) === String(sid)) $('#input').focus();
 };
 // ---- approvals, questions, Plan-mode offers: the TUI's cards and keys ----
 // Hotkeys (y/n, 1-9, Enter/e/Esc) need an empty composer, as in the TUI, and
