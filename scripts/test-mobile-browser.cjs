@@ -407,6 +407,20 @@ async function main() {
     },otherSid);
     assert.deepEqual(switched,{emptyOnSwitch:'',otherAfter:'',back:'draft here hello from the phone',otherKept:'other draft'});
     await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
+    // Closed and opened again at "/" (as a Home Screen app always is), it
+    // comes back to the session that was open; a link's ?sid= still wins.
+    // Both ways round: one of them is not the session listed first.
+    for(const want of [otherSid,sid]) {
+      await page.evaluate(id=>open(sessionsCache.find(s=>String(s.sid)===String(id))),want);
+      await page.goto(origin+'/');
+      await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
+      assert.equal(await page.evaluate(()=>String(sid)),String(want));
+    }
+    await page.goto(origin+'/?sid='+otherSid);
+    await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
+    assert.equal(await page.evaluate(()=>String(sid)),String(otherSid));
+    await page.goto(origin+'/?sid='+sid);
+    await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
     // An image well over the bridge's old 64 KB body cap goes through and persists.
     await page.evaluate(async()=>{
       const c=document.createElement('canvas'); c.width=c.height=1500;

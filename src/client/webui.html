@@ -1204,6 +1204,7 @@ function open(s) {
   tabTitle(s);
   sid = s.sid;
   cur = s;
+  rememberSession(s.sid);
   lastSeq = 0;
   oldestSeq = 0;
   historyHasOlder = false;
@@ -1226,6 +1227,11 @@ function open(s) {
   loadSessions();
 }
 
+// The session open when the app was closed is the one it reopens on (a
+// Home Screen app always launches at "/"). A link's ?sid= still wins.
+const lastSessionKey = 'marlin.session';
+function rememberSession(id) { try { localStorage.setItem(lastSessionKey, String(id)); } catch {} }
+function rememberedSession() { try { return localStorage.getItem(lastSessionKey); } catch { return null; } }
 async function loadSessions() {
   const r = await send('{"session_list":{"include_archived":false}}');
   if (r.err) throw Error(r.err.msg);
@@ -1233,8 +1239,9 @@ async function loadSessions() {
   const list = (r.session_list_result || {}).sessions || [];
   renderSessions(list);
   if (!sid) {
-    const requested = new URL(location.href).searchParams.get('sid');
-    const first = list.find(s => String(s.sid) === requested) || list.find(s => !s.parent_sid) || list[0];
+    const linked = new URL(location.href).searchParams.get('sid');
+    const pick = id => id ? list.find(s => String(s.sid) === id) : null;
+    const first = pick(linked) || pick(rememberedSession()) || list.find(s => !s.parent_sid) || list[0];
     if (first) open(first);
   }
 }
