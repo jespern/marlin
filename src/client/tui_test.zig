@@ -4227,6 +4227,41 @@ test "!co names the folded source it copies (positional batch pairing)" {
     try std.testing.expectEqualStrings("Read docs/PERMISSIONS.md", app.clipboard_desc.items);
 }
 
+test "!c after a shell ends copies the shell's output; a later reply wins again" {
+    // Case: Jesper left a `!!` shell and expected !c to copy what it printed.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{
+        .gpa = gpa,
+        .io = threaded.io(),
+        .conn = undefined,
+        .view = .{
+            .sid = 1,
+            .editor = Editor.init(gpa),
+        },
+    };
+    defer app.deinit();
+
+    const Body = @FieldType(block.Block, "body");
+    const bodies = [_]Body{
+        .{ .assistant_msg = .{ .text = "An earlier answer." } },
+        .{ .shell_transcript = .{ .text = "$ ls\na.zig  b.zig\n$ \n\n", .exit_code = 0 } },
+    };
+    for (bodies, 1..) |body, seq| app.applyBlock(.{ .id = seq, .session_id = 1, .turn_id = seq, .seq = seq, .ts = 0, .body = body });
+
+    app.runCommand("!c");
+    try std.testing.expect(!app.reply_copy_pending);
+    try std.testing.expectEqualStrings("$ ls\na.zig  b.zig\n$", app.clipboard_pending.items);
+    try std.testing.expectEqualStrings("shell", app.clipboard_desc.items);
+
+    app.clipboard_pending.clearRetainingCapacity();
+    app.applyBlock(.{ .id = 3, .session_id = 1, .turn_id = 3, .seq = 3, .ts = 0, .body = .{ .assistant_msg = .{ .text = "A newer answer." } } });
+    app.runCommand("!c");
+    try std.testing.expect(app.reply_copy_pending);
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_pending.items.len);
+}
+
 test "!c copies the last reply's rendered prose, not its tool calls" {
     // Case: !c copied the last tool result; Jesper expected exactly what a
     // mouse drag over the answer yields.

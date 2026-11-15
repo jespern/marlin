@@ -3515,7 +3515,24 @@ pub const App = struct {
     /// `!c`: copy the last reply the way dragging over it would — the
     /// rendered prose only, no tool calls, results, or reasoning. Wrapping
     /// needs the terminal's grapheme widths, so the frame loop resolves it.
+    /// A shell that ended after the last reply is what was just read, so its
+    /// output (plain text, as the shell printed it) is copied instead.
     pub fn copyLastReply(self: *App) void {
+        var i = self.view.blocks.items.len;
+        while (i > 0) {
+            i -= 1;
+            const b = self.view.blocks.items[i];
+            if (b.kind == .assistant_msg and b.text.len > 0) break;
+            if (b.kind != .shell_transcript) continue;
+            const text = std.mem.trim(u8, b.text, " \t\r\n");
+            if (text.len == 0) {
+                self.setNotice("the shell printed nothing to copy", .{});
+                return;
+            }
+            self.setClipboardDesc(.{ .name = "shell", .arg = null });
+            self.stageClipboard(text);
+            return;
+        }
         if (self.lastReplyTurn() == null) {
             self.setNotice("no reply to copy", .{});
             return;

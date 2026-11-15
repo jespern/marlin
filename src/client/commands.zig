@@ -71,7 +71,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
     .{ .name = "!!", .description = "turn this session into a shell (Ctrl+D turns it back)" },
     .{ .name = "/screenshot", .usage = " [slim]", .description = "copy the window to the clipboard as an image (Alt+S); slim: transcript only", .accepts_args = true },
-    .{ .name = "!c", .description = "copy the last reply's text (no tool calls or output)" },
+    .{ .name = "!c", .description = "copy the last reply's text (no tool calls or output), or the last shell's output" },
     .{ .name = "!co", .description = "copy the last full tool output" },
     .{ .name = "!ss", .usage = " [slim]", .description = "copy the window to the clipboard as an image (alias for /screenshot)", .accepts_args = true },
     .{ .name = "!s", .usage = " [" ++ effects.usage_list ++ "]", .description = "start the screensaver (alias for /screensaver)", .accepts_args = true },
