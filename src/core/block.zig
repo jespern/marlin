@@ -151,6 +151,9 @@ pub const ShellTranscript = struct {
     /// What was running in the foreground when it was lost, with arguments;
     /// null at the prompt.
     command: ?[]const u8 = null,
+    /// The one command the shell was opened to run (`!! <command>`); null
+    /// for an interactive shell.
+    ran: ?[]const u8 = null,
     /// The commands it ran, oldest first, as the shell reported them
     /// (OSC 133); empty when it did not.
     commands: []const ShellCommand = &.{},

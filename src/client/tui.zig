@@ -2489,6 +2489,11 @@ pub const App = struct {
                 const label = layout_mod.shellExitLabel(self.gpa, st) catch return;
                 defer self.gpa.free(label);
                 self.pushDurableBlock(b, .shell_transcript, st.text, label, .ok);
+                if (st.ran) |ran| if (ran.len > 0) {
+                    const rendered = &self.view.blocks.items[self.view.blocks.items.len - 1];
+                    if (rendered.seq == b.seq and rendered.shell_ran.len == 0)
+                        rendered.shell_ran = self.gpa.dupe(u8, ran) catch &.{};
+                };
                 if (st.styled) |styled| if (styled.len > 0) {
                     const rendered = &self.view.blocks.items[self.view.blocks.items.len - 1];
                     if (rendered.seq == b.seq and rendered.styled.len == 0)

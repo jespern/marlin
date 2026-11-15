@@ -1445,6 +1445,53 @@ test "Sleep rows show compact requested durations without expanding the transcri
     }
 }
 
+test "a finished `!! <command>` names its command in the header" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const blocks = [_]RenderBlock{.{
+        .kind = .shell_transcript,
+        .turn_id = 1,
+        .text = @constCast("ok"),
+        .label = @constCast("exited 2"),
+        .shell_ran = @constCast("make test"),
+    }};
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = (try layoutLines(arena_state.allocator(), gpa, &transcript, 40)).items;
+    var header: ?Line = null;
+    for (lines) |line| if (std.mem.eql(u8, line.text, "  $ ")) {
+        header = line;
+    };
+    try std.testing.expectEqualStrings("make test", header.?.text2);
+    try std.testing.expectEqualStrings(" · exited 2", header.?.text3);
+}
+
 test "a finished shell keeps its colors and wraps long rows" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

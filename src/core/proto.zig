@@ -477,8 +477,9 @@ pub const ClientMsg = union(enum) {
     /// shell_opened then shell_snapshot, or err with the same request_id.
     /// When the shell ends, its transcript is appended to the session and
     /// the session is an ordinary one again. Cell sizes (pixels) are zero
-    /// when unknown.
-    shell_open: struct { request_id: u64 = 0, sid: u64 = 0, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0, theme: ?ShellTheme = null },
+    /// when unknown. With `command` (`!! <command>`), the shell runs just
+    /// that and ends with it; ignored when the session already is a shell.
+    shell_open: struct { request_id: u64 = 0, sid: u64 = 0, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0, theme: ?ShellTheme = null, command: ?[]const u8 = null },
     /// View and drive a running shell, resizing it to this client. Replies
     /// shell_opened then shell_snapshot; shell_output follows.
     shell_attach: struct { request_id: u64 = 0, shell_id: u64, cols: u16, rows: u16, cell_width: u16 = 0, cell_height: u16 = 0, theme: ?ShellTheme = null },

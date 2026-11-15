@@ -371,6 +371,9 @@ pub const RenderBlock = struct {
     /// shell_transcript: the output with its colors as VT text; empty when
     /// the block predates it, and `text` is drawn plain.
     styled: []u8 = &.{},
+    /// shell_transcript: the command `!! <command>` ran; empty for an
+    /// interactive shell.
+    shell_ran: []u8 = &.{},
     /// Source payload size supplied by the tool runtime when available.
     payload_bytes: ?u64 = null,
     /// reasoning blocks: true = deliberate mid-turn narration (visible);
@@ -395,6 +398,7 @@ pub const RenderBlock = struct {
         if (self.plan_items.len > 0) gpa.free(self.plan_items);
         if (self.full_body_ref) |ref| gpa.free(ref);
         if (self.styled.len > 0) gpa.free(self.styled);
+        if (self.shell_ran.len > 0) gpa.free(self.shell_ran);
     }
 };
 
@@ -511,6 +515,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     var status: block.ToolStatus = .ok;
     var full_body_ref: ?[]const u8 = null;
     var styled: []const u8 = "";
+    var shell_ran: []const u8 = "";
     var payload_bytes: ?u64 = null;
     var generated_text: ?[]u8 = null;
     var generated_label: ?[]u8 = null;
@@ -572,6 +577,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .shell_transcript => |st| {
             text = st.text;
             styled = st.styled orelse "";
+            shell_ran = st.ran orelse "";
             generated_label = try shellExitLabel(gpa, st);
             label = generated_label.?;
         },
@@ -597,6 +603,8 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     const owned_call_id: []u8 = if (call_id.len > 0) try gpa.dupe(u8, call_id) else &.{};
     errdefer if (owned_call_id.len > 0) gpa.free(owned_call_id);
     const owned_styled: []u8 = if (styled.len > 0) try gpa.dupe(u8, styled) else &.{};
+    errdefer if (owned_styled.len > 0) gpa.free(owned_styled);
+    const owned_ran: []u8 = if (shell_ran.len > 0) try gpa.dupe(u8, shell_ran) else &.{};
 
     return .{
         .kind = kind,
@@ -611,6 +619,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .full_body_ref = owned_ref,
         .payload_bytes = payload_bytes,
         .styled = owned_styled,
+        .shell_ran = owned_ran,
     };
 }
 
@@ -2030,7 +2039,7 @@ pub fn layoutBlockRange(
             },
             .shell_transcript => {
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
-                try appendShellTranscript(alloc, lines, rb.text, rb.styled, rb.label, w);
+                try appendShellTranscript(alloc, lines, rb.text, rb.styled, rb.shell_ran, rb.label, w);
             },
         }
     }
@@ -2052,12 +2061,12 @@ pub fn shellExitLabel(gpa: std.mem.Allocator, st: block.ShellTranscript) ![]u8 {
 }
 
 /// A finished shell: a header, then its output verbatim, one row per line.
-fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), text: []const u8, styled: []const u8, status: []const u8, w: usize) !void {
+fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), text: []const u8, styled: []const u8, ran: []const u8, status: []const u8, w: usize) !void {
     try blankLine(alloc, lines);
     try lines.append(alloc, .{
         .text = "  $ ",
         .style = Palette.shell_command,
-        .text2 = "shell",
+        .text2 = if (ran.len > 0) ran else "shell",
         .style2 = Palette.shell_command,
         .text3 = try std.fmt.allocPrint(alloc, " · {s}", .{status}),
         .style3 = Palette.collapse_hint,

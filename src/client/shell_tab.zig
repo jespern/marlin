@@ -125,8 +125,10 @@ fn nextRequestId(app: *App) u64 {
     return id;
 }
 
-/// `!!`: turn the focused session into a shell.
-pub fn open(app: *App) void {
+/// `!!`: turn the focused session into a shell. With a command
+/// (`!! make test`), the shell runs just that and hands the session back
+/// when it ends.
+pub fn open(app: *App, command: []const u8) void {
     if (!app.conn.remote_shell) {
         app.setNotice("the daemon has no shell sessions yet — rebuild it with !rb", .{});
         return;
@@ -150,6 +152,7 @@ pub fn open(app: *App) void {
         .cell_width = grid.cell_width,
         .cell_height = grid.cell_height,
         .theme = theme(app),
+        .command = if (command.len > 0) command else null,
     } }) catch {
         state.destroy();
         app.setNotice("could not reach the daemon to open a shell", .{});

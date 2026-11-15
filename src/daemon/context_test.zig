@@ -607,6 +607,11 @@ test "a shell transcript reaches the model as user context, newest output kept" 
     try std.testing.expect(std.mem.indexOf(u8, with_commands, "  $ make test  → exit 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_commands, "  $ vim notes.md  → no status\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, with_commands, "[The shell exited with status 0.]"));
+
+    // `!! <command>`: the model is told which command, and its status.
+    const ran = try context.shellTranscriptContext(a, .{ .text = "ok", .exit_code = 2, .ran = "make test" });
+    try std.testing.expect(std.mem.startsWith(u8, ran, "[The user ran `make test` in a shell"));
+    try std.testing.expect(std.mem.endsWith(u8, ran, "[The command exited with status 2.]"));
 }
 
 test "a shell lost with Marlin tells the model what was running" {

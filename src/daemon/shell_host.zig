@@ -57,6 +57,9 @@ pub const Host = struct {
     /// Commands the shell reported running (OSC 133), oldest first, the
     /// newest `max_commands` kept; owned text.
     commands: std.ArrayList(block.ShellCommand) = .empty,
+    /// The one command this shell runs (`!! <command>`), owned; null for an
+    /// interactive shell.
+    ran: ?[]u8 = null,
 
     /// Heap-allocated: the stream's handler points at `terminal`. The PTY is
     /// spawned by `start` once the host is at its final address.
@@ -107,6 +110,7 @@ pub const Host = struct {
         self.signals.deinit(gpa);
         for (self.commands.items) |command| gpa.free(command.command);
         self.commands.deinit(gpa);
+        if (self.ran) |ran| gpa.free(ran);
         gpa.free(self.cwd);
         gpa.destroy(self);
     }

@@ -349,3 +349,92 @@ test "shells outlive their opener and are shared by every viewer" {
     try std.testing.expect(std.mem.indexOf(u8, recorded.text, "hi-2") != null);
     try std.testing.expectEqual(@as(?i32, 1), recorded.signal);
 }
+
+test "!! <command>: the shell runs just that and hands the session back when it ends" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var peer = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer peer.close(io);
+    var stream = try server.accept(io);
+    defer stream.close(io);
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("SHELL", "/bin/sh");
+    try environ.put("HOME", "/");
+    try environ.put("PATH", "/usr/bin:/bin");
+
+    var daemon: daemon_mod.Daemon = undefined;
+    daemon.gpa = gpa;
+    daemon.io = io;
+    daemon.environ = &environ;
+    daemon.events = .init(gpa);
+    daemon.clients = .empty;
+    defer daemon.clients.deinit(gpa);
+    daemon.clients_mutex = .init;
+    daemon.sessions = .empty;
+    defer daemon.sessions.deinit(gpa);
+    daemon.shells = .empty;
+    daemon.next_shell_id = 1;
+    daemon.store = try store.Store.open(gpa, null);
+    defer daemon.store.close();
+    daemon.cfg = .{};
+    daemon.network = .{ .gpa = gpa };
+    daemon.advertiser = null;
+    daemon.sandbox_backend = .unavailable;
+    daemon.presence = .{};
+    daemon.pending_reboot = null;
+    try daemon.store.createSession(7, 0, "/", "m", .auto);
+    var session = daemon_mod.Session{ .id = 7, .model = try gpa.dupe(u8, "m"), .cwd = try gpa.dupe(u8, "/") };
+    defer gpa.free(session.model);
+    defer gpa.free(session.cwd);
+    try daemon.sessions.put(gpa, session.id, &session);
+    var client = daemon_mod.Client{ .id = 1, .stream = stream, .outbox = .init(gpa), .said_hello = true };
+    defer {
+        while (client.outbox.tryPop(io)) |line| gpa.free(line.bytes);
+        client.outbox.deinit();
+    }
+    try daemon.clients.put(gpa, client.id, &client);
+    defer {
+        var hosts = daemon.shells.valueIterator();
+        while (hosts.next()) |host| host.*.destroy();
+        daemon.shells.deinit(gpa);
+        while (daemon.events.tryPop(io)) |event| switch (event) {
+            .shell_output => |o| gpa.free(o.bytes),
+            else => {},
+        };
+        daemon.events.deinit();
+    }
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const open = try std.fmt.allocPrint(gpa, "{{\"shell_open\":{{\"request_id\":3,\"sid\":7,\"cols\":80,\"rows\":24,\"command\":\" echo ran-$((2+3)); exit 3 \"}}}}\n", .{});
+    try daemon.handleEvent(.{ .client_msg = .{ .client_id = client.id, .msg_line = open } });
+    var exited: ?proto.DaemonMsg = null;
+    for (0..500) |_| {
+        while (daemon.events.tryPop(io)) |event| try daemon.handleEvent(event);
+        while (client.outbox.tryPop(io)) |line| {
+            defer gpa.free(line.bytes);
+            const msg = try proto.decode(proto.DaemonMsg, a, try a.dupe(u8, line.bytes));
+            if (msg == .shell_exited) exited = msg;
+        }
+        if (exited != null) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.Timeout;
+    try std.testing.expectEqual(@as(?i32, 3), exited.?.shell_exited.code);
+
+    // Nobody pressed Ctrl+D: the session is ordinary again, the command and
+    // what it printed in its log.
+    try std.testing.expect(daemon.sessionShell(7) == null);
+    var blocks: std.ArrayList(@import("../core/block.zig").Block) = .empty;
+    try daemon.store.loadTailInto(a, &blocks, 7, 1);
+    const recorded = blocks.items[0].body.shell_transcript;
+    try std.testing.expectEqualStrings("echo ran-$((2+3)); exit 3", recorded.ran.?);
+    try std.testing.expect(std.mem.indexOf(u8, recorded.text, "ran-5") != null);
+    try std.testing.expectEqual(@as(?i32, 3), recorded.exit_code);
+}

@@ -64,7 +64,9 @@ permissions. What Marlin adds is everything around them:
   your own HTTPS proxy ([setup](docs/MOBILE.md)).
 - **A real shell in every session.** `!!` turns a session into a login shell
   on the daemon's host. It survives detaching and restarts, and `Ctrl+D`
-  hands the session back with the shell's output in the transcript.
+  hands the session back with the shell's output in the transcript;
+  `!! <command>` runs just that command and hands it back when it ends.
+  `!c` then copies what the shell printed.
 - **Long runs you can leave alone.** `/runtime 12h` sets how long a guest
   may run, `/compact` compacts its context, and a gauge shows how full that
   context is.
@@ -123,6 +125,7 @@ Inside the TUI:
 | `/search <query>` | search every transcript |
 | `/cwd <path>` | change the session's directory |
 | `!!` | turn the session into a shell; `Ctrl+D` hands it back |
+| `!! <command>` | run one command in that shell; its output joins the transcript |
 | `!<command>` | run one command in the session's workspace |
 | `Shift+Tab` | Plan mode |
 | `Alt+S`, `/screenshot` | copy a PNG of the window |

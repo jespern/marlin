@@ -263,7 +263,10 @@ pub fn shellTranscriptContext(arena: std.mem.Allocator, st: block.ShellTranscrip
     const tail = text[text.len -| shell_transcript_context_bytes..];
     const elided = text.len - tail.len;
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, "[The user ran an interactive shell in this session's working directory. Its terminal output follows");
+    if (st.ran) |ran|
+        try out.print(arena, "[The user ran `{s}` in a shell in this session's working directory. Its terminal output follows", .{ran})
+    else
+        try out.appendSlice(arena, "[The user ran an interactive shell in this session's working directory. Its terminal output follows");
     if (elided > 0) try out.print(arena, " (the first {d} bytes are elided)", .{elided});
     try out.appendSlice(arena, ".]\n```\n");
     try out.appendSlice(arena, tail);
@@ -276,7 +279,9 @@ pub fn shellTranscriptContext(arena: std.mem.Allocator, st: block.ShellTranscrip
             try out.appendSlice(arena, "[The shell ended when Marlin stopped.]");
     } else if (st.signal) |s|
         try out.print(arena, "[The shell was ended by signal {d}.]", .{s})
-    else if (st.exit_code) |code|
+    else if (st.exit_code) |code| if (st.ran != null)
+        try out.print(arena, "[The command exited with status {d}.]", .{code})
+    else
         try out.print(arena, "[The shell exited with status {d}.]", .{code});
     return out.items;
 }

@@ -108,6 +108,22 @@ test "!! explains itself when the daemon cannot serve shells" {
     try std.testing.expectEqual(@as(usize, 0), h.output.written().len);
 }
 
+test "!! <command> asks the daemon to run just that" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    h.app.runCommand("!!   make test  ");
+    const open = (try h.sent())[0].shell_open;
+    try std.testing.expectEqualStrings("make test", open.command.?);
+    try std.testing.expectEqual(@as(u64, 42), open.sid);
+
+    var plain: Harness = undefined;
+    plain.init(true);
+    defer plain.deinit();
+    plain.app.runCommand("!!");
+    try std.testing.expect((try plain.sent())[0].shell_open.command == null);
+}
+
 test "!! turns the session into a shell sized to the transcript area" {
     var h: Harness = undefined;
     h.init(true);

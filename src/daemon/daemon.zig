@@ -835,7 +835,7 @@ pub const Daemon = struct {
     /// Turn session `sid` into a shell (`!!`): a login shell on a PTY in the
     /// session's cwd, with `client` attached. A session that already is a
     /// shell is attached to instead. Failures reply err with the request id.
-    fn openShell(self: *Daemon, client: *Client, request_id: u64, sid: u64, geometry: shell_host.Geometry) !void {
+    fn openShell(self: *Daemon, client: *Client, request_id: u64, sid: u64, geometry: shell_host.Geometry, command: ?[]const u8) !void {
         const session = (try self.getOrLoadSession(sid)) orelse {
             self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session", .request_id = request_id } });
             return;
@@ -859,9 +859,18 @@ pub const Daemon = struct {
         const id = self.next_shell_id;
         self.next_shell_id += 1;
         const host = try shell_host.Host.create(self.gpa, self.io, id, sid, cwd, nowMs(self.io), geometry);
+        // `!! <command>`: the same login shell, interactive so the user's
+        // aliases and functions resolve, running just that; it ends with it.
+        const run = if (command) |text| std.mem.trim(u8, text, " \t\r\n") else "";
+        if (run.len > 0) host.ran = self.gpa.dupe(u8, run) catch |err| {
+            host.destroy();
+            return err;
+        };
+        const interactive_argv: []const []const u8 = if (integration.bash_posix) &.{ argv0, "--posix" } else &.{argv0};
+        const command_argv: []const []const u8 = if (integration.bash_posix) &.{ argv0, "--posix", "-i", "-c", run } else &.{ argv0, "-i", "-c", run };
         host.start(self.io, .{
             .path = path,
-            .argv = if (integration.bash_posix) &.{ argv0, "--posix" } else &.{argv0},
+            .argv = if (run.len > 0) command_argv else interactive_argv,
             .cwd = cwd,
             .environ = &environ,
             .size = shellWinsize(geometry),
@@ -896,7 +905,7 @@ pub const Daemon = struct {
         defer host.destroy();
         if (text) |owned| {
             defer self.gpa.free(owned);
-            self.appendSessionBlock(sid, .{ .shell_transcript = .{ .text = owned, .styled = styled, .exit_code = status.code, .signal = status.signal, .commands = host.commands.items } });
+            self.appendSessionBlock(sid, .{ .shell_transcript = .{ .text = owned, .styled = styled, .exit_code = status.code, .signal = status.signal, .ran = host.ran, .commands = host.commands.items } });
         }
         self.broadcastShellList();
         self.broadcastSessionUpsert(sid);
@@ -1842,7 +1851,7 @@ pub const Daemon = struct {
                     .rows = so.rows,
                     .cell_width = so.cell_width,
                     .cell_height = so.cell_height,
-                });
+                }, so.command);
                 if (so.theme) |theme| if (self.sessionShell(so.sid)) |host| host.setTheme(theme);
             },
             .shell_attach => |sa| {

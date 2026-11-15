@@ -272,6 +272,12 @@ pub const Appender = struct {
     }
 };
 
+fn cloneShellCommands(arena: std.mem.Allocator, commands: []const block.ShellCommand) ![]const block.ShellCommand {
+    const out = try arena.alloc(block.ShellCommand, commands.len);
+    for (commands, out) |command, *slot| slot.* = .{ .command = try arena.dupe(u8, command.command), .exit_code = command.exit_code };
+    return out;
+}
+
 fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
     return switch (body) {
         .user_msg => |value| .{ .user_msg = .{
@@ -329,6 +335,8 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .signal = value.signal,
             .lost = value.lost,
             .command = if (value.command) |command| try arena.dupe(u8, command) else null,
+            .ran = if (value.ran) |ran| try arena.dupe(u8, ran) else null,
+            .commands = try cloneShellCommands(arena, value.commands),
         } },
     };
 }
