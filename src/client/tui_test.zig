@@ -3840,6 +3840,33 @@ test "a staged image stays with its own tab's draft instead of following tab swi
     try std.testing.expectEqualStrings("for later [image #1] ", app.view.editor.text.items);
 }
 
+test "a tab left mid-stream comes back without its stale live text" {
+    // Case: Jesper switched away while a guest's note streamed and came back
+    // to the note twice: once as the commentary it became, once as the
+    // leftover live text below the next tool call.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 10, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 10, .title = "first", .model = "m", .status = "running", .created_at = 10, .running = true },
+        .{ .sid = 20, .title = "second", .model = "m", .status = "idle", .created_at = 20, .running = false },
+    });
+
+    try app.view.delta.appendSlice(gpa, "The daemon builds. Before writing");
+    try app.view.reasoning_delta.appendSlice(gpa, "thinking about");
+    try app.switchSession(20, false);
+    try app.switchSession(10, false);
+    try std.testing.expectEqual(@as(usize, 0), app.view.delta.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.view.reasoning_delta.items.len);
+}
+
 test "tab overflow retains the active tab and tab hit testing is button-extensible" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

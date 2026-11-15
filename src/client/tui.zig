@@ -1197,7 +1197,10 @@ pub const App = struct {
         self.trimHistoryWindow(!self.view.history_has_newer);
         self.view.layout_cache.reset(self.gpa);
         self.view.tail_layout_cache.reset(self.gpa);
-        self.view.stream_layout_cache.reset(self.gpa);
+        // A background tab hears no live text, and none is replayed: what
+        // streamed so far would come back stale, shown below the block it
+        // became, or with new text glued on after a gap.
+        self.view.releaseStreamingBuffers(self.gpa);
         saved.* = self.view;
         saved.last_used = self.saved_view_clock;
         try self.saved_views.put(self.gpa, saved.sid, saved);
