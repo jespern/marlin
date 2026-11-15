@@ -154,13 +154,40 @@ const PluginJob = struct {
 
 const RecapResult = struct { client_id: u64, sid: u64, seq: u64, text: []u8, generated: bool };
 
+/// Which live text a delta extends, or a block finishes (the client rule:
+/// a reply ends both, commentary the text, thinking the reasoning).
+const LiveStream = enum { none, text, reasoning, both };
+
+fn blockEndsLiveStream(b: block.Block) LiveStream {
+    return switch (b.body) {
+        .assistant_msg => .both,
+        .reasoning => |r| if (r.commentary) .text else .reasoning,
+        else => .none,
+    };
+}
+
+/// Forget live text a block finished; at a turn's end, its memory too.
+fn endLiveStream(gpa: std.mem.Allocator, session: *Session, ends: LiveStream) void {
+    switch (ends) {
+        .none => {},
+        .text => session.live_text.clearRetainingCapacity(),
+        .reasoning => session.live_reasoning.clearRetainingCapacity(),
+        .both => {
+            session.live_text.clearAndFree(gpa);
+            session.live_reasoning.clearAndFree(gpa);
+        },
+    }
+}
+
 /// Everything that flows into the dispatcher.
 const Event = union(enum) {
     client_msg: struct { client_id: u64, msg_line: []u8 }, // raw NDJSON from client
     client_gone: struct { client_id: u64 },
     // From turn threads (loop.zig callbacks). All payloads gpa-owned.
-    turn_block: struct { sid: u64, line: []u8 }, // pre-encoded proto.DaemonMsg.blk
-    turn_delta: struct { sid: u64, line: []u8 },
+    turn_block: struct { sid: u64, line: []u8, ends: LiveStream = .none }, // pre-encoded proto.DaemonMsg.blk
+    /// `text` (owned, may be empty) is what `stream` gained, for late
+    /// subscribers; stream_status lines carry none.
+    turn_delta: struct { sid: u64, line: []u8, stream: LiveStream = .none, text: []u8 = &.{} },
     /// Live work trees are useful outside the focused transcript: session
     /// watchers (Ctrl+S / `marlin top`) receive them for every live session.
     turn_activity: struct { sid: u64, line: []u8 },
@@ -318,6 +345,10 @@ pub const Session = struct {
     approval_mode_live: std.atomic.Value(u8) = .init(@backingInt(approval.Mode.default)),
     /// maxInt inherits the turn’s configured default; zero disables its deadline.
     guest_max_runtime_live: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    /// What has streamed of the text and the thinking being written now,
+    /// sent whole to a client that subscribes mid-stream (dispatcher-only).
+    live_text: std.ArrayList(u8) = .empty,
+    live_reasoning: std.ArrayList(u8) = .empty,
     /// Kernel shell sandbox + prompt-free shell execution (/sandbox).
     /// Seeded from cfg.permissions_enabled; effective only with a verified
     /// backend. In-memory: a daemon restart returns the
@@ -1362,10 +1393,17 @@ pub const Daemon = struct {
             .shell_settled => |ss| if (self.shells.get(ss.shell_id)) |host| self.saveShellState(host),
             .turn_block => |tb| {
                 defer self.gpa.free(tb.line);
+                if (self.sessions.get(tb.sid)) |session| endLiveStream(self.gpa, session, tb.ends);
                 self.fanOutLine(tb.sid, tb.line);
             },
             .turn_delta => |td| {
                 defer self.gpa.free(td.line);
+                defer self.gpa.free(td.text);
+                if (self.sessions.get(td.sid)) |session| switch (td.stream) {
+                    .text => session.live_text.appendSlice(self.gpa, td.text) catch {},
+                    .reasoning => session.live_reasoning.appendSlice(self.gpa, td.text) catch {},
+                    .none, .both => {},
+                };
                 self.fanOutLine(td.sid, td.line);
             },
             .turn_activity => |activity| {
@@ -2640,6 +2678,14 @@ pub const Daemon = struct {
                     .usage_credits = if (session) |ses| ses.usage_credits.load(.acquire) else false,
                     .guest_pid = if (session) |ses| ses.guest_pid.load(.acquire) else 0,
                 } });
+                // Mid-stream: the text so far, whole, or the client would
+                // start it at whatever chunk came next ("est" for "Test").
+                if (session) |ses| if (state == .running or state == .awaiting_approval) {
+                    if (ses.live_reasoning.items.len > 0)
+                        self.sendTo(client, .{ .reasoning_delta = .{ .sid = s.sid, .turn_id = 0, .text = ses.live_reasoning.items, .replace = true } });
+                    if (ses.live_text.items.len > 0)
+                        self.sendTo(client, .{ .delta = .{ .sid = s.sid, .turn_id = 0, .text = ses.live_text.items, .replace = true } });
+                };
             },
             .unsub => |u| {
                 for (client.subs.items, 0..) |sid, i| {
@@ -3939,6 +3985,8 @@ pub const Daemon = struct {
         session.guest_activity_arena = null;
         session.guest_activity = &.{};
         session.guest_activity_mutex.unlock(self.io);
+        session.live_text.deinit(self.gpa);
+        session.live_reasoning.deinit(self.gpa);
         self.gpa.free(session.model);
         self.gpa.free(session.cwd);
         if (session.pending_guest_model) |guest| self.gpa.free(guest);
@@ -4820,21 +4868,33 @@ pub const Daemon = struct {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
             const line = proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = job.sid, .b = b } }) catch return;
-            self.events.push(self.io, .{ .turn_block = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+            self.events.push(self.io, .{ .turn_block = .{ .sid = job.sid, .line = line, .ends = blockEndsLiveStream(b) } }) catch self.gpa.free(line);
         }
 
         fn onDelta(ctx: ?*anyopaque, text: []const u8) void {
-            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
-            const self = job.daemon;
-            const line = proto.encode(self.gpa, proto.DaemonMsg{ .delta = .{ .sid = job.sid, .turn_id = 0, .text = text } }) catch return;
-            self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+            pushDelta(ctx, text, .text);
         }
 
         fn onReasoningDelta(ctx: ?*anyopaque, text: []const u8) void {
+            pushDelta(ctx, text, .reasoning);
+        }
+
+        fn pushDelta(ctx: ?*anyopaque, text: []const u8, stream: LiveStream) void {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
-            const line = proto.encode(self.gpa, proto.DaemonMsg{ .reasoning_delta = .{ .sid = job.sid, .turn_id = 0, .text = text } }) catch return;
-            self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line } }) catch self.gpa.free(line);
+            const msg: proto.DaemonMsg = if (stream == .reasoning)
+                .{ .reasoning_delta = .{ .sid = job.sid, .turn_id = 0, .text = text } }
+            else
+                .{ .delta = .{ .sid = job.sid, .turn_id = 0, .text = text } };
+            const line = proto.encode(self.gpa, msg) catch return;
+            const copy = self.gpa.dupe(u8, text) catch {
+                self.gpa.free(line);
+                return;
+            };
+            self.events.push(self.io, .{ .turn_delta = .{ .sid = job.sid, .line = line, .stream = stream, .text = copy } }) catch {
+                self.gpa.free(line);
+                self.gpa.free(copy);
+            };
         }
 
         fn onStreamStatus(ctx: ?*anyopaque, bytes: u64, quiet_ms: u64) void {
@@ -5251,6 +5311,8 @@ pub const Daemon = struct {
     /// client without the text that explains it.
     fn broadcastStatusErr(self: *Daemon, sid: u64, state: proto.SessionState, err_text: ?[]const u8) void {
         const session = self.sessions.get(sid);
+        // A turn that ended has nothing streaming (clients drop theirs too).
+        if (session) |ses| if (state == .idle or state == .done or state == .err) endLiveStream(self.gpa, ses, .both);
         const status_now = nowMs(self.io);
         const active_turn = state == .running or state == .awaiting_approval;
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{
@@ -6177,7 +6239,10 @@ pub const Daemon = struct {
             .client_gone, .turn_resumed, .turn_usage_credits, .turn_guest_pid, .turn_phase, .shell_exited, .shell_settled, .shutdown => {},
             .shell_output => |value| self.gpa.free(value.bytes),
             .turn_block => |value| self.gpa.free(value.line),
-            .turn_delta => |value| self.gpa.free(value.line),
+            .turn_delta => |value| {
+                self.gpa.free(value.line);
+                self.gpa.free(value.text);
+            },
             .turn_activity => |value| self.gpa.free(value.line),
             .turn_awaiting => |value| self.gpa.free(value.line),
             .catalog_ready => |value| {

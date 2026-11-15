@@ -419,9 +419,12 @@ const ShellRig = struct {
         for (&r.clients) |*client| {
             while (client.outbox.tryPop(io)) |line| gpa.free(line.bytes);
             client.outbox.deinit();
+            client.subs.deinit(gpa);
         }
         r.daemon.clients.deinit(gpa);
         r.daemon.sessions.deinit(gpa);
+        r.session.live_text.deinit(gpa);
+        r.session.live_reasoning.deinit(gpa);
         gpa.free(r.session.model);
         gpa.free(r.session.cwd);
         r.daemon.store.close();
@@ -525,4 +528,38 @@ test "a shell takes the size of whoever types; a follower is told, never resizes
     // Typing again at the same size resizes nothing.
     try r.send(1, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"Cg==\"}}}}", .{shell_id});
     for (try r.drain(2)) |msg| try std.testing.expect(msg != .shell_resized);
+}
+
+test "a client that subscribes mid-stream gets the text so far whole, not from the next chunk" {
+    // Case: Jesper saw "est" stream where the reply began "Test": the TUI
+    // (back from another tab) and the phone (just opened) joined mid-stream.
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const gpa = r.gpa;
+    r.session.state = .running;
+    const Delta = struct {
+        fn push(rig: *ShellRig, text: []const u8) !void {
+            const line = try proto.encode(rig.gpa, proto.DaemonMsg{ .delta = .{ .sid = 7, .turn_id = 0, .text = text } });
+            try rig.daemon.handleEvent(.{ .turn_delta = .{ .sid = 7, .line = line, .stream = .text, .text = try rig.gpa.dupe(u8, text) } });
+        }
+    };
+    try Delta.push(r, "T");
+    try Delta.push(r, "est the parser");
+
+    try r.send(2, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
+    var live: ?[]const u8 = null;
+    var replaced = false;
+    for (try r.drain(2)) |msg| if (msg == .delta) {
+        live = msg.delta.text;
+        replaced = msg.delta.replace;
+    };
+    try std.testing.expectEqualStrings("Test the parser", live.?);
+    try std.testing.expect(replaced);
+
+    // The note is written: nothing is streaming, so a new subscriber gets
+    // no live text (it reads the block).
+    const note = try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = .{ .id = 1, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 0, .body = .{ .reasoning = .{ .text = "Test the parser", .commentary = true } } } } });
+    try r.daemon.handleEvent(.{ .turn_block = .{ .sid = 7, .line = note, .ends = .text } });
+    try r.send(1, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
+    for (try r.drain(1)) |msg| try std.testing.expect(msg != .delta);
 }

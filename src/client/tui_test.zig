@@ -3867,6 +3867,23 @@ test "a tab left mid-stream comes back without its stale live text" {
     try std.testing.expectEqual(@as(usize, 0), app.view.reasoning_delta.items.len);
 }
 
+test "live text sent whole on subscribe replaces a partial stream instead of extending it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .delta = .{ .sid = 7, .turn_id = 0, .text = "est the" } }));
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .delta = .{ .sid = 7, .turn_id = 0, .text = "Test the", .replace = true } }));
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .delta = .{ .sid = 7, .turn_id = 0, .text = " parser" } }));
+    try std.testing.expectEqualStrings("Test the parser", app.view.delta.items);
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .reasoning_delta = .{ .sid = 7, .turn_id = 0, .text = "inking" } }));
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .reasoning_delta = .{ .sid = 7, .turn_id = 0, .text = "Thinking", .replace = true } }));
+    try std.testing.expectEqualStrings("Thinking", app.view.reasoning_delta.items);
+}
+
 test "tab overflow retains the active tab and tab hit testing is button-extensible" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

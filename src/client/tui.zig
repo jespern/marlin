@@ -1999,12 +1999,18 @@ pub const App = struct {
             .delta => |d| {
                 const view = self.liveView(d.sid) orelse return;
                 if (view.history_has_newer) return;
+                // Subscribed mid-stream: the daemon sends all of it so far.
+                if (d.replace) {
+                    view.delta.clearRetainingCapacity();
+                    view.stream_layout_cache.reset(self.gpa);
+                }
                 view.delta.appendSlice(self.gpa, d.text) catch {};
                 if (view == &self.view and self.stream_pacing) self.stream_pacing_active.store(true, .release);
             },
             .reasoning_delta => |d| {
                 const view = self.liveView(d.sid) orelse return;
                 if (view.history_has_newer) return;
+                if (d.replace) view.reasoning_delta.clearRetainingCapacity();
                 view.reasoning_delta.appendSlice(self.gpa, d.text) catch {};
             },
             .stream_status => |ss| {

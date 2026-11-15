@@ -601,8 +601,11 @@ pub const DaemonMsg = union(enum) {
     session_recap: struct { sid: u64, seq: u64, text: []const u8 = "", generated: bool = false, retry: bool = false },
     session_remove: struct { sid: u64 },
     blk: struct { sid: u64, b: block.Block },
-    delta: struct { sid: u64, turn_id: u64, text: []const u8 },
-    reasoning_delta: struct { sid: u64, turn_id: u64, text: []const u8 },
+    /// Live text, appended to what streamed before. With `replace` it is
+    /// everything streamed so far, sent to a client that subscribed mid-way:
+    /// replace what is held, so the text starts at its start.
+    delta: struct { sid: u64, turn_id: u64, text: []const u8, replace: bool = false },
+    reasoning_delta: struct { sid: u64, turn_id: u64, text: []const u8, replace: bool = false },
     /// Ephemeral stream telemetry while a turn is receiving from the
     /// provider: cumulative body bytes this round and ms since the last
     /// visible (text/reasoning) delta. Emitted at most ~1/s.
