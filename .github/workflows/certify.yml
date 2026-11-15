@@ -29,7 +29,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: shadybin/shadybin/.github/workflows/certify.yml@93871fcf6f35ac60d6325ed620fac532c5b1b044 # v1.1.2
+    uses: shadybin/shadybin/.github/workflows/certify.yml@4118283978ff431514818bc20d8ac5c54ac331ff # v1.1.3
     with:
       tag: ${{ inputs.tag }}
     secrets:
