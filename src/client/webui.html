@@ -209,6 +209,13 @@
   #question .opts button { text-align: left; white-space: normal; overflow-wrap: anywhere; }
   #question .opts .n { color: var(--dim); margin-right: 6px; }
   #question .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  /* Tap the question to fold the card to its first line and read what is
+     behind it; tap again (or just type the answer) when ready. */
+  #question .q { cursor: pointer; }
+  #question .q::before { content: "▾ "; color: var(--dim); font-weight: 400; }
+  #question.folded .q::before { content: "▸ "; }
+  #question.folded .q { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 0; }
+  #question.folded .opts, #question.folded .hint { display: none; }
   /* A finished Plan-mode proposal is an offer, not a modal. */
   #plan-offer {
     order: 2; display: none; background: #282d34; border-top: 1px solid var(--line);
@@ -422,7 +429,7 @@
     <button class="act no">deny</button>
   </div>
   <div id="question" role="dialog" aria-live="polite">
-    <div class="q"></div>
+    <div class="q" role="button" tabindex="0" aria-expanded="true" title="fold or unfold the question"></div>
     <div class="opts"></div>
     <div class="hint"></div>
   </div>
@@ -1922,10 +1929,20 @@ function showQuestion(qr) {
   $('#question .hint').textContent = (qr.options || []).length
     ? (hasKeyboard() ? '1-9 picks · or type your own answer and press Enter' : 'tap an option, or type your own answer')
     : 'type your answer and press Enter';
+  foldQuestion(qr.question_id === foldedQuestionId);
   $('#question').classList.add('show');
   document.body.classList.add('asking');
   scrollBottom();
 }
+// Folded stays folded for that question (a reconnect shows it again); a new
+// question arrives open.
+let foldedQuestionId = null;
+function foldQuestion(folded) {
+  $('#question').classList.toggle('folded', folded);
+  $('#question .q').setAttribute('aria-expanded', String(!folded));
+  foldedQuestionId = folded && pendingQuestion ? pendingQuestion.question_id : null;
+}
+$('#question .q').addEventListener('click', () => foldQuestion(!$('#question').classList.contains('folded')));
 function hideQuestion() {
   pendingQuestion = null;
   $('#question').classList.remove('show');

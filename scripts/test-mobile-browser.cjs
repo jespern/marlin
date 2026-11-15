@@ -188,6 +188,21 @@ async function main() {
         handle({question_request:{sid:qsid,question_id:'q1',question:'Which way?',options:['Left','Right']}});
         out.card=[document.querySelector('#question').classList.contains('show'),document.querySelector('#question .q').textContent,
           [...document.querySelectorAll('#question .opts button')].map(b=>b.textContent)];
+        // A big question folds to one line to read what is behind it, stays
+        // folded if shown again, and a new question arrives open.
+        const card=document.querySelector('#question'), tall=card.getBoundingClientRect().height;
+        card.querySelector('.q').click();
+        const lineHeight=parseFloat(getComputedStyle(card.querySelector('.q')).lineHeight);
+        out.folded=[card.classList.contains('folded'),card.getBoundingClientRect().height<tall,
+          card.getBoundingClientRect().height<lineHeight*2+30,getComputedStyle(card.querySelector('.opts')).display];
+        handle({question_request:{sid:qsid,question_id:'q1',question:'Which way?',options:['Left','Right']}});
+        out.foldedAgain=card.classList.contains('folded');
+        card.querySelector('.q').click();
+        out.unfolded=!card.classList.contains('folded')&&getComputedStyle(card.querySelector('.opts')).display!=='none';
+        card.querySelector('.q').click();
+        handle({question_request:{sid:qsid,question_id:'q0',question:'Another?',options:['Yes']}});
+        out.newOpen=!card.classList.contains('folded');
+        handle({question_request:{sid:qsid,question_id:'q1',question:'Which way?',options:['Left','Right']}});
         // Its transcript record waits behind the live card.
         addBlock({ts:Date.now(),body:{tool_call:{name:'mcp__marlin__ask_user',call_id:'ask1',args_json:JSON.stringify({question:'Which way?',options:['Left','Right']})}}});
         const record=document.querySelector('[data-call="ask1"]');
@@ -227,6 +242,8 @@ async function main() {
       return out;
     });
     assert.deepEqual(cards.card,[true,'? Which way?',['1Left','2Right']]);
+    assert.deepEqual(cards.folded,[true,true,true,'none']);
+    assert.deepEqual([cards.foldedAgain,cards.unfolded,cards.newOpen],[true,true,true]);
     assert.equal(cards.hiddenWhileAsking,'none');
     assert.equal(cards.recordUnfolded,true);
     assert.equal(cards.answer.question_answer.question_id,'q1');
