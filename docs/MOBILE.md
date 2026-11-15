@@ -48,8 +48,9 @@ finish). The old `tailscale = true` switch is gone and ignored if present.
   lasts 400 days (Chrome's cap), and renews whenever the app opens.
 - Host and Origin checks still reject DNS-rebinding and cross-site requests.
 - This is a full-control companion for your own machine, not a multi-user
-  service: a paired phone can do anything the terminal can, except shell
-  sessions, which are never exposed over the web.
+  service: a paired phone can do anything the terminal can, shells included.
+  Shells (`/shell`, a WebSocket) are for paired devices only: a loopback
+  browser, trusted for everything else, gets `403`.
 
 ## Pairing a phone
 
@@ -131,6 +132,27 @@ Tap to record, tap again to stop; the text lands at the cursor for review and
 is never sent on its own. Nothing leaves the machine: the clip is a temp file,
 deleted after transcription. Until `/voice setup` has run on the daemon's
 machine, the button says so. iOS keyboard dictation keeps working as well.
+
+## Shells
+
+A session that is a shell (`!!` in the TUI or the phone) shows the live
+terminal on the phone instead of the transcript. At the prompt the composer is
+a command line: Return runs it, with autocorrect and capitals off. Under a
+full-screen program (vim, less, htop) every key goes straight through. The key
+bar has Esc, Tab, Ctrl (the next key with Ctrl), ^C, ^D, backspace, and the
+arrows; ^D at the prompt ends the shell, and its output joins the transcript as
+it does in the TUI. `!! <command>` runs just that command and hands the session
+back when it ends.
+
+A shell has one size, set by whoever last typed in it (tmux's
+`window-size latest`). Looking from the phone changes nothing: a shell sized by
+a wider terminal is drawn smaller to fit. Typing on the phone takes the shell
+to the phone's size, and typing in the terminal takes it back.
+
+The bridge keeps its own libghostty-vt copy of the terminal and sends the
+phone rendered rows (SGR-styled text, the format of a finished shell's
+transcript) plus the cursor; the phone needs no terminal emulator. The newest
+200 rows of scrollback come with each frame at a prompt.
 
 ## Phone notifications
 

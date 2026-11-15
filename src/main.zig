@@ -149,6 +149,7 @@ test {
     _ = @import("client/voice_test.zig");
     _ = @import("client/web_test.zig");
     _ = @import("client/web_transcribe_test.zig");
+    _ = @import("client/web_shell_test.zig");
     _ = @import("mobile/presence_test.zig");
     _ = @import("mobile/webpush_test.zig");
     _ = @import("mobile/pairing_test.zig");

@@ -13,6 +13,7 @@ async function main() {
   const config=path.join(root,'config','marlin'); fs.mkdirSync(config,{recursive:true});
   const env={...process.env,HOME:root,XDG_CONFIG_HOME:path.join(root,'config'),XDG_STATE_HOME:path.join(root,'state'),MARLIN_SOCKET:path.join(root,'daemon.sock')};
   delete env.MARLIN_REMOTE;
+  env.SHELL='/bin/sh'; // shells (`!!`) without the machine's rc files
   for(const name of Object.keys(env)) if(/API_KEY|TOKEN|SECRET/.test(name)) delete env[name];
   const reserve=net.createServer(); await new Promise(r=>reserve.listen(0,'127.0.0.1',r));
   const port=reserve.address().port; await new Promise(r=>reserve.close(r));
@@ -309,7 +310,7 @@ async function main() {
     assert.equal(comp.queued,true);
     assert.deepEqual([comp.kept,comp.jump,comp.bottom],[true,true,true]);
     assert.equal(comp.credits,' · api credits');
-    assert.deepEqual([comp.warn,comp.hot],['ctx warn','ctx hot']);
+    assert.deepEqual([comp.warn,comp.hot],['ctx agent warn','ctx agent hot']);
     assert.deepEqual(comp.marks,['●:running','!:approval','×:err','‖:paused','·:idle','✓:done']);
     await page.reload();
     await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
@@ -323,6 +324,22 @@ async function main() {
       return {text,visible:!document.querySelector('#mic-btn').hidden};
     });
     assert.deepEqual(dictated,{text:'please hello from the phone',visible:true});
+    // Shells: the TUI's SGR rows drawn with their colors, the cursor where the
+    // terminal has it; a finished shell as the TUI shows it.
+    const sgr=await page.evaluate(()=>{
+      const rows=sgrRows('\x1b[31mred\x1b[0m plain\r\n\x1b[1;38;5;208mx\x1b]8;;https://x\x07y\x1b]8;;\x07\x1b[38:2::1:2:3mz',{row:1,col:4});
+      addBlock({seq:0,ts:0,body:{shell_transcript:{text:'$ make\nok',styled:'$ make\r\n\x1b[32mok\x1b[0m',exit_code:2,ran:'make test'}}});
+      const node=[...document.querySelectorAll('.block.shell')].pop();
+      const out={rows,head:node.querySelector('.head').textContent,body:node.querySelector('pre').innerHTML};
+      node.remove();
+      return out;
+    });
+    assert.equal(sgr.rows[0],'<span style="color:#f07178">red</span> plain');
+    assert.equal(sgr.rows[1],'<span style="color:rgb(255,135,0);font-weight:700">xy</span><span style="color:rgb(1,2,3);font-weight:700">z</span> <span class="cur"> </span>');
+    assert.equal(sgr.head,'$ make test · exited 2');
+    assert.equal(sgr.body,'$ make\n<span style="color:#73d091">ok</span>');
+    // A shell is the whole account: never for a browser that is not paired.
+    assert.equal((await fetch(origin+'/shell?sid='+sid+'&cols=40&rows=20')).status,403);
     // Each session keeps its own draft, and a transcription finishing after
     // a switch lands in the session it was recorded in, not the open one.
     const switched=await page.evaluate(async other=>{
@@ -419,6 +436,29 @@ async function main() {
       await phonePage.locator('#pair-code').pressSequentially(code);
       await phonePage.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
       assert.equal(await phonePage.locator('#pair').isHidden(),true);
+
+      // `!! <command>` from the phone: it runs on the daemon's host and its
+      // output joins the transcript once it ends.
+      await phonePage.evaluate(()=>{ document.querySelector('#input').value='!! echo ran-$((2+3)); exit 3'; submitComposer(); });
+      await phonePage.waitForFunction(()=>[...document.querySelectorAll('.block.shell')].some(n=>n.textContent.includes('ran-5')));
+      assert.equal(await phonePage.locator('.block.shell .head').last().textContent(),'$ echo ran-$((2+3)); exit 3 · exited 3');
+      assert.equal(await phonePage.locator('#main').getAttribute('class'),'');
+
+      // `!!`: a live shell. The screen is drawn here, Return runs a line,
+      // and ^D on the key bar ends it.
+      await phonePage.evaluate(()=>{ document.querySelector('#input').value='!!'; submitComposer(); });
+      await phonePage.waitForFunction(()=>document.querySelector('#main').classList.contains('shell') && document.querySelector('#term .row'));
+      assert.equal(await phonePage.locator('#status .state').textContent(),'shell');
+      assert.equal(await phonePage.locator('#status .model').isHidden(),true);
+      assert.equal(await phonePage.locator('#composer .prompt').textContent(),'$');
+      await phonePage.waitForFunction(()=>document.querySelector('#sessions .mark.shell'));
+      await phonePage.evaluate(()=>{ document.querySelector('#input').value='echo live-$((3+4))'; submitComposer(); });
+      await phonePage.waitForFunction(()=>document.querySelector('#term').textContent.includes('live-7'));
+      assert.equal(await phonePage.locator('#term .cur').count(),1);
+      await phonePage.locator('#keybar [data-key="^D"]').dispatchEvent('pointerdown');
+      await phonePage.waitForFunction(()=>!document.querySelector('#main').classList.contains('shell'));
+      await phonePage.waitForFunction(()=>[...document.querySelectorAll('.block.shell')].some(n=>n.textContent.includes('live-7')));
+      assert.equal(await phonePage.locator('#composer .prompt').textContent(),'❯');
       assert.deepEqual(phoneErrors,[]);
     } finally { await phone.close(); }
     status=(await post({web_status:{}})).web_status_result;

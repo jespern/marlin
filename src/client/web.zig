@@ -43,6 +43,7 @@ const html = @embedFile("webui.html");
 const mobile_push = @import("../mobile/push.zig");
 const pairing = @import("../mobile/pairing.zig");
 const web_transcribe = @import("web_transcribe.zig");
+const web_shell = @import("web_shell.zig");
 const service_worker = @embedFile("webui-sw.js");
 const icon_180 = @embedFile("webui-icon-180.png");
 const icon_512 = @embedFile("webui-icon-512.jpg");
@@ -59,9 +60,9 @@ pub const max_send_bytes = 28 * 1024 * 1024;
 /// One dictation clip: minutes of compressed phone audio.
 pub const max_clip_bytes = 25 * 1024 * 1024;
 
-/// Shell sessions are a terminal-client feature: a browser never gets a PTY,
-/// nor sees one. Every shell_* message is refused, including any added later,
-/// since attaching or listing would expose a running shell's screen.
+/// No shell_* message passes the generic /send route, including any added
+/// later: attaching or listing would expose a running shell's screen. Shells
+/// reach a browser only through /shell (web_shell.zig), for paired devices.
 pub fn allowedOverWeb(msg: proto.ClientMsg) bool {
     return !std.mem.startsWith(u8, @tagName(msg), "shell_");
 }
@@ -386,6 +387,10 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         // An event stream has no length: only closing the connection tells
         // the client it ended (a revoked device, a daemon that went away).
         return error.StreamEnded;
+    } else if (std.mem.eql(u8, path, "/shell")) {
+        try serveShell(ctx, req, target, device, &access);
+        // The connection was the shell's WebSocket; nothing follows it.
+        return error.StreamEnded;
     } else if (std.mem.startsWith(u8, target, "/history")) {
         try serveHistory(ctx, req, target, &access);
         return error.StreamEnded;
@@ -666,6 +671,40 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request, target: []const u8,
 
 /// One bounded older-history page as SSE. Unlike /events this stream ends at
 /// replay_done; the browser opens it only when the user asks for more.
+/// A live shell for a paired phone (see web_shell.zig). Never for an
+/// unpaired browser, loopback included: a shell is the whole account.
+fn serveShell(ctx: *ConnCtx, req: *std.http.Server.Request, target: []const u8, device: ?[]const u8, access: *Access) !void {
+    if (device == null) {
+        try reply(req, access,
+            \\{"err":{"code":"unpaired","msg":"shells are for paired devices"}}
+        , .{ .status = .forbidden, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+        return;
+    }
+    // A WebSocket handshake is a GET any page can start: refuse other sites.
+    if (!originAllowed(ctx.settings.hosts, headerValue(req, "origin"))) {
+        try reply(req, access, "forbidden: cross-origin request\n", .{ .status = .forbidden });
+        return;
+    }
+    const key = switch (req.upgradeRequested()) {
+        .websocket => |k| k orelse "",
+        else => "",
+    };
+    if (key.len == 0) {
+        try reply(req, access, "a WebSocket upgrade is required\n", .{ .status = .bad_request });
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const params = web_shell.parseQuery(arena_state.allocator(), target) catch {
+        try reply(req, access, "need shell_id or sid, and cols and rows\n", .{ .status = .bad_request });
+        return;
+    };
+    var ws = try req.respondWebSocket(.{ .key = key });
+    try ws.output.flush();
+    access.* = .{ .status = .switching_protocols, .bytes = 0 };
+    try web_shell.serve(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe, ctx.stream, &ws, params);
+}
+
 fn serveHistory(ctx: *ConnCtx, req: *std.http.Server.Request, target: []const u8, access: *Access) !void {
     const sid = queryU64(target, "sid") orelse {
         try reply(req, access, "missing or bad sid\n", .{ .status = .bad_request });

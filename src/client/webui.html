@@ -97,6 +97,32 @@
   #pair-error { color: var(--red); min-height: 1.5em; }
   #transcript { order: 1; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-wrap: anywhere; padding: 18px 22px; }
   #history-more { display: none; margin: 0 auto 14px; }
+  /* A live shell (`!!`): the daemon's terminal, row for row. A shell sized
+     by a wider terminal shrinks to fit until typing here takes it over. */
+  #term {
+    display: none; order: 1; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+    padding: 8px 6px; white-space: pre; font: 13px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  #main.shell #term { display: block; }
+  #main.shell #transcript { display: none; }
+  #term .row { min-height: 1.25em; }
+  #term .cur { background: var(--fg); color: var(--bg); }
+  #keybar {
+    display: none; order: 3; gap: 4px; padding: 5px 8px; background: var(--panel);
+    border-top: 1px solid var(--line);
+  }
+  #main.shell #keybar { display: flex; }
+  #keybar button {
+    flex: 1; min-width: 0; font: inherit; font-size: 13px; padding: 7px 0; cursor: pointer;
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line); border-radius: 4px;
+  }
+  #keybar button.on { border-color: var(--accent); color: var(--accent); }
+  #main.shell #status .agent { display: none; }
+  #status .state.shell { color: var(--blue); }
+  .block.shell .head .cmd { color: var(--blue); }
+  .block.shell .head .status { color: var(--dim); }
+  .block.shell pre { opacity: .8; white-space: pre-wrap; margin-top: 4px; }
+  .block.shell .earlier { color: var(--dim); }
   #history-more.show { display: block; }
   .block { margin: 0 0 10px; }
   .user {
@@ -388,6 +414,7 @@
     <span id="connection-badge" role="status">Connecting…</span>
   </div>
   <div id="transcript"><button id="history-more" class="act">load older</button></div>
+  <div id="term" aria-label="shell"></div>
   <div id="approval">
     <span class="q"></span>
     <button class="act yes">approve</button>
@@ -422,13 +449,16 @@
   </div>
   <div id="slashmenu" role="listbox"></div>
   <div id="status">
-    <span class="state">idle</span><span class="ctx"></span><span class="credits"></span><span>·</span><span class="model" title="switch model"></span><span class="cwd-sep">·</span><span class="cwd"></span>
+    <span class="state">idle</span><span class="ctx agent"></span><span class="credits agent"></span><span class="agent">·</span><span class="model agent" title="switch model"></span><span class="cwd-sep">·</span><span class="cwd"></span>
     <span class="notice"></span>
     <span class="right">
       <button id="jump" class="act" title="jump to the newest output">↓ new</button>
       <button id="sandbox-btn" class="act" title="the shell sandbox is off; click to turn it on">⛨ sandbox off</button>
       <button id="interrupt" class="act" title="interrupt running turn" aria-label="interrupt running turn">⏹</button>
     </span>
+  </div>
+  <div id="keybar" aria-label="shell keys">
+    <button data-key="esc">esc</button><button data-key="tab">tab</button><button data-key="ctrl" title="the next key with Ctrl">ctrl</button><button data-key="^C">^C</button><button data-key="^D" title="end the shell at its prompt">^D</button><button data-key="bs" aria-label="backspace">⌫</button><button data-key="up" aria-label="up">↑</button><button data-key="down" aria-label="down">↓</button><button data-key="left" aria-label="left">←</button><button data-key="right" aria-label="right">→</button>
   </div>
 </div>
 <script>
@@ -860,6 +890,7 @@ function addBlock(b, target = $('#transcript'), live = true) {
     if (isCompactionStatusNote(v.text || '')) return;
     node = el('div', 'block note', '[' + clippedNote(v.text || '') + ']');
   }
+  else if (kind === 'shell_transcript') node = shellTranscriptNode(v);
   else if (kind === 'compaction') node = el('div', 'block note', '≋ context compacted');
   else if (kind === 'approval') node = el('div', 'block note', 'approval: ' + (v.decision || 'pending'));
   else if (kind === 'steer') {
@@ -908,11 +939,11 @@ function setModelLabel(model) {
 function setContext(meta) {
   const ctx = $('#status .ctx');
   const used = meta ? Number(meta.context_used) : 0, limit = meta ? Number(meta.context_limit) : 0;
-  if (!limit || !used) { ctx.textContent = ''; ctx.className = 'ctx'; return; }
+  if (!limit || !used) { ctx.textContent = ''; ctx.className = 'ctx agent'; return; }
   const pct = Math.min(100, Math.round(used / limit * 100));
   ctx.textContent = ' · ' + pct + '%';
   ctx.title = used.toLocaleString() + ' of ' + limit.toLocaleString() + ' tokens';
-  ctx.className = 'ctx' + (pct >= 90 ? ' hot' : pct >= 70 ? ' warn' : '');
+  ctx.className = 'ctx agent' + (pct >= 90 ? ' hot' : pct >= 70 ? ' warn' : '');
 }
 // The TUI's "(using api credits)": a guest billing paid API credits.
 function setCredits(on) {
@@ -936,6 +967,7 @@ function setCwd(cwd) {
 }
 function setState(state) {
   const st = $('#status .state');
+  if (shellView) state = 'shell';
   if (spinTimer) { clearInterval(spinTimer); spinTimer = null; }
   if (state === 'running') {
     // The TUI's braille spinner; static "running" reads as stuck.
@@ -1076,6 +1108,7 @@ function tabTitle(s) {
 const unreadDone = new Set();
 function sessionMark(s) {
   if (s.pause && s.pause !== 'none') return ['‖', 'paused'];
+  if (Number(s.shell_id)) return ['$', 'shell'];
   if (s.state === 'running') return ['●', 'running'];
   if (s.state === 'awaiting_approval') return ['!', 'approval'];
   if (s.state === 'err') return ['×', 'err'];
@@ -1110,6 +1143,7 @@ function renderSessions(list) {
       updatePlanOffer();
     }
   }
+  syncShell();
 }
 
 function drawer(show) {
@@ -1119,6 +1153,8 @@ function drawer(show) {
 
 function open(s) {
   drawer(false);
+  closeShellView();
+  lostShellId = 0;
   disarmInterrupt();
   pinned = true;
   $('#jump').classList.remove('show');
@@ -1267,10 +1303,13 @@ $('#input').addEventListener('keydown', async e => {
 });
 async function submitComposer() {
   const input = $('#input');
+  if (shellView) { shellSubmit(); return; }
   const text = input.value.trim();
   if ((!text && !pendingAttachments.length) || !sid) return;
   input.value = '';
   growInput();
+  // `!!` makes this session a shell; `!! <command>` runs just that.
+  if (/^!!(\s|$)/.test(text)) { shellConnect({sid, command: text.slice(2).trim()}); return; }
   if (text.startsWith('/')) {
     hideSlashMenu();
     slashCommand(text).catch(() => notice('command failed'));
@@ -1384,6 +1423,299 @@ function insertAtCursor(text) {
 }
 $('#mic-btn').onclick = () => recorder ? stopDictation() : startDictation();
 $('#mic-btn').hidden = !canRecord();
+
+// ---- live shell (`!!`): the daemon's terminal, drawn here ----
+// Paired devices only (the bridge refuses others). The bridge sends frames:
+// rows as SGR-styled text, as the daemon records a finished shell, and the
+// cursor. At a prompt the composer is a command line (Return runs it); under
+// a full-screen program every key goes straight through.
+const ansiPalette = ['#2c313a', '#f07178', '#73d091', '#e8c765', '#82aaff', '#c792ea', '#89ddff', '#c8ccd4',
+  '#676e7b', '#ff8b92', '#9be7b0', '#ffe08a', '#a8c4ff', '#ddb3f5', '#b0ebff', '#ffffff'];
+function xterm256(n) {
+  if (!(n >= 0 && n <= 255)) return null;
+  if (n < 16) return ansiPalette[n];
+  if (n >= 232) { const v = 8 + (n - 232) * 10; return `rgb(${v},${v},${v})`; }
+  const c = v => v ? 55 + v * 40 : 0;
+  n -= 16;
+  return `rgb(${c(Math.floor(n / 36))},${c(Math.floor(n / 6) % 6)},${c(n % 6)})`;
+}
+function applySgr(pen, params) {
+  const p = params === '' ? [[0]] : params.split(';').map(x => x.split(':').map(Number));
+  for (let k = 0; k < p.length; k++) {
+    const [n, ...sub] = p[k];
+    if (!n) { for (const key in pen) delete pen[key]; }
+    else if (n === 1) pen.b = 1; else if (n === 2) pen.d = 1; else if (n === 3) pen.i = 1;
+    else if (n === 4) { if (sub.length && sub[0] === 0) delete pen.u; else pen.u = 1; }
+    else if (n === 7) pen.inv = 1; else if (n === 8) pen.hid = 1; else if (n === 9) pen.s = 1;
+    else if (n === 21 || n === 22) { delete pen.b; delete pen.d; }
+    else if (n === 23) delete pen.i; else if (n === 24) delete pen.u; else if (n === 27) delete pen.inv;
+    else if (n === 28) delete pen.hid; else if (n === 29) delete pen.s;
+    else if (n >= 30 && n <= 37) pen.fg = ansiPalette[n - 30];
+    else if (n >= 90 && n <= 97) pen.fg = ansiPalette[n - 82];
+    else if (n >= 40 && n <= 47) pen.bg = ansiPalette[n - 40];
+    else if (n >= 100 && n <= 107) pen.bg = ansiPalette[n - 92];
+    else if (n === 39) delete pen.fg; else if (n === 49) delete pen.bg;
+    else if (n === 38 || n === 48 || n === 58) {
+      // 38;5;N and 38;2;R;G;B, or the colon forms (38:5:N, 38:2::R:G:B).
+      const args = sub.length ? sub : p.slice(k + 1).map(x => x[0]);
+      let color = null;
+      if (args[0] === 5) { color = xterm256(args[1]); if (!sub.length) k += 2; }
+      else if (args[0] === 2) {
+        const rgb = sub.length ? args.slice(-3) : args.slice(1, 4);
+        if (rgb.length === 3 && rgb.every(v => v >= 0 && v <= 255)) color = `rgb(${rgb.join(',')})`;
+        if (!sub.length) k += 4;
+      }
+      if (n === 38) { if (color) pen.fg = color; } else if (n === 48) { if (color) pen.bg = color; }
+    }
+  }
+}
+function penStyle(pen) {
+  let fg = pen.fg, bg = pen.bg;
+  if (pen.inv) [fg, bg] = [bg || 'var(--bg)', fg || 'var(--fg)'];
+  const out = [];
+  if (fg) out.push('color:' + fg);
+  if (bg) out.push('background:' + bg);
+  if (pen.b) out.push('font-weight:700');
+  if (pen.d) out.push('opacity:.6');
+  if (pen.i) out.push('font-style:italic');
+  if (pen.u || pen.s) out.push('text-decoration:' + [pen.u && 'underline', pen.s && 'line-through'].filter(Boolean).join(' '));
+  if (pen.hid) out.push('visibility:hidden');
+  return out.join(';');
+}
+// SGR-styled text (rows apart by CRLF) to one HTML string per row. A style
+// carries across rows, as in a terminal; other escape sequences are dropped.
+// With `cursor` {row, col}, that cell is drawn as the cursor.
+function sgrRows(text, cursor = null) {
+  const rows = [], pen = {};
+  let out = '', run = '', col = 0, row = 0;
+  const flush = () => {
+    if (!run) return;
+    const st = penStyle(pen);
+    out += st ? `<span style="${st}">${escHtml(run)}</span>` : escHtml(run);
+    run = '';
+  };
+  const endRow = () => {
+    flush();
+    if (cursor && row === cursor.row && col <= cursor.col) out += ' '.repeat(cursor.col - col) + '<span class="cur"> </span>';
+    rows.push(out);
+    out = ''; col = 0; row++;
+  };
+  for (let i = 0; i < text.length;) {
+    const c = text[i];
+    if (c === '\x1b') {
+      const n = text[i + 1];
+      if (n === '[') {
+        let j = i + 2;
+        while (j < text.length && !(text.charCodeAt(j) >= 0x40 && text.charCodeAt(j) <= 0x7e)) j++;
+        if (text[j] === 'm') { flush(); applySgr(pen, text.slice(i + 2, j)); }
+        i = j + 1;
+      } else if (n === ']') {
+        let j = i + 2;
+        while (j < text.length && text[j] !== '\x07' && !(text[j] === '\x1b' && text[j + 1] === '\\')) j++;
+        i = text[j] === '\x07' ? j + 1 : j + 2;
+      } else i += 2;
+      continue;
+    }
+    if (c === '\r') { i++; continue; }
+    if (c === '\n') { endRow(); i++; continue; }
+    const ch = String.fromCodePoint(text.codePointAt(i));
+    if (cursor && row === cursor.row && col === cursor.col) {
+      flush();
+      out += `<span class="cur">${escHtml(ch)}</span>`;
+    } else run += ch;
+    col++;
+    i += ch.length;
+  }
+  endRow();
+  return rows;
+}
+function escHtml(s) { return s.replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'})[c]); }
+// layout.zig shellExitLabel
+function shellExitLabel(v) {
+  if (v.lost) return v.command ? 'ended when Marlin stopped · ' + v.command + ' was running' : 'ended when Marlin stopped';
+  if (v.signal != null) return 'ended by signal ' + v.signal;
+  if (v.exit_code != null && v.exit_code !== 0) return 'exited ' + v.exit_code;
+  return 'exited';
+}
+const shellTranscriptLines = 2000; // layout.zig shell_transcript_display_lines
+function shellTranscriptNode(v) {
+  const node = el('div', 'block shell');
+  const head = el('div', 'head');
+  head.appendChild(el('span', 'cmd', '$ ' + (v.ran || 'shell')));
+  head.appendChild(el('span', 'status', ' · ' + shellExitLabel(v)));
+  node.appendChild(head);
+  let rows = v.styled ? sgrRows(v.styled) : (v.text || '').split('\n').map(escHtml);
+  while (rows.length && !rows[rows.length - 1]) rows.pop();
+  const skip = Math.max(0, rows.length - shellTranscriptLines);
+  const pre = el('pre');
+  pre.innerHTML = (skip ? `<span class="earlier">… ${skip} earlier lines</span>\n` : '') + rows.slice(skip).join('\n');
+  node.appendChild(pre);
+  return node;
+}
+
+let shellWs = null, shellView = null, lostShellId = 0, ctrlArmed = false;
+const termFontPx = 13;
+// Cells that fit the shell view at its own font size.
+function termGrid() {
+  const t = $('#term');
+  const probe = el('span', null, 'M'.repeat(20));
+  probe.style.cssText = `font-size:${termFontPx}px;position:absolute;visibility:hidden`;
+  t.appendChild(probe);
+  const cell = probe.getBoundingClientRect().width / 20, line = termFontPx * 1.25;
+  probe.remove();
+  const style = getComputedStyle(t);
+  const width = t.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const height = t.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+  return {cols: Math.max(10, Math.floor(width / cell)), rows: Math.max(4, Math.floor(height / line))};
+}
+function setShellComposer(on) {
+  const input = $('#input');
+  input.placeholder = on ? 'command…' : 'message marlin…';
+  input.setAttribute('autocapitalize', on ? 'off' : 'sentences');
+  input.setAttribute('autocorrect', on ? 'off' : 'on');
+  input.spellcheck = !on;
+  $('#attach-btn').hidden = on;
+  $('#composer .prompt').textContent = on ? '$' : '❯';
+}
+// Attach to a running shell ({shell_id}) or make this session one ({sid,
+// command}).
+function shellConnect(target) {
+  closeShellView();
+  $('#main').classList.add('shell');
+  setShellComposer(true);
+  const grid = termGrid();
+  const query = new URLSearchParams({...target, cols: grid.cols, rows: grid.rows});
+  if (!target.command) query.delete('command');
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/shell?' + query);
+  shellWs = ws;
+  shellView = {sid, shellId: Number(target.shell_id) || 0, grid, frame: null, typed: false};
+  setState(cur ? cur.state : 'idle');
+  ws.onmessage = e => {
+    if (ws !== shellWs) return;
+    const m = JSON.parse(e.data);
+    if (m.frame) drawFrame(m.frame);
+    else if (m.opened) shellView.shellId = m.opened.shell_id;
+    else if (m.exited) closeShellView();
+    else if (m.err) { notice(m.err.msg); closeShellView(); }
+  };
+  ws.onclose = () => {
+    if (ws !== shellWs) return;
+    // Not an exit: the connection went. Show the transcript; opening the
+    // session again reattaches.
+    lostShellId = shellView.shellId;
+    notice('shell disconnected');
+    closeShellView();
+  };
+}
+function closeShellView() {
+  if (!shellView) return;
+  const ws = shellWs;
+  shellWs = null; shellView = null; ctrlArmed = false;
+  $('#keybar [data-key="ctrl"]').classList.remove('on');
+  if (ws && ws.readyState <= 1) ws.close();
+  $('#main').classList.remove('shell');
+  $('#term').replaceChildren();
+  setShellComposer(false);
+  setState(cur ? cur.state : 'idle');
+}
+// The session became a shell elsewhere (or stopped being one): follow it.
+function syncShell() {
+  if (!cur || String(cur.sid) !== String(sid)) return;
+  const id = Number(cur.shell_id) || 0;
+  if (id && !shellView && id !== lostShellId) shellConnect({shell_id: id});
+}
+function drawFrame(f) {
+  shellView.frame = f;
+  const t = $('#term');
+  const stick = nearBottom(t);
+  // Wider than this screen (another terminal sized it): shrink to fit.
+  t.style.fontSize = termFontPx * Math.min(1, shellView.grid.cols / f.cols) + 'px';
+  const cursor = f.cursor.visible ? {row: f.history + f.cursor.y, col: f.cursor.x} : null;
+  const lines = f.lines.slice();
+  const want = f.alternate ? f.history + f.rows : (cursor ? cursor.row + 1 : 0);
+  while (lines.length < want) lines.push('');
+  t.innerHTML = sgrRows(lines.join('\n'), cursor).map(r => `<div class="row">${r}</div>`).join('');
+  if (stick || !shellView.drawn) t.scrollTop = t.scrollHeight;
+  shellView.drawn = true;
+}
+function shellSend(data) {
+  if (!shellWs || shellWs.readyState !== 1 || !data) return;
+  shellView.typed = true;
+  shellWs.send(JSON.stringify({input: data}));
+}
+const liveKeys = () => !!(shellView && shellView.frame && shellView.frame.alternate);
+// Return: the line typed so far, then Enter.
+function shellSubmit() {
+  const input = $('#input');
+  const text = input.value;
+  input.value = '';
+  growInput();
+  shellSend(text + '\r');
+}
+// A key on its own (Tab, an arrow, ^C): what is typed goes first, so the
+// shell's line editor completes or recalls with it.
+function shellKey(seq) {
+  const input = $('#input');
+  if (input.value) { shellSend(input.value); input.value = ''; growInput(); }
+  shellSend(seq);
+}
+function arrow(dir) {
+  const app = shellView && shellView.frame && shellView.frame.app_cursor;
+  return '\x1b' + (app ? 'O' : '[') + {up: 'A', down: 'B', right: 'C', left: 'D'}[dir];
+}
+const ctrlChar = ch => String.fromCharCode(ch.toUpperCase().charCodeAt(0) & 0x1f);
+document.addEventListener('pointerdown', e => {
+  const button = e.target.closest('#keybar button');
+  if (!button) return;
+  e.preventDefault(); // keep the keyboard up
+  const key = button.dataset.key, input = $('#input');
+  if (key === 'ctrl') { ctrlArmed = !ctrlArmed; button.classList.toggle('on', ctrlArmed); return; }
+  if (key === 'bs' && input.value && !liveKeys()) { input.value = input.value.slice(0, -1); growInput(); return; }
+  if (key === '^C') { input.value = ''; growInput(); shellSend('\x03'); return; }
+  const seq = {esc: '\x1b', tab: '\t', '^D': '\x04', bs: '\x7f', up: arrow('up'), down: arrow('down'), left: arrow('left'), right: arrow('right')}[key];
+  shellKey(seq);
+});
+// Ctrl armed: the next character typed goes as its control code.
+$('#input').addEventListener('beforeinput', e => {
+  if (!shellView) return;
+  if (ctrlArmed && e.data) {
+    e.preventDefault();
+    ctrlArmed = false;
+    $('#keybar [data-key="ctrl"]').classList.remove('on');
+    shellKey(ctrlChar(e.data.slice(-1)));
+  }
+});
+// Under a full-screen program, what the phone keyboard types goes at once.
+$('#input').addEventListener('input', e => {
+  if (!liveKeys()) return;
+  const v = e.target.value;
+  if (v) { e.target.value = ''; shellSend(v.replace(/\n/g, '\r')); }
+});
+document.addEventListener('keydown', e => {
+  if (!shellView || e.target !== $('#input') || e.isComposing) return;
+  const keys = {Enter: '\r', Tab: '\t', Escape: '\x1b', Backspace: '\x7f',
+    ArrowUp: arrow('up'), ArrowDown: arrow('down'), ArrowLeft: arrow('left'), ArrowRight: arrow('right')};
+  let seq = null;
+  if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1 && /[a-z@\[\\\]^_]/i.test(e.key)) seq = ctrlChar(e.key);
+  else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.stopImmediatePropagation(); if (liveKeys()) shellSend('\r'); else shellSubmit(); return; }
+  else if (liveKeys() && keys[e.key]) seq = keys[e.key];
+  else if (liveKeys() && hasKeyboard() && e.key.length === 1 && !e.metaKey) seq = e.key;
+  else if (!liveKeys() && ['Tab', 'ArrowUp', 'ArrowDown'].includes(e.key)) seq = keys[e.key];
+  else if (!liveKeys() && e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); return; }
+  if (seq == null) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  if (liveKeys()) shellSend(seq); else shellKey(seq);
+}, true);
+// Turned or resized: if this phone drives the shell, it takes the new size.
+window.addEventListener('resize', () => {
+  if (!shellView) return;
+  const grid = termGrid();
+  if (grid.cols === shellView.grid.cols && grid.rows === shellView.grid.rows) return;
+  shellView.grid = grid;
+  if (shellView.typed && shellWs && shellWs.readyState === 1) shellWs.send(JSON.stringify({resize: grid}));
+  if (shellView.frame) drawFrame(shellView.frame);
+});
 $('#transcript').addEventListener('scroll', () => {
   pinned = nearBottom($('#transcript'));
   if (pinned) $('#jump').classList.remove('show');
