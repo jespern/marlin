@@ -284,6 +284,49 @@ test "the terminal continues the transcript: drawn rows, cursor, and search" {
     try std.testing.expect(h.app.view.scroll_up > 0);
 }
 
+test "a shell's status line leaves out the agent: no model, no context" {
+    const gpa = std.testing.allocator;
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    h.app.view.model.clearRetainingCapacity();
+    try h.app.view.model.appendSlice(gpa, "openrouter/vendor/some-model");
+    h.app.view.context_used = 50_000;
+    h.app.view.context_limit = 100_000;
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var render_out: std.Io.Writer.Allocating = .init(gpa);
+    defer render_out.deinit();
+    var vx = try vaxis.init(h.threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &render_out.writer);
+    try vx.resize(gpa, &render_out.writer, .{ .rows = 25, .cols = 120, .x_pixel = 0, .y_pixel = 0 });
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    const status_row = struct {
+        fn get(v: *vaxis.Vaxis, a: std.mem.Allocator) ![]const u8 {
+            const w = v.window();
+            var out: std.ArrayList(u8) = .empty;
+            for (0..w.width) |col| try out.appendSlice(a, w.readCell(@intCast(col), w.height - 1).?.char.grapheme);
+            return out.items;
+        }
+    }.get;
+
+    // An agent session names its model and context...
+    try tui.draw(&h.app, &vx, frame.allocator());
+    const agent = try status_row(&vx, frame.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, agent, "some-model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent, "50%") != null);
+
+    // ...a shell says only that it is one.
+    try h.openShell("$ ");
+    try tui.draw(&h.app, &vx, frame.allocator());
+    const shell = try status_row(&vx, frame.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, shell, " shell · ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "some-model") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "%") == null);
+}
+
 test "Marlin's session keys work from a shell session's normal mode" {
     var h: Harness = undefined;
     h.init(true);

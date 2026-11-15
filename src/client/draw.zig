@@ -1300,29 +1300,33 @@ fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16,
     status_n += 1;
     status_segments[status_n] = .{ .text = state_txt, .style = state_style };
     status_n += 1;
-    status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
-    status_n += 1;
-    status_segments[status_n] = .{ .text = try statusModel(arena, app.view.model.items), .style = Palette.status_model };
-    status_n += 1;
-    if (app.view.effort != .auto) {
+    // A shell has no model and no context: show where it is, not the agent's.
+    const agent_segments = !shell_tab.active(app);
+    if (agent_segments) {
+        status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
+        status_n += 1;
+        status_segments[status_n] = .{ .text = try statusModel(arena, app.view.model.items), .style = Palette.status_model };
+        status_n += 1;
+    }
+    if (agent_segments and app.view.effort != .auto) {
         status_segments[status_n] = .{
             .text = try std.fmt.allocPrint(arena, " {s}", .{@tagName(app.view.effort)}),
             .style = Palette.status_effort,
         };
         status_n += 1;
     }
-    if (ctx_txt.len > 0) {
+    if (agent_segments and ctx_txt.len > 0) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
         status_segments[status_n] = .{ .text = ctx_txt, .style = ctx_style };
         status_n += 1;
     }
-    if (try statusGuestProcess(arena, app.view.model.items, app.view.guest_pid)) |process_txt| {
+    if (agent_segments) if (try statusGuestProcess(arena, app.view.model.items, app.view.guest_pid)) |process_txt| {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
         status_segments[status_n] = .{ .text = process_txt, .style = Palette.status_muted };
         status_n += 1;
-    }
+    };
     status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
     status_n += 1;
     status_segments[status_n] = .{ .text = cwd_txt, .style = Palette.status_cwd };
