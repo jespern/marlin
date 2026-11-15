@@ -153,7 +153,8 @@ async function main() {
         rows:g.querySelectorAll(':scope > .tool').length,notes:g.querySelectorAll(':scope > .note').length,
         unwrapped:g.querySelectorAll('.tool')[1].querySelector('.prev').textContent};
       call('c3','false'); result('c3','error');
-      const failed={summary:g.firstElementChild.textContent,open:g.open};
+      const c3=g.querySelector('[data-call="c3"]');
+      const failed={summary:g.firstElementChild.textContent,open:g.open,callOpen:c3.open,marked:c3.classList.contains('err')};
       addBlock({ts:now,body:{assistant_msg:{text:'done'}}});
       call('c4','ls');
       const next=t.lastElementChild!==g && t.lastElementChild.classList.contains('single');
@@ -163,7 +164,8 @@ async function main() {
     });
     assert.deepEqual(tools.lone,{single:true,open:true,exe:'git',op:'|'});
     assert.deepEqual(tools.folded,{single:false,open:false,summary:'⚙ Ran 2 commands',rows:2,notes:1,unwrapped:'rg -n x src/'});
-    assert.deepEqual(tools.failed,{summary:'⚙ Ran 3 commands · 1 failed',open:true});
+    // A failure is marked, never unfolded: some models fail all the time.
+    assert.deepEqual(tools.failed,{summary:'⚙ Ran 3 commands · 1 failed',open:false,callOpen:false,marked:true});
     assert.equal(tools.next,true);
     assert.equal(tools.reasoning,tools.body);
     assert.equal(tools.note,'rgb(138, 166, 191)');

@@ -474,7 +474,6 @@ let sid = null, cur = null, es = null, lastSeq = 0, oldestSeq = 0, historyHasOld
   pendingInputs = [], nextInputRequestId = Date.now();
 // Set on each session open; replayed history stays collapsed while blocks
 // stamped after this moment count as live (block ts is ms epoch).
-let openedAt = 0;
 
 // ---- markdown (escape-first; only escaped text ever reaches innerHTML) ----
 const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -905,18 +904,12 @@ function addBlock(b, target = $('#transcript'), live = true) {
     const call = t.querySelector(`[data-call="${CSS.escape(v.call_id || '')}"]`);
     if (call && call.classList.contains('question-record')) { answerQuestionRecord(call, v); return; }
     if (call) {
-      if (v.status && v.status !== 'ok') {
-        call.classList.add('err');
-        // Auto-expand only LIVE failures; a replayed transcript full of
-        // historical errors must not arrive as a wall of open sections.
-        if (live && typeof b.ts === 'number' && b.ts >= openedAt) call.open = true;
-      }
+      // A failure stays folded, as in the TUI: the row and its group's
+      // "· N failed" say so, and a tap opens it. Some models fail often.
+      if (v.status && v.status !== 'ok') call.classList.add('err');
       call.appendChild(pre);
       const group = call.closest('.tool-group');
-      if (group) {
-        updateToolGroup(group);
-        if (call.open) group.open = true;
-      }
+      if (group) updateToolGroup(group);
       return;
     }
     node = el('details', 'block tool' + (v.status !== 'ok' ? ' err' : ''));
@@ -1215,7 +1208,6 @@ function open(s) {
   historyHasOlder = false;
   historyLoading = false;
   historyBlocks = [];
-  openedAt = Date.now();
   approvalId = null;
   clearDelta();
   clearReasoning();
