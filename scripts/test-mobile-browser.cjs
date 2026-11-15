@@ -337,6 +337,21 @@ async function main() {
     assert.equal(sgr.rows[0],'<span style="color:#f07178">red</span> plain');
     assert.equal(sgr.rows[1],'<span style="color:rgb(255,135,0);font-weight:700">xy</span><span style="color:rgb(1,2,3);font-weight:700">z</span> <span class="cur"> </span>');
     assert.equal(sgr.head,'$ make test · exited 2');
+    // Links as the TUI shows them: a file on the Mac is its name, not raw Markdown.
+    const links=await page.evaluate(()=>inlineMd('Updated [BLOBS.md](/Users/x/BLOBS.md:19) and [docs](https://x.test/a)'));
+    assert.equal(links,'Updated <span class="mdlink" title="/Users/x/BLOBS.md:19">BLOBS.md</span> and <a href="https://x.test/a" target="_blank" rel="noopener noreferrer">docs</a>');
+    // A partial live stream (the page opened mid-way) is still cleared by
+    // the commentary it became, and live text sent whole replaces it.
+    const live=await page.evaluate(()=>{
+      handle({delta:{sid,turn_id:0,text:'est the'}});
+      handle({delta:{sid,turn_id:0,text:'Test the',replace:true}});
+      const replaced=deltaText;
+      addBlock({seq:0,ts:0,body:{reasoning:{text:'Test the parser',commentary:true}}});
+      const cleared=deltaText===''&&!deltaEl;
+      [...document.querySelectorAll('.block.reasoning')].pop().remove();
+      return {replaced,cleared};
+    });
+    assert.deepEqual(live,{replaced:'Test the',cleared:true});
     assert.equal(sgr.body,'$ make\n<span style="color:#73d091">ok</span>');
     // A shell is the whole account: never for a browser that is not paired.
     assert.equal((await fetch(origin+'/shell?sid='+sid+'&cols=40&rows=20')).status,403);

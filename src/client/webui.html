@@ -97,6 +97,7 @@
   #pair-error { color: var(--red); min-height: 1.5em; }
   #transcript { order: 1; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-wrap: anywhere; padding: 18px 22px; }
   #history-more { display: none; margin: 0 auto 14px; }
+  .mdlink { color: var(--accent); }
   /* A live shell (`!!`): the daemon's terminal, row for row. A shell sized
      by a wider terminal shrinks to fit until typing here takes it over. */
   #term {
@@ -484,7 +485,10 @@ function inlineMd(s) {
     .replace(/(^|\W)\*([^*\s][^*]*)\*/g, '$1<em>$2</em>')
     .replace(/~~([^~]+)~~/g, '<del>$1</del>')
     .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
-      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    // A file on the Mac ([BLOBS.md](/Users/…/BLOBS.md:19)): its name, as the
+    // TUI shows it; the path is the tooltip, since a phone cannot open it.
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<span class="mdlink" title="$2">$1</span>');
 }
 const isDiff = t => t.startsWith('@@ ') || t.includes('\n@@ ');
 function diffHtml(t) {
@@ -839,8 +843,9 @@ function addBlock(b, target = $('#transcript'), live = true) {
     node = el('div', 'block md');
     node.innerHTML = renderMd(v.text);
   } else if (kind === 'reasoning') {
-    if (live && reasoningText === v.text) clearReasoning();
-    else if (live && deltaText === v.text) clearDelta();
+    // As in the TUI: commentary finishes the live text, thinking the live
+    // thinking, whatever part of either this page saw stream.
+    if (live) { if (v.commentary) clearDelta(); else clearReasoning(); }
     node = el('div', 'block reasoning md');
     node.innerHTML = renderMd(v.text);
   } else if (kind === 'tool_call' && isAskUserTool(v.name)) {
@@ -1020,11 +1025,14 @@ function handle(m) {
   } else if (m.delta) {
     if (m.delta.sid !== sid) return;
     if (!deltaEl) { deltaEl = el('div', 'block md'); $('#transcript').appendChild(deltaEl); }
+    // Opened mid-stream: the daemon sends all of it so far.
+    if (m.delta.replace) deltaText = '';
     deltaText += m.delta.text;
     deltaEl.innerHTML = renderMd(deltaText);
   } else if (m.reasoning_delta) {
     if (m.reasoning_delta.sid !== sid) return;
     if (!reasoningEl) { reasoningEl = el('div', 'block reasoning md'); $('#transcript').appendChild(reasoningEl); }
+    if (m.reasoning_delta.replace) reasoningText = '';
     reasoningText += m.reasoning_delta.text;
     reasoningEl.innerHTML = renderMd(reasoningText);
     scrollBottom();
