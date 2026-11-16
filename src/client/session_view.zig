@@ -88,6 +88,9 @@ pub const SessionView = struct {
     /// Images staged for this session's draft. They belong to the draft, not
     /// the client: switching tabs must not carry them into another session.
     attachments: std.ArrayList(media.Pending) = .empty,
+    /// The draft text the daemon holds for this session, as last sent or
+    /// received, so a sync sends only a change (App.syncDraft).
+    draft_synced: std.ArrayList(u8) = .empty,
     blocks: std.ArrayList(RenderBlock) = .empty,
     delta: std.ArrayList(u8) = .empty,
     reasoning_delta: std.ArrayList(u8) = .empty,
@@ -214,6 +217,7 @@ pub const SessionView = struct {
         if (self.shell) |shell| shell.destroy();
         self.shell = null;
         self.editor.deinit();
+        self.draft_synced.deinit(gpa);
         for (self.attachments.items) |*attachment| attachment.deinit(gpa);
         self.attachments.deinit(gpa);
         for (self.blocks.items) |*rb| rb.deinit(gpa);

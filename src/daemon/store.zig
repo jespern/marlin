@@ -62,7 +62,8 @@ const schema_sql =
     \\  title_locked INTEGER NOT NULL DEFAULT 0,
     \\  muse_session_id TEXT,
     \\  context_used INTEGER,
-    \\  guest_context_limit INTEGER
+    \\  guest_context_limit INTEGER,
+    \\  draft TEXT NOT NULL DEFAULT ''
     \\);
     \\CREATE TABLE IF NOT EXISTS live_shells(
     \\  session_id INTEGER PRIMARY KEY,
@@ -196,7 +197,7 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','18');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','19');
 ;
 
 pub const SessionRow = struct {
@@ -522,6 +523,12 @@ pub const Store = struct {
                 \\ALTER TABLE sessions ADD COLUMN context_used INTEGER;
                 \\ALTER TABLE sessions ADD COLUMN guest_context_limit INTEGER;
                 \\UPDATE kv SET value='18' WHERE key='schema_version';
+            );
+        }
+        if (ver < 19) {
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN draft TEXT NOT NULL DEFAULT '';
+                \\UPDATE kv SET value='19' WHERE key='schema_version';
             );
         }
     }
@@ -1560,6 +1567,27 @@ pub const Store = struct {
         if (rc == c.SQLITE_DONE) return error.NotFound;
         if (rc != c.SQLITE_ROW) return error.SqliteStep;
         if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+        return try self.dupeCol(stmt, 0);
+    }
+
+    /// What the user had typed but not sent in a session's composer, kept
+    /// so it survives clients exiting (detach, reboot); "" when none.
+    pub fn setSessionDraft(self: Store, id: u64, text: []const u8) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET draft=? WHERE id=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, text);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
+    /// Caller owns the returned text; "" when there is no draft.
+    pub fn getSessionDraft(self: Store, id: u64) Error![]const u8 {
+        const stmt = try self.prepare("SELECT draft FROM sessions WHERE id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return error.NotFound;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
         return try self.dupeCol(stmt, 0);
     }
 

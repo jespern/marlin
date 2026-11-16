@@ -65,6 +65,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_set_cwd | sid, cwd | ok, or err{busy} mid-turn / err{bad_cwd}; relative paths resolve against the current session cwd, and the canonical existing directory is persisted and broadcast as session_upsert |
 | session_rename | sid, title | ok; title normalized like auto-titles (first line, trimmed, capped) and broadcast as session_upsert |
 | session_set_approvals | sid, approvals ("default" \| "auto") | persists per session before ok and publishes refreshed session metadata; applies to the RUNNING turn too — granting full access resolves a parked prompt immediately |
+| session_draft | sid, text | no reply; keeps the session's unsent composer text in the store ("" clears it) so it outlives the client. The TUI sends it when a tab is parked, before it exits (detach, quit, reboot, `!`), and as "" on submit |
 | session_runtime | sid, value? (duration, "off", or "default") | session_runtime_result{sid,max_runtime_ms,uses_default}; omit value to query; persists per session and updates running guest deadlines |
 | session_set_plan_mode | sid, enabled | ok, or err{busy} mid-turn; persists collaboration mode with the session |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on guest sessions |
@@ -193,6 +194,7 @@ flag is read at export time, so it covers everything still in the outbox.
 | session_created | reply to session_create |
 | session_list_result | reply to session_list |
 | input_history_result {sid,entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
+| draft {sid,text} | after `sub`'s status, only when the session has a kept draft (see session_draft); the TUI puts it in an empty composer, never over typed text |
 | search_result {query,sid,hits} | reply to search; each hit carries session/block identity, kind, location, timestamp, and an FTS-highlighted snippet |
 | diagnostics_result | reply to diagnostics; aggregate provider/TTFT, measured local-preparation, and legacy pre-provider percentiles/outliers; latest provider/tool waterfall includes setup, context-load/SQLite-wait rows/bytes/VM steps, assembly, and body serialization; contains no prompt or tool content |
 | otel_status_result {enabled,content} | reply to `otel_status`, `otel_configure`, or `otel_content`; never includes endpoint headers |

@@ -2719,7 +2719,12 @@ pub const Daemon = struct {
                     if (ses.live_text.items.len > 0)
                         self.sendTo(client, .{ .delta = .{ .sid = s.sid, .turn_id = 0, .text = ses.live_text.items, .replace = true } });
                 };
+                const draft = self.store.getSessionDraft(s.sid) catch "";
+                defer if (draft.len > 0) self.gpa.free(draft);
+                if (draft.len > 0) self.sendTo(client, .{ .draft = .{ .sid = s.sid, .text = draft } });
             },
+            .session_draft => |d| self.store.setSessionDraft(d.sid, d.text) catch |err|
+                std.log.warn("could not keep the draft of session {d}: {t}", .{ d.sid, err }),
             .unsub => |u| {
                 for (client.subs.items, 0..) |sid, i| {
                     if (sid == u.sid) {

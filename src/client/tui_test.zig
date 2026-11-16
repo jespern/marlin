@@ -1386,6 +1386,63 @@ test "bang shell escape captures commands and bare interactive requests" {
     try std.testing.expectEqualStrings("", app.shell_command.items);
 }
 
+// Case: a half-written prompt was gone after a reboot. The client hands the
+// daemon each tab's draft when the tab is parked and before it exits; the
+// daemon hands it back on the next attach.
+test "drafts go to the daemon when a tab is parked or the client leaves, and come back" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const Sent = struct {
+        /// The drafts sent since the last call, as "sid:text".
+        fn drafts(out: *std.Io.Writer.Allocating, a: std.mem.Allocator) ![]const []const u8 {
+            var list: std.ArrayList([]const u8) = .empty;
+            var lines = std.mem.splitScalar(u8, out.written(), '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                const msg = try proto.decode(proto.ClientMsg, a, try a.dupe(u8, line));
+                if (msg == .session_draft) try list.append(a, try std.fmt.allocPrint(a, "{d}:{s}", .{ msg.session_draft.sid, msg.session_draft.text }));
+            }
+            out.clearRetainingCapacity();
+            return list.items;
+        }
+    };
+
+    // Parking a tab keeps its draft, which a later eviction would drop.
+    app.view.editor.insertSlice("half a thought");
+    try app.saveActiveView();
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"1:half a thought"}), try Sent.drafts(&output, arena.allocator()));
+    // Unchanged drafts are not sent again when the client leaves.
+    app.view.sid = 2;
+    app.view.editor.insertSlice("other tab");
+    app.syncAllDrafts();
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"2:other tab"}), try Sent.drafts(&output, arena.allocator()));
+
+    // Reattached: the kept draft fills an empty composer, never typed text.
+    app.view.editor.clear();
+    app.handleDaemonLine(try gpa.dupe(u8, "{\"draft\":{\"sid\":2,\"text\":\"kept words\"}}"));
+    try std.testing.expectEqualStrings("kept words", app.view.editor.text.items);
+    app.handleDaemonLine(try gpa.dupe(u8, "{\"draft\":{\"sid\":2,\"text\":\"stale\"}}"));
+    try std.testing.expectEqualStrings("kept words", app.view.editor.text.items);
+    app.syncAllDrafts();
+    try std.testing.expectEqual(@as(usize, 0), (try Sent.drafts(&output, arena.allocator())).len);
+
+    // Sent: the kept draft goes too, so it cannot come back after the next reboot.
+    const text = try app.view.editor.takeExpandedWithImages(0);
+    defer gpa.free(text);
+    app.submitInput(text);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"2:"}), try Sent.drafts(&output, arena.allocator()));
+}
+
 test "bang shell escape over --remote runs in the daemon's shell, like !!" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -3328,10 +3385,16 @@ test "session labels round-trip ids and preserve inactive view state" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
+    // Parking the tab hands its draft to the daemon.
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
     var app = App{
         .gpa = gpa,
         .io = threaded.io(),
-        .conn = undefined,
+        .conn = &conn,
         .view = .{
             .sid = 0x2a,
             .editor = Editor.init(gpa),

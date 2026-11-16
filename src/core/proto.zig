@@ -328,6 +328,10 @@ pub const ClientMsg = union(enum) {
     /// Switch a session's approval mode: "default" = boundary-crossing tools
     /// ask; "auto" = full access, nothing asks (/permissions full).
     session_set_approvals: struct { sid: u64, approvals: []const u8 },
+    /// What the user has typed but not sent in this session's composer, so
+    /// it outlives the client (detach, reboot); "" once sent or erased. No
+    /// reply. A later `sub` returns it as `draft`.
+    session_draft: struct { sid: u64, text: []const u8 },
     /// Toggle managed-tool hostname filtering for one session. Enabling
     /// requires a loaded policy (hello_ok.network_filtering).
     session_set_network_filtering: struct { sid: u64, enabled: bool },
@@ -594,6 +598,9 @@ pub const DaemonMsg = union(enum) {
     session_created: struct { sid: u64, request_id: u64 = 0 },
     session_list_result: struct { sessions: []const SessionInfo },
     input_history_result: struct { entries: []const InputHistoryEntry, sid: u64 = 0 },
+    /// The session's stored composer draft, after `sub`'s status; only sent
+    /// when there is one.
+    draft: struct { sid: u64, text: []const u8 },
     search_result: struct { query: []const u8, sid: u64 = 0, hits: []const SearchHit },
     diagnostics_result: Diagnostics,
     otel_status_result: struct { enabled: bool, content: bool = false },

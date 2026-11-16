@@ -1226,6 +1226,8 @@ fn checkSessionRestoreFlow(gpa: std.mem.Allocator, io: Io, env: *const std.proce
     try conn.send(.{ .unsub = .{ .sid = changed } });
     try assertFullAccess(conn, arena, full, true);
     try assertFullAccess(conn, arena, changed, true);
+    // A client left this half-written prompt in `changed`'s composer.
+    try conn.send(.{ .session_draft = .{ .sid = changed, .text = "unsent across reboots" } });
     for (0..2) |restart| {
         try conn.send(.{ .reboot = .{ .suspend_sessions = true } });
         _ = try recvTagBounded(conn, arena, "ok");
@@ -1252,6 +1254,13 @@ fn checkSessionRestoreFlow(gpa: std.mem.Allocator, io: Io, env: *const std.proce
             // A lost grant would park the write tool and time out here.
             try pauseWaitState(conn, arena, full, "none", "idle");
         }
+        // The draft came through the restart for whoever opens the session.
+        try conn.send(.{ .sub = .{ .sid = changed, .tail_limit = 1 } });
+        _ = try recvTagBounded(conn, arena, "status");
+        const draft = try recvTagBounded(conn, arena, "draft");
+        if (uintField(draft, "sid") != changed or !std.mem.eql(u8, stringField(draft, "text") orelse "", "unsent across reboots")) return error.DraftLostInRestart;
+        try conn.send(.{ .unsub = .{ .sid = changed } });
+        _ = try recvTagBounded(conn, arena, "ok");
     }
     try conn.send(.{ .sub = .{ .sid = full, .tail_limit = 1, .prompt_history_limit = 200 } });
     const history = try recvTagBounded(conn, arena, "input_history_result");

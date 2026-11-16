@@ -597,15 +597,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v18 with performance telemetry and scaling indexes" {
+test "schema is v19 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 18), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 19), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 18), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 19), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
@@ -955,6 +955,20 @@ test "skill search and recalled inputs use the slash command while blocks retain
     try std.testing.expectEqualStrings("/review banana", loaded[0].blk.body.user_msg.display_text.?);
 }
 
+test "a session keeps one composer draft" {
+    var store = try Store.open(std.testing.allocator, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "m", .auto);
+    const none = try store.getSessionDraft(1);
+    defer std.testing.allocator.free(none);
+    try std.testing.expectEqualStrings("", none);
+    try store.setSessionDraft(1, "unsent words");
+    const kept = try store.getSessionDraft(1);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings("unsent words", kept);
+    try std.testing.expectError(error.NotFound, store.getSessionDraft(2));
+}
+
 test "renaming a session locks its title; auto titles stay unlocked" {
     var store = try Store.open(std.testing.allocator, null);
     defer store.close();
@@ -985,6 +999,7 @@ test "v13 session runtime migration preserves defaults and independent overrides
         "ALTER TABLE sessions DROP COLUMN muse_session_id",
         "ALTER TABLE sessions DROP COLUMN context_used",
         "ALTER TABLE sessions DROP COLUMN guest_context_limit",
+        "ALTER TABLE sessions DROP COLUMN draft",
         "UPDATE kv SET value='13' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
@@ -1017,6 +1032,7 @@ test "v14 migration preserves paused grants and later revocation overrides old c
         "ALTER TABLE sessions DROP COLUMN muse_session_id",
         "ALTER TABLE sessions DROP COLUMN context_used",
         "ALTER TABLE sessions DROP COLUMN guest_context_limit",
+        "ALTER TABLE sessions DROP COLUMN draft",
         "UPDATE kv SET value='14' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);

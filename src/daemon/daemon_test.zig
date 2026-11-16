@@ -534,6 +534,41 @@ test "a shell takes the size of whoever types; a follower is told, never resizes
     for (try r.drain(2)) |msg| try std.testing.expect(msg != .shell_resized);
 }
 
+// Case: Jesper's half-written prompt was gone after a reboot; the client
+// hands its draft to the daemon, and whoever opens the session next gets it.
+test "a session's draft is kept for the next client that opens it, until it is cleared" {
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const Draft = struct {
+        fn after(rig: *ShellRig, client: u64) !?[]const u8 {
+            try rig.send(client, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
+            var text: ?[]const u8 = null;
+            var status_seen = false;
+            for (try rig.drain(client)) |msg| switch (msg) {
+                .status => status_seen = true,
+                // It fills the composer of a view that already exists.
+                .draft => |d| {
+                    try std.testing.expect(status_seen);
+                    try std.testing.expectEqual(@as(u64, 7), d.sid);
+                    text = d.text;
+                },
+                else => {},
+            };
+            return text;
+        }
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), try Draft.after(r, 2));
+
+    try r.send(1, "{{\"session_draft\":{{\"sid\":7,\"text\":\"half a thought\\nsecond line\"}}}}", .{});
+    try std.testing.expectEqual(@as(usize, 0), (try r.drain(1)).len); // no reply
+    try std.testing.expectEqualStrings("half a thought\nsecond line", (try Draft.after(r, 2)).?);
+    try std.testing.expectEqualStrings("half a thought\nsecond line", (try Draft.after(r, 1)).?);
+
+    // Sent or erased: nothing comes back.
+    try r.send(1, "{{\"session_draft\":{{\"sid\":7,\"text\":\"\"}}}}", .{});
+    try std.testing.expectEqual(@as(?[]const u8, null), try Draft.after(r, 2));
+}
+
 test "a client that subscribes mid-stream gets the text so far whole, not from the next chunk" {
     // Case: Jesper saw "est" stream where the reply began "Test": the TUI
     // (back from another tab) and the phone (just opened) joined mid-stream.

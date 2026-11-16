@@ -1184,9 +1184,41 @@ pub const App = struct {
         self.search.highlight_line = null;
     }
 
+    /// Hand the daemon `view`'s composer draft if it changed since the last
+    /// sync, so the draft outlives this client: parked tabs (which can be
+    /// evicted), detach, reboot, and `!` all end with one. A failed send
+    /// (offline) leaves it to the next sync.
+    pub fn syncDraft(self: *App, view: *SessionView) void {
+        // While walking input history the editor shows an old prompt; the
+        // draft is what history stashed.
+        const text = view.editor.draft orelse view.editor.text.items;
+        if (std.mem.eql(u8, text, view.draft_synced.items)) return;
+        self.conn.send(.{ .session_draft = .{ .sid = view.sid, .text = text } }) catch return;
+        view.draft_synced.clearRetainingCapacity();
+        view.draft_synced.appendSlice(self.gpa, text) catch {};
+    }
+
+    /// Every open tab's draft, before this client goes away.
+    pub fn syncAllDrafts(self: *App) void {
+        self.syncDraft(&self.view);
+        var it = self.saved_views.valueIterator();
+        while (it.next()) |saved| self.syncDraft(saved.*);
+    }
+
+    /// A draft the daemon kept for `sid` fills its composer, unless the user
+    /// already typed something there.
+    pub fn restoreDraft(self: *App, sid: u64, text: []const u8) void {
+        const view = if (sid == self.view.sid) &self.view else self.saved_views.get(sid) orelse return;
+        if (view.editor.text.items.len > 0 or view.editor.draft != null) return;
+        view.editor.insertSlice(text);
+        view.draft_synced.clearRetainingCapacity();
+        view.draft_synced.appendSlice(self.gpa, text) catch {};
+    }
+
     /// Park the focused view in the MRU cache and leave a fresh, empty view
     /// (same sid until the caller reassigns it) in its place.
     pub fn saveActiveView(self: *App) !void {
+        self.syncDraft(&self.view);
         if (self.view.show_tool_transcript)
             try self.expanded_transcripts.put(self.gpa, self.view.sid, {})
         else
@@ -2208,6 +2240,7 @@ pub const App = struct {
                 }
                 if (view == &self.view and self.history_search.active) self.refreshHistorySearch(true);
             },
+            .draft => |d| self.restoreDraft(d.sid, d.text),
             .search_result => |result| self.replaceSearchHits(result),
             .diagnostics_result => |report| {
                 if (self.liveView(report.sid) == null) return;
@@ -2659,6 +2692,9 @@ pub const App = struct {
 
     pub fn submitInput(self: *App, text: []const u8) void {
         if (self.inputBlockedDuringReconnect(text)) return;
+        // Sent (or run): the composer is empty now, and so is the kept draft.
+        // Refused input stays in the composer and keeps its draft as is.
+        defer if (self.view.editor.text.items.len == 0) self.syncDraft(&self.view);
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.view.attachments.items.len == 0) return;
         const is_command = isCommandInput(text);
@@ -6041,6 +6077,9 @@ pub fn run(
             }
             try writer.flush();
         }
+
+        // Detach, quit, reboot, `!`: the daemon keeps what was typed.
+        if (daemon_disconnect_reason == null) app.syncAllDrafts();
 
         // A quit that raced an in-flight reconnect can leave the worker's
         // fresh Conn (and its ssh child) queued and unowned: join the worker
