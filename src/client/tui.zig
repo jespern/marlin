@@ -323,6 +323,8 @@ pub const SessionSummary = struct {
     shell_id: u64 = 0,
     /// "$ name" tab label of a shell session; empty otherwise.
     shell_label: []u8 = &.{},
+    /// Where a shell session's shell is now; empty otherwise.
+    shell_cwd: []u8 = &.{},
 
     fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
@@ -330,6 +332,7 @@ pub const SessionSummary = struct {
         gpa.free(self.model);
         gpa.free(self.label);
         gpa.free(self.shell_label);
+        gpa.free(self.shell_cwd);
     }
 };
 
@@ -1542,6 +1545,7 @@ pub const App = struct {
                 self.gpa.dupe(u8, if (info.shell_title.len > 0) info.shell_title else if (info.title.len > 0) info.title else if (std.fs.path.basename(info.cwd).len > 0) std.fs.path.basename(info.cwd) else "shell") catch &.{}
             else
                 &.{},
+            .shell_cwd = if (info.shell_id != 0) self.gpa.dupe(u8, info.shell_cwd) catch &.{} else &.{},
         };
     }
 

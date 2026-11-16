@@ -1181,7 +1181,8 @@ function renderSessions(list) {
       tabTitle(s);
       $('#sandbox-btn').classList.toggle('off', !s.sandboxed);
       setCredits(!!s.usage_credits);
-      setCwd(s.cwd);
+      // A shell session shows where its shell is (`cd` moves it).
+      setCwd(Number(s.shell_id) && s.shell_cwd ? s.shell_cwd : s.cwd);
       updatePlanOffer();
     }
   }

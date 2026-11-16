@@ -1189,7 +1189,10 @@ fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16,
         Palette.status_context_warn
     else
         Palette.status_context;
-    const cwd_txt = try statusLocation(arena, app.daemon_hostname, app.view.cwd.items, app.home.items);
+    // A shell session shows where its shell is, which `cd` changes; the
+    // session's own cwd stays the agent's.
+    const shell_cwd: []const u8 = if (shell_tab.active(app)) if (app.sessionSummary(app.view.sid)) |summary| summary.shell_cwd else "" else "";
+    const cwd_txt = try statusLocation(arena, app.daemon_hostname, if (shell_cwd.len > 0) shell_cwd else app.view.cwd.items, app.home.items);
     const scroll_txt = if (app.view.history_has_newer)
         if (app.view.scroll_up > 0)
             try std.fmt.allocPrint(arena, "↕ {d} (G: latest)", .{app.view.scroll_up})
@@ -1331,7 +1334,8 @@ fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16,
     status_n += 1;
     status_segments[status_n] = .{ .text = cwd_txt, .style = Palette.status_cwd };
     status_n += 1;
-    if (app.git_supported and app.git_sid == app.view.sid and std.mem.eql(u8, app.git_cwd.items, app.view.cwd.items) and app.git_label.items.len > 0) {
+    // A shell's own prompt shows its branch, for the directory it is in.
+    if (agent_segments and app.git_supported and app.git_sid == app.view.sid and std.mem.eql(u8, app.git_cwd.items, app.view.cwd.items) and app.git_label.items.len > 0) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
         const git_label = app.git_label.items;

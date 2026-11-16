@@ -323,10 +323,17 @@ async function main() {
           {...base,sid:'94',state:'idle',pause:'paused'},{...base,sid:'95',state:'idle'},{...base,sid:'96',state:'running'}]);
         handle({status:{sid:'96',state:'idle'}});
         out.marks=[...document.querySelectorAll('#sessions .mark')].map(m=>m.textContent+m.className.replace('mark ',':'));
+        // A shell session's folder is where its shell is, not where it began.
+        lostShellId=7; // keep syncShell from connecting to this fake shell
+        const statusCwd=()=>document.querySelector('#status .cwd').textContent.replace(/\u200e/g,'');
+        renderSessions([{...base,sid,cwd:'/proj',shell_id:7,shell_cwd:'/elsewhere'}]); out.shellCwd=statusCwd();
+        renderSessions([{...base,sid,cwd:'/proj'}]); out.agentCwd=statusCwd();
+        lostShellId=0;
       } finally { window.send=realSend; window.matchMedia=real; }
       return out;
     });
     assert.equal(comp.cwd,'~');
+    assert.deepEqual([comp.shellCwd,comp.agentCwd],['/elsewhere','/proj']);
     assert.equal(comp.enterSent,0);
     assert.equal(comp.sendEnabled,true);
     assert.equal(comp.sentText,'line one\nline two');

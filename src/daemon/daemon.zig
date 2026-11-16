@@ -1405,9 +1405,12 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .shell_output = .{ .shell_id = so.shell_id, .data_base64 = encoded.? } });
                     viewer.unacked += so.bytes.len;
                 }
-                if (host.titleChanged()) {
+                // Both checks run: each records what it announced.
+                const title_changed = host.titleChanged();
+                if (host.cwdChanged() or title_changed) {
                     self.broadcastShellList();
-                    // Tabs label a shell by what its program calls itself.
+                    // Tabs label a shell by what its program calls itself;
+                    // the status line shows where it is.
                     self.broadcastSessionUpsert(host.sid);
                 }
             },
@@ -5674,6 +5677,7 @@ pub const Daemon = struct {
                 .archived = row.archived,
                 .shell_id = if (self.sessionShell(row.id)) |host| host.id else 0,
                 .shell_title = if (self.sessionShell(row.id)) |host| host.title() else "",
+                .shell_cwd = if (self.sessionShell(row.id)) |host| host.cwd else "",
             };
         }
         return infos;

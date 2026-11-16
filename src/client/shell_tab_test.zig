@@ -343,6 +343,50 @@ test "a shell's status line leaves out the agent: no model, no context" {
     try std.testing.expect(std.mem.indexOf(u8, shell, "%") == null);
 }
 
+test "a shell's status line shows where the shell is, without the branch its prompt shows" {
+    const gpa = std.testing.allocator;
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    h.app.view.cwd.clearRetainingCapacity();
+    try h.app.view.cwd.appendSlice(gpa, "/work/proj");
+    h.app.git_supported = true;
+    h.app.git_sid = 42;
+    try h.app.git_cwd.appendSlice(gpa, "/work/proj");
+    try h.app.git_label.appendSlice(gpa, "feature-x");
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var render_out: std.Io.Writer.Allocating = .init(gpa);
+    defer render_out.deinit();
+    var vx = try vaxis.init(h.threaded.io(), gpa, &env, .{});
+    defer vx.deinit(gpa, &render_out.writer);
+    try vx.resize(gpa, &render_out.writer, .{ .rows = 25, .cols = 120, .x_pixel = 0, .y_pixel = 0 });
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    const status_row = struct {
+        fn get(v: *vaxis.Vaxis, a: std.mem.Allocator) ![]const u8 {
+            const w = v.window();
+            var out: std.ArrayList(u8) = .empty;
+            for (0..w.width) |col| try out.appendSlice(a, w.readCell(@intCast(col), w.height - 1).?.char.grapheme);
+            return out.items;
+        }
+    }.get;
+
+    try tui.draw(&h.app, &vx, frame.allocator());
+    const agent = try status_row(&vx, frame.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, agent, "/work/proj · feature-x") != null);
+
+    try h.openShell("$ ");
+    // The user ran `cd ..`; the daemon passes on the shell's report.
+    try h.daemonSays("{{\"session_upsert\":{{\"session\":{{\"sid\":42,\"title\":\"\",\"cwd\":\"/work/proj\",\"model\":\"m\",\"status\":\"idle\",\"created_at\":1,\"running\":false,\"shell_id\":5,\"shell_cwd\":\"/work\"}}}}}}", .{});
+    try tui.draw(&h.app, &vx, frame.allocator());
+    const shell = try status_row(&vx, frame.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, shell, " shell · /work ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "/work/proj") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "feature-x") == null);
+}
+
 test "Marlin's session keys work from a shell session's normal mode" {
     var h: Harness = undefined;
     h.init(true);

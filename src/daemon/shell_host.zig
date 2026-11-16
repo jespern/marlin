@@ -52,6 +52,8 @@ pub const Host = struct {
     stream: vt.TerminalStream,
     geometry: Geometry,
     viewers: std.ArrayList(Viewer) = .empty,
+    /// Where the shell is: its start directory until the shell reports one
+    /// (OSC 7, which the injected shell integration sends at each prompt).
     cwd: []u8,
     created_at_ms: i64,
     /// Title last announced in a shell list, to notice OSC title changes.
@@ -210,6 +212,19 @@ pub const Host = struct {
         if (std.mem.eql(u8, current, self.announced_title.items)) return false;
         self.announced_title.clearRetainingCapacity();
         self.announced_title.appendSlice(self.gpa, current) catch {};
+        return true;
+    }
+
+    /// True once per change of the directory the shell reports (OSC 7),
+    /// which then is `cwd`.
+    pub fn cwdChanged(self: *Host) bool {
+        const reported = pwdPath(self.terminal.getPwd() orelse return false);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = percentDecode(&buf, reported) orelse return false;
+        if (path.len == 0 or path[0] != '/' or std.mem.eql(u8, path, self.cwd)) return false;
+        const owned = self.gpa.dupe(u8, path) catch return false;
+        self.gpa.free(self.cwd);
+        self.cwd = owned;
         return true;
     }
 
@@ -395,3 +410,33 @@ pub const Host = struct {
         };
     }
 };
+
+/// The path of an OSC 7 report: `file://host/path` (percent-encoded), the
+/// `kitty-shell-cwd://host/path` variant, or a bare path.
+pub fn pwdPath(url: []const u8) []const u8 {
+    for ([_][]const u8{ "file://", "kitty-shell-cwd://" }) |scheme| {
+        if (!std.mem.startsWith(u8, url, scheme)) continue;
+        const rest = url[scheme.len..];
+        return rest[std.mem.indexOfScalar(u8, rest, '/') orelse rest.len ..];
+    }
+    return url;
+}
+
+/// `%XX` escapes decoded into `buf`; null when it does not fit or an escape
+/// is malformed.
+pub fn percentDecode(buf: []u8, text: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (n += 1) {
+        if (n == buf.len) return null;
+        if (text[i] == '%') {
+            if (i + 3 > text.len) return null;
+            buf[n] = std.fmt.parseInt(u8, text[i + 1 .. i + 3], 16) catch return null;
+            i += 3;
+        } else {
+            buf[n] = text[i];
+            i += 1;
+        }
+    }
+    return buf[0..n];
+}

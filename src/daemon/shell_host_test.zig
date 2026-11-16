@@ -104,6 +104,36 @@ test "a host snapshot decodes to the same screen" {
     try std.testing.expectEqualStrings("hello\nworld", text);
 }
 
+test "the shell's directory follows its OSC 7 reports" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const host = try shell_host.Host.create(gpa, threaded.io(), 1, 9, "/start", 0, .{ .cols = 20, .rows = 4 });
+    defer host.destroy();
+    try std.testing.expect(!host.cwdChanged());
+    try std.testing.expectEqualStrings("/start", host.cwd);
+
+    host.feed("\x1b]7;file://victory.local/Users/j/My%20Work\x07");
+    try std.testing.expect(host.cwdChanged());
+    try std.testing.expect(!host.cwdChanged());
+    try std.testing.expectEqualStrings("/Users/j/My Work", host.cwd);
+
+    // The same directory reported at the next prompt is no change.
+    host.feed("\x1b]7;file://victory.local/Users/j/My%20Work\x1b\\");
+    try std.testing.expect(!host.cwdChanged());
+
+    host.feed("\x1b]7;kitty-shell-cwd://victory.local/tmp\x07");
+    try std.testing.expect(host.cwdChanged());
+    try std.testing.expectEqualStrings("/tmp", host.cwd);
+
+    // Not a path, or a broken escape: the last good directory stays.
+    for ([_][]const u8{ "\x1b]7;file://victory.local\x07", "\x1b]7;file://h/bad%2\x07", "\x1b]7;relative/dir\x07" }) |report| {
+        host.feed(report);
+        try std.testing.expect(!host.cwdChanged());
+        try std.testing.expectEqualStrings("/tmp", host.cwd);
+    }
+}
+
 test "viewers attach once and detach cleanly" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -248,4 +278,16 @@ test "a real zsh with the installed Ghostty's integration reports its commands" 
     try std.testing.expectEqual(@as(?i32, 1), host.commands.items[0].exit_code);
     try std.testing.expectEqualStrings("echo done-$((4+4))", host.commands.items[1].command);
     try std.testing.expectEqual(@as(?i32, 0), host.commands.items[1].exit_code);
+
+    // `cd` is reported (OSC 7) at the next prompt, so the status line follows.
+    const sub = try std.fmt.allocPrint(gpa, "{s}/sub dir", .{temp.path});
+    defer gpa.free(sub);
+    try std.Io.Dir.cwd().createDirPath(io, sub);
+    _ = host.cwdChanged();
+    try host.write("cd 'sub dir'\r");
+    for (0..500) |_| {
+        _ = try relay.pump(host);
+        if (host.cwdChanged() and std.mem.endsWith(u8, host.cwd, "/sub dir")) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.Timeout;
 }

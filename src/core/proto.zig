@@ -790,6 +790,9 @@ pub const SessionInfo = struct {
     shell_id: u64 = 0,
     /// The title the shell's program set (OSC 0/2); empty when none.
     shell_title: []const u8 = "",
+    /// Where the shell is now (OSC 7, as its integration reports each
+    /// prompt); its start directory until it reports one. Empty when no shell.
+    shell_cwd: []const u8 = "",
 };
 
 /// Encode one message as an NDJSON line (incl. trailing \n). Caller frees.
