@@ -49,6 +49,104 @@ test "SSH resolves pipe liveness and reconnect authentication options" {
     try std.testing.expect(!attach.isRetryableReconnectError(error.ConnectCanceled));
 }
 
+fn stub(io: Io, path: [:0]const u8, label: []const u8) !void {
+    var buf: [128]u8 = undefined;
+    const body = try std.fmt.bufPrint(&buf, "#!/bin/sh\necho {s} \"$@\"\n", .{label});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(path, 0o700));
+}
+
+fn runShell(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, argv: []const []const u8) !?[]u8 {
+    const result = std.process.run(gpa, io, .{ .argv = argv, .environ_map = env }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer gpa.free(result.stderr);
+    return result.stdout;
+}
+
+// Regression: over ssh, `sh -lc 'exec marlin _pipe'` found a stale Homebrew
+// marlin before the ~/.local/bin one the daemon ran from, so a remote reboot
+// restarted the wrong daemon and !rb refused to rebuild ("package install").
+test "remote commands prefer the ~/.local/bin marlin over another on PATH, in any login shell" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-remote-lookup");
+    defer temp.deinit();
+
+    const home = try std.fmt.allocPrint(gpa, "{s}/home", .{temp.path});
+    defer gpa.free(home);
+    const home_bin = try std.fmt.allocPrint(gpa, "{s}/.local/bin", .{home});
+    defer gpa.free(home_bin);
+    const other_bin = try std.fmt.allocPrint(gpa, "{s}/other", .{temp.path});
+    defer gpa.free(other_bin);
+    try Io.Dir.cwd().createDirPath(io, home_bin);
+    try Io.Dir.cwd().createDirPath(io, other_bin);
+    const other = try std.fmt.allocPrintSentinel(gpa, "{s}/marlin", .{other_bin}, 0);
+    defer gpa.free(other);
+    try stub(io, other, "other");
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("HOME", home);
+    const path_env = try std.fmt.allocPrint(gpa, "{s}:/usr/bin:/bin", .{other_bin});
+    defer gpa.free(path_env);
+    try env.put("PATH", path_env);
+
+    // No ~/.local/bin marlin: the PATH one. A plain `sh -c` keeps the test's
+    // PATH (a login shell would put the host's own installs first).
+    const lookup = "sh -c '" ++ attach.remote_lookup ++ "version'";
+    if (try runShell(gpa, io, &env, &.{ "/bin/sh", "-c", lookup })) |out| {
+        defer gpa.free(out);
+        try std.testing.expectEqualStrings("other version\n", out);
+    }
+
+    const installed = try std.fmt.allocPrintSentinel(gpa, "{s}/marlin", .{home_bin}, 0);
+    defer gpa.free(installed);
+    try stub(io, installed, "installed");
+    // The real commands, as each remote shell receives them from ssh.
+    var exe_buf: [256]u8 = undefined;
+    const exe = try std.fmt.bufPrint(&exe_buf, "{s}/checkout/zig-out/bin/marlin", .{temp.path});
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(exe).?);
+    const exe_z = try gpa.dupeSentinel(u8, exe, 0);
+    defer gpa.free(exe_z);
+    try stub(io, exe_z, "daemon");
+    const rebuild = try attach.remoteRebuildCommand(gpa, exe);
+    defer gpa.free(rebuild);
+    const fallback = try attach.remoteRebuildCommand(gpa, "");
+    defer gpa.free(fallback);
+    var shells_run: usize = 0;
+    for ([_][]const u8{ "/bin/sh", "/bin/bash", "/bin/zsh", "/opt/homebrew/bin/fish", "/usr/bin/fish" }) |shell| {
+        const cases = [_]struct { command: []const u8, want: []const u8 }{
+            .{ .command = attach.remote_pipe_command, .want = "installed _pipe\n" },
+            .{ .command = fallback, .want = "installed _rebuild\n" },
+            .{ .command = rebuild, .want = "daemon _rebuild\n" },
+        };
+        for (cases) |case| {
+            const out = (try runShell(gpa, io, &env, &.{ shell, "-c", case.command })) orelse break;
+            defer gpa.free(out);
+            try std.testing.expectEqualStrings(case.want, out);
+        } else shells_run += 1;
+    }
+    try std.testing.expect(shells_run > 0);
+}
+
+test "!rb rebuilds the daemon's own checkout unless its path needs quoting" {
+    const gpa = std.testing.allocator;
+    const plain = try attach.remoteRebuildCommand(gpa, "/Users/j/Work/marlin/zig-out/bin/marlin");
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("sh -lc 'exec /Users/j/Work/marlin/zig-out/bin/marlin _rebuild'", plain);
+    const lookup = "sh -lc '" ++ attach.remote_lookup ++ "_rebuild'";
+    for ([_][]const u8{ "", "zig-out/bin/marlin", "/Users/j/My Work/marlin", "/x/it's/marlin", "/x/$(id)/marlin" }) |exe| {
+        const command = try attach.remoteRebuildCommand(gpa, exe);
+        defer gpa.free(command);
+        try std.testing.expectEqualStrings(lookup, command);
+    }
+}
+
 const FlakyHelloServer = struct {
     io: Io,
     server: *Io.net.Server,

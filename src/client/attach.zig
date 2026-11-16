@@ -515,12 +515,42 @@ fn pollReadiness(pipe: Io.File) Readiness {
     return .gone;
 }
 
+/// How the far end finds marlin, as an `sh -lc` script ending in `exec
+/// <marlin> `: the installers' home (~/.local/bin, where install.sh and
+/// `make install` put it) first, then the login PATH. A login PATH alone
+/// misses ~/.local/bin on macOS (`sh -l` reads no zsh or bash rc file) and
+/// so can pick another install, such as a stale Homebrew one. Only double
+/// quotes inside, so the single-quoted script survives any remote shell.
+pub const remote_lookup = "m=\"$HOME/.local/bin/marlin\"; [ -x \"$m\" ] || m=marlin; exec \"$m\" ";
+pub const remote_pipe_command = "sh -lc '" ++ remote_lookup ++ "_pipe'";
+
+/// The `_rebuild` command for the far end. `daemon_exe` is the running
+/// daemon's executable as its hello reported it: !rb rebuilds that checkout,
+/// whatever `marlin` means on the remote PATH. A path that would need
+/// quoting, or none, falls back to the lookup. Still a login shell: the
+/// build needs zig on the login PATH. Caller owns the result.
+pub fn remoteRebuildCommand(gpa: std.mem.Allocator, daemon_exe: []const u8) ![]u8 {
+    if (daemon_exe.len > 0 and daemon_exe[0] == '/' and plainPath(daemon_exe))
+        return std.fmt.allocPrint(gpa, "sh -lc 'exec {s} _rebuild'", .{daemon_exe});
+    return gpa.dupe(u8, "sh -lc '" ++ remote_lookup ++ "_rebuild'");
+}
+
+fn plainPath(path: []const u8) bool {
+    for (path) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '/', '.', '_', '-', '+', '@', ',', ':', '=' => {},
+        else => return false,
+    };
+    return true;
+}
+
 /// `host` is an ssh destination, verbatim — ssh config owns naming, keys,
 /// agent, and jump hosts; marlin keeps no host registry. No BatchMode: ssh
 /// auth prompts use /dev/tty, so key-less setups still work at first
 /// connect; the remote handshake deadline is the hang backstop.
-pub fn spawnRemoteRebuild(gpa: std.mem.Allocator, io: Io, host: []const u8) !*Conn {
-    return spawnChildConn(gpa, io, &.{ "ssh", host, "sh -lc 'exec marlin _rebuild'" });
+pub fn spawnRemoteRebuild(gpa: std.mem.Allocator, io: Io, host: []const u8, daemon_exe: []const u8) !*Conn {
+    const command = try remoteRebuildCommand(gpa, daemon_exe);
+    defer gpa.free(command);
+    return spawnChildConn(gpa, io, &.{ "ssh", host, command });
 }
 
 /// A dedicated connection makes the liveness settings effective even when
@@ -528,10 +558,10 @@ pub fn spawnRemoteRebuild(gpa: std.mem.Allocator, io: Io, host: []const u8) !*Co
 /// for an authentication prompt; initial connects remain interactive.
 pub fn remoteArgv(host: []const u8, reconnecting: bool) [15][]const u8 {
     return .{
-        "ssh", "-T",                    "-S",                         "none",
-        "-o",  "ServerAliveInterval=5", "-o",                         "ServerAliveCountMax=3",
-        "-o",  "ConnectTimeout=10",     "-o",                         if (reconnecting) "BatchMode=yes" else "BatchMode=no",
-        "--",  host,                    "sh -lc 'exec marlin _pipe'",
+        "ssh", "-T",                    "-S",                "none",
+        "-o",  "ServerAliveInterval=5", "-o",                "ServerAliveCountMax=3",
+        "-o",  "ConnectTimeout=10",     "-o",                if (reconnecting) "BatchMode=yes" else "BatchMode=no",
+        "--",  host,                    remote_pipe_command,
     };
 }
 
@@ -549,10 +579,10 @@ fn connectRemote(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         if (connectCancelled(cancel)) return error.ConnectCanceled;
-        // A login shell (`sh -lc`) so the remote profile sets PATH: plain
-        // `ssh host marlin _pipe` runs a non-interactive shell whose PATH
-        // usually misses ~/.local/bin and homebrew. ssh config owns naming,
-        // keys, agent, and jump hosts; marlin keeps no host registry.
+        // remote_lookup finds marlin: plain `ssh host marlin _pipe` runs a
+        // non-interactive shell whose PATH usually misses ~/.local/bin and
+        // homebrew. ssh config owns naming, keys, agent, and jump hosts;
+        // marlin keeps no host registry.
         const argv = remoteArgv(host, reconnecting);
         const conn = try spawnChildConnWithStderr(gpa, io, &argv, !reconnecting);
         handshake(conn, remote_handshake_timeout_ms, cancel) catch |err| {
@@ -563,12 +593,14 @@ fn connectRemote(
                 continue;
             }
             if (!reconnecting) std.log.err(
-                "could not reach `ssh {s} sh -lc 'exec marlin _pipe'`: {t}\n" ++
+                "could not reach marlin on {s} over ssh: {t}\n" ++
                     "  ssh's own messages (host-key prompts, auth errors, 'command\n" ++
                     "  not found') appear above this line. Most common cause: marlin\n" ++
-                    "  is not installed on {s}, or not on the login-shell PATH.\n" ++
-                    "  Test by hand:  ssh {s} \"sh -lc 'marlin version'\"",
-                .{ host, err, host, host },
+                    "  is not installed on {s}, neither in ~/.local/bin nor on the\n" ++
+                    "  login-shell PATH.\n" ++
+                    "  Test by hand:  ssh {s} '~/.local/bin/marlin version'\n" ++
+                    "            or:  ssh {s} \"sh -lc 'marlin version'\"",
+                .{ host, err, host, host, host },
             );
             return err;
         };

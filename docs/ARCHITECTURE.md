@@ -283,11 +283,16 @@ marlin --remote work run "task"
 marlin --remote work web         # browser UI served locally, remote daemon
 ```
 
-Transport is `ssh <host> sh -lc 'exec marlin _pipe'`: an internal
-stdio↔daemon.sock bridge on the remote (readiness-probed, with daemon
-autostart), spawned per connection as a child of the local client. The
-login shell is deliberate — non-interactive ssh shells miss ~/.local/bin
-and homebrew on most setups. Initial SSH connections inherit stderr and the client's foreground
+Transport is `ssh <host> sh -lc '<find marlin>; exec "$m" _pipe'`: an
+internal stdio↔daemon.sock bridge on the remote (readiness-probed, with
+daemon autostart), spawned per connection as a child of the local client.
+The remote marlin is `~/.local/bin/marlin` when it exists (where install.sh
+and `make install` put it), else the login shell's `marlin`
+(`attach.remote_lookup`). The login PATH alone is not enough: `sh -l`
+reads no zsh or bash rc file, so on macOS it misses ~/.local/bin and finds
+any other install first, such as a stale Homebrew one. That once made every
+remote `/reboot` restart the stale binary's daemon and every remote `!rb`
+refuse to build. Initial SSH connections inherit stderr and the client's foreground
 process group, so first-connect host-key prompts and passphrase prompts can
 read `/dev/tty`, while failures such as `command not found` remain visible.
 Dispatch puts the host in
@@ -317,9 +322,11 @@ address change: recovery opens a fresh pipe and reloads durable session state.
 This does not improve packet-loss latency on a live TCP connection, and an
 unacknowledged command is not automatically resent.
 
-`marlin` must be installed on the remote and findable by a login shell (the
-connect error says how to test). Source-built installations get scoped
-self-hosting rebuilds: bare `!rb` rebuilds the side hosting the attached daemon,
+`marlin` must be installed on the remote, in ~/.local/bin or on the login
+shell's PATH (the connect error says how to test). Source-built installations
+get scoped self-hosting rebuilds: bare `!rb` rebuilds the side hosting the
+attached daemon (remotely, the checkout of the executable the daemon's hello
+reports, so another install on the remote PATH cannot shadow it),
 `!rb client` (or `!rbc`) rebuilds only the local client, and `!rb both` builds both before
 restarting anything. Each build is gated on the running executable resolving to
 `<checkout>/zig-out/bin/marlin` with Marlin checkout markers; install.sh and

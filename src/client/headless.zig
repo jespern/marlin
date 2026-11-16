@@ -1368,8 +1368,12 @@ pub fn reboot(
     defer if (remote_builder) |conn| conn.deinit();
     if (actions.remote) {
         const host = remote.?;
+        // Rebuild the checkout the attached daemon runs from, not whatever
+        // `marlin` the remote PATH finds (it can be another install).
+        var exe_buf: [4096]u8 = undefined;
+        const daemon_exe = remoteDaemonExe(gpa, io, environ, self_exe, &exe_buf);
         try eprint(io, "marlin: building attached Marlin on {s}...\n", .{host});
-        remote_builder = attach.spawnRemoteRebuild(gpa, io, host) catch |err| {
+        remote_builder = attach.spawnRemoteRebuild(gpa, io, host, daemon_exe) catch |err| {
             try eprint(io, "marlin: could not start remote build: {t}\n", .{err});
             return 1;
         };
@@ -1419,6 +1423,23 @@ pub fn reboot(
     const err = std.process.replace(io, .{ .argv = argv.items });
     try eprint(io, "marlin: exec failed: {t}\n", .{err});
     return 1;
+}
+
+/// The attached daemon's executable as its hello reports it, copied into
+/// `buf`; empty when unreachable (the remote lookup then decides).
+fn remoteDaemonExe(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    self_exe: []const u8,
+    buf: []u8,
+) []const u8 {
+    const conn = attach.connect(gpa, io, environ, self_exe) catch return "";
+    defer conn.deinit();
+    const exe = conn.daemonExe();
+    if (exe.len > buf.len) return "";
+    @memcpy(buf[0..exe.len], exe);
+    return buf[0..exe.len];
 }
 
 fn sanityCheckCandidate(gpa: std.mem.Allocator, io: Io, candidate: []const u8) !bool {
