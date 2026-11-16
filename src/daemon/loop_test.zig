@@ -552,6 +552,7 @@ test "delegated claude code turn persists rate-limit transitions through its ord
         \\case "$*" in *"--dangerously-skip-permissions"*) ;; *) exit 9 ;; esac
         \\case "$*" in *"--model fable-5"*) ;; *) exit 9 ;; esac
         \\echo '{"type":"system","subtype":"init","session_id":"x"}'
+        \\echo '{"type":"user","isReplay":true,"message":{"content":[{"type":"text","text":"do the thing"}]}}'
         \\echo '{"type":"rate_limit_event","rate_limit_info":{"isUsingOverage":true}}'
         \\echo '{"type":"rate_limit_event","rate_limit_info":{"isUsingOverage":true}}'
         \\echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"checking live reasoning"}}}'
@@ -565,6 +566,7 @@ test "delegated claude code turn persists rate-limit transitions through its ord
         \\echo '{"type":"assistant","parent_tool_use_id":"agent-tool","message":{"content":[{"type":"tool_use","id":"child-tool","name":"Bash","input":{"command":"zig build test"}}]}}'
         \\echo '{"type":"user","parent_tool_use_id":"agent-tool","message":{"content":[{"type":"tool_result","tool_use_id":"child-tool","content":"ok"}]}}'
         \\echo '{"type":"system","subtype":"task_notification","task_id":"agent-task","tool_use_id":"agent-tool","status":"completed","summary":"Agent finished"}'
+        \\printf '%s\n' '{"type":"user","isReplay":true,"message":{"content":[{"type":"text","text":"<task-notification>\n<task-id>agent-task</task-id>\n<tool-use-id>agent-tool</tool-use-id>\n<output-file>/tmp/tasks/agent-task.output</output-file>\n<status>completed</status>\n<summary>Agent \"inspect tests\" finished</summary>\n<result># Findings\n\nAll good.</result>\n</task-notification>"}]}}'
         \\echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
         \\echo '{"type":"rate_limit_event","rate_limit_info":{"isUsingOverage":false}}'
         \\echo '{"type":"result","subtype":"success","result":"DELEGATE-OK","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":90}}'
@@ -667,9 +669,65 @@ test "delegated claude code turn persists rate-limit transitions through its ord
     try std.testing.expectEqualStrings("Bash", loaded[4].blk.body.tool_call.name);
     try std.testing.expectEqualStrings("file.txt", loaded[5].blk.body.tool_result.inline_body);
     try std.testing.expectEqualStrings("Agent", loaded[6].blk.body.tool_call.name);
+    // Claude's echo of the notification as a user message is not a steer.
     try std.testing.expectEqualStrings("Agent finished", loaded[8].blk.body.system_note.text);
     try std.testing.expectEqualStrings("Claude Code returned to subscription usage", loaded[9].blk.body.system_note.text);
     try std.testing.expect(!usage_credits.load(.acquire));
+}
+
+test "a task-notification echo with no system event is the report, never user input" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-cc-echo-test");
+    defer temp.deinit();
+    const script =
+        \\#!/bin/sh
+        \\IFS= read -r initial
+        \\echo '{"type":"system","subtype":"init","session_id":"x"}'
+        \\echo '{"type":"user","isReplay":true,"message":{"content":[{"type":"text","text":"start"}]}}'
+        \\printf '%s\n' '{"type":"user","isReplay":true,"message":{"content":[{"type":"text","text":"<task-notification>\n<task-id>agent-task</task-id>\n<tool-use-id>agent-tool</tool-use-id>\n<output-file>/tmp/tasks/agent-task.output</output-file>\n<status>completed</status>\n<summary>Agent \"inspect tests\" finished</summary>\n<result># Findings\n\nAll good.</result>\n</task-notification>"}]}}'
+        \\echo '{"type":"result","subtype":"success","result":"DONE","usage":{"input_tokens":1,"output_tokens":1}}'
+        \\
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ temp.path, "fake-claude" });
+    defer gpa.free(script_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(claude_code.binary_env, script_path);
+    try env.put("PATH", "/usr/bin:/bin");
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, temp.path, "claudecode/fable-5", .auto);
+    var usage_credits = std.atomic.Value(bool).init(false);
+    const result = try runTurn(gpa, io, &store, .{
+        .session_id = 1,
+        .cwd = temp.path,
+        .endpoint = .{ .url = "", .bearer = null, .model = "fable-5", .backend = .{ .guest = .claude_code } },
+        .cfg = .{},
+        .tool_environ = &env,
+        .approval_mode = .auto,
+        .usage_credits_live = &usage_credits,
+    }, "start", &.{});
+    defer gpa.free(result.text);
+    const loaded = try store.getBlocks(1, 1, 1000);
+    defer {
+        for (loaded) |*lb| lb.deinit();
+        gpa.free(loaded);
+    }
+    var notes: usize = 0;
+    for (loaded) |lb| switch (lb.blk.body) {
+        .steer => return error.NotificationShownAsUserInput,
+        .system_note => |n| if (std.mem.eql(u8, n.text, "Agent \"inspect tests\" finished")) {
+            notes += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), notes);
 }
 
 test "delegated claude code turn consumes a steer racing finalization" {

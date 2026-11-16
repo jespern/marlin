@@ -193,6 +193,37 @@ pub fn sessionUuid(buf: *[36]u8, sid: u64) []const u8 {
 
 // --------------------------------------------------------------- events --
 
+pub const TaskNotification = struct {
+    task_id: []const u8,
+    tool_use_id: []const u8,
+    summary: []const u8,
+};
+
+/// A replayed user message, unless it is Claude Code's own
+/// `<task-notification>` envelope (see Event.replayed_task_notification).
+fn replayedUser(text: []const u8) Event {
+    return if (taskNotificationEnvelope(text)) |n| .{ .replayed_task_notification = n } else .{ .replayed_user = text };
+}
+
+/// The fields of a `<task-notification>…</task-notification>` message;
+/// null for anything else.
+pub fn taskNotificationEnvelope(text: []const u8) ?TaskNotification {
+    const body = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, body, "<task-notification>")) return null;
+    return .{
+        .task_id = tagText(body, "task-id") orelse "",
+        .tool_use_id = tagText(body, "tool-use-id") orelse "",
+        .summary = tagText(body, "summary") orelse "background task finished",
+    };
+}
+
+fn tagText(body: []const u8, comptime tag: []const u8) ?[]const u8 {
+    const open = "<" ++ tag ++ ">";
+    const start = (std.mem.indexOf(u8, body, open) orelse return null) + open.len;
+    const end = std.mem.indexOfPos(u8, body, start, "</" ++ tag ++ ">") orelse return null;
+    return std.mem.trim(u8, body[start..end], " \t\r\n");
+}
+
 pub const Event = union(enum) {
     /// system/init: the Claude Code session is live.
     init,
@@ -245,11 +276,7 @@ pub const Event = union(enum) {
     /// for these to finish (it emits another result when they do).
     background_tasks: []const BackgroundTask,
     /// system/task_notification: a background task finished.
-    task_notification: struct {
-        task_id: []const u8,
-        tool_use_id: []const u8,
-        summary: []const u8,
-    },
+    task_notification: TaskNotification,
     /// system/task_started: links Claude's durable background-task id to the
     /// tool-use id used by forwarded subagent events.
     task_started: struct {
@@ -262,6 +289,10 @@ pub const Event = union(enum) {
     },
     /// A root user message replayed from stream-json stdin.
     replayed_user: []const u8,
+    /// A `<task-notification>` envelope Claude Code wrote into the
+    /// conversation as a user message when a background task finished. It
+    /// echoes system/task_notification; it is not the user's input.
+    replayed_task_notification: TaskNotification,
     /// Terminal event: the turn's outcome and usage.
     result: struct {
         text: []const u8,
@@ -413,7 +444,7 @@ pub fn decodeLine(
         // A slash command (/compact) is echoed as its output, a plain string:
         // still the replay that tells Marlin the message was taken.
         if (replay) if (messageString(root)) |text| {
-            try out.append(arena, .{ .replayed_user = text });
+            try out.append(arena, replayedUser(text));
             return;
         };
         const content = messageContent(root) orelse return;
@@ -421,7 +452,7 @@ pub fn decodeLine(
             for (content) |item| {
                 if (item != .object) continue;
                 if (!std.mem.eql(u8, strField(item.object, "type") orelse "", "text")) continue;
-                if (strField(item.object, "text")) |text| try out.append(arena, .{ .replayed_user = text });
+                if (strField(item.object, "text")) |text| try out.append(arena, replayedUser(text));
             }
         }
         var first_result: ?usize = null;

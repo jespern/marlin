@@ -550,6 +550,13 @@ fn ccInvoke(
         background_links.deinit(gpa);
     }
     var replayed_users: usize = 0;
+    // Background tasks already reported, so Claude's echo of the same
+    // notification as a user message is not shown again.
+    var notified: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notified.items) |id| gpa.free(id);
+        notified.deinit(gpa);
+    }
 
     {
         const line_buf = try gpa.alloc(u8, 512 * 1024);
@@ -585,7 +592,7 @@ fn ccInvoke(
             var events: std.ArrayList(claude_code.Event) = .empty;
             claude_code.decodeLine(line_arena, line, &events) catch continue;
             if (first_event_at_ms == 0 and events.items.len > 0) first_event_at_ms = nowMs(io);
-            for (events.items) |ev| switch (ev) {
+            for (events.items) |ev| event: switch (ev) {
                 .init => outcome.got_init = true,
                 .text_delta => |text| {
                     if (opts.on_delta) |cb| cb(opts.on_delta_ctx, text);
@@ -795,7 +802,18 @@ fn ccInvoke(
                         };
                     }
                 },
+                // Claude's echo of a notification as a user message: the
+                // same report, whichever of the two arrives first.
+                .replayed_task_notification => |notification| continue :event .{ .task_notification = notification },
                 .task_notification => |notification| {
+                    for (notified.items) |id| if (std.mem.eql(u8, id, notification.task_id)) break :event;
+                    if (notification.task_id.len > 0) {
+                        const id = try gpa.dupe(u8, notification.task_id);
+                        notified.append(gpa, id) catch |err| {
+                            gpa.free(id);
+                            return err;
+                        };
+                    }
                     replied = false;
                     const activity_id = if (notification.tool_use_id.len > 0) notification.tool_use_id else notification.task_id;
                     tailer.unwatch(activity_id);

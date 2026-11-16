@@ -399,6 +399,21 @@ test "decode: background agent links task and tool-use ids" {
     try std.testing.expectEqualStrings("toolu_agent", events.items[2].task_notification.tool_use_id);
 }
 
+test "decode: Claude's task-notification echo is not user input" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var events: std.ArrayList(Event) = .empty;
+    try decodeLine(arena_state.allocator(),
+        \\{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<task-notification>\n<task-id>agent-task</task-id>\n<tool-use-id>agent-tool</tool-use-id>\n<output-file>/tmp/tasks/agent-task.output</output-file>\n<status>completed</status>\n<summary>Agent \"inspect tests\" finished</summary>\n<result># Findings\n\nAll good.</result>\n</task-notification>"}]},"parent_tool_use_id":null,"isReplay":true}
+    , &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    const n = events.items[0].replayed_task_notification;
+    try std.testing.expectEqualStrings("agent-task", n.task_id);
+    try std.testing.expectEqualStrings("agent-tool", n.tool_use_id);
+    try std.testing.expectEqualStrings("Agent \"inspect tests\" finished", n.summary);
+    try std.testing.expect(claude_code.taskNotificationEnvelope("please summarise <task-notification> docs") == null);
+}
+
 test "decode: stream-json stdin replay is surfaced as user input" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
