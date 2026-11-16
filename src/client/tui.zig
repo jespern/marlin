@@ -3586,12 +3586,11 @@ pub const App = struct {
 
     /// `! <cmd>` / `!cmd`: run through $SHELL in the focused session cwd
     /// (bare `!` = interactive shell). The TUI tears down first; the
-    /// entry point reattaches when the shell exits.
+    /// entry point reattaches when the shell exits. Over --remote this
+    /// machine is the wrong one (the session's cwd lives with the daemon),
+    /// so it is `!!` instead: the daemon's shell, on the daemon's machine.
     pub fn shellEscape(self: *App, command: []const u8) void {
-        if (self.remote_transport) {
-            self.setNotice("shell escape unavailable over --remote — run Marlin inside ssh/mosh", .{});
-            return;
-        }
+        if (self.remote_transport) return shell_tab.open(self, std.mem.trim(u8, command, " \t"));
         self.shell_command.clearRetainingCapacity();
         self.shell_command.appendSlice(self.gpa, std.mem.trim(u8, command, " \t")) catch {
             self.setNotice("could not prepare shell command", .{});

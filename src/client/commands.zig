@@ -68,7 +68,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/exit", .description = "leave Marlin (sessions keep running)" },
     .{ .name = "/detach", .description = "leave Marlin (sessions keep running)" },
     .{ .name = "/shutdown", .usage = " [--force]", .description = "leave Marlin and stop its daemon (ends shells and running work)", .accepts_args = true },
-    .{ .name = "!", .usage = " [command]", .description = "run a local command, or open an interactive shell", .accepts_args = true },
+    .{ .name = "!", .usage = " [command]", .description = "run a command, or open an interactive shell (over --remote, as !!)", .accepts_args = true },
     .{ .name = "!!", .description = "turn this session into a shell (Ctrl+D turns it back); !! <command> runs just that" },
     .{ .name = "/screenshot", .usage = " [slim]", .description = "copy the window to the clipboard as an image (Alt+S); slim: transcript only", .accepts_args = true },
     .{ .name = "!c", .description = "copy the last reply's text (no tool calls or output), or the last shell's output" },

@@ -1621,10 +1621,10 @@ lifecycle.
   `! <command>` runs through `$SHELL -c` in the focused session cwd;
   bare `!` starts `$SHELL` interactively. The client tears the TUI down before
   spawning the inherited-stdio child and reattaches to the durable session when
-  it exits, keeping terminal emulation outside Marlin. A direct `--remote`
-  transport refuses shell escapes because its local terminal and the daemon
-  workspace are on different hosts; running Marlin inside SSH or mosh keeps
-  both co-located. `!rb` rebuilds the attached daemon side, `!rb client`
+  it exits, keeping terminal emulation outside Marlin. Over a direct
+  `--remote` transport the local terminal and the daemon workspace are on
+  different hosts, so `!` becomes `!!` there: a daemon-owned shell on the
+  daemon's host, its run kept in the transcript. `!rb` rebuilds the attached daemon side, `!rb client`
   (or `!rbc`) rebuilds only the local client, `!rb both` rebuilds both, and `!c` copies the
   last output.
   Plain text + `Enter` starts a turn when idle and queues steering

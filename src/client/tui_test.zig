@@ -1386,26 +1386,44 @@ test "bang shell escape captures commands and bare interactive requests" {
     try std.testing.expectEqualStrings("", app.shell_command.items);
 }
 
-test "bang shell escape refuses remote transport" {
+test "bang shell escape over --remote runs in the daemon's shell, like !!" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    var app = App{
-        .gpa = gpa,
-        .io = threaded.io(),
-        .conn = undefined,
-        .view = .{
-            .sid = 1,
-            .editor = Editor.init(gpa),
-        },
-        .remote_transport = true,
-    };
-    defer app.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    // `! cmd`, `!cmd` and bare `!` never hand this machine's terminal to a
+    // local shell; each asks the daemon for a shell, as `!!` would.
+    for ([_]struct { input: []const u8, command: ?[]const u8 }{
+        .{ .input = "! pwd", .command = "pwd" },
+        .{ .input = "!ls -la", .command = "ls -la" },
+        .{ .input = "!", .command = null },
+    }) |case| {
+        var output: std.Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        var conn: attach.Conn = undefined;
+        conn.gpa = gpa;
+        conn.writer = &output.writer;
+        conn.remote_shell = true;
+        var app = App{
+            .gpa = gpa,
+            .io = threaded.io(),
+            .conn = &conn,
+            .view = .{ .sid = 1, .editor = Editor.init(gpa) },
+            .remote_transport = true,
+        };
+        defer app.deinit();
+        app.term_cols = 80;
+        app.term_rows = 25;
 
-    app.runCommand("! pwd");
-    try std.testing.expect(!app.shell_requested);
-    try std.testing.expect(!app.should_quit);
-    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "--remote") != null);
+        app.runCommand(case.input);
+        try std.testing.expect(!app.shell_requested);
+        try std.testing.expect(!app.should_quit);
+        const line = std.mem.trimEnd(u8, output.written(), "\n");
+        const open = (try proto.decode(proto.ClientMsg, arena.allocator(), try arena.allocator().dupe(u8, line))).shell_open;
+        try std.testing.expectEqual(@as(u64, 1), open.sid);
+        if (case.command) |want| try std.testing.expectEqualStrings(want, open.command.?) else try std.testing.expect(open.command == null);
+    }
 }
 
 test "bang rb expands to reboot with build" {

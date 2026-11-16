@@ -76,8 +76,8 @@ is unavailable.
 - **Terminal ergonomics.** Modal editing, `Ctrl+R` input history, transcript
   search, image attachments, and shell escapes keep routine work close.
   `!<command>` runs in the session workspace; bare `!` opens a local shell.
-  Direct remote attachments refuse shell escapes; use Marlin inside SSH or
-  mosh when the terminal and workspace live on another host.
+  Over `--remote` the workspace lives with the daemon, so `!` works like `!!`
+  there: the daemon's shell, on the daemon's machine.
   See [terminal effects](TERMINAL_EFFECTS.md) for the optional playful bits.
 - **Small deployment footprint.** One native binary, daemon-owned setup and
   credentials, and SSH for remote transport. MCP servers, custom tools, and
