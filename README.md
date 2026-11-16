@@ -62,6 +62,8 @@ permissions. What Marlin adds is everything around them:
   and `marlin discover` finds the Marlins on your LAN. The web companion
   lets you watch sessions and answer approvals from a paired phone behind
   your own HTTPS proxy ([setup](docs/MOBILE.md)).
+- **Agents that talk to each other.** Any session's agent, whatever its model,
+  can list the other sessions, read one, message it, and wait for its answer.
 - **A real shell in every session.** `!!` turns a session into a login shell
   on the daemon's host. It survives detaching and restarts, and `Ctrl+D`
   hands the session back with the shell's output in the transcript;

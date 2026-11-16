@@ -38,6 +38,13 @@ session switcher, and `/detach` closes the client while work
 continues. `marlin --remote <host>` attaches through SSH, and `marlin discover` lists
 the marlins on your LAN over Bonjour with the `--remote` target for each.
 
+Agents can talk to each other across sessions, whatever model each runs:
+ask one to "check with the Codex session in ~/Work/api" and it can list the
+other sessions, read one's recent transcript, message it, and wait for its
+answer. Messages show in both transcripts, marked with who sent them. A chain
+of agent-to-agent messages stops after five hops, and anything you type starts
+it over.
+
 ## Git status line
 
 The TUI status line shows the Git branch beside the cwd, with `↑`/`↓` commit

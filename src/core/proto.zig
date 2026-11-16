@@ -378,6 +378,11 @@ pub const ClientMsg = union(enum) {
     /// forwarded by the bridge. The daemon replies cc_question_result after a
     /// human answers the parked question_request (arbitrarily delayed).
     cc_question: struct { sid: u64, question: []const u8, options_json: []const u8 },
+    /// One of the tools for other sessions (sessions, read_session,
+    /// message_session, wait_for_session), called by session `sid`'s agent
+    /// through the `marlin cc_approve` bridge. Replies agent_tool_result,
+    /// for wait_for_session once the other session's turn ends.
+    agent_tool: struct { request_id: u64 = 0, sid: u64, name: []const u8, args_json: []const u8 },
     /// One Claude Code permission prompt forwarded by the `marlin cc_approve`
     /// bridge subprocess of a delegated session. The daemon replies
     /// cc_approval_result — immediately when policy auto-allows the call,
@@ -709,6 +714,7 @@ pub const DaemonMsg = union(enum) {
     cc_approval_result: struct { sid: u64, decision: ApprovalAnswer, message: ?[]const u8 = null },
     /// Reply to cc_question: the user's answer, or null when dismissed.
     cc_question_result: struct { sid: u64, answer: ?[]const u8 = null },
+    agent_tool_result: struct { request_id: u64 = 0, output: []const u8, status: block.ToolStatus = .ok },
     /// Terminal reply to gc.
     gc_result: struct { bytes_reclaimed: u64, orphan_blobs: u64, expired_blobs: u64 },
     /// Reply to council_set/council_remove/council_list: the full current

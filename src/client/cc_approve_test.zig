@@ -126,3 +126,54 @@ test "bridge ask_user: listed, forwards to the picker, and reports dismissal" {
     defer gpa.free(dismissed);
     try std.testing.expect(std.mem.indexOf(u8, dismissed, "dismissed the question") != null);
 }
+
+test "bridge: the tools for other sessions are listed and forwarded, failures flagged as errors" {
+    const gpa = std.testing.allocator;
+    const Probe = struct {
+        var name_buf: [64]u8 = undefined;
+        var name_len: usize = 0;
+        var args_buf: [256]u8 = undefined;
+        var args_len: usize = 0;
+        var ok = true;
+        fn decide(_: ?*anyopaque, _: []const u8, _: []const u8) Decision {
+            return Decision.init(.denied, null);
+        }
+        fn agent(_: ?*anyopaque, alloc: std.mem.Allocator, name: []const u8, args_json: []const u8) ?cc_approve.AgentToolResult {
+            name_len = name.len;
+            @memcpy(name_buf[0..name.len], name);
+            args_len = args_json.len;
+            @memcpy(args_buf[0..args_json.len], args_json);
+            return .{ .text = alloc.dupe(u8, "Delivered to ab12cd34.") catch return null, .ok = ok };
+        }
+    };
+    const decider = Decider{ .decide = Probe.decide, .agent_tool = Probe.agent };
+
+    const listed = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    , decider).?;
+    defer gpa.free(listed);
+    for ([_][]const u8{ "\"approve\"", "\"ask_user\"", "\"sessions\"", "\"read_session\"", "\"message_session\"", "\"wait_for_session\"" }) |name|
+        try std.testing.expect(std.mem.indexOf(u8, listed, name) != null);
+    // Without a daemon behind it, the bridge offers only what it had.
+    const bare = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    , Decider{ .decide = Probe.decide }).?;
+    defer gpa.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "message_session") == null);
+
+    const reply = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"message_session","arguments":{"handle":"ab12","text":"hi"}}}
+    , decider).?;
+    defer gpa.free(reply);
+    try std.testing.expectEqualStrings("message_session", Probe.name_buf[0..Probe.name_len]);
+    try std.testing.expectEqualStrings("{\"handle\":\"ab12\",\"text\":\"hi\"}", Probe.args_buf[0..Probe.args_len]);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Delivered to ab12cd34.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"isError\":false") != null);
+
+    Probe.ok = false;
+    const failed = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_session","arguments":{"handle":"zz"}}}
+    , decider).?;
+    defer gpa.free(failed);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"isError\":true") != null);
+}

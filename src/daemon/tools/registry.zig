@@ -19,6 +19,7 @@ const search = @import("search.zig");
 const fetch_tool = @import("fetch.zig");
 const task = @import("task.zig");
 const ask_user = @import("ask_user.zig");
+const sessions_tool = @import("sessions.zig");
 const plan = @import("plan.zig");
 
 pub const Spec = struct {
@@ -65,7 +66,19 @@ pub const specs = [_]Spec{
     .{ .name = task.batch_spec_name, .description = task.batch_spec_description, .schema_json = task.batch_spec_schema, .parallel_safe = false, .mutating = false },
     // Parks on the session's question gate; executed in loop.zig like task.
     .{ .name = ask_user.spec_name, .description = ask_user.spec_description, .schema_json = ask_user.spec_schema, .parallel_safe = false, .mutating = false },
+    // Other sessions (sessions.zig): daemon-executed through RunOpts.on_agent_tool.
+    // Never behind the approval gate (the hop limit bounds them); plan mode
+    // and read-only children get only the reading half (loop.toolAllowed).
+    sessionSpec(0),
+    sessionSpec(1),
+    sessionSpec(2),
+    sessionSpec(3),
 };
+
+fn sessionSpec(comptime i: usize) Spec {
+    const s = sessions_tool.specs[i];
+    return .{ .name = s.name, .description = s.description, .schema_json = s.schema, .parallel_safe = false, .mutating = false };
+}
 
 pub fn find(name: []const u8) ?*const Spec {
     // Case-insensitive: models with Claude-flavored training call `Bash` and

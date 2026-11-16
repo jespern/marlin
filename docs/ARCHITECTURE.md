@@ -115,11 +115,26 @@ does not generate substitute reasoning when none is provided.
 Both guests also receive the `marlin` stdio MCP `ask_user` tool, backed by
 `marlin cc_approve --sid <session>`. Shared instructions direct decisions and
 clarifications to this picker instead of the unconnected native Codex question
-interfaces. Codex's per-process MCP configuration exposes only `ask_user`, passes
+interfaces. Codex's per-process MCP configuration exposes only `ask_user` and
+the tools for other sessions (below), passes
 the daemon socket environment explicitly, requires successful initialization,
 and allows a seven-day human wait, matching Claude's bridge timeout. Thread
 start and resume both receive these instructions. Selected options and free-text
 answers travel through the same daemon question state, including reconnect replay.
+
+Agents reach each other across sessions, whatever model each runs, through
+four daemon-executed tools (`daemon/tools/sessions.zig`): `sessions` lists
+the others, `read_session` returns one's recent transcript, `message_session`
+delivers a message (an idle session starts a turn on it, a busy one reads it
+between steps, marked with the sender's handle and title), and
+`wait_for_session` parks the caller until that session's turn ends and
+returns its last reply. Native turns reach them through `RunOpts.on_agent_tool`;
+guests through the same `cc_approve` bridge (`agent_tool` /
+`agent_tool_result`). They are never behind the approval gate. A chain of agent
+messages stops after five hops (a human message starts it over), a turn sends
+at most ten, two sessions may not wait on each other, and an interrupt
+releases a waiting caller. Plan mode and read-only children may read but not
+message.
 
 Nothing else. Semantic rendering of unknown tools is a TUI fact, not a
 guest-tool catalogue. Images stay durable in Marlin and are not smuggled

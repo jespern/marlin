@@ -21,6 +21,7 @@ const build_options = @import("build_options");
 
 const proto = @import("../core/proto.zig");
 const attach = @import("attach.zig");
+const sessions_tool = @import("../daemon/tools/sessions.zig");
 
 /// One verdict, with the daemon's optional policy message (copied into a
 /// fixed buffer: the wire arena dies before the reply is composed).
@@ -69,7 +70,13 @@ pub const Decider = struct {
     ctx: ?*anyopaque = null,
     decide: *const fn (ctx: ?*anyopaque, tool_name: []const u8, input_json: []const u8) Decision,
     ask_question: ?*const fn (ctx: ?*anyopaque, question: []const u8, options_json: []const u8) QuestionAnswer = null,
+    /// Tools for other sessions (daemon/tools/sessions.zig): the result text
+    /// (gpa-owned) and whether it succeeded; null when the daemon is
+    /// unreachable.
+    agent_tool: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ?AgentToolResult = null,
 };
+
+pub const AgentToolResult = struct { text: []u8, ok: bool };
 
 pub fn run(
     gpa: std.mem.Allocator,
@@ -102,6 +109,7 @@ pub fn run(
         .ctx = &daemon_decider,
         .decide = DaemonDecider.decide,
         .ask_question = DaemonDecider.askQuestion,
+        .agent_tool = DaemonDecider.agentTool,
     };
 
     var in_buf: [64 * 1024]u8 = undefined;
@@ -148,6 +156,23 @@ const DaemonDecider = struct {
         defer arena_state.deinit();
         const result = try conn.recvUntil(arena_state.allocator(), .cc_approval_result);
         return Decision.init(result.decision, result.message);
+    }
+
+    fn agentTool(ctx: ?*anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ?AgentToolResult {
+        const self: *DaemonDecider = @ptrCast(@alignCast(ctx.?));
+        return self.forwardAgentTool(gpa, name, args_json) catch null;
+    }
+
+    /// The connection lives as long as the call: wait_for_session answers
+    /// only when the other session's turn ends.
+    fn forwardAgentTool(self: *DaemonDecider, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) !AgentToolResult {
+        const conn = try attach.connect(self.gpa, self.io, self.environ, self.self_exe);
+        defer conn.deinit();
+        try conn.send(.{ .agent_tool = .{ .request_id = 1, .sid = self.sid, .name = name, .args_json = args_json } });
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const result = try conn.recvUntil(arena_state.allocator(), .agent_tool_result);
+        return .{ .text = try gpa.dupe(u8, result.output), .ok = result.status == .ok };
     }
 
     fn askQuestion(ctx: ?*anyopaque, question: []const u8, options_json: []const u8) QuestionAnswer {
@@ -199,9 +224,8 @@ pub fn handleLine(gpa: std.mem.Allocator, line: []const u8, decider: Decider) ?[
     }
     if (std.mem.eql(u8, rpc.method, "ping")) return rpcResult(gpa, id, "{}");
     if (std.mem.eql(u8, rpc.method, "tools/list")) {
-        return rpcResult(gpa, id,
-            \\{"tools":[{"name":"approve","description":"Forward one Claude Code permission prompt to the marlin approval gate.","inputSchema":{"type":"object","properties":{"tool_name":{"type":"string"},"input":{"type":"object"}},"required":["tool_name","input"]}},{"name":"ask_user","description":"Ask the user a multiple-choice question, rendered as an interactive picker in their Marlin terminal. Use this whenever you would otherwise list options in prose and ask them to reply. The turn pauses until they answer; the result is the chosen option's exact text, or the user's own typed words.","inputSchema":{"type":"object","properties":{"question":{"type":"string","description":"The complete question, ending in a question mark"},"options":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":9,"description":"Distinct, mutually exclusive choices. No 'Other' option; the user can always type their own answer instead."}},"required":["question","options"]}}]}
-        );
+        if (decider.agent_tool != null) return toolsWithSessions(gpa, id);
+        return rpcResult(gpa, id, base_tools_json);
     }
     if (std.mem.eql(u8, rpc.method, "tools/call")) {
         return handleToolCall(gpa, id, rpc.params, decider);
@@ -211,6 +235,10 @@ pub fn handleLine(gpa: std.mem.Allocator, line: []const u8, decider: Decider) ?[
 
 const default_protocol_version = "2025-06-18";
 
+const base_tools_json =
+    \\{"tools":[{"name":"approve","description":"Forward one Claude Code permission prompt to the marlin approval gate.","inputSchema":{"type":"object","properties":{"tool_name":{"type":"string"},"input":{"type":"object"}},"required":["tool_name","input"]}},{"name":"ask_user","description":"Ask the user a multiple-choice question, rendered as an interactive picker in their Marlin terminal. Use this whenever you would otherwise list options in prose and ask them to reply. The turn pauses until they answer; the result is the chosen option's exact text, or the user's own typed words.","inputSchema":{"type":"object","properties":{"question":{"type":"string","description":"The complete question, ending in a question mark"},"options":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":9,"description":"Distinct, mutually exclusive choices. No 'Other' option; the user can always type their own answer instead."}},"required":["question","options"]}}]}
+;
+
 fn handleToolCall(gpa: std.mem.Allocator, id: std.json.Value, params: ?std.json.Value, decider: Decider) ?[]u8 {
     const p = params orelse return rpcError(gpa, id, -32602, "missing params");
     if (p != .object) return rpcError(gpa, id, -32602, "params must be an object");
@@ -218,6 +246,8 @@ fn handleToolCall(gpa: std.mem.Allocator, id: std.json.Value, params: ?std.json.
     if (name != .string) return rpcError(gpa, id, -32602, "unknown tool");
     if (std.mem.eql(u8, name.string, "ask_user"))
         return handleAskUser(gpa, id, p, decider);
+    if (sessions_tool.isTool(name.string))
+        return handleAgentTool(gpa, id, name.string, p, decider);
     if (!std.mem.eql(u8, name.string, "approve"))
         return rpcError(gpa, id, -32602, "unknown tool");
 
@@ -298,6 +328,46 @@ fn handleAskUser(gpa: std.mem.Allocator, id: std.json.Value, p: std.json.Value, 
     const result = std.fmt.allocPrint(gpa,
         \\{{"content":[{{"type":"text","text":{s}}}]}}
     , .{escaped}) catch return null;
+    defer gpa.free(result);
+    return rpcResult(gpa, id, result);
+}
+
+/// tools/list with the tools for other sessions after approve and ask_user,
+/// from the same specs the native agent gets.
+fn toolsWithSessions(gpa: std.mem.Allocator, id: std.json.Value) ?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Tool = struct { name: []const u8, description: []const u8, inputSchema: std.json.Value };
+    const base = std.json.parseFromSliceLeaky(struct { tools: []Tool }, arena, base_tools_json, .{}) catch return null;
+    var tools: std.ArrayList(Tool) = .empty;
+    tools.appendSlice(arena, base.tools) catch return null;
+    for (sessions_tool.specs) |spec| tools.append(arena, .{
+        .name = spec.name,
+        .description = spec.description,
+        .inputSchema = std.json.parseFromSliceLeaky(std.json.Value, arena, spec.schema, .{}) catch return null,
+    }) catch return null;
+    const result = std.json.Stringify.valueAlloc(arena, .{ .tools = tools.items }, .{}) catch return null;
+    return rpcResult(gpa, id, result);
+}
+
+/// A tool for other sessions: forwarded to the daemon; its text is the
+/// result, an error flagged as such so the model reads it as one.
+fn handleAgentTool(gpa: std.mem.Allocator, id: std.json.Value, name: []const u8, p: std.json.Value, decider: Decider) ?[]u8 {
+    const forward = decider.agent_tool orelse return rpcError(gpa, id, -32602, "unknown tool");
+    const args_json = if (p.object.get("arguments")) |arguments|
+        std.json.Stringify.valueAlloc(gpa, arguments, .{}) catch return null
+    else
+        gpa.dupe(u8, "{}") catch return null;
+    defer gpa.free(args_json);
+    const answer = forward(decider.ctx, gpa, name, args_json);
+    defer if (answer) |a| gpa.free(a.text);
+    const text = if (answer) |a| a.text else "error: could not reach the Marlin daemon";
+    const ok = if (answer) |a| a.ok else false;
+    const result = std.json.Stringify.valueAlloc(gpa, .{
+        .content = &[_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = text }},
+        .isError = !ok,
+    }, .{}) catch return null;
     defer gpa.free(result);
     return rpcResult(gpa, id, result);
 }

@@ -78,6 +78,8 @@ const http = @import("provider/http.zig");
 const process_io = @import("process_io.zig");
 const plugins = @import("plugins.zig");
 const task_tool = @import("tools/task.zig");
+const sessions_tool = @import("tools/sessions.zig");
+const session_handle = @import("../core/session_handle.zig");
 const tools_registry = @import("tools/registry.zig");
 
 const daemon_version = build_options.version;
@@ -185,6 +187,9 @@ const Event = union(enum) {
     client_gone: struct { client_id: u64 },
     // From turn threads (loop.zig callbacks). All payloads gpa-owned.
     turn_block: struct { sid: u64, line: []u8, ends: LiveStream = .none }, // pre-encoded proto.DaemonMsg.blk
+    /// A native agent's call of a tool for other sessions; name and args
+    /// gpa-owned. The turn is parked on `future`.
+    agent_tool: struct { sid: u64, name: []u8, args_json: []u8, future: *TaskFuture },
     /// `text` (owned, may be empty) is what `stream` gained, for late
     /// subscribers; stream_status lines carry none.
     turn_delta: struct { sid: u64, line: []u8, stream: LiveStream = .none, text: []u8 = &.{} },
@@ -297,6 +302,16 @@ const TaskFuture = struct {
     }
 };
 
+/// Where an agent tool's answer goes: a native turn parked on its future, or
+/// the bridge connection a guest's call came in on.
+const AgentReply = union(enum) {
+    future: *TaskFuture,
+    client: struct { client_id: u64, request_id: u64 },
+};
+/// wait_for_session: `caller` waits for `target`'s turn to end.
+const AgentWait = struct { caller: u64, target: u64, reply: AgentReply };
+const AgentResult = struct { text: []const u8, status: block.ToolStatus = .ok, parked: bool = false };
+
 /// A Claude Code permission prompt parked on the approval bar, keyed by the
 /// same approval_id namespace the native gate uses so `approve` answers both.
 const CcPending = struct { approval_id: u64, client_id: u64 };
@@ -345,6 +360,12 @@ pub const Session = struct {
     approval_mode_live: std.atomic.Value(u8) = .init(@backingInt(approval.Mode.default)),
     /// maxInt inherits the turn’s configured default; zero disables its deadline.
     guest_max_runtime_live: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    /// Agent-to-agent hops behind the current turn: 0 when a human started
+    /// or steered it, else the hop count of the message that did. A message
+    /// this session's agent sends is one hop more (sessions.max_hops).
+    agent_hops: u8 = 0,
+    /// Messages its agent sent in the current turn (dispatcher-only).
+    agent_sent: u32 = 0,
     /// What has streamed of the text and the thinking being written now,
     /// sent whole to a client that subscribes mid-stream (dispatcher-only).
     live_text: std.ArrayList(u8) = .empty,
@@ -482,6 +503,9 @@ pub const Daemon = struct {
     /// Dispatcher-owned.
     shells: std.AutoHashMapUnmanaged(u64, *shell_host.Host) = .empty,
     next_shell_id: u64 = 1,
+    /// Agents waiting on another session's turn (wait_for_session).
+    /// Dispatcher-owned.
+    agent_waits: std.ArrayList(AgentWait) = .empty,
     /// Held while any session is running a turn (macOS: prevents idle system
     /// sleep; elsewhere a no-op). Dispatcher-owned, synced after every event.
     sleep_assertion: power.SleepAssertion = .{},
@@ -1335,6 +1359,7 @@ pub const Daemon = struct {
             },
             .client_gone => |cg| {
                 _ = self.presence.update(self.io, .terminal, cg.client_id, 0, false, nowMs(self.io));
+                self.dropClientAgentWaits(cg.client_id);
                 // A reboot request belongs to its waiting client. If that
                 // client times out or exits before the daemon can acknowledge
                 // quiescence, cancel the pending reboot instead of surprising
@@ -1395,6 +1420,11 @@ pub const Daemon = struct {
                 defer self.gpa.free(tb.line);
                 if (self.sessions.get(tb.sid)) |session| endLiveStream(self.gpa, session, tb.ends);
                 self.fanOutLine(tb.sid, tb.line);
+            },
+            .agent_tool => |at| {
+                defer self.gpa.free(at.name);
+                defer self.gpa.free(at.args_json);
+                self.agentTool(at.sid, at.name, at.args_json, .{ .future = at.future });
             },
             .turn_delta => |td| {
                 defer self.gpa.free(td.line);
@@ -2770,9 +2800,12 @@ pub const Daemon = struct {
                         return;
                     };
                     session.steer_mutex.unlock(self.io);
+                    // A human spoke: any agent message chain starts over.
+                    session.agent_hops = 0;
                     self.sendTo(client, .{ .ok = .{ .request_id = inp.request_id } });
                     return;
                 }
+                session.agent_hops = 0;
                 const attachments = self.prepareAttachments(inp.attachments) catch |err| {
                     self.sendInputError(client, inp.request_id, "attachment", attachmentErrorMessage(err));
                     return;
@@ -3512,6 +3545,7 @@ pub const Daemon = struct {
                 }
                 self.sendTo(client, .{ .ok = .{} });
             },
+            .agent_tool => |at| self.agentTool(at.sid, at.name, at.args_json, .{ .client = .{ .client_id = client.id, .request_id = at.request_id } }),
             .interrupt => |i| {
                 const result = self.cancelSessionTree(i.sid);
                 if (i.report)
@@ -3873,6 +3907,8 @@ pub const Daemon = struct {
     }
 
     fn cancelSessionTree(self: *Daemon, sid: u64) proto.InterruptResult {
+        // An interrupted agent stops waiting on other sessions.
+        self.releaseAgentWaits(sid, "stopped waiting: interrupted", .interrupted);
         const now = nowMs(self.io);
         var result = proto.InterruptResult{
             .sid = sid,
@@ -3972,6 +4008,7 @@ pub const Daemon = struct {
 
     fn destroySession(self: *Daemon, session: *Session) void {
         if (session.turn_thread) |thread| thread.join();
+        self.resolveAgentWaits(session.id);
         self.clearPendingApproval(session);
         // An answer resolved after the turn stopped waiting would leak.
         if (session.question_gate.answer) |answer| self.gpa.free(answer);
@@ -4501,6 +4538,7 @@ pub const Daemon = struct {
             .on_delta_ctx = job,
             .on_block = TurnHooks.onBlock,
             .on_task = if (job.kind == .root) TurnHooks.onTask else null,
+            .on_agent_tool = TurnHooks.onAgentTool,
             .tool_profile = if (job.kind != .root) .read_only else if (job.plan_mode) .plan else .full,
             .synthetic_input = job.synthetic_input,
             .input_display_text = job.display_text,
@@ -5031,6 +5069,25 @@ pub const Daemon = struct {
             return future.wait(self.io);
         }
 
+        /// Tools for other sessions: executed by the dispatcher, which owns
+        /// every session; this turn parks until it answers.
+        fn onAgentTool(ctx: ?*anyopaque, name: []const u8, args_json: []const u8) tools_registry.ExecOut {
+            const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
+            const self = job.daemon;
+            const owned_name = self.gpa.dupe(u8, name) catch return taskError(self.gpa, "out of memory");
+            const owned_args = self.gpa.dupe(u8, args_json) catch {
+                self.gpa.free(owned_name);
+                return taskError(self.gpa, "out of memory");
+            };
+            var future = TaskFuture{};
+            self.events.push(self.io, .{ .agent_tool = .{ .sid = job.sid, .name = owned_name, .args_json = owned_args, .future = &future } }) catch {
+                self.gpa.free(owned_name);
+                self.gpa.free(owned_args);
+                return taskError(self.gpa, "daemon is shutting down");
+            };
+            return future.wait(self.io);
+        }
+
         fn pollSteer(ctx: ?*anyopaque, gpa: std.mem.Allocator) ?block.Input {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
@@ -5313,6 +5370,8 @@ pub const Daemon = struct {
         const session = self.sessions.get(sid);
         // A turn that ended has nothing streaming (clients drop theirs too).
         if (session) |ses| if (state == .idle or state == .done or state == .err) endLiveStream(self.gpa, ses, .both);
+        // ...and agents waiting on it get its answer.
+        if (state == .idle or state == .done or state == .err) self.resolveAgentWaits(sid);
         const status_now = nowMs(self.io);
         const active_turn = state == .running or state == .awaiting_approval;
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .status = .{
@@ -5359,6 +5418,209 @@ pub const Daemon = struct {
             infos[i] = .{ .name = council.name, .models = council.models };
         }
         self.sendTo(client, .{ .council_list_result = .{ .councils = infos } });
+    }
+
+    // ---- tools for other sessions (tools/sessions.zig) ----------------
+
+    /// Run one agent tool call from session `caller_sid` and answer it,
+    /// now or (wait_for_session on a working session) when that turn ends.
+    fn agentTool(self: *Daemon, caller_sid: u64, name: []const u8, args_json: []const u8, reply: AgentReply) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const result = self.runAgentTool(arena, caller_sid, name, args_json, reply) catch |err|
+            AgentResult{ .text = std.fmt.allocPrint(arena, "error: {t}", .{err}) catch "error", .status = .err };
+        if (!result.parked) self.finishAgentTool(reply, result.text, result.status);
+    }
+
+    fn finishAgentTool(self: *Daemon, reply: AgentReply, output: []const u8, status: block.ToolStatus) void {
+        switch (reply) {
+            .future => |future| {
+                const owned = self.gpa.dupe(u8, output) catch @panic("oom");
+                if (!future.resolve(self.io, owned, status)) self.gpa.free(owned);
+            },
+            .client => |c| if (self.lookupClient(c.client_id)) |client|
+                self.sendTo(client, .{ .agent_tool_result = .{ .request_id = c.request_id, .output = output, .status = status } }),
+        }
+    }
+
+    const AgentPeer = struct { sid: u64, handle: []const u8, title: []const u8, model: []const u8, cwd: []const u8, state: proto.SessionState, parent: bool };
+
+    fn runAgentTool(self: *Daemon, arena: std.mem.Allocator, caller_sid: u64, name: []const u8, args_json: []const u8, reply: AgentReply) !AgentResult {
+        const rows = try self.store.listSessions(false);
+        defer {
+            for (rows) |row| row.deinit(self.gpa);
+            self.gpa.free(rows);
+        }
+        const infos = try self.sessionInfos(rows);
+        defer self.gpa.free(infos);
+        const known = try arena.alloc(u64, infos.len);
+        for (infos, known) |info, *id| id.* = info.sid;
+        const peers = try arena.alloc(AgentPeer, infos.len);
+        for (infos, peers) |info, *peer| {
+            var buf: session_handle.Full = undefined;
+            peer.* = .{
+                .sid = info.sid,
+                .handle = try arena.dupe(u8, session_handle.display(&buf, info.sid, known)),
+                .title = try arena.dupe(u8, if (info.title.len > 0) info.title else "(untitled)"),
+                .model = try arena.dupe(u8, info.model),
+                .cwd = try arena.dupe(u8, info.cwd),
+                .state = info.state,
+                .parent = info.parent_sid != null,
+            };
+        }
+        const me = for (peers) |peer| {
+            if (peer.sid == caller_sid) break peer;
+        } else return .{ .text = "error: this session is not in the session list", .status = .err };
+
+        if (std.mem.eql(u8, name, sessions_tool.list_name)) {
+            var out: std.ArrayList(u8) = .empty;
+            try out.print(arena, "You are {s} \"{s}\" ({s}). Other sessions:\n", .{ me.handle, me.title, me.model });
+            var others: usize = 0;
+            for (peers) |peer| {
+                if (peer.sid == caller_sid) continue;
+                others += 1;
+                try out.print(arena, "\n{s}  {s}  {s}  \"{s}\"  {s}{s}", .{
+                    peer.handle,                                  agentStateLabel(peer.state), peer.model, peer.title, peer.cwd,
+                    if (peer.parent) "  (child session)" else "",
+                });
+            }
+            if (others == 0) try out.appendSlice(arena, "\n(none)");
+            return .{ .text = out.items };
+        }
+
+        const handle_query = blk: {
+            const parsed = std.json.parseFromSliceLeaky(sessions_tool.HandleArgs, arena, args_json, .{ .ignore_unknown_fields = true }) catch
+                return .{ .text = "error: give the session's handle (see `sessions`)", .status = .err };
+            break :blk std.mem.trim(u8, parsed.handle, " \t\r\n");
+        };
+        const target_sid = session_handle.resolve(handle_query, known) catch |err| return .{ .text = switch (err) {
+            error.PrefixTooShort => "error: that handle is too short; use at least 4 characters",
+            error.InvalidHandle => "error: that is not a session handle (see `sessions`)",
+            error.NotFound => "error: no session has that handle (see `sessions`)",
+            error.Ambiguous => "error: that handle matches more than one session; use more characters",
+        }, .status = .err };
+        const target = for (peers) |peer| {
+            if (peer.sid == target_sid) break peer;
+        } else unreachable;
+        if (target_sid == caller_sid) return .{ .text = "error: that handle is this session", .status = .err };
+
+        if (std.mem.eql(u8, name, sessions_tool.read_name)) {
+            const args = std.json.parseFromSliceLeaky(sessions_tool.ReadArgs, arena, args_json, .{ .ignore_unknown_fields = true }) catch
+                sessions_tool.ReadArgs{ .handle = handle_query };
+            const last = std.math.clamp(args.last orelse sessions_tool.default_read_blocks, 1, sessions_tool.max_read_blocks);
+            var blocks: std.ArrayList(block.Block) = .empty;
+            try self.store.loadTailInto(arena, &blocks, target_sid, @intCast(last));
+            const tail = try sessions_tool.transcriptTail(arena, blocks.items);
+            return .{ .text = try std.fmt.allocPrint(arena, "{s} \"{s}\" ({s}), {s}, in {s}:\n\n{s}", .{
+                target.handle,                               target.title, target.model, agentStateLabel(target.state), target.cwd,
+                if (tail.len > 0) tail else "(nothing yet)",
+            }) };
+        }
+
+        if (std.mem.eql(u8, name, sessions_tool.message_name)) {
+            const args = std.json.parseFromSliceLeaky(sessions_tool.MessageArgs, arena, args_json, .{ .ignore_unknown_fields = true }) catch
+                return .{ .text = "error: give handle and text", .status = .err };
+            const text = std.mem.trim(u8, args.text, " \t\r\n");
+            if (text.len == 0) return .{ .text = "error: the message is empty", .status = .err };
+            const caller = (try self.getOrLoadSession(caller_sid)) orelse return error.NoSession;
+            const hops = caller.agent_hops +| 1;
+            if (hops > sessions_tool.max_hops) return .{ .text = try std.fmt.allocPrint(arena, "not sent: this would be hop {d} of a chain of agent messages, past the limit of {d}. Tell the user what you need instead.", .{ hops, sessions_tool.max_hops }), .status = .denied };
+            if (caller.agent_sent >= sessions_tool.max_messages_per_turn) return .{ .text = try std.fmt.allocPrint(arena, "not sent: this turn already sent {d} messages to other sessions, the limit.", .{caller.agent_sent}), .status = .denied };
+            const session = (try self.getOrLoadSession(target_sid)) orelse return error.NoSession;
+            if (session.pause_requested.load(.acquire) or self.pending_reboot != null)
+                return .{ .text = "not sent: that session is paused", .status = .err };
+            if (self.sessionShell(target_sid) != null)
+                return .{ .text = "not sent: that session is a shell right now", .status = .err };
+            const message = try sessions_tool.messageText(arena, me.handle, me.title, me.model, text);
+            if (session.state == .running or session.state == .awaiting_approval) {
+                const owned = try self.prepareSteerInput(session.model, message, null, &.{});
+                session.steer_mutex.lockUncancelable(self.io);
+                if (!session.steer_accepting) {
+                    session.steer_mutex.unlock(self.io);
+                    owned.deinit(self.gpa);
+                    return .{ .text = "not sent: that session is finishing its turn; try again in a moment, or wait_for_session first", .status = .err };
+                }
+                session.steer_queue.append(self.gpa, owned) catch |err| {
+                    session.steer_mutex.unlock(self.io);
+                    owned.deinit(self.gpa);
+                    return err;
+                };
+                session.steer_mutex.unlock(self.io);
+                session.agent_hops = @max(session.agent_hops, hops);
+                caller.agent_sent += 1;
+                return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It is busy and reads it between its steps. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
+            }
+            session.agent_hops = hops;
+            self.startInputTurn(session, message, &.{}, false, null) catch |err| {
+                if (err == error.SessionBusy) return .{ .text = "not sent: that session just started a turn; try again", .status = .err };
+                return err;
+            };
+            caller.agent_sent += 1;
+            return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It was idle and has started on it. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
+        }
+
+        if (std.mem.eql(u8, name, sessions_tool.wait_name)) {
+            if (target.state == .running or target.state == .awaiting_approval) {
+                for (self.agent_waits.items) |w| if (w.caller == target_sid and w.target == caller_sid)
+                    return .{ .text = try std.fmt.allocPrint(arena, "not waiting: {s} is waiting for you, so neither would ever finish. Answer it with message_session instead.", .{target.handle}), .status = .err };
+                try self.agent_waits.append(self.gpa, .{ .caller = caller_sid, .target = target_sid, .reply = reply });
+                return .{ .text = "", .parked = true };
+            }
+            return .{ .text = try self.agentWaitAnswer(arena, target_sid) };
+        }
+        return .{ .text = "error: unknown tool", .status = .err };
+    }
+
+    /// What wait_for_session returns: the session's state and last reply.
+    fn agentWaitAnswer(self: *Daemon, arena: std.mem.Allocator, sid: u64) ![]const u8 {
+        var blocks: std.ArrayList(block.Block) = .empty;
+        try self.store.loadTailInto(arena, &blocks, sid, 50);
+        const state: proto.SessionState = if (self.sessions.get(sid)) |s| s.state else .idle;
+        const last = sessions_tool.lastReply(blocks.items) orelse "(it has not replied yet)";
+        return std.fmt.allocPrint(arena, "It is {s}. Its last reply:\n\n{s}", .{ agentStateLabel(state), last });
+    }
+
+    /// `sid`'s turn ended (or it went away): answer everyone waiting on it.
+    pub fn resolveAgentWaits(self: *Daemon, sid: u64) void {
+        var i: usize = 0;
+        while (i < self.agent_waits.items.len) {
+            const w = self.agent_waits.items[i];
+            if (w.target != sid) {
+                i += 1;
+                continue;
+            }
+            _ = self.agent_waits.orderedRemove(i);
+            var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena_state.deinit();
+            const text = self.agentWaitAnswer(arena_state.allocator(), sid) catch "error: could not read that session";
+            self.finishAgentTool(w.reply, text, .ok);
+        }
+    }
+
+    /// `caller` stops waiting (interrupted): answer its waits with `text`.
+    fn releaseAgentWaits(self: *Daemon, caller: u64, text: []const u8, status: block.ToolStatus) void {
+        var i: usize = 0;
+        while (i < self.agent_waits.items.len) {
+            const w = self.agent_waits.items[i];
+            if (w.caller != caller) {
+                i += 1;
+                continue;
+            }
+            _ = self.agent_waits.orderedRemove(i);
+            self.finishAgentTool(w.reply, text, status);
+        }
+    }
+
+    /// A bridge connection went away: its waits have no one to answer.
+    fn dropClientAgentWaits(self: *Daemon, client_id: u64) void {
+        var i: usize = 0;
+        while (i < self.agent_waits.items.len) {
+            const w = self.agent_waits.items[i];
+            if (w.reply == .client and w.reply.client.client_id == client_id) {
+                _ = self.agent_waits.orderedRemove(i);
+            } else i += 1;
+        }
     }
 
     fn sendSessionList(self: *Daemon, client: *Client, include_archived: bool) !void {
@@ -6129,6 +6391,9 @@ pub const Daemon = struct {
         }
         self.shells.deinit(self.gpa);
         self.shells = .empty;
+        // Nobody is left to answer: parked native turns get told.
+        while (self.agent_waits.pop()) |w| self.finishAgentTool(w.reply, "error: Marlin is shutting down", .err);
+        self.agent_waits.deinit(self.gpa);
         if (self.web_service) |service| service.stop();
         if (self.advertiser) |a| a.stop();
         self.sleep_assertion.sync(false);
@@ -6242,6 +6507,12 @@ pub const Daemon = struct {
             .turn_delta => |value| {
                 self.gpa.free(value.line);
                 self.gpa.free(value.text);
+            },
+            .agent_tool => |value| {
+                self.gpa.free(value.name);
+                self.gpa.free(value.args_json);
+                const output = self.gpa.dupe(u8, "error: Marlin is shutting down") catch @panic("oom");
+                if (!value.future.resolve(self.io, output, .err)) self.gpa.free(output);
             },
             .turn_activity => |value| self.gpa.free(value.line),
             .turn_awaiting => |value| self.gpa.free(value.line),
@@ -6499,6 +6770,15 @@ fn cancelActiveSession(self: *Daemon, session: *Session) void {
         self.resolveCcPending(session, pending.approval_id, .denied);
     if (session.cc_question_pending) |pending|
         self.resolveCcQuestion(session, pending.approval_id, null);
+}
+
+fn agentStateLabel(state: proto.SessionState) []const u8 {
+    return switch (state) {
+        .idle, .done => "idle",
+        .running => "running",
+        .awaiting_approval => "waiting on the user",
+        .err => "stopped with an error",
+    };
 }
 
 fn taskError(gpa: std.mem.Allocator, message: []const u8) tools_registry.ExecOut {
@@ -6882,6 +7162,7 @@ test "a dying bridge client unparks its session's parked cc approval" {
     daemon.clients_mutex = .init;
     daemon.presence = .{};
     daemon.shells = .empty;
+    daemon.agent_waits = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -6929,6 +7210,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     daemon.clients_mutex = .init;
     daemon.presence = .{};
     daemon.shells = .empty;
+    daemon.agent_waits = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -6973,6 +7255,7 @@ test "a disconnected requester cannot leave a delayed reboot armed" {
     daemon.clients_mutex = .init;
     daemon.presence = .{};
     daemon.shells = .empty;
+    daemon.agent_waits = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);

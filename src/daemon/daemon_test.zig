@@ -3,6 +3,7 @@ const std = @import("std");
 const daemon_mod = @import("daemon.zig");
 const proto = @import("../core/proto.zig");
 const store = @import("store.zig");
+const block_mod = @import("../core/block.zig");
 
 test {
     std.testing.refAllDecls(daemon_mod);
@@ -180,6 +181,7 @@ test "shells outlive their opener and are shared by every viewer" {
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
     daemon.shells = .empty;
+    daemon.agent_waits = .empty;
     daemon.next_shell_id = 1;
     daemon.store = try store.Store.open(gpa, null);
     defer daemon.store.close();
@@ -386,6 +388,7 @@ const ShellRig = struct {
         d.clients_mutex = .init;
         d.sessions = .empty;
         d.shells = .empty;
+        d.agent_waits = .empty;
         d.next_shell_id = 1;
         d.store = try store.Store.open(gpa, null);
         d.cfg = .{};
@@ -423,6 +426,7 @@ const ShellRig = struct {
         }
         r.daemon.clients.deinit(gpa);
         r.daemon.sessions.deinit(gpa);
+        r.daemon.agent_waits.deinit(gpa);
         r.session.live_text.deinit(gpa);
         r.session.live_reasoning.deinit(gpa);
         gpa.free(r.session.model);
@@ -562,4 +566,115 @@ test "a client that subscribes mid-stream gets the text so far whole, not from t
     try r.daemon.handleEvent(.{ .turn_block = .{ .sid = 7, .line = note, .ends = .text } });
     try r.send(1, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
     for (try r.drain(1)) |msg| try std.testing.expect(msg != .delta);
+}
+
+test "agents reach other sessions: list, read, message (hop and turn limits), wait, release" {
+    const session_handle = @import("../core/session_handle.zig");
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const gpa = r.gpa;
+    try r.daemon.store.createSession(8, 0, "/other", "codex/gpt", .auto);
+    var other = daemon_mod.Session{ .id = 8, .model = try gpa.dupe(u8, "codex/gpt"), .cwd = try gpa.dupe(u8, "/other") };
+    defer {
+        for (other.steer_queue.items) |input| input.deinit(gpa);
+        other.steer_queue.deinit(gpa);
+        for (r.session.steer_queue.items) |input| input.deinit(gpa);
+        r.session.steer_queue.deinit(gpa);
+        other.live_text.deinit(gpa);
+        other.live_reasoning.deinit(gpa);
+        gpa.free(other.model);
+        gpa.free(other.cwd);
+    }
+    try r.daemon.sessions.put(gpa, 8, &other);
+    var buf: session_handle.Full = undefined;
+    const handle = try r.arena.allocator().dupe(u8, session_handle.display(&buf, 8, &.{ 7, 8 }));
+    const caller_handle = try r.arena.allocator().dupe(u8, session_handle.display(&buf, 7, &.{ 7, 8 }));
+
+    const Call = struct {
+        fn send(rig: *ShellRig, caller: u64, request_id: u64, name: []const u8, args: anytype) !void {
+            const args_json = try std.json.Stringify.valueAlloc(rig.gpa, args, .{});
+            defer rig.gpa.free(args_json);
+            const msg = try std.json.Stringify.valueAlloc(rig.gpa, .{ .agent_tool = .{ .request_id = request_id, .sid = caller, .name = name, .args_json = args_json } }, .{});
+            defer rig.gpa.free(msg);
+            try rig.send(1, "{s}", .{msg});
+        }
+        /// The answer to request `id` on client 1, if it has come.
+        fn result(rig: *ShellRig, id: u64) !?@FieldType(proto.DaemonMsg, "agent_tool_result") {
+            for (try rig.drain(1)) |msg| if (msg == .agent_tool_result and msg.agent_tool_result.request_id == id) return msg.agent_tool_result;
+            return null;
+        }
+    };
+
+    // The list: who I am, and the other session.
+    try Call.send(r, 7, 1, "sessions", .{});
+    const listed = (try Call.result(r, 1)).?;
+    try std.testing.expect(std.mem.indexOf(u8, listed.output, "You are ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.output, handle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.output, "codex/gpt") != null);
+
+    // Reading its transcript.
+    try r.daemon.store.appendBlock(.{ .id = 1, .session_id = 8, .turn_id = 1, .seq = 1, .ts = 0, .body = .{ .user_msg = .{ .text = "hello" } } });
+    try r.daemon.store.appendBlock(.{ .id = 2, .session_id = 8, .turn_id = 1, .seq = 2, .ts = 0, .body = .{ .assistant_msg = .{ .text = "hi there" } } });
+    try Call.send(r, 7, 2, "read_session", .{ .handle = handle });
+    const read = (try Call.result(r, 2)).?;
+    try std.testing.expect(std.mem.indexOf(u8, read.output, "user: hello\n\nagent: hi there") != null);
+    try Call.send(r, 7, 3, "read_session", .{ .handle = caller_handle });
+    try std.testing.expectEqual(block_mod.ToolStatus.err, (try Call.result(r, 3)).?.status);
+
+    // A message to a busy session waits for its next step, marked as ours.
+    other.state = .running;
+    other.steer_accepting = true;
+    try Call.send(r, 7, 4, "message_session", .{ .handle = handle, .text = "Is the lexer done?" });
+    const sent = (try Call.result(r, 4)).?;
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, sent.status);
+    try std.testing.expectEqual(@as(usize, 1), other.steer_queue.items.len);
+    const delivered = other.steer_queue.items[0].text;
+    try std.testing.expect(std.mem.startsWith(u8, delivered, "[Message from another Marlin session"));
+    try std.testing.expect(std.mem.indexOf(u8, delivered, caller_handle) != null);
+    try std.testing.expect(std.mem.endsWith(u8, delivered, "Is the lexer done?"));
+    try std.testing.expectEqual(@as(u8, 1), other.agent_hops);
+    try std.testing.expectEqual(@as(u32, 1), r.session.agent_sent);
+
+    // A chain at the hop limit, or a turn at its message limit, stops.
+    r.session.agent_hops = 5;
+    try Call.send(r, 7, 5, "message_session", .{ .handle = handle, .text = "again" });
+    try std.testing.expectEqual(block_mod.ToolStatus.denied, (try Call.result(r, 5)).?.status);
+    r.session.agent_hops = 0;
+    r.session.agent_sent = 10;
+    try Call.send(r, 7, 6, "message_session", .{ .handle = handle, .text = "again" });
+    try std.testing.expectEqual(block_mod.ToolStatus.denied, (try Call.result(r, 6)).?.status);
+    try std.testing.expectEqual(@as(usize, 1), other.steer_queue.items.len);
+
+    // Waiting on a working session parks until its turn ends...
+    try Call.send(r, 7, 7, "wait_for_session", .{ .handle = handle });
+    try std.testing.expect(try Call.result(r, 7) == null);
+    // ...and it may not wait on us in turn: neither would finish.
+    r.session.state = .running;
+    try Call.send(r, 8, 8, "wait_for_session", .{ .handle = caller_handle });
+    const cycle = (try Call.result(r, 8)).?;
+    try std.testing.expectEqual(block_mod.ToolStatus.err, cycle.status);
+    try std.testing.expect(std.mem.indexOf(u8, cycle.output, "is waiting for you") != null);
+    r.session.state = .idle;
+    try r.daemon.store.appendBlock(.{ .id = 3, .session_id = 8, .turn_id = 2, .seq = 3, .ts = 0, .body = .{ .assistant_msg = .{ .text = "Yes, the lexer is done." } } });
+    other.state = .idle;
+    r.daemon.resolveAgentWaits(8);
+    const answered = (try Call.result(r, 7)).?;
+    try std.testing.expect(std.mem.endsWith(u8, answered.output, "Its last reply:\n\nYes, the lexer is done."));
+
+    // An idle session answers at once; an interrupted waiter is let go.
+    try Call.send(r, 7, 9, "wait_for_session", .{ .handle = handle });
+    try std.testing.expect(std.mem.indexOf(u8, (try Call.result(r, 9)).?.output, "the lexer is done") != null);
+    other.state = .running;
+    try Call.send(r, 7, 10, "wait_for_session", .{ .handle = handle });
+    try std.testing.expect(try Call.result(r, 10) == null);
+    try r.send(2, "{{\"interrupt\":{{\"sid\":7}}}}", .{});
+    try std.testing.expectEqual(block_mod.ToolStatus.interrupted, (try Call.result(r, 10)).?.status);
+    try std.testing.expectEqual(@as(usize, 0), r.daemon.agent_waits.items.len);
+
+    // A human speaking starts the chain over.
+    r.session.agent_hops = 3;
+    r.session.state = .running;
+    r.session.steer_accepting = true;
+    try r.send(2, "{{\"input\":{{\"sid\":7,\"text\":\"carry on\",\"request_id\":30}}}}", .{});
+    try std.testing.expectEqual(@as(u8, 0), r.session.agent_hops);
 }

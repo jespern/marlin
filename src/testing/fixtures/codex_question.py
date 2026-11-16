@@ -22,7 +22,8 @@ args = re.search(r'args = (\[[^\]]*\])', config).group(1)
 env_vars = re.search(r'env_vars = (\[[^\]]*\])', config).group(1)
 bridge = {"command": json.loads(command), "args": json.loads(args),
           "env_vars": json.loads(env_vars)}
-for required in ('enabled = true', 'required = true', 'enabled_tools = ["ask_user"]',
+for required in ('enabled = true', 'required = true',
+                 'enabled_tools = ["ask_user", "sessions", "read_session", "message_session", "wait_for_session"]',
                  'disabled_tools = []', 'tool_timeout_sec = 604800'):
     assert required in config
 sid = bridge["args"][-1]
@@ -61,7 +62,13 @@ for line in sys.stdin:
 
             rpc(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                                   "clientInfo": {"name": "codex-fixture", "version": "1"}})
-            assert any(t["name"] == "ask_user" for t in rpc(2, "tools/list", {})["tools"])
+            listed = {t["name"] for t in rpc(2, "tools/list", {})["tools"]}
+            assert {"ask_user", "sessions", "read_session", "message_session",
+                    "wait_for_session"} <= listed, listed
+            # The tools for other sessions answer through the real daemon.
+            peers = rpc(4, "tools/call", {"name": "sessions", "arguments": {}})
+            assert not peers["isError"], peers
+            assert peers["content"][0]["text"].startswith("You are "), peers
             result = rpc(3, "tools/call", {"name": "ask_user", "arguments": {
                 "question": "Where should history live?", "options": ["Per session", "Globally"]}})
             answer = result["content"][0]["text"]

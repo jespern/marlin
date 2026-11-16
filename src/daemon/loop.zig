@@ -31,6 +31,7 @@ const sse = @import("provider/sse.zig");
 const tools_registry = @import("tools/registry.zig");
 const task_tool = @import("tools/task.zig");
 const ask_user_tool = @import("tools/ask_user.zig");
+const sessions_tool = @import("tools/sessions.zig");
 const bash_tool = @import("tools/bash.zig");
 const files_tool = @import("tools/files.zig");
 const Effort = @import("../core/effort.zig").Effort;
@@ -172,6 +173,9 @@ pub const RunOpts = struct {
     /// Daemon-owned durable-child primitive. It receives the already-persisted
     /// parent tool_call block id and parks this turn until the child completes.
     on_task: ?*const fn (ctx: ?*anyopaque, parent_block_id: u64, args_json: []const u8) tools_registry.ExecOut = null,
+    /// Daemon-owned tools for other sessions (tools/sessions.zig): list,
+    /// read, message, wait. Parks the turn while waiting.
+    on_agent_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, args_json: []const u8) tools_registry.ExecOut = null,
     /// ask_user: park here until a client answers (or an interrupt dismisses).
     question_gate: ?*approval.QuestionGate = null,
     /// Session-owned record of time parked on the user. Guest run ceilings
@@ -1642,6 +1646,13 @@ pub fn toolAllowed(opts: RunOpts, spec: *const tools_registry.Spec) bool {
     const is_task = std.mem.eql(u8, spec.name, task_tool.spec_name) or
         std.mem.eql(u8, spec.name, task_tool.batch_spec_name);
     if (is_task) return opts.on_task != null and opts.tool_profile != .read_only;
+    if (sessions_tool.isTool(spec.name)) {
+        if (opts.on_agent_tool == null) return false;
+        // Messaging changes another session: not from plan mode or a
+        // read-only child, which may still look.
+        const sends = std.mem.eql(u8, spec.name, sessions_tool.message_name);
+        return !(sends and (opts.tool_profile == .plan or opts.tool_profile == .read_only));
+    }
     // Asking needs a human on the other end: a headless or child session has
     // no question channel and the tool is withheld from the spec list.
     if (std.mem.eql(u8, spec.name, ask_user_tool.spec_name))
@@ -1802,6 +1813,10 @@ fn runTool(gpa: std.mem.Allocator, io: Io, opts: RunOpts, parent_block_id: u64, 
         };
     }
     if (std.mem.eql(u8, name, ask_user_tool.spec_name)) return runAskUser(gpa, io, opts, args_json);
+    if (sessions_tool.isTool(name)) {
+        if (opts.on_agent_tool) |cb| return cb(opts.on_delta_ctx, name, args_json);
+        return .{ .output = gpa.dupe(u8, "error: other sessions are unavailable here") catch @panic("oom"), .status = .denied };
+    }
     if (std.mem.eql(u8, name, skills.spec_name)) {
         if (opts.skill_index) |index| {
             const output = index.loadContent(gpa, args_json) catch |err|

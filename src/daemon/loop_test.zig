@@ -280,6 +280,35 @@ test "plan tool profile permits investigation and denies execution mutations" {
     try std.testing.expect(!toolAllowed(opts, tools_registry.find("plan_update").?));
 }
 
+test "other sessions: offered with the daemon hook, plan mode may look but not message" {
+    const Probe = struct {
+        fn agent(_: ?*anyopaque, _: []const u8, _: []const u8) tools_registry.ExecOut {
+            unreachable;
+        }
+    };
+    var opts = RunOpts{
+        .session_id = 1,
+        .cwd = "/tmp",
+        .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .backend = .{ .native = .openai_compatible } },
+        .cfg = config.defaults(),
+    };
+    // No daemon behind the turn: none of them.
+    try std.testing.expect(!toolAllowed(opts, tools_registry.find("sessions").?));
+    opts.on_agent_tool = Probe.agent;
+    for ([_][]const u8{ "sessions", "read_session", "message_session", "wait_for_session" }) |name| {
+        const spec = tools_registry.find(name).?;
+        try std.testing.expect(toolAllowed(opts, spec));
+        // Never behind the approval gate.
+        try std.testing.expect(!spec.mutating);
+    }
+    for ([_]loop.ToolProfile{ .plan, .read_only }) |profile| {
+        opts.tool_profile = profile;
+        try std.testing.expect(toolAllowed(opts, tools_registry.find("read_session").?));
+        try std.testing.expect(toolAllowed(opts, tools_registry.find("wait_for_session").?));
+        try std.testing.expect(!toolAllowed(opts, tools_registry.find("message_session").?));
+    }
+}
+
 test "ask_user publishes its phase before the question and returns the full option" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

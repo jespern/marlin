@@ -116,7 +116,7 @@ pub fn buildArgvWithBridge(
         try config.appendSlice(arena, "mcp_servers.marlin={ command = ");
         try appendTomlString(arena, &config, target.marlin_exe);
         try config.appendSlice(arena, try std.fmt.allocPrint(arena,
-            \\, args = ["cc_approve", "--sid", "{d}"], enabled = true, required = true, enabled_tools = ["ask_user"], disabled_tools = [], tool_timeout_sec = 604800, env_vars = ["HOME", "MARLIN_SOCKET", "XDG_RUNTIME_DIR"] }}
+            \\, args = ["cc_approve", "--sid", "{d}"], enabled = true, required = true, enabled_tools = ["ask_user", "sessions", "read_session", "message_session", "wait_for_session"], disabled_tools = [], tool_timeout_sec = 604800, env_vars = ["HOME", "MARLIN_SOCKET", "XDG_RUNTIME_DIR"] }}
         , .{target.sid}));
         try argv.appendSlice(arena, &.{ "-c", config.items });
     }
