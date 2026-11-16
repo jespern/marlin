@@ -1420,7 +1420,10 @@ pub fn reboot(
     defer argv.deinit(gpa);
     try argv.append(gpa, exec_path);
     for (follow_up) |a| try argv.append(gpa, a);
-    const err = std.process.replace(io, .{ .argv = argv.items });
+    // The follow-up gets this invocation's environment map, not the process's
+    // original one: `--remote <host>` lives only in the map (MARLIN_REMOTE),
+    // and without it `attach @sid` would ask this machine's daemon.
+    const err = std.process.replace(io, .{ .argv = argv.items, .environ_map = environ });
     try eprint(io, "marlin: exec failed: {t}\n", .{err});
     return 1;
 }

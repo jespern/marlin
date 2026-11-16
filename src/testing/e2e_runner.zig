@@ -156,6 +156,9 @@ const Check = struct {
     approval_reconnect_flow: bool = false,
     session_restore_flow: bool = false,
     codex_question_flow: bool = false,
+    /// `marlin --remote <host> reboot --then …` through a fake ssh to this
+    /// scenario's daemon: the follow-up must reach the remote daemon too.
+    remote_reboot_flow: bool = false,
     pause_flow: []const u8 = "",
     /// Fetch a stored full tool-output blob over the daemon protocol and
     /// require at least this many decoded bytes (exercises large replies).
@@ -405,7 +408,7 @@ fn runScenario(
 
     // 3. Run ordinary CLI scenarios, or the direct multi-connection protocol
     // regression that cannot be expressed as a one-shot headless command.
-    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0 or sf.check.session_restore_flow or sf.check.codex_question_flow) {
+    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0 or sf.check.session_restore_flow or sf.check.codex_question_flow or sf.check.remote_reboot_flow) {
         const started = try process_io.run(gpa, io, .{
             .argv = &.{ marlin_bin, "ls" },
             .environ_map = &env,
@@ -417,7 +420,9 @@ fn runScenario(
         defer started.deinit(gpa);
         if (started.process_group_id) |group_id| try process_groups.append(gpa, group_id);
         if (started.term != .exited or started.term.exited != 0) return error.DaemonStartFailed;
-        if (sf.check.codex_question_flow)
+        if (sf.check.remote_reboot_flow)
+            try checkRemoteRebootFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups)
+        else if (sf.check.codex_question_flow)
             try checkCodexQuestionFlow(gpa, io, &env, state_dir)
         else if (sf.check.session_restore_flow)
             try checkSessionRestoreFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups)
@@ -1261,6 +1266,69 @@ fn checkSessionRestoreFlow(gpa: std.mem.Allocator, io: Io, env: *const std.proce
     try conn.send(.{ .sub = .{ .sid = changed, .prompt_history_limit = 200 } });
     const empty = try recvTagBounded(conn, arena, "input_history_result");
     if (uintField(empty, "sid") != changed or empty.get("entries").?.array.items.len != 0) return error.HistoryLeakedAcrossSessions;
+}
+
+/// Regression: after a remote reboot the client re-execs its follow-up
+/// (`attach @sid` in the TUI), and that exec dropped MARLIN_REMOTE, which
+/// `--remote` keeps only in the in-process environment map. The follow-up
+/// then ran against this machine, so the TUI said "invalid session handle".
+/// Here the scenario daemon plays the remote host: a fake `ssh` on PATH runs
+/// the remote command with the scenario's state (and, like ssh, without the
+/// local environment's MARLIN_REMOTE), and finds marlin where the
+/// installers put it (~/.local/bin). The local side gets its own empty state.
+fn checkRemoteRebootFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, exe: []const u8, groups: *std.ArrayList(std.posix.pid_t)) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var conn = try ProtocolConn.connect(gpa, io, env);
+    try conn.send(.{ .hello = .{ .proto_version = proto.proto_version, .client_kind = "e2e-protocol" } });
+    const hello = try recvTagBounded(conn, arena, "hello_ok");
+    const old_pid = uintField(hello, "daemon_pid") orelse 0;
+    _ = try pauseCreate(conn, arena, cwd, "default");
+    conn.deinit();
+
+    const remote_home = env.get("HOME").?;
+    const installed_dir = try std.fs.path.join(arena, &.{ remote_home, ".local", "bin" });
+    try Io.Dir.cwd().createDirPath(io, installed_dir);
+    try writeExecutable(gpa, io, try std.fs.path.join(arena, &.{ installed_dir, "marlin" }), try std.fmt.allocPrint(arena, "#!/bin/sh\nexec '{s}' \"$@\"\n", .{exe}));
+    const fake_bin = try std.fs.path.join(arena, &.{ cwd, "fake-bin" });
+    try Io.Dir.cwd().createDirPath(io, fake_bin);
+    try writeExecutable(gpa, io, try std.fs.path.join(arena, &.{ fake_bin, "ssh" }), try std.fmt.allocPrint(arena,
+        \\#!/bin/sh
+        \\for command; do :; done
+        \\unset MARLIN_REMOTE
+        \\HOME='{s}' XDG_STATE_HOME='{s}' MARLIN_SOCKET='{s}' exec /bin/sh -c "$command"
+        \\
+    , .{ remote_home, env.get("XDG_STATE_HOME").?, env.get("MARLIN_SOCKET").? }));
+
+    var local = try env.clone(arena);
+    const local_home = try std.fs.path.join(arena, &.{ cwd, "local-home" });
+    try Io.Dir.cwd().createDirPath(io, local_home);
+    try local.put("HOME", local_home);
+    try local.put("XDG_STATE_HOME", local_home);
+    try local.put("MARLIN_SOCKET", try std.fs.path.join(arena, &.{ local_home, "daemon.sock" }));
+    try local.put("PATH", try std.fmt.allocPrint(arena, "{s}:/usr/bin:/bin:/usr/sbin:/sbin", .{fake_bin}));
+
+    const result = try process_io.run(gpa, io, .{
+        .argv = &.{ exe, "--remote", "fakehost", "reboot", "--then", "diagnostics", "--daemon", "--json" },
+        .environ_map = &local,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = 256 * 1024,
+        .stderr_limit = 256 * 1024,
+        .timeout_ms = scenario_timeout_ms,
+    });
+    defer result.deinit(gpa);
+    if (result.process_group_id) |group| try groups.append(gpa, group);
+    if (result.term != .exited or result.term.exited != 0) {
+        print(io, "\n  remote reboot follow-up failed\n  stdout: {s}\n  stderr: {s}\n", .{ result.stdout, result.stderr });
+        return error.RemoteRebootFollowUpFailed;
+    }
+    const identity = try std.json.parseFromSliceLeaky(std.json.Value, arena, result.stdout, .{});
+    const remote = identity.object.get("remote") orelse .null;
+    if (remote != .string or !std.mem.eql(u8, remote.string, "fakehost")) return error.FollowUpLostRemote;
+    const new_pid = uintField(identity.object, "daemon_pid") orelse 0;
+    if (new_pid == 0 or new_pid == old_pid) return error.RemoteDaemonNotRestarted;
 }
 
 fn checkCodexQuestionFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {

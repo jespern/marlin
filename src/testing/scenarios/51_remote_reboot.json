@@ -1,0 +1,7 @@
+{
+  "steps": [],
+  "check": {
+    "argv": [],
+    "remote_reboot_flow": true
+  }
+}
