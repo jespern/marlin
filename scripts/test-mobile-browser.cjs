@@ -446,6 +446,37 @@ async function main() {
       return {text,visible:!document.querySelector('#mic-btn').hidden};
     });
     assert.deepEqual(dictated,{text:'please hello from the phone',visible:true});
+    // Dictation queues: a second clip records while the first transcribes,
+    // their text lands in the order spoken, and a send while any is on its
+    // way waits for them and goes with their words.
+    const queued=await page.evaluate(async()=>{
+      const realFetch=window.fetch, realSend=window.send, sent=[];
+      const replies={A:['first',80],B:['second',10],C:['third',30]};
+      window.fetch=async(url,opts)=>{
+        if(url!=='/transcribe') return realFetch(url,opts);
+        const [text,ms]=replies[await opts.body.text()];
+        await new Promise(r=>setTimeout(r,ms));
+        return new Response(JSON.stringify({text}),{status:200});
+      };
+      window.send=async raw=>{sent.push(JSON.parse(raw)); return {ok:{}};};
+      const input=document.querySelector('#input');
+      try {
+        input.value=''; growInput();
+        countDictation(sid,1); countDictation(sid,1);
+        const one=finishDictation(sid,new Blob(['A'])), two=finishDictation(sid,new Blob(['B']));
+        await Promise.all([one,two]);
+        const ordered=input.value;
+        input.value='please'; growInput();
+        countDictation(sid,1);
+        const sendEnabledWhileWaiting=!document.querySelector('#send-btn').disabled;
+        await submitComposer();
+        const before=sent.filter(m=>m.input).length;
+        await finishDictation(sid,new Blob(['C']));
+        await new Promise(r=>setTimeout(r,20));
+        return {ordered,sendEnabledWhileWaiting,before,after:(sent.find(m=>m.input)||{input:{}}).input.text};
+      } finally { window.fetch=realFetch; window.send=realSend; input.value=''; growInput(); }
+    });
+    assert.deepEqual(queued,{ordered:'first second',sendEnabledWhileWaiting:true,before:0,after:'please third'});
     // Not set up: the phone names the machine to set up, and the --remote route.
     const cfgPath=path.join(config,'config.toml'), cfgText=fs.readFileSync(cfgPath,'utf8');
     fs.writeFileSync(cfgPath,cfgText.replace(/\[voice\][\s\S]*$/,''));
@@ -662,6 +693,8 @@ async function main() {
       assert.equal(await phonePage.locator('#status .state').textContent(),'shell');
       assert.equal(await phonePage.locator('#status .model').isHidden(),true);
       assert.equal(await phonePage.locator('#composer .prompt').textContent(),'$');
+      // Commands are not prose: no capitals, corrections, or suggestions.
+      assert.deepEqual(await phonePage.evaluate(()=>{const i=document.querySelector('#input'); return [i.getAttribute('autocapitalize'),i.getAttribute('autocorrect'),i.getAttribute('autocomplete'),i.spellcheck];}),['off','off','off',false]);
       await phonePage.waitForFunction(()=>document.querySelector('#sessions .mark.shell'));
       // Typing into a shell keeps the keyboard up for the next line.
       const shellKeyboard=await phonePage.evaluate(async()=>{
@@ -699,6 +732,8 @@ async function main() {
       await phonePage.locator('#keybar [data-key="^D"]').dispatchEvent('pointerdown');
       await phonePage.waitForFunction(()=>!document.querySelector('#main').classList.contains('shell'));
       await phonePage.waitForFunction(()=>[...document.querySelectorAll('.block.shell')].some(n=>n.textContent.includes('live-7')));
+      // A finished shell is history: faint, as the TUI draws it.
+      assert.equal(await phonePage.evaluate(()=>getComputedStyle([...document.querySelectorAll('.block.shell pre')].pop()).opacity),'0.5');
       assert.equal(await phonePage.locator('#composer .prompt').textContent(),'❯');
       assert.deepEqual(phoneErrors,[]);
     } finally { await phone.close(); }

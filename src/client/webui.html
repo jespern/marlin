@@ -122,7 +122,8 @@
   #status .state.shell { color: var(--blue); }
   .block.shell .head .cmd { color: var(--blue); }
   .block.shell .head .status { color: var(--dim); }
-  .block.shell pre { opacity: .8; white-space: pre-wrap; margin-top: 4px; }
+  /* Faint, as the TUI draws a finished shell (SGR dim): it is history. */
+  .block.shell pre { opacity: .5; white-space: pre-wrap; margin-top: 4px; }
   .block.shell .earlier { color: var(--dim); }
   #history-more.show { display: block; }
   .block { margin: 0 0 10px; }
@@ -1688,6 +1689,14 @@ $('#input').addEventListener('keydown', async e => {
 async function submitComposer() {
   const input = $('#input');
   if (shellView) { shellSubmit(); return; }
+  // Dictation still on its way: send once its text has landed.
+  if (sid != null && pendingDictation(sid)) {
+    sendWhenTranscribed.add(String(sid));
+    if (recorder) stopDictation();
+    notice('sends once the dictation is transcribed');
+    if (!hasKeyboard()) input.blur();
+    return;
+  }
   const text = input.value.trim();
   if ((!text && !pendingAttachments.length) || !sid) return;
   input.value = '';
@@ -1712,7 +1721,7 @@ function growInput() {
   const input = $('#input');
   input.style.height = 'auto';
   input.style.height = input.scrollHeight + 'px';
-  $('#send-btn').disabled = !input.value.trim() && !pendingAttachments.length;
+  $('#send-btn').disabled = !input.value.trim() && !pendingAttachments.length && !(sid != null && pendingDictation(sid));
 }
 $('#input').addEventListener('input', growInput);
 // pointerdown, not click: the tap must not move focus on its own; the send
@@ -1796,12 +1805,32 @@ const draftAttachmentCount = id => String(id) === String(sid) ? pendingAttachmen
 // Tap to record, tap again to stop; the text lands at the cursor for review,
 // never sent on its own (as in the TUI).
 let recorder = null, recordTimer = null;
+// Clips transcribe one after another, in the order recorded, while the
+// next one records. A send while some are still on their way waits for
+// them (and stops a recording), then goes with their text.
+let transcribing = Promise.resolve();
+const dictating = new Map(); // String(sid) -> clips recording or transcribing
+const sendWhenTranscribed = new Set(); // String(sid)
+const pendingDictation = id => (dictating.get(String(id)) || 0) > 0;
+function countDictation(id, delta) {
+  const key = String(id), n = (dictating.get(key) || 0) + delta;
+  if (n > 0) dictating.set(key, n); else dictating.delete(key);
+  const busy = pendingDictation(sid);
+  $('#mic-btn').classList.toggle('busy', busy && !recorder);
+  $('#input').placeholder = shellView ? 'command…' : busy && !recorder ? 'transcribing…' : 'message marlin…';
+  growInput();
+  if (n <= 0 && sendWhenTranscribed.delete(key)) {
+    if (key === String(sid) && !shellView) submitComposer();
+    else notice('dictation finished in another session: its draft is waiting there');
+  }
+}
 const canRecord = () => !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
 async function startDictation() {
   const targetSid = sid;
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({audio: true}); }
   catch { notice('microphone access was denied'); return; }
+  countDictation(targetSid, 1);
   const mime = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported(t));
   const chunks = [];
   recorder = new MediaRecorder(stream, mime ? {mimeType: mime} : undefined);
@@ -1821,24 +1850,24 @@ function stopDictation() {
   $('#mic-btn').classList.remove('rec');
   if (recorder && recorder.state !== 'inactive') recorder.stop();
 }
-async function finishDictation(targetSid, blob) {
-  if (!blob.size) return;
-  const button = $('#mic-btn'), input = $('#input'), placeholder = input.placeholder;
-  button.classList.add('busy');
-  button.disabled = true;
-  input.placeholder = 'transcribing…';
-  try {
-    const r = await fetch('/transcribe', {method: 'POST', headers: {'Content-Type': blob.type || 'application/octet-stream'}, body: blob});
-    const reply = await r.json().catch(() => ({}));
-    if (!r.ok) throw Error((reply.err && reply.err.msg) || 'transcription failed');
-    if (reply.text) addDraftText(targetSid, reply.text);
-    else notice('no speech heard');
-  } catch (err) { notice(err.message); }
-  finally {
-    button.classList.remove('busy');
-    button.disabled = false;
-    input.placeholder = placeholder;
-  }
+function finishDictation(targetSid, blob) {
+  // Counted from the moment recording began; done once its text landed.
+  if (!blob.size) { countDictation(targetSid, -1); return Promise.resolve(); }
+  countDictation(targetSid, 0);
+  transcribing = transcribing.then(async () => {
+    try {
+      const r = await fetch('/transcribe', {method: 'POST', headers: {'Content-Type': blob.type || 'application/octet-stream'}, body: blob});
+      const reply = await r.json().catch(() => ({}));
+      if (!r.ok) throw Error((reply.err && reply.err.msg) || 'transcription failed');
+      if (reply.text) addDraftText(targetSid, reply.text);
+      else notice('no speech heard');
+    } catch (err) {
+      // A queued send must not go out without the words it waited for.
+      if (sendWhenTranscribed.delete(String(targetSid))) notice(err.message + ': not sent');
+      else notice(err.message);
+    } finally { countDictation(targetSid, -1); }
+  });
+  return transcribing;
 }
 function insertAtCursor(text) {
   const input = $('#input'), value = input.value;
@@ -2003,7 +2032,11 @@ function setShellComposer(on) {
   input.placeholder = on ? 'command…' : 'message marlin…';
   input.setAttribute('autocapitalize', on ? 'off' : 'sentences');
   input.setAttribute('autocorrect', on ? 'off' : 'on');
+  input.setAttribute('autocomplete', on ? 'off' : 'on');
   input.spellcheck = !on;
+  // The keyboard reads these when the field gains focus: one already up
+  // keeps capitalizing and correcting until it is focused again.
+  if (document.activeElement === input) { input.blur(); input.focus(); }
   $('#attach-btn').hidden = on;
   $('#composer .prompt').textContent = on ? '$' : '❯';
 }
