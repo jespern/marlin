@@ -2003,8 +2003,17 @@ function shellConnect(target) {
   ws.onmessage = e => {
     if (ws !== shellWs) return;
     const m = JSON.parse(e.data);
-    if (m.frame) drawFrame(m.frame);
-    else if (m.opened) shellView.shellId = m.opened.shell_id;
+    if (m.frame) {
+      // Opening the shell here is using it (tmux's "latest"): it takes this
+      // screen's size now, not at the first keystroke, or a shell left
+      // running (htop) keeps whatever size it had, keyboard up and all.
+      if (!shellView.claimed) {
+        shellView.claimed = shellView.typed = true;
+        const g = shellView.grid;
+        if (m.frame.cols !== g.cols || m.frame.rows !== g.rows) ws.send(JSON.stringify({resize: g}));
+      }
+      drawFrame(m.frame);
+    } else if (m.opened) shellView.shellId = m.opened.shell_id;
     else if (m.exited) closeShellView();
     else if (m.err) { notice(m.err.msg); closeShellView(); }
   };

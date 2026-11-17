@@ -672,6 +672,18 @@ async function main() {
       await phonePage.waitForFunction(b=>shellView.frame && shellView.frame.rows<b && shellView.frame.rows===termGrid().rows,before);
       await phonePage.evaluate(()=>{ document.body.style.height=''; });
       await phonePage.waitForFunction(b=>shellView.frame && shellView.frame.rows===b && termGrid().rows===b,before);
+      // Reopened on a shell left running at another size (the keyboard was
+      // up, or another screen typed last): it takes this screen's size at
+      // once, not at the first keystroke.
+      const reopened=await phonePage.evaluate(async()=>{
+        const id=shellView.shellId, ws=shellWs;
+        ws.send(JSON.stringify({resize:{cols:30,rows:9}}));
+        await new Promise(r=>{const t=setInterval(()=>{if(shellView.frame.rows===9){clearInterval(t);r();}},20);});
+        closeShellView();
+        shellConnect({shell_id:id});
+        return termGrid().rows;
+      });
+      await phonePage.waitForFunction(rows=>shellView && shellView.frame && shellView.frame.rows===rows && shellView.frame.cols===termGrid().cols,reopened);
       await phonePage.locator('#keybar [data-key="^D"]').dispatchEvent('pointerdown');
       await phonePage.waitForFunction(()=>!document.querySelector('#main').classList.contains('shell'));
       await phonePage.waitForFunction(()=>[...document.querySelectorAll('.block.shell')].some(n=>n.textContent.includes('live-7')));
