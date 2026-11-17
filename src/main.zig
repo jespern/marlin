@@ -150,6 +150,7 @@ test {
     _ = @import("client/web_test.zig");
     _ = @import("core/voice_transcribe_test.zig");
     _ = @import("daemon/voice_host_test.zig");
+    _ = @import("client/shell_intent_test.zig");
     _ = @import("client/web_shell_test.zig");
     _ = @import("daemon/tools/sessions_test.zig");
     _ = @import("mobile/presence_test.zig");

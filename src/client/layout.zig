@@ -6,6 +6,7 @@ const vaxis = @import("vaxis");
 const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const render = @import("render.zig");
+const shell_intent = @import("shell_intent.zig");
 const markdown = @import("markdown.zig");
 const shell_styled = @import("shell_styled.zig");
 const Palette = render.Palette;
@@ -995,7 +996,8 @@ pub fn appendToolCallLine(
     // Keep the machinery subdued. Bash commands receive semantic shell
     // roles; for file tools the emphasized value is a path.
     const hi = try completedToolDisplayArg(alloc, rb, completed_result, cwd);
-    const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{toolDisplayName(rb.label)});
+    const name = toolDisplayNameFor(alloc, rb.label, rb.text);
+    const head = try std.fmt.allocPrint(alloc, "  ⚙ {s} ", .{name});
     const note_text: []const u8 = if (note) |n|
         try std.fmt.allocPrint(alloc, " · {s}", .{n})
     else
@@ -1003,7 +1005,7 @@ pub fn appendToolCallLine(
     if (hi) |h| {
         const available = w -| (displayWidth(head) + displayWidth(note_text) + 2);
         const hi_capped = h[0..hardCellBreak(h, 0, available)];
-        const is_bash = std.ascii.eqlIgnoreCase(rb.label, "bash");
+        const is_bash = std.mem.eql(u8, name, "Bash");
         try lines.append(alloc, .{
             .text = head,
             .style = Palette.tool,
@@ -1659,12 +1661,13 @@ pub fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) !W
             try std.fmt.allocPrint(arena, " (+{d} queued)", .{cur.queued})
         else
             "";
+        const tool_name = toolDisplayNameFor(arena, cur.rb.label, cur.rb.text);
         const tool_prefix = try std.fmt.allocPrint(arena, "{s} · {s}{s}", .{
-            elapsed, toolDisplayName(cur.rb.label), sep,
+            elapsed, tool_name, sep,
         });
         detail = .{
             .text = try std.fmt.allocPrint(arena, "{s}{s} · {d}s{s}", .{ tool_prefix, arg, call_s, queued }),
-            .shell_command = if (std.ascii.eqlIgnoreCase(cur.rb.label, "bash") and arg.len > 0) arg else null,
+            .shell_command = if (std.mem.eql(u8, tool_name, "Bash") and arg.len > 0) arg else null,
             .shell_offset = tool_prefix.len,
         };
     }
@@ -1868,7 +1871,7 @@ pub fn layoutBlockRange(
                     const hi = (try toolDisplayArgDecoded(alloc, call.label, call.text, transcript.cwd)) orelse "";
                     const capped = hi[0..@min(hi.len, 60)];
                     hint = try std.fmt.allocPrint(alloc, " · {s} {s}{s}", .{
-                        toolDisplayName(call.label),
+                        toolDisplayNameFor(alloc, call.label, call.text),
                         capped,
                         if (capped.len < hi.len) "…" else "",
                     });
@@ -2383,6 +2386,25 @@ fn isFileTool(tool_name: []const u8) bool {
         std.ascii.eqlIgnoreCase(tool_name, "edit");
 }
 
+/// A Bash call that only reads or changes files (shell_intent.zig): its
+/// files and what it did to them. Null for everything else.
+pub fn shellFileIntent(arena: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ?shell_intent.Intent {
+    if (!std.ascii.eqlIgnoreCase(tool_name, "bash")) return null;
+    const parsed = std.json.parseFromSliceLeaky(struct { command: ?[]const u8 = null }, arena, args_json, .{ .ignore_unknown_fields = true }) catch return null;
+    return shell_intent.classify(arena, shellDisplayCommand(parsed.command orelse return null)) catch null;
+}
+
+/// The tool's name as the transcript shows it, seeing through Bash calls
+/// that are file reads or edits ("Edit", not "Bash").
+pub fn toolDisplayNameFor(arena: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) []const u8 {
+    if (shellFileIntent(arena, tool_name, args_json)) |intent| return switch (intent.kind) {
+        .read => "Read",
+        .write => "Write",
+        .edit => "Edit",
+    };
+    return toolDisplayName(tool_name);
+}
+
 pub fn toolDisplayName(tool_name: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(tool_name, "sleep")) return "Sleep";
     if (isReadTool(tool_name)) return "Read";
@@ -2460,6 +2482,15 @@ pub fn toolDisplayArgDecoded(
         error.OutOfMemory => return err,
         else => return malformedDisplayArg(tool_name, args_json, cwd),
     };
+    // A Bash call that only reads or edits files shows its files.
+    if (shellFileIntent(arena, tool_name, args_json)) |intent| {
+        var paths: std.ArrayList(u8) = .empty;
+        for (intent.paths) |path| {
+            if (paths.items.len > 0) try paths.appendSlice(arena, ", ");
+            try paths.appendSlice(arena, if (std.fs.path.isAbsolute(path)) shortenDisplayPath(path, cwd) else path);
+        }
+        return paths.items;
+    }
 
     if (isFileEditTool(tool_name)) {
         if (parsed.changes) |changes| {

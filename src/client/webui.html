@@ -787,6 +787,178 @@ function addToToolGroup(t, node, kind) {
   return true;
 }
 
+// Port of shell_intent.zig (keep the two in step): a Bash call that only
+// reads or changes files ({kind: 'read'|'write'|'edit', paths}), shown as
+// that instead of a script. Anything else in the command keeps it Bash.
+function shellFileIntent(command) {
+  const steps = shellSteps(command);
+  if (!steps) return null;
+  const paths = [];
+  let reads = false, writes = false, any = false, dir = null;
+  for (const step of steps) {
+    const w = step.words;
+    if (!w.length) { if (step.redirect || step.heredoc != null) return null; continue; }
+    if (w[0] === 'cd') {
+      if (w.length !== 2 || step.redirect || step.heredoc != null) return null;
+      dir = w[1];
+      continue;
+    }
+    const found = shellStepIntent(step);
+    if (!found) return null;
+    any = true;
+    if (found.kind !== 'write') reads = true;
+    if (found.kind !== 'read') writes = true;
+    for (const raw of found.paths) {
+      const path = dir && dir.startsWith('/') && raw && !raw.startsWith('/') && !raw.startsWith('~')
+        ? dir.replace(/\/+$/, '') + '/' + raw : raw;
+      if (!paths.includes(path)) paths.push(path);
+    }
+  }
+  if (!any || !paths.length) return null;
+  return {kind: !writes ? 'read' : !reads ? 'write' : 'edit', paths};
+}
+function shellStepIntent(step) {
+  const w = step.words, name = w[0].split('/').pop();
+  const digits = s => /^\d+$/.test(s);
+  if (name === 'cat') {
+    if (step.redirect) {
+      if (w.length !== 1 || step.heredoc == null) return null;
+      return {kind: step.redirect.append ? 'edit' : 'write', paths: [step.redirect.path]};
+    }
+    if (step.heredoc != null || w.length < 2 || w.slice(1).some(a => !a || a[0] === '-')) return null;
+    return {kind: 'read', paths: w.slice(1)};
+  }
+  if (step.redirect) return null;
+  if (name === 'head' || name === 'tail') {
+    if (step.heredoc != null) return null;
+    const files = [];
+    for (let i = 1; i < w.length; i++) {
+      const a = w[i];
+      if (a === '-n' || a === '-c') { i++; if (i >= w.length || !digits(w[i].replace(/^[+-]+/, ''))) return null; }
+      else if (a.length > 1 && a[0] === '-') { if (!digits(a.slice(1))) return null; }
+      else files.push(a);
+    }
+    return files.length ? {kind: 'read', paths: files} : null;
+  }
+  if (name === 'sed') {
+    if (step.heredoc != null) return null;
+    let inPlace = false, quiet = false, script = null;
+    const files = [];
+    for (let i = 1; i < w.length; i++) {
+      const a = w[i];
+      if (a === '-n') quiet = true;
+      else if (a.startsWith('-i')) { inPlace = true; if (a.length === 2 && i + 1 < w.length && (w[i + 1] === '' || w[i + 1][0] === '.')) i++; }
+      else if (a === '-E' || a === '-r') continue;
+      else if (a === '-e') { i++; if (i >= w.length) return null; script = w[i]; }
+      else if (a.length > 1 && a[0] === '-') return null;
+      else if (script === null) script = a;
+      else files.push(a);
+    }
+    if (!files.length || script === null) return null;
+    if (inPlace) return {kind: 'edit', paths: files};
+    if (!quiet || !/^[\d,$p; ]*$/.test(script)) return null;
+    return {kind: 'read', paths: files};
+  }
+  if (name.startsWith('python')) return pythonFileIntent(step);
+  return null;
+}
+function pythonFileIntent(step) {
+  const body = step.heredoc;
+  if (body == null || step.words.slice(1).some(a => a !== '-')) return null;
+  for (const risky of ['subprocess', 'os.system', 'socket', 'urllib', 'requests', 'rmtree', 'remove(', 'unlink(', 'rename(', 'replace(p', 'exec(', 'eval(', 'shutil', 'popen', 'chmod'])
+    if (body.includes(risky)) return null;
+  const writes = body.includes('.write(') || body.includes('write_text(');
+  const reads = body.includes('.read()') || body.includes('read_text(') || body.includes('readlines(');
+  if (!writes && !reads) return null;
+  const looksLikePath = t => {
+    if (!t || t.length > 300 || t[0] === '-' || /[ \n\t\\{%]/.test(t)) return false;
+    const base = t.split('/').pop(), dot = base.lastIndexOf('.');
+    return dot > 0 && dot + 1 < base.length && base.length - dot <= 9;
+  };
+  const paths = [];
+  let i = 0;
+  while (i < body.length) {
+    const c = body[i];
+    if (c === '#') { const nl = body.indexOf('\n', i); i = nl < 0 ? body.length : nl; continue; }
+    if (c !== "'" && c !== '"') { i++; continue; }
+    if (body[i + 1] === c && body[i + 2] === c) {
+      const end = body.indexOf(c + c + c, i + 3);
+      if (end < 0) return null;
+      i = end + 3;
+      continue;
+    }
+    const end = body.indexOf(c, i + 1);
+    if (end < 0) return null;
+    const literal = body.slice(i + 1, end), before = body.slice(0, i).replace(/[ \t]+$/, '');
+    const assigned = before.endsWith('=') && !before.endsWith('==');
+    const firstArg = before.endsWith('(') && body[i - 1] !== 'f';
+    if ((assigned || firstArg) && looksLikePath(literal) && !paths.includes(literal)) paths.push(literal);
+    i = end + 1;
+  }
+  if (!paths.length) return null;
+  return {kind: writes && reads ? 'edit' : writes ? 'write' : 'read', paths};
+}
+// Simple commands of a shell line: words without quotes, a stdout
+// redirection, a heredoc body. Null for what it does not understand
+// (pipes, $(…), backgrounding, other redirections).
+function shellSteps(src) {
+  const steps = [];
+  let at = 0;
+  const blanks = () => { while (at < src.length && (src[at] === ' ' || src[at] === '\t' || (src[at] === '\\' && src[at + 1] === '\n'))) at += src[at] === '\\' ? 2 : 1; };
+  const word = () => {
+    let out = '', any = false;
+    while (at < src.length) {
+      const c = src[at];
+      if (' \t\n;|&<>()'.includes(c)) break;
+      if (c === '$' || c === '`') return null;
+      if (c === "'") { const end = src.indexOf("'", at + 1); if (end < 0) return null; out += src.slice(at + 1, end); at = end + 1; }
+      else if (c === '"') { const end = src.indexOf('"', at + 1); if (end < 0) return null; const inner = src.slice(at + 1, end); if (/[$`\\]/.test(inner)) return null; out += inner; at = end + 1; }
+      else if (c === '\\') { if (at + 1 >= src.length) return null; out += src[at + 1]; at += 2; }
+      else { out += c; at++; }
+      any = true;
+    }
+    return any ? out : null;
+  };
+  while (at < src.length) {
+    const step = {words: [], redirect: null, heredoc: null};
+    let delimiter = null;
+    for (;;) {
+      blanks();
+      if (at >= src.length) break;
+      const c = src[at], rest = src.slice(at);
+      if (c === '\n' || c === ';') { at++; break; }
+      if (rest.startsWith('&&')) { at += 2; break; }
+      if ('|&`()'.includes(c)) return null;
+      if (rest.startsWith('2>&1')) { at += 4; continue; }
+      if (rest.startsWith('2>')) { at += 2; blanks(); if (word() !== '/dev/null') return null; continue; }
+      if (rest.startsWith('<<')) { at += 2; if (src[at] === '-') at++; blanks(); delimiter = word(); if (delimiter === null) return null; continue; }
+      if (c === '<') return null;
+      if (c === '>') {
+        const append = rest.startsWith('>>');
+        at += append ? 2 : 1;
+        blanks();
+        const target = word();
+        if (target === null || step.redirect) return null;
+        step.redirect = {path: target, append};
+        continue;
+      }
+      const w = word();
+      if (w === null) return null;
+      step.words.push(w);
+    }
+    if (delimiter !== null) {
+      if (at === 0 || src[at - 1] !== '\n') return null;
+      let consumed = 0, found = false;
+      for (const line of src.slice(at).split('\n')) {
+        if (line.trim() === delimiter) { step.heredoc = src.slice(at, at + consumed); at += consumed + line.length + 1; found = true; break; }
+        consumed += line.length + 1;
+      }
+      if (!found) return null;
+    }
+    steps.push(step);
+  }
+  return steps;
+}
 // Port of layout.zig toolDisplayName / decodedDisplayArg / shortenDisplayPath:
 // each tool shows the one argument worth scanning, never raw JSON.
 const lower = n => (n || '').toLowerCase();
@@ -890,9 +1062,19 @@ function addBlock(b, target = $('#transcript'), live = true) {
   } else if (kind === 'tool_call') {
     node = el('details', 'block tool');
     const s = el('summary', null, '⚙ ');
-    s.appendChild(el('span', 'name', toolDisplayName(v.name)));
-    const arg = toolDisplayArg(v.name, v.args_json, cur ? cur.cwd : '');
-    if (arg) {
+    // A Bash call that only reads or edits files shows as that, with its
+    // files; the command stays inside, a tap away.
+    const command = lower(v.name) === 'bash' ? toolDisplayArg(v.name, v.args_json, '') : null;
+    const intent = command ? shellFileIntent(shellDisplayCommand(command.value)) : null;
+    const cwd = cur ? cur.cwd : '';
+    s.appendChild(el('span', 'name', intent ? {read: 'Read', write: 'Write', edit: 'Edit'}[intent.kind] : toolDisplayName(v.name)));
+    const arg = intent
+      ? {value: intent.paths.map(p => p.startsWith('/') ? shortenDisplayPath(p, cwd) : p).join(', '), isPath: true}
+      : toolDisplayArg(v.name, v.args_json, cwd);
+    if (arg && intent) {
+      s.appendChild(document.createTextNode(' '));
+      s.appendChild(el('span', 'prev', arg.value.slice(0, 400)));
+    } else if (arg) {
       s.appendChild(document.createTextNode(' '));
       const preview = arg.value.slice(0, 400);
       if (lower(v.name) === 'bash') {
@@ -902,6 +1084,11 @@ function addBlock(b, target = $('#transcript'), live = true) {
       } else s.appendChild(el('span', 'prev', preview));
     }
     node.appendChild(s);
+    if (intent) {
+      const script = el('pre', 'sh');
+      script.innerHTML = shellHtml(shellDisplayCommand(command.value));
+      node.appendChild(script);
+    }
     node.dataset.call = v.call_id;
   } else if (kind === 'tool_result') {
     const pre = el('pre');

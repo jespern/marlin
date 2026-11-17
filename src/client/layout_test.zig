@@ -1835,3 +1835,26 @@ test "ask_user renders as the question, its options, and the answer on every bac
     try std.testing.expect(std.mem.indexOf(u8, failed_text, "  ↳ no answer\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed_text, "null") == null);
 }
+
+// Case: Claude edits files with `python3 - <<'EOF'` scripts and reads them
+// with `sed -n`; the transcript showed those as Bash. They show as what they
+// do, with session-relative paths; a step that is not a file read or change
+// keeps the call Bash.
+test "Bash calls that only read or edit files show as Read, Write, or Edit" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cwd = "/Users/j/Work/marlin";
+    const cases = [_]struct { args: []const u8, name: []const u8, arg: []const u8 }{
+        .{ .args = "{\"command\":\"/bin/zsh -lc \\\"sed -n '1,20p' src/main.zig\\\"\"}", .name = "Read", .arg = "src/main.zig" },
+        .{ .args = "{\"command\":\"cd /Users/j/Work/marlin && python3 - <<'EOF'\\np='src/web.zig'\\ns=open(p).read()\\nopen(p,'w').write(s)\\nEOF\"}", .name = "Edit", .arg = "src/web.zig" },
+        .{ .args = "{\"command\":\"cat > notes.md <<'EOF'\\nhi\\nEOF\"}", .name = "Write", .arg = "notes.md" },
+        .{ .args = "{\"command\":\"sed -n 1,5p src/main.zig && zig build test\"}", .name = "Bash", .arg = "sed -n 1,5p src/main.zig && zig build test" },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.name, layout.toolDisplayNameFor(arena, "Bash", case.args));
+        try std.testing.expectEqualStrings(case.arg, (try toolDisplayArgDecoded(arena, "Bash", case.args, cwd)).?);
+    }
+    // Other tools are untouched.
+    try std.testing.expectEqualStrings("Grep", layout.toolDisplayNameFor(arena, "grep", "{\"pattern\":\"x\"}"));
+}

@@ -177,6 +177,38 @@ async function main() {
       return [...document.querySelectorAll('#transcript .tool summary')].slice(-2).map(s=>s.textContent);
     },root);
     assert.deepEqual(readRow,['⚙ Read src/web.zig','⚙ TodoWrite']);
+    // A Bash call that only reads or edits files shows as that, with the
+    // command a tap away; anything else in it keeps it Bash (shell_intent.zig).
+    const intents=await page.evaluate(cwd=>{
+      const rows=[];
+      for (const [i,command] of [
+        "/bin/zsh -lc \"sed -n '1,20p' src/main.zig\"",
+        "cd "+cwd+" && python3 - <<'EOF'\ndef rep(p, old, new):\n    s=open(p).read(); open(p,'w').write(s.replace(old,new))\nrep('src/web.zig', '''a('x.zig')''', '''b''')\nEOF",
+        "cat > notes.md <<'EOF'\nhello\nEOF",
+        "sed -n 1,5p src/main.zig && zig build test",
+      ].entries()) {
+        addBlock({ts:Date.now(),body:{tool_call:{name:'Bash',call_id:'sh'+i,args_json:JSON.stringify({command})}}});
+        const row=[...document.querySelectorAll('#transcript .tool')].pop();
+        rows.push([row.querySelector('summary').textContent,!!row.querySelector('pre.sh')]);
+      }
+      const cases={
+        'sed -n 1,80p src/a.zig; sed -n 1,10p src/b.zig':['read','src/a.zig','src/b.zig'],
+        "sed -i '' 's/a/b/' src/core/config.zig":['edit','src/core/config.zig'],
+        'head -n 40 README.md\ntail -20 docs/USING.md 2>/dev/null':['read','README.md','docs/USING.md'],
+        "python3 - <<'EOF'\np='src/client/attach.zig'\ns=open(p).read()\nprint(s.count('x'))\nEOF":['read','src/client/attach.zig'],
+        'sed -n 1,80p src/x.zig | head':null, 'rg -n x src':null, 'tail -f daemon.log':null, 'cat $(ls *.zig)':null,
+        "python3 - <<'EOF'\nimport subprocess\np='a.zig'\nopen(p).read()\nEOF":null,
+      };
+      const verdicts=Object.entries(cases).map(([c,want])=>{
+        const got=shellFileIntent(c);
+        return JSON.stringify(got&&[got.kind,...got.paths])===JSON.stringify(want)||c;
+      });
+      return {rows,verdicts};
+    },root);
+    assert.deepEqual(intents.rows,[
+      ['⚙ Read src/main.zig',true],['⚙ Edit src/web.zig',true],['⚙ Write notes.md',true],
+      ["⚙ Bash sed -n 1,5p src/main.zig && zig build test",false]]);
+    assert.deepEqual(intents.verdicts,intents.verdicts.map(()=>true));
     // Interactive cards behave like the TUI's: questions, approvals, Plan offers.
     const cards=await page.evaluate(async()=>{
       const sent=[], realSend=window.send;
