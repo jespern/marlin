@@ -604,6 +604,18 @@ async function main() {
       assert.equal(shellKeyboard,true);
       await phonePage.waitForFunction(()=>document.querySelector('#term').textContent.includes('live-7'));
       assert.equal(await phonePage.locator('#term .cur').count(),1);
+      // The keyboard going down (iOS: only the visual viewport changes, the
+      // page body follows it) gives the shell the taller grid at once.
+      const before=await phonePage.evaluate(()=>shellView.frame.rows);
+      // After fitViewport's pending frame (the focus above queued one), or it
+      // puts the height back first.
+      await phonePage.evaluate(async()=>{
+        await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+        document.body.style.height=Math.round(window.innerHeight*0.55)+'px';
+      });
+      await phonePage.waitForFunction(b=>shellView.frame && shellView.frame.rows<b && shellView.frame.rows===termGrid().rows,before);
+      await phonePage.evaluate(()=>{ document.body.style.height=''; });
+      await phonePage.waitForFunction(b=>shellView.frame && shellView.frame.rows===b && termGrid().rows===b,before);
       await phonePage.locator('#keybar [data-key="^D"]').dispatchEvent('pointerdown');
       await phonePage.waitForFunction(()=>!document.querySelector('#main').classList.contains('shell'));
       await phonePage.waitForFunction(()=>[...document.querySelectorAll('.block.shell')].some(n=>n.textContent.includes('live-7')));

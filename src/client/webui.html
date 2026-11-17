@@ -1803,15 +1803,18 @@ document.addEventListener('keydown', e => {
   e.stopImmediatePropagation();
   if (liveKeys()) shellSend(seq); else shellKey(seq);
 }, true);
-// Turned or resized: if this phone drives the shell, it takes the new size.
-window.addEventListener('resize', () => {
+// The terminal area changed size: turned, a resized window, or the phone
+// keyboard going up or down (iOS resizes only the visual viewport, which
+// fitViewport follows, so no window resize fires). If this phone drives the
+// shell, the shell takes the new size, or htop keeps the keyboard-up rows.
+new ResizeObserver(() => {
   if (!shellView) return;
   const grid = termGrid();
   if (grid.cols === shellView.grid.cols && grid.rows === shellView.grid.rows) return;
   shellView.grid = grid;
   if (shellView.typed && shellWs && shellWs.readyState === 1) shellWs.send(JSON.stringify({resize: grid}));
   if (shellView.frame) drawFrame(shellView.frame);
-});
+}).observe($('#term'));
 async function submitInput(text) {
   const targetSid = sid;
   // The class, not the text: while running the text carries the spinner.
