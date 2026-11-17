@@ -294,9 +294,18 @@ async function main() {
         out.enterSent=sent.length;
         input.value='line one\nline two'; input.dispatchEvent(new Event('input'));
         out.sendEnabled=!document.querySelector('#send-btn').disabled;
+        input.focus();
         document.querySelector('#send-btn').dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,cancelable:true}));
         await new Promise(r=>setTimeout(r,0));
         out.sentText=(sent.find(m=>m.input)||{input:{}}).input.text;
+        // Sent from a phone: the keyboard goes down to show the reply.
+        out.keyboardDown=document.activeElement!==input;
+        // A real keyboard keeps typing where it was.
+        window.matchMedia=q=>q==='(pointer: fine)'?{matches:true}:q==='(pointer: coarse)'?{matches:false}:real(q);
+        input.focus(); input.value='from a keyboard';
+        input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+        await new Promise(r=>setTimeout(r,0));
+        out.keyboardKept=document.activeElement===input;
         window.matchMedia=real;
         // Queued: sent while running, marked at once (the spinner hid this).
         setState('running');
@@ -337,6 +346,7 @@ async function main() {
     assert.equal(comp.enterSent,0);
     assert.equal(comp.sendEnabled,true);
     assert.equal(comp.sentText,'line one\nline two');
+    assert.deepEqual([comp.keyboardDown,comp.keyboardKept],[true,true]);
     assert.equal(comp.queued,true);
     assert.deepEqual([comp.kept,comp.jump,comp.bottom],[true,true,true]);
     // Following the bottom survives what moves it without the reader: the
@@ -585,7 +595,13 @@ async function main() {
       assert.equal(await phonePage.locator('#status .model').isHidden(),true);
       assert.equal(await phonePage.locator('#composer .prompt').textContent(),'$');
       await phonePage.waitForFunction(()=>document.querySelector('#sessions .mark.shell'));
-      await phonePage.evaluate(()=>{ document.querySelector('#input').value='echo live-$((3+4))'; submitComposer(); });
+      // Typing into a shell keeps the keyboard up for the next line.
+      const shellKeyboard=await phonePage.evaluate(async()=>{
+        const input=document.querySelector('#input'); input.focus(); input.value='echo live-$((3+4))';
+        await submitComposer();
+        return document.activeElement===input;
+      });
+      assert.equal(shellKeyboard,true);
       await phonePage.waitForFunction(()=>document.querySelector('#term').textContent.includes('live-7'));
       assert.equal(await phonePage.locator('#term .cur').count(),1);
       await phonePage.locator('#keybar [data-key="^D"]').dispatchEvent('pointerdown');

@@ -1362,6 +1362,9 @@ async function submitComposer() {
   keepDraftText(sid, '');
   // `!!` makes this session a shell; `!! <command>` runs just that.
   if (/^!!(\s|$)/.test(text)) { shellConnect({sid, command: text.slice(2).trim()}); return; }
+  // Sent from a phone: the keyboard goes down so the reply can be read,
+  // as the keyboard's ✓ did after every message. A shell keeps it up.
+  if (!hasKeyboard()) input.blur();
   if (text.startsWith('/')) {
     hideSlashMenu();
     slashCommand(text).catch(() => notice('command failed'));
@@ -1379,7 +1382,8 @@ function growInput() {
   $('#send-btn').disabled = !input.value.trim() && !pendingAttachments.length;
 }
 $('#input').addEventListener('input', growInput);
-// pointerdown, not click: keep the field focused so the keyboard stays up.
+// pointerdown, not click: the tap must not move focus on its own; the send
+// decides (submitComposer closes the keyboard after a message).
 $('#send-btn').addEventListener('pointerdown', e => { e.preventDefault(); submitComposer(); });
 $('#jump').onclick = () => scrollBottom(true);
 
