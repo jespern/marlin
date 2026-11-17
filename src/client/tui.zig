@@ -49,7 +49,7 @@ const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const session_file = @import("session_file.zig");
 const initial_session = @import("initial_session.zig");
-const voice = @import("voice.zig");
+const voice = @import("../core/voice.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const daybreak = @import("daybreak.zig");
@@ -164,6 +164,9 @@ pub const VoiceEvent = union(enum) {
     transcript: []u8,
     /// Static human-readable failure.
     stt_failed: []const u8,
+    /// A recording for the daemon's machine to transcribe (`--remote`);
+    /// gpa-owned audio, handler frees.
+    clip: []u8,
     download_done,
     download_failed: []const u8,
 };
@@ -2241,6 +2244,10 @@ pub const App = struct {
                 if (view == &self.view and self.history_search.active) self.refreshHistorySearch(true);
             },
             .draft => |d| self.restoreDraft(d.sid, d.text),
+            .voice_status_result => |status| self.applyRemoteVoiceStatus(status),
+            .voice_setup_progress => |p| self.remoteVoiceProgress(p.done, p.total),
+            .voice_setup_result => |r| self.remoteVoiceSetupDone(r.ok, r.msg),
+            .voice_transcript => |t| self.remoteVoiceTranscript(t.request_id, t.text, t.err),
             .search_result => |result| self.replaceSearchHits(result),
             .diagnostics_result => |report| {
                 if (self.liveView(report.sid) == null) return;
@@ -3150,12 +3157,17 @@ pub const App = struct {
     pub fn voiceStatusNotice(self: *App) void {
         const rt = &self.voice_rt;
         if (!rt.enabled or rt.setup == null) {
-            self.setNotice("voice is not set up — /voice setup walks through it (local, offline)", .{});
+            if (self.remote_transport)
+                self.setNotice("voice is not set up on {s} — /voice setup walks through it", .{self.remoteVoiceHost()})
+            else
+                self.setNotice("voice is not set up — /voice setup walks through it (local, offline)", .{});
             return;
         }
         const st = rt.setup.?;
-        self.setNotice("voice · {s} · {s} · ctrl+space{s} · /voice [setup|mode ptt|toggle|off]", .{
+        self.setNotice("voice · {s}{s}{s} · {s} · ctrl+space{s} · /voice [setup|mode ptt|toggle|off]", .{
             st.engine.configName(),
+            if (self.remote_transport) @as([]const u8, " on ") else "",
+            if (self.remote_transport) self.remoteVoiceHost() else "",
             if (st.mode == .ptt) "push-to-talk" else "toggle",
             if (st.mode == .ptt and !rt.kitty_release) " (terminal lacks key-release: acting as toggle)" else "",
         });
@@ -3172,7 +3184,105 @@ pub const App = struct {
         self.voice_rt.ffmpeg = ffmpeg;
         self.voice_rt.wiz_engine = null;
         self.voice_rt.wiz_mode = null;
+        // Over --remote the engines are the daemon's machine's: ask first.
+        if (self.remote_transport) return self.requestRemoteVoice(.setup);
         self.openPicker(.voice_engine);
+    }
+
+    /// Over `--remote` the daemon's machine has the session, the phone, and
+    /// the engine: it sets voice up and transcribes (daemon/voice_host.zig).
+    /// This machine only records.
+    pub fn remoteVoiceHost(self: *const App) []const u8 {
+        return if (self.voice_rt.remote_host.items.len > 0) self.voice_rt.remote_host.items else "the daemon's machine";
+    }
+
+    /// Ask the daemon's machine what voice it has; `pending` says what the
+    /// answer is for (silent: just learn whether dictation works).
+    pub fn requestRemoteVoice(self: *App, pending: @FieldType(VoiceRt, "remote_pending")) void {
+        if (!self.conn.remote_voice) {
+            if (pending != .silent) self.setNotice("voice: the daemon on the other machine predates remote voice — !rb it, then /voice setup", .{});
+            return;
+        }
+        self.voice_rt.remote_pending = pending;
+        self.conn.send(.{ .voice_status = .{} }) catch self.setNotice("voice: could not reach the daemon", .{});
+    }
+
+    pub fn applyRemoteVoiceStatus(self: *App, status: proto.VoiceStatus) void {
+        const rt = &self.voice_rt;
+        rt.remote_host.clearRetainingCapacity();
+        rt.remote_host.appendSlice(self.gpa, status.host) catch {};
+        rt.remote_ffmpeg = status.ffmpeg;
+        rt.remote_available = .initFill(false);
+        for (status.engines) |info| if (voice.Engine.parse(info.name)) |engine| rt.remote_available.set(engine, info.available);
+        rt.freeSetup(self.gpa);
+        rt.enabled = false;
+        if (status.enabled) if (voice.Engine.parse(status.engine)) |engine| {
+            const model = self.gpa.dupe(u8, "") catch return;
+            const bin = self.gpa.dupe(u8, "") catch return;
+            rt.setup = .{ .engine = engine, .mode = if (std.mem.eql(u8, status.mode, "toggle")) .toggle else .ptt, .model_path = model, .stt_bin = bin };
+            rt.enabled = true;
+            if (rt.ffmpeg == null) if (self.environ) |environ| {
+                rt.ffmpeg = voice.findBinary(self.gpa, self.io, environ, &.{"ffmpeg"}) catch null;
+            };
+        };
+        const pending = rt.remote_pending;
+        rt.remote_pending = .silent;
+        switch (pending) {
+            .silent => {},
+            .announce => self.voiceStatusNotice(),
+            .setup => self.openPicker(.voice_engine),
+            .ready => self.setNotice("voice ready on {s} · {s} ctrl+space to dictate into the composer", .{
+                self.remoteVoiceHost(),
+                if (rt.setup != null and rt.setup.?.mode == .ptt and rt.kitty_release) @as([]const u8, "hold") else "press",
+            }),
+        }
+    }
+
+    pub fn remoteVoiceProgress(self: *App, done: u64, total: u64) void {
+        var bar: [24]u8 = undefined;
+        const filled = if (total > 0) @min(bar.len, done * bar.len / total) else 0;
+        for (0..bar.len) |i| bar[i] = if (i < filled) '#' else '-';
+        if (total > 0)
+            self.setNotice("voice model on {s}  [{s}] {d}% · {d}/{d} MB · esc cancels", .{ self.remoteVoiceHost(), bar[0..], done * 100 / total, done >> 20, total >> 20 })
+        else
+            self.setNotice("voice model on {s}  [{s}] {d} MB · esc cancels", .{ self.remoteVoiceHost(), bar[0..], done >> 20 });
+    }
+
+    pub fn remoteVoiceSetupDone(self: *App, ok: bool, msg: []const u8) void {
+        self.voice_rt.remote_setup_running = false;
+        self.voice_rt.wiz_engine = null;
+        self.voice_rt.wiz_mode = null;
+        if (ok) self.requestRemoteVoice(.ready) else self.setNotice("voice: {s}", .{msg});
+    }
+
+    /// The daemon's machine transcribed the clip sent for `request_id`.
+    pub fn remoteVoiceTranscript(self: *App, request_id: u64, text: []const u8, err: []const u8) void {
+        const rt = &self.voice_rt;
+        if (rt.phase != .transcribing or request_id != rt.remote_request) return;
+        rt.phase = .idle;
+        self.syncAnimationTicker();
+        if (err.len > 0) return self.setNotice("voice: {s}", .{err});
+        self.insertVoiceTranscript(text);
+    }
+
+    /// A transcript goes to the draft of the session dictation started in,
+    /// also when another tab is focused by the time it lands.
+    pub fn insertVoiceTranscript(self: *App, text: []const u8) void {
+        if (text.len == 0) {
+            self.setNotice("voice: heard nothing", .{});
+            return;
+        }
+        const target = self.voice_rt.target_sid;
+        if (target != 0 and target != self.view.sid) if (self.saved_views.get(target)) |view| {
+            if (!view.editor.isEmpty()) view.editor.insertSlice(" ");
+            view.editor.insertSlice(text);
+            self.setNotice("voice: {d} chars added to the draft of the tab you dictated in", .{text.len});
+            return;
+        };
+        if (!self.view.editor.isEmpty()) self.view.editor.insertSlice(" ");
+        self.view.editor.insertSlice(text);
+        self.mode = .insert;
+        self.setNotice("voice: {d} chars — review, then enter", .{text.len});
     }
 
     pub fn voiceWizardEngineChosen(self: *App, item: []const u8) void {
@@ -3182,6 +3292,16 @@ pub const App = struct {
             if (std.mem.eql(u8, label, item)) chosen = voice_engines[i];
         }
         const engine = chosen orelse return;
+        if (self.remote_transport) {
+            const host = self.remoteVoiceHost();
+            if (!self.voice_rt.remote_ffmpeg)
+                return self.setNotice("voice needs ffmpeg on {s} to read the clips — `brew install ffmpeg` there, then /voice setup again", .{host});
+            if (!self.voice_rt.remote_available.get(engine))
+                return self.setNotice("voice: {s} needs `{s}` on {s} — install it there, then /voice setup again", .{ engine.configName(), engine.installHint(), host });
+            self.voice_rt.wiz_engine = engine;
+            self.openPicker(.voice_mode);
+            return;
+        }
         const bin = (voice.findBinary(self.gpa, self.io, environ, engine.binaryCandidates()) catch null) orelse {
             self.setNotice("voice: {s} needs `{s}` — install it, then /voice setup again", .{
                 engine.configName(), engine.installHint(),
@@ -3200,6 +3320,13 @@ pub const App = struct {
         rt.wiz_mode = if (std.mem.startsWith(u8, item, "toggle")) .toggle else .ptt;
         if (rt.wiz_mode == .ptt and !rt.kitty_release)
             self.setNotice("this terminal doesn't report key releases — ctrl+space will act as a toggle here", .{});
+        if (self.remote_transport) {
+            self.conn.send(.{ .voice_setup = .{ .engine = engine.configName(), .mode = if (rt.wiz_mode == .toggle) "toggle" else "ptt" } }) catch
+                return self.setNotice("voice: could not reach the daemon", .{});
+            rt.remote_setup_running = true;
+            self.setNotice("voice: setting up {s} on {s}…", .{ engine.configName(), self.remoteVoiceHost() });
+            return;
+        }
 
         if (engine.modelUrl() == null) {
             self.finishVoiceSetup("");
@@ -3334,6 +3461,10 @@ pub const App = struct {
 
     pub fn voiceCancelDownload(self: *App) void {
         const rt = &self.voice_rt;
+        if (rt.remote_setup_running) {
+            self.conn.send(.{ .voice_setup_cancel = .{} }) catch {};
+            return;
+        }
         const progress = rt.download orelse return;
         progress.cancel.store(true, .release);
         // The worker notices and posts download_failed(Cancelled); the .part
@@ -3345,7 +3476,11 @@ pub const App = struct {
         if (rt.phase != .idle or !rt.enabled) return;
         const setup = rt.setup orelse return;
         _ = setup;
-        const ffmpeg = rt.ffmpeg orelse return;
+        const ffmpeg = rt.ffmpeg orelse {
+            self.setNotice("voice needs ffmpeg on this machine for the microphone — `brew install ffmpeg`", .{});
+            return;
+        };
+        rt.target_sid = self.view.sid;
         var nonce: [4]u8 = undefined;
         self.io.random(&nonce);
         const tmp = (self.environ orelse return).get("TMPDIR") orelse "/tmp";
@@ -3419,6 +3554,7 @@ pub const App = struct {
             .recorder = rt.recorder,
             .wav_path = rt.wav_path.?,
             .setup = setup,
+            .remote = self.remote_transport,
         };
         rt.recorder = null;
         rt.wav_path = null;
@@ -3457,14 +3593,26 @@ pub const App = struct {
                 defer self.gpa.free(text);
                 self.voice_rt.phase = .idle;
                 self.syncAnimationTicker();
-                if (text.len == 0) {
-                    self.setNotice("voice: heard nothing", .{});
+                self.insertVoiceTranscript(text);
+            },
+            .clip => |audio| {
+                defer self.gpa.free(audio);
+                const rt = &self.voice_rt;
+                const encoder = std.base64.standard.Encoder;
+                const encoded = self.gpa.alloc(u8, encoder.calcSize(audio.len)) catch {
+                    rt.phase = .idle;
+                    self.syncAnimationTicker();
                     return;
-                }
-                if (!self.view.editor.isEmpty()) self.view.editor.insertSlice(" ");
-                self.view.editor.insertSlice(text);
-                self.mode = .insert;
-                self.setNotice("voice: {d} chars — review, then enter", .{text.len});
+                };
+                defer self.gpa.free(encoded);
+                rt.remote_request +%= 1;
+                self.conn.send(.{ .voice_transcribe = .{ .request_id = rt.remote_request, .audio_base64 = encoder.encode(encoded, audio) } }) catch |err| {
+                    rt.phase = .idle;
+                    self.syncAnimationTicker();
+                    self.setNotice("voice: {s}", .{if (err == error.ProtocolLineTooLong) @as([]const u8, "that recording is too long to send") else "could not send the recording to the daemon"});
+                    return;
+                };
+                self.setNotice("… transcribing on {s}", .{self.remoteVoiceHost()});
             },
             .stt_failed => |name| {
                 self.voice_rt.phase = .idle;
@@ -5524,6 +5672,11 @@ pub fn dispatchEvent(
         },
         .reconnected => |maybe| {
             shell_tab.connectionLost(app);
+            // A clip or setup on the old connection will never be answered.
+            if (app.remote_transport) {
+                if (app.voice_rt.phase == .transcribing) app.voice_rt.phase = .idle;
+                app.voice_rt.remote_setup_running = false;
+            }
             app.cwd_completion_key = null;
             app.cwd_completion_waiting_key = null;
             verdicts.reconnect = maybe;
@@ -5844,7 +5997,9 @@ pub fn run(
                 if (std.fmt.parseUnsigned(usize, value, 10)) |budget| effects.setWireBudget(budget) else |_| {}
             }
         }
-        app.initVoiceFromConfig();
+        // Over --remote, dictation is the daemon's machine's (silently ask
+        // whether it is set up); locally, this machine's [voice].
+        if (app.remote_transport) app.requestRemoteVoice(.silent) else app.initVoiceFromConfig();
         try vx.setBracketedPaste(writer, true);
         // Mouse: wheel scrolls the session view; native cell-precise selection
         // copies through OSC52. Shift+drag remains the terminal's escape hatch.
@@ -6203,6 +6358,9 @@ const VoiceJob = struct {
     recorder: ?std.process.Child,
     wav_path: []u8,
     setup: voice.Setup,
+    /// `--remote`: hand the recording back for the daemon's machine to
+    /// transcribe instead of transcribing here.
+    remote: bool = false,
 
     fn run(job: *VoiceJob) void {
         defer job.gpa.destroy(job);
@@ -6215,6 +6373,13 @@ const VoiceJob = struct {
 
     fn transcribe(job: *VoiceJob) !void {
         if (job.recorder) |*recorder| _ = recorder.wait(job.io) catch {};
+        if (job.remote) {
+            // 16 kHz mono wav is 32 KB a second: minutes fit the protocol.
+            const audio = try Io.Dir.cwd().readFileAlloc(job.io, job.wav_path, job.gpa, .limited(proto.max_line_bytes / 2));
+            Io.Dir.cwd().deleteFile(job.io, job.wav_path) catch {};
+            job.loop.postEvent(.{ .voice = .{ .clip = audio } }) catch job.gpa.free(audio);
+            return;
+        }
         const out_dir = std.fs.path.dirname(job.wav_path) orelse ".";
         var arena_state = std.heap.ArenaAllocator.init(job.gpa);
         defer arena_state.deinit();
@@ -6302,6 +6467,19 @@ const VoiceRt = struct {
     prewarm_at_ms: i64 = 0,
     /// When the live capture began — drives the status bar's elapsed counter.
     record_started_ms: i64 = 0,
+    /// The session dictation started in: its transcript goes to that draft,
+    /// even if another tab is focused when it lands.
+    target_sid: u64 = 0,
+    // -- `--remote`: the daemon's machine sets up and transcribes --
+    remote_host: std.ArrayList(u8) = .empty,
+    remote_available: std.EnumArray(voice.Engine, bool) = .initFill(false),
+    remote_ffmpeg: bool = false,
+    /// What the next voice_status_result answers.
+    remote_pending: enum { silent, announce, setup, ready } = .silent,
+    /// A setup (model download) runs on the daemon's machine.
+    remote_setup_running: bool = false,
+    /// The clip being transcribed there.
+    remote_request: u64 = 0,
 
     fn freeSetup(self: *VoiceRt, gpa: std.mem.Allocator) void {
         if (self.setup) |st| {
@@ -6313,6 +6491,7 @@ const VoiceRt = struct {
 
     fn deinit(self: *VoiceRt, gpa: std.mem.Allocator) void {
         self.freeSetup(gpa);
+        self.remote_host.deinit(gpa);
         if (self.ffmpeg) |f| gpa.free(f);
         if (self.wav_path) |w| gpa.free(w);
         if (self.wiz_stt_bin) |b| gpa.free(b);

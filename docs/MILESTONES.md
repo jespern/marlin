@@ -77,7 +77,7 @@ marlin/
 │   │   ├── editor.zig         # composer editing + vim ops
 │   │   ├── top.zig            # `marlin top` live hierarchy view
 │   │   ├── media.zig          # image paste/path attachments
-│   │   ├── voice.zig          # optional local push-to-talk dictation
+│   │   ├── voice.zig          # (core/) push-to-talk dictation catalog, download, STT
 │   │   ├── self_build.zig / remote_rebuild.zig  # `!rb` source rebuilds
 │   │   ├── cc_approve.zig     # Claude Code permission bridge (MCP stdio)
 │   │   ├── web.zig            # `marlin web`: localhost HTTP/SSE bridge, tailnet-fronted

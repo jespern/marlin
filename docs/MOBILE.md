@@ -132,6 +132,9 @@ Tap to record, tap again to stop; the text lands at the cursor for review and
 is never sent on its own. Nothing leaves the machine: the clip is a temp file,
 deleted after transcription. Until `/voice setup` has run on the daemon's
 machine, the button says so. iOS keyboard dictation keeps working as well.
+A TUI attached with `--remote` sets up that same machine: its `/voice setup`
+installs on the daemon's machine, and its dictation records locally and is
+transcribed there, so one setup serves the phone and every remote terminal.
 
 ## Shells
 

@@ -1,13 +1,14 @@
-//! Phone dictation: a clip recorded in the web companion, transcribed on the
-//! daemon's machine by the same local engine as the TUI's /voice (whisper.cpp
-//! or parakeet, chosen by `/voice setup`). The browser's container (m4a on
-//! iOS, webm elsewhere) goes through ffmpeg to the 16 kHz mono wav every
-//! engine wants. Audio lives only in temp files, deleted before returning;
+//! Dictation recorded elsewhere, transcribed on the daemon's machine by the
+//! engine `/voice setup` chose there (whisper.cpp or parakeet): clips from
+//! the phone (web companion) and from TUIs attached over `--remote`
+//! (daemon/voice_host.zig). Whatever the container (m4a on iOS, webm in
+//! browsers, wav from a TUI), ffmpeg makes the 16 kHz mono wav every engine
+//! wants. Audio lives only in temp files, deleted before returning;
 //! the transcript goes back to the composer for review, never auto-sent.
 
 const std = @import("std");
 const Io = std.Io;
-const config = @import("../core/config.zig");
+const config = @import("config.zig");
 const voice = @import("voice.zig");
 
 pub const Error = error{ VoiceNotSetUp, ConvertFailed, TranscriberFailed };

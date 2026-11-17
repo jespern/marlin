@@ -328,6 +328,18 @@ pub const ClientMsg = union(enum) {
     /// Switch a session's approval mode: "default" = boundary-crossing tools
     /// ask; "auto" = full access, nothing asks (/permissions full).
     session_set_approvals: struct { sid: u64, approvals: []const u8 },
+    /// Voice for a client on another machine (`--remote`): the daemon's
+    /// machine holds the engine, model, and [voice] config, and transcribes;
+    /// the client only records. Each gets a voice_status_result.
+    voice_status: struct {},
+    /// Set up dictation on the daemon's machine: check the engine, download
+    /// its model (voice_setup_progress), write [voice]; voice_setup_result.
+    voice_setup: struct { engine: []const u8, mode: []const u8 },
+    voice_setup_cancel: struct {},
+    /// Turn voice on/off or change the mode, keeping the setup.
+    voice_set: struct { enabled: ?bool = null, mode: ?[]const u8 = null },
+    /// One recorded clip (any format ffmpeg reads) → voice_transcript.
+    voice_transcribe: struct { request_id: u64, audio_base64: []const u8 },
     /// What the user has typed but not sent in this session's composer, so
     /// it outlives the client (detach, reboot); "" once sent or erased. No
     /// reply. A later `sub` returns it as `draft`.
@@ -549,6 +561,27 @@ pub const ShellInfo = struct {
     viewers: u32 = 0,
 };
 
+/// Dictation on the daemon's machine: what is set up and what could be.
+pub const VoiceStatus = struct {
+    /// Set up and on: clients can send voice_transcribe.
+    enabled: bool = false,
+    /// The configured engine ("" when never set up) and its mode.
+    engine: []const u8 = "",
+    mode: []const u8 = "ptt",
+    /// The daemon's machine, for messages ("install it on victory").
+    host: []const u8 = "",
+    /// ffmpeg is on the daemon's PATH (it converts every clip).
+    ffmpeg: bool = false,
+    engines: []const VoiceEngine = &.{},
+};
+
+pub const VoiceEngine = struct {
+    name: []const u8,
+    /// Its binary is on the daemon's PATH.
+    available: bool,
+    install_hint: []const u8,
+};
+
 pub const ApprovalAnswer = enum { granted, denied };
 
 /// Daemon → client.
@@ -593,11 +626,20 @@ pub const DaemonMsg = union(enum) {
         daemon_started_at_ms: i64 = 0,
         /// Experimental: the daemon serves shell_open (the `!!` shell tab).
         remote_shell: bool = false,
+        /// The daemon serves voice_* (dictation set up and transcribed on its
+        /// machine, for clients attached from another one).
+        voice: bool = false,
     },
     session_runtime_result: struct { sid: u64, max_runtime_ms: u64, uses_default: bool },
     session_created: struct { sid: u64, request_id: u64 = 0 },
     session_list_result: struct { sessions: []const SessionInfo },
     input_history_result: struct { entries: []const InputHistoryEntry, sid: u64 = 0 },
+    voice_status_result: VoiceStatus,
+    voice_setup_progress: struct { done: u64, total: u64 },
+    /// `msg` says what to do when `ok` is false (install a binary, …).
+    voice_setup_result: struct { ok: bool, msg: []const u8 = "" },
+    /// `text` is empty when nothing was heard; `err` set on failure.
+    voice_transcript: struct { request_id: u64, text: []const u8 = "", err: []const u8 = "" },
     /// The session's stored composer draft, after `sub`'s status; only sent
     /// when there is one.
     draft: struct { sid: u64, text: []const u8 },

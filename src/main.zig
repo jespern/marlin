@@ -146,9 +146,10 @@ test {
     _ = @import("client/cc_approve_test.zig");
     _ = @import("client/remote_rebuild_test.zig");
     _ = @import("client/self_build_test.zig");
-    _ = @import("client/voice_test.zig");
+    _ = @import("core/voice_test.zig");
     _ = @import("client/web_test.zig");
-    _ = @import("client/web_transcribe_test.zig");
+    _ = @import("core/voice_transcribe_test.zig");
+    _ = @import("daemon/voice_host_test.zig");
     _ = @import("client/web_shell_test.zig");
     _ = @import("daemon/tools/sessions_test.zig");
     _ = @import("mobile/presence_test.zig");

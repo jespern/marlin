@@ -50,6 +50,8 @@ const mobile_presence = @import("../mobile/presence.zig");
 const block = @import("../core/block.zig");
 const ids = @import("../core/ids.zig");
 const config = @import("../core/config.zig");
+const voice = @import("../core/voice.zig");
+const voice_host = @import("voice_host.zig");
 const credentials = @import("../core/credentials.zig");
 const queue = @import("../core/queue.zig");
 const store_mod = @import("store.zig");
@@ -220,12 +222,77 @@ const Event = union(enum) {
     /// Parent turn thread → dispatcher. All strings are gpa-owned; `future`
     /// points into the parked parent turn's stack until resolve().
     child_start: ChildStart,
+    /// A worker's message for one client, encoded (gpa-owned), such as a
+    /// voice model download's progress.
+    client_line: struct { client_id: u64, line: []u8 },
+    /// A voice worker finished: its thread is joined and `line` (gpa-owned,
+    /// encoded) goes to the client that asked.
+    voice_done: struct { client_id: u64, line: []u8, setup: bool },
     /// Shell reader thread → dispatcher. `bytes` gpa-owned.
     shell_output: struct { shell_id: u64, bytes: []u8 },
     shell_exited: struct { shell_id: u64, status: shell_pty.Status },
     /// The shell's output went quiet: time to save its state.
     shell_settled: struct { shell_id: u64 },
     shutdown,
+};
+
+/// A voice setup on the daemon's machine for a `--remote` client; owned by
+/// Daemon.voice_setup_job until its voice_done is handled.
+const VoiceSetupJob = struct {
+    daemon: *Daemon,
+    client_id: u64,
+    engine: voice.Engine,
+    mode: voice.Mode,
+    progress: voice.DownloadProgress,
+    /// Last whole percent (or MiB, size unknown) reported.
+    reported: u64 = std.math.maxInt(u64),
+
+    fn run(job: *VoiceSetupJob) void {
+        const d = job.daemon;
+        var host_buf: [256]u8 = undefined;
+        const failure: ?[]u8 = voice_host.setup(d.gpa, d.io, d.environ, Daemon.hostName(&host_buf), job.engine, job.mode, &job.progress) catch |err| blk: {
+            break :blk std.fmt.allocPrint(d.gpa, "voice setup failed on the daemon's machine: {t}", .{err}) catch null;
+        };
+        defer if (failure) |msg| d.gpa.free(msg);
+        const line = proto.encode(d.gpa, .{ .voice_setup_result = .{ .ok = failure == null, .msg = failure orelse "" } }) catch return;
+        d.events.push(d.io, .{ .voice_done = .{ .client_id = job.client_id, .line = line, .setup = true } }) catch d.gpa.free(line);
+    }
+
+    /// Download progress as it lands, one message per percent.
+    fn onChunk(progress: *voice.DownloadProgress) void {
+        const job: *VoiceSetupJob = @fieldParentPtr("progress", progress);
+        const d = job.daemon;
+        const done = progress.done.load(.acquire);
+        const total = progress.total.load(.acquire);
+        const step = if (total > 0) done * 100 / total else done >> 20;
+        if (step == job.reported) return;
+        job.reported = step;
+        const line = proto.encode(d.gpa, .{ .voice_setup_progress = .{ .done = done, .total = total } }) catch return;
+        d.events.push(d.io, .{ .client_line = .{ .client_id = job.client_id, .line = line } }) catch d.gpa.free(line);
+    }
+};
+
+/// One `--remote` client's clip being transcribed on the daemon's machine.
+const VoiceTranscribeJob = struct {
+    daemon: *Daemon,
+    client_id: u64,
+    request_id: u64,
+    audio: []u8,
+
+    fn run(job: *VoiceTranscribeJob) void {
+        const d = job.daemon;
+        defer d.gpa.destroy(job);
+        defer d.gpa.free(job.audio);
+        const result = voice_host.transcribe(d.gpa, d.io, d.environ, job.audio);
+        defer if (result == .text) d.gpa.free(result.text);
+        const msg: proto.DaemonMsg = .{ .voice_transcript = .{
+            .request_id = job.request_id,
+            .text = if (result == .text) result.text else "",
+            .err = if (result == .err) result.err else "",
+        } };
+        const line = proto.encode(d.gpa, msg) catch return;
+        d.events.push(d.io, .{ .voice_done = .{ .client_id = job.client_id, .line = line, .setup = false } }) catch d.gpa.free(line);
+    }
 };
 
 const OutboundLine = struct {
@@ -555,6 +622,11 @@ pub const Daemon = struct {
     git_cancel: std.atomic.Value(bool) = .init(false),
     git_cache: std.ArrayList(GitResult) = .empty,
     recap_thread: ?std.Thread = null,
+    /// Dictation for `--remote` clients (voice_host.zig): one setup and one
+    /// transcription at a time, each on its own worker.
+    voice_setup_job: ?*VoiceSetupJob = null,
+    voice_setup_thread: ?std.Thread = null,
+    voice_transcribe_thread: ?std.Thread = null,
     recap_cancel: std.atomic.Value(bool) = .init(false),
     recap_cache: std.ArrayList(RecapResult) = .empty,
 
@@ -1498,6 +1570,23 @@ pub const Daemon = struct {
                 }
                 self.broadcastStatus(tr.sid, .running);
             },
+            .client_line => |cl| {
+                defer self.gpa.free(cl.line);
+                if (self.lookupClient(cl.client_id)) |client| self.sendLine(client, cl.line);
+            },
+            .voice_done => |vd| {
+                defer self.gpa.free(vd.line);
+                if (vd.setup) {
+                    if (self.voice_setup_thread) |thread| thread.join();
+                    self.voice_setup_thread = null;
+                    if (self.voice_setup_job) |job| self.gpa.destroy(job);
+                    self.voice_setup_job = null;
+                } else {
+                    if (self.voice_transcribe_thread) |thread| thread.join();
+                    self.voice_transcribe_thread = null;
+                }
+                if (self.lookupClient(vd.client_id)) |client| self.sendLine(client, vd.line);
+            },
             .catalog_ready => |cr| {
                 if (self.catalog_thread) |thread| thread.join();
                 self.catalog_thread = null;
@@ -1929,6 +2018,7 @@ pub const Daemon = struct {
                     .daemon_exe = self.marlin_exe orelse "",
                     .daemon_started_at_ms = self.started_at_ms,
                     .remote_shell = true,
+                    .voice = true,
                 } });
             },
             .shell_open => |so| {
@@ -2723,6 +2813,17 @@ pub const Daemon = struct {
                 defer if (draft.len > 0) self.gpa.free(draft);
                 if (draft.len > 0) self.sendTo(client, .{ .draft = .{ .sid = s.sid, .text = draft } });
             },
+            .voice_status => self.sendVoiceStatus(client),
+            .voice_set => |vs| {
+                voice_host.set(self.gpa, self.io, self.environ, vs.enabled, vs.mode) catch |err| {
+                    self.sendTo(client, .{ .err = .{ .code = "voice", .msg = if (err == error.NotSetUp) "voice isn't set up on the daemon's machine: /voice setup" else "could not change [voice] on the daemon's machine" } });
+                    return;
+                };
+                self.sendVoiceStatus(client);
+            },
+            .voice_setup => |vs| self.startVoiceSetup(client, vs.engine, vs.mode),
+            .voice_setup_cancel => if (self.voice_setup_job) |job| job.progress.cancel.store(true, .release),
+            .voice_transcribe => |vt| self.startVoiceTranscribe(client, vt.request_id, vt.audio_base64),
             .session_draft => |d| self.store.setSessionDraft(d.sid, d.text) catch |err|
                 std.log.warn("could not keep the draft of session {d}: {t}", .{ d.sid, err }),
             .unsub => |u| {
@@ -5441,6 +5542,66 @@ pub const Daemon = struct {
         if (!result.parked) self.finishAgentTool(reply, result.text, result.status);
     }
 
+    fn hostName(buf: *[256]u8) []const u8 {
+        buf.* = @splat(0);
+        return if (gethostname(buf, buf.len) == 0) std.mem.sliceTo(buf, 0) else "";
+    }
+
+    fn sendVoiceStatus(self: *Daemon, client: *Client) void {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        var host_buf: [256]u8 = undefined;
+        const status = voice_host.status(arena.allocator(), self.io, self.environ, hostName(&host_buf)) catch {
+            self.sendTo(client, .{ .err = .{ .code = "voice", .msg = "cannot read Marlin's config on the daemon's machine" } });
+            return;
+        };
+        self.sendTo(client, .{ .voice_status_result = status });
+    }
+
+    fn startVoiceSetup(self: *Daemon, client: *Client, engine_name: []const u8, mode_name: []const u8) void {
+        const engine = voice.Engine.parse(engine_name) orelse
+            return self.sendTo(client, .{ .voice_setup_result = .{ .ok = false, .msg = "unknown voice engine" } });
+        if (self.voice_setup_thread != null)
+            return self.sendTo(client, .{ .voice_setup_result = .{ .ok = false, .msg = "a voice setup is already running on the daemon's machine" } });
+        const job = self.gpa.create(VoiceSetupJob) catch return;
+        job.* = .{
+            .daemon = self,
+            .client_id = client.id,
+            .engine = engine,
+            .mode = if (std.mem.eql(u8, mode_name, "toggle")) .toggle else .ptt,
+            .progress = .{ .on_chunk = VoiceSetupJob.onChunk },
+        };
+        self.voice_setup_job = job;
+        self.voice_setup_thread = std.Thread.spawn(.{}, VoiceSetupJob.run, .{job}) catch {
+            self.gpa.destroy(job);
+            self.voice_setup_job = null;
+            self.sendTo(client, .{ .voice_setup_result = .{ .ok = false, .msg = "could not start the voice setup" } });
+            return;
+        };
+    }
+
+    fn startVoiceTranscribe(self: *Daemon, client: *Client, request_id: u64, audio_base64: []const u8) void {
+        if (self.voice_transcribe_thread != null)
+            return self.sendTo(client, .{ .voice_transcript = .{ .request_id = request_id, .err = "another clip is being transcribed; try again in a moment" } });
+        const decoder = std.base64.standard.Decoder;
+        const audio = self.gpa.alloc(u8, decoder.calcSizeForSlice(audio_base64) catch 0) catch return;
+        decoder.decode(audio, audio_base64) catch {
+            self.gpa.free(audio);
+            return self.sendTo(client, .{ .voice_transcript = .{ .request_id = request_id, .err = "the clip did not arrive intact" } });
+        };
+        const job = self.gpa.create(VoiceTranscribeJob) catch {
+            self.gpa.free(audio);
+            return;
+        };
+        job.* = .{ .daemon = self, .client_id = client.id, .request_id = request_id, .audio = audio };
+        self.voice_transcribe_thread = std.Thread.spawn(.{}, VoiceTranscribeJob.run, .{job}) catch {
+            self.gpa.free(audio);
+            self.gpa.destroy(job);
+            self.sendTo(client, .{ .voice_transcript = .{ .request_id = request_id, .err = "could not start transcribing" } });
+            return;
+        };
+    }
+
     fn finishAgentTool(self: *Daemon, reply: AgentReply, output: []const u8, status: block.ToolStatus) void {
         switch (reply) {
             .future => |future| {
@@ -6432,6 +6593,13 @@ pub const Daemon = struct {
         self.recap_cancel.store(true, .release);
         if (self.recap_thread) |thread| thread.join();
         self.recap_thread = null;
+        if (self.voice_setup_job) |job| job.progress.cancel.store(true, .release);
+        if (self.voice_setup_thread) |thread| thread.join();
+        self.voice_setup_thread = null;
+        if (self.voice_setup_job) |job| self.gpa.destroy(job);
+        self.voice_setup_job = null;
+        if (self.voice_transcribe_thread) |thread| thread.join();
+        self.voice_transcribe_thread = null;
         for (self.recap_cache.items) |cached| self.gpa.free(cached.text);
         self.recap_cache.deinit(self.gpa);
         if (self.otel_exporter) |exporter| {
@@ -6512,6 +6680,8 @@ pub const Daemon = struct {
             .client_msg => |value| self.gpa.free(value.msg_line),
             .client_gone, .turn_resumed, .turn_usage_credits, .turn_guest_pid, .turn_phase, .shell_exited, .shell_settled, .shutdown => {},
             .shell_output => |value| self.gpa.free(value.bytes),
+            .client_line => |value| self.gpa.free(value.line),
+            .voice_done => |value| self.gpa.free(value.line),
             .turn_block => |value| self.gpa.free(value.line),
             .turn_delta => |value| {
                 self.gpa.free(value.line);

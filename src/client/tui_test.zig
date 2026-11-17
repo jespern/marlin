@@ -10,7 +10,7 @@ const block = @import("../core/block.zig");
 const config = @import("../core/config.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
-const voice = @import("voice.zig");
+const voice = @import("../core/voice.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const media = @import("media.zig");
@@ -1441,6 +1441,86 @@ test "drafts go to the daemon when a tab is parked or the client leaves, and com
     defer gpa.free(text);
     app.submitInput(text);
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{"2:"}), try Sent.drafts(&output, arena.allocator()));
+}
+
+// Case: attached from the MacBook, /voice set up the MacBook. Over --remote
+// the daemon's machine sets voice up and transcribes; this one only records.
+test "/voice over --remote sets up and transcribes on the daemon's machine" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-remote-voice");
+    defer temp.deinit();
+    // The microphone is this machine's: recording needs a local ffmpeg.
+    const ffmpeg = try std.fmt.allocPrintSentinel(gpa, "{s}/ffmpeg", .{temp.path}, 0);
+    defer gpa.free(ffmpeg);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ffmpeg, .data = "#!/bin/sh\n" });
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(ffmpeg, 0o700));
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("PATH", temp.path);
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    conn.remote_voice = true;
+    var app = App{ .gpa = gpa, .io = io, .conn = &conn, .environ = &env, .remote_transport = true, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const Sent = struct {
+        fn last(out: *std.Io.Writer.Allocating, a: std.mem.Allocator) !proto.ClientMsg {
+            const line = std.mem.trimEnd(u8, out.written(), "\n");
+            const at = if (std.mem.lastIndexOfScalar(u8, line, '\n')) |nl| nl + 1 else 0;
+            const msg = try proto.decode(proto.ClientMsg, a, try a.dupe(u8, line[at..]));
+            out.clearRetainingCapacity();
+            return msg;
+        }
+    };
+    const status_off =
+        \\{"voice_status_result":{"enabled":false,"host":"victory","ffmpeg":true,"engines":[{"name":"whisper-turbo","available":false,"install_hint":"brew install whisper-cpp"},{"name":"whisper-base","available":false,"install_hint":"brew install whisper-cpp"},{"name":"parakeet","available":true,"install_hint":"uv tool install parakeet-mlx"}]}}
+    ;
+
+    // The engines offered are the daemon's machine's.
+    app.runCommand("/voice setup");
+    try std.testing.expect(try Sent.last(&output, arena.allocator()) == .voice_status);
+    app.handleDaemonLine(try gpa.dupe(u8, status_off));
+    try std.testing.expectEqual(PickerKind.voice_engine, app.picker_kind);
+    app.voiceWizardEngineChosen(voice.Engine.whisper_turbo.label());
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "brew install whisper-cpp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "on victory") != null);
+    app.voiceWizardEngineChosen(voice.Engine.parakeet.label());
+    try std.testing.expectEqual(PickerKind.voice_mode, app.picker_kind);
+    app.voiceWizardModeChosen("toggle · press ctrl+space to start, press again to stop");
+    const setup = (try Sent.last(&output, arena.allocator())).voice_setup;
+    try std.testing.expectEqualStrings("parakeet", setup.engine);
+    try std.testing.expectEqualStrings("toggle", setup.mode);
+
+    app.handleDaemonLine(try gpa.dupe(u8, "{\"voice_setup_progress\":{\"done\":524288000,\"total\":1048576000}}"));
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "voice model on victory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "50%") != null);
+    app.handleDaemonLine(try gpa.dupe(u8, "{\"voice_setup_result\":{\"ok\":true}}"));
+    try std.testing.expect(try Sent.last(&output, arena.allocator()) == .voice_status);
+    app.handleDaemonLine(try gpa.dupe(u8, "{\"voice_status_result\":{\"enabled\":true,\"engine\":\"parakeet\",\"mode\":\"toggle\",\"host\":\"victory\",\"ffmpeg\":true}}"));
+    try std.testing.expect(app.voice_rt.enabled);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "voice ready on victory") != null);
+
+    // A recording goes to the daemon; the transcript to the tab it was for.
+    app.voice_rt.phase = .transcribing;
+    app.voice_rt.target_sid = 1;
+    app.handleVoiceEvent(.{ .clip = try gpa.dupe(u8, "AUDIO") });
+    const clip = (try Sent.last(&output, arena.allocator())).voice_transcribe;
+    try std.testing.expectEqualStrings("QVVESU8=", clip.audio_base64);
+    try app.saveActiveView();
+    app.view.sid = 2;
+    app.handleDaemonLine(try std.fmt.allocPrint(gpa, "{{\"voice_transcript\":{{\"request_id\":{d},\"text\":\"hello there\"}}}}", .{clip.request_id}));
+    try std.testing.expectEqual(@as(usize, 0), app.view.editor.text.items.len);
+    try std.testing.expectEqualStrings("hello there", app.saved_views.get(1).?.editor.text.items);
+    try std.testing.expect(app.voice_rt.phase == .idle);
 }
 
 test "bang shell escape over --remote runs in the daemon's shell, like !!" {

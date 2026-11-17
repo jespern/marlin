@@ -573,7 +573,7 @@ pub fn setVoice(
     defer gpa.free(without);
 
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
+    defer out.deinit(gpa);
     try out.appendSlice(gpa, without);
     if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(gpa, '\n');
     if (out.items.len > 0) try out.append(gpa, '\n');

@@ -1,14 +1,14 @@
-//! Unit tests for web_transcribe.zig. Tests live beside the module they
+//! Unit tests for voice_transcribe.zig. Tests live beside the module they
 //! cover (docs/TESTING.md); anything they reach into is `pub` there.
 
 const std = @import("std");
 const Io = std.Io;
-const config = @import("../core/config.zig");
+const config = @import("config.zig");
 const temp_dir = @import("../testing/temp_dir.zig");
-const web_transcribe = @import("web_transcribe.zig");
+const voice_transcribe = @import("voice_transcribe.zig");
 
 test {
-    std.testing.refAllDecls(web_transcribe);
+    std.testing.refAllDecls(voice_transcribe);
 }
 
 fn script(gpa: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8, body: []const u8) ![:0]u8 {
@@ -26,13 +26,13 @@ test "dictation needs /voice setup and ffmpeg; it never guesses" {
     defer env.deinit();
     try env.put("PATH", "/nonexistent");
     const cfg: config.Config = .{};
-    try std.testing.expectError(error.VoiceNotSetUp, web_transcribe.runtime(gpa, threaded.io(), &env, cfg));
+    try std.testing.expectError(error.VoiceNotSetUp, voice_transcribe.runtime(gpa, threaded.io(), &env, cfg));
     var enabled = cfg;
     enabled.voice_enabled = true;
     enabled.voice_engine = "whisper-turbo";
     enabled.voice_stt_bin = "whisper-cli";
     // Configured, but no ffmpeg on PATH to convert the phone's audio.
-    try std.testing.expectError(error.VoiceNotSetUp, web_transcribe.runtime(gpa, threaded.io(), &env, enabled));
+    try std.testing.expectError(error.VoiceNotSetUp, voice_transcribe.runtime(gpa, threaded.io(), &env, enabled));
 }
 
 test "a clip is converted, transcribed, cleaned, and its files removed" {
@@ -74,9 +74,9 @@ test "a clip is converted, transcribed, cleaned, and its files removed" {
     cfg.voice_model = "/models/ggml.bin";
     cfg.voice_stt_bin = stt;
 
-    const rt = try web_transcribe.runtime(gpa, io, &env, cfg);
+    const rt = try voice_transcribe.runtime(gpa, io, &env, cfg);
     defer gpa.free(rt.ffmpeg);
-    const text = try web_transcribe.transcribe(gpa, io, &env, rt, "AUDIO");
+    const text = try voice_transcribe.transcribe(gpa, io, &env, rt, "AUDIO");
     defer gpa.free(text);
     try std.testing.expectEqualStrings("push the commits", text);
 

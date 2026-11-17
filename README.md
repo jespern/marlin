@@ -206,8 +206,9 @@ from a terminal.
 - No hosted or multi-user web product. The web companion listens on
   localhost unless you point a reverse proxy at it; phones pair once with a
   code from the terminal.
-- No voice stack. `/voice setup` configures local, offline push-to-talk
-  dictation into the composer, and that is all.
+- No voice stack. `/voice setup` configures offline push-to-talk dictation
+  into the composer, and that is all. Attached with `--remote`, it is set up
+  and transcribed on the daemon's machine; the microphone stays yours.
 - No OCR or video pipelines, themes, or cron.
 - No editor panes.
 - No TLS or VPN embedding. Your proxy terminates HTTPS; your network

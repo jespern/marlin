@@ -2,10 +2,12 @@
 //!
 //! Dormant by design. Nothing here runs, appears in help, or demands a
 //! dependency until the user invokes `/voice setup`. Everything heavy lives
-//! at process boundaries — ffmpeg records, an STT engine transcribes — and
-//! the daemon, protocol, and store never learn audio exists. Recordings are
-//! temp files deleted after transcription; the transcript lands in the
-//! composer for review, never auto-submitted.
+//! at process boundaries — ffmpeg records, an STT engine transcribes.
+//! Attached locally the TUI does both. Attached over `--remote` it only
+//! records; the daemon's machine holds the engine and transcribes
+//! (daemon/voice_host.zig), as it does for the phone. The store never sees
+//! audio. Recordings are temp files deleted after transcription; the
+//! transcript lands in the composer for review, never auto-submitted.
 //!
 //! Engines are a fixed, tiny catalog (a config slot, not a registry):
 //!   - whisper.cpp with large-v3-turbo (recommended: all languages, fast on
@@ -197,6 +199,9 @@ pub const DownloadProgress = struct {
     /// 0 until the response headers reveal the size.
     total: std.atomic.Value(u64) = .init(0),
     cancel: std.atomic.Value(bool) = .init(false),
+    /// Called on the downloading thread after each chunk lands, for a
+    /// caller that reports progress as it happens instead of sampling it.
+    on_chunk: ?*const fn (*DownloadProgress) void = null,
 };
 
 pub const DownloadError = error{
@@ -292,6 +297,7 @@ pub fn download(
         pos += chunk.len;
         reader.toss(chunk.len);
         _ = progress.done.fetchAdd(chunk.len, .acq_rel);
+        if (progress.on_chunk) |report| report(progress);
     }
     try file.sync(io);
 

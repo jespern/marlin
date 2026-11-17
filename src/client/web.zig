@@ -42,7 +42,7 @@ const attach = @import("attach.zig");
 const html = @embedFile("webui.html");
 const mobile_push = @import("../mobile/push.zig");
 const pairing = @import("../mobile/pairing.zig");
-const web_transcribe = @import("web_transcribe.zig");
+const voice_transcribe = @import("../core/voice_transcribe.zig");
 const web_shell = @import("web_shell.zig");
 const service_worker = @embedFile("webui-sw.js");
 const icon_180 = @embedFile("webui-icon-180.png");
@@ -509,14 +509,14 @@ fn serveTranscribe(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access
         return;
     };
     defer loaded.deinit();
-    const rt = web_transcribe.runtime(ctx.gpa, ctx.io, ctx.environ, loaded.value) catch {
+    const rt = voice_transcribe.runtime(ctx.gpa, ctx.io, ctx.environ, loaded.value) catch {
         try reply(req, access,
             \\{"err":{"code":"voice_setup","msg":"voice isn't set up: run /voice setup in Marlin on the Mac"}}
         , .{ .status = .conflict, .extra_headers = &json_header });
         return;
     };
     defer ctx.gpa.free(rt.ffmpeg);
-    const text = web_transcribe.transcribe(ctx.gpa, ctx.io, ctx.environ, rt, audio) catch |err| {
+    const text = voice_transcribe.transcribe(ctx.gpa, ctx.io, ctx.environ, rt, audio) catch |err| {
         std.log.warn("dictation failed: {t}", .{err});
         try reply(req, access,
             \\{"err":{"code":"transcribe","msg":"transcription failed; see /web on the Mac"}}

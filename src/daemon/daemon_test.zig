@@ -569,6 +569,75 @@ test "a session's draft is kept for the next client that opens it, until it is c
     try std.testing.expectEqual(@as(?[]const u8, null), try Draft.after(r, 2));
 }
 
+// Case: attached from the MacBook, /voice set up the MacBook. Over --remote
+// the daemon's machine sets up and transcribes; the client only records.
+test "a remote client's voice is set up and transcribed on the daemon's machine" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const gpa = r.gpa;
+    const io = r.threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-daemon-voice");
+    defer temp.deinit();
+    const bin = try std.fmt.allocPrint(gpa, "{s}/bin", .{temp.path});
+    defer gpa.free(bin);
+    try std.Io.Dir.cwd().createDirPath(io, bin);
+    inline for (.{
+        .{ "ffmpeg", "#!/bin/sh\nin=\"\"; while [ $# -gt 1 ]; do [ \"$1\" = -i ] && in=\"$2\"; shift; done\ncp \"$in\" \"$1\"\n" },
+        .{ "parakeet-mlx", "#!/bin/sh\nsleep 0.2\nprintf 'hello there\\n'\n" },
+    }) |stub| {
+        const path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ bin, stub[0] }, 0);
+        defer gpa.free(path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = stub[1] });
+        try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(path, 0o700));
+    }
+    const path_env = try std.fmt.allocPrint(gpa, "{s}:/bin:/usr/bin", .{bin});
+    defer gpa.free(path_env);
+    try r.environ.put("PATH", path_env);
+    try r.environ.put("HOME", temp.path);
+    try r.environ.put("TMPDIR", temp.path);
+    try r.environ.put("XDG_CONFIG_HOME", temp.path);
+    try r.environ.put("XDG_DATA_HOME", temp.path);
+
+    const Wait = struct {
+        /// Pump the daemon until client 1 gets a message tagged `tag`.
+        fn reply(rig: *ShellRig, comptime tag: std.meta.Tag(proto.DaemonMsg)) !@FieldType(proto.DaemonMsg, @tagName(tag)) {
+            for (0..500) |_| {
+                try rig.pump();
+                for (try rig.drain(1)) |msg| if (msg == tag) return @field(msg, @tagName(tag));
+                try rig.threaded.io().sleep(.fromMilliseconds(10), .awake);
+            }
+            return error.Timeout;
+        }
+    };
+    try r.send(1, "{{\"voice_status\":{{}}}}", .{});
+    try std.testing.expect(!(try Wait.reply(r, .voice_status_result)).enabled);
+
+    try r.send(1, "{{\"voice_setup\":{{\"engine\":\"parakeet\",\"mode\":\"toggle\"}}}}", .{});
+    try std.testing.expect((try Wait.reply(r, .voice_setup_result)).ok);
+    try r.send(1, "{{\"voice_status\":{{}}}}", .{});
+    const status = try Wait.reply(r, .voice_status_result);
+    try std.testing.expect(status.enabled);
+    try std.testing.expectEqualStrings("toggle", status.mode);
+
+    // One clip at a time; a second gets a clear answer instead of a queue.
+    try r.send(1, "{{\"voice_transcribe\":{{\"request_id\":9,\"audio_base64\":\"QVVESU8=\"}}}}", .{});
+    try r.send(1, "{{\"voice_transcribe\":{{\"request_id\":10,\"audio_base64\":\"QVVESU8=\"}}}}", .{});
+    var busy = false;
+    var heard: ?[]const u8 = null;
+    for (0..500) |_| {
+        try r.pump();
+        for (try r.drain(1)) |msg| if (msg == .voice_transcript) {
+            if (msg.voice_transcript.request_id == 10) busy = msg.voice_transcript.err.len > 0;
+            if (msg.voice_transcript.request_id == 9) heard = msg.voice_transcript.text;
+        };
+        if (heard != null) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(busy);
+    try std.testing.expectEqualStrings("hello there", heard.?);
+}
+
 test "a client that subscribes mid-stream gets the text so far whole, not from the next chunk" {
     // Case: Jesper saw "est" stream where the reply began "Test": the TUI
     // (back from another tab) and the phone (just opened) joined mid-stream.

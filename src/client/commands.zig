@@ -7,7 +7,7 @@ const std = @import("std");
 const proto = @import("../core/proto.zig");
 const config = @import("../core/config.zig");
 const effects = @import("effects.zig");
-const voice = @import("voice.zig");
+const voice = @import("../core/voice.zig");
 const Editor = @import("editor.zig");
 const tui = @import("tui.zig");
 const shell_tab = @import("shell_tab.zig");
@@ -40,7 +40,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/plugin", .usage = " [list|marketplace|install|uninstall]", .description = "manage plugins (skills and MCP servers) and marketplaces", .accepts_args = true },
     .{ .name = "/mcp", .usage = " [add|remove|restart|reload|login|logout]", .description = "inspect and manage MCP servers; login signs in to a remote one", .accepts_args = true },
     .{ .name = "/council", .usage = " [<name>|new <name>|edit <name>|remove <name>]", .description = "list, inspect, or edit review councils", .accepts_args = true },
-    .{ .name = "/voice", .usage = " [setup|mode|off]", .description = "dictate into the composer (local STT; setup on first use)", .accepts_args = true },
+    .{ .name = "/voice", .usage = " [setup|mode|off]", .description = "dictate into the composer (offline STT, on the daemon's machine over --remote; setup on first use)", .accepts_args = true },
     .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
     .{ .name = "/plan", .usage = " [task|off|clear]", .description = "enter Plan mode or manage its execution todo", .accepts_args = true },
     .{ .name = "/sessions", .description = "switch sessions" },
@@ -729,6 +729,27 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         self.submitInput(expanded);
     } else if (std.mem.eql(u8, head, "/voice")) {
         const action = it.next();
+        // Over --remote the daemon's machine holds voice (voice_host.zig).
+        if (self.remote_transport) {
+            if (action == null) {
+                if (self.voice_rt.enabled) self.requestRemoteVoice(.announce) else self.startVoiceSetup();
+            } else if (std.mem.eql(u8, action.?, "setup")) {
+                self.startVoiceSetup();
+            } else if (std.mem.eql(u8, action.?, "off") or std.mem.eql(u8, action.?, "on")) {
+                const on = std.mem.eql(u8, action.?, "on");
+                self.voice_rt.remote_pending = if (on) .announce else .silent;
+                self.conn.send(.{ .voice_set = .{ .enabled = on } }) catch return self.setNotice("voice: could not reach the daemon", .{});
+                if (!on) self.setNotice("voice off on {s} — /voice on turns it back on", .{self.remoteVoiceHost()});
+            } else if (std.mem.eql(u8, action.?, "mode")) {
+                const which = it.next() orelse return self.setNotice("usage: /voice mode ptt|toggle", .{});
+                self.voice_rt.remote_pending = .announce;
+                self.conn.send(.{ .voice_set = .{ .mode = if (std.mem.eql(u8, which, "toggle")) "toggle" else "ptt" } }) catch
+                    return self.setNotice("voice: could not reach the daemon", .{});
+            } else {
+                self.setNotice("usage: /voice [setup|mode ptt|toggle|off|on]", .{});
+            }
+            return;
+        }
         if (action == null) {
             if (!self.voice_rt.enabled) self.startVoiceSetup() else self.voiceStatusNotice();
         } else if (std.mem.eql(u8, action.?, "setup")) {

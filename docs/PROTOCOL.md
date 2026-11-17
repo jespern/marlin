@@ -66,6 +66,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_rename | sid, title | ok; title normalized like auto-titles (first line, trimmed, capped) and broadcast as session_upsert |
 | session_set_approvals | sid, approvals ("default" \| "auto") | persists per session before ok and publishes refreshed session metadata; applies to the RUNNING turn too — granting full access resolves a parked prompt immediately |
 | session_draft | sid, text | no reply; keeps the session's unsent composer text in the store ("" clears it) so it outlives the client. The TUI sends it when a tab is parked, before it exits (detach, quit, reboot, `!`), and as "" on submit |
+| voice_status / voice_setup {engine,mode} / voice_setup_cancel / voice_set {enabled?,mode?} / voice_transcribe {request_id,audio_base64} | dictation for a `--remote` client (gated on hello_ok.voice): the daemon's machine holds the engine, model, and [voice]; the client only records. voice_status and voice_set reply voice_status_result; voice_setup streams voice_setup_progress then voice_setup_result; voice_transcribe replies voice_transcript (one clip at a time; a second gets err) |
 | session_runtime | sid, value? (duration, "off", or "default") | session_runtime_result{sid,max_runtime_ms,uses_default}; omit value to query; persists per session and updates running guest deadlines |
 | session_set_plan_mode | sid, enabled | ok, or err{busy} mid-turn; persists collaboration mode with the session |
 | session_set_sandbox | sid, enabled | ok, or err when busy/unavailable, err{guest} on guest sessions |
@@ -195,6 +196,7 @@ flag is read at export time, so it covers everything still in the outbox.
 | session_list_result | reply to session_list |
 | input_history_result {sid,entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
 | draft {sid,text} | after `sub`'s status, only when the session has a kept draft (see session_draft); the TUI puts it in an empty composer, never over typed text |
+| voice_status_result {enabled,engine,mode,host,ffmpeg,engines} / voice_setup_progress {done,total} / voice_setup_result {ok,msg} / voice_transcript {request_id,text,err} | replies to the voice_* requests above; progress arrives as the model downloads, one message per percent |
 | search_result {query,sid,hits} | reply to search; each hit carries session/block identity, kind, location, timestamp, and an FTS-highlighted snippet |
 | diagnostics_result | reply to diagnostics; aggregate provider/TTFT, measured local-preparation, and legacy pre-provider percentiles/outliers; latest provider/tool waterfall includes setup, context-load/SQLite-wait rows/bytes/VM steps, assembly, and body serialization; contains no prompt or tool content |
 | otel_status_result {enabled,content} | reply to `otel_status`, `otel_configure`, or `otel_content`; never includes endpoint headers |

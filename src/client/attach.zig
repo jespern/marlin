@@ -64,6 +64,8 @@ pub const Conn = struct {
     git_status: bool = false,
     /// Experimental: the daemon serves the `!!` shell tab.
     remote_shell: bool = false,
+    /// The daemon sets up and transcribes dictation (hello_ok.voice).
+    remote_voice: bool = false,
     pause_resume: bool = false,
     network_filtering: bool = false,
     network_configured: bool = false,
@@ -368,6 +370,7 @@ pub fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !v
     conn.session_recaps = hello.session_recaps;
     conn.git_status = hello.git_status;
     conn.remote_shell = hello.remote_shell;
+    conn.remote_voice = hello.voice;
     conn.pause_resume = hello.pause_resume;
     conn.network_filtering = hello.network_filtering;
     conn.network_configured = hello.network_configured;

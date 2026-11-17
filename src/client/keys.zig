@@ -10,7 +10,7 @@ const proto = @import("../core/proto.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const media = @import("media.zig");
-const voice = @import("voice.zig");
+const voice = @import("../core/voice.zig");
 const tui = @import("tui.zig");
 const App = tui.App;
 const Mode = tui.Mode;
@@ -386,7 +386,7 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         app.abortVoiceRecording();
         return;
     }
-    if (app.voice_rt.download != null and key.matches(vaxis.Key.escape, .{})) {
+    if ((app.voice_rt.download != null or app.voice_rt.remote_setup_running) and key.matches(vaxis.Key.escape, .{})) {
         app.voiceCancelDownload();
         return;
     }
