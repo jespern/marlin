@@ -380,6 +380,16 @@ async function main() {
       return {text,visible:!document.querySelector('#mic-btn').hidden};
     });
     assert.deepEqual(dictated,{text:'please hello from the phone',visible:true});
+    // Not set up: the phone names the machine to set up, and the --remote route.
+    const cfgPath=path.join(config,'config.toml'), cfgText=fs.readFileSync(cfgPath,'utf8');
+    fs.writeFileSync(cfgPath,cfgText.replace(/\[voice\][\s\S]*$/,''));
+    const unset=await page.evaluate(async()=>{
+      const r=await fetch('/transcribe',{method:'POST',headers:{'Content-Type':'audio/mp4'},body:'AUDIO'});
+      return {status:r.status,msg:(await r.json()).err.msg};
+    });
+    fs.writeFileSync(cfgPath,cfgText);
+    assert.equal(unset.status,409);
+    assert.match(unset.msg,/^voice isn't set up on \S+: run \/voice setup in Marlin there, or in a terminal attached to it with --remote$/);
     // Shells: the TUI's SGR rows drawn with their colors, the cursor where the
     // terminal has it; a finished shell as the TUI shows it.
     const sgr=await page.evaluate(()=>{

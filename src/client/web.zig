@@ -43,6 +43,8 @@ const html = @embedFile("webui.html");
 const mobile_push = @import("../mobile/push.zig");
 const pairing = @import("../mobile/pairing.zig");
 const voice_transcribe = @import("../core/voice_transcribe.zig");
+
+extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
 const web_shell = @import("web_shell.zig");
 const service_worker = @embedFile("webui-sw.js");
 const icon_180 = @embedFile("webui-icon-180.png");
@@ -510,9 +512,15 @@ fn serveTranscribe(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access
     };
     defer loaded.deinit();
     const rt = voice_transcribe.runtime(ctx.gpa, ctx.io, ctx.environ, loaded.value) catch {
-        try reply(req, access,
-            \\{"err":{"code":"voice_setup","msg":"voice isn't set up: run /voice setup in Marlin on the Mac"}}
-        , .{ .status = .conflict, .extra_headers = &json_header });
+        // Name the machine: from another one, `/voice setup` in a terminal
+        // attached with --remote sets this one up too.
+        var host_buf: [256]u8 = @splat(0);
+        const host = if (gethostname(&host_buf, host_buf.len) == 0) std.mem.sliceTo(&host_buf, 0) else "this Mac";
+        const msg = try std.fmt.allocPrint(ctx.gpa, "voice isn't set up on {s}: run /voice setup in Marlin there, or in a terminal attached to it with --remote", .{host});
+        defer ctx.gpa.free(msg);
+        const body = try std.json.Stringify.valueAlloc(ctx.gpa, .{ .err = .{ .code = "voice_setup", .msg = msg } }, .{});
+        defer ctx.gpa.free(body);
+        try reply(req, access, body, .{ .status = .conflict, .extra_headers = &json_header });
         return;
     };
     defer ctx.gpa.free(rt.ffmpeg);
