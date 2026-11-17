@@ -35,6 +35,16 @@ test "reads: line ranges, cat, head and tail, also several and after a cd" {
     try expectIntent("head -n 40 README.md\ntail -20 docs/USING.md 2>/dev/null", .read, &.{ "README.md", "docs/USING.md" });
 }
 
+test "sed reads: pattern ranges, echo separators, and pipes through filters" {
+    try expectIntent("sed -n '/^pub fn layoutLines(/,/^}/p' src/client/layout.zig", .read, &.{"src/client/layout.zig"});
+    try expectIntent("sed -n '/a\\/b/,+3p;10p' x.zig", .read, &.{"x.zig"});
+    try expectIntent("sed -n 225,260p src/daemon/context.zig; echo ----; sed -n 600,680p src/daemon/loop.zig", .read, &.{ "src/daemon/context.zig", "src/daemon/loop.zig" });
+    try expectIntent("sed -n 8780,8840p src/terminal/PageList.zig | rg -v '^\\s*$'", .read, &.{"src/terminal/PageList.zig"});
+    try expectIntent("sed -n 1,30p src/styles/tokens.css | grep -n -e x | head -4", .read, &.{"src/styles/tokens.css"});
+    try expectIntent("cat src/x.zig | wc -l", .read, &.{"src/x.zig"});
+    try expectIntent("cat -n src/x.zig | sed -n 10,20p", .read, &.{"src/x.zig"});
+}
+
 test "changes: sed -i, cat > file, and python scripts that rewrite a file" {
     try expectIntent("sed -i '' 's/errdefer out/defer out/' src/core/config.zig", .edit, &.{"src/core/config.zig"});
     try expectIntent("sed -i 's/a/b/' x.txt y.txt", .edit, &.{ "x.txt", "y.txt" });
@@ -69,17 +79,26 @@ test "changes: sed -i, cat > file, and python scripts that rewrite a file" {
 
 test "anything else in the command keeps it a Bash call" {
     for ([_][]const u8{
-        "sed -n 1,80p src/x.zig | head",
         "sed -n 1,5p src/x.zig && zig build test",
+        // A filter given files of its own searches them; tee writes; sh runs.
+        "sed -n 1,5p src/x.zig | rg x src",
+        "sed -n 1,5p src/x.zig | tee out.txt",
+        "sed -n 1,5p src/x.zig | sh",
+        "sed -n 1,5p src/x.zig | head > out.txt",
+        "sed -n 1,5p src/x.zig || true",
+        "sed -i '' 's/a/b/' x.zig | head",
+        "sed -n '/x/w out.txt' src/x.zig",
+        "sed -n '1e date' src/x.zig",
+        "echo ---",
+        "sed -n 1,5p src/x.zig |",
         "python3 - <<'EOF'\np='a.zig'\nopen(p,'w').write('x')\nEOF\nzig build",
         "python3 - <<'EOF'\nimport subprocess\np='a.zig'\nopen(p).read()\nEOF",
         "python3 -c 'print(1)'",
         "rg -n x src",
-        "cat src/x.zig | wc -l",
         "cat > notes.md",
         "echo hi > notes.md",
         "tail -f daemon.log",
-        "sed -n '/x/p' src/x.zig",
+        "sed '/x/p' src/x.zig",
         "sed -n 1,5p $FILE",
         "cat $(ls *.zig)",
         "sed -n 1,5p f 2>err.log",

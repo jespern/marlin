@@ -794,17 +794,26 @@ function shellFileIntent(command) {
   const steps = shellSteps(command);
   if (!steps) return null;
   const paths = [];
-  let reads = false, writes = false, any = false, dir = null;
+  let reads = false, writes = false, any = false, dir = null, piped = false;
   for (const step of steps) {
-    const w = step.words;
-    if (!w.length) { if (step.redirect || step.heredoc != null) return null; continue; }
-    if (w[0] === 'cd') {
-      if (w.length !== 2 || step.redirect || step.heredoc != null) return null;
+    const w = step.words, wasPiped = piped;
+    piped = step.pipe;
+    if (!w.length) { if (step.redirect || step.heredoc != null || step.pipe || wasPiped) return null; continue; }
+    // Piped into: it must only shape the read's output.
+    if (wasPiped) { if (!isShellFilter(step)) return null; continue; }
+    const name = w[0].split('/').pop();
+    if (name === 'cd') {
+      if (w.length !== 2 || step.redirect || step.heredoc != null || step.pipe) return null;
       dir = w[1];
       continue;
     }
+    // `echo ----` between reads only labels the output.
+    if (name === 'echo' || name === 'printf') {
+      if (step.redirect || step.heredoc != null || step.pipe) return null;
+      continue;
+    }
     const found = shellStepIntent(step);
-    if (!found) return null;
+    if (!found || (step.pipe && found.kind !== 'read')) return null;
     any = true;
     if (found.kind !== 'write') reads = true;
     if (found.kind !== 'read') writes = true;
@@ -814,8 +823,41 @@ function shellFileIntent(command) {
       if (!paths.includes(path)) paths.push(path);
     }
   }
-  if (!any || !paths.length) return null;
+  if (piped || !any || !paths.length) return null;
   return {kind: !writes ? 'read' : !reads ? 'write' : 'edit', paths};
+}
+// A sed -n script that only prints: addresses (numbers, $, /regex/, +N, !)
+// and p; nothing that writes (w), runs (e), or edits.
+function sedPrintsOnly(script) {
+  let printed = false;
+  for (let i = 0; i < script.length; i++) {
+    const c = script[i];
+    if (c === '/') {
+      i++;
+      while (i < script.length && script[i] !== '/') { if (script[i] === '\\') i++; i++; }
+      if (i >= script.length) return false;
+    } else if (c === 'p') printed = true;
+    else if (!/[\d,$; +!]/.test(c)) return false;
+  }
+  return printed;
+}
+// A step a read can pipe through without touching files.
+function isShellFilter(step) {
+  if (step.redirect || step.heredoc != null) return false;
+  const w = step.words, name = w[0].split('/').pop();
+  let operands = 0;
+  for (let i = 1; i < w.length; i++) {
+    const a = w[i];
+    if (a.length > 1 && a[0] === '-') {
+      if (a.startsWith('-i') || a === '-f' || a.startsWith('--file') || a === '-o') return false;
+      if (a.length === 2 && i + 1 < w.length && 'nceABCmkt'.includes(a[1])) i++;
+      continue;
+    }
+    operands++;
+  }
+  if (['grep', 'rg', 'sed'].includes(name)) return operands <= 1;
+  if (['head', 'tail', 'cat', 'nl', 'wc', 'sort', 'uniq'].includes(name)) return operands === 0;
+  return false;
 }
 function shellStepIntent(step) {
   const w = step.words, name = w[0].split('/').pop();
@@ -825,8 +867,9 @@ function shellStepIntent(step) {
       if (w.length !== 1 || step.heredoc == null) return null;
       return {kind: step.redirect.append ? 'edit' : 'write', paths: [step.redirect.path]};
     }
-    if (step.heredoc != null || w.length < 2 || w.slice(1).some(a => !a || a[0] === '-')) return null;
-    return {kind: 'read', paths: w.slice(1)};
+    if (step.heredoc != null || w.slice(1).some(a => !a || a === '-')) return null;
+    const files = w.slice(1).filter(a => a[0] !== '-');
+    return files.length ? {kind: 'read', paths: files} : null;
   }
   if (step.redirect) return null;
   if (name === 'head' || name === 'tail') {
@@ -856,7 +899,7 @@ function shellStepIntent(step) {
     }
     if (!files.length || script === null) return null;
     if (inPlace) return {kind: 'edit', paths: files};
-    if (!quiet || !/^[\d,$p; ]*$/.test(script)) return null;
+    if (!quiet || !sedPrintsOnly(script)) return null;
     return {kind: 'read', paths: files};
   }
   if (name.startsWith('python')) return pythonFileIntent(step);
@@ -920,7 +963,7 @@ function shellSteps(src) {
     return any ? out : null;
   };
   while (at < src.length) {
-    const step = {words: [], redirect: null, heredoc: null};
+    const step = {words: [], redirect: null, heredoc: null, pipe: false};
     let delimiter = null;
     for (;;) {
       blanks();
@@ -928,7 +971,13 @@ function shellSteps(src) {
       const c = src[at], rest = src.slice(at);
       if (c === '\n' || c === ';') { at++; break; }
       if (rest.startsWith('&&')) { at += 2; break; }
-      if ('|&`()'.includes(c)) return null;
+      if (c === '|') {
+        if (rest.startsWith('||') || rest.startsWith('|&')) return null;
+        at++;
+        step.pipe = true;
+        break;
+      }
+      if ('&`()'.includes(c)) return null;
       if (rest.startsWith('2>&1')) { at += 4; continue; }
       if (rest.startsWith('2>')) { at += 2; blanks(); if (word() !== '/dev/null') return null; continue; }
       if (rest.startsWith('<<')) { at += 2; if (src[at] === '-') at++; blanks(); delimiter = word(); if (delimiter === null) return null; continue; }

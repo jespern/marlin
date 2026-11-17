@@ -196,7 +196,13 @@ async function main() {
         "sed -i '' 's/a/b/' src/core/config.zig":['edit','src/core/config.zig'],
         'head -n 40 README.md\ntail -20 docs/USING.md 2>/dev/null':['read','README.md','docs/USING.md'],
         "python3 - <<'EOF'\np='src/client/attach.zig'\ns=open(p).read()\nprint(s.count('x'))\nEOF":['read','src/client/attach.zig'],
-        'sed -n 1,80p src/x.zig | head':null, 'rg -n x src':null, 'tail -f daemon.log':null, 'cat $(ls *.zig)':null,
+        "sed -n '/^pub fn layoutLines(/,/^}/p' src/client/layout.zig":['read','src/client/layout.zig'],
+        'sed -n 225,260p a.zig; echo ----; sed -n 600,680p b.zig':['read','a.zig','b.zig'],
+        "sed -n 8780,8840p PageList.zig | rg -v '^\\s*$' | head -4":['read','PageList.zig'],
+        'cat -n src/x.zig | sed -n 10,20p':['read','src/x.zig'],
+        'sed -n 1,5p x.zig | rg x src':null, 'sed -n 1,5p x.zig | tee out.txt':null, 'sed -n 1,5p x.zig | sh':null,
+        "sed -n '/x/w out.txt' x.zig":null, 'echo ---':null,
+        'rg -n x src':null, 'tail -f daemon.log':null, 'cat $(ls *.zig)':null,
         "python3 - <<'EOF'\nimport subprocess\np='a.zig'\nopen(p).read()\nEOF":null,
       };
       const verdicts=Object.entries(cases).map(([c,want])=>{

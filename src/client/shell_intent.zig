@@ -2,10 +2,12 @@
 //! them as what they are ("Edit src/web.zig") instead of as a Bash script:
 //! `sed -n 1,80p f`, `cat f`, `head`/`tail f`, `sed -i … f`, `cat > f <<EOF`,
 //! and the `python3 - <<'EOF'` scripts that read a file, change it, and
-//! write it back. Several such steps (and leading `cd`s) joined by `&&`, `;`
-//! or newlines still count. Anything else in the command (a pipe, a build, a
-//! search) leaves it a Bash call, so nothing it did is hidden. The JS port is
-//! webui.html shellFileIntent; keep the two in step.
+//! write it back. Several such steps (and leading `cd`s, and `echo ----`
+//! separators) joined by `&&`, `;` or newlines still count, and a read may
+//! pipe through filters that only shape its output (`| head`, `| rg -v x`).
+//! Anything else in the command (a build, a search of files, a write
+//! elsewhere) leaves it a Bash call, so nothing it did is hidden. The JS
+//! port is webui.html shellFileIntent; keep the two in step.
 
 const std = @import("std");
 
@@ -26,14 +28,32 @@ pub fn classify(arena: std.mem.Allocator, command: []const u8) !?Intent {
     var writes = false;
     var any = false;
     var dir: ?[]const u8 = null;
+    // The previous step pipes into this one: it must be a filter, and what
+    // feeds it a read.
+    var piped = false;
     while (try lexer.step()) |step| {
-        if (step.words.len == 0) continue;
-        if (std.mem.eql(u8, step.words[0], "cd")) {
-            if (step.words.len != 2 or step.redirect != null or step.heredoc != null) return null;
+        defer piped = step.pipe;
+        if (step.words.len == 0) {
+            if (step.redirect != null or step.heredoc != null or step.pipe or piped) return null;
+            continue;
+        }
+        if (piped) {
+            if (!isFilter(step)) return null;
+            continue;
+        }
+        const name = std.fs.path.basename(step.words[0]);
+        if (std.mem.eql(u8, name, "cd")) {
+            if (step.words.len != 2 or step.redirect != null or step.heredoc != null or step.pipe) return null;
             dir = step.words[1];
             continue;
         }
+        // `echo ----` between reads only labels the output.
+        if (std.mem.eql(u8, name, "echo") or std.mem.eql(u8, name, "printf")) {
+            if (step.redirect != null or step.heredoc != null or step.pipe) return null;
+            continue;
+        }
         const found = (try stepIntent(arena, step)) orelse return null;
+        if (step.pipe and found.kind != .read) return null;
         any = true;
         switch (found.kind) {
             .read => reads = true,
@@ -53,12 +73,14 @@ pub fn classify(arena: std.mem.Allocator, command: []const u8) !?Intent {
             } else try paths.append(arena, path);
         }
     }
-    if (lexer.failed or !any or paths.items.len == 0) return null;
+    if (lexer.failed or piped or !any or paths.items.len == 0) return null;
     return .{ .kind = if (!writes) .read else if (!reads) .write else .edit, .paths = paths.items };
 }
 
 const Step = struct {
     words: []const []const u8,
+    /// Its output goes to the next step (`|`).
+    pipe: bool = false,
     /// `> f` or `>> f` on stdout.
     redirect: ?struct { path: []const u8, append: bool } = null,
     heredoc: ?[]const u8 = null,
@@ -74,9 +96,15 @@ fn stepIntent(arena: std.mem.Allocator, step: Step) !?Found {
             if (w.len != 1 or step.heredoc == null) return null;
             return .{ .kind = if (r.append) .edit else .write, .paths = try one(arena, r.path) };
         }
-        if (step.heredoc != null or w.len < 2) return null;
-        for (w[1..]) |arg| if (arg.len == 0 or arg[0] == '-') return null;
-        return .{ .kind = .read, .paths = w[1..] };
+        if (step.heredoc != null) return null;
+        // Flags (-n numbers lines) change the view, not what is read.
+        var files: std.ArrayList([]const u8) = .empty;
+        for (w[1..]) |arg| {
+            if (arg.len == 0 or std.mem.eql(u8, arg, "-")) return null;
+            if (arg[0] != '-') try files.append(arena, arg);
+        }
+        if (files.items.len == 0) return null;
+        return .{ .kind = .read, .paths = files.items };
     }
     if (step.redirect != null) return null;
     if (std.mem.eql(u8, name, "head") or std.mem.eql(u8, name, "tail")) {
@@ -130,10 +158,57 @@ fn sedIntent(arena: std.mem.Allocator, step: Step) !?Found {
     }
     if (files.items.len == 0 or script == null) return null;
     if (in_place) return .{ .kind = .edit, .paths = files.items };
-    // Printing line ranges, and nothing else, is a read.
-    if (!quiet) return null;
-    for (script.?) |c| if (!(std.ascii.isDigit(c) or c == ',' or c == '$' or c == 'p' or c == ';' or c == ' ')) return null;
+    // Printing lines, and nothing else, is a read.
+    if (!quiet or !printsOnly(script.?)) return null;
     return .{ .kind = .read, .paths = files.items };
+}
+
+/// A `sed -n` script that only prints: addresses (line numbers, `$`,
+/// `/regex/`, `+N`, `!`) and `p`, nothing that writes (`w`), runs (`e`), or
+/// edits.
+fn printsOnly(script: []const u8) bool {
+    var printed = false;
+    var i: usize = 0;
+    while (i < script.len) : (i += 1) {
+        const c = script[i];
+        if (c == '/') {
+            i += 1;
+            while (i < script.len and script[i] != '/') : (i += 1) {
+                if (script[i] == '\\') i += 1;
+            }
+            if (i >= script.len) return false;
+        } else if (c == 'p') {
+            printed = true;
+        } else if (!(std.ascii.isDigit(c) or c == ',' or c == '$' or c == ';' or c == ' ' or c == '+' or c == '!')) {
+            return false;
+        }
+    }
+    return printed;
+}
+
+/// A step a read can pipe through without touching files: it only shapes
+/// what it is given (no file operands, no in-place edits).
+fn isFilter(step: Step) bool {
+    if (step.redirect != null or step.heredoc != null) return false;
+    const w = step.words;
+    const name = std.fs.path.basename(w[0]);
+    var operands: usize = 0;
+    var i: usize = 1;
+    while (i < w.len) : (i += 1) {
+        const arg = w[i];
+        if (arg.len > 1 and arg[0] == '-') {
+            if (std.mem.startsWith(u8, arg, "-i") or std.mem.eql(u8, arg, "-f") or std.mem.startsWith(u8, arg, "--file") or std.mem.eql(u8, arg, "-o")) return false;
+            // A flag's value (`-n 40`, `-e pattern`, `-A 3`) is not a file.
+            if (arg.len == 2 and i + 1 < w.len and std.mem.indexOfScalar(u8, "nceABCmkt", arg[1]) != null) i += 1;
+            continue;
+        }
+        operands += 1;
+    }
+    const pattern_tools = [_][]const u8{ "grep", "rg", "sed" };
+    for (pattern_tools) |tool| if (std.mem.eql(u8, name, tool)) return operands <= 1;
+    const plain = [_][]const u8{ "head", "tail", "cat", "nl", "wc", "sort", "uniq" };
+    for (plain) |tool| if (std.mem.eql(u8, name, tool)) return operands == 0;
+    return false;
 }
 
 /// `python3 - <<'EOF'` with a script that only opens files: the paths are
@@ -230,7 +305,13 @@ const Lexer = struct {
                 self.at += 2;
                 break;
             }
-            if (c == '|' or c == '&' or c == '`' or c == '(' or c == ')') return self.fail();
+            if (c == '|') {
+                if (std.mem.startsWith(u8, self.src[self.at..], "||") or std.mem.startsWith(u8, self.src[self.at..], "|&")) return self.fail();
+                self.at += 1;
+                out.pipe = true;
+                break;
+            }
+            if (c == '&' or c == '`' or c == '(' or c == ')') return self.fail();
             if (std.mem.startsWith(u8, self.src[self.at..], "2>&1")) {
                 self.at += 4;
                 continue;
