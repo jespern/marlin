@@ -1846,10 +1846,14 @@ test "Bash calls that only read or edit files show as Read, Write, or Edit" {
     const arena = arena_state.allocator();
     const cwd = "/Users/j/Work/marlin";
     const cases = [_]struct { args: []const u8, name: []const u8, arg: []const u8 }{
-        .{ .args = "{\"command\":\"/bin/zsh -lc \\\"sed -n '1,20p' src/main.zig\\\"\"}", .name = "Read", .arg = "src/main.zig" },
+        .{ .args = "{\"command\":\"/bin/zsh -lc \\\"sed -n '1,20p' src/main.zig\\\"\"}", .name = "Read", .arg = "src/main.zig:1-20" },
         .{ .args = "{\"command\":\"cd /Users/j/Work/marlin && python3 - <<'EOF'\\np='src/web.zig'\\ns=open(p).read()\\nopen(p,'w').write(s)\\nEOF\"}", .name = "Edit", .arg = "src/web.zig" },
         .{ .args = "{\"command\":\"cat > notes.md <<'EOF'\\nhi\\nEOF\"}", .name = "Write", .arg = "notes.md" },
-        .{ .args = "{\"command\":\"sed -n 1,5p src/main.zig && zig build test\"}", .name = "Bash", .arg = "sed -n 1,5p src/main.zig && zig build test" },
+        // Mixed: still Bash, but each step says what it did.
+        .{ .args = "{\"command\":\"sed -n 1,5p src/main.zig && zig build test\"}", .name = "Bash", .arg = "read src/main.zig:1-5 · zig build test" },
+        .{ .args = "{\"command\":\"cd /Users/j/Work/marlin && sed -n 2370,2520p src/client/layout.zig | rg -v x; echo ---; head -40 /etc/hosts; zig build test 2>&1 | tail -3\"}", .name = "Bash", .arg = "read src/client/layout.zig:2370-2520 | rg -v x · read hosts:1-40 · zig build test 2>&1 | tail -3" },
+        // No file steps: the command as typed.
+        .{ .args = "{\"command\":\"zig build test && git status\"}", .name = "Bash", .arg = "zig build test && git status" },
     };
     for (cases) |case| {
         try std.testing.expectEqualStrings(case.name, layout.toolDisplayNameFor(arena, "Bash", case.args));

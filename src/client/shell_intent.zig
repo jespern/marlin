@@ -20,42 +20,27 @@ pub const Intent = struct {
     paths: []const []const u8,
 };
 
+/// What one step of a command did.
+pub const Action = struct {
+    /// Null for a step that is not a file read or change: `text` is its
+    /// command (first line).
+    kind: ?Kind,
+    paths: []const []const u8 = &.{},
+    /// The lines a read chose ("2370-2520", "1-40", "last 20"); null for a
+    /// whole file or a pattern range.
+    range: ?[]const u8 = null,
+    /// For a file action, the filters its output went through ("| head -4").
+    text: []const u8 = "",
+};
+
 /// Null unless every step of `command` is a file read or change.
 pub fn classify(arena: std.mem.Allocator, command: []const u8) !?Intent {
-    var lexer: Lexer = .{ .arena = arena, .src = command };
+    const actions = (try describe(arena, command)) orelse return null;
     var paths: std.ArrayList([]const u8) = .empty;
     var reads = false;
     var writes = false;
-    var any = false;
-    var dir: ?[]const u8 = null;
-    // The previous step pipes into this one: it must be a filter, and what
-    // feeds it a read.
-    var piped = false;
-    while (try lexer.step()) |step| {
-        defer piped = step.pipe;
-        if (step.words.len == 0) {
-            if (step.redirect != null or step.heredoc != null or step.pipe or piped) return null;
-            continue;
-        }
-        if (piped) {
-            if (!isFilter(step)) return null;
-            continue;
-        }
-        const name = std.fs.path.basename(step.words[0]);
-        if (std.mem.eql(u8, name, "cd")) {
-            if (step.words.len != 2 or step.redirect != null or step.heredoc != null or step.pipe) return null;
-            dir = step.words[1];
-            continue;
-        }
-        // `echo ----` between reads only labels the output.
-        if (std.mem.eql(u8, name, "echo") or std.mem.eql(u8, name, "printf")) {
-            if (step.redirect != null or step.heredoc != null or step.pipe) return null;
-            continue;
-        }
-        const found = (try stepIntent(arena, step)) orelse return null;
-        if (step.pipe and found.kind != .read) return null;
-        any = true;
-        switch (found.kind) {
+    for (actions) |action| {
+        switch (action.kind orelse return null) {
             .read => reads = true,
             .write => writes = true,
             .edit => {
@@ -63,22 +48,79 @@ pub fn classify(arena: std.mem.Allocator, command: []const u8) !?Intent {
                 writes = true;
             },
         }
-        for (found.paths) |raw| {
-            const path = if (dir != null and dir.?.len > 0 and dir.?[0] == '/' and raw.len > 0 and raw[0] != '/' and raw[0] != '~')
-                try std.fs.path.join(arena, &.{ dir.?, raw })
-            else
-                raw;
+        for (action.paths) |path| {
             for (paths.items) |seen| {
                 if (std.mem.eql(u8, seen, path)) break;
             } else try paths.append(arena, path);
         }
     }
-    if (lexer.failed or piped or !any or paths.items.len == 0) return null;
+    if (paths.items.len == 0) return null;
     return .{ .kind = if (!writes) .read else if (!reads) .write else .edit, .paths = paths.items };
+}
+
+/// Each step of `command` as what it did: file reads and changes (with the
+/// lines read), and the other commands as they were typed. `cd`s and `echo`
+/// labels are left out. Null when the command is beyond this lexer (`$(…)`,
+/// `||`, backgrounding).
+pub fn describe(arena: std.mem.Allocator, command: []const u8) !?[]const Action {
+    var lexer: Lexer = .{ .arena = arena, .src = command };
+    var steps: std.ArrayList(Step) = .empty;
+    while (try lexer.step()) |step| try steps.append(arena, step);
+    if (lexer.failed) return null;
+    var actions: std.ArrayList(Action) = .empty;
+    var dir: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < steps.items.len) {
+        // A pipeline: this step and every step it pipes into.
+        var last = i;
+        while (steps.items[last].pipe) : (last += 1) {
+            if (last + 1 >= steps.items.len) return null;
+        }
+        const pipeline = steps.items[i .. last + 1];
+        i = last + 1;
+        const head = pipeline[0];
+        const whole = firstLine(command[head.start..pipeline[pipeline.len - 1].end]);
+        if (head.words.len == 0) {
+            if (head.redirect != null or head.heredoc != null or pipeline.len > 1) try actions.append(arena, .{ .kind = null, .text = whole });
+            continue;
+        }
+        const name = std.fs.path.basename(head.words[0]);
+        const plain = pipeline.len == 1 and head.redirect == null and head.heredoc == null;
+        if (plain and std.mem.eql(u8, name, "cd") and head.words.len == 2) {
+            dir = head.words[1];
+            continue;
+        }
+        if (plain and (std.mem.eql(u8, name, "echo") or std.mem.eql(u8, name, "printf"))) continue;
+        const found = try stepIntent(arena, head);
+        var filtered = true;
+        for (pipeline[1..]) |filter| filtered = filtered and isFilter(filter);
+        if (found != null and (pipeline.len == 1 or (found.?.kind == .read and filtered))) {
+            const paths = try arena.alloc([]const u8, found.?.paths.len);
+            for (found.?.paths, paths) |raw, *path| path.* = if (dir != null and dir.?.len > 0 and dir.?[0] == '/' and raw.len > 0 and raw[0] != '/' and raw[0] != '~')
+                try std.fs.path.join(arena, &.{ dir.?, raw })
+            else
+                raw;
+            try actions.append(arena, .{
+                .kind = found.?.kind,
+                .paths = paths,
+                .range = found.?.range,
+                .text = if (pipeline.len > 1) firstLine(command[pipeline[1].start..pipeline[pipeline.len - 1].end]) else "",
+            });
+        } else try actions.append(arena, .{ .kind = null, .text = whole });
+    }
+    return actions.items;
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    return std.mem.trim(u8, text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len], " \t");
 }
 
 const Step = struct {
     words: []const []const u8,
+    /// Where it is in the command: from its first word to its last (a
+    /// heredoc body excluded), for showing it as typed.
+    start: usize = 0,
+    end: usize = 0,
     /// Its output goes to the next step (`|`).
     pipe: bool = false,
     /// `> f` or `>> f` on stdout.
@@ -86,7 +128,7 @@ const Step = struct {
     heredoc: ?[]const u8 = null,
 };
 
-const Found = struct { kind: Kind, paths: []const []const u8 };
+const Found = struct { kind: Kind, paths: []const []const u8, range: ?[]const u8 = null };
 
 fn stepIntent(arena: std.mem.Allocator, step: Step) !?Found {
     const w = step.words;
@@ -110,18 +152,30 @@ fn stepIntent(arena: std.mem.Allocator, step: Step) !?Found {
     if (std.mem.eql(u8, name, "head") or std.mem.eql(u8, name, "tail")) {
         if (step.heredoc != null) return null;
         var files: std.ArrayList([]const u8) = .empty;
+        var lines: ?[]const u8 = null;
         var i: usize = 1;
         while (i < w.len) : (i += 1) {
             const arg = w[i];
             if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "-c")) {
                 i += 1;
                 if (i >= w.len or !allDigits(std.mem.trimStart(u8, w[i], "+-"))) return null;
+                if (arg[1] == 'n') lines = w[i];
             } else if (arg.len > 1 and arg[0] == '-') {
                 if (!allDigits(arg[1..])) return null; // -f and friends are not a read
+                lines = arg[1..];
             } else try files.append(arena, arg);
         }
         if (files.items.len == 0) return null;
-        return .{ .kind = .read, .paths = files.items };
+        const range: ?[]const u8 = if (lines) |n|
+            if (std.mem.eql(u8, name, "head"))
+                try std.fmt.allocPrint(arena, "1-{s}", .{std.mem.trimStart(u8, n, "+-")})
+            else if (n[0] == '+')
+                try std.fmt.allocPrint(arena, "{s}-", .{n[1..]})
+            else
+                try std.fmt.allocPrint(arena, "last {s}", .{std.mem.trimStart(u8, n, "-")})
+        else
+            null;
+        return .{ .kind = .read, .paths = files.items, .range = range };
     }
     if (std.mem.eql(u8, name, "sed")) return sedIntent(arena, step);
     if (std.mem.startsWith(u8, name, "python")) return pythonIntent(arena, step);
@@ -160,7 +214,24 @@ fn sedIntent(arena: std.mem.Allocator, step: Step) !?Found {
     if (in_place) return .{ .kind = .edit, .paths = files.items };
     // Printing lines, and nothing else, is a read.
     if (!quiet or !printsOnly(script.?)) return null;
-    return .{ .kind = .read, .paths = files.items };
+    return .{ .kind = .read, .paths = files.items, .range = try lineRange(arena, script.?) };
+}
+
+/// "2370-2520" for `2370,2520p`, "5" for `5p`, "40-" for `40,$p`; null for
+/// pattern ranges and several ranges.
+fn lineRange(arena: std.mem.Allocator, script: []const u8) !?[]const u8 {
+    const body = std.mem.trimEnd(u8, std.mem.trim(u8, script, " "), "p");
+    if (body.len == 0 or std.mem.indexOfAny(u8, body, "/;+!p") != null) return null;
+    var parts = std.mem.splitScalar(u8, body, ',');
+    const from = parts.next().?;
+    const to = parts.next();
+    if (parts.next() != null or !allDigits(from)) return null;
+    if (to) |t| {
+        if (std.mem.eql(u8, t, "$")) return try std.fmt.allocPrint(arena, "{s}-", .{from});
+        if (!allDigits(t)) return null;
+        return try std.fmt.allocPrint(arena, "{s}-{s}", .{ from, t });
+    }
+    return from;
 }
 
 /// A `sed -n` script that only prints: addresses (line numbers, `$`,
@@ -206,7 +277,7 @@ fn isFilter(step: Step) bool {
     }
     const pattern_tools = [_][]const u8{ "grep", "rg", "sed" };
     for (pattern_tools) |tool| if (std.mem.eql(u8, name, tool)) return operands <= 1;
-    const plain = [_][]const u8{ "head", "tail", "cat", "nl", "wc", "sort", "uniq" };
+    const plain = [_][]const u8{ "head", "tail", "cat", "nl", "wc", "sort", "uniq", "cut" };
     for (plain) |tool| if (std.mem.eql(u8, name, tool)) return operands == 0;
     return false;
 }
@@ -217,7 +288,13 @@ fn isFilter(step: Step) bool {
 /// write (or an edit, when it also reads).
 fn pythonIntent(arena: std.mem.Allocator, step: Step) !?Found {
     const body = step.heredoc orelse return null;
-    for (step.words[1..]) |arg| if (!std.mem.eql(u8, arg, "-")) return null;
+    // Only `-` (read the script from stdin) and flags that change nothing
+    // about what it touches (-I isolated, -u unbuffered, …).
+    for (step.words[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "-")) continue;
+        if (arg.len < 2 or arg[0] != '-') return null;
+        for (arg[1..]) |flag| if (std.mem.indexOfScalar(u8, "IuBEsS", flag) == null) return null;
+    }
     for ([_][]const u8{ "subprocess", "os.system", "socket", "urllib", "requests", "rmtree", "remove(", "unlink(", "rename(", "replace(p", "exec(", "eval(", "shutil", "popen", "chmod" }) |risky| {
         if (std.mem.indexOf(u8, body, risky) != null) return null;
     }
@@ -293,6 +370,9 @@ const Lexer = struct {
         var words: std.ArrayList([]const u8) = .empty;
         var out: Step = .{ .words = &.{} };
         var delimiter: ?[]const u8 = null;
+        self.skipBlanks();
+        out.start = self.at;
+        out.end = self.at;
         while (true) {
             self.skipBlanks();
             if (self.at >= self.src.len) break;
@@ -314,6 +394,7 @@ const Lexer = struct {
             if (c == '&' or c == '`' or c == '(' or c == ')') return self.fail();
             if (std.mem.startsWith(u8, self.src[self.at..], "2>&1")) {
                 self.at += 4;
+                out.end = self.at;
                 continue;
             }
             if (std.mem.startsWith(u8, self.src[self.at..], "2>")) {
@@ -321,6 +402,7 @@ const Lexer = struct {
                 self.skipBlanks();
                 const target = (try self.word()) orelse return self.fail();
                 if (!std.mem.eql(u8, target, "/dev/null")) return self.fail();
+                out.end = self.at;
                 continue;
             }
             if (std.mem.startsWith(u8, self.src[self.at..], "<<")) {
@@ -328,6 +410,7 @@ const Lexer = struct {
                 if (self.at < self.src.len and self.src[self.at] == '-') self.at += 1;
                 self.skipBlanks();
                 delimiter = (try self.word()) orelse return self.fail();
+                out.end = self.at;
                 continue;
             }
             if (c == '<') return self.fail();
@@ -338,10 +421,12 @@ const Lexer = struct {
                 const target = (try self.word()) orelse return self.fail();
                 if (out.redirect != null) return self.fail();
                 out.redirect = .{ .path = target, .append = append };
+                out.end = self.at;
                 continue;
             }
             const w = (try self.word()) orelse return self.fail();
             try words.append(self.arena, w);
+            out.end = self.at;
         }
         if (delimiter) |d| {
             // The body starts on the next line and ends at a line that is

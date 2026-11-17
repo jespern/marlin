@@ -2394,6 +2394,59 @@ pub fn shellFileIntent(arena: std.mem.Allocator, tool_name: []const u8, args_jso
     return shell_intent.classify(arena, shellDisplayCommand(parsed.command orelse return null)) catch null;
 }
 
+/// A Bash command that touches files, as what it did. All file steps: their
+/// files and lines ("layout.zig:2370-2520, main.zig:1-10"), under a Read,
+/// Write, or Edit name. Mixed with other commands: each step in turn
+/// ("read layout.zig:2370-2520 · zig build test"), filters after their read.
+/// Null when no step touches files (the command shows as typed).
+pub fn shellSummary(arena: std.mem.Allocator, command: []const u8, cwd: []const u8) !?[]const u8 {
+    const actions = (try shell_intent.describe(arena, command)) orelse return null;
+    var files: usize = 0;
+    for (actions) |action| {
+        if (action.kind != null) files += 1;
+    }
+    if (files == 0) return null;
+    var out: std.ArrayList(u8) = .empty;
+    if (files == actions.len) {
+        var seen: std.ArrayList([]const u8) = .empty;
+        for (actions) |action| for (action.paths) |path| {
+            const item = try filePlace(arena, path, action.range, cwd);
+            for (seen.items) |prior| {
+                if (std.mem.eql(u8, prior, item)) break;
+            } else {
+                try seen.append(arena, item);
+                if (out.items.len > 0) try out.appendSlice(arena, ", ");
+                try out.appendSlice(arena, item);
+            }
+        };
+        return out.items;
+    }
+    for (actions) |action| {
+        if (out.items.len > 0) try out.appendSlice(arena, " · ");
+        const kind = action.kind orelse {
+            try out.appendSlice(arena, action.text);
+            continue;
+        };
+        try out.appendSlice(arena, switch (kind) {
+            .read => "read ",
+            .write => "write ",
+            .edit => "edit ",
+        });
+        for (action.paths, 0..) |path, i| {
+            if (i > 0) try out.appendSlice(arena, ", ");
+            try out.appendSlice(arena, try filePlace(arena, path, action.range, cwd));
+        }
+        if (action.text.len > 0) try out.print(arena, " | {s}", .{action.text});
+    }
+    return out.items;
+}
+
+/// "src/web.zig:10-20": the shown path and the lines read, if chosen.
+fn filePlace(arena: std.mem.Allocator, path: []const u8, range: ?[]const u8, cwd: []const u8) ![]const u8 {
+    const shown = if (std.fs.path.isAbsolute(path)) shortenDisplayPath(path, cwd) else path;
+    return if (range) |r| try std.fmt.allocPrint(arena, "{s}:{s}", .{ shown, r }) else shown;
+}
+
 /// The tool's name as the transcript shows it, seeing through Bash calls
 /// that are file reads or edits ("Edit", not "Bash").
 pub fn toolDisplayNameFor(arena: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) []const u8 {
@@ -2482,15 +2535,10 @@ pub fn toolDisplayArgDecoded(
         error.OutOfMemory => return err,
         else => return malformedDisplayArg(tool_name, args_json, cwd),
     };
-    // A Bash call that only reads or edits files shows its files.
-    if (shellFileIntent(arena, tool_name, args_json)) |intent| {
-        var paths: std.ArrayList(u8) = .empty;
-        for (intent.paths) |path| {
-            if (paths.items.len > 0) try paths.appendSlice(arena, ", ");
-            try paths.appendSlice(arena, if (std.fs.path.isAbsolute(path)) shortenDisplayPath(path, cwd) else path);
-        }
-        return paths.items;
-    }
+    // A Bash call that reads or edits files says so, step by step.
+    if (std.ascii.eqlIgnoreCase(tool_name, "bash")) if (parsed.command) |command| {
+        if (try shellSummary(arena, shellDisplayCommand(command), cwd)) |summary| return summary;
+    };
 
     if (isFileEditTool(tool_name)) {
         if (parsed.changes) |changes| {

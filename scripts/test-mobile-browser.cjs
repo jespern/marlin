@@ -186,6 +186,8 @@ async function main() {
         "cd "+cwd+" && python3 - <<'EOF'\ndef rep(p, old, new):\n    s=open(p).read(); open(p,'w').write(s.replace(old,new))\nrep('src/web.zig', '''a('x.zig')''', '''b''')\nEOF",
         "cat > notes.md <<'EOF'\nhello\nEOF",
         "sed -n 1,5p src/main.zig && zig build test",
+        "cd "+cwd+" && sed -n 2370,2520p src/a.zig | rg -v x; echo ---; head -40 /etc/hosts; zig build test 2>&1 | tail -3",
+        "zig build test && git status",
       ].entries()) {
         addBlock({ts:Date.now(),body:{tool_call:{name:'Bash',call_id:'sh'+i,args_json:JSON.stringify({command})}}});
         const row=[...document.querySelectorAll('#transcript .tool')].pop();
@@ -211,9 +213,13 @@ async function main() {
       });
       return {rows,verdicts};
     },root);
+    // Mixed with other commands it stays Bash, its steps said as done; a
+    // command without file steps shows as typed.
     assert.deepEqual(intents.rows,[
-      ['⚙ Read src/main.zig',true],['⚙ Edit src/web.zig',true],['⚙ Write notes.md',true],
-      ["⚙ Bash sed -n 1,5p src/main.zig && zig build test",false]]);
+      ['⚙ Read src/main.zig:1-20',true],['⚙ Edit src/web.zig',true],['⚙ Write notes.md',true],
+      ['⚙ Bash read src/main.zig:1-5 · zig build test',true],
+      ['⚙ Bash read src/a.zig:2370-2520 | rg -v x · read hosts:1-40 · zig build test 2>&1 | tail -3',true],
+      ['⚙ Bash zig build test && git status',false]]);
     assert.deepEqual(intents.verdicts,intents.verdicts.map(()=>true));
     // Interactive cards behave like the TUI's: questions, approvals, Plan offers.
     const cards=await page.evaluate(async()=>{

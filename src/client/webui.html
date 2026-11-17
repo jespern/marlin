@@ -787,44 +787,128 @@ function addToToolGroup(t, node, kind) {
   return true;
 }
 
-// Port of shell_intent.zig (keep the two in step): a Bash call that only
-// reads or changes files ({kind: 'read'|'write'|'edit', paths}), shown as
-// that instead of a script. Anything else in the command keeps it Bash.
-function shellFileIntent(command) {
+// Port of shell_intent.zig (keep the two in step). describeShell: each step
+// of a command as what it did ({kind: 'read'|'write'|'edit'|null, paths,
+// range, text}); shellFileIntent: the whole call when every step is a file
+// read or change; shellSummary: how a Bash row shows it.
+function describeShell(command) {
   const steps = shellSteps(command);
   if (!steps) return null;
-  const paths = [];
-  let reads = false, writes = false, any = false, dir = null, piped = false;
-  for (const step of steps) {
-    const w = step.words, wasPiped = piped;
-    piped = step.pipe;
-    if (!w.length) { if (step.redirect || step.heredoc != null || step.pipe || wasPiped) return null; continue; }
-    // Piped into: it must only shape the read's output.
-    if (wasPiped) { if (!isShellFilter(step)) return null; continue; }
-    const name = w[0].split('/').pop();
-    if (name === 'cd') {
-      if (w.length !== 2 || step.redirect || step.heredoc != null || step.pipe) return null;
-      dir = w[1];
+  const actions = [];
+  let dir = null;
+  for (let i = 0; i < steps.length;) {
+    let last = i;
+    while (steps[last].pipe) { if (last + 1 >= steps.length) return null; last++; }
+    const pipeline = steps.slice(i, last + 1);
+    i = last + 1;
+    const head = pipeline[0], firstLine = t => t.split('\n')[0].trim();
+    const whole = firstLine(command.slice(head.start, pipeline[pipeline.length - 1].end));
+    if (!head.words.length) {
+      if (head.redirect || head.heredoc != null || pipeline.length > 1) actions.push({kind: null, text: whole});
       continue;
     }
-    // `echo ----` between reads only labels the output.
-    if (name === 'echo' || name === 'printf') {
-      if (step.redirect || step.heredoc != null || step.pipe) return null;
-      continue;
-    }
-    const found = shellStepIntent(step);
-    if (!found || (step.pipe && found.kind !== 'read')) return null;
-    any = true;
-    if (found.kind !== 'write') reads = true;
-    if (found.kind !== 'read') writes = true;
-    for (const raw of found.paths) {
-      const path = dir && dir.startsWith('/') && raw && !raw.startsWith('/') && !raw.startsWith('~')
-        ? dir.replace(/\/+$/, '') + '/' + raw : raw;
-      if (!paths.includes(path)) paths.push(path);
-    }
+    const name = head.words[0].split('/').pop();
+    const plain = pipeline.length === 1 && !head.redirect && head.heredoc == null;
+    if (plain && name === 'cd' && head.words.length === 2) { dir = head.words[1]; continue; }
+    if (plain && (name === 'echo' || name === 'printf')) continue;
+    const found = shellStepIntent(head);
+    const filtered = pipeline.slice(1).every(isShellFilter);
+    if (found && (pipeline.length === 1 || (found.kind === 'read' && filtered))) {
+      const paths = found.paths.map(raw => dir && dir.startsWith('/') && raw && !raw.startsWith('/') && !raw.startsWith('~')
+        ? dir.replace(/\/+$/, '') + '/' + raw : raw);
+      actions.push({kind: found.kind, paths, range: found.range || null,
+        text: pipeline.length > 1 ? firstLine(command.slice(pipeline[1].start, pipeline[pipeline.length - 1].end)) : ''});
+    } else actions.push({kind: null, text: whole});
   }
-  if (piped || !any || !paths.length) return null;
+  return actions;
+}
+function shellFileIntent(command) {
+  const actions = describeShell(command);
+  if (!actions) return null;
+  const paths = [];
+  let reads = false, writes = false;
+  for (const a of actions) {
+    if (!a.kind) return null;
+    if (a.kind !== 'write') reads = true;
+    if (a.kind !== 'read') writes = true;
+    for (const p of a.paths) if (!paths.includes(p)) paths.push(p);
+  }
+  if (!paths.length) return null;
   return {kind: !writes ? 'read' : !reads ? 'write' : 'edit', paths};
+}
+function shellSummary(command, cwd) {
+  const actions = describeShell(command);
+  if (!actions) return null;
+  const files = actions.filter(a => a.kind).length;
+  if (!files) return null;
+  const place = (p, range) => (p.startsWith('/') ? shortenDisplayPath(p, cwd) : p) + (range ? ':' + range : '');
+  if (files === actions.length) {
+    const seen = [];
+    for (const a of actions) for (const p of a.paths) { const item = place(p, a.range); if (!seen.includes(item)) seen.push(item); }
+    return seen.join(', ');
+  }
+  return actions.map(a => !a.kind ? a.text
+    : a.kind + ' ' + a.paths.map(p => place(p, a.range)).join(', ') + (a.text ? ' | ' + a.text : '')).join(' · ');
+}
+function shellStepIntent(step) {
+  const w = step.words, name = w[0].split('/').pop();
+  const digits = s => /^\d+$/.test(s);
+  if (name === 'cat') {
+    if (step.redirect) {
+      if (w.length !== 1 || step.heredoc == null) return null;
+      return {kind: step.redirect.append ? 'edit' : 'write', paths: [step.redirect.path]};
+    }
+    if (step.heredoc != null || w.slice(1).some(a => !a || a === '-')) return null;
+    const files = w.slice(1).filter(a => a[0] !== '-');
+    return files.length ? {kind: 'read', paths: files} : null;
+  }
+  if (step.redirect) return null;
+  if (name === 'head' || name === 'tail') {
+    if (step.heredoc != null) return null;
+    const files = [];
+    let lines = null;
+    for (let i = 1; i < w.length; i++) {
+      const a = w[i];
+      if (a === '-n' || a === '-c') { i++; if (i >= w.length || !digits(w[i].replace(/^[+-]+/, ''))) return null; if (a === '-n') lines = w[i]; }
+      else if (a.length > 1 && a[0] === '-') { if (!digits(a.slice(1))) return null; lines = a.slice(1); }
+      else files.push(a);
+    }
+    if (!files.length) return null;
+    const n = lines && lines.replace(/^[+-]+/, '');
+    const range = !lines ? null : name === 'head' ? '1-' + n : lines[0] === '+' ? n + '-' : 'last ' + n;
+    return {kind: 'read', paths: files, range};
+  }
+  if (name === 'sed') {
+    if (step.heredoc != null) return null;
+    let inPlace = false, quiet = false, script = null;
+    const files = [];
+    for (let i = 1; i < w.length; i++) {
+      const a = w[i];
+      if (a === '-n') quiet = true;
+      else if (a.startsWith('-i')) { inPlace = true; if (a.length === 2 && i + 1 < w.length && (w[i + 1] === '' || w[i + 1][0] === '.')) i++; }
+      else if (a === '-E' || a === '-r') continue;
+      else if (a === '-e') { i++; if (i >= w.length) return null; script = w[i]; }
+      else if (a.length > 1 && a[0] === '-') return null;
+      else if (script === null) script = a;
+      else files.push(a);
+    }
+    if (!files.length || script === null) return null;
+    if (inPlace) return {kind: 'edit', paths: files};
+    if (!quiet || !sedPrintsOnly(script)) return null;
+    return {kind: 'read', paths: files, range: sedLineRange(script)};
+  }
+  if (name.startsWith('python')) return pythonFileIntent(step);
+  return null;
+}
+// "2370-2520" for 2370,2520p, "5" for 5p, "40-" for 40,$p; null otherwise.
+function sedLineRange(script) {
+  const body = script.trim().replace(/p+$/, '');
+  if (!body || /[\/;+!p]/.test(body)) return null;
+  const parts = body.split(',');
+  if (parts.length > 2 || !/^\d+$/.test(parts[0])) return null;
+  if (parts.length === 1) return parts[0];
+  if (parts[1] === '$') return parts[0] + '-';
+  return /^\d+$/.test(parts[1]) ? parts[0] + '-' + parts[1] : null;
 }
 // A sed -n script that only prints: addresses (numbers, $, /regex/, +N, !)
 // and p; nothing that writes (w), runs (e), or edits.
@@ -856,58 +940,12 @@ function isShellFilter(step) {
     operands++;
   }
   if (['grep', 'rg', 'sed'].includes(name)) return operands <= 1;
-  if (['head', 'tail', 'cat', 'nl', 'wc', 'sort', 'uniq'].includes(name)) return operands === 0;
+  if (['head', 'tail', 'cat', 'nl', 'wc', 'sort', 'uniq', 'cut'].includes(name)) return operands === 0;
   return false;
-}
-function shellStepIntent(step) {
-  const w = step.words, name = w[0].split('/').pop();
-  const digits = s => /^\d+$/.test(s);
-  if (name === 'cat') {
-    if (step.redirect) {
-      if (w.length !== 1 || step.heredoc == null) return null;
-      return {kind: step.redirect.append ? 'edit' : 'write', paths: [step.redirect.path]};
-    }
-    if (step.heredoc != null || w.slice(1).some(a => !a || a === '-')) return null;
-    const files = w.slice(1).filter(a => a[0] !== '-');
-    return files.length ? {kind: 'read', paths: files} : null;
-  }
-  if (step.redirect) return null;
-  if (name === 'head' || name === 'tail') {
-    if (step.heredoc != null) return null;
-    const files = [];
-    for (let i = 1; i < w.length; i++) {
-      const a = w[i];
-      if (a === '-n' || a === '-c') { i++; if (i >= w.length || !digits(w[i].replace(/^[+-]+/, ''))) return null; }
-      else if (a.length > 1 && a[0] === '-') { if (!digits(a.slice(1))) return null; }
-      else files.push(a);
-    }
-    return files.length ? {kind: 'read', paths: files} : null;
-  }
-  if (name === 'sed') {
-    if (step.heredoc != null) return null;
-    let inPlace = false, quiet = false, script = null;
-    const files = [];
-    for (let i = 1; i < w.length; i++) {
-      const a = w[i];
-      if (a === '-n') quiet = true;
-      else if (a.startsWith('-i')) { inPlace = true; if (a.length === 2 && i + 1 < w.length && (w[i + 1] === '' || w[i + 1][0] === '.')) i++; }
-      else if (a === '-E' || a === '-r') continue;
-      else if (a === '-e') { i++; if (i >= w.length) return null; script = w[i]; }
-      else if (a.length > 1 && a[0] === '-') return null;
-      else if (script === null) script = a;
-      else files.push(a);
-    }
-    if (!files.length || script === null) return null;
-    if (inPlace) return {kind: 'edit', paths: files};
-    if (!quiet || !sedPrintsOnly(script)) return null;
-    return {kind: 'read', paths: files};
-  }
-  if (name.startsWith('python')) return pythonFileIntent(step);
-  return null;
 }
 function pythonFileIntent(step) {
   const body = step.heredoc;
-  if (body == null || step.words.slice(1).some(a => a !== '-')) return null;
+  if (body == null || step.words.slice(1).some(a => a !== '-' && !/^-[IuBEsS]+$/.test(a))) return null;
   for (const risky of ['subprocess', 'os.system', 'socket', 'urllib', 'requests', 'rmtree', 'remove(', 'unlink(', 'rename(', 'replace(p', 'exec(', 'eval(', 'shutil', 'popen', 'chmod'])
     if (body.includes(risky)) return null;
   const writes = body.includes('.write(') || body.includes('write_text(');
@@ -941,9 +979,10 @@ function pythonFileIntent(step) {
   if (!paths.length) return null;
   return {kind: writes && reads ? 'edit' : writes ? 'write' : 'read', paths};
 }
-// Simple commands of a shell line: words without quotes, a stdout
-// redirection, a heredoc body. Null for what it does not understand
-// (pipes, $(…), backgrounding, other redirections).
+// Simple commands of a shell line: words without quotes, where each sits in
+// the source (start/end, heredoc body excluded), a stdout redirection, a
+// heredoc body, and whether it pipes on. Null for what it does not
+// understand ($(…), ||, backgrounding, other redirections).
 function shellSteps(src) {
   const steps = [];
   let at = 0;
@@ -963,7 +1002,9 @@ function shellSteps(src) {
     return any ? out : null;
   };
   while (at < src.length) {
-    const step = {words: [], redirect: null, heredoc: null, pipe: false};
+    blanks();
+    if (at >= src.length) break;
+    const step = {words: [], redirect: null, heredoc: null, pipe: false, start: at, end: at};
     let delimiter = null;
     for (;;) {
       blanks();
@@ -978,9 +1019,9 @@ function shellSteps(src) {
         break;
       }
       if ('&`()'.includes(c)) return null;
-      if (rest.startsWith('2>&1')) { at += 4; continue; }
-      if (rest.startsWith('2>')) { at += 2; blanks(); if (word() !== '/dev/null') return null; continue; }
-      if (rest.startsWith('<<')) { at += 2; if (src[at] === '-') at++; blanks(); delimiter = word(); if (delimiter === null) return null; continue; }
+      if (rest.startsWith('2>&1')) { at += 4; step.end = at; continue; }
+      if (rest.startsWith('2>')) { at += 2; blanks(); if (word() !== '/dev/null') return null; step.end = at; continue; }
+      if (rest.startsWith('<<')) { at += 2; if (src[at] === '-') at++; blanks(); delimiter = word(); if (delimiter === null) return null; step.end = at; continue; }
       if (c === '<') return null;
       if (c === '>') {
         const append = rest.startsWith('>>');
@@ -989,11 +1030,13 @@ function shellSteps(src) {
         const target = word();
         if (target === null || step.redirect) return null;
         step.redirect = {path: target, append};
+        step.end = at;
         continue;
       }
       const w = word();
       if (w === null) return null;
       step.words.push(w);
+      step.end = at;
     }
     if (delimiter !== null) {
       if (at === 0 || src[at - 1] !== '\n') return null;
@@ -1114,12 +1157,13 @@ function addBlock(b, target = $('#transcript'), live = true) {
     // A Bash call that only reads or edits files shows as that, with its
     // files; the command stays inside, a tap away.
     const command = lower(v.name) === 'bash' ? toolDisplayArg(v.name, v.args_json, '') : null;
-    const intent = command ? shellFileIntent(shellDisplayCommand(command.value)) : null;
+    const shown = command ? shellDisplayCommand(command.value) : '';
+    const intent = command ? shellFileIntent(shown) : null;
     const cwd = cur ? cur.cwd : '';
+    // Mixed with other commands it stays Bash, its steps said as done.
+    const summary = command ? shellSummary(shown, cwd) : null;
     s.appendChild(el('span', 'name', intent ? {read: 'Read', write: 'Write', edit: 'Edit'}[intent.kind] : toolDisplayName(v.name)));
-    const arg = intent
-      ? {value: intent.paths.map(p => p.startsWith('/') ? shortenDisplayPath(p, cwd) : p).join(', '), isPath: true}
-      : toolDisplayArg(v.name, v.args_json, cwd);
+    const arg = summary ? {value: summary, isPath: !!intent} : toolDisplayArg(v.name, v.args_json, cwd);
     if (arg && intent) {
       s.appendChild(document.createTextNode(' '));
       s.appendChild(el('span', 'prev', arg.value.slice(0, 400)));
@@ -1133,7 +1177,7 @@ function addBlock(b, target = $('#transcript'), live = true) {
       } else s.appendChild(el('span', 'prev', preview));
     }
     node.appendChild(s);
-    if (intent) {
+    if (summary) {
       const script = el('pre', 'sh');
       script.innerHTML = shellHtml(shellDisplayCommand(command.value));
       node.appendChild(script);

@@ -43,6 +43,8 @@ test "sed reads: pattern ranges, echo separators, and pipes through filters" {
     try expectIntent("sed -n 1,30p src/styles/tokens.css | grep -n -e x | head -4", .read, &.{"src/styles/tokens.css"});
     try expectIntent("cat src/x.zig | wc -l", .read, &.{"src/x.zig"});
     try expectIntent("cat -n src/x.zig | sed -n 10,20p", .read, &.{"src/x.zig"});
+    try expectIntent("sed -n 40,44p docs/a.md | cut -c1-400", .read, &.{"docs/a.md"});
+    try expectIntent("python3 -I - <<'EOF'\np='a.zig'\ns=open(p).read()\nEOF", .read, &.{"a.zig"});
 }
 
 test "changes: sed -i, cat > file, and python scripts that rewrite a file" {
@@ -94,6 +96,7 @@ test "anything else in the command keeps it a Bash call" {
         "python3 - <<'EOF'\np='a.zig'\nopen(p,'w').write('x')\nEOF\nzig build",
         "python3 - <<'EOF'\nimport subprocess\np='a.zig'\nopen(p).read()\nEOF",
         "python3 -c 'print(1)'",
+        "python3 -m http.server - <<'EOF'\nopen('a.zig').read()\nEOF",
         "rg -n x src",
         "cat > notes.md",
         "echo hi > notes.md",
@@ -106,4 +109,39 @@ test "anything else in the command keeps it a Bash call" {
         "> notes.md",
         "python3 - <<'EOF'\nprint('hello')\nEOF",
     }) |command| try expectIntent(command, null, &.{});
+}
+
+test "describe: each step as what it did, with the lines a read chose" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const actions = (try shell_intent.describe(a,
+        \\cd /w && sed -n 2370,2520p src/layout.zig; echo ----; head -n 40 README.md | rg -v x
+        \\tail -20 log.txt; tail -n +5 b.txt; sed -n '/^fn x/,/^}/p' c.zig
+        \\python3 - <<'EOF'
+        \\p='src/tui.zig'
+        \\s=open(p).read(); open(p,'w').write(s)
+        \\EOF
+        \\zig build test 2>&1 | tail -3
+    )).?;
+    const Want = struct { kind: ?shell_intent.Kind, path: []const u8 = "", range: ?[]const u8 = null, text: []const u8 = "" };
+    const want = [_]Want{
+        .{ .kind = .read, .path = "/w/src/layout.zig", .range = "2370-2520" },
+        .{ .kind = .read, .path = "/w/README.md", .range = "1-40", .text = "rg -v x" },
+        .{ .kind = .read, .path = "/w/log.txt", .range = "last 20" },
+        .{ .kind = .read, .path = "/w/b.txt", .range = "5-" },
+        .{ .kind = .read, .path = "/w/c.zig" },
+        .{ .kind = .edit, .path = "/w/src/tui.zig" },
+        .{ .kind = null, .text = "zig build test 2>&1 | tail -3" },
+    };
+    try std.testing.expectEqual(want.len, actions.len);
+    for (want, actions) |w, got| {
+        try std.testing.expectEqual(w.kind, got.kind);
+        if (w.kind != null) try std.testing.expectEqualStrings(w.path, got.paths[0]);
+        if (w.range) |r| try std.testing.expectEqualStrings(r, got.range.?) else try std.testing.expect(got.range == null);
+        try std.testing.expectEqualStrings(w.text, got.text);
+    }
+    // Beyond the lexer: no description, the command shows as typed.
+    try std.testing.expect(try shell_intent.describe(a, "sed -n 1,5p $(ls *.zig)") == null);
+    try std.testing.expect(try shell_intent.describe(a, "make || make clean") == null);
 }
