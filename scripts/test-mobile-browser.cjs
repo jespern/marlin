@@ -472,6 +472,18 @@ async function main() {
     // Links as the TUI shows them: a file on the Mac is its name, not raw Markdown.
     const links=await page.evaluate(()=>inlineMd('Updated [BLOBS.md](/Users/x/BLOBS.md:19) and [docs](https://x.test/a)'));
     assert.equal(links,'Updated <span class="mdlink" title="/Users/x/BLOBS.md:19">BLOBS.md</span> and <a href="https://x.test/a" target="_blank" rel="noopener noreferrer">docs</a>');
+    // Bare URLs link too (render.zig urlEnd's rules): sentence punctuation
+    // and an unopened closer stay out; inline code is left as code.
+    const bare=await page.evaluate(()=>[
+      inlineMd('See https://bugs.webkit.org/show_bug.cgi?id=215884.'),
+      inlineMd('(per https://en.wikipedia.org/wiki/Zig_(language))'),
+      inlineMd('run `curl https://code.test/x` and [y](https://y.test/z) then https://a.test/?q="b"&c=1'),
+    ].map(h=>{const d=document.createElement('div'); d.innerHTML=h; return [...d.querySelectorAll('a')].map(a=>a.getAttribute('href')+' '+a.textContent);}));
+    assert.deepEqual(bare,[
+      ['https://bugs.webkit.org/show_bug.cgi?id=215884 https://bugs.webkit.org/show_bug.cgi?id=215884'],
+      ['https://en.wikipedia.org/wiki/Zig_(language) https://en.wikipedia.org/wiki/Zig_(language)'],
+      ['https://y.test/z y','https://a.test/?q= https://a.test/?q='],
+    ]);
     // A partial live stream (the page opened mid-way) is still cleared by
     // the commentary it became, and live text sent whole replaces it.
     const live=await page.evaluate(()=>{

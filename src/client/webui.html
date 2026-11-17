@@ -487,7 +487,27 @@ let sid = null, cur = null, es = null, lastSeq = 0, oldestSeq = 0, historyHasOld
 
 // ---- markdown (escape-first; only escaped text ever reaches innerHTML) ----
 const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+// Bare http(s) URLs become links too, with render.zig urlEnd's rules:
+// trailing sentence punctuation stays out, and a closing bracket only when
+// the URL opened one ("(see https://x.test/a)" links without the ")").
+// Inline code and existing links are left alone.
+function autolink(html) {
+  return html.replace(/<(a|code)\b[^>]*>[\s\S]*?<\/\1>|<[^>]+>|https?:\/\/[^\s<]+/g, match => {
+    if (match[0] === '<') return match;
+    let url = match.split(/&quot;|&#39;|&gt;|&lt;|[`"']/)[0];
+    url = url.replace(/[.,;:!?]+$/, '');
+    for (const [open, close] of [['(', ')'], ['[', ']'], ['{', '}']]) {
+      const count = ch => url.split(ch).length - 1;
+      while (url.endsWith(close) && count(close) > count(open)) url = url.slice(0, -1);
+    }
+    if (url.length <= 'https://'.length) return match;
+    return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + url + '</a>' + match.slice(url.length);
+  });
+}
 function inlineMd(s) {
+  return autolink(inlineMdText(s));
+}
+function inlineMdText(s) {
   return esc(s)
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
