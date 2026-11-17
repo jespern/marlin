@@ -183,6 +183,7 @@ const View = struct {
                     dirty = true;
                 },
                 .shell_resized => |r| if (r.shell_id == self.shell_id.load(.acquire)) {
+                    logSize(self.io, "sized", r.shell_id, r.cols, r.rows);
                     if (emulator) |e| e.resize(r.cols, r.rows) catch {};
                     dirty = true;
                 },
@@ -279,6 +280,19 @@ pub fn serve(
             const encoded = try arena.alloc(u8, encoder.calcSize(input.len));
             view.sendDaemon(.{ .shell_input = .{ .shell_id = id, .data_base64 = encoder.encode(encoded, input) } });
         }
-        if (parsed.resize) |r| view.sendDaemon(.{ .shell_resize = .{ .shell_id = id, .cols = r.cols, .rows = r.rows } });
+        if (parsed.resize) |r| {
+            logSize(io, "phone asks", id, r.cols, r.rows);
+            view.sendDaemon(.{ .shell_resize = .{ .shell_id = id, .cols = r.cols, .rows = r.rows } });
+        }
     }
+}
+
+/// A size change in the companion log (the /web tab), as plain lines beside
+/// the access log: what the phone asked for, and what the shell became. A
+/// shell drawn at the wrong size on a phone shows which half went missing.
+fn logSize(io: Io, what: []const u8, shell_id: u64, cols: u16, rows: u16) void {
+    var buffer: [128]u8 = undefined;
+    var writer = Io.File.stderr().writer(io, &buffer);
+    writer.interface.print("shell {d}: {s} {d}x{d}\n", .{ shell_id, what, cols, rows }) catch return;
+    writer.interface.flush() catch {};
 }
