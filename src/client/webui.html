@@ -68,6 +68,7 @@
   .sess .mark.running, .sess .mark.approval { color: var(--yellow); font-weight: 700; }
   .sess .mark.err { color: var(--red); font-weight: 700; }
   .sess .m { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess .cwd { direction: rtl; text-align: left; } /* keep the folder's name; trim from the left */
   .sess.child .t::before { content: "↳ "; color: var(--dim); }
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   #topbar, #approval, #composer, #status { flex-shrink: 0; }
@@ -1328,6 +1329,10 @@ function displayCwd(cwd) {
   if (homeDir && (cwd === homeDir || cwd.startsWith(homeDir + '/'))) return '~' + cwd.slice(homeDir.length);
   return cwd;
 }
+// A shell session is where its shell is (`cd` moves it).
+function sessionCwd(s) {
+  return Number(s.shell_id) && s.shell_cwd ? s.shell_cwd : s.cwd;
+}
 function setCwd(cwd) {
   const shown = displayCwd(cwd);
   // LRM marks keep the path's slashes in order inside the right-to-left
@@ -1503,6 +1508,8 @@ function renderSessions(list) {
     title.appendChild(document.createTextNode(s.title || '(untitled)'));
     d.appendChild(title);
     d.appendChild(el('div', 'm', s.state + ' · ' + shortModel(s.model)));
+    const where = displayCwd(sessionCwd(s));
+    if (where) d.appendChild(el('div', 'm cwd', '\u200e' + where + '\u200e'));
     const pen = el('button', 'rename', '✎');
     pen.title = 'rename';
     pen.onclick = ev => { ev.stopPropagation(); renameSession(s); };
@@ -1515,8 +1522,7 @@ function renderSessions(list) {
       tabTitle(s);
       $('#sandbox-btn').classList.toggle('off', !s.sandboxed);
       setCredits(!!s.usage_credits);
-      // A shell session shows where its shell is (`cd` moves it).
-      setCwd(Number(s.shell_id) && s.shell_cwd ? s.shell_cwd : s.cwd);
+      setCwd(sessionCwd(s));
       updatePlanOffer();
     }
   }

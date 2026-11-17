@@ -388,13 +388,16 @@ async function main() {
         lostShellId=7; // keep syncShell from connecting to this fake shell
         const statusCwd=()=>document.querySelector('#status .cwd').textContent.replace(/\u200e/g,'');
         renderSessions([{...base,sid,cwd:'/proj',shell_id:7,shell_cwd:'/elsewhere'}]); out.shellCwd=statusCwd();
-        renderSessions([{...base,sid,cwd:'/proj'}]); out.agentCwd=statusCwd();
+        const listCwd=()=>document.querySelector('#sessions .cwd').textContent.replace(/\u200e/g,'');
+        out.listShellCwd=listCwd();
+        renderSessions([{...base,sid,cwd:'/proj'}]); out.agentCwd=statusCwd(); out.listAgentCwd=listCwd();
         lostShellId=0;
       } finally { window.send=realSend; window.matchMedia=real; }
       return out;
     });
     assert.equal(comp.cwd,'~');
     assert.deepEqual([comp.shellCwd,comp.agentCwd],['/elsewhere','/proj']);
+    assert.deepEqual([comp.listShellCwd,comp.listAgentCwd],['/elsewhere','/proj']);
     assert.equal(comp.enterSent,0);
     assert.equal(comp.sendEnabled,true);
     assert.equal(comp.sentText,'line one\nline two');
