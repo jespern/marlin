@@ -370,6 +370,14 @@ async function main() {
         out.credits=document.querySelector('#status .credits').textContent;
         setContext({context_used:75,context_limit:100}); out.warn=document.querySelector('#status .ctx').className;
         setContext({context_used:95,context_limit:100}); out.hot=document.querySelector('#status .ctx').className;
+        // Tapping the fill compacts: the first tap asks, the second does it.
+        const ctx=document.querySelector('#status .ctx'), compacts=()=>sent.filter(m=>m.session_compact).length;
+        setState('idle');
+        ctx.click(); out.ask=[ctx.textContent,compacts()];
+        ctx.click(); await new Promise(r=>setTimeout(r,0)); out.compacted=[ctx.textContent,compacts()];
+        ctx.click(); setContext({context_used:80,context_limit:100}); out.refreshed=ctx.textContent;
+        ctx.click(); ctx.click(); await new Promise(r=>setTimeout(r,0));
+        setState('running'); const before=compacts(); ctx.click(); out.midTurn=[ctx.textContent,compacts()-before]; setState('idle');
         // Session marks: running, approval, error, paused, unread completion.
         const base={title:'x',model:'m',cwd:'/'};
         renderSessions([{...base,sid:'91',state:'running'},{...base,sid:'92',state:'awaiting_approval'},{...base,sid:'93',state:'err'},
@@ -421,6 +429,10 @@ async function main() {
     assert.deepEqual(sticks,{keyboard:true,expanded:true,reading:true,back:true});
     assert.equal(comp.credits,' · api credits');
     assert.deepEqual([comp.warn,comp.hot],['ctx agent warn','ctx agent hot']);
+    assert.deepEqual(comp.ask,[' · compact? tap again',0]);
+    assert.deepEqual(comp.compacted.slice(0,2),[' · 95%',1]);
+    assert.equal(comp.refreshed,' · 80%');
+    assert.deepEqual(comp.midTurn,[' · 80%',0]);
     assert.deepEqual(comp.marks,['●:running','!:approval','×:err','‖:paused','·:idle','✓:done']);
     await page.reload();
     await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');

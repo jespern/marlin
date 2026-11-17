@@ -290,6 +290,9 @@
   /* render.zig: context warn at 70% (yellow), hot at 90% (red). */
   #status .ctx.warn { color: var(--yellow); }
   #status .ctx.hot { color: var(--red); }
+  /* Tap to compact; the first tap asks, the second does it. */
+  #status .ctx { cursor: pointer; }
+  #status .ctx.confirm { color: var(--yellow); text-decoration: underline; }
   #status .credits { color: var(--yellow); }
   /* One line: every piece keeps its words; only the folder gives way. */
   #status > span { white-space: nowrap; flex-shrink: 0; }
@@ -1254,6 +1257,7 @@ function setModelLabel(model) {
 }
 // Context fill from session_meta; blank until the daemon has measured it.
 function setContext(meta) {
+  disarmCompact();
   const ctx = $('#status .ctx');
   const used = meta ? Number(meta.context_used) : 0, limit = meta ? Number(meta.context_limit) : 0;
   if (!limit || !used) { ctx.textContent = ''; ctx.className = 'ctx agent'; return; }
@@ -1261,7 +1265,36 @@ function setContext(meta) {
   ctx.textContent = ' · ' + pct + '%';
   ctx.title = used.toLocaleString() + ' of ' + limit.toLocaleString() + ' tokens';
   ctx.className = 'ctx agent' + (pct >= 90 ? ' hot' : pct >= 70 ? ' warn' : '');
+  ctx.title += ' · tap to compact';
 }
+// Tapping the context fill compacts the session (the TUI's /compact): the
+// first tap asks, a second within a few seconds does it. Mid-turn it waits.
+let compactArmed = 0, compactShown = '';
+function disarmCompact() {
+  if (!compactArmed) return;
+  clearTimeout(compactArmed);
+  compactArmed = 0;
+  const ctx = $('#status .ctx');
+  ctx.textContent = compactShown;
+  ctx.classList.remove('confirm');
+}
+async function compactSession() {
+  const state = $('#status .state').className;
+  if (state.includes('running') || state.includes('awaiting_approval')) { notice('compact once this turn is done'); return; }
+  const r = await send('{"session_compact":{"sid":' + sid + '}}');
+  notice(r.err ? (r.err.msg || 'could not compact') : 'compacting…');
+}
+$('#status .ctx').addEventListener('click', () => {
+  const ctx = $('#status .ctx');
+  if (!ctx.textContent || sid == null) return;
+  if (compactArmed) { disarmCompact(); compactSession(); return; }
+  const state = $('#status .state').className;
+  if (state.includes('running') || state.includes('awaiting_approval')) { notice('compact once this turn is done'); return; }
+  compactShown = ctx.textContent;
+  ctx.textContent = ' · compact? tap again';
+  ctx.classList.add('confirm');
+  compactArmed = setTimeout(disarmCompact, 4000);
+});
 // The TUI's "(using api credits)": a guest billing paid API credits.
 function setCredits(on) {
   $('#status .credits').textContent = on ? ' · api credits' : '';
@@ -2463,8 +2496,8 @@ async function slashCommand(raw) {
     else if (!arg) await setPlanMode(true);
     else if (await setPlanMode(true)) await submitInput(arg);
   } else if (cmd === '/compact') {
-    r = await send('{"session_compact":{"sid":' + sid + '}}');
-    if (!r.err) notice('compacting…');
+    await compactSession();
+    return;
   } else if (cmd === '/rename') {
     if (!arg) { notice('usage: /rename <title>'); return; }
     r = await send('{"session_rename":{"sid":' + sid + ',"title":' + JSON.stringify(arg) + '}}');
