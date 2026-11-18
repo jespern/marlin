@@ -20,6 +20,7 @@ const Fake = struct {
     token: []const u8 = "tok1",
     refreshed: bool = false,
     stream_held: std.atomic.Value(u32) = .init(0),
+    listens: std.atomic.Value(u32) = .init(0),
     failure: ?[]const u8 = null,
 
     fn base(self: *const Fake, buf: []u8) []const u8 {
@@ -118,9 +119,15 @@ const Fake = struct {
             }
             if (!std.mem.eql(u8, headers.get("mcp-protocol-version") orelse "", mcp.current_protocol)) return error.MissingVersion;
             const rpc = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
-            const id = rpc.object.get("id").?.integer;
             const rpc_method = rpc.object.get("method").?.string;
             if (!std.mem.eql(u8, headers.get("mcp-method") orelse "", rpc_method)) return error.MethodHeader;
+            // Like many servers, no subscriptions: the client's listener
+            // must take the answer and leave it there.
+            if (std.mem.eql(u8, rpc_method, "subscriptions/listen")) {
+                _ = self.listens.fetchAdd(1, .release);
+                return json(out, "{\"jsonrpc\":\"2.0\",\"id\":\"marlin-tools-changed\",\"error\":{\"code\":-32601,\"message\":\"method not found\"}}");
+            }
+            const id = rpc.object.get("id").?.integer;
             if (std.mem.eql(u8, rpc_method, "tools/list")) {
                 return json(out, try std.fmt.allocPrint(arena,
                     \\{{"jsonrpc":"2.0","id":{d},"result":{{"tools":[{{"name":"echo","description":"Echo","inputSchema":{{"type":"object","properties":{{"text":{{"type":"string"}},"region":{{"type":"string","x-mcp-header":"Region"}}}}}}}}]}}}}

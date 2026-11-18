@@ -387,6 +387,7 @@ const ShellRig = struct {
         d.clients = .empty;
         d.clients_mutex = .init;
         d.phone_push = null;
+        d.mcp_stale = .empty;
         d.sessions = .empty;
         d.shells = .empty;
         d.agent_waits = .empty;
@@ -428,6 +429,8 @@ const ShellRig = struct {
         r.daemon.clients.deinit(gpa);
         r.daemon.sessions.deinit(gpa);
         r.daemon.agent_waits.deinit(gpa);
+        for (r.daemon.mcp_stale.items) |name| gpa.free(name);
+        r.daemon.mcp_stale.deinit(gpa);
         r.session.live_text.deinit(gpa);
         r.session.live_reasoning.deinit(gpa);
         gpa.free(r.session.model);
@@ -890,4 +893,35 @@ test "an assistant outside Marlin reads the attention log and answers what waits
     const newest = try std.json.parseFromSliceLeaky(std.json.Value, r.arena.allocator(), (try Call.result(r, 12)).output, .{});
     try std.testing.expectEqual(@as(usize, 1), newest.object.get("events").?.array.items.len);
     try std.testing.expectEqual(newest.object.get("latest").?.integer, newest.object.get("events").?.array.items[0].object.get("seq").?.integer);
+}
+
+// Turns borrow the tool list a refresh replaces: a server that changes its
+// tools mid-turn is re-listed once no turn runs, as /mcp restart waits too.
+test "a changed MCP server is re-listed only once no turn is running" {
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const gpa = r.gpa;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/bin:/bin");
+    const config = @import("../core/config.zig");
+    const cfg = config.Config{ .mcp_servers = &.{
+        .{ .name = "grow", .cmd = &.{ "sh", "-c", @import("tools/mcp_test.zig").changing_server }, .mutating = true },
+    } };
+    const runtime = try @import("extensions.zig").Runtime.init(gpa, r.threaded.io(), cfg, &environ);
+    defer runtime.deinit();
+    r.daemon.extensions = runtime;
+    const out = runtime.dispatch("mcp__grow__add", "{}", "/", null).?;
+    gpa.free(out.output);
+
+    r.session.state = .running;
+    for (0..2) |_| try r.daemon.handleEvent(.{ .mcp_tools_changed = .{ .name = try gpa.dupe(u8, "grow") } });
+    r.daemon.refreshMcpWhenIdle();
+    try std.testing.expect(runtime.find("mcp__grow__added") == null);
+    try std.testing.expectEqual(@as(usize, 1), r.daemon.mcp_stale.items.len); // once, not twice
+
+    r.session.state = .idle;
+    r.daemon.refreshMcpWhenIdle();
+    try std.testing.expect(runtime.find("mcp__grow__added") != null);
+    try std.testing.expectEqual(@as(usize, 0), r.daemon.mcp_stale.items.len);
 }

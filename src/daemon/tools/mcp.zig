@@ -64,6 +64,31 @@ pub const CallResult = struct {
 
 pub const ProtocolMode = enum { modern, legacy };
 
+/// Told when a server says its tools changed (notifications/tools/
+/// list_changed). Called on the server's reader or listener thread, so it
+/// must be quick and thread-safe: the daemon queues an event and re-lists
+/// once no turn is running (extensions.refreshMcpTools).
+pub const ChangeHook = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, server: []const u8) void,
+};
+
+/// The id of the request that subscribes to tools changes. A string, apart
+/// from the numbered requests a response is matched to.
+pub const listen_id = "marlin-tools-changed";
+/// A held-open HTTP listen stream is reopened after this long anyway, a
+/// safety net under a proxy that drops it silently.
+pub const listen_timeout_ms: i64 = 60 * 60 * 1000;
+
+/// One request waiting on a stdio server: its id, then its response line or
+/// why there will be none.
+const Waiter = struct {
+    id: u64,
+    line: ?[]u8 = null,
+    failure: ?anyerror = null,
+    done: Io.Event = .unset,
+};
+
 /// One persistent stdio MCP subprocess. Calls from concurrent Marlin sessions
 /// serialize through `mutex`; if the child exits, the next call restarts it
 /// using the protocol mode established during discovery.
@@ -82,6 +107,21 @@ pub const Server = struct {
     mode: ProtocolMode = .modern,
     mutex: Io.Mutex = .init,
     tools: std.ArrayList(Tool) = .empty,
+    /// Reads a stdio server's stdout for as long as it runs: a response goes
+    /// to the request waiting for it, a tools change to `hook`, at once,
+    /// even between calls. Joined in reset() after the process group dies.
+    reader_thread: ?std.Thread = null,
+    /// Guards `waiter` and `stdout_closed`.
+    pending_mutex: Io.Mutex = .init,
+    waiter: ?*Waiter = null,
+    stdout_closed: bool = false,
+    /// Where tools changes go; a change before any hook is set is kept in
+    /// `hook_missed` and delivered when one is.
+    hook_mutex: Io.Mutex = .init,
+    hook: ?ChangeHook = null,
+    hook_missed: bool = false,
+    /// 2025-11-25 servers: `initialize` offered tools.listChanged.
+    legacy_list_changed: bool = false,
     /// Absolute budget for one complete JSON-RPC exchange, including a
     /// blocked stdin write and any unrelated stdout records. Kept as a field
     /// so the failure paths can be exercised without 15-second tests.
@@ -103,6 +143,8 @@ pub const Server = struct {
     http_timeout_ms: i64 = http_timeout_ms,
     /// The last 401/403 `WWW-Authenticate`, for `/mcp login`.
     challenge: ?[]u8 = null,
+    /// Holds open the stream an HTTP server announces tools changes on.
+    listener: ?*Listener = null,
     /// Human words for the last failure, shown in `/mcp` status.
     detail_buf: [200]u8 = undefined,
     detail_len: usize = 0,
@@ -170,6 +212,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        self.stopListener();
         self.reset();
         for (self.tools.items) |*tool| tool.deinit(self.gpa);
         self.tools.deinit(self.gpa);
@@ -230,11 +273,78 @@ pub const Server = struct {
             try self.initializeLegacy();
             try self.listAllTools();
         };
+        self.sortTools();
+        self.startWatching();
+    }
+
+    fn sortTools(self: *Server) void {
         std.sort.insertion(Tool, self.tools.items, {}, struct {
             fn less(_: void, a: Tool, b: Tool) bool {
                 return std.mem.lessThan(u8, a.public_name, b.public_name);
             }
         }.less);
+    }
+
+    /// List the tools again after the server said they changed, keeping its
+    /// process. On failure the previous list stays.
+    pub fn relist(self: *Server) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var previous = self.tools;
+        self.tools = .empty;
+        errdefer {
+            for (self.tools.items) |*tool| tool.deinit(self.gpa);
+            self.tools.deinit(self.gpa);
+            self.tools = previous;
+        }
+        self.ensureReady() catch |err| {
+            self.reset();
+            return err;
+        };
+        self.listAllTools() catch |err| {
+            self.reset();
+            return err;
+        };
+        self.sortTools();
+        for (previous.items) |*tool| tool.deinit(self.gpa);
+        previous.deinit(self.gpa);
+    }
+
+    /// Send this server's tools changes to `hook` (null: nowhere). One that
+    /// came before is delivered now.
+    pub fn watch(self: *Server, hook: ?ChangeHook) void {
+        self.hook_mutex.lockUncancelable(self.io);
+        defer self.hook_mutex.unlock(self.io);
+        self.hook = hook;
+        if (hook) |h| if (self.hook_missed) {
+            self.hook_missed = false;
+            h.func(h.ctx, self.name);
+        };
+    }
+
+    fn toolsChanged(self: *Server) void {
+        self.hook_mutex.lockUncancelable(self.io);
+        defer self.hook_mutex.unlock(self.io);
+        if (self.hook) |h| h.func(h.ctx, self.name) else self.hook_missed = true;
+    }
+
+    /// Ask to hear about tools changes. A 2026-07-28 server sends them only
+    /// on a subscription (a stdio one on stdout, which the reader thread
+    /// always reads); an older stdio server sends them unasked; an older HTTP
+    /// server on its GET stream, when `initialize` offered them.
+    fn startWatching(self: *Server) void {
+        if (self.url != null) {
+            if (self.mode == .modern or self.legacy_list_changed) self.startListener();
+            return;
+        }
+        if (self.mode != .modern) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        // Not waited on: its response comes only when the subscription
+        // ends, and a server without subscriptions answers with an error
+        // the reader drops.
+        const body = listenBody(arena_state.allocator()) catch return;
+        self.writeMessage(body) catch {};
     }
 
     pub fn call(
@@ -283,32 +393,110 @@ pub const Server = struct {
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .inherit,
+            // Its own process group, killed whole in reset(): an npx-style
+            // launcher's real server too, which would hold stdout open.
+            .pgid = 0,
         });
         self.reader = self.child.?.stdout.?.reader(self.io, &self.reader_buffer);
         self.writer = self.child.?.stdin.?.writer(self.io, &self.writer_buffer);
+        self.stdout_closed = false;
+        self.reader_thread = std.Thread.spawn(.{}, readStdout, .{self}) catch |err| {
+            self.reset();
+            return err;
+        };
     }
 
     fn reset(self: *Server) void {
         if (self.url != null) {
+            // A 2025-11-25 stream belongs to the session that ends here.
+            if (self.mode == .legacy) self.stopListener();
             if (self.session_id) |id| self.gpa.free(id);
             self.session_id = null;
             self.http_ready = false;
             return;
         }
+        if (self.child) |*child| {
+            self.killGroup();
+            // The group is dead, so stdout reaches end of file and the
+            // reader ends; only then may the pipe close under it.
+            if (self.reader_thread) |thread| thread.join();
+            self.reader_thread = null;
+            child.kill(self.io);
+        }
         self.reader = null;
         self.writer = null;
-        if (self.child) |*child| child.kill(self.io);
         self.child = null;
+    }
+
+    fn killGroup(self: *Server) void {
+        const child = self.child orelse return;
+        const pid = child.id orelse return;
+        std.posix.kill(-pid, .KILL) catch {};
     }
 
     fn ensureReady(self: *Server) !void {
         if (self.url != null) {
-            if (self.mode == .legacy and !self.http_ready) try self.initializeLegacy();
+            if (self.mode == .legacy and !self.http_ready) {
+                try self.initializeLegacy();
+                self.startWatching();
+            }
             return;
         }
-        if (self.child != null) return;
+        // A server that exited on its own starts again.
+        if (self.child != null and !self.stdoutClosed()) return;
+        self.reset();
         try self.start();
         if (self.mode == .legacy) try self.initializeLegacy();
+        self.startWatching();
+    }
+
+    fn stdoutClosed(self: *Server) bool {
+        self.pending_mutex.lockUncancelable(self.io);
+        defer self.pending_mutex.unlock(self.io);
+        return self.stdout_closed;
+    }
+
+    /// The stdio reader: every line the server writes, until it exits.
+    fn readStdout(self: *Server) void {
+        while (true) {
+            const line = self.readMessage(self.gpa) catch break;
+            self.dispatchStdout(line);
+        }
+        self.pending_mutex.lockUncancelable(self.io);
+        defer self.pending_mutex.unlock(self.io);
+        self.stdout_closed = true;
+        if (self.waiter) |waiter| finishWaiter(self.io, waiter, error.McpServerExited);
+    }
+
+    fn dispatchStdout(self: *Server, line: []u8) void {
+        var handed = false;
+        defer if (!handed) self.gpa.free(line);
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const Head = struct { id: ?std.json.Value = null, method: ?[]const u8 = null };
+        const head = std.json.parseFromSliceLeaky(Head, arena_state.allocator(), line, .{ .ignore_unknown_fields = true }) catch return;
+        if (head.method) |method| {
+            // Other notifications, and requests from the server, go
+            // unanswered as before.
+            if (head.id == null and std.mem.eql(u8, method, "notifications/tools/list_changed")) self.toolsChanged();
+            return;
+        }
+        const id = head.id orelse return;
+        if (id != .integer or id.integer < 0) return;
+        self.pending_mutex.lockUncancelable(self.io);
+        defer self.pending_mutex.unlock(self.io);
+        const waiter = self.waiter orelse return;
+        if (waiter.done.isSet() or @as(u64, @intCast(id.integer)) != waiter.id) return;
+        waiter.line = line;
+        handed = true;
+        waiter.done.set(self.io);
+    }
+
+    /// The deadline gave up: the waiting request ends now, not at end of file.
+    fn failWaiter(self: *Server, waiter: *Waiter, err: anyerror) void {
+        self.pending_mutex.lockUncancelable(self.io);
+        defer self.pending_mutex.unlock(self.io);
+        finishWaiter(self.io, waiter, err);
     }
 
     fn initializeLegacy(self: *Server) !void {
@@ -318,6 +506,7 @@ pub const Server = struct {
             \\{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"marlin","version":"{s}"}}}}
         , .{build_options.version});
         const response = try self.request(arena_state.allocator(), "initialize", params);
+        self.legacy_list_changed = listChangedOffered(response);
         if (self.url != null) {
             // Later requests carry the version the server chose.
             const version = if (resultObject(response)) |result| stringField(result, "protocolVersion") orelse legacy_protocol else legacy_protocol;
@@ -444,28 +633,36 @@ pub const Server = struct {
         const id = self.next_id;
         self.next_id +%= 1;
         const line = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}", .{ id, method, params_json });
+        // The reader thread hands this request its response.
+        var waiter: Waiter = .{ .id = id };
+        self.pending_mutex.lockUncancelable(self.io);
+        const closed = self.stdout_closed;
+        if (!closed) self.waiter = &waiter;
+        self.pending_mutex.unlock(self.io);
+        if (closed) return error.McpServerExited;
+        defer {
+            self.pending_mutex.lockUncancelable(self.io);
+            self.waiter = null;
+            self.pending_mutex.unlock(self.io);
+            if (waiter.line) |owned| self.gpa.free(owned);
+        }
         // One watchdog covers the complete exchange. In particular, chatty
         // notifications cannot reset it and a server that stops consuming
         // stdin cannot trap the caller in flush forever.
-        var deadline = Deadline{ .server = self, .cancel = cancel, .thread = undefined };
+        var deadline = Deadline{ .server = self, .waiter = &waiter, .cancel = cancel, .thread = undefined };
         try deadline.start();
         defer deadline.finish();
 
         self.writeMessage(line) catch |err| return deadline.mapFailure(err);
-
-        while (true) {
-            const response_line = self.readMessage(self.gpa) catch |err| return deadline.mapFailure(err);
-            defer self.gpa.free(response_line);
-            const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, response_line, .{
-                .allocate = .alloc_always,
-            });
-            if (value != .object) continue;
-            const response_id = value.object.get("id") orelse continue;
-            if (response_id != .integer or response_id.integer < 0 or @as(u64, @intCast(response_id.integer)) != id) continue;
-            if (value.object.get("error") != null) return error.McpRpcError;
-            if (value.object.get("result") == null) return error.InvalidMcpResponse;
-            return value;
-        }
+        waiter.done.waitUncancelable(self.io);
+        if (waiter.failure) |err| return deadline.mapFailure(err);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, waiter.line.?, .{
+            .allocate = .alloc_always,
+        });
+        if (value != .object) return error.InvalidMcpResponse;
+        if (value.object.get("error") != null) return error.McpRpcError;
+        if (value.object.get("result") == null) return error.InvalidMcpResponse;
+        return value;
     }
 
     fn notify(self: *Server, line: []const u8) !void {
@@ -691,6 +888,33 @@ pub const Server = struct {
         return self.challenge;
     }
 
+    fn startListener(self: *Server) void {
+        if (self.listener != null) return;
+        const listener = self.gpa.create(Listener) catch return;
+        listener.* = .{ .server = self, .mode = self.mode };
+        if (self.mode == .legacy) {
+            const session = self.session_id orelse "";
+            listener.session_len = @min(session.len, listener.session_buf.len);
+            @memcpy(listener.session_buf[0..listener.session_len], session[0..listener.session_len]);
+            listener.version_len = self.legacy_version_len;
+            @memcpy(listener.version_buf[0..listener.version_len], self.legacy_version[0..self.legacy_version_len]);
+        }
+        listener.thread = std.Thread.spawn(.{}, Listener.run, .{listener}) catch {
+            self.gpa.destroy(listener);
+            return;
+        };
+        self.listener = listener;
+    }
+
+    fn stopListener(self: *Server) void {
+        const listener = self.listener orelse return;
+        self.listener = null;
+        listener.stop.store(true, .release);
+        listener.wake.set(self.io);
+        listener.thread.join();
+        self.gpa.destroy(listener);
+    }
+
     fn writeMessage(self: *Server, line: []const u8) !void {
         const writer = if (self.writer) |*value| value else return error.McpServerNotRunning;
         try writer.interface.writeAll(line);
@@ -813,6 +1037,135 @@ pub const Server = struct {
             .output = self.gpa.dupe(u8, "error: MCP call interrupted by user") catch @panic("oom"),
             .status = .interrupted,
         };
+    }
+};
+
+/// The stream an HTTP server announces tools changes on, held open on its
+/// own thread: subscriptions/listen (2026-07-28) or the GET stream of a
+/// 2025-11-25 session. When it ends it is reopened, after a backoff that
+/// doubles to a minute; a server without one (405, 404, an immediate JSON
+/// answer, an acknowledgement without tools changes) is left alone. It
+/// reads only what never changes after init, and the session it was
+/// started for; the Server joins it before letting go of either.
+const Listener = struct {
+    server: *Server,
+    mode: ProtocolMode,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Set to cut a backoff wait short when stopping.
+    wake: Io.Event = .unset,
+    thread: std.Thread = undefined,
+    session_buf: [256]u8 = undefined,
+    session_len: usize = 0,
+    version_buf: [32]u8 = undefined,
+    version_len: usize = 0,
+
+    const Outcome = enum { unsupported, ended };
+
+    fn run(self: *Listener) void {
+        const io = self.server.io;
+        var backoff_ms: i64 = 1000;
+        while (!self.stop.load(.acquire)) {
+            const began = nowMs(io);
+            if (self.once() == .unsupported) return;
+            if (self.stop.load(.acquire)) return;
+            // A stream that lasted was healthy: start the backoff over.
+            if (nowMs(io) - began > 60_000) backoff_ms = 1000;
+            self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(backoff_ms), .clock = .awake } }) catch {};
+            backoff_ms = @min(backoff_ms * 2, 60_000);
+        }
+    }
+
+    fn once(self: *Listener) Outcome {
+        const server = self.server;
+        var arena_state = std.heap.ArenaAllocator.init(server.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var headers: std.ArrayList(std.http.Header) = .empty;
+        for (server.headers) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            headers.append(arena, .{
+                .name = std.mem.trim(u8, line[0..colon], " \t"),
+                .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
+            }) catch return .ended;
+        }
+        const modern = self.mode == .modern;
+        if (modern) {
+            headers.appendSlice(arena, &.{
+                .{ .name = "MCP-Protocol-Version", .value = current_protocol },
+                .{ .name = "Mcp-Method", .value = "subscriptions/listen" },
+            }) catch return .ended;
+        } else {
+            headers.append(arena, .{ .name = "MCP-Protocol-Version", .value = if (self.version_len > 0) self.version_buf[0..self.version_len] else legacy_protocol }) catch return .ended;
+            if (self.session_len > 0) headers.append(arena, .{ .name = "Mcp-Session-Id", .value = self.session_buf[0..self.session_len] }) catch return .ended;
+        }
+        // The stored token as is: refreshing belongs to the request path,
+        // and a 401 here just waits for the next try.
+        const bearer: ?[]const u8 = if (server.auth_path) |path|
+            if (oauth.load(arena, server.io, path, server.name, server.url.?)) |creds| creds.access_token else null
+        else
+            null;
+        var sink: ListenSink = .{ .server = server, .arena = arena, .parser = .init(server.gpa) };
+        defer sink.parser.deinit();
+        const pool = server.pool orelse return .unsupported;
+        const result = http.exchange(&pool.client, server.gpa, .{
+            .method = if (modern) .POST else .GET,
+            .url = server.url.?,
+            .headers = headers.items,
+            .bearer = bearer,
+            .content_type = if (modern) "application/json" else null,
+            .accept = if (modern) "application/json, text/event-stream" else "text/event-stream",
+            .body = if (modern) (listenBody(arena) catch return .ended) else null,
+            .max_bytes = max_message_bytes,
+            .timeout_ms = listen_timeout_ms,
+            .cancel = &self.stop,
+            .sink = .{ .ctx = &sink, .func = ListenSink.write },
+        }) catch return if (sink.refused) .unsupported else .ended;
+        defer result.deinit(server.gpa);
+        if (sink.refused) return .unsupported;
+        switch (result.status) {
+            404, 405 => return .unsupported,
+            200 => {
+                const json_body = if (result.content_type) |ct| std.mem.startsWith(u8, ct, "application/json") else false;
+                // Answered at once instead of streaming: an error, or a
+                // subscription that ended before it began.
+                return if (json_body) .unsupported else .ended;
+            },
+            else => return .ended,
+        }
+    }
+};
+
+/// Reads a listen stream's events: the acknowledgement (which must grant
+/// tools changes) and each tools change.
+const ListenSink = struct {
+    server: *Server,
+    arena: std.mem.Allocator,
+    parser: sse.Parser,
+    refused: bool = false,
+
+    fn write(ctx: *anyopaque, bytes: []const u8) bool {
+        const self: *ListenSink = @ptrCast(@alignCast(ctx));
+        self.parser.feed(bytes, self, onEvent) catch return false;
+        return !self.refused;
+    }
+
+    fn onEvent(self: *ListenSink, event: sse.Event) void {
+        const value = std.json.parseFromSliceLeaky(std.json.Value, self.arena, event.data, .{ .allocate = .alloc_always }) catch return;
+        if (value != .object) return;
+        const method = stringField(value.object, "method") orelse return;
+        if (std.mem.eql(u8, method, "notifications/tools/list_changed")) {
+            self.server.toolsChanged();
+        } else if (std.mem.eql(u8, method, "notifications/subscriptions/acknowledged")) {
+            const granted = blk: {
+                const params = value.object.get("params") orelse break :blk false;
+                if (params != .object) break :blk false;
+                const notifications = params.object.get("notifications") orelse break :blk false;
+                if (notifications != .object) break :blk false;
+                const tools = notifications.object.get("toolsListChanged") orelse break :blk false;
+                break :blk tools == .bool and tools.bool;
+            };
+            if (!granted) self.refused = true;
+        }
     }
 };
 
@@ -965,13 +1318,14 @@ fn modernMeta() ModernMeta {
     };
 }
 
-/// Deadline watchdog for blocking stdio reads. Killing the child closes its
-/// stdout pipe, which unblocks the reader; finish() always joins before the
-/// Server mutates the child again.
+/// Deadline watchdog for one stdio exchange. Giving up kills the server's
+/// process group (unblocking a write it stopped reading) and ends the wait
+/// at once; finish() always joins before the Server mutates the child again.
 const DeadlineReason = enum(u8) { none, timed_out, cancelled };
 
 const Deadline = struct {
     server: *Server,
+    waiter: *Waiter,
     cancel: ?*const std.atomic.Value(bool) = null,
     done: std.atomic.Value(bool) = .init(false),
     reason: std.atomic.Value(DeadlineReason) = .init(.none),
@@ -1000,7 +1354,8 @@ const Deadline = struct {
 
     fn abort(self: *Deadline, reason: DeadlineReason) void {
         self.reason.store(reason, .release);
-        if (self.server.child) |*child| child.kill(self.server.io);
+        self.server.killGroup();
+        self.server.failWaiter(self.waiter, error.McpServerExited);
     }
 
     fn mapFailure(self: *Deadline, fallback: anyerror) anyerror {
@@ -1011,6 +1366,33 @@ const Deadline = struct {
         };
     }
 };
+
+fn finishWaiter(io: Io, waiter: *Waiter, err: anyerror) void {
+    if (waiter.done.isSet()) return;
+    waiter.failure = err;
+    waiter.done.set(io);
+}
+
+/// `initialize` result capabilities.tools.listChanged.
+fn listChangedOffered(response: std.json.Value) bool {
+    const result = resultObject(response) orelse return false;
+    const capabilities = result.get("capabilities") orelse return false;
+    if (capabilities != .object) return false;
+    const tools = capabilities.object.get("tools") orelse return false;
+    if (tools != .object) return false;
+    const offered = tools.object.get("listChanged") orelse return false;
+    return offered == .bool and offered.bool;
+}
+
+/// The 2026-07-28 subscription to tools changes.
+pub fn listenBody(arena: std.mem.Allocator) ![]const u8 {
+    return std.json.Stringify.valueAlloc(arena, .{
+        .jsonrpc = "2.0",
+        .id = listen_id,
+        .method = "subscriptions/listen",
+        .params = .{ ._meta = modernMeta(), .notifications = .{ .toolsListChanged = true } },
+    }, .{});
+}
 
 fn isCancelled(cancel: ?*const std.atomic.Value(bool)) bool {
     return if (cancel) |flag| flag.load(.acquire) else false;

@@ -313,6 +313,27 @@ pub const Runtime = struct {
         return entry.last_error == null;
     }
 
+    /// Send every MCP server's tools changes to `hook` (null: nowhere).
+    pub fn watchMcp(self: *Runtime, hook: ?mcp.ChangeHook) void {
+        for (self.mcp_servers.items) |entry| entry.server.watch(hook);
+    }
+
+    /// List one server's tools again after it said they changed, keeping its
+    /// process. Like restartMcp, only while no turn runs: specs borrow the
+    /// tool storage this replaces. A failed listing keeps the old tools.
+    /// Returns how many tools it has now.
+    pub fn refreshMcpTools(self: *Runtime, name: []const u8) !usize {
+        const entry = for (self.mcp_servers.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.server.name, name)) break candidate;
+        } else return error.UnknownMcpServer;
+        self.specs_list.clearRetainingCapacity();
+        const listed = entry.server.relist();
+        if (listed) |_| entry.clearError(self.gpa) else |err| std.log.warn("MCP server '{s}' changed its tools but listing them failed: {t}", .{ name, err });
+        try self.rebuildSpecs();
+        try listed;
+        return entry.server.tools.items.len;
+    }
+
     fn rebuildSpecs(self: *Runtime) !void {
         self.specs_list.clearRetainingCapacity();
         for (self.exec_tools.items) |entry| try self.appendSpec(entry.spec);

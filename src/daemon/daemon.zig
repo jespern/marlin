@@ -82,6 +82,7 @@ const plugins = @import("plugins.zig");
 const task_tool = @import("tools/task.zig");
 const sessions_tool = @import("tools/sessions.zig");
 const attention = @import("attention.zig");
+const mcp = @import("tools/mcp.zig");
 const mcp_tokens = @import("../mobile/mcp_tokens.zig");
 const session_handle = @import("../core/session_handle.zig");
 const tools_registry = @import("tools/registry.zig");
@@ -211,6 +212,8 @@ const Event = union(enum) {
     /// Model catalog fetched by a worker thread (registry-form ids plus
     /// normalized pricing; id allocations are dispatcher-owned on receipt).
     catalog_ready: struct { client_id: u64, models: []CatalogModel, err: ?anyerror = null },
+    /// An MCP server said its tools changed (mcp.ChangeHook, any thread).
+    mcp_tools_changed: struct { name: []u8 },
     recap_ready: RecapResult,
     git_ready: *GitResult,
     plugin_ready: *PluginJob,
@@ -561,6 +564,8 @@ pub const Daemon = struct {
     /// protected-read denials are parameterized on these roots.
     protected_roots: ?sandbox.ProtectedRoots = null,
     events: queue.Mpsc(Event),
+    /// MCP servers whose tools changed, re-listed once no turn runs.
+    mcp_stale: std.ArrayList([]u8) = .empty,
     clients: std.AutoHashMapUnmanaged(u64, *Client) = .empty,
     /// Client registry lock: both the accept path (add) and dispatcher
     /// (lookup/remove) touch the registry. Values are only *mutated* by
@@ -1364,6 +1369,7 @@ pub const Daemon = struct {
     fn dispatchLoop(self: *Daemon) void {
         self.recoverLostShells();
         self.resumePausedSessions(true) catch |err| std.log.err("could not resume suspended sessions: {t}", .{err});
+        self.extensions.watchMcp(self.mcpHook());
         while (self.events.pop(self.io)) |ev| {
             self.handleEvent(ev) catch |e| {
                 std.log.warn("dispatch error: {t}", .{e});
@@ -1371,9 +1377,36 @@ pub const Daemon = struct {
             // Every state transition happens on this thread, so syncing once
             // per event cannot miss a turn starting or ending.
             self.sleep_assertion.sync(self.anyTurnRunning());
+            self.refreshMcpWhenIdle();
             if (!self.running.load(.acquire)) break;
         }
         self.shutdownCleanup();
+    }
+
+    fn mcpHook(self: *Daemon) mcp.ChangeHook {
+        return .{ .ctx = self, .func = onMcpToolsChanged };
+    }
+
+    /// On the MCP server's reader or listener thread: queue it.
+    fn onMcpToolsChanged(ctx: *anyopaque, server: []const u8) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        const name = self.gpa.dupe(u8, server) catch return;
+        self.events.push(self.io, .{ .mcp_tools_changed = .{ .name = name } }) catch self.gpa.free(name);
+    }
+
+    /// Re-list the tools of servers that said they changed, once no turn
+    /// runs: turns borrow the tool list, as /mcp restart waits for too.
+    pub fn refreshMcpWhenIdle(self: *Daemon) void {
+        if (self.mcp_stale.items.len == 0 or self.anySessionBusy()) return;
+        for (self.mcp_stale.items) |name| {
+            defer self.gpa.free(name);
+            const count = self.extensions.refreshMcpTools(name) catch |err| {
+                std.log.warn("MCP server '{s}': tools not refreshed: {t}", .{ name, err });
+                continue;
+            };
+            std.log.info("MCP server '{s}' changed its tools: {d} now", .{ name, count });
+        }
+        self.mcp_stale.clearRetainingCapacity();
     }
 
     fn anyTurnRunning(self: *Daemon) bool {
@@ -1590,6 +1623,13 @@ pub const Daemon = struct {
                     self.voice_transcribe_thread = null;
                 }
                 if (self.lookupClient(vd.client_id)) |client| self.sendLine(client, vd.line);
+            },
+            .mcp_tools_changed => |changed| {
+                for (self.mcp_stale.items) |name| if (std.mem.eql(u8, name, changed.name)) {
+                    self.gpa.free(changed.name);
+                    return;
+                };
+                self.mcp_stale.append(self.gpa, changed.name) catch self.gpa.free(changed.name);
             },
             .catalog_ready => |cr| {
                 if (self.catalog_thread) |thread| thread.join();
@@ -6537,7 +6577,13 @@ pub const Daemon = struct {
         self.extension_config = loaded;
         self.cfg = loaded.value;
         loaded_transferred = true;
+        // The old servers stop reporting before they go; the new ones were
+        // just listed.
+        previous.watchMcp(null);
         previous.deinit();
+        for (self.mcp_stale.items) |name| self.gpa.free(name);
+        self.mcp_stale.clearRetainingCapacity();
+        replacement.watchMcp(self.mcpHook());
         if (previous_config) |*old| old.deinit();
         self.refreshSkillCatalogs();
     }
@@ -6756,6 +6802,8 @@ pub const Daemon = struct {
         // Nobody is left to answer: parked native turns get told.
         while (self.agent_waits.pop()) |w| self.finishAgentTool(w.reply, "error: Marlin is shutting down", .err);
         self.agent_waits.deinit(self.gpa);
+        for (self.mcp_stale.items) |name| self.gpa.free(name);
+        self.mcp_stale.deinit(self.gpa);
         if (self.web_service) |service| service.stop();
         if (self.advertiser) |a| a.stop();
         self.sleep_assertion.sync(false);
@@ -6874,6 +6922,7 @@ pub const Daemon = struct {
             .shell_output => |value| self.gpa.free(value.bytes),
             .client_line => |value| self.gpa.free(value.line),
             .voice_done => |value| self.gpa.free(value.line),
+            .mcp_tools_changed => |value| self.gpa.free(value.name),
             .turn_block => |value| self.gpa.free(value.line),
             .turn_delta => |value| {
                 self.gpa.free(value.line);

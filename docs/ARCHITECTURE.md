@@ -1170,8 +1170,14 @@ secret IMMORTAL):
   speaks the current stateless protocol and falls back to the deployed legacy
   initialize lifecycle. One absolute deadline spans lock acquisition, stdin
   write, and response matching; unrelated stdout cannot extend it. Turn
-  cancellation kills the server process so one wedged call cannot serialize
-  every session behind an uncancellable server mutex. Discovery is isolated
+  cancellation kills the server's process group so one wedged call cannot
+  serialize every session behind an uncancellable server mutex. A stdio
+  server's stdout is read by its own thread for as long as it runs, so a
+  `notifications/tools/list_changed` between calls is heard at once; HTTP
+  servers announce it on a held `subscriptions/listen` stream (or a 2025-11-25
+  GET stream), reopened with backoff. A change queues a daemon event, and
+  `refreshMcpWhenIdle` re-lists that server (`Server.relist`, same process)
+  once no turn runs, since running turns borrow the tool storage it replaces. Discovery is isolated
   per server: a broken process becomes visible health data and contributes no
   tools without preventing daemon startup. `/mcp` and `marlin mcp` list,
   add, remove, restart, and atomically reload daemon-owned configuration while

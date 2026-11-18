@@ -106,3 +106,25 @@ test "MCP discovery failures are isolated and tool policy is per-tool" {
     try std.testing.expectError(error.UnknownMcpServer, runtime.restartMcp("missing"));
     try std.testing.expect(runtime.find("mcp__healthy__inspect") != null);
 }
+
+test "a changed MCP server's tools are re-listed into the runtime's specs" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/bin:/bin");
+    const cfg = config.Config{ .mcp_servers = &.{
+        .{ .name = "grow", .cmd = &.{ "sh", "-c", @import("tools/mcp_test.zig").changing_server }, .mutating = true },
+    } };
+    var runtime = try Runtime.init(gpa, threaded.io(), cfg, &environ);
+    defer runtime.deinit();
+    try std.testing.expect(runtime.find("mcp__grow__added") == null);
+
+    const out = runtime.dispatch("mcp__grow__add", "{}", "/", null).?;
+    defer gpa.free(out.output);
+    try std.testing.expectEqual(@as(usize, 2), try runtime.refreshMcpTools("grow"));
+    try std.testing.expect(runtime.find("mcp__grow__added") != null);
+    try std.testing.expect(runtime.find("mcp__grow__add") != null);
+    try std.testing.expectError(error.UnknownMcpServer, runtime.refreshMcpTools("missing"));
+}

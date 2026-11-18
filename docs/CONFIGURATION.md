@@ -19,6 +19,13 @@ The TUI equivalents are `/mcp`, `/mcp add`, `/mcp restart`, `/mcp remove`, and
 `readonly_tools` and `mutating_tools` config overrides. Image results are stored
 as transcript media and sent back to vision-capable providers.
 
+A server that says its tools changed (`notifications/tools/list_changed`) has
+them listed again without a restart: Marlin subscribes with
+`subscriptions/listen` on 2026-07-28 servers, reads older stdio servers'
+unasked notices as they come, and holds an older HTTP server's GET stream when
+its `initialize` offers `tools.listChanged`. Running turns keep the list they
+started with; the new one applies once no turn is running.
+
 ### Remote servers and sign-in
 
 A server with a URL instead of a command speaks Streamable HTTP (MCP
