@@ -10,6 +10,8 @@
 //!   POST /send           body = ONE ClientMsg JSON line, forwarded on a
 //!                        fresh daemon connection; the first daemon reply
 //!                        line comes back as application/json.
+//!   POST /mcp            Marlin's MCP server for assistants outside it,
+//!                        bearer tokens instead of pairing (mcp_server.zig).
 //!
 //! The web layer holds no session state: subscriptions live on the SSE
 //! connection, everything else is stateless per request — the same shape as
@@ -43,6 +45,8 @@ const html = @embedFile("webui.html");
 const mobile_push = @import("../mobile/push.zig");
 const pairing = @import("../mobile/pairing.zig");
 const voice_transcribe = @import("../core/voice_transcribe.zig");
+const mcp_server = @import("mcp_server.zig");
+const mcp_tokens = @import("../mobile/mcp_tokens.zig");
 
 extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
 const web_shell = @import("web_shell.zig");
@@ -330,6 +334,13 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
         return;
     }
 
+    // Assistants outside Marlin hold a bearer token instead of a device
+    // cookie, from anywhere, loopback included (mcp_server.zig).
+    if (std.mem.eql(u8, path, mcp_server.path)) {
+        try serveMcp(ctx, req, &access);
+        return;
+    }
+
     // Loopback asking for itself is trusted, as it always was. Anything
     // addressed to a public name is a remote device and must be paired.
     const local = isLocal(ctx.peer, host);
@@ -488,6 +499,159 @@ fn servePair(ctx: *ConnCtx, req: *std.http.Server.Request, head: *const Head, ac
         .{ .name = "cache-control", .value = "no-store" },
         .{ .name = "set-cookie", .value = deviceCookie(&cookie_buf, &device.token, head.https) },
     } });
+}
+
+/// POST /mcp: one JSON-RPC message for Marlin's MCP server. The token is
+/// checked first; a subscriptions/listen keeps the connection as an event
+/// stream (and so ends it, like /events).
+fn serveMcp(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !void {
+    const json_header: std.http.Header = .{ .name = "content-type", .value = "application/json" };
+    if (req.head.method != .POST) {
+        // No GET stream: 2026-07-28 listens with subscriptions/listen, and
+        // older clients may do without (their spec allows the 405).
+        try reply(req, access, "", .{ .status = .method_not_allowed, .extra_headers = &.{.{ .name = "allow", .value = "POST" }} });
+        return;
+    }
+    // Reading the body reuses the header buffer: copy what is needed first.
+    var token_buf: [mcp_tokens.token_len]u8 = undefined;
+    var token_len: usize = 0;
+    var had_token = false;
+    if (headerValue(req, "authorization")) |auth| {
+        if (auth.len > 7 and std.ascii.eqlIgnoreCase(auth[0..7], "bearer ")) {
+            had_token = true;
+            const token = std.mem.trim(u8, auth[7..], " ");
+            if (token.len == token_buf.len) {
+                @memcpy(&token_buf, token);
+                token_len = token.len;
+            }
+        }
+    }
+    var version_buf: [32]u8 = undefined;
+    var method_buf: [64]u8 = undefined;
+    var name_buf: [1024]u8 = undefined;
+    const version_header = copyHeader(&version_buf, headerValue(req, "mcp-protocol-version"));
+    const method_header = copyHeader(&method_buf, headerValue(req, "mcp-method"));
+    const name_header = copyHeader(&name_buf, headerValue(req, "mcp-name"));
+
+    const root = ctx.settings.pairing_root orelse {
+        try reply(req, access, "MCP tokens need a state directory on the Marlin host\n", .{ .status = .service_unavailable });
+        return;
+    };
+    const token = token_buf[0..token_len];
+    const grant = (mcp_tokens.verify(ctx.gpa, ctx.io, root, token) catch null) orelse {
+        // RFC 6750: name the scheme; say the token is bad when there was one.
+        try reply(req, access, "a valid Marlin MCP token is required (marlin mcp token new <name>)\n", .{
+            .status = .unauthorized,
+            .extra_headers = &.{.{ .name = "www-authenticate", .value = if (had_token) "Bearer realm=\"marlin\", error=\"invalid_token\"" else "Bearer realm=\"marlin\"" }},
+        });
+        return;
+    };
+
+    var body_buf: [64 * 1024]u8 = undefined;
+    const body_reader = try req.readerExpectContinue(&body_buf);
+    const body = body_reader.allocRemaining(ctx.gpa, .limited(mcp_server.max_body_bytes)) catch {
+        try reply(req, access, "body too large\n", .{ .status = .payload_too_large });
+        return;
+    };
+    defer ctx.gpa.free(body);
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const response = try mcp_server.handle(arena, .{
+        .body = body,
+        .version_header = version_header,
+        .method_header = method_header,
+        .name_header = name_header,
+        .grant = .{ .name = grant.name(), .read = grant.read, .act = grant.act },
+    }, .{ .ctx = ctx, .call = mcpCallTool });
+
+    if (response.listen) |listen| {
+        try serveMcpListen(ctx, req, access, root, token, response.body, listen);
+        return error.StreamEnded;
+    }
+    const status: std.http.Status = @fromBackingInt(@intCast(response.status));
+    if (response.status == 202) {
+        try reply(req, access, "", .{ .status = .accepted });
+    } else if (response.insufficient_scope) |scope| {
+        try reply(req, access, response.body, .{ .status = status, .extra_headers = &.{
+            json_header,
+            .{ .name = "www-authenticate", .value = switch (scope) {
+                .read => "Bearer realm=\"marlin\", error=\"insufficient_scope\", scope=\"read\"",
+                .act => "Bearer realm=\"marlin\", error=\"insufficient_scope\", scope=\"act\"",
+            } },
+        } });
+    } else {
+        try reply(req, access, response.body, .{ .status = status, .extra_headers = &.{ json_header, .{ .name = "cache-control", .value = "no-store" } } });
+    }
+}
+
+fn copyHeader(buf: []u8, value: ?[]const u8) ?[]const u8 {
+    const v = value orelse return null;
+    if (v.len > buf.len) return null;
+    @memcpy(buf[0..v.len], v);
+    return buf[0..v.len];
+}
+
+/// One tool call, on its own daemon connection for as long as it takes
+/// (wait_for_session answers when the other session's turn ends).
+fn mcpCallTool(ctx_ptr: ?*anyopaque, arena: std.mem.Allocator, caller: []const u8, name: []const u8, args_json: []const u8) ?mcp_server.ToolResult {
+    const ctx: *ConnCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    const conn = attach.connect(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe) catch return null;
+    defer conn.deinit();
+    conn.send(.{ .agent_tool = .{ .request_id = 1, .sid = 0, .caller = caller, .name = name, .args_json = args_json } }) catch return null;
+    const result = conn.recvUntil(arena, .agent_tool_result) catch return null;
+    return .{ .text = result.output, .ok = result.status == .ok };
+}
+
+/// subscriptions/listen: the acknowledgement, then one resources/updated
+/// each time the attention log grows. Ends when the client goes, the token
+/// is revoked, or the daemon goes away, with the closing result in the last
+/// two cases.
+fn serveMcpListen(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access, root: []const u8, token: []const u8, ack: []const u8, listen: mcp_server.Listen) !void {
+    const conn = attach.connect(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe) catch {
+        try reply(req, access, "cannot reach daemon\n", .{ .status = .bad_gateway });
+        return;
+    };
+    defer conn.deinit();
+    try conn.send(.{ .attention_watch = .{} });
+
+    var stream_buf: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&stream_buf, .{ .respond_options = .{
+        .transfer_encoding = .none,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/event-stream" },
+            .{ .name = "cache-control", .value = "no-cache" },
+            .{ .name = "x-accel-buffering", .value = "no" },
+        },
+    } });
+    access.* = .{ .status = .ok, .bytes = 0 };
+    const Event = struct {
+        fn send(r: *std.http.BodyWriter, a: *Access, data: []const u8) !void {
+            try r.writer.writeAll("data: ");
+            try r.writer.writeAll(data);
+            try r.writer.writeAll("\n\n");
+            // Both flushes: the body buffer, then the protocol output.
+            try r.writer.flush();
+            try r.flush();
+            a.bytes += data.len + 8;
+        }
+    };
+    Event.send(&response, access, ack) catch return;
+    const updated = listen.updated orelse {
+        Event.send(&response, access, listen.end) catch {};
+        return;
+    };
+    while (true) {
+        const line = conn.readLine() catch break;
+        defer ctx.gpa.free(line);
+        if (std.mem.startsWith(u8, line, "{\"attention\":")) {
+            Event.send(&response, access, updated) catch return;
+        } else if (std.mem.startsWith(u8, line, "{\"mcp_tokens_changed\":")) {
+            const still = (mcp_tokens.verify(ctx.gpa, ctx.io, root, token) catch null) != null;
+            if (!still) break;
+        }
+    }
+    Event.send(&response, access, listen.end) catch {};
 }
 
 /// POST /transcribe: body is one recorded clip (any container ffmpeg reads);

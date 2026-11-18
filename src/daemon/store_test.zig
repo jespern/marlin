@@ -1129,3 +1129,31 @@ test "the context gauge survives a daemon restart and unknown stays null" {
     try std.testing.expectEqual(Store.SessionContext{ .used = 41_000 }, try store.getSessionContext(3));
     try std.testing.expectError(error.NotFound, store.getSessionContext(99));
 }
+
+test "the attention log numbers moments, reads after a seq, and keeps the newest" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try std.testing.expectEqual(@as(u64, 0), try store.lastAttentionSeq());
+    try std.testing.expectEqual(@as(u64, 1), try store.addAttention(10, 7, "question", "{\"question_id\":\"1\"}"));
+    try std.testing.expectEqual(@as(u64, 2), try store.addAttention(20, 7, "resolved", "{\"question_id\":\"1\"}"));
+    const after = try store.attentionAfter(1, 10);
+    defer {
+        for (after) |row| row.deinit(gpa);
+        gpa.free(after);
+    }
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqualStrings("resolved", after[0].kind);
+    try std.testing.expectEqual(@as(i64, 20), after[0].at_ms);
+    try std.testing.expectEqual(@as(u64, 7), after[0].sid);
+
+    for (0..Store.attention_kept) |i| _ = try store.addAttention(@intCast(i), 8, "done", "{}");
+    const kept = try store.attentionAfter(0, 5);
+    defer {
+        for (kept) |row| row.deinit(gpa);
+        gpa.free(kept);
+    }
+    // The two first moments were pruned; numbers never restart.
+    try std.testing.expectEqual(@as(u64, 3), kept[0].seq);
+    try std.testing.expectEqual(Store.attention_kept + 2, try store.lastAttentionSeq());
+}

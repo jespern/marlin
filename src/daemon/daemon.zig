@@ -81,6 +81,8 @@ const process_io = @import("process_io.zig");
 const plugins = @import("plugins.zig");
 const task_tool = @import("tools/task.zig");
 const sessions_tool = @import("tools/sessions.zig");
+const attention = @import("attention.zig");
+const mcp_tokens = @import("../mobile/mcp_tokens.zig");
 const session_handle = @import("../core/session_handle.zig");
 const tools_registry = @import("tools/registry.zig");
 
@@ -316,6 +318,8 @@ pub const Client = struct {
     /// Receives refreshed session-list snapshots without subscribing to every
     /// session's block stream (M4 multiplexer/background activity contract).
     watches_sessions: bool = false,
+    /// Woken with `attention` for each new attention-log moment.
+    watches_attention: bool = false,
     /// Additive catalog events are opt-in for protocol-v1 compatibility.
     watches_session_deltas: bool = false,
     /// Sent shell_list: receives shell_list_result on every change.
@@ -1499,7 +1503,7 @@ pub const Daemon = struct {
             .agent_tool => |at| {
                 defer self.gpa.free(at.name);
                 defer self.gpa.free(at.args_json);
-                self.agentTool(at.sid, at.name, at.args_json, .{ .future = at.future });
+                self.agentTool(at.sid, "", at.name, at.args_json, .{ .future = at.future });
             },
             .turn_delta => |td| {
                 defer self.gpa.free(td.line);
@@ -1557,7 +1561,7 @@ pub const Daemon = struct {
                     } else self.refusePendingRebootForApproval();
                     self.fanOutActionableLine(ta.sid, ta.line);
                     self.broadcastStatus(ta.sid, .awaiting_approval);
-                    self.notifyPhone(ta.sid, true, false);
+                    self.needsUser(ta.sid, true, null);
                 } else {
                     self.gpa.free(ta.line);
                 }
@@ -1817,7 +1821,7 @@ pub const Daemon = struct {
                     if (!continued) self.extensions.fireHook(.on_session_done, json);
                     if (terminal_error != null) self.extensions.fireHook(.on_error, json);
                 }
-                if (!paused and !continued and !td.interrupted) self.notifyPhone(td.sid, false, terminal_error != null);
+                if (!paused and !continued and !td.interrupted) self.needsUser(td.sid, false, terminal_error);
                 // A child is an ordinary durable session plus this one-shot
                 // rendezvous back to the parent tool call.
                 if (session.task_waiter) |future| {
@@ -1886,9 +1890,58 @@ pub const Daemon = struct {
         }
     }
 
-    fn notifyPhone(self: *Daemon, sid: u64, needs_input: bool, failed: bool) void {
+    /// A session needs its user: an approval or question is waiting
+    /// (`needs_input`, the session's pending line says which), or a turn
+    /// ended, failed when `err` is set. Logged for assistants outside Marlin
+    /// whoever is looking; the phone is pinged unless someone is.
+    fn needsUser(self: *Daemon, sid: u64, needs_input: bool, err: ?[]const u8) void {
+        self.logAttention(sid, needs_input, err);
         if (self.presence.suppress(self.io, sid, nowMs(self.io))) return;
-        if (self.phone_push) |worker| worker.notify(sid, needs_input, failed);
+        if (self.phone_push) |worker| worker.notify(sid, needs_input, err != null);
+    }
+
+    fn logAttention(self: *Daemon, sid: u64, needs_input: bool, err: ?[]const u8) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        if (needs_input) {
+            const session = self.sessions.get(sid) orelse return;
+            const line = session.pending_approval_line orelse return;
+            const waiting = attention.pending(arena, line) orelse return;
+            self.recordAttention(sid, waiting.kind, waiting.detail);
+            return;
+        }
+        var blocks: std.ArrayList(block.Block) = .empty;
+        self.store.loadTailInto(arena, &blocks, sid, 50) catch {};
+        const detail = attention.finishedDetail(arena, sessions_tool.lastReply(blocks.items), err) catch return;
+        self.recordAttention(sid, if (err != null) .failed else .done, detail);
+    }
+
+    fn recordAttention(self: *Daemon, sid: u64, kind: attention.Kind, detail: []const u8) void {
+        const seq = self.store.addAttention(nowMs(self.io), sid, @tagName(kind), detail) catch |e| {
+            std.log.warn("could not log attention for session {d}: {t}", .{ sid, e });
+            return;
+        };
+        const Wake = struct { self: *Daemon, seq: u64 };
+        self.forEachClient(Wake{ .self = self, .seq = seq }, struct {
+            fn send(ctx: Wake, client: *Client) void {
+                if (client.watches_attention) ctx.self.sendTo(client, .{ .attention = .{ .seq = ctx.seq } });
+            }
+        }.send);
+    }
+
+    fn sendMcpTokens(self: *Daemon, client: *Client) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const root = try mcp_tokens.stateRoot(arena, self.environ);
+        const state = mcp_tokens.load(arena, self.io, root) catch {
+            self.sendTo(client, .{ .err = .{ .code = "mcp_token", .msg = "could not read the tokens" } });
+            return;
+        };
+        const infos = try arena.alloc(proto.McpTokenInfo, state.tokens.len);
+        for (state.tokens, infos) |token, *info| info.* = .{ .id = token.id, .name = token.name, .scopes = mcp_tokens.scopesLabel(token.scopes), .created_ms = token.created_ms };
+        self.sendTo(client, .{ .mcp_token_list_result = .{ .tokens = infos } });
     }
 
     /// Companion state, log, and pairing: the live code and paired devices
@@ -1935,6 +1988,51 @@ pub const Daemon = struct {
                     return;
                 };
                 try self.sendWebStatus(client);
+            },
+            .mcp_token_create => |t| {
+                const scopes = mcp_tokens.parseScopes(t.scopes) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "mcp_token", .msg = "scopes are read, act, or read,act" } });
+                    return;
+                };
+                const root = mcp_tokens.stateRoot(self.gpa, self.environ) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "mcp_token", .msg = "tokens need HOME or XDG_STATE_HOME on the daemon host" } });
+                    return;
+                };
+                defer self.gpa.free(root);
+                const created = mcp_tokens.create(self.gpa, self.io, root, t.name, scopes, nowMs(self.io)) catch |err| {
+                    self.sendTo(client, .{ .err = .{ .code = "mcp_token", .msg = switch (err) {
+                        error.BadName => "token names are letters, digits, - _ and ., up to 64",
+                        error.NameTaken => "a token already has that name; revoke it first",
+                        error.TooManyTokens => "too many tokens; revoke one first",
+                        else => "could not save the token",
+                    } } });
+                    return;
+                };
+                self.sendTo(client, .{ .mcp_token_created = .{ .id = created.id, .name = t.name, .scopes = mcp_tokens.scopesLabel(scopes), .token = &created.token } });
+            },
+            .mcp_token_list => try self.sendMcpTokens(client),
+            .mcp_token_revoke => |t| {
+                const root = mcp_tokens.stateRoot(self.gpa, self.environ) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "mcp_token", .msg = "tokens need HOME or XDG_STATE_HOME on the daemon host" } });
+                    return;
+                };
+                defer self.gpa.free(root);
+                const revoked = mcp_tokens.revoke(self.gpa, self.io, root, t.which) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "mcp_token", .msg = "could not update the tokens" } });
+                    return;
+                };
+                if (!revoked) {
+                    self.sendTo(client, .{ .err = .{ .code = "mcp_token", .msg = "no token has that id or name" } });
+                    return;
+                }
+                // Requests re-check their token, but open listen streams
+                // were admitted earlier: each re-checks on this event.
+                self.forEachClient(self, struct {
+                    fn send(daemon: *Daemon, watcher: *Client) void {
+                        if (watcher.watches_attention) daemon.sendTo(watcher, .{ .mcp_tokens_changed = .{} });
+                    }
+                }.send);
+                try self.sendMcpTokens(client);
             },
             .web_unpair => |u| {
                 const root = pairing.stateRoot(self.gpa, self.environ) catch {
@@ -2952,11 +3050,7 @@ pub const Daemon = struct {
                     .granted => .approved,
                     .denied => .denied,
                 };
-                // First decision wins; stale answers are ignored. An id the
-                // native gate does not know may be a parked Claude Code
-                // bridge prompt — same approval bar, different waiter.
-                if (!session.gate.resolve(self.io, id, verdict))
-                    self.resolveCcPending(session, id, verdict);
+                self.answerApproval(session, id, verdict);
                 self.sendTo(client, .{ .ok = .{} });
             },
             .question_answer => |qa| {
@@ -2973,15 +3067,7 @@ pub const Daemon = struct {
                     self.sendTo(client, .{ .err = .{ .code = "bad_question", .msg = "answers are 1..8192 bytes" } });
                     return;
                 }
-                // Native gate first; an unknown id may be a parked bridge
-                // question — same picker, different waiter. First answer wins.
-                const copy = try self.gpa.dupe(u8, answer);
-                if (session.question_gate.resolve(self.io, id, copy)) {
-                    // The turn thread resumes and pushes turn_resumed itself.
-                } else {
-                    self.gpa.free(copy);
-                    self.resolveCcQuestion(session, id, answer);
-                }
+                try self.answerQuestion(session, id, answer);
                 self.sendTo(client, .{ .ok = .{} });
             },
             .cc_question => |cq| {
@@ -3025,7 +3111,7 @@ pub const Daemon = struct {
                 self.refusePendingRebootForApproval();
                 self.fanOutActionableLine(cq.sid, line);
                 self.broadcastStatus(cq.sid, .awaiting_approval);
-                self.notifyPhone(cq.sid, true, false);
+                self.needsUser(cq.sid, true, null);
                 // No reply yet: cc_question_result is sent when a client
                 // answers (or the bridge/turn goes away).
             },
@@ -3091,7 +3177,7 @@ pub const Daemon = struct {
                 self.refusePendingRebootForApproval();
                 self.fanOutActionableLine(ca.sid, line);
                 self.broadcastStatus(ca.sid, .awaiting_approval);
-                self.notifyPhone(ca.sid, true, false);
+                self.needsUser(ca.sid, true, null);
                 // Deliberately no reply yet: cc_approval_result is sent when
                 // a client answers (or the bridge/turn goes away).
             },
@@ -3654,7 +3740,8 @@ pub const Daemon = struct {
                 }
                 self.sendTo(client, .{ .ok = .{} });
             },
-            .agent_tool => |at| self.agentTool(at.sid, at.name, at.args_json, .{ .client = .{ .client_id = client.id, .request_id = at.request_id } }),
+            .agent_tool => |at| self.agentTool(at.sid, at.caller, at.name, at.args_json, .{ .client = .{ .client_id = client.id, .request_id = at.request_id } }),
+            .attention_watch => client.watches_attention = true,
             .interrupt => |i| {
                 const result = self.cancelSessionTree(i.sid);
                 if (i.report)
@@ -5332,9 +5419,17 @@ pub const Daemon = struct {
         _ = self.enqueueLine(client, copy);
     }
 
+    /// The session's approval or question stops waiting, however it ended
+    /// (answered anywhere, interrupted, its bridge gone): logged as resolved.
     fn clearPendingApproval(self: *Daemon, session: *Session) void {
-        if (session.pending_approval_line) |line| self.gpa.free(line);
+        const line = session.pending_approval_line orelse return;
+        defer self.gpa.free(line);
         session.pending_approval_line = null;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const waiting = attention.pending(arena_state.allocator(), line) orelse return;
+        const detail = attention.resolvedDetail(arena_state.allocator(), waiting) catch return;
+        self.recordAttention(session.id, .resolved, detail);
     }
 
     /// Answer a parked Claude Code bridge prompt (no-op for unknown ids).
@@ -5531,13 +5626,14 @@ pub const Daemon = struct {
 
     // ---- tools for other sessions (tools/sessions.zig) ----------------
 
-    /// Run one agent tool call from session `caller_sid` and answer it,
-    /// now or (wait_for_session on a working session) when that turn ends.
-    fn agentTool(self: *Daemon, caller_sid: u64, name: []const u8, args_json: []const u8, reply: AgentReply) void {
+    /// Run one agent tool call from session `caller_sid`, or with sid 0 from
+    /// the assistant outside Marlin named `outside`, and answer it, now or
+    /// (wait_for_session on a working session) when that turn ends.
+    fn agentTool(self: *Daemon, caller_sid: u64, outside: []const u8, name: []const u8, args_json: []const u8, reply: AgentReply) void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const result = self.runAgentTool(arena, caller_sid, name, args_json, reply) catch |err|
+        const result = self.runAgentTool(arena, caller_sid, outside, name, args_json, reply) catch |err|
             AgentResult{ .text = std.fmt.allocPrint(arena, "error: {t}", .{err}) catch "error", .status = .err };
         if (!result.parked) self.finishAgentTool(reply, result.text, result.status);
     }
@@ -5615,7 +5711,12 @@ pub const Daemon = struct {
 
     const AgentPeer = struct { sid: u64, handle: []const u8, title: []const u8, model: []const u8, cwd: []const u8, state: proto.SessionState, parent: bool };
 
-    fn runAgentTool(self: *Daemon, arena: std.mem.Allocator, caller_sid: u64, name: []const u8, args_json: []const u8, reply: AgentReply) !AgentResult {
+    fn runAgentTool(self: *Daemon, arena: std.mem.Allocator, caller_sid: u64, outside: []const u8, name: []const u8, args_json: []const u8, reply: AgentReply) !AgentResult {
+        const from_outside = caller_sid == 0;
+        if (from_outside and outside.len == 0) return .{ .text = "error: name the caller", .status = .err };
+        // Answering prompts and reading the log are for the user's own
+        // assistant outside Marlin, never for one session about another.
+        if (attention.isTool(name) and !from_outside) return .{ .text = "error: unknown tool", .status = .err };
         const rows = try self.store.listSessions(false);
         defer {
             for (rows) |row| row.deinit(self.gpa);
@@ -5638,13 +5739,18 @@ pub const Daemon = struct {
                 .parent = info.parent_sid != null,
             };
         }
-        const me = for (peers) |peer| {
+        const me: AgentPeer = if (from_outside) .{ .sid = 0, .handle = "", .title = outside, .model = "", .cwd = "", .state = .idle, .parent = false } else for (peers) |peer| {
             if (peer.sid == caller_sid) break peer;
         } else return .{ .text = "error: this session is not in the session list", .status = .err };
 
+        if (std.mem.eql(u8, name, attention.attention_name)) return .{ .text = try self.attentionLog(arena, args_json, peers, known) };
+
         if (std.mem.eql(u8, name, sessions_tool.list_name)) {
             var out: std.ArrayList(u8) = .empty;
-            try out.print(arena, "You are {s} \"{s}\" ({s}). Other sessions:\n", .{ me.handle, me.title, me.model });
+            if (from_outside)
+                try out.appendSlice(arena, "Marlin sessions:\n")
+            else
+                try out.print(arena, "You are {s} \"{s}\" ({s}). Other sessions:\n", .{ me.handle, me.title, me.model });
             var others: usize = 0;
             for (peers) |peer| {
                 if (peer.sid == caller_sid) continue;
@@ -5692,16 +5798,18 @@ pub const Daemon = struct {
                 return .{ .text = "error: give handle and text", .status = .err };
             const text = std.mem.trim(u8, args.text, " \t\r\n");
             if (text.len == 0) return .{ .text = "error: the message is empty", .status = .err };
-            const caller = (try self.getOrLoadSession(caller_sid)) orelse return error.NoSession;
-            const hops = caller.agent_hops +| 1;
+            // An outside caller has no turn to count against and starts a
+            // chain rather than continuing one.
+            const caller: ?*Session = if (from_outside) null else (try self.getOrLoadSession(caller_sid)) orelse return error.NoSession;
+            const hops: u8 = if (caller) |c| c.agent_hops +| 1 else 1;
             if (hops > sessions_tool.max_hops) return .{ .text = try std.fmt.allocPrint(arena, "not sent: this would be hop {d} of a chain of agent messages, past the limit of {d}. Tell the user what you need instead.", .{ hops, sessions_tool.max_hops }), .status = .denied };
-            if (caller.agent_sent >= sessions_tool.max_messages_per_turn) return .{ .text = try std.fmt.allocPrint(arena, "not sent: this turn already sent {d} messages to other sessions, the limit.", .{caller.agent_sent}), .status = .denied };
+            if (caller) |c| if (c.agent_sent >= sessions_tool.max_messages_per_turn) return .{ .text = try std.fmt.allocPrint(arena, "not sent: this turn already sent {d} messages to other sessions, the limit.", .{c.agent_sent}), .status = .denied };
             const session = (try self.getOrLoadSession(target_sid)) orelse return error.NoSession;
             if (session.pause_requested.load(.acquire) or self.pending_reboot != null)
                 return .{ .text = "not sent: that session is paused", .status = .err };
             if (self.sessionShell(target_sid) != null)
                 return .{ .text = "not sent: that session is a shell right now", .status = .err };
-            const message = try sessions_tool.messageText(arena, me.handle, me.title, me.model, text);
+            const message = if (from_outside) try sessions_tool.outsideMessageText(arena, outside, text) else try sessions_tool.messageText(arena, me.handle, me.title, me.model, text);
             if (session.state == .running or session.state == .awaiting_approval) {
                 const owned = try self.prepareSteerInput(session.model, message, null, &.{});
                 session.steer_mutex.lockUncancelable(self.io);
@@ -5717,7 +5825,7 @@ pub const Daemon = struct {
                 };
                 session.steer_mutex.unlock(self.io);
                 session.agent_hops = @max(session.agent_hops, hops);
-                caller.agent_sent += 1;
+                if (caller) |c| c.agent_sent += 1;
                 return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It is busy and reads it between its steps. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
             }
             session.agent_hops = hops;
@@ -5725,7 +5833,7 @@ pub const Daemon = struct {
                 if (err == error.SessionBusy) return .{ .text = "not sent: that session just started a turn; try again", .status = .err };
                 return err;
             };
-            caller.agent_sent += 1;
+            if (caller) |c| c.agent_sent += 1;
             return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It was idle and has started on it. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
         }
 
@@ -5738,7 +5846,91 @@ pub const Daemon = struct {
             }
             return .{ .text = try self.agentWaitAnswer(arena, target_sid) };
         }
+
+        if (std.mem.eql(u8, name, attention.approve_name)) {
+            const args = std.json.parseFromSliceLeaky(attention.ApproveArgs, arena, args_json, .{ .ignore_unknown_fields = true }) catch
+                return .{ .text = "error: give handle, approval_id and decision", .status = .err };
+            const verdict: approval.Verdict = if (std.mem.eql(u8, args.decision, "allow")) .approved else if (std.mem.eql(u8, args.decision, "deny")) .denied else return .{ .text = "error: decision is allow or deny", .status = .err };
+            const waiting = self.waitingOn(arena, target_sid, .approval, args.approval_id) orelse
+                return .{ .text = try std.fmt.allocPrint(arena, "not answered: {s} is not waiting on that approval (any more); see attention", .{target.handle}), .status = .err };
+            self.answerApproval(waiting.session, waiting.id, verdict);
+            return .{ .text = try std.fmt.allocPrint(arena, "{s} in {s} \"{s}\".", .{ if (verdict == .approved) "Allowed" else "Denied", target.handle, target.title }) };
+        }
+
+        if (std.mem.eql(u8, name, attention.answer_name)) {
+            const args = std.json.parseFromSliceLeaky(attention.AnswerArgs, arena, args_json, .{ .ignore_unknown_fields = true }) catch
+                return .{ .text = "error: give handle, question_id and answer", .status = .err };
+            const answer = std.mem.trim(u8, args.answer, " \t\r\n");
+            if (answer.len == 0 or answer.len > 8192) return .{ .text = "error: answers are 1..8192 bytes", .status = .err };
+            const waiting = self.waitingOn(arena, target_sid, .question, args.question_id) orelse
+                return .{ .text = try std.fmt.allocPrint(arena, "not answered: {s} is not waiting on that question (any more); see attention", .{target.handle}), .status = .err };
+            try self.answerQuestion(waiting.session, waiting.id, answer);
+            return .{ .text = try std.fmt.allocPrint(arena, "Answered {s} \"{s}\".", .{ target.handle, target.title }) };
+        }
         return .{ .text = "error: unknown tool", .status = .err };
+    }
+
+    /// The `attention` tool: logged moments after `after`, each with its
+    /// session's handle and title.
+    fn attentionLog(self: *Daemon, arena: std.mem.Allocator, args_json: []const u8, peers: []const AgentPeer, known: []const u64) ![]const u8 {
+        const args = std.json.parseFromSliceLeaky(attention.AttentionArgs, arena, args_json, .{ .ignore_unknown_fields = true }) catch attention.AttentionArgs{};
+        const latest = try self.store.lastAttentionSeq();
+        // Sequence numbers have no gaps (only the oldest are pruned), so the
+        // newest N start right after latest - N.
+        const after = args.after orelse if (args.last) |n| latest -| std.math.clamp(n, 1, attention.max_limit) else 0;
+        const limit = std.math.clamp(args.limit orelse args.last orelse attention.default_limit, 1, attention.max_limit);
+        const rows = try self.store.attentionAfter(after, limit);
+        defer {
+            for (rows) |row| row.deinit(self.gpa);
+            self.gpa.free(rows);
+        }
+        const events = try arena.alloc(attention.Event, rows.len);
+        for (rows, events) |row, *event| {
+            var buf: session_handle.Full = undefined;
+            const title = for (peers) |peer| {
+                if (peer.sid == row.sid) break peer.title;
+            } else "";
+            event.* = .{
+                .seq = row.seq,
+                .at_ms = row.at_ms,
+                .handle = try arena.dupe(u8, session_handle.display(&buf, row.sid, known)),
+                .title = title,
+                .kind = try arena.dupe(u8, row.kind),
+                .detail = try arena.dupe(u8, row.detail),
+            };
+        }
+        return attention.eventsJson(arena, latest, events);
+    }
+
+    const Waiting = struct { session: *Session, id: u64 };
+
+    /// Session `sid` when it is waiting on exactly this approval or question.
+    fn waitingOn(self: *Daemon, arena: std.mem.Allocator, sid: u64, kind: attention.Kind, id: []const u8) ?Waiting {
+        const session = self.sessions.get(sid) orelse return null;
+        const line = session.pending_approval_line orelse return null;
+        const waiting = attention.pending(arena, line) orelse return null;
+        if (waiting.kind != kind or !std.mem.eql(u8, waiting.id, std.mem.trim(u8, id, " \t\r\n"))) return null;
+        return .{ .session = session, .id = std.fmt.parseInt(u64, waiting.id, 10) catch return null };
+    }
+
+    /// Decide approval `id`, whoever asked: the native gate, else a parked
+    /// Claude Code bridge prompt (same approval bar, different waiter).
+    /// First decision wins; stale ones are ignored.
+    fn answerApproval(self: *Daemon, session: *Session, id: u64, verdict: approval.Verdict) void {
+        if (!session.gate.resolve(self.io, id, verdict))
+            self.resolveCcPending(session, id, verdict);
+    }
+
+    /// Answer question `id`: the native gate, else a parked bridge question.
+    /// First answer wins.
+    fn answerQuestion(self: *Daemon, session: *Session, id: u64, answer: []const u8) !void {
+        const copy = try self.gpa.dupe(u8, answer);
+        if (session.question_gate.resolve(self.io, id, copy)) {
+            // The turn thread resumes and pushes turn_resumed itself.
+        } else {
+            self.gpa.free(copy);
+            self.resolveCcQuestion(session, id, answer);
+        }
     }
 
     /// What wait_for_session returns: the session's state and last reply.

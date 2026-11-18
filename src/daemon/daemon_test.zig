@@ -386,6 +386,7 @@ const ShellRig = struct {
         d.events = .init(gpa);
         d.clients = .empty;
         d.clients_mutex = .init;
+        d.phone_push = null;
         d.sessions = .empty;
         d.shells = .empty;
         d.agent_waits = .empty;
@@ -781,4 +782,112 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
     r.session.steer_accepting = true;
     try r.send(2, "{{\"input\":{{\"sid\":7,\"text\":\"carry on\",\"request_id\":30}}}}", .{});
     try std.testing.expectEqual(@as(u8, 0), r.session.agent_hops);
+}
+
+// Case: Robin, Jesper's assistant outside Marlin, routes what needs him and
+// can answer it. It reads the attention log, hears when it grows, answers a
+// waiting question and approval, and messages a session as itself.
+test "an assistant outside Marlin reads the attention log and answers what waits" {
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const gpa = r.gpa;
+    defer {
+        for (r.session.steer_queue.items) |input| input.deinit(gpa);
+        r.session.steer_queue.deinit(gpa);
+    }
+    const Call = struct {
+        fn send(rig: *ShellRig, caller: u64, outside: []const u8, request_id: u64, name: []const u8, args: anytype) !void {
+            const args_json = try std.json.Stringify.valueAlloc(rig.gpa, args, .{});
+            defer rig.gpa.free(args_json);
+            const msg = try std.json.Stringify.valueAlloc(rig.gpa, .{ .agent_tool = .{ .request_id = request_id, .sid = caller, .caller = outside, .name = name, .args_json = args_json } }, .{});
+            defer rig.gpa.free(msg);
+            try rig.send(1, "{s}", .{msg});
+        }
+        fn result(rig: *ShellRig, id: u64) !@FieldType(proto.DaemonMsg, "agent_tool_result") {
+            for (try rig.drain(1)) |msg| if (msg == .agent_tool_result and msg.agent_tool_result.request_id == id) return msg.agent_tool_result;
+            return error.NoResult;
+        }
+        fn events(rig: *ShellRig, id: u64, after: u64) !std.json.Value {
+            try send(rig, 0, "robin", id, "attention", .{ .after = after });
+            const got = try result(rig, id);
+            try std.testing.expectEqual(block_mod.ToolStatus.ok, got.status);
+            return (try std.json.parseFromSliceLeaky(std.json.Value, rig.arena.allocator(), got.output, .{})).object.get("events").?;
+        }
+    };
+    try r.send(1, "{{\"attention_watch\":{{}}}}", .{});
+
+    // A session's agent asks a question through its bridge (client 2).
+    try r.send(2, "{{\"cc_question\":{{\"sid\":7,\"question\":\"Which colour?\",\"options_json\":\"[\\\"red\\\",\\\"blue\\\"]\"}}}}", .{});
+    var woken = false;
+    for (try r.drain(1)) |msg| if (msg == .attention) {
+        woken = true;
+    };
+    try std.testing.expect(woken);
+    const asked = (try Call.events(r, 1, 0)).array.items;
+    try std.testing.expectEqual(@as(usize, 1), asked.len);
+    const question = asked[0].object;
+    try std.testing.expectEqualStrings("question", question.get("kind").?.string);
+    try std.testing.expectEqualStrings("Which colour?", question.get("question").?.string);
+    const question_id = question.get("question_id").?.string;
+    const handle = question.get("handle").?.string;
+
+    // Sessions don't answer each other's prompts or read the log.
+    try Call.send(r, 7, "", 2, "attention", .{});
+    try std.testing.expectEqual(block_mod.ToolStatus.err, (try Call.result(r, 2)).status);
+    // An outside call names its caller.
+    try Call.send(r, 0, "", 3, "sessions", .{});
+    try std.testing.expectEqual(block_mod.ToolStatus.err, (try Call.result(r, 3)).status);
+
+    // The wrong question is refused; the right one reaches the bridge, and
+    // the log says it stopped waiting.
+    try Call.send(r, 0, "robin", 4, "answer", .{ .handle = handle, .question_id = "123", .answer = "red" });
+    try std.testing.expectEqual(block_mod.ToolStatus.err, (try Call.result(r, 4)).status);
+    try Call.send(r, 0, "robin", 5, "answer", .{ .handle = handle, .question_id = question_id, .answer = "blue" });
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, (try Call.result(r, 5)).status);
+    var answered: ?[]const u8 = null;
+    for (try r.drain(2)) |msg| if (msg == .cc_question_result) {
+        answered = msg.cc_question_result.answer;
+    };
+    try std.testing.expectEqualStrings("blue", answered.?);
+    const resolved = (try Call.events(r, 6, 1)).array.items;
+    try std.testing.expectEqualStrings("resolved", resolved[0].object.get("kind").?.string);
+    try std.testing.expectEqualStrings(question_id, resolved[0].object.get("question_id").?.string);
+
+    // An approval outside the session's folder waits; Robin denies it.
+    gpa.free(r.session.cwd);
+    r.session.cwd = try gpa.dupe(u8, "/tmp/marlin-outside-test");
+    try r.send(2, "{{\"cc_approval\":{{\"sid\":7,\"tool\":\"Write\",\"args_json\":\"{{\\\"file_path\\\":\\\"/etc/marlin-test\\\",\\\"content\\\":\\\"x\\\"}}\"}}}}", .{});
+    const waiting = (try Call.events(r, 7, 2)).array.items;
+    try std.testing.expectEqualStrings("approval", waiting[0].object.get("kind").?.string);
+    try std.testing.expectEqualStrings("Write", waiting[0].object.get("tool").?.string);
+    try std.testing.expectEqualStrings("/etc/marlin-test", waiting[0].object.get("args").?.object.get("file_path").?.string);
+    try Call.send(r, 0, "robin", 8, "approve", .{ .handle = handle, .approval_id = waiting[0].object.get("approval_id").?.string, .decision = "deny" });
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, (try Call.result(r, 8)).status);
+    var decided: ?proto.ApprovalAnswer = null;
+    for (try r.drain(2)) |msg| if (msg == .cc_approval_result) {
+        decided = msg.cc_approval_result.decision;
+    };
+    try std.testing.expectEqual(proto.ApprovalAnswer.denied, decided.?);
+    // Answered once is answered.
+    try Call.send(r, 0, "robin", 9, "approve", .{ .handle = handle, .approval_id = waiting[0].object.get("approval_id").?.string, .decision = "allow" });
+    try std.testing.expectEqual(block_mod.ToolStatus.err, (try Call.result(r, 9)).status);
+
+    // Robin sees every session and writes as itself; it has no turn, so no
+    // per-turn limit, and starts a chain at hop 1.
+    try Call.send(r, 0, "robin", 10, "sessions", .{});
+    try std.testing.expect(std.mem.startsWith(u8, (try Call.result(r, 10)).output, "Marlin sessions:"));
+    r.session.state = .running;
+    r.session.steer_accepting = true;
+    try Call.send(r, 0, "robin", 11, "message_session", .{ .handle = handle, .text = "Status?" });
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, (try Call.result(r, 11)).status);
+    const delivered = r.session.steer_queue.items[0].text;
+    try std.testing.expect(std.mem.startsWith(u8, delivered, "[Message from robin, the user's assistant outside Marlin."));
+    try std.testing.expect(std.mem.endsWith(u8, delivered, "Status?"));
+    try std.testing.expectEqual(@as(u8, 1), r.session.agent_hops);
+
+    // `last` reads the newest moments.
+    try Call.send(r, 0, "robin", 12, "attention", .{ .last = 1 });
+    const newest = try std.json.parseFromSliceLeaky(std.json.Value, r.arena.allocator(), (try Call.result(r, 12)).output, .{});
+    try std.testing.expectEqual(@as(usize, 1), newest.object.get("events").?.array.items.len);
+    try std.testing.expectEqual(newest.object.get("latest").?.integer, newest.object.get("events").?.array.items[0].object.get("seq").?.integer);
 }

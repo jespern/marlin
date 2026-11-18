@@ -90,6 +90,11 @@ policy that failed open. Both default false when decoding an older daemon.
 | ui_set_screensaver | after_ms, effect? | ui_config_result with all UI preferences; whole seconds only, persisted as canonical `Ns`, `Nm`, or `Nh` plus `screensaver_effect`; zero means `off`, and an omitted additive effect defaults to `matrix` |
 | mcp_restart | name | mcp_list_result after rediscovery; failure is reported as server health, not daemon failure |
 | mcp_reload | — | mcp_list_result after atomic registry replacement; old registry survives invalid config/build failure |
+| mcp_token_create | name, scopes ("read", "act", "read,act") | mcp_token_created{id, name, scopes, token}, the only time the token is sent; err{mcp_token} for a bad or taken name |
+| mcp_token_list | — | mcp_token_list_result{tokens[]{id, name, scopes, created_ms}} |
+| mcp_token_revoke | which (id or name) | mcp_token_list_result; attention watchers get mcp_tokens_changed so open MCP listen streams re-check their token |
+| agent_tool | request_id, sid, caller?, name, args_json | agent_tool_result; a session's agent (sid) through the `cc_approve` bridge, or with sid 0 an assistant outside Marlin named `caller` (the MCP server), which also gets `attention`, `approve`, and `answer` |
+| attention_watch | — | no reply; then attention{seq} each time the attention log grows |
 | approve | sid, approval_id, decision | ok (first decision wins; stale ids ignored) |
 | cc_approval | sid, tool, args_json | cc_approval_result — immediately when policy auto-allows/denies (read-only guest children deny writes outright), otherwise after a human answers the parked approval_request; sent by the `marlin cc_approve` bridge |
 | session_compact | sid | ok; runs L2 compaction on a turn-like lifecycle (running → idle), err{busy} mid-turn, err{guest} on guest sessions |

@@ -47,6 +47,9 @@ finish). The old `tailscale = true` switch is gone and ignored if present.
   `~/.local/state`, mode 0600). The cookie is `HttpOnly`, `SameSite=Lax`,
   lasts 400 days (Chrome's cap), and renews whenever the app opens.
 - Host and Origin checks still reject DNS-rebinding and cross-site requests.
+- `/mcp` is Marlin's MCP server for assistants outside it. It takes a bearer
+  token instead of a device cookie, from anywhere, loopback included
+  (docs/CONFIGURATION.md, "Marlin as an MCP server").
 - This is a full-control companion for your own machine, not a multi-user
   service: a paired phone can do anything the terminal can, shells included.
   Shells (`/shell`, a WebSocket) are for paired devices only: a loopback

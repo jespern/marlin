@@ -82,6 +82,16 @@ pub fn messageText(gpa: std.mem.Allocator, from_handle: []const u8, from_title: 
     , .{ title, from_model, from_handle, text });
 }
 
+/// A message from the user's assistant outside Marlin (the MCP server):
+/// it reads the answer from this session, so there is no handle to reply to.
+pub fn outsideMessageText(gpa: std.mem.Allocator, from: []const u8, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa,
+        \\[Message from {s}, the user's assistant outside Marlin. It reads your reply here.]
+        \\
+        \\{s}
+    , .{ from, text });
+}
+
 /// The newest assistant reply in `blocks` (oldest first), or null.
 pub fn lastReply(blocks: []const block.Block) ?[]const u8 {
     var i = blocks.len;

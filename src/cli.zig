@@ -358,6 +358,8 @@ const help_text =
     \\  marlin mcp list       inspect configured MCP servers
     \\  marlin mcp add <name> -- <command> [args...]
     \\  marlin mcp remove <name> | restart <name> | reload
+    \\  marlin mcp token [list] | new <name> [read|act|read,act] | revoke <id or name>
+    \\                         tokens for Marlin's own MCP server (docs/CONFIGURATION.md)
     \\  marlin gc [--expire-days N] reclaim orphan/old full-output blobs
     \\  marlin reboot [--build|--build-client|--build-both] [--force]
     \\                         rebuild scoped source binaries, then reattach

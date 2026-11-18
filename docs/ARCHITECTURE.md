@@ -136,6 +136,20 @@ at most ten, two sessions may not wait on each other, and an interrupt
 releases a waiting caller. Plan mode and read-only children may read but not
 message.
 
+The same tools serve assistants outside Marlin through its MCP server
+(`client/mcp_server.zig`, `POST /mcp` on the web companion, bearer tokens with
+`read`/`act` scopes from `mobile/mcp_tokens.zig`). They arrive as
+`agent_tool` with sid 0 and the token's name as `caller`, and get three more
+(`daemon/attention.zig`): `attention`, the log of moments a session needed
+its user, and `approve` and `answer`, which resolve a waiting prompt exactly
+as the approval bar and picker do. The log is written where the phone is
+pinged (`needsUser`: an approval or question parked, a turn ended) and where a
+pending prompt is cleared (`clearPendingApproval`, so every way a prompt ends
+is logged as `resolved`), stored in the `attention` table with a growing seq,
+and announced to `attention_watch` connections; the companion turns each
+announcement into `notifications/resources/updated` on open
+`subscriptions/listen` streams.
+
 Nothing else. Semantic rendering of unknown tools is a TUI fact, not a
 guest-tool catalogue. Images stay durable in Marlin and are not smuggled
 into the binary. `/compact`, `/sandbox`, session `/network`, and Marlin

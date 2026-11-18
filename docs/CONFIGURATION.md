@@ -61,6 +61,51 @@ name wins over a plugin's.
 These servers serve native Marlin sessions. Claude Code and Codex guests keep
 their own MCP configuration.
 
+### Marlin as an MCP server
+
+Marlin also serves MCP itself, for your assistants outside it (Robin, say):
+`POST /mcp` on the web companion, so at `http://127.0.0.1:8377/mcp` on the
+machine and through the same reverse proxy as the phone
+(`https://marlin.example.com/mcp`). It speaks Streamable HTTP, MCP 2026-07-28,
+and 2025-11-25 (and the two before) for older clients, without sessions.
+
+Every request needs a bearer token, loopback included. Make one per assistant,
+with the scopes it needs:
+
+```sh
+marlin mcp token new robin read,act   # prints the token once, on stdout
+marlin mcp token                      # list: id, name, scopes
+marlin mcp token revoke robin         # by name or id; open streams close
+```
+
+`/mcp token`, `/mcp token new <name> [scopes]` and `/mcp token revoke` do the
+same in the TUI, including over `--remote`; the new token appears once in a
+note of that view. Only a SHA-256 of each token is kept, in
+`$XDG_STATE_HOME/marlin/web/mcp_tokens.json` (mode 0600). Send it as
+`Authorization: Bearer <token>`.
+
+| Scope | Tools |
+| --- | --- |
+| `read` | `sessions`, `read_session`, `wait_for_session`, `attention`, the `marlin://attention` resource, `subscriptions/listen` |
+| `act` | `message_session`, `approve`, `answer` |
+
+A token lists only the tools it may call; calling another answers `403` with
+`WWW-Authenticate: Bearer error="insufficient_scope"`. A token holds only its
+own scopes, so a reader and an actor can be separate tokens.
+
+`attention` is the log of moments a session needed you: an approval or
+question waiting (with the id to answer it), a turn finished or failed (with
+its last reply or error), and a waiting one resolved, however it was
+answered. Each has a growing `seq`; pass the last you saw as `after` to catch
+up, or `last` for the newest few. The newest 1,000 are kept across restarts.
+A 2026-07-28 client opens `subscriptions/listen` for `marlin://attention` and
+gets `notifications/resources/updated` each time the log grows. Marlin's own
+phone notifications are unchanged.
+
+`message_session` arrives marked as from the token's name. `approve`
+(`allow` or `deny`) and `answer` act as you would from the approval bar or the
+picker, and fail when that prompt is no longer waiting.
+
 ## Provider routing
 
 Model ids are `provider/model`. Marlin strips the first component before

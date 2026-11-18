@@ -248,6 +248,15 @@ pub const ClientMsg = union(enum) {
     /// Forget a paired phone and close its open streams; answered with
     /// web_status_result.
     web_unpair: struct { id: u32 },
+    /// Tokens for Marlin's MCP server (mobile/mcp_tokens.zig). Make one,
+    /// with scopes "read", "act" or "read,act": answered with
+    /// mcp_token_created, the only time the token itself is sent.
+    mcp_token_create: struct { name: []const u8, scopes: []const u8 = "read" },
+    /// Answered with mcp_token_list_result.
+    mcp_token_list: struct {},
+    /// Revoke a token by id or name and close its open streams; answered
+    /// with mcp_token_list_result.
+    mcp_token_revoke: struct { which: []const u8 },
     /// Terminal leases belong to this connection. Phone leases use a per-page id
     /// because HTTP requests use fresh daemon connections. No transcript data.
     presence: struct { kind: enum { terminal, phone }, active: bool, sid: u64 = 0, page_id: u64 = 0 },
@@ -397,8 +406,14 @@ pub const ClientMsg = union(enum) {
     /// One of the tools for other sessions (sessions, read_session,
     /// message_session, wait_for_session), called by session `sid`'s agent
     /// through the `marlin cc_approve` bridge. Replies agent_tool_result,
-    /// for wait_for_session once the other session's turn ends.
-    agent_tool: struct { request_id: u64 = 0, sid: u64, name: []const u8, args_json: []const u8 },
+    /// for wait_for_session once the other session's turn ends. With sid 0
+    /// the caller is an assistant outside Marlin named `caller` (the MCP
+    /// server, client/mcp_server.zig), which also gets the attention log and
+    /// can answer approvals and questions (daemon/attention.zig).
+    agent_tool: struct { request_id: u64 = 0, sid: u64, caller: []const u8 = "", name: []const u8, args_json: []const u8 },
+    /// Wake this connection with `attention` each time a session needs its
+    /// user (daemon/attention.zig). Read the moments with the `attention` tool.
+    attention_watch: struct {},
     /// One Claude Code permission prompt forwarded by the `marlin cc_approve`
     /// bridge subprocess of a delegated session. The daemon replies
     /// cc_approval_result — immediately when policy auto-allows the call,
@@ -584,6 +599,8 @@ pub const VoiceEngine = struct {
 
 pub const ApprovalAnswer = enum { granted, denied };
 
+pub const McpTokenInfo = struct { id: u32, name: []const u8, scopes: []const u8, created_ms: i64 };
+
 /// Daemon → client.
 pub const DaemonMsg = union(enum) {
     web_status_result: WebStatus,
@@ -764,6 +781,13 @@ pub const DaemonMsg = union(enum) {
     /// Reply to cc_question: the user's answer, or null when dismissed.
     cc_question_result: struct { sid: u64, answer: ?[]const u8 = null },
     agent_tool_result: struct { request_id: u64 = 0, output: []const u8, status: block.ToolStatus = .ok },
+    /// A new moment in the attention log, for attention_watch connections.
+    attention: struct { seq: u64 },
+    mcp_token_created: struct { id: u32, name: []const u8, scopes: []const u8, token: []const u8 },
+    mcp_token_list_result: struct { tokens: []const McpTokenInfo },
+    /// An MCP token was revoked: attention_watch connections (the web
+    /// companion's listen streams) re-check theirs.
+    mcp_tokens_changed: struct {},
     /// Terminal reply to gc.
     gc_result: struct { bytes_reclaimed: u64, orphan_blobs: u64, expired_blobs: u64 },
     /// Reply to council_set/council_remove/council_list: the full current

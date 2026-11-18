@@ -38,7 +38,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
     .{ .name = "/plugin", .usage = " [list|marketplace|install|uninstall]", .description = "manage plugins (skills and MCP servers) and marketplaces", .accepts_args = true },
-    .{ .name = "/mcp", .usage = " [add|remove|restart|reload|login|logout]", .description = "inspect and manage MCP servers; login signs in to a remote one", .accepts_args = true },
+    .{ .name = "/mcp", .usage = " [add|remove|restart|reload|login|logout|token]", .description = "inspect and manage MCP servers; login signs in to a remote one; token lets an assistant outside Marlin in", .accepts_args = true },
     .{ .name = "/council", .usage = " [<name>|new <name>|edit <name>|remove <name>]", .description = "list, inspect, or edit review councils", .accepts_args = true },
     .{ .name = "/voice", .usage = " [setup|mode|off]", .description = "dictate into the composer (offline STT, on the daemon's machine over --remote; setup on first use)", .accepts_args = true },
     .{ .name = "/review", .usage = " <council> <question>", .description = "convene a named council on a question", .accepts_args = true },
@@ -604,8 +604,10 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             self.conn.send(.{ .mcp_reload = .{} }) catch {
                 self.setNotice("could not reload MCP config", .{});
             };
+        } else if (std.mem.eql(u8, action.?, "token")) {
+            self.mcpTokenCommand(&it);
         } else {
-            self.setNotice("usage: /mcp [add <name> <command or https-url>|remove <name>|restart <name>|reload|login <name> [callback-url]|logout <name>]", .{});
+            self.setNotice("usage: /mcp [add <name> <command or https-url>|remove <name>|restart <name>|reload|login <name> [callback-url]|logout <name>|token]", .{});
         }
     } else if (std.mem.eql(u8, head, "/plugin")) {
         const plugin_command = @import("../core/plugin_command.zig");
@@ -1112,6 +1114,65 @@ pub fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra
         return;
     };
     self.setNotice("{s} {s} (saving…)", .{ name, onOff(enable) });
+}
+
+const mcp_token_usage = "usage: /mcp token [new <name> [read|act|read,act]|revoke <id or name>]";
+
+/// Tokens for Marlin's own MCP server (client/mcp_server.zig).
+pub fn mcpTokenCommand(self: *App, it: anytype) void {
+    const action = it.next() orelse "list";
+    const sent = if (std.mem.eql(u8, action, "list") and it.next() == null)
+        self.conn.send(.{ .mcp_token_list = .{} })
+    else if (std.mem.eql(u8, action, "new")) blk: {
+        const name = it.next() orelse {
+            self.setNotice(mcp_token_usage, .{});
+            return;
+        };
+        const scopes = it.next() orelse "read";
+        if (it.next() != null) {
+            self.setNotice(mcp_token_usage, .{});
+            return;
+        }
+        break :blk self.conn.send(.{ .mcp_token_create = .{ .name = name, .scopes = scopes } });
+    } else if (std.mem.eql(u8, action, "revoke")) blk: {
+        const which = it.next() orelse {
+            self.setNotice(mcp_token_usage, .{});
+            return;
+        };
+        if (it.next() != null) {
+            self.setNotice(mcp_token_usage, .{});
+            return;
+        }
+        break :blk self.conn.send(.{ .mcp_token_revoke = .{ .which = which } });
+    } else {
+        self.setNotice(mcp_token_usage, .{});
+        return;
+    };
+    sent catch self.setNotice("could not reach the daemon", .{});
+}
+
+/// A new token is shown in a note of this view only: the daemon keeps
+/// just its hash, and nothing else ever shows it again.
+pub fn showMcpTokenCreated(self: *App, created: anytype) void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(self.gpa);
+    text.print(self.gpa, "MCP token {d} \"{s}\" ({s}), shown once:\n\n{s}\n\nUse it as `Authorization: Bearer <token>` on the companion's /mcp.", .{ created.id, created.name, created.scopes, created.token }) catch return;
+    self.pushBlock(.system_note, text.items, "mcp", .ok);
+    self.setNotice("MCP token \"{s}\" made · copy it from the transcript", .{created.name});
+}
+
+pub fn showMcpTokens(self: *App, tokens: []const proto.McpTokenInfo) void {
+    self.notice.clearRetainingCapacity();
+    self.armNoticeExpiry(2 * notice_ttl_ms); // a list the user asked to read
+    if (tokens.len == 0) {
+        self.notice.appendSlice(self.gpa, "MCP tokens · none (/mcp token new <name>)") catch {};
+        return;
+    }
+    self.notice.appendSlice(self.gpa, "MCP tokens · ") catch return;
+    for (tokens, 0..) |token, i| {
+        if (i > 0) self.notice.appendSlice(self.gpa, " · ") catch return;
+        self.notice.print(self.gpa, "{d} {s} {s}", .{ token.id, token.name, token.scopes }) catch return;
+    }
 }
 
 pub fn showMcpStatus(self: *App, servers: []const proto.McpServerInfo) void {

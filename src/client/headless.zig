@@ -291,6 +291,44 @@ pub fn plugin(
     return if (result.ok) 0 else 1;
 }
 
+const token_usage = "usage: marlin mcp token [list] | new <name> [read|act|read,act] | revoke <id or name>\n";
+
+/// Tokens for Marlin's own MCP server (mobile/mcp_tokens.zig): a new one
+/// is printed once, on stdout alone, so it can be piped into a secret store.
+fn mcpToken(gpa: std.mem.Allocator, io: Io, conn: *attach.Conn, args: []const [:0]const u8) !u8 {
+    if (args.len == 0 or (args.len == 1 and std.mem.eql(u8, args[0], "list"))) {
+        try conn.send(.{ .mcp_token_list = .{} });
+    } else if ((args.len == 2 or args.len == 3) and std.mem.eql(u8, args[0], "new")) {
+        try conn.send(.{ .mcp_token_create = .{ .name = args[1], .scopes = if (args.len == 3) args[2] else "read" } });
+    } else if (args.len == 2 and std.mem.eql(u8, args[0], "revoke")) {
+        try conn.send(.{ .mcp_token_revoke = .{ .which = args[1] } });
+    } else {
+        try eprint(io, token_usage, .{});
+        return 2;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    while (true) {
+        switch (conn.recv(arena_state.allocator()) catch return 1) {
+            .err => |e| {
+                try eprint(io, "marlin: {s}\n", .{e.msg});
+                return 1;
+            },
+            .mcp_token_created => |t| {
+                try eprint(io, "token {d} \"{s}\" ({s}); shown once, keep it secret:\n", .{ t.id, t.name, t.scopes });
+                try print(io, "{s}\n", .{t.token});
+                return 0;
+            },
+            .mcp_token_list_result => |r| {
+                if (r.tokens.len == 0) try print(io, "no MCP tokens\n", .{});
+                for (r.tokens) |t| try print(io, "{d}\t{s}\t{s}\n", .{ t.id, t.name, t.scopes });
+                return 0;
+            },
+            else => {},
+        }
+    }
+}
+
 pub fn mcp(
     gpa: std.mem.Allocator,
     io: Io,
@@ -303,6 +341,7 @@ pub fn mcp(
         return 1;
     };
     defer conn.deinit();
+    if (args.len > 0 and std.mem.eql(u8, args[0], "token")) return mcpToken(gpa, io, conn, args[1..]);
     var command_args: ?[][]const u8 = null;
     defer if (command_args) |owned| gpa.free(owned);
     if (args.len == 0 or (args.len == 1 and std.mem.eql(u8, args[0], "list"))) {
@@ -330,7 +369,7 @@ pub fn mcp(
         try conn.send(.{ .mcp_logout = .{ .name = args[1] } });
         return mcpNotes(io, conn);
     } else {
-        try eprint(io, "usage: marlin mcp [list|add <name> -- <command> [args...]|add <name> <https-url>|remove <name>|restart <name>|reload|login <name> [callback-url]|logout <name>]\n", .{});
+        try eprint(io, "usage: marlin mcp [list|add <name> -- <command> [args...]|add <name> <https-url>|remove <name>|restart <name>|reload|login <name> [callback-url]|logout <name>|token ...]\n", .{});
         return 2;
     }
 

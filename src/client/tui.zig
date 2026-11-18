@@ -2359,6 +2359,8 @@ pub const App = struct {
                 self.setNotice("{s}", .{if (result.ok) "plugin command completed" else "plugin command failed — see transcript"});
             },
             .mcp_list_result => |result| self.showMcpStatus(result.servers),
+            .mcp_token_created => |created| self.showMcpTokenCreated(created),
+            .mcp_token_list_result => |result| self.showMcpTokens(result.tokens),
             .mcp_note => |note| {
                 self.pushBlock(.system_note, note.message, "mcp", if (note.ok) .ok else .err);
                 self.setNotice("{s}", .{if (!note.ok) "MCP login failed — see transcript" else if (note.done) "MCP · see transcript" else "MCP · waiting for sign-in"});
@@ -4766,6 +4768,9 @@ pub const App = struct {
     pub const runCommand = commands.runCommand;
     pub const configCommand = commands.configCommand;
     pub const showMcpStatus = commands.showMcpStatus;
+    pub const showMcpTokenCreated = commands.showMcpTokenCreated;
+    pub const showMcpTokens = commands.showMcpTokens;
+    pub const mcpTokenCommand = commands.mcpTokenCommand;
     pub const otelCommand = commands.otelCommand;
     pub const submitOtelHeaders = commands.submitOtelHeaders;
     pub const cancelOtelSetup = commands.cancelOtelSetup;

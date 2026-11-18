@@ -197,6 +197,13 @@ const schema_sql =
     \\  PRIMARY KEY(session_id, turn_id, call_id),
     \\  FOREIGN KEY(session_id, turn_id) REFERENCES telemetry_turns(session_id, turn_id)
     \\) WITHOUT ROWID;
+    \\CREATE TABLE IF NOT EXISTS attention(
+    \\  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  at_ms INTEGER NOT NULL,
+    \\  session_id INTEGER NOT NULL,
+    \\  kind TEXT NOT NULL,
+    \\  detail TEXT NOT NULL DEFAULT '{}'
+    \\);
     \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','19');
 ;
 
@@ -1578,6 +1585,85 @@ pub const Store = struct {
         bindText(stmt, 1, text);
         bindInt(stmt, 2, @bitCast(id));
         try stepDone(stmt);
+    }
+
+    /// The attention log keeps this many newest moments.
+    pub const attention_kept: u64 = 1000;
+
+    pub const AttentionRow = struct {
+        seq: u64,
+        at_ms: i64,
+        sid: u64,
+        kind: []const u8,
+        detail: []const u8,
+
+        pub fn deinit(self: AttentionRow, gpa: std.mem.Allocator) void {
+            gpa.free(self.kind);
+            gpa.free(self.detail);
+        }
+    };
+
+    /// Record one moment a session needs its user; returns its sequence
+    /// number. Sequence numbers only grow (AUTOINCREMENT), so a reader that
+    /// remembers the last one it saw can always catch up. Older moments past
+    /// `attention_kept` are dropped.
+    pub fn addAttention(self: Store, at_ms: i64, sid: u64, kind: []const u8, detail: []const u8) Error!u64 {
+        const insert = try self.prepare("INSERT INTO attention(at_ms, session_id, kind, detail) VALUES(?,?,?,?)");
+        defer finalize(insert);
+        bindInt(insert, 1, at_ms);
+        bindInt(insert, 2, @bitCast(sid));
+        bindText(insert, 3, kind);
+        bindText(insert, 4, detail);
+        try stepDone(insert);
+        const seq: u64 = @bitCast(c.sqlite3_last_insert_rowid(self.db));
+        if (seq > attention_kept) {
+            const prune = try self.prepare("DELETE FROM attention WHERE seq <= ?");
+            defer finalize(prune);
+            bindInt(prune, 1, @bitCast(seq - attention_kept));
+            try stepDone(prune);
+        }
+        return seq;
+    }
+
+    /// Up to `limit` moments after `after`, oldest first. Caller frees each
+    /// row and the slice.
+    pub fn attentionAfter(self: Store, after: u64, limit: u32) Error![]AttentionRow {
+        const stmt = try self.prepare("SELECT seq, at_ms, session_id, kind, detail FROM attention WHERE seq > ? ORDER BY seq LIMIT ?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(after));
+        bindInt(stmt, 2, limit);
+        var out: std.ArrayList(AttentionRow) = .empty;
+        errdefer {
+            for (out.items) |row| row.deinit(self.gpa);
+            out.deinit(self.gpa);
+        }
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            const kind = try self.dupeCol(stmt, 3);
+            errdefer self.gpa.free(kind);
+            const detail = try self.dupeCol(stmt, 4);
+            errdefer self.gpa.free(detail);
+            try out.append(self.gpa, .{
+                .seq = @bitCast(c.sqlite3_column_int64(stmt, 0)),
+                .at_ms = c.sqlite3_column_int64(stmt, 1),
+                .sid = @bitCast(c.sqlite3_column_int64(stmt, 2)),
+                .kind = kind,
+                .detail = detail,
+            });
+        }
+        return out.toOwnedSlice(self.gpa);
+    }
+
+    /// The newest moment's sequence number; 0 before the first.
+    pub fn lastAttentionSeq(self: Store) Error!u64 {
+        const stmt = try self.prepare("SELECT seq FROM sqlite_sequence WHERE name='attention'");
+        defer finalize(stmt);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return 0;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        return @bitCast(c.sqlite3_column_int64(stmt, 0));
     }
 
     /// Caller owns the returned text; "" when there is no draft.
