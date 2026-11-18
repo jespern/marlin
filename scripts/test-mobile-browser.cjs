@@ -373,7 +373,7 @@ async function main() {
         // Tapping the fill compacts: the first tap asks, the second does it.
         const ctx=document.querySelector('#status .ctx'), compacts=()=>sent.filter(m=>m.session_compact).length;
         setState('idle');
-        ctx.click(); out.ask=[ctx.textContent,compacts()];
+        ctx.click(); out.ask=[ctx.textContent,compacts(),ctx.querySelector('.ask')?.textContent];
         ctx.click(); await new Promise(r=>setTimeout(r,0)); out.compacted=[ctx.textContent,compacts()];
         ctx.click(); setContext({context_used:80,context_limit:100}); out.refreshed=ctx.textContent;
         ctx.click(); ctx.click(); await new Promise(r=>setTimeout(r,0));
@@ -432,7 +432,7 @@ async function main() {
     assert.deepEqual(sticks,{keyboard:true,expanded:true,reading:true,back:true});
     assert.equal(comp.credits,' · api credits');
     assert.deepEqual([comp.warn,comp.hot],['ctx agent warn','ctx agent hot']);
-    assert.deepEqual(comp.ask,[' · compact? tap again',0]);
+    assert.deepEqual(comp.ask,[' · compact?',0,'compact?']);
     assert.deepEqual(comp.compacted.slice(0,2),[' · 95%',1]);
     assert.equal(comp.refreshed,' · 80%');
     assert.deepEqual(comp.midTurn,[' · 80%',0]);
@@ -506,6 +506,10 @@ async function main() {
     // Links as the TUI shows them: a file on the Mac is its name, not raw Markdown.
     const links=await page.evaluate(()=>inlineMd('Updated [BLOBS.md](/Users/x/BLOBS.md:19) and [docs](https://x.test/a)'));
     assert.equal(links,'Updated <span class="mdlink" title="/Users/x/BLOBS.md:19">BLOBS.md</span> and <a href="https://x.test/a" target="_blank" rel="noopener noreferrer">docs</a>');
+    // Case: a reply wrote [Configuration]( /Users/…/CONFIGURATION.md:71) and
+    // the phone showed the raw markdown; the TUI already linked it.
+    const spaced=await page.evaluate(()=>[inlineMd('[Configuration]( /Users/x/CONFIGURATION.md:71)'),inlineMd('[a](<https://x.test/a> )')]);
+    assert.deepEqual(spaced,['<span class="mdlink" title="/Users/x/CONFIGURATION.md:71">Configuration</span>','<a href="https://x.test/a" target="_blank" rel="noopener noreferrer">a</a>']);
     // Bare URLs link too (render.zig urlEnd's rules): sentence punctuation
     // and an unopened closer stay out; inline code is left as code.
     const bare=await page.evaluate(()=>[
