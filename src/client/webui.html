@@ -107,6 +107,13 @@
   }
   #main.shell #term { display: block; }
   #main.shell #transcript { display: none; }
+  /* The TUI's empty-session card (draw.zig drawWelcome), centered. */
+  #transcript.empty { display: flex; flex-direction: column; justify-content: center; }
+  #welcome { display: grid; grid-template-columns: max-content minmax(0, auto); gap: 4px 14px; align-self: center; width: fit-content; max-width: 100%; color: var(--dim); }
+  #welcome .k { color: var(--accent); font-weight: 700; }
+  #welcome .v { color: var(--fg); overflow-wrap: anywhere; }
+  #welcome .path { color: var(--green); overflow-wrap: anywhere; }
+  #welcome .gap { grid-column: 1 / -1; height: 10px; }
   #term .row { min-height: 1.25em; }
   #term .cur { background: var(--fg); color: var(--bg); }
   #keybar {
@@ -1146,6 +1153,30 @@ function clippedNote(text) {
   return text.length <= 480 ? text : text.slice(0, 480) + ' …';
 }
 
+// The terminal's empty-session card (draw.zig drawWelcome): what answers,
+// where, and how to start. Shown only once the session's history has loaded
+// with nothing in it and no turn is running; anything in the transcript
+// takes the space back.
+let marlinVersion = '', replayed = false;
+function syncWelcome() {
+  const t = $('#transcript');
+  let card = $('#welcome');
+  const content = [...t.children].some(c => c.id !== 'history-more' && c.id !== 'welcome');
+  const state = $('#status .state').className;
+  const show = !!cur && replayed && !content && !/running|awaiting_approval|shell/.test(state);
+  t.classList.toggle('empty', show);
+  if (!show) { if (card) card.remove(); return; }
+  if (!card) { card = el('div'); card.id = 'welcome'; t.appendChild(card); }
+  const rows = [['marlin', marlinVersion ? 'v' + marlinVersion : '', 'dim'], null,
+    ['model', cur.model || '', 'v'], ['folder', displayCwd(cur.cwd), 'path'], null,
+    ['prompt', 'type below and send', 'dim'],
+    ['/', 'slash commands · /model', 'dim'],
+    ['!!', 'a shell in this folder', 'dim'],
+    ['☰', 'sessions · + new', 'dim']];
+  card.replaceChildren(...rows.flatMap(r => r ? [el('span', 'k', r[0]), el('span', r[2], r[1])] : [el('span', 'gap')]));
+}
+new MutationObserver(syncWelcome).observe($('#transcript'), { childList: true });
+
 function addBlock(b, target = $('#transcript'), live = true) {
   const t = target;
   const kind = Object.keys(b.body)[0];
@@ -1358,6 +1389,7 @@ function setState(state) {
     st.textContent = state;
   }
   st.className = 'state ' + state;
+  syncWelcome();
   $('#interrupt').classList.toggle('show', state === 'running' || state === 'awaiting_approval');
   if (state !== 'running' && state !== 'awaiting_approval') disarmInterrupt();
   if (state !== 'awaiting_approval') { $('#approval').classList.remove('show'); hideQuestion(); }
@@ -1394,6 +1426,8 @@ function handle(m) {
       if (m.replay_done.oldest_seq) oldestSeq = m.replay_done.oldest_seq;
       historyHasOlder = !!m.replay_done.has_older;
       updateHistoryButton();
+      replayed = true;
+      syncWelcome();
       if (pendingReading) { applyReading(pendingReading); pendingReading = null; }
     }
   } else if (m.delta) {
@@ -1551,6 +1585,7 @@ function open(s) {
   tabTitle(s);
   sid = s.sid;
   cur = s;
+  replayed = false;
   rememberSession(s.sid);
   pendingReading = (keptState()[String(s.sid)] || {}).read || null;
   lastSeq = 0;
@@ -2749,7 +2784,12 @@ $('#new-btn').onclick = async () => {
   const cwd = cur ? cur.cwd : '/tmp';
   const model = cur ? cur.model : '';
   const r = await send('{"session_create":{"cwd":' + JSON.stringify(cwd) + ',"model":' + JSON.stringify(model) + '}}');
-  if (r.session_created) { sid = null; await loadSessions(); }
+  if (r.err) { notice(r.err.msg || 'could not start a session'); return; }
+  if (!r.session_created) return;
+  // Go to it, as Ctrl+N does in the terminal.
+  await loadSessions();
+  const created = sessionsCache.find(s => String(s.sid) === String(r.session_created.sid));
+  if (created) open(created);
 };
 
 // Unpaired devices see only the pairing screen; loopback is always paired.
@@ -2760,6 +2800,7 @@ async function boot() {
     if (!response.ok) throw Error('connection settings unavailable');
     settings = await response.json();
     homeDir = settings.home || '';
+    marlinVersion = settings.version || '';
   } catch {
     connectionState(navigator.onLine ? 'Reconnecting…' : 'Offline');
     return;

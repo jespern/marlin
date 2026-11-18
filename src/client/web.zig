@@ -38,6 +38,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const config = @import("../core/config.zig");
+const build_options = @import("build_options");
 const proto = @import("../core/proto.zig");
 const attach = @import("attach.zig");
 
@@ -362,6 +363,8 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
             // For ~/… paths in the status line, as the TUI shows them; only
             // a paired device learns the account's home directory.
             .home = if (paired) ctx.environ.get("HOME") else null,
+            // For the empty-session card, as the terminal shows it.
+            .version = if (paired) build_options.version else null,
         }, .{});
         defer ctx.gpa.free(body);
         // Each visit renews a paired device's cookie, so it never lapses

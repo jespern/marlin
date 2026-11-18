@@ -52,6 +52,8 @@ async function main() {
   try {
     await waitReady();
     const settings=await (await fetch(origin+'/connection')).json();
+    assert.match(settings.version,/\d/);
+    delete settings.version;
     assert.deepEqual(settings,{host:'marlin.test',push_enabled:true,paired:true,home:root});
     let managed;
     for (let i=0;i<100;i++) {
@@ -79,6 +81,20 @@ async function main() {
     await page.goto(origin+'/?sid='+sid);
     await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
     assert.equal(await page.evaluate(() => String(sid)),sid);
+    // An empty session shows the terminal's start card: model and folder.
+    await page.locator('#welcome').waitFor({state:'visible'});
+    const card=await page.locator('#welcome').innerText();
+    assert.ok(card.includes('local/testing') && card.includes('folder') && card.includes('!!'),card);
+    // Case: "+ new" made the session but stayed on the old one.
+    await page.locator('#menu-btn').click();
+    await page.locator('#new-btn').click();
+    await page.waitForFunction(old=>String(sid)!==old,sid);
+    const fresh=await page.evaluate(()=>({sid:String(sid),title:document.querySelector('#topbar .title').textContent,cwd:cur.cwd,open:document.querySelector('#side').classList.contains('open')}));
+    assert.equal(fresh.cwd,root);
+    assert.equal(fresh.open,false);
+    await page.locator('#welcome').waitFor({state:'visible'});
+    await page.goto(origin+'/?sid='+sid);
+    await page.waitForFunction(()=>document.querySelector('#connection-state').textContent==='Connected');
     await page.locator('#menu-btn').click();
     await page.locator('#push-toggle').waitFor({state:'visible'});
     assert.equal(await page.locator('#canonical-url').getAttribute('href'),'https://marlin.test/');
@@ -640,7 +656,7 @@ async function main() {
     assert.equal(await homeScreen.locator('#composer').evaluate(c=>Math.round(c.getBoundingClientRect().bottom)),785);
     await standaloneContext.close();
     // ---- pairing: the public name requires a paired device ----
-    assert.deepEqual((await remote('GET','/connection')).json(),{host:'marlin.test',push_enabled:true,paired:false,home:null});
+    assert.deepEqual((await remote('GET','/connection')).json(),{host:'marlin.test',push_enabled:true,paired:false,home:null,version:null});
     assert.equal((await remote('GET','/')).status,200);
     let denied=await remote('POST','/send',{body:'{"session_list":{}}'});
     assert.equal(denied.status,403); assert.equal(denied.json().err.code,'unpaired');
