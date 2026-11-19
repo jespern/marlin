@@ -1434,7 +1434,11 @@ fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16,
             voice_txt = if (ptt) "mic·ptt" else "mic·tap";
             voice_cols = 7; // "·" renders one cell
         },
-        .recording => {
+        .recording => if (!app.voice_rt.listening) {
+            voice_txt = "○ mic…";
+            voice_cols = 6;
+            voice_style = Palette.status_approval;
+        } else {
             const secs = @divTrunc(@max(0, nowWallMs(app.io) - app.voice_rt.record_started_ms), 1000);
             voice_txt = std.fmt.bufPrint(&voice_buf, "● rec {d}s", .{secs}) catch "● rec";
             voice_cols = @intCast(voice_txt.len - "●".len + 1);

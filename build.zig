@@ -109,6 +109,8 @@ fn configureScreenshot(module: *std.Build.Module, target: std.Build.ResolvedTarg
     if (target.result.os.tag != .macos) return;
     module.linkFramework("CoreText", .{});
     module.linkFramework("CoreGraphics", .{});
+    // Dictation records in-process (client/mic.zig).
+    module.linkFramework("AudioToolbox", .{});
 }
 
 /// A stripped build cannot print stack traces (Zig turns them off without

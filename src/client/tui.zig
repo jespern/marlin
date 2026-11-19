@@ -50,6 +50,7 @@ const attach = @import("attach.zig");
 const session_file = @import("session_file.zig");
 const initial_session = @import("initial_session.zig");
 const voice = @import("../core/voice.zig");
+const mic = @import("mic.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const daybreak = @import("daybreak.zig");
@@ -167,6 +168,8 @@ pub const VoiceEvent = union(enum) {
     /// A recording for the daemon's machine to transcribe (`--remote`);
     /// gpa-owned audio, handler frees.
     clip: []u8,
+    /// The microphone delivered its first audio: speech is captured now.
+    listening,
     download_done,
     download_failed: []const u8,
 };
@@ -3136,13 +3139,15 @@ pub const App = struct {
         const engine = voice.Engine.parse(cfg.voice_engine) orelse return;
         if (cfg.voice_stt_bin.len == 0) return;
         const environ = self.environ orelse return;
-        const ffmpeg = (voice.findBinary(self.gpa, self.io, environ, &.{"ffmpeg"}) catch null) orelse return;
+        // macOS records natively; elsewhere ffmpeg is the microphone.
+        const ffmpeg = voice.findBinary(self.gpa, self.io, environ, &.{"ffmpeg"}) catch null;
+        if (ffmpeg == null and !mic.native) return;
         const model = self.gpa.dupe(u8, cfg.voice_model) catch {
-            self.gpa.free(ffmpeg);
+            if (ffmpeg) |f| self.gpa.free(f);
             return;
         };
         const bin = self.gpa.dupe(u8, cfg.voice_stt_bin) catch {
-            self.gpa.free(ffmpeg);
+            if (ffmpeg) |f| self.gpa.free(f);
             self.gpa.free(model);
             return;
         };
@@ -3177,11 +3182,13 @@ pub const App = struct {
 
     pub fn startVoiceSetup(self: *App) void {
         const environ = self.environ orelse return;
-        // The only place dependencies are ever mentioned.
-        const ffmpeg = (voice.findBinary(self.gpa, self.io, environ, &.{"ffmpeg"}) catch null) orelse {
-            self.setNotice("voice needs ffmpeg for the microphone — `brew install ffmpeg`, then /voice setup again", .{});
+        // The only place dependencies are ever mentioned. macOS records
+        // natively, so only other platforms need ffmpeg for the microphone.
+        const ffmpeg = voice.findBinary(self.gpa, self.io, environ, &.{"ffmpeg"}) catch null;
+        if (ffmpeg == null and !mic.native) {
+            self.setNotice("voice needs ffmpeg for the microphone — install it (e.g. `apt install ffmpeg`), then /voice setup again", .{});
             return;
-        };
+        }
         if (self.voice_rt.ffmpeg) |old| self.gpa.free(old);
         self.voice_rt.ffmpeg = ffmpeg;
         self.voice_rt.wiz_engine = null;
@@ -3478,10 +3485,10 @@ pub const App = struct {
         if (rt.phase != .idle or !rt.enabled) return;
         const setup = rt.setup orelse return;
         _ = setup;
-        const ffmpeg = rt.ffmpeg orelse {
-            self.setNotice("voice needs ffmpeg on this machine for the microphone — `brew install ffmpeg`", .{});
+        if (!mic.native and rt.ffmpeg == null) {
+            self.setNotice("voice needs ffmpeg on this machine for the microphone", .{});
             return;
-        };
+        }
         rt.target_sid = self.view.sid;
         var nonce: [4]u8 = undefined;
         self.io.random(&nonce);
@@ -3489,31 +3496,61 @@ pub const App = struct {
         const wav = std.fmt.allocPrint(self.gpa, "{s}/marlin-voice-{x}.wav", .{
             std.mem.trimEnd(u8, tmp, "/"), std.mem.readInt(u32, &nonce, .little),
         }) catch return;
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const argv = voice.recordArgv(arena_state.allocator(), ffmpeg, wav) catch {
-            self.gpa.free(wav);
-            return;
-        };
-        const child = std.process.spawn(self.io, .{
-            .argv = argv,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .ignore,
-            .pgid = 0,
-        }) catch {
-            self.gpa.free(wav);
-            self.setNotice("voice: could not start recording (microphone permission?)", .{});
-            return;
-        };
-        rt.recorder = child;
+        if (mic.native) {
+            const recorder = self.gpa.create(mic.Recorder) catch {
+                self.gpa.free(wav);
+                return;
+            };
+            recorder.* = .{ .gpa = self.gpa, .io = self.io };
+            const notify: ?mic.OnListening = if (self.loop) |loop| .{ .ctx = loop, .func = postVoiceListening } else null;
+            recorder.start(notify) catch {
+                self.gpa.destroy(recorder);
+                self.gpa.free(wav);
+                self.setNotice("voice: could not open the microphone (permission for this terminal?)", .{});
+                return;
+            };
+            rt.mic = recorder;
+            rt.listening = false;
+        } else {
+            var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena_state.deinit();
+            const argv = voice.recordArgv(arena_state.allocator(), rt.ffmpeg.?, wav) catch {
+                self.gpa.free(wav);
+                return;
+            };
+            const child = std.process.spawn(self.io, .{
+                .argv = argv,
+                .stdin = .ignore,
+                .stdout = .ignore,
+                .stderr = .ignore,
+                .pgid = 0,
+            }) catch {
+                self.gpa.free(wav);
+                self.setNotice("voice: could not start recording (microphone permission?)", .{});
+                return;
+            };
+            rt.recorder = child;
+            // ffmpeg gives no signal when capture begins.
+            rt.listening = true;
+        }
         rt.wav_path = wav;
         rt.phase = .recording;
         rt.record_started_ms = nowWallMs(self.io);
         // Keep ticks flowing so the status bar's elapsed counter is live.
         self.syncAnimationTicker();
         self.prewarmVoiceModel();
+        if (rt.listening) self.voiceListeningNotice() else self.setNotice("○ opening mic…", .{});
+    }
+
+    fn voiceListeningNotice(self: *App) void {
+        const rt = &self.voice_rt;
         self.setNotice("● recording — {s}", .{if (rt.setup.?.mode == .ptt and rt.kitty_release) "release to transcribe" else "ctrl+space to stop"});
+    }
+
+    /// From the audio thread: the first audio arrived.
+    fn postVoiceListening(ctx: *anyopaque) void {
+        const loop: *vaxis.Loop(Event) = @ptrCast(@alignCast(ctx));
+        loop.postEvent(.{ .voice = .listening }) catch {};
     }
 
     /// While the user is talking, pull the model through the page cache so
@@ -3548,12 +3585,19 @@ pub const App = struct {
         if (rt.recorder) |recorder| {
             if (recorder.id) |pid| std.posix.kill(pid, std.posix.SIG.INT) catch {};
         }
+        var pcm: ?[]u8 = null;
+        if (rt.mic) |recorder| {
+            pcm = recorder.stop() catch null;
+            self.gpa.destroy(recorder);
+            rt.mic = null;
+        }
         const job = self.gpa.create(VoiceJob) catch return;
         job.* = .{
             .gpa = self.gpa,
             .io = self.io,
             .loop = self.loop orelse return,
             .recorder = rt.recorder,
+            .pcm = pcm,
             .wav_path = rt.wav_path.?,
             .setup = setup,
             .remote = self.remote_transport,
@@ -3579,6 +3623,11 @@ pub const App = struct {
             _ = recorder.wait(self.io) catch {};
         }
         rt.recorder = null;
+        if (rt.mic) |recorder| {
+            recorder.abort();
+            self.gpa.destroy(recorder);
+            rt.mic = null;
+        }
         if (rt.wav_path) |wav| {
             Io.Dir.cwd().deleteFile(self.io, wav) catch {};
             self.gpa.free(wav);
@@ -3620,6 +3669,14 @@ pub const App = struct {
                 self.voice_rt.phase = .idle;
                 self.syncAnimationTicker();
                 self.setNotice("voice: transcription failed ({s})", .{name});
+            },
+            .listening => {
+                const rt = &self.voice_rt;
+                if (rt.phase != .recording or rt.listening) return;
+                rt.listening = true;
+                // The clock starts when speech is captured, not at the press.
+                rt.record_started_ms = nowWallMs(self.io);
+                self.voiceListeningNotice();
             },
             .download_done => self.voiceDownloadFinished(null),
             .download_failed => |name| self.voiceDownloadFinished(name),
@@ -6361,6 +6418,8 @@ const VoiceJob = struct {
     io: Io,
     loop: *vaxis.Loop(Event),
     recorder: ?std.process.Child,
+    /// Native capture's audio (gpa-owned), written to wav_path first.
+    pcm: ?[]u8 = null,
     wav_path: []u8,
     setup: voice.Setup,
     /// `--remote`: hand the recording back for the daemon's machine to
@@ -6378,6 +6437,11 @@ const VoiceJob = struct {
 
     fn transcribe(job: *VoiceJob) !void {
         if (job.recorder) |*recorder| _ = recorder.wait(job.io) catch {};
+        if (job.pcm) |pcm| {
+            defer job.gpa.free(pcm);
+            job.pcm = null;
+            try mic.writeWav(job.io, job.wav_path, pcm);
+        }
         if (job.remote) {
             // 16 kHz mono wav is 32 KB a second: minutes fit the protocol.
             const audio = try Io.Dir.cwd().readFileAlloc(job.io, job.wav_path, job.gpa, .limited(proto.max_line_bytes / 2));
@@ -6455,6 +6519,10 @@ const VoiceRt = struct {
     ffmpeg: ?[]u8 = null,
     phase: enum { idle, recording, transcribing } = .idle,
     recorder: ?std.process.Child = null,
+    /// macOS: the in-process recorder.
+    mic: ?*mic.Recorder = null,
+    /// Audio is arriving (native capture reports it; ffmpeg cannot).
+    listening: bool = false,
     wav_path: ?[]u8 = null,
     /// Terminal reports key releases (kitty): push-to-talk possible.
     kitty_release: bool = false,
@@ -6497,6 +6565,10 @@ const VoiceRt = struct {
     fn deinit(self: *VoiceRt, gpa: std.mem.Allocator) void {
         self.freeSetup(gpa);
         self.remote_host.deinit(gpa);
+        if (self.mic) |recorder| {
+            recorder.abort();
+            gpa.destroy(recorder);
+        }
         if (self.ffmpeg) |f| gpa.free(f);
         if (self.wav_path) |w| gpa.free(w);
         if (self.wiz_stt_bin) |b| gpa.free(b);
