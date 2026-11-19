@@ -1418,22 +1418,14 @@ fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16,
         Palette.status_sep;
     const dns_cols: u16 = @intCast(displayWidth(dns_txt));
     const mode_txt: []const u8 = if (app.view.plan_mode) "PLAN" else if (app.view.permissions_full) "FULL ACCESS" else "";
-    // Voice dictation state. Invisible until /voice setup enables it —
-    // dormant means dormant — then a quiet armed hint that turns loud
-    // while a capture or transcription is in flight.
+    // Voice dictation state: shown only while a capture or transcription
+    // is in flight. Armed-but-idle takes no room.
     var voice_buf: [24]u8 = undefined;
     var voice_txt: []const u8 = "";
     var voice_cols: u16 = 0;
     var voice_style: vaxis.Style = Palette.status_sep;
     if (app.voice_rt.enabled) switch (app.voice_rt.phase) {
-        .idle => {
-            const ptt = if (app.voice_rt.setup) |st|
-                st.mode == .ptt and app.voice_rt.kitty_release
-            else
-                false;
-            voice_txt = if (ptt) "mic·ptt" else "mic·tap";
-            voice_cols = 7; // "·" renders one cell
-        },
+        .idle => {},
         .recording => if (!app.voice_rt.listening) {
             voice_txt = "○ mic…";
             voice_cols = 6;
