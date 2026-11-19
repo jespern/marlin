@@ -1523,6 +1523,53 @@ test "/voice over --remote sets up and transcribes on the daemon's machine" {
     try std.testing.expect(app.voice_rt.phase == .idle);
 }
 
+// Case: a client new enough for remote voice, attached to a daemon from
+// before it: no mic segment and ctrl+space did nothing, silently. An older
+// daemon now leaves this client doing voice itself, from its own [voice].
+test "over --remote, a daemon without remote voice leaves dictation local" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-old-daemon-voice");
+    defer temp.deinit();
+    const ffmpeg = try std.fmt.allocPrintSentinel(gpa, "{s}/ffmpeg", .{temp.path}, 0);
+    defer gpa.free(ffmpeg);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ffmpeg, .data = "#!/bin/sh\n" });
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(ffmpeg, 0o700));
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("PATH", temp.path);
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    conn.remote_voice = false;
+    var app = App{ .gpa = gpa, .io = io, .conn = &conn, .environ = &env, .remote_transport = true, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.cfg.voice_enabled = true;
+    app.cfg.voice_engine = "whisper-turbo";
+    app.cfg.voice_model = "/models/ggml-large-v3-turbo.bin";
+    app.cfg.voice_stt_bin = "/usr/bin/whisper-cli";
+
+    try std.testing.expect(!app.voiceOnDaemon());
+    // Startup takes this machine's [voice], as before remote voice.
+    app.initVoiceFromConfig();
+    try std.testing.expect(app.voice_rt.enabled);
+    try std.testing.expectEqualStrings("/usr/bin/whisper-cli", app.voice_rt.setup.?.stt_bin);
+    // /voice setup is this machine's wizard, not a question to the daemon.
+    app.runCommand("/voice setup");
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try std.testing.expectEqual(PickerKind.voice_engine, app.picker_kind);
+
+    // A daemon that knows remote voice takes over.
+    conn.remote_voice = true;
+    try std.testing.expect(app.voiceOnDaemon());
+}
+
 test "bang shell escape over --remote runs in the daemon's shell, like !!" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

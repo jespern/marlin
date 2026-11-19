@@ -732,7 +732,7 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
     } else if (std.mem.eql(u8, head, "/voice")) {
         const action = it.next();
         // Over --remote the daemon's machine holds voice (voice_host.zig).
-        if (self.remote_transport) {
+        if (self.voiceOnDaemon()) {
             if (action == null) {
                 if (self.voice_rt.enabled) self.requestRemoteVoice(.announce) else self.startVoiceSetup();
             } else if (std.mem.eql(u8, action.?, "setup")) {

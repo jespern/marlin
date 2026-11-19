@@ -3161,10 +3161,17 @@ pub const App = struct {
         self.voice_rt.enabled = true;
     }
 
+    /// Over --remote the daemon's machine holds dictation, when its daemon
+    /// knows how. An older one leaves this client doing voice itself, from
+    /// its own [voice], as before remote voice existed: never silently off.
+    pub fn voiceOnDaemon(self: *const App) bool {
+        return self.remote_transport and self.conn.remote_voice;
+    }
+
     pub fn voiceStatusNotice(self: *App) void {
         const rt = &self.voice_rt;
         if (!rt.enabled or rt.setup == null) {
-            if (self.remote_transport)
+            if (self.voiceOnDaemon())
                 self.setNotice("voice is not set up on {s} — /voice setup walks through it", .{self.remoteVoiceHost()})
             else
                 self.setNotice("voice is not set up — /voice setup walks through it (local, offline)", .{});
@@ -3173,8 +3180,8 @@ pub const App = struct {
         const st = rt.setup.?;
         self.setNotice("voice · {s}{s}{s} · {s} · ctrl+space{s} · /voice [setup|mode ptt|toggle|off]", .{
             st.engine.configName(),
-            if (self.remote_transport) @as([]const u8, " on ") else "",
-            if (self.remote_transport) self.remoteVoiceHost() else "",
+            if (self.voiceOnDaemon()) @as([]const u8, " on ") else "",
+            if (self.voiceOnDaemon()) self.remoteVoiceHost() else "",
             if (st.mode == .ptt) "push-to-talk" else "toggle",
             if (st.mode == .ptt and !rt.kitty_release) " (terminal lacks key-release: acting as toggle)" else "",
         });
@@ -3194,7 +3201,7 @@ pub const App = struct {
         self.voice_rt.wiz_engine = null;
         self.voice_rt.wiz_mode = null;
         // Over --remote the engines are the daemon's machine's: ask first.
-        if (self.remote_transport) return self.requestRemoteVoice(.setup);
+        if (self.voiceOnDaemon()) return self.requestRemoteVoice(.setup);
         self.openPicker(.voice_engine);
     }
 
@@ -3600,7 +3607,7 @@ pub const App = struct {
             .pcm = pcm,
             .wav_path = rt.wav_path.?,
             .setup = setup,
-            .remote = self.remote_transport,
+            .remote = self.voiceOnDaemon(),
         };
         rt.recorder = null;
         rt.wav_path = null;
@@ -5514,6 +5521,18 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
     app.git_next_poll_ms = 0;
     app.git_label.clearRetainingCapacity();
     app.recaps_supported = new_conn.session_recaps;
+    // A rebooted daemon may now hold dictation (or no longer): ask again.
+    // Mid-recording, keep what is running.
+    if (app.voice_rt.phase == .idle) {
+        if (app.voiceOnDaemon()) {
+            app.requestRemoteVoice(.silent);
+        } else if (app.remote_transport and app.voice_rt.setup != null and app.voice_rt.setup.?.stt_bin.len == 0) {
+            // The daemon's setup is gone with its support: back to ours.
+            app.voice_rt.freeSetup(app.gpa);
+            app.voice_rt.enabled = false;
+            app.initVoiceFromConfig();
+        }
+    }
     app.view.recap.pending_seq = 0;
     app.view.recap.attempted_seq = 0;
     rt.* = new_rt;
@@ -6061,7 +6080,7 @@ pub fn run(
         }
         // Over --remote, dictation is the daemon's machine's (silently ask
         // whether it is set up); locally, this machine's [voice].
-        if (app.remote_transport) app.requestRemoteVoice(.silent) else app.initVoiceFromConfig();
+        if (app.voiceOnDaemon()) app.requestRemoteVoice(.silent) else app.initVoiceFromConfig();
         try vx.setBracketedPaste(writer, true);
         // Mouse: wheel scrolls the session view; native cell-precise selection
         // copies through OSC52. Shift+drag remains the terminal's escape hatch.
