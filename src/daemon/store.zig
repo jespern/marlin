@@ -2468,14 +2468,18 @@ pub const Store = struct {
         const stmt = try self.prepare(
             \\SELECT session_id, seq, ts, text FROM (
             \\  SELECT session_id, seq, ts, text, block_id, 0 AS bucket FROM (
-            \\    SELECT session_id, seq, ts, text, block_id FROM search_docs
-            \\    WHERE session_id=? AND kind IN ('user_msg','steer')
+            \\    SELECT session_id, seq, ts, text, block_id FROM search_docs d
+            \\    WHERE session_id=? AND kind IN ('user_msg','steer') AND NOT EXISTS (
+            \\      SELECT 1 FROM blocks b WHERE b.id=d.block_id AND
+            \\      coalesce(json_extract(b.body_json,'$.user_msg.from'),json_extract(b.body_json,'$.steer.from')) IS NOT NULL)
             \\    ORDER BY ts DESC, block_id DESC LIMIT ?
             \\  )
             \\  UNION ALL
             \\  SELECT session_id, seq, ts, text, block_id, 1 AS bucket FROM (
-            \\    SELECT session_id, seq, ts, text, block_id FROM search_docs
-            \\    WHERE session_id<>? AND kind IN ('user_msg','steer')
+            \\    SELECT session_id, seq, ts, text, block_id FROM search_docs d
+            \\    WHERE session_id<>? AND kind IN ('user_msg','steer') AND NOT EXISTS (
+            \\      SELECT 1 FROM blocks b WHERE b.id=d.block_id AND
+            \\      coalesce(json_extract(b.body_json,'$.user_msg.from'),json_extract(b.body_json,'$.steer.from')) IS NOT NULL)
             \\    ORDER BY ts DESC, block_id DESC LIMIT ?
             \\  )
             \\) ORDER BY bucket, ts DESC, block_id DESC LIMIT ?

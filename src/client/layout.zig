@@ -380,6 +380,9 @@ pub const RenderBlock = struct {
     /// reasoning blocks: true = deliberate mid-turn narration (visible);
     /// false = raw provider reasoning (folded; ctrl+t reveals).
     commentary: bool = false,
+    /// user_msg/steer sent by another agent; `label` names the sender.
+    /// Folded to one line; ctrl+t shows the message.
+    from_agent: bool = false,
     /// Locally inserted for instant submit feedback. The matching durable
     /// block clears this bit instead of producing a duplicate render block.
     pending_echo: bool = false,
@@ -518,6 +521,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     var styled: []const u8 = "";
     var shell_ran: []const u8 = "";
     var payload_bytes: ?u64 = null;
+    var from_agent = false;
     var generated_text: ?[]u8 = null;
     var generated_label: ?[]u8 = null;
     var plan_items: []block.PlanItem = &.{};
@@ -536,7 +540,10 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
                 text = generated_text.?;
             } else {
                 text = u.display_text orelse u.text;
-                if (u.attachments.len > 0) {
+                if (u.from) |from| {
+                    label = from;
+                    from_agent = true;
+                } else if (u.attachments.len > 0) {
                     generated_label = try mediaLabel(gpa, u.attachments);
                     label = generated_label.?;
                 }
@@ -544,7 +551,10 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         },
         .steer => |s| {
             text = s.display_text orelse s.text;
-            if (s.attachments.len > 0) {
+            if (s.from) |from| {
+                label = from;
+                from_agent = true;
+            } else if (s.attachments.len > 0) {
                 generated_label = try mediaLabel(gpa, s.attachments);
                 label = generated_label.?;
             }
@@ -614,6 +624,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .turn_id = b.turn_id,
         .text = owned_text,
         .label = owned_label,
+        .from_agent = from_agent,
         .call_id = owned_call_id,
         .plan_items = plan_items,
         .status = status,
@@ -1919,6 +1930,10 @@ pub fn layoutBlockRange(
             .user_msg => {
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 try blankLine(alloc, lines);
+                if (rb.from_agent) {
+                    try appendAgentMessage(alloc, lines, rb, transcript.show_tool_transcript, w);
+                    continue;
+                }
                 try wrapPromptCard(alloc, lines, rb.text, w);
                 if (rb.label.len > 0)
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
@@ -1998,6 +2013,10 @@ pub fn layoutBlockRange(
             .steer => {
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 try blankLine(alloc, lines);
+                if (rb.from_agent) {
+                    try appendAgentMessage(alloc, lines, rb, transcript.show_tool_transcript, w);
+                    continue;
+                }
                 try wrapInputCard(alloc, lines, rb.text, w, true, rb.pending_echo);
                 if (rb.label.len > 0)
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
@@ -2171,6 +2190,33 @@ fn rangeSeamNeedsBlank(stable_lines: []const Line, tail_lines: []const Line) boo
     return !last_blank and !first_blank;
 }
 
+/// A message from another agent: one quiet line naming the sender and how
+/// it starts; the transcript view (ctrl+t) shows it whole.
+fn appendAgentMessage(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, expanded: bool, w: usize) !void {
+    if (expanded) {
+        const head = try std.fmt.allocPrint(alloc, "  ↔ from {s}", .{rb.label});
+        try wrapPrefixed(alloc, lines, "", head, Palette.note, w);
+        try wrapPrefixed(alloc, lines, "    ", rb.text, Palette.collapse_hint, w);
+        return;
+    }
+    // The first line of what was said, flattened and cut to the row.
+    const first = std.mem.trim(u8, rb.text[0 .. std.mem.indexOfScalar(u8, rb.text, '\n') orelse rb.text.len], " \t\r");
+    const head = try std.fmt.allocPrint(alloc, "  ↔ {s} · ", .{rb.label});
+    const hint = " · ctrl+t";
+    // clipText appends " …" past `room`.
+    const room = w -| (displayWidth(head) + displayWidth(hint) + 3);
+    const clipped = try clipText(alloc, first, room);
+    try lines.append(alloc, .{
+        .timestamp_ms = rb.timestamp_ms,
+        .text = head,
+        .style = Palette.note,
+        .text2 = clipped,
+        .style2 = Palette.collapse_hint,
+        .text3 = hint,
+        .style3 = Palette.collapse_hint,
+    });
+}
+
 /// Range occupied by the active turn's prompt card in the most recent
 /// layoutLines result. The active turn starts with its user_msg; prompt-card
 /// rows are the contiguous filled rows at the head of the mutable tail.
@@ -2178,6 +2224,8 @@ pub fn activePromptLineRange(transcript: *const Transcript) ?LineRange {
     if (transcript.state != .running and transcript.state != .awaiting_approval) return null;
     const stable = stableBlockCount(transcript);
     if (stable >= transcript.blocks.len or transcript.blocks[stable].kind != .user_msg) return null;
+    // Another agent's message is not the user's prompt to keep in view.
+    if (transcript.blocks[stable].from_agent) return null;
 
     const tail_lines = transcript.tail_layout_cache.lines.items;
     var len: usize = 0;

@@ -193,6 +193,8 @@ pub const RunOpts = struct {
     /// authored user input or entering composer history.
     synthetic_input: bool = false,
     input_display_text: ?[]const u8 = null,
+    /// The input came from another agent (user_msg.from).
+    input_from: ?[]const u8 = null,
     /// Root sessions checkpoint a very long agent loop at max_rounds and let
     /// the daemon immediately resume it as a fresh internal turn. Children
     /// keep max_rounds as a hard parent-facing completion boundary.
@@ -289,6 +291,7 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .display_text = if (value.display_text) |text| try arena.dupe(u8, text) else null,
             .attachments = try cloneMediaRefs(arena, value.attachments),
             .synthetic = value.synthetic,
+            .from = if (value.from) |from| try arena.dupe(u8, from) else null,
         } },
         .assistant_msg => |value| .{ .assistant_msg = .{ .text = try arena.dupe(u8, value.text) } },
         .reasoning => |value| .{ .reasoning = .{ .text = try arena.dupe(u8, value.text), .commentary = value.commentary } },
@@ -315,6 +318,7 @@ fn cloneBody(arena: std.mem.Allocator, body: block.Body) !block.Body {
             .text = try arena.dupe(u8, value.text),
             .display_text = if (value.display_text) |text| try arena.dupe(u8, text) else null,
             .attachments = try cloneMediaRefs(arena, value.attachments),
+            .from = if (value.from) |from| try arena.dupe(u8, from) else null,
         } },
         .plan => |value| blk: {
             const items = try arena.alloc(block.PlanItem, value.items.len);
@@ -568,6 +572,7 @@ pub fn runTurn(
             .attachments = attachments,
             .synthetic = opts.synthetic_input,
             .display_text = opts.input_display_text,
+            .from = opts.input_from,
         } });
         for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
         const delegated_prompt: ?[]u8 = if (attachments.len > 0)
@@ -630,6 +635,7 @@ pub fn runTurn(
         .attachments = attachments,
         .synthetic = opts.synthetic_input,
         .display_text = opts.input_display_text,
+        .from = opts.input_from,
     } });
     for (attachments) |attachment| try store.addBlobRef(attachment.hash, user_block_id);
 

@@ -82,6 +82,11 @@ pub fn messageText(gpa: std.mem.Allocator, from_handle: []const u8, from_title: 
     , .{ title, from_model, from_handle, text });
 }
 
+/// Who a session message is from, as its receiver's transcript names it.
+pub fn senderLabel(gpa: std.mem.Allocator, handle: []const u8, title: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} · {s}", .{ if (title.len > 0) title else "(untitled)", handle });
+}
+
 /// A message from the user's assistant outside Marlin (the MCP server):
 /// it reads the answer from this session, so there is no handle to reply to.
 pub fn outsideMessageText(gpa: std.mem.Allocator, from: []const u8, text: []const u8) ![]u8 {
@@ -112,8 +117,14 @@ pub fn transcriptTail(arena: std.mem.Allocator, blocks: []const block.Block) ![]
     var entries: std.ArrayList([]const u8) = .empty;
     for (blocks) |b| {
         const entry: ?[]const u8 = switch (b.body) {
-            .user_msg => |u| if (u.synthetic) null else try labelled(arena, "user", u.display_text orelse u.text),
-            .steer => |s| try labelled(arena, "user (while it worked)", s.display_text orelse s.text),
+            .user_msg => |u| if (u.synthetic) null else if (u.from) |from|
+                try labelled(arena, try std.fmt.allocPrint(arena, "message from {s}", .{from}), u.display_text orelse u.text)
+            else
+                try labelled(arena, "user", u.display_text orelse u.text),
+            .steer => |s| if (s.from) |from|
+                try labelled(arena, try std.fmt.allocPrint(arena, "message from {s} (while it worked)", .{from}), s.display_text orelse s.text)
+            else
+                try labelled(arena, "user (while it worked)", s.display_text orelse s.text),
             .assistant_msg => |a| try labelled(arena, "agent", a.text),
             .reasoning => |r| if (r.commentary) try labelled(arena, "agent (note)", r.text) else null,
             .tool_call => |tc| try std.fmt.allocPrint(arena, "tool: {s} {s}", .{ tc.name, clip(tc.args_json, 200) }),

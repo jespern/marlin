@@ -1862,3 +1862,63 @@ test "Bash calls that only read or edit files show as Read, Write, or Edit" {
     // Other tools are untouched.
     try std.testing.expectEqualStrings("Grep", layout.toolDisplayNameFor(arena, "grep", "{\"pattern\":\"x\"}"));
 }
+
+test "a message from another agent folds to one line; ctrl+t shows it whole" {
+    // Case: cross-session messages filled the receiving session with full
+    // prompt cards.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var message = RenderBlock{
+        .kind = .user_msg,
+        .text = try arena.dupe(u8, "1. I'm not changing gate or actuator now.\n2. Where the hold should live: in the ledger."),
+        .label = try arena.dupe(u8, "phone/voice · 2e96c9d3"),
+        .from_agent = true,
+    };
+    const folded = try questionTranscriptText(arena, &.{message}, true);
+    try std.testing.expect(std.mem.indexOf(u8, folded, "↔ phone/voice · 2e96c9d3 · 1. I'm not changing gate or actuator now. · ctrl+t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, folded, "in the ledger") == null);
+
+    var expanded_lines: std.ArrayList(Line) = .empty;
+    message.from_agent = true;
+    const blocks = [_]RenderBlock{message};
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = true,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .guest = true,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    expanded_lines = try layoutLines(arena, gpa, &transcript, 100);
+    var text: std.ArrayList(u8) = .empty;
+    for (expanded_lines.items) |line| {
+        try text.appendSlice(arena, try lineText(arena, line));
+        try text.append(arena, '\n');
+    }
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "↔ from phone/voice · 2e96c9d3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "in the ledger") != null);
+    // Never a prompt card: no filled rows.
+    for (expanded_lines.items) |line| try std.testing.expect(line.fill_style == null);
+}

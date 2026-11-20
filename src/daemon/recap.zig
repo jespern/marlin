@@ -38,7 +38,10 @@ pub fn snapshot(arena: std.mem.Allocator, blocks: []const block.Block) !Snapshot
     });
     const start = blocks.len -| 24;
     for (blocks[start..]) |b| switch (b.body) {
-        .user_msg => |u| try transcript.print(arena, "USER: {s}\n", .{limits.clipped(u.display_text orelse u.text, 600)}),
+        .user_msg => |u| if (u.from) |from|
+            try transcript.print(arena, "MESSAGE FROM {s}: {s}\n", .{ from, limits.clipped(u.display_text orelse u.text, 600) })
+        else
+            try transcript.print(arena, "USER: {s}\n", .{limits.clipped(u.display_text orelse u.text, 600)}),
         .assistant_msg => |a| try transcript.print(arena, "ASSISTANT: {s}\n", .{limits.clipped(a.text, 600)}),
         .tool_call => |t| try transcript.print(arena, "TOOL: {s} {s}\n", .{ t.name, limits.clipped(t.args_json, 300) }),
         .tool_result => |t| try transcript.print(arena, "RESULT ({t}): {s}\n", .{ t.status, limits.clipped(t.inline_body, 300) }),

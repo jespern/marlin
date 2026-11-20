@@ -4342,6 +4342,8 @@ pub const Daemon = struct {
         effort: proto.ReasoningEffort,
         text: []u8,
         display_text: ?[]u8 = null,
+        /// Sent by another agent (user_msg.from); job-owned.
+        from: ?[]u8 = null,
         attachments: []const block.MediaRef,
         sandbox_enabled: bool,
         network_filtering_enabled: bool,
@@ -4388,13 +4390,13 @@ pub const Daemon = struct {
         synthetic_input: bool,
         display_text: ?[]const u8,
     ) !void {
-        return self.startTurnJob(session, text, attachments, synthetic_input, display_text, false);
+        return self.startTurnJob(session, text, attachments, synthetic_input, display_text, false, null);
     }
 
     /// A guest session's /compact: the guest compacts its own context in a
     /// turn of its own, with `instructions` as Claude Code's focus.
     fn startGuestCompact(self: *Daemon, session: *Session, instructions: []const u8) !void {
-        return self.startTurnJob(session, instructions, &.{}, true, null, true);
+        return self.startTurnJob(session, instructions, &.{}, true, null, true, null);
     }
 
     fn startTurnJob(
@@ -4405,6 +4407,7 @@ pub const Daemon = struct {
         synthetic_input: bool,
         display_text: ?[]const u8,
         guest_compact: bool,
+        from: ?[]const u8,
     ) !void {
         if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
             return error.SessionBusy;
@@ -4419,6 +4422,8 @@ pub const Daemon = struct {
         errdefer self.gpa.free(owned_text);
         const owned_display = if (display_text) |value| try self.gpa.dupe(u8, value) else null;
         errdefer if (owned_display) |value| self.gpa.free(value);
+        const owned_from = if (from) |value| try self.gpa.dupe(u8, value) else null;
+        errdefer if (owned_from) |value| self.gpa.free(value);
         const owned_attachments = try dupeMediaRefs(self.gpa, attachments);
         errdefer freeMediaRefs(self.gpa, owned_attachments);
         const otel_base: []u8 = if (self.otel_exporter) |e| try self.gpa.dupe(u8, e.raw_base_endpoint) else try self.gpa.dupe(u8, "");
@@ -4442,6 +4447,7 @@ pub const Daemon = struct {
             .effort = session.effort,
             .text = owned_text,
             .display_text = owned_display,
+            .from = owned_from,
             .attachments = owned_attachments,
             .sandbox_enabled = session.sandbox_enabled,
             .network_filtering_enabled = session.network_filtering_enabled,
@@ -4535,7 +4541,7 @@ pub const Daemon = struct {
         const turn_id = if (job.turn_id != 0) job.turn_id else ids.next(self.io);
         var seq = self.store.lastSeq(job.sid) catch return;
         const all = [_]block.Body{
-            .{ .user_msg = .{ .text = job.text, .display_text = job.display_text, .attachments = job.attachments } },
+            .{ .user_msg = .{ .text = job.text, .display_text = job.display_text, .attachments = job.attachments, .from = job.from } },
             .{ .system_note = .{ .text = note } },
         };
         // A compaction's text is focus instructions, not something typed.
@@ -4662,6 +4668,7 @@ pub const Daemon = struct {
             self.gpa.free(job.model);
             self.gpa.free(job.text);
             if (job.display_text) |value| self.gpa.free(value);
+            if (job.from) |value| self.gpa.free(value);
             self.gpa.free(job.otel_base);
             self.gpa.free(job.otel_traces);
             @memset(job.otel_headers, 0);
@@ -4778,6 +4785,7 @@ pub const Daemon = struct {
             .tool_profile = if (job.kind != .root) .read_only else if (job.plan_mode) .plan else .full,
             .synthetic_input = job.synthetic_input,
             .input_display_text = job.display_text,
+            .input_from = job.from,
             .auto_continue_round_budget = job.kind == .root,
             .cancel = job.cancel,
             .pause = &job.session.pause_requested,
@@ -4855,6 +4863,7 @@ pub const Daemon = struct {
             self.gpa.free(job.model);
             self.gpa.free(job.text);
             if (job.display_text) |value| self.gpa.free(value);
+            if (job.from) |value| self.gpa.free(value);
             freeMediaRefs(self.gpa, job.attachments);
             self.gpa.destroy(job);
         }
@@ -5072,6 +5081,7 @@ pub const Daemon = struct {
             self.gpa.free(job.model);
             self.gpa.free(job.text);
             if (job.display_text) |value| self.gpa.free(value);
+            if (job.from) |value| self.gpa.free(value);
             freeMediaRefs(self.gpa, job.attachments);
             self.gpa.destroy(job);
         }
@@ -5850,8 +5860,15 @@ pub const Daemon = struct {
             if (self.sessionShell(target_sid) != null)
                 return .{ .text = "not sent: that session is a shell right now", .status = .err };
             const message = if (from_outside) try sessions_tool.outsideMessageText(arena, outside, text) else try sessions_tool.messageText(arena, me.handle, me.title, me.model, text);
+            // The transcript shows the sender's words, folded under who sent
+            // them; the model reads the message with its reply instructions.
+            const sender = if (from_outside) outside else try sessions_tool.senderLabel(arena, me.handle, me.title);
             if (session.state == .running or session.state == .awaiting_approval) {
-                const owned = try self.prepareSteerInput(session.model, message, null, &.{});
+                var owned = try self.prepareSteerInput(session.model, message, text, &.{});
+                owned.from = self.gpa.dupe(u8, sender) catch |err| {
+                    owned.deinit(self.gpa);
+                    return err;
+                };
                 session.steer_mutex.lockUncancelable(self.io);
                 if (!session.steer_accepting) {
                     session.steer_mutex.unlock(self.io);
@@ -5869,7 +5886,7 @@ pub const Daemon = struct {
                 return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It is busy and reads it between its steps. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
             }
             session.agent_hops = hops;
-            self.startInputTurn(session, message, &.{}, false, null) catch |err| {
+            self.startTurnJob(session, message, &.{}, false, text, false, sender) catch |err| {
                 if (err == error.SessionBusy) return .{ .text = "not sent: that session just started a turn; try again", .status = .err };
                 return err;
             };

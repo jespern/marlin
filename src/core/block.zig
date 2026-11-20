@@ -57,10 +57,13 @@ pub const Input = struct {
     text: []const u8,
     display_text: ?[]const u8 = null,
     attachments: []const MediaRef = &.{},
+    /// Sent by another agent, not typed: see user_msg.from.
+    from: ?[]const u8 = null,
 
     pub fn deinit(self: Input, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
         if (self.display_text) |text| gpa.free(text);
+        if (self.from) |from| gpa.free(from);
         for (self.attachments) |attachment| {
             gpa.free(attachment.hash);
             gpa.free(attachment.mime);
@@ -81,6 +84,11 @@ pub const Body = union(BlockKind) {
         /// Internal context injected after compaction. It remains model-visible
         /// but clients must not present it as authored user input or history.
         synthetic: bool = false,
+        /// Who sent it when it was not the user: another Marlin session
+        /// ("title · handle") or the user's outside assistant. Clients fold
+        /// it to one line and keep it out of prompt history; display_text
+        /// holds the sender's words, text what the model reads.
+        from: ?[]const u8 = null,
     },
     assistant_msg: struct { text: []const u8 },
     reasoning: struct {

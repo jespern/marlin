@@ -1752,6 +1752,11 @@ pub const App = struct {
         }
     }
 
+    fn markAgentMessage(self: *App, seq: u64) void {
+        const last = if (self.view.blocks.items.len > 0) &self.view.blocks.items[self.view.blocks.items.len - 1] else return;
+        if (last.seq == seq) last.from_agent = true;
+    }
+
     pub fn pushDurableToolResult(
         self: *App,
         b: block.Block,
@@ -2449,6 +2454,11 @@ pub const App = struct {
                     const label = rehydrationLabel(self.gpa, u.text) catch return;
                     defer self.gpa.free(label);
                     self.pushDurableBlock(b, .system_note, label, "", .ok);
+                } else if (u.from) |from| {
+                    // Another agent's message: folded, and not the user's
+                    // history to recall.
+                    self.pushDurableBlock(b, .user_msg, u.display_text orelse u.text, from, .ok);
+                    self.markAgentMessage(b.seq);
                 } else {
                     const label = if (u.attachments.len > 0)
                         layout_mod.mediaLabel(self.gpa, u.attachments) catch null
@@ -2474,6 +2484,11 @@ pub const App = struct {
                 }
             },
             .steer => |s| {
+                if (s.from) |from| {
+                    self.pushDurableBlock(b, .steer, s.display_text orelse s.text, from, .ok);
+                    self.markAgentMessage(b.seq);
+                    return;
+                }
                 const label = if (s.attachments.len > 0) layout_mod.mediaLabel(self.gpa, s.attachments) catch null else null;
                 defer if (label) |owned| self.gpa.free(owned);
                 const reconciled = reconcilePendingEcho(self.view.blocks.items, .steer, s.display_text orelse s.text, b.seq, b.turn_id, b.ts);
