@@ -84,6 +84,7 @@ test {
     _ = @import("client/shell_styled_test.zig");
     _ = @import("client/screenshot_test.zig");
     _ = @import("client/mic_test.zig");
+    _ = @import("client/transcript_images_test.zig");
     _ = @import("client/ghostty_font_test.zig");
     _ = @import("client/raster_test.zig");
     _ = @import("client/raster_coretext_test.zig");
@@ -155,6 +156,7 @@ test {
     _ = @import("client/shell_intent_test.zig");
     _ = @import("client/web_shell_test.zig");
     _ = @import("daemon/tools/sessions_test.zig");
+    _ = @import("daemon/tools/show_image_test.zig");
     _ = @import("mobile/presence_test.zig");
     _ = @import("mobile/webpush_test.zig");
     _ = @import("mobile/pairing_test.zig");

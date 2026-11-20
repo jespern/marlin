@@ -22,6 +22,7 @@ const build_options = @import("build_options");
 const proto = @import("../core/proto.zig");
 const attach = @import("attach.zig");
 const sessions_tool = @import("../daemon/tools/sessions.zig");
+const show_image = @import("../daemon/tools/show_image.zig");
 
 /// One verdict, with the daemon's optional policy message (copied into a
 /// fixed buffer: the wire arena dies before the reply is composed).
@@ -74,6 +75,8 @@ pub const Decider = struct {
     /// (gpa-owned) and whether it succeeded; null when the daemon is
     /// unreachable.
     agent_tool: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ?AgentToolResult = null,
+    /// show_image: read an image from the session's working directory.
+    load_image: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator, path: []const u8) anyerror!show_image.Loaded = null,
 };
 
 pub const AgentToolResult = struct { text: []u8, ok: bool };
@@ -110,6 +113,7 @@ pub fn run(
         .decide = DaemonDecider.decide,
         .ask_question = DaemonDecider.askQuestion,
         .agent_tool = DaemonDecider.agentTool,
+        .load_image = DaemonDecider.loadImage,
     };
 
     var in_buf: [64 * 1024]u8 = undefined;
@@ -156,6 +160,14 @@ const DaemonDecider = struct {
         defer arena_state.deinit();
         const result = try conn.recvUntil(arena_state.allocator(), .cc_approval_result);
         return Decision.init(result.decision, result.message);
+    }
+
+    /// Claude Code starts this bridge in the session's directory.
+    fn loadImage(ctx: ?*anyopaque, gpa: std.mem.Allocator, path: []const u8) anyerror!show_image.Loaded {
+        const self: *DaemonDecider = @ptrCast(@alignCast(ctx.?));
+        const cwd = try Io.Dir.cwd().realPathFileAlloc(self.io, ".", gpa);
+        defer gpa.free(cwd);
+        return show_image.load(gpa, self.io, path, cwd);
     }
 
     fn agentTool(ctx: ?*anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ?AgentToolResult {
@@ -236,7 +248,7 @@ pub fn handleLine(gpa: std.mem.Allocator, line: []const u8, decider: Decider) ?[
 const default_protocol_version = "2025-06-18";
 
 const base_tools_json =
-    \\{"tools":[{"name":"approve","description":"Forward one Claude Code permission prompt to the marlin approval gate.","inputSchema":{"type":"object","properties":{"tool_name":{"type":"string"},"input":{"type":"object"}},"required":["tool_name","input"]}},{"name":"ask_user","description":"Ask the user a multiple-choice question, rendered as an interactive picker in their Marlin terminal. Use this whenever you would otherwise list options in prose and ask them to reply. The turn pauses until they answer; the result is the chosen option's exact text, or the user's own typed words.","inputSchema":{"type":"object","properties":{"question":{"type":"string","description":"The complete question, ending in a question mark"},"options":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":9,"description":"Distinct, mutually exclusive choices. No 'Other' option; the user can always type their own answer instead."}},"required":["question","options"]}}]}
+    \\{"tools":[{"name":"approve","description":"Forward one Claude Code permission prompt to the marlin approval gate.","inputSchema":{"type":"object","properties":{"tool_name":{"type":"string"},"input":{"type":"object"}},"required":["tool_name","input"]}},{"name":"show_image","description":"Show the user an image file (PNG or JPEG, up to 8 MB) inline in their Marlin transcript: a chart, screenshot, or diagram you made or found. You see the image too.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"The image file: absolute, or relative to the working directory"}},"required":["path"]}},{"name":"ask_user","description":"Ask the user a multiple-choice question, rendered as an interactive picker in their Marlin terminal. Use this whenever you would otherwise list options in prose and ask them to reply. The turn pauses until they answer; the result is the chosen option's exact text, or the user's own typed words.","inputSchema":{"type":"object","properties":{"question":{"type":"string","description":"The complete question, ending in a question mark"},"options":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":9,"description":"Distinct, mutually exclusive choices. No 'Other' option; the user can always type their own answer instead."}},"required":["question","options"]}}]}
 ;
 
 fn handleToolCall(gpa: std.mem.Allocator, id: std.json.Value, params: ?std.json.Value, decider: Decider) ?[]u8 {
@@ -246,6 +258,8 @@ fn handleToolCall(gpa: std.mem.Allocator, id: std.json.Value, params: ?std.json.
     if (name != .string) return rpcError(gpa, id, -32602, "unknown tool");
     if (std.mem.eql(u8, name.string, "ask_user"))
         return handleAskUser(gpa, id, p, decider);
+    if (std.mem.eql(u8, name.string, show_image.spec_name))
+        return handleShowImage(gpa, id, p, decider);
     if (sessions_tool.isTool(name.string))
         return handleAgentTool(gpa, id, name.string, p, decider);
     if (!std.mem.eql(u8, name.string, "approve"))
@@ -348,6 +362,40 @@ fn toolsWithSessions(gpa: std.mem.Allocator, id: std.json.Value) ?[]u8 {
         .inputSchema = std.json.parseFromSliceLeaky(std.json.Value, arena, spec.schema, .{}) catch return null,
     }) catch return null;
     const result = std.json.Stringify.valueAlloc(arena, .{ .tools = tools.items }, .{}) catch return null;
+    return rpcResult(gpa, id, result);
+}
+
+/// show_image: the image goes back as MCP image content, which Claude Code
+/// shows its model and echoes in its stream, where the guest translation
+/// stores it as the tool result's attachment (drawn inline).
+fn handleShowImage(gpa: std.mem.Allocator, id: std.json.Value, p: std.json.Value, decider: Decider) ?[]u8 {
+    const loader = decider.load_image orelse return rpcError(gpa, id, -32602, "show_image unavailable");
+    const path: []const u8 = blk: {
+        const arguments = p.object.get("arguments") orelse break :blk "";
+        if (arguments != .object) break :blk "";
+        const value = arguments.object.get("path") orelse break :blk "";
+        break :blk if (value == .string) value.string else "";
+    };
+    const Text = struct { type: []const u8 = "text", text: []const u8 };
+    const loaded = loader(decider.ctx, gpa, path) catch |err| {
+        const text = show_image.failureText(gpa, path, err);
+        defer gpa.free(text);
+        const result = std.json.Stringify.valueAlloc(gpa, .{ .content = &[_]Text{.{ .text = text }}, .isError = true }, .{}) catch return null;
+        defer gpa.free(result);
+        return rpcResult(gpa, id, result);
+    };
+    defer gpa.free(loaded.bytes);
+    const encoder = std.base64.standard.Encoder;
+    const data = gpa.alloc(u8, encoder.calcSize(loaded.bytes.len)) catch return null;
+    defer gpa.free(data);
+    _ = encoder.encode(data, loaded.bytes);
+    const note = std.fmt.allocPrint(gpa, "Shown to the user: {s}", .{loaded.name}) catch return null;
+    defer gpa.free(note);
+    const Image = struct { type: []const u8 = "image", data: []const u8, mimeType: []const u8 };
+    const result = std.json.Stringify.valueAlloc(gpa, .{
+        .content = .{ Image{ .data = data, .mimeType = loaded.mime }, Text{ .text = note } },
+    }, .{}) catch return null;
+    defer gpa.free(result);
     return rpcResult(gpa, id, result);
 }
 

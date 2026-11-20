@@ -198,6 +198,17 @@ pub const Line = struct {
     /// How selection copy treats this row: whether it continues the row
     /// above (a soft wrap) and which display columns hold copyable content.
     copy: CopyRow = .{},
+    /// One row of an inline image (transcript_images.zig); the text is blank.
+    image: ?LineImage = null,
+};
+
+pub const LineImage = struct {
+    hash: []const u8,
+    /// This line's row within the image, of `rows`.
+    row: u16,
+    rows: u16,
+    cols: u16,
+    col: u16,
 };
 
 pub const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };

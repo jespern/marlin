@@ -1,5 +1,6 @@
-//! Kitty graphics from shell sessions (`kitten icat`, ...) shown on the host
-//! terminal. The shell's emulator keeps the images and their placements;
+//! Kitty graphics placed over transcript rows on the host terminal: images
+//! from shell sessions (`kitten icat`, ...) and images in the transcript
+//! (transcript_images.zig), each through its own Display and id range. The shell's emulator keeps the images and their placements;
 //! after each frame this sends every image once, places the visible ones
 //! over their transcript rows (cropped when partly scrolled off), and
 //! removes placements that left the view. vaxis's own graphics stay off
@@ -11,10 +12,26 @@ const vt = @import("ghostty-vt");
 
 const chunk_bytes: usize = 4096;
 const first_id: u32 = 0x4d530000;
+/// Transcript images use ids above the shells'.
+pub const transcript_first_id: u32 = 0x4d540000;
+
+/// An image Marlin holds itself: PNG for the terminal to decode, or RGBA
+/// pixels already zlib-compressed (Kitty's o=z).
+pub const Encoded = struct {
+    format: enum { png, rgba_zlib },
+    width: u32,
+    height: u32,
+    data: []const u8,
+};
+
+pub const Pixels = union(enum) {
+    shell: *const vt.kitty.graphics.Image,
+    encoded: *const Encoded,
+};
 
 /// Where one image placement goes on the host terminal this frame.
 pub const Want = struct {
-    image: *const vt.kitty.graphics.Image,
+    image: Pixels,
     /// Identity of the image data, so a retransmitted image is resent.
     key: ImageKey,
     placement: u32,
@@ -34,7 +51,12 @@ const Shown = struct { id: u32, placement: u32 };
 pub const Display = struct {
     sent: std.AutoHashMapUnmanaged(ImageKey, u32) = .empty,
     shown: std.AutoHashMapUnmanaged(Shown, void) = .empty,
+    base_id: u32 = first_id,
     next_id: u32 = first_id,
+
+    pub fn withBase(base: u32) Display {
+        return .{ .base_id = base, .next_id = base };
+    }
 
     pub fn deinit(self: *Display, gpa: std.mem.Allocator) void {
         self.sent.deinit(gpa);
@@ -49,8 +71,11 @@ pub const Display = struct {
             const id = self.sent.get(want.key) orelse id: {
                 const id = self.next_id;
                 self.next_id +%= 1;
-                if (self.next_id < first_id) self.next_id = first_id;
-                try transmit(gpa, w, id, want.image);
+                if (self.next_id < self.base_id) self.next_id = self.base_id;
+                switch (want.image) {
+                    .shell => |image| try transmit(gpa, w, id, image),
+                    .encoded => |image| try transmitEncoded(gpa, w, id, image),
+                }
                 try self.sent.put(gpa, want.key, id);
                 break :id id;
             };
@@ -114,6 +139,26 @@ fn transmit(gpa: std.mem.Allocator, w: *std.Io.Writer, id: u32, image: *const vt
             try w.print("\x1b_Ga=t,f={d},s={d},v={d},i={d},q=2,m={d};{s}\x1b\\", .{ format, image.width, image.height, id, more, encoded[offset..end] })
         else
             try w.print("\x1b_Gm={d};{s}\x1b\\", .{ more, encoded[offset..end] });
+        first = false;
+        offset = end;
+    }
+}
+
+/// Send an image Marlin encoded itself (a=t), chunked like the rest.
+fn transmitEncoded(gpa: std.mem.Allocator, w: *std.Io.Writer, id: u32, image: *const Encoded) !void {
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try gpa.alloc(u8, encoder.calcSize(image.data.len));
+    defer gpa.free(encoded);
+    _ = encoder.encode(encoded, image.data);
+    var offset: usize = 0;
+    var first = true;
+    while (offset < encoded.len or first) {
+        const end = @min(offset + chunk_bytes, encoded.len);
+        const more: u1 = if (end < encoded.len) 1 else 0;
+        if (first) switch (image.format) {
+            .png => try w.print("\x1b_Ga=t,f=100,i={d},q=2,m={d};{s}\x1b\\", .{ id, more, encoded[offset..end] }),
+            .rgba_zlib => try w.print("\x1b_Ga=t,f=32,o=z,s={d},v={d},i={d},q=2,m={d};{s}\x1b\\", .{ image.width, image.height, id, more, encoded[offset..end] }),
+        } else try w.print("\x1b_Gm={d};{s}\x1b\\", .{ more, encoded[offset..end] });
         first = false;
         offset = end;
     }

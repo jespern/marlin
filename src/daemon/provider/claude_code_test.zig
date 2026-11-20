@@ -538,3 +538,19 @@ test "decode: a slash command's echo is a string replay, and still a replay (cla
     , &events);
     try std.testing.expectEqual(@as(usize, 0), events.items.len);
 }
+
+test "decode: tool_result keeps image content in both shapes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: std.ArrayList(Event) = .empty;
+    try decodeLine(arena,
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw=="}},{"type":"image","data":"/9j/","mimeType":"image/jpeg"},{"type":"text","text":"Shown to the user: chart.png"}]}]}}
+    , &events);
+    const result = events.items[0].tool_result;
+    try std.testing.expectEqualStrings("Shown to the user: chart.png", result.text);
+    try std.testing.expectEqual(@as(usize, 2), result.images.len);
+    try std.testing.expectEqualStrings("image/png", result.images[0].media_type);
+    try std.testing.expectEqualStrings("iVBORw==", result.images[0].data_base64);
+    try std.testing.expectEqualStrings("image/jpeg", result.images[1].media_type);
+}

@@ -766,6 +766,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const win = vx.window();
     win.clear();
     app.tab_hits.clearRetainingCapacity();
+    app.image_rows.clearRetainingCapacity();
     const h = win.height;
     const w = win.width;
     if (h < 4 or w < 20) return;
@@ -993,6 +994,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     for (visible.items, 0..) |display, row| {
         const ln = display.line;
         const abs_line = display.abs_line;
+        if (ln.image) |image| app.image_rows.append(app.gpa, .{ .image = image, .screen_row = @intCast(top_rows + row) }) catch {};
         if (app.hover_mouse) |mouse| {
             if (mouse.row == top_rows + row and mouse.col >= 0 and mouse.col < w and
                 !app.view.sel_dragging)

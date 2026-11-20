@@ -19,6 +19,7 @@ const search = @import("search.zig");
 const fetch_tool = @import("fetch.zig");
 const task = @import("task.zig");
 const ask_user = @import("ask_user.zig");
+const show_image = @import("show_image.zig");
 const sessions_tool = @import("sessions.zig");
 const plan = @import("plan.zig");
 
@@ -66,6 +67,8 @@ pub const specs = [_]Spec{
     .{ .name = task.batch_spec_name, .description = task.batch_spec_description, .schema_json = task.batch_spec_schema, .parallel_safe = false, .mutating = false },
     // Parks on the session's question gate; executed in loop.zig like task.
     .{ .name = ask_user.spec_name, .description = ask_user.spec_description, .schema_json = ask_user.spec_schema, .parallel_safe = false, .mutating = false },
+    // Reads one image file; the transcript shows it inline.
+    .{ .name = show_image.spec_name, .description = show_image.spec_description, .schema_json = show_image.spec_schema, .parallel_safe = true, .mutating = false },
     // Other sessions (sessions.zig): daemon-executed through RunOpts.on_agent_tool.
     // Never behind the approval gate (the hop limit bounds them); plan mode
     // and read-only children get only the reading half (loop.toolAllowed).
@@ -219,6 +222,11 @@ pub fn dispatch(
             return .{ .output = with_code, .status = .err };
         }
         return .{ .output = r.output, .status = .ok };
+    }
+    if (std.mem.eql(u8, name, show_image.spec_name)) {
+        const parsed = parseArgs(show_image.Args, gpa, args_json) orelse return argError(gpa, args_json);
+        defer parsed.deinit();
+        return show_image.run(gpa, io, parsed.value, cwd);
     }
     if (std.mem.eql(u8, name, files.read_spec_name)) {
         const parsed = parseArgs(files.ReadArgs, gpa, args_json) orelse return argError(gpa, args_json);

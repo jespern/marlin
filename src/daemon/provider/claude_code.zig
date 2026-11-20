@@ -259,6 +259,8 @@ pub const Event = union(enum) {
         parent_tool_use_id: []const u8 = "",
         text: []const u8,
         is_error: bool,
+        /// Image content blocks (base64), kept as the result's attachments.
+        images: []const ResultImage = &.{},
     },
     /// Claude Code's structured signal that paid usage credits are active.
     usage_credits: bool,
@@ -466,6 +468,7 @@ pub fn decodeLine(
                 .parent_tool_use_id = parent_tool_use_id,
                 .text = try flattenContent(arena, item.object.get("content")),
                 .is_error = boolField(item.object, "is_error") orelse false,
+                .images = try contentImages(arena, item.object.get("content")),
             } });
             if (first_result == null) first_result = out.items.len - 1;
             result_count += 1;
@@ -679,6 +682,33 @@ fn creationDiff(arena: std.mem.Allocator, path: []const u8, content: []const u8)
     }
     const text = acc.toOwnedSlice() catch return null;
     return std.mem.trimEnd(u8, text, "\n");
+}
+
+pub const ResultImage = struct { media_type: []const u8, data_base64: []const u8 };
+
+/// Image blocks in tool_result content: Anthropic's {"type":"image","source":
+/// {"type":"base64","media_type","data"}} and MCP's {"type":"image","data",
+/// "mimeType"}, as an MCP tool's result may echo either.
+fn contentImages(arena: std.mem.Allocator, value: ?std.json.Value) ![]const ResultImage {
+    const v = value orelse return &.{};
+    if (v != .array) return &.{};
+    var out: std.ArrayList(ResultImage) = .empty;
+    for (v.array.items) |item| {
+        if (item != .object) continue;
+        if (!std.mem.eql(u8, strField(item.object, "type") orelse "", "image")) continue;
+        if (item.object.get("source")) |source| {
+            if (source != .object) continue;
+            if (!std.mem.eql(u8, strField(source.object, "type") orelse "", "base64")) continue;
+            const media_type = strField(source.object, "media_type") orelse continue;
+            const data = strField(source.object, "data") orelse continue;
+            try out.append(arena, .{ .media_type = media_type, .data_base64 = data });
+        } else {
+            const media_type = strField(item.object, "mimeType") orelse continue;
+            const data = strField(item.object, "data") orelse continue;
+            try out.append(arena, .{ .media_type = media_type, .data_base64 = data });
+        }
+    }
+    return out.items;
 }
 
 /// tool_result content is a string or an array of text blocks; flatten.

@@ -723,7 +723,7 @@ pub fn imageWants(app: *App, arena: std.mem.Allocator) ![]const shell_images.Wan
 
         const id_bits = entry.key_ptr.placement_id;
         try wants.append(arena, .{
-            .image = image,
+            .image = .{ .shell = image },
             .key = .{ .owner = @intFromPtr(emulator), .image_id = image.id, .data = @intFromPtr(data.ptr), .len = data.len },
             .placement = ((id_bits.id & 0x3fffffff) | (@as(u32, @backingInt(id_bits.tag)) << 30)) + 1,
             .col = @intCast(@min(pin.x, std.math.maxInt(u16))),

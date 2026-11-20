@@ -177,3 +177,34 @@ test "bridge: the tools for other sessions are listed and forwarded, failures fl
     defer gpa.free(failed);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"isError\":true") != null);
 }
+
+const ImageDecider = struct {
+    fn load(_: ?*anyopaque, gpa: std.mem.Allocator, path: []const u8) anyerror!@import("../daemon/tools/show_image.zig").Loaded {
+        if (!std.mem.eql(u8, path, "chart.png")) return error.FileNotFound;
+        return .{ .bytes = try gpa.dupe(u8, "\x89PNG\r\n\x1a\nDATA"), .mime = "image/png", .name = "chart.png" };
+    }
+};
+
+test "show_image over the bridge returns MCP image content Claude Code echoes" {
+    const gpa = std.testing.allocator;
+    const decider = Decider{ .decide = TestDecider.decide, .load_image = ImageDecider.load };
+    const list = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    , decider).?;
+    defer gpa.free(list);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"name\":\"show_image\"") != null);
+
+    const shown = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"show_image","arguments":{"path":"chart.png"}}}
+    , decider).?;
+    defer gpa.free(shown);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "{\"type\":\"image\",\"data\":\"iVBORw0KGgpEQVRB\",\"mimeType\":\"image/png\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "Shown to the user: chart.png") != null);
+
+    const missing = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"show_image","arguments":{"path":"gone.png"}}}
+    , decider).?;
+    defer gpa.free(missing);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "gone.png does not exist") != null);
+}

@@ -6,6 +6,7 @@ const vaxis = @import("vaxis");
 const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const agent_message = @import("../core/agent_message.zig");
+const transcript_images = @import("transcript_images.zig");
 const render = @import("render.zig");
 const shell_intent = @import("shell_intent.zig");
 const markdown = @import("markdown.zig");
@@ -381,6 +382,8 @@ pub const RenderBlock = struct {
     /// reasoning blocks: true = deliberate mid-turn narration (visible);
     /// false = raw provider reasoning (folded; ctrl+t reveals).
     commentary: bool = false,
+    /// Image attachments drawn inline under the label (owned hashes).
+    images: []ImageRef = &.{},
     /// user_msg/steer sent by another agent; `label` names the sender.
     /// Folded to one line; ctrl+t shows the message.
     from_agent: bool = false,
@@ -404,8 +407,67 @@ pub const RenderBlock = struct {
         if (self.full_body_ref) |ref| gpa.free(ref);
         if (self.styled.len > 0) gpa.free(self.styled);
         if (self.shell_ran.len > 0) gpa.free(self.shell_ran);
+        for (self.images) |image| gpa.free(image.hash);
+        if (self.images.len > 0) gpa.free(self.images);
     }
 };
+
+pub const ImageRef = struct { hash: []u8 };
+
+/// The attachments that can be drawn inline, as owned refs.
+pub fn imageRefs(gpa: std.mem.Allocator, refs: []const block.MediaRef) ![]ImageRef {
+    var out: std.ArrayList(ImageRef) = .empty;
+    errdefer {
+        for (out.items) |image| gpa.free(image.hash);
+        out.deinit(gpa);
+    }
+    for (refs) |ref| {
+        if (!transcript_images.isImageMime(ref.mime) or ref.byte_len > transcript_images.max_blob_bytes) continue;
+        const hash = try gpa.dupe(u8, ref.hash);
+        out.append(gpa, .{ .hash = hash }) catch |err| {
+            gpa.free(hash);
+            return err;
+        };
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Inline images for a durable block's attachments.
+pub fn blockImageRefs(gpa: std.mem.Allocator, body: block.Body) ![]ImageRef {
+    return switch (body) {
+        .user_msg => |u| imageRefs(gpa, u.attachments),
+        .steer => |s| imageRefs(gpa, s.attachments),
+        .tool_result => |t| imageRefs(gpa, t.attachments),
+        else => &.{},
+    };
+}
+
+/// Where inline images come from and how big they may be drawn.
+pub const ImageView = struct {
+    cache: *const transcript_images.Cache,
+    cell_w: u32,
+    cell_h: u32,
+    max_rows: u16,
+};
+
+/// Reserve the rows each ready image covers, under the block's label.
+fn appendImageRows(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, view: ?ImageView, w: usize) !void {
+    const images = view orelse return;
+    const indent: u16 = 4;
+    for (rb.images) |ref| {
+        const entry = images.cache.get(ref.hash) orelse continue;
+        if (entry.state != .ready) continue;
+        const max_cols: u16 = @intCast(@min(w -| indent, std.math.maxInt(u16)));
+        const cells = transcript_images.fit(entry.image.width, entry.image.height, images.cell_w, images.cell_h, max_cols, images.max_rows);
+        if (cells.rows == 0) continue;
+        for (0..cells.rows) |row| try lines.append(alloc, .{
+            .timestamp_ms = rb.timestamp_ms,
+            .text = "",
+            .style = .{},
+            .image = .{ .hash = ref.hash, .row = @intCast(row), .rows = cells.rows, .cols = cells.cols, .col = indent },
+        });
+    }
+}
 
 fn completedPlan(items: []const block.PlanItem) bool {
     if (items.len == 0) return false;
@@ -627,6 +689,8 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
     const owned_styled: []u8 = if (styled.len > 0) try gpa.dupe(u8, styled) else &.{};
     errdefer if (owned_styled.len > 0) gpa.free(owned_styled);
     const owned_ran: []u8 = if (shell_ran.len > 0) try gpa.dupe(u8, shell_ran) else &.{};
+    errdefer if (owned_ran.len > 0) gpa.free(owned_ran);
+    const owned_images = try blockImageRefs(gpa, b.body);
 
     return .{
         .kind = kind,
@@ -635,6 +699,7 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
         .turn_id = b.turn_id,
         .text = owned_text,
         .label = owned_label,
+        .images = owned_images,
         .from_agent = from_agent,
         .call_id = owned_call_id,
         .plan_items = plan_items,
@@ -1338,7 +1403,9 @@ pub fn scanToolBatch(
                     isFileEditTool(blocks[call_idx].label);
                 const network_read = !failed and isNetworkReadTool(blocks[call_idx].label);
                 const question = isAskUserTool(blocks[call_idx].label);
-                if (failed or author_diff or network_read or question) {
+                // An image a tool returned is there to be seen.
+                const image = blocks[i].images.len > 0;
+                if (failed or author_diff or network_read or question or image) {
                     try expand.append(alloc, .{
                         .call = call_idx,
                         .result = i,
@@ -1538,6 +1605,8 @@ pub const Transcript = struct {
     blocks: []const RenderBlock,
     show_tool_transcript: bool,
     state: proto.SessionState,
+    /// Inline images; null draws labels only (no Kitty graphics).
+    images: ?ImageView = null,
     layout_epoch: u64,
     delta: []const u8,
     reasoning_delta: []const u8,
@@ -1924,6 +1993,7 @@ pub fn layoutBlockRange(
                         const note = if (result.status == .ok) try diffSummaryNote(alloc, result.text) else null;
                         try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note, result);
                         try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
+                        try appendImageRows(alloc, lines, result, transcript.images, w);
                     } else {
                         try appendNetworkSuccessLine(alloc, lines, blocks_all[pair.call], result, transcript.cwd, w);
                     }
@@ -1948,6 +2018,7 @@ pub fn layoutBlockRange(
                 try wrapPromptCard(alloc, lines, rb.text, w);
                 if (rb.label.len > 0)
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
+                try appendImageRows(alloc, lines, rb, transcript.images, w);
             },
             .assistant_msg => {
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
@@ -2014,8 +2085,9 @@ pub fn layoutBlockRange(
                 // successful result body is machinery unless it is an
                 // authored diff. Failures always show.
                 if (transcript.guest and !transcript.show_tool_transcript and rb.status == .ok and
-                    !(isFileEditTool(tool_label) and isDiffOutput(rb.text))) continue;
+                    rb.images.len == 0 and !(isFileEditTool(tool_label) and isDiffOutput(rb.text))) continue;
                 try appendToolResultLines(alloc, lines, rb, tool_label);
+                try appendImageRows(alloc, lines, rb, transcript.images, w);
             },
             .approval => {
                 const txt = try std.fmt.allocPrint(alloc, "    [approval: {s}]", .{rb.text});
@@ -2031,6 +2103,7 @@ pub fn layoutBlockRange(
                 try wrapInputCard(alloc, lines, rb.text, w, true, rb.pending_echo);
                 if (rb.label.len > 0)
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
+                try appendImageRows(alloc, lines, rb, transcript.images, w);
             },
             .plan => {
                 if (visibleCompletedPlan(transcript.blocks, block_idx)) {

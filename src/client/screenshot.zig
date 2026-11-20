@@ -301,15 +301,19 @@ fn imagesFrom(arena: std.mem.Allocator, app: *App, top: usize, end: usize, cell_
     var images: std.ArrayList(raster.Image) = .empty;
     for (wants) |want| {
         if (want.row < top or want.row >= end) continue;
-        const rgba = try rgbaFrom(arena, want.image) orelse continue;
+        const shell_image = switch (want.image) {
+            .shell => |image| image,
+            .encoded => continue,
+        };
+        const rgba = try rgbaFrom(arena, shell_image) orelse continue;
         try images.append(arena, .{
             .pixels = rgba,
-            .width = want.image.width,
-            .height = want.image.height,
+            .width = shell_image.width,
+            .height = shell_image.height,
             .src_x = want.source.x,
             .src_y = want.source.y,
-            .src_width = @min(want.source.width, want.image.width -| want.source.x),
-            .src_height = @min(want.source.height, want.image.height -| want.source.y),
+            .src_width = @min(want.source.width, shell_image.width -| want.source.x),
+            .src_height = @min(want.source.height, shell_image.height -| want.source.y),
             .x = @intCast(@as(u32, want.col) * cell_width + want.x_offset),
             .y = @intCast(@as(u32, want.row - @as(u16, @intCast(top))) * cell_height + want.y_offset),
             .dst_width = @as(u32, want.cols) * cell_width,

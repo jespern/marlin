@@ -52,6 +52,7 @@ const initial_session = @import("initial_session.zig");
 const voice = @import("../core/voice.zig");
 const mic = @import("mic.zig");
 const agent_message = @import("../core/agent_message.zig");
+const transcript_images = @import("transcript_images.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const daybreak = @import("daybreak.zig");
@@ -662,6 +663,14 @@ pub const App = struct {
     shell_prefix_pending: bool = false,
     /// Kitty images of shell sessions currently on the host terminal.
     shell_images: shell_images.Display = .{},
+    /// Inline transcript images: fetched once, placed every frame.
+    images: transcript_images.Cache = .{},
+    image_display: shell_images.Display = .withBase(shell_images.transcript_first_id),
+    /// Image rows this frame's draw put on screen.
+    image_rows: std.ArrayList(ImageRow) = .empty,
+    /// blob_get requests in flight, in order: an image hash, or null for
+    /// a clipboard copy. A "blob" error answers the oldest.
+    blob_requests: std.ArrayList(?[]const u8) = .empty,
     /// Cell size in pixels from the winsize report (0 = unknown).
     cell_px_w: u32 = 0,
     cell_px_h: u32 = 0,
@@ -723,6 +732,10 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.shell_images.deinit(self.gpa);
+        self.image_display.deinit(self.gpa);
+        self.images.deinit(self.gpa);
+        self.image_rows.deinit(self.gpa);
+        self.blob_requests.deinit(self.gpa);
         if (self.cwd_completion_arena) |*arena| arena.deinit();
         self.copy_cursor_line_text.deinit(self.gpa);
         self.yank_register.deinit(self.gpa);
@@ -859,8 +872,10 @@ pub const App = struct {
     }
 
     fn resetWindowLayout(self: *App) void {
-        // Every window change ends here; the client-only recap rejoins it.
+        // Every window change ends here; the client-only recap rejoins it,
+        // and images in the new window are fetched.
         self.view.restoreRecap(self.gpa) catch {};
+        self.requestWindowImages();
         self.copy_cursor = null;
         self.view.sel_anchor = null;
         self.view.sel_dragging = false;
@@ -1750,7 +1765,100 @@ pub const App = struct {
                 else => "",
             };
             if (call_id.len > 0) rendered.call_id = self.gpa.dupe(u8, call_id) catch &.{};
+            self.attachImages(rendered, b.body);
         }
+    }
+
+    /// A reconciled echo became durable `b`: it may carry images now.
+    fn attachImagesBySeq(self: *App, b: block.Block) void {
+        for (self.view.blocks.items) |*rendered| if (rendered.seq == b.seq) {
+            self.attachImages(rendered, b.body);
+            return;
+        };
+    }
+
+    fn attachImages(self: *App, rendered: *RenderBlock, body: block.Body) void {
+        if (rendered.images.len > 0) return;
+        rendered.images = layout_mod.blockImageRefs(self.gpa, body) catch &.{};
+        self.requestImages(rendered.images);
+    }
+
+    /// Fetch images not yet held; each arrives as a blob_result.
+    pub fn requestImages(self: *App, refs: []const layout_mod.ImageRef) void {
+        if (!self.kitty_graphics) return;
+        for (refs) |ref| {
+            if (!self.images.want(self.gpa, ref.hash)) continue;
+            const key = self.images.map.getKey(ref.hash).?;
+            self.blob_requests.append(self.gpa, key) catch {
+                self.images.fail(ref.hash);
+                continue;
+            };
+            self.conn.send(.{ .blob_get = .{ .hash = ref.hash } }) catch {
+                _ = self.blob_requests.pop();
+                self.images.fail(ref.hash);
+            };
+        }
+    }
+
+    /// Fetch for every image in the window (after a history page).
+    fn requestWindowImages(self: *App) void {
+        for (self.view.blocks.items) |rendered| if (rendered.images.len > 0) self.requestImages(rendered.images);
+    }
+
+    /// A blob arrived: an image goes to the cache and the view re-lays out
+    /// to make room for it; anything else is a clipboard copy.
+    pub fn blobArrived(self: *App, hash: []const u8, bytes: []const u8) void {
+        for (self.blob_requests.items, 0..) |request, i| {
+            const awaited = request orelse continue;
+            if (!std.mem.eql(u8, awaited, hash)) continue;
+            _ = self.blob_requests.orderedRemove(i);
+            if (self.images.deliver(self.gpa, hash, bytes)) {
+                self.view.layout_epoch +%= 1;
+                self.refresh_requested = true;
+            }
+            return;
+        }
+        for (self.blob_requests.items, 0..) |request, i| if (request == null) {
+            _ = self.blob_requests.orderedRemove(i);
+            break;
+        };
+        self.stageClipboard(bytes);
+    }
+
+    /// Place this frame's visible image rows (after draw), one placement
+    /// per contiguous run of an image's rows, cropped to what is on screen.
+    pub fn showTranscriptImages(self: *App, writer: *std.Io.Writer, arena: std.mem.Allocator) !void {
+        const covered = self.picker != null or self.top_view != null or self.shortcut_help;
+        var wants: std.ArrayList(shell_images.Want) = .empty;
+        const rows = self.image_rows.items;
+        var i: usize = 0;
+        while (!covered and i < rows.len) {
+            const first = rows[i];
+            var j = i;
+            while (j + 1 < rows.len and std.mem.eql(u8, rows[j + 1].image.hash, first.image.hash) and
+                rows[j + 1].image.row == rows[j].image.row + 1 and rows[j + 1].screen_row == rows[j].screen_row + 1) j += 1;
+            const shown: u32 = @intCast(j - i + 1);
+            i = j + 1;
+            const entry = self.images.get(first.image.hash) orelse continue;
+            if (entry.state != .ready) continue;
+            const height = entry.image.height;
+            const total: u32 = first.image.rows;
+            const top: u32 = first.image.row;
+            const src_y = top * height / total;
+            const src_end = if (top + shown >= total) height else (top + shown) * height / total;
+            if (src_end <= src_y) continue;
+            try wants.append(arena, .{
+                .image = .{ .encoded = &entry.image },
+                .key = .{ .owner = @intFromPtr(&self.images), .image_id = 0, .data = @intFromPtr(entry.image.data.ptr), .len = entry.image.data.len },
+                .placement = @intCast(wants.items.len + 1),
+                .col = first.image.col,
+                .row = first.screen_row,
+                .cols = first.image.cols,
+                .rows = @intCast(shown),
+                .source = .{ .x = 0, .y = src_y, .width = entry.image.width, .height = src_end - src_y },
+            });
+        }
+        try self.image_display.update(self.gpa, writer, wants.items);
     }
 
     const AgentInput = struct {
@@ -2360,7 +2468,7 @@ pub const App = struct {
                     });
                 }
             },
-            .blob_result => |blob| self.stageClipboard(blob.bytes),
+            .blob_result => |blob| self.blobArrived(blob.hash, blob.bytes),
             .model_list_result => |ml| {
                 for (self.catalog.items) |old| self.gpa.free(old);
                 self.catalog.clearRetainingCapacity();
@@ -2431,6 +2539,14 @@ pub const App = struct {
             },
             .err => |e| {
                 if (shell_tab.failed(self, e.request_id, e.code, e.msg)) return;
+                // A missing blob answers the oldest request; an image just
+                // stays a label.
+                if (std.mem.eql(u8, e.code, "blob") and self.blob_requests.items.len > 0) {
+                    if (self.blob_requests.orderedRemove(0)) |hash| {
+                        self.images.fail(hash);
+                        return;
+                    }
+                }
                 self.rejectInput(e.request_id);
                 self.setup.status_pending = false;
                 if (self.setup.apply_pending) {
@@ -2488,6 +2604,7 @@ pub const App = struct {
                     defer if (label) |owned| self.gpa.free(owned);
                     const reconciled = reconcilePendingEcho(self.view.blocks.items, .user_msg, u.display_text orelse u.text, b.seq, b.turn_id, b.ts);
                     if (reconciled) self.view.layout_epoch +%= 1;
+                    if (reconciled) self.attachImagesBySeq(b);
                     if (!reconciled) {
                         self.pushDurableBlock(b, .user_msg, u.display_text orelse u.text, label orelse "", .ok);
                     } else if (label) |owned| {
@@ -2515,6 +2632,7 @@ pub const App = struct {
                 defer if (label) |owned| self.gpa.free(owned);
                 const reconciled = reconcilePendingEcho(self.view.blocks.items, .steer, s.display_text orelse s.text, b.seq, b.turn_id, b.ts);
                 if (reconciled) self.view.layout_epoch +%= 1;
+                if (reconciled) self.attachImagesBySeq(b);
                 if (!reconciled)
                     self.pushDurableBlock(b, .steer, s.display_text orelse s.text, label orelse "", .ok);
                 self.view.editor.pushHistory(s.display_text orelse s.text);
@@ -3804,7 +3922,9 @@ pub const App = struct {
             // clipboard corruption.
             self.setClipboardDesc(self.toolResultSource(i));
             if (rendered.full_body_ref) |ref| {
+                self.blob_requests.append(self.gpa, null) catch {};
                 self.conn.send(.{ .blob_get = .{ .hash = ref } }) catch {
+                    _ = self.blob_requests.pop();
                     self.setNotice("could not request full tool output", .{});
                     return;
                 };
@@ -4991,6 +5111,9 @@ pub const commandSuggestions = commands.commandSuggestions;
 
 pub const completeSuggestion = commands.completeSuggestion;
 
+/// One on-screen row of an inline image, recorded by draw.
+pub const ImageRow = struct { image: render.LineImage, screen_row: u16 };
+
 pub fn transcriptView(app: *App) Transcript {
     return .{
         .io = app.io,
@@ -5026,6 +5149,13 @@ pub fn transcriptView(app: *App) Transcript {
         .layout_cache = &app.view.layout_cache,
         .tail_layout_cache = &app.view.tail_layout_cache,
         .stream_layout_cache = &app.view.stream_layout_cache,
+        .images = if (app.kitty_graphics) .{
+            .cache = &app.images,
+            .cell_w = app.cell_px_w,
+            .cell_h = app.cell_px_h,
+            // At most two thirds of the transcript, and never past 24 rows.
+            .max_rows = @intCast(@min(24, @max(4, app.view.last_view_h * 2 / 3))),
+        } else null,
         .stream_reveal_rows = if (!app.stream_pacing or app.view.delta.items.len == 0) std.math.maxInt(usize) else app.view.stream_pacer.revealed,
     };
 }
@@ -6344,6 +6474,7 @@ pub fn run(
             try vx.render(writer);
             screenshot.takePending(&app, &vx.screen);
             if (app.kitty_graphics) shell_tab.showImages(&app, writer, frame_arena.allocator()) catch {};
+            if (app.kitty_graphics) app.showTranscriptImages(writer, frame_arena.allocator()) catch {};
             if (app.bell_pending) {
                 app.bell_pending = false;
                 try writer.writeAll("\x07");

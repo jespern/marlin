@@ -7341,6 +7341,65 @@ test "messages from other agents fold and stay out of composer history" {
     try std.testing.expectEqualStrings("fix the parser", app.view.editor.history.items[0]);
 }
 
+// An image a tool returned (or the user attached) is fetched once and drawn
+// inline under its label, sized to the cells; a missing one stays a label.
+test "inline images are fetched once and reserve rows in the transcript" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .state = .idle,
+        .last_view_h = 30,
+    }, .kitty_graphics = true, .cell_px_w = 8, .cell_px_h = 16 };
+    defer app.deinit();
+    const attachment = [_]block.MediaRef{.{ .hash = "img1", .mime = "image/png", .name = "chart.png", .byte_len = 100 }};
+    app.applyBlock(.{ .id = 1, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 1, .body = .{ .tool_call = .{ .call_id = "c1", .name = "show_image", .args_json = "{\"path\":\"chart.png\"}" } } });
+    app.applyBlock(.{ .id = 2, .session_id = 7, .turn_id = 1, .seq = 2, .ts = 2, .body = .{ .tool_result = .{ .call_id = "c1", .status = .ok, .inline_body = "chart.png", .full_body_ref = null, .attachments = &attachment } } });
+    // Requested once, even if the block is seen again.
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"blob_get\":{\"hash\":\"img1\"}") != null);
+    output.clearRetainingCapacity();
+    app.requestImages(app.view.blocks.items[1].images);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    var before: usize = 0;
+    for ((try layoutLines(frame.allocator(), &app, 80)).items) |line| if (line.image != null) {
+        before += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 0), before);
+
+    // The 16×16 PNG arrives: 2×1 cells of 8×16 px.
+    const png = @embedFile("png_sample_rgba");
+    const epoch = app.view.layout_epoch;
+    app.blobArrived("img1", png);
+    try std.testing.expect(app.view.layout_epoch != epoch);
+    var rows: usize = 0;
+    for ((try layoutLines(frame.allocator(), &app, 80)).items) |line| if (line.image) |image| {
+        rows += 1;
+        try std.testing.expectEqualStrings("img1", image.hash);
+        try std.testing.expectEqual(@as(u16, 2), image.cols);
+    };
+    try std.testing.expectEqual(@as(usize, 1), rows);
+    // A copy of tool output still goes to the clipboard, not the cache.
+    try std.testing.expectEqual(@as(usize, 0), app.blob_requests.items.len);
+
+    // A missing image answers with a blob error: no notice, just the label.
+    const gone = [_]block.MediaRef{.{ .hash = "img2", .mime = "image/jpeg", .name = "gone.jpg", .byte_len = 100 }};
+    app.applyBlock(.{ .id = 3, .session_id = 7, .turn_id = 2, .seq = 3, .ts = 3, .body = .{ .user_msg = .{ .text = "look", .attachments = &gone } } });
+    app.notice.clearRetainingCapacity();
+    app.handleDaemonLine(try gpa.dupe(u8, "{\"err\":{\"code\":\"blob\",\"msg\":\"full tool output expired or missing\"}}"));
+    try std.testing.expect(app.images.get("img2").?.state == .failed);
+    try std.testing.expectEqual(@as(usize, 0), app.notice.items.len);
+}
+
 test "a recap survives the window reload of a tab switch or reconnect" {
     // Case: recaps blipped in and out. The recap lives only in the client,
     // and the tail reload on refocus swapped it out of the view for good.
