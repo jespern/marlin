@@ -2472,6 +2472,8 @@ pub const Store = struct {
             \\    WHERE session_id=? AND kind IN ('user_msg','steer') AND NOT EXISTS (
             \\      SELECT 1 FROM blocks b WHERE b.id=d.block_id AND
             \\      coalesce(json_extract(b.body_json,'$.user_msg.from'),json_extract(b.body_json,'$.steer.from')) IS NOT NULL)
+            \\    AND text NOT LIKE '[Message from another Marlin session: %'
+            \\    AND text NOT LIKE '[Message from %, the user''s assistant outside Marlin.%'
             \\    ORDER BY ts DESC, block_id DESC LIMIT ?
             \\  )
             \\  UNION ALL
@@ -2480,6 +2482,8 @@ pub const Store = struct {
             \\    WHERE session_id<>? AND kind IN ('user_msg','steer') AND NOT EXISTS (
             \\      SELECT 1 FROM blocks b WHERE b.id=d.block_id AND
             \\      coalesce(json_extract(b.body_json,'$.user_msg.from'),json_extract(b.body_json,'$.steer.from')) IS NOT NULL)
+            \\    AND text NOT LIKE '[Message from another Marlin session: %'
+            \\    AND text NOT LIKE '[Message from %, the user''s assistant outside Marlin.%'
             \\    ORDER BY ts DESC, block_id DESC LIMIT ?
             \\  )
             \\) ORDER BY bucket, ts DESC, block_id DESC LIMIT ?

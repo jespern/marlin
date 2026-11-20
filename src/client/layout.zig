@@ -5,6 +5,7 @@ const Io = std.Io;
 const vaxis = @import("vaxis");
 const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
+const agent_message = @import("../core/agent_message.zig");
 const render = @import("render.zig");
 const shell_intent = @import("shell_intent.zig");
 const markdown = @import("markdown.zig");
@@ -543,6 +544,11 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
                 if (u.from) |from| {
                     label = from;
                     from_agent = true;
+                } else if (if (u.display_text == null) try agent_message.parseLegacy(gpa, u.text) else null) |legacy| {
+                    generated_label = @constCast(legacy.from);
+                    label = legacy.from;
+                    text = legacy.body;
+                    from_agent = true;
                 } else if (u.attachments.len > 0) {
                     generated_label = try mediaLabel(gpa, u.attachments);
                     label = generated_label.?;
@@ -553,6 +559,11 @@ pub fn allocDurableRenderBlock(gpa: std.mem.Allocator, b: block.Block) !?RenderB
             text = s.display_text orelse s.text;
             if (s.from) |from| {
                 label = from;
+                from_agent = true;
+            } else if (if (s.display_text == null) try agent_message.parseLegacy(gpa, s.text) else null) |legacy| {
+                generated_label = @constCast(legacy.from);
+                label = legacy.from;
+                text = legacy.body;
                 from_agent = true;
             } else if (s.attachments.len > 0) {
                 generated_label = try mediaLabel(gpa, s.attachments);

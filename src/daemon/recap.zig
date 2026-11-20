@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_message = @import("../core/agent_message.zig");
 const block = @import("../core/block.zig");
 const limits = @import("../core/recap.zig");
 
@@ -40,6 +41,8 @@ pub fn snapshot(arena: std.mem.Allocator, blocks: []const block.Block) !Snapshot
     for (blocks[start..]) |b| switch (b.body) {
         .user_msg => |u| if (u.from) |from|
             try transcript.print(arena, "MESSAGE FROM {s}: {s}\n", .{ from, limits.clipped(u.display_text orelse u.text, 600) })
+        else if (try agent_message.parseLegacy(arena, u.text)) |legacy|
+            try transcript.print(arena, "MESSAGE FROM {s}: {s}\n", .{ legacy.from, limits.clipped(legacy.body, 600) })
         else
             try transcript.print(arena, "USER: {s}\n", .{limits.clipped(u.display_text orelse u.text, 600)}),
         .assistant_msg => |a| try transcript.print(arena, "ASSISTANT: {s}\n", .{limits.clipped(a.text, 600)}),

@@ -51,6 +51,7 @@ const session_file = @import("session_file.zig");
 const initial_session = @import("initial_session.zig");
 const voice = @import("../core/voice.zig");
 const mic = @import("mic.zig");
+const agent_message = @import("../core/agent_message.zig");
 const Editor = @import("editor.zig");
 const effects = @import("effects.zig");
 const daybreak = @import("daybreak.zig");
@@ -1752,6 +1753,25 @@ pub const App = struct {
         }
     }
 
+    const AgentInput = struct {
+        from: []const u8,
+        body: []const u8,
+        owned_from: ?[]const u8 = null,
+
+        fn deinit(self: AgentInput, gpa: std.mem.Allocator) void {
+            if (self.owned_from) |from| gpa.free(from);
+        }
+    };
+
+    /// Input another agent sent: marked with `from`, or (stored before
+    /// that field) recognized by its delivery header.
+    fn agentInput(gpa: std.mem.Allocator, from: ?[]const u8, display_text: ?[]const u8, text: []const u8) ?AgentInput {
+        if (from) |sender| return .{ .from = sender, .body = display_text orelse text };
+        if (display_text != null) return null;
+        const legacy = (agent_message.parseLegacy(gpa, text) catch null) orelse return null;
+        return .{ .from = legacy.from, .body = legacy.body, .owned_from = legacy.from };
+    }
+
     fn markAgentMessage(self: *App, seq: u64) void {
         const last = if (self.view.blocks.items.len > 0) &self.view.blocks.items[self.view.blocks.items.len - 1] else return;
         if (last.seq == seq) last.from_agent = true;
@@ -2454,10 +2474,11 @@ pub const App = struct {
                     const label = rehydrationLabel(self.gpa, u.text) catch return;
                     defer self.gpa.free(label);
                     self.pushDurableBlock(b, .system_note, label, "", .ok);
-                } else if (u.from) |from| {
+                } else if (agentInput(self.gpa, u.from, u.display_text, u.text)) |agent| {
                     // Another agent's message: folded, and not the user's
                     // history to recall.
-                    self.pushDurableBlock(b, .user_msg, u.display_text orelse u.text, from, .ok);
+                    defer agent.deinit(self.gpa);
+                    self.pushDurableBlock(b, .user_msg, agent.body, agent.from, .ok);
                     self.markAgentMessage(b.seq);
                 } else {
                     const label = if (u.attachments.len > 0)
@@ -2484,8 +2505,9 @@ pub const App = struct {
                 }
             },
             .steer => |s| {
-                if (s.from) |from| {
-                    self.pushDurableBlock(b, .steer, s.display_text orelse s.text, from, .ok);
+                if (agentInput(self.gpa, s.from, s.display_text, s.text)) |agent| {
+                    defer agent.deinit(self.gpa);
+                    self.pushDurableBlock(b, .steer, agent.body, agent.from, .ok);
                     self.markAgentMessage(b.seq);
                     return;
                 }

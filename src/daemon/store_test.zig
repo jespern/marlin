@@ -1070,6 +1070,9 @@ test "composer history returns the last 200 authored prompts independently of tr
     // Other agents' messages are not the user's prompts to recall.
     try store.appendBlock(.{ .id = 503, .session_id = 1, .turn_id = 302, .seq = 503, .ts = 503, .body = .{ .user_msg = .{ .text = "[Message from another Marlin session…]", .display_text = "Is the lexer done?", .from = "parser · 5588ce26" } } });
     try store.appendBlock(.{ .id = 504, .session_id = 1, .turn_id = 302, .seq = 504, .ts = 504, .body = .{ .steer = .{ .text = "[Message…]", .display_text = "Also the tests", .from = "parser · 5588ce26" } } });
+    // Stored before `from` existed: recognized by the delivery header.
+    try store.appendBlock(.{ .id = 505, .session_id = 1, .turn_id = 303, .seq = 505, .ts = 505, .body = .{ .user_msg = .{ .text = "[Message from another Marlin session: \"parser\" (codex/gpt), handle 5588ce26. Answer with message_session to that handle if it needs an answer.]\n\nOld message" } } });
+    try store.appendBlock(.{ .id = 506, .session_id = 1, .turn_id = 303, .seq = 506, .ts = 506, .body = .{ .steer = .{ .text = "[Message from Robin, the user's assistant outside Marlin. It reads your reply here.]\n\nOld outside message" } } });
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const entries = try store.recentSessionInputs(arena.allocator(), 1, 200);

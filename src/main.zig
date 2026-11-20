@@ -148,6 +148,7 @@ test {
     _ = @import("client/remote_rebuild_test.zig");
     _ = @import("client/self_build_test.zig");
     _ = @import("core/voice_test.zig");
+    _ = @import("core/agent_message_test.zig");
     _ = @import("client/web_test.zig");
     _ = @import("core/voice_transcribe_test.zig");
     _ = @import("daemon/voice_host_test.zig");

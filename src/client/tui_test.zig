@@ -7314,6 +7314,33 @@ test "web tab pins the pairing code beside the address and lists paired phones" 
     try std.testing.expect(std.mem.indexOf(u8, out.items, "· 44s left") != null);
 }
 
+// Case: arrow-up history offered messages other sessions had sent, and
+// they rendered as the user's own prompt cards.
+test "messages from other agents fold and stay out of composer history" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .state = .idle,
+    } };
+    defer app.deinit();
+    app.applyBlock(.{ .id = 1, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 1, .body = .{ .user_msg = .{ .text = "fix the parser" } } });
+    app.applyBlock(.{ .id = 2, .session_id = 7, .turn_id = 2, .seq = 2, .ts = 2, .body = .{ .user_msg = .{ .text = "[Message from another Marlin session: \"phone/voice\" (claudecode/opus), handle 2e96c9d3. Answer with message_session to that handle if it needs an answer.]\n\nOld-style message" } } });
+    app.applyBlock(.{ .id = 3, .session_id = 7, .turn_id = 3, .seq = 3, .ts = 3, .body = .{ .steer = .{ .text = "[Message…]", .display_text = "New-style message", .from = "phone/voice · 2e96c9d3" } } });
+
+    try std.testing.expectEqual(@as(usize, 3), app.view.blocks.items.len);
+    const old = app.view.blocks.items[1];
+    try std.testing.expect(old.from_agent);
+    try std.testing.expectEqualStrings("phone/voice · 2e96c9d3", old.label);
+    try std.testing.expectEqualStrings("Old-style message", old.text);
+    try std.testing.expect(app.view.blocks.items[2].from_agent);
+    // Only what the user typed is recalled.
+    try std.testing.expectEqual(@as(usize, 1), app.view.editor.history.items.len);
+    try std.testing.expectEqualStrings("fix the parser", app.view.editor.history.items[0]);
+}
+
 test "a recap survives the window reload of a tab switch or reconnect" {
     // Case: recaps blipped in and out. The recap lives only in the client,
     // and the tail reload on refocus swapped it out of the view for good.

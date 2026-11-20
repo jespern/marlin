@@ -5,6 +5,7 @@
 //! Execution is daemon-owned (daemon.zig agentTool); this module holds the
 //! specs and the text the tools return.
 const std = @import("std");
+const agent_message = @import("../../core/agent_message.zig");
 const block = @import("../../core/block.zig");
 
 pub const list_name = "sessions";
@@ -119,10 +120,14 @@ pub fn transcriptTail(arena: std.mem.Allocator, blocks: []const block.Block) ![]
         const entry: ?[]const u8 = switch (b.body) {
             .user_msg => |u| if (u.synthetic) null else if (u.from) |from|
                 try labelled(arena, try std.fmt.allocPrint(arena, "message from {s}", .{from}), u.display_text orelse u.text)
+            else if (try agent_message.parseLegacy(arena, u.text)) |legacy|
+                try labelled(arena, try std.fmt.allocPrint(arena, "message from {s}", .{legacy.from}), legacy.body)
             else
                 try labelled(arena, "user", u.display_text orelse u.text),
             .steer => |s| if (s.from) |from|
                 try labelled(arena, try std.fmt.allocPrint(arena, "message from {s} (while it worked)", .{from}), s.display_text orelse s.text)
+            else if (try agent_message.parseLegacy(arena, s.text)) |legacy|
+                try labelled(arena, try std.fmt.allocPrint(arena, "message from {s} (while it worked)", .{legacy.from}), legacy.body)
             else
                 try labelled(arena, "user (while it worked)", s.display_text orelse s.text),
             .assistant_msg => |a| try labelled(arena, "agent", a.text),
