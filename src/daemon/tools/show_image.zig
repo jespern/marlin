@@ -10,7 +10,7 @@ const files = @import("files.zig");
 const registry = @import("registry.zig");
 
 pub const spec_name = "show_image";
-pub const spec_description = "Show the user an image file (PNG or JPEG, up to 8 MB) inline in their Marlin transcript: a chart, screenshot, or diagram you made or found. You see the image too.";
+pub const spec_description = "Show the user a PNG image (up to 8 MB) inline in their Marlin transcript: a chart, screenshot, or diagram you made or found. You see the image too.";
 pub const spec_schema =
     \\{"type":"object","properties":{"path":{"type":"string","description":"The image file: absolute, or relative to the working directory"}},"required":["path"]}
 ;
@@ -29,7 +29,6 @@ pub const Loaded = struct {
 
 pub fn mimeOf(bytes: []const u8) ?[]const u8 {
     if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
-    if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
     return null;
 }
 
@@ -49,7 +48,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8, cwd: []const u8) !
 /// What the model reads back after a failed load.
 pub fn failureText(gpa: std.mem.Allocator, path: []const u8, err: anyerror) []u8 {
     return switch (err) {
-        error.NotAnImage => std.fmt.allocPrint(gpa, "error: {s} is not a PNG or JPEG image", .{path}),
+        error.NotAnImage => std.fmt.allocPrint(gpa, "error: {s} is not a PNG image; convert it first (e.g. `sips -s format png` or ImageMagick)", .{path}),
         error.ImageTooLarge => std.fmt.allocPrint(gpa, "error: {s} is larger than 8 MB; save a smaller copy and show that", .{path}),
         error.FileNotFound => std.fmt.allocPrint(gpa, "error: {s} does not exist", .{path}),
         else => std.fmt.allocPrint(gpa, "error: could not read {s}: {t}", .{ path, err }),

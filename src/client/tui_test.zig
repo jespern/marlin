@@ -7392,7 +7392,7 @@ test "inline images are fetched once and reserve rows in the transcript" {
     try std.testing.expectEqual(@as(usize, 0), app.blob_requests.items.len);
 
     // A missing image answers with a blob error: no notice, just the label.
-    const gone = [_]block.MediaRef{.{ .hash = "img2", .mime = "image/jpeg", .name = "gone.jpg", .byte_len = 100 }};
+    const gone = [_]block.MediaRef{.{ .hash = "img2", .mime = "image/png", .name = "gone.png", .byte_len = 100 }};
     app.applyBlock(.{ .id = 3, .session_id = 7, .turn_id = 2, .seq = 3, .ts = 3, .body = .{ .user_msg = .{ .text = "look", .attachments = &gone } } });
     app.notice.clearRetainingCapacity();
     app.handleDaemonLine(try gpa.dupe(u8, "{\"err\":{\"code\":\"blob\",\"msg\":\"full tool output expired or missing\"}}"));

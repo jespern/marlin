@@ -221,7 +221,7 @@ test "a guest tool result's images are stored as attachments" {
     _ = encoder.encode(&b64, png);
     const images = [_]claude_code.ResultImage{
         .{ .media_type = "image/png", .data_base64 = &b64 },
-        .{ .media_type = "image/webp", .data_base64 = "AAAA" }, // not drawable: dropped
+        .{ .media_type = "image/jpeg", .data_base64 = "AAAA" }, // not drawable: dropped
     };
     try claude_code_turn.appendGuestResult(gpa, &ap, .{ .call_id = "t1", .status = .ok, .inline_body = "Shown to the user: chart.png", .full_body_ref = null }, &images);
 
