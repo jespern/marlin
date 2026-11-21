@@ -1614,10 +1614,13 @@ test "bang rb expands to reboot with build" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
+    // A daemon without graceful handover: the client exits and re-execs.
+    var legacy_conn: attach.Conn = undefined;
+    legacy_conn.handover = false;
     var app = App{
         .gpa = gpa,
         .io = threaded.io(),
-        .conn = undefined,
+        .conn = &legacy_conn,
         .view = .{
             .sid = 1,
             .editor = Editor.init(gpa),
@@ -1633,14 +1636,64 @@ test "bang rb expands to reboot with build" {
     try std.testing.expectEqualStrings("!rb", app.view.editor.history.items[0]);
 }
 
+test "a reboot that hands over keeps this client running unless it rebuilds it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    for ([_]struct { input: []const u8, remote: bool, build: ?bool }{
+        // Sent in place: this client is moved across like any other.
+        .{ .input = "/reboot", .remote = false, .build = false },
+        .{ .input = "/reboot --force", .remote = true, .build = false },
+        // A remote daemon rebuilds its own checkout.
+        .{ .input = "!rb", .remote = true, .build = true },
+        // A local build replaces this client too: exit and re-exec.
+        .{ .input = "!rb", .remote = false, .build = null },
+        .{ .input = "!rbc", .remote = true, .build = null },
+    }) |case| {
+        var output: std.Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        var conn: attach.Conn = undefined;
+        conn.gpa = gpa;
+        conn.writer = &output.writer;
+        conn.handover = true;
+        var app = App{
+            .gpa = gpa,
+            .io = threaded.io(),
+            .conn = &conn,
+            .view = .{ .sid = 1, .editor = Editor.init(gpa) },
+            .remote_transport = case.remote,
+        };
+        defer app.deinit();
+        app.runCommand(case.input);
+        const build = case.build orelse {
+            try std.testing.expect(app.should_quit);
+            try std.testing.expect(app.reboot_request.requested);
+            try std.testing.expectEqual(@as(usize, 0), output.written().len);
+            continue;
+        };
+        try std.testing.expect(!app.should_quit);
+        try std.testing.expect(!app.reboot_request.requested);
+        const line = std.mem.trimEnd(u8, output.written(), "\n");
+        const reboot = (try proto.decode(proto.ClientMsg, arena.allocator(), try arena.allocator().dupe(u8, line))).reboot;
+        try std.testing.expect(reboot.handover and reboot.suspend_sessions);
+        try std.testing.expectEqual(build, reboot.build);
+        try std.testing.expectEqual(std.mem.indexOf(u8, case.input, "--force") != null, reboot.force);
+    }
+}
+
 test "bang rb supports client and both scopes" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
+    // A daemon without graceful handover: the client exits and re-execs.
+    var legacy_conn: attach.Conn = undefined;
+    legacy_conn.handover = false;
     var app = App{
         .gpa = gpa,
         .io = threaded.io(),
-        .conn = undefined,
+        .conn = &legacy_conn,
         .view = .{
             .sid = 1,
             .editor = Editor.init(gpa),
@@ -1669,10 +1722,13 @@ test "plain reboot refuses a focused approval unless forced" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
+    // A daemon without graceful handover: the client exits and re-execs.
+    var legacy_conn: attach.Conn = undefined;
+    legacy_conn.handover = false;
     var app = App{
         .gpa = gpa,
         .io = threaded.io(),
-        .conn = undefined,
+        .conn = &legacy_conn,
         .view = .{
             .sid = 1,
             .editor = Editor.init(gpa),

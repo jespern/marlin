@@ -926,6 +926,19 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         if (self.view.state == .running and rebuild != .client) {
             self.setNotice("{s}", .{if (self.pause_supported) @as([]const u8, "reboot will suspend active work and resume it afterward") else "turn running — /reboot waits for it (interrupt first if you want force)"});
         }
+        // A daemon that hands over moves this client across like any other,
+        // so it stays open, unless its own binary is being rebuilt: a remote
+        // daemon rebuilds its checkout itself; a local !rb rebuilds this
+        // client too, which only a re-exec picks up.
+        const remote_build = rebuild == .attached and self.remote_transport;
+        if (self.conn.handover and (rebuild == .none or remote_build)) {
+            self.conn.send(.{ .reboot = .{ .force = force, .suspend_sessions = true, .handover = true, .build = remote_build } }) catch {
+                self.setNotice("could not send {s}", .{head});
+                return;
+            };
+            self.setNotice("{s}", .{if (remote_build) @as([]const u8, "building Marlin…") else "restarting Marlin…"});
+            return;
+        }
         self.reboot_request = .{ .requested = true, .rebuild = rebuild, .force = force };
         self.should_quit = true;
     } else if (std.mem.eql(u8, head, "/compact")) {

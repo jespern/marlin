@@ -468,7 +468,10 @@ Current clients restart through a handover instead (`reboot{handover}`,
 process exits only once the new one has every client.
 
 1. **Build** (optional, `build`): the daemon rebuilds its own checkout on a
-   worker, for a phone that has no build to run. Terminals build as before.
+   worker, for a phone or a `--remote` terminal (`!rb`) that has nothing of
+   its own to rebuild. The requesting terminal stays open and is moved across
+   like every other client; only a local `!rb` (or `!rb client`/`both`),
+   which rebuilds the terminal's own binary, still exits and re-execs.
 2. **Pause**: running roots pause with restart intent, exactly as above.
 3. **Freeze**: the accept loop stops polling the listening socket, shell
    readers stop (unread output stays in the PTY), and client requests get
