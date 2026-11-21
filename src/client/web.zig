@@ -10,6 +10,8 @@
 //!   POST /send           body = ONE ClientMsg JSON line, forwarded on a
 //!                        fresh daemon connection; the first daemon reply
 //!                        line comes back as application/json.
+//!   GET  /blob?hash=H    one stored image (an attachment or a tool's
+//!                        image) as raw bytes, for <img> in the transcript.
 //!   POST /mcp            Marlin's MCP server for assistants outside it,
 //!                        bearer tokens instead of pairing (mcp_server.zig).
 //!
@@ -41,6 +43,7 @@ const config = @import("../core/config.zig");
 const build_options = @import("build_options");
 const proto = @import("../core/proto.zig");
 const attach = @import("attach.zig");
+const media = @import("media.zig");
 
 const html = @embedFile("webui.html");
 const mobile_push = @import("../mobile/push.zig");
@@ -410,6 +413,8 @@ fn handleRequest(ctx: *ConnCtx, req: *std.http.Server.Request) !void {
     } else if (std.mem.startsWith(u8, target, "/history")) {
         try serveHistory(ctx, req, target, &access);
         return error.StreamEnded;
+    } else if (std.mem.eql(u8, path, "/blob") and (req.head.method == .GET or req.head.method == .HEAD)) {
+        try serveBlob(ctx, req, target, &access);
     } else if (std.mem.eql(u8, target, "/send") and req.head.method == .POST) {
         try serveSend(ctx, req, &access);
     } else {
@@ -786,6 +791,64 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !voi
     try reply(req, access, daemon_reply, .{ .extra_headers = &json_header });
 }
 
+/// A blob's hash as the store writes it: lowercase SHA-256 hex.
+pub fn validBlobHash(hash: []const u8) bool {
+    if (hash.len != 64) return false;
+    for (hash) |c| switch (c) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// One stored image by hash, as raw bytes the browser decodes itself. Only
+/// images: other blobs (full tool output) stay behind /send. Content-
+/// addressed, so the browser may keep it forever.
+fn serveBlob(ctx: *ConnCtx, req: *std.http.Server.Request, target: []const u8, access: *Access) !void {
+    const hash = queryValue(target, "hash") orelse "";
+    if (!validBlobHash(hash)) {
+        try reply(req, access, "missing or bad hash\n", .{ .status = .bad_request });
+        return;
+    }
+    const conn = attach.connect(ctx.gpa, ctx.io, ctx.environ, ctx.self_exe) catch {
+        try reply(req, access, "cannot reach daemon\n", .{ .status = .bad_gateway });
+        return;
+    };
+    defer conn.deinit();
+    const request: proto.ClientMsg = .{ .blob_get = .{ .hash = hash } };
+    const line = try proto.encode(ctx.gpa, request);
+    defer ctx.gpa.free(line);
+    try conn.writer.writeAll(line);
+    try conn.writer.flush();
+    const daemon_reply = conn.readLine() catch {
+        try reply(req, access, "daemon closed the connection\n", .{ .status = .bad_gateway });
+        return;
+    };
+    defer ctx.gpa.free(daemon_reply);
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const msg = proto.decode(proto.DaemonMsg, arena_state.allocator(), daemon_reply) catch {
+        try reply(req, access, "unreadable daemon reply\n", .{ .status = .bad_gateway });
+        return;
+    };
+    const bytes = switch (msg) {
+        .blob_result => |blob| blob.bytes,
+        else => {
+            try reply(req, access, "not found\n", .{ .status = .not_found });
+            return;
+        },
+    };
+    const mime = media.detectMime(bytes) orelse {
+        try reply(req, access, "not an image\n", .{ .status = .not_found });
+        return;
+    };
+    try reply(req, access, bytes, .{ .extra_headers = &.{
+        .{ .name = "content-type", .value = mime },
+        .{ .name = "cache-control", .value = "private, max-age=31536000, immutable" },
+        .{ .name = "x-content-type-options", .value = "nosniff" },
+    } });
+}
+
 /// Dedicated daemon connection per SSE stream; ends when either side closes.
 /// `device` is the paired device's token (null for loopback); the stream
 /// ends as soon as that device is unpaired.
@@ -1054,13 +1117,17 @@ pub fn cookieValue(header: ?[]const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn queryU64(target: []const u8, name: []const u8) ?u64 {
+pub fn queryValue(target: []const u8, name: []const u8) ?[]const u8 {
     const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
     var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
     while (it.next()) |pair| {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (!std.mem.eql(u8, pair[0..eq], name)) continue;
-        return std.fmt.parseInt(u64, pair[eq + 1 ..], 10) catch null;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
     }
     return null;
+}
+
+pub fn queryU64(target: []const u8, name: []const u8) ?u64 {
+    const value = queryValue(target, name) orelse return null;
+    return std.fmt.parseInt(u64, value, 10) catch null;
 }

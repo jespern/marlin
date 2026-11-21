@@ -641,7 +641,11 @@ async function main() {
     await page.evaluate(()=>submitComposer()); // Enter on a keyboard, ↑ on a phone
     await page.waitForFunction(()=>!document.querySelector('#attachments img'));
     await page.reload();
-    await page.waitForFunction(()=>[...document.querySelectorAll('.block.user:not(.optimistic)')].some(n=>n.textContent==='look at this [1 image]'));
+    // After a reload the image is drawn from the daemon's blob store.
+    await page.waitForFunction(()=>[...document.querySelectorAll('.block.user:not(.optimistic)')].some(n=>{
+      const img=n.querySelector('.images img');
+      return n.textContent==='look at this' && img && img.complete && img.naturalWidth===1500 && img.getAttribute('src').startsWith('/blob?hash=');
+    }));
     assert.deepEqual(errors,[]);
     // A Home Screen app fills its web view and never extends past it: iOS
     // can report a screen taller than the view, and content laid out to the

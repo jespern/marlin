@@ -135,6 +135,9 @@
   .block.shell .earlier { color: var(--dim); }
   #history-more.show { display: block; }
   .block { margin: 0 0 10px; }
+  .images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  .images a { display: block; line-height: 0; }
+  .images img { max-width: 100%; max-height: 60vh; border-radius: 4px; border: 1px solid var(--line); }
   .user {
     background: var(--prompt-bg); border-left: 3px solid var(--accent);
     padding: 8px 12px; border-radius: 4px; white-space: pre-wrap;
@@ -694,13 +697,37 @@ function addOptimisticInput(targetSid, text, steer) {
   return pendingInputs[pendingInputs.length - 1];
 }
 
-function settleOptimisticInput(kind, text) {
+// Images a block carries (attachments, a tool's image), drawn from the
+// daemon's blob store; a tap opens one full size.
+function imageStrip(attachments) {
+  const images = (attachments || []).filter(a => a && a.hash && (a.mime || '').startsWith('image/'));
+  if (!images.length) return null;
+  const strip = el('div', 'images');
+  for (const a of images) {
+    const src = '/blob?hash=' + encodeURIComponent(a.hash);
+    const link = el('a');
+    link.href = src;
+    link.target = '_blank';
+    const img = el('img');
+    img.src = src;
+    img.alt = a.name || 'image';
+    img.loading = 'lazy';
+    img.onerror = () => link.replaceWith(el('span', 'note', '[' + (a.name || 'image') + ']'));
+    link.appendChild(img);
+    strip.appendChild(link);
+  }
+  return strip;
+}
+
+function settleOptimisticInput(kind, text, attachments) {
   const i = pendingInputs.findIndex(p => p.sid === sid && p.text === text);
   if (i < 0) return false;
   const pending = pendingInputs.splice(i, 1)[0];
   if (!pending.node.isConnected) return false;
   pending.node.className = 'block user';
   pending.node.textContent = (kind === 'steer' ? '↪ ' : '') + text;
+  const strip = imageStrip(attachments);
+  if (strip) pending.node.appendChild(strip);
   delete pending.node.dataset.requestId;
   // Move the optimistic row to the durable event's actual position. This is
   // observable for steering: the in-flight row can precede the assistant's
@@ -1234,12 +1261,12 @@ function addBlock(b, target = $('#transcript'), live = true) {
     if (!synthetic && target === $('#transcript')) planProposalReady = false;
     if (synthetic)
       node = el('div', 'block note', '[' + rehydrationNote(v.text) + ']');
-    else if (live && settleOptimisticInput(kind, v.text || ''))
+    else if (live && settleOptimisticInput(kind, v.text || '', v.attachments))
       return;
     else {
       node = el('div', 'block user', v.text);
-      const n = (v.attachments || []).length;
-      if (n) node.appendChild(el('span', 'note', (v.text ? ' ' : '') + '[' + n + (n === 1 ? ' image]' : ' images]')));
+      const strip = imageStrip(v.attachments);
+      if (strip) node.appendChild(strip);
     }
   }
   else if (kind === 'assistant_msg') {
@@ -1294,6 +1321,17 @@ function addBlock(b, target = $('#transcript'), live = true) {
     else pre.textContent = body;
     const call = t.querySelector(`[data-call="${CSS.escape(v.call_id || '')}"]`);
     if (call && call.classList.contains('question-record')) { answerQuestionRecord(call, v); return; }
+    // A tool's images are what it showed the user: they stay out of the
+    // fold, under the call, and end its group as in the TUI.
+    const strip = imageStrip(v.attachments);
+    if (strip) {
+      const shown = el('div', 'block tool-images');
+      shown.appendChild(strip);
+      if (b.seq) shown.dataset.seq = b.seq;
+      const anchor = call ? (call.closest('.tool-group') || call) : null;
+      if (anchor) anchor.after(shown); else t.appendChild(shown);
+      if (live) scrollBottom();
+    }
     if (call) {
       // A failure stays folded, as in the TUI: the row and its group's
       // "· N failed" say so, and a tap opens it. Some models fail often.
@@ -1314,8 +1352,10 @@ function addBlock(b, target = $('#transcript'), live = true) {
   else if (kind === 'compaction') node = el('div', 'block note', '≋ context compacted');
   else if (kind === 'approval') node = el('div', 'block note', 'approval: ' + (v.decision || 'pending'));
   else if (kind === 'steer') {
-    if (live && settleOptimisticInput(kind, v.text || '')) return;
+    if (live && settleOptimisticInput(kind, v.text || '', v.attachments)) return;
     node = el('div', 'block user', '↪ ' + v.text);
+    const strip = imageStrip(v.attachments);
+    if (strip) node.appendChild(strip);
   }
   if (node) {
     if (b.seq) node.dataset.seq = b.seq;

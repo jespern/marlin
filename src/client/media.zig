@@ -121,7 +121,7 @@ fn fromBytes(gpa: std.mem.Allocator, name: []const u8, bytes: []const u8) !Pendi
     };
 }
 
-fn detectMime(bytes: []const u8) ?[]const u8 {
+pub fn detectMime(bytes: []const u8) ?[]const u8 {
     if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
     if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "\xff\xd8\xff")) return "image/jpeg";
     if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) return "image/gif";
