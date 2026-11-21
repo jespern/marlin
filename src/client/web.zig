@@ -86,9 +86,25 @@ fn parentDeathWatch(io: Io) void {
     while (true) {
         const n = in.readStreaming(io, &.{&buf}) catch break;
         if (n == 0) break;
+        // Any byte: the daemon is handing over (web_service.drain).
+        if (!draining.swap(true, .acq_rel)) {
+            const wake = accept_wake.load(.acquire);
+            if (wake >= 0) _ = std.c.write(wake, "d", 1);
+        }
     }
     std.process.exit(0);
 }
+
+/// Draining for a handover: stop accepting, let open connections finish
+/// (their daemon connections are closing), then exit.
+var draining: std.atomic.Value(bool) = .init(false);
+/// Write end of the accept loop's wake pipe; -1 before it exists.
+var accept_wake: std.atomic.Value(i32) = .init(-1);
+var open_connections: std.atomic.Value(usize) = .init(0);
+/// Set when the last open connection ends during a drain.
+var connections_done: Io.Event = .unset;
+/// How long a drain waits for open connections before exiting anyway.
+const drain_grace_ms: i64 = 3_000;
 
 pub fn serve(
     gpa: std.mem.Allocator,
@@ -172,7 +188,21 @@ pub fn serve(
         std.log.warn("listening beyond loopback with no [web] hosts: remote requests are refused", .{});
     }
 
-    while (true) {
+    var wake_fds: [2]std.posix.fd_t = .{ -1, -1 };
+    if (std.c.pipe(&wake_fds) == 0) {
+        for (wake_fds) |fd| _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+        accept_wake.store(wake_fds[1], .release);
+    }
+    while (!draining.load(.acquire)) {
+        if (wake_fds[0] >= 0) {
+            var ready = [_]std.c.pollfd{
+                .{ .fd = server.socket.handle, .events = std.c.POLL.IN, .revents = 0 },
+                .{ .fd = wake_fds[0], .events = std.c.POLL.IN, .revents = 0 },
+            };
+            if (std.c.poll(&ready, ready.len, -1) < 0) continue; // EINTR
+            if (ready[1].revents != 0) break;
+            if (ready[0].revents == 0) continue;
+        }
         var stream = server.accept(io) catch break;
         const peer = stream.socket.address;
         if (!peerAllowed(proxy, peer)) {
@@ -191,6 +221,14 @@ pub fn serve(
             continue;
         };
         thread.detach();
+    }
+    if (draining.load(.acquire)) {
+        // Refuse new connections now; the successor's companion takes the
+        // port once this process is gone.
+        server.deinit(io);
+        if (open_connections.load(.acquire) > 0)
+            connections_done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(drain_grace_ms), .clock = .awake } }) catch {};
+        std.process.exit(0);
     }
     return 0;
 }
@@ -219,6 +257,10 @@ const ConnCtx = struct {
 };
 
 fn connMain(ctx: *ConnCtx) void {
+    // Copied: `ctx` is freed by the defer below, which runs first.
+    const io = ctx.io;
+    _ = open_connections.fetchAdd(1, .acq_rel);
+    defer if (open_connections.fetchSub(1, .acq_rel) == 1 and draining.load(.acquire)) connections_done.set(io);
     defer ctx.gpa.destroy(ctx);
     var stream = ctx.stream;
     defer stream.close(ctx.io);
@@ -791,14 +833,24 @@ fn serveSend(ctx: *ConnCtx, req: *std.http.Server.Request, access: *Access) !voi
     try reply(req, access, daemon_reply, .{ .extra_headers = &json_header });
 }
 
-/// A blob's hash as the store writes it: lowercase SHA-256 hex.
-pub fn validBlobHash(hash: []const u8) bool {
-    if (hash.len != 64) return false;
-    for (hash) |c| switch (c) {
+/// Exactly `len` lowercase hex digits.
+fn lowerHex(text: []const u8, len: usize) bool {
+    if (text.len != len) return false;
+    for (text) |c| switch (c) {
         '0'...'9', 'a'...'f' => {},
         else => return false,
     };
     return true;
+}
+
+/// A blob's hash as the store writes it: lowercase SHA-256 hex.
+pub fn validBlobHash(hash: []const u8) bool {
+    return lowerHex(hash, 64);
+}
+
+/// A handover token as the daemon issues it (handover.newToken).
+pub fn validHandoverToken(token: []const u8) bool {
+    return lowerHex(token, 32);
 }
 
 /// One stored image by hash, as raw bytes the browser decodes itself. Only
@@ -872,6 +924,16 @@ fn serveEvents(ctx: *ConnCtx, req: *std.http.Server.Request, target: []const u8,
     ) catch unreachable;
     try conn.writer.writeAll("{\"session_watch\":{\"incremental\":true}}\n");
     try conn.writer.writeAll(sub_line);
+    if (conn.handover) {
+        // The page follows a restart: daemon_handover reaches it like any
+        // line, and it comes back with the token (`&handover=`).
+        try conn.writer.writeAll("{\"handover_watch\":{}}\n");
+        if (queryValue(target, "handover")) |token| if (validHandoverToken(token)) {
+            const line = try proto.encode(ctx.gpa, proto.ClientMsg{ .handover_arrived = .{ .token = token } });
+            defer ctx.gpa.free(line);
+            try conn.writer.writeAll(line);
+        };
+    }
     try conn.writer.flush();
 
     var stream_buf: [1024]u8 = undefined;

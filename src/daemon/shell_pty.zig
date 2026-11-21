@@ -156,6 +156,9 @@ pub const Shell = struct {
     closing: std.atomic.Value(bool) = .init(false),
     reaped: std.atomic.Value(bool) = .init(false),
     unacked: std.atomic.Value(usize) = .init(0),
+    /// Taken over from a predecessor daemon (handover.zig): the shell is not
+    /// our child, so its exit is noticed but its status is unknown.
+    adopted: bool = false,
 
     pub fn spawn(gpa: std.mem.Allocator, io: Io, id: u64, opts: Options, sink: Sink) !*Shell {
         // Everything the child needs is prepared before fork: between fork
@@ -198,6 +201,43 @@ pub const Shell = struct {
             return err;
         };
         return self;
+    }
+
+    /// A shell a predecessor daemon started, its PTY master inherited at
+    /// `master`. The master must not cross exec again: tools this daemon
+    /// spawns would hold the terminal open.
+    pub fn adopt(gpa: std.mem.Allocator, io: Io, id: u64, master: c_int, pid: c.pid_t, sink: Sink) !*Shell {
+        _ = c.fcntl(master, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
+        const self = try gpa.create(Shell);
+        self.* = .{ .gpa = gpa, .io = io, .id = id, .master = master, .pid = pid, .sink = sink, .adopted = true };
+        self.thread = std.Thread.spawn(.{}, readLoop, .{self}) catch |err| {
+            gpa.destroy(self);
+            return err;
+        };
+        return self;
+    }
+
+    /// Stop reading without touching the shell: unread output stays in the
+    /// PTY for whoever reads next. Dispatcher only.
+    pub fn pauseReader(self: *Shell) void {
+        self.closing.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.closing.store(false, .release);
+    }
+
+    /// Read again after pauseReader (a handover that did not happen).
+    pub fn resumeReader(self: *Shell) !void {
+        if (self.thread != null) return;
+        self.thread = try std.Thread.spawn(.{}, readLoop, .{self});
+    }
+
+    /// Let go of a shell a successor daemon now owns: stop reading, close
+    /// this process's copy of the master, and free. The shell keeps running.
+    pub fn release(self: *Shell) void {
+        self.pauseReader();
+        _ = c.close(self.master);
+        self.gpa.destroy(self);
     }
 
     /// Hang up the shell, stop the reader, reap, and free. Dispatcher only.
@@ -317,6 +357,12 @@ pub const Shell = struct {
     }
 
     fn tryReap(self: *Shell) ?Status {
+        if (self.adopted) {
+            // Not our child: waitpid cannot see it. Gone is all we can know.
+            if (c.kill(self.pid, @fromBackingInt(@intCast(0))) == 0 or std.c._errno().* != @backingInt(c.E.SRCH)) return null;
+            self.reaped.store(true, .release);
+            return .{};
+        }
         var raw: c_int = 0;
         if (c.waitpid(self.pid, &raw, c.W.NOHANG) != self.pid) return null;
         self.reaped.store(true, .release);

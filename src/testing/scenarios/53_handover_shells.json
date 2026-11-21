@@ -1,0 +1,8 @@
+{
+  "steps": [],
+  "check": {
+    "argv": [],
+    "handover_flow": "shells",
+    "config_toml": "[reboot]\nhandover_wait = \"2s\"\n"
+  }
+}

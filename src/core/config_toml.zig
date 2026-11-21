@@ -83,6 +83,7 @@ pub const Document = struct {
     web_proxy: ?[]const u8 = null,
     web_push: ?bool = null,
     discovery_enabled: ?bool = null,
+    reboot_handover_wait_ms: ?u64 = null,
     ui_tab_bar: ?bool = null,
     ui_bell: ?bool = null,
     ui_stream_pacing: ?bool = null,
@@ -112,6 +113,7 @@ const Section = enum {
     workspace,
     web,
     discovery,
+    reboot,
     ui,
     voice,
     network,
@@ -251,6 +253,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             },
             .discovery => if (std.mem.eql(u8, key, "enabled")) {
                 doc.discovery_enabled = try boolean(value);
+            },
+            .reboot => if (std.mem.eql(u8, key, "handover_wait")) {
+                doc.reboot_handover_wait_ms = try durationMs(value);
             },
             .ui => {
                 if (std.mem.eql(u8, key, "tab_bar")) doc.ui_tab_bar = try boolean(value);
@@ -396,6 +401,7 @@ fn sectionFor(name: []const u8) Section {
         .{ "workspace", Section.workspace },
         .{ "web", Section.web },
         .{ "discovery", Section.discovery },
+        .{ "reboot", Section.reboot },
         .{ "voice", Section.voice },
         .{ "ui", Section.ui },
         .{ "network", Section.network },

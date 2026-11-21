@@ -469,6 +469,15 @@ test "default user skill roots include shared skills and can be overridden" {
     try std.testing.expectEqualStrings("/custom/skills", custom.value.skill_directories[0]);
 }
 
+test "a handover waits a minute for moved clients unless configured" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(u64, 60_000), defaults().reboot_handover_wait_ms);
+    var cfg = defaults();
+    applyDocument(&cfg, try toml.parse(arena.allocator(), "[reboot]\nhandover_wait = \"5s\"\n"));
+    try std.testing.expectEqual(@as(u64, 5_000), cfg.reboot_handover_wait_ms);
+}
+
 test "guest runtime supports durations and off without changing the default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

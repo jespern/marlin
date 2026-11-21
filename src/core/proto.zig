@@ -507,7 +507,27 @@ pub const ClientMsg = union(enum) {
     /// release the socket, exit 0. Reply `ok` is sent RIGHT BEFORE exit; the
     /// requesting client execs the new binary when it sees it. Autostart
     /// then brings up the new daemon (one restart mechanism, not two).
-    reboot: struct { force: bool = false, suspend_sessions: bool = false },
+    reboot: struct {
+        force: bool = false,
+        suspend_sessions: bool = false,
+        /// Graceful handover (hello_ok.handover): this daemon starts its
+        /// own executable as the successor, passes it the listening sockets
+        /// and running shells, moves every handover watcher across, and exits
+        /// only once the successor confirms each one arrived. Replies `ok` as
+        /// soon as the request is accepted; progress and failure reach
+        /// watchers as daemon_notice. Implies suspend_sessions.
+        handover: bool = false,
+        /// With handover: rebuild this daemon's source checkout first and
+        /// start the result (a phone has no build of its own to run).
+        build: bool = false,
+    },
+    /// This connection follows a graceful handover (reboot.handover): it is
+    /// sent daemon_handover{token} and daemon_notice, then closed, and should
+    /// reconnect and present the token with handover_arrived.
+    handover_watch: struct {},
+    /// Sent to the successor daemon once this client has resubscribed after
+    /// a handover; the predecessor exits when every token has arrived.
+    handover_arrived: struct { token: []const u8 },
     shutdown: struct {},
     /// Experimental shell tabs (`!!`): login shells on PTYs on the daemon's
     /// host. A shell belongs to the daemon, not a connection: it runs until
@@ -615,6 +635,13 @@ pub const DaemonMsg = union(enum) {
     web_devices_changed: struct {},
     /// Opt-in via hello.lifecycle_events; deliberate shutdown must not autostart.
     daemon_stopping: struct {},
+    /// To handover watchers: this daemon is being replaced. The connection
+    /// closes next; reconnect, resubscribe, then send handover_arrived with
+    /// this token.
+    daemon_handover: struct { token: []const u8 },
+    /// To handover watchers: progress or failure of a restart, for the
+    /// status line.
+    daemon_notice: struct { text: []const u8, err: bool = false },
     hello_ok: struct {
         proto_version: u32,
         daemon_version: []const u8,
@@ -652,6 +679,8 @@ pub const DaemonMsg = union(enum) {
         /// The daemon serves voice_* (dictation set up and transcribed on its
         /// machine, for clients attached from another one).
         voice: bool = false,
+        /// The daemon serves reboot.handover and handover_watch.
+        handover: bool = false,
     },
     session_runtime_result: struct { sid: u64, max_runtime_ms: u64, uses_default: bool },
     session_created: struct { sid: u64, request_id: u64 = 0 },

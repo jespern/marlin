@@ -131,6 +131,11 @@ pub const Config = struct {
     /// `MARLIN_DISCOVERY=0` turns it off.
     discovery_enabled: bool = true,
 
+    /// How long a daemon handing over to its successor (`/reboot`) waits for
+    /// each moved client to arrive before exiting anyway (`[reboot]
+    /// handover_wait = "60s"`). Clients that miss it reconnect normally.
+    reboot_handover_wait_ms: u64 = 60_000,
+
     /// TUI chrome (`[ui]`): the top tab strip. Toggleable live via /config;
     /// the daemon serializes persistence through setUiTabBar.
     ui_tab_bar: bool = true,
@@ -827,6 +832,7 @@ pub fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.web_proxy) |value| cfg.web_proxy = value;
     if (doc.web_push) |value| cfg.web_push = value;
     if (doc.discovery_enabled) |value| cfg.discovery_enabled = value;
+    if (doc.reboot_handover_wait_ms) |value| cfg.reboot_handover_wait_ms = value;
     if (doc.ui_tab_bar) |value| cfg.ui_tab_bar = value;
     if (doc.ui_bell) |value| cfg.ui_bell = value;
     if (doc.ui_stream_pacing) |value| cfg.ui_stream_pacing = value;

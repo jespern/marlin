@@ -28,6 +28,11 @@ test "guest progress cannot dismiss a parked question or approval" {
     defer stream.close(io);
 
     var daemon: daemon_mod.Daemon = undefined;
+    daemon.outgoing = null;
+    daemon.predecessor_fd = -1;
+    daemon.predecessor_reader = null;
+    daemon.handed_over = false;
+    daemon.web_deferred = false;
     daemon.gpa = gpa;
     daemon.io = io;
     daemon.store = try store.Store.open(gpa, null);
@@ -105,6 +110,11 @@ test "image steering keeps durable refs and gives guests readable files" {
     defer env.deinit();
     try env.put("TMPDIR", temp.path);
     var daemon: daemon_mod.Daemon = undefined;
+    daemon.outgoing = null;
+    daemon.predecessor_fd = -1;
+    daemon.predecessor_reader = null;
+    daemon.handed_over = false;
+    daemon.web_deferred = false;
     daemon.gpa = gpa;
     daemon.io = io;
     daemon.environ = &env;
@@ -171,6 +181,11 @@ test "shells outlive their opener and are shared by every viewer" {
     try environ.put("PATH", "/usr/bin:/bin");
 
     var daemon: daemon_mod.Daemon = undefined;
+    daemon.outgoing = null;
+    daemon.predecessor_fd = -1;
+    daemon.predecessor_reader = null;
+    daemon.handed_over = false;
+    daemon.web_deferred = false;
     daemon.gpa = gpa;
     daemon.io = io;
     daemon.environ = &environ;
@@ -399,6 +414,11 @@ const ShellRig = struct {
         d.sandbox_backend = .unavailable;
         d.presence = .{};
         d.pending_reboot = null;
+        d.outgoing = null;
+        d.predecessor_fd = -1;
+        d.predecessor_reader = null;
+        d.handed_over = false;
+        d.web_deferred = false;
         try d.store.createSession(7, 0, "/", "m", .auto);
         r.session = .{ .id = 7, .model = try gpa.dupe(u8, "m"), .cwd = try gpa.dupe(u8, "/") };
         try d.sessions.put(gpa, r.session.id, &r.session);

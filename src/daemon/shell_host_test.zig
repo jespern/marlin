@@ -104,6 +104,31 @@ test "a host snapshot decodes to the same screen" {
     try std.testing.expectEqualStrings("hello\nworld", text);
 }
 
+test "a successor's mirror restored from a snapshot is the same terminal" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const host = try shell_host.Host.create(gpa, io, 1, 9, "/", 0, .{ .cols = 20, .rows = 4 });
+    defer host.destroy();
+    // A half-sent colour escape: the successor's next bytes complete it.
+    host.feed("\x1b]2;my title\x07hello\r\nworld \x1b[3");
+    const bytes = try host.snapshot(gpa);
+    defer gpa.free(bytes);
+
+    const restored = try shell_host.Host.fromSnapshot(gpa, io, 1, 9, "/", 0, .{ .cols = 20, .rows = 4 }, bytes);
+    defer restored.destroy();
+    try restored.restore("htop", &.{.{ .command = "make", .exit_code = 0 }});
+    // Already announced by the predecessor.
+    try std.testing.expect(!restored.titleChanged());
+    try std.testing.expectEqualStrings("htop", restored.ran.?);
+    try std.testing.expectEqualStrings("make", restored.commands.items[0].command);
+    restored.feed("1mred");
+    const text = try restored.terminal.plainString(gpa);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("hello\nworld red", text);
+}
+
 test "the shell's directory follows its OSC 7 reports" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

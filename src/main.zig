@@ -77,6 +77,7 @@ test {
     _ = @import("daemon/process_io_test.zig");
     _ = @import("daemon/shell_pty_test.zig");
     _ = @import("daemon/shell_host_test.zig");
+    _ = @import("daemon/handover_test.zig");
     _ = @import("daemon/shell_env_test.zig");
     _ = @import("core/png_test.zig");
     _ = @import("client/shell_term_test.zig");

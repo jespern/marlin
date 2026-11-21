@@ -1,0 +1,10 @@
+{
+  "steps": [],
+  "check": {
+    "argv": [],
+    "handover_flow": "abort",
+    "env": {
+      "MARLIN_TEST_HANDOVER_FAIL": "1"
+    }
+  }
+}

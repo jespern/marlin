@@ -100,11 +100,14 @@ pub fn dispatch(
         // `--ready-stdout` is the autostart handshake: the daemon writes one
         // 'R' to stdout right after listen(), so the spawning client waits on
         // readiness instead of a blind timer (docs/ARCHITECTURE.md §1).
+        // `--handover-fd <n>`: started by a running daemon as its successor
+        // (handover.zig), with its state and control channel on fd n.
         .daemon => try daemon.Daemon.serve(
             gpa,
             io,
             environ,
             if (rest.len == 1 and std.mem.eql(u8, rest[0], "--ready-stdout")) Io.File.stdout() else null,
+            if (rest.len == 2 and std.mem.eql(u8, rest[0], "--handover-fd")) std.fmt.parseInt(std.posix.fd_t, rest[1], 10) catch null else null,
         ),
         .run => return headless.run(gpa, io, environ, self_exe, rest),
         .ls => return headless.ls(gpa, io, environ, self_exe, rest),

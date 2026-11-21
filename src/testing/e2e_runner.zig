@@ -159,6 +159,10 @@ const Check = struct {
     /// `marlin --remote <host> reboot --then …` through a fake ssh to this
     /// scenario's daemon: the follow-up must reach the remote daemon too.
     remote_reboot_flow: bool = false,
+    /// Graceful handover beyond sessions: "shells" (a running shell moves,
+    /// a client that never returns holds the old daemon until
+    /// [reboot] handover_wait) or "abort" (the successor fails to start).
+    handover_flow: []const u8 = "",
     pause_flow: []const u8 = "",
     /// Fetch a stored full tool-output blob over the daemon protocol and
     /// require at least this many decoded bytes (exercises large replies).
@@ -408,7 +412,7 @@ fn runScenario(
 
     // 3. Run ordinary CLI scenarios, or the direct multi-connection protocol
     // regression that cannot be expressed as a one-shot headless command.
-    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0 or sf.check.session_restore_flow or sf.check.codex_question_flow or sf.check.remote_reboot_flow) {
+    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0 or sf.check.session_restore_flow or sf.check.codex_question_flow or sf.check.remote_reboot_flow or sf.check.handover_flow.len > 0) {
         const started = try process_io.run(gpa, io, .{
             .argv = &.{ marlin_bin, "ls" },
             .environ_map = &env,
@@ -420,7 +424,9 @@ fn runScenario(
         defer started.deinit(gpa);
         if (started.process_group_id) |group_id| try process_groups.append(gpa, group_id);
         if (started.term != .exited or started.term.exited != 0) return error.DaemonStartFailed;
-        if (sf.check.remote_reboot_flow)
+        if (sf.check.handover_flow.len > 0)
+            try checkHandoverFlow(gpa, io, &env, state_dir, sf.check.handover_flow)
+        else if (sf.check.remote_reboot_flow)
             try checkRemoteRebootFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups)
         else if (sf.check.codex_question_flow)
             try checkCodexQuestionFlow(gpa, io, &env, state_dir)
@@ -721,6 +727,16 @@ fn runScenario(
 /// True once no process in the group remains (probe: CONT to -pgid until
 /// ProcessNotFound). Scenario daemons opt into group inheritance, so a
 /// wedged daemon keeps the group alive and is observable here.
+/// Whether process `pid` exits within `timeout_ms`.
+fn waitPidGone(io: Io, pid: std.posix.pid_t, timeout_ms: u32) bool {
+    var waited: u32 = 0;
+    while (waited < timeout_ms) : (waited += 10) {
+        if (std.c.kill(pid, @fromBackingInt(@intCast(0))) != 0) return true;
+        io.sleep(.fromMilliseconds(10), .awake) catch return false;
+    }
+    return std.c.kill(pid, @fromBackingInt(@intCast(0))) != 0;
+}
+
 fn waitGroupGone(io: Io, group_id: std.posix.pid_t, timeout_ms: u32) bool {
     const deadline = Io.Timestamp.now(io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
     while (true) {
@@ -1340,6 +1356,117 @@ fn checkRemoteRebootFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process
     if (new_pid == 0 or new_pid == old_pid) return error.RemoteDaemonNotRestarted;
 }
 
+/// Type into a shell and wait until its output shows `expect`.
+fn shellRoundTrip(conn: *ProtocolConn, arena: std.mem.Allocator, shell_id: u64, text: []const u8, expect: []const u8) !void {
+    const encoder = std.base64.standard.Encoder;
+    const typed = try arena.alloc(u8, encoder.calcSize(text.len));
+    try conn.send(.{ .shell_input = .{ .shell_id = shell_id, .data_base64 = encoder.encode(typed, text) } });
+    var seen: std.ArrayList(u8) = .empty;
+    while (std.mem.indexOf(u8, seen.items, expect) == null) {
+        const output = try recvTagBounded(conn, arena, "shell_output");
+        const encoded = stringField(output, "data_base64") orelse continue;
+        const decoder = std.base64.standard.Decoder;
+        const bytes = try arena.alloc(u8, try decoder.calcSizeForSlice(encoded));
+        try decoder.decode(bytes, encoded);
+        try seen.appendSlice(arena, bytes);
+        try conn.send(.{ .shell_ack = .{ .shell_id = shell_id, .bytes = bytes.len } });
+    }
+}
+
+fn checkHandoverFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, flow: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const abort = std.mem.eql(u8, flow, "abort");
+
+    var watcher = try ProtocolConn.connect(gpa, io, env);
+    var watcher_open = true;
+    defer if (watcher_open) watcher.deinit();
+    try watcher.send(.{ .hello = .{ .proto_version = proto.proto_version, .client_kind = "e2e-protocol" } });
+    const hello = try recvTagBounded(watcher, arena, "hello_ok");
+    if (hello.get("handover") == null) return error.HandoverNotAdvertised;
+    const old_pid: std.posix.pid_t = @intCast(uintField(hello, "daemon_pid") orelse return error.DaemonPidMissing);
+    try watcher.send(.{ .handover_watch = struct {}{} });
+    try watcher.send(.{ .session_create = .{ .cwd = cwd, .model = "local/testing" } });
+    const sid = uintField(try recvTagBounded(watcher, arena, "session_created"), "sid") orelse return error.SessionIdMissing;
+    try watcher.send(.{ .shell_open = .{ .sid = sid, .cols = 80, .rows = 24 } });
+    const shell_id = uintField(try recvTagBounded(watcher, arena, "shell_opened"), "shell_id") orelse return error.ShellIdMissing;
+    try shellRoundTrip(watcher, arena, shell_id, "echo before-$((40+2))\r", "before-42");
+
+    // A second watcher that never comes back.
+    const absent = try connectProtocol(gpa, io, env);
+    defer absent.deinit();
+    try absent.send(.{ .handover_watch = struct {}{} });
+
+    const requester = try connectProtocol(gpa, io, env);
+    defer requester.deinit();
+    try requester.send(.{ .reboot = .{ .handover = true } });
+    _ = try recvTagBounded(requester, arena, "ok");
+
+    if (abort) {
+        // The successor fails while starting: the watcher hears why and
+        // stays connected to a daemon that carries on.
+        const notice = try recvTagBounded(watcher, arena, "daemon_notice");
+        while (true) {
+            const err_notice = if (notice.get("err")) |e| e == .bool and e.bool else false;
+            if (err_notice) break;
+            const next = try recvTagBounded(watcher, arena, "daemon_notice");
+            if (next.get("err")) |e| if (e == .bool and e.bool) break;
+        }
+        const refused = try recvBounded(requester, arena);
+        if (tagObject(refused, "err") == null) return error.HandoverAbortNotReported;
+        try shellRoundTrip(watcher, arena, shell_id, "echo still-$((1+1))\r", "still-2");
+        try watcher.send(.{ .session_create = .{ .cwd = cwd, .model = "local/testing" } });
+        _ = try recvTagBounded(watcher, arena, "session_created");
+        const again = try connectProtocol(gpa, io, env);
+        defer again.deinit();
+        try again.send(.{ .hello = .{ .proto_version = proto.proto_version } });
+        if (uintField(try recvTagBounded(again, arena, "hello_ok"), "daemon_pid") != @as(u64, @intCast(old_pid))) return error.HandoverAbortReplacedDaemon;
+        return;
+    }
+
+    var token: ?[]const u8 = null;
+    while (true) {
+        const msg = recvBounded(watcher, arena) catch |err| {
+            if (err != error.EndOfStream and err != error.ReadFailed) return err;
+            break;
+        };
+        if (tagObject(msg, "daemon_handover")) |moved| token = stringField(moved, "token");
+    }
+    watcher.deinit();
+    watcher_open = false;
+    const presented = token orelse return error.HandoverTokenMissing;
+
+    var moved = try connectProtocol(gpa, io, env);
+    defer moved.deinit();
+    try moved.send(.{ .hello = .{ .proto_version = proto.proto_version } });
+    const new_pid = uintField(try recvTagBounded(moved, arena, "hello_ok"), "daemon_pid") orelse 0;
+    if (new_pid == 0 or new_pid == @as(u64, @intCast(old_pid))) return error.HandoverNoSuccessor;
+    try moved.send(.{ .handover_watch = struct {}{} });
+    try moved.send(.{ .shell_attach = .{ .shell_id = shell_id, .cols = 80, .rows = 24 } });
+    const snapshot = try recvTagBounded(moved, arena, "shell_snapshot");
+    const encoded = stringField(snapshot, "data_base64") orelse return error.ShellSnapshotMissing;
+    const decoder = std.base64.standard.Decoder;
+    const screen = try arena.alloc(u8, try decoder.calcSizeForSlice(encoded));
+    try decoder.decode(screen, encoded);
+    if (std.mem.indexOf(u8, screen, "before-42") == null) return error.HandoverShellScreenLost;
+    try moved.send(.{ .handover_arrived = .{ .token = presented } });
+
+    // The other watcher is still owed its wait ([reboot] handover_wait).
+    try io.sleep(.fromMilliseconds(500), .awake);
+    if (std.c.kill(old_pid, @fromBackingInt(@intCast(0))) != 0) return error.HandoverDidNotWaitForEveryClient;
+    if (!waitPidGone(io, old_pid, helper_timeout_ms)) return error.HandoverPredecessorStayed;
+
+    // The same shell, now the successor's: it runs, and its end is noticed
+    // (with an unknown status: it is not the successor's child).
+    try shellRoundTrip(moved, arena, shell_id, "echo after-$((1+1))\r", "after-2");
+    const encoder = std.base64.standard.Encoder;
+    var exit_buf: [16]u8 = undefined;
+    try moved.send(.{ .shell_input = .{ .shell_id = shell_id, .data_base64 = encoder.encode(&exit_buf, "exit\r") } });
+    const exited = try recvTagBounded(moved, arena, "shell_exited");
+    if (exited.get("code")) |code| if (code != .null) return error.HandoverShellStatusInvented;
+}
+
 fn checkCodexQuestionFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1493,6 +1620,9 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
     const approval_flow = std.mem.eql(u8, flow, "approval");
     const question_flow = std.mem.eql(u8, flow, "question");
     const reboot_flow = std.mem.eql(u8, flow, "reboot");
+    // A graceful handover: the old daemon starts its successor and waits for
+    // this client to arrive there before exiting.
+    const handover_flow = std.mem.eql(u8, flow, "handover");
     const crash_flow = std.mem.eql(u8, flow, "crash");
     const disconnect_flow = std.mem.eql(u8, flow, "disconnect");
     const force_flow = std.mem.eql(u8, flow, "force");
@@ -1530,7 +1660,8 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
     try pauseWaitState(conn, arena, sid, "paused", "idle");
     try pauseAssertListed(conn, arena, sid, "paused");
 
-    if (reboot_flow or crash_flow or disconnect_flow) {
+    if (reboot_flow or crash_flow or disconnect_flow or handover_flow) {
+        if (handover_flow) try conn.send(.{ .handover_watch = struct {}{} });
         const second = try pauseCreate(conn, arena, cwd, "auto");
         try conn.send(.{ .input = .{ .sid = second, .text = "second restart task" } });
         try pauseWaitCall(conn, arena, second);
@@ -1542,7 +1673,7 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
         try requester.send(.{ .hello = .{ .proto_version = proto.proto_version } });
         const hello = try recvTagBounded(requester, arena, "hello_ok");
         const pid = uintField(hello, "daemon_pid") orelse return error.DaemonPidMissing;
-        try requester.send(.{ .reboot = .{ .suspend_sessions = true } });
+        try requester.send(.{ .reboot = .{ .suspend_sessions = true, .handover = handover_flow } });
         try pauseWaitState(conn, arena, second, "pausing", "running");
         if (crash_flow) {
             if (std.c.kill(@intCast(pid), std.posix.SIG.KILL) != 0) return error.DaemonKillFailed;
@@ -1556,17 +1687,33 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
         } else {
             _ = try recvTagBounded(requester, arena, "ok");
         }
-        // EOF confirms the old daemon has released this connection.
+        // EOF confirms the old daemon has released this connection; before
+        // it, a handover sends the token to present to the successor.
+        var token: ?[]const u8 = null;
         while (true) {
-            _ = recvBounded(conn, arena) catch |err| {
+            const msg = recvBounded(conn, arena) catch |err| {
                 if (err != error.EndOfStream and err != error.ReadFailed) return err;
                 break;
             };
+            if (tagObject(msg, "daemon_handover")) |moved| token = stringField(moved, "token");
         }
-        try pauseStartDaemon(gpa, io, env, cwd, exe, groups);
-        const replacement = try connectProtocol(gpa, io, env);
-        conn.deinit();
-        conn = replacement;
+        if (handover_flow) {
+            const presented = token orelse return error.HandoverTokenMissing;
+            // The old daemon waits for this client, and the successor
+            // already accepts on the same socket.
+            if (std.c.kill(@intCast(pid), @fromBackingInt(@intCast(0))) != 0) return error.HandoverPredecessorGone;
+            const replacement = try connectProtocol(gpa, io, env);
+            conn.deinit();
+            conn = replacement;
+            try conn.send(.{ .handover_watch = struct {}{} });
+            try conn.send(.{ .handover_arrived = .{ .token = presented } });
+            if (!waitPidGone(io, @intCast(pid), helper_timeout_ms)) return error.HandoverPredecessorStayed;
+        } else {
+            try pauseStartDaemon(gpa, io, env, cwd, exe, groups);
+            const replacement = try connectProtocol(gpa, io, env);
+            conn.deinit();
+            conn = replacement;
+        }
         try pauseAssertListed(conn, arena, sid, "paused");
         if (disconnect_flow) {
             try pauseAssertListed(conn, arena, second, "paused");

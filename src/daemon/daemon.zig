@@ -43,6 +43,8 @@ const Io = std.Io;
 
 const proto = @import("../core/proto.zig");
 const web_service_mod = @import("web_service.zig");
+const handover = @import("handover.zig");
+const self_build = @import("../client/self_build.zig");
 const pairing = @import("../mobile/pairing.zig");
 const discovery = @import("../core/discovery.zig");
 const mobile_push = @import("../mobile/push.zig");
@@ -239,7 +241,46 @@ const Event = union(enum) {
     shell_exited: struct { shell_id: u64, status: shell_pty.Status },
     /// The shell's output went quiet: time to save its state.
     shell_settled: struct { shell_id: u64 },
+    /// Graceful handover (handover.zig), outgoing side. The daemon-side
+    /// build finished; `err` (gpa-owned) says why it failed.
+    handover_built: struct { failed: bool, msg: ?[]u8 = null },
+    /// Shell readers stopped; every earlier shell_output is mirrored.
+    handover_snapshot,
+    /// The successor reported; `text` (gpa-owned) is the token or message.
+    handover_report: struct { kind: enum { ready, arrived, failed }, text: []u8 },
+    /// The successor's control channel closed.
+    handover_closed,
+    /// Moved clients had their time to arrive.
+    handover_deadline,
+    /// Incoming side: the predecessor freed the web port, or is gone.
+    handover_command: enum { web_released, done },
     shutdown,
+};
+
+/// A graceful handover this daemon is making to a successor; dispatcher-owned
+/// apart from the control reader's atomics.
+const Outgoing = struct {
+    phase: enum { building, quiescing, snapshotting, starting, moving, finishing },
+    requester: u64,
+    force: bool,
+    build_thread: ?std.Thread = null,
+    control_fd: std.posix.fd_t = -1,
+    child: ?std.process.Child = null,
+    reader: ?std.Thread = null,
+    /// When moved clients stop being waited for (ms, awake clock); 0 = no
+    /// deadline yet. Read by the control reader thread.
+    deadline_ms: std.atomic.Value(i64) = .init(0),
+    /// Wakes the control reader to notice a new deadline.
+    wake: [2]std.posix.fd_t = .{ -1, -1 },
+    pending: handover.Pending = .{},
+
+    /// Past quiescing: the successor owns (or is taking) the store.
+    fn frozen(self: *const Outgoing) bool {
+        return switch (self.phase) {
+            .building, .quiescing => false,
+            else => true,
+        };
+    }
 };
 
 /// A voice setup on the daemon's machine for a `--remote` client; owned by
@@ -328,6 +369,8 @@ pub const Client = struct {
     watches_session_deltas: bool = false,
     /// Sent shell_list: receives shell_list_result on every change.
     watches_shells: bool = false,
+    /// Sent handover_watch: moved across a graceful handover with a token.
+    watches_handover: bool = false,
 
     fn subscribed(self: *const Client, sid: u64) bool {
         for (self.subs.items) |s| {
@@ -594,6 +637,23 @@ pub const Daemon = struct {
     /// The daemon quiesces (waits for turns to reach done) then acks + exits.
     pending_reboot: ?u64 = null,
     reboot_suspend: bool = false,
+    /// A graceful handover to a successor in progress (handover.zig).
+    outgoing: ?*Outgoing = null,
+    /// The accept loop leaves the listening socket alone: the successor
+    /// accepts on it now (or is about to).
+    handing_over: std.atomic.Value(bool) = .init(false),
+    /// The successor took over. Cleanup leaves the socket, the lock, the
+    /// shells and the store to it.
+    handed_over: bool = false,
+    /// The listening socket's descriptor, for a handover to pass on.
+    listen_fd: std.posix.fd_t = -1,
+    /// Incoming side: the predecessor's control channel, open until it says
+    /// done. Arrivals are reported on it.
+    predecessor_fd: std.posix.fd_t = -1,
+    predecessor_reader: ?std.Thread = null,
+    /// Incoming side: the web companion starts once the predecessor's has
+    /// released the port.
+    web_deferred: bool = false,
     /// Set when reboot cleanup retires the listener before closing clients.
     /// The final cleanup tail must not unlink a replacement daemon's socket.
     socket_retired: bool = false,
@@ -647,12 +707,37 @@ pub const Daemon = struct {
         io: Io,
         environ: *std.process.Environ.Map,
         ready_pipe: ?Io.File,
+        /// Started by a running daemon as its successor (handover.zig): the
+        /// control channel, with the state to adopt as its first line.
+        handover_fd: ?std.posix.fd_t,
     ) !void {
         // The daemon must survive its spawning terminal: autostart puts us in
         // our own process group, and we ignore SIGHUP for the case where the
         // user runs `marlin daemon` in a terminal that later goes away.
         ignoreSighup();
         const startup_began_ms = nowMs(io);
+
+        // A successor adopts its predecessor's listener, lock and shells
+        // instead of making its own. Until it reports ready, any failure is
+        // reported back and the predecessor carries on.
+        var incoming_reader: ?handover.LineReader = if (handover_fd) |fd| .{ .fd = fd } else null;
+        var incoming_reader_moved = false;
+        defer if (incoming_reader) |*reader| if (!incoming_reader_moved) reader.deinit(gpa);
+        var incoming: ?std.json.Parsed(handover.State) = null;
+        defer if (incoming) |*parsed| parsed.deinit();
+        var ready_reported = false;
+        // The error itself reaches the log on the way out of main.
+        errdefer if (handover_fd) |fd| if (!ready_reported)
+            handover.send(gpa, fd, handover.Report{ .failed = .{ .msg = "startup failed; see the daemon log" } }) catch {};
+        if (handover_fd) |fd| {
+            setCloseOnExec(fd) catch {};
+            incoming = try handover.readState(gpa, &incoming_reader.?);
+            // e2e: a successor that fails before it is ready.
+            if (environ.get("MARLIN_TEST_HANDOVER_FAIL") != null) return error.HandoverTestFailure;
+            // Inherited across exec; they must not cross the next one.
+            setCloseOnExec(incoming.?.value.listen_fd) catch {};
+            setCloseOnExec(incoming.?.value.lock_fd) catch {};
+        }
 
         // Serialize startup before touching the database or stale socket.
         // The lock file may remain on disk; ownership is the kernel lock, so
@@ -664,7 +749,9 @@ pub const Daemon = struct {
         }
         const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{sock_path});
         defer gpa.free(lock_path);
-        var instance_lock = try acquireInstanceLock(io, lock_path);
+        // A successor holds its predecessor's lock: the same open file, so
+        // the lock never lapses between them.
+        var instance_lock = if (incoming) |state| handover.file(state.value.lock_fd) else try acquireInstanceLock(io, lock_path);
         var lock_moved = false;
         defer if (!lock_moved) instance_lock.close(io);
 
@@ -772,14 +859,22 @@ pub const Daemon = struct {
         defer if (self.secrets.len > 0) gpa.free(self.secrets);
         defer self.network.deinit();
 
-        // The instance lock makes this socket provably stale.
-        Io.Dir.cwd().deleteFile(io, sock_path) catch {};
-
-        const ua = try Io.net.UnixAddress.init(sock_path);
-        var server = try ua.listen(io, .{});
+        // A successor accepts on its predecessor's socket: connections never
+        // find nobody listening. Otherwise the instance lock makes any socket
+        // file provably stale.
+        var server: Io.net.Server = if (incoming) |state| .{
+            .socket = .{ .handle = state.value.listen_fd, .address = .{ .ip4 = .loopback(0) } },
+            .options = if (Io.net.Server.AcceptOptions != void) .{ .mode = .stream, .protocol = null },
+        } else listen: {
+            Io.Dir.cwd().deleteFile(io, sock_path) catch {};
+            const ua = try Io.net.UnixAddress.init(sock_path);
+            const listening = try ua.listen(io, .{});
+            // Belt-and-braces: unix sockets are also protected by the parent dir.
+            posixChmod600(sock_path);
+            break :listen listening;
+        };
         defer server.deinit(io);
-        // Belt-and-braces: unix sockets are also protected by the parent dir.
-        posixChmod600(sock_path);
+        self.listen_fd = server.socket.handle;
 
         // Startup is measured, not asserted: extensions (skills + MCP
         // discovery) are the dominant term and the one that grows with config.
@@ -842,7 +937,8 @@ pub const Daemon = struct {
         // Registered even while disabled so /web enable can start it later.
         if (self.marlin_exe != null) self.web_service = &companion;
         if (cfg.web_enabled and self.marlin_exe != null) {
-            companion.start() catch |err| {
+            // A successor's companion waits for the predecessor's to free the port.
+            if (incoming != null) self.web_deferred = true else companion.start() catch |err| {
                 std.log.warn("cannot start companion: {t}", .{err});
             };
         }
@@ -860,6 +956,8 @@ pub const Daemon = struct {
             _ = std.c.close(fds[0]);
         };
         if (accept_wake) |fds| self.accept_wake_write.store(@intCast(fds[1]), .release);
+
+        if (incoming) |state| self.adoptShells(state.value.shells, state.value.next_shell_id);
 
         // Dispatcher thread: consumes events, owns all state.
         const dispatcher = try std.Thread.spawn(.{}, dispatchLoop, .{&self});
@@ -903,17 +1001,38 @@ pub const Daemon = struct {
             }}) catch null;
         }
 
+        if (handover_fd) |fd| {
+            handover.send(gpa, fd, handover.Report{ .ready = .{} }) catch |err|
+                std.log.warn("handover: could not report ready: {t}", .{err});
+            ready_reported = true;
+            std.log.info("took over from pid {d}", .{incoming.?.value.predecessor_pid});
+            self.predecessor_fd = fd;
+            if (std.Thread.spawn(.{}, readPredecessor, .{ &self, incoming_reader.? })) |thread| {
+                self.predecessor_reader = thread;
+                incoming_reader_moved = true;
+            } else |_| self.events.push(io, .{ .handover_command = .done }) catch {};
+        }
+
         // Accept loop (main thread). Exits when shutdown writes the wake
         // pipe (or, without one, when its nudge connection arrives).
         while (true) {
             if (accept_wake) |fds| {
+                // Mid-handover the successor accepts: leave the socket alone
+                // (a negative fd is ignored by poll).
+                const listening = !self.handing_over.load(.acquire);
                 var ready = [_]std.c.pollfd{
-                    .{ .fd = server.socket.handle, .events = std.c.POLL.IN, .revents = 0 },
+                    .{ .fd = if (listening) server.socket.handle else -1, .events = std.c.POLL.IN, .revents = 0 },
                     .{ .fd = fds[0], .events = std.c.POLL.IN, .revents = 0 },
                 };
                 if (std.c.poll(&ready, ready.len, -1) < 0) continue; // EINTR
-                if (ready[1].revents != 0 or !self.running.load(.acquire)) break;
-                if (ready[0].revents == 0) continue;
+                if (!self.running.load(.acquire)) break;
+                if (ready[1].revents != 0) {
+                    // A nudge: look again at running and handing_over.
+                    var drained: [64]u8 = undefined;
+                    _ = std.c.read(fds[0], &drained, drained.len);
+                    continue;
+                }
+                if (ready[0].revents == 0 or !listening) continue;
             }
             const stream = server.accept(io) catch break;
             if (!self.running.load(.acquire)) {
@@ -1072,6 +1191,8 @@ pub const Daemon = struct {
             return;
         };
         for (lost) |shell| {
+            // Taken over from a predecessor: still running.
+            if (self.sessionShell(shell.sid) != null) continue;
             if (shell.session_exists) self.appendSessionBlock(shell.sid, .{ .shell_transcript = .{
                 .text = shell.text,
                 .styled = if (shell.styled.len > 0) shell.styled else null,
@@ -1527,6 +1648,7 @@ pub const Daemon = struct {
                 self.endShell(host, se.status);
             },
             .shell_settled => |ss| if (self.shells.get(ss.shell_id)) |host| self.saveShellState(host),
+            .handover_built, .handover_snapshot, .handover_report, .handover_closed, .handover_deadline, .handover_command => self.handleHandoverEvent(ev),
             .turn_block => |tb| {
                 defer self.gpa.free(tb.line);
                 const session = self.sessions.get(tb.sid);
@@ -2017,6 +2139,11 @@ pub const Daemon = struct {
             self.sendTo(client, .{ .err = .{ .code = "no_hello", .msg = "hello required first" } });
             return;
         }
+        // Mid-handover the successor owns the store: nothing here may change.
+        if (self.outgoing) |out| if (out.frozen() and msg != .hello and msg != .handover_watch) {
+            self.sendTo(client, .{ .err = .{ .code = "restarting", .msg = "Marlin is restarting; try again in a moment" } });
+            return;
+        };
         switch (msg) {
             .web_status => try self.sendWebStatus(client),
             .web_pair => {
@@ -2160,8 +2287,11 @@ pub const Daemon = struct {
                     .daemon_started_at_ms = self.started_at_ms,
                     .remote_shell = true,
                     .voice = true,
+                    .handover = self.marlin_exe != null,
                 } });
             },
+            .handover_watch => client.watches_handover = true,
+            .handover_arrived => |ha| self.reportArrival(ha.token),
             .shell_open => |so| {
                 try self.openShell(client, so.request_id, so.sid, .{
                     .cols = so.cols,
@@ -3848,11 +3978,12 @@ pub const Daemon = struct {
                 self.nudgeAcceptLoop();
             },
             .reboot => |r| {
+                if (r.handover) return self.requestHandover(client, r.force, r.build);
                 // A reboot is a voluntary, coordinated crash (ARCHITECTURE.md
                 // §self-hosting reboot). Quiesce: by default wait for running
                 // turns to finish; force interrupts them (blocks are truth,
                 // partial deltas are discardable).
-                if (self.pending_reboot != null) {
+                if (self.pending_reboot != null or self.outgoing != null) {
                     self.sendTo(client, .{ .err = .{
                         .code = "reboot_pending",
                         .msg = "another client already requested reboot",
@@ -6569,7 +6700,418 @@ pub const Daemon = struct {
     /// Complete a pending /reboot once every session is quiescent. Sends the
     /// ok ack, tears down, then closes the requesting connection; ACK plus EOF
     /// is the client's cue to exec and autostart the new binary.
+    // ------------------------------------------------------- handover --
+    // Graceful handover (handover.zig). Outgoing: build (optional), pause
+    // sessions, stop shell readers, start the successor with our listener,
+    // lock and PTYs, then on its `ready` move every client with a token and
+    // exit once each has arrived. Incoming: adopt all of that in serve().
+
+    fn anySessionActive(self: *Daemon) bool {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            const state = sp.*.state;
+            if (state == .running or state == .awaiting_approval) return true;
+        }
+        return false;
+    }
+
+    const NoticeCtx = struct { self: *Daemon, line: []const u8 };
+
+    /// To handover watchers: a restart's progress or failure.
+    fn handoverNotice(self: *Daemon, text: []const u8, err: bool) void {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const line = proto.encode(arena.allocator(), proto.DaemonMsg{ .daemon_notice = .{ .text = text, .err = err } }) catch return;
+        self.forEachClient(NoticeCtx{ .self = self, .line = line }, struct {
+            fn send(ctx: NoticeCtx, client: *Client) void {
+                if (client.said_hello and client.watches_handover) ctx.self.sendLine(client, ctx.line);
+            }
+        }.send);
+    }
+
+    fn requestHandover(self: *Daemon, client: *Client, force: bool, build: bool) !void {
+        if (self.pending_reboot != null or self.outgoing != null) {
+            self.sendTo(client, .{ .err = .{ .code = "reboot_pending", .msg = "a restart is already under way" } });
+            return;
+        }
+        if (self.marlin_exe == null) {
+            self.sendTo(client, .{ .err = .{ .code = "handover", .msg = "this Marlin cannot find its own executable to restart" } });
+            return;
+        }
+        const out = try self.gpa.create(Outgoing);
+        out.* = .{ .phase = if (build) .building else .quiescing, .requester = client.id, .force = force };
+        self.outgoing = out;
+        self.sendTo(client, .{ .ok = .{} });
+        if (!build) return self.handoverQuiesce();
+        self.handoverNotice("building Marlin…", false);
+        out.build_thread = std.Thread.spawn(.{}, buildForHandover, .{self}) catch
+            return self.abortHandover("could not start the build; Marlin keeps running");
+    }
+
+    /// Worker: rebuild this daemon's checkout in place (self_build.zig).
+    fn buildForHandover(self: *Daemon) void {
+        const msg: ?[]u8 = if (self_build.build(self.gpa, self.io, "Marlin")) |candidate| {
+            self.gpa.free(candidate);
+            self.events.push(self.io, .{ .handover_built = .{ .failed = false } }) catch {};
+            return;
+        } else |err| switch (err) {
+            error.NotSourceBuild => self.gpa.dupe(u8, "this Marlin is not a source build: update it with its installer") catch null,
+            else => std.fmt.allocPrint(self.gpa, "the build failed ({t}); Marlin keeps running, details in its log", .{err}) catch null,
+        };
+        self.events.push(self.io, .{ .handover_built = .{ .failed = true, .msg = msg } }) catch if (msg) |m| self.gpa.free(m);
+    }
+
+    fn handoverQuiesce(self: *Daemon) void {
+        const out = self.outgoing orelse return;
+        out.phase = .quiescing;
+        self.handoverNotice("restarting Marlin…", false);
+        // Paused with restart intent, so the successor resumes them.
+        self.pauseActiveSessions(true, out.force) catch |err| {
+            std.log.err("handover: could not pause sessions: {t}", .{err});
+            return self.abortHandover("could not pause the running sessions; Marlin keeps running");
+        };
+        self.maybeFinishReboot();
+    }
+
+    /// Sessions are quiet: stop accepting and stop reading shells. The
+    /// snapshot waits for an event behind every shell_output already queued.
+    fn handoverQuiesced(self: *Daemon) void {
+        const out = self.outgoing orelse return;
+        out.phase = .snapshotting;
+        self.handing_over.store(true, .release);
+        self.nudgeAcceptLoop();
+        var it = self.shells.valueIterator();
+        while (it.next()) |hp| if (hp.*.pty) |pty| pty.pauseReader();
+        self.events.push(self.io, .handover_snapshot) catch
+            self.abortHandover("could not start the new Marlin; Marlin keeps running");
+    }
+
+    fn startSuccessor(self: *Daemon) !void {
+        const out = self.outgoing orelse return;
+        const lock = self.instance_lock orelse return error.NoInstanceLock;
+        if (self.listen_fd < 0) return error.NoListener;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var shells: std.ArrayList(handover.ShellState) = .empty;
+        var inherit: std.ArrayList(std.posix.fd_t) = .empty;
+        try inherit.appendSlice(arena, &.{ self.listen_fd, lock.handle });
+        var it = self.shells.valueIterator();
+        while (it.next()) |hp| {
+            const host = hp.*;
+            const pty = host.pty orelse continue;
+            const snapshot = try host.snapshot(arena);
+            const encoder = std.base64.standard.Encoder;
+            const encoded = try arena.alloc(u8, encoder.calcSize(snapshot.len));
+            try shells.append(arena, .{
+                .id = host.id,
+                .sid = host.sid,
+                .pid = pty.pid,
+                .master_fd = pty.master,
+                .cols = host.geometry.cols,
+                .rows = host.geometry.rows,
+                .cell_width = host.geometry.cell_width,
+                .cell_height = host.geometry.cell_height,
+                .cwd = host.cwd,
+                .created_at_ms = host.created_at_ms,
+                .ran = host.ran,
+                .commands = host.commands.items,
+                .snapshot_base64 = encoder.encode(encoded, snapshot),
+            });
+            try inherit.append(arena, pty.master);
+        }
+        const control = try handover.controlPair();
+        out.control_fd = control[0];
+        if (std.c.pipe(&out.wake) != 0) {
+            out.wake = .{ -1, -1 };
+            _ = std.c.close(control[1]);
+            return error.PipeFailed;
+        }
+        for (out.wake) |fd| setCloseOnExec(fd) catch {};
+        out.child = handover.spawnSuccessor(self.gpa, self.io, self.marlin_exe.?, self.environ, control[1], inherit.items) catch |err| {
+            _ = std.c.close(control[1]);
+            return err;
+        };
+        _ = std.c.close(control[1]);
+        out.phase = .starting;
+        out.reader = try std.Thread.spawn(.{}, readSuccessor, .{ self, out });
+        try handover.send(self.gpa, out.control_fd, handover.State{
+            .listen_fd = self.listen_fd,
+            .lock_fd = lock.handle,
+            .predecessor_pid = std.c.getpid(),
+            .next_shell_id = self.next_shell_id,
+            .shells = shells.items,
+        });
+        std.log.info("handover: started successor pid {d} with {d} shell(s)", .{ out.child.?.id.?, shells.items.len });
+        self.handoverNotice("starting the new Marlin…", false);
+    }
+
+    /// Control reader (outgoing side): the successor's reports, and the
+    /// arrival deadline once one is set.
+    fn readSuccessor(self: *Daemon, out: *Outgoing) void {
+        var reader: handover.LineReader = .{ .fd = out.control_fd };
+        defer reader.deinit(self.gpa);
+        while (true) {
+            while (reader.take()) |line| {
+                var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena_state.deinit();
+                const report = handover.parseReport(arena_state.allocator(), line) catch continue;
+                const kind: @FieldType(@FieldType(Event, "handover_report"), "kind") = switch (report) {
+                    .ready => .ready,
+                    .arrived => .arrived,
+                    .failed => .failed,
+                };
+                const text = self.gpa.dupe(u8, switch (report) {
+                    .ready => "",
+                    .arrived => |a| a.token,
+                    .failed => |f| f.msg,
+                }) catch continue;
+                self.events.push(self.io, .{ .handover_report = .{ .kind = kind, .text = text } }) catch {
+                    self.gpa.free(text);
+                    return;
+                };
+            }
+            const deadline = out.deadline_ms.load(.acquire);
+            const timeout: c_int = if (deadline == 0) -1 else @intCast(std.math.clamp(deadline - nowMs(self.io), 0, std.math.maxInt(c_int)));
+            var fds = [_]std.c.pollfd{
+                .{ .fd = out.control_fd, .events = std.c.POLL.IN, .revents = 0 },
+                .{ .fd = out.wake[0], .events = std.c.POLL.IN, .revents = 0 },
+            };
+            const ready = std.c.poll(&fds, fds.len, timeout);
+            if (ready < 0) continue; // EINTR
+            if (ready == 0) {
+                if (out.deadline_ms.cmpxchgStrong(deadline, 0, .acq_rel, .acquire) == null)
+                    self.events.push(self.io, .handover_deadline) catch return;
+                continue;
+            }
+            if (fds[1].revents != 0) {
+                var drained: [64]u8 = undefined;
+                if (std.c.read(out.wake[0], &drained, drained.len) <= 0) return;
+            }
+            if (fds[0].revents == 0) continue;
+            const more = reader.fill(self.gpa, 64 * 1024) catch false;
+            if (!more) {
+                self.events.push(self.io, .handover_closed) catch {};
+                return;
+            }
+        }
+    }
+
+    /// The successor is ready: hand each watcher a token, close every
+    /// connection, let the web companion finish and free the port, and wait
+    /// for the tokens to arrive.
+    fn moveClients(self: *Daemon) void {
+        const out = self.outgoing orelse return;
+        out.phase = .moving;
+        // Collected first: flushing waits, and must not hold the registry lock.
+        var client_ids: std.ArrayList(u64) = .empty;
+        defer client_ids.deinit(std.heap.page_allocator);
+        self.forEachClient(&client_ids, struct {
+            fn collect(list: *std.ArrayList(u64), client: *Client) void {
+                list.append(std.heap.page_allocator, client.id) catch {};
+            }
+        }.collect);
+        for (client_ids.items) |id| {
+            const client = self.lookupClient(id) orelse continue;
+            if (client.said_hello and client.watches_handover) {
+                const token = handover.newToken(self.io);
+                out.pending.add(self.gpa, token) catch {};
+                if (self.sendToTracked(client, .{ .daemon_handover = .{ .token = &token } })) |seq| {
+                    if (!self.waitForClientFlush(client, seq, 2_000))
+                        std.log.warn("handover token did not flush to client {d}", .{client.id});
+                }
+            }
+            client.stream.shutdown(self.io, .both) catch {};
+        }
+        if (self.web_service) |service| service.drain();
+        handover.send(self.gpa, out.control_fd, handover.Command{ .web_released = .{} }) catch {};
+        std.log.info("handover: moved {d} client(s), waiting for {d} to arrive", .{ client_ids.items.len, out.pending.tokens.items.len });
+        if (out.pending.empty()) return self.finishHandover();
+        out.deadline_ms.store(nowMs(self.io) + @as(i64, @intCast(@min(self.cfg.reboot_handover_wait_ms, std.math.maxInt(i32)))), .release);
+        _ = std.c.write(out.wake[1], "x", 1);
+    }
+
+    fn finishHandover(self: *Daemon) void {
+        const out = self.outgoing orelse return;
+        if (out.phase == .finishing) return;
+        out.phase = .finishing;
+        handover.send(self.gpa, out.control_fd, handover.Command{ .done = .{} }) catch {};
+        self.handed_over = true;
+        // The successor runs the shells now: let go without hanging up.
+        var it = self.shells.valueIterator();
+        while (it.next()) |hp| if (hp.*.pty) |pty| {
+            pty.release();
+            hp.*.pty = null;
+        };
+        std.log.info("handover complete; exiting", .{});
+        self.events.close(self.io);
+        self.running.store(false, .release);
+        self.nudgeAcceptLoop();
+    }
+
+    /// Before the successor is ready, nothing happened: carry on as before.
+    fn abortHandover(self: *Daemon, msg: []const u8) void {
+        const out = self.outgoing orelse return;
+        std.log.warn("handover aborted: {s}", .{msg});
+        self.outgoing = null;
+        const requester = out.requester; // `out` is freed below
+        if (out.child) |*child| child.kill(self.io);
+        out.child = null;
+        self.endOutgoing(out);
+        var it = self.shells.valueIterator();
+        while (it.next()) |hp| if (hp.*.pty) |pty| pty.resumeReader() catch |err|
+            std.log.err("shell {d} stopped mirroring: {t}", .{ hp.*.id, err });
+        self.handing_over.store(false, .release);
+        self.nudgeAcceptLoop();
+        self.resumePausedSessions(true) catch |err| std.log.err("could not resume suspended sessions: {t}", .{err});
+        self.handoverNotice(msg, true);
+        if (self.lookupClient(requester)) |client| self.sendTo(client, .{ .err = .{ .code = "handover", .msg = msg } });
+    }
+
+    /// Close the control channel, join its reader and any build, and free.
+    fn endOutgoing(self: *Daemon, out: *Outgoing) void {
+        if (out.control_fd >= 0) _ = std.c.shutdown(out.control_fd, std.c.SHUT.RDWR);
+        if (out.wake[1] >= 0) _ = std.c.close(out.wake[1]);
+        if (out.reader) |thread| thread.join();
+        if (out.build_thread) |thread| thread.join();
+        if (out.wake[0] >= 0) _ = std.c.close(out.wake[0]);
+        if (out.control_fd >= 0) _ = std.c.close(out.control_fd);
+        out.pending.deinit(self.gpa);
+        self.gpa.destroy(out);
+    }
+
+    fn handleHandoverEvent(self: *Daemon, ev: Event) void {
+        switch (ev) {
+            .handover_built => |hb| {
+                defer if (hb.msg) |m| self.gpa.free(m);
+                const out = self.outgoing orelse return;
+                if (out.build_thread) |thread| thread.join();
+                out.build_thread = null;
+                if (hb.failed) return self.abortHandover(hb.msg orelse "the build failed; Marlin keeps running");
+                self.handoverQuiesce();
+            },
+            .handover_snapshot => {
+                if (self.outgoing == null) return;
+                self.startSuccessor() catch |err| {
+                    std.log.err("handover: could not start the successor: {t}", .{err});
+                    self.abortHandover("could not start the new Marlin; Marlin keeps running");
+                };
+            },
+            .handover_report => |r| {
+                defer self.gpa.free(r.text);
+                const out = self.outgoing orelse return;
+                switch (r.kind) {
+                    .ready => if (out.phase == .starting) self.moveClients(),
+                    .arrived => if (out.pending.arrive(r.text) and out.phase == .moving and out.pending.empty()) self.finishHandover(),
+                    .failed => if (out.phase == .starting) {
+                        std.log.err("handover: the successor failed: {s}", .{r.text});
+                        const msg = std.fmt.allocPrint(self.gpa, "the new Marlin did not start ({s}); Marlin keeps running", .{r.text}) catch null;
+                        defer if (msg) |m| self.gpa.free(m);
+                        self.abortHandover(msg orelse "the new Marlin did not start; Marlin keeps running");
+                    },
+                }
+            },
+            .handover_closed => {
+                const out = self.outgoing orelse return;
+                switch (out.phase) {
+                    .starting => self.abortHandover("the new Marlin exited while starting; Marlin keeps running"),
+                    .moving => {
+                        std.log.err("handover: the successor exited after taking over", .{});
+                        self.finishHandover();
+                    },
+                    else => {},
+                }
+            },
+            .handover_deadline => {
+                const out = self.outgoing orelse return;
+                if (out.phase != .moving) return;
+                std.log.warn("handover: {d} client(s) did not arrive within {d} ms; exiting anyway", .{ out.pending.tokens.items.len, self.cfg.reboot_handover_wait_ms });
+                self.finishHandover();
+            },
+            .handover_command => |command| switch (command) {
+                .web_released => self.startDeferredWeb(),
+                .done => {
+                    self.startDeferredWeb();
+                    self.endPredecessor();
+                },
+            },
+            else => unreachable,
+        }
+    }
+
+    // Incoming side.
+
+    /// A client presented its token: tell the predecessor.
+    fn reportArrival(self: *Daemon, token: []const u8) void {
+        if (self.predecessor_fd < 0) return;
+        handover.send(self.gpa, self.predecessor_fd, handover.Report{ .arrived = .{ .token = token } }) catch {};
+    }
+
+    fn startDeferredWeb(self: *Daemon) void {
+        if (!self.web_deferred) return;
+        self.web_deferred = false;
+        if (self.web_service) |service| service.start() catch |err| std.log.warn("cannot start companion: {t}", .{err});
+    }
+
+    fn endPredecessor(self: *Daemon) void {
+        if (self.predecessor_fd < 0) return;
+        _ = std.c.shutdown(self.predecessor_fd, std.c.SHUT.RDWR);
+        if (self.predecessor_reader) |thread| thread.join();
+        self.predecessor_reader = null;
+        _ = std.c.close(self.predecessor_fd);
+        self.predecessor_fd = -1;
+    }
+
+    /// Control reader (incoming side): the predecessor's commands. EOF means
+    /// it is gone, which is as good as done.
+    fn readPredecessor(self: *Daemon, start: handover.LineReader) void {
+        var reader = start;
+        defer reader.deinit(self.gpa);
+        while (true) {
+            const line = (reader.next(self.gpa, 64 * 1024) catch null) orelse break;
+            var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena_state.deinit();
+            const command = handover.parseCommand(arena_state.allocator(), line) catch continue;
+            switch (command) {
+                .web_released => self.events.push(self.io, .{ .handover_command = .web_released }) catch return,
+                .done => break,
+            }
+        }
+        self.events.push(self.io, .{ .handover_command = .done }) catch {};
+    }
+
+    /// Take over the predecessor's running shells: a mirror restored from
+    /// its snapshot, reading the inherited PTY.
+    fn adoptShells(self: *Daemon, shells: []const handover.ShellState, next_shell_id: u64) void {
+        self.next_shell_id = @max(self.next_shell_id, next_shell_id);
+        for (shells) |state| {
+            self.adoptShell(state) catch |err| {
+                std.log.err("handover: could not adopt shell {d}: {t}", .{ state.id, err });
+                _ = std.c.kill(-state.pid, .HUP);
+                _ = std.c.close(state.master_fd);
+            };
+        }
+    }
+
+    fn adoptShell(self: *Daemon, state: handover.ShellState) !void {
+        const geometry: shell_host.Geometry = .{ .cols = state.cols, .rows = state.rows, .cell_width = state.cell_width, .cell_height = state.cell_height };
+        const decoder = std.base64.standard.Decoder;
+        const snapshot = try self.gpa.alloc(u8, try decoder.calcSizeForSlice(state.snapshot_base64));
+        defer self.gpa.free(snapshot);
+        try decoder.decode(snapshot, state.snapshot_base64);
+        const host = try shell_host.Host.fromSnapshot(self.gpa, self.io, state.id, state.sid, state.cwd, state.created_at_ms, geometry, snapshot);
+        errdefer host.destroy();
+        try host.restore(state.ran, state.commands);
+        host.pty = try shell_pty.Shell.adopt(self.gpa, self.io, state.id, state.master_fd, state.pid, .{ .ctx = self, .output = onShellOutput, .exited = onShellExited, .settled = onShellSettled });
+        try self.shells.put(self.gpa, state.id, host);
+        std.log.info("handover: adopted shell {d} (pid {d})", .{ state.id, state.pid });
+    }
+
     fn maybeFinishReboot(self: *Daemon) void {
+        if (self.outgoing) |out| {
+            if (out.phase == .quiescing and !self.anySessionActive()) self.handoverQuiesced();
+            return;
+        }
         const requester = self.pending_reboot orelse return;
         var sit = self.sessions.valueIterator();
         while (sit.next()) |sp| {
@@ -6826,6 +7368,7 @@ pub const Daemon = struct {
     }
 
     fn refusePendingRebootForCheckpoint(self: *Daemon) void {
+        if (self.outgoing != null) return self.abortHandover("could not save a paused session; Marlin keeps running");
         const requester = self.pending_reboot orelse return;
         self.pending_reboot = null;
         self.reboot_suspend = false;
@@ -6865,10 +7408,16 @@ pub const Daemon = struct {
     }
 
     fn shutdownCleanup(self: *Daemon) void {
+        if (self.outgoing) |out| {
+            self.outgoing = null;
+            self.endOutgoing(out);
+        }
+        self.endPredecessor();
         var shells = self.shells.valueIterator();
         while (shells.next()) |shell| {
-            // Their last state, for the next start to report.
-            self.saveShellState(shell.*);
+            // Their last state, for the next start to report; after a
+            // handover the successor has them and the store.
+            if (!self.handed_over) self.saveShellState(shell.*);
             shell.*.destroy();
         }
         self.shells.deinit(self.gpa);
@@ -6979,8 +7528,9 @@ pub const Daemon = struct {
         self.clients.deinit(self.gpa);
         self.clients_mutex.unlock(self.io);
 
-        // Remove the socket so the (blocked) accept loop errors out.
-        if (!self.socket_retired) self.removeSocketFile();
+        // Remove the socket so the (blocked) accept loop errors out. After a
+        // handover it is the successor's.
+        if (!self.socket_retired and !self.handed_over) self.removeSocketFile();
         self.releaseInstanceLock();
     }
 
@@ -6993,6 +7543,9 @@ pub const Daemon = struct {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
             .client_gone, .turn_resumed, .turn_usage_credits, .turn_guest_pid, .turn_phase, .shell_exited, .shell_settled, .shutdown => {},
+            .handover_snapshot, .handover_closed, .handover_deadline, .handover_command => {},
+            .handover_built => |value| if (value.msg) |msg| self.gpa.free(msg),
+            .handover_report => |value| self.gpa.free(value.text),
             .shell_output => |value| self.gpa.free(value.bytes),
             .client_line => |value| self.gpa.free(value.line),
             .voice_done => |value| self.gpa.free(value.line),
@@ -7535,6 +8088,11 @@ test "client teardown interrupts a writer blocked on a non-reading peer" {
     defer client_stream.close(io);
 
     var daemon: Daemon = undefined;
+    daemon.outgoing = null;
+    daemon.predecessor_fd = -1;
+    daemon.predecessor_reader = null;
+    daemon.handed_over = false;
+    daemon.web_deferred = false;
     daemon.gpa = gpa;
     daemon.io = io;
     var client = Client{
@@ -7582,6 +8140,11 @@ test "slow-client outbox is bounded" {
     defer client_stream.close(io);
 
     var daemon: Daemon = undefined;
+    daemon.outgoing = null;
+    daemon.predecessor_fd = -1;
+    daemon.predecessor_reader = null;
+    daemon.handed_over = false;
+    daemon.web_deferred = false;
     daemon.gpa = gpa;
     daemon.io = io;
     var client = Client{
@@ -7648,6 +8211,11 @@ test "a dying bridge client unparks its session's parked cc approval" {
     const io = threaded.io();
 
     var daemon: Daemon = undefined;
+    daemon.outgoing = null;
+    daemon.predecessor_fd = -1;
+    daemon.predecessor_reader = null;
+    daemon.handed_over = false;
+    daemon.web_deferred = false;
     daemon.gpa = gpa;
     daemon.io = io;
     daemon.store = try store_mod.Store.open(gpa, null);
@@ -7694,6 +8262,11 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     const io = threaded.io();
 
     var daemon: Daemon = undefined;
+    daemon.outgoing = null;
+    daemon.predecessor_fd = -1;
+    daemon.predecessor_reader = null;
+    daemon.handed_over = false;
+    daemon.web_deferred = false;
     daemon.gpa = gpa;
     daemon.io = io;
     daemon.store = try store_mod.Store.open(gpa, null);
@@ -7743,6 +8316,11 @@ test "a disconnected requester cannot leave a delayed reboot armed" {
     defer threaded.deinit();
 
     var daemon: Daemon = undefined;
+    daemon.outgoing = null;
+    daemon.predecessor_fd = -1;
+    daemon.predecessor_reader = null;
+    daemon.handed_over = false;
+    daemon.web_deferred = false;
     daemon.gpa = gpa;
     daemon.io = threaded.io();
     daemon.clients = .empty;

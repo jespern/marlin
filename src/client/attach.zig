@@ -67,6 +67,8 @@ pub const Conn = struct {
     /// The daemon sets up and transcribes dictation (hello_ok.voice).
     remote_voice: bool = false,
     pause_resume: bool = false,
+    /// The daemon hands over gracefully on restart (hello_ok.handover).
+    handover: bool = false,
     network_filtering: bool = false,
     network_configured: bool = false,
     /// OTLP exporter state at handshake; the /otel status reply refreshes it.
@@ -338,6 +340,20 @@ fn requestStopRun(conn: *Conn, command: proto.ClientMsg) !void {
     var arena = std.heap.ArenaAllocator.init(conn.gpa);
     defer arena.deinit();
     _ = try conn.recvUntil(arena.allocator(), .ok);
+    // A handover is accepted at once and closes this connection only when
+    // the successor accepts on the socket, so what runs next reaches it; an
+    // err means it was abandoned and this daemon carries on. Closing the
+    // write side here would read as this client leaving.
+    if (command == .reboot and command.reboot.handover) {
+        while (true) {
+            const line = conn.readLine() catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => return err,
+            };
+            defer conn.gpa.free(line);
+            if (std.mem.startsWith(u8, line, "{\"err\"")) return error.DaemonError;
+        }
+    }
     conn.closeWrite();
     while (true) {
         const line = conn.readLine() catch |err| switch (err) {
@@ -372,6 +388,7 @@ pub fn handshake(conn: *Conn, timeout_ms: u32, cancel: ?*const ConnectCancel) !v
     conn.remote_shell = hello.remote_shell;
     conn.remote_voice = hello.voice;
     conn.pause_resume = hello.pause_resume;
+    conn.handover = hello.handover;
     conn.network_filtering = hello.network_filtering;
     conn.network_configured = hello.network_configured;
     conn.otel_enabled = hello.otel_enabled;

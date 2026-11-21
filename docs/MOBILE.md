@@ -213,6 +213,17 @@ shows the canonical address; the mobile header reports connecting, offline,
 and reconnecting states. Returning to the app opens a fresh SSE stream and
 replays session history with the existing sequence deduplication.
 
+## Restarting from the phone
+
+`/reboot` in the composer restarts Marlin on its machine; `/reboot --build`
+first rebuilds it from its source checkout (a phone has no build of its own).
+It is the terminal's graceful handover: running turns pause and resume on the
+new daemon, shells keep running, and this page is moved across like every
+terminal. Its event stream carries a token, the page reconnects with it after
+a moment (the web server is restarted too, so there is a gap of well under a
+second), and the old daemon exits once the page has arrived. A failed build or
+start says why in the status strip and leaves Marlin as it was.
+
 ## Verification
 
 Run `zig build test` and `zig build e2e`. For the browser check, install

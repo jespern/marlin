@@ -802,6 +802,10 @@ pub const App = struct {
     shell_requested: bool = false,
     remote_transport: bool = false,
     reconnecting: bool = false,
+    /// The daemon is handing over (daemon_handover): the token to present
+    /// to its successor once reconnected. Empty otherwise.
+    handover_token: [64]u8 = undefined,
+    handover_token_len: usize = 0,
     next_input_request_id: u64 = 1,
     /// Up asked the daemon for this queue entry back; its ok fills the composer.
     unqueue_pending: struct { request_id: u64 = 0, sid: u64 = 0, queue_id: u64 = 0 } = .{},
@@ -2177,6 +2181,15 @@ pub const App = struct {
             .shell_exited => |m| shell_tab.exited(self, m),
             .shell_signal => |signal| self.shellSignal(signal),
             .shell_list_result => {},
+            .daemon_handover => |dh| {
+                // The connection closes next; reconnecting quietly is the
+                // whole point, and the token proves this client arrived.
+                const n = @min(dh.token.len, self.handover_token.len);
+                @memcpy(self.handover_token[0..n], dh.token[0..n]);
+                self.handover_token_len = n;
+                self.setNotice("restarting Marlin…", .{});
+            },
+            .daemon_notice => |dn| self.setNotice("{s}", .{dn.text}),
             .daemon_stopping => {
                 // Deliberate shutdown must not enter the crash-reconnect path,
                 // which would immediately autostart a replacement daemon.
@@ -5752,6 +5765,7 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
         return false;
     };
     new_conn.send(.{ .council_list = .{} }) catch {};
+    if (new_conn.handover) new_conn.send(.{ .handover_watch = .{} }) catch {};
     if (app.view.last_seq == 0) {
         new_conn.send(.{ .sub = .{
             .skill_catalog = true,
@@ -5838,6 +5852,12 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
         app.setNotice("reconnected · retry {s} if it did not finish", .{command});
     } else {
         app.setNotice("reconnected", .{});
+    }
+    if (app.handover_token_len > 0) {
+        // Resubscribed: tell the new daemon this client made it across.
+        new_conn.send(.{ .handover_arrived = .{ .token = app.handover_token[0..app.handover_token_len] } }) catch {};
+        app.handover_token_len = 0;
+        app.setNotice("Marlin restarted · v{s}", .{new_conn.daemonVersion()});
     }
     return true;
 }
@@ -6407,6 +6427,8 @@ pub fn run(
         // Lightweight catalog/status updates for every session; block streams
         // remain subscribed only for the focused session.
         try conn.send(.{ .session_watch = .{ .incremental = true } });
+        // Follow the daemon across a graceful restart.
+        if (conn.handover) conn.send(.{ .handover_watch = .{} }) catch {};
         // Council cache for /review expansion; silent (no notice pending).
         conn.send(.{ .council_list = .{} }) catch {};
 
@@ -6475,7 +6497,7 @@ pub fn run(
                     app.should_quit = true;
                 } else {
                     app.reconnecting = true;
-                    app.setNotice("connection lost — reconnecting…", .{});
+                    if (app.handover_token_len == 0) app.setNotice("connection lost — reconnecting…", .{});
                     reconnect_job = .{ .app = &app, .loop = &loop, .self_exe = self_exe };
                     reconnect_thread = std.Thread.spawn(.{}, ReconnectJob.run, .{&reconnect_job}) catch blk: {
                         daemon_disconnect_reason = reason;

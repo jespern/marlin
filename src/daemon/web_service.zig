@@ -10,6 +10,8 @@ pub const Service = struct {
     exe: []const u8,
     mutex: Io.Mutex = .init,
     pid: ?std.process.Child.Id = null,
+    /// The companion's stdin while it runs: a byte asks it to drain.
+    stdin: ?Io.File = null,
     stopping: bool = false,
     thread: ?std.Thread = null,
     state: []const u8 = "stopped",
@@ -37,6 +39,18 @@ pub const Service = struct {
         if (self.pid) |pid| {
             if (@import("builtin").os.tag != .windows) _ = std.c.kill(pid, std.posix.SIG.KILL);
         }
+        self.mutex.unlock(self.io);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+    }
+    /// Graceful stop for a handover: the companion stops accepting, lets
+    /// its open streams forward what the daemon last sent them (their daemon
+    /// connections are already closed), and exits. Returns once it has, with
+    /// the port free.
+    pub fn drain(self: *Service) void {
+        self.mutex.lockUncancelable(self.io);
+        self.stopping = true;
+        if (self.stdin) |stdin| _ = std.c.write(stdin.handle, "d", 1);
         self.mutex.unlock(self.io);
         if (self.thread) |thread| thread.join();
         self.thread = null;
@@ -90,8 +104,10 @@ pub const Service = struct {
         defer child.kill(self.io);
         self.mutex.lockUncancelable(self.io);
         self.pid = child.id;
+        self.stdin = child.stdin;
         if (self.stopping) {
             self.pid = null;
+            self.stdin = null;
             self.mutex.unlock(self.io);
             return;
         }
@@ -100,6 +116,7 @@ pub const Service = struct {
         defer {
             self.mutex.lockUncancelable(self.io);
             self.pid = null;
+            self.stdin = null;
             self.mutex.unlock(self.io);
         }
         var buf: [32768]u8 = undefined;

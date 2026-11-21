@@ -1,6 +1,8 @@
 //! Internal remote source rebuild command. The local coordinator invokes it
 //! through SSH, waits for a readiness marker, then reboots the daemon through
-//! the existing protocol before releasing this process to start the new daemon.
+//! the existing protocol before releasing this process to start the new daemon
+//! ("continue"), or tells it the daemon handed over to the build itself
+//! ("handover").
 
 const std = @import("std");
 const Io = std.Io;
@@ -39,6 +41,8 @@ pub fn run(
     var stdin_buf: [64]u8 = undefined;
     var stdin_reader = Io.File.stdin().reader(io, &stdin_buf);
     const command = stdin_reader.interface.takeDelimiterExclusive('\n') catch return 1;
+    // The daemon started the new build itself (a graceful handover).
+    if (std.mem.eql(u8, command, "handover")) return 0;
     if (!std.mem.eql(u8, command, "continue")) return 1;
 
     var child = std.process.spawn(io, .{

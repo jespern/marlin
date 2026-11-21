@@ -71,19 +71,44 @@ pub const Host = struct {
     /// Heap-allocated: the stream's handler points at `terminal`. The PTY is
     /// spawned by `start` once the host is at its final address.
     pub fn create(gpa: std.mem.Allocator, io: Io, id: u64, sid: u64, cwd: []const u8, created_at_ms: i64, geometry: Geometry) !*Host {
-        const self = try gpa.create(Host);
-        errdefer gpa.destroy(self);
-        const owned_cwd = try gpa.dupe(u8, cwd);
-        errdefer gpa.free(owned_cwd);
+        const terminal: vt.Terminal = try .init(io, gpa, .{
+            .cols = @max(geometry.cols, 1),
+            .rows = @max(geometry.rows, 1),
+            .max_scrollback_bytes = scrollback_bytes,
+        });
+        return withTerminal(gpa, id, sid, cwd, created_at_ms, geometry, terminal, "");
+    }
+
+    /// A mirror restored from another daemon's snapshot (handover). The
+    /// PTY is attached afterwards, so a reply the half-parsed sequence
+    /// provokes goes nowhere.
+    pub fn fromSnapshot(gpa: std.mem.Allocator, io: Io, id: u64, sid: u64, cwd: []const u8, created_at_ms: i64, geometry: Geometry, bytes: []const u8) !*Host {
+        var reader: Io.Reader = .fixed(bytes);
+        var decoded = try vt.snapshot.decode(gpa, io, &reader, .{ .max_continuation_bytes = max_continuation_bytes });
+        defer decoded.deinit(gpa);
+        const pending: []const u8 = switch (decoded.continuation) {
+            .ground => "",
+            .bytes => |b| b,
+        };
+        return withTerminal(gpa, id, sid, cwd, created_at_ms, geometry, decoded.toOwned(), pending);
+    }
+
+    fn withTerminal(gpa: std.mem.Allocator, id: u64, sid: u64, cwd: []const u8, created_at_ms: i64, geometry: Geometry, terminal: vt.Terminal, pending: []const u8) !*Host {
+        var owned_terminal = terminal;
+        const self = gpa.create(Host) catch |err| {
+            owned_terminal.deinit(gpa);
+            return err;
+        };
+        const owned_cwd = gpa.dupe(u8, cwd) catch |err| {
+            owned_terminal.deinit(gpa);
+            gpa.destroy(self);
+            return err;
+        };
         self.* = .{
             .gpa = gpa,
             .id = id,
             .sid = sid,
-            .terminal = try .init(io, gpa, .{
-                .cols = @max(geometry.cols, 1),
-                .rows = @max(geometry.rows, 1),
-                .max_scrollback_bytes = scrollback_bytes,
-            }),
+            .terminal = owned_terminal,
             .stream = undefined,
             .geometry = geometry,
             .cwd = owned_cwd,
@@ -99,7 +124,31 @@ pub const Host = struct {
         handler.effects.semantic_prompt = onSemanticPrompt;
         self.stream = .init(.{ .allocator = gpa, .handler = handler, .continuation_max_bytes = max_continuation_bytes });
         self.applyCellSize();
+        if (pending.len > 0) {
+            self.feed(pending);
+            self.freeSignals();
+        }
+        // A restored title was announced already.
+        _ = self.titleChanged();
         return self;
+    }
+
+    /// What a predecessor daemon knew about the shell beyond its terminal
+    /// (handover): the command it runs and the commands it reported.
+    pub fn restore(self: *Host, ran: ?[]const u8, commands: []const block.ShellCommand) !void {
+        for (self.commands.items) |command| self.gpa.free(command.command);
+        self.commands.clearRetainingCapacity();
+        for (commands) |command| {
+            const text = try self.gpa.dupe(u8, command.command);
+            self.commands.append(self.gpa, .{ .command = text, .exit_code = command.exit_code }) catch |err| {
+                self.gpa.free(text);
+                return err;
+            };
+        }
+        if (ran) |text| {
+            if (self.ran) |old| self.gpa.free(old);
+            self.ran = try self.gpa.dupe(u8, text);
+        }
     }
 
     pub fn start(self: *Host, io: Io, opts: shell_pty.Options, sink: shell_pty.Sink) !void {

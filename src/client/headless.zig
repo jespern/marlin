@@ -1427,13 +1427,23 @@ pub fn reboot(
         }
     }
 
+    var handed_over = false;
     if (actions.reboot_daemon) {
-        const ok = if (remote != null)
+        const outcome = if (remote != null)
             try rebootConnectedDaemon(gpa, io, environ, self_exe, options.force)
         else
             try rebootLocalDaemon(gpa, io, environ, options.force);
-        if (!ok) return 1;
+        if (outcome == .refused) return 1;
+        handed_over = outcome == .handing_over;
     }
+
+    // The daemon started the remote build as its successor: nothing to start.
+    if (remote_builder) |conn| if (handed_over) {
+        conn.writer.writeAll("handover\n") catch {};
+        conn.writer.flush() catch {};
+        remote_builder = null;
+        conn.deinit();
+    };
 
     if (remote_builder) |conn| {
         conn.writer.writeAll("continue\n") catch |err| {
@@ -1510,10 +1520,10 @@ fn rebootConnectedDaemon(
     environ: *const std.process.Environ.Map,
     self_exe: []const u8,
     force: bool,
-) !bool {
+) !RebootOutcome {
     const conn = attach.connect(gpa, io, environ, self_exe) catch |err| {
         try eprint(io, "marlin: cannot reach attached daemon for reboot: {t}\n", .{err});
-        return false;
+        return .refused;
     };
     defer conn.deinit();
     return requestReboot(gpa, io, conn, force);
@@ -1524,24 +1534,29 @@ fn rebootLocalDaemon(
     io: Io,
     environ: *const std.process.Environ.Map,
     force: bool,
-) !bool {
-    const conn = (attach.tryConnect(gpa, io, environ) catch null) orelse return true;
+) !RebootOutcome {
+    const conn = (attach.tryConnect(gpa, io, environ) catch null) orelse return .stopped;
     defer conn.deinit();
     try attach.handshake(conn, 2_000, null);
     return requestReboot(gpa, io, conn, force);
 }
 
-fn requestReboot(gpa: std.mem.Allocator, io: Io, conn: *attach.Conn, force: bool) !bool {
+const RebootOutcome = enum { refused, stopped, handing_over };
+
+fn requestReboot(gpa: std.mem.Allocator, io: Io, conn: *attach.Conn, force: bool) !RebootOutcome {
     _ = gpa;
-    try eprint(io, "marlin: waiting for daemon {d} to quiesce and close (up to 120s)...\n", .{conn.daemon_pid});
-    attach.requestStop(conn, .{ .reboot = .{ .force = force, .suspend_sessions = conn.pause_resume } }, 120_000) catch |err| {
+    if (conn.handover)
+        try eprint(io, "marlin: daemon {d} hands over to its new build...\n", .{conn.daemon_pid})
+    else
+        try eprint(io, "marlin: waiting for daemon {d} to quiesce and close (up to 120s)...\n", .{conn.daemon_pid});
+    attach.requestStop(conn, .{ .reboot = .{ .force = force, .suspend_sessions = conn.pause_resume, .handover = conn.handover } }, 120_000) catch |err| {
         if (err == error.DaemonError)
             try eprint(io, "marlin: reboot refused; daemon remains running\n", .{})
         else
             try eprint(io, "marlin: reboot not confirmed ({t}); client replacement aborted. Disconnect cancels a reboot still waiting for quiescence.\n", .{err});
-        return false;
+        return .refused;
     };
-    return true;
+    return if (conn.handover) .handing_over else .stopped;
 }
 
 fn print(io: Io, comptime fmt: []const u8, args: anytype) !void {

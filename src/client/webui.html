@@ -1483,6 +1483,14 @@ function setState(state) {
 }
 
 function handle(m) {
+  if (m.daemon_handover) {
+    // This stream ends next; come back to the new daemon with the token.
+    handoverToken = m.daemon_handover.token;
+    notice('restarting Marlin…');
+    setTimeout(connectEvents, 500);
+    return;
+  }
+  if (m.daemon_notice) { notice(m.daemon_notice.text); return; }
   if (m.blk) {
     if (m.blk.sid !== sid) return;
     const b = m.blk.b;
@@ -1733,6 +1741,7 @@ const slash_commands = [
   { name: '/archive', usage: '', desc: 'archive this session' },
   { name: '/new', usage: '', desc: 'start a new session' },
   { name: '/interrupt', usage: '', desc: 'interrupt the running turn' },
+  { name: '/reboot', usage: ' [--build]', desc: 'restart Marlin; --build rebuilds it first' },
 ];
 let slashSel = 0;
 function slashMatches(value) {
@@ -2704,6 +2713,12 @@ async function slashCommand(raw) {
     return $('#new-btn').onclick();
   } else if (cmd === '/interrupt') {
     r = await send('{"interrupt":{"sid":' + sid + ',"report":true}}');
+  } else if (cmd === '/reboot') {
+    // A graceful handover: the daemon starts its successor, moves every
+    // client across (this page included), and only then exits.
+    const build = arg === '--build';
+    r = await send(JSON.stringify({reboot: {handover: true, build}}));
+    if (!r.err) { notice(build ? 'building Marlin…' : 'restarting Marlin…'); return; }
   } else {
     notice(cmd + ' works in the terminal, not here');
     return;
@@ -2717,6 +2732,8 @@ $('#backdrop').onclick = () => drawer(false);
 // ---- connection, phone presence, and push ----
 const pageId = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER) || 1;
 let connectionReady = false, pushRegistration = null, pushSubscription = null, pushKey = null;
+// From daemon_handover until the new daemon's stream opens.
+let handoverToken = '';
 function connectionState(text) {
   $('#connection-state').textContent = text;
   $('#connection-badge').textContent = text === 'Connected' ? '' : text;
@@ -2732,8 +2749,11 @@ function connectEvents() {
   connectionReady = false;
   connectionState(navigator.onLine ? 'Connecting…' : 'Offline');
   if (!sid) return;
-  es = new EventSource('/events?sid=' + sid);
-  es.onopen = () => { connectionReady = true; connectionState('Connected'); phonePresence(); };
+  es = new EventSource('/events?sid=' + sid + (handoverToken ? '&handover=' + handoverToken : ''));
+  es.onopen = () => {
+    connectionReady = true; connectionState('Connected'); phonePresence();
+    if (handoverToken) { handoverToken = ''; notice('Marlin restarted'); loadSessions().catch(() => {}); }
+  };
   es.onmessage = e => handle(JSON.parse(bigints(e.data)));
   es.onerror = () => {
     connectionReady = false;

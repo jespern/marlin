@@ -461,6 +461,46 @@ Sequence:
    accepting clients; the handshake rejects mismatched proto_version so
    old-client/new-daemon is a clean error, never a crash.
 
+### Graceful handover
+
+Current clients restart through a handover instead (`reboot{handover}`,
+`src/daemon/handover.zig`): no client sees the daemon go away, and the old
+process exits only once the new one has every client.
+
+1. **Build** (optional, `build`): the daemon rebuilds its own checkout on a
+   worker, for a phone that has no build to run. Terminals build as before.
+2. **Pause**: running roots pause with restart intent, exactly as above.
+3. **Freeze**: the accept loop stops polling the listening socket, shell
+   readers stop (unread output stays in the PTY), and client requests get
+   err{restarting}. The predecessor writes nothing to the store from here.
+4. **Start**: the predecessor spawns its own executable with the listening
+   socket, the instance lock (the same open file, so it never lapses) and
+   each shell's PTY master inherited, plus a socketpair as control channel.
+   The first line on it is the state (fd numbers, shell geometry, commands,
+   and each mirror's libghostty snapshot). The successor opens and migrates
+   the store, rebuilds the shell mirrors from their snapshots, reads the
+   PTYs, and reports `ready`. Any failure before that (`failed`, or the
+   channel closing) resumes everything in the predecessor as if nothing
+   happened, and handover watchers hear why.
+5. **Move**: on `ready` each `handover_watch` client gets
+   `daemon_handover{token}`; then every connection is closed. Clients
+   reconnect through their usual path (the listener never closed, so nothing
+   is refused), resubscribe, reattach their shells, and send
+   `handover_arrived{token}`, which the successor reports back. The web
+   companion drains — forwards what its streams were sent, then exits — and
+   the successor starts its own on the freed port; the page reconnects with
+   its token.
+6. **Exit**: once every token has arrived, or `[reboot] handover_wait`
+   (default 60 s) passes, the predecessor releases its copies of the PTYs
+   without hanging up, leaves the socket file and the store alone, and exits.
+   The successor resumes the paused sessions.
+
+Shells are not the successor's children: their exit is noticed but its status
+is unknown (`shell_exited` without code or signal), never reported as 0. A
+successor that fails after migrating the store leaves the predecessor running
+on the migrated schema; migrations are additive, so this is the same position
+as running an older build against a newer store.
+
 What survives: everything durable (sessions, block logs, blobs, approvals,
 config) — by construction, since store ≠ context. What's rebuilt: in-flight
 turns (resumable), MCP server processes (spawn-on-use), UI state

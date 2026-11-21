@@ -139,6 +139,13 @@ test "blob requests name one store hash and nothing else" {
     try std.testing.expect(web.queryValue("/blob", "hash") == null);
 }
 
+test "a page presents a handover token only in the daemon's form" {
+    try std.testing.expect(web.validHandoverToken("0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(!web.validHandoverToken("0123456789abcdef0123456789abcde"));
+    try std.testing.expect(!web.validHandoverToken("0123456789ABCDEF0123456789abcdef"));
+    try std.testing.expect(!web.validHandoverToken("0123456789abcdef0123456789abcd\"}"));
+}
+
 test "access log timestamps are Common Log Format in UTC" {
     var buf: [40]u8 = undefined;
     // 2026-09-08 13:07:05 UTC

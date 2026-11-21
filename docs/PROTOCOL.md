@@ -102,7 +102,9 @@ policy that failed open. Both default false when decoding an older daemon.
 | interrupt | sid, report? | ok, or interrupt_result with phase/elapsed diagnostics when report=true (cooperative cancel; also denies a pending approval) |
 | session_pause | sid?, all?, force? | persist pause intent for an active root and its children; ok acknowledges the request, status.pause advances from pausing to paused after workers stop |
 | session_resume | sid?, all? | resume manually paused roots; idempotent for already idle sessions, err{busy} while an addressed session is still pausing |
-| reboot | force?, suspend_sessions? | with suspend_sessions=true, checkpoint active roots for automatic continuation after restart; otherwise retain legacy whole-turn drain/forced interrupt. Acknowledge, finish teardown, retire listener/lock, then close — EOF is the requester's cue to re-exec |
+| reboot | force?, suspend_sessions?, handover?, build? | with suspend_sessions=true, checkpoint active roots for automatic continuation after restart; otherwise retain legacy whole-turn drain/forced interrupt. Acknowledge, finish teardown, retire listener/lock, then close — EOF is the requester's cue to re-exec. With handover=true (hello_ok.handover): ok at once, then a graceful handover (ARCHITECTURE.md §Graceful handover); this connection closes when the successor accepts on the socket, or gets err{handover} if it never got that far. build=true rebuilds the daemon's checkout first |
+| handover_watch | — | no reply; this connection is moved across a graceful handover: it receives daemon_notice and daemon_handover{token}, then is closed |
+| handover_arrived | token | no reply; sent to the successor after resubscribing. The predecessor exits once every token it handed out has arrived (or `[reboot] handover_wait` passes) |
 | shutdown | — | optional daemon_stopping notice, ok, then clean teardown and connection close |
 | gc | expire_before_ms? | gc report (orphan blobs, expired blobs, bytes reclaimed); holds the store's connection mutex across its transaction |
 
@@ -197,7 +199,9 @@ flag is read at export time, so it covers everything still in the outbox.
 | message | when |
 |---|---|
 | daemon_stopping | deliberate shutdown, only for clients that opted into lifecycle_events |
-| hello_ok | handshake; pause_resume advertises durable suspend/resume support (default false), hostname identifies the daemon host (default empty) |
+| daemon_handover {token} | to handover watchers: this daemon is being replaced; the connection closes next. Reconnect, resubscribe, then send handover_arrived with the token |
+| daemon_notice {text, err} | to handover watchers: a restart's progress (`restarting Marlin…`) or why it was abandoned (err=true) |
+| hello_ok | handshake; pause_resume advertises durable suspend/resume support (default false), hostname identifies the daemon host (default empty), handover that reboot.handover and handover_watch are served (default false) |
 | session_created | reply to session_create |
 | session_list_result | reply to session_list |
 | input_history_result {sid,entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
@@ -223,7 +227,7 @@ flag is read at export time, so it covers everything still in the outbox.
 | setup_result {model,session_updated} | reply to `setup_apply`; confirms the durable default and whether a fresh empty placeholder session was updated directly |
 | interrupt_result {sid, active, already_requested, request_count, pending_ms, phase_ms, phase} | opt-in cancellation acknowledgement; reports the current starting/context/provider/approval/tool/child/compaction/finishing phase and its age; repeated interrupts also report elapsed cancellation time |
 | ok {request_id?} | generic ack; non-zero for a correlated input reply |
-| err {code, msg, request_id?} | bad_msg, no_hello, version, no_session, busy, archived, bad_approval, approval_pending, reboot_pending, line_too_long, response_too_large; non-zero for a correlated input rejection |
+| err {code, msg, request_id?} | bad_msg, no_hello, version, no_session, busy, archived, bad_approval, approval_pending, reboot_pending, handover, restarting (a request reached a daemon mid-handover), line_too_long, response_too_large; non-zero for a correlated input rejection |
 
 Each entry in `session_list_result.sessions` includes `sid`, `title`, `cwd`,
 `model`, `effort`, persisted `status`, `created_at`, whether the session is

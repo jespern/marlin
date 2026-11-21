@@ -170,6 +170,20 @@ The default is four hours. Set a different default in
 max_runtime = "12h" # or "off"; omitted defaults to "4h"
 ```
 
+## Restart handover
+
+`/reboot` (and `!rb`, and `/reboot` on the phone) restarts Marlin without
+dropping anyone: the running daemon starts its successor, passes it the
+listening socket and every running `!!` shell, moves each connected terminal
+and phone across, and exits only once each has arrived on the new one. A
+client that does not come back in time (a laptop asleep, a phone offline)
+stops being waited for after a minute; it reconnects normally when it returns.
+
+```toml
+[reboot]
+handover_wait = "60s" # how long the old daemon waits for moved clients
+```
+
 ## Context management today
 
 Marlin implements a three-stage structural cascade:
