@@ -207,7 +207,12 @@
   .md ul, .md ol { padding-left: 24px; }
   .md blockquote { border-left: 3px solid var(--line); padding-left: 10px; color: var(--dim); font-style: italic; }
   .md a { color: var(--blue); }
-  .md table { border-collapse: collapse; }
+  /* Cells break between words only: the transcript's overflow-wrap:anywhere
+     lets a column shrink to one letter wide (a word per letter on a phone). */
+  .md table { border-collapse: collapse; overflow-wrap: break-word; display: block; max-width: max-content; overflow-x: auto; }
+  /* Links and code are the long tokens: those may still break anywhere. A
+     table still too wide scrolls on its own rather than being cut off. */
+  .md td a, .md td code, .md th a, .md th code { overflow-wrap: anywhere; }
   .md th, .md td { border: 1px solid var(--line); padding: 3px 10px; text-align: left; }
   .md th { background: var(--panel2); }
   .md hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
