@@ -39,9 +39,10 @@ pub fn run(
     // daemon → stdout runs in a helper; stdin → daemon in this thread.
     // stdin EOF (client left, ssh tore down) ends the bridge: shutting the
     // daemon socket down releases the helper's blocked read. If instead the
-    // DAEMON dies first, the helper's exit closes nothing here — but the
-    // remote client sees the stream end, deinits, ssh closes, and our stdin
-    // EOFs, so both directions still unwind without a process kill.
+    // DAEMON closes first (it exited, or handed over and is moving its
+    // clients), the helper ends the process: while it lives, ssh keeps the
+    // channel open and the remote client would wait for an end that never
+    // comes.
     var downstream = Downstream{ .gpa = gpa, .conn = conn, .writer = &stdout_writer.interface };
     const thread = std.Thread.spawn(.{}, Downstream.run, .{&downstream}) catch {
         std.log.err("_pipe: cannot start bridge thread", .{});
@@ -60,6 +61,7 @@ const Downstream = struct {
 
     fn run(self: *Downstream) void {
         pump(self.gpa, self.conn.reader, self.writer);
+        std.process.exit(0);
     }
 };
 
