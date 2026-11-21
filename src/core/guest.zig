@@ -29,7 +29,14 @@ pub const question_instructions =
     "that the picker could not be opened. A dismissal is not an answer or approval. " ++
     "Skip unnecessary questions when a reasonable default lets you proceed.";
 
-pub const interactive_instructions = question_instructions ++ "\n\n" ++ progress_instructions;
+/// show_image on the same server; the image lands inline in the transcript.
+pub const image_instructions =
+    "To show the user an image (a chart, plot, screenshot or diagram you made or found), " ++
+    "call the marlin MCP tool mcp__marlin__show_image (show_image on the marlin server) " ++
+    "with its path. It appears inline in their Marlin transcript, on the terminal and on " ++
+    "their phone. PNG or JPEG up to 8 MB; convert other formats first.";
+
+pub const interactive_instructions = question_instructions ++ "\n\n" ++ image_instructions ++ "\n\n" ++ progress_instructions;
 
 pub const Backend = enum {
     claude_code,

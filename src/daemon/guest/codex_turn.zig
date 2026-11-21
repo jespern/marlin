@@ -318,6 +318,36 @@ pub fn codexToolBody(arena: std.mem.Allocator, item: std.json.Value) ![]const u8
     return codex.stringify(arena, item);
 }
 
+/// The MCP content blocks of a finished mcpToolCall: result.content.
+fn mcpResultContent(item: std.json.Value) ?std.json.Value {
+    const kind = codex.strField(item, "type") orelse return null;
+    if (!std.mem.eql(u8, kind, "mcpToolCall")) return null;
+    const result = codex.field(item, "result") orelse return null;
+    if (result != .object) return null;
+    return result.object.get("content");
+}
+
+pub fn mcpResultImages(arena: std.mem.Allocator, item: std.json.Value) ![]const claude_code.ResultImage {
+    return claude_code.contentImages(arena, mcpResultContent(item));
+}
+
+/// The text blocks of an MCP result, joined by newlines.
+pub fn mcpResultText(arena: std.mem.Allocator, item: std.json.Value) ![]const u8 {
+    const content = mcpResultContent(item) orelse return "";
+    if (content != .array) return "";
+    var joined: std.ArrayList(u8) = .empty;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const kind = part.object.get("type") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "text")) continue;
+        const text = part.object.get("text") orelse continue;
+        if (text != .string) continue;
+        if (joined.items.len > 0) try joined.append(arena, '\n');
+        try joined.appendSlice(arena, text.string);
+    }
+    return joined.items;
+}
+
 fn codexStatus(item: std.json.Value) block.ToolStatus {
     const status = codex.strField(item, "status") orelse return .ok;
     return if (std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "declined")) .err else .ok;
@@ -427,16 +457,19 @@ fn appendCodexToolCompleted(
 ) !bool {
     const name = (try codexToolName(arena, item)) orelse return false;
     const call_id = codex.strField(item, "id") orelse return false;
-    const raw_body = try codexToolBody(arena, item);
+    // An MCP tool's images (show_image) are stored as attachments, and only
+    // its text becomes the body: the base64 is not something to read.
+    const images = try mcpResultImages(arena, item);
+    const raw_body = if (images.len > 0) try mcpResultText(arena, item) else try codexToolBody(arena, item);
     const redacted = try permissions.redactSecrets(gpa, opts.secrets, raw_body);
     defer if (redacted) |value| gpa.free(value);
     const body = redacted orelse raw_body;
-    _ = try ap.append(.{ .tool_result = .{
+    try shared.appendGuestResult(gpa, ap, .{
         .call_id = call_id,
         .status = codexStatus(item),
         .inline_body = body[0..@min(body.len, opts.cfg.inline_tool_cap_bytes)],
         .full_body_ref = null,
-    } });
+    }, images);
     if (opts.on_tool) |callback| callback(opts.on_delta_ctx, name, .done);
     return true;
 }

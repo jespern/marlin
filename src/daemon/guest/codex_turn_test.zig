@@ -508,3 +508,23 @@ test "Codex /compact compacts the saved thread in a turn of its own, and never s
         try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
     }
 }
+
+test "an MCP tool's image is lifted out of a Codex result and its text kept" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const item = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"type":"mcpToolCall","server":"marlin","tool":"show_image","status":"completed","result":{"content":[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"},{"type":"text","text":"Shown to the user: chart.png (12.0KiB)"}]}}
+    , .{});
+    const images = try codex_turn.mcpResultImages(arena, item);
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+    try std.testing.expectEqualStrings("image/png", images[0].media_type);
+    try std.testing.expectEqualStrings("iVBORw0KGgo=", images[0].data_base64);
+    try std.testing.expectEqualStrings("Shown to the user: chart.png (12.0KiB)", try codex_turn.mcpResultText(arena, item));
+
+    // Other items keep their usual body.
+    const shell = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"type":"commandExecution","result":{"content":[{"type":"image","data":"AAAA","mimeType":"image/png"}]}}
+    , .{});
+    try std.testing.expectEqual(@as(usize, 0), (try codex_turn.mcpResultImages(arena, shell)).len);
+}

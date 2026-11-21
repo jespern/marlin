@@ -93,6 +93,9 @@ pub const system_prompt_base =
     \\  pick. Never list choices as prose and ask them to reply; that is what
     \\  ask_user replaces. Skip it when one option is the obvious default:
     \\  state your choice and proceed.
+    \\- To show the user an image (a chart, plot, screenshot or diagram you
+    \\  made or found), call show_image with its path: it appears inline in
+    \\  their transcript, on the terminal and on their phone. PNG or JPEG.
     \\- If the user asks whether you have read a specific URL, call `fetch`
     \\  before claiming that you have read it.
     \\- Read a file before editing it; after a change, re-run a focused check.

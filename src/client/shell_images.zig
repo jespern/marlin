@@ -15,9 +15,10 @@ const first_id: u32 = 0x4d530000;
 /// Transcript images use ids above the shells'.
 pub const transcript_first_id: u32 = 0x4d540000;
 
-/// An image Marlin holds itself: PNG for the terminal to decode.
+/// An image Marlin holds itself: PNG for the terminal to decode, or RGBA
+/// pixels already zlib-compressed (Kitty's o=z).
 pub const Encoded = struct {
-    format: enum { png },
+    format: enum { png, rgba_zlib },
     width: u32,
     height: u32,
     data: []const u8,
@@ -156,6 +157,7 @@ fn transmitEncoded(gpa: std.mem.Allocator, w: *std.Io.Writer, id: u32, image: *c
         const more: u1 = if (end < encoded.len) 1 else 0;
         if (first) switch (image.format) {
             .png => try w.print("\x1b_Ga=t,f=100,i={d},q=2,m={d};{s}\x1b\\", .{ id, more, encoded[offset..end] }),
+            .rgba_zlib => try w.print("\x1b_Ga=t,f=32,o=z,s={d},v={d},i={d},q=2,m={d};{s}\x1b\\", .{ image.width, image.height, id, more, encoded[offset..end] }),
         } else try w.print("\x1b_Gm={d};{s}\x1b\\", .{ more, encoded[offset..end] });
         first = false;
         offset = end;

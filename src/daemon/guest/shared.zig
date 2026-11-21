@@ -8,6 +8,10 @@ const Allocator = std.mem.Allocator;
 const process_io = @import("../process_io.zig");
 const nowMs = @import("../loop.zig").nowMs;
 const approval = @import("../approval.zig");
+const block = @import("../../core/block.zig");
+const loop = @import("../loop.zig");
+const Store = @import("../store.zig").Store;
+const claude_code = @import("../provider/claude_code.zig");
 
 pub const default_runtime = std.math.maxInt(u64);
 
@@ -235,4 +239,32 @@ pub fn takeEventLine(
         try acc.appendSlice(gpa, chunk);
         return acc.items;
     }
+}
+
+/// A guest tool result, with the images it returned stored as attachments
+/// (blobs) so the transcript can draw them; undecodable ones are dropped.
+pub fn appendGuestResult(gpa: std.mem.Allocator, ap: *loop.Appender, result: @FieldType(block.Body, "tool_result"), images: []const claude_code.ResultImage) !void {
+    if (images.len == 0) {
+        _ = try ap.append(.{ .tool_result = result });
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var refs: std.ArrayList(block.MediaRef) = .empty;
+    var blobs: std.ArrayList(Store.BlobPayload) = .empty;
+    const decoder = std.base64.standard.Decoder;
+    for (images, 1..) |image, n| {
+        const ext = if (std.mem.eql(u8, image.media_type, "image/png")) "png" else if (std.mem.eql(u8, image.media_type, "image/jpeg")) "jpg" else continue;
+        const len = decoder.calcSizeForSlice(image.data_base64) catch continue;
+        if (len == 0 or len > 8 * 1024 * 1024) continue;
+        const bytes = try arena.alloc(u8, len);
+        decoder.decode(bytes, image.data_base64) catch continue;
+        const hash = try Store.blobHashAlloc(arena, bytes);
+        try refs.append(arena, .{ .hash = hash, .mime = image.media_type, .name = try std.fmt.allocPrint(arena, "image-{d}.{s}", .{ n, ext }), .byte_len = bytes.len });
+        try blobs.append(arena, .{ .hash = hash, .bytes = bytes });
+    }
+    var with_media = result;
+    with_media.attachments = refs.items;
+    _ = try ap.appendWithBlobs(.{ .tool_result = with_media }, blobs.items);
 }

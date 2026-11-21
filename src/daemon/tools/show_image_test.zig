@@ -1,7 +1,7 @@
 const std = @import("std");
 const show_image = @import("show_image.zig");
 
-test "show_image returns a PNG as media and explains everything else" {
+test "show_image returns a PNG or JPEG as media and explains everything else" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -23,7 +23,7 @@ test "show_image returns a PNG as media and explains everything else" {
 
     const text = show_image.run(gpa, io, .{ .path = "notes.txt" }, dir);
     defer text.deinit(gpa);
-    try std.testing.expect(std.mem.startsWith(u8, text.output, "error: notes.txt is not a PNG image"));
+    try std.testing.expect(std.mem.startsWith(u8, text.output, "error: notes.txt is not a PNG or JPEG image;"));
     const missing = show_image.run(gpa, io, .{ .path = "gone.png" }, dir);
     defer missing.deinit(gpa);
     try std.testing.expectEqualStrings("error: gone.png does not exist", missing.output);

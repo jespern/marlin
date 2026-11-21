@@ -126,35 +126,6 @@ pub const CcOutcome = struct {
     }
 };
 
-/// A guest tool result, with the images it returned stored as attachments
-/// (blobs) so the transcript can draw them; undecodable ones are dropped.
-pub fn appendGuestResult(gpa: std.mem.Allocator, ap: *loop.Appender, result: @FieldType(block.Body, "tool_result"), images: []const claude_code.ResultImage) !void {
-    if (images.len == 0) {
-        _ = try ap.append(.{ .tool_result = result });
-        return;
-    }
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var refs: std.ArrayList(block.MediaRef) = .empty;
-    var blobs: std.ArrayList(Store.BlobPayload) = .empty;
-    const decoder = std.base64.standard.Decoder;
-    for (images, 1..) |image, n| {
-        // The transcript draws PNG only.
-        if (!std.mem.eql(u8, image.media_type, "image/png")) continue;
-        const len = decoder.calcSizeForSlice(image.data_base64) catch continue;
-        if (len == 0 or len > 8 * 1024 * 1024) continue;
-        const bytes = try arena.alloc(u8, len);
-        decoder.decode(bytes, image.data_base64) catch continue;
-        const hash = try Store.blobHashAlloc(arena, bytes);
-        try refs.append(arena, .{ .hash = hash, .mime = image.media_type, .name = try std.fmt.allocPrint(arena, "image-{d}.png", .{n}), .byte_len = bytes.len });
-        try blobs.append(arena, .{ .hash = hash, .bytes = bytes });
-    }
-    var with_media = result;
-    with_media.attachments = refs.items;
-    _ = try ap.appendWithBlobs(.{ .tool_result = with_media }, blobs.items);
-}
-
 fn writeCcUserInput(allocator: std.mem.Allocator, writer: *Io.Writer, text: []const u8) !void {
     const encoded = try std.json.Stringify.valueAlloc(allocator, .{
         .type = "user",
@@ -707,7 +678,7 @@ fn ccInvoke(
                     const redacted = try permissions.redactSecrets(gpa, opts.secrets, tr.text);
                     defer if (redacted) |r| gpa.free(r);
                     const body = redacted orelse tr.text;
-                    try appendGuestResult(gpa, ap, .{
+                    try shared.appendGuestResult(gpa, ap, .{
                         .call_id = tr.tool_use_id,
                         .status = if (tr.is_error) .err else .ok,
                         .inline_body = body[0..@min(body.len, cap)],

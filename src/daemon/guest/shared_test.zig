@@ -8,6 +8,10 @@ const process_io = @import("../process_io.zig");
 const nowMs = @import("../loop.zig").nowMs;
 
 const shared = @import("shared.zig");
+const block = @import("../../core/block.zig");
+const loop_mod = @import("../loop.zig");
+const Store = @import("../store.zig").Store;
+const claude_code = @import("../provider/claude_code.zig");
 const repeat = @import("../../testing/repeat.zig").repeat;
 const max_event_line_bytes = shared.max_event_line_bytes;
 const takeEventLine = shared.takeEventLine;
@@ -126,4 +130,35 @@ test "disabled guest deadline still cancels its subprocess" {
     try std.testing.expect(term == .signal);
     try std.testing.expect(watcher.cancelled.load(.acquire));
     try std.testing.expect(!watcher.timed_out.load(.acquire));
+}
+
+test "a guest tool result's images are stored as attachments" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    try store.createSession(1, 0, "/", "claudecode/opus", .auto);
+    const opts: loop_mod.RunOpts = .{ .session_id = 1, .cwd = "/", .endpoint = .{ .url = "", .bearer = null, .model = "opus", .backend = .{ .guest = .claude_code } }, .cfg = .{} };
+    var ap: loop_mod.Appender = .{ .store = &store, .io = threaded.io(), .opts = &opts, .seq = 0, .turn_id = 1 };
+    const png = @embedFile("png_sample_rgba");
+    const encoder = std.base64.standard.Encoder;
+    var b64: [encoder.calcSize(png.len)]u8 = undefined;
+    _ = encoder.encode(&b64, png);
+    const images = [_]claude_code.ResultImage{
+        .{ .media_type = "image/png", .data_base64 = &b64 },
+        .{ .media_type = "image/webp", .data_base64 = "AAAA" }, // not drawable: dropped
+    };
+    try shared.appendGuestResult(gpa, &ap, .{ .call_id = "t1", .status = .ok, .inline_body = "Shown to the user: chart.png", .full_body_ref = null }, &images);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var blocks: std.ArrayList(block.Block) = .empty;
+    try store.loadBlocksInto(arena_state.allocator(), &blocks, 1, 0, 10);
+    const result = blocks.items[0].body.tool_result;
+    try std.testing.expectEqual(@as(usize, 1), result.attachments.len);
+    try std.testing.expectEqualStrings("image/png", result.attachments[0].mime);
+    const stored = try store.getBlob(result.attachments[0].hash);
+    defer gpa.free(stored);
+    try std.testing.expectEqualSlices(u8, png, stored);
 }

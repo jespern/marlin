@@ -2,16 +2,31 @@ const std = @import("std");
 const transcript_images = @import("transcript_images.zig");
 const shell_images = @import("shell_images.zig");
 
-test "PNG passes through with its header size; other formats stay a label" {
+test "PNG passes through with its header size; JPEG decodes to compressed RGBA" {
     const gpa = std.testing.allocator;
     const png = @embedFile("png_sample_rgba");
     const encoded_png = try transcript_images.encode(gpa, png);
     defer gpa.free(encoded_png.data);
+    try std.testing.expect(encoded_png.format == .png);
     try std.testing.expectEqual(@as(u32, 16), encoded_png.width);
     try std.testing.expectEqual(@as(u32, 16), encoded_png.height);
     try std.testing.expectEqualSlices(u8, png, encoded_png.data);
-    try std.testing.expectError(error.UnsupportedImage, transcript_images.encode(gpa, "\xff\xd8\xff\xe0 a jpeg"));
-    try std.testing.expect(!transcript_images.isImageMime("image/jpeg"));
+
+    const jpeg = @embedFile("testdata/tiny.jpg");
+    const encoded_jpeg = try transcript_images.encode(gpa, jpeg);
+    defer gpa.free(encoded_jpeg.data);
+    try std.testing.expect(encoded_jpeg.format == .rgba_zlib);
+    try std.testing.expectEqual(@as(u32, 16), encoded_jpeg.width);
+    // A zlib stream (0x78 header) that inflates to w×h RGBA.
+    try std.testing.expectEqual(@as(u8, 0x78), encoded_jpeg.data[0]);
+    var input: std.Io.Reader = .fixed(encoded_jpeg.data);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var inflate: std.compress.flate.Decompress = .init(&input, .zlib, &window);
+    const pixels = try inflate.reader.allocRemaining(gpa, .unlimited);
+    defer gpa.free(pixels);
+    try std.testing.expectEqual(@as(usize, 16 * 16 * 4), pixels.len);
+
+    try std.testing.expectError(error.UnsupportedImage, transcript_images.encode(gpa, "GIF89a...."));
 }
 
 test "images fit the cell box without upscaling and keep their aspect" {

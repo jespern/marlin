@@ -689,7 +689,7 @@ pub const ResultImage = struct { media_type: []const u8, data_base64: []const u8
 /// Image blocks in tool_result content: Anthropic's {"type":"image","source":
 /// {"type":"base64","media_type","data"}} and MCP's {"type":"image","data",
 /// "mimeType"}, as an MCP tool's result may echo either.
-fn contentImages(arena: std.mem.Allocator, value: ?std.json.Value) ![]const ResultImage {
+pub fn contentImages(arena: std.mem.Allocator, value: ?std.json.Value) ![]const ResultImage {
     const v = value orelse return &.{};
     if (v != .array) return &.{};
     var out: std.ArrayList(ResultImage) = .empty;
