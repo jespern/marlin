@@ -397,6 +397,9 @@ pub const RenderBlock = struct {
     /// Non-null only for a new-turn echo whose optimistic running state must
     /// be restored if the daemon rejects that exact request.
     pending_prior_state: ?proto.SessionState = null,
+    /// An entry of the daemon's queue (proto `queued`), by its id; zero for
+    /// everything else. Shown as a pending echo until the turn takes it.
+    queue_id: u64 = 0,
 
     pub fn deinit(self: *RenderBlock, gpa: std.mem.Allocator) void {
         gpa.free(self.text);

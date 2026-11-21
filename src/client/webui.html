@@ -145,7 +145,18 @@
   .user.optimistic.accepted { opacity: 1; }
   /* Sent while the agent works: queued until the turn takes it (layout.zig
      wrapInputCard "Queued"). */
-  .user.optimistic.queued::before { content: "Queued"; display: block; color: var(--dim); font-size: 12px; font-weight: 400; }
+  .user.queued::before { content: "Queued"; display: block; color: var(--dim); font-size: 12px; font-weight: 400; }
+  /* The session's queue, the daemon's (proto `queued`), pinned above the
+     composer as Claude Code does: new output never buries it. */
+  #queue { order: 2; padding: 0 22px; }
+  #queue:empty { display: none; }
+  #queue .user { margin: 8px 0; position: relative; padding-right: 40px; }
+  #queue .unqueue {
+    position: absolute; top: 2px; right: 2px; padding: 6px 10px; cursor: pointer;
+    font: inherit; font-size: 16px; line-height: 1; background: none; border: 0; color: var(--dim);
+  }
+  #queue .unqueue:hover { color: var(--fg); }
+  #queue .user.cancelling { opacity: .4; }
   .user.optimistic.accepted::after { content: ""; }
   .user.optimistic.unconfirmed { border-left-color: var(--yellow); }
   .user.optimistic.unconfirmed::after { content: " · delivery?"; color: var(--yellow); }
@@ -389,6 +400,7 @@
     #side h1 { padding: 16px 16px 12px; }
     #side h1 button { padding: 4px 10px; }
     #transcript { padding: 12px; }
+    #queue { padding: 0 12px; }
     #input { font-size: 16px; } /* <16px makes iOS zoom the page on focus */
     #composer .prompt, #attach-btn { padding-top: 13px; }
     button.act { padding: 8px 14px; }
@@ -435,6 +447,7 @@
   </div>
   <div id="transcript"><button id="history-more" class="act">load older</button></div>
   <div id="term" aria-label="shell"></div>
+  <div id="queue" aria-label="queued messages"></div>
   <div id="approval">
     <span class="q"></span>
     <button class="act yes">approve</button>
@@ -483,14 +496,14 @@
 </div>
 <script>
 "use strict";
-// u64 session/block ids exceed Number.MAX_SAFE_INTEGER: quote them in the
-// raw JSON before parsing and send them back unquoted via raw templates.
-const bigints = raw => raw.replace(/"(sid|parent_sid|session_id)":(\d{12,})/g, '"$1":"$2"');
+// u64 session/block/queue ids exceed Number.MAX_SAFE_INTEGER: quote them in
+// the raw JSON before parsing and send them back unquoted via raw templates.
+const bigints = raw => raw.replace(/"(sid|parent_sid|session_id|id)":(\d{12,})/g, '"$1":"$2"');
 const $ = s => document.querySelector(s);
 let sid = null, cur = null, es = null, lastSeq = 0, oldestSeq = 0, historyHasOlder = false,
   historyLoading = false, historyBlocks = [], deltaEl = null, deltaText = '', reasoningEl = null,
   reasoningText = '', approvalId = null, sessionsCache = [], interruptArmTimer = null,
-  pendingInputs = [], nextInputRequestId = Date.now();
+  pendingInputs = [], nextInputRequestId = Date.now(), queuedEntries = [];
 // Set on each session open; replayed history stays collapsed while blocks
 // stamped after this moment count as live (block ts is ms epoch).
 
@@ -675,7 +688,7 @@ function addOptimisticInput(targetSid, text, steer) {
   const requestId = ++nextInputRequestId;
   const node = el('div', 'block user optimistic' + (steer ? ' queued' : ''), (steer ? '↪ ' : '') + text);
   node.dataset.requestId = String(requestId);
-  $('#transcript').appendChild(node);
+  $(steer ? '#queue' : '#transcript').appendChild(node);
   pendingInputs.push({ requestId, sid: targetSid, text, steer, node });
   scrollBottom(true);
   return pendingInputs[pendingInputs.length - 1];
@@ -695,6 +708,39 @@ function settleOptimisticInput(kind, text) {
   $('#transcript').appendChild(pending.node);
   scrollBottom();
   return true;
+}
+
+// The daemon's queue, whole. A send of ours it now lists is shown by its
+// entry; sends still in flight keep their own card after the entries.
+function showQueue(items) {
+  queuedEntries = items;
+  const listed = items.map(item => item.input.display_text || item.input.text);
+  pendingInputs = pendingInputs.filter(p => {
+    const i = p.steer && p.sid === sid ? listed.indexOf(p.text) : -1;
+    if (i < 0) return true;
+    listed.splice(i, 1);
+    p.node.remove();
+    return false;
+  });
+  const inFlight = [...$('#queue').children].filter(n => n.classList.contains('optimistic'));
+  $('#queue').replaceChildren(...items.map(queuedCard), ...inFlight);
+  scrollBottom();
+}
+
+function queuedCard(item) {
+  const v = item.input;
+  const node = el('div', 'block user queued', '↪ ' + (v.from ? v.from + ': ' : '') + (v.display_text || v.text));
+  const x = el('button', 'unqueue', '×');
+  x.title = 'don’t send';
+  x.setAttribute('aria-label', 'don’t send');
+  x.onclick = async () => {
+    node.classList.add('cancelling');
+    const r = await send('{"unqueue":{"sid":' + sid + ',"id":' + item.id + ',"request_id":' + (++nextInputRequestId) + '}}');
+    // Success shows as the daemon's next queue, without this entry.
+    if (r.err) { node.classList.remove('cancelling'); notice(r.err.msg); }
+  };
+  node.appendChild(x);
+  return node;
 }
 
 function rejectOptimisticInput(pending, message, uncertain) {
@@ -1444,6 +1490,9 @@ function handle(m) {
     reasoningText += m.reasoning_delta.text;
     reasoningEl.innerHTML = renderMd(reasoningText);
     scrollBottom();
+  } else if (m.queued) {
+    if (m.queued.sid !== sid) return;
+    showQueue(m.queued.items);
   } else if (m.session_meta) {
     if (m.session_meta.sid === sid) setContext(m.session_meta);
   } else if (m.status) {
@@ -1580,6 +1629,8 @@ function open(s) {
   $('#jump').classList.remove('show');
   unreadDone.delete(String(s.sid));
   pendingInputs = [];
+  queuedEntries = [];
+  $('#queue').replaceChildren();
   stashDraft();
   $('#topbar .title').textContent = s.title || '(untitled)';
   tabTitle(s);

@@ -535,7 +535,10 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
                 defer app.gpa.free(text);
                 app.submitInput(text);
             } else if (isPreviousInputRowKey(key)) {
-                if (!ed.moveUp(edit_w)) ed.histUp();
+                // Empty composer: the newest queued message comes back to edit
+                // (as in Claude Code); with none queued, Up walks history.
+                const took_back = ed.isEmpty() and !ed.isWalkingHistory() and app.takeBackQueued();
+                if (!took_back and !ed.moveUp(edit_w)) ed.histUp();
                 app.command_selection = 0;
             } else if (isNextInputRowKey(key)) {
                 if (!ed.moveDown(edit_w)) ed.histDown();

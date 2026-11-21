@@ -191,7 +191,8 @@ const Event = union(enum) {
     client_msg: struct { client_id: u64, msg_line: []u8 }, // raw NDJSON from client
     client_gone: struct { client_id: u64 },
     // From turn threads (loop.zig callbacks). All payloads gpa-owned.
-    turn_block: struct { sid: u64, line: []u8, ends: LiveStream = .none }, // pre-encoded proto.DaemonMsg.blk
+    /// `steer`: the turn took a queued input, so the queue changed.
+    turn_block: struct { sid: u64, line: []u8, ends: LiveStream = .none, steer: bool = false }, // pre-encoded proto.DaemonMsg.blk
     /// A native agent's call of a tool for other sessions; name and args
     /// gpa-owned. The turn is parked on `future`.
     agent_tool: struct { sid: u64, name: []u8, args_json: []u8, future: *TaskFuture },
@@ -491,7 +492,7 @@ pub const Session = struct {
     /// A guest's context window as it reports it; 0 until it has.
     guest_context_limit: std.atomic.Value(u64) = .init(0),
     /// Queued mid-turn steer texts (gpa-owned), drained by poll_steer.
-    steer_queue: std.ArrayList(block.Input) = .empty,
+    steer_queue: std.ArrayList(proto.QueuedInput) = .empty,
     /// Guarded by steer_mutex. A turn closes this atomically with observing
     /// an empty queue, so dispatcher input can never be acknowledged into the
     /// final-poll/turn-done gap. Compact and handover operations leave it off.
@@ -1528,8 +1529,12 @@ pub const Daemon = struct {
             .shell_settled => |ss| if (self.shells.get(ss.shell_id)) |host| self.saveShellState(host),
             .turn_block => |tb| {
                 defer self.gpa.free(tb.line);
-                if (self.sessions.get(tb.sid)) |session| endLiveStream(self.gpa, session, tb.ends);
+                const session = self.sessions.get(tb.sid);
+                if (session) |ses| endLiveStream(self.gpa, ses, tb.ends);
                 self.fanOutLine(tb.sid, tb.line);
+                // After the block, so a queued card becomes the message
+                // without a frame where neither shows.
+                if (tb.steer) if (session) |ses| self.publishQueue(ses);
             },
             .agent_tool => |at| {
                 defer self.gpa.free(at.name);
@@ -2948,6 +2953,10 @@ pub const Daemon = struct {
                 const draft = self.store.getSessionDraft(s.sid) catch "";
                 defer if (draft.len > 0) self.gpa.free(draft);
                 if (draft.len > 0) self.sendTo(client, .{ .draft = .{ .sid = s.sid, .text = draft } });
+                if (session) |ses| if (self.queuedLine(ses, false)) |line| {
+                    defer self.gpa.free(line);
+                    self.sendLine(client, line);
+                };
             },
             .voice_status => self.sendVoiceStatus(client),
             .voice_set => |vs| {
@@ -2971,6 +2980,27 @@ pub const Daemon = struct {
                 }
                 self.sendTo(client, .{ .ok = .{} });
                 self.releaseSessionIfUnused(u.sid);
+            },
+            .unqueue => |uq| {
+                const session = (self.getOrLoadSession(uq.sid) catch null) orelse {
+                    self.sendInputError(client, uq.request_id, "no_session", "unknown session");
+                    return;
+                };
+                var taken: ?proto.QueuedInput = null;
+                session.steer_mutex.lockUncancelable(self.io);
+                for (session.steer_queue.items, 0..) |queued, i| if (queued.id == uq.id) {
+                    taken = session.steer_queue.orderedRemove(i);
+                    break;
+                };
+                session.steer_mutex.unlock(self.io);
+                if (taken) |queued| queued.input.deinit(self.gpa);
+                const removed = taken != null or (self.store.deletePausedInput(uq.sid, uq.id) catch false);
+                if (!removed) {
+                    self.sendInputError(client, uq.request_id, "not_queued", "already sent");
+                    return;
+                }
+                self.sendTo(client, .{ .ok = .{ .request_id = uq.request_id } });
+                self.publishQueue(session);
             },
             .input => |inp| {
                 const session = (self.getOrLoadSession(inp.sid) catch {
@@ -3038,7 +3068,7 @@ pub const Daemon = struct {
                         );
                         return;
                     }
-                    session.steer_queue.append(self.gpa, owned) catch {
+                    session.steer_queue.append(self.gpa, .{ .id = ids.next(self.io), .input = owned }) catch {
                         session.steer_mutex.unlock(self.io);
                         owned.deinit(self.gpa);
                         self.sendInputError(client, inp.request_id, "internal", "could not queue input");
@@ -3048,6 +3078,7 @@ pub const Daemon = struct {
                     // A human spoke: any agent message chain starts over.
                     session.agent_hops = 0;
                     self.sendTo(client, .{ .ok = .{ .request_id = inp.request_id } });
+                    self.publishQueue(session);
                     return;
                 }
                 session.agent_hops = 0;
@@ -4043,10 +4074,10 @@ pub const Daemon = struct {
             defer session.steer_mutex.unlock(self.io);
             const pending = try self.gpa.alloc(store_mod.Store.PausedInput, session.steer_queue.items.len);
             defer self.gpa.free(pending);
-            for (session.steer_queue.items, pending) |input, *item| item.* = .{ .id = ids.next(self.io), .input = input };
+            @memcpy(pending, session.steer_queue.items);
             try self.store.checkpointPause(session.id, restart, @tagName(session.approval_mode), pending);
             session.pause_requested.store(true, .release);
-            for (session.steer_queue.items) |input| input.deinit(self.gpa);
+            for (session.steer_queue.items) |queued| queued.input.deinit(self.gpa);
             session.steer_queue.clearRetainingCapacity();
             session.steer_accepting = false;
         }
@@ -4083,6 +4114,7 @@ pub const Daemon = struct {
             defer self.gpa.free(line);
             self.fanOutLine(session.id, line);
         }
+        if (pending.len > 0) self.publishQueue(session);
     }
 
     fn resumeSession(self: *Daemon, session: *Session) !void {
@@ -4248,7 +4280,7 @@ pub const Daemon = struct {
         if (session.question_gate.answer) |answer| self.gpa.free(answer);
         session.question_gate.answer = null;
         session.steer_mutex.lockUncancelable(self.io);
-        for (session.steer_queue.items) |steer| steer.deinit(self.gpa);
+        for (session.steer_queue.items) |steer| steer.input.deinit(self.gpa);
         session.steer_queue.deinit(self.gpa);
         session.steer_mutex.unlock(self.io);
         session.guest_activity_mutex.lockUncancelable(self.io);
@@ -4623,11 +4655,12 @@ pub const Daemon = struct {
         if (pending.items.len == 0) return;
 
         var seq = self.store.lastSeq(session.id) catch {
-            for (pending.items) |text| text.deinit(self.gpa);
+            for (pending.items) |queued| queued.input.deinit(self.gpa);
             return;
         };
         const turn_id = ids.next(self.io);
-        for (pending.items) |text| {
+        for (pending.items) |queued| {
+            const text = queued.input;
             defer text.deinit(self.gpa);
             seq += 1;
             const b = block.Block{
@@ -4643,6 +4676,7 @@ pub const Daemon = struct {
             defer self.gpa.free(line);
             self.fanOutLine(session.id, line);
         }
+        self.publishQueue(session);
 
         seq += 1;
         const note = block.Block{
@@ -5150,7 +5184,7 @@ pub const Daemon = struct {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
             const line = proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = job.sid, .b = b } }) catch return;
-            self.events.push(self.io, .{ .turn_block = .{ .sid = job.sid, .line = line, .ends = blockEndsLiveStream(b) } }) catch self.gpa.free(line);
+            self.events.push(self.io, .{ .turn_block = .{ .sid = job.sid, .line = line, .ends = blockEndsLiveStream(b), .steer = b.body == .steer } }) catch self.gpa.free(line);
         }
 
         fn onDelta(ctx: ?*anyopaque, text: []const u8) void {
@@ -5338,7 +5372,7 @@ pub const Daemon = struct {
             job.session.steer_mutex.lockUncancelable(self.io);
             defer job.session.steer_mutex.unlock(self.io);
             if (job.session.pause_requested.load(.acquire) or job.session.steer_queue.items.len == 0) return null;
-            const text = job.session.steer_queue.orderedRemove(0);
+            const text = job.session.steer_queue.orderedRemove(0).input;
             // Transfer to the loop's allocator (same gpa in practice).
             _ = gpa;
             return text;
@@ -5581,6 +5615,33 @@ pub const Daemon = struct {
 
     fn broadcastStatus(self: *Daemon, sid: u64, state: proto.SessionState) void {
         self.broadcastStatusErr(sid, state, null);
+    }
+
+    /// The session's whole input queue as a `queued` line: what is queued in
+    /// memory for the running turn, then what a pause holds in the store.
+    /// Null when empty and `allow_empty` is false (a subscribe needs no
+    /// clearing message).
+    fn queuedLine(self: *Daemon, session: *Session, allow_empty: bool) ?[]u8 {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const paused = self.store.pausedInputs(arena, session.id) catch &.{};
+        // Encoded under the lock: a turn's poll_steer takes from the front
+        // and frees what it took.
+        session.steer_mutex.lockUncancelable(self.io);
+        defer session.steer_mutex.unlock(self.io);
+        const items = arena.alloc(proto.QueuedInput, session.steer_queue.items.len + paused.len) catch return null;
+        @memcpy(items[0..session.steer_queue.items.len], session.steer_queue.items);
+        @memcpy(items[session.steer_queue.items.len..], paused);
+        if (items.len == 0 and !allow_empty) return null;
+        return proto.encode(self.gpa, proto.DaemonMsg{ .queued = .{ .sid = session.id, .items = items } }) catch null;
+    }
+
+    /// After any change to a session's queue: every subscriber gets it whole.
+    fn publishQueue(self: *Daemon, session: *Session) void {
+        const line = self.queuedLine(session, true) orelse return;
+        defer self.gpa.free(line);
+        self.fanOutLine(session.id, line);
     }
 
     fn broadcastUsageCredits(self: *Daemon, sid: u64, state: proto.SessionState, active: bool) void {
@@ -5872,13 +5933,14 @@ pub const Daemon = struct {
                     owned.deinit(self.gpa);
                     return .{ .text = "not sent: that session is finishing its turn; try again in a moment, or wait_for_session first", .status = .err };
                 }
-                session.steer_queue.append(self.gpa, owned) catch |err| {
+                session.steer_queue.append(self.gpa, .{ .id = ids.next(self.io), .input = owned }) catch |err| {
                     session.steer_mutex.unlock(self.io);
                     owned.deinit(self.gpa);
                     return err;
                 };
                 session.steer_mutex.unlock(self.io);
                 session.agent_hops = @max(session.agent_hops, hops);
+                self.publishQueue(session);
                 return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It is busy and reads it between its steps. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
             }
             session.agent_hops = hops;

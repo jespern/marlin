@@ -57,7 +57,8 @@ permissions. What Marlin adds is everything around them:
   them with their live work underneath: subagents, running commands, and
   background jobs, each with inspectable output.
 - **Steer while it works.** Type while the agent is running; your message is
-  queued, stays visible, and can carry images.
+  queued, shows on every device, can carry images, and can be taken back
+  (Up in the terminal, × on the web) until the agent reads it.
 - **Reach it from anywhere.** `marlin --remote <host>` attaches over SSH,
   and `marlin discover` finds the Marlins on your LAN. The web companion
   lets you watch sessions and answer approvals from a paired phone behind

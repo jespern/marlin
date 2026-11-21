@@ -573,6 +573,90 @@ test "a session's draft is kept for the next client that opens it, until it is c
     try std.testing.expectEqual(@as(?[]const u8, null), try Draft.after(r, 2));
 }
 
+// Case: Jesper queued a message on his phone mid-turn, switched tabs and came
+// back: it was gone until the turn took it. The queue is the daemon's, so
+// every client shows it, and any of them can take an entry back.
+test "a session's queued input reaches every client, and any client can take it back" {
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const gpa = r.gpa;
+    defer {
+        for (r.session.steer_queue.items) |queued| queued.input.deinit(gpa);
+        r.session.steer_queue.deinit(gpa);
+    }
+    const Queue = struct {
+        /// The last queue snapshot client `id` was sent, if any.
+        fn last(rig: *ShellRig, id: u64) !?[]const proto.QueuedInput {
+            var items: ?[]const proto.QueuedInput = null;
+            for (try rig.drain(id)) |msg| if (msg == .queued) {
+                try std.testing.expectEqual(@as(u64, 7), msg.queued.sid);
+                items = msg.queued.items;
+            };
+            return items;
+        }
+        fn reply(rig: *ShellRig, id: u64) !proto.DaemonMsg {
+            for (try rig.drain(id)) |msg| if (msg == .ok or msg == .err) return msg;
+            return error.NoReply;
+        }
+    };
+    r.session.state = .running;
+    r.session.steer_accepting = true;
+    try r.send(1, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
+    try r.send(2, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
+    // Nothing queued: a subscribe brings no snapshot.
+    try std.testing.expectEqual(@as(?[]const proto.QueuedInput, null), try Queue.last(r, 2));
+    _ = try r.drain(1);
+
+    // Queued from the phone: the terminal sees it at once.
+    try r.send(2, "{{\"input\":{{\"sid\":7,\"text\":\"also run the tests\",\"request_id\":5}}}}", .{});
+    const seen = (try Queue.last(r, 1)).?;
+    try std.testing.expectEqual(@as(usize, 1), seen.len);
+    try std.testing.expectEqualStrings("also run the tests", seen[0].input.text);
+    const id = seen[0].id;
+    _ = try r.drain(2);
+
+    // The phone comes back to the session: the queue comes with it.
+    try r.send(2, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
+    try std.testing.expectEqual(id, (try Queue.last(r, 2)).?[0].id);
+
+    // Taken back from the terminal: the phone's queue empties.
+    try r.send(1, "{{\"unqueue\":{{\"sid\":7,\"id\":{d},\"request_id\":6}}}}", .{id});
+    try std.testing.expectEqual(@as(usize, 0), (try Queue.last(r, 2)).?.len);
+    try std.testing.expectEqual(@as(usize, 0), r.session.steer_queue.items.len);
+    try std.testing.expect(try Queue.reply(r, 1) == .ok);
+    // Again, or after the turn took it: already gone.
+    try r.send(1, "{{\"unqueue\":{{\"sid\":7,\"id\":{d},\"request_id\":7}}}}", .{id});
+    try std.testing.expect(try Queue.reply(r, 1) == .err);
+
+    // The turn takes one: its message arrives first, then the shorter queue,
+    // so the queued card becomes the message without a gap.
+    try r.send(2, "{{\"input\":{{\"sid\":7,\"text\":\"taken\",\"request_id\":10}}}}", .{});
+    _ = try r.drain(1);
+    const taken = r.session.steer_queue.orderedRemove(0).input;
+    const b = @import("../core/block.zig").Block{ .id = 1, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 0, .body = .{ .steer = taken } };
+    const line = try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = b } });
+    taken.deinit(gpa);
+    try r.daemon.handleEvent(.{ .turn_block = .{ .sid = 7, .line = line, .steer = true } });
+    const after = try r.drain(1);
+    try std.testing.expectEqual(@as(usize, 2), after.len);
+    try std.testing.expect(after[0] == .blk);
+    try std.testing.expectEqual(@as(usize, 0), after[1].queued.items.len);
+    _ = try r.drain(2);
+
+    // A pause keeps the queue for /resume; it still shows, and still goes.
+    try r.send(2, "{{\"input\":{{\"sid\":7,\"text\":\"after the pause\",\"request_id\":8}}}}", .{});
+    _ = try r.drain(1);
+    _ = try r.drain(2);
+    try r.send(1, "{{\"session_pause\":{{\"sid\":7}}}}", .{});
+    try std.testing.expectEqual(@as(usize, 0), r.session.steer_queue.items.len);
+    try r.send(2, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
+    const held = (try Queue.last(r, 2)).?;
+    try std.testing.expectEqualStrings("after the pause", held[0].input.text);
+    try r.send(2, "{{\"unqueue\":{{\"sid\":7,\"id\":{d},\"request_id\":9}}}}", .{held[0].id});
+    try std.testing.expectEqual(@as(usize, 0), (try Queue.last(r, 1)).?.len);
+    try std.testing.expect(!try r.daemon.store.hasPausedInputs(7));
+}
+
 // Case: attached from the MacBook, /voice set up the MacBook. Over --remote
 // the daemon's machine sets up and transcribes; the client only records.
 test "a remote client's voice is set up and transcribed on the daemon's machine" {
@@ -684,9 +768,9 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
     try r.daemon.store.createSession(8, 0, "/other", "codex/gpt", .auto);
     var other = daemon_mod.Session{ .id = 8, .model = try gpa.dupe(u8, "codex/gpt"), .cwd = try gpa.dupe(u8, "/other") };
     defer {
-        for (other.steer_queue.items) |input| input.deinit(gpa);
+        for (other.steer_queue.items) |queued| queued.input.deinit(gpa);
         other.steer_queue.deinit(gpa);
-        for (r.session.steer_queue.items) |input| input.deinit(gpa);
+        for (r.session.steer_queue.items) |queued| queued.input.deinit(gpa);
         r.session.steer_queue.deinit(gpa);
         other.live_text.deinit(gpa);
         other.live_reasoning.deinit(gpa);
@@ -736,13 +820,13 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
     const sent = (try Call.result(r, 4)).?;
     try std.testing.expectEqual(block_mod.ToolStatus.ok, sent.status);
     try std.testing.expectEqual(@as(usize, 1), other.steer_queue.items.len);
-    const delivered = other.steer_queue.items[0].text;
+    const delivered = other.steer_queue.items[0].input.text;
     try std.testing.expect(std.mem.startsWith(u8, delivered, "[Message from another Marlin session"));
     try std.testing.expect(std.mem.indexOf(u8, delivered, caller_handle) != null);
     try std.testing.expect(std.mem.endsWith(u8, delivered, "Is the lexer done?"));
     // The receiver's transcript folds it under the sender, showing their words.
-    try std.testing.expectEqualStrings("Is the lexer done?", other.steer_queue.items[0].display_text.?);
-    try std.testing.expect(std.mem.indexOf(u8, other.steer_queue.items[0].from.?, caller_handle) != null);
+    try std.testing.expectEqualStrings("Is the lexer done?", other.steer_queue.items[0].input.display_text.?);
+    try std.testing.expect(std.mem.indexOf(u8, other.steer_queue.items[0].input.from.?, caller_handle) != null);
     try std.testing.expectEqual(@as(u8, 1), other.agent_hops);
 
     // A chain at the hop limit stops.
@@ -801,7 +885,7 @@ test "an assistant outside Marlin reads the attention log and answers what waits
     defer r.destroy();
     const gpa = r.gpa;
     defer {
-        for (r.session.steer_queue.items) |input| input.deinit(gpa);
+        for (r.session.steer_queue.items) |queued| queued.input.deinit(gpa);
         r.session.steer_queue.deinit(gpa);
     }
     const Call = struct {
@@ -889,7 +973,7 @@ test "an assistant outside Marlin reads the attention log and answers what waits
     r.session.steer_accepting = true;
     try Call.send(r, 0, "robin", 11, "message_session", .{ .handle = handle, .text = "Status?" });
     try std.testing.expectEqual(block_mod.ToolStatus.ok, (try Call.result(r, 11)).status);
-    const delivered = r.session.steer_queue.items[0].text;
+    const delivered = r.session.steer_queue.items[0].input.text;
     try std.testing.expect(std.mem.startsWith(u8, delivered, "[Message from robin, the user's assistant outside Marlin."));
     try std.testing.expect(std.mem.endsWith(u8, delivered, "Status?"));
     try std.testing.expectEqual(@as(u8, 1), r.session.agent_hops);

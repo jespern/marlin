@@ -75,6 +75,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | unsub | sid | ok |
 | blob_get | hash | blob_result{hash, bytes}; the uncapped tool output behind a truncated inline body (`!co`) |
 | input | sid, text, request_id?, attachments? | ok/err echoing request_id; uploads bounded image media and starts a turn (idle), or queues a text-only steer while an agent turn is accepting them (running/awaiting approval); newly started root turns update the session title from the prompt's normalized first line, except generic follow-ups such as `commit it` preserve an existing title; steers and child turns do not retitle; compact, handover, and the atomic finishing edge return `err{not_steerable}` |
+| unqueue | sid, id, request_id? | ok/err echoing request_id; takes one entry (by its `queued` id) out of the session's queue, live or held by a pause, before a turn takes it. `err{not_queued}` when it is already gone (delivered, or taken back by another client). Every subscriber then gets the shorter `queued` |
 | council_list | — | council_list_result with every configured [[council]] roster |
 | council_set | name, models[] | council_list_result after atomically persisting the (new or replaced) [[council]] table to config.toml |
 | council_remove | name | council_list_result after atomically removing the table; err{council} when unknown |
@@ -201,6 +202,7 @@ flag is read at export time, so it covers everything still in the outbox.
 | session_list_result | reply to session_list |
 | input_history_result {sid,entries} | reply to input_history; each entry carries sid, seq, timestamp, and full authored text for client-side fuzzy matching |
 | draft {sid,text} | after `sub`'s status, only when the session has a kept draft (see session_draft); the TUI puts it in an empty composer, never over typed text |
+| queued {sid,items} | the session's whole input queue, oldest first, each `{id, input}`: steers waiting for the running turn, then input a pause holds until /resume. Sent after `sub`'s status when non-empty, and to every subscriber after each change (an empty list clears it). When a turn takes an entry, its durable steer block comes first, then the shorter queue. Clients show the queue from this, not from their own sends, so every device agrees |
 | voice_status_result {enabled,engine,mode,host,ffmpeg,engines} / voice_setup_progress {done,total} / voice_setup_result {ok,msg} / voice_transcript {request_id,text,err} | replies to the voice_* requests above; progress arrives as the model downloads, one message per percent |
 | search_result {query,sid,hits} | reply to search; each hit carries session/block identity, kind, location, timestamp, and an FTS-highlighted snippet |
 | diagnostics_result | reply to diagnostics; aggregate provider/TTFT, measured local-preparation, and legacy pre-provider percentiles/outliers; latest provider/tool waterfall includes setup, context-load/SQLite-wait rows/bytes/VM steps, assembly, and body serialization; contains no prompt or tool content |

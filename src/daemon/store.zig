@@ -780,7 +780,7 @@ pub const Store = struct {
         try stepDone(stmt);
     }
 
-    pub const PausedInput = struct { id: u64, input: block.Input };
+    pub const PausedInput = proto.QueuedInput;
 
     pub fn checkpointPause(self: Store, sid: u64, restart: bool, mode: []const u8, inputs: []const PausedInput) Error!void {
         const mutex = c.sqlite3_db_mutex(self.db);
@@ -822,6 +822,16 @@ pub const Store = struct {
             try inputs.append(arena, .{ .id = @bitCast(c.sqlite3_column_int64(stmt, 0)), .input = input });
         }
         return inputs.toOwnedSlice(arena);
+    }
+
+    /// False when no such input is held (already restored, or another id).
+    pub fn deletePausedInput(self: Store, sid: u64, id: u64) Error!bool {
+        const stmt = try self.prepare("DELETE FROM paused_inputs WHERE id=? AND session_id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        bindInt(stmt, 2, @bitCast(sid));
+        try stepDone(stmt);
+        return c.sqlite3_changes(self.db) > 0;
     }
 
     pub fn hasPausedInputs(self: Store, sid: u64) Error!bool {

@@ -250,6 +250,7 @@ pub fn reconcilePendingEcho(
             rendered.pending_echo = false;
             rendered.kind = kind;
             rendered.pending_request_id = 0;
+            rendered.queue_id = 0;
             rendered.pending_prior_state = null;
             rendered.seq = seq;
             rendered.turn_id = turn_id;
@@ -263,6 +264,79 @@ pub fn reconcilePendingEcho(
         }
     }
     return false;
+}
+
+/// The daemon's queue, whole: its entries replace the ones shown before, and
+/// stand in for this client's own echoes of the sends they list. Echoes it
+/// does not list yet (still on their way) stay.
+pub fn replaceQueuedBlocks(
+    gpa: std.mem.Allocator,
+    blocks: *std.ArrayList(RenderBlock),
+    items: []const proto.QueuedInput,
+    last_seq: u64,
+    now_ms: i64,
+) void {
+    const claimed = gpa.alloc(bool, items.len) catch return;
+    defer gpa.free(claimed);
+    @memset(claimed, false);
+    var i: usize = 0;
+    while (i < blocks.items.len) {
+        const rendered = &blocks.items[i];
+        const listed = rendered.queue_id != 0 or (rendered.pending_echo and rendered.kind == .steer and for (items, claimed) |item, *taken| {
+            if (!taken.* and std.mem.eql(u8, rendered.text, queuedText(item.input))) {
+                taken.* = true;
+                break true;
+            }
+        } else false);
+        if (!listed) {
+            i += 1;
+            continue;
+        }
+        rendered.deinit(gpa);
+        _ = blocks.orderedRemove(i);
+    }
+    for (items) |item| {
+        const text = gpa.dupe(u8, queuedText(item.input)) catch return;
+        const label = gpa.dupe(u8, item.input.from orelse "") catch {
+            gpa.free(text);
+            return;
+        };
+        blocks.append(gpa, .{
+            .kind = .steer,
+            .text = text,
+            .label = label,
+            .status = .ok,
+            .from_agent = item.input.from != null,
+            .pending_echo = true,
+            .pending_after_seq = last_seq,
+            .queue_id = item.id,
+            .timestamp_ms = now_ms,
+        }) catch {
+            gpa.free(text);
+            gpa.free(label);
+            return;
+        };
+    }
+}
+
+/// What a queued input shows: what was typed (or the sender's words).
+fn queuedText(input: block.Input) []const u8 {
+    return input.display_text orelse input.text;
+}
+
+fn queueHas(items: []const proto.QueuedInput, id: u64) bool {
+    for (items) |item| if (item.id == id) return true;
+    return false;
+}
+
+/// The newest queue entry shown, for Up to take back.
+pub fn newestQueued(blocks: []const RenderBlock) ?*const RenderBlock {
+    var i = blocks.len;
+    while (i > 0) {
+        i -= 1;
+        if (blocks[i].queue_id != 0) return &blocks[i];
+    }
+    return null;
 }
 
 fn acknowledgeInputInBlocks(blocks: []RenderBlock, request_id: u64) bool {
@@ -729,6 +803,8 @@ pub const App = struct {
     remote_transport: bool = false,
     reconnecting: bool = false,
     next_input_request_id: u64 = 1,
+    /// Up asked the daemon for this queue entry back; its ok fills the composer.
+    unqueue_pending: struct { request_id: u64 = 0, sid: u64 = 0, queue_id: u64 = 0 } = .{},
 
     pub fn deinit(self: *App) void {
         self.shell_images.deinit(self.gpa);
@@ -1954,6 +2030,44 @@ pub const App = struct {
         rendered.pending_prior_state = prior_state;
     }
 
+    pub fn applyQueued(self: *App, sid: u64, items: []const proto.QueuedInput) void {
+        const view = if (sid == self.view.sid) &self.view else self.saved_views.get(sid) orelse return;
+        replaceQueuedBlocks(self.gpa, &view.blocks, items, view.last_seq, nowWallMs(self.io));
+        view.layout_epoch +%= 1;
+        // Its answer was lost (a reconnect) and the entry is gone: Up is free.
+        if (self.unqueue_pending.sid == sid and !queueHas(items, self.unqueue_pending.queue_id))
+            self.unqueue_pending = .{};
+    }
+
+    /// Up in an empty composer: the newest queued input comes back into it,
+    /// to edit and send again or to drop. False when nothing is queued.
+    pub fn takeBackQueued(self: *App) bool {
+        const queued = newestQueued(self.view.blocks.items) orelse return false;
+        // One at a time: a second Up before the answer would ask again.
+        if (self.unqueue_pending.request_id != 0) return true;
+        const request_id = self.next_input_request_id;
+        self.next_input_request_id +%= 1;
+        if (self.next_input_request_id == 0) self.next_input_request_id = 1;
+        self.conn.send(.{ .unqueue = .{ .sid = self.view.sid, .id = queued.queue_id, .request_id = request_id } }) catch {
+            self.setNotice("could not reach the daemon", .{});
+            return true;
+        };
+        self.unqueue_pending = .{ .request_id = request_id, .sid = self.view.sid, .queue_id = queued.queue_id };
+        return true;
+    }
+
+    /// The daemon gave the entry back. Its ok comes before the queue without
+    /// it, so the entry is still shown to take the text from.
+    fn tookBackQueued(self: *App) void {
+        const pending = self.unqueue_pending;
+        self.unqueue_pending = .{};
+        const view = if (pending.sid == self.view.sid) &self.view else self.saved_views.get(pending.sid) orelse return;
+        for (view.blocks.items) |rendered| if (rendered.queue_id == pending.queue_id) {
+            view.editor.insertSlice(rendered.text);
+            break;
+        };
+    }
+
     pub fn acknowledgeInput(self: *App, request_id: u64) void {
         if (request_id == 0) return;
         if (acknowledgeInputInBlocks(self.view.blocks.items, request_id)) return;
@@ -2380,6 +2494,7 @@ pub const App = struct {
                 if (view == &self.view and self.history_search.active) self.refreshHistorySearch(true);
             },
             .draft => |d| self.restoreDraft(d.sid, d.text),
+            .queued => |q| self.applyQueued(q.sid, q.items),
             .voice_status_result => |status| self.applyRemoteVoiceStatus(status),
             .voice_setup_progress => |p| self.remoteVoiceProgress(p.done, p.total),
             .voice_setup_result => |r| self.remoteVoiceSetupDone(r.ok, r.msg),
@@ -2539,6 +2654,11 @@ pub const App = struct {
             },
             .err => |e| {
                 if (shell_tab.failed(self, e.request_id, e.code, e.msg)) return;
+                if (e.request_id != 0 and e.request_id == self.unqueue_pending.request_id) {
+                    self.unqueue_pending = .{};
+                    self.setNotice("already sent", .{});
+                    return;
+                }
                 // A missing blob answers the oldest request; an image just
                 // stays a label.
                 if (std.mem.eql(u8, e.code, "blob") and self.blob_requests.items.len > 0) {
@@ -2574,7 +2694,10 @@ pub const App = struct {
                 self.web_text.clearRetainingCapacity();
                 writeWebStatus(&self.web_text, self.gpa, status, render.nowWallMs(self.io)) catch {};
             },
-            .ok => |ok| self.acknowledgeInput(ok.request_id),
+            .ok => |ok| if (ok.request_id != 0 and ok.request_id == self.unqueue_pending.request_id)
+                self.tookBackQueued()
+            else
+                self.acknowledgeInput(ok.request_id),
             else => {},
         }
     }

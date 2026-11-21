@@ -36,6 +36,9 @@ pub const SessionState = enum { idle, running, awaiting_approval, err, done };
 /// of the model until one completes.
 pub const TurnPhase = enum { idle, starting, context, provider, approval, tool, child, compaction, finishing, background };
 
+/// An input waiting in a session's queue; `id` names it to `unqueue`.
+pub const QueuedInput = struct { id: u64, input: block.Input };
+
 /// Live operational work owned by a turn. Guest ids/parents come from the
 /// harness stream; native ids are tool call ids. These are not durable child
 /// sessions and disappear when the work finishes.
@@ -384,6 +387,9 @@ pub const ClientMsg = union(enum) {
         replay_done: bool = false,
     },
     unsub: struct { sid: u64 },
+    /// Take a queued input back before its turn takes it: answered `ok`,
+    /// or `err` when it is already gone (delivered, or taken back elsewhere).
+    unqueue: struct { sid: u64, id: u64, request_id: u64 = 0 },
     /// `request_id` correlates the optimistic client echo with the one
     /// terminal ok/err reply. Zero is the legacy/untracked value.
     input: struct {
@@ -660,6 +666,11 @@ pub const DaemonMsg = union(enum) {
     /// The session's stored composer draft, after `sub`'s status; only sent
     /// when there is one.
     draft: struct { sid: u64, text: []const u8 },
+    /// Every input queued for the session, oldest first: sent mid-turn and
+    /// not yet taken, or held by a pause until /resume. Whole after each
+    /// change (empty clears it), and after `sub`'s status when non-empty, so
+    /// every client and device shows the same queue.
+    queued: struct { sid: u64, items: []const QueuedInput },
     search_result: struct { query: []const u8, sid: u64 = 0, hits: []const SearchHit },
     diagnostics_result: Diagnostics,
     otel_status_result: struct { enabled: bool, content: bool = false },

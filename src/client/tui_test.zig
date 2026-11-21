@@ -7088,6 +7088,91 @@ test "returning to a tab with pending input replays missed deliveries and retain
     try std.testing.expect(!app.view.blocks.items[0].pending_echo);
 }
 
+// Case: Jesper queued a message on his phone, switched tabs and came back: it
+// was gone until the turn took it. The daemon's queue is what shows; Up in an
+// empty composer takes the newest entry back to edit or drop.
+test "the daemon's queue shows as Queued cards, and Up takes the newest back" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    const Queue = struct {
+        fn set(a: *App, items: []const proto.QueuedInput) !void {
+            a.handleDaemonLine(try proto.encode(a.gpa, proto.DaemonMsg{ .queued = .{ .sid = 7, .items = items } }));
+        }
+        fn ids(a: *App, buf: []u64) []u64 {
+            var n: usize = 0;
+            for (a.view.blocks.items) |rendered| if (rendered.pending_echo) {
+                buf[n] = rendered.queue_id;
+                n += 1;
+            };
+            return buf[0..n];
+        }
+    };
+    var buf: [8]u64 = undefined;
+
+    // Our own send, acknowledged; then the queue listing it and the phone's.
+    app.pushInputEcho(.steer, "also check the docs", 55, null);
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .ok = .{ .request_id = 55 } }));
+    try Queue.set(&app, &.{
+        .{ .id = 900, .input = .{ .text = "also check the docs" } },
+        .{ .id = 901, .input = .{ .text = "from the phone" } },
+    });
+    // One card each: the entry stands in for our echo.
+    try std.testing.expectEqualSlices(u64, &.{ 900, 901 }, Queue.ids(&app, &buf));
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    var queued: usize = 0;
+    for ((try layoutLines(frame.allocator(), &app, 80)).items) |line| {
+        if (std.mem.eql(u8, line.text, "   Queued")) queued += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), queued);
+
+    // Up in the empty composer asks for the newest back; its ok fills the
+    // composer, and the next queue drops the card.
+    try handleKey(&app, .{ .codepoint = vaxis.Key.up });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"unqueue\":{\"sid\":7,\"id\":901") != null);
+    const request_id = app.unqueue_pending.request_id;
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .ok = .{ .request_id = request_id } }));
+    try std.testing.expectEqualStrings("from the phone", app.view.editor.text.items);
+    try Queue.set(&app, &.{.{ .id = 900, .input = .{ .text = "also check the docs" } }});
+    try std.testing.expectEqualSlices(u64, &.{900}, Queue.ids(&app, &buf));
+    // With text in the composer, Up is the composer's again.
+    output.clearRetainingCapacity();
+    try handleKey(&app, .{ .codepoint = vaxis.Key.up });
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    app.view.editor.clear();
+
+    // Too late: the turn took it first.
+    try std.testing.expect(app.takeBackQueued());
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .err = .{ .code = "not_queued", .msg = "already sent", .request_id = app.unqueue_pending.request_id } }));
+    try std.testing.expectEqualStrings("already sent", app.notice.items);
+    try std.testing.expectEqualStrings("", app.view.editor.text.items);
+
+    // Delivered: the card becomes the message, and the emptied queue that
+    // follows leaves the message alone.
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = .{
+        .id = 1,
+        .session_id = 7,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 100,
+        .body = .{ .steer = .{ .text = "also check the docs" } },
+    } } }));
+    try Queue.set(&app, &.{});
+    try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
+    try std.testing.expect(!app.view.blocks.items[0].pending_echo);
+    try std.testing.expectEqual(@as(u64, 0), app.view.blocks.items[0].queue_id);
+    // Nothing queued: Up walks history as before.
+    try std.testing.expect(!app.takeBackQueued());
+}
+
 test "steering cards keep a uniform background and italic text across wrapped lines" {
     const gpa = std.testing.allocator;
     var threaded: Io.Threaded = .init(gpa, .{});
