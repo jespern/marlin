@@ -1922,3 +1922,72 @@ test "a message from another agent folds to one line; ctrl+t shows it whole" {
     // Never a prompt card: no filled rows.
     for (expanded_lines.items) |line| try std.testing.expect(line.fill_style == null);
 }
+
+test "session tools say what they do and name the session, under every backend's name" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    for ([_][]const u8{ "wait_for_session", "mcp__marlin__wait_for_session", "MCP marlin/wait_for_session" }) |name|
+        try std.testing.expectEqual(layout.SessionTool.wait, layout.sessionTool(name).?);
+    try std.testing.expect(layout.sessionTool("mcp__other__wait_for_session") == null);
+
+    const session_handle = @import("../core/session_handle.zig");
+    const jev = session_handle.full(42);
+    const wait_args = try std.fmt.allocPrint(gpa, "{{\"handle\":\"{s}\"}}", .{jev[0..4]});
+    defer gpa.free(wait_args);
+    const message_args = try std.fmt.allocPrint(gpa, "{{\"handle\":\"{s}\",\"text\":\"Are you releasing?\\nDetails follow.\"}}", .{jev[0..8]});
+    defer gpa.free(message_args);
+    const blocks = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("go"), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{}"), .label = @constCast("mcp__marlin__sessions") },
+        .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("…"), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .text = message_args, .label = @constCast("mcp__marlin__message_session") },
+        .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("delivered"), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{\"handle\":\"beef\"}"), .label = @constCast("read_session") },
+        .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("…"), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .text = wait_args, .label = @constCast("mcp__marlin__wait_for_session") },
+    };
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    const sessions = [_]layout.SessionRef{ .{ .sid = 42, .title = "jev" }, .{ .sid = 7, .title = "robin" } };
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = &blocks,
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .guest = true,
+        .sessions = &sessions,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const lines = try layoutLines(arena, gpa, &transcript, 120);
+    var all: std.ArrayList(u8) = .empty;
+    for (lines.items) |line| try all.print(arena, "{s}\n", .{try lineText(arena, line)});
+    const text = all.items;
+    const named = try std.fmt.allocPrint(arena, "jev · {s}", .{jev[0..8]});
+    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Listed sessions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Message to {s}: Are you releasing?\n", .{named})) != null);
+    // A handle this client does not know stays as the agent typed it.
+    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Read session beef") != null);
+    // Still waiting: present tense, the session by name.
+    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "Waiting on {s}", .{named})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mcp__marlin__") == null);
+}

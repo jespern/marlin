@@ -636,6 +636,11 @@ pub const App = struct {
     /// existing fuzzy picker; full view state lives in saved_views.
     sessions: std.ArrayList(SessionSummary) = .empty,
     session_labels: std.ArrayList([]const u8) = .empty,
+    /// Titles by id, so a session tool's row names its target. Rebuilt
+    /// with the catalog; `session_names` hashes them so a rename or a new
+    /// session re-lays out the transcript and a state change does not.
+    session_refs: std.ArrayList(layout_mod.SessionRef) = .empty,
+    session_names: u64 = 0,
     /// Monotonic catalog of active and archived ids, seeded before entering
     /// the TUI. It lets visible handles remain globally unambiguous even
     /// though session_watch intentionally omits archived rows.
@@ -843,6 +848,7 @@ pub const App = struct {
         for (self.sessions.items) |*session| session.deinit(self.gpa);
         self.sessions.deinit(self.gpa);
         self.session_labels.deinit(self.gpa);
+        self.session_refs.deinit(self.gpa);
         self.known_session_ids.deinit(self.gpa);
         var saved_it = self.saved_views.valueIterator();
         while (saved_it.next()) |saved| {
@@ -1538,7 +1544,27 @@ pub const App = struct {
         return @min(ordinal - 1, len - 1);
     }
 
+    /// Rebuild session_refs from the catalog; when a title or the set of
+    /// sessions changed, re-lay out every view (cached rows name sessions).
+    fn syncSessionRefs(self: *App) void {
+        self.session_refs.clearRetainingCapacity();
+        var hash = std.hash.Wyhash.init(0);
+        for (self.sessions.items) |s| {
+            self.session_refs.append(self.gpa, .{ .sid = s.sid, .title = s.title }) catch {};
+            hash.update(std.mem.asBytes(&s.sid));
+            hash.update(s.title);
+            hash.update("\x00");
+        }
+        const names = hash.final();
+        if (names == self.session_names) return;
+        self.session_names = names;
+        self.view.layout_epoch +%= 1;
+        var it = self.saved_views.valueIterator();
+        while (it.next()) |saved| saved.*.layout_epoch +%= 1;
+    }
+
     pub fn replaceSessionSummaries(self: *App, incoming: []const proto.SessionInfo) void {
+        defer self.syncSessionRefs();
         for (incoming) |info| self.rememberSession(info.sid);
         // A catalog refresh can race the direct status event. Observe its
         // transitions before replacing the old summaries so completion
@@ -1684,6 +1710,7 @@ pub const App = struct {
     }
 
     pub fn upsertSessionSummary(self: *App, info: proto.SessionInfo) void {
+        defer self.syncSessionRefs();
         self.rememberSession(info.sid);
         var summary = self.allocSessionSummary(info) orelse return;
 
@@ -1781,6 +1808,7 @@ pub const App = struct {
     }
 
     pub fn removeSessionSummary(self: *App, sid: u64) void {
+        defer self.syncSessionRefs();
         // The overlay's fallback is a DISPLAY position (tree order), not the
         // storage index: keep the cursor where the removed row was so the
         // next sibling slides under it and archives can cascade with `a`.
@@ -5270,6 +5298,7 @@ pub fn transcriptView(app: *App) Transcript {
         .stream_status_at_ms = app.view.stream_status_at_ms,
         .show_working_ticker = !hasUnfinishedPlan(app.view.plan.items),
         .cwd = app.view.cwd.items,
+        .sessions = app.session_refs.items,
         .guest = proto.isGuestModel(app.view.model.items),
         .guest_activity = app.view.guest_activity,
         .approval = if (app.view.pending) |*pending| .{

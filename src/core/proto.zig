@@ -906,6 +906,9 @@ pub const SessionInfo = struct {
     /// Where the shell is now (OSC 7, as its integration reports each
     /// prompt); its start directory until it reports one. Empty when no shell.
     shell_cwd: []const u8 = "",
+    /// The full session handle (session_handle.full, 64 hex): web clients
+    /// match an agent's handle prefix against it to name the session.
+    handle: []const u8 = "",
 };
 
 /// Encode one message as an NDJSON line (incl. trailing \n). Caller frees.

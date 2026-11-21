@@ -558,6 +558,8 @@ test "older session-list entries default cwd" {
         \\{"session_list_result":{"sessions":[{"sid":5,"title":"old","model":"m","status":"idle","created_at":1,"running":false}]}}
     );
     try std.testing.expectEqualStrings("", m.session_list_result.sessions[0].cwd);
+    // A daemon before handles on the wire: web clients fall back to the typed handle.
+    try std.testing.expectEqualStrings("", m.session_list_result.sessions[0].handle);
     try std.testing.expectEqual(SessionState.idle, m.session_list_result.sessions[0].state);
     try std.testing.expectEqual(SessionKind.root, m.session_list_result.sessions[0].kind);
     try std.testing.expectEqual(@as(?u64, null), m.session_list_result.sessions[0].parent_sid);

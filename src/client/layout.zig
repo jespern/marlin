@@ -6,6 +6,7 @@ const vaxis = @import("vaxis");
 const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 const agent_message = @import("../core/agent_message.zig");
+const session_handle = @import("../core/session_handle.zig");
 const transcript_images = @import("transcript_images.zig");
 const render = @import("render.zig");
 const shell_intent = @import("shell_intent.zig");
@@ -978,6 +979,126 @@ pub fn pendingToolBatch(blocks: []const RenderBlock, start: usize) ?CollapsedToo
     return null;
 }
 
+/// A session this client knows, for naming the one a session tool targets.
+pub const SessionRef = struct { sid: u64, title: []const u8 };
+
+pub const SessionTool = enum { list, read, message, wait };
+
+/// The cross-session tools (sessions, read_session, message_session,
+/// wait_for_session) under each backend's name, like isAskUserTool.
+pub fn sessionTool(name: []const u8) ?SessionTool {
+    var bare = name;
+    for ([_][]const u8{ "mcp__marlin__", "MCP marlin/" }) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) bare = name[prefix.len..];
+    }
+    const table = [_]struct { []const u8, SessionTool }{
+        .{ "sessions", .list },           .{ "read_session", .read },
+        .{ "message_session", .message }, .{ "wait_for_session", .wait },
+    };
+    for (table) |entry| if (std.mem.eql(u8, bare, entry[0])) return entry[1];
+    return null;
+}
+
+/// A session tool call said as what it does: "Waiting on" "jev · 1a2b3c4d",
+/// with a message's first line as the note. The target is the session's
+/// title and handle when this client knows the session, else the handle
+/// the agent typed.
+pub const SessionToolLine = struct { verb: []const u8, target: []const u8 = "", note: []const u8 = "" };
+
+pub fn sessionToolLine(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    args_json: []const u8,
+    sessions: []const SessionRef,
+    done: bool,
+) !?SessionToolLine {
+    const tool = sessionTool(name) orelse return null;
+    const verb: []const u8 = switch (tool) {
+        .list => if (done) "Listed sessions" else "Listing sessions",
+        .read => if (done) "Read session" else "Reading session",
+        .message => "Message to",
+        .wait => if (done) "Waited on" else "Waiting on",
+    };
+    if (tool == .list) return .{ .verb = verb };
+    const args = std.json.parseFromSliceLeaky(struct { handle: ?[]const u8 = null, text: ?[]const u8 = null }, arena, args_json, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .{ .verb = verb },
+    };
+    const query = args.handle orelse return .{ .verb = verb };
+    const note = if (args.text) |text|
+        std.mem.trim(u8, text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len], " \t\r")
+    else
+        "";
+    for (sessions) |s| {
+        if (!session_handle.matchesPrefix(query, s.sid)) continue;
+        const known = try arena.alloc(u64, sessions.len);
+        for (sessions, known) |other, *sid| sid.* = other.sid;
+        var buf: session_handle.Full = undefined;
+        const handle = session_handle.display(&buf, s.sid, known);
+        return .{
+            .verb = verb,
+            .target = try std.fmt.allocPrint(arena, "{s} · {s}", .{ if (s.title.len > 0) s.title else "(untitled)", handle }),
+            .note = note,
+        };
+    }
+    return .{ .verb = verb, .target = query, .note = note };
+}
+
+/// A session tool's row: the verb, the session, and a message's first line.
+fn appendSessionToolLine(
+    alloc: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    rb: RenderBlock,
+    line: SessionToolLine,
+    w: usize,
+) !void {
+    const output_start = lines.items.len;
+    defer stampOutputLines(lines.items[output_start..], rb.timestamp_ms);
+    const head = try std.fmt.allocPrint(alloc, "  ⚙ {s}{s}", .{ line.verb, if (line.target.len > 0) " " else "" });
+    const target = line.target[0..hardCellBreak(line.target, 0, w -| (displayWidth(head) + 2))];
+    var note: []const u8 = "";
+    if (line.note.len > 0) {
+        const room = w -| (displayWidth(head) + displayWidth(target) + 5);
+        const cut = hardCellBreak(line.note, 0, room);
+        if (cut > 0) note = try std.fmt.allocPrint(alloc, ": {s}{s}", .{ line.note[0..cut], if (cut < line.note.len) "…" else "" });
+    }
+    try lines.append(alloc, .{
+        .text = head,
+        .style = Palette.tool,
+        .text2 = target,
+        .style2 = Palette.tool_cmd,
+        .text3 = note,
+        .style3 = Palette.collapse_hint,
+    });
+}
+
+/// A tool call's row: a session tool said as what it does, anything else
+/// as its name and argument.
+fn appendCallLine(
+    alloc: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    rb: RenderBlock,
+    cwd: []const u8,
+    sessions: []const SessionRef,
+    w: usize,
+    note: ?[]const u8,
+    result: ?RenderBlock,
+) !void {
+    if (try sessionToolLine(alloc, rb.label, rb.text, sessions, result != null)) |line|
+        return appendSessionToolLine(alloc, lines, rb, line, w);
+    try appendToolCallLine(alloc, lines, rb, cwd, w, note, result);
+}
+
+/// The running-status words for a call: a session tool as what it does
+/// ("Waiting on jev · 1a2b3c4d"), else null.
+fn sessionToolStatus(arena: std.mem.Allocator, rb: RenderBlock, sessions: []const SessionRef) !?[]const u8 {
+    const line = (try sessionToolLine(arena, rb.label, rb.text, sessions, false)) orelse return null;
+    if (line.target.len == 0) return line.verb;
+    return try std.fmt.allocPrint(arena, "{s} {s}", .{ line.verb, line.target });
+}
+
 /// ask_user under each backend's name: native, Claude Code's MCP prefix,
 /// and Codex's "MCP server/tool" label.
 pub fn isAskUserTool(name: []const u8) bool {
@@ -1630,6 +1751,8 @@ pub const Transcript = struct {
     guest: bool = false,
     guest_activity: []const proto.GuestActivity = &.{},
     cwd: []const u8 = "",
+    /// Sessions this client knows, so a session tool names its target.
+    sessions: []const SessionRef = &.{},
     approval: ?ApprovalView,
     question: ?QuestionView = null,
     layout_cache: *LayoutCache,
@@ -1744,7 +1867,8 @@ pub fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) !W
         }
     }
     if (currentInflightCall(transcript.blocks)) |cur| {
-        const arg_full = (try toolDisplayArgDecoded(arena, cur.rb.label, cur.rb.text, transcript.cwd)) orelse "";
+        const said = try sessionToolStatus(arena, cur.rb.*, transcript.sessions);
+        const arg_full = if (said != null) "" else (try toolDisplayArgDecoded(arena, cur.rb.label, cur.rb.text, transcript.cwd)) orelse "";
         const arg = arg_full[0..utf8Floor(arg_full, @min(arg_full.len, 60))];
         const call_s: i64 = if (transcript.call_started_ms > 0)
             @max(0, @divTrunc(nowWallMs(transcript.io) - transcript.call_started_ms, 1000))
@@ -1755,7 +1879,7 @@ pub fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) !W
             try std.fmt.allocPrint(arena, " (+{d} queued)", .{cur.queued})
         else
             "";
-        const tool_name = toolDisplayNameFor(arena, cur.rb.label, cur.rb.text);
+        const tool_name = said orelse toolDisplayNameFor(arena, cur.rb.label, cur.rb.text);
         const tool_prefix = try std.fmt.allocPrint(arena, "{s} · {s}{s}", .{
             elapsed, tool_name, sep,
         });
@@ -1962,13 +2086,17 @@ pub fn layoutBlockRange(
                 var hint: []const u8 = " · ctrl+t to view transcript";
                 if (running_count == 1) {
                     const call = blocks_all[running_call_idx];
-                    const hi = (try toolDisplayArgDecoded(alloc, call.label, call.text, transcript.cwd)) orelse "";
-                    const capped = hi[0..@min(hi.len, 60)];
-                    hint = try std.fmt.allocPrint(alloc, " · {s} {s}{s}", .{
-                        toolDisplayNameFor(alloc, call.label, call.text),
-                        capped,
-                        if (capped.len < hi.len) "…" else "",
-                    });
+                    if (try sessionToolStatus(alloc, call, transcript.sessions)) |said| {
+                        hint = try std.fmt.allocPrint(alloc, " · {s}", .{said});
+                    } else {
+                        const hi = (try toolDisplayArgDecoded(alloc, call.label, call.text, transcript.cwd)) orelse "";
+                        const capped = hi[0..utf8Floor(hi, @min(hi.len, 60))];
+                        hint = try std.fmt.allocPrint(alloc, " · {s} {s}{s}", .{
+                            toolDisplayNameFor(alloc, call.label, call.text),
+                            capped,
+                            if (capped.len < hi.len) "…" else "",
+                        });
+                    }
                 } else if (total_ran > 0 and running_count > 1) {
                     hint = try std.fmt.allocPrint(alloc, " · running {d} more", .{running_count});
                 }
@@ -1994,7 +2122,7 @@ pub fn layoutBlockRange(
                         try appendQuestionRecord(alloc, lines, blocks_all[pair.call], result, w);
                     } else if (pair.show_result) {
                         const note = if (result.status == .ok) try diffSummaryNote(alloc, result.text) else null;
-                        try appendToolCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, w, note, result);
+                        try appendCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, transcript.sessions, w, note, result);
                         try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
                         try appendImageRows(alloc, lines, result, transcript.images, w);
                     } else {
@@ -2067,15 +2195,7 @@ pub fn layoutBlockRange(
                     try diffSummaryNote(alloc, result.?.text)
                 else
                     null;
-                try appendToolCallLine(
-                    alloc,
-                    lines,
-                    rb,
-                    transcript.cwd,
-                    w,
-                    note,
-                    result,
-                );
+                try appendCallLine(alloc, lines, rb, transcript.cwd, transcript.sessions, w, note, result);
             },
             .tool_result => {
                 const tool_label = if (pairedToolCallIndex(transcript.blocks, block_idx)) |call_idx|

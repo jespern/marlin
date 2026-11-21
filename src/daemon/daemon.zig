@@ -5963,7 +5963,7 @@ pub const Daemon = struct {
             self.gpa.free(rows);
         }
         const infos = try self.sessionInfos(rows);
-        defer self.gpa.free(infos);
+        defer self.freeSessionInfos(infos);
         const known = try arena.alloc(u64, infos.len);
         for (infos, known) |info, *id| id.* = info.sid;
         const peers = try arena.alloc(AgentPeer, infos.len);
@@ -6236,16 +6236,28 @@ pub const Daemon = struct {
             self.gpa.free(rows);
         }
         const infos = try self.sessionInfos(rows);
-        defer self.gpa.free(infos);
+        defer self.freeSessionInfos(infos);
         self.sendTo(client, .{ .session_list_result = .{ .sessions = infos } });
     }
 
     /// Project durable rows through the live in-memory state. Returned info
     /// borrows row strings and owns only its outer slice.
+    fn freeSessionInfos(self: *Daemon, infos: []proto.SessionInfo) void {
+        for (infos) |info| self.gpa.free(info.handle);
+        self.gpa.free(infos);
+    }
+
     fn sessionInfos(self: *Daemon, rows: []const store_mod.Store.SessionListing) ![]proto.SessionInfo {
         const infos = try self.gpa.alloc(proto.SessionInfo, rows.len);
-        errdefer self.gpa.free(infos);
+        var filled: usize = 0;
+        errdefer {
+            for (infos[0..filled]) |info| self.gpa.free(info.handle);
+            self.gpa.free(infos);
+        }
         for (rows, 0..) |row, i| {
+            const full_handle = session_handle.full(row.id);
+            const handle = try self.gpa.dupe(u8, &full_handle);
+            errdefer self.gpa.free(handle);
             const live = self.sessions.get(row.id);
             const stored_pause = if (live == null) try self.store.getPause(row.id) else null;
             defer if (stored_pause) |paused| paused.deinit(self.gpa);
@@ -6281,7 +6293,9 @@ pub const Daemon = struct {
                 .shell_id = if (self.sessionShell(row.id)) |host| host.id else 0,
                 .shell_title = if (self.sessionShell(row.id)) |host| host.title() else "",
                 .shell_cwd = if (self.sessionShell(row.id)) |host| host.cwd else "",
+                .handle = handle,
             };
+            filled = i + 1;
         }
         return infos;
     }
@@ -6316,7 +6330,7 @@ pub const Daemon = struct {
             self.gpa.free(rows);
         }
         const infos = self.sessionInfos(rows) catch return;
-        defer self.gpa.free(infos);
+        defer self.freeSessionInfos(infos);
         const line = proto.encode(self.gpa, proto.DaemonMsg{ .session_list_result = .{ .sessions = infos } }) catch return;
         defer self.gpa.free(line);
         const ctx = struct { daemon: *Daemon, encoded: []const u8 }{ .daemon = self, .encoded = line };
@@ -6355,7 +6369,7 @@ pub const Daemon = struct {
 
     fn fanOutSessionUpsertRow(self: *Daemon, row: store_mod.Store.SessionListing) void {
         const infos = self.sessionInfos(&.{row}) catch return;
-        defer self.gpa.free(infos);
+        defer self.freeSessionInfos(infos);
         const line = proto.encode(self.gpa, proto.DaemonMsg{
             .session_upsert = .{ .session = infos[0] },
         }) catch return;
