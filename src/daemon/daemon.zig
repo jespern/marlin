@@ -438,8 +438,6 @@ pub const Session = struct {
     /// or steered it, else the hop count of the message that did. A message
     /// this session's agent sends is one hop more (sessions.max_hops).
     agent_hops: u8 = 0,
-    /// Messages its agent sent in the current turn (dispatcher-only).
-    agent_sent: u32 = 0,
     /// What has streamed of the text and the thinking being written now,
     /// sent whole to a client that subscribes mid-stream (dispatcher-only).
     live_text: std.ArrayList(u8) = .empty,
@@ -5853,7 +5851,6 @@ pub const Daemon = struct {
             const caller: ?*Session = if (from_outside) null else (try self.getOrLoadSession(caller_sid)) orelse return error.NoSession;
             const hops: u8 = if (caller) |c| c.agent_hops +| 1 else 1;
             if (hops > sessions_tool.max_hops) return .{ .text = try std.fmt.allocPrint(arena, "not sent: this would be hop {d} of a chain of agent messages, past the limit of {d}. Tell the user what you need instead.", .{ hops, sessions_tool.max_hops }), .status = .denied };
-            if (caller) |c| if (c.agent_sent >= sessions_tool.max_messages_per_turn) return .{ .text = try std.fmt.allocPrint(arena, "not sent: this turn already sent {d} messages to other sessions, the limit.", .{c.agent_sent}), .status = .denied };
             const session = (try self.getOrLoadSession(target_sid)) orelse return error.NoSession;
             if (session.pause_requested.load(.acquire) or self.pending_reboot != null)
                 return .{ .text = "not sent: that session is paused", .status = .err };
@@ -5882,7 +5879,6 @@ pub const Daemon = struct {
                 };
                 session.steer_mutex.unlock(self.io);
                 session.agent_hops = @max(session.agent_hops, hops);
-                if (caller) |c| c.agent_sent += 1;
                 return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It is busy and reads it between its steps. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
             }
             session.agent_hops = hops;
@@ -5890,7 +5886,6 @@ pub const Daemon = struct {
                 if (err == error.SessionBusy) return .{ .text = "not sent: that session just started a turn; try again", .status = .err };
                 return err;
             };
-            if (caller) |c| c.agent_sent += 1;
             return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It was idle and has started on it. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
         }
 

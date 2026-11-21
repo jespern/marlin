@@ -17,8 +17,6 @@ pub const names = [_][]const u8{ list_name, read_name, message_name, wait_name }
 /// A message chain stops after this many agent-to-agent hops (A tells B,
 /// B tells C or answers A, …): two agents must not ping-pong forever.
 pub const max_hops: u8 = 5;
-/// Messages one turn may send.
-pub const max_messages_per_turn: u32 = 10;
 /// read_session: blocks shown by default and at most, and the text cap.
 pub const default_read_blocks: usize = 20;
 pub const max_read_blocks: usize = 100;

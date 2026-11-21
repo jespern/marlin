@@ -744,17 +744,20 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
     try std.testing.expectEqualStrings("Is the lexer done?", other.steer_queue.items[0].display_text.?);
     try std.testing.expect(std.mem.indexOf(u8, other.steer_queue.items[0].from.?, caller_handle) != null);
     try std.testing.expectEqual(@as(u8, 1), other.agent_hops);
-    try std.testing.expectEqual(@as(u32, 1), r.session.agent_sent);
 
-    // A chain at the hop limit, or a turn at its message limit, stops.
+    // A chain at the hop limit stops.
     r.session.agent_hops = 5;
     try Call.send(r, 7, 5, "message_session", .{ .handle = handle, .text = "again" });
     try std.testing.expectEqual(block_mod.ToolStatus.denied, (try Call.result(r, 5)).?.status);
-    r.session.agent_hops = 0;
-    r.session.agent_sent = 10;
-    try Call.send(r, 7, 6, "message_session", .{ .handle = handle, .text = "again" });
-    try std.testing.expectEqual(block_mod.ToolStatus.denied, (try Call.result(r, 6)).?.status);
     try std.testing.expectEqual(@as(usize, 1), other.steer_queue.items.len);
+    r.session.agent_hops = 0;
+
+    // How many messages a session sends is not capped (it once was, at 10).
+    for (0..15) |i| {
+        try Call.send(r, 7, 100 + i, "message_session", .{ .handle = handle, .text = "more" });
+        try std.testing.expectEqual(block_mod.ToolStatus.ok, (try Call.result(r, 100 + i)).?.status);
+    }
+    try std.testing.expectEqual(@as(usize, 16), other.steer_queue.items.len);
 
     // Waiting on a working session parks until its turn ends...
     try Call.send(r, 7, 7, "wait_for_session", .{ .handle = handle });
