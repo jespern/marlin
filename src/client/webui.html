@@ -1806,6 +1806,7 @@ const slash_commands = [
   { name: '/sandbox', usage: ' [on|off]', desc: 'toggle the shell sandbox' },
   { name: '/permissions', usage: ' [full|default]', desc: 'full access or default approvals' },
   { name: '/compact', usage: '', desc: 'compact the current context' },
+  { name: '/autocompact', usage: ' [300k|off|default]', desc: 'when Claude Code compacts this session' },
   { name: '/plan', usage: ' [task|off|clear]', desc: 'enter Plan mode or manage its execution todo' },
   { name: '/rename', usage: ' <title>', desc: 'rename this session' },
   { name: '/archive', usage: '', desc: 'archive this session' },
@@ -2752,6 +2753,14 @@ async function slashCommand(raw) {
     if (!arg) return openModelPicker();
     r = await send('{"session_set_model":{"sid":' + sid + ',"model":' + JSON.stringify(arg) + '}}');
     if (!r.err) setModelLabel(arg);
+  } else if (cmd === '/autocompact') {
+    r = await send(JSON.stringify({session_autocompact: {sid, value: arg || null}}));
+    const res = r.session_autocompact_result;
+    if (res) {
+      const n = res.tokens, src = res.uses_default ? 'default' : 'this session';
+      const shown = n === 0 ? 'off' : n % 1000000 === 0 ? n / 1000000 + 'm' : n % 1000 === 0 ? n / 1000 + 'k' : String(n);
+      notice('autocompact: ' + shown + ' (' + src + ')' + (n === 0 ? ' — Claude Code compacts when its window is nearly full' : ''));
+    }
   } else if (cmd === '/sandbox') {
     const enable = arg === 'on' ? true : arg === 'off' ? false : !(cur && cur.sandboxed);
     r = await send('{"session_set_sandbox":{"sid":' + sid + ',"enabled":' + enable + '}}');

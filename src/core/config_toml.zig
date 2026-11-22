@@ -58,6 +58,7 @@ pub const Provider = struct {
 
 pub const Document = struct {
     guest_max_runtime_ms: ?u64 = null,
+    guest_autocompact_tokens: ?u64 = null,
     setup_completed: ?bool = null,
     model_default: ?[]const u8 = null,
     model_compaction: ?[]const u8 = null,
@@ -216,6 +217,9 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Document {
             },
             .guest => if (std.mem.eql(u8, key, "max_runtime")) {
                 doc.guest_max_runtime_ms = try durationMs(value);
+            } else if (std.mem.eql(u8, key, "autocompact")) {
+                if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return error.ExpectedTokenCount;
+                doc.guest_autocompact_tokens = parseTokenCount(value[1 .. value.len - 1]) catch return error.ExpectedTokenCount;
             },
             .model => {
                 if (std.mem.eql(u8, key, "default")) doc.model_default = try string(arena, value);
@@ -467,6 +471,23 @@ fn optionalString(arena: std.mem.Allocator, value: []const u8) !?[]const u8 {
 fn durationMs(value: []const u8) !u64 {
     if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return error.ExpectedDuration;
     return parseDurationMs(value[1 .. value.len - 1]) catch return error.ExpectedDuration;
+}
+
+pub fn parseTokenCount(raw: []const u8) !u64 {
+    if (std.mem.eql(u8, raw, "off")) return 0;
+    if (raw.len == 0) return error.InvalidTokenCount;
+    const multiplier: u64 = switch (std.ascii.toLower(raw[raw.len - 1])) {
+        'k' => 1_000,
+        'm' => 1_000_000,
+        '0'...'9' => 1,
+        else => return error.InvalidTokenCount,
+    };
+    const digits = if (multiplier == 1) raw else raw[0 .. raw.len - 1];
+    const amount = std.fmt.parseInt(u64, digits, 10) catch return error.InvalidTokenCount;
+    const tokens = std.math.mul(u64, amount, multiplier) catch return error.InvalidTokenCount;
+    // Below this Claude Code would compact on every turn.
+    if (tokens < 20_000) return error.InvalidTokenCount;
+    return tokens;
 }
 
 pub fn parseDurationMs(raw: []const u8) !u64 {

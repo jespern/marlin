@@ -332,6 +332,9 @@ pub const ClientMsg = union(enum) {
     /// Persist the session collaboration mode. Plan mode is daemon-enforced
     /// read-only and survives client reconnects and daemon restarts.
     session_runtime: struct { sid: u64, value: ?[]const u8 = null },
+    /// Show (value null) or set a Claude Code guest's autocompact threshold:
+    /// "300k", "off", or "default".
+    session_autocompact: struct { sid: u64, value: ?[]const u8 = null },
     session_set_plan_mode: struct { sid: u64, enabled: bool },
     /// Toggle the kernel shell sandbox (and its prompt-free shell execution)
     /// for one session. Enabling requires the daemon's verified backend
@@ -683,6 +686,8 @@ pub const DaemonMsg = union(enum) {
         handover: bool = false,
     },
     session_runtime_result: struct { sid: u64, max_runtime_ms: u64, uses_default: bool },
+    /// tokens 0: the guest compacts on its own schedule.
+    session_autocompact_result: struct { sid: u64, tokens: u64, uses_default: bool },
     session_created: struct { sid: u64, request_id: u64 = 0 },
     session_list_result: struct { sessions: []const SessionInfo },
     input_history_result: struct { entries: []const InputHistoryEntry, sid: u64 = 0 },

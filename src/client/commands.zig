@@ -34,6 +34,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/setup", .description = "choose and authenticate a provider or guest agent" },
     .{ .name = "/effort", .usage = " [level]", .description = "set reasoning effort or open the picker", .accepts_args = true },
     .{ .name = "/runtime", .usage = " [duration|off|default]", .description = "show or change this session’s guest runtime limit", .accepts_args = true },
+    .{ .name = "/autocompact", .usage = " [300k|off|default]", .description = "show or change when this session’s Claude Code compacts its context", .accepts_args = true },
     .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
     .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
@@ -121,6 +122,7 @@ pub fn commandQuery(editor: *const Editor) ?[]const u8 {
             !std.mem.eql(u8, head, "/review") and
             !std.mem.eql(u8, head, "/plan") and
             !std.mem.eql(u8, head, "/runtime") and
+            !std.mem.eql(u8, head, "/autocompact") and
             !std.mem.eql(u8, head, "/animate") and
             !std.mem.eql(u8, head, "/screensaver") and
             !std.mem.eql(u8, head, "/otel") and
@@ -155,6 +157,21 @@ pub fn cwdArgument(editor: *const Editor) ?[]const u8 {
 pub fn commandSuggestions(app: *const App, arena: std.mem.Allocator) ![]const CommandSuggestion {
     const query = commandQuery(&app.view.editor) orelse return &.{};
     var out: std.ArrayList(CommandSuggestion) = .empty;
+    if (std.mem.startsWith(u8, query, "/autocompact ") or std.mem.startsWith(u8, query, "/autocompact\t")) {
+        const rest = std.mem.trimStart(u8, query["/autocompact".len..], " \t");
+        const choices = [_]struct { value: []const u8, description: []const u8 }{
+            .{ .value = "200k", .description = "compact early: cheapest requests, least kept verbatim" },
+            .{ .value = "500k", .description = "compact at half of a 1M-token window" },
+            .{ .value = "off", .description = "let Claude Code compact when its window is nearly full" },
+            .{ .value = "default", .description = "use the configured threshold" },
+        };
+        for (choices) |choice| {
+            if (!std.mem.startsWith(u8, choice.value, rest)) continue;
+            const replacement = try std.fmt.allocPrint(arena, "/autocompact {s}", .{choice.value});
+            try out.append(arena, .{ .label = replacement, .description = choice.description, .replacement = replacement, .submit_on_enter = true });
+        }
+        return out.items;
+    }
     if (std.mem.startsWith(u8, query, "/runtime ") or std.mem.startsWith(u8, query, "/runtime\t")) {
         const rest = std.mem.trimStart(u8, query["/runtime".len..], " \t");
         const choices = [_]struct { value: []const u8, description: []const u8 }{
@@ -520,6 +537,17 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         }
         self.conn.send(.{ .session_runtime = .{ .sid = self.view.sid, .value = if (value.len == 0) null else value } }) catch {
             self.setNotice("could not send runtime command", .{});
+        };
+    } else if (std.mem.eql(u8, head, "/autocompact")) {
+        const value = std.mem.trim(u8, it.rest(), " \t\r\n");
+        if (value.len > 0 and !std.mem.eql(u8, value, "default")) {
+            _ = config.parseTokenCount(value) catch {
+                self.setNotice("usage: /autocompact [300k|off|default] (at least 20k tokens)", .{});
+                return;
+            };
+        }
+        self.conn.send(.{ .session_autocompact = .{ .sid = self.view.sid, .value = if (value.len == 0) null else value } }) catch {
+            self.setNotice("could not send autocompact command", .{});
         };
     } else if (std.mem.eql(u8, head, "/permissions")) {
         self.setPermissions(it.rest());

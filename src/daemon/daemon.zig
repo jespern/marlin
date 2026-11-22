@@ -487,6 +487,9 @@ pub const Session = struct {
     approval_mode_live: std.atomic.Value(u8) = .init(@backingInt(approval.Mode.default)),
     /// maxInt inherits the turn’s configured default; zero disables its deadline.
     guest_max_runtime_live: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    /// Claude Code guest autocompact threshold in tokens; maxInt uses the
+    /// configured default, 0 leaves it to the guest. Read per invocation.
+    guest_autocompact_live: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     /// Agent-to-agent hops behind the current turn: 0 when a human started
     /// or steered it, else the hop count of the message that did. A message
     /// this session's agent sends is one hop more (sessions.max_hops).
@@ -2789,6 +2792,28 @@ pub const Daemon = struct {
                     .uses_default = uses_default,
                 } });
             },
+            .session_autocompact => |request| {
+                const session = (try self.getOrLoadSession(request.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (request.value) |value| {
+                    if (self.rejectArchivedSession(client, session)) return;
+                    const tokens: ?u64 = if (std.mem.eql(u8, value, "default")) null else config.parseTokenCount(value) catch {
+                        self.sendTo(client, .{ .err = .{ .code = "autocompact", .msg = "usage: /autocompact [300k|off|default] (at least 20k tokens)" } });
+                        return;
+                    };
+                    try self.store.setSessionGuestAutocompact(request.sid, tokens);
+                    session.guest_autocompact_live.store(tokens orelse std.math.maxInt(u64), .release);
+                }
+                const value = session.guest_autocompact_live.load(.acquire);
+                const uses_default = value == std.math.maxInt(u64);
+                self.sendTo(client, .{ .session_autocompact_result = .{
+                    .sid = request.sid,
+                    .tokens = if (uses_default) self.cfg.guest_autocompact_tokens else value,
+                    .uses_default = uses_default,
+                } });
+            },
             .session_set_plan_mode => |sp| {
                 const session = (try self.getOrLoadSession(sp.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
@@ -4120,6 +4145,7 @@ pub const Daemon = struct {
             session.pause_requested.store(true, .release);
         }
         session.guest_max_runtime_live.store((try self.store.getSessionGuestRuntime(sid)) orelse std.math.maxInt(u64), .release);
+        session.guest_autocompact_live.store((try self.store.getSessionGuestAutocompact(sid)) orelse std.math.maxInt(u64), .release);
         // The gauge survives a daemon restart: a guest's window is otherwise
         // unknown until its next model call reports it.
         const stored_context = try self.store.getSessionContext(sid);
@@ -5116,6 +5142,7 @@ pub const Daemon = struct {
             .pause = &job.session.pause_requested,
             .park_clock = &job.session.park_clock,
             .guest_max_runtime_live = &job.session.guest_max_runtime_live,
+            .guest_autocompact_live = &job.session.guest_autocompact_live,
             .poll_steer = if (job.guest_compact) null else TurnHooks.pollSteer,
             .try_close_steer = TurnHooks.tryCloseSteer,
             .max_rounds = job.max_rounds,

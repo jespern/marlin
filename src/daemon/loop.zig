@@ -135,6 +135,9 @@ pub const RunOpts = struct {
     /// journaling into a directory under this root, so the turn outlives a
     /// daemon restart. Null starts the guest directly.
     keeper_root: ?[]const u8 = null,
+    /// Claude Code guests: compact at this many tokens (maxInt: the
+    /// configured default; 0: the guest's own schedule). Read per invocation.
+    guest_autocompact_live: ?*const std.atomic.Value(u64) = null,
     /// Where a kept guest turn publishes its keeper, so the daemon can
     /// detach it when it hands over.
     kept_slot: ?*kept.Slot = null,

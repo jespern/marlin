@@ -498,3 +498,29 @@ test "guest runtime supports durations and off without changing the default" {
         try std.testing.expectError(error.ExpectedDuration, toml.parse(arena.allocator(), text));
     }
 }
+
+test "guest autocompact takes token counts and off, defaulting to 300k" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(u64, 300_000), defaults().guest_autocompact_tokens);
+    for ([_]struct { value: []const u8, tokens: u64 }{
+        .{ .value = "200k", .tokens = 200_000 },
+        .{ .value = "1m", .tokens = 1_000_000 },
+        .{ .value = "450000", .tokens = 450_000 },
+        .{ .value = "off", .tokens = 0 },
+    }) |case| {
+        const text = try std.fmt.allocPrint(arena.allocator(), "[guest]\nautocompact = \"{s}\"\n", .{case.value});
+        var cfg = defaults();
+        applyDocument(&cfg, try toml.parse(arena.allocator(), text));
+        try std.testing.expectEqual(case.tokens, cfg.guest_autocompact_tokens);
+    }
+    // Below 20k a guest would compact every turn.
+    for ([_][]const u8{ "\"5k\"", "\"lots\"", "300000", "\"\"" }) |value| {
+        const text = try std.fmt.allocPrint(arena.allocator(), "[guest]\nautocompact = {s}\n", .{value});
+        try std.testing.expectError(error.ExpectedTokenCount, toml.parse(arena.allocator(), text));
+    }
+    var buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("300k", try config.formatTokenCount(&buf, 300_000));
+    try std.testing.expectEqualStrings("1m", try config.formatTokenCount(&buf, 1_000_000));
+    try std.testing.expectEqualStrings("off", try config.formatTokenCount(&buf, 0));
+}

@@ -63,7 +63,8 @@ const schema_sql =
     \\  muse_session_id TEXT,
     \\  context_used INTEGER,
     \\  guest_context_limit INTEGER,
-    \\  draft TEXT NOT NULL DEFAULT ''
+    \\  draft TEXT NOT NULL DEFAULT '',
+    \\  guest_autocompact_tokens INTEGER
     \\);
     \\CREATE TABLE IF NOT EXISTS live_shells(
     \\  session_id INTEGER PRIMARY KEY,
@@ -204,7 +205,7 @@ const schema_sql =
     \\  kind TEXT NOT NULL,
     \\  detail TEXT NOT NULL DEFAULT '{}'
     \\);
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','19');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','20');
 ;
 
 pub const SessionRow = struct {
@@ -536,6 +537,12 @@ pub const Store = struct {
             try self.execAll(
                 \\ALTER TABLE sessions ADD COLUMN draft TEXT NOT NULL DEFAULT '';
                 \\UPDATE kv SET value='19' WHERE key='schema_version';
+            );
+        }
+        if (ver < 20) {
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN guest_autocompact_tokens INTEGER;
+                \\UPDATE kv SET value='20' WHERE key='schema_version';
             );
         }
     }
@@ -1520,6 +1527,27 @@ pub const Store = struct {
         bindOptionalInt(stmt, 1, runtime_ms);
         bindInt(stmt, 2, @bitCast(id));
         try stepDone(stmt);
+    }
+
+    /// The session's guest autocompact threshold: null uses the configured
+    /// default, 0 leaves it to the guest.
+    pub fn setSessionGuestAutocompact(self: Store, id: u64, tokens: ?u64) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET guest_autocompact_tokens=? WHERE id=?");
+        defer finalize(stmt);
+        bindOptionalInt(stmt, 1, tokens);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
+    pub fn getSessionGuestAutocompact(self: Store, id: u64) Error!?u64 {
+        const stmt = try self.prepare("SELECT guest_autocompact_tokens FROM sessions WHERE id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return error.NotFound;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+        return @intCast(c.sqlite3_column_int64(stmt, 0));
     }
 
     pub fn getSessionGuestRuntime(self: Store, id: u64) Error!?u64 {

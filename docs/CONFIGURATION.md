@@ -170,6 +170,32 @@ The default is four hours. Set a different default in
 max_runtime = "12h" # or "off"; omitted defaults to "4h"
 ```
 
+### Claude Code's context size and cache
+
+A Claude Code guest rereads its whole context on every request, from the
+prompt cache when the cache is warm, and writes all of it to the cache again
+when it has expired. A long-lived session on a 1M-token model can carry
+500-800K tokens, so its size, and whether its cache survives, decide what it
+costs. Marlin therefore starts every Claude Code invocation with:
+
+- `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`: Claude Code keeps its cache for an hour
+  only while your account is not drawing on extra usage ("now using API
+  credits"); then it falls back to five minutes. A guest waits longer than
+  that between requests often (a long command, `wait_for_session`, a reply
+  from the phone), and each miss rewrites the whole context.
+- `CLAUDE_CODE_AUTO_COMPACT_WINDOW`: the guest compacts once its context
+  reaches this many tokens instead of waiting until the model's window is
+  nearly full. 300K by default; `/autocompact 500k`, `/autocompact off`
+  (Claude Code decides) or `/autocompact default` per session, from its next
+  turn.
+
+Values you set in the daemon's environment win over both.
+
+```toml
+[guest]
+autocompact = "300k" # or "off"
+```
+
 ## Restart handover
 
 `/reboot` (and `!rb`, and `/reboot` on the phone) restarts Marlin without

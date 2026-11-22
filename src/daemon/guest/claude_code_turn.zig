@@ -353,6 +353,32 @@ pub fn claudeErrorNote(
     return std.fmt.allocPrint(allocator, "claude code error: {s}", .{trimmed_detail});
 }
 
+/// The session's autocompact threshold for this invocation (0: the guest's).
+pub fn guestAutocompactTokens(opts: RunOpts) u64 {
+    const live = if (opts.guest_autocompact_live) |v| v.load(.acquire) else std.math.maxInt(u64);
+    return if (live == std.math.maxInt(u64)) opts.cfg.guest_autocompact_tokens else live;
+}
+
+/// Keep Claude Code's prompt cache for an hour, and compact at `autocompact`
+/// tokens (0: Claude Code decides). Values already in the environment win.
+///
+/// Claude Code caches for an hour only while the account is not drawing on
+/// extra usage; drawing on it, it falls back to five minutes. Through Marlin
+/// a guest often waits longer than that between requests (a long command,
+/// wait_for_session, a reply from the phone), and every miss writes its whole
+/// context to the cache again: in the store, 82-97% of guest cache writes were
+/// such rewrites, 300-800K tokens each. An hour's write costs 2x rather than
+/// 1.25x, far less than a full rewrite every five minutes.
+pub fn putGuestCacheEnv(map: *std.process.Environ.Map, autocompact: u64) bool {
+    var ok = putEnvDefault(map, "CLAUDE_CODE_PROMPT_CACHE_TTL", "1h");
+    if (autocompact > 0) {
+        var buf: [24]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d}", .{autocompact}) catch return false;
+        ok = ok and putEnvDefault(map, "CLAUDE_CODE_AUTO_COMPACT_WINDOW", text);
+    }
+    return ok;
+}
+
 /// The replay caught up: persist and announce from here on, starting with
 /// where the turn stands.
 fn ccGoLive(
@@ -443,7 +469,7 @@ fn ccInvoke(
     var traceparent_buf: [64]u8 = undefined;
     var child_environ: ?std.process.Environ.Map = null;
     defer if (child_environ) |*map| map.deinit();
-    if (bridge != null or opts.otel_guest != null) {
+    {
         if (opts.tool_environ) |source| {
             var map = std.process.Environ.Map.init(gpa);
             var ok = true;
@@ -454,6 +480,7 @@ fn ccInvoke(
                     break;
                 };
             }
+            ok = ok and putGuestCacheEnv(&map, guestAutocompactTokens(opts));
             if (bridge != null) {
                 if (ok and map.get("MCP_TOOL_TIMEOUT") == null)
                     map.put("MCP_TOOL_TIMEOUT", "86400000") catch {

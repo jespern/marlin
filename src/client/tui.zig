@@ -2567,6 +2567,16 @@ pub const App = struct {
                     self.queueTerminalNotification(ar.sid, "Approval needed");
                 }
             },
+            .session_autocompact_result => |result| {
+                if (result.sid != self.view.sid) return;
+                var tokens_buf: [24]u8 = undefined;
+                const tokens = config.formatTokenCount(&tokens_buf, result.tokens) catch return;
+                const source: []const u8 = if (result.uses_default) "default" else "this session";
+                if (result.tokens == 0)
+                    self.setNotice("autocompact: off ({s}) — Claude Code compacts when its window is nearly full", .{source})
+                else
+                    self.setNotice("autocompact: {s} tokens ({s}) — Claude Code compacts its context there, from its next turn", .{ tokens, source });
+            },
             .session_runtime_result => |result| {
                 if (result.sid != self.view.sid) return;
                 var duration_buf: [32]u8 = undefined;

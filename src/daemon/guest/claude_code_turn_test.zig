@@ -205,3 +205,27 @@ test "Claude Code /compact resumes the conversation with the focus and never sta
         try std.testing.expectEqualStrings("x\n", invocations);
     }
 }
+
+test "guests keep Claude Code's cache for an hour and compact at the session's threshold; the user's own values win" {
+    const gpa = std.testing.allocator;
+    var map = std.process.Environ.Map.init(gpa);
+    defer map.deinit();
+    try std.testing.expect(claude_code_turn.putGuestCacheEnv(&map, 300_000));
+    try std.testing.expectEqualStrings("1h", map.get("CLAUDE_CODE_PROMPT_CACHE_TTL").?);
+    try std.testing.expectEqualStrings("300000", map.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").?);
+
+    var own = std.process.Environ.Map.init(gpa);
+    defer own.deinit();
+    try own.put("CLAUDE_CODE_PROMPT_CACHE_TTL", "5m");
+    try own.put("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "800000");
+    try std.testing.expect(claude_code_turn.putGuestCacheEnv(&own, 300_000));
+    try std.testing.expectEqualStrings("5m", own.get("CLAUDE_CODE_PROMPT_CACHE_TTL").?);
+    try std.testing.expectEqualStrings("800000", own.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").?);
+
+    // Off: Claude Code's own compaction schedule, still the long cache.
+    var off = std.process.Environ.Map.init(gpa);
+    defer off.deinit();
+    try std.testing.expect(claude_code_turn.putGuestCacheEnv(&off, 0));
+    try std.testing.expect(off.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == null);
+    try std.testing.expectEqualStrings("1h", off.get("CLAUDE_CODE_PROMPT_CACHE_TTL").?);
+}

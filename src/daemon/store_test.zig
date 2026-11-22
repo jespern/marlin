@@ -597,16 +597,22 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v19 with performance telemetry and scaling indexes" {
+test "schema is v20 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 19), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 20), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 19), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 20), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
+    // v20: a guest's autocompact threshold, null (configured default) until set.
+    try std.testing.expectEqual(@as(?u64, null), try store.getSessionGuestAutocompact(42));
+    try store.setSessionGuestAutocompact(42, 200_000);
+    try std.testing.expectEqual(@as(?u64, 200_000), try store.getSessionGuestAutocompact(42));
+    try store.setSessionGuestAutocompact(42, 0);
+    try std.testing.expectEqual(@as(?u64, 0), try store.getSessionGuestAutocompact(42));
     try store.setSessionPlanMode(42, true);
     const row = try store.getSession(42);
     defer store.freeSession(row);
@@ -1000,6 +1006,7 @@ test "v13 session runtime migration preserves defaults and independent overrides
         "ALTER TABLE sessions DROP COLUMN context_used",
         "ALTER TABLE sessions DROP COLUMN guest_context_limit",
         "ALTER TABLE sessions DROP COLUMN draft",
+        "ALTER TABLE sessions DROP COLUMN guest_autocompact_tokens",
         "UPDATE kv SET value='13' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
@@ -1033,6 +1040,7 @@ test "v14 migration preserves paused grants and later revocation overrides old c
         "ALTER TABLE sessions DROP COLUMN context_used",
         "ALTER TABLE sessions DROP COLUMN guest_context_limit",
         "ALTER TABLE sessions DROP COLUMN draft",
+        "ALTER TABLE sessions DROP COLUMN guest_autocompact_tokens",
         "UPDATE kv SET value='14' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);

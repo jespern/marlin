@@ -24,6 +24,12 @@ pub const Config = struct {
     setup_completed: bool = false,
     /// Shared guest invocation ceiling; zero disables the deadline.
     guest_max_runtime_ms: u64 = 4 * 60 * 60 * 1000,
+    /// Claude Code guests compact their context once it reaches this many
+    /// tokens (CLAUDE_CODE_AUTO_COMPACT_WINDOW); 0 leaves it to Claude Code,
+    /// which on a 1M-token model waits until the window is nearly full.
+    /// Every request rereads the whole context, and every cache miss
+    /// rewrites it, so a long-lived session costs in proportion to it.
+    guest_autocompact_tokens: u64 = 300_000,
     model_default: []const u8 = "openrouter/anthropic/claude-sonnet-4.5",
     model_compaction: ?[]const u8 = null, // null → use model_default
     /// `.auto` omits the request parameter and preserves the model default.
@@ -159,6 +165,19 @@ pub fn defaults() Config {
 
 pub fn parseDurationMs(value: []const u8) !u64 {
     return toml.parseDurationMs(value);
+}
+
+/// "300k", "1m", "250000", or "off" (0).
+pub fn parseTokenCount(value: []const u8) !u64 {
+    return toml.parseTokenCount(value);
+}
+
+/// "300k", "1.5m" style; "off" for 0.
+pub fn formatTokenCount(buf: []u8, tokens: u64) ![]const u8 {
+    if (tokens == 0) return "off";
+    if (tokens % 1_000_000 == 0) return std.fmt.bufPrint(buf, "{d}m", .{tokens / 1_000_000});
+    if (tokens % 1_000 == 0) return std.fmt.bufPrint(buf, "{d}k", .{tokens / 1_000});
+    return std.fmt.bufPrint(buf, "{d}", .{tokens});
 }
 
 pub fn formatDuration(buf: []u8, duration_ms: u64) ![]const u8 {
@@ -813,6 +832,7 @@ fn hasCsvEntry(value: ?[]const u8) bool {
 pub fn applyDocument(cfg: *Config, doc: toml.Document) void {
     if (doc.setup_completed) |value| cfg.setup_completed = value;
     if (doc.guest_max_runtime_ms) |value| cfg.guest_max_runtime_ms = value;
+    if (doc.guest_autocompact_tokens) |value| cfg.guest_autocompact_tokens = value;
     if (doc.model_default) |value| cfg.model_default = value;
     if (doc.model_compaction) |value| cfg.model_compaction = value;
     if (doc.model_favorites) |value| cfg.model_favorites = value;
