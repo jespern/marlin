@@ -196,6 +196,8 @@
     border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere;
   }
   .tool pre { color: var(--dim); max-height: 340px; overflow-y: auto; }
+  /* A message to another session, whole, above its delivery receipt. */
+  .tool .sent { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0 6px 1.2em; }
   .tool.err summary { color: var(--red); }
   .note { color: var(--code); font-size: 13px; } /* render.zig: note = soft blue */
   /* markdown */
@@ -1237,13 +1239,14 @@ function marlinToolLine(name, argsJson, done) {
   // Codex records its whole MCP item, the call's own arguments nested.
   if (a.arguments && typeof a.arguments === 'object') a = a.arguments;
   else if (typeof a.arguments === 'string') try { a = JSON.parse(a.arguments) || {}; } catch {}
-  if (tool === 'show_image') return {verb, target: typeof a.path === 'string' ? a.path.split('/').pop() : '', note: ''};
+  if (tool === 'show_image') return {verb, target: typeof a.path === 'string' ? a.path.split('/').pop() : '', note: '', text: ''};
   const query = tool !== 'list' && typeof a.handle === 'string' ? a.handle : '';
-  const note = typeof a.text === 'string' ? a.text.split('\n', 1)[0].trim() : '';
-  if (!query) return {verb, target: '', note};
+  const text = typeof a.text === 'string' ? a.text : '';
+  const note = text.split('\n', 1)[0].trim();
+  if (!query) return {verb, target: '', note, text};
   const q = query.toLowerCase();
   const s = q.length >= 4 && sessionsCache.find(x => (x.handle || '').startsWith(q));
-  if (!s) return {verb, target: query, note};
+  if (!s) return {verb, target: query, note, text};
   // Eight characters, longer only while another known session shares them.
   let len = 8;
   for (const o of sessionsCache) {
@@ -1252,7 +1255,7 @@ function marlinToolLine(name, argsJson, done) {
     while (common < o.handle.length && o.handle[common] === s.handle[common]) common++;
     if (common >= len) len = common + 1;
   }
-  return {verb, target: (s.title || '(untitled)') + ' · ' + s.handle.slice(0, len), note};
+  return {verb, target: (s.title || '(untitled)') + ' · ' + s.handle.slice(0, len), note, text};
 }
 function marlinToolSummary(summary, line) {
   summary.replaceChildren('⚙ ', el('span', 'name', line.verb));
@@ -1339,6 +1342,8 @@ function addBlock(b, target = $('#transcript'), live = true) {
     const s = el('summary');
     marlinToolSummary(s, line);
     node.appendChild(s);
+    // Opened, a message reads whole; the receipt follows it.
+    if (line.text) node.appendChild(el('div', 'sent', line.text));
     node.dataset.call = v.call_id;
     node.dataset.marlinTool = v.name;
     node.dataset.said = line.verb + (line.target ? ' ' + line.target : '');
