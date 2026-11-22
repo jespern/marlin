@@ -7619,3 +7619,32 @@ test "a recap survives the window reload of a tab switch or reconnect" {
     app.finishReplacementHistoryPage(1, 1, false, true, 0);
     try std.testing.expectEqual(@as(usize, 1), app.view.blocks.items.len);
 }
+
+test "clicking a transcript image opens it full size; any click or key closes it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    // An image drawn on screen rows 5-6, columns 4-13.
+    for (0..2) |row| try app.image_rows.append(gpa, .{
+        .image = .{ .hash = "abc123", .row = @intCast(row), .rows = 2, .cols = 10, .col = 4 },
+        .screen_row = @intCast(5 + row),
+    });
+    // Beside it: an ordinary click, nothing opens.
+    handleMouse(&app, .{ .row = 5, .col = 14, .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(app.viewedImage() == null);
+    handleMouse(&app, .{ .row = 6, .col = 4, .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expectEqualStrings("abc123", app.viewedImage().?);
+    // Scrolling does not close it; a click anywhere does.
+    handleMouse(&app, .{ .row = 0, .col = 0, .button = .wheel_up, .mods = .{}, .type = .press });
+    try std.testing.expect(app.viewedImage() != null);
+    handleMouse(&app, .{ .row = 0, .col = 0, .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(app.viewedImage() == null);
+    // Esc closes it and does nothing else: the composer stays in insert.
+    handleMouse(&app, .{ .row = 5, .col = 8, .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(app.viewedImage() != null);
+    try handleKey(&app, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(app.viewedImage() == null);
+    try std.testing.expectEqual(Mode.insert, app.mode);
+}

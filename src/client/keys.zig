@@ -30,6 +30,12 @@ const isCommandInput = commands.isCommandInput;
 
 pub fn handleKey(app: *App, key: vaxis.Key) !void {
     app.cwd_completion_waiting_key = null;
+    // A full-size image is a glance: any key (Esc, q, …) closes it and
+    // does nothing else.
+    if (app.image_view_len > 0) {
+        app.closeImageView();
+        return;
+    }
     if (app.web_view) {
         if (optionTabNavigationDirection(key)) |direction| {
             app.web_view = false;
@@ -826,6 +832,17 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
 /// row (the ⧉ copy affordance) copies the whole block instead.
 pub fn handleMouse(app: *App, m: vaxis.Mouse) void {
     if (app.top_view != null) return;
+    // A full-size image closes on any click, on it or outside it.
+    if (app.image_view_len > 0) {
+        if (m.type == .press and m.button != .wheel_up and m.button != .wheel_down) app.closeImageView();
+        return;
+    }
+    if (m.type == .press and m.button == .left and !m.mods.ctrl and !m.mods.shift) {
+        if (app.imageAtMouse(m)) |hash| {
+            app.openImageView(hash);
+            return;
+        }
+    }
     if (app.web_view and m.row >= app.tabBarRows()) {
         if (m.button == .wheel_up) app.web_scroll +|= 3;
         if (m.button == .wheel_down) app.web_scroll -|= 3;

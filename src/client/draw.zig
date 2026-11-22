@@ -327,6 +327,18 @@ fn drawCouncilDetail(app: *const App, win: vaxis.Window, arena: std.mem.Allocato
 /// catalog, in one scrollable panel: on a 24-row terminal only half the rows
 /// fit, and silently truncating the help was the one place a user could not
 /// discover the surface.
+/// The full-size image's screen: empty but for the close hint; the image
+/// itself is placed after draw (App.showTranscriptImages).
+fn drawImageView(win: vaxis.Window) void {
+    const hint = "esc or click to close";
+    if (win.width < hint.len) return;
+    _ = win.printSegment(.{ .text = hint, .style = Palette.tool_out }, .{
+        .row_offset = win.height - 1,
+        .col_offset = @intCast((win.width - hint.len) / 2),
+        .wrap = .none,
+    });
+}
+
 fn drawShortcutHelp(app: *App, win: vaxis.Window, arena: std.mem.Allocator) !void {
     const h = win.height;
     const w = win.width;
@@ -772,6 +784,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     if (h < 4 or w < 20) return;
     shell_tab.sync(app);
     if (app.top_view != null) return drawTop(app, win, arena);
+    if (app.image_view_len > 0) return drawImageView(win);
 
     if (app.show_tab_bar) try drawTabBar(app, win, arena);
     const top_rows = app.tabBarRows();

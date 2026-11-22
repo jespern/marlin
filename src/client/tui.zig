@@ -747,6 +747,10 @@ pub const App = struct {
     image_display: shell_images.Display = .withBase(shell_images.transcript_first_id),
     /// Image rows this frame's draw put on screen.
     image_rows: std.ArrayList(ImageRow) = .empty,
+    /// The transcript image opened full size by a click (its blob hash);
+    /// empty when none is. Any click or key closes it.
+    image_view: [128]u8 = undefined,
+    image_view_len: usize = 0,
     /// blob_get requests in flight, in order: an image hash, or null for
     /// a clipboard copy. A "blob" error answers the oldest.
     blob_requests: std.ArrayList(?[]const u8) = .empty,
@@ -1933,9 +1937,57 @@ pub const App = struct {
         self.stageClipboard(bytes);
     }
 
+    /// The transcript image under a mouse position, from this frame's rows.
+    pub fn imageAtMouse(self: *const App, m: vaxis.Mouse) ?[]const u8 {
+        if (m.row < 0 or m.col < 0) return null;
+        const row: usize = @intCast(m.row);
+        const col: usize = @intCast(m.col);
+        for (self.image_rows.items) |r| {
+            if (r.screen_row == row and col >= r.image.col and col < @as(usize, r.image.col) + r.image.cols) return r.image.hash;
+        }
+        return null;
+    }
+
+    pub fn openImageView(self: *App, hash: []const u8) void {
+        if (hash.len == 0 or hash.len > self.image_view.len) return;
+        @memcpy(self.image_view[0..hash.len], hash);
+        self.image_view_len = hash.len;
+    }
+
+    pub fn closeImageView(self: *App) void {
+        self.image_view_len = 0;
+    }
+
+    pub fn viewedImage(self: *const App) ?[]const u8 {
+        return if (self.image_view_len > 0) self.image_view[0..self.image_view_len] else null;
+    }
+
+    /// Place the opened image alone, centred, at its own size or as much
+    /// of it as the terminal holds above the hint row.
+    fn showViewedImage(self: *App, writer: *std.Io.Writer, hash: []const u8) !void {
+        const entry = self.images.get(hash) orelse return self.image_display.update(self.gpa, writer, &.{});
+        if (entry.state != .ready) return self.image_display.update(self.gpa, writer, &.{});
+        const cols: u16 = @intCast(@min(self.term_cols, std.math.maxInt(u16)));
+        const rows: u16 = self.term_rows -| 1;
+        const cells = transcript_images.fit(entry.image.width, entry.image.height, self.cell_px_w, self.cell_px_h, cols, rows);
+        if (cells.rows == 0) return self.image_display.update(self.gpa, writer, &.{});
+        const want: shell_images.Want = .{
+            .image = .{ .encoded = &entry.image },
+            .key = .{ .owner = @intFromPtr(&self.images), .image_id = 0, .data = @intFromPtr(entry.image.data.ptr), .len = entry.image.data.len },
+            .placement = 1,
+            .col = (cols - cells.cols) / 2,
+            .row = (rows - cells.rows) / 2,
+            .cols = cells.cols,
+            .rows = cells.rows,
+            .source = .{ .x = 0, .y = 0, .width = entry.image.width, .height = entry.image.height },
+        };
+        try self.image_display.update(self.gpa, writer, &.{want});
+    }
+
     /// Place this frame's visible image rows (after draw), one placement
     /// per contiguous run of an image's rows, cropped to what is on screen.
     pub fn showTranscriptImages(self: *App, writer: *std.Io.Writer, arena: std.mem.Allocator) !void {
+        if (self.viewedImage()) |hash| return self.showViewedImage(writer, hash);
         const covered = self.picker != null or self.top_view != null or self.shortcut_help;
         var wants: std.ArrayList(shell_images.Want) = .empty;
         const rows = self.image_rows.items;
@@ -6028,7 +6080,7 @@ pub fn dispatchEvent(
             if (app.screensaver_active) return;
             if (shell_tab.mouse(app, m)) return;
             app.hover_mouse = if (m.type == .motion and m.button == .none) m else null;
-            vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null) .pointer else .default);
+            vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null or (app.image_view_len == 0 and app.imageAtMouse(m) != null)) .pointer else .default);
             if (linkAtMouse(vx.window(), m, app.link_super_held)) |uri| {
                 openExternalLink(app, uri);
                 return;
