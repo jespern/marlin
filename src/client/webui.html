@@ -703,9 +703,11 @@ function addOptimisticInput(targetSid, text, steer) {
 }
 
 // Images a block carries (attachments, a tool's image), drawn from the
-// daemon's blob store; a tap opens one full size.
+// daemon's blob store; a tap opens one full size. One the transcript already
+// shows is not drawn again: a pasted image the agent then reads appears once.
 function imageStrip(attachments) {
-  const images = (attachments || []).filter(a => a && a.hash && (a.mime || '').startsWith('image/'));
+  const shown = hash => $('#transcript').querySelector('img[data-hash="' + CSS.escape(hash) + '"]');
+  const images = (attachments || []).filter(a => a && a.hash && (a.mime || '').startsWith('image/') && !shown(a.hash));
   if (!images.length) return null;
   const strip = el('div', 'images');
   for (const a of images) {
@@ -716,6 +718,7 @@ function imageStrip(attachments) {
     const img = el('img');
     img.src = src;
     img.alt = a.name || 'image';
+    img.dataset.hash = a.hash;
     img.loading = 'lazy';
     img.onerror = () => link.replaceWith(el('span', 'note', '[' + (a.name || 'image') + ']'));
     link.appendChild(img);

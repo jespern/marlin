@@ -454,11 +454,29 @@ pub const ImageView = struct {
     max_rows: u16,
 };
 
+/// True when a block before `rb` already shows image `hash`: a pasted image
+/// the agent then reads is drawn once, where it was pasted.
+fn shownBefore(blocks: []const RenderBlock, rb: RenderBlock, hash: []const u8) bool {
+    for (blocks) |earlier| {
+        // Each block owns its image list, so this pointer finds `rb`.
+        if (earlier.images.ptr == rb.images.ptr) return false;
+        for (earlier.images) |ref| if (std.mem.eql(u8, ref.hash, hash)) return true;
+    }
+    return false;
+}
+
+/// Whether `rb` has an image not already shown earlier in the transcript.
+fn hasFreshImage(blocks: []const RenderBlock, rb: RenderBlock) bool {
+    for (rb.images) |ref| if (!shownBefore(blocks, rb, ref.hash)) return true;
+    return false;
+}
+
 /// Reserve the rows each ready image covers, under the block's label.
-fn appendImageRows(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, view: ?ImageView, w: usize) !void {
-    const images = view orelse return;
+fn appendImageRows(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, transcript: *const Transcript, w: usize) !void {
+    const images = transcript.images orelse return;
     const indent: u16 = 4;
     for (rb.images) |ref| {
+        if (shownBefore(transcript.blocks, rb, ref.hash)) continue;
         const entry = images.cache.get(ref.hash) orelse continue;
         if (entry.state != .ready) continue;
         const max_cols: u16 = @intCast(@min(w -| indent, std.math.maxInt(u16)));
@@ -1532,8 +1550,9 @@ pub fn scanToolBatch(
                     isFileEditTool(blocks[call_idx].label);
                 const network_read = !failed and isNetworkReadTool(blocks[call_idx].label);
                 const question = isAskUserTool(blocks[call_idx].label);
-                // An image a tool returned is there to be seen.
-                const image = blocks[i].images.len > 0;
+                // An image a tool returned is there to be seen, unless the
+                // transcript already shows it (the agent read a pasted one).
+                const image = hasFreshImage(blocks, blocks[i]);
                 if (failed or author_diff or network_read or question or image) {
                     try expand.append(alloc, .{
                         .call = call_idx,
@@ -2129,7 +2148,7 @@ pub fn layoutBlockRange(
                         const note = if (result.status == .ok) try diffSummaryNote(alloc, result.text) else null;
                         try appendCallLine(alloc, lines, blocks_all[pair.call], transcript.cwd, transcript.sessions, w, note, result);
                         try appendToolResultLines(alloc, lines, result, blocks_all[pair.call].label);
-                        try appendImageRows(alloc, lines, result, transcript.images, w);
+                        try appendImageRows(alloc, lines, result, transcript, w);
                     } else {
                         try appendNetworkSuccessLine(alloc, lines, blocks_all[pair.call], result, transcript.cwd, w);
                     }
@@ -2154,7 +2173,7 @@ pub fn layoutBlockRange(
                 try wrapPromptCard(alloc, lines, rb.text, w);
                 if (rb.label.len > 0)
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
-                try appendImageRows(alloc, lines, rb, transcript.images, w);
+                try appendImageRows(alloc, lines, rb, transcript, w);
             },
             .assistant_msg => {
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
@@ -2213,9 +2232,9 @@ pub fn layoutBlockRange(
                 // successful result body is machinery unless it is an
                 // authored diff. Failures always show.
                 if (transcript.guest and !transcript.show_tool_transcript and rb.status == .ok and
-                    rb.images.len == 0 and !(isFileEditTool(tool_label) and isDiffOutput(rb.text))) continue;
+                    !hasFreshImage(transcript.blocks, rb) and !(isFileEditTool(tool_label) and isDiffOutput(rb.text))) continue;
                 try appendToolResultLines(alloc, lines, rb, tool_label);
-                try appendImageRows(alloc, lines, rb, transcript.images, w);
+                try appendImageRows(alloc, lines, rb, transcript, w);
             },
             .approval => {
                 const txt = try std.fmt.allocPrint(alloc, "    [approval: {s}]", .{rb.text});
@@ -2231,7 +2250,7 @@ pub fn layoutBlockRange(
                 try wrapInputCard(alloc, lines, rb.text, w, true, rb.pending_echo);
                 if (rb.label.len > 0)
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
-                try appendImageRows(alloc, lines, rb, transcript.images, w);
+                try appendImageRows(alloc, lines, rb, transcript, w);
             },
             .plan => {
                 if (visibleCompletedPlan(transcript.blocks, block_idx)) {

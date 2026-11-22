@@ -7484,6 +7484,41 @@ test "messages from other agents fold and stay out of composer history" {
 
 // An image a tool returned (or the user attached) is fetched once and drawn
 // inline under its label, sized to the cells; a missing one stays a label.
+// Case: Jesper pasted a screenshot and the agent read it: the same image
+// showed twice, under his message and under the read. Once is enough.
+test "an image already shown is not drawn again when the agent reads it" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{
+        .sid = 7,
+        .editor = Editor.init(gpa),
+        .state = .idle,
+        .last_view_h = 30,
+    }, .kitty_graphics = true, .cell_px_w = 8, .cell_px_h = 16 };
+    defer app.deinit();
+    app.setModelStr("claudecode/fable");
+    const pasted = [_]block.MediaRef{.{ .hash = "img1", .mime = "image/png", .name = "clipboard.png", .byte_len = 100 }};
+    app.applyBlock(.{ .id = 1, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 1, .body = .{ .user_msg = .{ .text = "you don't see this?", .attachments = &pasted } } });
+    app.applyBlock(.{ .id = 2, .session_id = 7, .turn_id = 1, .seq = 2, .ts = 2, .body = .{ .tool_call = .{ .call_id = "c1", .name = "Read", .args_json = "{\"file_path\":\"img1.png\"}" } } });
+    app.applyBlock(.{ .id = 3, .session_id = 7, .turn_id = 1, .seq = 3, .ts = 3, .body = .{ .tool_result = .{ .call_id = "c1", .status = .ok, .inline_body = "", .full_body_ref = null, .attachments = &pasted } } });
+    app.blobArrived("img1", @embedFile("png_sample_rgba"));
+
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    var rows: usize = 0;
+    for ((try layoutLines(frame.allocator(), &app, 80)).items) |line| if (line.image != null) {
+        rows += 1;
+    };
+    // The 16x16 sample is one row tall: drawn under the message only.
+    try std.testing.expectEqual(@as(usize, 1), rows);
+}
+
 test "inline images are fetched once and reserve rows in the transcript" {
     const gpa = std.testing.allocator;
     var threaded: Io.Threaded = .init(gpa, .{});
