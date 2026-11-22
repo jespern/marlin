@@ -133,6 +133,14 @@ pub fn run(
     return 0;
 }
 
+/// How long a bridged call keeps asking across a daemon restart.
+const restart_retry_ms: i64 = 120_000;
+
+fn nowMs(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
 /// Forwards to the daemon over a fresh socket connection per prompt: the
 /// connection doubles as the pending request's lifetime (the daemon drops a
 /// parked prompt when its bridge client disappears).
@@ -149,17 +157,60 @@ const DaemonDecider = struct {
     }
 
     fn ask(self: *DaemonDecider, tool_name: []const u8, input_json: []const u8) !Decision {
-        const conn = try attach.connect(self.gpa, self.io, self.environ, self.self_exe);
-        defer conn.deinit();
-        try conn.send(.{ .cc_approval = .{
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const result = try self.call(arena_state.allocator(), .cc_approval_result, .{ .cc_approval = .{
             .sid = self.sid,
             .tool = tool_name,
             .args_json = input_json,
         } });
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const result = try conn.recvUntil(arena_state.allocator(), .cc_approval_result);
         return Decision.init(result.decision, result.message);
+    }
+
+    /// One request, asked again if the daemon restarts (graceful handover)
+    /// before answering: its connection ends, or it refuses the request
+    /// while its successor starts. Requests a restarting daemon refuses were
+    /// never acted on, so asking again cannot do anything twice. Gives up
+    /// after `restart_retry_ms` without an answer.
+    fn call(
+        self: *DaemonDecider,
+        arena: std.mem.Allocator,
+        comptime tag: std.meta.Tag(proto.DaemonMsg),
+        request: proto.ClientMsg,
+    ) !@FieldType(proto.DaemonMsg, @tagName(tag)) {
+        const started = nowMs(self.io);
+        var delay_ms: i64 = 100;
+        while (true) {
+            if (self.callOnce(arena, tag, request)) |result| return result else |err| switch (err) {
+                error.OutOfMemory, error.DaemonError => return err,
+                // Refused while restarting, or the connection ended.
+                else => {
+                    if (nowMs(self.io) - started > restart_retry_ms) return err;
+                    self.io.sleep(.fromMilliseconds(delay_ms), .awake) catch return err;
+                    delay_ms = @min(delay_ms * 2, 1000);
+                },
+            }
+        }
+    }
+
+    fn callOnce(
+        self: *DaemonDecider,
+        arena: std.mem.Allocator,
+        comptime tag: std.meta.Tag(proto.DaemonMsg),
+        request: proto.ClientMsg,
+    ) !@FieldType(proto.DaemonMsg, @tagName(tag)) {
+        const conn = try attach.connect(self.gpa, self.io, self.environ, self.self_exe);
+        defer conn.deinit();
+        try conn.send(request);
+        while (true) {
+            const msg = try conn.recv(arena);
+            if (msg == tag) return @field(msg, @tagName(tag));
+            if (msg == .err) {
+                if (std.mem.eql(u8, msg.err.code, "restarting")) return error.DaemonRestarting;
+                std.log.err("daemon: {s}: {s}", .{ msg.err.code, msg.err.msg });
+                return error.DaemonError;
+            }
+        }
     }
 
     /// Claude Code starts this bridge in the session's directory.
@@ -178,12 +229,9 @@ const DaemonDecider = struct {
     /// The connection lives as long as the call: wait_for_session answers
     /// only when the other session's turn ends.
     fn forwardAgentTool(self: *DaemonDecider, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) !AgentToolResult {
-        const conn = try attach.connect(self.gpa, self.io, self.environ, self.self_exe);
-        defer conn.deinit();
-        try conn.send(.{ .agent_tool = .{ .request_id = 1, .sid = self.sid, .name = name, .args_json = args_json } });
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
-        const result = try conn.recvUntil(arena_state.allocator(), .agent_tool_result);
+        const result = try self.call(arena_state.allocator(), .agent_tool_result, .{ .agent_tool = .{ .request_id = 1, .sid = self.sid, .name = name, .args_json = args_json } });
         return .{ .text = try gpa.dupe(u8, result.output), .ok = result.status == .ok };
     }
 
@@ -193,16 +241,13 @@ const DaemonDecider = struct {
     }
 
     fn forwardQuestion(self: *DaemonDecider, question: []const u8, options_json: []const u8) !QuestionAnswer {
-        const conn = try attach.connect(self.gpa, self.io, self.environ, self.self_exe);
-        defer conn.deinit();
-        try conn.send(.{ .cc_question = .{
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const result = try self.call(arena_state.allocator(), .cc_question_result, .{ .cc_question = .{
             .sid = self.sid,
             .question = question,
             .options_json = options_json,
         } });
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const result = try conn.recvUntil(arena_state.allocator(), .cc_question_result);
         return QuestionAnswer.init(result.answer);
     }
 };
