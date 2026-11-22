@@ -464,12 +464,17 @@ fn appendImageRows(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: Re
         const max_cols: u16 = @intCast(@min(w -| indent, std.math.maxInt(u16)));
         const cells = transcript_images.fit(entry.image.width, entry.image.height, images.cell_w, images.cell_h, max_cols, images.max_rows);
         if (cells.rows == 0) continue;
+        // A blank row above and below: the image does not touch its label
+        // or whatever follows.
+        const blank: Line = .{ .timestamp_ms = rb.timestamp_ms, .text = "", .style = .{} };
+        try lines.append(alloc, blank);
         for (0..cells.rows) |row| try lines.append(alloc, .{
             .timestamp_ms = rb.timestamp_ms,
             .text = "",
             .style = .{},
             .image = .{ .hash = ref.hash, .row = @intCast(row), .rows = cells.rows, .cols = cells.cols, .col = indent },
         });
+        try lines.append(alloc, blank);
     }
 }
 

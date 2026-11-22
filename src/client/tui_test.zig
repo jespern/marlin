@@ -7529,6 +7529,12 @@ test "inline images are fetched once and reserve rows in the transcript" {
         try std.testing.expectEqual(@as(u16, 2), image.cols);
     };
     try std.testing.expectEqual(@as(usize, 1), rows);
+    // A blank row on each side: it touches neither its label nor what follows.
+    const laid = (try layoutLines(frame.allocator(), &app, 80)).items;
+    for (laid, 0..) |line, i| if (line.image != null) {
+        try std.testing.expect(laid[i - 1].image == null and laid[i - 1].text.len == 0);
+        try std.testing.expect(laid[i + 1].image == null and laid[i + 1].text.len == 0);
+    };
     // A copy of tool output still goes to the clipboard, not the cache.
     try std.testing.expectEqual(@as(usize, 0), app.blob_requests.items.len);
 
