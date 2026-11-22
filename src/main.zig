@@ -73,6 +73,7 @@ test {
     _ = @import("daemon/guest/muse_turn_test.zig");
     _ = @import("daemon/guest/claude_code_turn_test.zig");
     _ = @import("daemon/guest/tail_test.zig");
+    _ = @import("daemon/guest/kept_test.zig");
     _ = @import("daemon/shell_network_test.zig");
     _ = @import("daemon/process_io_test.zig");
     _ = @import("daemon/shell_pty_test.zig");

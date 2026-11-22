@@ -377,39 +377,45 @@ pub const JournalReader = struct {
     interface: Io.Reader,
     file_pos: u64 = 0,
 
+    /// Straight into `w`, as a file reader does. A line longer than the
+    /// buffer comes here with a writer that refuses: that refusal is how
+    /// the caller learns to take the line in pieces (takeEventLine), so it
+    /// must not turn into a failed read.
     fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-        _ = w;
-        _ = limit;
-        try fill(r);
-        return 0;
+        const self: *JournalReader = @fieldParentPtr("interface", r);
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const n = try self.readSome(dest);
+        w.advance(n);
+        return n;
     }
 
     fn readVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
         _ = data;
-        try fill(r);
-        return 0;
-    }
-
-    fn fill(r: *Io.Reader) Io.Reader.Error!void {
         const self: *JournalReader = @fieldParentPtr("interface", r);
-        const k = self.kept;
         if (r.end == r.buffer.len) {
-            if (r.seek == 0) return error.ReadFailed;
+            if (r.seek == 0) return 0; // full: the caller streams instead
             const len = r.end - r.seek;
             std.mem.copyForwards(u8, r.buffer[0..len], r.buffer[r.seek..r.end]);
             r.seek = 0;
             r.end = len;
         }
+        r.end += try self.readSome(r.buffer[r.end..]);
+        return 0;
+    }
+
+    /// Some journal bytes into `dest`, waiting for the guest to write them.
+    fn readSome(self: *JournalReader, dest: []u8) Io.Reader.Error!usize {
+        const k = self.kept;
+        if (dest.len == 0) return 0;
         while (true) {
-            const n = std.c.pread(k.out_fd, r.buffer[r.end..].ptr, r.buffer.len - r.end, @intCast(self.file_pos));
+            const n = std.c.pread(k.out_fd, dest.ptr, dest.len, @intCast(self.file_pos));
             if (n < 0) {
                 if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
                 return error.ReadFailed;
             }
             if (n > 0) {
-                r.end += @intCast(n);
                 self.file_pos += @intCast(n);
-                return;
+                return @intCast(n);
             }
             // Caught up. The keeper notes its end only after journaling
             // everything, so one more read above has already seen the rest.
