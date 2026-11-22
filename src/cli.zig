@@ -6,6 +6,7 @@ const build_options = @import("build_options");
 
 const attach = @import("client/attach.zig");
 const cc_approve = @import("client/cc_approve.zig");
+const keeper = @import("daemon/guest/keeper.zig");
 const daemon = @import("daemon/daemon.zig");
 const headless = @import("client/headless.zig");
 const pipe = @import("client/pipe.zig");
@@ -43,6 +44,7 @@ pub const Command = enum {
     version,
     resolve_host,
     cc_approve,
+    _keep,
     landlock_exec,
     sandbox_probe,
     _pipe,
@@ -87,6 +89,9 @@ pub fn dispatch(
         // Internal permission bridge for delegated Claude Code sessions
         // (spawned via --mcp-config by the daemon); omitted from help.
         .cc_approve => return cc_approve.run(gpa, io, environ, self_exe, rest),
+        // Internal keeper of one guest invocation (spawned by the daemon):
+        // journals it and outlives a daemon restart; omitted from help.
+        ._keep => return keeper.run(gpa, io, rest),
         // Internal Linux sandbox wrapper (spawned by the daemon's bash
         // adapter): applies a Landlock ruleset to itself, then execs.
         .landlock_exec => return landlock.run(gpa, io, rest),

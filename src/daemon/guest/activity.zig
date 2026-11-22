@@ -33,6 +33,8 @@ pub const Tracker = struct {
     callback: ?PublishFn,
     ctx: ?*anyopaque,
     items: std.ArrayList(Owned) = .empty,
+    /// The callback set aside while muted (a journal replay).
+    muted: ?PublishFn = null,
     /// Set when another thread shares the tree (a tail.Tailer adding live
     /// output): every public method then holds mutex.
     io: ?Io = null,
@@ -48,6 +50,23 @@ pub const Tracker = struct {
 
     pub fn init(gpa: std.mem.Allocator, callback: ?PublishFn, ctx: ?*anyopaque) Tracker {
         return .{ .gpa = gpa, .callback = callback, .ctx = ctx };
+    }
+
+    /// Build the tree without publishing it (replaying a journal).
+    pub fn mute(self: *Tracker) void {
+        self.lock();
+        defer self.unlock();
+        if (self.callback) |cb| self.muted = cb;
+        self.callback = null;
+    }
+
+    /// Publish again, starting with the tree as it stands.
+    pub fn unmute(self: *Tracker) void {
+        self.lock();
+        defer self.unlock();
+        if (self.muted) |cb| self.callback = cb;
+        self.muted = null;
+        self.publish();
     }
 
     pub fn deinit(self: *Tracker) void {

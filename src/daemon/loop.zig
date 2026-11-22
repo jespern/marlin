@@ -131,6 +131,16 @@ pub const RunOpts = struct {
     /// Guest turns only: compact the guest's own context instead of
     /// prompting it; the value is focus instructions ("" for none).
     guest_compact: ?[]const u8 = null,
+    /// Guest turns only: start the guest under a keeper (guest/keeper.zig)
+    /// journaling into a directory under this root, so the turn outlives a
+    /// daemon restart. Null starts the guest directly.
+    keeper_root: ?[]const u8 = null,
+    /// Where a kept guest turn publishes its keeper, so the daemon can
+    /// detach it when it hands over.
+    kept_slot: ?*kept.Slot = null,
+    /// Resume following a kept guest a previous daemon started: no prompt
+    /// is sent; its journal is replayed, then followed live.
+    guest_attach: ?kept.Attach = null,
     /// Dispatcher/daemon preparation before entering runTurn.
     initial_setup_ms: u64 = 0,
     /// Session approval mode (default: mutating tools ask). Snapshot used
@@ -242,6 +252,9 @@ pub const Appender = struct {
     turn_id: u64,
     history: ?*std.ArrayList(block.Block) = null,
     history_arena: ?std.mem.Allocator = null,
+    /// Replaying a kept guest's journal: these blocks were persisted by the
+    /// daemon that read it first, so nothing is written or announced.
+    replaying: bool = false,
 
     pub fn append(self: *Appender, body: block.Body) !u64 {
         return self.appendWithBlobs(body, &.{});
@@ -252,6 +265,7 @@ pub const Appender = struct {
     }
 
     pub fn appendWithBlobs(self: *Appender, body: block.Body, blobs: []const Store.BlobPayload) !u64 {
+        if (self.replaying) return 0;
         self.seq += 1;
         errdefer self.seq -= 1;
         var cached_body: ?block.Body = null;
@@ -565,6 +579,12 @@ pub fn runTurn(
             .claude_code => claude_code_turn.compactClaudeCode(gpa, io, store, opts, &ap, instructions),
             .codex => runCodexTurn(gpa, io, store, opts, &ap, ""),
             .muse => runMuseTurn(gpa, io, store, opts, &ap, ""),
+        };
+        // A kept guest a previous daemon started: its prompt is persisted
+        // and sent; only its journal remains to follow.
+        if (opts.guest_attach != null) return switch (guest) {
+            .claude_code => runClaudeCodeTurn(gpa, io, store, opts, &ap, "", false),
+            .codex, .muse => error.GuestAttachUnsupported,
         };
         const fresh = ap.seq == 0;
         const user_block_id = try ap.append(.{ .user_msg = .{
@@ -1418,6 +1438,7 @@ fn maybeCompact(
 // the block appender, turn options, phase/steer handling, approval
 // resolution, and redaction from it.
 const claude_code_turn = @import("guest/claude_code_turn.zig");
+pub const kept = @import("guest/kept.zig");
 pub const codex_turn = @import("guest/codex_turn.zig");
 const guest_shared = @import("guest/shared.zig");
 pub const lastDelegateErrorNote = guest_shared.lastDelegateErrorNote;

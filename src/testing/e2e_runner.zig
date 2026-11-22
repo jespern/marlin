@@ -357,10 +357,12 @@ fn runScenario(
     while (env_it.next()) |kv| {
         try env.put(kv.key_ptr.*, kv.value_ptr.*);
     }
-    if (std.mem.startsWith(u8, sf.check.pause_flow, "guest_")) {
-        const claude = std.mem.startsWith(u8, sf.check.pause_flow, "guest_claude");
-        const auth = std.mem.indexOf(u8, sf.check.pause_flow, "_auth_") != null;
-        const fixture_name: []const u8 = if (auth) (if (claude) "claude_auth.sh" else "codex_auth.sh") else (if (claude) "claude.sh" else "codex.sh");
+    const guest_handover = std.mem.startsWith(u8, sf.check.handover_flow, "guest_");
+    if (std.mem.startsWith(u8, sf.check.pause_flow, "guest_") or guest_handover) {
+        const flow = if (guest_handover) sf.check.handover_flow else sf.check.pause_flow;
+        const claude = std.mem.startsWith(u8, flow, "guest_claude");
+        const auth = std.mem.indexOf(u8, flow, "_auth_") != null;
+        const fixture_name: []const u8 = if (guest_handover) "claude_handover.sh" else if (auth) (if (claude) "claude_auth.sh" else "codex_auth.sh") else (if (claude) "claude.sh" else "codex.sh");
         const fixture = try std.fs.path.join(arena, &.{ scenarios_dir, "..", "fixtures", "pause", fixture_name });
         const script = try Io.Dir.cwd().readFileAlloc(io, fixture, arena, .limited(64 * 1024));
         const path = try std.fs.path.joinZ(arena, &.{ state_dir, "guest-peer" });
@@ -1374,6 +1376,7 @@ fn shellRoundTrip(conn: *ProtocolConn, arena: std.mem.Allocator, shell_id: u64, 
 }
 
 fn checkHandoverFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, flow: []const u8) !void {
+    if (std.mem.eql(u8, flow, "guest_claude")) return checkGuestHandover(gpa, io, env, cwd);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1465,6 +1468,117 @@ fn checkHandoverFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
     try moved.send(.{ .shell_input = .{ .shell_id = shell_id, .data_base64 = encoder.encode(&exit_buf, "exit\r") } });
     const exited = try recvTagBounded(moved, arena, "shell_exited");
     if (exited.get("code")) |code| if (code != .null) return error.HandoverShellStatusInvented;
+}
+
+/// A Claude Code turn running across a graceful handover: its guest is not
+/// stopped or resumed but followed by the successor, which finishes the
+/// same turn with every block exactly once.
+fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var watcher = try ProtocolConn.connect(gpa, io, env);
+    var watcher_open = true;
+    defer if (watcher_open) watcher.deinit();
+    try watcher.send(.{ .hello = .{ .proto_version = proto.proto_version, .client_kind = "e2e-protocol" } });
+    const hello = try recvTagBounded(watcher, arena, "hello_ok");
+    const old_pid: std.posix.pid_t = @intCast(uintField(hello, "daemon_pid") orelse return error.DaemonPidMissing);
+    try watcher.send(.{ .handover_watch = struct {}{} });
+    try watcher.send(.{ .session_create = .{ .cwd = cwd, .model = "claudecode/default", .approvals = "auto" } });
+    const sid = uintField(try recvTagBounded(watcher, arena, "session_created"), "sid") orelse return error.SessionIdMissing;
+    try watcher.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
+    try watcher.send(.{ .input = .{ .sid = sid, .text = "guest handover task" } });
+    try pauseWaitCall(watcher, arena, sid);
+    const pid_path = try std.fs.path.join(arena, &.{ cwd, "guest-pid" });
+    const guest_pid = try std.fmt.parseInt(std.posix.pid_t, try Io.Dir.cwd().readFileAlloc(io, pid_path, arena, .limited(128)), 10);
+
+    const requester = try connectProtocol(gpa, io, env);
+    defer requester.deinit();
+    try requester.send(.{ .reboot = .{ .handover = true } });
+    _ = try recvTagBounded(requester, arena, "ok");
+    var token: ?[]const u8 = null;
+    while (true) {
+        const msg = recvBounded(watcher, arena) catch |err| {
+            if (err != error.EndOfStream and err != error.ReadFailed) return err;
+            break;
+        };
+        if (tagObject(msg, "daemon_handover")) |moved| token = stringField(moved, "token");
+    }
+    watcher.deinit();
+    watcher_open = false;
+
+    var moved = try connectProtocol(gpa, io, env);
+    defer moved.deinit();
+    try moved.send(.{ .hello = .{ .proto_version = proto.proto_version } });
+    const new_pid = uintField(try recvTagBounded(moved, arena, "hello_ok"), "daemon_pid") orelse 0;
+    if (new_pid == 0 or new_pid == @as(u64, @intCast(old_pid))) return error.HandoverNoSuccessor;
+    try moved.send(.{ .handover_watch = struct {}{} });
+    try moved.send(.{ .handover_arrived = .{ .token = token orelse return error.HandoverTokenMissing } });
+    if (!waitPidGone(io, old_pid, helper_timeout_ms)) return error.HandoverPredecessorStayed;
+    // The guest outlived its daemon: the same process, still parked.
+    if (std.c.kill(guest_pid, @fromBackingInt(@intCast(0))) != 0) return error.GuestDiedInHandover;
+
+    // Everything the session holds, from its first block: what the old
+    // daemon persisted and what the new one adds, each exactly once.
+    try moved.send(.{ .sub = .{ .sid = sid, .from_seq = 1 } });
+    const release = try std.fs.path.joinZ(arena, &.{ cwd, "release" });
+    const fifo = std.c.open(release, .{ .ACCMODE = .WRONLY });
+    if (fifo < 0) return error.GuestReleaseFailed;
+    _ = std.c.write(fifo, "go\n", 3);
+    _ = std.c.close(fifo);
+
+    var user_msgs: usize = 0;
+    var calls: usize = 0;
+    var results: usize = 0;
+    var answers: usize = 0;
+    var commentary: usize = 0;
+    var notes: std.ArrayList(u8) = .empty;
+    while (true) {
+        const msg = try recvBounded(moved, arena);
+        if (tagObject(msg, "status")) |status| {
+            if (uintField(status, "sid") != sid) continue;
+            const state = stringField(status, "state") orelse "";
+            if (std.mem.eql(u8, state, "err")) {
+                print(io, "turn error: {s}\n", .{stringField(status, "err_text") orelse "unknown"});
+                return error.GuestHandoverTurnFailed;
+            }
+            if (std.mem.eql(u8, state, "idle") and answers > 0) break;
+            continue;
+        }
+        const blk = tagObject(msg, "blk") orelse continue;
+        if (uintField(blk, "sid") != sid) continue;
+        const body = (objectField(objectField(blk, "b") orelse continue, "body")) orelse continue;
+        if (objectField(body, "user_msg") != null) user_msgs += 1;
+        if (objectField(body, "tool_call") != null) calls += 1;
+        if (objectField(body, "tool_result") != null) results += 1;
+        if (objectField(body, "assistant_msg")) |a| {
+            if (!std.mem.eql(u8, stringField(a, "text") orelse "", "guest finished across the handover")) return error.GuestHandoverWrongAnswer;
+            answers += 1;
+        }
+        if (objectField(body, "reasoning")) |r| {
+            if (std.mem.indexOf(u8, stringField(r, "text") orelse "", "Commentary before the restart") != null) commentary += 1;
+        }
+        if (objectField(body, "system_note")) |n| try notes.print(arena, "{s}\n", .{stringField(n, "text") orelse ""});
+    }
+    if (user_msgs != 1 or calls != 1 or results != 1 or answers != 1 or commentary != 1) {
+        print(io, "blocks: user {d} call {d} result {d} answer {d} commentary {d}; notes:\n{s}", .{ user_msgs, calls, results, answers, commentary, notes.items });
+        return error.GuestHandoverBlocksWrong;
+    }
+    if (notes.items.len > 0) {
+        print(io, "unexpected notes:\n{s}", .{notes.items});
+        return error.GuestHandoverUnexpectedNote;
+    }
+    if (!waitPidGone(io, guest_pid, helper_timeout_ms)) return error.GuestOutlivedItsTurn;
+    // The finished turn's journal is gone.
+    const root = try std.fs.path.join(arena, &.{ cwd, "marlin", "g" });
+    var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        print(io, "left behind: {s}\n", .{entry.name});
+        return error.GuestJournalLeftBehind;
+    }
 }
 
 fn checkCodexQuestionFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {

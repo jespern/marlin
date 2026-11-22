@@ -43,6 +43,9 @@ const tryCloseSteering = loop.tryCloseSteering;
 
 const shared = @import("shared.zig");
 const guest_activity = @import("activity.zig");
+const kept_mod = @import("kept.zig");
+const keeper = @import("keeper.zig");
+const Kept = kept_mod.Kept;
 const guest_tail = @import("tail.zig");
 const setDelegateError = shared.setDelegateError;
 const lastDelegateErrorNote = shared.lastDelegateErrorNote;
@@ -126,7 +129,20 @@ pub const CcOutcome = struct {
     }
 };
 
-fn writeCcUserInput(allocator: std.mem.Allocator, writer: *Io.Writer, text: []const u8) !void {
+/// Claude Code's stdin: its pipe, or its keeper (which journals it).
+const CcStdin = union(enum) {
+    pipe: struct { file: Io.File, writer: *Io.Writer },
+    kept: *Kept,
+
+    fn close(self: CcStdin, io: Io) void {
+        switch (self) {
+            .pipe => |p| p.file.close(io),
+            .kept => |k| k.closeStdin(),
+        }
+    }
+};
+
+fn writeCcUserInput(allocator: std.mem.Allocator, stdin: CcStdin, steer: bool, text: []const u8) !void {
     const encoded = try std.json.Stringify.valueAlloc(allocator, .{
         .type = "user",
         .message = .{ .role = "user", .content = .{.{ .type = "text", .text = text }} },
@@ -134,9 +150,14 @@ fn writeCcUserInput(allocator: std.mem.Allocator, writer: *Io.Writer, text: []co
         .session_id = "",
     }, .{});
     defer allocator.free(encoded);
-    try writer.writeAll(encoded);
-    try writer.writeByte('\n');
-    try writer.flush();
+    switch (stdin) {
+        .pipe => |p| {
+            try p.writer.writeAll(encoded);
+            try p.writer.writeByte('\n');
+            try p.writer.flush();
+        },
+        .kept => |k| try k.writeLine(if (steer) keeper.tag_steer else keeper.tag_write, encoded),
+    }
 }
 
 /// Owns Claude Code's stdin while stdout is decoded on the turn thread.
@@ -146,9 +167,10 @@ const CcInputPump = struct {
     gpa: std.mem.Allocator,
     io: Io,
     opts: *const RunOpts,
-    file: Io.File,
-    writer: *Io.Writer,
+    stdin: CcStdin,
     max_inputs: u32,
+    /// Detached: the guest's stdin stays open for the next daemon.
+    keep_open: bool = false,
     mutex: Io.Mutex = .init,
     done: bool = false,
     finalized: bool = false,
@@ -158,7 +180,12 @@ const CcInputPump = struct {
     write_failed: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *CcInputPump) void {
-        defer self.file.close(self.io);
+        defer {
+            self.mutex.lockUncancelable(self.io);
+            const keep = self.keep_open;
+            self.mutex.unlock(self.io);
+            if (!keep) self.stdin.close(self.io);
+        }
         while (true) {
             self.mutex.lockUncancelable(self.io);
             if (self.done) {
@@ -178,7 +205,7 @@ const CcInputPump = struct {
                 };
                 self.sent_total += 1;
                 self.mutex.unlock(self.io);
-                writeCcUserInput(self.gpa, self.writer, input.text) catch {
+                writeCcUserInput(self.gpa, self.stdin, true, input.text) catch {
                     self.write_failed.store(true, .release);
                     return;
                 };
@@ -220,6 +247,14 @@ const CcInputPump = struct {
 
     fn stop(self: *CcInputPump) void {
         self.mutex.lockUncancelable(self.io);
+        self.done = true;
+        self.mutex.unlock(self.io);
+    }
+
+    /// Stop without closing the guest's stdin: it is handed over.
+    fn detach(self: *CcInputPump) void {
+        self.mutex.lockUncancelable(self.io);
+        self.keep_open = true;
         self.done = true;
         self.mutex.unlock(self.io);
     }
@@ -270,7 +305,7 @@ fn noteBackgroundWait(gpa: std.mem.Allocator, opts: RunOpts, ap: *Appender, open
         try std.fmt.allocPrint(gpa, "waiting on {d} background task{s}", .{ open, if (open == 1) "" else "s" });
     defer gpa.free(note);
     _ = try ap.append(.{ .system_note = .{ .text = note } });
-    publishPhase(opts, .background);
+    if (!ap.replaying) publishPhase(opts, .background);
 }
 
 pub fn compactDiagnostic(allocator: std.mem.Allocator, text: []const u8, max: usize) ![]u8 {
@@ -318,6 +353,61 @@ pub fn claudeErrorNote(
     return std.fmt.allocPrint(allocator, "claude code error: {s}", .{trimmed_detail});
 }
 
+/// Start Claude Code under a keeper when the daemon keeps guests: null
+/// (start it directly) when it does not, or the keeper cannot start.
+fn spawnKept(
+    gpa: std.mem.Allocator,
+    io: Io,
+    opts: RunOpts,
+    argv: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    round: u32,
+    turn_id: u64,
+) ?*Kept {
+    const root = opts.keeper_root orelse return null;
+    const exe = opts.marlin_exe orelse return null;
+    // /compact is short and answers nothing: not worth keeping.
+    if (opts.guest_compact != null) return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.fmt.bufPrint(&buf, "{s}/{x}", .{ root, ids.next(io) }) catch return null;
+    const k = Kept.spawn(gpa, io, exe, dir, argv, opts.cwd, environ_map) catch |err| {
+        std.log.warn("guest keeper unavailable ({t}): Claude Code runs as this daemon's child", .{err});
+        kept_mod.removeDir(io, dir);
+        return null;
+    };
+    kept_mod.writeJson(gpa, io, dir, kept_mod.turn_name, kept_mod.TurnFile{
+        .sid = opts.session_id,
+        .turn_id = turn_id,
+        .backend = "claude_code",
+        .round = round,
+        .started_at_ms = nowMs(io),
+    }) catch |err| std.log.warn("guest keeper: could not record the turn: {t}", .{err});
+    return k;
+}
+
+/// The replay caught up: persist and announce from here on, starting with
+/// where the turn stands.
+fn ccGoLive(
+    io: Io,
+    opts: RunOpts,
+    ap: *Appender,
+    activity: *guest_activity.Tracker,
+    open_tools: usize,
+    replied: bool,
+    background_open: usize,
+) !void {
+    _ = io;
+    ap.replaying = false;
+    ap.seq = try ap.store.lastSeq(opts.session_id);
+    activity.unmute();
+    publishPhase(opts, if (open_tools > 0)
+        guestToolPhase(open_tools)
+    else if (replied and background_open > 0)
+        .background
+    else
+        .provider);
+}
+
 /// One `claude -p` invocation: spawn, decode stream-json, persist blocks.
 fn ccInvoke(
     gpa: std.mem.Allocator,
@@ -328,6 +418,12 @@ fn ccInvoke(
     prompt: []const u8,
     fresh: bool,
     round: u32,
+    /// Follow this kept guest instead of starting one: replay its journal
+    /// silently up to `replay_until`, then act on what follows.
+    resume_kept: ?*Kept,
+    replay_until: u64,
+    /// User messages the guest has already been sent (resume only).
+    inputs_sent: u32,
 ) !CcOutcome {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -433,10 +529,17 @@ fn ccInvoke(
         }
     }
 
-    var child = std.process.spawn(io, .{
+    // A kept guest (keeper.zig) runs on through a daemon restart; without a
+    // keeper it is this daemon's child, as before.
+    const guest_environ = if (child_environ) |*map| map else opts.tool_environ;
+    const kept: ?*Kept = resume_kept orelse spawnKept(gpa, io, opts, argv, guest_environ, round, ap.turn_id);
+    // False once the kept guest is handed over (detached) or finished.
+    var kept_owned = kept != null;
+    var child: ?std.process.Child = null;
+    if (kept == null) child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = opts.cwd },
-        .environ_map = if (child_environ) |*map| map else opts.tool_environ,
+        .environ_map = guest_environ,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -447,42 +550,64 @@ fn ccInvoke(
         _ = try ap.append(.{ .system_note = .{ .text = text } });
         return error.DelegateSpawnFailed;
     };
+    // The guest's pid is its process group; 0 when a kept guest already
+    // ended before this daemon attached (nothing left to signal).
+    const guest_pid: std.posix.pid_t = if (kept) |k| k.pid else child.?.id.?;
+    if (kept) |k| if (opts.kept_slot) |slot| slot.set(io, k);
+    // A failing turn stops a kept guest too and drops its journal.
+    errdefer if (kept_owned) {
+        const k = kept.?;
+        if (opts.kept_slot) |slot| slot.set(io, null);
+        _ = k.terminate(0);
+        kept_mod.removeDir(io, k.dir);
+        k.deinit();
+    };
 
     var outcome = CcOutcome{};
     errdefer outcome.final_text.deinit(gpa);
 
-    var watcher = CcWatcher.init(io, opts.cancel, child.id.?, opts.park_clock, opts.cfg.guest_max_runtime_ms);
+    var watcher = CcWatcher.init(io, opts.cancel, guest_pid, opts.park_clock, opts.cfg.guest_max_runtime_ms);
     watcher.max_runtime_live = opts.guest_max_runtime_live;
-    const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
-    var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
-    const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
+    const watcher_thread: ?std.Thread = if (guest_pid > 0) try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher}) else null;
+    var drain: CcStderrDrain = undefined;
+    const drain_thread: ?std.Thread = if (child) |c| blk: {
+        drain = .{ .io = io, .file = c.stderr.? };
+        break :blk std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
+    } else null;
     // Both threads point into this frame. Any error return from here on must
     // stop them and reap the child before the frame unwinds; the success path
     // tears down the same way and clears this guard first.
     var threads_live = true;
     errdefer if (threads_live) {
         watcher.done.store(true, .release);
-        watcher_thread.join();
-        process_io.terminateProcessGroup(io, child.id.?, 0);
-        if (drain_thread) |t| t.join();
-        _ = child.wait(io) catch {};
+        if (watcher_thread) |t| t.join();
+        if (child) |*c| {
+            process_io.terminateProcessGroup(io, c.id.?, 0);
+            if (drain_thread) |t| t.join();
+            _ = c.wait(io) catch {};
+        }
     };
 
     // Stream-json input keeps this exact Claude process alive while a steer
     // arrives. The first message is synchronous; a pump owns the pipe after
     // that so a silent long-running tool cannot starve steering.
-    var stdin_file = child.stdin.?;
-    child.stdin = null;
     var stdin_buffer: [64 * 1024]u8 = undefined;
-    var stdin_writer_file = stdin_file.writer(io, &stdin_buffer);
+    var stdin_writer_file: Io.File.Writer = undefined;
+    const stdin: CcStdin = if (kept) |k| .{ .kept = k } else blk: {
+        const file = child.?.stdin.?;
+        child.?.stdin = null;
+        stdin_writer_file = file.writer(io, &stdin_buffer);
+        break :blk .{ .pipe = .{ .file = file, .writer = &stdin_writer_file.interface } };
+    };
     // A claude that exits before reading its prompt (an immediate error
     // result, e.g. an unknown --resume id) has already said why on stdout;
-    // the broken pipe is not the outcome. Read that stdout as usual.
-    const prompt_written = if (writeCcUserInput(gpa, &stdin_writer_file.interface, prompt)) |_|
+    // the broken pipe is not the outcome. Read that stdout as usual. A
+    // followed guest already has its prompt.
+    const prompt_written = if (resume_kept != null) true else if (writeCcUserInput(gpa, stdin, false, prompt)) |_|
         true
     else |err| switch (err) {
         error.OutOfMemory => {
-            stdin_file.close(io);
+            stdin.close(io);
             return error.OutOfMemory;
         },
         else => false,
@@ -493,8 +618,8 @@ fn ccInvoke(
         .gpa = gpa,
         .io = io,
         .opts = &opts,
-        .file = stdin_file,
-        .writer = &stdin_writer_file.interface,
+        .stdin = stdin,
+        .sent_total = if (resume_kept != null) inputs_sent else 1,
         .max_inputs = if (opts.max_rounds >= round) opts.max_rounds - round + 1 else 1,
     };
     defer input_pump.deinit();
@@ -550,6 +675,8 @@ fn ccInvoke(
         background_links.deinit(gpa);
     }
     var replayed_users: usize = 0;
+    var detached = false;
+    var detach_offset: u64 = 0;
     // Background tasks already reported, so Claude's echo of the same
     // notification as a user message is not shown again.
     var notified: std.ArrayList([]u8) = .empty;
@@ -559,22 +686,47 @@ fn ccInvoke(
     }
 
     {
-        const line_buf = try gpa.alloc(u8, 512 * 1024);
-        defer gpa.free(line_buf);
-        var reader = child.stdout.?.reader(io, line_buf);
+        // A kept guest's stdout is its journal, read by the keeper's reader.
+        var line_buf: []u8 = &.{};
+        defer if (line_buf.len > 0) gpa.free(line_buf);
+        var file_reader: Io.File.Reader = undefined;
+        const event_reader: *Io.Reader = if (kept) |k| &k.reader.interface else blk: {
+            line_buf = try gpa.alloc(u8, 512 * 1024);
+            file_reader = child.?.stdout.?.reader(io, line_buf);
+            break :blk &file_reader.interface;
+        };
+        // Following a guest another daemon read first: what it read is
+        // replayed to rebuild this turn's state, without persisting or
+        // announcing anything again.
+        var replaying = resume_kept != null and replay_until > 0;
+        if (replaying) {
+            ap.replaying = true;
+            activity.mute();
+        }
         var line_arena_state = std.heap.ArenaAllocator.init(gpa);
         defer line_arena_state.deinit();
         var line_acc: std.ArrayList(u8) = .empty;
         defer line_acc.deinit(gpa);
         read_events: while (true) {
-            const line = shared.takeEventLine(&reader.interface, gpa, &line_acc, shared.max_event_line_bytes) catch |err| switch (err) {
+            const line = shared.takeEventLine(event_reader, gpa, &line_acc, shared.max_event_line_bytes) catch |err| switch (err) {
                 error.LineTooLong => {
                     _ = try ap.append(.{ .system_note = .{ .text = "claude code: one event line exceeded 64 MiB and was dropped" } });
                     continue;
                 },
-                error.ReadFailed => break,
+                error.ReadFailed => {
+                    // Detached while waiting: a partial line stays unread.
+                    if (kept) |k| if (k.detached) {
+                        detached = true;
+                        detach_offset = k.consumed() - line_acc.items.len;
+                    };
+                    break;
+                },
                 error.OutOfMemory => return error.OutOfMemory,
             } orelse break;
+            if (replaying and kept.?.consumed() > replay_until) {
+                replaying = false;
+                try ccGoLive(io, opts, ap, &activity, open_tools, replied, background_open);
+            }
             _ = line_arena_state.reset(.retain_capacity);
             const line_arena = line_arena_state.allocator();
             // Claude can emit an authentication failure as an assistant
@@ -595,10 +747,10 @@ fn ccInvoke(
             for (events.items) |ev| event: switch (ev) {
                 .init => outcome.got_init = true,
                 .text_delta => |text| {
-                    if (opts.on_delta) |cb| cb(opts.on_delta_ctx, text);
+                    if (!replaying) if (opts.on_delta) |cb| cb(opts.on_delta_ctx, text);
                 },
                 .reasoning_delta => |text| {
-                    if (opts.on_reasoning_delta) |cb| cb(opts.on_delta_ctx, text);
+                    if (!replaying) if (opts.on_reasoning_delta) |cb| cb(opts.on_delta_ctx, text);
                 },
                 .text => |text| {
                     if (pending_text.items.len > 0) try pending_text.append(gpa, '\n');
@@ -652,8 +804,10 @@ fn ccInvoke(
                         };
                     }
                     open_tools += 1;
-                    if (open_tools == 1) publishPhase(opts, guestToolPhase(open_tools));
-                    if (opts.on_tool) |cb| cb(opts.on_delta_ctx, tu.name, .start);
+                    if (!replaying) {
+                        if (open_tools == 1) publishPhase(opts, guestToolPhase(open_tools));
+                        if (opts.on_tool) |cb| cb(opts.on_delta_ctx, tu.name, .start);
+                    }
                 },
                 .tool_result => |tr| {
                     const nested = tr.parent_tool_use_id.len > 0 or activity.isNested(tr.tool_use_id);
@@ -687,7 +841,7 @@ fn ccInvoke(
                     if (ap.turn_id != 0) for (pending_tools.items, 0..) |tool, i| {
                         if (!std.mem.eql(u8, tool.call_id, tr.tool_use_id)) continue;
                         const span = telemetry_ids.spanId(ids.next(io));
-                        ap.store.telemetryRecordTool(opts.session_id, ap.turn_id, .{
+                        if (!replaying) ap.store.telemetryRecordTool(opts.session_id, ap.turn_id, .{
                             .round = round,
                             .call_id = tool.call_id,
                             .span_id = &span,
@@ -703,8 +857,10 @@ fn ccInvoke(
                         break;
                     };
                     if (open_tools > 0) open_tools -= 1;
-                    if (open_tools == 0) publishPhase(opts, guestToolPhase(open_tools));
-                    if (opts.on_tool) |cb| cb(opts.on_delta_ctx, "claude", .done);
+                    if (!replaying) {
+                        if (open_tools == 0) publishPhase(opts, guestToolPhase(open_tools));
+                        if (opts.on_tool) |cb| cb(opts.on_delta_ctx, "claude", .done);
+                    }
                 },
                 .context_used => |used| outcome.noteContextUsed(used.model, used.tokens, opts.context_used_out),
                 .context_window => |window| outcome.noteContextWindow(window.model, window.tokens, opts.context_limit_out),
@@ -719,7 +875,7 @@ fn ccInvoke(
                     _ = try ap.append(.{ .system_note = .{ .text = usageCreditsTransitionNote(active) } });
                     usage_credits.* = active;
                     if (opts.usage_credits_live) |live| live.store(active, .release);
-                    if (opts.on_usage_credits) |cb| cb(opts.on_delta_ctx, active);
+                    if (!replaying) if (opts.on_usage_credits) |cb| cb(opts.on_delta_ctx, active);
                 },
                 .result => |r| {
                     outcome.got_result = true;
@@ -744,7 +900,7 @@ fn ccInvoke(
                     }
                     replied = true;
                     if (background_open > 0) try noteBackgroundWait(gpa, opts, ap, background_open, background_description.items);
-                    input_pump.result(background_open);
+                    if (!replaying) input_pump.result(background_open);
                 },
                 .background_tasks => |bg| {
                     const was_open = background_open;
@@ -827,7 +983,7 @@ fn ccInvoke(
                     }
                     _ = try ap.append(.{ .system_note = .{ .text = notification.summary } });
                     // The run resumes on its own: the model now reads the result.
-                    publishPhase(opts, .provider);
+                    if (!replaying) publishPhase(opts, .provider);
                 },
                 .replayed_user => |text| {
                     input_pump.replayed();
@@ -841,12 +997,43 @@ fn ccInvoke(
                     }
                 },
             };
+            if (replaying and kept.?.consumed() >= replay_until) {
+                replaying = false;
+                try ccGoLive(io, opts, ap, &activity, open_tools, replied, background_open);
+            }
+            // Handing over: stop at this line boundary; the next daemon
+            // replays to here and carries on.
+            if (kept) |k| if (k.detachRequested()) {
+                detached = true;
+                detach_offset = k.consumed();
+                break :read_events;
+            };
             // Claude's SDK stream can remain resident waiting for more input
             // even after stdin is closed after a multi-message run. Once the
             // terminal result atomically closed steering, no later stdout is
             // part of this Marlin turn.
             if (input_pump.isFinalized()) break :read_events;
         }
+    }
+
+    if (detached) {
+        // Handed over: the guest runs on with its stdin open, and the next
+        // daemon replays its journal to this offset before acting on it.
+        input_pump.detach();
+        input_thread.join();
+        input_joined = true;
+        threads_live = false;
+        watcher.done.store(true, .release);
+        if (watcher_thread) |t| t.join();
+        const k = kept.?;
+        kept_mod.writeJson(gpa, io, k.dir, kept_mod.detach_name, kept_mod.DetachFile{
+            .consumed = @max(detach_offset, replay_until),
+            .inputs_sent = input_pump.inputCount(),
+        }) catch |err| std.log.err("guest keeper: could not record the handover point: {t}", .{err});
+        if (opts.kept_slot) |slot| slot.set(io, null);
+        kept_owned = false;
+        k.deinit();
+        return error.GuestDetached;
     }
 
     input_pump.stop();
@@ -860,29 +1047,44 @@ fn ccInvoke(
     // can reap the child and free that id for reuse.
     threads_live = false;
     watcher.done.store(true, .release);
-    watcher_thread.join();
-    // A finalized Claude can stay resident on a closed stdin, so it is
-    // signalled, but given time to exit: its SIGTERM handler ships the turn's
-    // last OTLP logs (the final api_request and the assistant_response), and
-    // a kill 50 ms later used to throw exactly those away.
-    const reaped = outcome.steering_finalized and
-        process_io.terminateProcessGroupAndReap(&child, io, cc_shutdown_grace_ms);
-    if (drain_thread) |t| t.join();
+    if (watcher_thread) |t| t.join();
     outcome.cancelled = watcher.cancelled.load(.acquire);
     outcome.timed_out = watcher.timed_out.load(.acquire);
     outcome.timed_out_runtime_ms = watcher.timed_out_runtime_ms;
-    if (reaped) {
-        // A finalized run has its result, so its exit code is never read.
-        process_io.releaseReapedChild(&child, io);
+    if (kept) |k| {
+        // Its keeper reaps it and journals how it ended. A finalized Claude
+        // gets the same grace as a direct one (below).
+        if (outcome.steering_finalized or !k.waitExit(cc_shutdown_grace_ms))
+            _ = k.terminate(cc_shutdown_grace_ms);
+        if (!outcome.steering_finalized) outcome.exit_code = k.exitCode() orelse -1;
+        outcome.stderr_len = k.stderrTail(&outcome.stderr_tail).len;
+        if (opts.kept_slot) |slot| slot.set(io, null);
+        kept_owned = false;
+        k.reap();
+        kept_mod.removeDir(io, k.dir);
+        k.deinit();
     } else {
-        const term: std.process.Child.Term = child.wait(io) catch .{ .exited = 255 };
-        outcome.exit_code = switch (term) {
-            .exited => |code| code,
-            else => -1,
-        };
+        // A finalized Claude can stay resident on a closed stdin, so it is
+        // signalled, but given time to exit: its SIGTERM handler ships the
+        // turn's last OTLP logs (the final api_request and the
+        // assistant_response), and a kill 50 ms later used to throw exactly
+        // those away.
+        const reaped = outcome.steering_finalized and
+            process_io.terminateProcessGroupAndReap(&child.?, io, cc_shutdown_grace_ms);
+        if (drain_thread) |t| t.join();
+        if (reaped) {
+            // A finalized run has its result, so its exit code is never read.
+            process_io.releaseReapedChild(&child.?, io);
+        } else {
+            const term: std.process.Child.Term = child.?.wait(io) catch .{ .exited = 255 };
+            outcome.exit_code = switch (term) {
+                .exited => |code| code,
+                else => -1,
+            };
+        }
+        @memcpy(outcome.stderr_tail[0..drain.len], drain.tail[0..drain.len]);
+        outcome.stderr_len = drain.len;
     }
-    @memcpy(outcome.stderr_tail[0..drain.len], drain.tail[0..drain.len]);
-    outcome.stderr_len = drain.len;
 
     // One model-call row per completed invocation. Claude Code's result
     // usage is the billed sum for this run (fresh + cache read + cache
@@ -962,7 +1164,7 @@ pub fn compactClaudeCode(
         try gpa.dupe(u8, "/compact");
     defer gpa.free(prompt);
     var usage_credits = if (opts.usage_credits_live) |live| live.load(.acquire) else false;
-    var outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt, false, 1);
+    var outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt, false, 1, null, 0, 0);
     defer outcome.final_text.deinit(gpa);
     const result: TurnResult = .{ .text = try gpa.dupe(u8, ""), .rounds = 1, .tokens_in = outcome.tokens_in, .tokens_out = outcome.tokens_out };
     errdefer gpa.free(result.text);
@@ -1027,7 +1229,10 @@ pub fn runClaudeCodeTurn(
     var prompt: std.ArrayList(u8) = .empty;
     defer prompt.deinit(gpa);
     try prompt.appendSlice(gpa, first_text);
-    {
+    // Following a kept guest a previous daemon started: it has its prompt.
+    var attach = opts.guest_attach;
+    if (attach) |a| rounds = a.round -| 1;
+    if (attach == null) {
         var history: std.ArrayList(block.Block) = .empty;
         var history_arena_state = std.heap.ArenaAllocator.init(gpa);
         defer history_arena_state.deinit();
@@ -1042,7 +1247,18 @@ pub fn runClaudeCodeTurn(
 
     while (true) {
         rounds += 1;
-        var outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh, rounds);
+        var outcome = if (attach) |a| blk: {
+            attach = null;
+            const k = Kept.attach(gpa, io, a.dir) catch |err| {
+                const note = try std.fmt.allocPrint(gpa, "claude code could not be followed after the restart: {t}", .{err});
+                defer gpa.free(note);
+                setDelegateError(note);
+                _ = try ap.append(.{ .system_note = .{ .text = note } });
+                kept_mod.removeDir(io, a.dir);
+                return error.DelegateFailed;
+            };
+            break :blk try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, false, rounds, k, a.replay_until, a.inputs_sent);
+        } else try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh, rounds, null, 0, 0);
         if (!outcome.cancelled and (guest_auth.isAuthFailure(outcome.result_error[0..outcome.result_error_len]) or
             (outcome.result_is_error and guest_auth.isAuthFailure(outcome.final_text.items)) or
             guest_auth.isAuthFailure(outcome.stderr_tail[0..outcome.stderr_len])))
@@ -1061,7 +1277,7 @@ pub fn runClaudeCodeTurn(
         if (!outcome.got_init and !outcome.cancelled and !outcome.timed_out) {
             outcome.final_text.deinit(gpa);
             fresh = !fresh;
-            outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh, rounds);
+            outcome = try ccInvoke(gpa, io, opts, ap, &usage_credits, prompt.items, fresh, rounds, null, 0, 0);
         }
         defer outcome.final_text.deinit(gpa);
 

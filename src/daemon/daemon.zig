@@ -227,6 +227,9 @@ const Event = union(enum) {
     /// Turn thread → dispatcher completion. final_text and err_text are
     /// separately owned because child task results serialize both fields.
     turn_done: struct { sid: u64, interrupted: bool, round_budget_reached: bool, err_text: ?[]u8, final_text: ?[]u8, tokens_in: u64, tokens_out: u64 },
+    /// A kept guest turn stopped being followed: it runs on for the next
+    /// daemon, which replays its journal (handover).
+    turn_detached: struct { sid: u64 },
     /// Parent turn thread → dispatcher. All strings are gpa-owned; `future`
     /// points into the parked parent turn's stack until resolve().
     child_start: ChildStart,
@@ -464,6 +467,12 @@ pub const Session = struct {
     turn_thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = .init(false),
     pause_requested: std.atomic.Value(bool) = .init(false),
+    /// The kept guest of the running turn, if any: a handover detaches it.
+    kept_slot: loop.kept.Slot = .{},
+    /// Handing over: this session's kept turn is being detached, not paused.
+    detaching: bool = false,
+    /// Its kept turn detached: the guest runs on for the successor.
+    handed_over: bool = false,
     /// Dispatcher-owned phase, including cancellation diagnostics.
     phase: std.atomic.Value(u8) = .init(@backingInt(proto.TurnPhase.idle)),
     turn_started_at_ms: std.atomic.Value(i64) = .init(0),
@@ -667,6 +676,9 @@ pub const Daemon = struct {
     /// Absolute path to this marlin binary (gpa-owned), handed to delegated
     /// Claude Code sessions so their permission bridge can call back here.
     marlin_exe: ?[:0]u8 = null,
+    /// Where kept guest turns journal (guest/keeper.zig): `<state>/g`, beside
+    /// the store. Null runs guests as this daemon's children.
+    keeper_root: ?[]u8 = null,
     /// mtime (ms) of that binary CAPTURED AT STARTUP — after an on-disk
     /// rebuild it still describes the running build, which is exactly what
     /// lets clients detect a stale daemon. 0 when unknown.
@@ -839,6 +851,7 @@ pub const Daemon = struct {
             // their permission bridge; an unresolvable path just means the
             // bridge stays unwired (headless prompts auto-deny as before).
             .marlin_exe = marlin_exe,
+            .keeper_root = if (marlin_exe != null) keeperRoot(gpa, db_path) else null,
             .exe_mtime_ms = exe_mtime_ms,
             .started_at_ms = startup_began_ms,
             // Secret values this process holds, for capture-time redaction
@@ -856,6 +869,7 @@ pub const Daemon = struct {
         defer self.store.close();
         defer self.events.deinit();
         defer if (self.marlin_exe) |exe| gpa.free(exe);
+        defer if (self.keeper_root) |root| gpa.free(root);
         defer if (self.secrets.len > 0) gpa.free(self.secrets);
         defer self.network.deinit();
 
@@ -1488,6 +1502,7 @@ pub const Daemon = struct {
 
     fn dispatchLoop(self: *Daemon) void {
         self.recoverLostShells();
+        self.attachKeptTurns();
         self.resumePausedSessions(true) catch |err| std.log.err("could not resume suspended sessions: {t}", .{err});
         self.extensions.watchMcp(self.mcpHook());
         while (self.events.pop(self.io)) |ev| {
@@ -1879,6 +1894,18 @@ pub const Daemon = struct {
                 }
                 if (self.recap_cache.items.len >= 64) self.gpa.free(self.recap_cache.orderedRemove(0).text);
                 self.recap_cache.append(self.gpa, result) catch self.gpa.free(result.text);
+            },
+            .turn_detached => |td| {
+                const session = self.sessions.get(td.sid) orelse return;
+                if (session.turn_thread) |t| {
+                    t.join();
+                    session.turn_thread = null;
+                }
+                // Still running, as far as anyone can tell: its guest is. The
+                // steering it has not taken yet goes along with it.
+                session.handed_over = true;
+                self.handOverQueuedInputs(session);
+                if (self.outgoing) |out| if (out.phase == .quiescing and !self.anySessionActive()) self.handoverQuiesced();
             },
             .turn_done => |td| {
                 defer if (td.err_text) |t| self.gpa.free(t);
@@ -4199,6 +4226,8 @@ pub const Daemon = struct {
 
     fn pauseOne(self: *Daemon, session: *Session, restart: bool, force: bool) !void {
         if (session.archived) return;
+        // A kept guest turn is handed over instead (detachKeptTurns).
+        if (session.detaching or session.handed_over) return;
         if (!session.pause_requested.load(.acquire)) {
             if (session.state != .running and session.state != .awaiting_approval) return;
             session.steer_mutex.lockUncancelable(self.io);
@@ -4223,6 +4252,103 @@ pub const Daemon = struct {
         while (it.next()) |sp| {
             if (sp.*.parent_sid == root.id) try self.pauseOne(sp.*, false, force);
         }
+    }
+
+    /// Handing over: each running kept guest turn stops being followed at
+    /// its next line, its guest left running for the successor.
+    fn detachKeptTurns(self: *Daemon) void {
+        var it = self.sessions.valueIterator();
+        while (it.next()) |sp| {
+            const session = sp.*;
+            if (session.state != .running) continue;
+            if (session.kept_slot.detachIfRunning(self.io)) session.detaching = true;
+        }
+    }
+
+    fn queuedInputsPath(self: *Daemon, buf: []u8, sid: u64) ?[]const u8 {
+        const root = self.keeper_root orelse return null;
+        return std.fmt.bufPrint(buf, "{s}/q-{d}.json", .{ root, sid }) catch null;
+    }
+
+    /// The steering a detached turn had not taken yet, for the successor.
+    fn handOverQueuedInputs(self: *Daemon, session: *Session) void {
+        session.steer_mutex.lockUncancelable(self.io);
+        defer session.steer_mutex.unlock(self.io);
+        session.steer_accepting = false;
+        if (session.steer_queue.items.len == 0) return;
+        defer {
+            for (session.steer_queue.items) |queued| queued.input.deinit(self.gpa);
+            session.steer_queue.clearRetainingCapacity();
+        }
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.queuedInputsPath(&buf, session.id) orelse return;
+        const json = std.json.Stringify.valueAlloc(self.gpa, session.steer_queue.items, .{}) catch return;
+        defer self.gpa.free(json);
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = json }) catch |err|
+            std.log.err("handover: queued input for session {d} lost: {t}", .{ session.id, err });
+    }
+
+    /// Steering handed over with a followed turn, queued again here.
+    fn takeHandedOverInputs(self: *Daemon, session: *Session) void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.queuedInputsPath(&buf, session.id) orelse return;
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const json = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(64 * 1024 * 1024)) catch return;
+        Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        const queued = std.json.parseFromSliceLeaky([]const proto.QueuedInput, arena, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return;
+        session.steer_mutex.lockUncancelable(self.io);
+        defer session.steer_mutex.unlock(self.io);
+        for (queued) |item| {
+            const owned = dupeInput(self.gpa, item.input) catch continue;
+            session.steer_queue.append(self.gpa, .{ .id = item.id, .input = owned }) catch owned.deinit(self.gpa);
+        }
+        self.publishQueue(session);
+    }
+
+    /// Follow every kept guest turn a previous daemon handed over (or that
+    /// this one handed over before its successor failed). A kept guest that
+    /// was not handed over lost its daemon to a crash: it is stopped.
+    fn attachKeptTurns(self: *Daemon) void {
+        const root = self.keeper_root orelse return;
+        var dir = Io.Dir.cwd().openDir(self.io, root, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            const path = std.fs.path.join(self.gpa, &.{ root, entry.name }) catch continue;
+            defer self.gpa.free(path);
+            self.attachKeptTurn(path) catch |err| {
+                std.log.warn("kept guest turn {s} not followed ({t}): stopping it", .{ entry.name, err });
+                if (loop.kept.Kept.attach(self.gpa, self.io, path)) |k| {
+                    _ = k.terminate(0);
+                    k.deinit();
+                } else |_| {}
+                loop.kept.removeDir(self.io, path);
+            };
+        }
+    }
+
+    fn attachKeptTurn(self: *Daemon, path: []const u8) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const opts: std.json.ParseOptions = .{ .ignore_unknown_fields = true, .allocate = .alloc_always };
+        const turn_path = try std.fs.path.join(arena, &.{ path, loop.kept.turn_name });
+        const detach_path = try std.fs.path.join(arena, &.{ path, loop.kept.detach_name });
+        const turn = try std.json.parseFromSliceLeaky(loop.kept.TurnFile, arena, try Io.Dir.cwd().readFileAlloc(self.io, turn_path, arena, .limited(64 * 1024)), opts);
+        const detached = try std.json.parseFromSliceLeaky(loop.kept.DetachFile, arena, Io.Dir.cwd().readFileAlloc(self.io, detach_path, arena, .limited(64 * 1024)) catch return error.NotHandedOver, opts);
+        const session = (try self.getOrLoadSession(turn.sid)) orelse return error.SessionGone;
+        try self.startTurnJobFull(session, "", &.{}, true, null, false, null, .{
+            .attach = .{ .dir = path, .replay_until = detached.consumed, .inputs_sent = detached.inputs_sent, .round = turn.round },
+            .turn_id = turn.turn_id,
+            .started_at_ms = turn.started_at_ms,
+        });
+        // Followed now: a crash from here leaves it unhanded, so stopped.
+        Io.Dir.cwd().deleteFile(self.io, detach_path) catch {};
+        self.takeHandedOverInputs(session);
+        std.log.info("following session {d}'s guest across the restart", .{turn.sid});
     }
 
     fn pauseActiveSessions(self: *Daemon, restart: bool, force: bool) !void {
@@ -4525,6 +4651,9 @@ pub const Daemon = struct {
         otel_headers: []u8 = &.{},
         otel_content: bool = false,
         cancel: *std.atomic.Value(bool),
+        /// Follow a kept guest a previous daemon started; `attach.dir` is
+        /// job-owned.
+        attach: ?loop.kept.Attach = null,
         /// Live turn state only; configuration must use the value fields above.
         session: *Session,
     };
@@ -4570,11 +4699,31 @@ pub const Daemon = struct {
         guest_compact: bool,
         from: ?[]const u8,
     ) !void {
+        return self.startTurnJobFull(session, text, attachments, synthetic_input, display_text, guest_compact, from, null);
+    }
+
+    /// Follow the kept guest turn in `dir` (detached by the daemon before
+    /// this one): same turn, its journal replayed, then followed live.
+    const AttachStart = struct { attach: loop.kept.Attach, turn_id: u64, started_at_ms: i64 };
+
+    fn startTurnJobFull(
+        self: *Daemon,
+        session: *Session,
+        text: []const u8,
+        attachments: []const block.MediaRef,
+        synthetic_input: bool,
+        display_text: ?[]const u8,
+        guest_compact: bool,
+        from: ?[]const u8,
+        attach: ?AttachStart,
+    ) !void {
         if (session.turn_thread != null or session.state == .running or session.state == .awaiting_approval)
             return error.SessionBusy;
         if (session.pause_requested.load(.acquire) or self.pending_reboot != null) return error.SessionPaused;
         const job = try self.gpa.create(TurnJob);
         errdefer self.gpa.destroy(job);
+        const attach_dir: ?[]u8 = if (attach) |a| try self.gpa.dupe(u8, a.attach.dir) else null;
+        errdefer if (attach_dir) |dir| self.gpa.free(dir);
         const cwd = try self.gpa.dupe(u8, session.cwd);
         errdefer self.gpa.free(cwd);
         const model = try self.gpa.dupe(u8, session.model);
@@ -4621,6 +4770,15 @@ pub const Daemon = struct {
             .cancel = &session.cancel,
             .session = session,
         };
+        if (attach) |a| {
+            job.turn_id = a.turn_id;
+            job.started_at_ms = a.started_at_ms;
+            job.attach = a.attach;
+            job.attach.?.dir = attach_dir.?;
+        }
+        session.kept_slot = .{};
+        session.detaching = false;
+        session.handed_over = false;
         session.steer_mutex.lockUncancelable(self.io);
         session.steer_accepting = !guest_compact;
         session.steer_mutex.unlock(self.io);
@@ -4837,6 +4995,7 @@ pub const Daemon = struct {
             @memset(job.otel_headers, 0);
             self.gpa.free(job.otel_headers);
             freeMediaRefs(self.gpa, job.attachments);
+            if (job.attach) |a| self.gpa.free(a.dir);
             self.gpa.destroy(job);
         }
 
@@ -4848,7 +5007,8 @@ pub const Daemon = struct {
         // Thread dispatch is complete. Everything below prepares the first
         // provider request: runtime resolution, history loading, and assembly.
         TurnHooks.onPhase(job, .context);
-        self.store.telemetryBeginTurn(
+        // A followed turn's telemetry row was begun by the daemon that started it.
+        if (job.attach == null) self.store.telemetryBeginTurn(
             job.sid,
             job.turn_id,
             job.model,
@@ -4958,7 +5118,15 @@ pub const Daemon = struct {
             .try_close_steer = TurnHooks.tryCloseSteer,
             .max_rounds = job.max_rounds,
             .guest_compact = if (job.guest_compact) job.text else null,
+            .keeper_root = self.keeper_root,
+            .kept_slot = &job.session.kept_slot,
+            .guest_attach = job.attach,
         }, job.text, job.attachments) catch |e| {
+            // Handed over: no end of turn here; the successor follows it.
+            if (e == error.GuestDetached) {
+                self.events.push(self.io, .{ .turn_detached = .{ .sid = job.sid } }) catch {};
+                return;
+            }
             // Delegated failures carry actionable prose (missing binary,
             // login required, or guest-reported error); prefer that detail.
             const delegate_detail: ?[]const u8 = switch (e) {
@@ -6724,6 +6892,7 @@ pub const Daemon = struct {
         var it = self.sessions.valueIterator();
         while (it.next()) |sp| {
             const state = sp.*.state;
+            if (sp.*.handed_over) continue;
             if (state == .running or state == .awaiting_approval) return true;
         }
         return false;
@@ -6779,7 +6948,9 @@ pub const Daemon = struct {
         const out = self.outgoing orelse return;
         out.phase = .quiescing;
         self.handoverNotice("restarting Marlin…", false);
-        // Paused with restart intent, so the successor resumes them.
+        // Kept guest turns run on and the successor follows them; the rest
+        // are paused with restart intent, so the successor resumes them.
+        self.detachKeptTurns();
         self.pauseActiveSessions(true, out.force) catch |err| {
             std.log.err("handover: could not pause sessions: {t}", .{err});
             return self.abortHandover("could not pause the running sessions; Marlin keeps running");
@@ -6977,6 +7148,13 @@ pub const Daemon = struct {
             std.log.err("shell {d} stopped mirroring: {t}", .{ hp.*.id, err });
         self.handing_over.store(false, .release);
         self.nudgeAcceptLoop();
+        // Kept turns this daemon handed over: follow them again.
+        var sit = self.sessions.valueIterator();
+        while (sit.next()) |sp| {
+            sp.*.detaching = false;
+            if (sp.*.handed_over) sp.*.state = .idle;
+        }
+        self.attachKeptTurns();
         self.resumePausedSessions(true) catch |err| std.log.err("could not resume suspended sessions: {t}", .{err});
         self.handoverNotice(msg, true);
         if (self.lookupClient(requester)) |client| self.sendTo(client, .{ .err = .{ .code = "handover", .msg = msg } });
@@ -7556,7 +7734,7 @@ pub const Daemon = struct {
     fn discardShutdownEvent(self: *Daemon, event: Event) void {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
-            .client_gone, .turn_resumed, .turn_usage_credits, .turn_guest_pid, .turn_phase, .shell_exited, .shell_settled, .shutdown => {},
+            .client_gone, .turn_resumed, .turn_usage_credits, .turn_guest_pid, .turn_phase, .turn_detached, .shell_exited, .shell_settled, .shutdown => {},
             .handover_snapshot, .handover_closed, .handover_deadline, .handover_command => {},
             .handover_built => |value| if (value.msg) |msg| self.gpa.free(msg),
             .handover_report => |value| self.gpa.free(value.text),
@@ -7620,6 +7798,16 @@ fn detectImageMime(bytes: []const u8) ?[]const u8 {
     if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP"))
         return "image/webp";
     return null;
+}
+
+fn dupeInput(gpa: std.mem.Allocator, input: block.Input) !block.Input {
+    const text = try gpa.dupe(u8, input.text);
+    errdefer gpa.free(text);
+    const display = if (input.display_text) |value| try gpa.dupe(u8, value) else null;
+    errdefer if (display) |value| gpa.free(value);
+    const from = if (input.from) |value| try gpa.dupe(u8, value) else null;
+    errdefer if (from) |value| gpa.free(value);
+    return .{ .text = text, .display_text = display, .from = from, .attachments = try dupeMediaRefs(gpa, input.attachments) };
 }
 
 fn dupeMediaRefs(gpa: std.mem.Allocator, refs: []const block.MediaRef) ![]block.MediaRef {
@@ -7820,6 +8008,13 @@ fn posixChmod600(path: []const u8) void {
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
     _ = std.c.chmod(buf[0..path.len :0], 0o600);
+}
+
+/// `<dir of the store>/g`: kept guest turns' journals (guest/keeper.zig).
+/// Short, since each holds a Unix socket path. Null leaves guests unkept.
+fn keeperRoot(gpa: std.mem.Allocator, db_path: []const u8) ?[]u8 {
+    const dir = std.fs.path.dirname(db_path) orelse return null;
+    return std.fs.path.join(gpa, &.{ dir, "g" }) catch null;
 }
 
 fn cancelActiveSession(self: *Daemon, session: *Session) void {
