@@ -1043,9 +1043,7 @@ pub fn sessionToolLine(
         .wait => if (done) "Waited on" else "Waiting on",
     };
     if (tool == .list) return .{ .verb = verb };
-    const args = std.json.parseFromSliceLeaky(struct { handle: ?[]const u8 = null, text: ?[]const u8 = null }, arena, args_json, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| switch (err) {
+    const args = sessionToolArgs(arena, args_json) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return .{ .verb = verb },
     };
@@ -1067,6 +1065,32 @@ pub fn sessionToolLine(
         };
     }
     return .{ .verb = verb, .target = query, .note = note };
+}
+
+const SessionToolArgs = struct { handle: ?[]const u8 = null, text: ?[]const u8 = null };
+
+/// The handle and text of a session tool call. Claude Code and native calls
+/// carry them at the top; Codex records its whole MCP item, with them under
+/// "arguments" (an object, or a JSON string).
+fn sessionToolArgs(arena: std.mem.Allocator, args_json: []const u8) !SessionToolArgs {
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{});
+    if (root != .object) return .{};
+    var obj = root.object;
+    if (obj.get("arguments")) |nested| switch (nested) {
+        .object => |o| obj = o,
+        .string => |s| {
+            const inner = try std.json.parseFromSliceLeaky(std.json.Value, arena, s, .{});
+            if (inner == .object) obj = inner.object;
+        },
+        else => {},
+    };
+    const str = struct {
+        fn get(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+            const v = o.get(key) orelse return null;
+            return if (v == .string) v.string else null;
+        }
+    }.get;
+    return .{ .handle = str(obj, "handle"), .text = str(obj, "text") };
 }
 
 /// A session tool's row: the verb, the session, and a message's first line.

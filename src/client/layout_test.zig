@@ -1937,6 +1937,8 @@ test "session tools say what they do and name the session, under every backend's
     defer gpa.free(wait_args);
     const message_args = try std.fmt.allocPrint(gpa, "{{\"handle\":\"{s}\",\"text\":\"Are you releasing?\\nDetails follow.\"}}", .{jev[0..8]});
     defer gpa.free(message_args);
+    const codex_args = try std.fmt.allocPrint(gpa, "{{\"type\":\"mcpToolCall\",\"server\":\"marlin\",\"tool\":\"message_session\",\"status\":\"inProgress\",\"arguments\":{{\"handle\":\"{s}\",\"text\":\"Taking 072.\"}}}}", .{jev[0..8]});
+    defer gpa.free(codex_args);
     const blocks = [_]RenderBlock{
         .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("go"), .label = @constCast("") },
         .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{}"), .label = @constCast("mcp__marlin__sessions") },
@@ -1944,6 +1946,9 @@ test "session tools say what they do and name the session, under every backend's
         .{ .kind = .tool_call, .turn_id = 1, .text = message_args, .label = @constCast("mcp__marlin__message_session") },
         .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("delivered"), .label = @constCast("") },
         .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{\"handle\":\"beef\"}"), .label = @constCast("read_session") },
+        .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("…"), .label = @constCast("") },
+        // Codex: the whole MCP item, as stored live, the arguments nested.
+        .{ .kind = .tool_call, .turn_id = 1, .text = codex_args, .label = @constCast("MCP marlin/message_session") },
         .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("…"), .label = @constCast("") },
         .{ .kind = .tool_call, .turn_id = 1, .text = wait_args, .label = @constCast("mcp__marlin__wait_for_session") },
     };
@@ -1985,6 +1990,7 @@ test "session tools say what they do and name the session, under every backend's
     const named = try std.fmt.allocPrint(arena, "jev · {s}", .{jev[0..8]});
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Listed sessions") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Message to {s}: Are you releasing?\n", .{named})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Message to {s}: Taking 072.\n", .{named})) != null);
     // A handle this client does not know stays as the agent typed it.
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Read session beef") != null);
     // Still waiting: present tense, the session by name.

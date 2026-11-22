@@ -1233,6 +1233,9 @@ function sessionToolLine(name, argsJson, done) {
                 message: 'Message to', wait: done ? 'Waited on' : 'Waiting on'}[tool];
   let a = {};
   try { a = JSON.parse(argsJson || '{}') || {}; } catch {}
+  // Codex records its whole MCP item, the call's own arguments nested.
+  if (a.arguments && typeof a.arguments === 'object') a = a.arguments;
+  else if (typeof a.arguments === 'string') try { a = JSON.parse(a.arguments) || {}; } catch {}
   const query = tool !== 'list' && typeof a.handle === 'string' ? a.handle : '';
   const note = typeof a.text === 'string' ? a.text.split('\n', 1)[0].trim() : '';
   if (!query) return {verb, target: '', note};
