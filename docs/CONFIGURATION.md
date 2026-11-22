@@ -178,6 +178,9 @@ listening socket and every running `!!` shell, moves each connected terminal
 and phone across, and exits only once each has arrived on the new one. A
 client that does not come back in time (a laptop asleep, a phone offline)
 stops being waited for after a minute; it reconnects normally when it returns.
+Claude Code and Codex turns keep running through it: their processes are
+not stopped, and the new daemon picks up where the old one left off. Native
+turns pause and resume.
 
 ```toml
 [reboot]

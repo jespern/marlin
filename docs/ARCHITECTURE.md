@@ -472,7 +472,8 @@ process exits only once the new one has every client.
    its own to rebuild. The requesting terminal stays open and is moved across
    like every other client; only a local `!rb` (or `!rb client`/`both`),
    which rebuilds the terminal's own binary, still exits and re-execs.
-2. **Pause**: running roots pause with restart intent, exactly as above.
+2. **Pause**: running roots pause with restart intent, exactly as above,
+   except kept guest turns, which detach (below).
 3. **Freeze**: the accept loop stops polling the listening socket, shell
    readers stop (unread output stays in the PTY), and client requests get
    err{restarting}. The predecessor writes nothing to the store from here.
@@ -504,9 +505,37 @@ successor that fails after migrating the store leaves the predecessor running
 on the migrated schema; migrations are additive, so this is the same position
 as running an older build against a newer store.
 
+#### Kept guest turns
+
+A Claude Code or Codex turn is not paused by a handover: its guest runs on
+and the successor follows it. Each invocation runs under a keeper
+(`marlin _keep`, `src/daemon/guest/keeper.zig`): a small process in a
+session of its own that starts the guest and journals its stdout, stderr and
+stdin under `<state>/g/<id>/`, with its socket at `/tmp/marlin-<uid>/k-<id>`
+(a short path, as Unix sockets need; the folder is the user's alone). The
+daemon reads the stdout journal as a stream (`kept.zig`), woken by the
+keeper's one-byte notes, and writes stdin through the socket.
+
+At a handover the predecessor detaches each running kept turn at a line
+boundary, writing `detach.json` (how far it read, how many messages the guest
+was sent) and the session's queued steering (`q-<sid>.json`), and leaves the
+guest running. Any daemon that starts (the successor, or the predecessor
+after a failed start) follows every handed-over turn: it replays the journal
+from the start through the same decoding, persisting, announcing and writing
+nothing, up to the recorded offset, then carries on live. Codex's follow-up
+turns are inferred from the journal going on. Bridged calls from the guest
+(`wait_for_session`, `ask_user`, permission prompts) are asked again of the
+successor when the predecessor drops or refuses them (`cc_approve.zig`).
+
+Not kept: Muse, `/compact` turns, guests whose keeper cannot start (they run
+as before, as the daemon's children), and a Codex turn waiting on the user's
+approval, which is paused as before. A kept guest whose daemon crashed is
+stopped by the next daemon (only a handover leaves a turn to follow).
+Shutdown cancels kept turns like any other.
+
 What survives: everything durable (sessions, block logs, blobs, approvals,
 config) — by construction, since store ≠ context. What's rebuilt: in-flight
-turns (resumable), MCP server processes (spawn-on-use), UI state
+turns (resumable; kept guest turns keep running), MCP server processes (spawn-on-use), UI state
 (best-effort snapshot).
 
 ### Concurrency model
