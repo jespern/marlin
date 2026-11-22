@@ -1225,14 +1225,18 @@ pub const Daemon = struct {
         }
     }
 
-    /// Make `client` a viewer of `host` (resizing it to the client when
-    /// `geometry` is given) and bring it up to date with a snapshot.
+    /// Make `client` a viewer of `host` (resizing it to the client's
+    /// `geometry` when nobody else views it) and bring it up to date with a
+    /// snapshot.
     fn attachShell(self: *Daemon, client: *Client, host: *shell_host.Host, request_id: u64, geometry: shell_host.Geometry, follow_size: bool) !void {
         try host.attach(client.id);
         const v = host.viewer(client.id).?;
         v.geometry = geometry;
         v.follow_size = follow_size;
-        if (!follow_size) self.resizeShell(host, geometry);
+        // Looking does not take a shell from someone using it (a terminal
+        // following its session into a shell the phone opened would shrink
+        // the phone's screen); typing does, in shell_input.
+        if (!follow_size and host.viewers.items.len == 1) self.resizeShell(host, geometry);
         self.sendTo(client, .{ .shell_opened = .{ .shell_id = host.id, .request_id = request_id } });
         try self.sendShellSnapshot(client, host);
         self.broadcastShellList();

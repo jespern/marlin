@@ -2260,17 +2260,27 @@ function shellConnect(target) {
   closeShellView();
   $('#main').classList.add('shell');
   setShellComposer(true);
-  const grid = termGrid();
+  shellView = {sid, shellId: Number(target.shell_id) || 0, grid: termGrid(), frame: null, typed: false};
+  setState(cur ? cur.state : 'idle');
+  shellSocket(target);
+}
+// One connection to the view's shell. The view outlives it: a phone that
+// sleeps, changes network, or sees Marlin restart loses the socket, keeps
+// the screen, and reattaches when it can (shellReattach).
+function shellSocket(target) {
+  const grid = shellView.grid;
   const query = new URLSearchParams({...target, cols: grid.cols, rows: grid.rows});
   if (!target.command) query.delete('command');
   const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/shell?' + query);
   shellWs = ws;
-  shellView = {sid, shellId: Number(target.shell_id) || 0, grid, frame: null, typed: false};
-  setState(cur ? cur.state : 'idle');
+  // Opening the shell here is using it: each connection takes its size.
+  shellView.claimed = false;
+  let framed = false;
   ws.onmessage = e => {
     if (ws !== shellWs) return;
     const m = JSON.parse(e.data);
     if (m.frame) {
+      framed = true;
       // Opening the shell here is using it (tmux's "latest"): it takes this
       // screen's size now, not at the first keystroke, or a shell left
       // running (htop) keeps whatever size it had, keyboard up and all.
@@ -2282,16 +2292,26 @@ function shellConnect(target) {
       drawFrame(m.frame);
     } else if (m.opened) shellView.shellId = m.opened.shell_id;
     else if (m.exited) closeShellView();
-    else if (m.err) { notice(m.err.msg); closeShellView(); }
+    else if (m.err) {
+      // Refused (gone, or a daemon without shells): not again until the
+      // session is opened again.
+      lostShellId = shellView.shellId;
+      notice(m.err.msg);
+      closeShellView();
+    }
   };
   ws.onclose = () => {
     if (ws !== shellWs) return;
-    // Not an exit: the connection went. Show the transcript; opening the
-    // session again reattaches.
-    lostShellId = shellView.shellId;
-    notice('shell disconnected');
-    closeShellView();
+    shellWs = null;
+    // Not an exit: the connection went. One that worked is retried at once
+    // if the page shows; otherwise the page showing again, the network
+    // returning, or the events reconnecting retries it.
+    if (framed) shellReattach();
   };
+}
+function shellReattach() {
+  if (!shellView || shellWs || !shellView.shellId || document.visibilityState !== 'visible') return;
+  shellSocket({shell_id: shellView.shellId});
 }
 function closeShellView() {
   if (!shellView) return;
@@ -2308,7 +2328,21 @@ function closeShellView() {
 function syncShell() {
   if (!cur || String(cur.sid) !== String(sid)) return;
   const id = Number(cur.shell_id) || 0;
+  if (shellView && !shellWs && id !== shellView.shellId) {
+    // It ended (or another replaced it) while this page was away.
+    if (!shellView.shellId && id) { shellView.shellId = id; shellReattach(); return; }
+    closeShellView();
+  }
   if (id && !shellView && id !== lostShellId) shellConnect({shell_id: id});
+}
+// Back from the background: the socket may have died without a word (iOS
+// freezes a hidden page), so attach afresh rather than trust it.
+function shellResume() {
+  if (!shellView) return;
+  const ws = shellWs;
+  shellWs = null;
+  if (ws && ws.readyState <= 1) ws.close();
+  shellReattach();
 }
 function drawFrame(f) {
   shellView.frame = f;
@@ -2831,6 +2865,7 @@ function connectEvents() {
   es = new EventSource('/events?sid=' + sid + (handoverToken ? '&handover=' + handoverToken : ''));
   es.onopen = () => {
     connectionReady = true; connectionState('Connected'); phonePresence();
+    shellReattach();
     if (handoverToken) { handoverToken = ''; notice('Marlin restarted'); loadSessions().catch(() => {}); }
   };
   es.onmessage = e => handle(JSON.parse(bigints(e.data)));
@@ -2842,12 +2877,13 @@ function connectEvents() {
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') { phonePresence(false); return; }
+  shellResume();
   connectEvents();
   loadSessions().catch(() => connectionState('Reconnecting…'));
 });
 window.addEventListener('pagehide', () => phonePresence(false));
 window.addEventListener('offline', () => { connectionReady = false; connectionState('Offline'); });
-window.addEventListener('online', () => { connectEvents(); loadSessions().catch(() => {}); });
+window.addEventListener('online', () => { shellReattach(); connectEvents(); loadSessions().catch(() => {}); });
 setInterval(() => phonePresence(), 10000);
 async function pushRequest(action, body) {
   const response = await fetch('/push/' + action, body === undefined ? {} : {

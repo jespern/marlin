@@ -558,6 +558,36 @@ test "a shell takes the size of whoever types; a follower is told, never resizes
     for (try r.drain(2)) |msg| try std.testing.expect(msg != .shell_resized);
 }
 
+// Case: Jesper typed `!!` on his phone while the terminal showed the same
+// session; the terminal followed it into the shell and took the size, and
+// the phone drew a 120-column screen in tiny type.
+test "attaching to a shell someone else is viewing leaves its size until you type" {
+    const r = try ShellRig.create();
+    defer r.destroy();
+
+    try r.send(2, "{{\"shell_open\":{{\"request_id\":3,\"sid\":7,\"cols\":44,\"rows\":30,\"follow_size\":true}}}}", .{});
+    const shell_id = (try r.drain(2))[0].shell_opened.shell_id;
+    const host = r.daemon.shells.get(shell_id).?;
+
+    // The terminal follows the session into the shell: the phone keeps it.
+    try r.send(1, "{{\"shell_attach\":{{\"request_id\":4,\"shell_id\":{d},\"cols\":120,\"rows\":40}}}}", .{shell_id});
+    _ = try r.drain(1);
+    try std.testing.expectEqual(@as(u16, 44), host.geometry.cols);
+    for (try r.drain(2)) |msg| try std.testing.expect(msg != .shell_resized);
+
+    // Typing at the terminal takes it.
+    try r.send(1, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"Cg==\"}}}}", .{shell_id});
+    try std.testing.expectEqual(@as(u16, 120), host.geometry.cols);
+
+    // With the phone gone, attaching alone takes the size at once.
+    try r.send(2, "{{\"shell_input\":{{\"shell_id\":{d},\"data_base64\":\"Cg==\"}}}}", .{shell_id});
+    try r.send(2, "{{\"shell_detach\":{{\"shell_id\":{d}}}}}", .{shell_id});
+    try r.send(1, "{{\"shell_detach\":{{\"shell_id\":{d}}}}}", .{shell_id});
+    try std.testing.expectEqual(@as(u16, 44), host.geometry.cols);
+    try r.send(1, "{{\"shell_attach\":{{\"request_id\":5,\"shell_id\":{d},\"cols\":120,\"rows\":40}}}}", .{shell_id});
+    try std.testing.expectEqual(@as(u16, 120), host.geometry.cols);
+}
+
 // Case: Jesper's half-written prompt was gone after a reboot; the client
 // hands its draft to the daemon, and whoever opens the session next gets it.
 test "a session's draft is kept for the next client that opens it, until it is cleared" {

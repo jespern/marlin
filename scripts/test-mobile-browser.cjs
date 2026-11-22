@@ -756,6 +756,33 @@ async function main() {
         return termGrid().rows;
       });
       await phonePage.waitForFunction(rows=>shellView && shellView.frame && shellView.frame.rows===rows && shellView.frame.cols===termGrid().cols,reopened);
+      // Case: Jesper left the phone for a minute and came back to "shell
+      // disconnected". A lost socket keeps the shell on screen and
+      // reattaches: at once while the page shows, else when it shows again.
+      const dropped=await phonePage.evaluate(async()=>{
+        const old=shellWs; old.close();
+        await new Promise(r=>{const t=setInterval(()=>{if(shellWs && shellWs!==old && shellWs.readyState===1){clearInterval(t);r();}},20);});
+        return document.querySelector('#main').classList.contains('shell');
+      });
+      assert.equal(dropped,true);
+      const asleep=await phonePage.evaluate(async()=>{
+        Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>'hidden'});
+        document.dispatchEvent(new Event('visibilitychange'));
+        const old=shellWs; old.close();
+        await new Promise(r=>old.addEventListener('close',()=>setTimeout(r,100)));
+        return [shellWs, document.querySelector('#main').classList.contains('shell'), document.querySelector('#term .row')!==null];
+      });
+      assert.deepEqual(asleep,[null,true,true]);
+      await phonePage.evaluate(()=>{
+        Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>'visible'});
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      await phonePage.evaluate(async()=>{
+        await new Promise(r=>{const t=setInterval(()=>{if(shellWs && shellWs.readyState===1 && shellView.claimed){clearInterval(t);r();}},20);});
+        const input=document.querySelector('#input'); input.value='echo back-$((4+4))';
+        await submitComposer();
+      });
+      await phonePage.waitForFunction(()=>document.querySelector('#term').textContent.includes('back-8'));
       await phonePage.locator('#keybar [data-key="^D"]').dispatchEvent('pointerdown');
       await phonePage.waitForFunction(()=>!document.querySelector('#main').classList.contains('shell'));
       await phonePage.waitForFunction(()=>[...document.querySelectorAll('.block.shell')].some(n=>n.textContent.includes('live-7')));
