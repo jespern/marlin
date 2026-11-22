@@ -1923,13 +1923,13 @@ test "a message from another agent folds to one line; ctrl+t shows it whole" {
     for (expanded_lines.items) |line| try std.testing.expect(line.fill_style == null);
 }
 
-test "session tools say what they do and name the session, under every backend's name" {
+test "Marlin's own tools say what they do and name the session or image, under every backend's name" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     for ([_][]const u8{ "wait_for_session", "mcp__marlin__wait_for_session", "MCP marlin/wait_for_session" }) |name|
-        try std.testing.expectEqual(layout.SessionTool.wait, layout.sessionTool(name).?);
-    try std.testing.expect(layout.sessionTool("mcp__other__wait_for_session") == null);
+        try std.testing.expectEqual(layout.MarlinTool.wait, layout.marlinTool(name).?);
+    try std.testing.expect(layout.marlinTool("mcp__other__wait_for_session") == null);
 
     const session_handle = @import("../core/session_handle.zig");
     const jev = session_handle.full(42);
@@ -1939,6 +1939,7 @@ test "session tools say what they do and name the session, under every backend's
     defer gpa.free(message_args);
     const codex_args = try std.fmt.allocPrint(gpa, "{{\"type\":\"mcpToolCall\",\"server\":\"marlin\",\"tool\":\"message_session\",\"status\":\"inProgress\",\"arguments\":{{\"handle\":\"{s}\",\"text\":\"Taking 072.\"}}}}", .{jev[0..8]});
     defer gpa.free(codex_args);
+    var shown_image = [_]layout.ImageRef{.{ .hash = @constCast("feedface") }};
     const blocks = [_]RenderBlock{
         .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("go"), .label = @constCast("") },
         .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{}"), .label = @constCast("mcp__marlin__sessions") },
@@ -1949,6 +1950,9 @@ test "session tools say what they do and name the session, under every backend's
         .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("…"), .label = @constCast("") },
         // Codex: the whole MCP item, as stored live, the arguments nested.
         .{ .kind = .tool_call, .turn_id = 1, .text = codex_args, .label = @constCast("MCP marlin/message_session") },
+        .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("delivered"), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .text = @constCast("{\"type\":\"mcpToolCall\",\"tool\":\"show_image\",\"arguments\":{\"path\":\"/tmp/robin-messages-preview.png\"}}"), .label = @constCast("MCP marlin/show_image") },
+        .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("Shown to the user: robin-messages-preview.png"), .label = @constCast(""), .images = &shown_image },
         .{ .kind = .tool_result, .turn_id = 1, .text = @constCast("…"), .label = @constCast("") },
         .{ .kind = .tool_call, .turn_id = 1, .text = wait_args, .label = @constCast("mcp__marlin__wait_for_session") },
     };
@@ -1991,9 +1995,13 @@ test "session tools say what they do and name the session, under every backend's
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Listed sessions") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Message to {s}: Are you releasing?\n", .{named})) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Message to {s}: Taking 072.\n", .{named})) != null);
+    // A shown image's row says so; the result's own words would repeat it.
+    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Showed robin-messages-preview.png\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Shown to the user") == null);
     // A handle this client does not know stays as the agent typed it.
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Read session beef") != null);
     // Still waiting: present tense, the session by name.
     try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "Waiting on {s}", .{named})) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "mcp__marlin__") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "MCP marlin/") == null);
 }

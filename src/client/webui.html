@@ -1220,22 +1220,24 @@ function toolDisplayArg(name, argsJson, cwd) {
   return null;
 }
 
-// Port of layout.zig sessionTool / sessionToolLine: the cross-session
-// tools said as what they do, the target session by title and handle.
-function sessionTool(name) {
+// Port of layout.zig marlinTool / marlinToolLine: the cross-session tools
+// and show_image said as what they do, a session by title and handle.
+function marlinTool(name) {
   const bare = (name || '').replace(/^mcp__marlin__|^MCP marlin\//, '');
-  return {sessions: 'list', read_session: 'read', message_session: 'message', wait_for_session: 'wait'}[bare] || null;
+  return {sessions: 'list', read_session: 'read', message_session: 'message', wait_for_session: 'wait', show_image: 'show_image'}[bare] || null;
 }
-function sessionToolLine(name, argsJson, done) {
-  const tool = sessionTool(name);
+function marlinToolLine(name, argsJson, done) {
+  const tool = marlinTool(name);
   if (!tool) return null;
   const verb = {list: done ? 'Listed sessions' : 'Listing sessions', read: done ? 'Read session' : 'Reading session',
-                message: 'Message to', wait: done ? 'Waited on' : 'Waiting on'}[tool];
+                message: 'Message to', wait: done ? 'Waited on' : 'Waiting on',
+                show_image: done ? 'Showed' : 'Showing'}[tool];
   let a = {};
   try { a = JSON.parse(argsJson || '{}') || {}; } catch {}
   // Codex records its whole MCP item, the call's own arguments nested.
   if (a.arguments && typeof a.arguments === 'object') a = a.arguments;
   else if (typeof a.arguments === 'string') try { a = JSON.parse(a.arguments) || {}; } catch {}
+  if (tool === 'show_image') return {verb, target: typeof a.path === 'string' ? a.path.split('/').pop() : '', note: ''};
   const query = tool !== 'list' && typeof a.handle === 'string' ? a.handle : '';
   const note = typeof a.text === 'string' ? a.text.split('\n', 1)[0].trim() : '';
   if (!query) return {verb, target: '', note};
@@ -1252,7 +1254,7 @@ function sessionToolLine(name, argsJson, done) {
   }
   return {verb, target: (s.title || '(untitled)') + ' · ' + s.handle.slice(0, len), note};
 }
-function sessionToolSummary(summary, line) {
+function marlinToolSummary(summary, line) {
   summary.replaceChildren('⚙ ', el('span', 'name', line.verb));
   if (line.target) summary.append(' ', el('span', 'prev', line.target));
   if (line.note) summary.append(el('span', 'said', ': ' + line.note.slice(0, 400)));
@@ -1331,14 +1333,14 @@ function addBlock(b, target = $('#transcript'), live = true) {
     node.innerHTML = renderMd(v.text);
   } else if (kind === 'tool_call' && isAskUserTool(v.name)) {
     node = questionRecord(v);
-  } else if (kind === 'tool_call' && sessionTool(v.name)) {
+  } else if (kind === 'tool_call' && marlinTool(v.name)) {
     node = el('details', 'block tool');
-    const line = sessionToolLine(v.name, v.args_json, false);
+    const line = marlinToolLine(v.name, v.args_json, false);
     const s = el('summary');
-    sessionToolSummary(s, line);
+    marlinToolSummary(s, line);
     node.appendChild(s);
     node.dataset.call = v.call_id;
-    node.dataset.sessionTool = v.name;
+    node.dataset.marlinTool = v.name;
     node.dataset.said = line.verb + (line.target ? ' ' + line.target : '');
   } else if (kind === 'tool_call') {
     node = el('details', 'block tool');
@@ -1394,9 +1396,9 @@ function addBlock(b, target = $('#transcript'), live = true) {
       // A failure stays folded, as in the TUI: the row and its group's
       // "· N failed" say so, and a tap opens it. Some models fail often.
       if (v.status && v.status !== 'ok') call.classList.add('err');
-      if (call.dataset.sessionTool) {
+      if (call.dataset.marlinTool) {
         const name = call.querySelector('summary .name');
-        const done = sessionToolLine(call.dataset.sessionTool, '', true);
+        const done = marlinToolLine(call.dataset.marlinTool, '', true);
         if (name && done) name.textContent = done.verb;
       }
       call.appendChild(pre);

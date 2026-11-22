@@ -1005,48 +1005,52 @@ pub fn pendingToolBatch(blocks: []const RenderBlock, start: usize) ?CollapsedToo
 /// A session this client knows, for naming the one a session tool targets.
 pub const SessionRef = struct { sid: u64, title: []const u8 };
 
-pub const SessionTool = enum { list, read, message, wait };
+pub const MarlinTool = enum { list, read, message, wait, show_image };
 
-/// The cross-session tools (sessions, read_session, message_session,
-/// wait_for_session) under each backend's name, like isAskUserTool.
-pub fn sessionTool(name: []const u8) ?SessionTool {
+/// Marlin's own agent tools that read as what they do: the cross-session
+/// tools (sessions, read_session, message_session, wait_for_session) and
+/// show_image, under each backend's name, like isAskUserTool.
+pub fn marlinTool(name: []const u8) ?MarlinTool {
     var bare = name;
     for ([_][]const u8{ "mcp__marlin__", "MCP marlin/" }) |prefix| {
         if (std.mem.startsWith(u8, name, prefix)) bare = name[prefix.len..];
     }
-    const table = [_]struct { []const u8, SessionTool }{
+    const table = [_]struct { []const u8, MarlinTool }{
         .{ "sessions", .list },           .{ "read_session", .read },
         .{ "message_session", .message }, .{ "wait_for_session", .wait },
+        .{ "show_image", .show_image },
     };
     for (table) |entry| if (std.mem.eql(u8, bare, entry[0])) return entry[1];
     return null;
 }
 
-/// A session tool call said as what it does: "Waiting on" "jev · 1a2b3c4d",
+/// A Marlin tool call said as what it does: "Waiting on" "jev · 1a2b3c4d",
 /// with a message's first line as the note. The target is the session's
 /// title and handle when this client knows the session, else the handle
 /// the agent typed.
-pub const SessionToolLine = struct { verb: []const u8, target: []const u8 = "", note: []const u8 = "" };
+pub const MarlinToolLine = struct { verb: []const u8, target: []const u8 = "", note: []const u8 = "" };
 
-pub fn sessionToolLine(
+pub fn marlinToolLine(
     arena: std.mem.Allocator,
     name: []const u8,
     args_json: []const u8,
     sessions: []const SessionRef,
     done: bool,
-) !?SessionToolLine {
-    const tool = sessionTool(name) orelse return null;
+) !?MarlinToolLine {
+    const tool = marlinTool(name) orelse return null;
     const verb: []const u8 = switch (tool) {
         .list => if (done) "Listed sessions" else "Listing sessions",
         .read => if (done) "Read session" else "Reading session",
         .message => "Message to",
         .wait => if (done) "Waited on" else "Waiting on",
+        .show_image => if (done) "Showed" else "Showing",
     };
     if (tool == .list) return .{ .verb = verb };
-    const args = sessionToolArgs(arena, args_json) catch |err| switch (err) {
+    const args = marlinToolArgs(arena, args_json) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return .{ .verb = verb },
     };
+    if (tool == .show_image) return .{ .verb = verb, .target = std.fs.path.basename(args.path orelse "") };
     const query = args.handle orelse return .{ .verb = verb };
     const note = if (args.text) |text|
         std.mem.trim(u8, text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len], " \t\r")
@@ -1067,12 +1071,12 @@ pub fn sessionToolLine(
     return .{ .verb = verb, .target = query, .note = note };
 }
 
-const SessionToolArgs = struct { handle: ?[]const u8 = null, text: ?[]const u8 = null };
+const MarlinToolArgs = struct { handle: ?[]const u8 = null, text: ?[]const u8 = null, path: ?[]const u8 = null };
 
 /// The handle and text of a session tool call. Claude Code and native calls
 /// carry them at the top; Codex records its whole MCP item, with them under
 /// "arguments" (an object, or a JSON string).
-fn sessionToolArgs(arena: std.mem.Allocator, args_json: []const u8) !SessionToolArgs {
+fn marlinToolArgs(arena: std.mem.Allocator, args_json: []const u8) !MarlinToolArgs {
     const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{});
     if (root != .object) return .{};
     var obj = root.object;
@@ -1090,15 +1094,15 @@ fn sessionToolArgs(arena: std.mem.Allocator, args_json: []const u8) !SessionTool
             return if (v == .string) v.string else null;
         }
     }.get;
-    return .{ .handle = str(obj, "handle"), .text = str(obj, "text") };
+    return .{ .handle = str(obj, "handle"), .text = str(obj, "text"), .path = str(obj, "path") };
 }
 
-/// A session tool's row: the verb, the session, and a message's first line.
-fn appendSessionToolLine(
+/// A Marlin tool's row: the verb, its target, and a message's first line.
+fn appendMarlinToolLine(
     alloc: std.mem.Allocator,
     lines: *std.ArrayList(Line),
     rb: RenderBlock,
-    line: SessionToolLine,
+    line: MarlinToolLine,
     w: usize,
 ) !void {
     const output_start = lines.items.len;
@@ -1133,15 +1137,15 @@ fn appendCallLine(
     note: ?[]const u8,
     result: ?RenderBlock,
 ) !void {
-    if (try sessionToolLine(alloc, rb.label, rb.text, sessions, result != null)) |line|
-        return appendSessionToolLine(alloc, lines, rb, line, w);
+    if (try marlinToolLine(alloc, rb.label, rb.text, sessions, result != null)) |line|
+        return appendMarlinToolLine(alloc, lines, rb, line, w);
     try appendToolCallLine(alloc, lines, rb, cwd, w, note, result);
 }
 
 /// The running-status words for a call: a session tool as what it does
 /// ("Waiting on jev · 1a2b3c4d"), else null.
-fn sessionToolStatus(arena: std.mem.Allocator, rb: RenderBlock, sessions: []const SessionRef) !?[]const u8 {
-    const line = (try sessionToolLine(arena, rb.label, rb.text, sessions, false)) orelse return null;
+fn marlinToolStatus(arena: std.mem.Allocator, rb: RenderBlock, sessions: []const SessionRef) !?[]const u8 {
+    const line = (try marlinToolLine(arena, rb.label, rb.text, sessions, false)) orelse return null;
     if (line.target.len == 0) return line.verb;
     return try std.fmt.allocPrint(arena, "{s} {s}", .{ line.verb, line.target });
 }
@@ -1410,6 +1414,8 @@ pub fn appendToolResultLines(alloc: std.mem.Allocator, lines: *std.ArrayList(Lin
     // AUTHORED (edit/write tools) shows whole (up to 24) because
     // a truncated diff misleads. Diffs merely read via bash keep
     // diff coloring but the ordinary cap.
+    // A shown image's row already says so; the image follows.
+    if (marlinTool(tool_label) == .show_image and rb.status == .ok) return;
     const is_diff = isDiffOutput(rb.text);
     const authored = is_diff and isFileEditTool(tool_label);
     const max_shown: usize = if (authored) 24 else 8;
@@ -1915,7 +1921,7 @@ pub fn workingDetail(arena: std.mem.Allocator, transcript: *const Transcript) !W
         }
     }
     if (currentInflightCall(transcript.blocks)) |cur| {
-        const said = try sessionToolStatus(arena, cur.rb.*, transcript.sessions);
+        const said = try marlinToolStatus(arena, cur.rb.*, transcript.sessions);
         const arg_full = if (said != null) "" else (try toolDisplayArgDecoded(arena, cur.rb.label, cur.rb.text, transcript.cwd)) orelse "";
         const arg = arg_full[0..utf8Floor(arg_full, @min(arg_full.len, 60))];
         const call_s: i64 = if (transcript.call_started_ms > 0)
@@ -2134,7 +2140,7 @@ pub fn layoutBlockRange(
                 var hint: []const u8 = " · ctrl+t to view transcript";
                 if (running_count == 1) {
                     const call = blocks_all[running_call_idx];
-                    if (try sessionToolStatus(alloc, call, transcript.sessions)) |said| {
+                    if (try marlinToolStatus(alloc, call, transcript.sessions)) |said| {
                         hint = try std.fmt.allocPrint(alloc, " · {s}", .{said});
                     } else {
                         const hi = (try toolDisplayArgDecoded(alloc, call.label, call.text, transcript.cwd)) orelse "";
