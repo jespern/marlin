@@ -12,6 +12,7 @@
 //!                     for the park/approve/resume path)
 
 const std = @import("std");
+const cost = @import("../core/cost.zig");
 const Io = std.Io;
 
 const block = @import("../core/block.zig");
@@ -80,6 +81,68 @@ pub fn search(
     return 0;
 }
 
+/// `marlin diagnostics --cost`: what guest agents cost, Marlin's against the
+/// vendors' own terminal UIs, from the guests' own request logs.
+fn costDiagnostics(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, self_exe: []const u8, days: u32, json: bool) !u8 {
+    const conn = attach.connect(gpa, io, environ, self_exe) catch |err| {
+        try eprint(io, "marlin: cannot reach daemon: {t}\n", .{err});
+        return 1;
+    };
+    defer conn.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try conn.send(.{ .cost_report = .{ .since_days = days } });
+    const report = conn.recvUntil(arena, .cost_report_result) catch {
+        try eprint(io, "marlin diagnostics: the daemon could not produce a cost report\n", .{});
+        return 1;
+    };
+    if (json) {
+        try print(io, "{s}\n", .{try std.json.Stringify.valueAlloc(arena, report, .{})});
+        return 0;
+    }
+    try print(io, "{s}", .{try formatCostReport(arena, report, days)});
+    return 0;
+}
+
+pub fn formatCostReport(arena: std.mem.Allocator, report: cost.Report, days: u32) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "Guest cost, last {d} day{s} · from {d} log file{s} on the daemon host\n", .{ days, if (days == 1) "" else "s", report.files, if (report.files == 1) "" else "s" });
+    var b1: [16]u8 = undefined;
+    var b2: [16]u8 = undefined;
+    var b3: [16]u8 = undefined;
+    for ([_][]const u8{ "claude_code", "codex" }) |backend| {
+        const claude = std.mem.eql(u8, backend, "claude_code");
+        var any = false;
+        for (report.groups) |g| {
+            if (!std.mem.eql(u8, g.backend, backend) or g.requests < 5) continue;
+            if (!any) {
+                try out.print(arena, "\n{s:<36} {s:>8} {s:>8} {s:>7} {s:>17} {s:>12}\n", .{
+                    if (claude) "Claude Code" else "Codex", "requests", "context", "cached", "rewrites", if (claude) "cost/req" else "uncached/req",
+                });
+                any = true;
+            }
+            const label = try std.fmt.allocPrint(arena, "  {s} · {s}", .{ g.model, g.client });
+            const rewrites = try std.fmt.allocPrint(arena, "{d} · {s}", .{ g.rewrites, cost.formatTokens(&b2, g.rewrite_tokens) });
+            const per_request = if (claude) cost.groupCostUnits(g) / g.requests else g.input / g.requests;
+            try out.print(arena, "{s:<36} {d:>8} {s:>8} {d:>6.1}% {s:>17} {s:>12}\n", .{
+                label, g.requests, cost.formatTokens(&b1, g.context() / g.requests), g.cachedPercent(), rewrites, cost.formatTokens(&b3, per_request),
+            });
+        }
+    }
+    if (report.sessions.len > 0) {
+        try out.print(arena, "\nCostliest Marlin sessions on Claude Code\n", .{});
+        for (report.sessions) |s| {
+            const name = try std.fmt.allocPrint(arena, "  {s} · {s}", .{ if (s.title.len > 0) s.title[0..@min(s.title.len, 28)] else "(untitled)", s.handle });
+            try out.print(arena, "{s:<46} {d:>6} req · context {s:>5} · ≈ {s:>5} · rewrites {d} ({s})\n", .{
+                name, s.requests, cost.formatTokens(&b1, s.context / @max(s.requests, 1)), cost.formatTokens(&b2, s.cost_units), s.rewrites, cost.formatTokens(&b3, s.rewrite_tokens),
+            });
+        }
+    }
+    try out.print(arena, "\ncontext: tokens sent per request · rewrites: requests that wrote most of a context over 100K to the cache again\ncost: approximate, in fresh-input tokens: {s}\n", .{cost.claude_weights});
+    return out.items;
+}
+
 fn daemonDiagnostics(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, self_exe: []const u8, json: bool) !u8 {
     const remote = environ.get(attach.remote_env);
     const conn = if (remote != null)
@@ -129,12 +192,25 @@ pub fn diagnostics(
 ) !u8 {
     var json = false;
     var daemon_only = false;
+    var cost_days: ?u32 = null;
     var handle: ?[]const u8 = null;
-    for (args) |arg| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--json")) {
             json = true;
         } else if (std.mem.eql(u8, arg, "--daemon")) {
             daemon_only = true;
+        } else if (std.mem.eql(u8, arg, "--cost")) {
+            cost_days = cost_days orelse 7;
+        } else if (std.mem.eql(u8, arg, "--since") and i + 1 < args.len) {
+            i += 1;
+            const text = args[i];
+            const days = if (std.mem.endsWith(u8, text, "d")) text[0 .. text.len - 1] else text;
+            cost_days = std.fmt.parseInt(u32, days, 10) catch {
+                try eprint(io, "marlin diagnostics: --since takes days, like 7d or 30d\n", .{});
+                return 2;
+            };
         } else if (handle == null) {
             handle = arg;
         } else {
@@ -143,6 +219,7 @@ pub fn diagnostics(
         }
     }
 
+    if (cost_days) |days| return costDiagnostics(gpa, io, environ, self_exe, days, json);
     if (daemon_only) {
         if (handle != null) {
             try eprint(io, "usage: marlin diagnostics [session-handle | --daemon] [--json]\n", .{});

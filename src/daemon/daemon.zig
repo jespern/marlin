@@ -75,6 +75,7 @@ const mcp_login = @import("mcp_login.zig");
 const mcp_oauth = @import("tools/mcp_oauth.zig");
 const registry = @import("provider/registry.zig");
 const claude_code = @import("provider/claude_code.zig");
+const cost_report = @import("cost_report.zig");
 const codex = @import("provider/codex.zig");
 const muse = @import("provider/muse.zig");
 const guest_models = @import("guest_models.zig");
@@ -230,6 +231,8 @@ const Event = union(enum) {
     /// A kept guest turn stopped being followed: it runs on for the next
     /// daemon, which replays its journal (handover).
     turn_detached: struct { sid: u64 },
+    /// A cost report for this client, encoded (or an error line).
+    cost_report_done: struct { client_id: u64, line: []u8 },
     /// Parent turn thread → dispatcher. All strings are gpa-owned; `future`
     /// points into the parked parent turn's stack until resolve().
     child_start: ChildStart,
@@ -698,6 +701,8 @@ pub const Daemon = struct {
     catalog_fetching: bool = false,
     catalog_cancel: std.atomic.Value(bool) = .init(false),
     catalog_thread: ?std.Thread = null,
+    /// The running `diagnostics --cost` scan; one at a time.
+    cost_thread: ?std.Thread = null,
     plugin_thread: ?std.Thread = null,
     mcp_logins: std.ArrayList(*mcp_login.Job) = .empty,
     plugin_cancel: std.atomic.Value(bool) = .init(false),
@@ -1898,6 +1903,14 @@ pub const Daemon = struct {
                 if (self.recap_cache.items.len >= 64) self.gpa.free(self.recap_cache.orderedRemove(0).text);
                 self.recap_cache.append(self.gpa, result) catch self.gpa.free(result.text);
             },
+            .cost_report_done => |done| {
+                defer self.gpa.free(done.line);
+                if (self.cost_thread) |thread| {
+                    thread.join();
+                    self.cost_thread = null;
+                }
+                if (self.lookupClient(done.client_id)) |c| self.sendLine(c, done.line);
+            },
             .turn_detached => |td| {
                 const session = self.sessions.get(td.sid) orelse return;
                 if (session.turn_thread) |t| {
@@ -2435,6 +2448,7 @@ pub const Daemon = struct {
                     .hits = hits,
                 } });
             },
+            .cost_report => |request| self.startCostReport(client, request.since_days),
             .diagnostics => |request| {
                 _ = (try self.getOrLoadSession(request.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
@@ -4278,6 +4292,79 @@ pub const Daemon = struct {
         while (it.next()) |sp| {
             if (sp.*.parent_sid == root.id) try self.pauseOne(sp.*, false, force);
         }
+    }
+
+    const CostJob = struct {
+        daemon: *Daemon,
+        client_id: u64,
+        arena: std.heap.ArenaAllocator,
+        marlin: cost_report.Marlin = .{},
+        home: []const u8 = "",
+        since_ms: i64 = 0,
+    };
+
+    /// `diagnostics --cost`: which logged guest sessions are Marlin's is
+    /// known here; the scan of the logs runs on a worker.
+    fn startCostReport(self: *Daemon, client: *Client, since_days: u32) void {
+        if (self.cost_thread != null) {
+            self.sendTo(client, .{ .err = .{ .code = "busy", .msg = "a cost report is already being prepared" } });
+            return;
+        }
+        self.prepareCostReport(client.id, since_days) catch |err| {
+            const msg = std.fmt.allocPrint(self.gpa, "could not prepare the cost report: {t}", .{err}) catch return;
+            defer self.gpa.free(msg);
+            self.sendTo(client, .{ .err = .{ .code = "cost_report", .msg = msg } });
+        };
+    }
+
+    fn prepareCostReport(self: *Daemon, client_id: u64, since_days: u32) !void {
+        const job = try self.gpa.create(CostJob);
+        job.* = .{ .daemon = self, .client_id = client_id, .arena = .init(self.gpa) };
+        errdefer {
+            job.arena.deinit();
+            self.gpa.destroy(job);
+        }
+        const a = job.arena.allocator();
+        job.home = try a.dupe(u8, self.environ.get("HOME") orelse return error.NoHome);
+        job.since_ms = nowMs(self.io) - @as(i64, @max(since_days, 1)) * std.time.ms_per_day;
+        const rows = try self.store.listSessions(true);
+        defer {
+            for (rows) |row| row.deinit(self.gpa);
+            self.gpa.free(rows);
+        }
+        const known = try a.alloc(u64, rows.len);
+        for (rows, known) |row, *sid| sid.* = row.id;
+        for (rows) |row| {
+            var uuid_buf: [36]u8 = undefined;
+            try job.marlin.claude.put(a, try a.dupe(u8, claude_code.sessionUuid(&uuid_buf, row.id)), row.id);
+            if (try self.store.getCodexThreadId(row.id)) |thread| {
+                defer self.gpa.free(thread);
+                try job.marlin.codex.put(a, try a.dupe(u8, thread), row.id);
+            }
+            var handle_buf: session_handle.Full = undefined;
+            try job.marlin.names.put(a, row.id, .{
+                .handle = try a.dupe(u8, session_handle.display(&handle_buf, row.id, known)),
+                .title = try a.dupe(u8, row.title),
+            });
+        }
+        self.cost_thread = try std.Thread.spawn(.{}, costMain, .{job});
+    }
+
+    fn costMain(job: *CostJob) void {
+        const self = job.daemon;
+        defer {
+            job.arena.deinit();
+            self.gpa.destroy(job);
+        }
+        const report = cost_report.scan(job.arena.allocator(), self.io, job.home, job.since_ms, &job.marlin);
+        const line = if (report) |r|
+            proto.encode(self.gpa, proto.DaemonMsg{ .cost_report_result = r })
+        else |err| blk: {
+            const msg = std.fmt.allocPrint(job.arena.allocator(), "the cost report failed: {t}", .{err}) catch "the cost report failed";
+            break :blk proto.encode(self.gpa, proto.DaemonMsg{ .err = .{ .code = "cost_report", .msg = msg } });
+        };
+        const owned = line catch return;
+        self.events.push(self.io, .{ .cost_report_done = .{ .client_id = job.client_id, .line = owned } }) catch self.gpa.free(owned);
     }
 
     /// Handing over: each running kept guest turn stops being followed at
@@ -7660,6 +7747,8 @@ pub const Daemon = struct {
         self.catalog_cancel.store(true, .release);
         if (self.catalog_thread) |thread| thread.join();
         self.catalog_thread = null;
+        if (self.cost_thread) |thread| thread.join();
+        self.cost_thread = null;
         self.catalog_fetching = false;
         self.plugin_cancel.store(true, .release);
         if (self.plugin_thread) |thread| thread.join();
@@ -7764,6 +7853,7 @@ pub const Daemon = struct {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
             .client_gone, .turn_resumed, .turn_usage_credits, .turn_guest_pid, .turn_phase, .turn_detached, .shell_exited, .shell_settled, .shutdown => {},
+            .cost_report_done => |value| self.gpa.free(value.line),
             .handover_snapshot, .handover_closed, .handover_deadline, .handover_command => {},
             .handover_built => |value| if (value.msg) |msg| self.gpa.free(msg),
             .handover_report => |value| self.gpa.free(value.text),

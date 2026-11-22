@@ -35,6 +35,24 @@ legacy turn-start-to-first-provider gap for older rows and report its
 p50/p95/max plus the count at or above one second. It does not duplicate
 prompts, completions, tool arguments, or tool output into telemetry.
 
+### What guest agents cost
+
+```sh
+marlin diagnostics --cost              # last 7 days
+marlin diagnostics --cost --since 30d  # or --json
+```
+
+compares Claude Code and Codex run by Marlin with the same tools run on their
+own, per model: requests, context sent per request, how much of it came from
+the prompt cache, full-context rewrites (a request that wrote most of a
+context over 100K to the cache again, because the cache had expired), and an
+approximate cost per request in fresh-input tokens. It then names the
+costliest Marlin sessions on Claude Code. The daemon reads the guests' own
+request logs on its host (`~/.claude/projects`, `~/.codex/sessions`); a
+response logged once per content block counts once. Marlin's Claude Code
+sessions are recognised by the session ids Marlin gives them, its Codex ones
+by `originator`; other headless use shows as `other`.
+
 ## Transport failures and recovery
 
 Native turns, compaction, and native-to-guest handovers share the HTTP

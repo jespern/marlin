@@ -193,6 +193,7 @@ test {
     _ = @import("client/session_view_test.zig");
     _ = @import("client/recap_test.zig");
     _ = @import("daemon/recap_test.zig");
+    _ = @import("daemon/cost_report_test.zig");
     _ = @import("client/commands.zig");
     _ = @import("client/keys.zig");
     _ = @import("client/setup.zig");

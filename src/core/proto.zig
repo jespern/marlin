@@ -12,6 +12,7 @@
 //!   - Unknown fields are ignored on read; unknown message types are an err.
 
 const std = @import("std");
+const cost = @import("cost.zig");
 const block = @import("block.zig");
 const guest = @import("guest.zig");
 pub const ReasoningEffort = @import("effort.zig").Effort;
@@ -289,6 +290,9 @@ pub const ClientMsg = union(enum) {
     /// Operational timings/outcomes for one session. `turn_limit` bounds the
     /// percentile sample; the latest turn's waterfall is always included.
     diagnostics: struct { sid: u64, turn_limit: u32 = 50 },
+    /// What guest agents cost over the last `since_days`, from their own
+    /// request logs on the daemon host (cost.zig).
+    cost_report: struct { since_days: u32 = 7 },
     session_recap: struct { sid: u64, seq: u64 },
     session_git_status: struct { sid: u64 },
     /// Replace or disable the daemon's process-local OTLP exporter without a
@@ -707,6 +711,7 @@ pub const DaemonMsg = union(enum) {
     queued: struct { sid: u64, items: []const QueuedInput },
     search_result: struct { query: []const u8, sid: u64 = 0, hits: []const SearchHit },
     diagnostics_result: Diagnostics,
+    cost_report_result: cost.Report,
     otel_status_result: struct { enabled: bool, content: bool = false },
     /// Sent only to session watchers that explicitly opted in: older tagged
     /// union decoders reject message types they do not know.

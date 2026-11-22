@@ -358,6 +358,7 @@ const help_text =
     \\  marlin watch <handle> [--json] [--until-idle]  stream live session events
     \\  marlin diagnostics [handle] [--json]  inspect recent turn timings
     \\  marlin diagnostics --daemon [--json]  identify the connected daemon
+    \\  marlin diagnostics --cost [--since 30d] [--json]  what guest agents cost, Marlin vs their own UIs
     \\  marlin archive <handle> hide a session tree without deleting it
     \\  marlin unarchive <handle> restore an archived session tree
     \\  marlin kill <handle>   interrupt a session's running turn
